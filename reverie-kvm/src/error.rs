@@ -13,6 +13,25 @@ use thiserror::Error;
 /// Errors produced by the KVM backend prototype.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Native retirement failed without proving guest terminal completion.
+    #[error("KVM terminal file retirement {operation} failed (errno {errno})")]
+    TerminalFileRetirement {
+        /// Failed host/protocol operation.
+        operation: &'static str,
+        /// Original errno, or EPROTO for a malformed private frame.
+        errno: i32,
+    },
+
+    /// A parent-thread-death operation cannot be represented or published.
+    /// This is terminal backend capability/failure, never a guest errno.
+    #[error("KVM parent-thread-death {operation} failed (errno {errno})")]
+    ParentDeathSignal {
+        /// Exact failed capability or publication operation.
+        operation: &'static str,
+        /// Original Linux-style failure, retained without collapsing precision.
+        errno: i32,
+    },
+
     /// Admission or retirement of guest execution could not be completed.
     #[error("KVM entry control failed during {operation}: {source}")]
     EntryControl {
@@ -266,6 +285,57 @@ pub enum Error {
     #[error("failed to allocate guest memory: {0}")]
     MemoryMapping(#[source] std::io::Error),
 
+    /// A writable syscall alias could not be physically retired. This is a
+    /// terminal backend failure, never a guest errno. A process-lifetime ledger
+    /// owns the exact refused range and its backing until host process exit;
+    /// repeated independent failed VMs can accumulate retained resources.
+    #[error(
+        "writable alias munmap at {address:#x} for {length} bytes failed: {source} (ownership retained until process exit; record {retention_id:#x})"
+    )]
+    WriteAliasCleanup {
+        /// Original munmap error, including its errno.
+        #[source]
+        source: std::io::Error,
+        /// Start of the confirmed-owned range whose cleanup was refused.
+        address: usize,
+        /// Length of that range in bytes.
+        length: usize,
+        /// Stable identity of the process-lifetime ownership record.
+        retention_id: usize,
+    },
+
+    /// An ordinary shared-file history requires an unsupported backend capability.
+    /// This is terminal, not a Linux syscall errno or fabricated guest SIGBUS.
+    #[error("unsupported KVM shared-file operation {operation}: {reason}")]
+    SharedFileCapability {
+        /// Operation refused before its unsupported memory effect.
+        operation: &'static str,
+        /// Exact capability boundary, independent of host timing retries.
+        reason: &'static str,
+    },
+
+    /// A fault-contained copy involving mutable ordinary-file backing stopped.
+    /// The recorded prefix is real and is never rolled back or reported as a
+    /// complete copy; source preserves the actual host errno on a failed call.
+    #[error(
+        "shared-file {operation} at {address:#x} copied {transferred}/{requested} bytes after {prior_transferred} earlier vector bytes: {source}"
+    )]
+    SharedFileCopy {
+        /// Copy direction or initialization operation.
+        operation: &'static str,
+        /// First guest address of the complete requested copy.
+        address: u64,
+        /// Complete requested byte count.
+        requested: usize,
+        /// Actual prefix transferred, including earlier stable chunks.
+        transferred: usize,
+        /// Bytes completed by preceding vector elements, independent of this segment.
+        prior_transferred: usize,
+        /// Kernel error, or an explicit short-copy diagnostic.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Live backing replacement requires KVM to observe host mmap changes.
     #[error("KVM does not support synchronous host memory-map updates")]
     SynchronousMmuUnsupported,
@@ -277,6 +347,10 @@ pub enum Error {
     /// The ELF image could not be parsed.
     #[error("failed to parse ELF image: {0}")]
     ElfParse(#[from] goblin::error::Error),
+
+    /// This host cannot run guests with Reverie's canonical process image.
+    #[error("unsupported host: {0}")]
+    UnsupportedHost(String),
 
     /// The ELF image cannot run in the minimal KVM process personality.
     #[error("unsupported ELF image: {0}")]
@@ -353,6 +427,11 @@ pub enum Error {
     /// Full-owner dequeue observation cannot cover deliberately uninstrumented workers.
     #[error("KVM signal dequeue observation requires Tool-owned threads")]
     SignalObservationRequiresToolThreads,
+
+    /// Host metadata timestamps would reach the guest without a Tool to
+    /// rewrite them: the run has no Tool, or its threads are host-owned.
+    #[error("KVM host metadata timestamps require a Tool that owns every guest thread")]
+    HostMetadataTimestampsRequireToolThreads,
 
     /// Replacing the process image from a guest thread is not implemented.
     #[error("KVM guest threads cannot replace the process image")]

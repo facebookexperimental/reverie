@@ -11,7 +11,7 @@
 //! Flow of one trapped syscall:
 //!
 //! 1. The guest issues a syscall; seccomp returns `SECCOMP_RET_TRAP`.
-//! 2. The kernel delivers a thread-directed `SIGSYS`; [`sigsys_handler`] runs.
+//! 2. The kernel delivers a thread-directed `SIGSYS`; `sigsys_handler` runs.
 //! 3. The handler reconstructs a [`SyscallEvent`] from the `ucontext` registers
 //!    and calls the registered [`SyscallDispatcher`].
 //! 4. The dispatcher may forward through [`SyscallEvent::forward`], using an

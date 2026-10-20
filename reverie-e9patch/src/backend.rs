@@ -33,6 +33,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use reverie::Backend;
+use reverie::BackendStatsRequest;
 use reverie::BackendStatsSource;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -520,6 +521,14 @@ fn is_elf_file(path: &Path) -> io::Result<bool> {
 // TODO-HUMAN-REVIEW(PR-104): Review activating in-guest seccomp under ptrace.
 const LDPRELOAD_FALLBACK_ENV: &str = "REVERIE_E9PATCH_LDPRELOAD_FALLBACK";
 
+/// Whether the guest's final environment selects an in-guest e9patch runtime,
+/// whether this backend armed it, the caller configured the command, or the
+/// launcher's own environment passes the selection through. Its signals and
+/// patched calls are invisible to the tracer.
+fn in_guest_runtime_armed(command: &Command) -> bool {
+    command.get_env(crate::RUNTIME_ENV).is_some() || command.get_env(crate::TOOL_ENV).is_some()
+}
+
 /// Parse [`LDPRELOAD_FALLBACK_ENV`] into a [`crate::RuntimeMode`], or `None`
 /// (leave the guest command untouched) when unset or unrecognized.
 fn ldpreload_fallback_mode() -> Option<crate::RuntimeMode> {
@@ -534,11 +543,14 @@ async fn spawn_tracer<T>(
     command: Command,
     config: <T::GlobalState as GlobalTool>::Config,
     provenance: Option<(PathBuf, u64, Vec<u64>)>,
+    stats: BackendStatsRequest,
 ) -> Result<Tracer<T::GlobalState>, Error>
 where
     T: Tool + 'static,
 {
-    let builder = TracerBuilder::<T>::new(command).config(config);
+    let builder = TracerBuilder::<T>::new(command)
+        .config(config)
+        .backend_stats(stats);
     let builder = if let Some((image, image_entry_address, patched_site_addresses)) = provenance {
         builder.site_validated_injected_syscall_trap(
             E9PATCH_SYSCALL_TRAP_MARKER,
@@ -713,6 +725,7 @@ impl E9patchBackend {
         mut command: Command,
         config: <T::GlobalState as GlobalTool>::Config,
         preserve_executable: bool,
+        request: BackendStatsRequest,
     ) -> Result<
         (
             Tracer<T::GlobalState>,
@@ -732,23 +745,29 @@ impl E9patchBackend {
         // ptrace-only path is unchanged. The shared runtime covers residual
         // un-rewritten sites; ptrace remains the lifecycle owner and Guest.
         // AUTONOMOUS-BOT-IMPLEMENTED
-        let ldpreload = match ldpreload_fallback_mode() {
+        let fallback_mode = ldpreload_fallback_mode();
+        let ldpreload = match fallback_mode {
             Some(mode) => {
                 crate::configure_guest_command(&mut command, mode)?;
                 mode.controller_name()
             }
             None => "off",
         };
+        let in_guest_runtime = in_guest_runtime_armed(&command);
 
         // TODO-HUMAN-REVIEW(PR-103): Review non-ELF ptrace fallback behavior.
         if !is_elf_file(&source)? {
-            let stats = E9patchBackendStatsSource::unsupported_non_elf();
+            let mut stats = E9patchBackendStatsSource::unsupported_non_elf();
+            if in_guest_runtime {
+                stats.arm_in_guest_runtime();
+            }
             eprintln!(
                 ":: Backend: e9patch hybrid; {}; controller=ptrace; ldpreload={ldpreload}",
                 stats.snapshot(),
             );
             command.program(&source).arg0(arg0);
-            let tracer = spawn_tracer::<T>(command, config, None).await?;
+            let tracer = spawn_tracer::<T>(command, config, None, request).await?;
+            stats.attach_tracer(tracer.backend_stats());
             return Ok((tracer, ExecutableResource::Original, stats));
         }
 
@@ -756,7 +775,10 @@ impl E9patchBackend {
         let report = prepared.report();
         let image_entry_address = report.image_entry_address();
         let patched_site_addresses = report.patched_site_addresses().to_vec();
-        let stats = E9patchBackendStatsSource::from_report(report);
+        let mut stats = E9patchBackendStatsSource::from_report(report);
+        if in_guest_runtime {
+            stats.arm_in_guest_runtime();
+        }
         // TODO-HUMAN-REVIEW(PR-103): Review the stable backend coverage diagnostic.
         eprintln!(
             ":: Backend: e9patch hybrid; {}; controller=ptrace; ldpreload={ldpreload}",
@@ -766,7 +788,8 @@ impl E9patchBackend {
         // TODO-HUMAN-REVIEW(PR-103): Review zero-site original-image execution.
         if report.patched_sites() == 0 {
             command.program(&source).arg0(arg0);
-            let tracer = spawn_tracer::<T>(command, config, None).await?;
+            let tracer = spawn_tracer::<T>(command, config, None, request).await?;
+            stats.attach_tracer(tracer.backend_stats());
             return Ok((tracer, ExecutableResource::Original, stats));
         }
 
@@ -799,9 +822,11 @@ impl E9patchBackend {
             command,
             config,
             Some((mapped_image, image_entry_address, patched_site_addresses)),
+            request,
         )
         .await;
         let (tracer, resource) = finish_spawn(spawn_result, resource)?;
+        stats.attach_tracer(tracer.backend_stats());
         Ok((tracer, resource, stats))
     }
 
@@ -836,7 +861,8 @@ impl E9patchBackend {
     where
         T: Tool + 'static,
     {
-        let (tracer, resource, _stats) = Self::spawn::<T>(command, config, true).await?;
+        let (tracer, resource, _stats) =
+            Self::spawn::<T>(command, config, true, BackendStatsRequest::DISABLED).await?;
         finish_legacy_wait(tracer.wait().await, resource)
     }
 
@@ -857,7 +883,8 @@ impl E9patchBackend {
     where
         T: Tool + 'static,
     {
-        let (tracer, resource, _stats) = Self::spawn::<T>(command, config, true).await?;
+        let (tracer, resource, _stats) =
+            Self::spawn::<T>(command, config, true, BackendStatsRequest::DISABLED).await?;
         finish_legacy_wait(tracer.wait_with_output().await, resource)
     }
 }
@@ -1188,7 +1215,8 @@ impl Backend for E9patchBackend {
     where
         T: Tool + 'static,
     {
-        let (tracer, resource, _stats) = Self::spawn::<T>(command, config, false).await?;
+        let (tracer, resource, _stats) =
+            Self::spawn::<T>(command, config, false, BackendStatsRequest::DISABLED).await?;
         finish_legacy_wait(tracer.wait().await, resource)
     }
 
@@ -1199,7 +1227,8 @@ impl Backend for E9patchBackend {
     where
         T: Tool + 'static,
     {
-        let (tracer, resource, stats) = Self::spawn::<T>(command, config, false).await?;
+        let (tracer, resource, stats) =
+            Self::spawn::<T>(command, config, false, BackendStatsRequest::ENABLED).await?;
         finish_legacy_wait(tracer.wait().await, resource)
             .map(|(status, global)| (status, global, stats.backend_stats()))
     }
@@ -1217,7 +1246,8 @@ impl Backend for E9patchBackend {
         // guest that printed nothing.
         command.stdout(reverie::process::Stdio::piped());
         command.stderr(reverie::process::Stdio::piped());
-        let (tracer, resource, stats) = Self::spawn::<T>(command, config, false).await?;
+        let (tracer, resource, stats) =
+            Self::spawn::<T>(command, config, false, BackendStatsRequest::ENABLED).await?;
         finish_legacy_wait(tracer.wait_with_output().await, resource)
             .map(|(output, global)| (output, global, stats.backend_stats()))
     }

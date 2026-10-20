@@ -19,6 +19,7 @@ use std::process::Command as ProcessCommand;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use reverie::BackendStatsSnapshot;
 use reverie::BackendStatsSource;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -290,7 +291,7 @@ async fn trap_only_stats_report_no_patched_sites() {
     let scratch = tempfile::tempdir().unwrap();
     let mut command = Command::new(&binary);
     command.arg(scratch.path().join("stats.pid"));
-    let (status, _log, stats) = tokio::time::timeout(
+    let (status, log, stats) = tokio::time::timeout(
         Duration::from_secs(20),
         LiteinstBackend::run_host_trap_only_and_stats::<RecordTool>(command, false),
     )
@@ -311,6 +312,34 @@ async fn trap_only_stats_report_no_patched_sites() {
         0,
         "a patch decision was counted with patching off: {:?}",
         snapshot.patch_decisions().counts()
+    );
+    // With patching off every syscall is a seccomp stop, and the Tool,
+    // subscribed to all of them, sees each one exactly once.
+    let record = snapshot
+        .dispatch_stats()
+        .expect("trap-only LiteInst reports a dispatch record");
+    assert_eq!(record.inconsistencies(), Vec::<String>::new(), "{record}");
+    assert_eq!(record.counters.patched_direct_calls, Some(0), "{record}");
+    assert_eq!(record.counters.signal_traps, Some(0), "{record}");
+    assert_eq!(record.counters.ptrace_sigtrap_stops, Some(0), "{record}");
+    assert_eq!(record.sites.patched, Some(0), "{record}");
+    let tool_syscalls = log
+        .0
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, event)| event.starts_with("syscall "))
+        .count() as u64;
+    assert!(tool_syscalls >= 5, "the fixture makes five syscalls");
+    assert_eq!(
+        record.counters.ptrace_seccomp_stops,
+        Some(tool_syscalls),
+        "{record}"
+    );
+    assert_eq!(
+        record.counters.dispatches(),
+        Some(tool_syscalls),
+        "{record}"
     );
 }
 
@@ -383,9 +412,21 @@ fn run_arm_in_fresh_pid_namespace(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn /usr/bin/unshare");
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
+    // Drain both pipes while the child runs. Once the user's pipe pages pass
+    // fs.pipe-user-pages-soft, a new pipe holds only 8 KiB, and a child
+    // blocked writing a longer record would never exit.
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("read the arm's output");
+            bytes
+        })
+    }
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -393,14 +434,14 @@ fn run_arm_in_fresh_pid_namespace(
             panic!("{arm} arm in a fresh PID namespace exceeded 60 s");
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    };
+    let stdout = stdout.join().unwrap();
+    let stderr = stderr.join().unwrap();
+    let stdout = String::from_utf8_lossy(&stdout);
     assert!(
-        output.status.success(),
-        "{arm} arm in a fresh PID namespace failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+        status.success(),
+        "{arm} arm in a fresh PID namespace failed ({status}):\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&stderr)
     );
     let record = stdout
         .lines()

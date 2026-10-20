@@ -17,7 +17,7 @@
 //!   `bincode`(legacy)-encoded payload;
 //! * on connect the server sends exactly one `Config` frame, which we read and
 //!   discard (the guest carries no config in its address space);
-//! * every request is a [`RequestEnvelope`] `{ from, request }` and the
+//! * every request is a `RequestEnvelope` `{ from, request }` and the
 //!   response travels back bare.
 //!
 //! When [`RPC_SOCKET_ENV`] is set, a coordinator process (e.g. `hermit-cli`)

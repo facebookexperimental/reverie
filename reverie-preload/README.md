@@ -1,5 +1,11 @@
 # reverie-preload
 
+Part of [Hermit](https://hermetic-infra.org) and
+[Reverie](https://docs.rs/reverie-core). See the
+[API documentation](https://docs.rs/reverie-preload) for embedding this runtime,
+and [`hermit-run`](https://crates.io/crates/hermit-run) for the command-line
+interface. Hermit selects this runtime only through optional backends.
+
 Shared `LD_PRELOAD` + seccomp/`SIGSYS` instrumentation runtime for Reverie's
 ld-preload backends (**e9patch** and **liteinst**). It exists so the ld-preload
 mechanism is written and reviewed once instead of duplicated per backend (DRY).

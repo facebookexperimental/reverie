@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[cfg(target_arch = "x86_64")]
+use reverie::BackendStatsSnapshot;
 use reverie::CpuIdResult;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -1596,6 +1597,54 @@ async fn first_site_is_installed_once_and_hot_calls_use_liteinst() {
     assert_eq!(
         stats.straddle_prefix_counts().into_iter().sum::<usize>(),
         stats.cacheline_straddlers()
+    );
+    let snapshot = stats.snapshot();
+    let record = snapshot
+        .dispatch_stats()
+        .expect("hybrid LiteInst reports a dispatch record");
+    assert_eq!(record.inconsistencies(), Vec::<String>::new(), "{record}");
+    // The hybrid takes no in-guest route: every subscribed syscall is a seccomp
+    // stop, except the hot site's 31 patched calls, which return to the tracer
+    // through SIGTRAP. Nothing here restarts, so the tracer's SIGTRAP stops
+    // equal the runtime's hook entries, which are counted separately.
+    assert_eq!(record.counters.signal_traps, Some(0), "{record}");
+    assert_eq!(record.counters.patched_direct_calls, Some(0), "{record}");
+    assert_eq!(
+        record.counters.ptrace_sigtrap_stops,
+        Some(
+            snapshot
+                .dispatch_paths()
+                .count(&reverie::LiteinstDispatchPath::DirectHook)
+        ),
+        "{record}"
+    );
+    assert!(
+        record.counters.ptrace_sigtrap_stops >= Some(31),
+        "the hot site's 31 hooks must be SIGTRAP dispatches: {record}"
+    );
+    assert!(
+        record.counters.ptrace_seccomp_stops >= Some(1),
+        "the hot site's first call is a seccomp stop: {record}"
+    );
+    // Every stop is a dispatch, but LiteInst completes its own mapping
+    // tracking without a Tool callback. The rest reached the Tool exactly once.
+    let internal = snapshot
+        .ptrace()
+        .expect("the hybrid reports its tracer's stats")
+        .internal_seccomp_stops();
+    assert!(internal >= 1, "the loader's mappings are tracked: {record}");
+    assert_eq!(
+        record.counters.dispatches().map(|total| total - internal),
+        Some(
+            global.delivered.load(Ordering::SeqCst)
+                + global.helper_mprotect_callbacks.load(Ordering::SeqCst)
+        ),
+        "every non-internal dispatch reached the Tool exactly once: {record}"
+    );
+    assert_eq!(
+        record.per_process.as_ref().map(Vec::len),
+        Some(1),
+        "{record}"
     );
     assert!(output.status.success(), "{output:?}");
 }
@@ -5381,6 +5430,57 @@ async fn host_hybrid_tool_restart_codes_re_invoke_the_syscall() {
     }
 }
 
+/// The shared record counts the tracer's SIGTRAP stops, not hook entries: each
+/// Tool-returned restart of a hooked syscall re-traps through the runtime int3
+/// without a second hook entry, so it adds one stop and no hook.
+#[tokio::test(flavor = "current_thread")]
+async fn host_hybrid_restart_re_traps_count_as_sigtrap_stops() {
+    const RESTARTS: u8 = 2;
+    let plan = RestartPlan {
+        errno: reverie::Errno::ERESTARTSYS.into_raw(),
+        restarts: RESTARTS,
+        ..Default::default()
+    };
+    let (_directory, guest) = compile_fixture("hybrid_restart.c");
+    let mut command = Command::new(guest);
+    command.arg("read");
+    let (output, log, stats) = LiteinstBackend::run_host_with_output_and_preload_and_stats::<
+        RestartTool,
+    >(command, plan.encode(), preload_path())
+    .await
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "read-result={RESTART_RESULT} {}\n",
+            restart_counts(RestartBackend::HostHybrid, 1)
+        )
+    );
+    assert_eq!(
+        log.events(),
+        [
+            "read(warm)",
+            "magic read(0x7e57,1)",
+            "magic read(0x7e57,1)",
+            "magic read(0x7e57,1)"
+        ]
+    );
+    let snapshot = stats.snapshot();
+    let record = snapshot
+        .dispatch_stats()
+        .expect("hybrid LiteInst reports a dispatch record");
+    let hooks = snapshot
+        .dispatch_paths()
+        .count(&reverie::LiteinstDispatchPath::DirectHook);
+    assert!(hooks >= 1, "the magic read must be a hook entry: {stats}");
+    assert_eq!(
+        record.counters.ptrace_sigtrap_stops,
+        Some(hooks + u64::from(RESTARTS)),
+        "{record}\n{stats}"
+    );
+}
+
 /// `-ERESTART_RESTARTBLOCK` re-dispatches as `restart_syscall` with the
 /// original argument registers, as Linux does.
 #[tokio::test(flavor = "current_thread")]
@@ -5902,9 +6002,12 @@ async fn host_hybrid_restart_with_an_sa_restart_sigchld_handler_restarts() {
 /// it and delivers it on the restart's resume instead of at a fresh signal
 /// stop. The Linux rule must apply to that delivery too: a handler without
 /// `SA_RESTART` interrupts, an `SA_RESTART` one restarts, and no handler
-/// restarts. As under plain ptrace, a signal that interrupts a Tool
-/// injection reaches the guest without a Tool signal event, so the handler
-/// count is the evidence of delivery.
+/// restarts. The handler count is the evidence of delivery.
+///
+/// Both backends report the held signal to the Tool before the resume that
+/// delivers it (https://github.com/rrnewton/hermit/issues/3468,
+/// https://github.com/rrnewton/reverie/issues/853), so the Tool events
+/// include that signal event.
 #[tokio::test(flavor = "current_thread")]
 async fn host_hybrid_restart_with_a_signal_held_across_an_injection_follows_linux() {
     for (mode, signal, result) in [
@@ -5931,10 +6034,15 @@ async fn host_hybrid_restart_with_a_signal_held_across_an_injection_follows_linu
             format!("read-result={result}{handled} traps=- hooks=-\n"),
             "{mode}"
         );
+        let signal_event = format!(
+            "signal {}",
+            reverie::Signal::try_from(signal).unwrap().as_str()
+        );
         let mut expected = vec!["read(warm)", "magic read(0x7e57,1)"];
         if result == RESTART_RESULT {
             expected.push("magic read(0x7e57,1)");
         }
+        expected.insert(2, signal_event.as_str());
         assert_eq!(events, expected, "{mode}");
     }
 }
@@ -6028,6 +6136,139 @@ async fn host_hybrid_interrupted_sleep_continues_through_restart_syscall() {
             "{backend:?}"
         );
     }
+}
+
+/// Holds a SIGURG across a nanosleep hook that returns the original
+/// `-ERESTART_RESTARTBLOCK`, and replaces the restart block from SIGURG's
+/// signal event if that event runs: it arms a 200 ms alarm, injects a 20 s
+/// sleep the alarm interrupts and holds the alarm with a getpid.
+#[derive(Default)]
+struct ReplacingSleepTool;
+
+#[reverie::tool]
+impl Tool for ReplacingSleepTool {
+    type GlobalState = RestartLog;
+    /// The guest's 20 s timespec and 200 ms `itimerval`, from the
+    /// nanosleep's ignored third and fourth arguments.
+    type ThreadState = Option<(u64, u64)>;
+
+    fn subscriptions(_config: &u64) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::read);
+        subscription.syscall(Sysno::nanosleep);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let (nr, args) = syscall.into_parts();
+        if nr == Sysno::read && args.arg0 as u64 == RESTART_WARM_FD {
+            guest.send_rpc("read(warm)".to_owned()).await;
+            return Ok(0);
+        }
+        if nr == Sysno::nanosleep && guest.thread_state().is_none() {
+            *guest.thread_state_mut() = Some((args.arg2 as u64, args.arg3 as u64));
+            // SAFETY: tgkill has no memory effects.
+            let sent = unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    guest.pid().as_raw(),
+                    guest.tid().as_raw(),
+                    libc::SIGURG,
+                )
+            };
+            assert_eq!(sent, 0, "tgkill failed");
+            // The pending SIGURG interrupts the original sleep, which
+            // establishes the guest's restart block; the getpid then holds it.
+            let original = guest.inject(syscall).await;
+            guest
+                .send_rpc(format!(
+                    "nanosleep original={:?}",
+                    original.map_err(|errno| errno.into_raw())
+                ))
+                .await;
+            let getpid = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+            let _ = guest.inject(getpid).await;
+            return Ok(original?);
+        }
+        Ok(guest.inject(syscall).await?)
+    }
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: reverie::Signal,
+    ) -> Result<Option<reverie::Signal>, reverie::Errno> {
+        guest.send_rpc(format!("signal {}", signal.as_str())).await;
+        if signal != reverie::Signal::SIGURG {
+            return Ok(Some(signal));
+        }
+        let (replacement, alarm) = guest.thread_state().expect("the nanosleep ran first");
+        let arm = Syscall::from_raw(
+            Sysno::setitimer,
+            SyscallArgs::new(libc::ITIMER_REAL as usize, alarm as usize, 0, 0, 0, 0),
+        );
+        assert_eq!(guest.inject(arm).await, Ok(0), "setitimer failed");
+        // Interrupted by the alarm, the 20 s sleep leaves its own restart
+        // block in place of the guest's.
+        let sleep = Syscall::from_raw(
+            Sysno::nanosleep,
+            SyscallArgs::new(replacement as usize, 0, 0, 0, 0, 0),
+        );
+        let _ = guest.inject(sleep).await;
+        let getpid = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+        let _ = guest.inject(getpid).await;
+        Ok(None)
+    }
+}
+
+/// A held signal on a host-hybrid restart through `restart_syscall` is
+/// passed on unreported: the controller's `orig_rax` is -1, so a signal
+/// event injecting a sleep there would replace the guest's restart block
+/// unseen and `restart_syscall` would continue the injected 20 s sleep
+/// instead of the guest's 400 ms one. Known gap: the held signal is not
+/// reported at this restart
+/// (https://github.com/rrnewton/reverie/issues/853).
+#[tokio::test(flavor = "current_thread")]
+async fn host_hybrid_restart_syscall_with_a_held_signal_keeps_the_guest_restart_block() {
+    let (_directory, guest) = compile_fixture("hybrid_restart.c");
+    let mut command = Command::new(guest);
+    command.arg("sleep-replaced");
+    let started = std::time::Instant::now();
+    let (output, log) = LiteinstBackend::run_host_with_output_and_preload::<ReplacingSleepTool>(
+        command,
+        0,
+        preload_path(),
+    )
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "sleep-result=0 slept-enough=1 {}\n",
+            restart_counts(RestartBackend::HostHybrid, 1)
+        )
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the guest's restart continued the injected 20 s sleep: {elapsed:?}"
+    );
+    assert_eq!(
+        log.events(),
+        [
+            "read(warm)",
+            format!(
+                "nanosleep original=Err({})",
+                reverie::Errno::ERESTART_RESTARTBLOCK.into_raw()
+            )
+            .as_str()
+        ]
+    );
 }
 
 /// A syscall that completes with a signal pending is not re-executed: the
@@ -6442,10 +6683,11 @@ async fn host_hybrid_original_injection_with_a_pending_signal_follows_ptrace() {
 ///
 /// An injection the guest cannot observe must leave the outcome of the run
 /// without it, so the reference is plain ptrace with no injection. Plain
-/// ptrace with the injection is not a reference: its signal-stop injection
-/// does not restore `rax`, which holds the pending `-ERESTARTSYS`, so the
-/// kernel returns the injected `getpid` result from the read instead of
-/// deciding the restart.
+/// ptrace with the injection is not a reference: its injection at a
+/// signal's delivery stop does not restore `rax`, which holds the pending
+/// `-ERESTARTSYS`, so the kernel returns the injected `getpid` result from
+/// the read instead of deciding the restart
+/// (https://github.com/rrnewton/reverie/issues/892).
 #[tokio::test(flavor = "current_thread")]
 async fn host_hybrid_tool_injection_at_the_deciding_signal_keeps_the_restart() {
     for (mode, signal, result, hooks) in [

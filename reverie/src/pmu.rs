@@ -14,6 +14,7 @@
 const AMD_RCB_EVENT: u64 = 0x5100d1;
 const AMD_DEFAULT_SKID_MARGIN: u64 = 10_000;
 const AMD_EPYC_9D85_SKID_MARGIN: u64 = 1_000;
+const AMD_FAMILY_19H_MODEL_A0H_SKID_MARGIN: u64 = 1_000;
 
 /// A raw retired conditional branch event and its default ptrace timer margin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +53,11 @@ impl PmuProfile {
             // performance margin avoids excessive single stepping. Rare larger
             // overshoots are reported and delivered at the observed counter.
             0x1A if model_id == 0x11 => (AMD_RCB_EVENT, AMD_EPYC_9D85_SKID_MARGIN),
+            // Family 19h model A0h uses the same 1K margin. Under the 10K guard, one
+            // chaos run with a 1 ms timeslice spent 48 CPU-s single stepping in a
+            // debug build, against 5 CPU-s at 1K. Rare larger overshoots take the
+            // same reported path as above, and harnesses retry them.
+            0x19 if model_id == 0xA0 => (AMD_RCB_EVENT, AMD_FAMILY_19H_MODEL_A0H_SKID_MARGIN),
             // Other Zen CPUs keep rr's 10K guard because they have exhibited rare large skid.
             0x17 | 0x19 | 0x1A => (AMD_RCB_EVENT, AMD_DEFAULT_SKID_MARGIN),
             _ => return None,

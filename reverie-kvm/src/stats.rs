@@ -198,6 +198,12 @@ impl fmt::Display for KvmBackendStats {
 
 impl BackendStatsSnapshot for KvmBackendStats {
     const BACKEND_NAME: &'static str = "kvm";
+
+    /// None: every syscall leaves the guest as a VM exit, which is
+    /// none of the shared record's signal, patched-call, or ptrace routes.
+    fn dispatch_stats(&self) -> Option<reverie::DispatchStats> {
+        None
+    }
 }
 
 #[cfg(test)]

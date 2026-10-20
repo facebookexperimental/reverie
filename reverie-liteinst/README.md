@@ -1,5 +1,11 @@
 # Reverie LiteInst
 
+Part of [Hermit](https://hermetic-infra.org) and
+[Reverie](https://docs.rs/reverie-core). See the
+[API documentation](https://docs.rs/reverie-liteinst) for this experimental
+backend and [`hermit-run`](https://crates.io/crates/hermit-run) for the CLI.
+Hermit's `liteinst` feature is optional and off by default.
+
 `reverie-liteinst` is an experimental Linux x86-64 Reverie backend built on the
 standalone `liteinst2` patching library, the shared `reverie-preload` runtime,
 and `reverie-rpc-transport`.
@@ -117,6 +123,16 @@ and returns its status and final global state. Existing preload APIs retain the
 uses `run_with_output_and_preload_data` instead, passing the coordinator
 path and selector in a sealed, dynamically allocated memfd that the preload
 discovers, validates, consumes, and closes before guest `main`.
+`run_with_preload_data` does the same but returns only the exit status and
+leaves the command's stdio exactly as the caller configured it.
+`run_with_output_and_preload_data_and_stats`,
+`run_with_inherited_stdio_and_preload_data_and_stats` and
+`run_with_preload_data_and_stats` do the same and also return one statistics
+snapshot per process; the statistics coordinator path still travels in
+`REVERIE_LITEINST_STATS_COORDINATOR`. That path is random per run and stays
+in the guest's initial environment (`/proc/self/environ`) even after Tool
+installation removes the variable, so a statistics run is not leak-free and
+its guest-visible behavior must not be compared for determinism.
 `REVERIE_LITEINST_TOOL_PRELOAD` must name a DSO that embeds the same concrete
 `T` and calls `install_tool::<T>`.
 
@@ -237,7 +253,9 @@ trap path. Quiescent publication is never selected from this route.
   unregisters its own rseq area for both native and Tool controls; the runtime
   does not unregister production guests. Direct installed-hook behavior for
   this registered-rseq case remains unmeasured.
-- Timer arming currently returns success without delivery. Clock reads use a
+- Timer arming (`set_timer` and `set_timer_precise`) is refused with `ENOSYS`,
+  because nothing in the guest delivers a timer event; a Tool that needs
+  preemption fails closed instead of running unpreempted. Clock reads use a
   calling-thread RDPMC RCB counter and deduct branches retired inside active
   LiteInst handlers. Hosts that deny perf-event access report the clock as
   unsupported. This is not PMU preemption or complete scheduling support.

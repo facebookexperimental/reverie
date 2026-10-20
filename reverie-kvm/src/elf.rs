@@ -49,6 +49,9 @@ use crate::memory::RegionKind;
 use crate::signal::ProcessSignalState;
 use crate::signal::SharedThreadSignalState;
 
+#[path = "parent_death.rs"]
+pub(crate) mod parent_death;
+
 const PAGE_SIZE: u64 = 4096;
 pub(crate) const TASK_COMM_LEN: usize = 16;
 pub(crate) const STACK_LIMIT: u64 = 8 * 1024 * 1024;
@@ -200,12 +203,103 @@ const CLOCK_TICKS_PER_SECOND: u64 = 100;
 // syscall, which diverges the guest's startup syscall stream from the native
 // (ptrace) path and breaks cross-backend syscall-count parity.
 const AT_SYSINFO_EHDR: u64 = 33;
+const AT_FLAGS: u64 = 8;
+const AT_PLATFORM: u64 = 15;
+const AT_HWCAP: u64 = 16;
+const AT_HWCAP2: u64 = 26;
+/// The string `AT_PLATFORM` names: `ELF_PLATFORM` of every x86_64 kernel.
+const GUEST_PLATFORM: &[u8] = b"x86_64";
+
+/// The guest-side values of a guest's auxiliary vector.
+struct GuestAuxvValues {
+    program_headers: u64,
+    program_header_size: u64,
+    program_header_count: u64,
+    base: u64,
+    entry: u64,
+    random: u64,
+    execfn: u64,
+    platform: u64,
+}
+
+/// A guest's auxiliary vector: the entries Linux 6.3 and later give a
+/// process, in the order Linux writes them (`create_elf_tables` in
+/// fs/binfmt_elf.c, with x86_64's `ARCH_DLINFO` first). glibc's loader spends
+/// branches on every entry and reads several, so the same vector gives a KVM
+/// guest the start-up, and the virtual time, a traced guest has
+/// (<https://github.com/rrnewton/reverie/issues/947>).
+///
+/// The entries that describe the CPU or the kernel carry
+/// `reverie::canonical_auxv_value`, which reverie-ptrace also writes into a
+/// traced guest's vector, so neither depends on the host. Identity entries
+/// are the guest's own: root, not secure. `AT_FLAGS` is 0, as on every Linux
+/// kernel.
+fn guest_auxv(guest: &GuestAuxvValues) -> Vec<(u64, u64)> {
+    let canonical = |key| {
+        reverie::canonical_auxv_value(key)
+            .unwrap_or_else(|| panic!("auxv entry {key} has no canonical value"))
+    };
+    vec![
+        (AT_SYSINFO_EHDR, VDSO_ADDRESS),
+        (reverie::AT_MINSIGSTKSZ, canonical(reverie::AT_MINSIGSTKSZ)),
+        (AT_HWCAP, canonical(AT_HWCAP)),
+        (AT_PAGESZ, PAGE_SIZE),
+        (AT_CLKTCK, CLOCK_TICKS_PER_SECOND),
+        (AT_PHDR, guest.program_headers),
+        (AT_PHENT, guest.program_header_size),
+        (AT_PHNUM, guest.program_header_count),
+        (AT_BASE, guest.base),
+        (AT_FLAGS, 0),
+        (AT_ENTRY, guest.entry),
+        (AT_UID, 0),
+        (AT_EUID, 0),
+        (AT_GID, 0),
+        (AT_EGID, 0),
+        (AT_SECURE, 0),
+        (AT_RANDOM, guest.random),
+        (AT_HWCAP2, canonical(AT_HWCAP2)),
+        (AT_EXECFN, guest.execfn),
+        (AT_PLATFORM, guest.platform),
+        (
+            reverie::AT_RSEQ_FEATURE_SIZE,
+            canonical(reverie::AT_RSEQ_FEATURE_SIZE),
+        ),
+        (reverie::AT_RSEQ_ALIGN, canonical(reverie::AT_RSEQ_ALIGN)),
+    ]
+}
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Share deterministic file identities across fork.
 // TODO-HUMAN-REVIEW(PR-136): Review linked and anonymous object identity lifetimes.
 #[derive(Debug)]
 pub(crate) struct GuestFileIdentity {
     pub inode: u64,
+    /// Which timestamps `stat`, `fstat`, `newfstatat` and `statx` report for
+    /// the object in a run that reports host metadata timestamps. Every alias
+    /// shares this identity: a dup, a `/proc/self/fd` reopen, a fork and an
+    /// exec. A received SCM_RIGHTS carrier is recognized from the carrier
+    /// itself; see `crate::executor::received_carrier_timestamps`.
+    pub timestamps: IdentityTimestamps,
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/933):
+// Review the fixed-timestamp classes of backend-made carriers.
+/// The timestamps an object reports in a run that reports host metadata
+/// timestamps. A run that does not report them uses the fixed
+/// `DETERMINISTIC_METADATA_SECONDS` for every object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IdentityTimestamps {
+    /// The times the kernel stored for the host object.
+    Host,
+    /// A virtual file the backend made, such as the carrier for
+    /// `/proc/self/loginuid`. It reports the fixed
+    /// `DETERMINISTIC_METADATA_SECONDS`, because its host times are those of
+    /// the carrier rather than of any guest-visible file.
+    VirtualFile,
+    /// A synthetic `/proc` snapshot carrier, such as the one for
+    /// `/proc/uptime`. It reports timestamp 0, like every synthetic `/proc`
+    /// file.
+    ProcSnapshot,
 }
 
 // TODO-HUMAN-REVIEW(PR-136): Review the identity entry lifetime API.
@@ -251,6 +345,8 @@ pub(crate) struct TaskLifecycleState {
     pub pgid: i32,
     pub robust_list_head: u64,
     pub dumpable: bool,
+    pub real_parent: Option<reverie::SignalTaskIdentity>,
+    pub parent_death_signal: i32,
 }
 
 #[derive(Debug, Default)]
@@ -262,6 +358,7 @@ pub(crate) struct TaskLifecycleTable {
         std::sync::Weak<std::sync::Mutex<crate::signal::ThreadSignalState>>,
     >,
     process_exits: std::collections::BTreeMap<(i32, u64), ProcessExitState>,
+    pub(crate) parent_death: parent_death::ParentDeathState,
 }
 
 #[derive(Debug, Default)]
@@ -301,6 +398,8 @@ impl TaskLifecycleTable {
                 pgid,
                 robust_list_head: 0,
                 dumpable,
+                real_parent: None,
+                parent_death_signal: 0,
             },
         );
         // A reused numeric TID never inherits the old task's signal endpoint.
@@ -760,6 +859,9 @@ pub(crate) struct LoadedStaticElf {
     pub fs_base: u64,
     pub gs_base: u64,
     pub pid: i32,
+    /// Process incarnation for the bounded pipe-owner configuration domain.
+    /// Threads and exec retain it; a forked process receives a fresh token.
+    pub(crate) pipe_owner_process: std::sync::Arc<()>,
     /// Virtual process-group identity, inherited across `fork`.
     pub pgid: i32,
     // TODO-HUMAN-REVIEW(PR-132): Review single-vCPU thread identity transitions.
@@ -803,6 +905,17 @@ pub(crate) struct LoadedStaticElf {
     /// fork/thread starts at zero under its own virtual TID; exec preserves
     /// the caller's position. Only successful copyout advances the stream.
     pub getrandom_offset: u64,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
+    // Review host metadata timestamps for Tool runs.
+    /// Whether `stat`, `fstat`, `newfstatat` and `statx` report the kernel's
+    /// timestamps for real host files and descriptors. When false (the
+    /// default) every timestamp in those results is the fixed
+    /// `DETERMINISTIC_METADATA_SECONDS`. Synthetic objects keep fixed
+    /// timestamps either way. Set through
+    /// [`crate::KvmBackend::set_host_metadata_timestamps`]; fork, clone and
+    /// exec carry it unchanged.
+    pub host_metadata_timestamps: bool,
     /// Linux task name (`comm`), including the terminating NUL byte.
     ///
     /// This is per-thread state: fork and clone inherit the caller's value,
@@ -858,10 +971,16 @@ pub(crate) struct LoadedStaticElf {
     pub task_lifecycle: std::sync::Arc<std::sync::Mutex<TaskLifecycleTable>>,
     pub files: std::collections::BTreeMap<i32, std::fs::File>,
     pub file_retirement: FileRetirement,
+    pub(crate) pipe_owners:
+        std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::pipe_owner::PipeOwner>>,
     /// Identity of each descriptor entry, independent of its filesystem object.
     /// Insertion, including a dup destination, creates a new identity. Table
     /// snapshots and fork copies retain it so unchanged host handles stay stable.
     pub fd_entry_ids: std::collections::BTreeMap<i32, std::sync::Arc<()>>,
+    pub(crate) epoll_domain: std::sync::Arc<std::sync::Mutex<crate::executor::EpollDomain>>,
+    pub(crate) poll_table_id: std::sync::Arc<crate::executor::NativePollTable>,
+    pub(crate) native_poll_fds:
+        std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::NativePollBinding>>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Keep deterministic random descriptors on the Tool path.
     // TODO-HUMAN-REVIEW(PR-235): Review random-device descriptor lifecycle parity.
     pub random_device_fds: std::collections::BTreeSet<i32>,
@@ -919,7 +1038,15 @@ impl LoadedStaticElf {
     /// callers retire them after both the authoritative file-table and
     /// signal-transaction guards are released.
     pub(crate) fn insert_file(&mut self, fd: i32, file: std::fs::File) -> Vec<std::fs::File> {
+        {
+            let domain = self.epoll_domain.clone();
+            let _proof = domain.lock().expect("KVM epoll provenance lock poisoned");
+            if let Some(binding) = self.native_poll_fds.remove(&fd) {
+                binding.retire();
+            }
+        }
         self.random_device_descriptions.remove(&fd);
+        self.pipe_owners.remove(&fd);
         let mut retired: Vec<_> = self.files.insert(fd, file).into_iter().collect();
         if fd == libc::STDIN_FILENO {
             retired.extend(self.take_stdin());
@@ -937,7 +1064,15 @@ impl LoadedStaticElf {
     }
 
     pub(crate) fn remove_file(&mut self, fd: i32) -> Option<std::fs::File> {
+        {
+            let domain = self.epoll_domain.clone();
+            let _proof = domain.lock().expect("KVM epoll provenance lock poisoned");
+            if let Some(binding) = self.native_poll_fds.remove(&fd) {
+                binding.retire();
+            }
+        }
         self.random_device_descriptions.remove(&fd);
+        self.pipe_owners.remove(&fd);
         let file = self.files.remove(&fd);
         self.fd_entry_ids.remove(&fd);
         file
@@ -993,6 +1128,7 @@ impl LoadedStaticElf {
             fs_base: self.fs_base,
             gs_base: self.gs_base,
             pid: child_pid,
+            pipe_owner_process: std::sync::Arc::new(()),
             pgid: self.pgid,
             tid: child_pid,
             ppid: self.pid,
@@ -1003,6 +1139,7 @@ impl LoadedStaticElf {
             umask: self.umask,
             random_seed: self.random_seed,
             getrandom_offset: 0,
+            host_metadata_timestamps: self.host_metadata_timestamps,
             thread_name: self.thread_name,
             thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(self.thread_name)),
             thp_disabled: std::sync::Arc::new(AtomicU8::new(
@@ -1042,7 +1179,15 @@ impl LoadedStaticElf {
                 .map(|(fd, file)| (fd, file.into_file()))
                 .collect(),
             file_retirement: FileRetirement::default(),
+            pipe_owners: self.pipe_owners.clone(),
             fd_entry_ids: self.fd_entry_ids.clone(),
+            epoll_domain: self.epoll_domain.clone(),
+            poll_table_id: self.poll_table_id.fork_identity(),
+            native_poll_fds: self
+                .native_poll_fds
+                .iter()
+                .map(|(&fd, binding)| (fd, binding.fork_binding()))
+                .collect(),
             random_device_fds: self.random_device_fds.clone(),
             random_device_descriptions: self.random_device_descriptions.clone(),
             stdout_alias_fds: self.stdout_alias_fds.clone(),
@@ -1089,6 +1234,24 @@ impl LoadedStaticElf {
             std::sync::Arc::new(AtomicU8::new(previous.thp_disabled.load(Ordering::SeqCst)));
         let regular_create_directory_policy = previous.regular_create_directory_policy;
         let cloexec_fds = previous.cloexec_fds;
+        let native_poll_fds = {
+            let _proof = previous
+                .epoll_domain
+                .lock()
+                .expect("KVM epoll provenance lock poisoned");
+            previous
+                .native_poll_fds
+                .into_iter()
+                .filter_map(|(fd, binding)| {
+                    if cloexec_fds.contains(&fd) {
+                        binding.retire();
+                        None
+                    } else {
+                        Some((fd, binding))
+                    }
+                })
+                .collect()
+        };
         let mut retired = Vec::new();
         previous
             .file_retirement
@@ -1119,6 +1282,11 @@ impl LoadedStaticElf {
             .collect();
         let random_device_descriptions = previous
             .random_device_descriptions
+            .into_iter()
+            .filter(|(fd, _)| files.contains_key(fd))
+            .collect();
+        let pipe_owners = previous
+            .pipe_owners
             .into_iter()
             .filter(|(fd, _)| files.contains_key(fd))
             .collect();
@@ -1193,6 +1361,10 @@ impl LoadedStaticElf {
             process_signals
                 .signalfd_carriers
                 .retain(|fd, _| files.contains_key(fd));
+            lifecycle.reset_parent_death_after_exec(
+                previous.tid,
+                previous.capability_bounding & !previous.capability_permitted != 0,
+            );
             lifecycle.reset_after_exec_with_signals(
                 previous.tid,
                 previous.pid,
@@ -1218,6 +1390,7 @@ impl LoadedStaticElf {
         self.umask = previous.umask;
         self.random_seed = previous.random_seed;
         self.getrandom_offset = previous.getrandom_offset;
+        self.host_metadata_timestamps = previous.host_metadata_timestamps;
         // `thread_name` intentionally remains the replacement image's name.
         self.thp_disabled = thp_disabled;
         self.keep_capabilities = false;
@@ -1240,7 +1413,12 @@ impl LoadedStaticElf {
         self.task_lifecycle = task_lifecycle;
         retired.extend(std::mem::replace(&mut self.files, files).into_values());
         self.file_retirement = previous.file_retirement;
+        self.pipe_owner_process = previous.pipe_owner_process;
+        self.pipe_owners = pipe_owners;
         self.fd_entry_ids = fd_entry_ids;
+        self.epoll_domain = previous.epoll_domain;
+        self.poll_table_id = previous.poll_table_id;
+        self.native_poll_fds = native_poll_fds;
         self.random_device_fds = random_device_fds;
         self.random_device_descriptions = random_device_descriptions;
         self.stdout_alias_fds = stdout_alias_fds;
@@ -1585,6 +1763,7 @@ fn load_executable(
         fs_base: 0,
         gs_base: 0,
         pid: 1,
+        pipe_owner_process: std::sync::Arc::new(()),
         pgid: 1,
         tid: 1,
         ppid: 0,
@@ -1597,6 +1776,7 @@ fn load_executable(
         umask: 0o022,
         random_seed: 0,
         getrandom_offset: 0,
+        host_metadata_timestamps: false,
         thread_name,
         thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(thread_name)),
         thp_disabled: std::sync::Arc::new(AtomicU8::new(0)),
@@ -1622,7 +1802,11 @@ fn load_executable(
         ))),
         files: std::collections::BTreeMap::new(),
         file_retirement: FileRetirement::default(),
+        pipe_owners: Default::default(),
         fd_entry_ids: std::collections::BTreeMap::new(),
+        epoll_domain: Default::default(),
+        poll_table_id: Default::default(),
+        native_poll_fds: Default::default(),
         random_device_fds: std::collections::BTreeSet::new(),
         random_device_descriptions: std::collections::BTreeMap::new(),
         stdout_alias_fds: std::collections::BTreeSet::new(),
@@ -1958,6 +2142,11 @@ fn build_initial_stack(
     }
     let argv0_address = arg_addresses[0];
 
+    // Linux writes the platform string below the argument and environment
+    // strings, and the AT_RANDOM bytes below it.
+    cursor = push_c_string(memory, cursor, GUEST_PLATFORM)?;
+    let platform_address = cursor;
+
     let random = [
         0x52, 0x65, 0x76, 0x65, 0x72, 0x69, 0x65, 0x2d, 0x4b, 0x56, 0x4d, 0x2d, 0x45, 0x4c, 0x46,
         0x21,
@@ -1970,23 +2159,20 @@ fn build_initial_stack(
 
     // Build the SysV initial stack image, low to high:
     //   argc, argv[0..], NULL, envp[0..], NULL, auxv pairs.., AT_NULL/0
-    let auxv = vec![
-        (AT_SYSINFO_EHDR, VDSO_ADDRESS),
-        (AT_PHDR, program_headers_address),
-        (AT_PHENT, u64::from(elf.header.e_phentsize)),
-        (AT_PHNUM, u64::from(elf.header.e_phnum)),
-        (AT_PAGESZ, PAGE_SIZE),
-        (AT_BASE, at_base),
-        (AT_ENTRY, at_entry),
-        (AT_UID, 0),
-        (AT_EUID, 0),
-        (AT_GID, 0),
-        (AT_EGID, 0),
-        (AT_CLKTCK, CLOCK_TICKS_PER_SECOND),
-        (AT_SECURE, 0),
-        (AT_RANDOM, random_address),
-        (AT_EXECFN, argv0_address),
-    ];
+    // The canonical AT_MINSIGSTKSZ must also bound this host, as it must for a
+    // traced guest on it.
+    reverie::check_host_minsigstksz(unsafe { libc::getauxval(reverie::AT_MINSIGSTKSZ) })
+        .map_err(Error::UnsupportedHost)?;
+    let auxv = guest_auxv(&GuestAuxvValues {
+        program_headers: program_headers_address,
+        program_header_size: u64::from(elf.header.e_phentsize),
+        program_header_count: u64::from(elf.header.e_phnum),
+        base: at_base,
+        entry: at_entry,
+        random: random_address,
+        execfn: argv0_address,
+        platform: platform_address,
+    });
 
     let mut words: Vec<u64> = Vec::new();
     words.push(argv.len() as u64);
@@ -2242,6 +2428,64 @@ mod tests {
         assert_ne!(first_execfn, second_execfn);
         assert_eq!(clock_tick_entries(&first.auxv), vec![(17, 100)]);
         assert_eq!(clock_tick_entries(&second.auxv), vec![(17, 100)]);
+    }
+
+    /// The keys and order of the vector Linux 7.1 gives a process on this
+    /// repository's x86_64 hosts (`LD_SHOW_AUXV=1 /bin/true`), and the
+    /// canonical CPU and kernel values in place of the host's.
+    #[test]
+    fn auxiliary_vector_has_linuxs_entries_in_linuxs_order() {
+        let auxv = guest_auxv(&GuestAuxvValues {
+            program_headers: 0x200040,
+            program_header_size: 56,
+            program_header_count: 13,
+            base: 0x1000000,
+            entry: 0x201000,
+            random: 0x3fffef00,
+            execfn: 0x3fffefe0,
+            platform: 0x3fffef10,
+        });
+        let keys: Vec<u64> = auxv.iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            keys,
+            [
+                33, 51, 16, 6, 17, 3, 4, 5, 7, 8, 9, 11, 12, 13, 14, 23, 25, 26, 31, 15, 27, 28
+            ]
+        );
+        let value = |key| auxv.iter().find(|(k, _)| *k == key).unwrap().1;
+        assert_eq!(value(33), VDSO_ADDRESS);
+        assert_eq!(value(16), 0x078b_fbfd);
+        assert_eq!(value(26), 0);
+        assert_eq!(value(51), 16384);
+        assert_eq!(value(27), 28);
+        assert_eq!(value(28), 32);
+        assert_eq!(value(8), 0);
+        assert_eq!(value(15), 0x3fffef10);
+        assert_eq!(value(11), 0);
+    }
+
+    /// `AT_PLATFORM` points at the platform string on the guest stack.
+    #[test]
+    fn loaded_auxiliary_vector_names_the_platform() {
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let image = test_static_elf(&[0x0f, 0x0b]);
+        let loaded = load_static_elf(
+            &mut memory,
+            &image,
+            &["initial"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let platform = loaded
+            .auxv
+            .iter()
+            .find(|(key, _)| *key == AT_PLATFORM)
+            .unwrap()
+            .1;
+        let mut bytes = [0; 7];
+        memory.read_raw(platform, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"x86_64\0");
     }
 
     #[test]

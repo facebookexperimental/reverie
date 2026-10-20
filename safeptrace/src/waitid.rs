@@ -76,7 +76,13 @@ fn waitid_si(waitid_type: IdType, flags: WaitPidFlag) -> Result<libc::siginfo_t,
 /// must survive so the notifier can decode `PTRACE_EVENT_*` losslessly.
 #[cfg(feature = "notifier")]
 pub fn waitpidfd(raw_fd: RawFd, flags: WaitPidFlag) -> Result<Option<i32>, Errno> {
-    let si = waitid_si(IdType::Pidfd(raw_fd), flags)?;
+    wait_raw(IdType::Pidfd(raw_fd), flags)
+}
+
+/// Lossless wait status for a notifier-owned thread or pidfd.
+#[cfg(feature = "notifier")]
+pub fn wait_raw(id: IdType, flags: WaitPidFlag) -> Result<Option<i32>, Errno> {
+    let si = waitid_si(id, flags)?;
 
     if unsafe { si.si_pid() } == 0 {
         return Ok(None);

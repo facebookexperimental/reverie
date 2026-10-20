@@ -31,6 +31,7 @@ pub use backend::STATS_COORDINATOR_ENV;
 pub use backend::TOOL_PRELOAD_ENV;
 pub use backend::take_preload_bootstrap;
 pub use reverie_ptrace::LiteinstInstrumentationStats;
+pub use stats::InheritedEntries;
 pub use stats::LiteinstBackendStatsSnapshot;
 pub use stats::LiteinstBackendStatsSource;
 pub use stats::LiteinstDispatchPath;
@@ -55,11 +56,13 @@ pub use reverie_preload::SPOOF_PID;
 pub use runtime::ALT_STACK_ENV;
 pub use runtime::IN_GUEST_STAGE_STREAM_ENV;
 pub use runtime::PROCESS_FORK_ENV;
+pub use runtime::SITE_PATCHING_ENV;
 /// `REVERIE_LITEINST_TOOL` values and parser for shared built-in selection.
 pub use runtime::TOOL_PASSTHROUGH;
 pub use runtime::TOOL_SPOOF_GETPID;
 pub use runtime::alt_stack_from_env_value;
 pub use runtime::builtin_tool_from_env_value;
+pub use runtime::site_patching_from_env_value;
 pub use straddler::STRADDLER_STALENESS_TICKS_ENV;
 pub use straddler::straddler_staleness_from_env_value;
 pub use tool_host::install_tool;
@@ -203,6 +206,17 @@ pub fn set_guest_alt_stack(command: &mut Command, use_alt_stack: bool) {
 /// fork bracket.
 pub fn set_guest_process_forks(command: &mut Command, allowed: bool) {
     command.env(PROCESS_FORK_ENV, if allowed { "1" } else { "0" });
+}
+
+/// Select whether an in-guest Reverie Tool patches trapping syscall sites.
+///
+/// With `enabled == false` every trapping syscall runs the Tool through the
+/// in-guest `SIGSYS` fallback and no syscall site is patched; subscribed
+/// `cpuid`, `rdtsc`, and `rdtscp` instruction sites still are. See
+/// [`SITE_PATCHING_ENV`].
+/// The written value round-trips through [`site_patching_from_env_value`].
+pub fn set_guest_site_patching(command: &mut Command, enabled: bool) {
+    command.env(SITE_PATCHING_ENV, if enabled { "1" } else { "0" });
 }
 
 // TODO-HUMAN-REVIEW(#61): this constructor installs process-wide signal and seccomp state.
@@ -368,8 +382,11 @@ mod tests {
     use std::process::Command;
 
     use super::ALT_STACK_ENV;
+    use super::SITE_PATCHING_ENV;
     use super::alt_stack_from_env_value;
     use super::set_guest_alt_stack;
+    use super::set_guest_site_patching;
+    use super::site_patching_from_env_value;
 
     /// The value the launcher writes must parse back to the same boolean it
     /// selected, for both polarities. This closes the loop between the setter
@@ -390,6 +407,39 @@ mod tests {
                 alt_stack_from_env_value(Some(written.as_os_str())).unwrap(),
                 use_alt_stack,
                 "written value must parse back to the selected boolean"
+            );
+        }
+    }
+
+    #[test]
+    fn site_patching_setter_round_trips_through_the_parser() {
+        for enabled in [true, false] {
+            let mut command = Command::new("/bin/true");
+            set_guest_site_patching(&mut command, enabled);
+            let written = command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new(SITE_PATCHING_ENV))
+                .and_then(|(_, value)| value)
+                .expect("set_guest_site_patching must set SITE_PATCHING_ENV")
+                .to_owned();
+            assert_eq!(
+                site_patching_from_env_value(Some(written.as_os_str())).unwrap(),
+                enabled,
+                "written value must parse back to the selected boolean"
+            );
+        }
+    }
+
+    #[test]
+    fn site_patching_parser_defaults_on_and_rejects_other_values() {
+        assert!(site_patching_from_env_value(None).unwrap());
+        for rejected in ["", " 0", "0 ", "off", "false", "2", "yes"] {
+            let error = site_patching_from_env_value(Some(OsStr::new(rejected)))
+                .expect_err("only unset, 1, and 0 are accepted");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{rejected:?}"
             );
         }
     }

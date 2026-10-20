@@ -95,6 +95,7 @@ fn show_proc_maps(maps: &procfs::process::MemoryMap) -> String {
 
 fn task_rip_is_valid(pid: Pid, rip: u64) -> bool {
     let mut has_valid_rip = None;
+    let _open = crate::launch_window::TransientOpen::begin();
     if let Ok(mapping) = procfs::process::Process::new(pid.as_raw()).and_then(|p| p.maps()) {
         has_valid_rip = mapping
             .iter()
@@ -159,18 +160,20 @@ pub fn show_fault_context(task: &Stopped, sig: signal::Signal) {
         debug!("insn @{:x?} = <invalid rip>", regs.rip);
     }
 
-    procfs::process::Process::new(task.pid().as_raw())
-        .map_or_else(
+    let maps = {
+        // The guard ends before anything is logged.
+        let _open = crate::launch_window::TransientOpen::begin();
+        procfs::process::Process::new(task.pid().as_raw()).map_or_else(
             |_| Vec::new(),
             |p| match p.maps() {
                 Ok(maps) => maps.0,
                 Err(_) => Vec::new(),
             },
         )
-        .iter()
-        .for_each(|e| {
-            debug!("{}", show_proc_maps(e));
-        });
+    };
+    maps.iter().for_each(|e| {
+        debug!("{}", show_proc_maps(e));
+    });
 }
 
 /// As a debugging aid, dump the current state of the guest in a readbale format.

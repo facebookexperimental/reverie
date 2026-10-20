@@ -24,15 +24,28 @@ use reverie::BackendStatsRequest;
 use reverie::BackendStatsSnapshot;
 use reverie::BackendStatsSource;
 use reverie::CounterSnapshot;
+use reverie::DispatchCounters;
+use reverie::DispatchStats;
+use reverie::SiteCounters;
 
 /// Private descriptor setting shared with the SaBRe loader.
 pub const BACKEND_STATS_ENV: &str = "REVERIE_SABRE_BACKEND_STATS_FD";
 
+/// Lowest descriptor number the inherited statistics page may occupy.
+///
+/// The guest inherits this descriptor, so a low number would shift every
+/// descriptor the guest opens: its first `open` would no longer return 3.
+/// Placing it above the plugin's fixed RPC socket (descriptor 100) keeps the
+/// guest's low descriptor numbering identical whether or not statistics are
+/// collected.
+pub const INHERITED_FD_FLOOR: RawFd = 101;
+
 const BACKEND_STATS_MAGIC: u64 = 0x3154_4154_5352_4253;
-const BACKEND_STATS_VERSION: u32 = 1;
+const BACKEND_STATS_VERSION: u32 = 2;
 const PATCH_BUCKETS: usize = 15;
 const PATCH_ROUTE_COUNT: usize = 3;
 const SLOW_PATH_COUNT: usize = 10;
+const DISPATCH_ROUTE_COUNT: usize = 2;
 
 /// How SaBRe installed a syscall interception site.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -99,6 +112,34 @@ impl fmt::Display for SabreSlowPath {
     }
 }
 
+/// How a guest syscall reached the SaBRe plugin.
+///
+/// Counted where the loader's router hands a syscall to the plugin, so the
+/// plugin's own natively executed syscalls are not dispatches. The SIGILL slow
+/// paths, by contrast, count every marker executed, including the plugin's.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(usize)]
+pub enum SabreDispatchRoute {
+    /// A rewritten site's jump trampoline.
+    Trampoline = 0,
+    /// The SIGILL handler for a syscall marker.
+    SigillMarker = 1,
+}
+
+impl fmt::Display for SabreDispatchRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Trampoline => "trampoline",
+            Self::SigillMarker => "sigill_marker",
+        })
+    }
+}
+
+const DISPATCH_ROUTES: [SabreDispatchRoute; DISPATCH_ROUTE_COUNT] = [
+    SabreDispatchRoute::Trampoline,
+    SabreDispatchRoute::SigillMarker,
+];
+
 const PATCH_ROUTES: [SabrePatchRoute; PATCH_ROUTE_COUNT] = [
     SabrePatchRoute::JumpTrampoline,
     SabrePatchRoute::RewriteSigillMarker,
@@ -132,6 +173,7 @@ struct RawBackendStats {
     straddle_after: [AtomicU64; PATCH_BUCKETS],
     patch_routes: [AtomicU64; PATCH_ROUTE_COUNT],
     slow_paths: [AtomicU64; SLOW_PATH_COUNT],
+    dispatch_routes: [AtomicU64; DISPATCH_ROUTE_COUNT],
 }
 
 impl RawBackendStats {
@@ -149,6 +191,7 @@ impl RawBackendStats {
             straddle_after: std::array::from_fn(|_| AtomicU64::new(0)),
             patch_routes: std::array::from_fn(|_| AtomicU64::new(0)),
             slow_paths: std::array::from_fn(|_| AtomicU64::new(0)),
+            dispatch_routes: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -229,12 +272,19 @@ impl SabreStats {
             return Ok(None);
         }
 
-        let fd = unsafe {
+        let created = unsafe {
             libc::memfd_create(
                 c"reverie-sabre-backend-stats".as_ptr(),
-                libc::MFD_ALLOW_SEALING,
+                libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC,
             )
         };
+        if created == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let created = unsafe { OwnedFd::from_raw_fd(created) };
+        // Only the duplicate is inherited: F_DUPFD clears close-on-exec, and
+        // the low-numbered original closes when `created` drops.
+        let fd = unsafe { libc::fcntl(created.as_raw_fd(), libc::F_DUPFD, INHERITED_FD_FLOOR) };
         if fd == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -320,6 +370,11 @@ impl SabreGuestStats {
     pub fn increment_slow_path(&self, path: SabreSlowPath) {
         self.shared.page().slow_paths[path as usize].fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Increments one guest-owned dispatch-route counter.
+    pub fn increment_dispatch(&self, route: SabreDispatchRoute) {
+        self.shared.page().dispatch_routes[route as usize].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Aggregate SaBRe patch instruction shapes.
@@ -350,6 +405,22 @@ pub struct SabreStatsSnapshot {
     pub patch_routes: CounterSnapshot<SabrePatchRoute>,
     /// Slow and semi-slow dispatch paths.
     pub slow_paths: CounterSnapshot<SabreSlowPath>,
+    /// Guest syscalls handed to the plugin, by route.
+    pub dispatch_routes: CounterSnapshot<SabreDispatchRoute>,
+}
+
+impl SabreStatsSnapshot {
+    fn slow_path(&self, path: SabreSlowPath) -> u64 {
+        self.slow_paths.count(&path)
+    }
+
+    fn dispatch_route(&self, route: SabreDispatchRoute) -> u64 {
+        self.dispatch_routes.count(&route)
+    }
+
+    fn patch_route(&self, route: SabrePatchRoute) -> u64 {
+        self.patch_routes.count(&route)
+    }
 }
 
 impl fmt::Display for SabreStatsSnapshot {
@@ -378,12 +449,46 @@ impl fmt::Display for SabreStatsSnapshot {
             }
             write!(formatter, "{path}={count}")?;
         }
+        formatter.write_str("} dispatch_routes={")?;
+        for (index, (route, count)) in self.dispatch_routes.counts().iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(",")?;
+            }
+            write!(formatter, "{route}={count}")?;
+        }
         formatter.write_str("}")
     }
 }
 
 impl BackendStatsSnapshot for SabreStatsSnapshot {
     const BACKEND_NAME: &'static str = "sabre";
+
+    /// A trampoline dispatch is a patched direct call and a syscall-marker
+    /// dispatch is a SIGILL marker hit. The supervisor's syscall-entry and
+    /// -exit stops are overhead, not routes. A marker-patched site, whether
+    /// SaBRe's decoder or Hermit's ptrace safety net installed it, fell back
+    /// from the trampoline.
+    fn dispatch_stats(&self) -> Option<DispatchStats> {
+        Some(DispatchStats::new(
+            Self::BACKEND_NAME,
+            DispatchCounters {
+                patched_direct_calls: Some(self.dispatch_route(SabreDispatchRoute::Trampoline)),
+                sigill_marker_hits: Some(self.dispatch_route(SabreDispatchRoute::SigillMarker)),
+                ptrace_syscall_entry_stops: Some(self.slow_path(SabreSlowPath::PtraceSyscallEntry)),
+                ptrace_syscall_exit_stops: Some(self.slow_path(SabreSlowPath::PtraceSyscallExit)),
+                refusals: Some(self.slow_path(SabreSlowPath::VforkChildRejected)),
+                ..DispatchCounters::ZERO
+            },
+            SiteCounters {
+                candidates: Some(self.patch_shapes.candidate_rips),
+                patched: Some(self.patch_route(SabrePatchRoute::JumpTrampoline)),
+                fell_back: Some(
+                    self.patch_route(SabrePatchRoute::RewriteSigillMarker)
+                        + self.patch_route(SabrePatchRoute::PtraceInstalledMarker),
+                ),
+            },
+        ))
+    }
 }
 
 impl BackendStatsSource for SabreStats {
@@ -412,10 +517,16 @@ impl BackendStatsSource for SabreStats {
             let count = page.slow_paths[path as usize].load(Ordering::Relaxed);
             (count != 0).then_some((path, count))
         }));
+        let dispatch_routes =
+            CounterSnapshot::new(DISPATCH_ROUTES.into_iter().filter_map(|route| {
+                let count = page.dispatch_routes[route as usize].load(Ordering::Relaxed);
+                (count != 0).then_some((route, count))
+            }));
         SabreStatsSnapshot {
             patch_shapes,
             patch_routes,
             slow_paths,
+            dispatch_routes,
         }
     }
 }
@@ -436,13 +547,49 @@ mod tests {
     }
 
     #[test]
+    fn inherited_descriptor_sits_above_the_guest_range_and_survives_exec() {
+        let stats = SabreStats::create(BackendStatsRequest::ENABLED)
+            .unwrap()
+            .unwrap();
+        let fd = stats.raw_fd();
+        assert!(
+            fd >= INHERITED_FD_FLOOR,
+            "stats descriptor {fd} is in the guest range"
+        );
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, 0, "the loader must inherit it");
+        // No low-numbered copy is left behind for the guest to inherit.
+        let memfds = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                let target = std::fs::read_link(entry.path()).ok()?;
+                target
+                    .to_string_lossy()
+                    .contains("reverie-sabre-backend-stats")
+                    .then(|| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .parse::<RawFd>()
+                            .unwrap()
+                    })
+            })
+            .filter(|&open| open < INHERITED_FD_FLOOR)
+            .filter(|&open| unsafe { libc::fcntl(open, libc::F_GETFD) } & libc::FD_CLOEXEC == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(memfds, Vec::<RawFd>::new());
+    }
+
+    #[test]
     fn shared_page_layout_matches_sabre_c_abi() {
-        assert_eq!(size_of::<RawBackendStats>(), 400);
+        assert_eq!(size_of::<RawBackendStats>(), 416);
         assert_eq!(offset_of!(RawBackendStats, candidate_rips), 16);
         assert_eq!(offset_of!(RawBackendStats, instruction_lengths), 56);
         assert_eq!(offset_of!(RawBackendStats, straddle_after), 176);
         assert_eq!(offset_of!(RawBackendStats, patch_routes), 296);
         assert_eq!(offset_of!(RawBackendStats, slow_paths), 320);
+        assert_eq!(offset_of!(RawBackendStats, dispatch_routes), 400);
     }
 
     #[test]
@@ -489,5 +636,35 @@ mod tests {
                 (SabreSlowPath::PtraceRawSyscallRedirect, 1),
             ]
         );
+    }
+
+    #[test]
+    fn dispatch_record_maps_routes_and_marker_fallbacks() {
+        let stats = SabreStats::create(BackendStatsRequest::ENABLED)
+            .unwrap()
+            .unwrap();
+        let guest = unsafe { SabreGuestStats::from_inherited_fd(stats.raw_fd()) }.unwrap();
+        stats.record_patch(0x1000, 2, SabrePatchRoute::JumpTrampoline);
+        stats.record_patch(0x1010, 2, SabrePatchRoute::JumpTrampoline);
+        stats.record_patch(0x2000, 2, SabrePatchRoute::PtraceInstalledMarker);
+        for _ in 0..5 {
+            guest.increment_dispatch(SabreDispatchRoute::Trampoline);
+        }
+        guest.increment_dispatch(SabreDispatchRoute::SigillMarker);
+        stats.increment_slow_path(SabreSlowPath::PtraceSyscallEntry);
+        guest.increment_slow_path(SabreSlowPath::VforkChildRejected);
+
+        let record = stats.backend_stats().dispatch_stats().unwrap();
+        assert_eq!(record.backend, "sabre");
+        assert_eq!(record.counters.patched_direct_calls, Some(5));
+        assert_eq!(record.counters.sigill_marker_hits, Some(1));
+        assert_eq!(record.counters.dispatches(), Some(6));
+        assert_eq!(record.counters.ptrace_seccomp_stops, Some(0));
+        assert_eq!(record.counters.ptrace_syscall_entry_stops, Some(1));
+        assert_eq!(record.counters.refusals, Some(1));
+        assert_eq!(record.sites.candidates, Some(3));
+        assert_eq!(record.sites.patched, Some(2));
+        assert_eq!(record.sites.fell_back, Some(1));
+        assert_eq!(record.inconsistencies(), Vec::<String>::new());
     }
 }

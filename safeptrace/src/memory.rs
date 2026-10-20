@@ -64,6 +64,48 @@ impl Stopped {
 }
 
 impl MemoryAccess for Stopped {
+    fn write_native_user_vectored(
+        &mut self,
+        expected_tid: i32,
+        local: &[io::IoSlice],
+        remote: &[reverie_memory::RemoteIoVec],
+    ) -> Result<usize, Errno> {
+        if expected_tid <= 0 || self.0.as_raw() != expected_tid {
+            return Err(Errno::ESRCH);
+        }
+        // The fixed remote iovec array below holds two segments; a longer
+        // list is refused before any access (documented on the trait).
+        if remote.len() > 2 {
+            return Err(Errno::E2BIG);
+        }
+        let mut raw_remote = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; 2];
+        for (raw, span) in raw_remote.iter_mut().zip(remote) {
+            raw.iov_base = span.address() as *mut libc::c_void;
+            raw.iov_len = span.length();
+        }
+        // Exactly one permission-respecting syscall. In particular an eight
+        // byte operand never enters write()/PTRACE_POKEDATA, and EFAULT remains
+        // distinct from a native successful zero-byte result. Remote addresses
+        // remain numeric kernel operands; no Rust reference into this process
+        // is formed for another process's mapping.
+        self.1.on_held_tid(|| {
+            Errno::result(unsafe {
+                libc::process_vm_writev(
+                    self.0.as_raw(),
+                    local.as_ptr() as *const libc::iovec,
+                    local.len() as libc::c_ulong,
+                    raw_remote.as_ptr(),
+                    remote.len() as libc::c_ulong,
+                    0,
+                )
+            })
+            .map(|count| count as usize)
+        })
+    }
+
     /// Does a vectored read from the remote address space. Returns the number of
     /// bytes read.
     ///
@@ -262,9 +304,14 @@ mod test {
     use nix::unistd::fork;
     use quickcheck::QuickCheck;
     use quickcheck_macros::quickcheck;
+    use reverie_memory::RemoteIoVec;
     use reverie_process::Pid;
 
     use super::*;
+
+    fn remote(address: usize, length: usize) -> RemoteIoVec {
+        RemoteIoVec::new(AddrMut::from_raw(address).unwrap(), length).unwrap()
+    }
 
     // Helper function for spawning a child process in a stopped state. The
     // value `T` will be in the child's address space allowing us to read or
@@ -704,5 +751,225 @@ mod test {
             },
             |_| {},
         )
+    }
+    // PTRACE_PEEKDATA is used only for independent readback here, including
+    // protected bytes which process_vm_readv must not expose. No fixture write
+    // uses ptrace or changes the stopped child's page protections afterward.
+    fn native_write_readback(memory: &Stopped, address: usize) -> Option<[u8; 32]> {
+        let mut observed = [0; 32];
+        for (index, bytes) in observed.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            let addr = Addr::from_raw(address.checked_add(index * 8)?)?;
+            bytes.copy_from_slice(&memory.read_u64(addr).ok()?.to_ne_bytes());
+        }
+        Some(observed)
+    }
+
+    #[test]
+    fn native_user_write_full_vectored_keeps_canaries_and_raw_count() {
+        let (mapping, length) = map_pages(1);
+        unsafe { core::ptr::write_bytes(mapping, 0xa5, 32) };
+        let passed = fork_helper(
+            mapping as usize,
+            move |child, address| {
+                let mut memory = Stopped::new_unchecked(child);
+                let payload = *b"0123456789abcdef";
+                let local = [
+                    io::IoSlice::new(&payload[..8]),
+                    io::IoSlice::new(&payload[8..]),
+                ];
+                let remote = [remote(address + 8, 7), remote(address + 15, 9)];
+                let result = memory.write_native_user_vectored(child.as_raw(), &local, &remote);
+                let mut expected = [0xa5; 32];
+                expected[8..24].copy_from_slice(&payload);
+                result == Ok(16) && native_write_readback(&memory, address) == Some(expected)
+            },
+            |_| {},
+        );
+        let parent_unchanged = unsafe { core::slice::from_raw_parts(mapping, 32) } == [0xa5; 32];
+        unmap_pages(mapping, length);
+        assert!(passed);
+        assert!(
+            parent_unchanged,
+            "remote write must not target the equal parent address"
+        );
+    }
+
+    #[test]
+    fn native_user_write_unaligned_eight_bytes_uses_raw_permission_respecting_path() {
+        #[repr(align(8))]
+        struct Aligned([u8; 9]);
+        let (mapping, length) = map_pages(1);
+        unsafe { core::ptr::write_bytes(mapping, 0xa5, 32) };
+        let passed = fork_helper(
+            mapping as usize,
+            move |child, address| {
+                let mut memory = Stopped::new_unchecked(child);
+                let source = Aligned([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+                let payload = &source.0[1..];
+                let local = [io::IoSlice::new(payload)];
+                let result = memory.write_native_user_vectored(
+                    child.as_raw(),
+                    &local,
+                    &[remote(address + 9, 8)],
+                );
+                let mut expected = [0xa5; 32];
+                expected[9..17].copy_from_slice(payload);
+                !(payload.as_ptr() as usize).is_multiple_of(mem::align_of::<u64>())
+                    && !(address + 9).is_multiple_of(mem::align_of::<u64>())
+                    && result == Ok(8)
+                    && native_write_readback(&memory, address) == Some(expected)
+            },
+            |_| {},
+        );
+        unmap_pages(mapping, length);
+        assert!(passed);
+    }
+
+    #[test]
+    fn native_user_write_wrong_actual_stopped_task_refuses_equal_virtual_address() {
+        let (mapping, length) = map_pages(1);
+        unsafe { core::ptr::write_bytes(mapping, 0xa5, 32) };
+        let passed = fork_helper(
+            mapping as usize,
+            move |first_child, address| {
+                fork_helper(
+                    address,
+                    move |second_child, same_address| {
+                        let mut first = Stopped::new_unchecked(first_child);
+                        let second = Stopped::new_unchecked(second_child);
+                        let local = [io::IoSlice::new(b"newbytes")];
+                        let mut all_refused =
+                            first_child != second_child && address == same_address;
+                        for wrong in [second_child.as_raw(), 0, -1] {
+                            all_refused &= first.write_native_user_vectored(
+                                wrong,
+                                &local,
+                                &[remote(address + 8, 8)],
+                            ) == Err(Errno::ESRCH);
+                        }
+                        all_refused
+                            && native_write_readback(&first, address) == Some([0xa5; 32])
+                            && native_write_readback(&second, same_address) == Some([0xa5; 32])
+                    },
+                    |_| {},
+                )
+            },
+            |_| {},
+        );
+        let parent_unchanged = unsafe { core::slice::from_raw_parts(mapping, 32) } == [0xa5; 32];
+        unmap_pages(mapping, length);
+        assert!(passed);
+        assert!(parent_unchanged);
+    }
+
+    #[test]
+    fn native_user_write_protected_eight_bytes_retains_efault_and_all_canaries() {
+        for protection in [libc::PROT_NONE, libc::PROT_READ] {
+            let (mapping, length) = map_pages(1);
+            unsafe { core::ptr::write_bytes(mapping, 0xa5, 32) };
+            let passed = fork_helper(
+                mapping as usize,
+                move |child, address| {
+                    let mut memory = Stopped::new_unchecked(child);
+                    let local = [io::IoSlice::new(b"newbytes")];
+                    let result = memory.write_native_user_vectored(
+                        child.as_raw(),
+                        &local,
+                        &[remote(address + 8, 8)],
+                    );
+                    result == Err(Errno::EFAULT)
+                        && native_write_readback(&memory, address) == Some([0xa5; 32])
+                },
+                move |address| {
+                    assert_eq!(
+                        unsafe {
+                            libc::mprotect(*address as *mut libc::c_void, length, protection)
+                        },
+                        0
+                    );
+                },
+            );
+            unmap_pages(mapping, length);
+            assert!(passed, "protection {protection}");
+        }
+    }
+
+    #[test]
+    fn native_user_write_split_page_reports_exact_prefix_and_preserves_protected_tail() {
+        let page = page_size();
+        let (mapping, length) = map_pages(2);
+        let start = unsafe { mapping.add(page - 4) };
+        unsafe { core::ptr::write_bytes(start.sub(8), 0xa5, 32) };
+        let passed = fork_helper(
+            start as usize,
+            move |child, address| {
+                let mut memory = Stopped::new_unchecked(child);
+                let payload = *b"12345678";
+                let local = [io::IoSlice::new(&payload)];
+                let remote_ranges = [remote(address, 4), remote(address + 4, 4)];
+                let first =
+                    memory.write_native_user_vectored(child.as_raw(), &local, &remote_ranges);
+                let mut expected = [0xa5; 32];
+                expected[8..12].copy_from_slice(&payload[..4]);
+                let after_prefix = native_write_readback(&memory, address - 8);
+                // A separate tail-only syscall must remain an actual EFAULT,
+                // not an automatic retry or a successful zero from the API.
+                let local_tail = [io::IoSlice::new(&payload[4..])];
+                let second = memory.write_native_user_vectored(
+                    child.as_raw(),
+                    &local_tail,
+                    &[remote(address + 4, 4)],
+                );
+                first == Ok(4)
+                    && after_prefix == Some(expected)
+                    && second == Err(Errno::EFAULT)
+                    && native_write_readback(&memory, address - 8) == Some(expected)
+            },
+            move |_| {
+                assert_eq!(
+                    unsafe { libc::mprotect(mapping.add(page).cast(), page, libc::PROT_NONE) },
+                    0
+                );
+            },
+        );
+        unmap_pages(mapping, length);
+        assert!(passed);
+    }
+
+    #[test]
+    fn native_user_write_empty_transfer_keeps_native_zero_distinct_from_efault() {
+        let (mapping, length) = map_pages(1);
+        unsafe { core::ptr::write_bytes(mapping, 0xa5, 32) };
+        let passed = fork_helper(
+            mapping as usize,
+            move |child, address| {
+                let mut memory = Stopped::new_unchecked(child);
+                // A genuinely empty local vector succeeds without touching the
+                // protected target. The identical nonempty target must fault.
+                let zero = memory.write_native_user_vectored(
+                    child.as_raw(),
+                    &[],
+                    &[remote(address + 8, 8)],
+                );
+                let error = memory.write_native_user_vectored(
+                    child.as_raw(),
+                    &[io::IoSlice::new(b"newbytes")],
+                    &[remote(address + 8, 8)],
+                );
+                zero == Ok(0)
+                    && error == Err(Errno::EFAULT)
+                    && native_write_readback(&memory, address) == Some([0xa5; 32])
+            },
+            move |address| {
+                assert_eq!(
+                    unsafe {
+                        libc::mprotect(*address as *mut libc::c_void, length, libc::PROT_NONE)
+                    },
+                    0
+                );
+            },
+        );
+        unmap_pages(mapping, length);
+        assert!(passed);
     }
 }

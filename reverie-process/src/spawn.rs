@@ -9,6 +9,8 @@
 use std::io;
 use std::io::Write;
 
+use syscalls::Errno;
+
 use super::Child;
 use super::Command;
 use super::clone::clone;
@@ -18,6 +20,8 @@ use super::error::Error;
 use super::fd::Fd;
 use super::fd::pipe;
 use super::id_map::make_id_map;
+use super::launch_window::Launch;
+use super::launch_window::TransientOpen;
 use super::seccomp::SeccompNotif;
 use super::stdio::ChildStderr;
 use super::stdio::ChildStdin;
@@ -25,16 +29,31 @@ use super::stdio::ChildStdout;
 use super::util::CStringArray;
 use super::util::SharedValue;
 
+/// The allocated parts of a launch, made before its lock (`Command::prepare`).
+struct Prepared {
+    env: CStringArray,
+    uid_map: Vec<u8>,
+    gid_map: Vec<u8>,
+}
+
 impl Command {
     /// Executes the command as a child process, returning a handle to it.
     ///
     /// By default, stdin, stdout and stderr are inherited from the parent.
     pub fn spawn(&mut self) -> Result<Child, Error> {
+        let prepared = self.prepare();
+
+        // Every descriptor the child may inherit is made under the launch
+        // lock, which ends when clone returns (see `launch_window`). On an
+        // early return the lock, declared later, ends before `prepared` is
+        // freed.
+        let launch = Launch::begin();
+
         // Create a pipe to send back errors to the parent process if `execve`
         // fails.
-        let (reader, mut writer) = pipe()?;
+        let (reader, mut writer) = launch.allocate(pipe, Errno::into_raw)?;
 
-        let child = self.spawn_with(|err| {
+        let child = self.spawn_launched(prepared, launch, |err| {
             send_error(&mut writer, err);
             1
         })?;
@@ -52,44 +71,90 @@ impl Command {
     /// child process if an error occurs during execution of the process. The
     /// `wait` function can be used to wait for the child to fully start up and
     /// to transform it into another type.
-    pub fn spawn_with<F>(&mut self, mut onfail: F) -> Result<Child, Error>
+    pub fn spawn_with<F>(&mut self, onfail: F) -> Result<Child, Error>
     where
         F: FnMut(Error) -> i32,
     {
-        let env = self.container.env.array();
+        let prepared = self.prepare();
+        self.spawn_launched(prepared, Launch::begin(), onfail)
+    }
 
-        // Set up IO pipes
-        let (stdin, child_stdin) = self.container.stdin.pipes(true)?;
-        let (stdout, child_stdout) = self.container.stdout.pipes(false)?;
-        let (stderr, child_stderr) = self.container.stdout.pipes(false)?;
+    /// Builds what a launch needs that allocates, before the launch lock is
+    /// taken. Nothing may allocate or free under that lock: an allocator
+    /// can hold its own lock, or call code that needs a transient open, while
+    /// it waits for the launch to end.
+    fn prepare(&self) -> Prepared {
+        Prepared {
+            env: self.container.env.array(),
+            uid_map: make_id_map(&self.container.uid_map),
+            gid_map: make_id_map(&self.container.gid_map),
+        }
+    }
+
+    fn spawn_launched<F>(
+        &mut self,
+        prepared: Prepared,
+        launch: Launch,
+        mut onfail: F,
+    ) -> Result<Child, Error>
+    where
+        F: FnMut(Error) -> i32,
+    {
+        let Prepared {
+            env,
+            uid_map,
+            gid_map,
+        } = prepared;
 
         let clone_flags = self.container.namespace.bits() | libc::SIGCHLD;
 
-        let uid_map = &make_id_map(&self.container.uid_map);
-        let gid_map = &make_id_map(&self.container.gid_map);
+        // Under the lock: the child's descriptors, its shared page and the
+        // clone, all system calls. On failure only descriptors and that page
+        // are released, which frees no memory, and the error is plain data.
+        let launched = (|| {
+            // Set up IO pipes
+            let (stdin, child_stdin) =
+                launch.allocate(|| self.container.stdin.pipes(true), Errno::into_raw)?;
+            let (stdout, child_stdout) =
+                launch.allocate(|| self.container.stdout.pipes(false), Errno::into_raw)?;
+            let (stderr, child_stderr) =
+                launch.allocate(|| self.container.stdout.pipes(false), Errno::into_raw)?;
 
-        let seccomp_fd = if self.container.seccomp_notify {
-            Some(SharedValue::new(core::sync::atomic::AtomicI32::new(0))?)
-        } else {
-            None
-        };
+            let seccomp_fd = if self.container.seccomp_notify {
+                Some(SharedValue::new(core::sync::atomic::AtomicI32::new(0))?)
+            } else {
+                None
+            };
 
-        let context = ChildContext {
-            stdin: child_stdin.as_ref(),
-            stdout: child_stdout.as_ref(),
-            stderr: child_stderr.as_ref(),
-            uid_map,
-            gid_map,
-            seccomp_fd: seccomp_fd.as_ref().map(|x| x.as_ref()),
-        };
+            let context = ChildContext {
+                stdin: child_stdin.as_ref(),
+                stdout: child_stdout.as_ref(),
+                stderr: child_stderr.as_ref(),
+                uid_map: &uid_map,
+                gid_map: &gid_map,
+                seccomp_fd: seccomp_fd.as_ref().map(|x| x.as_ref()),
+            };
 
-        let pid = clone(
-            || {
-                let code = onfail(self.do_exec(&context, &env));
-                unsafe { libc::_exit(code) }
-            },
-            clone_flags,
-        )?;
+            let pid = clone(
+                || {
+                    let code = onfail(self.do_exec(&context, &env));
+                    unsafe { libc::_exit(code) }
+                },
+                clone_flags,
+            )?;
+            Ok::<_, Error>((
+                pid,
+                [stdin, stdout, stderr],
+                [child_stdin, child_stdout, child_stderr],
+                seccomp_fd,
+            ))
+        })();
+        // The child exists, so it cannot inherit what the parent opens from
+        // here on. The waits below for the child's startup must not hold the
+        // lock: the child's setup may wait on a thread that needs it.
+        drop(launch);
+        let (pid, [stdin, stdout, stderr], [child_stdin, child_stdout, child_stderr], seccomp_fd) =
+            launched?;
 
         drop(child_stdin);
         drop(child_stdout);
@@ -108,8 +173,11 @@ impl Command {
                 }
 
                 // Use pidfd_getfd to copy the file descriptor
-                let pidfd = Fd::pidfd_open(pid.into(), 0)?;
-                let fd = pidfd.pidfd_getfd(targetfd, 0)?;
+                let fd = {
+                    let _open = TransientOpen::begin();
+                    let pidfd = Fd::pidfd_open(pid.into(), 0)?;
+                    pidfd.pidfd_getfd(targetfd, 0)?
+                };
 
                 // We've successfully duplicated the file descriptor. Let the
                 // child continue on to execve.

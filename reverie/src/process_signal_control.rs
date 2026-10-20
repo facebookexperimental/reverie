@@ -181,6 +181,62 @@ pub struct SignalBoundaryReceipt {
     pub outcome: SignalBoundaryOutcome,
 }
 
+/// One retained parent-thread-death effect in a process shared-pending queue.
+/// The sender and signal were frozen by the backend's logical death transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParentDeathSignalPublication {
+    /// Exact receiving process generation.
+    pub process: SignalProcessId,
+    /// Linux standard signal selected by the registering guest task.
+    pub signal: i32,
+    /// Generation frozen when its real parent died.
+    pub pending_generation: u64,
+    /// The first standard event was retained instead of replaced.
+    pub coalesced: bool,
+    /// A disposition change, explicit ignore, or dead receiver discarded it.
+    pub discarded: bool,
+}
+
+/// At-most-once acknowledgement for a real terminal or image boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParentDeathPublication {
+    /// Exact scheduler permit and actual backend outcome authorizing publication.
+    pub boundary: SignalBoundaryReceipt,
+    /// Backend-generated batch identities, never supplied as send authority.
+    pub batches: Vec<u64>,
+    /// Effects in stable registered-task order, for existing wake selection.
+    pub signals: Vec<ParentDeathSignalPublication>,
+}
+
+/// Parent-death publication never converts a partial commit into a retry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ParentDeathPublicationResult {
+    /// No batch was consumed and no signal effect occurred.
+    RejectedBeforeCommit(Errno),
+    /// Every retained effect was accounted for, including empty batches.
+    Committed(ParentDeathPublication),
+    /// Effects are retained; the run must become terminal after releasing locks.
+    FailedAfterCommit {
+        /// Exact effects already committed before the failure.
+        receipt: ParentDeathPublication,
+        /// Original failure, not a fabricated guest errno.
+        errno: Errno,
+    },
+}
+
+/// Immediate result of an original-callback parent-death preflight with no
+/// guest-visible effects (retained-image exec may stage private callback state).
+/// Neither result is a reusable permit for a later or rewritten syscall.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParentDeathSyscallAdmission {
+    /// This exact live task/process generation has not entered the restricted
+    /// delivery domain. This conveys no descriptor or I/O authority.
+    Unenrolled,
+    /// The enrolled original callback and raw operands are supported now.
+    /// Actual backend injection still independently checks its own boundary.
+    Admitted,
+}
+
 /// Shared run-owned facade. Implementations must not retain a Tool or Guest.
 ///
 /// Calls are synchronous. Except for the explicitly named failure forwarding
@@ -189,6 +245,42 @@ pub struct SignalBoundaryReceipt {
 /// signal/file-table guard is held. The caller supplies the causal scheduler
 /// fence; a snapshot by itself is not deterministic admission.
 pub trait ProcessSignalControl: Debug + Send + Sync {
+    /// Opt into the parent-thread-death protocol before starting any guest task.
+    ///
+    /// A controlled Tool promises to consume each real terminal/image batch
+    /// before releasing its existing fence, and to admit recipient waits/mask
+    /// transitions only in its supported delivery domain. This is distinct from
+    /// merely selecting ordinary process signals. Older consumers remain refused
+    /// by nonzero PR_SET_PDEATHSIG rather than silently losing future delivery.
+    fn enable_parent_death_control(&self) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// Sticky process-generation delivery domain: a nonzero setting has been
+    /// admitted, even if a later SET(0) or exec reset clears that setting. A
+    /// retained/pending death may still need delivery. Consumers check this
+    /// before parking, and must refuse unsupported blocking capability there.
+    fn parent_death_enrolled(&self, _process: SignalProcessId) -> Result<bool, Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// Publish only the backend-retained batch of this exact owned boundary.
+    /// No caller supplies signal numbers, recipients or fabricated exit events.
+    /// Call after validating the existing fence and before releasing it. This
+    /// method cannot call Tool code or retain a sender transaction while taking
+    /// a receiver transaction. Exact duplicate calls return the retained result.
+    fn publish_parent_death(
+        &self,
+        _boundary: SignalBoundaryReceipt,
+    ) -> ParentDeathPublicationResult {
+        ParentDeathPublicationResult::RejectedBeforeCommit(Errno::ENOSYS)
+    }
+
+    /// Forward the retained partial failure only after the scheduler unlocks.
+    fn finish_parent_death_failure(&self, _receipt: &ParentDeathPublication) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
     /// Publish a complete SIGALRM/SI_KERNEL event to an exact process lifetime.
     fn publish_alarm(
         &self,

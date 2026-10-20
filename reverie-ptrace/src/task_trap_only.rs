@@ -43,6 +43,7 @@ use crate::liteinst_trap_only::RetiredReason;
 use crate::liteinst_trap_only::SLOT;
 use crate::liteinst_trap_only::SLOT_RET;
 use crate::liteinst_trap_only::SYSCALL_BYTES;
+use crate::liteinst_trap_only::StoredSiginfo;
 use crate::liteinst_trap_only::TAG_I386;
 use crate::liteinst_trap_only::TAG_SLOT;
 use crate::liteinst_trap_only::TrapOnlyFailure;
@@ -50,6 +51,7 @@ use crate::liteinst_trap_only::is_reserved_site;
 use crate::liteinst_trap_only::read_site;
 use crate::liteinst_trap_only::site_mapping_is_patchable;
 use crate::liteinst_trap_only::write_site;
+use crate::tracer::WaitOnPtracer;
 
 /// How `handle_seccomp` continues after trap-only routing.
 pub(super) enum TrapOnlyRoute {
@@ -139,7 +141,7 @@ impl HopThreadStatus {
 /// Reads [`HopThreadStatus`] for thread `tid`; `Ok(None)` when the thread is
 /// gone (killed and reaped, or being reaped).
 fn read_hop_thread_status(tid: i32) -> Result<Option<HopThreadStatus>, String> {
-    match std::fs::read_to_string(format!("/proc/{tid}/status")) {
+    match crate::launch_window::read_to_string(format!("/proc/{tid}/status")) {
         Ok(status) => HopThreadStatus::parse(&status).map(Some),
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(None),
         Err(error) => Err(format!("read /proc/{tid}/status: {error}")),
@@ -215,16 +217,10 @@ fn deferred_stops_next(status: Option<&HopThreadStatus>) -> DeferredStopsNext {
 /// before a second task can share the address space.
 #[derive(Clone, Copy, Default)]
 struct DeferredStops {
-    private: Option<libc::siginfo_t>,
-    shared: Option<libc::siginfo_t>,
+    private: Option<StoredSiginfo>,
+    shared: Option<StoredSiginfo>,
     count: usize,
 }
-
-// SAFETY: The pointers in the siginfos are addresses in the tracee, copied
-// from PTRACE_GETSIGINFO. The tracer never dereferences them; it only hands
-// the siginfo back to PTRACE_SETSIGINFO, so it is plain data on this side.
-unsafe impl Send for DeferredStops {}
-unsafe impl Sync for DeferredStops {}
 
 impl DeferredStops {
     /// Defers one SIGSTOP; returns its queue and whether its siginfo was
@@ -238,7 +234,7 @@ impl DeferredStops {
         };
         let kept = slot.is_none();
         if kept {
-            *slot = Some(info);
+            *slot = Some(StoredSiginfo(info));
         }
         (queue, kept)
     }
@@ -370,6 +366,7 @@ fn creating_flags(tid: nix::unistd::Pid, nr: Sysno, args: &SyscallArgs) -> Optio
         Sysno::clone3 => {
             use std::os::unix::fs::FileExt;
             let mut flags = [0u8; 8];
+            let _open = crate::launch_window::TransientOpen::begin();
             Some(
                 match std::fs::File::open(format!("/proc/{tid}/mem"))
                     .and_then(|mem| mem.read_exact_at(&mut flags, args.arg0 as u64))
@@ -705,8 +702,9 @@ impl<L: Tool + 'static> TracedTask<L> {
     ) -> Result<Wait, TraceError> {
         // The run loop already counted this I386 stop, which plain ptrace
         // never produces; the P2 comparator accounts for it explicitly.
-        #[cfg(test)]
         if let Some(stats) = &self.global_state.backend_stats {
+            stats.record_internal_seccomp_stop();
+            #[cfg(test)]
             stats.mark_last_stop_internal(self.tid);
         }
         match self.trap_only_hop(task, view).await? {
@@ -745,7 +743,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                         "allow-class site={site:#x} nr={}",
                         view.orig_rax as i64
                     ));
-                self.resume_stopped(task, None)?.next_state().await
+                self.resume_stopped(task, None)?
+                    .next_state_with_owner(&self.ptracer_waits)
+                    .await
             }
             HopOutcome::Other(wait) => Ok(wait),
         }
@@ -931,7 +931,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         hop_regs.rax = nr;
         hop_regs.rip = target;
         task.setregs(&hop_regs)?;
-        let wait = self.resume_stopped(task, None)?.next_state().await?;
+        let wait = self
+            .resume_stopped(task, None)?
+            .next_state_with_owner(&self.ptracer_waits)
+            .await?;
         self.arm_liteinst_wait(&wait);
 
         // H2: the slot's (or the restored site's) own seccomp stop.
@@ -1014,7 +1017,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                                     .to_owned(),
                             );
                             task.setregs(&hop_regs)?;
-                            wait = self.resume_stopped(task, None)?.next_state().await?;
+                            wait = self
+                                .resume_stopped(task, None)?
+                                .next_state_with_owner(&self.ptracer_waits)
+                                .await?;
                             self.arm_liteinst_wait(&wait);
                         }
                         DeferredStopsNext::Reraise {
@@ -1049,9 +1055,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                             },
                         ));
                     }
-                    // Scoped so that the siginfo, which is not Send, is not
-                    // held across the await below.
-                    {
+                    // A block, so that the `siginfo_t` (not `Send` from libc
+                    // 0.2.190) is gone before the `.await` below.
+                    let (queue, kept, code) = {
                         let info = match task.getsiginfo() {
                             Ok(info) => info,
                             // A non-seized tracee's group stop looks like a
@@ -1072,13 +1078,16 @@ impl<L: Tool + 'static> TracedTask<L> {
                             Err(error) => return Err(error),
                         };
                         let (queue, kept) = deferred.defer(info);
-                        self.trap_only_record(format!(
-                            "slot SIGSTOP deferred code={} queue={queue}{}",
-                            info.si_code,
-                            if kept { "" } else { " (coalesced)" }
-                        ));
-                    }
-                    wait = self.resume_stopped(task, None)?.next_state().await?;
+                        (queue, kept, info.si_code)
+                    };
+                    self.trap_only_record(format!(
+                        "slot SIGSTOP deferred code={code} queue={queue}{}",
+                        if kept { "" } else { " (coalesced)" }
+                    ));
+                    wait = self
+                        .resume_stopped(task, None)?
+                        .next_state_with_owner(&self.ptracer_waits)
+                        .await?;
                     self.arm_liteinst_wait(&wait);
                 }
                 Wait::Stopped(task, event) => {
@@ -1108,7 +1117,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         if let Some(deferred) = reraise {
             self.trap_only_reraise_stops(site, deferred)?;
         }
-        let wait = self.syscall_stopped(task, None)?.next_state().await?;
+        let wait = self
+            .syscall_stopped(task, None)?
+            .next_state_with_owner(&self.ptracer_waits)
+            .await?;
         self.arm_liteinst_wait(&wait);
 
         // H4.
@@ -1281,7 +1293,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.trap_only_record(format!(
                 "deferred SIGSTOP re-raised queue={} code={}",
                 if private { "private" } else { "shared" },
-                info.si_code
+                info.0.si_code
             ));
             if let Some(trap_only) = self.trap_only.as_mut() {
                 trap_only
@@ -1334,7 +1346,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             return Ok(());
         };
         let reraised = trap_only.reraised_stops.remove(index);
-        task.setsiginfo(&reraised.info)
+        task.setsiginfo(&reraised.info.0)
     }
 
     /// Forgets re-raised SIGSTOPs that were not delivered before this task's
@@ -1396,7 +1408,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         view: libc::user_regs_struct,
     ) -> Result<Wait, TraceError> {
         match self.trap_only_hop(task, view).await? {
-            HopOutcome::ExitStop(task) => self.resume_stopped(task, None)?.next_state().await,
+            HopOutcome::ExitStop(task) => {
+                self.resume_stopped(task, None)?
+                    .next_state_with_owner(&self.ptracer_waits)
+                    .await
+            }
             HopOutcome::Other(wait @ Wait::Stopped(_, Event::NewChild(..))) => {
                 // The run loop dispatches this stop; its handler restores both
                 // tasks from the view, as the inject path does directly.
@@ -1642,18 +1658,20 @@ impl<L: Tool + 'static> TracedTask<L> {
         // A zeroed kernel `struct sigaction` (SIG_DFL, no flags, empty mask),
         // written below the red zone of the guest stack.
         let act = (regs.rsp.wrapping_sub(256)) & !15;
-        {
+        let written = {
             use std::os::unix::fs::FileExt;
-            let written = std::fs::OpenOptions::new()
+            // The guard ends before a failure is published.
+            let _open = crate::launch_window::TransientOpen::begin();
+            std::fs::OpenOptions::new()
                 .write(true)
                 .open(format!("/proc/{}/mem", task.pid()))
-                .and_then(|mem| mem.write_all_at(&[0u8; 32], act));
-            if let Err(error) = written {
-                return Err(self.trap_only_failure(
-                    "trap-only foreign int 0x80",
-                    foreign(format!("write SIG_DFL sigaction at {act:#x}: {error}")),
-                ));
-            }
+                .and_then(|mem| mem.write_all_at(&[0u8; 32], act))
+        };
+        if let Err(error) = written {
+            return Err(self.trap_only_failure(
+                "trap-only foreign int 0x80",
+                foreign(format!("write SIG_DFL sigaction at {act:#x}: {error}")),
+            ));
         }
         let restored = self
             .untraced_syscall(
@@ -1696,7 +1714,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                 )),
             ));
         }
-        let mut wait = self.resume_stopped(task, None)?.next_state().await?;
+        let mut wait = self
+            .resume_stopped(task, None)?
+            .next_state_with_owner(&self.ptracer_waits)
+            .await?;
         self.arm_liteinst_wait(&wait);
         let mut delivered = false;
         loop {
@@ -1707,7 +1728,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     delivered = true;
                     wait = self
                         .resume_stopped(task, nix::sys::signal::Signal::SIGSYS)?
-                        .next_state()
+                        .next_state_with_owner(&self.ptracer_waits)
                         .await?;
                     self.arm_liteinst_wait(&wait);
                 }
@@ -2163,8 +2184,8 @@ mod hop_stop_tests {
         assert_eq!(deferred.defer(stop(libc::SI_KERNEL)), ("shared", false));
         assert!(!deferred.is_empty());
         assert_eq!(deferred.count, 5);
-        assert_eq!(deferred.shared.unwrap().si_code, libc::SI_USER);
-        assert_eq!(deferred.private.unwrap().si_code, libc::SI_TKILL);
+        assert_eq!(deferred.shared.unwrap().0.si_code, libc::SI_USER);
+        assert_eq!(deferred.private.unwrap().0.si_code, libc::SI_TKILL);
     }
 
     #[test]

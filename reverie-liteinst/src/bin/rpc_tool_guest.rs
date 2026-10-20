@@ -12,6 +12,8 @@ use core::sync::atomic::AtomicI64;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use std::collections::BTreeSet;
+use std::ffi::CStr;
+use std::ffi::CString;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -29,7 +31,10 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::ExitGroup;
+use reverie::syscalls::RtSigprocmask;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
@@ -47,6 +52,12 @@ mod owned_frame_guest;
 #[path = "rpc_tool_guest/vdso_getrandom.rs"]
 mod vdso_getrandom_guest;
 
+#[path = "rpc_tool_guest/vdso_fail_closed.rs"]
+mod vdso_fail_closed_guest;
+
+#[path = "rpc_tool_guest/late_code.rs"]
+mod late_code_guest;
+
 const CALLS: u64 = 32;
 const TOOL_CPUID_EAX: u32 = 0x1111_1111;
 const TOOL_CPUID_EBX: u32 = 0x2222_2222;
@@ -60,6 +71,10 @@ static LAST_MASK_RESULT: AtomicI64 = AtomicI64::new(0);
 static LAST_FIRST_USE_EXEC_RESULT: AtomicI64 = AtomicI64::new(0);
 static LAST_FIRST_USE_SIGNAL_RESULT: AtomicI64 = AtomicI64::new(0);
 static CHILD_RECONSTRUCTED: AtomicBool = AtomicBool::new(false);
+static MASK_DURING_WAIT: AtomicU64 = AtomicU64::new(0);
+static MASK_PROBE_READABLE: AtomicI64 = AtomicI64::new(0);
+static MASK_PROBE_UNREADABLE: AtomicI64 = AtomicI64::new(0);
+static MASK_INSTRUCTION_CALLBACKS: AtomicU64 = AtomicU64::new(0);
 static RCB_BEFORE: AtomicU64 = AtomicU64::new(0);
 static RCB_AFTER: AtomicU64 = AtomicU64::new(0);
 static RCB_CALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -464,6 +479,149 @@ impl Tool for TailForkTool {
     }
 }
 
+const SIGSET_SIZE: usize = core::mem::size_of::<u64>();
+
+const fn signal_bit(signal: libc::c_int) -> u64 {
+    1 << (signal - 1)
+}
+
+/// The mask left by blocking every signal under Mode A: Linux never blocks
+/// SIGKILL or SIGSTOP, and the runtime keeps SIGSYS unblocked.
+const FULL_MASK_UNDER_MODE_A: u64 =
+    !(signal_bit(libc::SIGKILL) | signal_bit(libc::SIGSTOP) | signal_bit(libc::SIGSYS));
+
+/// The same mask while CPUID or RDTSC is subscribed: those instructions trap
+/// with SIGSEGV, so the runtime keeps SIGSEGV unblocked too.
+const FULL_MASK_UNDER_INSTRUCTIONS: u64 = FULL_MASK_UNDER_MODE_A & !signal_bit(libc::SIGSEGV);
+
+/// The value [`MaskInstructionTool`] returns for RDTSC.
+const MASK_TOOL_TSC: u64 = 0x1234_5678_9abc_def0;
+
+fn errno_result(result: Result<i64, reverie::Errno>) -> i64 {
+    result.unwrap_or_else(|error| -i64::from(error.into_raw()))
+}
+
+/// An `rt_sigprocmask` call on the Tool's own sets; 0 passes no set.
+fn signal_mask_call(how: libc::c_int, set: usize, old_set: usize) -> RtSigprocmask {
+    RtSigprocmask::new()
+        .with_how(how)
+        .with_set(Addr::from_raw(set))
+        .with_oldset(AddrMut::from_raw(old_set))
+        .with_sigsetsize(SIGSET_SIZE)
+}
+
+/// Blocks every signal around a guest `wait4`, as Detcore's blocking wait does.
+#[derive(Default)]
+struct BlockingWaitTool;
+
+#[reverie::tool]
+impl Tool for BlockingWaitTool {
+    type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> Subscription {
+        [Sysno::rt_sigprocmask, Sysno::wait4].into_iter().collect()
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        if syscall.number() != Sysno::wait4 {
+            return Ok(guest.inject(syscall).await?);
+        }
+        // Addresses, not raw pointers, keep the future `Send`; the sets live
+        // in the pinned future, so they stay put across each await.
+        let all = u64::MAX;
+        let mut previous = 0_u64;
+        let mut during = 0_u64;
+        let all_addr = (&raw const all) as usize;
+        let previous_addr = (&raw mut previous) as usize;
+        let during_addr = (&raw mut during) as usize;
+        // Detcore checks that a guest set is readable with an invalid `how`,
+        // which Linux rejects only after it has read the set.
+        let readable = guest.inject(signal_mask_call(-1, all_addr, 0)).await;
+        MASK_PROBE_READABLE.store(errno_result(readable), Ordering::Release);
+        let unreadable = guest.inject(signal_mask_call(-1, 0x10, 0)).await;
+        MASK_PROBE_UNREADABLE.store(errno_result(unreadable), Ordering::Release);
+        guest
+            .inject(signal_mask_call(libc::SIG_SETMASK, all_addr, previous_addr))
+            .await?;
+        guest
+            .inject(signal_mask_call(libc::SIG_SETMASK, 0, during_addr))
+            .await?;
+        let during = unsafe { (during_addr as *const u64).read_volatile() };
+        MASK_DURING_WAIT.store(during, Ordering::Release);
+        let waited = guest.inject(syscall).await;
+        guest
+            .inject(signal_mask_call(libc::SIG_SETMASK, previous_addr, 0))
+            .await?;
+        Ok(waited?)
+    }
+}
+
+/// Subscribes CPUID and RDTSC, so the runtime reserves SIGSEGV, and injects the
+/// guest's own `rt_sigprocmask` calls, as Detcore does. The instruction set is
+/// [`InstructionTool`]'s, so the test's capability result from the instruction
+/// modes decides whether this install succeeds or refuses.
+#[derive(Default)]
+struct MaskInstructionTool;
+
+#[reverie::tool]
+impl Tool for MaskInstructionTool {
+    type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> Subscription {
+        let mut subscriptions: Subscription = [Sysno::rt_sigprocmask].into_iter().collect();
+        subscriptions.cpuid().rdtsc();
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+
+    async fn handle_rdtsc_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        request: Rdtsc,
+    ) -> Result<RdtscResult, reverie::Errno> {
+        MASK_INSTRUCTION_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(request, Rdtsc::Tsc);
+        Ok(RdtscResult {
+            tsc: MASK_TOOL_TSC,
+            aux: None,
+        })
+    }
+}
+
+#[derive(Default)]
+struct TailMaskTool;
+
+#[reverie::tool]
+impl Tool for TailMaskTool {
+    type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> Subscription {
+        [Sysno::rt_sigprocmask].into_iter().collect()
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        guest.tail_inject(syscall).await
+    }
+}
+
 global_asm!(
     r#"
     .text
@@ -521,6 +679,61 @@ reverie_liteinst_rpc_sigprocmask_site:
     ret
     .cfi_endproc
     .size reverie_liteinst_rpc_sigprocmask, .-reverie_liteinst_rpc_sigprocmask
+
+    # A second rt_sigprocmask site whose first call carries a set: that call
+    # traps once, the runtime installs the site's hook, and the call then
+    # completes through that hook.
+    .p2align 4
+    .global reverie_liteinst_rpc_sigprocmask_first
+    .hidden reverie_liteinst_rpc_sigprocmask_first
+    .type reverie_liteinst_rpc_sigprocmask_first,@function
+reverie_liteinst_rpc_sigprocmask_first:
+    .cfi_startproc
+    mov r10, rcx
+    mov eax, 14
+    .global reverie_liteinst_rpc_sigprocmask_first_site
+    .hidden reverie_liteinst_rpc_sigprocmask_first_site
+reverie_liteinst_rpc_sigprocmask_first_site:
+    syscall
+    nop
+    nop
+    nop
+    ret
+    .cfi_endproc
+    .size reverie_liteinst_rpc_sigprocmask_first, .-reverie_liteinst_rpc_sigprocmask_first
+
+    # An RDTSC site first reached after every signal has been blocked.
+    .p2align 4
+    .global reverie_liteinst_rpc_mask_rdtsc
+    .hidden reverie_liteinst_rpc_mask_rdtsc
+    .type reverie_liteinst_rpc_mask_rdtsc,@function
+reverie_liteinst_rpc_mask_rdtsc:
+    .global reverie_liteinst_rpc_mask_rdtsc_site
+    .hidden reverie_liteinst_rpc_mask_rdtsc_site
+reverie_liteinst_rpc_mask_rdtsc_site:
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    ret
+    .size reverie_liteinst_rpc_mask_rdtsc, .-reverie_liteinst_rpc_mask_rdtsc
+
+    # rt_sigprocmask(rsi, rdx, rcx, r8) through the `syscall` at rdi.
+    .p2align 4
+    .global reverie_liteinst_rpc_mask_at
+    .hidden reverie_liteinst_rpc_mask_at
+    .type reverie_liteinst_rpc_mask_at,@function
+reverie_liteinst_rpc_mask_at:
+    .cfi_startproc
+    mov r11, rdi
+    mov rdi, rsi
+    mov rsi, rdx
+    mov rdx, rcx
+    mov r10, r8
+    mov eax, 14
+    call r11
+    ret
+    .cfi_endproc
+    .size reverie_liteinst_rpc_mask_at, .-reverie_liteinst_rpc_mask_at
 
     .p2align 4
     .global reverie_liteinst_rpc_wait4
@@ -734,6 +947,20 @@ unsafe extern "C" {
         old_set: *mut u64,
         size: usize,
     ) -> i64;
+    fn reverie_liteinst_rpc_sigprocmask_first(
+        how: u64,
+        set: *const u64,
+        old_set: *mut u64,
+        size: usize,
+    ) -> i64;
+    fn reverie_liteinst_rpc_mask_rdtsc() -> u64;
+    fn reverie_liteinst_rpc_mask_at(
+        site: u64,
+        how: u64,
+        set: *const u64,
+        old_set: *mut u64,
+        size: usize,
+    ) -> i64;
     fn reverie_liteinst_rpc_wait4(
         pid: libc::pid_t,
         status: *mut libc::c_int,
@@ -743,6 +970,8 @@ unsafe extern "C" {
     static reverie_liteinst_rpc_getpid_site: u8;
     static reverie_liteinst_rpc_getuid_site: u8;
     static reverie_liteinst_rpc_sigprocmask_site: u8;
+    static reverie_liteinst_rpc_sigprocmask_first_site: u8;
+    static reverie_liteinst_rpc_mask_rdtsc_site: u8;
     static reverie_liteinst_rpc_wait4_site: u8;
     static reverie_liteinst_rpc_nested_cpuid_site: u8;
     static reverie_liteinst_rpc_first_use_rdtsc_site: u8;
@@ -1336,6 +1565,319 @@ fn tail_fork_guest(path: &Path) {
     check_reconstructed_fork("tail");
 }
 
+fn guest_signal_mask(how: libc::c_int, set: *const u64, size: usize) -> (i64, u64) {
+    let mut old_set = 0_u64;
+    let result = unsafe { reverie_liteinst_rpc_sigprocmask(how as u64, set, &mut old_set, size) };
+    (result, old_set)
+}
+
+fn current_signal_mask() -> u64 {
+    let (result, mask) = guest_signal_mask(libc::SIG_BLOCK, core::ptr::null(), SIGSET_SIZE);
+    assert_eq!(result, 0);
+    mask
+}
+
+/// Maps a `syscall; ret` at the end of an anonymous executable page, as the
+/// fallback guest does. The runtime cannot patch such a site, so every call
+/// through it completes through the SIGSYS fallback; callers check that with
+/// its hook count.
+fn unpatchable_syscall_site() -> u64 {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mapping = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    let site = unsafe { mapping.cast::<u8>().add(page - 3) };
+    unsafe { core::ptr::copy_nonoverlapping([0x0f, 0x05, 0xc3].as_ptr(), site, 3) };
+    assert_eq!(
+        unsafe { libc::mprotect(mapping, page, libc::PROT_READ | libc::PROT_EXEC) },
+        0
+    );
+    site as u64
+}
+
+/// Checks a guest's own `rt_sigprocmask` calls under Mode A: each installs
+/// its set without the reserved signals, whichever path completes it, a later
+/// trap still reaches the runtime, and a refused call changes nothing.
+fn signal_mask_checks(label: &str, expected_uid: i64, full_mask: u64) -> u64 {
+    let initial = current_signal_mask();
+    let usr1 = signal_bit(libc::SIGUSR1);
+
+    // Linux reads the set with an ordinary user copy, which can read a
+    // write-only page.
+    let page = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            4096,
+            libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(page, libc::MAP_FAILED);
+    let write_only = page.cast::<u64>();
+    unsafe { write_only.write_volatile(usr1) };
+    assert_eq!(
+        guest_signal_mask(libc::SIG_BLOCK, write_only, SIGSET_SIZE),
+        (0, initial)
+    );
+    assert_eq!(current_signal_mask(), initial | usr1);
+    assert_eq!(
+        guest_signal_mask(libc::SIG_UNBLOCK, write_only, SIGSET_SIZE).0,
+        0
+    );
+    assert_eq!(current_signal_mask(), initial);
+    assert_eq!(unsafe { libc::munmap(page, 4096) }, 0);
+
+    assert_eq!(guest_signal_mask(libc::SIG_BLOCK, &usr1, SIGSET_SIZE).0, 0);
+    assert_eq!(current_signal_mask(), initial | usr1);
+
+    // The first call at a fresh site traps with SIGSYS, installs the site's
+    // hook and completes through it after the signal frame has returned, so
+    // the mask saved in that frame must not undo the set the call installs.
+    let all = u64::MAX;
+    let mut old = 0_u64;
+    let first = unsafe {
+        reverie_liteinst_rpc_sigprocmask_first(
+            libc::SIG_SETMASK as u64,
+            &all,
+            &mut old,
+            SIGSET_SIZE,
+        )
+    };
+    assert_eq!((first, old), (0, initial | usr1));
+    let first_site =
+        core::ptr::addr_of!(reverie_liteinst_rpc_sigprocmask_first_site) as usize as u64;
+    assert_eq!(
+        reverie_liteinst::reverie_liteinst_site_trap_count(first_site),
+        1
+    );
+    assert_eq!(
+        reverie_liteinst::reverie_liteinst_site_hook_count(first_site),
+        1
+    );
+    assert_eq!(current_signal_mask(), full_mask);
+
+    // At a site that cannot be patched, each call completes through the
+    // SIGSYS fallback, which returns through a second signal frame.
+    let site = unpatchable_syscall_site();
+    let fallback = unsafe {
+        reverie_liteinst_rpc_mask_at(
+            site,
+            libc::SIG_SETMASK as u64,
+            &initial,
+            &mut old,
+            SIGSET_SIZE,
+        )
+    };
+    assert_eq!((fallback, old), (0, full_mask));
+    assert_eq!(current_signal_mask(), initial);
+    let fallback = unsafe {
+        reverie_liteinst_rpc_mask_at(site, libc::SIG_SETMASK as u64, &all, &mut old, SIGSET_SIZE)
+    };
+    assert_eq!((fallback, old), (0, initial));
+    assert_eq!(current_signal_mask(), full_mask);
+    assert_eq!(reverie_liteinst::reverie_liteinst_site_trap_count(site), 2);
+    assert_eq!(reverie_liteinst::reverie_liteinst_site_hook_count(site), 0);
+
+    // The first call at this site traps with SIGSYS. Had SIGSYS been blocked,
+    // Linux would reset it to its default action and kill the process here.
+    let uid = unsafe { reverie_liteinst_rpc_getuid() };
+    assert_eq!(uid, expected_uid);
+    let getuid_site = core::ptr::addr_of!(reverie_liteinst_rpc_getuid_site) as usize as u64;
+    assert_eq!(
+        reverie_liteinst::reverie_liteinst_site_trap_count(getuid_site),
+        1
+    );
+    let unreadable = 0x10 as *const u64;
+    assert_eq!(
+        guest_signal_mask(libc::SIG_SETMASK, unreadable, SIGSET_SIZE).0,
+        -i64::from(libc::EFAULT)
+    );
+    assert_eq!(
+        guest_signal_mask(libc::SIG_SETMASK, &initial, SIGSET_SIZE / 2).0,
+        -i64::from(libc::EINVAL)
+    );
+    assert_eq!(
+        guest_signal_mask(99, &initial, SIGSET_SIZE).0,
+        -i64::from(libc::EINVAL)
+    );
+    // Linux checks the size before it reads the set, and reads the set
+    // before it checks `how`.
+    assert_eq!(
+        guest_signal_mask(libc::SIG_SETMASK, unreadable, SIGSET_SIZE / 2).0,
+        -i64::from(libc::EINVAL)
+    );
+    assert_eq!(
+        guest_signal_mask(99, unreadable, SIGSET_SIZE).0,
+        -i64::from(libc::EFAULT)
+    );
+    assert_eq!(current_signal_mask(), full_mask);
+    assert_eq!(
+        guest_signal_mask(libc::SIG_SETMASK, &initial, SIGSET_SIZE).0,
+        0
+    );
+    assert_eq!(current_signal_mask(), initial);
+    println!(
+        "{label}-mask full={full_mask:#x} write-only-set first-call fallback-site trap-after-full-mask"
+    );
+    initial
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Runs in the forked child. Waits until the parent is asleep with every
+/// signal blocked, which happens only inside the Tool's blocking `wait4`,
+/// then sends it SIGUSR2. Returns the child's exit status.
+fn signal_parent_in_blocking_wait(
+    parent: libc::pid_t,
+    status_path: &CStr,
+    blocked_line: &[u8],
+) -> libc::c_int {
+    let mut buffer = [0_u8; 4096];
+    for _ in 0..5000 {
+        let fd = unsafe { libc::open(status_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return 2;
+        }
+        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        unsafe { libc::close(fd) };
+        if read <= 0 {
+            return 2;
+        }
+        let status = &buffer[..read as usize];
+        if contains(status, b"State:\tS") && contains(status, blocked_line) {
+            return if unsafe { libc::kill(parent, libc::SIGUSR2) } == 0 {
+                0
+            } else {
+                4
+            };
+        }
+        unsafe { libc::usleep(1000) };
+    }
+    3
+}
+
+fn mask_inject_guest(path: &Path) {
+    let expected_uid = i64::from(unsafe { libc::getuid() });
+    unsafe { reverie_liteinst::install_tool::<BlockingWaitTool>(path) }.unwrap();
+    let initial = signal_mask_checks("inject", expected_uid, FULL_MASK_UNDER_MODE_A);
+    // An ordinary signal the guest blocks itself, which the Tool's wait must
+    // leave blocked once it restores the guest's mask.
+    let usr2 = signal_bit(libc::SIGUSR2);
+    assert_eq!(guest_signal_mask(libc::SIG_BLOCK, &usr2, SIGSET_SIZE).0, 0);
+    let seeded = initial | usr2;
+    assert_eq!(current_signal_mask(), seeded);
+    let parent = unsafe { libc::getpid() };
+    let status_path = CString::new(format!("/proc/{parent}/status")).unwrap();
+    let blocked_line = format!("SigBlk:\t{FULL_MASK_UNDER_MODE_A:016x}\n");
+    let child = unsafe { libc::fork() };
+    assert!(
+        child >= 0,
+        "fork failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if child == 0 {
+        let status = signal_parent_in_blocking_wait(parent, &status_path, blocked_line.as_bytes());
+        unsafe { libc::_exit(status) };
+    }
+    wait_for_child(child);
+    let during = MASK_DURING_WAIT.load(Ordering::Acquire);
+    assert_eq!(during, FULL_MASK_UNDER_MODE_A);
+    assert_eq!(
+        MASK_PROBE_READABLE.load(Ordering::Acquire),
+        -i64::from(libc::EINVAL)
+    );
+    assert_eq!(
+        MASK_PROBE_UNREADABLE.load(Ordering::Acquire),
+        -i64::from(libc::EFAULT)
+    );
+    assert_eq!(current_signal_mask(), seeded);
+    // The child sent SIGUSR2 while the wait blocked every signal. The restored
+    // mask still blocks it, so it is pending rather than delivered.
+    let mut pending = 0_u64;
+    assert_eq!(
+        unsafe { libc::syscall(libc::SYS_rt_sigpending, &mut pending, SIGSET_SIZE) },
+        0
+    );
+    assert_eq!(pending, usr2);
+    let no_wait = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigtimedwait,
+                &usr2,
+                core::ptr::null_mut::<libc::siginfo_t>(),
+                &no_wait,
+                SIGSET_SIZE,
+            )
+        },
+        i64::from(libc::SIGUSR2)
+    );
+    assert_eq!(
+        guest_signal_mask(libc::SIG_SETMASK, &initial, SIGSET_SIZE).0,
+        0
+    );
+    assert_eq!(current_signal_mask(), initial);
+    println!(
+        "blocking-wait during={during:#x} probe=EINVAL,EFAULT parent-asleep-in-wait seeded-mask-restored blocked-signal-pending"
+    );
+}
+
+fn mask_unsubscribed_guest(path: &Path) {
+    let expected_uid = i64::from(unsafe { libc::getuid() });
+    unsafe { reverie_liteinst::install_tool::<UnsubscribedForkTool>(path) }.unwrap();
+    signal_mask_checks("unsubscribed", expected_uid, FULL_MASK_UNDER_MODE_A);
+}
+
+fn mask_tail_guest(path: &Path) {
+    let expected_uid = i64::from(unsafe { libc::getuid() });
+    unsafe { reverie_liteinst::install_tool::<TailMaskTool>(path) }.unwrap();
+    signal_mask_checks("tail", expected_uid, FULL_MASK_UNDER_MODE_A);
+}
+
+fn mask_instruction_guest(path: &Path) {
+    let expected_uid = i64::from(unsafe { libc::getuid() });
+    if let Err(error) = unsafe { reverie_liteinst::install_tool::<MaskInstructionTool>(path) } {
+        fail_instruction_install(error);
+    }
+    let initial = signal_mask_checks("instruction", expected_uid, FULL_MASK_UNDER_INSTRUCTIONS);
+    // With every other signal blocked, an RDTSC at a fresh site must still
+    // trap with SIGSEGV and reach the Tool. Had SIGSEGV been blocked, Linux
+    // would kill the process here instead.
+    let all = u64::MAX;
+    assert_eq!(guest_signal_mask(libc::SIG_SETMASK, &all, SIGSET_SIZE).0, 0);
+    assert_eq!(current_signal_mask(), FULL_MASK_UNDER_INSTRUCTIONS);
+    assert_eq!(unsafe { reverie_liteinst_rpc_mask_rdtsc() }, MASK_TOOL_TSC);
+    let rdtsc_site = core::ptr::addr_of!(reverie_liteinst_rpc_mask_rdtsc_site) as usize as u64;
+    assert_eq!(
+        reverie_liteinst::reverie_liteinst_site_trap_count(rdtsc_site),
+        1
+    );
+    assert_eq!(MASK_INSTRUCTION_CALLBACKS.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        guest_signal_mask(libc::SIG_SETMASK, &initial, SIGSET_SIZE).0,
+        0
+    );
+    assert_eq!(current_signal_mask(), initial);
+    println!("rdtsc-after-full-mask=tool");
+}
+
 fn main() {
     let mut args = std::env::args_os();
     let _program = args.next();
@@ -1365,6 +1907,7 @@ fn main() {
         }
         Some("clock-and-vdso-guest") => clock_and_vdso_guest(Path::new(&path)),
         Some("vdso-getrandom-guest") => vdso_getrandom_guest::run(Path::new(&path)),
+        Some("vdso-fail-closed-guest") => vdso_fail_closed_guest::run(Path::new(&path)),
         Some("unsubscribed-lifecycle") => unsubscribed_lifecycle_guest(Path::new(&path)),
         Some("injected-exit") => injected_exit_guest(Path::new(&path)),
         Some("fork-guest") => fork_guest(Path::new(&path)),
@@ -1374,6 +1917,20 @@ fn main() {
         Some("vfork-guest") => vfork_guest(Path::new(&path)),
         Some("unsubscribed-fork") => unsubscribed_fork_guest(Path::new(&path)),
         Some("tail-fork") => tail_fork_guest(Path::new(&path)),
+        Some("mask-inject") => mask_inject_guest(Path::new(&path)),
+        Some("mask-unsubscribed") => mask_unsubscribed_guest(Path::new(&path)),
+        Some("mask-tail") => mask_tail_guest(Path::new(&path)),
+        Some("mask-instruction") => mask_instruction_guest(Path::new(&path)),
+        Some("late-code-instruction") => late_code_guest::run_instruction(Path::new(&path)),
+        Some("late-code-dlopen") => {
+            late_code_guest::run_dlopen(Path::new(&path), &args.next().expect("library path"))
+        }
+        Some("late-code-dlopen-system") => late_code_guest::run_dlopen_system(
+            Path::new(&path),
+            &args.next().expect("library path"),
+        ),
+        Some("late-code-gp-fault") => late_code_guest::run_fault(Path::new(&path), false),
+        Some("late-code-null-load") => late_code_guest::run_fault(Path::new(&path), true),
         _ => panic!("expected coordinator or guest"),
     }
 }

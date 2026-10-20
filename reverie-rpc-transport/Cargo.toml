@@ -4,18 +4,23 @@
 
 [package]
 name = "reverie-rpc-transport"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/reverie-rpc-transport"
+keywords = ["linux", "instrumentation", "hermit"]
+categories = ["development-tools::debugging", "os::linux-apis"]
 description = "Cross-process transport for the Reverie GlobalTool RPC (Unix-domain sockets + bincode). Shared by non-ptrace backends (DBT, KVM, ...) that must run GlobalState in a separate coordinator process."
 
 [dependencies]
 async-trait = "0.1.86"
 bincode = { version = "2", features = ["serde"] }
 libc = "0.2.186"
-reverie = { version = "0.4.0", path = "../reverie", package = "reverie-core" }
+reverie = { version = "0.4.1", path = "../reverie", package = "reverie-core" }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.4", features = ["io-util", "net", "rt", "sync", "macros"] }

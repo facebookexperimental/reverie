@@ -63,8 +63,10 @@ impl Libraries {
 
         use procfs::process::MMapPath;
 
-        let process = procfs::process::Process::new(pid.as_raw())?;
-        let maps = process.maps()?;
+        let maps = {
+            let _open = crate::process::launch_window::TransientOpen::begin();
+            procfs::process::Process::new(pid.as_raw())?.maps()?
+        };
 
         let mut libraries = BTreeMap::new();
 

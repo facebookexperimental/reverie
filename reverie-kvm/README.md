@@ -1,5 +1,11 @@
 # reverie-kvm
 
+Part of [Hermit](https://hermetic-infra.org) and
+[Reverie](https://docs.rs/reverie-core). See the
+[API documentation](https://docs.rs/reverie-kvm) for the backend interfaces and
+[`hermit-run`](https://crates.io/crates/hermit-run) for the command-line interface
+and platform requirements.
+
 `reverie-kvm` is an x86-64 research backend for driving small KVM guests. It
 creates a VM and vCPU, provides bounded guest-physical memory access, turns a
 guest `vmcall`/`vmmcall` into a typed Reverie syscall event, and can run
@@ -217,9 +223,29 @@ Invalid flags or required-zero arguments fail without changing state. These
 are virtual guest policy values, not changes to supervisor THP policy or a
 claim that the guest RAM uses physical huge pages.
 
-`PR_SET_PDEATHSIG` accepts zero; nonzero requests return `ENOSYS` because
-deterministic parent-death signal delivery is not implemented. The getter
-returns a four-byte zero. These two getters check guest writable-page state:
+By default, `PR_SET_PDEATHSIG` accepts zero and refuses valid nonzero signals
+with `ENOSYS` before changing state. Nonzero delivery requires Tool-controlled
+signals, explicit `ProcessSignalControl::enable_parent_death_control` adoption,
+and native terminal cleanup configured through `KvmBackend::set_native_exit_broker`.
+That configuration supports standard signals except `SIGKILL`, `SIGCONT` and
+stop signals; realtime signals remain unsupported. Enrollment requires a single
+live recipient task and retains a restricted syscall/wait domain until process
+retirement, even after SET(0). This is not general blocked-I/O or direct-mode
+support. `PR_GET_PDEATHSIG` returns the task's stored signal as four bytes,
+initially zero; an out-of-range full-width SET operand returns `EINVAL`.
+
+The early native broker refuses unproved ambient filesystem classes before
+querying inode attributes: Linux can flush NFS or 9p data during `fstat`, and
+9p can do so even for a type-only `statx` with `DONT_SYNC`. Mount identity comes
+from the kernel's procfs records, not a server-reported `statfs` magic. Local
+ext2/3/4, btrfs, tmpfs, devtmpfs and devpts retain the audited descriptor classes;
+`O_PATH`, sockets and pipes use separate paths, and kernel-identified shmem
+(including internal memfd mounts) remains supported. Character-device nodes on
+other filesystems and detached or hidden mounts absent from mountinfo are
+explicitly refused. This does not promise nonblocking arbitrary device metadata
+hooks or unconditional bootstrap progress.
+
+The NAME and PDEATHSIG getters check guest writable-page state:
 NAME may copy a writable prefix before reporting `EFAULT`, whereas PDEATHSIG
 uses a scalar store and leaves the output unchanged when that store faults.
 The strict eight-byte NAME boundary control is qualified on the tested x86-64

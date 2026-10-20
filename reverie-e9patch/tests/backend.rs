@@ -16,6 +16,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use reverie::Backend;
+use reverie::BackendStatsSnapshot;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
@@ -269,6 +270,31 @@ async fn elf_stats_report_measured_coverage_even_when_counts_are_zero() {
     assert!(stats.b0_sites().is_some());
 }
 
+/// The rewritten getpid site reaches the Tool through the injected-trap
+/// `SIGTRAP`, never a seccomp stop, and the record counts that trap once.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
+async fn dispatch_record_counts_the_rewritten_site_as_a_sigtrap_dispatch() {
+    let (_directory, guest) = compile_fixture("direct_spoof_getpid.c");
+    let (status, global, stats) =
+        E9patchBackend::run_with_stats::<CountGetpid>(Command::new(guest), ())
+            .await
+            .unwrap();
+    assert_eq!(status, ExitStatus::Exited(0));
+    let record = stats
+        .dispatch_stats()
+        .expect("e9patch reports a dispatch record");
+    assert_eq!(record.inconsistencies(), Vec::<String>::new(), "{record}");
+    assert_eq!(record.backend, "e9patch");
+    assert!(record.sites.patched >= Some(1), "{record}");
+    assert_eq!(record.counters.patched_direct_calls, Some(0), "{record}");
+    assert_eq!(record.counters.signal_traps, Some(0), "{record}");
+    assert_eq!(global.delivered.load(Ordering::SeqCst), 1);
+    assert_eq!(record.counters.ptrace_sigtrap_stops, Some(1), "{record}");
+    assert_eq!(record.counters.ptrace_seccomp_stops, Some(0), "{record}");
+    assert_eq!(record.counters.dispatches(), Some(1), "{record}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a built e9tool/e9patch pair and a C compiler"]
 async fn direct_builtin_passthrough_handles_far_rt_sigreturn_site() {
@@ -365,6 +391,56 @@ async fn non_elf_script_uses_ptrace_fallback() {
     );
     assert_eq!(stats.recovered_sites(), None);
     assert_eq!(stats.patched_sites(), None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a ptrace-capable host"]
+async fn caller_armed_in_guest_runtime_leaves_its_routes_unmeasured() {
+    let directory = tempfile::tempdir().unwrap();
+    let guest = directory.path().join("guest.sh");
+    fs::write(&guest, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&guest).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&guest, permissions).unwrap();
+
+    for (variable, value) in [
+        (reverie_e9patch::RUNTIME_ENV, "fallback"),
+        (reverie_e9patch::TOOL_ENV, "passthrough"),
+    ] {
+        // The caller, not REVERIE_E9PATCH_LDPRELOAD_FALLBACK, selects the
+        // in-guest runtime. Without its preload the script never loads it, but
+        // the backend cannot know that, so it must not claim zero signals.
+        let mut command = Command::new(&guest);
+        command.env(variable, value);
+        let (status, (), stats) = E9patchBackend::run_with_stats::<()>(command, ())
+            .await
+            .unwrap();
+        assert_eq!(status, ExitStatus::Exited(0));
+        let record = stats
+            .dispatch_stats()
+            .expect("e9patch reports a dispatch record");
+        assert_eq!(record.counters.signal_traps, None, "{variable}: {record}");
+        assert_eq!(
+            record.counters.patched_direct_calls, None,
+            "{variable}: {record}"
+        );
+        assert_eq!(record.counters.dispatches(), None, "{variable}: {record}");
+        assert!(
+            record.counters.ptrace_seccomp_stops.is_some(),
+            "{variable}: {record}"
+        );
+    }
+
+    // Unarmed, the tracer sees every route.
+    let (status, (), stats) = E9patchBackend::run_with_stats::<()>(Command::new(&guest), ())
+        .await
+        .unwrap();
+    assert_eq!(status, ExitStatus::Exited(0));
+    let record = stats
+        .dispatch_stats()
+        .expect("e9patch reports a dispatch record");
+    assert_eq!(record.counters.signal_traps, Some(0), "{record}");
+    assert!(record.counters.dispatches().is_some(), "{record}");
 }
 
 #[path = "fixtures/pkey_nested_support.rs"]

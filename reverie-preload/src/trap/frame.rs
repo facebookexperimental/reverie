@@ -201,6 +201,55 @@ impl<'signal> SignalFrame<'signal> {
         context: *mut libc::c_void,
         info: *const libc::siginfo_t,
     ) -> Result<Self, FrameError> {
+        let frame = unsafe { Self::from_kernel_frame(context, info)? };
+        // siginfo's x86-64 SIGSYS union follows its 16-byte fixed header.
+        let call = unsafe { info.cast::<u8>().add(16).cast::<u64>().read_unaligned() };
+        let number = unsafe { info.cast::<u8>().add(24).cast::<i32>().read_unaligned() };
+        let arch = unsafe { info.cast::<u8>().add(28).cast::<u32>().read_unaligned() };
+        if arch != 0xc000_003e
+            || call != frame.register(libc::REG_RIP as usize) as u64
+            || number != frame.register(libc::REG_RAX as usize) as i32
+        {
+            return Err(FrameError);
+        }
+        Ok(frame)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(liteinst-late-code-cpuid): Review the kernel-fault frame provenance check.
+    /// Borrow the frame of a kernel-forced `SIGSEGV`, such as the general
+    /// protection fault that CPUID faulting or `PR_TSC_SIGSEGV` raises.
+    ///
+    /// Accepts only `si_signo == SIGSEGV` with `si_code == SI_KERNEL`: the
+    /// kernel sends that for a #GP raised by an instruction it had already
+    /// fetched, and never for a user-sent `kill`/`tgkill`/`sigqueue`, whose
+    /// `si_code` is `SI_USER` or negative.
+    ///
+    /// # Safety
+    /// The pointers must come directly from this invocation's kernel-created
+    /// x86-64 SA_SIGINFO frame. Runtime memory access must already be enabled.
+    /// No other references may alias the context prefix or its FP allocation
+    /// while the returned frame is alive.
+    pub unsafe fn from_instruction_fault(
+        context: *mut libc::c_void,
+        info: *const libc::siginfo_t,
+    ) -> Result<Self, FrameError> {
+        if info.is_null() {
+            return Err(FrameError);
+        }
+        let (signal, code) = unsafe { ((*info).si_signo, (*info).si_code) };
+        if signal != libc::SIGSEGV || code != libc::SI_KERNEL {
+            return Err(FrameError);
+        }
+        unsafe { Self::from_kernel_frame(context, info) }
+    }
+
+    /// Validate the parts every kernel `rt_sigframe` shares: the ucontext
+    /// prefix is immediately followed by siginfo, and the FP image decodes.
+    unsafe fn from_kernel_frame(
+        context: *mut libc::c_void,
+        info: *const libc::siginfo_t,
+    ) -> Result<Self, FrameError> {
         let layout = LAYOUT.get().ok_or(FrameError)?;
         let address = context as usize;
         if address < 8
@@ -231,24 +280,13 @@ impl<'signal> SignalFrame<'signal> {
                 return Err(FrameError);
             }
         }
-        let frame = Self {
+        Ok(Self {
             context,
             fp,
             kind,
             layout,
             _borrow: PhantomData,
-        };
-        // siginfo's x86-64 SIGSYS union follows its 16-byte fixed header.
-        let call = unsafe { info.cast::<u8>().add(16).cast::<u64>().read_unaligned() };
-        let number = unsafe { info.cast::<u8>().add(24).cast::<i32>().read_unaligned() };
-        let arch = unsafe { info.cast::<u8>().add(28).cast::<u32>().read_unaligned() };
-        if arch != 0xc000_003e
-            || call != frame.register(libc::REG_RIP as usize) as u64
-            || number != frame.register(libc::REG_RAX as usize) as i32
-        {
-            return Err(FrameError);
-        }
-        Ok(frame)
+        })
     }
 
     /// Read an architectural greg, without borrowing libc's oversized context.

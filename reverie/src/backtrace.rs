@@ -11,9 +11,7 @@ mod library;
 mod symbols;
 
 use core::fmt;
-use std::fs::File;
 use std::io;
-use std::io::Read;
 use std::path::PathBuf;
 
 use addr2line::LookupContinuation;
@@ -340,10 +338,8 @@ impl fmt::Display for PrettyBacktrace {
 }
 
 fn thread_name(thread_id: Pid) -> io::Result<String> {
-    let mut name = String::new();
-
-    let mut f = File::open(format!("/proc/{}/comm", thread_id))?;
-    f.read_to_string(&mut name)?;
+    let mut name =
+        crate::process::launch_window::read_to_string(format!("/proc/{}/comm", thread_id))?;
 
     // Remove trailing newline character
     assert_eq!(name.pop(), Some('\n'));

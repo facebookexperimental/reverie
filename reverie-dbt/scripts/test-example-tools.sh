@@ -41,6 +41,7 @@ simultaneous_exit_guest="$tmpdir/simultaneous-exit-group"
 chaos_read_guest="$tmpdir/chaos-read-file"
 chaos_data="$tmpdir/chaos-data.txt"
 vdso_getrandom_guest="$tmpdir/vdso-getrandom"
+vdso_fail_closed_guest="$tmpdir/vdso-fail-closed"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
   "$crate_dir/tests/fixtures/pthread_lifecycle.c" -o "$pthread_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
@@ -72,6 +73,8 @@ vdso_getrandom_guest="$tmpdir/vdso-getrandom"
   "$crate_dir/tests/fixtures/chaos_read_file.c" -o "$chaos_read_guest"
 "${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
   "$crate_dir/tests/fixtures/vdso_getrandom.c" -ldl -o "$vdso_getrandom_guest"
+"${CC:-cc}" -O2 -g -std=c11 -Wall -Wextra -Werror \
+  "$crate_dir/tests/fixtures/vdso_fail_closed.c" -ldl -o "$vdso_fail_closed_guest"
 printf 'CHAOS-ONE-BYTE-AT-A-TIME\n' >"$chaos_data"
 
 # Run the guest under one tool (selected by $1=ENV) and capture stdout/stderr.
@@ -236,6 +239,25 @@ else
   [[ $(grep -Ec 'getrandom\(0x[0-9a-f]+, 37, 0\) = ' "$tmpdir/err") -eq 5 ]] \
     || fail "vDSO getrandom: draws did not reach the tool as five getrandom syscalls"
   echo "PASS: vDSO getrandom (query refused; five draws reached the tool as syscalls)"
+fi
+
+# vDSO fail-closed: an entry point with no syscall equivalent must not keep
+# running the kernel's code. The SGX enclave entry rejects leaf 0 with -EINVAL
+# natively and must return -ENOSYS under the client, which reports only
+# entry points it does not know.
+native_sgx=$("$vdso_fail_closed_guest") || fail "vDSO fail-closed: native guest failed"
+if [[ $native_sgx == vdso-sgx=absent ]]; then
+  echo "SKIP: vDSO fail-closed (this kernel's vDSO exports no __vdso_sgx_enter_enclave)"
+else
+  [[ $native_sgx == vdso-sgx=-22 ]] \
+    || fail "vDSO fail-closed: native SGX entry returned '$native_sgx', not -EINVAL"
+  run_tool HERMIT_DBT_NOOP "$vdso_fail_closed_guest" \
+    || fail "vDSO fail-closed: guest failed under the client"
+  grep -qx 'vdso-sgx=-38' "$tmpdir/out" \
+    || fail "vDSO fail-closed: SGX entry was not replaced by the -ENOSYS stub"
+  ! grep -q 'unknown vdso entry point' "$tmpdir/err" \
+    || fail "vDSO fail-closed: a known entry point was reported as unknown"
+  echo "PASS: vDSO fail-closed (SGX entry returns -ENOSYS instead of running natively)"
 fi
 
 # counter (histogram): must print a per-number histogram at exit.

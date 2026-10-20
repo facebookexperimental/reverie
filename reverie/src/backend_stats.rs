@@ -58,6 +58,12 @@ impl BackendStatsRequest {
 pub trait BackendStatsSnapshot: fmt::Display {
     /// Canonical backend name used by command-line selection and log output.
     const BACKEND_NAME: &'static str;
+
+    /// Projects this snapshot onto the shared, backend-neutral dispatch record.
+    ///
+    /// Every backend implements this explicitly. `None` means the backend has
+    /// no dispatch counters to project; it is never a silent default.
+    fn dispatch_stats(&self) -> Option<crate::DispatchStats>;
 }
 
 /// A backend-owned source of a typed end-of-run statistics snapshot.
@@ -137,6 +143,10 @@ liteinst_dispatch_paths! {
     InGuestSigsys => "in_guest_sigsys",
     /// An actual in-guest `SIGSYS` was forwarded while a Tool callback was active.
     InGuestNestedSigsys => "in_guest_nested_sigsys",
+    /** A patched site's in-guest hook was entered while a Tool callback was
+    active: the Tool's own syscall or instruction reached a site that an earlier
+    guest event patched. These entries are also counted in `DirectHook`. */
+    InGuestNestedHook => "in_guest_nested_hook",
     /** A genuine kernel SIGSYS entered shared frame dispatch in this process.
     Unlike guest-path attribution, this is not inherited/recreated at fork. */
     InGuestPhysicalSigsys => "in_guest_physical_sigsys",
@@ -151,10 +161,16 @@ liteinst_dispatch_paths! {
     or successful in-guest Tool dispatch. Refused in-guest attempts are counted
     by `FallbackRefusal` instead. */
     UnpatchableOrOtherFallback => "unpatchable_or_other",
-    /// A patched-site callback that returned to the ptrace-host Tool through SIGTRAP.
+    /** A patched-site hook entry. Under the ptrace-hosted runtime the hook
+    returns to the host Tool through SIGTRAP; under an in-guest Tool it calls
+    the Tool directly in the guest, with no trap. */
     DirectHook => "direct_hook",
     /// An in-guest fallback attempt refused before ordinary Tool dispatch.
     FallbackRefusal => "fallback_refusal",
+    /** A syscall serviced by in-guest Tool fallback because the run disabled
+    site patching, so the site was never claimed or patched. Such calls are not
+    counted as `CachelineStraddlerFallback` or `UnpatchableOrOtherFallback`. */
+    PatchingDisabledFallback => "patching_disabled",
 }
 
 /// Decoded shape of one candidate patch site.
@@ -369,6 +385,10 @@ mod tests {
 
     impl BackendStatsSnapshot for FakeSnapshot {
         const BACKEND_NAME: &'static str = "fake";
+
+        fn dispatch_stats(&self) -> Option<crate::DispatchStats> {
+            None
+        }
     }
 
     impl BackendStatsSource for FakeSource {

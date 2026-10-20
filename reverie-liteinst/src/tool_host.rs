@@ -171,8 +171,17 @@ where
         rdtsc: subscriptions.has_rdtsc(),
     };
     runtime::preflight_instruction_faulting(instruction_subscriptions)?;
-    let vdso_sites = reverie_ptrace::patch_current_vdso(&subscriptions)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let site_patching = runtime::site_patching_from_env_value(
+        std::env::var_os(runtime::SITE_PATCHING_ENV).as_deref(),
+    )?;
+    // With site patching off, the vDSO gets ptrace's full trapping stubs and no
+    // hooks, so its fast paths reach the Tool through the SIGSYS fallback too.
+    let vdso_sites = if site_patching {
+        reverie_ptrace::patch_current_vdso(&subscriptions)
+    } else {
+        reverie_ptrace::patch_current_vdso_trapping(&subscriptions).map(|()| Vec::new())
+    }
+    .map_err(|error| io::Error::other(error.to_string()))?;
     let _signal_state = runtime::prepare_guest_signal_state(instruction_subscriptions)?;
     let syscall_subscriptions = subscriptions.iter_syscalls().collect();
     if remove_legacy_environment {
@@ -193,7 +202,13 @@ where
         .map_err(|_| {
             io::Error::new(io::ErrorKind::AlreadyExists, "Reverie tool installed twice")
         })?;
-    runtime::initialize_reverie_tool(stats, publication, instruction_subscriptions, &vdso_sites)
+    runtime::initialize_reverie_tool(
+        stats,
+        publication,
+        instruction_subscriptions,
+        site_patching,
+        &vdso_sites,
+    )
 }
 
 pub(crate) fn dispatch(event: &mut SyscallEvent) {
@@ -331,7 +346,19 @@ where
             }
             // This is the original unsubscribed guest operation. Private
             // inject/tail_inject below deliberately keep caller rights.
-            event.result = unsafe { event.forward() };
+            match stripped_signal_mask(number, args) {
+                Err(error) => event.result = -i64::from(error.into_raw()),
+                Ok(None) => event.result = unsafe { event.forward() },
+                Ok(Some(mask)) => {
+                    // The stripped copy is runtime-private, so the call runs
+                    // through the ordinary raw gate, as on inject and
+                    // tail_inject, with the thread's current keys rather than
+                    // the guest's saved PKRU (see stripped_signal_mask).
+                    let mut stripped_args = args;
+                    stripped_args[1] = (&raw const mask) as u64;
+                    event.result = unsafe { raw_syscall6(number, stripped_args) };
+                }
+            }
             return;
         }
         let args = guest.event.args.map(|arg| arg as usize);
@@ -773,9 +800,7 @@ fn injected_syscall_guard(number: i64, args: [u64; 6]) -> Option<Errno> {
         // TODO-HUMAN-REVIEW(PR-133): Review fail-closed guest signal-handler policy.
         !runtime::signal_action_supported(number, args)
         // AUTONOMOUS-BOT-IMPLEMENTED
-        || (number == libc::SYS_sigaltstack && args[0] != 0)
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || (number == libc::SYS_rt_sigprocmask && args[1] != 0);
+        || (number == libc::SYS_sigaltstack && args[0] != 0);
 
     if unsupported_process {
         Some(Errno::EOPNOTSUPP)
@@ -783,6 +808,93 @@ fn injected_syscall_guard(number: i64, args: [u64; 6]) -> Option<Errno> {
         Some(Errno::EPERM)
     } else {
         None
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-913): Review stripping reserved signals from
+// rt_sigprocmask sets instead of refusing them.
+/// For an `rt_sigprocmask` that installs a set, returns a copy of that set
+/// without [`runtime::reserved_signal_mask`], to forward in its place.
+///
+/// Linux silently drops SIGKILL and SIGSTOP from such a set; the reserved
+/// signals are dropped the same way. A guest, or a Tool such as Detcore that
+/// blocks every signal around a blocking `wait4`, can then block everything
+/// else and keep running, instead of failing with EPERM. A later read of the
+/// mask shows the reserved signals unblocked, which Linux would not. A reserved
+/// signal that the guest asked to block also stays deliverable: one sent with
+/// `kill`, `tgkill` or `sigqueue` reaches the runtime's handler, which ends the
+/// process with status 126 for SIGSYS and applies the default action to
+/// SIGSEGV, where Linux would hold it pending for `rt_sigpending`,
+/// `rt_sigtimedwait` or `signalfd` to observe. Both deviations are tracked in
+/// <https://github.com/rrnewton/reverie/issues/915>.
+///
+/// `Ok(None)` forwards the call unchanged: it installs no set, or its size is
+/// not 8, which Linux rejects with EINVAL before reading the set. A set that
+/// cannot be read returns `Err(EFAULT)`, as Linux would, and nothing is
+/// forwarded, so an unstripped set never reaches Linux.
+///
+/// The set is copied by `process_vm_writev` from this process to itself: the
+/// kernel reads the source with the same user copy `rt_sigprocmask` uses, so
+/// any set Linux could read is read here, including one on a write-only page,
+/// and an unreadable one fails without a fault in the runtime.
+///
+/// The copy, and the stripped call that writes the old set, run with the
+/// calling thread's current protection-key rights; neither switches PKRU. At an
+/// installed hook those are the guest's rights, so a set or old set in memory
+/// whose key the guest's PKRU denies fails with EFAULT, as on Linux. On the
+/// SIGSYS fallback path the runtime has opened every key, so the same call is
+/// accepted there and the old set is written.
+///
+/// A seccomp filter the guest added sees calls Linux would not make. If it
+/// refuses `gettid` or `process_vm_writev` with an error, that error is returned
+/// instead of EFAULT; if it kills or traps on either, that happens to a call
+/// Linux would have accepted. A filter that inspects `rt_sigprocmask`'s
+/// arguments sees the runtime's set pointer in place of the guest's, so one
+/// that allows only the guest's pointer refuses the stripped call. Each case
+/// fails closed: no unstripped set is installed.
+fn stripped_signal_mask(number: i64, args: [u64; 6]) -> Result<Option<u64>, Errno> {
+    const SIGSET_SIZE: u64 = core::mem::size_of::<u64>() as u64;
+    if number != libc::SYS_rt_sigprocmask || args[1] == 0 || args[3] != SIGSET_SIZE {
+        return Ok(None);
+    }
+    let mut requested = 0_u64;
+    // The guest's set is the local source; this runtime's copy is the remote
+    // destination, written into the same address space.
+    let source = libc::iovec {
+        iov_base: args[1] as usize as *mut libc::c_void,
+        iov_len: SIGSET_SIZE as usize,
+    };
+    let destination = libc::iovec {
+        iov_base: (&raw mut requested).cast(),
+        iov_len: SIGSET_SIZE as usize,
+    };
+    // A thread id names this address space even after the thread-group leader
+    // has exited, when its process id no longer does.
+    let tid = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) };
+    if tid < 0 {
+        return Err(Errno::new(-tid as i32));
+    }
+    let copied = unsafe {
+        raw_syscall6(
+            libc::SYS_process_vm_writev,
+            [
+                tid as u64,
+                (&raw const source) as u64,
+                1,
+                (&raw const destination) as u64,
+                1,
+                0,
+            ],
+        )
+    };
+    if copied == SIGSET_SIZE as i64 {
+        Ok(Some(requested & !runtime::reserved_signal_mask()))
+    } else if copied >= 0 || copied == -i64::from(libc::EFAULT) {
+        // Part of the set, or none of it, could be read.
+        Err(Errno::EFAULT)
+    } else {
+        Err(Errno::new(-copied as i32))
     }
 }
 
@@ -944,15 +1056,7 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
             self.tail.set_exit(number, raw_args);
             return std::future::pending().await;
         }
-        let kernel_signal_mask =
-            (number == libc::SYS_rt_sigprocmask && raw_args[1] != 0).then(|| {
-                let requested = unsafe { (raw_args[1] as *const u64).read_unaligned() };
-                let mut reserved = 1_u64 << (libc::SIGSYS - 1);
-                if runtime::cpuid_interception_enabled() || runtime::rdtsc_interception_enabled() {
-                    reserved |= 1_u64 << (libc::SIGSEGV - 1);
-                }
-                requested & !reserved
-            });
+        let kernel_signal_mask = stripped_signal_mask(number, raw_args)?;
         if let Some(mask) = kernel_signal_mask.as_ref() {
             raw_args[1] = mask as *const u64 as u64;
         }
@@ -992,7 +1096,15 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
         } else if is_exit_syscall(number) {
             self.tail.set_exit(number, args);
         } else {
-            let value = unsafe { raw_syscall6(number, args) };
+            let value = match stripped_signal_mask(number, args) {
+                Err(error) => -i64::from(error.into_raw()),
+                Ok(None) => unsafe { raw_syscall6(number, args) },
+                Ok(Some(mask)) => {
+                    let mut args = args;
+                    args[1] = (&raw const mask) as u64;
+                    unsafe { raw_syscall6(number, args) }
+                }
+            };
             self.tail.set_result(value);
         }
         std::future::pending().await
@@ -1001,14 +1113,17 @@ impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
     // TODO-HUMAN-REVIEW(PR-326): Review the coarse
     // syscall-boundary clock until the minimal ptrace supervisor wires PMU delivery.
     fn set_timer(&mut self, _sched: TimerSchedule) -> Result<(), Error> {
-        // Every intercepted syscall remains a deterministic scheduling boundary,
-        // but a CPU-bound thread cannot yet be preempted between syscalls.
-        Ok(())
+        // Nothing in the guest arms an RCB threshold or dispatches
+        // `Tool::handle_timer_event`. Accepting the request would let a Tool
+        // believe a CPU-bound thread is bounded while it runs unpreempted to
+        // its next syscall, so refuse, as reverie-dbt does, and let a Tool
+        // that needs preemption fail closed. Clock reads still work.
+        Err(Errno::ENOSYS.into())
     }
 
     fn set_timer_precise(&mut self, _sched: TimerSchedule) -> Result<(), Error> {
-        // Same coarse boundary as set_timer; never synthesize host time.
-        Ok(())
+        // Same refusal as set_timer; never synthesize host time.
+        Err(Errno::ENOSYS.into())
     }
 
     fn read_clock(&mut self) -> Result<u64, Error> {

@@ -52,9 +52,14 @@ no consumer can observe or overwrite a partial install.
 Clean CI builds enforce a concurrency-normalized source-build ratchet. Three
 clean builds measured on 2026-08-03 were 13.91s and 14.54s with 16 jobs on
 devbig014 and 71.49s with 4 jobs on a GitHub-hosted runner (`n=3`). Their
-elapsed-seconds times requested-jobs proxies were 222.56, 232.64, and 285.96
+elapsed-seconds times jobs proxies were 222.56, 232.64, and 285.96
 job-seconds. CI rejects a value above 572 job-seconds, twice the slowest
-observation rounded up. This is a build-throughput regression guard, not a CPU
+observation rounded up. The job count is the `NUM_JOBS` request, clamped to
+1–16 and then capped at the CPUs available to the build
+(`std::thread::available_parallelism()`, which follows the affinity mask and
+cgroup quota). Jobs beyond that cap could not run in parallel, so the build
+neither passes them to cmake nor counts them; the slowest baseline itself ran
+4 jobs on a 4-vCPU runner. This is a build-throughput regression guard, not a CPU
 time measurement or an ETA. Set `REVERIE_DBT_MAX_BUILD_SECONDS` to enforce an
 explicit wall-time limit on a controlled machine; local builds otherwise report
 actual duration without enforcing a machine-independent wall-time guess.

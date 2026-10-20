@@ -134,6 +134,32 @@ static int interrupted_sleep(void) {
   return 0;
 }
 
+// A 400 ms nanosleep through the site with no timer. The third and fourth
+// arguments, which nanosleep ignores, hand the Tool a 20 s timespec and a
+// 200 ms ITIMER_REAL value: an injected sleep that the alarm interrupts
+// would replace the guest's restart block. SIGALRM is ignored, so a later
+// delivery of the alarm leaves the guest running.
+static int replaced_sleep(void) {
+  signal(SIGALRM, SIG_IGN);
+  warm_up();
+  struct timespec request = {.tv_sec = 0, .tv_nsec = 400 * 1000 * 1000};
+  struct timespec remaining = {0, 0};
+  struct timespec replacement = {.tv_sec = 20, .tv_nsec = 0};
+  struct itimerval alarm = {.it_interval = {0, 0}, .it_value = {0, 200 * 1000}};
+  int64_t start = now_ns();
+  long result = restart_site(
+      SYS_nanosleep,
+      (long)&request,
+      (long)&remaining,
+      (long)&replacement,
+      (long)&alarm);
+  int64_t elapsed = now_ns() - start;
+  printf(
+      "sleep-result=%ld slept-enough=%d", result, elapsed >= 400 * 1000 * 1000);
+  print_site_counts();
+  return 0;
+}
+
 static int pipe_write_fd;
 
 static void* late_writer(void* unused) {
@@ -740,6 +766,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "sleep") == 0) {
     return interrupted_sleep();
+  }
+  if (strcmp(mode, "sleep-replaced") == 0) {
+    return replaced_sleep();
   }
   if (strcmp(mode, "readv") == 0) {
     return interrupted_readv();

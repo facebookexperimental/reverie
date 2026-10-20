@@ -42,6 +42,37 @@ thread_local! {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Pending {
     instruction: u64,
+    kind: PendingKind,
+}
+
+/// What the single per-thread continuation emulates after sigreturn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingKind {
+    /// A trapped `syscall` whose `SIGSYS` frame resumes after the instruction.
+    Syscall,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(liteinst-late-code-cpuid): Review instruction emulation through the continuation.
+    /// A faulting CPUID/RDTSC/RDTSCP with no patchable site, whose kernel
+    /// `SIGSEGV` frame still points at the instruction itself.
+    Instruction(crate::runtime::InstructionEventKind),
+}
+
+impl PendingKind {
+    /// Bytes from the instruction's address to its saved resume address.
+    fn frame_offset(self) -> u64 {
+        match self {
+            Self::Syscall => 2,
+            Self::Instruction(_) => 0,
+        }
+    }
+
+    /// Bytes the committed guest context advances past the instruction.
+    fn length(self) -> u64 {
+        match self {
+            Self::Syscall => 2,
+            Self::Instruction(kind) => kind.encoded_len(),
+        }
+    }
 }
 
 fn configure_save() -> Result<(), &'static str> {
@@ -208,23 +239,65 @@ pub(crate) fn initialize() -> io::Result<()> {
     Ok(())
 }
 
+/// Reserve the activation for a trapped syscall; see [`prepare_pending`].
+#[cfg(test)]
+pub(crate) fn prepare(instruction: u64) -> Option<u64> {
+    prepare_pending(Pending {
+        instruction,
+        kind: PendingKind::Syscall,
+    })
+}
+
 /// Reserve the existing single activation without overwriting a pending one.
 /// Kept separate from frame capture so its reentry contract remains testable.
-pub(crate) fn prepare(instruction: u64) -> Option<u64> {
+fn prepare_pending(request: Pending) -> Option<u64> {
     PENDING.with(|pending| {
         if !READY.get() || pending.get().is_some() {
             return None;
         }
-        pending.set(Some(Pending { instruction }));
+        pending.set(Some(request));
         Some(fallback_entry as *const () as u64)
     })
 }
 
+/// Capture a trapped `syscall`'s `SIGSYS` frame for ordinary-context dispatch.
 pub(crate) fn prepare_signal(
     instruction: u64,
     frame: &mut SignalFrame<'_>,
 ) -> Result<Option<u64>, FrameError> {
-    let Some(entry) = prepare(instruction) else {
+    prepare_signal_for(
+        Pending {
+            instruction,
+            kind: PendingKind::Syscall,
+        },
+        frame,
+    )
+}
+
+/// Capture a faulting instruction's kernel `SIGSEGV` frame so the Tool
+/// emulates it in ordinary context, exactly like an unpatched syscall. The
+/// frame's saved RIP must be the instruction itself; the committed context
+/// resumes after its `kind.encoded_len()` bytes.
+pub(crate) fn prepare_instruction_signal(
+    instruction: u64,
+    kind: crate::runtime::InstructionEventKind,
+    frame: &mut SignalFrame<'_>,
+) -> Result<Option<u64>, FrameError> {
+    prepare_signal_for(
+        Pending {
+            instruction,
+            kind: PendingKind::Instruction(kind),
+        },
+        frame,
+    )
+}
+
+fn prepare_signal_for(
+    request: Pending,
+    frame: &mut SignalFrame<'_>,
+) -> Result<Option<u64>, FrameError> {
+    let instruction = request.instruction;
+    let Some(entry) = prepare_pending(request) else {
         return Ok(None);
     };
     let pointer = OWNER.get();
@@ -237,7 +310,9 @@ pub(crate) fn prepare_signal(
     }
     owner.generation = owner.generation.checked_add(1).ok_or(FrameError)?;
     frame.capture(&mut owner.saved)?;
-    let resume = instruction.checked_add(2).ok_or(FrameError)?;
+    let resume = instruction
+        .checked_add(request.kind.frame_offset())
+        .ok_or(FrameError)?;
     if frame.register(libc::REG_RIP as usize) as u64 != resume {
         return Err(FrameError);
     }
@@ -282,7 +357,7 @@ fn context_from_image(saved: &SavedState, instruction: u64) -> HookContext {
     context
 }
 
-fn commit_context(owner: &mut Continuation) -> Result<(), FrameError> {
+fn commit_context(owner: &mut Continuation, length: u64) -> Result<(), FrameError> {
     let c = &owner.context;
     let r = &mut owner.saved.registers;
     for (index, value) in [
@@ -306,7 +381,10 @@ fn commit_context(owner: &mut Continuation) -> Result<(), FrameError> {
     ] {
         r[index as usize] = value as i64;
     }
-    r[libc::REG_RIP as usize] = c.instruction_pointer.checked_add(2).ok_or(FrameError)? as i64;
+    r[libc::REG_RIP as usize] = c
+        .instruction_pointer
+        .checked_add(length)
+        .ok_or(FrameError)? as i64;
     Ok(())
 }
 
@@ -338,7 +416,10 @@ fn fatal() -> ! {
 }
 
 unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
-    if pointer.is_null() || pointer != OWNER.get() || PENDING.get().is_none() {
+    let Some(pending) = PENDING.get() else {
+        fatal()
+    };
+    if pointer.is_null() || pointer != OWNER.get() {
         fatal()
     }
     // No reference to the full owner is held across Tool dispatch: child fork
@@ -354,16 +435,21 @@ unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
     let saved_errno = unsafe { *errno };
     let mut pkru = unsafe { (*pointer).saved.pkru() };
     unsafe {
-        crate::runtime::dispatch_fallback_context(
-            core::ptr::addr_of_mut!((*pointer).context),
-            &mut pkru,
-        );
+        let context = core::ptr::addr_of_mut!((*pointer).context);
+        match pending.kind {
+            PendingKind::Syscall => crate::runtime::dispatch_fallback_context(context, &mut pkru),
+            // An instruction has no permission effect: the guest's interrupted
+            // PKRU is restored unchanged by completion.
+            PendingKind::Instruction(kind) => {
+                crate::runtime::dispatch_fallback_instruction(context, kind)
+            }
+        }
         *errno = saved_errno;
     }
     let owner = unsafe { &mut *pointer };
     if owner.owner_tid != current_tid()
         || owner.saved.set_pkru(pkru).is_err()
-        || commit_context(owner).is_err()
+        || commit_context(owner, pending.kind.length()).is_err()
     {
         fatal()
     }
@@ -559,7 +645,8 @@ mod tests {
         assert_eq!(
             PENDING.get(),
             Some(Pending {
-                instruction: 0x1000
+                instruction: 0x1000,
+                kind: PendingKind::Syscall,
             })
         );
         assert!(initialize().is_err());
@@ -568,9 +655,44 @@ mod tests {
         assert_eq!(
             PENDING.get(),
             Some(Pending {
-                instruction: 0x3000
+                instruction: 0x3000,
+                kind: PendingKind::Syscall,
             })
         );
         PENDING.set(None);
+    }
+
+    #[test]
+    fn instruction_continuations_resume_after_their_own_encoding() {
+        use crate::runtime::InstructionEventKind;
+        // A SIGSYS frame already points after the 2-byte syscall; a SIGSEGV
+        // instruction fault points at the instruction itself.
+        assert_eq!(PendingKind::Syscall.frame_offset(), 2);
+        assert_eq!(PendingKind::Syscall.length(), 2);
+        for (kind, length) in [
+            (InstructionEventKind::Cpuid, 2),
+            (InstructionEventKind::Rdtsc, 2),
+            (InstructionEventKind::Rdtscp, 3),
+        ] {
+            assert_eq!(PendingKind::Instruction(kind).frame_offset(), 0);
+            assert_eq!(PendingKind::Instruction(kind).length(), length);
+        }
+
+        let mut owner = Continuation {
+            stack: CallbackStack::new().unwrap(),
+            saved: SavedState::new().unwrap(),
+            context: HookContext::default(),
+            owner_tid: current_tid(),
+            generation: 0,
+            phase: Phase::Idle,
+            entries: 0,
+            callbacks: 0,
+            completions: 0,
+        };
+        owner.context.instruction_pointer = 0x7000;
+        commit_context(&mut owner, 3).unwrap();
+        assert_eq!(owner.saved.registers[libc::REG_RIP as usize], 0x7003);
+        owner.context.instruction_pointer = u64::MAX - 1;
+        assert!(commit_context(&mut owner, 3).is_err());
     }
 }

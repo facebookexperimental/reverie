@@ -43,6 +43,9 @@ use super::set_signalfd_ready;
 use crate::elf::TaskLifecycleTable;
 use crate::signal::ProcessSignalState;
 
+#[path = "parent_death_publication.rs"]
+mod parent_death_publication;
+
 #[path = "child_wait.rs"]
 mod child_wait;
 use std::sync::Condvar;
@@ -101,6 +104,16 @@ pub(super) struct ProcessBinding {
 impl ProcessBinding {
     pub(super) fn rebind(&self, state: &LoadedStaticElf, files: &Arc<Mutex<FileTableState>>) {
         // Caller holds the authoritative file table and process transaction.
+        state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .parent_death
+            .signals
+            .insert(
+                process_key(self.identity),
+                Arc::downgrade(&state.process_signals),
+            );
         *self.image.lock().unwrap_or_else(|p| p.into_inner()) = CurrentImage {
             revision: ImageRevision(Arc::new(())),
             files: Arc::downgrade(files),
@@ -312,6 +325,10 @@ pub(crate) struct ProcessSignalRegistry {
     // publication; it is not a substitute for that owner transition.
     failure: Mutex<Option<PublicationFailure>>,
     controlled: AtomicBool,
+    parent_death_adopted: AtomicBool,
+    parent_death_installation_closed: AtomicBool,
+    parent_death_results: Mutex<BTreeMap<u64, parent_death_publication::BatchResult>>,
+    parent_death_error: Mutex<Option<Errno>>,
     permits: Mutex<BTreeMap<(i32, u64, i32, u64), RegisteredPermit>>,
     completed_permits: Mutex<BTreeMap<(i32, u64, i32, u64), reverie::SignalDeliveryPermit>>,
     run_failure: Mutex<Weak<crate::failure::RunFailure>>,
@@ -331,6 +348,16 @@ impl ProcessSignalRegistry {
             tgid: reverie::Pid::from_raw(state.pid),
             generation,
         };
+        state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .parent_death
+            .signals
+            .insert(
+                (state.pid, generation),
+                Arc::downgrade(&state.process_signals),
+            );
         // Successful exec and same-process executor reconstruction retain the
         // process generation; they are not a fork edge and cannot make a
         // process its own child.
@@ -870,7 +897,7 @@ impl ProcessSignalControl {
         {
             return ProcessPublication::Rejected(PublicationRejection::InvalidEvent);
         }
-        self.publish(target, event, None, false)
+        self.publish(target, event, None, false, None)
     }
 
     fn publish_active_alarm(
@@ -887,7 +914,7 @@ impl ProcessSignalControl {
         {
             return ProcessPublication::Rejected(PublicationRejection::InvalidEvent);
         }
-        self.publish(target, event, None, true)
+        self.publish(target, event, None, true, None)
     }
 
     fn publish_child_completion(
@@ -898,7 +925,7 @@ impl ProcessSignalControl {
             Ok(event) => event,
             Err(rejection) => return ProcessPublication::Rejected(rejection),
         };
-        self.publish(completion.parent, event, Some(&completion), true)
+        self.publish(completion.parent, event, Some(&completion), true, None)
     }
 
     fn publish(
@@ -907,6 +934,7 @@ impl ProcessSignalControl {
         event: SignalEvent,
         completion: Option<&reverie::ChildExitCompletion>,
         independent_carriers: bool,
+        parent_death: Option<&crate::elf::parent_death::ParentDeathEvent>,
     ) -> ProcessPublication {
         use ProcessPublication::Rejected;
         use PublicationRejection::*;
@@ -1047,8 +1075,20 @@ impl ProcessSignalControl {
             },
             |snapshot| snapshot.disposition,
         );
-        let pending_generation = child_snapshot.map_or_else(
-            || process.pending_generation(signal),
+        let disposition = parent_death.map_or(disposition, |snapshot| {
+            if snapshot.ignored {
+                PublicationDisposition::Ignored
+            } else {
+                disposition
+            }
+        });
+        let pending_generation = parent_death.map_or_else(
+            || {
+                child_snapshot.map_or_else(
+                    || process.pending_generation(signal),
+                    |snapshot| snapshot.pending_generation,
+                )
+            },
             |snapshot| snapshot.pending_generation,
         );
         let mut receipt = PublicationReceipt {
@@ -1060,7 +1100,16 @@ impl ProcessSignalControl {
             disposition,
             child_completion: completion.copied(),
         };
-        if signal == libc::SIGCHLD && disposition == PublicationDisposition::Ignored {
+        // Parent-death causation already captured Linux generation-time
+        // suppression, including the recipient's mask and observation mode.
+        // A blocked SIG_IGN event must remain queued; the current disposition
+        // alone cannot erase it. A later ignore transition is handled by the
+        // pending-generation comparison below, not by resampling SIG_IGN.
+        let discard_at_generation = parent_death.map_or(
+            signal == libc::SIGCHLD && disposition == PublicationDisposition::Ignored,
+            |snapshot| snapshot.ignored,
+        );
+        if discard_at_generation {
             if let (Some(completion), Some(publications)) =
                 (completion, child_publications.as_mut())
             {
@@ -1072,8 +1121,8 @@ impl ProcessSignalControl {
             }
             return ProcessPublication::Committed(receipt);
         }
-        if let Some(snapshot) = child_snapshot
-            && process.pending_generation(signal) != snapshot.pending_generation
+        if (child_snapshot.is_some() || parent_death.is_some())
+            && process.pending_generation(signal) != pending_generation
         {
             receipt.change = PendingChange::Discarded;
             if let (Some(completion), Some(publications)) =
@@ -1201,10 +1250,26 @@ impl ProcessSignalRegistry {
         failure: &Arc<crate::failure::RunFailure>,
     ) {
         *self.run_failure.lock().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(failure);
+        self.parent_death_installation_closed
+            .store(true, Ordering::Release);
         self.controlled.store(
             mode == reverie::BackendSignalControlMode::ToolControlled,
             Ordering::Release,
         );
+        let processes = self
+            .processes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for process in processes {
+            if let Some(lifecycle) = process.lifecycle.upgrade() {
+                let mut lifecycle = lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+                lifecycle.parent_death.controlled = self.controlled();
+                lifecycle.parent_death.adopted = self.parent_death_adopted.load(Ordering::Acquire);
+            }
+        }
     }
 
     pub(super) fn controlled(&self) -> bool {
@@ -1323,6 +1388,58 @@ fn report_publication_failure(
 }
 
 impl reverie::ProcessSignalControl for ProcessSignalControl {
+    fn enable_parent_death_control(&self) -> Result<(), Errno> {
+        let registry = self.0.upgrade().ok_or(Errno::ESRCH)?;
+        if registry
+            .parent_death_installation_closed
+            .load(Ordering::Acquire)
+        {
+            return Err(Errno::EBUSY);
+        }
+        registry.parent_death_adopted.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn parent_death_enrolled(&self, process: SignalProcessId) -> Result<bool, Errno> {
+        let registry = self.0.upgrade().ok_or(Errno::ESRCH)?;
+        let binding = registry.lookup(process).ok_or(Errno::ESRCH)?;
+        let lifecycle = binding.lifecycle.upgrade().ok_or(Errno::ESRCH)?;
+        let lifecycle = lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        if !lifecycle.contains_process(process.tgid.as_raw(), process.generation) {
+            return Err(Errno::ESRCH);
+        }
+        Ok(lifecycle.parent_death_enrolled(process))
+    }
+
+    fn publish_parent_death(
+        &self,
+        boundary: reverie::SignalBoundaryReceipt,
+    ) -> reverie::ParentDeathPublicationResult {
+        self.publish_parent_death_boundary(boundary)
+    }
+
+    fn finish_parent_death_failure(
+        &self,
+        receipt: &reverie::ParentDeathPublication,
+    ) -> Result<(), Errno> {
+        let registry = self.0.upgrade().ok_or(Errno::ESRCH)?;
+        registry.verify_parent_death_receipt(receipt)?;
+        let errno = registry
+            .parent_death_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ok_or(Errno::EINVAL)?;
+        report_publication_failure(
+            &registry,
+            receipt.boundary.permit.task.process,
+            "parent-thread-death publication",
+            crate::Error::ParentDeathSignal {
+                operation: "publication",
+                errno: errno.into_raw(),
+            },
+        )
+    }
+
     fn publish_alarm(
         &self,
         process: SignalProcessId,
@@ -5264,6 +5381,7 @@ mod tests {
         reaper.adopt(super::super::Retirement {
             workers: None,
             roots,
+            terminal: Vec::new(),
         });
         drop(reaper);
         (shared, reaping)
@@ -6457,11 +6575,11 @@ mod tests {
 
         let control = parent.signal_registry.control();
         assert_eq!(
-            receipt(control.publish(parent_id, first_event, None, true)).change,
+            receipt(control.publish(parent_id, first_event, None, true, None)).change,
             PendingChange::Queued
         );
         assert_eq!(
-            receipt(control.publish(parent_id, second_event, None, true)).change,
+            receipt(control.publish(parent_id, second_event, None, true, None)).change,
             PendingChange::Coalesced
         );
         assert_eq!(

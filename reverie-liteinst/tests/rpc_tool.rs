@@ -608,6 +608,27 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         "{vdso_getrandom_stdout}"
     );
 
+    // An entry point with no syscall equivalent must not stay native once a
+    // Tool observing any syscall is installed: the guest calls the SGX enclave
+    // entry natively, installs a Tool observing only openat, and requires the
+    // -ENOSYS stub.
+    let vdso_fail_closed = Command::new(binary)
+        .arg("vdso-fail-closed-guest")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert!(vdso_fail_closed.status.success(), "{vdso_fail_closed:?}");
+    let vdso_fail_closed_stdout = String::from_utf8(vdso_fail_closed.stdout).unwrap();
+    eprintln!(
+        "vDSO fail-closed evidence: {}",
+        vdso_fail_closed_stdout.trim_end()
+    );
+    assert!(
+        vdso_fail_closed_stdout == "vdso-sgx=stubbed\n"
+            || vdso_fail_closed_stdout == "vdso-sgx=absent\n",
+        "{vdso_fail_closed_stdout}"
+    );
+
     let unsubscribed_lifecycle = Command::new(binary)
         .arg("unsubscribed-lifecycle")
         .arg(&socket)
@@ -724,6 +745,18 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
             b"unsubscribed-fork-reconstructed\n".as_slice(),
         ),
         ("tail-fork", b"tail-fork-reconstructed\n".as_slice()),
+        (
+            "mask-inject",
+            b"inject-mask full=0xffffffffbffbfeff write-only-set first-call fallback-site trap-after-full-mask\nblocking-wait during=0xffffffffbffbfeff probe=EINVAL,EFAULT parent-asleep-in-wait seeded-mask-restored blocked-signal-pending\n".as_slice(),
+        ),
+        (
+            "mask-unsubscribed",
+            b"unsubscribed-mask full=0xffffffffbffbfeff write-only-set first-call fallback-site trap-after-full-mask\n".as_slice(),
+        ),
+        (
+            "mask-tail",
+            b"tail-mask full=0xffffffffbffbfeff write-only-set first-call fallback-site trap-after-full-mask\n".as_slice(),
+        ),
     ] {
         let output = Command::new(binary)
             .arg(mode)
@@ -732,6 +765,37 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
             .unwrap();
         assert!(output.status.success(), "{mode}: {output:?}");
         assert_eq!(output.stdout, expected, "{mode}: {output:?}");
+    }
+
+    // With CPUID and RDTSC subscribed, the runtime also keeps SIGSEGV out of
+    // the guest's mask, and an RDTSC after a full-mask set still reaches the
+    // Tool. The Tool subscribes the same instructions as the instruction
+    // modes above, so their capability result decides this mode's outcome.
+    let mut mask_instruction = Command::new(binary);
+    mask_instruction.arg("mask-instruction").arg(&socket).env(
+        STRADDLER_STALENESS_TICKS_ENV,
+        TEST_STRADDLER_STALENESS_TICKS,
+    );
+    let mask_instruction = output_with_timeout(mask_instruction, Duration::from_secs(10));
+    if instruction_control_available {
+        assert!(mask_instruction.status.success(), "{mask_instruction:?}");
+        assert_eq!(
+            mask_instruction.stdout,
+            b"instruction-mask full=0xffffffffbffbfaff write-only-set first-call fallback-site trap-after-full-mask\nrdtsc-after-full-mask=tool\n",
+            "{mask_instruction:?}"
+        );
+        assert!(mask_instruction.stderr.is_empty(), "{mask_instruction:?}");
+    } else {
+        assert_eq!(
+            mask_instruction.status.code(),
+            Some(INSTRUCTION_CONTROL_UNAVAILABLE_STATUS),
+            "{mask_instruction:?}"
+        );
+        assert!(mask_instruction.stdout.is_empty(), "{mask_instruction:?}");
+        assert_eq!(
+            mask_instruction.stderr, b"instruction-control-unavailable\n",
+            "{mask_instruction:?}"
+        );
     }
 
     let guest = Command::new(binary)
@@ -757,4 +821,234 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         ),
         "{stdout}"
     );
+}
+
+/// Run one `rpc_tool_guest` mode against its own coordinator.
+fn late_code_guest(
+    mode: &str,
+    extra: &[&std::ffi::OsStr],
+    on_alt_stack: bool,
+    configure: impl FnOnce(&mut Command),
+) -> Output {
+    let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("coordinator.sock");
+    let mut coordinator = Command::new(binary)
+        .arg("coordinator")
+        .arg(&socket)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let ready = socket.exists();
+    let mut command = Command::new(binary);
+    command.arg(mode).arg(&socket).args(extra);
+    reverie_liteinst::set_guest_alt_stack(&mut command, on_alt_stack);
+    configure(&mut command);
+    let output = ready.then(|| output_with_timeout(command, Duration::from_secs(20)));
+    let _ = coordinator.kill();
+    let _ = coordinator.wait();
+    output.expect("coordinator socket was not created")
+}
+
+/// Whether the host refused CPUID/TSC faulting; asserts the single refusal
+/// diagnostic so an unrelated failure cannot be mistaken for a refusal.
+fn instruction_control_refused(output: &Output, label: &str) -> bool {
+    if output.status.code() != Some(INSTRUCTION_CONTROL_UNAVAILABLE_STATUS) {
+        return false;
+    }
+    assert_eq!(
+        output.stderr, b"instruction-control-unavailable\n",
+        "{label}: {output:?}"
+    );
+    eprintln!("{label}: instruction controls unavailable on this host; unmeasured");
+    true
+}
+
+// CPUID/RDTSC/RDTSCP in an executable page mapped after the runtime started has
+// no arena. Each one must still reach the Tool on the owned continuation, with
+// the same result as the patched path, and resume after the instruction with
+// every other register intact.
+#[test]
+fn late_code_instructions_reach_the_tool_through_the_continuation() {
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest("late-code-instruction", &[], on_alt_stack, |_| {});
+        if instruction_control_refused(&output, "late-code-instruction") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "late-code cpuid=tool rdtsc=tool rdtscp=tool equals-patched=1 continuation=163 owned-stack=163 sites=0 registers=preserved\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+    }
+}
+
+// The libcrypto shape: a dlopen'd library's constructor runs CPUID and RDTSC in
+// code the runtime never saw at startup.
+#[test]
+fn dlopen_constructor_cpuid_reaches_the_tool_through_the_continuation() {
+    let directory = tempfile::tempdir().unwrap();
+    let library = directory.path().join("liblate_code_cpuid.so");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/late_code_cpuid_constructor.c");
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let compiled = Command::new(compiler)
+        .args(["-std=gnu11", "-O0", "-shared", "-fPIC"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "{compiled:?}");
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest(
+            "late-code-dlopen",
+            &[library.as_os_str()],
+            on_alt_stack,
+            |command| {
+                command.env(reverie_liteinst::IN_GUEST_STAGE_STREAM_ENV, "1");
+            },
+        );
+        if instruction_control_refused(&output, "late-code-dlopen") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "late-code dlopen constructor-cpuid=tool constructor-rdtsc=tool owned-stack=2\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stage_count = |stage: &str| stderr.lines().filter(|line| line.ends_with(stage)).count();
+        for stage in [
+            "stage=instruction-fault-continuation-cpuid",
+            "stage=instruction-fault-continuation-rdtsc",
+        ] {
+            assert_eq!(stage_count(stage), 1, "{stage}: {stderr}");
+        }
+        assert!(
+            !stderr.contains("instruction-sigsegv-"),
+            "no refusal stage may appear: {stderr}"
+        );
+    }
+}
+
+// The production case itself: the host's libcrypto runs OPENSSL_cpuid_setup
+// from its initializer during dlopen. Skipped on a host without libcrypto 3.
+#[test]
+fn dlopen_system_libcrypto_initializer_reaches_the_tool() {
+    let Some(library) = [
+        "/usr/lib64/libcrypto.so.3",
+        "/lib64/libcrypto.so.3",
+        "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+        "/lib/x86_64-linux-gnu/libcrypto.so.3",
+    ]
+    .into_iter()
+    .map(std::path::Path::new)
+    .find(|path| path.exists()) else {
+        eprintln!("libcrypto.so.3 is not installed; the system dlopen case is unmeasured");
+        return;
+    };
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest(
+            "late-code-dlopen-system",
+            &[library.as_os_str()],
+            on_alt_stack,
+            |command| {
+                command.env(reverie_liteinst::IN_GUEST_STAGE_STREAM_ENV, "1");
+            },
+        );
+        if instruction_control_refused(&output, "late-code-dlopen-system") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "late-code dlopen-system initializer-cpuid=tool\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.ends_with("stage=instruction-fault-continuation-cpuid")),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("instruction-sigsegv-"),
+            "no refusal stage may appear: {stderr}"
+        );
+    }
+}
+
+// A fault in code without an arena that is not an emulated instruction (a #GP
+// on a non-canonical load, and a NULL page fault) keeps the guest's native
+// fate: death by a genuine SIGSEGV, never an ordinary exit status 139.
+#[test]
+fn undecodable_late_code_fault_ends_the_guest_by_sigsegv() {
+    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt;
+    for mode in ["late-code-gp-fault", "late-code-null-load"] {
+        for on_alt_stack in [true, false] {
+            let output = late_code_guest(mode, &[], on_alt_stack, |command| {
+                command.env(reverie_liteinst::IN_GUEST_STAGE_STREAM_ENV, "1");
+                // Keep the expected crash from writing a core file.
+                unsafe {
+                    command.pre_exec(|| {
+                        let limit = libc::rlimit {
+                            rlim_cur: 0,
+                            rlim_max: 0,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    })
+                };
+            });
+            if instruction_control_refused(&output, mode) {
+                return;
+            }
+            let label = format!("{mode} alt_stack={on_alt_stack}: {output:?}");
+            assert_eq!(output.status.code(), None, "{label}");
+            assert_eq!(output.status.signal(), Some(libc::SIGSEGV), "{label}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let rip = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("fault-rip="))
+                .unwrap_or_else(|| panic!("{label}"));
+            assert!(!stdout.contains("survived"), "{label}");
+            let refusal = format!(
+                "stage=instruction-sigsegv-no-reachable-arena rip={rip} bytes=48-8b-00-c3-00-00-00-00 map=[anon]"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| line.ends_with(&refusal))
+                    .count(),
+                1,
+                "{label}"
+            );
+        }
+    }
 }

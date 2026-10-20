@@ -21,12 +21,16 @@ use std::sync::atomic::Ordering;
 use reverie::BackendStatsSnapshot;
 use reverie::BackendStatsSource;
 use reverie::CounterSnapshot;
+use reverie::DispatchCounters;
+use reverie::DispatchStats;
 use reverie::GlobalTool;
 use reverie::InstructionPatchShape;
 pub use reverie::LiteinstDispatchPath;
 use reverie::PatchShapeCollector;
 use reverie::PatchShapeStats;
+use reverie::SiteCounters;
 use reverie::Tid;
+use reverie_ptrace::PtraceBackendStatsSnapshot;
 use reverie_rpc_transport::BlockingRpcClient;
 use serde::Deserialize;
 use serde::Serialize;
@@ -44,19 +48,53 @@ pub enum LiteinstPatchDecision {
     OtherFallback,
 }
 
+/// Which LiteInst runtime produced a statistics snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiteinstStatsMode {
+    /// The ptrace-host hybrid: patched sites return to the tracer via SIGTRAP.
+    HostHybrid,
+    /// Runtime-free trap-only LiteInst: every syscall is a ptrace seccomp stop.
+    TrapOnly,
+    /// The in-guest runtime: no tracer; SIGSYS and patched hooks run in the guest.
+    InGuest,
+}
+
 /// Stable LiteInst statistics captured after one backend run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiteinstBackendStatsSnapshot {
+    mode: LiteinstStatsMode,
+    ptrace: Option<PtraceBackendStatsSnapshot>,
     process_reports: u64,
     patch_shapes: PatchShapeStats,
     patch_decisions: CounterSnapshot<LiteinstPatchDecision>,
     dispatch_paths: CounterSnapshot<LiteinstDispatchPath>,
+    fork_child_entries: InheritedEntries,
 }
 
 impl LiteinstBackendStatsSnapshot {
+    /// The runtime that produced this snapshot.
+    pub const fn mode(&self) -> LiteinstStatsMode {
+        self.mode
+    }
+
+    /// The tracer's own stop counts, for the tracer-owned modes.
+    pub const fn ptrace(&self) -> Option<&PtraceBackendStatsSnapshot> {
+        self.ptrace.as_ref()
+    }
+
     /// Number of process-local reports aggregated by the in-guest runtime.
     pub const fn process_reports(&self) -> u64 {
         self.process_reports
+    }
+
+    /// In-guest entries that a fork-like syscall's child reported again as
+    /// its own first event, summed over the reports.
+    ///
+    /// [`Self::dispatch_paths`] keeps them, since each process's paths
+    /// describe that process. The shared record subtracts them, since each
+    /// is one physical entry already counted in the parent.
+    pub const fn fork_child_entries(&self) -> InheritedEntries {
+        self.fork_child_entries
     }
 
     /// Aggregate shape distribution over distinct patch-site identities.
@@ -121,6 +159,78 @@ impl fmt::Display for LiteinstBackendStatsSnapshot {
 
 impl BackendStatsSnapshot for LiteinstBackendStatsSnapshot {
     const BACKEND_NAME: &'static str = "liteinst";
+
+    /// Projects the existing LiteInst counters onto the shared record.
+    ///
+    /// Tracer-owned modes take seccomp and `SIGTRAP` stops (and the
+    /// per-process attribution) from the tracer's stop counts, which are
+    /// unmeasured when the run did not collect them. The `SIGTRAP` count is
+    /// the tracer's physical stops, not [`LiteinstDispatchPath::DirectHook`]:
+    /// a restarted hooked syscall re-traps without a second hook entry.
+    ///
+    /// The in-guest runtime has no tracer. Its signal traps are every `SIGSYS`
+    /// the handler received ([`LiteinstDispatchPath::InGuestPhysicalSigsys`]),
+    /// so they include the signal that installs a site's hook and then
+    /// re-enters through it, a fallback's completion signal, and the Tool's
+    /// own syscalls trapped during a callback. Its direct calls are
+    /// patched-site hook entries, including those the Tool's own syscalls make
+    /// during a callback (also counted, alone, as
+    /// [`LiteinstDispatchPath::InGuestNestedHook`]). A fork-like syscall's
+    /// child reports the parent's hook entry again as its own first event, so the aggregate
+    /// subtracts those inherited entries to count each physical entry once. A
+    /// patched site's hook count includes patched `rdtsc`/`cpuid` instruction
+    /// sites, which are intercepted events but not syscalls. In-guest totals
+    /// cover only the processes that submitted a report
+    /// ([`LiteinstBackendStatsSnapshot::process_reports`]); a process killed
+    /// before it could report is missing from them.
+    fn dispatch_stats(&self) -> Option<DispatchStats> {
+        let sites = SiteCounters {
+            candidates: Some(self.patch_shapes.candidate_rips()),
+            patched: Some(self.patch_shapes.patched_rips()),
+            fell_back: Some(
+                self.decision_count(LiteinstPatchDecision::StraddlerFallback)
+                    + self.decision_count(LiteinstPatchDecision::OtherFallback),
+            ),
+        };
+        let refusals = Some(self.path_count(LiteinstDispatchPath::FallbackRefusal));
+        let record = match self.mode {
+            LiteinstStatsMode::HostHybrid | LiteinstStatsMode::TrapOnly => {
+                let mut record = match &self.ptrace {
+                    Some(ptrace) => ptrace.dispatch_stats_as(Self::BACKEND_NAME),
+                    None => DispatchStats::new(
+                        Self::BACKEND_NAME,
+                        DispatchCounters {
+                            ptrace_seccomp_stops: None,
+                            ptrace_sigtrap_stops: None,
+                            ptrace_syscall_entry_stops: None,
+                            ptrace_syscall_exit_stops: None,
+                            ..DispatchCounters::ZERO
+                        },
+                        sites,
+                    ),
+                };
+                record.counters.refusals = refusals;
+                record.sites = sites;
+                record
+            }
+            LiteinstStatsMode::InGuest => DispatchStats::new(
+                Self::BACKEND_NAME,
+                DispatchCounters {
+                    signal_traps: Some(
+                        self.path_count(LiteinstDispatchPath::InGuestPhysicalSigsys),
+                    ),
+                    patched_direct_calls: Some(
+                        self.path_count(LiteinstDispatchPath::DirectHook)
+                            .saturating_sub(self.fork_child_entries.hooks),
+                    ),
+                    refusals,
+                    ..DispatchCounters::ZERO
+                },
+                sites,
+            ),
+        };
+        Some(record)
+    }
 }
 
 /// Backend-owned source for a typed LiteInst end-of-run snapshot.
@@ -132,11 +242,22 @@ pub struct LiteinstBackendStatsSource {
 impl LiteinstBackendStatsSource {
     pub(crate) fn from_ptrace_host_hybrid(
         stats: reverie_ptrace::LiteinstInstrumentationStats,
+        ptrace: Option<PtraceBackendStatsSnapshot>,
+    ) -> Self {
+        Self::from_tracer(LiteinstStatsMode::HostHybrid, stats, ptrace)
+    }
+
+    fn from_tracer(
+        mode: LiteinstStatsMode,
+        stats: reverie_ptrace::LiteinstInstrumentationStats,
+        ptrace: Option<PtraceBackendStatsSnapshot>,
     ) -> Self {
         let decisions = stats.decision_counts();
         let dispatch_paths = stats.ptrace_host_dispatch_paths();
         Self {
             snapshot: LiteinstBackendStatsSnapshot {
+                mode,
+                ptrace,
                 process_reports: 0,
                 patch_shapes: stats.patch_shape_stats(),
                 patch_decisions: CounterSnapshot::new([
@@ -146,6 +267,7 @@ impl LiteinstBackendStatsSource {
                     (LiteinstPatchDecision::OtherFallback, decisions[3]),
                 ]),
                 dispatch_paths,
+                fork_child_entries: InheritedEntries::default(),
             },
         }
     }
@@ -154,8 +276,11 @@ impl LiteinstBackendStatsSource {
     ///
     /// Trap-only sites are recorded through the same tracer-owned collector as
     /// the host hybrid; with patching off it stays empty.
-    pub(crate) fn from_trap_only(stats: reverie_ptrace::LiteinstInstrumentationStats) -> Self {
-        Self::from_ptrace_host_hybrid(stats)
+    pub(crate) fn from_trap_only(
+        stats: reverie_ptrace::LiteinstInstrumentationStats,
+        ptrace: Option<PtraceBackendStatsSnapshot>,
+    ) -> Self {
+        Self::from_tracer(LiteinstStatsMode::TrapOnly, stats, ptrace)
     }
 
     /// Returns the captured snapshot without performing another collection pass.
@@ -235,11 +360,15 @@ struct GuestStatsCollector {
     coordinator: PathBuf,
     in_guest_sigsys: AtomicU64,
     in_guest_nested_sigsys: AtomicU64,
+    in_guest_nested_hook: AtomicU64,
     in_guest_physical_sigsys: AtomicU64,
     fallback_completion_sigsys: AtomicU64,
     cacheline_straddler_fallback: AtomicU64,
     unpatchable_or_other_fallback: AtomicU64,
     fallback_refusal: AtomicU64,
+    inherited_sigsys: AtomicU64,
+    inherited_hooks: AtomicU64,
+    patching_disabled_fallback: AtomicU64,
 }
 
 impl GuestStatsCollector {
@@ -247,11 +376,13 @@ impl GuestStatsCollector {
         match path {
             LiteinstDispatchPath::InGuestSigsys => &self.in_guest_sigsys,
             LiteinstDispatchPath::InGuestNestedSigsys => &self.in_guest_nested_sigsys,
+            LiteinstDispatchPath::InGuestNestedHook => &self.in_guest_nested_hook,
             LiteinstDispatchPath::InGuestPhysicalSigsys => &self.in_guest_physical_sigsys,
             LiteinstDispatchPath::FallbackCompletionSigsys => &self.fallback_completion_sigsys,
             LiteinstDispatchPath::CachelineStraddlerFallback => &self.cacheline_straddler_fallback,
             LiteinstDispatchPath::UnpatchableOrOtherFallback => &self.unpatchable_or_other_fallback,
             LiteinstDispatchPath::FallbackRefusal => &self.fallback_refusal,
+            LiteinstDispatchPath::PatchingDisabledFallback => &self.patching_disabled_fallback,
             LiteinstDispatchPath::FirstSiteSeccomp
             | LiteinstDispatchPath::PtraceInstallation
             | LiteinstDispatchPath::DirectHook => {
@@ -279,6 +410,10 @@ impl GuestStatsCollector {
                 self.in_guest_nested_sigsys.load(Ordering::Relaxed),
             ),
             (
+                LiteinstDispatchPath::InGuestNestedHook,
+                self.in_guest_nested_hook.load(Ordering::Relaxed),
+            ),
+            (
                 LiteinstDispatchPath::CachelineStraddlerFallback,
                 self.cacheline_straddler_fallback.load(Ordering::Relaxed),
             ),
@@ -291,12 +426,17 @@ impl GuestStatsCollector {
                 LiteinstDispatchPath::FallbackRefusal,
                 self.fallback_refusal.load(Ordering::Relaxed),
             ),
+            (
+                LiteinstDispatchPath::PatchingDisabledFallback,
+                self.patching_disabled_fallback.load(Ordering::Relaxed),
+            ),
         ])
     }
 
     fn reset(&self) {
         self.in_guest_sigsys.store(0, Ordering::Relaxed);
         self.in_guest_nested_sigsys.store(0, Ordering::Relaxed);
+        self.in_guest_nested_hook.store(0, Ordering::Relaxed);
         self.in_guest_physical_sigsys.store(0, Ordering::Relaxed);
         self.fallback_completion_sigsys.store(0, Ordering::Relaxed);
         self.cacheline_straddler_fallback
@@ -304,6 +444,16 @@ impl GuestStatsCollector {
         self.unpatchable_or_other_fallback
             .store(0, Ordering::Relaxed);
         self.fallback_refusal.store(0, Ordering::Relaxed);
+        self.inherited_sigsys.store(0, Ordering::Relaxed);
+        self.inherited_hooks.store(0, Ordering::Relaxed);
+        self.patching_disabled_fallback.store(0, Ordering::Relaxed);
+    }
+
+    fn inherited_entries(&self) -> InheritedEntries {
+        InheritedEntries {
+            sigsys: self.inherited_sigsys.load(Ordering::Relaxed),
+            hooks: self.inherited_hooks.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -314,6 +464,7 @@ pub(crate) struct GuestStatsHooks {
     collector: Option<&'static GuestStatsCollector>,
     record_path: fn(Option<&'static GuestStatsCollector>, LiteinstDispatchPath),
     reset_after_fork: fn(Option<&'static GuestStatsCollector>),
+    record_inherited_entry: fn(Option<&'static GuestStatsCollector>, InheritedEntry),
 }
 
 impl GuestStatsHooks {
@@ -321,6 +472,7 @@ impl GuestStatsHooks {
         collector: None,
         record_path: disabled_record_path,
         reset_after_fork: disabled_reset_after_fork,
+        record_inherited_entry: disabled_record_inherited_entry,
     };
 
     fn enabled(collector: &'static GuestStatsCollector) -> Self {
@@ -328,7 +480,15 @@ impl GuestStatsHooks {
             collector: Some(collector),
             record_path: enabled_record_path,
             reset_after_fork: enabled_reset_after_fork,
+            record_inherited_entry: enabled_record_inherited_entry,
         }
+    }
+
+    /// This process's hooks, for code that is not handed the dispatcher's
+    /// copy, such as a patched site's hook. Disabled when the run collects no
+    /// statistics.
+    pub(crate) fn current() -> Self {
+        GUEST_STATS.get().map_or(Self::DISABLED, Self::enabled)
     }
 
     pub(crate) fn is_enabled(self) -> bool {
@@ -343,6 +503,12 @@ impl GuestStatsHooks {
         (self.reset_after_fork)(self.collector);
     }
 
+    /// Notes that a fork-like syscall's child counted the parent's entry
+    /// again as its own first event.
+    pub(crate) fn record_inherited_entry(self, entry: InheritedEntry) {
+        (self.record_inherited_entry)(self.collector, entry);
+    }
+
     pub(crate) fn submit(
         self,
         tid: Tid,
@@ -353,10 +519,15 @@ impl GuestStatsHooks {
             return Ok(());
         };
         let paths = stats.snapshot(direct_hooks);
+        let inherited = stats.inherited_entries();
         let client = BlockingRpcClient::<LiteinstStatsGlobal>::connect(&stats.coordinator, tid)
             .map_err(|error| io::Error::other(error.to_string()))?;
         client
-            .try_send_rpc(LiteinstProcessStats { paths, sites })
+            .try_send_rpc(LiteinstProcessStats {
+                paths,
+                sites,
+                inherited,
+            })
             .map_err(|error| io::Error::other(error.to_string()))
     }
 }
@@ -368,6 +539,12 @@ fn disabled_record_path(
 }
 
 fn disabled_reset_after_fork(_collector: Option<&'static GuestStatsCollector>) {}
+
+fn disabled_record_inherited_entry(
+    _collector: Option<&'static GuestStatsCollector>,
+    _entry: InheritedEntry,
+) {
+}
 
 fn enabled_record_path(
     collector: Option<&'static GuestStatsCollector>,
@@ -389,6 +566,18 @@ fn enabled_reset_after_fork(collector: Option<&'static GuestStatsCollector>) {
         .reset();
 }
 
+fn enabled_record_inherited_entry(
+    collector: Option<&'static GuestStatsCollector>,
+    entry: InheritedEntry,
+) {
+    let collector = collector.expect("enabled stats dispatch requires a collector");
+    match entry {
+        InheritedEntry::Sigsys => &collector.inherited_sigsys,
+        InheritedEntry::Hook => &collector.inherited_hooks,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 static ENABLED_STATS_PROBES: AtomicU64 = AtomicU64::new(0);
 
@@ -398,11 +587,15 @@ pub(crate) fn initialize_guest_stats(coordinator: &Path) -> io::Result<GuestStat
             coordinator: coordinator.to_path_buf(),
             in_guest_sigsys: AtomicU64::new(0),
             in_guest_nested_sigsys: AtomicU64::new(0),
+            in_guest_nested_hook: AtomicU64::new(0),
             in_guest_physical_sigsys: AtomicU64::new(0),
             fallback_completion_sigsys: AtomicU64::new(0),
             cacheline_straddler_fallback: AtomicU64::new(0),
             unpatchable_or_other_fallback: AtomicU64::new(0),
             fallback_refusal: AtomicU64::new(0),
+            inherited_sigsys: AtomicU64::new(0),
+            inherited_hooks: AtomicU64::new(0),
+            patching_disabled_fallback: AtomicU64::new(0),
         })
         .map_err(|_| {
             io::Error::new(
@@ -431,6 +624,25 @@ pub(crate) struct LiteinstProcessSiteStats {
 pub(crate) struct LiteinstProcessStats {
     pub(crate) paths: CounterSnapshot<LiteinstDispatchPath>,
     pub(crate) sites: Vec<LiteinstProcessSiteStats>,
+    pub(crate) inherited: InheritedEntries,
+}
+
+/// The in-guest route of an entry a fork-like syscall's child re-counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InheritedEntry {
+    /// The fork-like syscall entered through `SIGSYS`.
+    Sigsys,
+    /// The fork-like syscall entered through a patched site's hook.
+    Hook,
+}
+
+/// Entries a fork-like syscall's child counted again as its own first event.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InheritedEntries {
+    /// Entries through `SIGSYS`.
+    pub sigsys: u64,
+    /// Entries through a patched site's hook.
+    pub hooks: u64,
 }
 
 /// Coordinator-side typed RPC target for per-process LiteInst snapshots.
@@ -470,10 +682,13 @@ impl LiteinstStatsGlobal {
         let mut seen_sites = BTreeSet::new();
         let mut decisions = [0_u64; 4];
         let mut paths = Vec::new();
+        let mut fork_child_entries = InheritedEntries::default();
 
         for (process_identity, process) in processes {
             reported_processes.insert(process_identity);
             paths.extend(process.paths.counts().iter().copied());
+            fork_child_entries.sigsys += process.inherited.sigsys;
+            fork_child_entries.hooks += process.inherited.hooks;
             for site in process.sites {
                 if !seen_sites.insert((process_identity, site.rip)) {
                     continue;
@@ -497,6 +712,8 @@ impl LiteinstStatsGlobal {
 
         LiteinstBackendStatsSource {
             snapshot: LiteinstBackendStatsSnapshot {
+                mode: LiteinstStatsMode::InGuest,
+                ptrace: None,
                 process_reports: reported_processes.len() as u64,
                 patch_shapes: shapes.snapshot(),
                 patch_decisions: CounterSnapshot::new([
@@ -506,6 +723,7 @@ impl LiteinstStatsGlobal {
                     (LiteinstPatchDecision::OtherFallback, decisions[3]),
                 ]),
                 dispatch_paths: CounterSnapshot::new(paths),
+                fork_child_entries,
             },
         }
     }
@@ -552,6 +770,8 @@ mod tests {
         );
         let source = LiteinstBackendStatsSource {
             snapshot: LiteinstBackendStatsSnapshot {
+                mode: LiteinstStatsMode::HostHybrid,
+                ptrace: None,
                 process_reports: 0,
                 patch_shapes: shapes.snapshot(),
                 patch_decisions: CounterSnapshot::new([(LiteinstPatchDecision::Relocated, 1)]),
@@ -560,6 +780,7 @@ mod tests {
                     (LiteinstDispatchPath::PtraceInstallation, 1),
                     (LiteinstDispatchPath::DirectHook, 9),
                 ]),
+                fork_child_entries: InheritedEntries::default(),
             },
         };
 
@@ -584,6 +805,8 @@ mod tests {
                         paths: CounterSnapshot::new([
                             (LiteinstDispatchPath::InGuestSigsys, 1),
                             (LiteinstDispatchPath::InGuestNestedSigsys, 2),
+                            // The inherited signal was the parent's.
+                            (LiteinstDispatchPath::InGuestPhysicalSigsys, 2),
                             (LiteinstDispatchPath::CachelineStraddlerFallback, 3),
                             (LiteinstDispatchPath::UnpatchableOrOtherFallback, 4),
                             (LiteinstDispatchPath::DirectHook, direct_hooks),
@@ -595,6 +818,10 @@ mod tests {
                             instruction_length: 2,
                             straddle_after: 0,
                         }],
+                        inherited: InheritedEntries {
+                            sigsys: 1,
+                            hooks: direct_hooks % 2,
+                        },
                     },
                 )
                 .await;
@@ -620,13 +847,134 @@ mod tests {
         );
         assert_eq!(paths.count(&LiteinstDispatchPath::DirectHook), 18);
         assert_eq!(paths.count(&LiteinstDispatchPath::FallbackRefusal), 10);
-        assert_eq!(paths.total(), 48);
+        assert_eq!(paths.count(&LiteinstDispatchPath::InGuestPhysicalSigsys), 4);
+        assert_eq!(paths.total(), 52);
+        assert_eq!(
+            source.snapshot().fork_child_entries(),
+            InheritedEntries {
+                sigsys: 2,
+                hooks: 2,
+            }
+        );
+        let record = source
+            .snapshot()
+            .dispatch_stats()
+            .expect("LiteInst measures dispatch");
+        assert_eq!(record.counters.signal_traps, Some(4));
+        assert_eq!(record.counters.patched_direct_calls, Some(16));
         let rendered = source.to_string();
         assert!(rendered.contains("first_site_seccomp=0"), "{rendered}");
         assert!(rendered.contains("in_guest_sigsys=2"), "{rendered}");
         assert!(rendered.contains("in_guest_nested_sigsys=4"), "{rendered}");
         assert!(!rendered.contains("pid="), "{rendered}");
         assert!(!rendered.contains("0x4000"), "{rendered}");
+    }
+
+    fn snapshot_with(
+        mode: LiteinstStatsMode,
+        paths: impl IntoIterator<Item = (LiteinstDispatchPath, u64)>,
+    ) -> LiteinstBackendStatsSnapshot {
+        let mut shapes = PatchShapeCollector::default();
+        shapes.record_site(0x1000, true, Some(InstructionPatchShape::new(2, None)));
+        shapes.record_site(0x103f, false, Some(InstructionPatchShape::new(2, Some(1))));
+        shapes.record_site(0x2000, false, None);
+        LiteinstBackendStatsSnapshot {
+            mode,
+            ptrace: None,
+            process_reports: 1,
+            patch_shapes: shapes.snapshot(),
+            patch_decisions: CounterSnapshot::new([
+                (LiteinstPatchDecision::DirectPun, 1),
+                (LiteinstPatchDecision::StraddlerFallback, 1),
+                (LiteinstPatchDecision::OtherFallback, 1),
+            ]),
+            dispatch_paths: CounterSnapshot::new(paths),
+            fork_child_entries: InheritedEntries::default(),
+        }
+    }
+
+    #[test]
+    fn in_guest_dispatch_record_counts_sigsys_and_hooks_once() {
+        let snapshot = snapshot_with(
+            LiteinstStatsMode::InGuest,
+            [
+                (LiteinstDispatchPath::InGuestSigsys, 4),
+                (LiteinstDispatchPath::InGuestNestedSigsys, 2),
+                (LiteinstDispatchPath::InGuestPhysicalSigsys, 7),
+                (LiteinstDispatchPath::FallbackCompletionSigsys, 1),
+                (LiteinstDispatchPath::CachelineStraddlerFallback, 3),
+                (LiteinstDispatchPath::DirectHook, 9),
+                (LiteinstDispatchPath::FallbackRefusal, 1),
+            ],
+        );
+        let record = snapshot
+            .dispatch_stats()
+            .expect("LiteInst measures dispatch");
+        assert_eq!(record.backend, "liteinst");
+        // Every SIGSYS the handler received, whatever it was then classified as.
+        assert_eq!(record.counters.signal_traps, Some(7));
+        assert_eq!(record.counters.patched_direct_calls, Some(9));
+        assert_eq!(record.counters.ptrace_seccomp_stops, Some(0));
+        assert_eq!(record.counters.dispatches(), Some(16));
+        assert_eq!(record.counters.refusals, Some(1));
+        assert_eq!(record.sites.candidates, Some(3));
+        assert_eq!(record.sites.patched, Some(1));
+        assert_eq!(record.sites.fell_back, Some(2));
+        assert_eq!(record.per_process, None);
+        assert_eq!(record.inconsistencies(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn in_guest_dispatch_record_counts_a_fork_child_entry_once() {
+        let mut snapshot = snapshot_with(
+            LiteinstStatsMode::InGuest,
+            [
+                (LiteinstDispatchPath::InGuestSigsys, 4),
+                (LiteinstDispatchPath::InGuestPhysicalSigsys, 2),
+                (LiteinstDispatchPath::DirectHook, 9),
+            ],
+        );
+        snapshot.fork_child_entries = InheritedEntries {
+            sigsys: 2,
+            hooks: 3,
+        };
+        let record = snapshot
+            .dispatch_stats()
+            .expect("LiteInst measures dispatch");
+        // A child's reset physical count never held the parent's signal.
+        assert_eq!(record.counters.signal_traps, Some(2));
+        assert_eq!(record.counters.patched_direct_calls, Some(6));
+        assert_eq!(record.counters.dispatches(), Some(8));
+        // The per-process paths still describe each process's own events.
+        assert_eq!(
+            snapshot
+                .dispatch_paths()
+                .count(&LiteinstDispatchPath::DirectHook),
+            9
+        );
+    }
+
+    #[test]
+    fn tracer_owned_dispatch_record_leaves_seccomp_unmeasured_without_tracer_stats() {
+        let snapshot = snapshot_with(
+            LiteinstStatsMode::HostHybrid,
+            [
+                (LiteinstDispatchPath::FirstSiteSeccomp, 3),
+                (LiteinstDispatchPath::PtraceInstallation, 1),
+                (LiteinstDispatchPath::DirectHook, 7),
+            ],
+        );
+        let record = snapshot
+            .dispatch_stats()
+            .expect("LiteInst measures dispatch");
+        // The tracer's stop counts are the only source of SIGTRAP stops; the
+        // hook entry count is not a substitute for them.
+        assert_eq!(record.counters.ptrace_sigtrap_stops, None);
+        assert_eq!(record.counters.signal_traps, Some(0));
+        assert_eq!(record.counters.patched_direct_calls, Some(0));
+        assert_eq!(record.counters.ptrace_seccomp_stops, None);
+        assert_eq!(record.counters.trapped_dispatches(), None);
+        assert_eq!(record.inconsistencies(), Vec::<String>::new());
     }
 
     #[test]
@@ -649,6 +997,10 @@ mod tests {
                 (LiteinstDispatchPath::FallbackRefusal, 3),
             ]),
             sites: Vec::new(),
+            inherited: InheritedEntries {
+                sigsys: 1,
+                hooks: 4,
+            },
         };
 
         let bytes = bincode::serde::encode_to_vec(&report, bincode::config::legacy()).unwrap();

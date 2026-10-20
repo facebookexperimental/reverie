@@ -239,6 +239,7 @@ impl<'mmap> Context<'mmap> {
 
 /// Creates a memory map from the given path.
 fn mmap_path(path: &Path) -> io::Result<Mmap> {
+    let _open = crate::process::launch_window::TransientOpen::begin();
     let f = File::open(path)?;
     unsafe { Mmap::map(&f) }
 }

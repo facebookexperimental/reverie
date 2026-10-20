@@ -24,7 +24,7 @@
 //! switch is *additive*: implement a new controller, select it via config; the
 //! dispatcher, seccomp filter, trap handler, and RPC client are unchanged. Both
 //! controllers install the identical guest-half in-process trap (see
-//! [`install_in_process_trap`]); launcher selection is a separate caller
+//! `install_in_process_trap`); launcher selection is a separate caller
 //! responsibility. See [`HybridPtrace`] for the precise boundary.
 
 use std::io;
@@ -117,7 +117,7 @@ unsafe fn install_in_process_trap(config: &RuntimeConfig) -> io::Result<()> {
 ///
 /// * **This call (guest half, run in the `LD_PRELOAD` constructor)** installs the
 ///   exact same in-process `SIGSYS` trap as [`InProcessSeccomp`] — the handler,
-///   then the trusted-gate seccomp filter — via [`install_in_process_trap`].
+///   then the trusted-gate seccomp filter — via `install_in_process_trap`.
 ///   Rewritten sites therefore stay on the in-process hot path, and a tool such
 ///   as Detcore can run entirely in-guest. Un-instrumented / fail-closed sites
 ///   resolve through the in-guest `SIGSYS` handler; under a ptrace launcher the

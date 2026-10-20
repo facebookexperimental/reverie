@@ -92,6 +92,8 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::perf::*;
+use crate::tracer::PtracerWaitOwner;
+use crate::tracer::WaitOnPtracer;
 
 // This signal is unused, in that the kernel will never send it to a process.
 const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;
@@ -102,8 +104,9 @@ const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;
 const SINGLESTEP_TIMEOUT_RCBS: u64 = 5;
 
 /// The largest default skid margin of any processor in the PMU table
-/// (`reverie::pmu::PmuProfile`, and 1000 on aarch64): that of AMD Zen other
-/// than the EPYC 9D85. A unit test checks it against the whole table.
+/// (`reverie::pmu::PmuProfile`, and 1000 on aarch64): that of the AMD Zen
+/// processors without a measured 1K entry. A unit test checks it against the
+/// whole table.
 pub const LARGEST_TABLE_SKID_MARGIN: u64 = 10_000;
 
 /// The single, greppable marker emitted to stderr whenever this backend detects
@@ -216,8 +219,8 @@ pub(crate) static KEPT_PROGRAMMINGS_CHANGED_EVENTS: std::sync::Mutex<Vec<KeptPro
 const KEPT_PROGRAMMINGS_CHANGED_KEPT: usize = 1024;
 
 /// What a check of a kept event's programming found (see
-/// [`TimerImpl::check_kept_programming`] and
-/// [`TimerImpl::recheck_kept_programming`]). The programming is unchanged
+/// `TimerImpl::check_kept_programming` and
+/// `TimerImpl::recheck_kept_programming`). The programming is unchanged
 /// only if `reprogrammed` is zero and, at the stop itself, `found` is
 /// `armed`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -304,7 +307,7 @@ fn kernel_is_preempt_rt() -> bool {
                 .into_owned()
         });
         version.is_none_or(|version| version_is_preempt_rt(&version))
-            || std::fs::read_to_string("/sys/kernel/realtime")
+            || crate::launch_window::read_to_string("/sys/kernel/realtime")
                 .is_ok_and(|value| value.trim() == "1")
     })
 }
@@ -473,7 +476,7 @@ impl PmuConfig {
     /// period, and no notification can be pending, taken or lost. Closer, one
     /// of those holds as host interrupt timing decides. Using the largest
     /// margin of any processor in the PMU table,
-    /// [`LARGEST_TABLE_SKID_MARGIN`], instead of this processor's own gives a
+    /// `LARGEST_TABLE_SKID_MARGIN`, instead of this processor's own gives a
     /// stop the same outcome on every supported processor, since each
     /// processor's own point lies at or after it. A skid margin override
     /// above the table's largest raises it, so that the point still comes
@@ -506,7 +509,7 @@ impl PmuConfig {
     /// then return `true`. A non-overshoot (`rcb_actual <= rcb_target`) records
     /// nothing and returns `false`.
     ///
-    /// [`Self::attempt_single_step`]'s late-delivery guard is the sole runtime
+    /// `TimerImpl::attempt_single_step`'s late-delivery guard is the sole runtime
     /// caller, so a unit test that drives real `(actual, target)` pairs through
     /// this method exercises exactly the behaviour the supervisor runs — a
     /// genuine overshoot causes exactly one witness record — without needing a
@@ -1148,9 +1151,10 @@ impl Timer {
         task: Stopped,
         step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
-            Some(t) => t.handle_signal(task, step, observe).await,
+            Some(t) => t.handle_signal(task, step, observe, waits).await,
             None => {
                 warn!("Stray SIGSTKFLT indicates a bug!");
                 Err(HandleFailure::ImproperSignal(task))
@@ -1167,9 +1171,13 @@ impl Timer {
         unfinished: Unfinished,
         step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
-            Some(t) => t.continue_stepping(task, unfinished, step, observe).await,
+            Some(t) => {
+                t.continue_stepping(task, unfinished, step, observe, waits)
+                    .await
+            }
             // Only an initialized timer leaves anything unfinished.
             None => Err(HandleFailure::ImproperSignal(task)),
         }
@@ -2330,14 +2338,22 @@ impl TimerImpl {
         unfinished: Unfinished,
         step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match unfinished {
             Unfinished::Steps(steps) => {
                 // Steps are only interrupted, and so only continued, once the
                 // event has been decided on.
                 debug_assert_eq!(self.timer_status, EventStatus::Armed);
-                self.attempt_single_step(task, steps.steps, steps.target_instr, step, observe)
-                    .await
+                self.attempt_single_step(
+                    task,
+                    steps.steps,
+                    steps.target_instr,
+                    step,
+                    observe,
+                    waits,
+                )
+                .await
             }
             Unfinished::Notification => {
                 // The stop stands in for the notification's, which the guest
@@ -2345,7 +2361,7 @@ impl TimerImpl {
                 // instruction, so the steps start from the same clock.
                 self.tick_observed();
                 match self.timer_status {
-                    EventStatus::Armed => self.deliver(task, step, observe).await,
+                    EventStatus::Armed => self.deliver(task, step, observe, waits).await,
                     _ => {
                         self.disable_timer_before_stepping();
                         Err(HandleFailure::Cancelled(task))
@@ -2502,10 +2518,11 @@ impl TimerImpl {
         task: Stopped,
         step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         self.recheck_kept_programming();
-        // Scoped so that the siginfo, which is not Send, is not held across
-        // the await below.
+        // From libc 0.2.190 `siginfo_t` is not `Send`, so it must not be
+        // alive at the `.await` below; this block owns it.
         let controller = {
             let signal = task.getsiginfo()?;
             #[cfg(test)]
@@ -2569,7 +2586,7 @@ impl TimerImpl {
         };
 
         // At this point, we've decided that a timer event is to be delivered.
-        self.deliver(task, step, observe).await
+        self.deliver(task, step, observe, waits).await
     }
 
     /// Delivers the active event, whose notification the guest has taken or
@@ -2580,6 +2597,7 @@ impl TimerImpl {
         task: Stopped,
         step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         // Ensure any new timer signals don't mess with us while single-stepping
         self.disable_timer_before_stepping();
@@ -2617,7 +2635,7 @@ impl TimerImpl {
                     count_host_timed(|events| events.unstepped_at_target += 1);
                 }
                 let current = ClockCounter::new(ctr, 0, clock_target);
-                self.attempt_single_step(task, current, offset, step, observe)
+                self.attempt_single_step(task, current, offset, step, observe, waits)
                     .await
             }
             ActiveEvent::Imprecise { clock_min } => {
@@ -2641,6 +2659,7 @@ impl TimerImpl {
         target_instr: u64,
         step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         let target_rcb = current.target_rcb;
         // The perf interrupt can arrive *past* the target when descheduling or
@@ -2705,7 +2724,7 @@ impl TimerImpl {
                 rax: regs.rax,
                 clock: self.read_clock(),
             };
-            let wait = step(task)?.next_state().await?;
+            let wait = step(task)?.next_state_with_owner(waits).await?;
             observe(&wait)?;
             task = match wait {
                 // a successful single step results in SIGTRAP stop
@@ -4595,6 +4614,14 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn amd_family_19h_model_a0h_uses_reduced_skid_margin() {
+        let config = PmuConfig::from_family_model(0x19, 0xA0);
+        assert_eq!(config.raw_rcb_event(), 0x5100d1);
+        assert_eq!(config.skid_margin(), 1_000);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn unknown_cpu_is_unavailable_to_fallible_in_guest_clock() {
         assert_eq!(PmuConfig::try_from_family_model(0x06, 0xCF), None);
         assert_eq!(PmuConfig::try_from_family_model(0xFF, 0x01), None);
@@ -4603,7 +4630,13 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn other_amd_cpus_keep_default_skid_margin() {
-        for (family, model) in [(0x17, 0x71), (0x19, 0x61), (0x1A, 0x20)] {
+        for (family, model) in [
+            (0x17, 0x71),
+            (0x19, 0x61),
+            (0x19, 0x9F),
+            (0x19, 0xA1),
+            (0x1A, 0x20),
+        ] {
             let config = PmuConfig::from_family_model(family, model);
             assert_eq!(config.raw_rcb_event(), 0x5100d1);
             assert_eq!(config.skid_margin(), 10_000);

@@ -20,6 +20,35 @@ pub use addr::AddrSliceMut;
 pub use local::LocalMemory;
 use syscalls::Errno;
 
+/// One numeric destination in another process's address space.
+///
+/// Unlike [`io::IoSliceMut`], this forms no Rust reference to the remote
+/// address. The address is only a kernel operand for a backend that has
+/// independently authenticated the stopped target task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteIoVec {
+    address: usize,
+    length: usize,
+}
+
+impl RemoteIoVec {
+    pub fn new(address: AddrMut<u8>, length: usize) -> Result<Self, Errno> {
+        address.as_raw().checked_add(length).ok_or(Errno::EFAULT)?;
+        Ok(Self {
+            address: address.as_raw(),
+            length,
+        })
+    }
+
+    pub fn address(self) -> usize {
+        self.address
+    }
+
+    pub fn length(self) -> usize {
+        self.length
+    }
+}
+
 /// Trait for accessing potentially remote memory.
 pub trait MemoryAccess {
     /// Reads bytes from the address space. Returns the number of bytes read.
@@ -41,6 +70,30 @@ pub trait MemoryAccess {
         read_from: &[io::IoSlice],
         write_to: &mut [io::IoSliceMut],
     ) -> Result<usize, Errno>;
+
+    /// Performs one synchronous native write to the exact expected task.
+    ///
+    /// An implementation must check its actual task against `expected_tid`
+    /// before any effect, respect the target's VMA access permissions, and
+    /// return the unmodified native byte count or errno. It must not retry a
+    /// short transfer, collapse `EFAULT` to zero, or fall back to ptrace writes.
+    /// All effects must finish before return: no detached work or retained
+    /// buffer references are permitted. Remote protection keys are not proved
+    /// by this interface; the caller separately owns task-generation, mapping,
+    /// foreground and lifetime authority throughout the operation.
+    ///
+    /// Backends without this exact capability refuse without accessing memory.
+    /// An implementation may also cap the number of `remote` segments and
+    /// refuse a longer list with `E2BIG`, again without accessing memory; the
+    /// ptrace backend accepts at most two.
+    fn write_native_user_vectored(
+        &mut self,
+        _expected_tid: i32,
+        _local: &[io::IoSlice],
+        _remote: &[RemoteIoVec],
+    ) -> Result<usize, Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
 
     /// Performs a read starting at the given address. The number of bytes read
     /// is returned. The buffer is not guaranteed to be completely filled.
@@ -425,5 +478,41 @@ mod user_access_default_tests {
         }
         assert_eq!(memory.write(address, &[0; 8]), Ok(8));
         assert_eq!(memory.calls, 1);
+    }
+}
+
+#[cfg(test)]
+mod native_user_write_tests {
+    use super::*;
+
+    #[test]
+    fn native_user_write_default_refuses_without_using_ordinary_memory_access() {
+        struct Unsupported;
+        impl MemoryAccess for Unsupported {
+            fn read_vectored(
+                &self,
+                _: &[io::IoSlice],
+                _: &mut [io::IoSliceMut],
+            ) -> Result<usize, Errno> {
+                panic!("native write must not call ordinary read");
+            }
+
+            fn write_vectored(
+                &mut self,
+                _: &[io::IoSlice],
+                _: &mut [io::IoSliceMut],
+            ) -> Result<usize, Errno> {
+                panic!("native write must not call ordinary write");
+            }
+        }
+
+        let mut memory = Unsupported;
+        let local = [io::IoSlice::new(b"newbytes")];
+        let target = [0xa5; 8];
+        let remote = [RemoteIoVec::new(AddrMut::from_ptr(target.as_ptr()).unwrap(), 8).unwrap()];
+        let result = memory.write_native_user_vectored(1, &local, &remote);
+        assert_eq!(result, Err(Errno::EOPNOTSUPP));
+        assert_eq!(Errno::EOPNOTSUPP, Errno::new(libc::ENOTSUP));
+        assert_eq!(target, [0xa5; 8]);
     }
 }

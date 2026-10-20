@@ -10,6 +10,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/io_uring.h>
 #include <linux/mman.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -56,6 +57,11 @@ static void fail(const char* operation) {
 
 static void expect_eperm(long result, const char* operation) {
   if (result != -1 || errno != EPERM)
+    fail(operation);
+}
+
+static void expect_enosys(long result, const char* operation) {
+  if (result != -1 || errno != ENOSYS)
     fail(operation);
 }
 
@@ -324,6 +330,32 @@ static void test_memory_origin_guards(void) {
   close(ordinary);
 }
 
+static void test_io_uring_guards(void) {
+  // A one-entry setup with zeroed parameters is valid on a host that supports
+  // io_uring, so ENOSYS here comes from the guard, which must also not have
+  // run the setup: the kernel writes the ring geometry back into `params`.
+  struct io_uring_params params;
+  const unsigned char* bytes = (const unsigned char*)&params;
+  memset(&params, 0, sizeof(params));
+  errno = 0;
+  long result = syscall(SYS_io_uring_setup, 1, &params);
+  if (result >= 0)
+    close((int)result);
+  expect_enosys(result, "io_uring_setup");
+  for (size_t index = 0; index < sizeof(params); ++index) {
+    if (bytes[index] != 0) {
+      errno = 0;
+      fail("refused io_uring_setup wrote its parameters");
+    }
+  }
+  errno = 0;
+  expect_enosys(
+      syscall(SYS_io_uring_enter, -1, 0, 0, 0, NULL, 0), "io_uring_enter");
+  errno = 0;
+  expect_enosys(
+      syscall(SYS_io_uring_register, -1, 0, NULL, 0), "io_uring_register");
+}
+
 static uintptr_t resolve_client_symbol(const char* wanted) {
   FILE* maps = fopen("/proc/self/maps", "re");
   if (maps == NULL)
@@ -540,6 +572,7 @@ int main(void) {
   }
   test_socket_guards();
   test_memory_origin_guards();
+  test_io_uring_guards();
   test_config_guards();
   puts("evidence-guards-ok");
   return 0;

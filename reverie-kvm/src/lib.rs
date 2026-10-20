@@ -34,15 +34,25 @@ mod executor;
 mod failure;
 mod fdinfo;
 mod memory;
+pub mod native_exit_broker;
 mod proc_mounts;
 mod runtime;
 mod signal;
 mod stats;
 mod syscall;
+mod terminal_cleanup;
 mod terminal_read;
 mod timestamp;
 mod tools;
 mod vm;
+
+#[cfg(test)]
+#[path = "../tests/support/broker_library_tests.rs"]
+mod broker_library_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/alias_failure.rs"]
+mod alias_failure;
 
 pub use cpuid::CpuidPolicy;
 pub use error::Error;

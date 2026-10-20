@@ -3,11 +3,16 @@
 [package]
 name = "safeptrace"
 description = "Safe, ergonomic Rust wrappers around the Linux ptrace(2) API."
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/safeptrace"
+keywords = ["linux", "instrumentation", "hermit"]
+categories = ["development-tools::debugging", "os::linux-apis"]
 
 # `sanitized` is a Meta-internal cfg (set for sanitizer builds to skip
 # fork-based tests); declare it as a known cfg name so the open-source build
@@ -21,8 +26,8 @@ futures = { version = "0.3.31", features = ["async-await", "compat"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
-reverie-memory = { version = "0.4.0", path = "../reverie-memory", optional = true }
-reverie-process = { version = "0.4.0", path = "../reverie-process" }
+reverie-memory = { version = "0.4.1", path = "../reverie-memory", optional = true }
+reverie-process = { version = "0.4.1", path = "../reverie-process" }
 syscalls = { version = "0.6.18", features = ["serde"] }
 thiserror = "2.0.18"
 

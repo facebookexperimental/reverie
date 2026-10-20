@@ -343,6 +343,7 @@ commands! {
             "qsThreadInfo" => qsThreadInfo,
             "qSupported" => qSupported,
             "qXfer" => qXfer,
+            "T" => T,
             /* LLDB extensions */
             "qHostInfo" => qHostInfo,
             "qProcessInfo" => qProcessInfo,

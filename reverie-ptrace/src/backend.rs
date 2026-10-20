@@ -117,7 +117,176 @@ impl Backend for PtraceBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    use reverie::BackendStatsSnapshot;
+    use reverie::Guest;
+    use reverie::Pid;
+    use reverie::Subscription;
+    use reverie::Tid;
+    use reverie::syscalls::Syscall;
+
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct SyscallCount(AtomicU64, Mutex<HashSet<i32>>);
+
+    impl SyscallCount {
+        fn only_tracee_tid(&self) -> i32 {
+            let tids = self
+                .1
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(tids.len(), 1, "the control must identify its actual tracee");
+            *tids.iter().next().unwrap()
+        }
+    }
+
+    #[reverie::global_tool]
+    impl GlobalTool for SyscallCount {
+        type Config = ();
+        type Request = ();
+        type Response = ();
+
+        async fn receive_rpc(&self, _from: Pid, _request: ()) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountEverySyscall;
+
+    #[reverie::tool]
+    impl Tool for CountEverySyscall {
+        type GlobalState = SyscallCount;
+        type ThreadState = ();
+
+        fn subscriptions(_config: &()) -> Subscription {
+            Subscription::all_syscalls()
+        }
+
+        fn on_thread_state_ready(
+            &self,
+            tid: Tid,
+            global: &SyscallCount,
+            _state: &Self::ThreadState,
+        ) -> Result<(), Error> {
+            global
+                .1
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(tid.as_raw());
+            Ok(())
+        }
+
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            guest.send_rpc(()).await;
+            guest.tail_inject(syscall).await
+        }
+    }
+
+    /// Plain ptrace dispatches every syscall through a seccomp stop: none is
+    /// patched, and each stop reaches a Tool subscribed to all of them exactly
+    /// once, in whichever process made it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_record_counts_each_tool_syscall_once_per_process() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "/bin/true; :"]);
+        let (status, global, stats) =
+            PtraceBackend::run_with_stats::<CountEverySyscall>(command, ())
+                .await
+                .unwrap();
+        assert_eq!(status, ExitStatus::Exited(0));
+        let record = stats.dispatch_stats().expect("ptrace measures dispatch");
+        assert_eq!(record.inconsistencies(), Vec::<String>::new(), "{record}");
+        assert_eq!(record.backend, "ptrace");
+        assert_eq!(record.counters.patched_direct_calls, Some(0), "{record}");
+        assert_eq!(record.counters.signal_traps, Some(0), "{record}");
+        assert_eq!(record.counters.ptrace_sigtrap_stops, Some(0), "{record}");
+        assert_eq!(record.sites.patched, Some(0), "{record}");
+        assert_eq!(stats.internal_seccomp_stops(), 0, "{record}");
+        let tool_syscalls = global.0.load(Ordering::SeqCst);
+        assert!(tool_syscalls > 0);
+        assert_eq!(
+            record.counters.dispatches(),
+            Some(tool_syscalls),
+            "{record}"
+        );
+        let processes = record
+            .per_process
+            .as_ref()
+            .expect("ptrace attributes stops");
+        assert_eq!(processes.len(), 2, "the shell forked /bin/true: {record}");
+        assert_eq!(
+            processes
+                .iter()
+                .map(|process| process.counters.ptrace_seccomp_stops)
+                .sum::<Option<u64>>(),
+            record.counters.ptrace_seccomp_stops,
+            "{record}"
+        );
+    }
+
+    /// Count only this host's actual tracee, retaining any pre-exec record too.
+    fn canonicalized_count(tid: i32) -> usize {
+        let host = std::thread::current().id();
+        crate::task::CANONICALIZED_FOR_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(owner, recorded_tid)| *owner == host && *recorded_tid == tid)
+            .count()
+    }
+
+    /// A new image gets the canonical vDSO and auxv at its exec stop:
+    /// glibc's loader, asked to show the auxv, reports the canonical vDSO
+    /// address and AT_HWCAP, and the image was canonicalized exactly once.
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_execd_image_gets_the_canonical_vdso_and_auxv_once() {
+        let mut command = Command::new("/bin/true");
+        command.env("LD_SHOW_AUXV", "1");
+        let (output, global, _stats) =
+            PtraceBackend::run_with_output::<CountEverySyscall>(command, ())
+                .await
+                .unwrap();
+        assert_eq!(output.status, ExitStatus::Exited(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = |key: &str| {
+            stdout
+                .lines()
+                .find(|line| line.starts_with(key))
+                .unwrap_or_else(|| panic!("no {key} line in: {stdout}"))
+                .to_owned()
+        };
+        assert!(line("AT_SYSINFO_EHDR:").ends_with("0x14f000"), "{stdout}");
+        assert!(
+            line("AT_HWCAP:").trim_end().ends_with("78bfbfd"),
+            "{stdout}"
+        );
+        assert_eq!(canonicalized_count(global.only_tracee_tid()), 1);
+    }
+
+    /// The root's first stop comes before its exec, while its stack is still
+    /// the launcher's (here a spawned function's). It must not be read as an
+    /// initial process stack, so nothing is canonicalized for a tracee that
+    /// never execs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tracee_that_never_execs_is_not_canonicalized() {
+        let tracer = crate::tracer::spawn_fn::<CountEverySyscall, _>(|| {})
+            .await
+            .unwrap();
+        let (status, global) = tracer.wait().await.unwrap();
+        assert_eq!(status, ExitStatus::Exited(0));
+        assert_eq!(canonicalized_count(global.only_tracee_tid()), 0);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn stats_run_observes_real_tracee_activity() {

@@ -9,7 +9,7 @@
 //! Backend-agnostic driver core for the in-guest Reverie tool hosts.
 //!
 //! The e9patch and liteinst backends both host a concrete Reverie
-//! [`Tool`](reverie::Tool) in the guest address space and drive its `async`
+//! [`Tool`] in the guest address space and drive its `async`
 //! handlers to completion with a
 //! no-op waker (there is no async executor inside a `SIGSYS`-driven guest). That
 //! driver — the poll loop, the tail-injection rendezvous, and the syscall
@@ -20,7 +20,7 @@
 //!
 //! # What lives here
 //!
-//! * [`TailResult`] / [`TailAction`] / [`SyscallOutcome`] — the async-signal-safe
+//! * [`TailResult`] / `TailAction` / [`SyscallOutcome`] — the async-signal-safe
 //!   rendezvous a `tail_inject`/`inject` future uses to hand a result (or an
 //!   exit / fork-child transition) back to the synchronous driver.
 //! * [`drive_ready`] — poll a `Future` to completion with a no-op waker.

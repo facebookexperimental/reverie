@@ -371,6 +371,23 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         None
     }
 
+    /// Admission without guest-visible effects, before Tool metadata changes.
+    ///
+    /// Unenrolled requires a live exact task/process generation and grants no
+    /// descriptor authority. Admitted additionally authenticates the current,
+    /// unconsumed original callback and every raw operand. The result must not
+    /// be cached: later or rewritten injection is checked independently. The
+    /// backend may privately stage the authenticated current-image exec target
+    /// for this callback. Repeated preflight reuses its first immutable snapshot;
+    /// a new callback, cancellation, or consumption cannot reuse that authority.
+    /// Unsupported backends fail closed; this is not a default-success opt-in.
+    fn parent_death_syscall_preflight(
+        &self,
+        _call: crate::syscalls::Syscall,
+    ) -> Result<crate::ParentDeathSyscallAdmission, crate::Error> {
+        Err(crate::syscalls::Errno::ENOSYS.into())
+    }
+
     /// Authenticates the current original scalar write to backend-captured output.
     ///
     /// This read-only query returns the full callback identity only when `call`
@@ -718,6 +735,12 @@ where
         call: crate::syscalls::Write,
     ) -> Option<crate::CallbackSignalSite> {
         self.inner.captured_write_signal_site(call)
+    }
+    fn parent_death_syscall_preflight(
+        &self,
+        call: crate::syscalls::Syscall,
+    ) -> Result<crate::ParentDeathSyscallAdmission, crate::Error> {
+        self.inner.parent_death_syscall_preflight(call)
     }
     fn signal_observation_lease(&self) -> Option<crate::ParkedObservationLease> {
         self.inner.signal_observation_lease()

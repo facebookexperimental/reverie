@@ -116,6 +116,31 @@ static STEPPED_SEEN: Mutex<BTreeMap<i32, u64>> = Mutex::new(BTreeMap::new());
 /// `stepped_entries`, so the backend comparisons see exactly the events they
 /// saw before the reports existed.
 const STEPPED_ENTRY_PREFIX: &str = "stepped-entry ";
+/// RFLAGS' arithmetic status flags: CF, PF, AF, ZF, SF and OF.
+const RFLAGS_STATUS: u64 = 0x8d5;
+
+/// The root's thread-start is the SIGSTOP that the launcher's fork child
+/// raises in `traceme_and_stop`, before `execve`. Its r11 is the RFLAGS image
+/// the kernel saved at glibc's `raise` -> `tgkill`, so the status flags are
+/// whatever that libc code last computed (platform010's glibc tests the host
+/// tid there, making PF follow it); neither backend sets them, and `execve`
+/// discards them. Every other thread-start keeps its exact r11.
+fn mask_launcher_status_flags(event: String) -> String {
+    if !event.starts_with("thread-start ") {
+        return event;
+    }
+    event
+        .split(' ')
+        .map(|token| match token.strip_prefix("r11=0x") {
+            Some(hex) => format!(
+                "r11={:#x}",
+                u64::from_str_radix(hex, 16).expect("a hex r11") & !RFLAGS_STATUS
+            ),
+            None => token.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 /// The last tagged call (sequence number) each tid acted on, so that a call
 /// the kernel restarts does not send its signals again.
 static ACTED: Mutex<BTreeMap<i32, u64>> = Mutex::new(BTreeMap::new());
@@ -871,7 +896,15 @@ async fn run_p2_options(
                 .entry(names.name(pid))
                 .or_default()
                 .push(entry.to_owned()),
-            None => tool_events.entry(names.name(pid)).or_default().push(event),
+            None => {
+                let task = names.name(pid);
+                let events = tool_events.entry(task.clone()).or_default();
+                if task == "task#0" && events.is_empty() {
+                    events.push(mask_launcher_status_flags(event));
+                } else {
+                    events.push(event);
+                }
+            }
         }
     }
     let mut resume_events = BTreeMap::<String, Vec<String>>::new();

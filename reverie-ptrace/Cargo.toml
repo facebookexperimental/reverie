@@ -3,11 +3,23 @@
 [package]
 name = "reverie-ptrace"
 description = "ptrace-based execution backend for the Reverie instrumentation framework."
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
+build = "build.rs"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/reverie-ptrace"
+keywords = ["linux", "instrumentation", "hermit"]
+categories = ["development-tools::debugging", "os::linux-apis"]
+
+[features]
+default = []
+# Clear libtest's thread-local stdout/stderr capture in forked function guests.
+# Normal subprocess execution and descriptor-based capture use stable Rust.
+nightly = []
 
 [dependencies]
 anyhow = "1.0.103"
@@ -28,8 +40,8 @@ paste = "1.0.14"
 perf-event-open-sys = "5.0"
 procfs = "0.18.0"
 raw-cpuid = "10.7.0"
-reverie = { version = "0.4.0", path = "../reverie", package = "reverie-core" }
-safeptrace = { version = "0.4.0", path = "../safeptrace", features = ["memory", "notifier"] }
+reverie = { version = "0.4.1", path = "../reverie", package = "reverie-core" }
+safeptrace = { version = "0.4.1", path = "../safeptrace", features = ["memory", "notifier"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
@@ -37,6 +49,9 @@ tokio-stream = { version = "0.1.18", features = ["fs", "io-util", "net", "signal
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
 unwind = { version = "0.4.2", features = ["ptrace"] }
+
+[build-dependencies]
+pkg-config = "0.3"
 
 [dev-dependencies]
 test-case = "3.3.1"

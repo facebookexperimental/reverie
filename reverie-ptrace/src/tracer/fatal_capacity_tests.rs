@@ -33,9 +33,9 @@ pub(super) mod fatal_capacity_tests {
     enum CapacityFault {
         None,
         RetainSixOwners,
-        // Retains three owners, and each marker samples only after the bodies
+        // Retains two owners, and each marker samples only after the bodies
         // of every child created so far have dropped.
-        RetainThreeOwnersSettledSamples,
+        RetainTwoOwnersSettledSamples,
         HoldOneExitHook,
     }
 
@@ -64,7 +64,7 @@ pub(super) mod fatal_capacity_tests {
                 assert_ne!(Some(task.tid), state.root, "root registered twice");
                 let retain = match state.fault {
                     CapacityFault::RetainSixOwners => 6,
-                    CapacityFault::RetainThreeOwnersSettledSamples => 3,
+                    CapacityFault::RetainTwoOwnersSettledSamples => 2,
                     _ => 0,
                 };
                 if state.retained.len() < retain {
@@ -149,7 +149,7 @@ pub(super) mod fatal_capacity_tests {
         let completed = RETIREMENT.with(|slot| {
             let slot = slot.borrow();
             let state = slot.as_ref().unwrap();
-            if state.fault != CapacityFault::RetainThreeOwnersSettledSamples {
+            if state.fault != CapacityFault::RetainTwoOwnersSettledSamples {
                 return None;
             }
             assert_eq!(
@@ -321,9 +321,7 @@ pub(super) mod fatal_capacity_tests {
         let fault = match std::env::var("REVERIE_FATAL_CAPACITY_FAULT").as_deref() {
             Err(std::env::VarError::NotPresent) => CapacityFault::None,
             Ok("retain-six-owners") => CapacityFault::RetainSixOwners,
-            Ok("retain-three-owners-settled-samples") => {
-                CapacityFault::RetainThreeOwnersSettledSamples
-            }
+            Ok("retain-two-owners-settled-samples") => CapacityFault::RetainTwoOwnersSettledSamples,
             Ok("hold-one-exit-hook") => CapacityFault::HoldOneExitHook,
             other => panic!("unknown capacity fault: {other:?}"),
         };
@@ -631,18 +629,22 @@ pub(super) mod fatal_capacity_tests {
 
     #[test]
     fn retained_owners_with_settled_samples_falsify_steady_state_bound() {
-        // The first retained owner's two descriptors are already in the
-        // baseline. The other two owners add a pair each, so iteration 2 on
-        // and steady_fds should read baseline + 4: above +2, within +8. This
-        // fault mode samples each marker only after every child created so
-        // far has dropped its body, so no child is in flight at any sample.
+        // The first retained owner's descriptors are already in the
+        // baseline. Each further retained owner adds one retired task's
+        // descriptors: measured +4 per owner before the retained proc-mount
+        // root (f05dc8f7e) and +5 after it, so a third owner (+10) also trips
+        // the immediate +8 bound and no longer isolates the final bound.
+        // With two owners, later samples and steady_fds read baseline + 5:
+        // above +2, within +8. This fault mode samples each marker only after
+        // every child created so far has dropped its body, so no child is in
+        // flight at any sample.
         // Check the actual measurements; do not assume that accounting.
         let failure = "descriptor count did not return to the initial steady state";
         let stderr = capacity_negative_control(
             true,
-            "retain-three-owners-settled-samples",
+            "retain-two-owners-settled-samples",
             failure,
-            "capacity retirement checkpoint: registered=97, completed=96, retained=3, held_hook=false, steady_fds=Some(",
+            "capacity retirement checkpoint: registered=97, completed=96, retained=2, held_hook=false, steady_fds=Some(",
         );
         assert!(!stderr.contains("capacity rescue only:"));
         assert!(!stderr.contains("retired tasks retained descriptors"));

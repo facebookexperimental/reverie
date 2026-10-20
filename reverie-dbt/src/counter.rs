@@ -9,7 +9,7 @@
 //! A syscall-counting [`GlobalTool`] with real (non-`()`) serde state, used to
 //! validate the DBT backend's cross-process GlobalState IPC.
 //!
-//! Unlike the process-local histogram in [`crate::tools`], this global lives in
+//! Unlike the process-local histogram in `crate::tools`, this global lives in
 //! a single coordinator process (e.g. `hermit-cli`, which hosts a
 //! [`reverie_rpc_transport::RpcServer`]). Every guest process — including every
 //! `fork(2)` child — records its syscalls into this one instance over a

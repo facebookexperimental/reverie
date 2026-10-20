@@ -94,20 +94,22 @@ mod fatal_parent_kill_tests {
             )
             .await?;
         word(address, 13).store((queued + 1) as usize, Ordering::SeqCst);
-        // The siginfo is not Send, so only its fields are held across awaits.
-        let observe = |tid: Pid| {
-            let info = nix::sys::ptrace::getsiginfo(tid.into())
-                .map_err(|error| Errno::new(error as i32))?;
-            Ok::<_, Errno>((info.si_signo, info.si_code, unsafe { info.si_pid() }))
-        };
-        let (mut signo, mut code, mut pid) = observe(guest.tid())?;
+        // Only the fields are kept: from libc 0.2.190 a `siginfo_t` is not
+        // `Send`, so none may be alive at an `.await`.
+        let fields =
+            |info: libc::siginfo_t| (info.si_signo, info.si_code, unsafe { info.si_pid() });
+        let (mut signo, mut code, mut pid) = nix::sys::ptrace::getsiginfo(guest.tid().into())
+            .map(fields)
+            .map_err(|error| Errno::new(error as i32))?;
         eprintln!("forged callback first injection: queued={queued}, signo={signo}, code={code}");
         if code != (libc::PTRACE_EVENT_EXIT << 8) | libc::SIGTRAP {
             // At most one additional legal injection; no raw resume, step,
             // SETSIGINFO, second waiter, timing retry or replacement capability.
             let result = guest.inject(Getpid::new()).await?;
             word(address, 14).store(result as usize, Ordering::SeqCst);
-            (signo, code, pid) = observe(guest.tid())?;
+            (signo, code, pid) = nix::sys::ptrace::getsiginfo(guest.tid().into())
+                .map(fields)
+                .map_err(|error| Errno::new(error as i32))?;
             eprintln!(
                 "forged callback second injection: result={result}, signo={signo}, code={code}"
             );

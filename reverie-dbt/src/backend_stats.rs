@@ -483,6 +483,12 @@ impl fmt::Display for DbtBackendStatsSnapshot {
 
 impl BackendStatsSnapshot for DbtBackendStatsSnapshot {
     const BACKEND_NAME: &'static str = "dbt";
+
+    /// None: DynamoRIO translates every syscall in the code cache, which is
+    /// none of the shared record's signal, patched-call, or ptrace routes.
+    fn dispatch_stats(&self) -> Option<reverie::DispatchStats> {
+        None
+    }
 }
 
 /// Commutative accumulator that folds per-process records into one snapshot.

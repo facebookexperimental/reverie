@@ -15,14 +15,14 @@
 //! * [`seccomp`] — the trap-everything-but-the-trusted-gate BPF filter;
 //! * [`trap`] — the trusted syscall gate, the `SIGSYS` handler, and dispatcher
 //!   registration;
-//! * [`dispatch`] — the [`SyscallDispatcher`](dispatch::SyscallDispatcher) seam
-//!   and the shared fail-closed [`PassthroughDispatcher`](dispatch::PassthroughDispatcher);
+//! * [`dispatch`] — the [`SyscallDispatcher`] seam
+//!   and the shared fail-closed [`PassthroughDispatcher`];
 //! * [`fork`] — fork-following (the filter is inherited atomically; only
 //!   per-process state must be reset);
 //! * [`signal`] — signal multiplexing / reserved-signal policy;
 //! * [`sync`] — the async-signal-safe [`SpinMutex`](sync::SpinMutex) the
 //!   in-guest tool hosts use for RPC and per-thread state;
-//! * [`lifecycle`] — the [`LifecycleController`](lifecycle::LifecycleController)
+//! * [`lifecycle`] — the [`LifecycleController`]
 //!   seam that makes switching to a hybrid in-process-trap + ptrace backend an
 //!   additive change rather than a rewrite;
 //! * [`rpc`] (feature `coordinator-rpc`) — a synchronous coordinator RPC client
@@ -42,7 +42,7 @@
 //! # Two ways to use it
 //!
 //! * **As a library (`rlib`):** e9patch/liteinst embed the runtime, register a
-//!   custom [`SyscallDispatcher`](dispatch::SyscallDispatcher), and call
+//!   custom [`SyscallDispatcher`], and call
 //!   [`install`].
 //! * **As a standalone `LD_PRELOAD` (`cdylib`):** set `REVERIE_PRELOAD_TOOL` and
 //!   preload `libreverie_preload.so`; the constructor installs a built-in tool.

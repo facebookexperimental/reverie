@@ -26,6 +26,7 @@ use reverie_liteinst::BuiltinTool;
 use reverie_liteinst::COMPAT_EVENT_COOKIE_ENV;
 use reverie_liteinst::COMPAT_EVENT_FD_ENV;
 use reverie_liteinst::PreloadTool;
+use reverie_liteinst::SITE_PATCHING_ENV;
 use reverie_liteinst::SPOOF_PID;
 use reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV;
 use reverie_liteinst::configure_command;
@@ -590,6 +591,60 @@ fn compatibility_event_fd_rejects_read_only_descriptor() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Only an in-guest Tool takes the site-patching selector. Every other runtime
+/// selected from the environment must start when the variable holds the
+/// default `1`, and must refuse to start, rather than ignore it, for any other
+/// value.
+#[test]
+fn other_runtimes_refuse_site_patching_selector() {
+    fn check(mut command: Command, runtime: &str, value: &str) {
+        command.env(SITE_PATCHING_ENV, value);
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if value == "1" {
+            assert!(output.status.success(), "{runtime} {value}: {output:?}");
+            assert!(
+                !stderr.contains(SITE_PATCHING_ENV),
+                "{runtime} {value}: {stderr}"
+            );
+            return;
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(127),
+            "{runtime} {value}: {output:?}"
+        );
+        assert!(
+            stderr.contains(&format!("the {runtime} runtime does not take it")),
+            "{runtime} {value}: {stderr}"
+        );
+    }
+    for value in ["1", "0", "2"] {
+        for (tool, runtime) in [
+            (PreloadTool::Strace, "strace"),
+            (PreloadTool::Compatibility, "compat"),
+        ] {
+            let mut command = Command::new("/bin/true");
+            configure_command(&mut command, tool).unwrap();
+            check(command, runtime, value);
+        }
+        let mut command = Command::new("/bin/true");
+        configure_command_builtin(&mut command, BuiltinTool::Passthrough).unwrap();
+        check(command, "built-in Tool", value);
+        // Past the guard, the ptrace-hosted runtime stops at its tracer
+        // handshake trap, which needs the LiteInst tracer, so only the refused
+        // values run here. The accepted `1` takes the same guard as the three
+        // runtimes above.
+        if value != "1" {
+            let mut command = Command::new("/bin/true");
+            command
+                .env("LD_PRELOAD", preload_path())
+                .env("REVERIE_LITEINST_HOST_RUNTIME", "1");
+            check(command, "ptrace-hosted", value);
+        }
+    }
 }
 
 #[test]

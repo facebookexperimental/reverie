@@ -12,6 +12,19 @@
 
 //! A safe ptrace API. This API forces correct usage of ptrace in that it is
 //! not possible to call ptrace on a process not in a stopped state.
+//!
+//! With `notifier`, generic wait and exit futures retain their Send contract
+//! and require native thread pidfds (Linux 6.9 or newer). A native
+//! `PIDFD_THREAD` acquisition refusal with `EINVAL` reports this requirement
+//! to stderr on a best-effort basis and returns the same typed errno.
+//! Select the named `_on_ptracer_thread`
+//! constructors and waits to permit a retained legacy fallback. Their local
+//! wrappers are !Send and !Sync on every kernel; their Send manual drivers
+//! do not implement Future. Borrow and retain the same driver through refusal
+//! and cancellation, and progress it only on its original ptracer OS thread.
+//! The explicit mode requires procfs aligned with the caller's PID namespace;
+//! mismatched inherited mounts are refused with EXDEV. Descriptor SIGKILL
+//! remains available; exact thread SIGSTOP requires a native thread pidfd.
 #[cfg(feature = "memory")]
 mod memory;
 #[cfg(feature = "notifier")]
@@ -35,7 +48,35 @@ use syscalls::Sysno;
 use thiserror::Error;
 
 #[cfg(feature = "notifier")]
+pub use crate::notifier::ExitFuture;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::GuardedPendingStatusReservation;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PendingStatusReservation;
+#[cfg(feature = "notifier")]
 pub use crate::notifier::ProcStatError;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerCleanupDriver;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerExitDriver;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerExitFuture;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerOwnedWaitFuture;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerPendingStatusReservation;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerSyncDriver;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerSyncWait;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerTerminalCleanup;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerThreadGuard;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerWaitDriver;
+#[cfg(feature = "notifier")]
+pub use crate::notifier::PtracerWaitFuture;
 #[cfg(feature = "notifier")]
 pub use crate::notifier::StopObservationError;
 #[cfg(feature = "notifier")]
@@ -53,10 +94,41 @@ use crate::waitid::IdType;
 use crate::waitid::waitid;
 
 /// Immutable generation token carried through every typed tracee state.
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct TraceeToken {
     #[cfg(feature = "notifier")]
     event: notifier::EventHandle,
+    #[cfg(feature = "notifier")]
+    policy: notifier::WaitPolicy,
+    #[cfg(feature = "notifier")]
+    ptracer_owner: Option<std::sync::Arc<notifier::LegacyWaitOwner>>,
+    #[cfg(feature = "notifier")]
+    // Host selection alone does not authorize a wait for this generation.
+    // Retain an actual attachment/real-parent proof through later retirement.
+    ptracer_wait_role: bool,
+}
+
+impl PartialEq for TraceeToken {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "notifier")]
+        return self.event == other.event;
+        #[cfg(not(feature = "notifier"))]
+        {
+            let _ = other;
+            true
+        }
+    }
+}
+impl Eq for TraceeToken {}
+impl std::hash::Hash for TraceeToken {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        #[cfg(feature = "notifier")]
+        {
+            std::hash::Hash::hash(&self.event, state);
+        }
+        #[cfg(not(feature = "notifier"))]
+        let _ = state;
+    }
 }
 
 impl TraceeToken {
@@ -64,6 +136,12 @@ impl TraceeToken {
         Self {
             #[cfg(feature = "notifier")]
             event: notifier::EventHandle::new(),
+            #[cfg(feature = "notifier")]
+            policy: notifier::WaitPolicy::Native,
+            #[cfg(feature = "notifier")]
+            ptracer_owner: None,
+            #[cfg(feature = "notifier")]
+            ptracer_wait_role: false,
         }
     }
 
@@ -73,6 +151,12 @@ impl TraceeToken {
         Ok(Self {
             #[cfg(feature = "notifier")]
             event: notifier::EventHandle::current_or_new(pid)?,
+            #[cfg(feature = "notifier")]
+            policy: notifier::WaitPolicy::Native,
+            #[cfg(feature = "notifier")]
+            ptracer_owner: None,
+            #[cfg(feature = "notifier")]
+            ptracer_wait_role: false,
         })
     }
 
@@ -91,12 +175,60 @@ impl TraceeToken {
         Self {
             #[cfg(feature = "notifier")]
             event: notifier::EventHandle::current_or_error(pid),
+            #[cfg(feature = "notifier")]
+            policy: notifier::WaitPolicy::Native,
+            #[cfg(feature = "notifier")]
+            ptracer_owner: None,
+            #[cfg(feature = "notifier")]
+            ptracer_wait_role: false,
         }
     }
 
     #[cfg(feature = "notifier")]
     fn from_event(event: notifier::EventHandle) -> Self {
-        Self { event }
+        Self::from_event_for_policy(event, notifier::WaitPolicy::Native)
+    }
+
+    #[cfg(feature = "notifier")]
+    fn from_event_for_policy(event: notifier::EventHandle, policy: notifier::WaitPolicy) -> Self {
+        let ptracer_owner = (policy == notifier::WaitPolicy::PtracerThread)
+            .then(|| event.capture_current_ptracer_owner().ok())
+            .flatten();
+        let ptracer_wait_role = ptracer_owner.is_some();
+        Self {
+            event,
+            policy,
+            ptracer_owner,
+            ptracer_wait_role,
+        }
+    }
+
+    #[cfg(feature = "notifier")]
+    fn current_on_ptracer_thread(pid: Pid) -> Result<Self, Errno> {
+        let mut token = Self::from_event_for_policy(
+            notifier::EventHandle::current_or_new_on_ptracer_thread(pid)?,
+            notifier::WaitPolicy::PtracerThread,
+        );
+        if token.ptracer_owner.is_none() && token.event().current_tracer_pid()?.as_raw() == 0 {
+            token.ptracer_owner = Some(token.event().capture_current_constructor_owner()?);
+            // Selecting an untraced nonchild remains available for a later
+            // attachment. It grants no wait role. A positive direct-parent
+            // proof can be retained now, before the target later disappears;
+            // any refusal is rechecked by the first named wait operation.
+            token.ptracer_wait_role = token
+                .event()
+                .authenticates_wait_role(token.ptracer_owner.as_ref().unwrap())
+                .unwrap_or(false);
+        }
+        Ok(token)
+    }
+
+    fn capture_child(&self, pid: Pid) -> Result<Running, Errno> {
+        #[cfg(feature = "notifier")]
+        if self.policy == notifier::WaitPolicy::PtracerThread {
+            return Running::new_on_ptracer_thread(pid);
+        }
+        Running::from_current_or_new(pid)
     }
 
     #[cfg(feature = "notifier")]
@@ -111,15 +243,35 @@ impl TraceeToken {
     /// while the capability is still held. Once that reap has marked this
     /// generation's gate, the request fails with `ESRCH` without reaching the
     /// kernel, so it does not name a replacement task. A reap that marks no
-    /// gate lets the request through: a generation whose identity was never
-    /// captured, a bulk wait, or an order in
+    /// gate lets the request through while nothing else has marked it: a
+    /// reap while the generation is unbound, a bulk wait, or an order in
     /// <https://github.com/rrnewton/reverie/issues/860>. Without the notifier
     /// the request always runs.
     fn on_held_tid<T>(&self, request: impl FnOnce() -> Result<T, Errno>) -> Result<T, Errno> {
         #[cfg(feature = "notifier")]
+        if let Some(error) = self.event.initial_capture_error() {
+            return Err(error);
+        }
+        #[cfg(feature = "notifier")]
         let Some(_held) = self.event.hold_tid() else {
             return Err(Errno::ESRCH);
         };
+        #[cfg(feature = "notifier")]
+        if self.policy == notifier::WaitPolicy::PtracerThread {
+            // A retained task generation cannot make a copied numeric PID
+            // meaningful in another host task or PID namespace. Use this
+            // token's original owner; never recapture one from the number.
+            let owner = self.ptracer_owner.as_ref().ok_or(Errno::EPERM)?;
+            if !owner.is_current()? {
+                return Err(Errno::EPERM);
+            }
+            // Nonleader exec can release its former TID before an
+            // unregistered Event has any reaper to close the gate. Refuse
+            // an already-retired retained target before a numeric request
+            // can address its replacement. This is a lifetime precheck,
+            // not an atomic descriptor-valued ptrace operation.
+            self.event.check_numeric_target_lifetime(owner)?;
+        }
         request()
     }
 }
@@ -246,7 +398,7 @@ impl Event {
                 notifier::register_new_child_for_test_cleanup(task.1.event(), child_pid)?;
                 Ok(Self::NewChild(
                     ChildOp::Fork,
-                    Running::from_current_or_new(child_pid)?,
+                    task.1.capture_child(child_pid)?,
                 ))
             }
             libc::PTRACE_EVENT_VFORK => {
@@ -257,7 +409,7 @@ impl Event {
                 notifier::register_new_child_for_test_cleanup(task.1.event(), child_pid)?;
                 Ok(Self::NewChild(
                     ChildOp::Vfork,
-                    Running::from_current_or_new(child_pid)?,
+                    task.1.capture_child(child_pid)?,
                 ))
             }
             libc::PTRACE_EVENT_CLONE => {
@@ -268,7 +420,7 @@ impl Event {
                 notifier::register_new_child_for_test_cleanup(task.1.event(), child_pid)?;
                 Ok(Self::NewChild(
                     ChildOp::Clone,
-                    Running::from_current_or_new(child_pid)?,
+                    task.1.capture_child(child_pid)?,
                 ))
             }
             libc::PTRACE_EVENT_EXEC => {
@@ -465,6 +617,8 @@ impl Wait {
     }
 
     fn from_raw_with_token(pid: Pid, status: i32, token: TraceeToken) -> Result<Self, Error> {
+        #[cfg(feature = "notifier")]
+        token.event().invalidate_numeric_auth();
         Ok(if libc::WIFEXITED(status) {
             Wait::Exited(pid, ExitStatus::Exited(libc::WEXITSTATUS(status)))
         } else if libc::WIFSIGNALED(status) {
@@ -603,16 +757,77 @@ impl TraceeGeneration {
         self.0
     }
 
+    /// Retains a passive descriptor/observation facade for this generation.
+    /// This does not register a worker, recapture the numeric PID, or grant a
+    /// stopped capability. Registration starts on a later explicit request.
+    #[cfg(feature = "notifier")]
+    pub fn terminal_cleanup(&self) -> TerminalCleanup {
+        TerminalCleanup::new_unregistered(self.0, &self.1)
+    }
+
+    /// Retains this token's host anchor, or binds the current controller host
+    /// through the generation's original proc mount when none was captured.
+    /// This selects only a host thread; it grants no attachment or wait role.
+    /// Bind before callbacks or suspension, then keep that same guard rather
+    /// than capturing another after a foreign poll, error or cancellation.
+    #[cfg(feature = "notifier")]
+    pub fn ptracer_thread_guard(&self) -> Result<PtracerThreadGuard, Errno> {
+        if let Some(error) = self.1.event().initial_capture_error() {
+            return Err(error);
+        }
+        match &self.1.ptracer_owner {
+            Some(owner) => Ok(PtracerThreadGuard::from_owner(owner.clone())),
+            None => self.1.event().capture_host_thread_guard(),
+        }
+    }
+
+    /// Returns an existing host anchor only when this token already retains
+    /// a positive wait-role witness for its original generation.
+    ///
+    /// This passive accessor captures nothing and does not check the current
+    /// attachment or upgrade a constructor-only role. Authenticate a returned
+    /// guard with [`PtracerThreadGuard::check_current`] before controller use.
+    /// It remains the same host anchor after genuine target retirement.
+    #[cfg(feature = "notifier")]
+    pub fn retained_ptracer_thread_guard(&self) -> Result<Option<PtracerThreadGuard>, Errno> {
+        if let Some(error) = self.1.event().initial_capture_error() {
+            return Err(error);
+        }
+        Ok(self
+            .1
+            .ptracer_wait_role
+            .then(|| self.1.ptracer_owner.clone())
+            .flatten()
+            .map(PtracerThreadGuard::from_owner))
+    }
+
+    /// Binds a controller host only after proving its current wait role for
+    /// this original live generation. The proof requires the actual ptracer
+    /// TID, or the real parent TGID for an untraced descriptor waiter.
+    ///
+    /// Use this fallible cold binder before callbacks or suspension when no
+    /// previously bound controller guard is available. Retain the same guard
+    /// thereafter, including for children and terminal results. A refusal
+    /// registers no worker and leaves this generation available for its real
+    /// owner; a retired task cannot supply a missing controller anchor.
+    #[cfg(feature = "notifier")]
+    pub fn ptracer_thread_guard_for_wait(&self) -> Result<PtracerThreadGuard, Errno> {
+        let guard = self.ptracer_thread_guard()?;
+        guard.check_wait_role(self.1.event())?;
+        Ok(guard)
+    }
+
     /// Creates a stopped state for this generation. Like
     /// [`Stopped::new_unchecked`], the caller must independently know that the
     /// tracee is stopped. Unlike it, with the `notifier` feature and once this
     /// generation's identity has been captured, requests through the result
     /// are refused once the notifier or [`Running::wait`] reaps this
     /// generation, even if another task has reused the TID. Without that
-    /// feature, or for a generation whose identity could not be captured,
-    /// requests go to the numeric TID unchecked. A reap through [`wait_all`],
-    /// [`try_wait_all`] or [`wait_group`], and the registration orders in
-    /// <https://github.com/rrnewton/reverie/issues/860>, do not refuse them yet.
+    /// feature, or while the generation is unbound because its identity could
+    /// not be captured, requests go to the numeric TID unchecked. A reap
+    /// through [`wait_all`], [`try_wait_all`] or [`wait_group`], and the
+    /// registration orders in <https://github.com/rrnewton/reverie/issues/860>,
+    /// do not refuse them yet.
     pub fn assume_stopped(&self) -> Stopped {
         Stopped::from_token(self.0, self.1.clone())
     }
@@ -705,6 +920,13 @@ impl Stopped {
         notifier::ExitFuture::new(self.0, &self.1)
     }
 
+    /// Observes this exact exit epoch using the explicit ptracer-thread mode.
+    /// The new interface is !Send and !Sync, including on native kernels.
+    #[cfg(feature = "notifier")]
+    pub fn exit_event_on_ptracer_thread(&self) -> PtracerExitFuture {
+        PtracerExitFuture::new(self.0, &self.1)
+    }
+
     /// Returns a generation-bound terminal cleanup acknowledgment.
     ///
     /// This is primarily useful with [`Stopped::new_unchecked`] during
@@ -713,6 +935,14 @@ impl Stopped {
     #[cfg(feature = "notifier")]
     pub fn terminal_cleanup(&self) -> TerminalCleanup {
         TerminalCleanup::new(self.0, &self.1)
+    }
+
+    /// Retains explicit ptracer-thread progress for this same stopped state.
+    /// Its separate shared facade performs only descriptor signaling and
+    /// observation; construction never recaptures this numeric identity.
+    #[cfg(feature = "notifier")]
+    pub fn terminal_cleanup_on_ptracer_thread(&self) -> PtracerTerminalCleanup {
+        PtracerTerminalCleanup::new(self.0, &self.1)
     }
 
     /// Retain a read-only observer for this actual token and its current exec epoch.
@@ -744,6 +974,17 @@ impl Stopped {
     #[cfg(feature = "notifier")]
     pub fn try_new_current_unchecked(pid: Pid) -> Result<Self, Errno> {
         Ok(Self::from_token(pid, TraceeToken::current_or_new(pid)?))
+    }
+
+    /// Captures the original identity for explicit ptracer-thread waits.
+    /// Like [`Self::new_unchecked`], the caller must prove this exact task is
+    /// physically stopped. Capture failures return without an unbound token.
+    #[cfg(feature = "notifier")]
+    pub fn new_unchecked_on_ptracer_thread(pid: Pid) -> Result<Self, Errno> {
+        Ok(Self::from_token(
+            pid,
+            TraceeToken::current_on_ptracer_thread(pid)?,
+        ))
     }
 
     fn from_token(pid: Pid, token: TraceeToken) -> Self {
@@ -788,7 +1029,7 @@ impl Stopped {
     /// ESRCH and the child is never captured. The refusal names the queued
     /// status instead. This makes no ptrace request and changes no queue; a
     /// prefix holding such a stop is also never retired (see
-    /// [`Stopped::retire_statuses_before_exit_stop`]). Always succeeds on any
+    /// `Stopped::retire_statuses_before_exit_stop`). Always succeeds on any
     /// other capability.
     #[cfg(feature = "notifier")]
     pub fn superseded_new_child(&self) -> Result<(), SupersededStopRefusal> {
@@ -801,6 +1042,8 @@ impl Stopped {
     /// Converts this capability into the running state after a successful
     /// ptrace request moved the tracee out of its stop.
     fn into_running(self) -> Running {
+        #[cfg(feature = "notifier")]
+        self.1.event().invalidate_numeric_auth();
         self.retire_statuses_before_exit_stop();
         Running::from_token(self.0, self.1)
     }
@@ -854,10 +1097,13 @@ impl Stopped {
             })
             .map_err(|err| self.map_err(err))?;
 
-        // PTRACE_GETREGSET modifies the length to the real length of the
-        // registers, but we should already know the exact number of registers
-        // for this architecture.
-        debug_assert_eq!(iov.iov_len, core::mem::size_of_val(&regs));
+        // GETREGSET selects the target's ABI, which may differ from the
+        // tracer's (for example, a compat PRSTATUS reply is shorter). Require
+        // the entire typed layout in every build before assuming initialization.
+        // Zero-filling the tail would not make a short reply a valid native ABI.
+        if iov.iov_len != core::mem::size_of_val(&regs) {
+            return Err(Error::Errno(Errno::EPROTO));
+        }
 
         Ok(unsafe { regs.assume_init() })
     }
@@ -1000,6 +1246,14 @@ impl Stopped {
     #[cfg(feature = "notifier")]
     pub fn wait_owned(self) -> notifier::OwnedWaitFuture {
         notifier::OwnedWaitFuture::from_stopped(self)
+    }
+
+    /// Transfers this same stopped state into an explicit ptracer-thread wait.
+    /// Non-owning refusals retain the original state for retry or return to
+    /// its ptracer through [`PtracerOwnedWaitFuture::into_driver`].
+    #[cfg(feature = "notifier")]
+    pub fn wait_owned_on_ptracer_thread(self) -> PtracerOwnedWaitFuture {
+        PtracerOwnedWaitFuture::from_stopped(self)
     }
 
     pub(crate) fn finish_retained_resume(
@@ -1366,10 +1620,30 @@ impl Running {
     /// of them stops reaching the TID once the notifier or [`Running::wait`]
     /// reaps that task, except in the orders listed in
     /// <https://github.com/rrnewton/reverie/issues/860>. If the identity
-    /// cannot be captured, the state gets a fresh generation that no reap
-    /// gates.
+    /// cannot be captured, the state gets a fresh, unbound generation, which
+    /// no reap gates until a later registration binds it.
     pub fn new(pid: Pid) -> Self {
         Self::from_token(pid, TraceeToken::current_or_fresh(pid))
+    }
+
+    /// Captures a running generation using the generic native thread-pidfd
+    /// interface and returns its exact acquisition error. This preserves the
+    /// same sibling-pollable contract as [`Self::new`] and enables no legacy
+    /// fallback.
+    #[cfg(feature = "notifier")]
+    pub fn try_new(pid: Pid) -> Result<Self, Errno> {
+        Self::from_current_or_new(pid)
+    }
+
+    /// Captures this original generation for explicit ptracer-thread waits.
+    /// Only this named mode enables the retained legacy fallback when
+    /// PIDFD_THREAD is unavailable. A failed capture returns no unbound state.
+    #[cfg(feature = "notifier")]
+    pub fn new_on_ptracer_thread(pid: Pid) -> Result<Self, Errno> {
+        Ok(Self::from_token(
+            pid,
+            TraceeToken::current_on_ptracer_thread(pid)?,
+        ))
     }
 
     fn from_token(pid: Pid, token: TraceeToken) -> Self {
@@ -1380,13 +1654,24 @@ impl Running {
         Ok(Self::from_token(pid, TraceeToken::current_or_new(pid)?))
     }
 
+    fn newly_attached(pid: Pid) -> Self {
+        let running = Self::new(pid);
+        #[cfg(feature = "notifier")]
+        return Self::from_token(
+            pid,
+            TraceeToken::from_event(running.1.event().reconnect_attachment(pid)),
+        );
+        #[cfg(not(feature = "notifier"))]
+        running
+    }
+
     /// Attaches to a running process. The process becomes a tracee and a SIGSTOP
     /// is sent to it. By the time this function ends, the tracee may not yet
     /// have actually stopped. Thus, the tracee is still considered to be in a
     /// running state and needs to be waited upon to observe the SIGSTOP.
     pub fn attach(pid: Pid) -> Result<Self, Errno> {
         ptrace::attach(pid.into()).map_err(|err| Errno::new(err as i32))?;
-        Ok(Self::new(pid))
+        Ok(Self::newly_attached(pid))
     }
 
     /// Similar to attach, but does not stop the process. This also affects the
@@ -1396,7 +1681,49 @@ impl Running {
     /// Unlike other modes, a seized process can also accept interrupts.
     pub fn seize(pid: Pid, options: Options) -> Result<Self, Errno> {
         ptrace::seize(pid.into(), options).map_err(|err| Errno::new(err as i32))?;
-        Ok(Self::new(pid))
+        Ok(Self::newly_attached(pid))
+    }
+
+    /// Attaches, then captures the task that the atomic ptrace request owns.
+    /// If that first exact capture is refused, the successful attachment is
+    /// retained in the returned state with its original errno. Local waits
+    /// refuse that unbound state without capturing a replacement generation.
+    #[cfg(feature = "notifier")]
+    pub fn attach_on_ptracer_thread(pid: Pid) -> Result<Self, Errno> {
+        let owner = notifier::EventHandle::capture_current_host_owner()?;
+        let original = notifier::AttachmentAnchor::capture(pid)?;
+        ptrace::attach(pid.into()).map_err(nix_errno)?;
+        #[cfg(test)]
+        notifier::after_initial_attachment_for_test(pid, &original);
+        let mut token = TraceeToken::from_event_for_policy(
+            notifier::EventHandle::attachment_on_ptracer_thread(pid, &original),
+            notifier::WaitPolicy::PtracerThread,
+        );
+        token.ptracer_owner = Some(owner);
+        // attachment_on_ptracer_thread validated the same retained original
+        // generation after the successful atomic request. A later transient
+        // host lookup cannot erase that established attachment role.
+        token.ptracer_wait_role = token.event().initial_capture_error().is_none();
+        Ok(Self::from_token(pid, token))
+    }
+
+    /// Seizes, then captures the task actually owned by that ptrace request.
+    /// Capture refusals retain the successful attached state as described by
+    /// [`Self::attach_on_ptracer_thread`]; no later local recapture is allowed.
+    #[cfg(feature = "notifier")]
+    pub fn seize_on_ptracer_thread(pid: Pid, options: Options) -> Result<Self, Errno> {
+        let owner = notifier::EventHandle::capture_current_host_owner()?;
+        let original = notifier::AttachmentAnchor::capture(pid)?;
+        ptrace::seize(pid.into(), options).map_err(nix_errno)?;
+        #[cfg(test)]
+        notifier::after_initial_attachment_for_test(pid, &original);
+        let mut token = TraceeToken::from_event_for_policy(
+            notifier::EventHandle::attachment_on_ptracer_thread(pid, &original),
+            notifier::WaitPolicy::PtracerThread,
+        );
+        token.ptracer_owner = Some(owner);
+        token.ptracer_wait_role = token.event().initial_capture_error().is_none();
+        Ok(Self::from_token(pid, token))
     }
 
     /// Interrupts the running process, even if it is in the middle of a syscall.
@@ -1406,6 +1733,11 @@ impl Running {
     /// # Limitations
     ///
     /// This only works for processes being traced via `Running::seize`.
+    /// The request addresses a numeric TID. A concurrent nonleader exec can
+    /// release that TID and allow a same-ptracer replacement to receive the
+    /// request, including after an explicit interface's lifetime precheck.
+    /// Native thread pidfds do not make this ptrace request atomic. See
+    /// <https://github.com/rrnewton/reverie/issues/860>.
     pub fn interrupt(&self) -> Result<(), Errno> {
         // nix doesn't provide `ptrace::interrupt` yet, so we need to roll our
         // own.
@@ -1425,6 +1757,13 @@ impl Running {
     /// Returns the pid of the running process.
     pub fn pid(&self) -> Pid {
         self.0
+    }
+
+    /// Retains this exact task generation without granting a ptrace request.
+    /// The caller must independently establish a real stop before using
+    /// [`TraceeGeneration::assume_stopped`].
+    pub fn generation(&self) -> TraceeGeneration {
+        TraceeGeneration(self.0, self.1.clone())
     }
 
     /// Blocks until a state change occurs. This may transition the process to
@@ -1449,6 +1788,14 @@ impl Running {
                 Wait::from_wait_status_with_token(status.unwrap(), token)
             })
         }
+    }
+
+    /// Creates a retaining synchronous wait for this exact ptracer thread.
+    /// Its explicit wait operation permits the legacy descriptor mode and
+    /// keeps the same original input on a foreign-thread or backend refusal.
+    #[cfg(feature = "notifier")]
+    pub fn wait_sync_on_ptracer_thread(self) -> PtracerSyncWait {
+        PtracerSyncWait::new(self)
     }
 
     /// Like `wait`, but filters out events we don't care about by resuming the
@@ -1498,11 +1845,25 @@ impl Running {
         notifier::ExitFuture::new(self.0, &self.1)
     }
 
+    /// Waits for this same exit epoch in the explicit ptracer-thread mode.
+    /// The returned future is !Send and !Sync on every supported kernel.
+    #[cfg(feature = "notifier")]
+    pub fn exit_event_on_ptracer_thread(&self) -> PtracerExitFuture {
+        PtracerExitFuture::new(self.0, &self.1)
+    }
+
     /// Registers this process with the async notifier and returns a bounded
     /// synchronous acknowledgment handle for terminal cleanup.
     #[cfg(feature = "notifier")]
     pub fn terminal_cleanup(&self) -> TerminalCleanup {
         TerminalCleanup::new(self.0, &self.1)
+    }
+
+    /// Retains explicit ptracer-thread cleanup for this original generation.
+    /// The returned progressing facade is !Send and !Sync on every kernel.
+    #[cfg(feature = "notifier")]
+    pub fn terminal_cleanup_on_ptracer_thread(&self) -> PtracerTerminalCleanup {
+        PtracerTerminalCleanup::new(self.0, &self.1)
     }
 
     /// Transfers this generation into an owned notifier wait.
@@ -1516,6 +1877,22 @@ impl Running {
     #[cfg(feature = "notifier")]
     pub fn wait_owned(self) -> notifier::OwnedWaitFuture {
         notifier::OwnedWaitFuture::new(self)
+    }
+
+    /// Transfers this original generation into an explicit owner-thread wait.
+    /// Every refusal preserves that same state; no numeric recapture occurs.
+    #[cfg(feature = "notifier")]
+    pub fn wait_owned_on_ptracer_thread(self) -> PtracerOwnedWaitFuture {
+        PtracerOwnedWaitFuture::new(self)
+    }
+
+    /// Waits through the explicitly selected ptracer-thread interface.
+    /// This has the retained, non-owning error contract of
+    /// [`Self::wait_owned_on_ptracer_thread`], rather than a sibling-pollable
+    /// generic future. Use the explicit constructor before first capture.
+    #[cfg(feature = "notifier")]
+    pub fn next_state_on_ptracer_thread(self) -> PtracerWaitFuture {
+        self.wait_owned_on_ptracer_thread()
     }
 
     /// Like `wait`, but wait asynchronously for the next state change.
@@ -1546,6 +1923,12 @@ impl Zombie {
         self.0.pid()
     }
 
+    /// Retains this zombie's original generation without capturing a target
+    /// or registering another wait owner.
+    pub fn generation(&self) -> TraceeGeneration {
+        self.0.generation()
+    }
+
     /// Transfers the original generation into a retained notifier wait.
     ///
     /// The same retry contract as [`Running::wait_owned`] applies. A subsequent
@@ -1554,6 +1937,12 @@ impl Zombie {
     #[cfg(feature = "notifier")]
     pub fn wait_owned(self) -> notifier::OwnedWaitFuture {
         self.0.wait_owned()
+    }
+
+    /// Retains this same zombie generation in an explicit ptracer-thread wait.
+    #[cfg(feature = "notifier")]
+    pub fn wait_owned_on_ptracer_thread(self) -> PtracerOwnedWaitFuture {
+        self.0.wait_owned_on_ptracer_thread()
     }
 
     /// Reaps the zombie by waiting for it to fully exit.
@@ -1702,6 +2091,87 @@ mod test {
             Wait::Exited(pid, ExitStatus::Exited(42))
         );
 
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    const PRSTATUS_BYTES: usize = core::mem::size_of::<libc::user_regs_struct>();
+    #[cfg(target_arch = "x86_64")]
+    const PRSTATUS_CS: usize = core::mem::offset_of!(libc::user_regs_struct, cs);
+
+    // Independent raw observation: this deliberately does not call
+    // Stopped::getregs or any decoder that assumes a native reply size.
+    #[cfg(target_arch = "x86_64")]
+    fn raw_prstatus(tid: i32) -> Result<([u8; PRSTATUS_BYTES], usize), Errno> {
+        let mut bytes = [0xa5u8; PRSTATUS_BYTES];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        Errno::result(unsafe {
+            libc::ptrace(
+                libc::PTRACE_GETREGSET,
+                tid,
+                libc::NT_PRSTATUS as usize as *mut libc::c_void,
+                &mut iov as *mut libc::iovec,
+            )
+        })?;
+        Ok((bytes, iov.iov_len))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_native_prstatus(tid: i32, bytes: &[u8; PRSTATUS_BYTES]) -> Result<(), Errno> {
+        // On x86-64, PTRACE_SETREGS uses the native tracer layout even when the
+        // stopped target's current CS selects compat GETREGSET. This permits
+        // exact restoration without executing a single instruction in compat
+        // mode.
+        Errno::result(unsafe {
+            libc::ptrace(
+                libc::PTRACE_SETREGS,
+                tid,
+                std::ptr::null_mut::<libc::c_void>(),
+                bytes.as_ptr(),
+            )
+        })
+        .map(|_| ())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn generic_getregs_refuses_actual_compat_and_restores()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(|| 42, Options::PTRACE_O_EXITKILL)?;
+        let tid = pid.as_raw();
+        let (original, length) = raw_prstatus(tid)?;
+        assert_eq!(length, PRSTATUS_BYTES);
+        assert_eq!(tracee.getregs()?.cs, 0x33);
+        let mut compat = original;
+        compat[PRSTATUS_CS..PRSTATUS_CS + 8].copy_from_slice(&0x23u64.to_ne_bytes());
+        set_native_prstatus(tid, &compat)?;
+        let (reply, length) = raw_prstatus(tid)?;
+        assert_eq!(length, 68, "actual short kernel PRSTATUS, never a mock");
+        assert_eq!(u16::from_ne_bytes(reply[52..54].try_into().unwrap()), 0x23);
+        assert!(reply[length..].iter().all(|byte| *byte == 0xa5));
+
+        // The fixed generic API must refuse before constructing Regs. Restore
+        // the native registers before asserting, so the child can exit
+        // normally. (Before the fix, debug builds panicked on the length
+        // assertion and release builds constructed Regs from 148
+        // uninitialized bytes.)
+        let result = tracee.getregs();
+        set_native_prstatus(tid, &original)?;
+        let (restored, length) = raw_prstatus(tid)?;
+        assert_eq!(length, PRSTATUS_BYTES);
+        assert_eq!(restored, original);
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::EPROTO))),
+            "{result:?}"
+        );
+        assert_eq!(tracee.getregs()?.cs, 0x33);
+        assert_eq!(
+            tracee.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(42))
+        );
         Ok(())
     }
 

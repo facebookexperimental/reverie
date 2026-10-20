@@ -81,14 +81,38 @@ pub struct GuestStack {
 }
 
 impl GuestStack {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserve the Native constructor; production callbacks retain their existing stopped capability."
+        )
+    )]
     pub fn new(pid: Pid, flag: Arc<AtomicBool>) -> Result<Self, TraceError> {
-        let token = match StackToken::acquire(flag) {
+        let token = Self::checkout(flag);
+        Self::from_stopped(Stopped::new_unchecked(pid), token)
+    }
+
+    /// Retain the task's original generation and ptracer-thread authority.
+    /// The caller supplies its already stopped capability, without a new PID lookup.
+    pub(crate) fn new_on_ptracer_thread(
+        task: Stopped,
+        flag: Arc<AtomicBool>,
+    ) -> Result<Self, TraceError> {
+        let token = Self::checkout(flag);
+        Self::from_stopped(task, token)
+    }
+
+    fn checkout(flag: Arc<AtomicBool>) -> StackToken {
+        match StackToken::acquire(flag) {
             Some(token) => token,
             None => panic!(
                 "Invariant violation, cannot retrieve handle on guest Stack when there is already a StackGuard still alive."
             ),
-        };
-        let task = Stopped::new_unchecked(pid);
+        }
+    }
+
+    fn from_stopped(task: Stopped, token: StackToken) -> Result<Self, TraceError> {
         // If the register read fails, `token` is dropped on this early return and
         // the flag is released, so a later retry on the same task is not poisoned.
         let rsp = task.getregs()?.stack_ptr() as usize;
@@ -225,6 +249,8 @@ pub unsafe fn transmute_u64s<T: Sized>(value: T) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("stack_owner_tests.rs");
 
     #[test]
     fn user_copy_stack_forwarder_enforces_permissions_and_exact_prefix() {

@@ -55,13 +55,6 @@ pub(crate) struct MappingGeneration(u64);
 impl MappingGeneration {
     pub(crate) const INITIAL: Self = Self(0);
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the mapping publisher is deliberately non-activating"
-        )
-    )]
     fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
     }
@@ -323,15 +316,11 @@ struct Member {
 
 struct State {
     admission: Admission,
+    // An ordinary shared-file image is supported only by its existing vCPU.
+    // A quiescent close reserves this before any mapping can be installed.
+    single_member_domain: bool,
     generation: MappingGeneration,
     next_member: u64,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "The private unchanged-mapping close protocol has no production closer yet"
-        )
-    )]
     next_close: u64,
     members: BTreeMap<u64, Member>,
     copies: usize,
@@ -418,13 +407,6 @@ impl State {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "The private unchanged-mapping close protocol has no production closer yet"
-        )
-    )]
     fn stopped(&self) -> bool {
         self.copies == 0
             && self
@@ -527,6 +509,7 @@ impl EntryGate {
             prepare_probe: Mutex::new(None),
             state: Mutex::new(State {
                 admission: Admission::Open,
+                single_member_domain: false,
                 generation: MappingGeneration::INITIAL,
                 next_member: 0,
                 next_close: 0,
@@ -600,30 +583,45 @@ impl EntryGate {
     }
 
     /// Registration while closed is allowed, but grants no entry or access.
+    /// The ordinary shared-file domain is the exception: its existing member
+    /// is exclusive, and bypassing the syscall-level refusal is terminal.
     pub(crate) fn register(self: &Arc<Self>) -> GateResult<Participant> {
         let result = {
             let mut state = self.state.lock().unwrap();
             state.check()?;
-            match state.next_member.checked_add(1) {
-                Some(id) => {
-                    state.next_member = id;
-                    state.members.insert(
-                        id,
-                        Member {
-                            run: 0,
-                            generation: None,
-                            activity: Activity::Stopped,
-                            origin: EntryOrigin::default(),
-                        },
-                    );
-                    Ok(Participant {
-                        gate: self.clone(),
-                        id,
-                        #[cfg(test)]
-                        prepare_probe: None,
-                    })
+            if state.single_member_domain
+                && (state.admission != Admission::Open || !state.members.is_empty())
+            {
+                Err(state.fail(
+                    None,
+                    protocol_failure(
+                        "ordinary shared-file domain permits only its existing stopped participant",
+                    ),
+                ))
+            } else {
+                match state.next_member.checked_add(1) {
+                    Some(id) => {
+                        state.next_member = id;
+                        state.members.insert(
+                            id,
+                            Member {
+                                run: 0,
+                                generation: None,
+                                activity: Activity::Stopped,
+                                origin: EntryOrigin::default(),
+                            },
+                        );
+                        Ok(Participant {
+                            gate: self.clone(),
+                            id,
+                            #[cfg(test)]
+                            prepare_probe: None,
+                        })
+                    }
+                    None => {
+                        Err(state.fail(None, protocol_failure("participant identity exhausted")))
+                    }
                 }
-                None => Err(state.fail(None, protocol_failure("participant identity exhausted"))),
             }
         };
         if result.is_err() {
@@ -631,6 +629,59 @@ impl EntryGate {
             notify(sender);
         }
         result
+    }
+
+    /// Quietly inspect the capability restriction before a fork or snapshot
+    /// can create a new participant or copy a shared-file image.
+    pub(crate) fn single_member_domain_active(&self) -> bool {
+        self.state.lock().unwrap().single_member_domain
+    }
+
+    /// Close synchronously only when the sole participant is already stopped
+    /// and no copy or retained host pointer exists. Unlike `try_close`, this
+    /// never interrupts, waits, or notifies: `None` changes no state. Callers
+    /// can therefore retain their allocation transaction during admission and
+    /// construct any capability failure after releasing that transaction.
+    ///
+    /// The domain reservation and member check occur under the same lock, so
+    /// registration cannot slip between the check and the first file mapping.
+    pub(crate) fn try_close_quiescent_single(self: &Arc<Self>) -> GateResult<Option<Closed>> {
+        self.try_close_quiescent_members(1)
+    }
+
+    /// Publish into an unexecuted arena without fabricating a stopped vCPU.
+    /// This has the same copy, retained-pointer and domain checks as the live
+    /// single-member path, but requires that no participant exists at all.
+    /// The first real participant can register only after this close reopens.
+    pub(crate) fn try_close_quiescent_unattached(self: &Arc<Self>) -> GateResult<Option<Closed>> {
+        self.try_close_quiescent_members(0)
+    }
+
+    fn try_close_quiescent_members(self: &Arc<Self>, members: usize) -> GateResult<Option<Closed>> {
+        let mut state = self.state.lock().unwrap();
+        state.check()?;
+        if state.admission != Admission::Open
+            || state.members.len() != members
+            || !state.stopped()
+            || state.retained_operands != 0
+            || state.generation.next().is_none()
+        {
+            return Ok(None);
+        }
+        let Some(id) = state.next_close.checked_add(1) else {
+            return Ok(None);
+        };
+        let previous_domain = state.single_member_domain;
+        state.next_close = id;
+        state.admission = Admission::Closed(id);
+        state.single_member_domain = true;
+        Ok(Some(Closed {
+            gate: self.clone(),
+            id,
+            published: false,
+            previous_domain: Some(previous_domain),
+            published_domain: true,
+        }))
     }
 
     pub(crate) fn try_copy(
@@ -690,6 +741,7 @@ impl EntryGate {
             gate: self.clone(),
             origin,
             generation: state.generation,
+            retired: false,
         })
     }
 
@@ -1122,19 +1174,80 @@ pub(crate) struct CopyAccess {
     gate: Arc<EntryGate>,
     origin: EntryOrigin,
     generation: MappingGeneration,
+    retired: bool,
 }
 
-impl Drop for CopyAccess {
-    fn drop(&mut self) {
-        let sender = {
+impl CopyAccess {
+    /// Retire the actual access now, while deferring every notification and
+    /// the issuing context's destruction until the caller releases its locks.
+    /// The returned token owns no memory or allocation transaction.
+    pub(crate) fn retire_deferred(mut self) -> CopyRetirement {
+        let change = self.retire();
+        CopyRetirement {
+            change: Some(change),
+            origin: Some(std::mem::take(&mut self.origin)),
+            _gate: self.gate.clone(),
+        }
+    }
+
+    fn retire(&mut self) -> ChangeSignal {
+        assert!(!self.retired, "copy retired twice");
+        {
             let mut state = self.gate.state.lock().unwrap();
             if std::thread::panicking() {
                 state.fail(self.origin.clone(), protocol_failure("host copy unwound"));
             }
             state.copies = state.copies.checked_sub(1).expect("copy retired twice");
+            self.retired = true;
             state.changed()
-        };
-        notify(sender);
+        }
+    }
+}
+
+impl Drop for CopyAccess {
+    fn drop(&mut self) {
+        if !self.retired {
+            notify(self.retire());
+        }
+    }
+}
+
+/// Linear notification ownership after a copy's count has already retired.
+/// Dropping an unqueued token remains safe and notifies as a fallback; a caller
+/// holding memory locks must retain the token until after releasing them.
+pub(crate) struct CopyRetirement {
+    change: Option<ChangeSignal>,
+    origin: Option<EntryOrigin>,
+    _gate: Arc<EntryGate>,
+}
+
+impl std::fmt::Debug for CopyRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CopyRetirement")
+            .field("notification_pending", &self.change.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CopyRetirement {
+    pub(crate) fn notify(mut self) {
+        self.notify_pending();
+    }
+
+    fn notify_pending(&mut self) {
+        if let Some(change) = self.change.take() {
+            notify(change);
+            // As with ordinary CopyAccess::drop, release the copy's own
+            // issuing context after its retirement notification, not under
+            // the gate mutex or while its caller still owns memory locks.
+            drop(self.origin.take());
+        }
+    }
+}
+
+impl Drop for CopyRetirement {
+    fn drop(&mut self) {
+        self.notify_pending();
     }
 }
 
@@ -1207,6 +1320,8 @@ impl Closing {
                         gate: self.gate.clone(),
                         id: self.id,
                         published: false,
+                        previous_domain: None,
+                        published_domain: false,
                     });
                 }
                 state.changed.clone()
@@ -1228,27 +1343,35 @@ impl Drop for Closing {
 /// Exclusive stopped-address-space token. Dropping it reopens admission. A
 /// mapping change is authorized only through [`Closed::publish`], which binds
 /// the external change and the next admitted generation.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "The private unchanged-mapping close protocol has no production closer yet"
-    )
-)]
 pub(crate) struct Closed {
     gate: Arc<EntryGate>,
     id: u64,
     published: bool,
+    // Only a quiescent single-member close can change this capability. A
+    // clean abandoned plan restores the previous state; a poisoned one cannot
+    // reopen a usable mapping and keeps the conservative reservation.
+    previous_domain: Option<bool>,
+    published_domain: bool,
 }
 
 impl Closed {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the mapping publisher is deliberately non-activating"
-        )
-    )]
+    /// Stage the known final image's shared-file domain before publication.
+    /// The reservation stays active until successful publication commits this
+    /// value. In particular, retiring the last file view cannot admit another
+    /// participant while the old image is still installed.
+    pub(crate) fn set_single_member_domain(&mut self, active: bool) -> GateResult<()> {
+        let state = self.gate.state.lock().unwrap();
+        state.check()?;
+        assert_eq!(state.admission, Admission::Closed(self.id));
+        assert!(
+            self.previous_domain.is_some(),
+            "domain requires a quiescent single-member close"
+        );
+        assert!(!self.published, "domain must be staged before publication");
+        self.published_domain = active;
+        Ok(())
+    }
+
     pub(crate) fn belongs_to(&self, gate: &Arc<EntryGate>) -> bool {
         Arc::ptr_eq(&self.gate, gate)
     }
@@ -1261,13 +1384,6 @@ impl Closed {
     /// Success requires the memory owner's opaque installed-view receipt. Its
     /// private constructor binds generation advancement to retained backing and
     /// pointer-provenance metadata instead of trusting an arbitrary callback.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the mapping publisher is deliberately non-activating"
-        )
-    )]
     pub(crate) fn publish(
         &mut self,
         origin: impl Into<EntryOrigin>,
@@ -1286,6 +1402,7 @@ impl Closed {
                 );
                 let sender = state.changed();
                 drop(state);
+                drop(operation);
                 notify(sender);
                 return Err(failure);
             }
@@ -1296,6 +1413,7 @@ impl Closed {
                 );
                 let sender = state.changed();
                 drop(state);
+                drop(operation);
                 notify(sender);
                 return Err(failure);
             }
@@ -1306,6 +1424,7 @@ impl Closed {
                 );
                 let sender = state.changed();
                 drop(state);
+                drop(operation);
                 notify(sender);
                 return Err(failure);
             }
@@ -1316,6 +1435,7 @@ impl Closed {
                 );
                 let sender = state.changed();
                 drop(state);
+                drop(operation);
                 notify(sender);
                 return Err(failure);
             };
@@ -1345,6 +1465,9 @@ impl Closed {
             assert_eq!(state.generation.next(), Some(next));
             state.generation = next;
             self.published = true;
+            if self.previous_domain.is_some() {
+                state.single_member_domain = self.published_domain;
+            }
             state.changed()
         };
         notify(sender);
@@ -1359,6 +1482,12 @@ impl Drop for Closed {
             assert_eq!(state.admission, Admission::Closed(self.id));
             if std::thread::panicking() {
                 state.fail(None, protocol_failure("closed operation unwound"));
+            }
+            if !self.published
+                && state.failure.is_none()
+                && let Some(previous) = self.previous_domain
+            {
+                state.single_member_domain = previous;
             }
             state.admission = Admission::Open;
             state.changed()
@@ -1381,6 +1510,544 @@ mod tests {
 
     fn poll<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
         future.poll(&mut Context::from_waker(&noop_waker()))
+    }
+
+    fn assert_quiescent_refusal_is_quiet(gate: &Arc<EntryGate>) {
+        let before = gate.test_state();
+        let bookkeeping = {
+            let state = gate.state.lock().unwrap();
+            (
+                state.single_member_domain,
+                state.next_close,
+                state.next_member,
+            )
+        };
+        let changed = gate.subscribe();
+        assert!(gate.try_close_quiescent_single().unwrap().is_none());
+        assert_eq!(gate.test_state(), before);
+        let state = gate.state.lock().unwrap();
+        assert_eq!(
+            (
+                state.single_member_domain,
+                state.next_close,
+                state.next_member
+            ),
+            bookkeeping
+        );
+        assert!(state.failure.is_none());
+        drop(state);
+        assert!(changed.now_or_never().is_none(), "quiet refusal notified");
+    }
+
+    #[test]
+    fn quiescent_single_refuses_missing_or_multiple_members_without_effects() {
+        let gate = EntryGate::new();
+        assert_quiescent_refusal_is_quiet(&gate);
+        let _first = gate.register().unwrap();
+        let second = gate.register().unwrap();
+        assert_quiescent_refusal_is_quiet(&gate);
+        drop(second);
+        let closed = gate.try_close_quiescent_single().unwrap().unwrap();
+        assert!(gate.single_member_domain_active());
+        assert!(gate.test_state().closed);
+        drop(closed);
+        assert!(!gate.single_member_domain_active());
+        assert!(gate.test_state().open);
+    }
+
+    #[test]
+    fn quiescent_single_refuses_setup_running_and_retiring_without_interrupt() {
+        let gate = EntryGate::new();
+        let mut participant = gate.register().unwrap();
+        let mut entry = participant.try_enter().unwrap().unwrap();
+        assert_quiescent_refusal_is_quiet(&gate);
+        // This only records this thread's identity. The quiescent operation
+        // must never send its reserved signal to the unmasked test thread.
+        assert!(entry.activate(|| Ok(())).unwrap());
+        assert_quiescent_refusal_is_quiet(&gate);
+        entry.withdraw();
+        assert_quiescent_refusal_is_quiet(&gate);
+        entry.acknowledge(Ok(())).unwrap();
+        drop(gate.try_close_quiescent_single().unwrap().unwrap());
+    }
+
+    #[test]
+    fn quiescent_single_refuses_copies_retained_operands_and_other_closes() {
+        let gate = EntryGate::new();
+        let _participant = gate.register().unwrap();
+        let copy = gate.try_copy(None).unwrap().unwrap();
+        assert_quiescent_refusal_is_quiet(&gate);
+        let retained = gate.retain_operand(&copy).unwrap();
+        drop(copy);
+        assert_quiescent_refusal_is_quiet(&gate);
+        drop(retained);
+
+        let closing = gate.try_close().unwrap().unwrap();
+        assert_quiescent_refusal_is_quiet(&gate);
+        let closed = block_on(closing.finish()).unwrap();
+        assert_quiescent_refusal_is_quiet(&gate);
+        drop(closed);
+        drop(gate.try_close_quiescent_single().unwrap().unwrap());
+    }
+
+    #[test]
+    fn quiescent_single_exhaustion_is_quiet_and_prior_failure_identity_survives() {
+        for close_exhausted in [false, true] {
+            let gate = EntryGate::new();
+            let _participant = gate.register().unwrap();
+            {
+                let mut state = gate.state.lock().unwrap();
+                if close_exhausted {
+                    state.next_close = u64::MAX;
+                } else {
+                    state.generation = MappingGeneration(u64::MAX);
+                }
+            }
+            assert_quiescent_refusal_is_quiet(&gate);
+        }
+
+        let gate = EntryGate::new();
+        let _participant = gate.register().unwrap();
+        let expected = gate.poison(None, protocol_failure("prior quiescent admission failure"));
+        let before = gate.test_state();
+        let changed = gate.subscribe();
+        let Err(actual) = gate.try_close_quiescent_single() else {
+            panic!("poisoned gate admitted quiescent publication");
+        };
+        assert!(Arc::ptr_eq(&expected, &actual));
+        assert_eq!(actual.causes().len(), 1);
+        assert_eq!(gate.test_state(), before);
+        assert!(!gate.single_member_domain_active());
+        assert!(changed.now_or_never().is_none());
+    }
+
+    #[test]
+    fn quiescent_single_domain_commits_only_with_the_published_image() {
+        let gate = EntryGate::new();
+        let _participant = gate.register().unwrap();
+        let mut closed = gate.try_close_quiescent_single().unwrap().unwrap();
+        let first = closed
+            .publish(None, MappingGeneration::INITIAL, |next| {
+                Ok(crate::memory::InstalledMapping::gate_control(next))
+            })
+            .unwrap();
+        drop(closed);
+        assert!(gate.single_member_domain_active());
+
+        let mut abandoned = gate.try_close_quiescent_single().unwrap().unwrap();
+        abandoned.set_single_member_domain(false).unwrap();
+        assert!(gate.single_member_domain_active());
+        drop(abandoned);
+        assert!(gate.single_member_domain_active());
+        assert_eq!(gate.generation().unwrap(), first);
+
+        let mut retirement = gate.try_close_quiescent_single().unwrap().unwrap();
+        retirement.set_single_member_domain(false).unwrap();
+        retirement
+            .publish(None, first, |next| {
+                assert!(gate.single_member_domain_active());
+                Ok(crate::memory::InstalledMapping::gate_control(next))
+            })
+            .unwrap();
+        assert!(!gate.single_member_domain_active());
+        drop(retirement);
+        let _second = gate.register().unwrap();
+        assert_eq!(gate.test_state().members.len(), 2);
+    }
+
+    #[test]
+    fn quiescent_unattached_publication_admits_only_its_first_real_participant() {
+        let gate = EntryGate::new();
+        let mut closed = gate.try_close_quiescent_unattached().unwrap().unwrap();
+        assert!(gate.test_state().members.is_empty());
+        assert!(gate.single_member_domain_active());
+        closed
+            .publish(None, MappingGeneration::INITIAL, |next| {
+                Ok(crate::memory::InstalledMapping::gate_control(next))
+            })
+            .unwrap();
+        drop(closed);
+        let mut participant = gate.register().unwrap();
+        assert_eq!(gate.test_state().members.len(), 1);
+        let mut entry = participant.try_enter().unwrap().unwrap();
+        assert_eq!(entry.generation, MappingGeneration(1));
+        entry.withdraw();
+        entry.acknowledge(Ok(())).unwrap();
+        let Err(failure) = gate.register() else {
+            panic!("ordinary shared-file arena admitted a second participant");
+        };
+        assert_eq!(gate.test_state().members.len(), 1);
+        assert!(Arc::ptr_eq(&failure, &gate.pending_failure().unwrap()));
+    }
+
+    #[test]
+    fn quiescent_unattached_requires_empty_quiet_arena_and_closed_registration_refuses() {
+        let gate = EntryGate::new();
+        let first = gate.register().unwrap();
+        let before = gate.test_state();
+        let changed = gate.subscribe();
+        assert!(gate.try_close_quiescent_unattached().unwrap().is_none());
+        assert_eq!(gate.test_state(), before);
+        assert!(changed.now_or_never().is_none());
+        drop(first);
+
+        let copy = gate.try_copy(None).unwrap().unwrap();
+        let before = gate.test_state();
+        let changed = gate.subscribe();
+        assert!(gate.try_close_quiescent_unattached().unwrap().is_none());
+        assert_eq!(gate.test_state(), before);
+        assert!(changed.now_or_never().is_none());
+        let retained = gate.retain_operand(&copy).unwrap();
+        drop(copy);
+        let before = gate.test_state();
+        let changed = gate.subscribe();
+        assert!(gate.try_close_quiescent_unattached().unwrap().is_none());
+        assert_eq!(gate.test_state(), before);
+        assert!(changed.now_or_never().is_none());
+        drop(retained);
+
+        let closed = gate.try_close_quiescent_unattached().unwrap().unwrap();
+        assert!(gate.register().is_err());
+        assert!(gate.test_state().members.is_empty());
+        drop(closed);
+        assert!(gate.single_member_domain_active());
+        assert!(gate.pending_failure().is_some());
+    }
+
+    #[test]
+    fn quiescent_single_failed_publication_keeps_terminal_domain() {
+        let gate = EntryGate::new();
+        let _participant = gate.register().unwrap();
+        let mut closed = gate.try_close_quiescent_single().unwrap().unwrap();
+        closed.set_single_member_domain(false).unwrap();
+        let failure = closed
+            .publish(None, MappingGeneration::INITIAL, |_| {
+                Err(protocol_failure("shared-file replacement failed"))
+            })
+            .unwrap_err();
+        drop(closed);
+        assert!(gate.single_member_domain_active());
+        assert_eq!(gate.test_state().generation, MappingGeneration::INITIAL);
+        let Err(refused) = gate.try_close_quiescent_single() else {
+            panic!("failed shared-file publication admitted another close");
+        };
+        assert!(Arc::ptr_eq(&failure, &refused));
+        assert!(gate.try_copy(None).is_err());
+    }
+
+    #[test]
+    fn quiescent_single_registration_race_has_no_second_member_window() {
+        let gate = EntryGate::new();
+        let _first = gate.register().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let registering_gate = gate.clone();
+        let registering_barrier = barrier.clone();
+        let registering = std::thread::spawn(move || {
+            registering_barrier.wait();
+            registering_gate.register()
+        });
+        barrier.wait();
+        let closed = gate.try_close_quiescent_single().unwrap();
+        let registered = registering.join().unwrap();
+        match closed {
+            Some(closed) => {
+                let Err(failure) = registered else {
+                    panic!("registration crossed the single-member reservation");
+                };
+                assert_eq!(gate.test_state().members.len(), 1);
+                assert!(Arc::ptr_eq(&gate.pending_failure().unwrap(), &failure));
+                assert!(failure.primary.to_string().contains(
+                    "ordinary shared-file domain permits only its existing stopped participant"
+                ));
+                drop(closed);
+                assert!(gate.single_member_domain_active());
+            }
+            None => {
+                let _second = registered.unwrap();
+                assert_eq!(gate.test_state().members.len(), 2);
+                assert!(!gate.single_member_domain_active());
+                assert!(gate.pending_failure().is_none());
+            }
+        }
+    }
+
+    struct PublicationLockWake {
+        gate: Arc<EntryGate>,
+        allocation: Arc<Mutex<()>>,
+        address: Arc<Mutex<()>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::task::Wake for PublicationLockWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _allocation = self.allocation.try_lock().expect("wake held allocation");
+            let _address = self.address.try_lock().expect("wake held address state");
+            let _state = self
+                .gate
+                .state
+                .try_lock()
+                .expect("wake held entry registry");
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn copy_retirement_decrements_now_and_notifies_once_after_external_unlock() {
+        for explicit_notify in [false, true] {
+            let gate = EntryGate::new();
+            let copy = gate.try_copy(None).unwrap().unwrap();
+            let observer = Arc::new(PublicationLockWake {
+                gate: gate.clone(),
+                allocation: Arc::new(Mutex::new(())),
+                address: Arc::new(Mutex::new(())),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let waker = std::task::Waker::from(observer.clone());
+            let mut changed = pin!(gate.subscribe());
+            assert!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let allocation = observer.allocation.lock().unwrap();
+            let address = observer.address.lock().unwrap();
+            let retirement = copy.retire_deferred();
+            assert_eq!(gate.test_state().copies, 0);
+            assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            drop((address, allocation));
+            if explicit_notify {
+                retirement.notify();
+            } else {
+                drop(retirement);
+            }
+            assert_eq!(
+                gate.test_state().copies,
+                0,
+                "token decremented a retired copy again"
+            );
+            assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            // Shared::poll wakes its registered tasks when it observes Ready.
+            // Use a non-counting waker only for this completion observation;
+            // the Pending polls above still count the retirement's actual wake.
+            assert!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                    .is_ready()
+            );
+            assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            let ordinary = gate.try_copy(None).unwrap().unwrap();
+            let mut next = pin!(gate.subscribe());
+            assert!(
+                next.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            drop(ordinary);
+            assert_eq!(gate.test_state().copies, 0);
+            assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(
+                next.as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                    .is_ready()
+            );
+            assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn copy_retirement_retains_then_releases_its_gate_without_leaking_a_copy() {
+        let gate = EntryGate::new();
+        let weak = Arc::downgrade(&gate);
+        let copy = gate.try_copy(None).unwrap().unwrap();
+        let retirement = copy.retire_deferred();
+        assert_eq!(gate.test_state().copies, 0);
+        drop(gate);
+        assert!(
+            weak.upgrade().is_some(),
+            "retirement lost its gate lifetime"
+        );
+        retirement.notify();
+        assert!(weak.upgrade().is_none(), "retirement leaked its gate");
+    }
+
+    #[test]
+    fn copy_retirement_preserves_unwind_cause_before_deferred_notification() {
+        struct DeferredCopy {
+            copy: Option<CopyAccess>,
+            queue: Arc<Mutex<Vec<CopyRetirement>>>,
+        }
+        impl Drop for DeferredCopy {
+            fn drop(&mut self) {
+                let retirement = self.copy.take().unwrap().retire_deferred();
+                self.queue.lock().unwrap().push(retirement);
+            }
+        }
+        let gate = EntryGate::new();
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let changed = gate.subscribe();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _copy = DeferredCopy {
+                copy: Some(gate.try_copy(None).unwrap().unwrap()),
+                queue: queue.clone(),
+            };
+            panic!("injected deferred copy unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(gate.test_state().copies, 0);
+        let failure = gate.pending_failure().unwrap();
+        assert!(failure.primary.to_string().contains("host copy unwound"));
+        assert_eq!(failure.causes().len(), 1);
+        assert!(changed.clone().now_or_never().is_none());
+        let retirement = {
+            let mut queue = queue.lock().unwrap();
+            assert_eq!(queue.len(), 1);
+            queue.pop().unwrap()
+        };
+        retirement.notify();
+        assert!(changed.now_or_never().is_some());
+        assert!(Arc::ptr_eq(&failure, &gate.pending_failure().unwrap()));
+        assert_eq!(failure.causes().len(), 1);
+    }
+
+    #[test]
+    fn publication_preoperation_failures_drop_owned_guards_before_notification() {
+        for scenario in ["generation", "duplicate", "retained", "exhaustion", "prior"] {
+            let gate = EntryGate::new();
+            let retained = if scenario == "retained" {
+                let copy = gate.try_copy(None).unwrap().unwrap();
+                let retained = gate.retain_operand(&copy).unwrap();
+                drop(copy);
+                Some(retained)
+            } else {
+                None
+            };
+            if scenario == "exhaustion" {
+                gate.state.lock().unwrap().generation = MappingGeneration(u64::MAX);
+            }
+            let mut closed = block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
+            if scenario == "duplicate" {
+                closed
+                    .publish(None, MappingGeneration::INITIAL, |next| {
+                        Ok(crate::memory::InstalledMapping::gate_control(next))
+                    })
+                    .unwrap();
+            }
+            let expected = if scenario == "generation" {
+                MappingGeneration(99)
+            } else {
+                gate.generation().unwrap()
+            };
+            let prior = (scenario == "prior")
+                .then(|| gate.poison(None, protocol_failure("prior publication failure")));
+            let observer = Arc::new(PublicationLockWake {
+                gate: gate.clone(),
+                allocation: Arc::new(Mutex::new(())),
+                address: Arc::new(Mutex::new(())),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let waker = std::task::Waker::from(observer.clone());
+            let mut changed = pin!(gate.subscribe());
+            assert!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let allocation = observer.allocation.lock().unwrap();
+            let address = observer.address.lock().unwrap();
+            let called = std::cell::Cell::new(false);
+            let called_ref = &called;
+            let failure = closed
+                .publish(None, expected, move |next| {
+                    called_ref.set(true);
+                    drop((address, allocation));
+                    Ok(crate::memory::InstalledMapping::gate_control(next))
+                })
+                .unwrap_err();
+            assert!(!called.get(), "rejected operation ran for {scenario}");
+            assert!(observer.allocation.try_lock().is_ok());
+            assert!(observer.address.try_lock().is_ok());
+            assert_eq!(
+                observer.calls.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(prior.is_none()),
+                "unexpected wake count for {scenario}"
+            );
+            if let Some(prior) = prior {
+                assert!(Arc::ptr_eq(&prior, &failure));
+                assert_eq!(failure.causes().len(), 1);
+                assert!(
+                    changed
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            } else {
+                assert!(
+                    changed
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_ready()
+                );
+            }
+            drop(retained);
+            drop(closed);
+        }
+    }
+
+    #[test]
+    fn quiescent_publication_success_and_error_notify_after_owned_locks_drop() {
+        for succeeds in [false, true] {
+            let gate = EntryGate::new();
+            let _participant = gate.register().unwrap();
+            let mut closed = gate.try_close_quiescent_single().unwrap().unwrap();
+            let observer = Arc::new(PublicationLockWake {
+                gate: gate.clone(),
+                allocation: Arc::new(Mutex::new(())),
+                address: Arc::new(Mutex::new(())),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let waker = std::task::Waker::from(observer.clone());
+            let mut changed = pin!(gate.subscribe());
+            assert!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let allocation = observer.allocation.lock().unwrap();
+            let address = observer.address.lock().unwrap();
+            let result = closed.publish(None, MappingGeneration::INITIAL, move |next| {
+                drop((address, allocation));
+                if succeeds {
+                    Ok(crate::memory::InstalledMapping::gate_control(next))
+                } else {
+                    Err(protocol_failure("injected shared-file install failure"))
+                }
+            });
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(gate.pending_failure().is_none(), succeeds);
+            assert!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_ready()
+            );
+            drop(closed);
+        }
     }
 
     #[test]

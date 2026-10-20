@@ -51,14 +51,16 @@ pub(crate) const THREAD_SYSCALL_AREA_STRIDE: u64 = 2 * PAGE_SIZE;
 pub(crate) const MAX_GUEST_THREADS: u64 = 160;
 // AUTONOMOUS-BOT-IMPLEMENTED: Provide a kernel-note vDSO for glibc os-version discovery.
 // TODO-HUMAN-REVIEW(PR-266): Review the guest vDSO placement and note contents.
-// A single read-only page holding a minimal vDSO ELF whose only purpose is to
-// carry the Linux kernel-version note. glibc's `_dl_discover_osversion` reads
-// this note (reached through `AT_SYSINFO_EHDR`) instead of falling back to
-// `uname(2)`, matching the native/ptrace dynamic-linker startup path. The page
-// sits inside the boot-reserved region (below `BOOT_RESERVED_END`), so guest
-// brk/mmap never allocate over it and the user-memory zeroing leaves it intact.
-// It is covered by the identity map (present + user), so the guest reads it
-// directly without an executor round-trip.
+// A single read-only page holding the canonical vDSO
+// (`reverie::vdso::canonical_vdso_image`), the image every backend maps in
+// place of the host kernel's. glibc's loader reaches it through
+// `AT_SYSINFO_EHDR`, reads its kernel-version note (`_dl_discover_osversion`)
+// instead of calling `uname(2)`, and looks up its functions, each a stub that
+// issues the syscall. The page sits inside the boot-reserved region (below
+// `BOOT_RESERVED_END`), so guest brk/mmap never allocate over it and the
+// user-memory zeroing leaves it intact. It is covered by the identity map
+// (present + user, executable), so the guest reads and runs it directly
+// without an executor round-trip.
 pub(crate) const VDSO_ADDRESS: u64 =
     THREAD_SYSCALL_AREA_START + THREAD_SYSCALL_AREA_STRIDE * MAX_GUEST_THREADS;
 // Keep the established syscall-transport and vDSO addresses unchanged. Each
@@ -73,6 +75,8 @@ const _: () = {
         THREAD_SYSCALL_AREA_START + THREAD_SYSCALL_AREA_STRIDE * MAX_GUEST_THREADS <= VDSO_ADDRESS
     );
     assert!(VDSO_ADDRESS + PAGE_SIZE <= THREAD_TOOL_STACK_AREA_START);
+    assert!(VDSO_ADDRESS == reverie::vdso::CANONICAL_VDSO_ADDRESS);
+    assert!(reverie::vdso::CANONICAL_VDSO_SIZE <= PAGE_SIZE);
 };
 
 /// Returns the exclusive upper address of the Tool scratch page assigned to a
@@ -641,76 +645,13 @@ const GUEST_LINUX_VERSION_PATCH: u32 = 0;
 const GUEST_LINUX_VERSION_CODE: u32 = (GUEST_LINUX_VERSION_MAJOR << 16)
     | (GUEST_LINUX_VERSION_MINOR << 8)
     | GUEST_LINUX_VERSION_PATCH;
+const _: () = assert!(GUEST_LINUX_VERSION_CODE == reverie::vdso::CANONICAL_LINUX_VERSION_CODE);
 
-/// Writes a minimal in-guest vDSO whose sole purpose is to carry the Linux
-/// kernel-version ELF note. During startup glibc's dynamic linker reads this
-/// note through `AT_SYSINFO_EHDR` (`_dl_discover_osversion`); when the vDSO is
-/// absent glibc instead issues a `uname(2)` syscall and its early mmap/open
-/// sequence diverges from the native path, breaking cross-backend syscall
-/// stream/count parity (ptrace vs KVM). The image contains only an ELF header,
-/// one `PT_LOAD`, and one `PT_NOTE`; it intentionally has no dynamic section, so
-/// glibc resolves no vDSO symbols and every real syscall still flows through the
-/// executor (preserving determinism).
+/// Writes the canonical vDSO at [`VDSO_ADDRESS`]. Its kernel-version note
+/// reports [`GUEST_LINUX_VERSION_CODE`], the release the executor's `uname(2)`
+/// reports.
 fn write_vdso(memory: &mut GuestMemory) -> Result<()> {
-    const EHDR_SIZE: usize = 64;
-    const PHDR_SIZE: usize = 56;
-    const PHNUM: usize = 2;
-    const NOTE_OFFSET: usize = EHDR_SIZE + PHNUM * PHDR_SIZE; // 0xb0
-    // Nhdr (namesz,descsz,type) + "Linux\0" padded to 4 + 4-byte desc.
-    const NOTE_SIZE: usize = 12 + 8 + 4;
-    const IMAGE_SIZE: usize = NOTE_OFFSET + NOTE_SIZE;
-
-    let mut image = [0u8; IMAGE_SIZE];
-
-    // ELF64 header.
-    image[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-    image[4] = 2; // ELFCLASS64
-    image[5] = 1; // ELFDATA2LSB
-    image[6] = 1; // EV_CURRENT
-    // e_ident[7..16] left zero (ELFOSABI_SYSV).
-    image[16..18].copy_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
-    image[18..20].copy_from_slice(&62u16.to_le_bytes()); // e_machine = EM_X86_64
-    image[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
-    // e_entry = 0.
-    image[32..40].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes()); // e_phoff
-    // e_shoff = 0, e_flags = 0.
-    image[52..54].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes()); // e_ehsize
-    image[54..56].copy_from_slice(&(PHDR_SIZE as u16).to_le_bytes()); // e_phentsize
-    image[56..58].copy_from_slice(&(PHNUM as u16).to_le_bytes()); // e_phnum
-    // e_shentsize/e_shnum/e_shstrndx = 0.
-
-    // PT_LOAD covering the whole image. p_offset == p_vaddr so glibc's load-bias
-    // arithmetic (l_addr = AT_SYSINFO_EHDR - p_vaddr) yields exactly VDSO_ADDRESS.
-    let load = EHDR_SIZE;
-    image[load..load + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
-    image[load + 4..load + 8].copy_from_slice(&5u32.to_le_bytes()); // p_flags = R|X
-    // p_offset = 0, p_vaddr = 0, p_paddr = 0.
-    image[load + 32..load + 40].copy_from_slice(&(IMAGE_SIZE as u64).to_le_bytes()); // p_filesz
-    image[load + 40..load + 48].copy_from_slice(&(IMAGE_SIZE as u64).to_le_bytes()); // p_memsz
-    image[load + 48..load + 56].copy_from_slice(&PAGE_SIZE.to_le_bytes()); // p_align
-
-    // PT_NOTE pointing at the kernel-version note.
-    let note_ph = EHDR_SIZE + PHDR_SIZE;
-    image[note_ph..note_ph + 4].copy_from_slice(&4u32.to_le_bytes()); // p_type = PT_NOTE
-    image[note_ph + 4..note_ph + 8].copy_from_slice(&4u32.to_le_bytes()); // p_flags = R
-    image[note_ph + 8..note_ph + 16].copy_from_slice(&(NOTE_OFFSET as u64).to_le_bytes()); // p_offset
-    image[note_ph + 16..note_ph + 24].copy_from_slice(&(NOTE_OFFSET as u64).to_le_bytes()); // p_vaddr
-    // p_paddr = 0.
-    image[note_ph + 32..note_ph + 40].copy_from_slice(&(NOTE_SIZE as u64).to_le_bytes()); // p_filesz
-    image[note_ph + 40..note_ph + 48].copy_from_slice(&(NOTE_SIZE as u64).to_le_bytes()); // p_memsz
-    image[note_ph + 48..note_ph + 56].copy_from_slice(&4u64.to_le_bytes()); // p_align
-
-    // The note: n_namesz=6 ("Linux\0"), n_descsz=4, n_type=0, name padded to 4,
-    // desc = LINUX_VERSION_CODE. This is byte-compatible with the note the real
-    // x86_64 kernel vDSO exposes, which is what glibc scans for.
-    let n = NOTE_OFFSET;
-    image[n..n + 4].copy_from_slice(&6u32.to_le_bytes()); // n_namesz
-    image[n + 4..n + 8].copy_from_slice(&4u32.to_le_bytes()); // n_descsz
-    image[n + 8..n + 12].copy_from_slice(&0u32.to_le_bytes()); // n_type
-    image[n + 12..n + 18].copy_from_slice(b"Linux\0"); // name (padded to 8)
-    image[n + 20..n + 24].copy_from_slice(&GUEST_LINUX_VERSION_CODE.to_le_bytes()); // desc
-
-    memory.write_raw(VDSO_ADDRESS, &image)
+    memory.write_raw(VDSO_ADDRESS, reverie::vdso::canonical_vdso_image())
 }
 
 fn write_u64(memory: &mut GuestMemory, address: u64, value: u64) -> Result<()> {
@@ -1106,6 +1047,17 @@ mod tests {
             read_u64(&memory, PAGE_SIZE - 8).unwrap(),
             (511 * PAGE_SIZE) | 0x7
         );
+    }
+
+    /// The guest's vDSO page holds the canonical image every backend maps.
+    #[test]
+    fn the_guest_vdso_is_the_canonical_vdso() {
+        let mut memory = GuestMemory::new(0, (VDSO_ADDRESS + PAGE_SIZE) as usize).unwrap();
+        write_vdso(&mut memory).unwrap();
+        let expected = reverie::vdso::canonical_vdso_image();
+        let mut image = vec![0; expected.len()];
+        memory.read_raw(VDSO_ADDRESS, &mut image).unwrap();
+        assert_eq!(image, expected);
     }
 
     #[test]

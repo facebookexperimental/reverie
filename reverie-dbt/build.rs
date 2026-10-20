@@ -29,9 +29,13 @@ const DYNAMORIO_REVISION: &str = "929840ad9190e5086775e8debc0f0b79b4208d59";
 const MAX_PARALLEL_JOBS: usize = 16;
 // Provenance: three clean builds of this curated source tree on 2026-08-03:
 // 13.91s and 14.54s with 16 jobs on a development runner, and 71.49s with 4 jobs on a
-// GitHub-hosted runner. Their elapsed-seconds * requested-jobs proxies were
-// 222.56, 232.64, and 285.96 job-seconds. The CI ratchet is 2x the slowest
-// observation, rounded up; local source installs report without enforcing it.
+// GitHub-hosted runner. Their elapsed-seconds * jobs proxies were
+// 222.56, 232.64, and 285.96 job-seconds. The slowest one ran 4 jobs on a
+// 4-vCPU runner, so every job it counted could run at once; the build therefore
+// caps the job count at the available CPUs (dynamorio_build_jobs) rather than
+// counting jobs that could only queue behind each other.
+// The CI ratchet is 2x the slowest observation, rounded up; local source
+// installs report without enforcing it.
 const CI_MAX_BUILD_JOB_SECONDS: f64 = 572.0;
 
 fn main() {
@@ -569,16 +573,19 @@ fn build_dynamorio(
         "install",
         "--parallel",
     ]);
-    let jobs = env::var("NUM_JOBS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, MAX_PARALLEL_JOBS);
+    let requested_jobs = env::var("NUM_JOBS").ok();
+    let available_cpus =
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let jobs = dynamorio_build_jobs(requested_jobs.as_deref(), available_cpus);
     build.arg(jobs.to_string());
     run(&mut build, "build and install DynamoRIO");
 
     let seconds = started.elapsed().as_secs_f64();
-    println!("cargo:warning=DynamoRIO source build completed in {seconds:.2}s (jobs={jobs})");
+    let job_seconds = seconds * jobs as f64;
+    println!(
+        "cargo:warning=DynamoRIO source build completed in {seconds:.2}s (jobs={jobs}, {job_seconds:.2} job-seconds; NUM_JOBS={}, available CPUs={available_cpus})",
+        requested_jobs.as_deref().unwrap_or("unset")
+    );
     if let Ok(limit) = env::var("REVERIE_DBT_MAX_BUILD_SECONDS") {
         let limit = limit
             .parse::<f64>()
@@ -594,6 +601,20 @@ fn build_dynamorio(
     } else if env::var_os("CI").is_some() {
         enforce_ci_build_ratchet(seconds, jobs);
     }
+}
+
+/// Number of parallel jobs for the DynamoRIO source build, which is also the
+/// job count the CI ratchet multiplies by. `NUM_JOBS` asks for a count, but jobs
+/// beyond the CPUs this process may run on cannot execute in parallel: passing
+/// them to cmake only oversubscribes, and counting them in the ratchet inflates
+/// the job-second product without any extra work being done. So the request is
+/// clamped to `1..=MAX_PARALLEL_JOBS` and then capped at the available CPUs.
+fn dynamorio_build_jobs(requested: Option<&str>, available_cpus: usize) -> usize {
+    requested
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, MAX_PARALLEL_JOBS)
+        .min(available_cpus.max(1))
 }
 
 fn enforce_ci_build_ratchet(seconds: f64, jobs: usize) {
@@ -879,5 +900,38 @@ mod tests {
     #[should_panic(expected = "exceeding the 572.00 job-second CI ratchet")]
     fn throughput_regression_fails_the_ci_ratchet() {
         enforce_ci_build_ratchet(144.0, 4);
+    }
+
+    #[test]
+    fn build_jobs_are_capped_at_the_available_cpus() {
+        // A request above the CPU count runs, and is counted, at the CPU count.
+        assert_eq!(dynamorio_build_jobs(Some("32"), 4), 4);
+        assert_eq!(dynamorio_build_jobs(Some("16"), 4), 4);
+        // With enough CPUs the existing 16-job clamp still applies.
+        assert_eq!(dynamorio_build_jobs(Some("32"), 64), MAX_PARALLEL_JOBS);
+        assert_eq!(dynamorio_build_jobs(Some("8"), 64), 8);
+        // A request within the CPU count is used unchanged.
+        assert_eq!(dynamorio_build_jobs(Some("4"), 4), 4);
+        assert_eq!(dynamorio_build_jobs(Some("2"), 8), 2);
+    }
+
+    #[test]
+    fn build_jobs_fall_back_to_one() {
+        assert_eq!(dynamorio_build_jobs(None, 8), 1);
+        assert_eq!(dynamorio_build_jobs(Some("0"), 8), 1);
+        assert_eq!(dynamorio_build_jobs(Some("not-a-number"), 8), 1);
+        // A zero CPU count cannot come from available_parallelism, but the cap
+        // must still leave one job rather than ask cmake for zero.
+        assert_eq!(dynamorio_build_jobs(Some("8"), 0), 1);
+    }
+
+    #[test]
+    fn oversubscribed_request_no_longer_inflates_the_ratchet() {
+        // A 16-job request on a 4-vCPU runner does the same CPU work as the
+        // 71.49s 4-job baseline. Counted as 16 jobs that would be about 1144
+        // job-seconds and fail; capped at the 4 CPUs it is the baseline again.
+        let jobs = dynamorio_build_jobs(Some("16"), 4);
+        assert_eq!(jobs, 4);
+        enforce_ci_build_ratchet(71.49, jobs);
     }
 }

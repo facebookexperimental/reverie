@@ -89,6 +89,7 @@ fn wait_discarding_output_drains_piped_stdio() {
 #[test]
 fn forked_guest_exits_nonzero_when_stdout_flush_fails() {
     let (output, ()) = reverie_ptrace::testing::test_fn::<(), _>(|| {
+        use std::io::Write;
         use std::os::fd::AsRawFd;
 
         let full = std::fs::OpenOptions::new()
@@ -99,7 +100,11 @@ fn forked_guest_exits_nonzero_when_stdout_flush_fails() {
         assert_eq!(unsafe { libc::dup2(full.as_raw_fd(), 1) }, 1);
         // No newline, so the line-buffered stdout keeps the text until the
         // exit-time flush.
-        print!("unflushed");
+        // Write to buffered stdout directly so libtest's printing-macro capture
+        // cannot consume the bytes before this flush-failure check on stable.
+        std::io::stdout()
+            .write_all(b"unflushed")
+            .expect("buffer guest stdout");
     })
     .expect("run the guest");
     let stderr = String::from_utf8_lossy(&output.stderr);

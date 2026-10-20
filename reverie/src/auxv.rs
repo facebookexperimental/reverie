@@ -7,7 +7,6 @@
  */
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::io;
 
 use byteorder::NativeEndian;
@@ -15,6 +14,59 @@ use byteorder::ReadBytesExt;
 
 use crate::Pid;
 use crate::syscalls::Addr;
+
+/// `AT_MINSIGSTKSZ`: the smallest signal stack the kernel can deliver on.
+pub const AT_MINSIGSTKSZ: libc::c_ulong = 51;
+/// `AT_RSEQ_FEATURE_SIZE`: the size of the rseq area features the kernel
+/// supports. glibc registers rseq with it as the length.
+pub const AT_RSEQ_FEATURE_SIZE: libc::c_ulong = 27;
+/// `AT_RSEQ_ALIGN`: the alignment the kernel requires of the rseq area.
+pub const AT_RSEQ_ALIGN: libc::c_ulong = 28;
+
+/// The value every backend gives a guest for the auxiliary-vector entry
+/// `key`, when the entry describes the CPU or the kernel rather than the
+/// process, so that a guest starts up the same way on every host and under
+/// every backend (<https://github.com/rrnewton/reverie/issues/947>,
+/// <https://github.com/rrnewton/reverie/issues/449>). `None` for every other
+/// entry.
+///
+/// - `AT_HWCAP` is CPUID leaf 1 EDX, and `AT_HWCAP2` the FSGSBASE bit of leaf
+///   7 EBX, of the virtual CPU Detcore presents (hermit's
+///   detcore/src/cpuid.rs, which a hermit test compares with these). Both
+///   advertise a subset of what any supported host can do.
+/// - `AT_MINSIGSTKSZ` must cover the largest signal frame any supported host
+///   kernel writes, since under ptrace the host kernel writes them: 3,376
+///   bytes on an AVX-512 host and about 11 KiB on an AMX host. 16 KiB covers
+///   both.
+/// - `AT_RSEQ_FEATURE_SIZE` and `AT_RSEQ_ALIGN` are Linux 6.3's, the first
+///   release to report them.
+pub const fn canonical_auxv_value(key: libc::c_ulong) -> Option<libc::c_ulong> {
+    match key {
+        libc::AT_HWCAP => Some(0x078b_fbfd),
+        libc::AT_HWCAP2 => Some(0),
+        AT_MINSIGSTKSZ => Some(16384),
+        AT_RSEQ_FEATURE_SIZE => Some(28),
+        AT_RSEQ_ALIGN => Some(32),
+        _ => None,
+    }
+}
+
+/// Refuses a host whose kernel reports an `AT_MINSIGSTKSZ` larger than the
+/// canonical one: there a guest that sizes its alternate signal stack from
+/// the canonical value could overflow it, since under ptrace the host kernel
+/// writes the signal frames. `kernel_value` is what the host kernel put in an
+/// auxiliary vector; 0 means it reported none.
+pub fn check_host_minsigstksz(kernel_value: libc::c_ulong) -> Result<(), String> {
+    let canonical = canonical_auxv_value(AT_MINSIGSTKSZ).unwrap_or(0);
+    if kernel_value > canonical {
+        return Err(format!(
+            "this host's kernel reports AT_MINSIGSTKSZ {kernel_value}, larger than the \
+             {canonical} bytes Reverie gives every guest; its signal frames would not \
+             fit a guest's alternate signal stack"
+        ));
+    }
+    Ok(())
+}
 
 /// Represents the auxv table of a process.
 ///
@@ -40,7 +92,7 @@ impl Auxv {
     /// Reads the auxiliary values from `/proc/{pid}/auxv`.
     pub(crate) fn new(pid: Pid) -> io::Result<Self> {
         let mut map = BTreeMap::new();
-        let buf = fs::read(format!("/proc/{}/auxv", pid))?;
+        let buf = crate::process::launch_window::read(format!("/proc/{}/auxv", pid))?;
 
         // The file size should be a multiple of `size_of::<u64>() * 2`.
         debug_assert_eq!(
@@ -133,6 +185,47 @@ mod tests {
         assert_eq!(
             map.at_random().map(|address| address.as_raw()),
             Some(0x1000),
+        );
+    }
+
+    #[test]
+    fn only_cpu_and_kernel_entries_have_canonical_values() {
+        for key in [
+            libc::AT_HWCAP,
+            libc::AT_HWCAP2,
+            AT_MINSIGSTKSZ,
+            AT_RSEQ_FEATURE_SIZE,
+            AT_RSEQ_ALIGN,
+        ] {
+            assert!(canonical_auxv_value(key).is_some(), "{key}");
+        }
+        for key in [
+            libc::AT_PHDR,
+            libc::AT_ENTRY,
+            libc::AT_RANDOM,
+            libc::AT_UID,
+            libc::AT_SYSINFO_EHDR,
+            libc::AT_EXECFN,
+        ] {
+            assert_eq!(canonical_auxv_value(key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn a_host_needing_larger_signal_stacks_is_refused() {
+        assert_eq!(check_host_minsigstksz(0), Ok(()));
+        assert_eq!(check_host_minsigstksz(3376), Ok(()));
+        assert_eq!(check_host_minsigstksz(16384), Ok(()));
+        let error = check_host_minsigstksz(16385).unwrap_err();
+        assert!(error.contains("16385"), "{error}");
+        assert!(error.contains("16384"), "{error}");
+    }
+
+    #[test]
+    fn this_host_fits_the_canonical_signal_stack() {
+        assert_eq!(
+            check_host_minsigstksz(unsafe { libc::getauxval(AT_MINSIGSTKSZ) }),
+            Ok(())
         );
     }
 

@@ -119,21 +119,25 @@ fn cycles_attr(precise_ip: bool) -> perf::perf_event_attr {
     )
 }
 
-#[derive(Debug)]
-struct ScopedFd(i32);
-
-impl From<i64> for ScopedFd {
-    fn from(fd: i64) -> Self {
-        ScopedFd(fd as i32)
-    }
-}
+/// A counter's descriptor, a transient open from [`start_counter`] to its
+/// close here. Each check builds its counters' attributes before it opens the
+/// first one, so nothing but system calls on the counters runs under the
+/// guard.
+struct ScopedFd(i32, crate::launch_window::TransientOpen);
 
 impl Drop for ScopedFd {
     fn drop(&mut self) {
         if let Err(errno) = Errno::result(unsafe { libc::close(self.0) }) {
-            warn!("Error while closing file descriptor - {:?}", errno);
+            warn_after_guards(format!("Error while closing file descriptor - {:?}", errno));
         }
     }
+}
+
+/// Logs `message` once this thread holds no transient open: a log subscriber
+/// may block on a thread that is launching a guest, which waits for the open
+/// to close.
+fn warn_after_guards(message: String) {
+    crate::launch_window::run_after_guards(move || warn!("{message}"));
 }
 
 /// This function is a transcription of the function `check_for_bugs` from
@@ -195,6 +199,7 @@ fn start_counter(
         **disabled = false
     }
 
+    let open = crate::launch_window::TransientOpen::begin();
     let fd_result = Errno::result(unsafe {
         libc::syscall(
             libc::SYS_perf_event_open,
@@ -227,14 +232,14 @@ fn start_counter(
                 if let Some(disabled) = disabled_txcp.as_mut() {
                     **disabled = true
                 }
-                warn!("kernel does not support IN_TXCP");
+                warn_after_guards("kernel does not support IN_TXCP".to_owned());
             }
 
             no_txcp_fd
         }
         _ => fd_result,
     }
-    .map(|raw_fd| raw_fd.into())
+    .map(|raw_fd| ScopedFd(raw_fd as i32, open))
     .map_err(|errno| match errno {
         Errno::EACCES => PmuValidationError::CouldNotCreateTimer {
             errno,

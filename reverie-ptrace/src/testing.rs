@@ -460,6 +460,9 @@ where
 }
 
 /// Runs a function as a guest and returns its collected (stdout/err) output and global state.
+///
+/// See [`spawn_fn_with_config`] for libtest printing-macro capture: stable tests
+/// must use `--nocapture` or write directly to stdout/stderr with `std::io::Write`.
 pub fn test_fn_with_config<T, F>(
     f: F,
     config: <T::GlobalState as GlobalTool>::Config,
@@ -476,6 +479,8 @@ where
 }
 
 /// Runs a function as a guest and returns its collected output and global state.
+///
+/// See [`test_fn_with_config`] for libtest output capture on stable Rust.
 pub fn test_fn<T, F>(f: F) -> Result<(Output, T::GlobalState), Error>
 where
     T: Tool + 'static,

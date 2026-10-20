@@ -444,9 +444,21 @@ fn run_arm_in_fresh_pid_namespace(test_name: &str, arm: &str) -> String {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn /usr/bin/unshare");
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
+    // Drain both pipes while the child runs. Once the user's pipe pages pass
+    // fs.pipe-user-pages-soft, a new pipe holds only 8 KiB, and a child
+    // blocked writing a longer record would never exit.
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("read the arm's output");
+            bytes
+        })
+    }
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -454,14 +466,14 @@ fn run_arm_in_fresh_pid_namespace(test_name: &str, arm: &str) -> String {
             panic!("{arm} arm in a fresh PID namespace exceeded 60 s");
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    };
+    let stdout = stdout.join().unwrap();
+    let stderr = stderr.join().unwrap();
+    let stdout = String::from_utf8_lossy(&stdout);
     assert!(
-        output.status.success(),
-        "{arm} arm in a fresh PID namespace failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+        status.success(),
+        "{arm} arm in a fresh PID namespace failed ({status}):\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&stderr)
     );
     let record = stdout
         .lines()

@@ -35,6 +35,12 @@ use crate::failure::FailureContext;
 
 const PAGE_SIZE: usize = 4096;
 
+mod shared_file;
+pub(crate) use shared_file::AllocationGuard;
+use shared_file::MemoryCopyAccess;
+pub(crate) use shared_file::PrivateRangePlan;
+pub(crate) use shared_file::SharedFileRangePlan;
+
 #[cfg(test)]
 type SyscallDispatchObserver = Arc<dyn Fn(&crate::SyscallRequest) + Send + Sync>;
 
@@ -46,6 +52,11 @@ struct TestUserCopyFailure {
     calls: std::sync::atomic::AtomicUsize,
     copied: std::sync::atomic::AtomicUsize,
 }
+
+#[cfg(test)]
+type SharedMapHook = Arc<dyn Fn(usize, usize) -> Option<io::Result<usize>> + Send + Sync>;
+#[cfg(test)]
+type SharedSyncHook = Arc<dyn Fn(usize, usize, i32) -> Option<i32> + Send + Sync>;
 
 /// A contiguous, page-aligned guest-physical memory region.
 #[derive(Clone)]
@@ -65,6 +76,10 @@ pub struct GuestMemory {
     test_user_copy_failure: Option<Arc<TestUserCopyFailure>>,
     #[cfg(test)]
     test_user_copy_backing_wait: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)]
+    test_shared_map: Option<SharedMapHook>,
+    #[cfg(test)]
+    test_shared_sync: Option<SharedSyncHook>,
 }
 
 impl std::fmt::Debug for GuestMemory {
@@ -90,11 +105,18 @@ impl RawMemoryRead<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackingKind {
+    Fixed,
+    OrdinaryFile { max_writable: bool },
+}
+
 #[derive(Debug)]
 struct Backing {
     fd: OwnedFd,
     length: usize,
     host_access: Mutex<()>,
+    kind: BackingKind,
 }
 
 impl Backing {
@@ -116,6 +138,7 @@ impl Backing {
             fd,
             length,
             host_access: Mutex::new(()),
+            kind: BackingKind::Fixed,
         })
     }
 }
@@ -142,7 +165,7 @@ impl BackingSlice {
         libc::off_t::try_from(offset).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "backing offset exceeds off_t")
         })?;
-        if end > backing.length {
+        if backing.kind == BackingKind::Fixed && end > backing.length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "backing slice exceeds its backing",
@@ -172,6 +195,9 @@ struct Mapping {
     address_space: Mutex<AddressSpaceState>,
     allocation: Mutex<()>,
     entry_gate: Arc<EntryGate>,
+    retirement: Mutex<Option<Box<WriteAliasMapping>>>,
+    deferred: Mutex<shared_file::DeferredFailures>,
+    sync_mmu: Mutex<Option<bool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -196,10 +222,11 @@ struct InstalledBackingPage {
     mapping: NonNull<u8>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct HostChunk {
     mapping: NonNull<u8>,
     length: usize,
+    backing: Arc<Backing>,
 }
 
 /// Compatibility placement for the current fixed physical arena. Coverage is
@@ -284,6 +311,8 @@ pub(crate) struct UserMemory {
 /// operation returns. No permission/mutation lock is held across a blocking
 /// syscall. This is sound only for the current immutable identity coverage;
 /// live remapping and noncontiguous operands require a later adapter protocol.
+/// This contract belongs to HostMemoryOperand; UserWriteAlias below instead
+/// holds permission and host-copy locks through its scoped kernel operation.
 #[derive(Debug)]
 pub(crate) struct HostMemoryOperand {
     _memory: GuestMemory,
@@ -292,39 +321,359 @@ pub(crate) struct HostMemoryOperand {
     _length: usize,
 }
 
+struct WriteAliasExtent {
+    offset: usize,
+    slice: BackingSlice,
+}
+
+const AMBIGUOUS_WRITE_ALIAS_PHASE: &str =
+    "failed writable-alias MAP_FIXED target retained until process exit (ownership unknown)";
+const UNEXPECTED_WRITE_ALIAS_ADDRESS: &str =
+    "MAP_FIXED installed a writable alias at an unexpected address";
+
+#[derive(Clone, Copy)]
+struct WriteAliasRange {
+    address: usize,
+    length: usize,
+}
+
+#[derive(Clone, Copy)]
+struct WriteAliasCleanupFailure {
+    range: WriteAliasRange,
+    errno: i32,
+}
+
+/// Owns only virtual addresses; every accessible page aliases retained guest
+/// backing. The numeric address is passed to the kernel, never dereferenced as
+/// a Rust slice spanning its distinct shared mappings.
+///
+/// This box is allocated before reserving an address. If Linux refuses cleanup,
+/// it becomes a process-lifetime ledger entry without allocating or retaining a
+/// guest-memory handle, gate, callable origin, or retained-operand token.
+struct WriteAliasMapping {
+    address: usize,
+    length: usize,
+    // A failed MAP_FIXED may retain the reservation or leave a foreign-owned
+    // gap. This interval is never included in owned or retried by raw address.
+    ambiguous: Option<WriteAliasRange>,
+    mapping_errno: Option<i32>,
+    // Diagnostic metadata only, never raw cleanup authority. A positive mmap
+    // result normally names a valid aligned allocation; if even those bounds
+    // are invalid, retain the observation without attempting to unmap it.
+    unexpected: Option<WriteAliasRange>,
+    unexpected_bounds_valid: bool,
+    // The reservation, or its prefix/suffix plus a defensive wrong-address
+    // positive mmap result. Each interval is cleared only after munmap succeeds.
+    owned: [Option<WriteAliasRange>; 3],
+    cleanup: [Option<WriteAliasCleanupFailure>; 3],
+    _extents: Vec<WriteAliasExtent>,
+    next: Option<Box<WriteAliasMapping>>,
+}
+
+impl std::fmt::Debug for WriteAliasMapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteAliasMapping")
+            .field("address", &self.address)
+            .field("length", &self.length)
+            .field("ambiguous", &self.ambiguous.is_some())
+            .field("backings", &self._extents.len())
+            .finish()
+    }
+}
+
+// Like the terminal-reader ledger, this intentionally has no process teardown
+// destructor that retries uncertain addresses or forgets refused ownership.
+// getdents64 bounds each reservation to 16 MiB + one page. This does not bound
+// whole backing objects pinned by an alias, or accumulation across independent
+// failed VMs. The poisoned gate prevents reuse by this VM; host exit finally
+// retires the retained mappings. There is no global quota or retry policy.
+static RETAINED_WRITE_ALIASES: Mutex<Option<Box<WriteAliasMapping>>> = Mutex::new(None);
+
+#[derive(Default)]
+struct WriteAliasRetirement {
+    retention_id: usize,
+    ambiguous: bool,
+    mapping_errno: Option<i32>,
+    cleanup: [Option<WriteAliasCleanupFailure>; 3],
+}
+
+impl WriteAliasMapping {
+    fn lose_fixed_target(&mut self, offset: usize, length: usize, errno: Option<i32>) {
+        // All bounds were established while constructing extents, before mmap.
+        let end = offset + length;
+        self.ambiguous = Some(WriteAliasRange {
+            address: self.address + offset,
+            length,
+        });
+        self.mapping_errno = errno;
+        self.owned = [
+            (offset != 0).then_some(WriteAliasRange {
+                address: self.address,
+                length: offset,
+            }),
+            (end != self.length).then_some(WriteAliasRange {
+                address: self.address + end,
+                length: self.length - end,
+            }),
+            None,
+        ];
+    }
+
+    fn note_unexpected_address(&mut self, address: usize, length: usize) {
+        self.unexpected = Some(WriteAliasRange { address, length });
+        let Some(end) = address.checked_add(length) else {
+            return;
+        };
+        if !address.is_multiple_of(PAGE_SIZE) || length > self.length {
+            return;
+        }
+        self.unexpected_bounds_valid = true;
+        let reservation_end = self.address + self.length;
+        // Prefix/suffix already cover every still-owned byte inside the
+        // reservation. Add only the returned allocation's outside portion,
+        // excluding overlaps and the ambiguous target. Its length equals the
+        // failed extent's length and cannot exceed the reservation, so it
+        // cannot extend past both ends. There is at most one extra interval.
+        self.owned[2] = if address < self.address {
+            Some(WriteAliasRange {
+                address,
+                length: end.min(self.address) - address,
+            })
+        } else if end > reservation_end {
+            let start = address.max(reservation_end);
+            Some(WriteAliasRange {
+                address: start,
+                length: end - start,
+            })
+        } else {
+            None
+        };
+    }
+
+    fn retire(self: Box<Self>) -> WriteAliasRetirement {
+        self.retire_with(|range| {
+            // SAFETY: this interval remains ours. Failed fixed targets and
+            // already retired intervals never enter the ownership array.
+            let result = unsafe {
+                libc::munmap(
+                    std::ptr::with_exposed_provenance_mut::<libc::c_void>(range.address),
+                    range.length,
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            }
+        })
+    }
+
+    fn retire_with(
+        mut self: Box<Self>,
+        mut unmap: impl FnMut(WriteAliasRange) -> std::result::Result<(), i32>,
+    ) -> WriteAliasRetirement {
+        for (index, owned) in self.owned.iter_mut().enumerate() {
+            let Some(range) = *owned else {
+                continue;
+            };
+            // Linux's normal munmap error paths leave these pages mapped,
+            // even if a VMA split occurred before refusal (5.15 __do_munmap;
+            // 7.1 do_vmi_align_munmap's explicit point of no return).
+            match unmap(range) {
+                Ok(()) => *owned = None,
+                Err(errno) => self.cleanup[index] = Some(WriteAliasCleanupFailure { range, errno }),
+            }
+        }
+        let retained = self.ambiguous.is_some() || self.owned.iter().any(Option::is_some);
+        let outcome = WriteAliasRetirement {
+            retention_id: if retained {
+                std::ptr::from_ref(self.as_ref()).addr()
+            } else {
+                0
+            },
+            ambiguous: self.ambiguous.is_some(),
+            mapping_errno: self.mapping_errno,
+            cleanup: self.cleanup,
+        };
+        if retained {
+            // Ownership transfer allocates nothing, invokes no destructor or
+            // notification, and does not depend on formatting the later error.
+            let mut head = RETAINED_WRITE_ALIASES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.next = head.take();
+            *head = Some(self);
+        }
+        outcome
+    }
+}
+
+impl WriteAliasRetirement {
+    fn error(self, primary: Option<Error>) -> Option<Error> {
+        let mut error = if self.ambiguous {
+            let primary = primary.unwrap_or_else(|| {
+                Error::MemoryMapping(match self.mapping_errno {
+                    Some(errno) => io::Error::from_raw_os_error(errno),
+                    None => io::Error::other(UNEXPECTED_WRITE_ALIAS_ADDRESS),
+                })
+            });
+            Some(primary.cleanup(AMBIGUOUS_WRITE_ALIAS_PHASE))
+        } else {
+            primary
+        };
+        for failure in self.cleanup.into_iter().flatten() {
+            let cleanup = Error::WriteAliasCleanup {
+                source: io::Error::from_raw_os_error(failure.errno),
+                address: failure.range.address,
+                length: failure.range.length,
+                retention_id: self.retention_id,
+            };
+            error = Some(match error {
+                Some(primary) => primary.with_cleanup(vec![cleanup]),
+                None => cleanup,
+            });
+        }
+        error
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedWriteAliasSnapshot {
+    pub(crate) retention_id: usize,
+    pub(crate) address: usize,
+    pub(crate) length: usize,
+    // All tuples use absolute start addresses and byte lengths.
+    pub(crate) ambiguous: Option<(usize, usize)>,
+    // Unexpected positive return metadata, not additional cleanup authority.
+    pub(crate) unexpected: Option<(usize, usize)>,
+    pub(crate) unexpected_bounds_valid: bool,
+    pub(crate) owned_ranges: [Option<(usize, usize)>; 3],
+    pub(crate) cleanup_errors: [Option<(usize, usize, i32)>; 3],
+    // Number of retained extent owners, not necessarily distinct backing files.
+    pub(crate) backing_count: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn retained_write_aliases_for_test() -> Vec<RetainedWriteAliasSnapshot> {
+    let head = RETAINED_WRITE_ALIASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut next = head.as_deref();
+    let mut snapshots = Vec::new();
+    while let Some(record) = next {
+        snapshots.push(RetainedWriteAliasSnapshot {
+            retention_id: std::ptr::from_ref(record).addr(),
+            address: record.address,
+            length: record.length,
+            ambiguous: record.ambiguous.map(|range| (range.address, range.length)),
+            unexpected: record.unexpected.map(|range| (range.address, range.length)),
+            unexpected_bounds_valid: record.unexpected_bounds_valid,
+            owned_ranges: record
+                .owned
+                .map(|range| range.map(|range| (range.address, range.length))),
+            cleanup_errors: record.cleanup.map(|failure| {
+                failure.map(|failure| (failure.range.address, failure.range.length, failure.errno))
+            }),
+            backing_count: record._extents.len(),
+        });
+        next = record.next.as_deref();
+    }
+    snapshots
+}
+
+/// A scoped kernel copyout view. Permissions and host copies are serialized
+/// through the syscall, while peer vCPUs still see the exact shared-byte writes.
+/// Use only for synchronous operations with bounded buffer sizes that do not
+/// reenter guest memory or acquire its allocation lock. Filesystem latency is
+/// not bounded: a stalled syscall keeps these locks held. This does not hold a
+/// short-copy admission.
+pub(crate) struct UserWriteAlias<'a> {
+    // Explicit retirement makes every field optional: finish, construction
+    // failure, plain Drop and unwind all use the same exactly-once finalizer.
+    mapping: Option<Box<WriteAliasMapping>>,
+    offset: usize,
+    memory: &'a GuestMemory,
+    host_access: Option<MutexGuard<'a, ()>>,
+    permissions: Option<MutexGuard<'a, AddressSpaceState>>,
+    retained: Option<RetainedOperand>,
+}
+
+impl UserWriteAlias<'_> {
+    /// Kernel-only operand for at most the requested byte count. For zero bytes
+    /// this is an unowned sentinel, not a dereferenceable allocation. The caller
+    /// must use a syscall whose zero-count contract never accesses that pointer.
+    pub(crate) fn address(&self) -> *mut libc::c_void {
+        let address = self
+            .mapping
+            .as_ref()
+            .map_or(PAGE_SIZE, |mapping| mapping.address);
+        std::ptr::with_exposed_provenance_mut(address + self.offset)
+    }
+
+    fn retire(&mut self, primary: Option<Error>) {
+        let retirement = self
+            .mapping
+            .take()
+            .map_or_else(WriteAliasRetirement::default, WriteAliasMapping::retire);
+        // Neither error publication nor operand retirement may notify a waker
+        // while either guest-memory lock is held. The ownership ledger has
+        // already accepted every unresolved interval before these unlocks.
+        drop(self.host_access.take());
+        drop(self.permissions.take());
+        if std::thread::panicking() {
+            // The operand captures the original unwind before notifying. Do
+            // not let a secondary munmap failure replace that primary cause.
+            // With no cleanup error this remains the original single wake.
+            drop(self.retained.take());
+        }
+        if let Some(error) = retirement.error(primary) {
+            self.memory
+                .mapping
+                .entry_gate
+                .poison(self.memory.entry_origin(), error);
+        }
+        drop(self.retained.take());
+    }
+
+    fn fail(mut self, error: Error) -> Error {
+        if matches!(&error, Error::MemoryMapping(_)) {
+            self.retire(Some(error));
+            self.memory
+                .check_copy_failure()
+                .expect_err("writable alias infrastructure failure must poison its gate")
+        } else {
+            self.retire(None);
+            self.memory.check_copy_failure().err().unwrap_or(error)
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.retire(None);
+        self.memory.check_copy_failure()
+    }
+}
+
+impl Drop for UserWriteAlias<'_> {
+    fn drop(&mut self) {
+        self.retire(None);
+    }
+}
+
 /// Proof returned only after the memory owner has retained an installed mmap
 /// view. Closed admission consumes this receipt before advancing the sole
 /// mapping generation.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the mapping publisher is deliberately non-activating"
-    )
-)]
 pub(crate) struct InstalledMapping {
     generation: MappingGeneration,
 }
 
 impl InstalledMapping {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the mapping publisher is deliberately non-activating"
-        )
-    )]
     fn new(generation: MappingGeneration) -> Self {
         Self { generation }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the mapping publisher is deliberately non-activating"
-        )
-    )]
     pub(crate) fn generation(&self) -> MappingGeneration {
         self.generation
     }
@@ -351,7 +700,12 @@ impl HostMemoryOperand {
             .expect("retained host operand belongs to its mapping");
         let chunks = self._memory.mapping.host_chunks(offset, length);
         assert_eq!(chunks.len(), 1, "test value crosses an mmap boundary");
-        let chunk = chunks[0];
+        let chunk = &chunks[0];
+        assert_eq!(
+            chunk.backing.kind,
+            BackingKind::Fixed,
+            "volatile Rust dereference requires fixed backing"
+        );
         // SAFETY: the caller excludes concurrent writers. The retained operand
         // prevents publication, and host_chunks returned the exact live mmap
         // pointer rather than reconstructing it from the numeric HVA.
@@ -372,7 +726,7 @@ impl HostMemoryOperand {
 )]
 pub(crate) struct PendingBackingPage<'a> {
     memory: &'a GuestMemory,
-    _allocation: MutexGuard<'a, ()>,
+    _allocation: AllocationGuard<'a>,
     page: u64,
     expected_generation: MappingGeneration,
     slice: Option<BackingSlice>,
@@ -426,13 +780,16 @@ enum UserPageState {
 // SAFETY: Mapping owns every mmap view until Drop, not a Rust reference.
 // Arc<Backing> retains the shared host_access mutex and each file descriptor
 // needed for backing operations. Host access through all views is serialized
-// by the original backing's mutex. Rust dereferences are split at mmap page
-// boundaries and use the exact live pointer for that page. The KVM backend
+// by the original backing's mutex. Rust dereferences touch only fixed RAM,
+// split at mmap page boundaries with the exact live pointer for that page.
+// Truncate-capable ordinary files are accessed only by fault-contained kernel
+// copies using retained raw addresses, never Rust slices or raw memcpy.
+// The KVM backend
 // exposes handles only while its single vCPU is stopped at an exit; the host
 // mutex does not stop vCPU access.
 unsafe impl Send for Mapping {}
 // SAFETY: See the Send implementation. All host reads and writes take the
-// backing's mutex before dereferencing the pointer.
+// backing's mutex before dereferencing fixed RAM or issuing a contained file copy.
 unsafe impl Sync for Mapping {}
 
 impl GuestMemory {
@@ -460,6 +817,12 @@ impl GuestMemory {
 
     fn from_backing_slice(guest_base: u64, slice: BackingSlice) -> Result<Self> {
         Self::validate_layout(guest_base, slice.length)?;
+        if slice.backing.kind != BackingKind::Fixed {
+            return Err(Error::SharedFileCapability {
+                operation: "initial memory image",
+                reason: "ordinary files require the retained publication path",
+            });
+        }
 
         // SAFETY: slice owns a live memfd and a validated page-aligned range;
         // its offset fits off_t. The returned view is released once in Drop.
@@ -498,6 +861,9 @@ impl GuestMemory {
                 address_space: Mutex::new(AddressSpaceState::new(guest_base, size)),
                 allocation: Mutex::new(()),
                 entry_gate: EntryGate::new(),
+                retirement: Mutex::new(None),
+                deferred: Mutex::new(shared_file::DeferredFailures::default()),
+                sync_mmu: Mutex::new(None),
             }),
             failure_context: None,
             operation_origin: None,
@@ -513,6 +879,10 @@ impl GuestMemory {
             test_user_copy_failure: None,
             #[cfg(test)]
             test_user_copy_backing_wait: None,
+            #[cfg(test)]
+            test_shared_map: None,
+            #[cfg(test)]
+            test_shared_sync: None,
         })
     }
 
@@ -544,17 +914,22 @@ impl GuestMemory {
         }
     }
 
-    fn copy_access(&self) -> Result<CopyAccess> {
+    fn copy_access(&self) -> Result<MemoryCopyAccess<'_>> {
+        self.check_copy_failure()?;
         self.mapping
             .entry_gate
             .copy_blocking(self.entry_origin())
+            .map(|copy| MemoryCopyAccess::new(self, copy))
             .map_err(|failure| failure.error())
     }
 
     fn check_copy_failure(&self) -> Result<()> {
         match self.mapping.entry_gate.pending_failure() {
             Some(failure) => Err(failure.error()),
-            None => Ok(()),
+            None => match self.deferred_failure() {
+                Some(cause) => Err(Error::SharedFailure(cause)),
+                None => Ok(()),
+            },
         }
     }
 
@@ -566,6 +941,10 @@ impl GuestMemory {
         let result = operation(&copy);
         // An admitted operation may have effects before poison. Keep them,
         // but do not turn an observed backend failure into ordinary success.
+        let prior = self.check_copy_failure();
+        drop(copy);
+        let result = result.map_err(|error| self.capture_shared_file_error(error));
+        prior?;
         self.check_copy_failure()?;
         result
     }
@@ -577,6 +956,7 @@ impl GuestMemory {
         &self,
         operation: impl FnOnce(&RawMemoryRead<'_>) -> Result<T>,
     ) -> Result<Option<T>> {
+        self.check_copy_failure()?;
         let Some(copy) = self
             .mapping
             .entry_gate
@@ -585,10 +965,15 @@ impl GuestMemory {
         else {
             return Ok(None);
         };
+        let copy = MemoryCopyAccess::new(self, copy);
         let result = operation(&RawMemoryRead {
             memory: self,
             copy: &copy,
         });
+        let prior = self.check_copy_failure();
+        drop(copy);
+        let result = result.map_err(|error| self.capture_shared_file_error(error));
+        prior?;
         self.check_copy_failure()?;
         result.map(Some)
     }
@@ -655,6 +1040,15 @@ impl GuestMemory {
 
         self.check_copy_failure()?;
         let _allocation = self.allocation_guard();
+        if self.contains_shared_file() {
+            return self.snapshot_with_shared_files(_allocation);
+        }
+        if self.entry_gate().single_member_domain_active() {
+            return Err(Error::SharedFileCapability {
+                operation: "memory snapshot",
+                reason: "shared-file publication is not quiescent",
+            });
+        }
         let snapshot = Self::new(self.guest_base(), self.len())?;
         let user_access = self
             .mapping
@@ -751,13 +1145,6 @@ impl GuestMemory {
         UserMemory {
             memory: self.clone(),
         }
-    }
-
-    pub(crate) fn allocation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.mapping
-            .allocation
-            .lock()
-            .expect("KVM allocation transaction lock poisoned")
     }
 
     /// Prepare one page replacement without changing the live HVA or KVM
@@ -934,6 +1321,13 @@ impl GuestMemory {
 
     // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
     pub(crate) fn clear_user_access(&self) {
+        if self.contains_shared_file() {
+            self.capture_shared_file_error(Error::SharedFileCapability {
+                operation: "clear user access",
+                reason: "ordinary-file views must retire before reset",
+            });
+            return;
+        }
         let mut access = self
             .mapping
             .address_space
@@ -984,6 +1378,24 @@ impl GuestMemory {
             .address_space
             .lock()
             .expect("guest memory access map lock poisoned");
+        if writable
+            && access
+                .backing_pages
+                .range(first_page..=last_page)
+                .any(|(_, page)| {
+                    matches!(
+                        page._slice.backing.kind,
+                        BackingKind::OrdinaryFile {
+                            max_writable: false
+                        }
+                    )
+                })
+        {
+            return Err(Error::GuestMemoryAccessDenied {
+                address: guest_address,
+                length: length as usize,
+            });
+        }
         for page in first_page..=last_page {
             access.pages.insert(page, state);
             access.reservations.entry(page).or_insert(RegionKind::User);
@@ -993,6 +1405,12 @@ impl GuestMemory {
 
     // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
     pub(crate) fn unmap_user_range(&self, guest_address: u64, length: u64) -> Result<()> {
+        if self.range_contains_shared_file(guest_address, length as usize) {
+            return Err(Error::SharedFileCapability {
+                operation: "metadata-only unmap",
+                reason: "ordinary-file backing requires physical private replacement",
+            });
+        }
         let Some((first_page, last_page)) = self.checked_page_range(guest_address, length)? else {
             return Ok(());
         };
@@ -1080,6 +1498,14 @@ impl GuestMemory {
         new_address: u64,
         new_length: u64,
     ) -> Result<()> {
+        if self.range_contains_shared_file(old_address, old_length as usize)
+            || self.range_contains_shared_file(new_address, new_length as usize)
+        {
+            return Err(Error::SharedFileCapability {
+                operation: "memory remap",
+                reason: "ordinary-file source or destination is not supported by the private-copy remapper",
+            });
+        }
         let Some((old_first, old_last)) = self.checked_page_range(old_address, old_length)? else {
             return Ok(());
         };
@@ -1201,29 +1627,7 @@ impl GuestMemory {
                 observe();
             }
         }
-        let _guard = self
-            .mapping
-            .slice
-            .backing
-            .host_access
-            .lock()
-            .expect("guest memory lock poisoned");
-        let mut copied = 0;
-        for chunk in chunks {
-            // SAFETY: host_chunks split the validated range at mmap boundaries
-            // and returned the exact live pointer for this chunk. Destination
-            // is a distinct mutable slice with the same remaining length.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    chunk.mapping.as_ptr(),
-                    destination.as_mut_ptr().add(copied),
-                    chunk.length,
-                );
-            }
-            copied += chunk.length;
-        }
-        debug_assert_eq!(copied, destination.len());
-        Ok(())
+        self.read_host_chunks(&chunks, guest_address, destination)
     }
 
     /// Copies bytes from a host slice into guest memory.
@@ -1273,6 +1677,7 @@ impl GuestMemory {
     /// The owner must subscribe, recheck its stop predicates and await before
     /// retrying; None is neither a completed copy nor a guest memory fault.
     pub(crate) fn try_write_raw(&self, guest_address: u64, source: &[u8]) -> Result<Option<()>> {
+        self.check_copy_failure()?;
         let Some(copy) = self
             .mapping
             .entry_gate
@@ -1281,7 +1686,12 @@ impl GuestMemory {
         else {
             return Ok(None);
         };
+        let copy = MemoryCopyAccess::new(self, copy);
         let result = self.write_raw_admitted(guest_address, source, &copy);
+        let prior = self.check_copy_failure();
+        drop(copy);
+        let result = result.map_err(|error| self.capture_shared_file_error(error));
+        prior?;
         self.check_copy_failure()?;
         result.map(Some)
     }
@@ -1294,14 +1704,13 @@ impl GuestMemory {
     ) -> Result<()> {
         let offset = self.checked_offset(guest_address, source.len())?;
         let chunks = self.mapping.host_chunks(offset, source.len());
-        self.write_host_chunks(&chunks, source);
-        Ok(())
+        self.write_host_chunks(&chunks, guest_address, source)
     }
 
     /// Write through pointers already resolved under the caller's applicable
     /// address-space guard. Keeping resolution separate lets permission-aware
     /// copyout retain that guard through the actual write without re-locking.
-    fn write_host_chunks(&self, chunks: &[HostChunk], source: &[u8]) {
+    fn write_host_chunks(&self, chunks: &[HostChunk], address: u64, source: &[u8]) -> Result<()> {
         #[cfg(test)]
         if let Some(observed) = &self.test_user_copy_backing_wait {
             // Passive observation of an actual failed lock attempt. The test
@@ -1323,20 +1732,19 @@ impl GuestMemory {
             .expect("guest memory lock poisoned");
         let mut copied = 0;
         for chunk in chunks {
-            // SAFETY: host_chunks split the validated range at mmap boundaries
-            // and returned the exact live pointer for this chunk. The source
-            // slice has the same remaining length and does not overlap guest
-            // RAM.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    source.as_ptr().add(copied),
-                    chunk.mapping.as_ptr(),
-                    chunk.length,
-                );
+            let local = unsafe { source.as_ptr().add(copied).cast_mut() };
+            match chunk.backing.kind {
+                BackingKind::OrdinaryFile { .. } => {
+                    self.copy_file_chunk(chunk, local, true, address, source.len(), copied)?
+                }
+                BackingKind::Fixed => unsafe {
+                    std::ptr::copy_nonoverlapping(local, chunk.mapping.as_ptr(), chunk.length);
+                },
             }
             copied += chunk.length;
         }
         debug_assert_eq!(copied, source.len());
+        Ok(())
     }
     /// Zeros a guest-physical address range.
     // TODO-HUMAN-REVIEW(PR-132): Review user-map enforcement on this public API.
@@ -1378,11 +1786,23 @@ impl GuestMemory {
             .lock()
             .expect("guest memory lock poisoned");
         let mut zeroed = 0;
+        let mut zeros = [0_u8; PAGE_SIZE];
         for chunk in chunks {
-            // SAFETY: host_chunks split the validated range at mmap boundaries
-            // and returned the exact live pointer for this chunk.
-            unsafe {
-                std::ptr::write_bytes(chunk.mapping.as_ptr(), 0, chunk.length);
+            match chunk.backing.kind {
+                BackingKind::OrdinaryFile { .. } => {
+                    debug_assert!(chunk.length <= zeros.len());
+                    self.copy_file_chunk(
+                        &chunk,
+                        zeros.as_mut_ptr(),
+                        true,
+                        guest_address,
+                        length,
+                        zeroed,
+                    )?;
+                }
+                BackingKind::Fixed => unsafe {
+                    std::ptr::write_bytes(chunk.mapping.as_ptr(), 0, chunk.length);
+                },
             }
             zeroed += chunk.length;
         }
@@ -1417,6 +1837,15 @@ impl GuestMemory {
             });
         }
         let chunks = self.mapping.host_chunks(offset, length);
+        if chunks
+            .iter()
+            .any(|chunk| matches!(chunk.backing.kind, BackingKind::OrdinaryFile { .. }))
+        {
+            return Err(Error::SharedFileCapability {
+                operation: "discard pages",
+                reason: "ordinary-file views must be physically retired before reset",
+            });
+        }
         let _guard = self
             .mapping
             .slice
@@ -1531,51 +1960,70 @@ impl PendingBackingPage<'_> {
         )
         .expect("mapping offset must fit usize");
         let origin = self.memory.entry_origin();
+        let memory = self.memory;
+        let allocation = self._allocation;
+        let mut prepared = mapping.address_space.lock().unwrap().clone();
+        prepared.backing_pages.insert(
+            page,
+            InstalledBackingPage {
+                _generation: expected_generation,
+                _slice: slice.clone(),
+                mapping: mapping.original_pages[offset / PAGE_SIZE],
+            },
+        );
+        let ledger = self.memory.prepare_mapping_retirement(&prepared);
         let generation = closed
-            .publish(origin, expected_generation, |generation| {
-                let mut state = mapping
-                    .address_space
-                    .lock()
-                    .expect("guest memory access map lock poisoned");
-                let target_address = mapping
-                    .base_address
-                    .checked_add(offset)
-                    .expect("validated mapping address cannot overflow");
-                // SAFETY: admission is closed, every short copy is drained,
-                // retained operands were refused by Closed::publish, and slice
-                // owns a page-aligned live memfd. MAP_FIXED is the intended
-                // backing replacement. The target pointer supplies only the
-                // exposed numeric HVA; Rust dereferences retain mmap's returned
-                // pointer below. Failure poisons the gate.
-                let installed = unsafe {
-                    libc::mmap(
-                        std::ptr::with_exposed_provenance_mut::<u8>(target_address).cast(),
-                        PAGE_SIZE,
+            .publish(origin, expected_generation, move |generation| {
+                let outcome = (|| {
+                    let mut ownership = mapping.retirement.lock().unwrap();
+                    *ownership = Some(ledger);
+                    let target_address = mapping.base_address + offset;
+                    // All cleanup authority and metadata nodes are already
+                    // allocated. The target becomes ambiguous on any failure.
+                    ownership
+                        .as_mut()
+                        .unwrap()
+                        .lose_fixed_target(offset, PAGE_SIZE, None);
+                    let installed = memory.map_shared_image(
+                        target_address,
+                        &slice,
                         libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_SHARED | libc::MAP_FIXED,
-                        slice.backing.fd.as_raw_fd(),
-                        slice.offset as libc::off_t,
-                    )
-                };
-                if installed == libc::MAP_FAILED {
-                    return Err(Error::MemoryMapping(std::io::Error::last_os_error()));
-                }
-                let installed: NonNull<u8> =
-                    NonNull::new(installed.cast()).expect("MAP_FIXED returned a null guest page");
-                if installed.as_ptr().expose_provenance() != target_address {
-                    return Err(Error::MemoryMapping(std::io::Error::other(
-                        "MAP_FIXED installed a guest page at an unexpected address",
-                    )));
-                }
-                state.backing_pages.insert(
-                    page,
-                    InstalledBackingPage {
-                        _generation: generation,
-                        _slice: slice,
-                        mapping: installed,
-                    },
-                );
-                Ok(InstalledMapping::new(generation))
+                    );
+                    let installed = match installed {
+                        Ok(installed) => installed,
+                        Err(error) => {
+                            ownership.as_mut().unwrap().mapping_errno = error.raw_os_error();
+                            return Err(Error::MemoryMapping(error));
+                        }
+                    };
+                    if installed.expose_provenance() != target_address {
+                        ownership
+                            .as_mut()
+                            .unwrap()
+                            .note_unexpected_address(installed.expose_provenance(), PAGE_SIZE);
+                        return Err(Error::MemoryMapping(io::Error::other(
+                            "MAP_FIXED installed a guest page at an unexpected address",
+                        )));
+                    }
+                    let owner = ownership.as_mut().unwrap();
+                    owner.ambiguous = None;
+                    owner.owned = [
+                        Some(WriteAliasRange {
+                            address: mapping.base_address,
+                            length: mapping.slice.length,
+                        }),
+                        None,
+                        None,
+                    ];
+                    let page_state = prepared.backing_pages.get_mut(&page).unwrap();
+                    page_state._generation = generation;
+                    page_state.mapping =
+                        NonNull::new(installed.cast()).expect("nonzero fixed arena");
+                    *mapping.address_space.lock().unwrap() = prepared;
+                    Ok(InstalledMapping::new(generation))
+                })();
+                drop(allocation);
+                outcome
             })
             .map_err(|failure| failure.error())?;
         Ok(generation)
@@ -1629,6 +2077,190 @@ impl UserMemory {
     pub(crate) fn host_operand(&self, address: u64, length: usize) -> Result<HostMemoryOperand> {
         self.memory
             .with_copy(|copy| self.host_operand_admitted(address, length, copy))
+    }
+
+    /// Mirror current writable guest pages into a bounded kernel-only alias.
+    /// Invalid and protected addresses remain PROT_NONE so the actual syscall
+    /// decides whether it needs to touch them, including at EOF or zero count.
+    pub(crate) fn writable_alias(&self, address: u64, length: usize) -> Result<UserWriteAlias<'_>> {
+        // Retire the short copy before taking either alias lock: retirement
+        // notifies subscribers synchronously and their wakers may read memory.
+        // The retained operand still prevents a mapping-generation change.
+        let retained = self.memory.with_copy(|copy| {
+            self.memory
+                .mapping
+                .entry_gate
+                .retain_operand(copy)
+                .map_err(|failure| failure.error())
+        })?;
+        let mut alias = UserWriteAlias {
+            mapping: None,
+            offset: address as usize % PAGE_SIZE,
+            memory: &self.memory,
+            host_access: None,
+            permissions: None,
+            retained: Some(retained),
+        };
+        let result = (|| {
+            // Match permission-aware copyout's lock order. Keeping both guards
+            // through the syscall prevents stale mprotect/munmap permissions
+            // and simultaneous Rust dereferences of kernel-written memory.
+            alias.permissions = Some(
+                self.memory
+                    .mapping
+                    .address_space
+                    .lock()
+                    .expect("guest memory access map lock poisoned"),
+            );
+            alias.host_access = Some(
+                self.memory
+                    .mapping
+                    .slice
+                    .backing
+                    .host_access
+                    .lock()
+                    .expect("guest memory lock poisoned"),
+            );
+            let permissions = alias.permissions.as_ref().unwrap();
+            let offset = alias.offset;
+            let mapping_length = if length == 0 {
+                0
+            } else {
+                offset
+                    .checked_add(length)
+                    .and_then(|size| size.checked_add(PAGE_SIZE - 1))
+                    .map(|size| size & !(PAGE_SIZE - 1))
+                    .ok_or(Error::GuestMemoryAccessDenied { address, length })?
+            };
+            let mut extents: Vec<WriteAliasExtent> = Vec::new();
+            let first_page = address - offset as u64;
+            for alias_offset in (0..mapping_length).step_by(PAGE_SIZE) {
+                let Some(page_address) = first_page.checked_add(alias_offset as u64) else {
+                    break;
+                };
+                if page_address < self.guest_base() || page_address >= self.guest_end() {
+                    continue;
+                }
+                let page = page_address / PAGE_SIZE as u64;
+                if permissions.enabled
+                    && !matches!(
+                        permissions.pages.get(&page),
+                        Some(UserPageState::Accessible { writable: true })
+                    )
+                {
+                    continue;
+                }
+                let slice = match permissions.backing_pages.get(&page) {
+                    Some(installed) => installed._slice.clone(),
+                    None => BackingSlice {
+                        backing: self.memory.mapping.slice.backing.clone(),
+                        offset: self.memory.mapping.slice.offset
+                            + (page_address - self.guest_base()) as usize,
+                        length: PAGE_SIZE,
+                    },
+                };
+                if let Some(last) = extents.last_mut()
+                    && last.offset + last.slice.length == alias_offset
+                    && Arc::ptr_eq(&last.slice.backing, &slice.backing)
+                    && last.slice.offset + last.slice.length == slice.offset
+                {
+                    last.slice.length += slice.length;
+                } else {
+                    extents.push(WriteAliasExtent {
+                        offset: alias_offset,
+                        slice,
+                    });
+                }
+            }
+            if mapping_length == 0 {
+                // The unowned sentinel still retains admission and both locks.
+                return Ok(());
+            }
+            // Preallocate both the normal owner and its terminal ledger link
+            // before acquiring any address that might later refuse retirement.
+            alias.mapping = Some(Box::new(WriteAliasMapping {
+                address: 0,
+                length: mapping_length,
+                ambiguous: None,
+                mapping_errno: None,
+                unexpected: None,
+                unexpected_bounds_valid: false,
+                owned: [None; 3],
+                cleanup: [None; 3],
+                _extents: extents,
+                next: None,
+            }));
+            let mapping = alias.mapping.as_mut().unwrap();
+            // SAFETY: this anonymous inaccessible reservation owns no guest
+            // bytes; shared extents below replace only its own pages.
+            let reservation = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    mapping_length,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if reservation == libc::MAP_FAILED {
+                return Err(Error::MemoryMapping(io::Error::last_os_error()));
+            }
+            mapping.address = reservation.expose_provenance();
+            mapping.owned[0] = Some(WriteAliasRange {
+                address: mapping.address,
+                length: mapping_length,
+            });
+            for index in 0..mapping._extents.len() {
+                let extent = &mapping._extents[index];
+                let offset = extent.offset;
+                let length = extent.slice.length;
+                let target = mapping.address + offset;
+                // SAFETY: this range is still ours and the memfd slice remains
+                // retained. Atomic MAP_FIXED replacement does not expose a
+                // successful-path hole to another ordinary host allocator.
+                let installed = unsafe {
+                    libc::mmap(
+                        std::ptr::with_exposed_provenance_mut::<libc::c_void>(target),
+                        length,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_FIXED,
+                        extent.slice.backing.fd.as_raw_fd(),
+                        extent.slice.offset as libc::off_t,
+                    )
+                };
+                if installed == libc::MAP_FAILED {
+                    let error = io::Error::last_os_error();
+                    // Linux 5.15 mmap_region and Linux 7.1 __mmap_setup /
+                    // __mmap_new_vma / vms_abort_munmap_vmas can leave a gap
+                    // after a failed fixed replacement. It may already have a
+                    // foreign occupant. Earlier failures can retain the old
+                    // reservation. Never unmap or retry this ambiguous target.
+                    mapping.lose_fixed_target(offset, length, error.raw_os_error());
+                    return Err(Error::MemoryMapping(error));
+                }
+                if installed.expose_provenance() != target {
+                    // MAP_FIXED must return its exact target. Partition a
+                    // defensive positive result into disjoint owned ranges,
+                    // excluding the requested ambiguous interval throughout.
+                    mapping.lose_fixed_target(offset, length, None);
+                    mapping.note_unexpected_address(installed.expose_provenance(), length);
+                    return Err(Error::MemoryMapping(io::Error::other(
+                        UNEXPECTED_WRITE_ALIAS_ADDRESS,
+                    )));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(alias.fail(error));
+        }
+        // A preparation notification may have poisoned admission. Retire first
+        // so the returned failure includes any newly refused cleanup as well.
+        if let Err(primary) = self.memory.check_copy_failure() {
+            return Err(alias.finish().err().unwrap_or(primary));
+        }
+        Ok(alias)
     }
 
     fn host_operand_admitted(
@@ -1778,29 +2410,8 @@ impl UserMemory {
                     .memory
                     .mapping
                     .host_chunks_from_state(&access, offset, length);
-                let _backing = self
-                    .memory
-                    .mapping
-                    .slice
-                    .backing
-                    .host_access
-                    .lock()
-                    .expect("guest memory lock poisoned");
-                let mut copied = 0;
-                for chunk in chunks {
-                    // SAFETY: the address-space lock retains these mappings,
-                    // backing is locked, and the destination is a distinct host
-                    // slice with space for the complete validated prefix.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            chunk.mapping.as_ptr(),
-                            destination.as_mut_ptr().add(copied),
-                            chunk.length,
-                        );
-                    }
-                    copied += chunk.length;
-                }
-                debug_assert_eq!(copied, length);
+                self.memory
+                    .read_host_chunks(&chunks, guest_address, &mut destination[..length])?;
             }
             drop(access);
             Ok(length)
@@ -1866,7 +2477,20 @@ impl UserMemory {
                 .memory
                 .mapping
                 .host_chunks_from_state(&access, offset, length);
-            self.memory.write_host_chunks(&chunks, &source[..length]);
+            // Permission failure takes precedence. A scalar must refuse the
+            // entire destination before even a preceding private chunk changes.
+            if !partial
+                && chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk.backing.kind, BackingKind::OrdinaryFile { .. }))
+            {
+                return Err(Error::SharedFileCapability {
+                    operation: "atomic scalar store",
+                    reason: "truncate-capable file backing has no proven fault-contained atomic store",
+                });
+            }
+            self.memory
+                .write_host_chunks(&chunks, guest_address, &source[..length])?;
         }
         // Preserve the API's permission-atomicity contract through the write.
         drop(access);
@@ -2055,7 +2679,15 @@ impl MemoryAccess for GuestMemory {
             }
             let destination =
                 &mut write_to[destination_index][destination_offset..destination_offset + count];
-            if self.read_raw_admitted(address, destination, &copy).is_err() {
+            if let Err(error) = self.read_raw_admitted(address, destination, &copy) {
+                drop(copy);
+                if matches!(
+                    error.primary(),
+                    Error::SharedFileCopy { .. } | Error::SharedFileCapability { .. }
+                ) {
+                    self.capture_shared_file_error(shared_file::vector_copy_error(error, total));
+                    return Err(Errno::EIO);
+                }
                 self.check_copy_failure().map_err(|_| Errno::EIO)?;
                 return if total == 0 {
                     Err(Errno::EFAULT)
@@ -2120,7 +2752,15 @@ impl MemoryAccess for GuestMemory {
                 };
             }
             let source = &read_from[source_index][source_offset..source_offset + count];
-            if self.write_raw_admitted(address, source, &copy).is_err() {
+            if let Err(error) = self.write_raw_admitted(address, source, &copy) {
+                drop(copy);
+                if matches!(
+                    error.primary(),
+                    Error::SharedFileCopy { .. } | Error::SharedFileCapability { .. }
+                ) {
+                    self.capture_shared_file_error(shared_file::vector_copy_error(error, total));
+                    return Err(Errno::EIO);
+                }
                 self.check_copy_failure().map_err(|_| Errno::EIO)?;
                 return if total == 0 {
                     Err(Errno::EFAULT)
@@ -2309,7 +2949,11 @@ impl Mapping {
             // SAFETY: no page of the original whole-range mmap has ever been
             // replaced, and the validated range remains within that mapping.
             let mapping = unsafe { NonNull::new_unchecked(self.mapping.as_ptr().add(offset)) };
-            return vec![HostChunk { mapping, length }];
+            return vec![HostChunk {
+                mapping,
+                length,
+                backing: self.slice.backing.clone(),
+            }];
         }
 
         let mut chunks = Vec::with_capacity(length.div_ceil(PAGE_SIZE) + 1);
@@ -2319,9 +2963,12 @@ impl Mapping {
             let within_page = cursor % PAGE_SIZE;
             let chunk_length = (PAGE_SIZE - within_page).min(end - cursor);
             let page = self.guest_base / PAGE_SIZE as u64 + relative_page as u64;
-            let page_start = match state.backing_pages.get(&page) {
-                Some(installed) => installed.mapping,
-                None => self.original_pages[relative_page],
+            let (page_start, backing) = match state.backing_pages.get(&page) {
+                Some(installed) => (installed.mapping, installed._slice.backing.clone()),
+                None => (
+                    self.original_pages[relative_page],
+                    self.slice.backing.clone(),
+                ),
             };
             // SAFETY: page_start is the exact live pointer for this page and
             // chunk_length cannot cross the page boundary.
@@ -2329,6 +2976,7 @@ impl Mapping {
             chunks.push(HostChunk {
                 mapping,
                 length: chunk_length,
+                backing,
             });
             cursor += chunk_length;
         }
@@ -2338,9 +2986,20 @@ impl Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: base_address and slice length are the exact stable arena
-        // bounds. munmap consumes the numeric address and releases every
-        // current VMA in that range, including installed page replacements.
+        if let Some(ledger) = self
+            .retirement
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let retired = ledger.retire();
+            if let Some(error) = retired.error(None) {
+                self.entry_gate.poison(None, error);
+            }
+            return;
+        }
+        // No MAP_FIXED has ever affected this arena. Only that untouched
+        // initial case still owns the complete original interval.
         unsafe {
             libc::munmap(
                 std::ptr::with_exposed_provenance_mut::<u8>(self.base_address).cast(),
@@ -2957,7 +3616,11 @@ impl MemoryAccess for UserMemory {
         let (local_result, post_copy_failure) = {
             // Admission failures are already retained. Do not classify them
             // together with fresh helper errors and poison the same cause again.
-            let copy = gate.copy_blocking(origin.clone()).map_err(|_| Errno::EIO)?;
+            self.memory.check_copy_failure().map_err(|_| Errno::EIO)?;
+            let copy = MemoryCopyAccess::new(
+                &self.memory,
+                gate.copy_blocking(origin.clone()).map_err(|_| Errno::EIO)?,
+            );
             let local_result =
                 self.write_user_prefix_admitted(addr.as_raw() as u64, buf, true, &copy);
             #[cfg(test)]
@@ -2995,11 +3658,20 @@ impl MemoryAccess for UserMemory {
                 // Its fresh unexpected error must remain typed. Capture only
                 // after our token/guards retire; a peer may have captured first,
                 // in which case the gate retains this distinct cause as cleanup.
-                gate.poison(origin, error);
+                if matches!(
+                    error.primary(),
+                    Error::SharedFileCopy { .. } | Error::SharedFileCapability { .. }
+                ) {
+                    self.memory.capture_shared_file_error(error);
+                } else {
+                    // SharedFailure also wraps unrelated typed failures. They
+                    // still require the original unexpected-copy capture.
+                    gate.poison(origin, error);
+                }
                 return Err(Errno::EIO);
             }
         };
-        if post_copy_failure.is_some() || gate.pending_failure().is_some() {
+        if post_copy_failure.is_some() || self.memory.check_copy_failure().is_err() {
             Err(Errno::EIO)
         } else {
             ordinary
@@ -3049,10 +3721,16 @@ impl MemoryAccess for UserMemory {
             }
             let destination =
                 &mut write_to[destination_index][destination_offset..destination_offset + count];
-            if self
-                .read_translated_raw_admitted(address, destination, &copy)
-                .is_err()
-            {
+            if let Err(error) = self.read_translated_raw_admitted(address, destination, &copy) {
+                drop(copy);
+                if matches!(
+                    error.primary(),
+                    Error::SharedFileCopy { .. } | Error::SharedFileCapability { .. }
+                ) {
+                    self.memory
+                        .capture_shared_file_error(shared_file::vector_copy_error(error, total));
+                    return Err(Errno::EIO);
+                }
                 self.memory.check_copy_failure().map_err(|_| Errno::EIO)?;
                 return if total == 0 {
                     Err(Errno::EFAULT)
@@ -3116,10 +3794,16 @@ impl MemoryAccess for UserMemory {
                 };
             }
             let source = &read_from[source_index][source_offset..source_offset + count];
-            if self
-                .write_translated_raw_admitted(address, source, &copy)
-                .is_err()
-            {
+            if let Err(error) = self.write_translated_raw_admitted(address, source, &copy) {
+                drop(copy);
+                if matches!(
+                    error.primary(),
+                    Error::SharedFileCopy { .. } | Error::SharedFileCapability { .. }
+                ) {
+                    self.memory
+                        .capture_shared_file_error(shared_file::vector_copy_error(error, total));
+                    return Err(Errno::EIO);
+                }
                 self.memory.check_copy_failure().map_err(|_| Errno::EIO)?;
                 return if total == 0 {
                     Err(Errno::EFAULT)
@@ -3150,6 +3834,18 @@ mod tests {
     use reverie::syscalls::AddrMut;
 
     use super::*;
+
+    impl GuestMemory {
+        /// Independent admission for observing the initial backing in alias
+        /// failure fixtures. This intentionally does not mirror installed
+        /// replacement pages; callers create it before arming the interposer.
+        pub(crate) fn test_alias_backing_observer(&self) -> Self {
+            let observer =
+                Self::from_backing_slice(self.guest_base(), self.mapping.slice.clone()).unwrap();
+            assert!(!Arc::ptr_eq(&self.entry_gate(), &observer.entry_gate()));
+            observer
+        }
+    }
 
     mod entry_copy_tests {
         use std::sync::atomic::AtomicUsize;
@@ -4537,6 +5233,1303 @@ mod tests {
                 .copy_to_user_prefix(2 * PAGE_SIZE as u64, b"x")
                 .is_err()
         );
+    }
+
+    mod writable_alias_notification_tests {
+        use std::future::Future;
+        use std::task::Context;
+        use std::task::Wake;
+        use std::task::Waker;
+
+        use super::*;
+
+        enum WakeAction {
+            SetWritable(bool),
+            Poison(Arc<Error>),
+        }
+
+        #[derive(Debug)]
+        struct Observation {
+            copies: usize,
+            retained: usize,
+            permissions_available: bool,
+            host_access_available: bool,
+            read: Option<Result<[u8; 4]>>,
+        }
+
+        struct ObserveAliasWake {
+            memory: GuestMemory,
+            action: Mutex<Option<WakeAction>>,
+            observations: Mutex<Vec<Observation>>,
+        }
+
+        impl Wake for ObserveAliasWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                let state = self.memory.entry_gate().test_state();
+                let permissions_available = !matches!(
+                    self.memory.mapping.address_space.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                );
+                let host_access_available = !matches!(
+                    self.memory.mapping.slice.backing.host_access.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                );
+                // Do not hang the baseline: record lock contention instead of
+                // reentering a mutex held by the notifying thread. On the fixed
+                // path this performs a real public GuestMemory read. Both
+                // try_lock temporaries have retired before that operation.
+                // Unwinding may poison an unlocked mutex; the real read then
+                // observes the already-retained gate failure before locking.
+                let read = if permissions_available && host_access_available {
+                    let mut bytes = [0; 4];
+                    Some(self.memory.read(0, &mut bytes).map(|()| bytes))
+                } else {
+                    None
+                };
+                self.observations.lock().unwrap().push(Observation {
+                    copies: state.copies,
+                    retained: state.retained_operands,
+                    permissions_available,
+                    host_access_available,
+                    read,
+                });
+                // No observation lock crosses a permission update or poison,
+                // which can itself notify another registered subscriber.
+                let action = if permissions_available && host_access_available {
+                    self.action.lock().unwrap().take()
+                } else {
+                    None
+                };
+                match action {
+                    Some(WakeAction::SetWritable(writable)) => self
+                        .memory
+                        .map_user_permissions(0, PAGE_SIZE as u64, true, writable)
+                        .unwrap(),
+                    Some(WakeAction::Poison(cause)) => {
+                        self.memory
+                            .entry_gate()
+                            .poison(self.memory.entry_origin(), Error::SharedFailure(cause));
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        fn fixture(writable: bool) -> GuestMemory {
+            let memory = GuestMemory::new(0, PAGE_SIZE).unwrap();
+            memory.write_raw(0, &[0xa5; PAGE_SIZE]).unwrap();
+            memory
+                .map_user_permissions(0, PAGE_SIZE as u64, true, writable)
+                .unwrap();
+            memory.enable_user_access();
+            memory
+        }
+
+        fn probe(memory: &GuestMemory, action: Option<WakeAction>) -> Arc<ObserveAliasWake> {
+            Arc::new(ObserveAliasWake {
+                memory: memory.clone(),
+                action: Mutex::new(action),
+                observations: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn assert_preparation_notification(probe: &ObserveAliasWake) {
+            let observations = probe.observations.lock().unwrap();
+            assert_eq!(observations.len(), 1, "{observations:?}");
+            let observed = &observations[0];
+            assert_eq!(observed.copies, 0);
+            assert_eq!(observed.retained, 1);
+            assert!(observed.permissions_available, "{observed:?}");
+            assert!(observed.host_access_available, "{observed:?}");
+            assert_eq!(
+                observed
+                    .read
+                    .as_ref()
+                    .expect("reentrant read was not attempted")
+                    .as_ref()
+                    .unwrap(),
+                &[0xa5; 4]
+            );
+            assert!(probe.action.lock().unwrap().is_none());
+        }
+
+        fn assert_retired(memory: &GuestMemory) {
+            let state = memory.entry_gate().test_state();
+            assert_eq!(state.copies, 0);
+            assert_eq!(state.retained_operands, 0);
+            assert!(memory.mapping.address_space.try_lock().is_ok());
+            assert!(memory.mapping.slice.backing.host_access.try_lock().is_ok());
+            assert_eq!(Arc::strong_count(&memory.mapping.slice.backing), 1);
+        }
+
+        #[test]
+        fn successful_preparation_notifies_before_alias_locks() {
+            for (address, length) in [(u64::MAX, 0), (3, 17)] {
+                let memory = fixture(true);
+                let mapping = Arc::downgrade(&memory.mapping);
+                let generation = memory.entry_gate().test_state().generation;
+                let probe = probe(&memory, None);
+                let waker = Waker::from(probe.clone());
+                // This is the same subscription used by the checked Tool
+                // driver's private-failure future before polling its callback.
+                let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
+                let mut changed = Box::pin(watch.wait());
+                assert!(
+                    changed
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                let user = memory.user();
+                let alias = user.writable_alias(address, length).unwrap();
+                assert_eq!(memory.entry_gate().test_state().copies, 0);
+                assert_eq!(memory.entry_gate().test_state().retained_operands, 1);
+                assert_eq!(memory.entry_gate().test_state().generation, generation);
+                assert!(memory.mapping.address_space.try_lock().is_err());
+                assert!(memory.mapping.slice.backing.host_access.try_lock().is_err());
+                alias.finish().unwrap();
+                assert_preparation_notification(&probe);
+                assert_retired(&memory);
+                let mut actual = [0; PAGE_SIZE];
+                memory.read(0, &mut actual).unwrap();
+                assert_eq!(actual, [0xa5; PAGE_SIZE]);
+                drop(changed);
+                drop(watch);
+                drop(waker);
+                drop(probe);
+                drop(user);
+                drop(memory);
+                assert!(mapping.upgrade().is_none());
+            }
+        }
+
+        #[test]
+        fn preparation_uses_permissions_changed_by_notification() {
+            for writable in [false, true] {
+                let memory = fixture(!writable);
+                let probe = probe(&memory, Some(WakeAction::SetWritable(writable)));
+                let waker = Waker::from(probe.clone());
+                let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
+                let mut changed = Box::pin(watch.wait());
+                assert!(
+                    changed
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                let zero = std::fs::File::open("/dev/zero").unwrap();
+                let user = memory.user();
+                let alias = user.writable_alias(3, 1).unwrap();
+                // SAFETY: the alias owns this kernel destination until finish;
+                // protected pages are deliberately inaccessible to the kernel.
+                let copied = unsafe { libc::read(zero.as_raw_fd(), alias.address(), 1) };
+                let errno = io::Error::last_os_error().raw_os_error();
+                alias.finish().unwrap();
+                assert_preparation_notification(&probe);
+                assert_retired(&memory);
+                if writable {
+                    assert_eq!(copied, 1);
+                } else {
+                    assert_eq!(copied, -1);
+                    assert_eq!(errno, Some(libc::EFAULT));
+                }
+                let mut actual = [0; PAGE_SIZE];
+                memory.read(0, &mut actual).unwrap();
+                let mut expected = [0xa5; PAGE_SIZE];
+                if writable {
+                    expected[3] = 0;
+                }
+                assert_eq!(actual, expected);
+            }
+        }
+
+        #[test]
+        fn preparation_preserves_poison_from_notification() {
+            for length in [0, 1, usize::MAX] {
+                let memory = fixture(true);
+                let cause = Arc::new(Error::UnexpectedVcpuExit(
+                    "alias preparation notification poison".to_owned(),
+                ));
+                let probe = probe(&memory, Some(WakeAction::Poison(cause.clone())));
+                let waker = Waker::from(probe.clone());
+                let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
+                let mut changed = Box::pin(watch.wait());
+                assert!(
+                    changed
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                let user = memory.user();
+                let error = user
+                    .writable_alias(3, length)
+                    .err()
+                    .expect("poison became success");
+                assert!(error.retains_primary(&cause), "{error}");
+                assert!(
+                    memory
+                        .entry_gate()
+                        .pending_failure()
+                        .unwrap()
+                        .error()
+                        .retains_primary(&cause)
+                );
+                assert_preparation_notification(&probe);
+                assert_retired(&memory);
+            }
+        }
+
+        #[test]
+        fn unwinding_alias_releases_locks_before_retained_notification() {
+            let memory = fixture(true);
+            let user = memory.user();
+            let alias = user.writable_alias(3, 1).unwrap();
+            let probe = probe(&memory, None);
+            let waker = Waker::from(probe.clone());
+            let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
+            let mut changed = Box::pin(watch.wait());
+            assert!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _alias = alias;
+                panic!("controlled alias unwind");
+            }));
+            assert!(result.is_err());
+            let observations = probe.observations.lock().unwrap();
+            assert_eq!(observations.len(), 1, "{observations:?}");
+            let observed = &observations[0];
+            assert_eq!((observed.copies, observed.retained), (0, 0));
+            assert!(
+                observed.permissions_available && observed.host_access_available,
+                "{observed:?}"
+            );
+            let error = observed
+                .read
+                .as_ref()
+                .expect("reentrant read was not attempted")
+                .as_ref()
+                .unwrap_err();
+            assert!(matches!(
+                error.primary(),
+                Error::EntryControl {
+                    operation: "retained host operand unwound",
+                    ..
+                }
+            ));
+            let state = memory.entry_gate().test_state();
+            assert_eq!((state.copies, state.retained_operands), (0, 0));
+            // Guard destruction during unwind preserves ordinary Mutex poison.
+            // Poisoned means try_lock acquired the now-unlocked mutex, unlike
+            // WouldBlock; do not clear either mutex's poison for this control.
+            assert!(matches!(
+                memory.mapping.address_space.try_lock(),
+                Err(std::sync::TryLockError::Poisoned(_))
+            ));
+            assert!(matches!(
+                memory.mapping.slice.backing.host_access.try_lock(),
+                Err(std::sync::TryLockError::Poisoned(_))
+            ));
+            assert_eq!(Arc::strong_count(&memory.mapping.slice.backing), 1);
+        }
+    }
+
+    #[test]
+    fn writable_alias_shares_live_bytes_and_holds_copyout_permissions() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        const BASE: u64 = 0x1000;
+        let backing = Arc::new(Backing::new(4 * PAGE_SIZE).unwrap());
+        let slice = BackingSlice::new(backing, PAGE_SIZE, 3 * PAGE_SIZE).unwrap();
+        let memory = GuestMemory::from_backing_slice(BASE, slice).unwrap();
+        memory.write_raw(BASE, &[0xa5; 3 * PAGE_SIZE]).unwrap();
+        memory
+            .map_user_range(BASE, PAGE_SIZE as u64, false)
+            .unwrap();
+        memory
+            .map_user_permissions(BASE + PAGE_SIZE as u64, PAGE_SIZE as u64, true, false)
+            .unwrap();
+        memory
+            .map_user_range(BASE + 2 * PAGE_SIZE as u64, PAGE_SIZE as u64, true)
+            .unwrap();
+        memory.enable_user_access();
+        // This atomic is a controlled peer-vCPU store, which deliberately does
+        // not acquire the host-copy mutex. It is naturally aligned and remains
+        // in this live mapping, disjoint from the kernel's one-byte output.
+        let marker = unsafe { &*memory.mapping.mapping.as_ptr().add(512).cast::<AtomicU64>() };
+        marker.store(41, Ordering::SeqCst);
+        let zero = std::fs::File::open("/dev/zero").unwrap();
+        let user = memory.user();
+        let alias = user.writable_alias(BASE + 3, 3 * PAGE_SIZE - 3).unwrap();
+        assert_eq!(alias.address() as usize % PAGE_SIZE, 3);
+        assert_eq!(memory.entry_gate().test_state().copies, 0);
+        assert_eq!(memory.entry_gate().test_state().retained_operands, 1);
+        assert!(memory.mapping.address_space.try_lock().is_err());
+        assert!(memory.mapping.slice.backing.host_access.try_lock().is_err());
+        // SAFETY: the alias retains every mapping through these kernel copies.
+        assert_eq!(
+            unsafe { libc::read(zero.as_raw_fd(), alias.address(), 1) },
+            1
+        );
+        for offset in [PAGE_SIZE - 3, 2 * PAGE_SIZE - 3] {
+            let destination = alias.address().cast::<u8>().wrapping_add(offset).cast();
+            assert_eq!(unsafe { libc::read(zero.as_raw_fd(), destination, 1) }, -1);
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EFAULT)
+            );
+        }
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| marker.store(42, Ordering::SeqCst))
+                .join()
+                .unwrap();
+        });
+        alias.finish().unwrap();
+        assert_eq!(marker.load(Ordering::SeqCst), 42);
+        assert_eq!(memory.entry_gate().test_state().retained_operands, 0);
+        let mut actual = vec![0; 3 * PAGE_SIZE];
+        memory.read_raw(BASE, &mut actual).unwrap();
+        let mut expected = vec![0xa5; 3 * PAGE_SIZE];
+        expected[3] = 0;
+        expected[512..520].copy_from_slice(&42_u64.to_ne_bytes());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn writable_alias_uses_installed_backings_across_page_boundaries() {
+        match Kvm::new() {
+            Ok(_) => {}
+            Err(error) if matches!(error.errno(), libc::ENOENT | libc::EACCES | libc::EPERM) => {
+                assert!(
+                    std::env::var_os("REVERIE_REQUIRE_KVM").is_none(),
+                    "installed-backing alias test requires /dev/kvm: {error}"
+                );
+                eprintln!(
+                    "skipping KVM installed-backing alias test: cannot open /dev/kvm: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+        }
+
+        let memory = GuestMemory::new(0, 3 * PAGE_SIZE).unwrap();
+        memory.write_raw(0, &[0xa5; 3 * PAGE_SIZE]).unwrap();
+        memory
+            .map_user_range(0, 3 * PAGE_SIZE as u64, false)
+            .unwrap();
+        memory.enable_user_access();
+        let pending = memory
+            .stage_backing_page(PAGE_SIZE as u64, &[0x5a; PAGE_SIZE])
+            .unwrap();
+        let gate = memory.entry_gate();
+        let mut closed =
+            futures::executor::block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
+        pending.publish(&mut closed).unwrap();
+        drop(closed);
+        let zero = std::fs::File::open("/dev/zero").unwrap();
+        let user = memory.user();
+        let alias = user.writable_alias(0, 3 * PAGE_SIZE).unwrap();
+        for offset in [PAGE_SIZE - 1, 2 * PAGE_SIZE - 1] {
+            let destination = alias.address().cast::<u8>().wrapping_add(offset).cast();
+            // SAFETY: both bytes are writable in the retained alias, crossing
+            // from one separately mapped backing to another only in the kernel.
+            assert_eq!(unsafe { libc::read(zero.as_raw_fd(), destination, 2) }, 2);
+        }
+        alias.finish().unwrap();
+        let mut actual = vec![0; 3 * PAGE_SIZE];
+        memory.read_raw(0, &mut actual).unwrap();
+        let mut expected = vec![0xa5; 3 * PAGE_SIZE];
+        expected[PAGE_SIZE..2 * PAGE_SIZE].fill(0x5a);
+        expected[PAGE_SIZE - 1..PAGE_SIZE + 1].fill(0);
+        expected[2 * PAGE_SIZE - 1..2 * PAGE_SIZE + 1].fill(0);
+        assert_eq!(actual, expected);
+    }
+
+    fn alias_failure_memory(fault: &crate::alias_failure::Fault) -> (GuestMemory, GuestMemory) {
+        let length = fault.pages() * PAGE_SIZE;
+        let memory = GuestMemory::new(0, length).unwrap();
+        memory.write_raw(0, &vec![0xa5; length]).unwrap();
+        if fault.case() != crate::alias_failure::Case::CleanupAtEof {
+            for page in (0..fault.pages()).step_by(2) {
+                memory
+                    .map_user_range((page * PAGE_SIZE) as u64, PAGE_SIZE as u64, false)
+                    .unwrap();
+            }
+        }
+        memory.enable_user_access();
+        let observer = memory.test_alias_backing_observer();
+        (memory, observer)
+    }
+
+    fn assert_alias_ledger(
+        fault: &crate::alias_failure::Fault,
+        before: &[RetainedWriteAliasSnapshot],
+    ) -> Option<RetainedWriteAliasSnapshot> {
+        use crate::alias_failure::Case;
+        let after = retained_write_aliases_for_test();
+        if matches!(fault.case(), Case::Reservation | Case::AtomicCollision) {
+            assert_eq!(after, before);
+            return None;
+        }
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(&after[1..], before, "earlier retained records changed");
+        let actual = &after[0];
+        let addresses = fault.addresses();
+        assert_ne!(actual.retention_id, 0);
+        assert!(
+            before
+                .iter()
+                .all(|prior| prior.retention_id != actual.retention_id)
+        );
+        assert_ne!(addresses.base, 0);
+        assert_eq!(addresses.length, fault.pages() * PAGE_SIZE);
+        let ambiguous = matches!(
+            fault.case(),
+            Case::SecondExtent
+                | Case::Foreign
+                | Case::WrongAddress
+                | Case::MiddleExtent
+                | Case::ConstructionCleanup
+                | Case::SuffixCleanup
+        );
+        let mut expected = RetainedWriteAliasSnapshot {
+            retention_id: actual.retention_id,
+            address: addresses.base,
+            length: addresses.length,
+            ambiguous: ambiguous.then_some((addresses.base + 2 * PAGE_SIZE, PAGE_SIZE)),
+            unexpected: (fault.case() == Case::WrongAddress)
+                .then_some((addresses.wrong, PAGE_SIZE)),
+            unexpected_bounds_valid: fault.case() == Case::WrongAddress,
+            owned_ranges: [None; 3],
+            cleanup_errors: [None; 3],
+            backing_count: if fault.case() == Case::CleanupAtEof {
+                0
+            } else {
+                fault.pages().div_ceil(2)
+            },
+        };
+        assert_eq!(
+            addresses.ambiguous,
+            expected.ambiguous.map_or(0, |range| range.0)
+        );
+        let refused = match fault.case() {
+            Case::CleanupAfterSuccess | Case::PersistentCleanup | Case::CleanupAtEof => {
+                Some((0, addresses.base, addresses.length))
+            }
+            Case::ConstructionCleanup => Some((0, addresses.base, 2 * PAGE_SIZE)),
+            Case::SuffixCleanup => Some((1, addresses.base + 3 * PAGE_SIZE, 2 * PAGE_SIZE)),
+            _ => None,
+        };
+        if let Some((slot, address, length)) = refused {
+            expected.owned_ranges[slot] = Some((address, length));
+            expected.cleanup_errors[slot] = Some((address, length, libc::ENOMEM));
+        }
+        if fault.case() == Case::WrongAddress {
+            assert_ne!(addresses.wrong, 0);
+            assert!(
+                addresses.wrong + PAGE_SIZE <= addresses.base
+                    || addresses.base + addresses.length <= addresses.wrong
+            );
+        } else {
+            assert_eq!(addresses.wrong, 0);
+        }
+        assert_eq!(*actual, expected, "case {:?}", fault.case());
+        Some(actual.clone())
+    }
+
+    fn alias_expected_cause<'a>(
+        fault: &crate::alias_failure::Fault,
+        error: &'a Error,
+        retained: Option<&RetainedWriteAliasSnapshot>,
+    ) -> &'a Error {
+        let cause = match retained {
+            Some(record) => fault.cause(error, Some(record.retention_id)),
+            None => fault.cause(error, None),
+        };
+        cause.unwrap_or_else(|| panic!("wrong alias cause for {:?}: {error:?}", fault.case()))
+    }
+
+    fn assert_alias_terminal_identity(
+        fault: &crate::alias_failure::Fault,
+        memory: &GuestMemory,
+        error: &Error,
+        retained: Option<&RetainedWriteAliasSnapshot>,
+    ) {
+        let cause = alias_expected_cause(fault, error, retained);
+        let pending = memory.entry_gate().pending_failure().unwrap();
+        let sticky = pending.error();
+        assert!(std::ptr::eq(
+            cause,
+            alias_expected_cause(fault, &sticky, retained)
+        ));
+        let mut bytes = [0; 4];
+        let read = memory.read_raw(0, &mut bytes).unwrap_err();
+        assert!(std::ptr::eq(
+            cause,
+            alias_expected_cause(fault, &read, retained)
+        ));
+        let user = memory.user();
+        let retry = user
+            .writable_alias(0, PAGE_SIZE)
+            .err()
+            .expect("poison allowed another alias");
+        assert!(std::ptr::eq(
+            cause,
+            alias_expected_cause(fault, &retry, retained)
+        ));
+        let state = memory.entry_gate().test_state();
+        assert_eq!((state.copies, state.retained_operands), (0, 0));
+        assert!(memory.mapping.address_space.try_lock().is_ok());
+        assert!(memory.mapping.slice.backing.host_access.try_lock().is_ok());
+    }
+
+    fn release_alias_test_handles(
+        memory: GuestMemory,
+        observer: GuestMemory,
+        error: Option<Error>,
+        expected: &[RetainedWriteAliasSnapshot],
+        retained_backings: usize,
+    ) {
+        let mapping = Arc::downgrade(&memory.mapping);
+        let observed_mapping = Arc::downgrade(&observer.mapping);
+        let gate = Arc::downgrade(&memory.entry_gate());
+        let observed_gate = Arc::downgrade(&observer.entry_gate());
+        let backing = Arc::downgrade(&memory.mapping.slice.backing);
+        drop(error);
+        drop(observer);
+        drop(memory);
+        assert!(
+            mapping.upgrade().is_none(),
+            "ledger retained a guest Mapping"
+        );
+        assert!(observed_mapping.upgrade().is_none());
+        assert!(gate.upgrade().is_none(), "ledger retained an entry gate");
+        assert!(observed_gate.upgrade().is_none());
+        assert_eq!(backing.strong_count(), retained_backings);
+        assert_eq!(
+            retained_write_aliases_for_test(),
+            expected,
+            "ordinary teardown changed retained ownership"
+        );
+    }
+
+    fn writable_alias_construction_failure_case(fault: crate::alias_failure::Fault) {
+        assert!(!fault.case().setup_succeeds());
+        let before = retained_write_aliases_for_test();
+        assert!(before.is_empty(), "fault child was not isolated");
+        let (memory, observer) = alias_failure_memory(&fault);
+        fault.arm();
+        let error = {
+            let user = memory.user();
+            user.writable_alias(u64::MAX, 0).unwrap().finish().unwrap();
+            user.writable_alias(0, fault.pages() * PAGE_SIZE)
+                .err()
+                .unwrap()
+        };
+        let retained = assert_alias_ledger(&fault, &before);
+        assert_alias_terminal_identity(&fault, &memory, &error, retained.as_ref());
+        let mut actual = vec![0; fault.pages() * PAGE_SIZE];
+        observer.read_raw(0, &mut actual).unwrap();
+        assert_eq!(actual, vec![0xa5; actual.len()]);
+        let after = retained_write_aliases_for_test();
+        release_alias_test_handles(
+            memory,
+            observer,
+            Some(error),
+            &after,
+            retained.as_ref().map_or(0, |record| record.backing_count),
+        );
+        fault.assert_fired();
+        assert_eq!(retained_write_aliases_for_test(), after);
+    }
+
+    #[test]
+    fn writable_alias_construction_failure_has_exact_ownership() {
+        let Some(fault) = crate::alias_failure::child(
+            "memory::tests::writable_alias_construction_failure_has_exact_ownership",
+        ) else {
+            return;
+        };
+        writable_alias_construction_failure_case(fault);
+    }
+
+    #[test]
+    fn writable_alias_foreign_mapping_preserves_ownership() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_foreign_mapping_preserves_ownership",
+            crate::alias_failure::Case::Foreign,
+        ) else {
+            return;
+        };
+        writable_alias_construction_failure_case(fault);
+    }
+
+    #[test]
+    fn writable_alias_unexpected_address_preserves_ownership() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_unexpected_address_preserves_ownership",
+            crate::alias_failure::Case::WrongAddress,
+        ) else {
+            return;
+        };
+        writable_alias_construction_failure_case(fault);
+    }
+
+    #[test]
+    fn writable_alias_middle_extent_preserves_ownership() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_middle_extent_preserves_ownership",
+            crate::alias_failure::Case::MiddleExtent,
+        ) else {
+            return;
+        };
+        writable_alias_construction_failure_case(fault);
+    }
+
+    #[test]
+    fn writable_alias_construction_cleanup_retains_prefix_and_primary() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_construction_cleanup_retains_prefix_and_primary",
+            crate::alias_failure::Case::ConstructionCleanup,
+        ) else {
+            return;
+        };
+        writable_alias_construction_failure_case(fault);
+    }
+
+    #[test]
+    fn writable_alias_suffix_cleanup_never_retries_reallocated_prefix() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_suffix_cleanup_never_retries_reallocated_prefix",
+            crate::alias_failure::Case::SuffixCleanup,
+        ) else {
+            return;
+        };
+        writable_alias_construction_failure_case(fault);
+    }
+
+    #[test]
+    fn writable_alias_atomic_replacement_survives_allocator_contention() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_atomic_replacement_survives_allocator_contention",
+            crate::alias_failure::Case::AtomicCollision,
+        ) else {
+            return;
+        };
+        // The old NOREPLACE collision control expected terminal EEXIST. This
+        // distinct positive control requires our fixed replacement to succeed
+        // while the real competing allocator receives EEXIST instead.
+        assert!(fault.succeeds());
+        let before = retained_write_aliases_for_test();
+        assert!(before.is_empty());
+        let (memory, observer) = alias_failure_memory(&fault);
+        let zero = std::fs::File::open("/dev/zero").unwrap();
+        fault.arm();
+        {
+            let user = memory.user();
+            user.writable_alias(u64::MAX, 0).unwrap().finish().unwrap();
+            let alias = user.writable_alias(0, fault.pages() * PAGE_SIZE).unwrap();
+            // SAFETY: the alias remains live for this synchronous kernel write.
+            assert_eq!(
+                unsafe { libc::read(zero.as_raw_fd(), alias.address(), 1) },
+                1
+            );
+            alias.finish().unwrap();
+            user.writable_alias(u64::MAX, 0).unwrap().finish().unwrap();
+        }
+        let mut expected = vec![0xa5; fault.pages() * PAGE_SIZE];
+        expected[0] = 0;
+        for view in [&memory, &observer] {
+            let mut actual = vec![0; expected.len()];
+            view.read_raw(0, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            view.check_copy_failure().unwrap();
+        }
+        assert!(assert_alias_ledger(&fault, &before).is_none());
+        drop(zero);
+        release_alias_test_handles(memory, observer, None, &before, 0);
+        let observed = fault.assert_fired();
+        assert_eq!(observed.case, crate::alias_failure::Case::AtomicCollision);
+        assert_eq!(
+            observed.counters[18], 1,
+            "allocator did not observe real EEXIST"
+        );
+        assert_eq!(
+            observed.counters[3], 0,
+            "successful install was mislabeled failure"
+        );
+    }
+
+    struct AliasEofDirectory {
+        file: std::fs::File,
+        path: std::path::PathBuf,
+    }
+
+    impl AliasEofDirectory {
+        fn drained() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("reverie-alias-eof-{}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            let directory = Self {
+                file: std::fs::File::open(&path).unwrap(),
+                path,
+            };
+            let mut buffer = [0_u8; 256];
+            let mut calls = 0;
+            loop {
+                // SAFETY: this stack buffer is writable for its stated size.
+                let count = unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        directory.file.as_raw_fd(),
+                        buffer.as_mut_ptr(),
+                        buffer.len(),
+                    )
+                };
+                assert!(
+                    count >= 0,
+                    "directory drain: {}",
+                    io::Error::last_os_error()
+                );
+                calls += 1;
+                assert!(calls <= 4, "empty test directory did not reach EOF");
+                if count == 0 {
+                    break;
+                }
+            }
+            assert!(calls >= 2, "empty directory lacked dot entries");
+            directory
+        }
+    }
+
+    impl Drop for AliasEofDirectory {
+        fn drop(&mut self) {
+            let removed = std::fs::remove_dir(&self.path);
+            if !std::thread::panicking() {
+                removed.unwrap();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AliasRetirementMode {
+        Finish,
+        Drop,
+        Unwind,
+        PriorFailure,
+    }
+
+    #[derive(Debug)]
+    struct AliasRetirementObservation {
+        copies: usize,
+        retained: usize,
+        permissions_available: bool,
+        backing_available: bool,
+        read: Option<Result<[u8; 4]>>,
+        ledger: Vec<RetainedWriteAliasSnapshot>,
+    }
+
+    struct AliasRetirementWake {
+        memory: GuestMemory,
+        observations: Mutex<Vec<AliasRetirementObservation>>,
+    }
+
+    impl std::task::Wake for AliasRetirementWake {
+        fn wake(self: Arc<Self>) {
+            std::task::Wake::wake_by_ref(&self);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let state = self.memory.entry_gate().test_state();
+            let permissions_available = !matches!(
+                self.memory.mapping.address_space.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            let backing_available = !matches!(
+                self.memory.mapping.slice.backing.host_access.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            let ledger = retained_write_aliases_for_test();
+            let read = if permissions_available && backing_available {
+                let mut bytes = [0; 4];
+                Some(self.memory.read_raw(0, &mut bytes).map(|()| bytes))
+            } else {
+                None
+            };
+            self.observations
+                .lock()
+                .unwrap()
+                .push(AliasRetirementObservation {
+                    copies: state.copies,
+                    retained: state.retained_operands,
+                    permissions_available,
+                    backing_available,
+                    read,
+                    ledger,
+                });
+        }
+    }
+
+    fn writable_alias_cleanup_case(
+        fault: &crate::alias_failure::Fault,
+        mode: AliasRetirementMode,
+        before: &[RetainedWriteAliasSnapshot],
+    ) -> RetainedWriteAliasSnapshot {
+        use std::future::Future;
+        use std::os::unix::fs::FileExt;
+        use std::task::Context;
+        use std::task::Waker;
+        assert!(fault.case().setup_succeeds() && !fault.succeeds());
+        assert_eq!(retained_write_aliases_for_test(), before);
+        let (memory, observer) = alias_failure_memory(fault);
+        let backing_file =
+            std::fs::File::from(memory.mapping.slice.backing.fd.try_clone().unwrap());
+        let zero = std::fs::File::open("/dev/zero").unwrap();
+        let eof = (fault.case() == crate::alias_failure::Case::CleanupAtEof)
+            .then(AliasEofDirectory::drained);
+        let original = (mode == AliasRetirementMode::PriorFailure).then(|| {
+            Arc::new(Error::UnexpectedVcpuExit(
+                "prior alias cleanup failure".to_owned(),
+            ))
+        });
+        fault.arm();
+        let user = memory.user();
+        user.writable_alias(u64::MAX, 0).unwrap().finish().unwrap();
+        let alias = user.writable_alias(0, fault.pages() * PAGE_SIZE).unwrap();
+        let mut expected = vec![0xa5; fault.pages() * PAGE_SIZE];
+        if let Some(directory) = &eof {
+            // SAFETY: the positive alias is entirely PROT_NONE; Linux at an
+            // actually drained directory must return EOF without touching it.
+            assert_eq!(
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        directory.file.as_raw_fd(),
+                        alias.address(),
+                        expected.len(),
+                    )
+                },
+                0
+            );
+        } else {
+            // SAFETY: first page is writable and retained through the syscall.
+            assert_eq!(
+                unsafe { libc::read(zero.as_raw_fd(), alias.address(), 1) },
+                1
+            );
+            expected[0] = 0;
+        }
+        if let Some(primary) = &original {
+            // No notification observer is armed yet. The cleanup must preserve
+            // this already-sticky cause, rather than publishing a replacement.
+            memory
+                .entry_gate()
+                .poison(None, Error::SharedFailure(primary.clone()));
+        }
+        let wake = Arc::new(AliasRetirementWake {
+            memory: memory.clone(),
+            observations: Mutex::new(Vec::new()),
+        });
+        let waker = Waker::from(wake.clone());
+        let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
+        let mut changed = Box::pin(watch.wait());
+        if original.is_none() {
+            assert!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+        }
+        let error = match mode {
+            AliasRetirementMode::Finish | AliasRetirementMode::PriorFailure => {
+                alias.finish().unwrap_err()
+            }
+            AliasRetirementMode::Drop => {
+                drop(alias);
+                memory.check_copy_failure().unwrap_err()
+            }
+            AliasRetirementMode::Unwind => {
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _alias = alias;
+                    panic!("controlled cleanup alias unwind");
+                }))
+                .expect_err("alias unwind was swallowed");
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"controlled cleanup alias unwind")
+                );
+                drop(panic);
+                memory.check_copy_failure().unwrap_err()
+            }
+        };
+        drop(user);
+        let record = assert_alias_ledger(fault, before).unwrap();
+        let after = retained_write_aliases_for_test();
+        let gate = memory.entry_gate();
+        let pending = gate.pending_failure().unwrap();
+        let causes = pending.causes();
+        let alias_cause = if matches!(
+            mode,
+            AliasRetirementMode::Unwind | AliasRetirementMode::PriorFailure
+        ) {
+            assert_eq!(
+                causes.len(),
+                2,
+                "primary or cleanup was duplicated: {error:?}"
+            );
+            if let Some(primary) = &original {
+                assert!(error.retains_primary(primary));
+                assert!(causes[0].retains_primary(primary));
+                assert!(std::ptr::eq(error.primary(), primary.primary()));
+            } else {
+                assert!(matches!(
+                    error.primary(),
+                    Error::EntryControl {
+                        operation: "retained host operand unwound",
+                        ..
+                    }
+                ));
+                assert!(std::ptr::eq(error.primary(), causes[0].primary()));
+            }
+            alias_expected_cause(fault, &causes[1], Some(&record))
+        } else {
+            assert_eq!(causes.len(), 1, "cleanup was published twice: {error:?}");
+            assert_alias_terminal_identity(fault, &memory, &error, Some(&record));
+            let cause = alias_expected_cause(fault, &error, Some(&record));
+            assert!(std::ptr::eq(
+                cause,
+                alias_expected_cause(fault, &causes[0], Some(&record))
+            ));
+            cause
+        };
+        assert!(
+            matches!(alias_cause, Error::WriteAliasCleanup { source, address, length, retention_id }
+            if source.raw_os_error() == Some(libc::ENOMEM) && *address == record.address && *length == record.length && *retention_id == record.retention_id)
+        );
+        let denied = memory.read_raw(0, &mut [0; 4]).unwrap_err();
+        assert!(std::ptr::eq(denied.primary(), error.primary()));
+        let retry = memory
+            .user()
+            .writable_alias(0, PAGE_SIZE)
+            .err()
+            .expect("poison allowed an alias retry");
+        assert!(std::ptr::eq(retry.primary(), error.primary()));
+        assert_eq!(retained_write_aliases_for_test(), after);
+        let state = gate.test_state();
+        assert_eq!((state.copies, state.retained_operands), (0, 0));
+        {
+            let observations = wake.observations.lock().unwrap();
+            if mode == AliasRetirementMode::PriorFailure {
+                assert!(observations.is_empty());
+            } else {
+                assert_eq!(
+                    observations.len(),
+                    1,
+                    "unexpected notification count: {observations:?}"
+                );
+                let observed = &observations[0];
+                assert_eq!(observed.copies, 0);
+                assert_eq!(
+                    observed.retained,
+                    usize::from(mode != AliasRetirementMode::Unwind)
+                );
+                assert!(observed.permissions_available && observed.backing_available);
+                assert_eq!(
+                    observed.ledger, after,
+                    "notification preceded ownership transfer"
+                );
+                let observed_error = observed
+                    .read
+                    .as_ref()
+                    .expect("waker could not reenter memory")
+                    .as_ref()
+                    .unwrap_err();
+                assert!(std::ptr::eq(observed_error.primary(), error.primary()));
+            }
+        }
+        let mut actual = vec![0; expected.len()];
+        if mode == AliasRetirementMode::Unwind {
+            assert!(matches!(
+                memory.mapping.address_space.try_lock(),
+                Err(std::sync::TryLockError::Poisoned(_))
+            ));
+            assert!(matches!(
+                memory.mapping.slice.backing.host_access.try_lock(),
+                Err(std::sync::TryLockError::Poisoned(_))
+            ));
+            // Original Mutex poison remains. A preowned duplicate backing fd
+            // observes bytes without reopening guest admission or clearing it.
+            backing_file.read_exact_at(&mut actual, 0).unwrap();
+        } else {
+            observer.read_raw(0, &mut actual).unwrap();
+        }
+        assert_eq!(actual, expected);
+        drop(retry);
+        drop(denied);
+        drop(causes);
+        drop(pending);
+        drop(gate);
+        drop(original);
+        drop(changed);
+        drop(watch);
+        drop(waker);
+        drop(wake);
+        drop(backing_file);
+        drop(zero);
+        drop(eof);
+        release_alias_test_handles(memory, observer, Some(error), &after, record.backing_count);
+        fault.assert_fired();
+        assert_eq!(retained_write_aliases_for_test(), after);
+        record
+    }
+
+    #[test]
+    fn writable_alias_finish_cleanup_failure_is_terminal_after_unlock() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_finish_cleanup_failure_is_terminal_after_unlock",
+            crate::alias_failure::Case::CleanupAfterSuccess,
+        ) else {
+            return;
+        };
+        assert!(retained_write_aliases_for_test().is_empty());
+        writable_alias_cleanup_case(&fault, AliasRetirementMode::Finish, &[]);
+    }
+
+    #[test]
+    fn writable_alias_drop_cleanup_failure_retains_ownership_once() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_drop_cleanup_failure_retains_ownership_once",
+            crate::alias_failure::Case::CleanupAfterSuccess,
+        ) else {
+            return;
+        };
+        assert!(retained_write_aliases_for_test().is_empty());
+        writable_alias_cleanup_case(&fault, AliasRetirementMode::Drop, &[]);
+    }
+
+    #[test]
+    fn writable_alias_unwind_cleanup_preserves_primary_before_notification() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_unwind_cleanup_preserves_primary_before_notification",
+            crate::alias_failure::Case::CleanupAfterSuccess,
+        ) else {
+            return;
+        };
+        assert!(retained_write_aliases_for_test().is_empty());
+        writable_alias_cleanup_case(&fault, AliasRetirementMode::Unwind, &[]);
+    }
+
+    #[test]
+    fn writable_alias_cleanup_preserves_existing_primary_identity() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_cleanup_preserves_existing_primary_identity",
+            crate::alias_failure::Case::CleanupAfterSuccess,
+        ) else {
+            return;
+        };
+        assert!(retained_write_aliases_for_test().is_empty());
+        writable_alias_cleanup_case(&fault, AliasRetirementMode::PriorFailure, &[]);
+    }
+
+    #[test]
+    fn writable_alias_eof_cleanup_failure_retains_inaccessible_reservation() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_eof_cleanup_failure_retains_inaccessible_reservation",
+            crate::alias_failure::Case::CleanupAtEof,
+        ) else {
+            return;
+        };
+        assert!(retained_write_aliases_for_test().is_empty());
+        writable_alias_cleanup_case(&fault, AliasRetirementMode::Finish, &[]);
+    }
+
+    #[test]
+    fn writable_alias_three_independent_failures_keep_exact_retained_records() {
+        let Some(fault) = crate::alias_failure::child_case(
+            "memory::tests::writable_alias_three_independent_failures_keep_exact_retained_records",
+            crate::alias_failure::Case::PersistentCleanup,
+        ) else {
+            return;
+        };
+        assert!(retained_write_aliases_for_test().is_empty());
+        let mut expected = Vec::new();
+        for operation in 1..=3 {
+            let record =
+                writable_alias_cleanup_case(&fault, AliasRetirementMode::Finish, &expected);
+            assert_eq!(fault.addresses().operation, operation);
+            expected.insert(0, record);
+            assert_eq!(retained_write_aliases_for_test(), expected);
+        }
+        assert_eq!(expected.len(), 3);
+        for (index, record) in expected.iter().enumerate() {
+            assert!(
+                expected[index + 1..]
+                    .iter()
+                    .all(|other| other.retention_id != record.retention_id
+                        && other.address != record.address)
+            );
+        }
+    }
+
+    #[test]
+    fn writable_alias_unexpected_address_geometry_excludes_ambiguous_and_owned_overlaps() {
+        const START: usize = 100 * PAGE_SIZE;
+        const LENGTH: usize = 9 * PAGE_SIZE;
+        let prefix = Some((START, 3 * PAGE_SIZE));
+        let suffix = Some((START + 6 * PAGE_SIZE, 3 * PAGE_SIZE));
+        // These are arithmetic-only records, not mappings. The exact expected
+        // outside intervals are stated independently of the production helper.
+        let cases = [
+            (
+                "disjoint below",
+                90 * PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                Some((90 * PAGE_SIZE, 3 * PAGE_SIZE)),
+            ),
+            (
+                "overlaps lower boundary",
+                START - PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                Some((START - PAGE_SIZE, PAGE_SIZE)),
+            ),
+            ("exact prefix", START, 3 * PAGE_SIZE, true, None),
+            (
+                "prefix and ambiguous",
+                START + PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                None,
+            ),
+            (
+                "inside ambiguous",
+                START + 3 * PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                None,
+            ),
+            (
+                "ambiguous and suffix",
+                START + 4 * PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                None,
+            ),
+            (
+                "exact suffix",
+                START + 6 * PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                None,
+            ),
+            (
+                "overlaps upper boundary",
+                START + 8 * PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                Some((START + 9 * PAGE_SIZE, 2 * PAGE_SIZE)),
+            ),
+            (
+                "disjoint above",
+                START + 12 * PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                Some((START + 12 * PAGE_SIZE, 3 * PAGE_SIZE)),
+            ),
+            ("unaligned positive", START - 1, 3 * PAGE_SIZE, false, None),
+            (
+                "overflowing positive",
+                usize::MAX - (PAGE_SIZE - 1),
+                3 * PAGE_SIZE,
+                false,
+                None,
+            ),
+            (
+                "oversized positive",
+                START - PAGE_SIZE,
+                LENGTH + PAGE_SIZE,
+                false,
+                None,
+            ),
+        ];
+        for (name, address, length, bounds_valid, outside) in cases {
+            // Suppress any future ownership destructor as well: these addresses
+            // are synthetic and this pure geometry test must never unmap them.
+            let mut record = std::mem::ManuallyDrop::new(WriteAliasMapping {
+                address: START,
+                length: LENGTH,
+                ambiguous: None,
+                mapping_errno: None,
+                unexpected: None,
+                unexpected_bounds_valid: false,
+                owned: [None; 3],
+                cleanup: [None; 3],
+                _extents: Vec::new(),
+                next: None,
+            });
+            record.lose_fixed_target(3 * PAGE_SIZE, 3 * PAGE_SIZE, None);
+            record.note_unexpected_address(address, length);
+            assert_eq!(
+                record.unexpected.map(|range| (range.address, range.length)),
+                Some((address, length)),
+                "{name}"
+            );
+            assert_eq!(record.unexpected_bounds_valid, bounds_valid, "{name}");
+            let ambiguous = record.ambiguous.unwrap();
+            assert_eq!(
+                (ambiguous.address, ambiguous.length),
+                (START + 3 * PAGE_SIZE, 3 * PAGE_SIZE)
+            );
+            let owned = record
+                .owned
+                .map(|range| range.map(|range| (range.address, range.length)));
+            assert_eq!(owned, [prefix, suffix, outside], "{name}");
+            let intervals: Vec<_> = owned.into_iter().flatten().collect();
+            for (index, &(start, bytes)) in intervals.iter().enumerate() {
+                assert_ne!(bytes, 0, "{name}");
+                assert!(
+                    start + bytes <= ambiguous.address
+                        || ambiguous.address + ambiguous.length <= start,
+                    "{name}: touches ambiguous target"
+                );
+                for &(other, other_bytes) in &intervals[index + 1..] {
+                    assert!(
+                        start + bytes <= other || other + other_bytes <= start,
+                        "{name}: overlapping cleanup intervals"
+                    );
+                }
+            }
+            assert!(record.cleanup.iter().all(Option::is_none), "{name}");
+            assert!(record.next.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn writable_alias_zero_length_checks_poison_and_releases_failed_preparation() {
+        let memory = GuestMemory::new(0, PAGE_SIZE).unwrap();
+        let user = memory.user();
+        assert!(user.writable_alias(1, usize::MAX).is_err());
+        assert_eq!(memory.entry_gate().test_state().retained_operands, 0);
+        assert!(memory.mapping.address_space.try_lock().is_ok());
+        assert!(memory.mapping.slice.backing.host_access.try_lock().is_ok());
+        let alias = user.writable_alias(u64::MAX, 0).unwrap();
+        memory.entry_gate().poison(
+            None,
+            Error::UnexpectedVcpuExit("alias poison control".to_owned()),
+        );
+        assert!(alias.finish().is_err());
+        assert_eq!(memory.entry_gate().test_state().retained_operands, 0);
+        assert!(user.writable_alias(u64::MAX, 0).is_err());
     }
 
     #[test]

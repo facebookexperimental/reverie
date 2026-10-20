@@ -537,6 +537,27 @@ pub trait Tool: Send + Sync + Default {
         Ok(())
     }
 
+    /// Observe this backend's actual thread state after a successful
+    /// `handle_thread_start` or `handle_post_exec`, before ordinary guest
+    /// execution resumes. The ptrace backend supplies this synchronous hook;
+    /// other backends must implement an equivalent owned lifecycle boundary
+    /// before relying on it. The default performs no work.
+    ///
+    /// This associates Tool objects, not kernel FD identity or an injected
+    /// operation. It supplies no capability, preparation, selection, result,
+    /// or scheduler turn. Request serialization remains unchanged. A Tool must
+    /// still validate current owner/MM/table authority when using an association.
+    /// Never await or wait for guest progress here. A failure is a backend/run
+    /// failure: the backend reports it and must stop before guest resume.
+    fn on_thread_state_ready(
+        &self,
+        _tid: Tid,
+        _global_state: &Self::GlobalState,
+        _thread_state: &Self::ThreadState,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Called upon a *successful* execve. In `handle_syscall_event`, after
     /// injecting `execve`, it is not possible to run code after a successful
     /// `execve` because it never returns.

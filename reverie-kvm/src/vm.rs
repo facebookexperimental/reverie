@@ -1471,6 +1471,12 @@ pub struct KvmBackend {
     completed_tool_panics: Mutex<Vec<CompletedToolPanic>>,
     thread_slot: Option<usize>,
     is_guest_thread: bool,
+    // Conservative certificate for a non-CLONE_VM process snapshot. The
+    // ordinary shared-file domain separately excludes additional same-mm
+    // participants. Initial roots and legacy vfork snapshots have no certificate;
+    // a later CLONE_VM process preparation revokes it instead of guessing when
+    // the other process has stopped using the guest mm.
+    independent_process_mm: bool,
     // Who owns this backend's guest threads. The single value drives BOTH the
     // CLONE_THREAD worker dispatch path (`run_process_action_with_tool`) and
     // `futex`/CLEARTID ownership (`is_backend_owned_syscall`), so the two can
@@ -1489,7 +1495,8 @@ pub struct KvmBackend {
     intercept_rdtsc: bool,
     cpuid_interception: crate::cpuid_instruction::Interception,
     pub(crate) static_elf: Option<LoadedStaticElf>,
-    stdin: Option<File>,
+    pub(crate) stdin: Arc<Mutex<Option<File>>>,
+    pub(crate) native_exit_broker: Option<crate::native_exit_broker::BrokerClient>,
     pub(crate) root_pid: i32,
     // One optional collector is shared by every fork and thread backend in the
     // guest tree. `None` is the allocation-free, update-free default.
@@ -1708,6 +1715,13 @@ impl KvmBackend {
         if !vm.check_extension(Cap::ExitHypercall) {
             return Err(Error::HypercallExitUnsupported);
         }
+        // Serialize the capability record with physical publication. A file
+        // image created before attachment requires synchronous invalidation;
+        // a private image can still attach on a host lacking this capability,
+        // but must refuse a later file publication before changing the HVA.
+        // VM creation and the hypercall capability check do not publish or use
+        // this HVA: slot registration below is its first attachment to the VM.
+        memory.record_kvm_sync_mmu(kvm.check_extension(Cap::SyncMmu))?;
 
         let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
         // TODO-HUMAN-REVIEW(PR-129): Review host-selected private hypercall transport.
@@ -1781,6 +1795,7 @@ impl KvmBackend {
             completed_tool_panics: Mutex::new(Vec::new()),
             thread_slot: None,
             is_guest_thread: false,
+            independent_process_mm: false,
             // Effective ownership before any tool run resolves it. The direct
             // (non-tool) personality never dispatches threads through a Tool loop,
             // so Host is the correct effective value there; when a tool runs,
@@ -1793,7 +1808,8 @@ impl KvmBackend {
             intercept_rdtsc: false,
             cpuid_interception: crate::cpuid_instruction::Interception::default(),
             static_elf: None,
-            stdin,
+            stdin: Arc::new(Mutex::new(stdin)),
+            native_exit_broker: None,
             root_pid: 1,
             exit_collector: None,
             abandoned_runs: Arc::default(),
@@ -2039,7 +2055,7 @@ impl KvmBackend {
             self.root_pid,
             loaded.dumpable,
         )));
-        loaded.stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+        loaded.stdin = self.clone_reserved_stdin()?;
         configure_long_mode(
             &mut self.memory,
             &self.vcpu,
@@ -2088,6 +2104,67 @@ impl KvmBackend {
             .ok_or(Error::StaticElfNotInstalled)?;
         loaded.random_seed = seed;
         loaded.getrandom_offset = 0;
+        Ok(())
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
+    // Review host metadata timestamps for Tool runs.
+    /// Report the kernel's timestamps from `stat`, `fstat`, `newfstatat` and
+    /// `statx` on real host files and descriptors, instead of the fixed
+    /// timestamp the backend uses by default. Captured output, synthetic
+    /// `/proc` files, guest descriptor links and virtual random devices keep
+    /// their fixed timestamps.
+    ///
+    /// Host timestamps are host wall-clock values, so enable this only for a
+    /// Tool that rewrites every timestamp it returns to the guest, such as
+    /// Detcore with virtual metadata. The Tool can then read the values the
+    /// kernel stored, for example to confirm that `utimensat` stored the
+    /// requested time. A run without a Tool, or with host-owned threads
+    /// (see [`Self::unmonitored_threads`]), refuses to start while this is
+    /// enabled, because those syscalls would reach the guest unrewritten.
+    ///
+    /// A successful call writes the stored values into the guest's buffer
+    /// before the Tool rewrites them. The backend cannot see whether another
+    /// guest thread runs in that interval, so the Tool must also keep every
+    /// other guest thread from running until it has rewritten the result, as
+    /// Detcore does when it sequentializes threads. A failed call is not
+    /// rewritten, so the backend leaves only fixed timestamps in the part of
+    /// a buffer that a faulting copy reached.
+    ///
+    /// While enabled, a guest cannot change the mode of a file the backend
+    /// serves from its own data: `fchmod` and empty-path `fchmodat` and
+    /// `fchmodat2` fail with `EPERM` on a synthetic `/proc` file and on a
+    /// virtual file such as `/proc/self/loginuid` or a CPU-frequency file
+    /// under `/sys/devices/system/cpu`. Linux refuses a mode change on a
+    /// process `/proc` file with `EPERM` too, but lets the owner change the
+    /// mode of a writable sysfs file, so for those files this is a
+    /// compatibility restriction. The backend recognizes such a file received
+    /// over a socket by reopening it, which a mode without read permission
+    /// would prevent.
+    pub fn set_host_metadata_timestamps(&mut self, enabled: bool) -> Result<()> {
+        AbandonedRuns::admit(&self.abandoned_runs)?;
+        let loaded = self
+            .static_elf
+            .as_mut()
+            .ok_or(Error::StaticElfNotInstalled)?;
+        loaded.host_metadata_timestamps = enabled;
+        Ok(())
+    }
+
+    /// Whether the installed image reports host metadata timestamps.
+    fn host_metadata_timestamps_enabled(&self) -> bool {
+        self.static_elf
+            .as_ref()
+            .is_some_and(|loaded| loaded.host_metadata_timestamps)
+    }
+
+    /// Refuses a run that would show host metadata timestamps to the guest:
+    /// one without a Tool, or one whose threads the Tool does not all own.
+    pub(crate) fn admit_host_metadata_timestamps(&self, tool_owns_threads: bool) -> Result<()> {
+        if self.host_metadata_timestamps_enabled() && !tool_owns_threads {
+            return Err(Error::HostMetadataTimestampsRequireToolThreads);
+        }
         Ok(())
     }
 
@@ -2146,7 +2223,7 @@ impl KvmBackend {
             memory,
             registers: self.vcpu.get_regs()?,
             xsave: self.vcpu.get_xsave()?,
-            stdin: self.stdin.as_ref().map(File::try_clone).transpose()?,
+            stdin: self.clone_reserved_stdin()?,
             cpuid_policy: self.cpuid_policy,
         })
     }
@@ -2230,6 +2307,9 @@ impl KvmBackend {
         // is the same point-of-no-return behavior as the prior zero_raw reset.
         let user_length = usize::try_from(self.memory.guest_end() - BOOT_RESERVED_END)
             .expect("guest memory length must fit usize");
+        // Replace file-backed HVA pages before discarding the new private
+        // image. Clearing the outgoing file mapping would corrupt its file.
+        self.memory.retire_shared_files_for_exec()?;
         self.memory.discard_pages(BOOT_RESERVED_END, user_length)?;
 
         let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2247,7 +2327,7 @@ impl KvmBackend {
             .thread_group_leader_name
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = thread_name;
-        loaded.stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+        loaded.stdin = self.clone_reserved_stdin()?;
         configure_long_mode(
             &mut self.memory,
             &self.vcpu,
@@ -2468,11 +2548,25 @@ impl KvmBackend {
         fault: Option<&PageZeroFault>,
         stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
     ) -> Result<Option<ForkedProcess>> {
-        let mut child_executor =
-            executor.fork_child(child_pid, clear_sighand, share_address_space)?;
-        #[cfg(test)]
-        tests::entry_action_tests::observe("fork_executor");
-        child_executor.set_clear_child_tid(clear_child_tid);
+        let shared_file_snapshot = self.memory.contains_shared_file();
+        if shared_file_snapshot && share_address_space {
+            return Err(Error::SharedFileCapability {
+                operation: "CLONE_VM/thread creation",
+                reason: "ordinary shared-file views require one vCPU per address space",
+            });
+        }
+        // Preserve the existing private-fork preparation order. For real file
+        // views, duplication may fail after unmapping a child destination;
+        // finish that owned snapshot/VM preparation before publishing a child
+        // lifecycle or writing the parent's TID word.
+        let mut prepared_executor = if shared_file_snapshot {
+            None
+        } else {
+            let child = executor.fork_child(child_pid, clear_sighand, share_address_space)?;
+            #[cfg(test)]
+            tests::entry_action_tests::observe("fork_executor");
+            Some(child)
+        };
         if park_syscall_return
             && !self
                 .park_process_action("parent did not park at fork", stop)
@@ -2481,9 +2575,14 @@ impl KvmBackend {
             return Ok(None);
         }
         let child_snapshot = self.snapshot_process()?;
-        write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
+        if !shared_file_snapshot {
+            write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
+        }
 
         let mut child = Self::from_process_snapshot(child_snapshot)?;
+        if let Some(child_executor) = prepared_executor.as_mut() {
+            child_executor.set_clear_child_tid(clear_child_tid);
+        }
         // Forked children inherit the parent's thread ownership so execution and
         // `is_backend_owned_syscall`'s futex classification stay consistent.
         child.thread_ownership = self.thread_ownership;
@@ -2493,10 +2592,20 @@ impl KvmBackend {
                 .map(|failure| failure.for_process(Pid::from_raw(child_pid))),
         );
         child.set_operation_origin(self.memory.entry_origin().operation);
-        child_executor.bind_address_space(&child.memory);
+        if let Some(child_executor) = prepared_executor.as_mut() {
+            child_executor.bind_address_space(&child.memory);
+        }
         child.exit_collector = self.exit_collector.clone();
-        write_tid_best_effort(&mut child.memory, child_tid, child_pid);
-        let (fs_base, gs_base) = child_executor.segment_bases();
+        if !shared_file_snapshot {
+            write_tid_best_effort(&mut child.memory, child_tid, child_pid);
+        }
+        // The shared-file child has not registered a lifecycle yet. Its segment
+        // bases are inherited unchanged, so use the parent during fallible VM
+        // setup rather than creating observable child state prematurely.
+        let (fs_base, gs_base) = prepared_executor
+            .as_ref()
+            .unwrap_or(executor)
+            .segment_bases();
         set_user_segment_base(&child.vcpu, SegmentBase::Fs, fs_base)?;
         set_user_segment_base(&child.vcpu, SegmentBase::Gs, gs_base)?;
         // The child uses root transport for future syscalls, but its initial
@@ -2510,6 +2619,33 @@ impl KvmBackend {
         )?;
         if let Some(fault) = fault {
             fault.configure_child(&mut child, child_stack)?;
+        }
+        let mut child_executor = match prepared_executor {
+            Some(child) => child,
+            None => {
+                let mut child_executor = executor.fork_child(child_pid, clear_sighand, false)?;
+                #[cfg(test)]
+                tests::entry_action_tests::observe("fork_executor");
+                child_executor.set_clear_child_tid(clear_child_tid);
+                child_executor.bind_address_space(&child.memory);
+                child_executor
+            }
+        };
+        child_executor.bind_terminal_stdin(child.stdin.clone());
+        child.native_exit_broker = self.native_exit_broker.clone();
+        // A successfully prepared non-CLONE_VM process gets an independent
+        // guest mm. The legacy vfork path also creates a backend snapshot, so
+        // distinct host mappings alone cannot confer this certificate. Never
+        // recover a revoked parent certificate from a guessed join condition.
+        child.independent_process_mm = !share_address_space;
+        if share_address_space {
+            self.independent_process_mm = false;
+        }
+        if shared_file_snapshot {
+            // Child TID may itself lie in a shared file, so neither TID store
+            // precedes fallible VM setup or descriptor/lifecycle preparation.
+            write_tid_best_effort(&mut child.memory, child_tid, child_pid);
+            write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
         }
         Ok(Some(ForkedProcess {
             pid: child_pid,
@@ -2791,7 +2927,7 @@ impl KvmBackend {
                     executor.thread_child_with_signal_observation(child_tid, false)?;
                 child_executor.set_thread_context(child_tid, child_fs, parent_gs);
                 child_executor.set_clear_child_tid(clear_child_tid);
-                let child_stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+                let child_stdin = self.clone_reserved_stdin()?;
                 let mut child = Self::from_thread_state(
                     self.memory.clone(),
                     child_registers,
@@ -2801,6 +2937,8 @@ impl KvmBackend {
                     child_tid,
                     self.thread_group.clone(),
                 )?;
+                child_executor.bind_terminal_stdin(child.stdin.clone());
+                child.native_exit_broker = self.native_exit_broker.clone();
                 // Thread children inherit the parent's thread ownership so
                 // execution and futex classification stay consistent.
                 self.debug_assert_thread_ownership_consistent();
@@ -2961,6 +3099,10 @@ impl KvmBackend {
                 // new address space becomes visible. Leaving a sibling vCPU
                 // alive lets it execute stale instructions in the replacement
                 // image and can turn an otherwise successful exec into a fault.
+                // Freeze every sibling identity before host cancellation can
+                // retire any of them. Publication is authenticated only by the
+                // later actual ImageReplaced boundary, never by peer cleanup.
+                executor.prepare_parent_death_exec()?;
                 self.cancel_guest_threads_for_exec(stop.as_mut()).await?;
                 self.guest_worker_teardown_result()
                     .map_err(|error| Error::ExecWorkerTeardown(Box::new(error)))?;
@@ -3559,7 +3701,7 @@ impl KvmBackend {
                 let mut child_executor = executor.thread_child(child_tid)?;
                 child_executor.set_thread_context(child_tid, child_fs, parent_gs);
                 child_executor.set_clear_child_tid(clear_child_tid);
-                let child_stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+                let child_stdin = self.clone_reserved_stdin()?;
                 let mut child = Self::from_thread_state(
                     self.memory.clone(),
                     child_registers,
@@ -3569,6 +3711,8 @@ impl KvmBackend {
                     child_tid,
                     self.thread_group.clone(),
                 )?;
+                child_executor.bind_terminal_stdin(child.stdin.clone());
+                child.native_exit_broker = self.native_exit_broker.clone();
                 // Thread children inherit the parent's thread ownership so
                 // execution and futex classification stay consistent.
                 self.debug_assert_thread_ownership_consistent();
@@ -4517,6 +4661,24 @@ impl KvmBackend {
             return;
         };
         debug_assert!(self.thread_slot.is_none());
+        if self.independent_process_mm
+            && !self.is_guest_thread
+            && self.memory.contains_shared_file()
+            && self.memory.entry_gate().single_member_domain_active()
+        {
+            // Linux mm_release discards clear_child_tid in either case, but
+            // stores/wakes only for mm_users > 1. File pages shared with a
+            // different process do not share the guest mm. This certificate
+            // plus the exclusive file domain proves the virtual last-user
+            // case; it is not a general model of host mm_users, which temporary
+            // /proc readers can also increment. No virtual observer owns such
+            // a reference here. Consume the registration without accessing its
+            // address; existing gate failures remain pending and unchanged.
+            // https://github.com/gregkh/linux/blob/v7.1.3/kernel/fork.c#L1463
+            #[cfg(test)]
+            clear_tid_diagnostic::stopped("single-owner shared-file process mm");
+            return;
+        }
         // Errors below are dropped on purpose. A bad guest address is Linux's
         // EFAULT: mm_release ignores the failed store ("if userspace has not
         // set up a proper pointer then tough luck") and the exit proceeds with
@@ -4526,6 +4688,8 @@ impl KvmBackend {
         // a backend failure already recorded on the entry gate. Reading it
         // here does not consume it: it stays pending on the gate, and
         // route_entry_outcome folds it into the exiting thread's outcome.
+        // This also retains a typed shared-file scalar capability refusal;
+        // it is never presented as a successful store or invented SIGBUS.
         let _ = self.memory.user().put_user_i32(address, 0);
         if self.memory.user().user_accessible_prefix(address, 4).ok() != Some(4) {
             #[cfg(test)]
@@ -4662,6 +4826,7 @@ impl KvmBackend {
     }
 
     fn run_admitted_static_elf(&mut self) -> Result<i32> {
+        self.admit_host_metadata_timestamps(false)?;
         let loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
         let mut executor = ElfExecutor::with_output(loaded, None);
         let result = self.run_static_elf_process(&mut executor);
@@ -4678,6 +4843,7 @@ impl KvmBackend {
     }
 
     fn run_admitted_static_elf_captured(&mut self) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        self.admit_host_metadata_timestamps(false)?;
         // Declared before the executor so its private pipe identities outlive
         // executor/child cleanup, including early-return and unwind paths.
         let capture_owner = self.prepare_captured_output(true)?;
@@ -4735,6 +4901,7 @@ impl KvmBackend {
         &mut self,
         executor: &mut ElfExecutor,
     ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+        executor.ready_terminal_cleanup().await?;
         // This loop never dispatches Tool events, including Host-owned workers.
         self.set_rdtsc_interception(false)?;
         self.set_cpuid_interception(false)?;
@@ -4755,7 +4922,7 @@ impl KvmBackend {
                 }
             }
             if let Some(exit) = executor.take_exit() {
-                return self.finish_static_elf_thread(executor, exit);
+                return self.finish_static_elf_thread(executor, exit).await;
             }
         }
         loop {
@@ -4776,22 +4943,26 @@ impl KvmBackend {
                 .admit_operation()
                 .map_err(|failure| failure.error())?;
             if let Some(status) = self.guest_thread_group_exit_status() {
-                return self.finish_static_elf_thread(
-                    executor,
-                    ProcessExit {
-                        status,
-                        group: true,
-                    },
-                );
+                return self
+                    .finish_static_elf_thread(
+                        executor,
+                        ProcessExit {
+                            status,
+                            group: true,
+                        },
+                    )
+                    .await;
             }
             if self.is_guest_thread && self.thread_group.cancelled.load(Ordering::Acquire) {
-                return self.finish_static_elf_thread(
-                    executor,
-                    ProcessExit {
-                        status: ExitStatus::SUCCESS,
-                        group: false,
-                    },
-                );
+                return self
+                    .finish_static_elf_thread(
+                        executor,
+                        ProcessExit {
+                            status: ExitStatus::SUCCESS,
+                            group: false,
+                        },
+                    )
+                    .await;
             }
             let vcpu_exit = match self.vcpu.run() {
                 Ok(Some(exit)) => exit,
@@ -4858,7 +5029,7 @@ impl KvmBackend {
                                 Ok(result) => result,
                                 Err(Error::ChildWaitGroupExit { status }) => {
                                     let exit = executor.retire_child_wait_group_exit(status)?;
-                                    return self.finish_static_elf_thread(executor, exit);
+                                    return self.finish_static_elf_thread(executor, exit).await;
                                 }
                                 Err(Error::TerminalReadCancelled) => {
                                     let exit = match self.guest_thread_group_exit_status() {
@@ -4867,7 +5038,7 @@ impl KvmBackend {
                                         }
                                         None => executor.cancel_current_thread(),
                                     };
-                                    return self.finish_static_elf_thread(executor, exit);
+                                    return self.finish_static_elf_thread(executor, exit).await;
                                 }
                                 Err(error) => return Err(error),
                             };
@@ -4939,7 +5110,7 @@ impl KvmBackend {
                             group: false,
                         },
                     };
-                    return self.finish_static_elf_thread(executor, exit);
+                    return self.finish_static_elf_thread(executor, exit).await;
                 }
                 returns_to_original_image = !outcome.image_replaced;
                 if let Some((_, result)) = signal_boundary.as_mut() {
@@ -4959,19 +5130,20 @@ impl KvmBackend {
 
             pending_exit = pending_exit.or_else(|| executor.take_exit());
             if let Some(exit) = pending_exit {
-                return self.finish_static_elf_thread(executor, exit);
+                return self.finish_static_elf_thread(executor, exit).await;
             }
         }
     }
 
-    fn finish_static_elf_thread(
+    async fn finish_static_elf_thread(
         &mut self,
         executor: &mut ElfExecutor,
         exit: ProcessExit,
     ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
         executor.retire_current_thread(exit.status, exit.group);
+        executor.check_parent_death_failure()?;
         self.clear_registered_worker_tid_before_exit(executor);
-        executor.release_files_on_exit();
+        executor.finish_terminal_cleanup().await?;
         self.release_stdin_on_exit();
         if exit.group {
             self.request_guest_thread_group_exit(exit.status);
@@ -5006,7 +5178,36 @@ impl KvmBackend {
     /// Drop this backend's reserved input description at terminal ownership
     /// cleanup. Fork and thread backends retain their independent references.
     pub(crate) fn release_stdin_on_exit(&mut self) {
-        self.stdin = None;
+        let input = self.stdin.lock().unwrap_or_else(|p| p.into_inner()).take();
+        drop(input);
+    }
+
+    fn clone_reserved_stdin(&self) -> std::io::Result<Option<File>> {
+        self.stdin
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(File::try_clone)
+            .transpose()
+    }
+
+    /// Attach a client bootstrapped by the caller at a proven early launch
+    /// boundary. This method never forks or infers quiescence from a live task
+    /// census. Configure before installing an image. Ordinary callers without
+    /// this explicit capability retain their existing behavior.
+    pub fn set_native_exit_broker(
+        &mut self,
+        client: crate::native_exit_broker::BrokerClient,
+    ) -> Result<()> {
+        AbandonedRuns::admit(&self.abandoned_runs)?;
+        if self.static_elf.is_some() {
+            return Err(Error::TerminalFileRetirement {
+                operation: "broker configured after image installation",
+                errno: libc::EBUSY,
+            });
+        }
+        self.native_exit_broker = Some(client);
+        Ok(())
     }
 
     pub(crate) fn tool_panic_owner(&self) -> Arc<crate::failure::tool_panics::ToolPanics> {
@@ -5647,6 +5848,79 @@ mod tests {
     include!("vm/memory_publication_tests.rs");
     include!("vm/read_zero_guest_tests.rs");
 
+    #[derive(Default)]
+    struct HostMetadataTimestampsTool;
+
+    #[reverie::tool]
+    impl reverie::Tool for HostMetadataTimestampsTool {
+        type GlobalState = ();
+        type ThreadState = ();
+    }
+
+    #[test]
+    fn host_metadata_timestamps_require_tool_owned_threads() {
+        // mov eax, 60; xor edi, edi; syscall
+        let code = [0xb8, 60, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05];
+        let mut backend = KvmBackend::new(16 * 1024 * 1024)
+            .expect("host metadata timestamp admission requires /dev/kvm");
+        assert!(
+            matches!(
+                backend.set_host_metadata_timestamps(true),
+                Err(Error::StaticElfNotInstalled)
+            ),
+            "the setting belongs to an installed image"
+        );
+        backend
+            .install_static_elf(&minimal_test_elf(&code), "/bin/host-metadata-timestamps")
+            .unwrap();
+        assert!(
+            !backend.host_metadata_timestamps_enabled(),
+            "an installed image reports fixed timestamps by default"
+        );
+        backend.set_host_metadata_timestamps(true).unwrap();
+        assert!(backend.host_metadata_timestamps_enabled());
+
+        assert!(
+            matches!(
+                backend.run_static_elf(),
+                Err(Error::HostMetadataTimestampsRequireToolThreads)
+            ),
+            "a run without a Tool would show host timestamps to the guest"
+        );
+        assert!(
+            matches!(
+                backend.run_static_elf_captured(),
+                Err(Error::HostMetadataTimestampsRequireToolThreads)
+            ),
+            "a captured run without a Tool would show host timestamps to the guest"
+        );
+        backend.unmonitored_threads();
+        assert!(
+            matches!(
+                futures::executor::block_on(
+                    backend.run_static_elf_with_tool_completion::<HostMetadataTimestampsTool>(
+                        (),
+                        false,
+                    ),
+                ),
+                Err(Error::HostMetadataTimestampsRequireToolThreads)
+            ),
+            "host-owned threads would show host timestamps to the guest"
+        );
+
+        // The refusals left the image installed. Tool-owned threads admit it.
+        assert!(backend.host_metadata_timestamps_enabled());
+        backend.set_thread_ownership(ThreadOwnership::Tool);
+        let completion = futures::executor::block_on(
+            backend.run_static_elf_with_tool_completion::<HostMetadataTimestampsTool>((), false),
+        )
+        .unwrap();
+        let (status, stdout, stderr) = completion.result.unwrap();
+        assert_eq!(status, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
     #[test]
     fn action_parent_captures_yield_for_close_and_keep_stop_and_validation() {
         use std::task::Context;
@@ -6199,7 +6473,15 @@ mod tests {
                     assert_eq!(backend.memory.host_address(), address);
                     assert_eq!(backend.cpuid_policy, policy);
                     assert_eq!(
-                        backend.stdin.as_ref().unwrap().metadata().unwrap().ino(),
+                        backend
+                            .stdin
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .metadata()
+                            .unwrap()
+                            .ino(),
                         metadata.ino()
                     );
                     assert!(backend.thread_slot.is_none());
@@ -7523,6 +7805,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shared_file_preparation_failures_precede_child_lifecycle_and_shared_tid_copyout() {
+        for fail_duplication in [true, false] {
+            let mut parent = KvmBackend::new(16 * 1024 * 1024)
+                .expect("shared-file fork failure control requires /dev/kvm");
+            parent
+                .install_static_elf(&minimal_test_elf(&[HLT]), "/bin/shared-fork-failure")
+                .unwrap();
+            let state = parent.static_elf.take().unwrap();
+            let lifecycle = state.task_lifecycle.clone();
+            let executor = ElfExecutor::new(state, false);
+            let fd =
+                unsafe { libc::memfd_create(c"shared-fork-failure".as_ptr(), libc::MFD_CLOEXEC) };
+            assert!(fd >= 0, "memfd setup: {}", std::io::Error::last_os_error());
+            // SAFETY: memfd_create returned the new descriptor owned by this File.
+            let backing = unsafe { File::from_raw_fd(fd) };
+            backing.set_len(PAGE_SIZE).unwrap();
+            parent
+                .memory
+                .publish_shared_file_range(
+                    parent.memory.allocation_guard(),
+                    crate::memory::SharedFileRangePlan {
+                        address: 0x40_0000,
+                        length: PAGE_SIZE as usize,
+                        file: backing.try_clone().unwrap().into(),
+                        offset: 0,
+                        readable: true,
+                        writable: true,
+                        max_writable: true,
+                        cursors: None,
+                    },
+                )
+                .unwrap();
+            const TID: u64 = 0x30_0000;
+            parent
+                .memory
+                .write_raw(TID, &0x11223344_u32.to_ne_bytes())
+                .unwrap();
+            const CHILD_TID: u64 = 0x40_0100;
+            parent
+                .memory
+                .write_raw(CHILD_TID, &0xaabbccdd_u32.to_ne_bytes())
+                .unwrap();
+            if fail_duplication {
+                parent.memory.fail_shared_snapshot_duplication_for_test();
+            } else {
+                // The real frame import fails after child VM allocation. This must
+                // still precede lifecycle registration and either shared TID store.
+                parent.syscall_frame_address = 32 * 1024 * 1024;
+            }
+            assert!(lifecycle.lock().unwrap().get(2).is_none());
+            let result = parent.prepare_forked_process(
+                &executor,
+                2,
+                None,
+                Some(TID),
+                Some(CHILD_TID),
+                None,
+                false,
+                false,
+                false,
+                None,
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("injected duplication failure succeeded"),
+            };
+            if fail_duplication {
+                assert!(
+                    matches!(error.primary(), Error::MemoryMapping(e) if e.raw_os_error() == Some(libc::ENOMEM))
+                );
+            } else {
+                assert!(matches!(error.primary(), Error::InvalidGuestAddress { .. }));
+            }
+            assert!(lifecycle.lock().unwrap().get(2).is_none());
+            assert!(!executor.has_pending_child_process(2));
+            let mut bytes = [0; 4];
+            parent.memory.read_raw(TID, &mut bytes).unwrap();
+            assert_eq!(bytes, 0x11223344_u32.to_ne_bytes());
+            parent.memory.read_raw(CHILD_TID, &mut bytes).unwrap();
+            assert_eq!(bytes, 0xaabbccdd_u32.to_ne_bytes());
+            assert!(parent.memory.entry_gate().pending_failure().is_none());
+            assert!(!parent.thread_group.has_worker_handles());
+        }
+    }
+
     // Exercise the real fork preparation with different leader/worker frames.
     // No guest runs: register readback isolates the initial return from all
     // later wait/publication behavior, while the guest tests cover that path.
@@ -7749,6 +8117,70 @@ mod tests {
         fn report_backend_failure(&self, event: reverie::BackendFailure) {
             self.events.lock().unwrap().push(event);
         }
+    }
+
+    #[test]
+    fn independent_process_mm_certificate_excludes_vfork_and_stays_revoked() {
+        let mut parent =
+            KvmBackend::new(16 * 1024 * 1024).expect("independent mm control requires KVM");
+        parent
+            .install_static_elf(&minimal_test_elf(&[0xf4]), "/bin/independent-mm")
+            .unwrap();
+        let executor = ElfExecutor::new(parent.static_elf.take().unwrap(), false);
+        let registers = parent.vcpu.get_regs().unwrap();
+        stage_process_syscall_return(
+            &mut parent.memory,
+            &parent.vcpu,
+            parent.syscall_frame_address,
+            registers,
+        )
+        .unwrap();
+        assert!(!parent.independent_process_mm);
+        let mut child = parent
+            .prepare_forked_process(
+                &executor, 2, None, None, None, None, false, false, false, None,
+            )
+            .unwrap();
+        assert!(child.backend.independent_process_mm);
+        assert!(!parent.independent_process_mm);
+
+        let vfork_child = child
+            .backend
+            .prepare_forked_process(
+                &child.executor,
+                3,
+                None,
+                None,
+                None,
+                None,
+                false,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(!vfork_child.backend.independent_process_mm);
+        assert!(!child.backend.independent_process_mm);
+        drop(vfork_child);
+        assert!(!child.backend.independent_process_mm);
+
+        let independent_child = child
+            .backend
+            .prepare_forked_process(
+                &child.executor,
+                4,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(independent_child.backend.independent_process_mm);
+        assert!(!child.backend.independent_process_mm);
     }
 
     // This control requires KVM construction and snapshot/register ioctls. It

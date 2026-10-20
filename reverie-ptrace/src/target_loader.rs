@@ -163,6 +163,7 @@ struct Snapshot {
 }
 fn bounded_file(path: &str, limit: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    let _open = crate::launch_window::TransientOpen::begin();
     std::fs::File::open(path)?
         .take((limit + 1) as u64)
         .read_to_end(&mut bytes)?;

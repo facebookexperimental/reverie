@@ -3,11 +3,16 @@
 [package]
 name = "reverie-process"
 description = "Deterministic async process spawning and management for the Reverie framework."
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/reverie-process"
+keywords = ["linux", "instrumentation", "hermit"]
+categories = ["development-tools::debugging", "os::linux-apis"]
 
 # `sanitized` is a Meta-internal cfg (set for sanitizer builds to skip
 # fork-based tests); declare it as a known cfg name so the open-source build

@@ -69,13 +69,19 @@ and trapping components they build on.
 
 Reverie needs the following system-level dependencies:
 ```text
-sudo apt install pkg-config libunwind-devel
+sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev
 ```
-(These are required to get backtraces from the guest process.)
+(This is the Ubuntu recipe; these libraries provide guest backtraces. Fedora
+uses `libunwind-devel` and `xz-devel` for the corresponding libraries.)
+
+The default published libraries build on stable Rust. This source workspace
+pins nightly for development. Function-guest tests that collect printing macros
+need the ptrace crate's `nightly` feature, or stable tests run with `--nocapture`;
+see [the ptrace README](reverie-ptrace/README.md).
 
 To test, run:
 ```text
-cargo test -- --test-threads=1
+cargo test --features reverie-ptrace/nightly -- --test-threads=1
 ```
 
 To run the `strace` example:

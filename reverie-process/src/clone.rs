@@ -110,29 +110,32 @@ pub(super) fn clone_with_stack<F>(
 where
     F: FnMut() -> i32,
 {
-    // Both the stack and the boxed callback may be dropped as soon as clone
-    // returns in the parent, so the child must have its own address space.
+    // Both the stack and the callback, passed by address, may be dropped as
+    // soon as clone returns in the parent, so the child must have its own
+    // address space.
     if flags & libc::CLONE_VM != 0 {
         return Err(Errno::EINVAL);
     }
-    type CloneCb<'a> = Box<dyn FnMut() -> i32 + 'a>;
-
-    extern "C" fn callback(data: *mut CloneCb) -> libc::c_int {
-        let cb: &mut CloneCb = unsafe { &mut *data };
-        (*cb)() as libc::c_int
+    extern "C" fn callback<G: FnMut() -> i32>(data: *mut libc::c_void) -> libc::c_int {
+        // No pthread_atfork handler runs in this child.
+        super::launch_window::reset_after_raw_clone();
+        // SAFETY: `data` is the parent's `cb`, of type `G`; without CLONE_VM
+        // the child has its own copy of it.
+        let cb = unsafe { &mut *data.cast::<G>() };
+        cb() as libc::c_int
     }
 
-    let mut cb: CloneCb = Box::new(cb);
+    // The callback is passed by address rather than boxed: Command::spawn
+    // calls this under a launch's lock (`launch_window`), where nothing may
+    // allocate.
+    let mut cb = cb;
 
     let res = unsafe {
         libc::clone(
-            core::mem::transmute::<
-                extern "C" fn(*mut Box<dyn FnMut() -> i32>) -> i32,
-                extern "C" fn(*mut libc::c_void) -> libc::c_int,
-            >(callback as extern "C" fn(*mut Box<dyn FnMut() -> i32>) -> i32),
+            callback::<F>,
             stack.top(),
             flags,
-            &mut cb as *mut _ as *mut libc::c_void,
+            (&mut cb as *mut F).cast::<libc::c_void>(),
         )
     };
 
@@ -177,6 +180,8 @@ where
 
     type CloneCb<'a> = Box<dyn FnMut() -> i32 + 'a>;
     extern "C" fn callback(data: *mut CloneCb) -> libc::c_int {
+        // No pthread_atfork handler runs in this child.
+        super::launch_window::reset_after_raw_clone();
         let cb: &mut CloneCb = unsafe { &mut *data };
         (*cb)() as libc::c_int
     }

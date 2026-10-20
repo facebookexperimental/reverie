@@ -281,11 +281,10 @@ mod stop_observation_tests {
         let former = child.pid();
         let child_terminal = child.terminal_cleanup();
         let child_identity = child_terminal.event.identity().unwrap();
-        let fd = unsafe { libc::fcntl(child_identity.pidfd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        assert!(fd >= 0);
+        let pidfd = child_identity.pidfd.try_clone().unwrap();
         let mut child_cleanup = TraceeCleanupGuard {
             pid: former.into(),
-            pidfd: unsafe { OwnedFd::from_raw_fd(fd) },
+            pidfd,
             ownership: TraceeCleanupOwnership::PreRegistration,
             armed: true,
         };

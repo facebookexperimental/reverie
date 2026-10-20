@@ -623,6 +623,7 @@ fn proc_mem(tid: nix::unistd::Pid, write: bool) -> std::io::Result<std::fs::File
 pub(crate) fn read_site(tid: nix::unistd::Pid, site: u64) -> std::io::Result<[u8; 2]> {
     use std::os::unix::fs::FileExt;
     let mut bytes = [0u8; 2];
+    let _open = crate::launch_window::TransientOpen::begin();
     proc_mem(tid, false)?.read_exact_at(&mut bytes, site)?;
     Ok(bytes)
 }
@@ -640,6 +641,7 @@ pub(crate) fn write_site(
     skip_write: bool,
 ) -> Result<(), anyhow::Error> {
     use std::os::unix::fs::FileExt;
+    let _open = crate::launch_window::TransientOpen::begin();
     let mem = proc_mem(tid, true)?;
     if !skip_write {
         mem.write_all_at(&bytes, site)?;
@@ -692,7 +694,7 @@ pub(crate) fn site_mapping_is_patchable(
     tid: nix::unistd::Pid,
     site: u64,
 ) -> Result<Result<(), PatchDecline>, std::io::Error> {
-    let maps = std::fs::read_to_string(format!("/proc/{tid}/maps"))?;
+    let maps = crate::launch_window::read_to_string(format!("/proc/{tid}/maps"))?;
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
         let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
@@ -818,21 +820,29 @@ pub(crate) struct ReraisedStop {
     /// with `si_code` `SI_QUEUE` and the tracer's pid).
     pub(crate) tag: u64,
     /// The siginfo of the original SIGSTOP's delivery stop.
-    pub(crate) info: libc::siginfo_t,
+    pub(crate) info: StoredSiginfo,
 }
 
-// SAFETY: The pointers in `info` are addresses in the tracee, copied from
-// PTRACE_GETSIGINFO. The tracer never dereferences them; it only hands the
-// siginfo back to PTRACE_SETSIGINFO, so it is plain data on this side.
-unsafe impl Send for ReraisedStop {}
-unsafe impl Sync for ReraisedStop {}
+/// A copy of a stop's siginfo, kept to be written back with
+/// `PTRACE_SETSIGINFO`. From libc 0.2.190 `siginfo_t` holds a raw pointer
+/// (`si_addr`), so it is neither `Send` nor `Sync`, and a task that keeps one
+/// could no longer be a `Guest`.
+#[derive(Clone, Copy)]
+pub(crate) struct StoredSiginfo(pub(crate) libc::siginfo_t);
+
+// SAFETY: the tracer only copies these bytes and hands them back to the
+// kernel. It never dereferences the pointer fields, which are addresses in
+// the guest's address space, not the tracer's.
+unsafe impl Send for StoredSiginfo {}
+// SAFETY: as above; a shared reference only reads the copied bytes.
+unsafe impl Sync for StoredSiginfo {}
 
 impl std::fmt::Debug for ReraisedStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReraisedStop")
             .field("tag", &self.tag)
-            .field("si_signo", &self.info.si_signo)
-            .field("si_code", &self.info.si_code)
+            .field("si_signo", &self.info.0.si_signo)
+            .field("si_code", &self.info.0.si_code)
             .finish()
     }
 }
@@ -1369,10 +1379,6 @@ unsafe fn int80_getpid() -> Int80Getpid {
 /// never falls back to an ordinary child that would take the next PID.
 #[cfg(target_arch = "x86_64")]
 mod probe_in_child {
-    use std::os::fd::AsRawFd;
-    use std::os::fd::FromRawFd;
-    use std::os::fd::OwnedFd;
-
     use super::Ia32EmulationProbe;
     use super::Int80Getpid;
     use super::classify_probe_outcome;
@@ -1399,28 +1405,89 @@ mod probe_in_child {
     /// finding a free one.
     const CANDIDATE_PIDS: libc::pid_t = 64;
 
+    /// The probe child's result: its `Int80Getpid`, then its own PID from an
+    /// ordinary getpid.
+    const RESULT_LEN: usize = Int80Getpid::SIZE + 8;
+
+    /// An anonymous shared page the probe child writes its result into. It is
+    /// memory, not a descriptor, so it takes no descriptor number from another
+    /// thread's launch and no descriptor of it can reach that launch's child.
+    /// A fork on another thread while the page is mapped still inherits the
+    /// mapping itself; only the probe child writes to it.
+    struct ResultPage(*mut u8);
+
+    impl ResultPage {
+        /// Offset of the byte the child sets after writing the result.
+        const WRITTEN: usize = RESULT_LEN;
+
+        fn new() -> std::io::Result<Self> {
+            // SAFETY: an anonymous mapping with no address hint.
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    Self::len(),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if page == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(ResultPage(page.cast()))
+        }
+
+        fn len() -> usize {
+            // SAFETY: sysconf has no preconditions.
+            (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize).max(RESULT_LEN + 1)
+        }
+
+        /// The result, if the child wrote all of it. Read only after the
+        /// child has been reaped.
+        fn result(&self) -> Option<[u8; RESULT_LEN]> {
+            // SAFETY: the page is mapped and at least `RESULT_LEN + 1` bytes
+            // long, and the child that wrote it has exited.
+            unsafe {
+                if self.0.add(Self::WRITTEN).read_volatile() != 1 {
+                    return None;
+                }
+                Some(self.0.cast::<[u8; RESULT_LEN]>().read_volatile())
+            }
+        }
+    }
+
+    impl Drop for ResultPage {
+        fn drop(&mut self) {
+            // SAFETY: unmaps the mapping made in `new`, which nothing else
+            // refers to.
+            unsafe { libc::munmap(self.0.cast(), Self::len()) };
+        }
+    }
+
     pub(super) fn run(filter: &str, boot_note: &str) -> Ia32EmulationProbe {
         let refuse = |what: String| {
             Ia32EmulationProbe::Unavailable(format!(
                 "{filter}, so int 0x80 must be probed in a child, and {what}"
             ))
         };
-        let pid_max = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        let pid_max = crate::launch_window::read_to_string("/proc/sys/kernel/pid_max")
             .ok()
             .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
             .unwrap_or(32768);
-        let mut fds = [0; 2];
-        // SAFETY: pipe2 writes two descriptors into `fds`.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return refuse(format!(
-                "its result pipe could not be created: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: both descriptors were just created and are owned here.
-        let (reader, writer) =
-            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let page = match ResultPage::new() {
+            Ok(page) => page,
+            Err(error) => return refuse(format!("its result page could not be mapped: {error}")),
+        };
 
+        // Like a guest launch, the child's fork runs with no transient open
+        // of another thread in flight, so the child inherits none, unless an
+        // open waited out `launch_window::OPEN_WAIT_LIMIT` and proceeded
+        // while this launch was held. The lock
+        // is released as soon as clone3 returns: the child may stop for a
+        // seccomp supervisor or tracer on another thread that needs a
+        // transient open, so it must not be awaited under the lock.
+        let launch = crate::launch_window::Launch::begin();
         let mut child = None;
         let lowest = (pid_max - CANDIDATE_PIDS).max(2);
         for tid in (lowest..pid_max).rev() {
@@ -1441,7 +1508,7 @@ mod probe_in_child {
                 )
             };
             if pid == 0 {
-                unsafe { child_main(writer.as_raw_fd()) }
+                unsafe { child_main(page.0) }
             }
             if pid > 0 {
                 child = Some(pid as libc::pid_t);
@@ -1449,6 +1516,7 @@ mod probe_in_child {
             }
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EEXIST) {
+                drop(launch);
                 return refuse(format!(
                     "creating that child at a chosen PID (clone3 with set_tid {chosen}, which \
                      needs CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN over this PID namespace) \
@@ -1456,32 +1524,13 @@ mod probe_in_child {
                 ));
             }
         }
+        drop(launch);
         let Some(child) = child else {
             return refuse(format!(
                 "no PID in {lowest}..{pid_max} was free for the probe child"
             ));
         };
-        drop(writer);
 
-        // The child's `Int80Getpid`, then its own PID from an ordinary getpid.
-        let mut bytes = [0u8; Int80Getpid::SIZE + 8];
-        let mut filled = 0;
-        while filled < bytes.len() {
-            // SAFETY: reads into the unfilled tail of `bytes`.
-            let n = unsafe {
-                libc::read(
-                    reader.as_raw_fd(),
-                    bytes[filled..].as_mut_ptr().cast(),
-                    bytes.len() - filled,
-                )
-            };
-            if n > 0 {
-                filled += n as usize;
-            } else if n == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-            {
-                break;
-            }
-        }
         let mut status = 0;
         loop {
             // SAFETY: waits for the child created above.
@@ -1494,6 +1543,7 @@ mod probe_in_child {
                 return refuse(format!("waiting for the probe child failed: {error}"));
             }
         }
+        let bytes = page.result();
 
         if libc::WIFSIGNALED(status) {
             let signal = libc::WTERMSIG(status);
@@ -1502,7 +1552,10 @@ mod probe_in_child {
                 signal_name(signal)
             ));
         }
-        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 && filled == bytes.len() {
+        if let (true, Some(bytes)) = (
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            bytes,
+        ) {
             let outcome = Int80Getpid::from_bytes(bytes[..Int80Getpid::SIZE].try_into().unwrap());
             let expected = u64::from_ne_bytes(bytes[Int80Getpid::SIZE..].try_into().unwrap());
             return match classify_probe_outcome(None, outcome, expected, boot_note) {
@@ -1516,15 +1569,18 @@ mod probe_in_child {
             };
         }
         refuse(format!(
-            "the probe child ended with wait status {status:#x} after sending {filled} of {} \
-             result bytes",
-            bytes.len()
+            "the probe child ended with wait status {status:#x}, {} its result",
+            if bytes.is_some() {
+                "after writing"
+            } else {
+                "without writing"
+            }
         ))
     }
 
     /// Runs in the probe child, a fork of a possibly multithreaded process:
     /// only async-signal-safe calls.
-    unsafe fn child_main(writer: libc::c_int) -> ! {
+    unsafe fn child_main(page: *mut u8) -> ! {
         unsafe {
             // A fault or trap must terminate the child with its own signal,
             // neither running an inherited handler nor dumping core.
@@ -1538,10 +1594,11 @@ mod probe_in_child {
             libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
             let outcome = super::int80_getpid();
             let expected = libc::syscall(libc::SYS_getpid) as u64;
-            let mut bytes = [0u8; Int80Getpid::SIZE + 8];
+            let mut bytes = [0u8; RESULT_LEN];
             bytes[..Int80Getpid::SIZE].copy_from_slice(&outcome.to_bytes());
             bytes[Int80Getpid::SIZE..].copy_from_slice(&expected.to_ne_bytes());
-            libc::write(writer, bytes.as_ptr().cast(), bytes.len());
+            page.cast::<[u8; RESULT_LEN]>().write_volatile(bytes);
+            page.add(ResultPage::WRITTEN).write_volatile(1);
             libc::_exit(0)
         }
     }
@@ -1741,7 +1798,7 @@ mod guarded_fault {
 /// Names an `ia32_emulation=` boot parameter, when present, for diagnostics.
 #[cfg(target_arch = "x86_64")]
 fn boot_parameter_note() -> String {
-    std::fs::read_to_string("/proc/cmdline")
+    crate::launch_window::read_to_string("/proc/cmdline")
         .ok()
         .and_then(|cmdline| {
             cmdline

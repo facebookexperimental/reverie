@@ -31,7 +31,9 @@ mod fatal_dead_exec_tests {
             }
             ForkResult::Parent { child } => Pid::from(child),
         };
-        let (stopped, event) = Running::new(pid)
+        let (stopped, event) = Running::new_on_ptracer_thread(pid)
+            .unwrap()
+            .wait_sync_on_ptracer_thread()
             .wait()
             .expect("wait exec tracee")
             .assume_stopped();
@@ -61,16 +63,17 @@ mod fatal_dead_exec_tests {
     /// Claims the killed tracee's exit stop and requires its actual final
     /// SIGKILL status.
     async fn reap_killed_exec(pid: Pid, running: Running, deadline: Instant) {
-        let exit_stop = tokio::time::timeout_at(deadline.into(), running.exit_event())
-            .await
-            .expect("exit stop claim is bounded")
-            .expect("claim the exit stop");
+        let exit_stop =
+            tokio::time::timeout_at(deadline.into(), running.exit_event_on_ptracer_thread())
+                .await
+                .expect("exit stop claim is bounded")
+                .expect("claim the exit stop");
         let exited = tokio::time::timeout_at(
             deadline.into(),
             exit_stop
                 .resume(None)
                 .expect("resume exit stop")
-                .next_state(),
+                .next_state_on_ptracer_thread(),
         )
         .await
         .expect("final status is bounded")
@@ -85,20 +88,32 @@ mod fatal_dead_exec_tests {
     async fn fatal_freeze_consumes_a_killed_exec_without_holding_it() {
         let deadline = Instant::now() + Duration::from_secs(3);
         let (pid, running) = killed_exec_tracee(deadline);
+        let waits = Arc::new(PtracerWaitOwner::default());
+        waits.bind_running(&running);
         let stop = FatalTaskStop {
             tid: pid,
             terminal: running.terminal_cleanup(),
             held: Arc::new(StdMutex::new(None)),
             frozen: AtomicBool::new(false),
+            waits: waits.clone(),
         };
+        // This single-threaded fixture is held at its actual EXIT stop. Keep
+        // a regular process descriptor available for the legacy callback too.
+        let group = TraceeIdentity::open_root(pid).expect("retain fixture process descriptor");
+        let mut retained_delivery = None;
         let frozen = tokio::time::timeout_at(
             deadline.into(),
-            stop.freeze(deadline, |parent, op, child| {
-                panic!(
-                    "a killed exec reported child {} of {parent} by {op:?}",
-                    child.pid()
-                )
-            }),
+            stop.freeze(
+                deadline,
+                |parent, op, child| {
+                    panic!(
+                        "a killed exec reported child {} of {parent} by {op:?}",
+                        child.pid()
+                    )
+                },
+                || group.send_signal(Signal::SIGSTOP),
+                &mut retained_delivery,
+            ),
         )
         .await
         .expect("freeze of a killed exec is bounded");
@@ -152,7 +167,9 @@ mod fatal_dead_exec_tests {
         let session = FatalSession::for_test(pid);
         let terminal = running.terminal_cleanup();
         let held = Arc::new(StdMutex::new(None));
-        let exit_stop = tokio::time::timeout_at(deadline.into(), running.exit_event())
+        let waits = Arc::new(PtracerWaitOwner::default());
+        waits.bind_running(&running);
+        let exit_stop = tokio::time::timeout_at(deadline.into(), waits.exit_running(&running))
             .await
             .expect("exit stop claim is bounded")
             .expect("claim the exit stop");
@@ -163,6 +180,7 @@ mod fatal_dead_exec_tests {
                 Ok(exit_stop),
                 &terminal,
                 &held,
+                &waits,
                 &session
             ));
             loop {
@@ -243,7 +261,9 @@ mod fatal_dead_exec_tests {
             }
             ForkResult::Parent { child } => Pid::from(child),
         };
-        let (stopped, event) = Running::new(pid)
+        let (stopped, event) = Running::new_on_ptracer_thread(pid)
+            .unwrap()
+            .wait_sync_on_ptracer_thread()
             .wait()
             .expect("wait fork tracee")
             .assume_stopped();

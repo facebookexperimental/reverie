@@ -8,6 +8,14 @@
 
 //! Reverie ptrace backend.
 //!
+//! Part of [Hermit](https://hermetic-infra.org). For the command-line interface,
+//! see [`hermit-run`](https://crates.io/crates/hermit-run), and for background,
+//! see [Hermit: Deterministic Linux for Controlled Testing and Software Bug-finding](https://developers.facebook.com/blog/post/2022/11/22/hermit-deterministic-linux-testing/).
+//!
+//! Default features build on stable Rust. The optional `nightly` feature lets
+//! [`spawn_fn_with_config`] clear libtest's capture of printing macros before
+//! forking; see that function's documentation for stable test alternatives.
+//!
 //! ptraced task implements `Guest` trait.
 //!
 //! `TracedTask` implements handlers for ptrace events including
@@ -28,7 +36,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![cfg(target_os = "linux")]
-#![feature(internal_output_capture)]
+#![cfg_attr(feature = "nightly", feature(internal_output_capture))]
 
 mod backend;
 mod capture;
@@ -62,6 +70,7 @@ mod tracer;
 mod validation;
 mod vdso;
 
+// Shared with the transient opens in reverie-core and safeptrace.
 pub use backend::PtraceBackend;
 pub use failure::CapturedPrefix;
 pub use failure::LegacyCleanupDiagnostics;
@@ -86,6 +95,7 @@ pub use liteinst_trap_only::SitePatching;
 pub use liteinst_trap_only::SiteTable;
 pub use liteinst_trap_only::probe_ia32_emulation;
 pub use perf::is_perf_supported;
+use reverie::process::launch_window;
 pub use stats::PtraceBackendStatsSnapshot;
 pub use stats::PtraceBackendStatsSource;
 pub use timer::PmuConfig;
@@ -108,3 +118,5 @@ pub use tracer::spawn_fn_with_config;
 pub use vdso::VdsoSyscallSite;
 #[cfg(target_arch = "x86_64")]
 pub use vdso::patch_current_vdso;
+#[cfg(target_arch = "x86_64")]
+pub use vdso::patch_current_vdso_trapping;

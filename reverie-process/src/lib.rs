@@ -23,6 +23,8 @@ mod error;
 mod exit_status;
 mod fd;
 mod id_map;
+#[doc(hidden)]
+pub mod launch_window;
 mod mount;
 mod namespace;
 mod net;

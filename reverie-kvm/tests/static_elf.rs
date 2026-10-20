@@ -78,11 +78,762 @@ use reverie_kvm::StraceTool;
 
 const MEMORY_SIZE: usize = 16 * 1024 * 1024;
 
+#[path = "support/alias_failure.rs"]
+mod alias_failure;
+
+#[path = "support/broker_test_client.rs"]
+mod broker_test_client;
+use reverie_kvm::native_exit_broker;
+
+#[path = "support/broker_test_protocol.rs"]
+mod broker_test_protocol;
+
+static ALIAS_FAILURE_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+static ALIAS_FAILURE_CALLBACK_RESUMED: AtomicBool = AtomicBool::new(false);
+static ALIAS_FAILURE_CALLBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AliasFailureTool;
+
+#[reverie::tool]
+impl Tool for AliasFailureTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscalls([Sysno::getdents64]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        ALIAS_FAILURE_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        let result = guest.inject(syscall).await;
+        ALIAS_FAILURE_CALLBACK_RESUMED.store(true, Ordering::SeqCst);
+        ALIAS_FAILURE_CALLBACK_COMPLETIONS.fetch_add(1, Ordering::SeqCst);
+        Ok(result?)
+    }
+}
+
+#[test]
+fn getdents64_alias_resource_failure_stops_direct_guest() {
+    getdents64_alias_failure_case(
+        "getdents64_alias_resource_failure_stops_direct_guest",
+        false,
+    );
+}
+
+#[test]
+fn getdents64_alias_resource_failure_stops_tool_and_guest() {
+    getdents64_alias_failure_case(
+        "getdents64_alias_resource_failure_stops_tool_and_guest",
+        true,
+    );
+}
+
+#[test]
+fn getdents64_alias_foreign_mapping_stops_direct_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_foreign_mapping_stops_direct_guest",
+        false,
+        Some(alias_failure::Case::Foreign),
+    );
+}
+
+#[test]
+fn getdents64_alias_foreign_mapping_stops_tool_and_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_foreign_mapping_stops_tool_and_guest",
+        true,
+        Some(alias_failure::Case::Foreign),
+    );
+}
+
+#[test]
+fn getdents64_alias_atomic_collision_completes_direct_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_atomic_collision_completes_direct_guest",
+        false,
+        Some(alias_failure::Case::AtomicCollision),
+    );
+}
+
+#[test]
+fn getdents64_alias_atomic_collision_completes_tool_and_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_atomic_collision_completes_tool_and_guest",
+        true,
+        Some(alias_failure::Case::AtomicCollision),
+    );
+}
+
+#[test]
+fn getdents64_alias_cleanup_failure_stops_direct_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_cleanup_failure_stops_direct_guest",
+        false,
+        Some(alias_failure::Case::CleanupAfterSuccess),
+    );
+}
+
+#[test]
+fn getdents64_alias_cleanup_failure_stops_tool_and_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_cleanup_failure_stops_tool_and_guest",
+        true,
+        Some(alias_failure::Case::CleanupAfterSuccess),
+    );
+}
+
+#[test]
+fn getdents64_alias_unexpected_address_stops_direct_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_unexpected_address_stops_direct_guest",
+        false,
+        Some(alias_failure::Case::WrongAddress),
+    );
+}
+
+#[test]
+fn getdents64_alias_unexpected_address_stops_tool_and_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_unexpected_address_stops_tool_and_guest",
+        true,
+        Some(alias_failure::Case::WrongAddress),
+    );
+}
+
+#[test]
+fn getdents64_alias_middle_extent_stops_direct_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_middle_extent_stops_direct_guest",
+        false,
+        Some(alias_failure::Case::MiddleExtent),
+    );
+}
+
+#[test]
+fn getdents64_alias_middle_extent_stops_tool_and_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_middle_extent_stops_tool_and_guest",
+        true,
+        Some(alias_failure::Case::MiddleExtent),
+    );
+}
+
+#[test]
+fn getdents64_alias_construction_cleanup_stops_direct_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_construction_cleanup_stops_direct_guest",
+        false,
+        Some(alias_failure::Case::ConstructionCleanup),
+    );
+}
+
+#[test]
+fn getdents64_alias_construction_cleanup_stops_tool_and_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_construction_cleanup_stops_tool_and_guest",
+        true,
+        Some(alias_failure::Case::ConstructionCleanup),
+    );
+}
+
+#[test]
+fn getdents64_alias_suffix_cleanup_stops_direct_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_suffix_cleanup_stops_direct_guest",
+        false,
+        Some(alias_failure::Case::SuffixCleanup),
+    );
+}
+
+#[test]
+fn getdents64_alias_suffix_cleanup_stops_tool_and_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_suffix_cleanup_stops_tool_and_guest",
+        true,
+        Some(alias_failure::Case::SuffixCleanup),
+    );
+}
+
+#[test]
+fn getdents64_alias_eof_cleanup_stops_direct_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_eof_cleanup_stops_direct_guest",
+        false,
+        Some(alias_failure::Case::CleanupAtEof),
+    );
+}
+
+#[test]
+fn getdents64_alias_eof_cleanup_stops_tool_and_guest() {
+    getdents64_alias_failure_case_selected(
+        "getdents64_alias_eof_cleanup_stops_tool_and_guest",
+        true,
+        Some(alias_failure::Case::CleanupAtEof),
+    );
+}
+
+fn getdents64_alias_failure_case(test: &str, with_tool: bool) {
+    getdents64_alias_failure_case_selected(test, with_tool, None);
+}
+
+fn getdents64_alias_failure_case_selected(
+    test: &str,
+    with_tool: bool,
+    case: Option<alias_failure::Case>,
+) {
+    if !kvm_available(test) {
+        return;
+    }
+    let fault = match case {
+        Some(case) => alias_failure::child_case(test, case),
+        None => alias_failure::child(test),
+    };
+    let Some(fault) = fault else {
+        return;
+    };
+    let directory = TestDirectory::new();
+    std::fs::create_dir(directory.0.join("empty")).unwrap();
+    assert_eq!(ALIAS_FAILURE_CALLBACKS.load(Ordering::SeqCst), 0);
+    assert_eq!(ALIAS_FAILURE_CALLBACK_COMPLETIONS.load(Ordering::SeqCst), 0);
+    assert!(!ALIAS_FAILURE_CALLBACK_RESUMED.load(Ordering::SeqCst));
+    let at_eof = fault.case() == alias_failure::Case::CleanupAtEof;
+    let program_source = format!(
+        "#define ALIAS_PAGE_COUNT {}\n#define ALIAS_AT_EOF {}\n{}",
+        fault.pages(),
+        u8::from(at_eof),
+        GETDENTS_ALIAS_FAILURE_PROGRAM,
+    );
+    let program = compile_c_program(&directory.0, "alias-failure", &program_source);
+    let marker = directory.0.join("guest-continued");
+    let native = std::process::Command::new("timeout")
+        .args(["--kill-after=2s", "10s"])
+        .arg(&program)
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    assert!(
+        !native.stdout.is_empty(),
+        "native alias oracle emitted no result"
+    );
+    assert_eq!(std::fs::read(&marker).unwrap(), b"resumed");
+    std::fs::remove_file(&marker).unwrap();
+    let mut backend = KvmBackend::new(64 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_file_with_context(
+            std::fs::File::open(&program).unwrap(),
+            &[program.to_str().unwrap()],
+            &["PATH=/usr/bin:/bin"],
+            &directory.0,
+        )
+        .unwrap();
+    // The loader maps the stack through guest_end(), while its strings and
+    // initial stack grow down from guest_end() - 4096. This fixture never
+    // writes the zero-filled top-page headroom. Probe one real mapped byte
+    // before arming, then require the same access/value after completion.
+    let memory_probe_address = backend.memory().unwrap().guest_end() - 1;
+    let mut before_run_memory = [0xff];
+    backend
+        .memory()
+        .unwrap()
+        .read(memory_probe_address, &mut before_run_memory)
+        .unwrap();
+    assert_eq!(before_run_memory, [0]);
+    fault.arm();
+    let result = if with_tool {
+        futures::executor::block_on(backend.run_static_elf_with_tool::<AliasFailureTool>((), true))
+            .map(|(_, code, stdout, stderr)| (code, stdout, stderr))
+    } else {
+        backend.run_static_elf_captured()
+    };
+    let preceding_calls = if at_eof { 2 } else { 0 };
+    let callbacks = ALIAS_FAILURE_CALLBACKS.load(Ordering::SeqCst);
+    let completions = ALIAS_FAILURE_CALLBACK_COMPLETIONS.load(Ordering::SeqCst);
+    let resumed = ALIAS_FAILURE_CALLBACK_RESUMED.load(Ordering::SeqCst);
+    assert_eq!(callbacks, u64::from(with_tool) * (preceding_calls + 1));
+    if fault.succeeds() {
+        // The host allocator really contended for the still-owned target and
+        // received EEXIST. The guest syscall must nonetheless complete with
+        // exactly the native bytes and directory cursor, through either path.
+        let (code, stdout, stderr) = result.unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stdout));
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(
+            stdout, native.stdout,
+            "atomic allocator contention changed copyout"
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"resumed");
+        assert_eq!(completions, u64::from(with_tool));
+        assert_eq!(resumed, with_tool);
+        let mut after_run_memory = [0xff];
+        backend
+            .memory()
+            .unwrap()
+            .read(memory_probe_address, &mut after_run_memory)
+            .unwrap();
+        assert_eq!(after_run_memory, before_run_memory);
+        drop(backend);
+        fault.assert_fired();
+        eprintln!(
+            "atomic alias completed with_tool={with_tool}: callbacks={callbacks} completions={completions} guest_marker=true"
+        );
+        return;
+    }
+    eprintln!(
+        "\nalias refusal observation: result={result:?} callbacks={callbacks} completions={completions} resumed={resumed} guest_marker={}",
+        marker.exists(),
+    );
+    let error = result.unwrap_err();
+    let cause = fault
+        .cause(&error, None)
+        .unwrap_or_else(|| panic!("{error:?}"));
+    assert!(!marker.exists(), "guest resumed after supervisor failure");
+    // The EOF setup has two successful small reads before the targeted alias.
+    // Neither the failed syscall nor its Tool injection may resume afterwards.
+    assert_eq!(completions, u64::from(with_tool) * preceding_calls);
+    assert_eq!(resumed, with_tool && preceding_calls != 0);
+    let mut refused_memory = [0xff];
+    let refused = backend
+        .memory()
+        .expect("completed alias-failure run must release memory access admission")
+        .read(memory_probe_address, &mut refused_memory)
+        .unwrap_err();
+    assert_eq!(
+        refused_memory,
+        [0xff],
+        "terminal refusal must precede copying"
+    );
+    assert!(std::ptr::eq(
+        cause,
+        fault
+            .cause(&refused, None)
+            .unwrap_or_else(|| panic!("{refused:?}"))
+    ));
+    // Retain the original invalid-address control as well: terminal poison
+    // must take precedence over the otherwise inaccessible null address.
+    let invalid_refused = backend.memory().unwrap().read(0, &mut [0]).unwrap_err();
+    assert!(std::ptr::eq(
+        cause,
+        fault
+            .cause(&invalid_refused, None)
+            .unwrap_or_else(|| panic!("{invalid_refused:?}"))
+    ));
+    eprintln!(
+        "terminal alias failure with_tool={with_tool}: {error}; callbacks={callbacks} completions={completions} preceding_calls={preceding_calls}"
+    );
+    drop(invalid_refused);
+    drop(refused);
+    drop(error);
+    drop(backend);
+    // Keep interception live through ordinary teardown: an erroneous later
+    // cleanup must still fail the exact ownership/duplicate-attempt counters.
+    fault.assert_fired();
+}
+
+const GETDENTS_ALIAS_FAILURE_PROGRAM: &str = r#"
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef ALIAS_PAGE_COUNT
+#define ALIAS_PAGE_COUNT 3
+#endif
+#ifndef ALIAS_AT_EOF
+#define ALIAS_AT_EOF 0
+#endif
+#define ALIAS_BYTES (ALIAS_PAGE_COUNT * 4096)
+#define CHECK(x) do { if (!(x)) return 93; } while (0)
+int main(void) {
+    CHECK(close(0) == 0);
+    int fd = open("empty", O_RDONLY | O_DIRECTORY);
+    CHECK(fd == 0);
+    unsigned char *p = mmap(0, ALIAS_BYTES, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(p != MAP_FAILED);
+    memset(p, 0xa5, ALIAS_BYTES);
+    if (ALIAS_AT_EOF) {
+        unsigned char small[256];
+        long count = syscall(SYS_getdents64, fd, small, sizeof(small));
+        CHECK(count > 0 && count <= (long)sizeof(small));
+        CHECK(syscall(SYS_getdents64, fd, small, sizeof(small)) == 0);
+        CHECK(mprotect(p, ALIAS_BYTES, PROT_NONE) == 0);
+    } else {
+        for (int page = 1; page < ALIAS_PAGE_COUNT; page += 2)
+            CHECK(mprotect(p + page * 4096, 4096, PROT_NONE) == 0);
+    }
+    long count = syscall(SYS_getdents64, fd, p, ALIAS_BYTES);
+    CHECK(ALIAS_AT_EOF ? count == 0 : count > 0 && count <= 4096);
+    off_t cursor = lseek(fd, 0, SEEK_CUR);
+    CHECK(cursor > 0);
+    printf("count=%ld cursor=%lld\n", count, (long long)cursor);
+    if (!ALIAS_AT_EOF) {
+        for (int page = 0; page < ALIAS_PAGE_COUNT; page += 2) {
+            for (int i = 0; i < 4096; i++) printf("%02x", p[page * 4096 + i]);
+            putchar('\n');
+        }
+    }
+    int marker = open("guest-continued", O_WRONLY | O_CREAT | O_EXCL, 0600);
+    CHECK(marker >= 0 && write(marker, "resumed", 7) == 7);
+    return 0;
+}
+"#;
+
+#[test]
+fn getdents64_copyout_matches_native_direct() {
+    getdents64_copyout_case("getdents64_copyout_matches_native_direct", false);
+}
+
+#[test]
+fn getdents64_copyout_matches_native_tool() {
+    getdents64_copyout_case("getdents64_copyout_matches_native_tool", true);
+}
+
+#[test]
+fn getdents64_preserves_concurrent_unwritten_bytes_direct() {
+    getdents64_native_parity_case(
+        "getdents64_preserves_concurrent_unwritten_bytes_direct",
+        false,
+        GETDENTS_CONCURRENT_PROGRAM,
+    );
+}
+
+#[test]
+fn getdents64_preserves_concurrent_unwritten_bytes_tool() {
+    getdents64_native_parity_case(
+        "getdents64_preserves_concurrent_unwritten_bytes_tool",
+        true,
+        GETDENTS_CONCURRENT_PROGRAM,
+    );
+}
+
+fn getdents64_copyout_case(test: &str, with_tool: bool) {
+    getdents64_native_parity_case(test, with_tool, GETDENTS_COPYOUT_PROGRAM);
+}
+
+fn getdents64_native_parity_case(test: &str, with_tool: bool, source: &str) {
+    if !leader_self_exec_bounded(test) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let input = directory.0.join("input");
+    std::fs::create_dir(&input).unwrap();
+    std::fs::create_dir(directory.0.join("empty")).unwrap();
+    std::fs::write(input.join("a-long-directory-entry-for-copyout"), b"x").unwrap();
+    let program = compile_c_program(&directory.0, "getdents-copyout", source);
+    let native = std::process::Command::new("timeout")
+        .args(["--kill-after=2s", "10s"])
+        .arg(&program)
+        .arg("native")
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    eprintln!(
+        "native copyout oracle passed: {} bytes",
+        native.stdout.len()
+    );
+    for repetition in 0..2 {
+        let mut backend = KvmBackend::new(64 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_file_with_context(
+                std::fs::File::open(&program).unwrap(),
+                &[program.to_str().unwrap(), "guest"],
+                &["PATH=/usr/bin:/bin"],
+                &directory.0,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if with_tool {
+            let (log, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            let callbacks = log
+                .syscalls()
+                .iter()
+                .filter(|name| name.as_str() == "getdents64")
+                .count();
+            assert!(callbacks > 0, "typed getdents64 callback was bypassed");
+            eprintln!("typed getdents64 callbacks={callbacks}");
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stdout));
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(
+            std::str::from_utf8(&stdout).unwrap(),
+            std::str::from_utf8(&native.stdout).unwrap(),
+            "with_tool={with_tool} repetition={repetition}"
+        );
+        eprintln!("copyout parity passed: with_tool={with_tool} repetition={repetition}");
+    }
+}
+
+const GETDENTS_CONCURRENT_PROGRAM: &str = r#"
+#define _GNU_SOURCE
+#include <stdatomic.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define SIZE (16 * 1024 * 1024)
+#define CHECK(expression) do { if (!(expression)) { printf("failure line=%d errno=%d\n", __LINE__, errno); return 93; } } while (0)
+static _Atomic unsigned long *wide_marker;
+static _Atomic unsigned char *padding_marker;
+static _Atomic int stop, clobber;
+static _Atomic unsigned long progress;
+static unsigned long before, observed;
+
+static unsigned long marker_value(void) {
+    return padding_marker ? atomic_load(padding_marker) : atomic_load(wide_marker);
+}
+
+static void *writer(void *unused) {
+    (void)unused;
+    unsigned long last = 0;
+    while (!atomic_load(&stop)) {
+        unsigned long actual = marker_value();
+        if (actual != last) {
+            before = last;
+            observed = actual;
+            atomic_store(&clobber, 1);
+            return 0;
+        }
+        if (padding_marker) {
+            last = (unsigned char)(last + 1);
+            atomic_store(padding_marker, last);
+        } else {
+            atomic_store(wide_marker, ++last);
+        }
+        atomic_fetch_add(&progress, 1);
+        sched_yield();
+    }
+    // Check once after the stop request too, so a final copyout cannot escape
+    // detection merely because it overlapped the writer's final yield.
+    unsigned long actual = marker_value();
+    if (actual != last) {
+        before = last;
+        observed = actual;
+        atomic_store(&clobber, 1);
+    }
+    return 0;
+}
+
+int main(void) {
+    CHECK(close(0) == 0);
+    int fd = open("empty", O_RDONLY | O_DIRECTORY);
+    CHECK(fd == 0);
+    unsigned char reference[256];
+    CHECK(syscall(SYS_getdents64, fd, reference, sizeof(reference)) == 48);
+    size_t padding_offset = 20 + strlen((char *)reference + 19);
+    CHECK(padding_offset < 24);
+    unsigned char *buffer = mmap(0, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(buffer != MAP_FAILED);
+    const char *names[] = {"EOF", "short tail", "padding", "EINVAL"};
+    for (int mode = 0; mode < 4; ++mode) {
+        memset(buffer, 0, SIZE);
+        CHECK(lseek(fd, 0, SEEK_SET) == 0);
+        if (mode == 0) {
+            CHECK(syscall(SYS_getdents64, fd, reference, sizeof(reference)) == 48);
+            CHECK(syscall(SYS_getdents64, fd, reference, sizeof(reference)) == 0);
+        }
+        padding_marker = mode == 2 ? (_Atomic unsigned char *)(buffer + padding_offset) : 0;
+        wide_marker = (_Atomic unsigned long *)(buffer + (mode == 3 ? 8 : SIZE / 2));
+        atomic_store(&stop, 0);
+        atomic_store(&clobber, 0);
+        atomic_store(&progress, 0);
+        pthread_t thread;
+        CHECK(pthread_create(&thread, 0, writer, 0) == 0);
+        while (atomic_load(&progress) < 1000) sched_yield();
+        int calls = 0;
+        for (; calls < 32 && !atomic_load(&clobber); ++calls) {
+            if (mode != 0) CHECK(lseek(fd, 0, SEEK_SET) == 0);
+            errno = 0;
+            long result = syscall(SYS_getdents64, fd, buffer, mode == 3 ? 23 : SIZE);
+            CHECK(mode == 3 ? result == -1 && errno == EINVAL : result == (mode == 0 ? 0 : 48));
+        }
+        atomic_store(&stop, 1);
+        CHECK(pthread_join(thread, 0) == 0);
+        if (atomic_load(&clobber)) {
+            printf("%s calls=%d clobber=1 before=%lu observed=%lu\n", names[mode], calls, before, observed);
+            return 94;
+        }
+        CHECK(calls == 32);
+        printf("%s calls=32 sole-writer-preserved\n", names[mode]);
+    }
+    CHECK(munmap(buffer, SIZE) == 0 && close(fd) == 0);
+    return 0;
+}
+"#;
+
+const GETDENTS_COPYOUT_PROGRAM: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define CHECK(expression) do { if (!(expression)) { printf("failure line=%d errno=%d\n", __LINE__, errno); return 93; } } while (0)
+struct entry { uint64_t ino; int64_t off; unsigned short len; unsigned char type; char name[]; };
+
+static void bytes(const unsigned char *buffer, size_t count) {
+    for (size_t i = 0; i < count; ++i) printf("%02x", buffer[i]);
+}
+
+int main(int argc, char **argv) {
+    CHECK(argc == 2);
+    int guest = !strcmp(argv[1], "guest");
+    CHECK(close(0) == 0);
+    int fd = open("input", O_RDONLY | O_DIRECTORY);
+    CHECK(fd == 0);
+    unsigned char reference[256];
+    long size = syscall(SYS_getdents64, fd, reference, sizeof(reference));
+    CHECK(size > 48 && size <= sizeof(reference));
+    off_t long_start = -1, previous = 0;
+    int entries = 0;
+    for (long offset = 0; offset < size;) {
+        struct entry *entry = (struct entry *)(reference + offset);
+        CHECK(entry->len >= 24 && offset + entry->len <= size);
+        if (!strcmp(entry->name, "a-long-directory-entry-for-copyout")) long_start = previous;
+        previous = entry->off;
+        offset += entry->len;
+        ++entries;
+    }
+    CHECK(entries == 3 && long_start >= 0);
+    off_t starts[] = {0, long_start, previous};
+    CHECK(close(fd) == 0);
+    unsigned char *mapping = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(mapping != MAP_FAILED);
+    const int prefixes[] = {0, 16, 21, 23, 24, 40, 48, 128};
+    const int counts[] = {0, 23, 24, 128};
+    for (int protection = 0; protection < 2; ++protection) {
+        for (int start = 0; start < 3; ++start) {
+            for (unsigned pi = 0; pi < sizeof(prefixes) / sizeof(prefixes[0]); ++pi) {
+                for (unsigned ci = 0; ci < sizeof(counts) / sizeof(counts[0]); ++ci) {
+                    CHECK(mprotect(mapping, 8192, PROT_READ | PROT_WRITE) == 0);
+                    memset(mapping, 0xa5, 8192);
+                    CHECK(mprotect(mapping + 4096, 4096, protection ? PROT_READ : PROT_NONE) == 0);
+                    fd = open("input", O_RDONLY | O_DIRECTORY);
+                    CHECK(fd == 0);
+                    int alias = dup(fd);
+                    CHECK(alias >= 3);
+                    CHECK(lseek(fd, starts[start], SEEK_SET) == starts[start]);
+                    unsigned char *output = mapping + 4096 - prefixes[pi];
+                    errno = 0;
+                    long result = syscall(SYS_getdents64, fd, output, counts[ci]);
+                    int error = errno;
+                    off_t position = lseek(alias, 0, SEEK_CUR);
+                    CHECK(position >= 0);
+                    CHECK(mprotect(mapping, 8192, PROT_READ | PROT_WRITE) == 0);
+                    printf("protect=%d start=%d prefix=%d count=%d result=%ld errno=%d cursor=%ld bytes=",
+                           protection, start, prefixes[pi], counts[ci], result, error, position);
+                    bytes(output - 8, 144);
+                    unsigned char retry[256];
+                    memset(retry, 0xa5, sizeof(retry));
+                    errno = 0;
+                    long retry_size = syscall(SYS_getdents64, alias, retry, sizeof(retry));
+                    CHECK(retry_size >= 0 && retry_size <= sizeof(retry));
+                    printf(" retry=%ld errno=%d bytes=", retry_size, errno);
+                    bytes(retry, sizeof(retry));
+                    printf(" cursor=%ld\n", lseek(fd, 0, SEEK_CUR));
+                    CHECK(close(alias) == 0 && close(fd) == 0);
+                }
+            }
+        }
+    }
+    const uintptr_t invalid[] = {0, UINTPTR_MAX - 15};
+    for (int start = 0; start < 3; ++start) {
+        for (unsigned pointer = 0; pointer < sizeof(invalid) / sizeof(invalid[0]); ++pointer) {
+            for (unsigned ci = 0; ci < sizeof(counts) / sizeof(counts[0]); ++ci) {
+                fd = open("input", O_RDONLY | O_DIRECTORY);
+                CHECK(fd == 0);
+                CHECK(lseek(fd, starts[start], SEEK_SET) == starts[start]);
+                errno = 0;
+                long result = syscall(SYS_getdents64, fd, (void *)invalid[pointer], counts[ci]);
+                int error = errno;
+                printf("invalid=%u start=%d count=%d result=%ld errno=%d cursor=%ld\n",
+                       pointer, start, counts[ci], result, error, lseek(fd, 0, SEEK_CUR));
+                CHECK(close(fd) == 0);
+            }
+        }
+    }
+    // Descriptor/type checks precede copyout, including zero and undersized counts.
+    int path = open("input", O_PATH | O_DIRECTORY);
+    int regular = open("input/a-long-directory-entry-for-copyout", O_RDONLY);
+    CHECK(path == 0 && regular >= 3);
+    int descriptors[] = {-1, path, regular};
+    int errors[] = {EBADF, EBADF, ENOTDIR};
+    CHECK(mprotect(mapping, 8192, PROT_READ) == 0);
+    for (int descriptor = 0; descriptor < 3; ++descriptor) {
+        for (unsigned ci = 0; ci < sizeof(counts) / sizeof(counts[0]); ++ci) {
+            errno = 0;
+            CHECK(syscall(SYS_getdents64, descriptors[descriptor], mapping, counts[ci]) == -1);
+            CHECK(errno == errors[descriptor]);
+        }
+    }
+    CHECK(close(path) == 0 && close(regular) == 0);
+    if (guest) {
+        // The backend deliberately exposes synthetic proc directories as empty.
+        fd = open("/proc", O_RDONLY | O_DIRECTORY);
+        CHECK(fd == 0);
+        CHECK(syscall(SYS_getdents64, fd, mapping, 128) == 0);
+        CHECK(syscall(SYS_getdents64, fd, (void *)-1, 0) == 0);
+        CHECK(close(fd) == 0);
+    }
+    for (int i = 0; i < 8192; ++i) CHECK(mapping[i] == 0xa5);
+    CHECK(munmap(mapping, 8192) == 0);
+    puts("copyout errors and synthetic proc policy PASS");
+    return 0;
+}
+"#;
+
 #[path = "support/random_device_stream.rs"]
 mod random_device_stream;
 
 #[path = "support/poll_descriptor_abi.rs"]
 mod poll_descriptor_abi;
+
+#[path = "support/pselect_zero.rs"]
+mod pselect_zero;
+
+#[path = "support/epoll_pwait2.rs"]
+mod epoll_pwait2;
+
+#[path = "support/syncfs.rs"]
+mod syncfs;
+
+#[path = "support/fcntl_owner.rs"]
+mod fcntl_owner;
+
+#[path = "support/msync.rs"]
+mod msync;
+
+#[path = "support/msync_lifecycle.rs"]
+mod msync_lifecycle;
 
 #[test]
 fn file_script_exec_plain() {
@@ -1597,10 +2348,17 @@ int main(void) {{
 }
 
 fn leader_self_exec_bounded(test: &str) -> bool {
+    leader_self_exec_bounded_with_output(test, false)
+}
+
+fn leader_self_exec_bounded_with_output(test: &str, forward_output: bool) -> bool {
     if !kvm_available(test) {
         return false;
     }
     if std::env::var("REVERIE_LEADER_EXEC_CHILD").as_deref() == Ok(test) {
+        if broker_test_protocol::selected(test) {
+            broker_test_client::attach(test);
+        }
         return true;
     }
     // Guest writes can share stdout with libtest without a trailing newline.
@@ -1609,14 +2367,27 @@ fn leader_self_exec_bounded(test: &str) -> bool {
     let result_directory = TestDirectory::new();
     std::fs::set_permissions(&result_directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
     let execution_log = result_directory.0.join("libtest.log");
-    let output = std::process::Command::new("timeout")
-        .args(["--kill-after=2s", "30s"])
+    let mut command = std::process::Command::new("timeout");
+    command.args(["--kill-after=2s", "30s"]);
+    if broker_test_protocol::selected(test) {
+        // Buck builds and runs tests on different hosts, so it names the
+        // helper at run time, relative to the test's working directory.
+        command.arg(match std::env::var_os("REVERIE_KVM_TEST_BROKER_LAUNCHER") {
+            Some(path) => std::env::current_dir().unwrap().join(path),
+            None => env!("CARGO_BIN_EXE_reverie-kvm-broker-test-launcher").into(),
+        });
+    }
+    let output = command
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture", "--logfile"])
         .arg(&execution_log)
         .env("REVERIE_LEADER_EXEC_CHILD", test)
         .output()
         .unwrap();
+    if forward_output {
+        std::io::Write::write_all(&mut std::io::stdout().lock(), &output.stdout).unwrap();
+        std::io::Write::write_all(&mut std::io::stderr().lock(), &output.stderr).unwrap();
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -10463,6 +11234,53 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "native_and_kvm_prctl_names_keep_worker_local_and_format_procfs_leader_bytes",
         "kvm_direct_and_tool_match_prctl_identity_cell",
         "kvm_direct_and_tool_match_thp_disable_cell",
+        "stable_socket_metadata_queries_match_native_linux_on_kvm",
+        "pselect_zero::readiness_matches_native_pipe_socket_and_path_states",
+        "pselect_zero::raw_abi_and_readonly_zero_timeout_match_native",
+        "pselect_zero::copyout_faults_order_and_aliasing_match_native",
+        "pselect_zero::captured_outputs_and_dup_aliases_are_refused",
+        "epoll_pwait2::seven_check_contract_matches_native",
+        "epoll_pwait2::empty_and_ready_eventfd_match_native",
+        "epoll_pwait2::raw_abi_and_readonly_timeout_match_native",
+        "epoll_pwait2::inaccessible_output_depends_on_readiness",
+        "epoll_pwait2::scalar_faults_preserve_bytes_and_oneshot_events",
+        "epoll_pwait2::captured_output_and_dup_registrations_are_refused",
+        "syncfs::unchanged_six_check_durability_contract_matches_native",
+        "fcntl_owner::unchanged_six_check_contract_matches_native",
+        "fcntl_owner::unchanged_negative_control_preserves_failure",
+        "fcntl_owner::fork_aliases_keep_configuration_and_permanent_guards",
+        "msync::unchanged_five_check_contract_matches_native",
+        "msync_lifecycle::shared_coherence_and_mapping_lifetime_match_native",
+        "shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native",
+        "shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner",
+        "pdeathsig::unchanged_six_check_state_matches_native_controlled",
+        "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
+        "pdeathsig::creator_thread_death_and_clear_match_native_shared_pending",
+        "pdeathsig::ignored_parent_death_retains_blocked_and_does_not_resurrect_unblocked",
+        "pdeathsig::enrolled_retained_image_exec_preserves_setting_and_actual_creator_delivery",
+        "pdeathsig::actual_creator_death_wakes_controlled_pause_and_nanosleep",
+        "pdeathsig::linger_process::creator_process_queued_tcp_exit_publishes_before_peer_drain",
+        "fstat_and_fstatfs_consume_low_descriptor_words_on_kvm",
+        "fchdir_consumes_low_descriptor_words_on_kvm",
+        "getdents64_consumes_low_descriptor_words_on_kvm",
+        "getdents64_alias_resource_failure_stops_direct_guest",
+        "getdents64_alias_resource_failure_stops_tool_and_guest",
+        "getdents64_alias_foreign_mapping_stops_direct_guest",
+        "getdents64_alias_foreign_mapping_stops_tool_and_guest",
+        "getdents64_alias_atomic_collision_completes_direct_guest",
+        "getdents64_alias_atomic_collision_completes_tool_and_guest",
+        "getdents64_alias_cleanup_failure_stops_direct_guest",
+        "getdents64_alias_cleanup_failure_stops_tool_and_guest",
+        "getdents64_alias_unexpected_address_stops_direct_guest",
+        "getdents64_alias_unexpected_address_stops_tool_and_guest",
+        "getdents64_alias_middle_extent_stops_direct_guest",
+        "getdents64_alias_middle_extent_stops_tool_and_guest",
+        "getdents64_alias_construction_cleanup_stops_direct_guest",
+        "getdents64_alias_construction_cleanup_stops_tool_and_guest",
+        "getdents64_alias_suffix_cleanup_stops_direct_guest",
+        "getdents64_alias_suffix_cleanup_stops_tool_and_guest",
+        "getdents64_alias_eof_cleanup_stops_direct_guest",
+        "getdents64_alias_eof_cleanup_stops_tool_and_guest",
     ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([test, "--exact", "--test-threads=1", "--nocapture"])
@@ -10479,6 +11297,21 @@ fn repair_prctl_required_kvm_is_not_optional() {
             String::from_utf8_lossy(&output.stderr).contains("requires usable /dev/kvm"),
             "{output:?}"
         );
+        if test.starts_with("getdents64_alias_") {
+            let optional = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--test-threads=1", "--nocapture"])
+                .env("LD_PRELOAD", &library)
+                .env_remove("REVERIE_REQUIRE_KVM")
+                .output()
+                .unwrap();
+            assert!(optional.status.success(), "{optional:?}");
+            assert!(
+                String::from_utf8_lossy(&optional.stderr)
+                    .contains(&format!("skipping {test}: cannot open /dev/kvm")),
+                "{optional:?}"
+            );
+            eprintln!("\ndevice-denial contract {test}: required=101 optional=0");
+        }
     }
 }
 
@@ -13995,6 +14828,158 @@ int main(void) {
     );
     assert_eq!(stdout, native.stdout);
     assert_eq!(stderr, native.stderr);
+}
+
+#[test]
+fn stable_socket_metadata_queries_match_native_linux_on_kvm() {
+    const TEST: &str = "stable_socket_metadata_queries_match_native_linux_on_kvm";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "socket-metadata-parity",
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int expect_option(int fd, int option, int expected, int code) {
+  int value = -1;
+  socklen_t length = sizeof(value);
+  if (getsockopt(fd, SOL_SOCKET, option, &value, &length) != 0 ||
+      length != sizeof(value) || value != expected) return code;
+  return 0;
+}
+
+static int expect_mutable_options(int fd, int reuse, int keepalive,
+                                  int broadcast, int code) {
+  if (expect_option(fd, SO_REUSEADDR, reuse, code) ||
+      expect_option(fd, SO_KEEPALIVE, keepalive, code + 1) ||
+      expect_option(fd, SO_BROADCAST, broadcast, code + 2)) return code + 3;
+  return 0;
+}
+
+int main(void) {
+  int inet = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (inet < 0) return 10;
+  if (expect_option(inet, SO_TYPE, SOCK_STREAM, 11) ||
+      expect_option(inet, SO_DOMAIN, AF_INET, 12) ||
+      expect_option(inet, SO_ACCEPTCONN, 0, 13)) return 14;
+
+  int zero = 0;
+  int one = 1;
+  int code = expect_mutable_options(inet, 0, 0, 0, 20);
+  if (code) return code;
+  if (setsockopt(inet, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
+    return 24;
+  if ((code = expect_mutable_options(inet, 1, 0, 0, 25))) return code;
+  if (setsockopt(inet, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0)
+    return 29;
+  if ((code = expect_mutable_options(inet, 1, 1, 0, 30))) return code;
+  if (setsockopt(inet, SOL_SOCKET, SO_REUSEADDR, &zero, sizeof(zero)) != 0)
+    return 34;
+  if ((code = expect_mutable_options(inet, 0, 1, 0, 35))) return code;
+  if (setsockopt(inet, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one)) != 0)
+    return 39;
+  if ((code = expect_mutable_options(inet, 0, 1, 1, 40))) return code;
+  if (setsockopt(inet, SOL_SOCKET, SO_KEEPALIVE, &zero, sizeof(zero)) != 0)
+    return 60;
+  if ((code = expect_mutable_options(inet, 0, 0, 1, 61))) return code;
+  if (setsockopt(inet, SOL_SOCKET, SO_BROADCAST, &zero, sizeof(zero)) != 0)
+    return 65;
+  if ((code = expect_mutable_options(inet, 0, 0, 0, 66))) return code;
+  if (listen(inet, 1) != 0 || expect_option(inet, SO_ACCEPTCONN, 1, 44))
+    return 45;
+
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                 0, pair) != 0) return 40;
+  for (int index = 0; index < 2; ++index) {
+    int descriptor_flags = fcntl(pair[index], F_GETFD);
+    if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0)
+      return 41 + index;
+    int status_flags = fcntl(pair[index], F_GETFL);
+    if (status_flags < 0 || (status_flags & O_NONBLOCK) == 0)
+      return 43 + index;
+  }
+  if (expect_option(pair[0], SO_TYPE, SOCK_STREAM, 45) ||
+      expect_option(pair[0], SO_DOMAIN, AF_UNIX, 46) ||
+      expect_option(pair[0], SO_ACCEPTCONN, 0, 47)) return 48;
+
+  int plain[2];
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, plain) != 0) return 49;
+  for (int index = 0; index < 2; ++index) {
+    int descriptor_flags = fcntl(plain[index], F_GETFD);
+    if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) != 0)
+      return 50 + index;
+    int status_flags = fcntl(plain[index], F_GETFL);
+    if (status_flags < 0 || (status_flags & O_NONBLOCK) != 0)
+      return 52 + index;
+  }
+  if (expect_option(plain[0], SO_TYPE, SOCK_DGRAM, 54) ||
+      expect_option(plain[0], SO_DOMAIN, AF_UNIX, 55) ||
+      expect_option(plain[0], SO_ACCEPTCONN, 0, 56)) return 57;
+
+  int nonblocking[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, nonblocking) != 0)
+    return 70;
+  for (int index = 0; index < 2; ++index) {
+    int descriptor_flags = fcntl(nonblocking[index], F_GETFD);
+    if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) != 0)
+      return 71 + index;
+    int status_flags = fcntl(nonblocking[index], F_GETFL);
+    if (status_flags < 0 || (status_flags & O_NONBLOCK) == 0)
+      return 73 + index;
+  }
+
+  struct sockaddr_storage local = {0};
+  struct sockaddr_storage peer = {0};
+  socklen_t local_length = sizeof(local);
+  socklen_t peer_length = sizeof(peer);
+  if (getsockname(pair[0], (struct sockaddr *)&local, &local_length) != 0 ||
+      getpeername(pair[0], (struct sockaddr *)&peer, &peer_length) != 0)
+    return 50;
+  if (local_length != sizeof(sa_family_t) ||
+      peer_length != sizeof(sa_family_t) ||
+      local.ss_family != AF_UNIX || peer.ss_family != AF_UNIX) return 51;
+  errno = 0;
+  if (getpeername(-1, (struct sockaddr *)&peer, &peer_length) != -1 ||
+      errno != EBADF) return 52;
+
+  close(pair[0]);
+  close(pair[1]);
+  close(plain[0]);
+  close(plain[1]);
+  close(nonblocking[0]);
+  close(nonblocking[1]);
+  close(inet);
+  puts("stable socket metadata queries ok");
+  return 0;
+}
+"#,
+    );
+
+    let native = std::process::Command::new(&executable).output().unwrap();
+    assert_eq!(native.status.code(), Some(0), "native: {native:?}");
+    assert_eq!(native.stdout, b"stable socket metadata queries ok\n");
+    assert!(native.stderr.is_empty(), "native: {native:?}");
+
+    let executable = executable.to_str().unwrap();
+    let (direct_stdout, direct_stderr) =
+        run_host_program_captured(executable, &[executable], &directory.0);
+    assert_eq!(direct_stdout, native.stdout);
+    assert_eq!(direct_stderr, native.stderr);
+
+    let (tool_stdout, tool_stderr) =
+        run_host_program_with_tool_captured(executable, &[executable], &directory.0);
+    assert_eq!(tool_stdout, native.stdout);
+    assert_eq!(tool_stderr, native.stderr);
 }
 
 #[test]
@@ -17968,6 +18953,296 @@ int main(int argc, char **argv) {
 }
 
 #[test]
+fn getdents64_consumes_low_descriptor_words_on_kvm() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const TEST: &str = "getdents64_consumes_low_descriptor_words_on_kvm";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let primary = directory.0.join("getdents-primary");
+    let decoy = directory.0.join("getdents-decoy");
+    std::fs::create_dir(&primary).unwrap();
+    std::fs::create_dir(&decoy).unwrap();
+    std::fs::create_dir(primary.join("nested")).unwrap();
+    let regular = primary.join("alpha");
+    std::fs::write(&regular, b"alpha\n").unwrap();
+    std::fs::write(primary.join("beta-long"), b"beta\n").unwrap();
+    std::fs::write(decoy.join("decoy-only"), b"decoy\n").unwrap();
+    let executable = compile_c_program_with_args(
+        &directory.0,
+        "getdents64-fd-width",
+        include_str!("fixtures/getdents64_fd_width.c"),
+        &["-std=c11", "-Wall", "-Wextra", "-Werror"],
+    );
+
+    let proc_path_stdin = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open("/proc")
+            .unwrap()
+    };
+    let mut common = String::from("getdents64 inherited-proc-opath fd=301 identity=preserved\n");
+    for fd in [0, 3, 257] {
+        for upper in [
+            0_u64,
+            1_u64 << 32,
+            1_u64 << 63,
+            0x5a5a_5a5a_0000_0000,
+            0xffff_ffff_0000_0000,
+        ] {
+            let names = if fd == 257 {
+                ".,..,decoy-only"
+            } else {
+                ".,..,alpha,beta-long,nested"
+            };
+            common.push_str(&format!(
+                "getdents64 fd={fd} upper={upper:016x} exact={names}\n"
+            ));
+        }
+    }
+    common.push_str("getdents64 error-order rows=500 buffers=unchanged\n");
+    let start = std::time::Instant::now();
+    let native = std::process::Command::new("timeout")
+        .args(["--kill-after=2s", "10s"])
+        .arg(&executable)
+        .arg("native")
+        .args([&primary, &decoy, &regular])
+        .stdin(std::process::Stdio::from(proc_path_stdin()))
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "native fixture failed: {native:?}");
+    // Parse exactly three ordered, fixed-width native cookie vectors. Do not
+    // strip or normalize output: the complete native and guest byte comparisons
+    // below also reject extra, missing, duplicate, or misplaced rows.
+    let native_text = std::str::from_utf8(&native.stdout).unwrap();
+    let mut native_rows = native_text
+        .strip_prefix(common.as_str())
+        .unwrap()
+        .split('\n');
+    for fd in [0, 3, 257] {
+        let row = native_rows.next().unwrap();
+        let prefix = format!("getdents64 short-count-cookies fd={fd} ");
+        let fields: Vec<_> = row
+            .strip_prefix(prefix.as_str())
+            .unwrap()
+            .split(' ')
+            .collect();
+        assert_eq!(fields.len(), 3, "native cookie vector for fd {fd}");
+        let mut cookies = [0_u64; 3];
+        for (index, label) in ["count0=", "count1=", "count23="].into_iter().enumerate() {
+            let value = fields[index].strip_prefix(label).unwrap();
+            assert_eq!(value.len(), 16, "native {label} cookie width for fd {fd}");
+            assert!(
+                value
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
+            );
+            cookies[index] = u64::from_str_radix(value, 16).unwrap();
+            assert!(cookies[index] <= i64::MAX as u64);
+        }
+        common.push_str(&format!(
+            "getdents64 short-count-cookies fd={fd} count0={:016x} count1={:016x} count23={:016x}\n",
+            cookies[0], cookies[1], cookies[2]
+        ));
+        let cursor_row = format!(
+            "getdents64 cursor fd={fd} rows=80 short=EINVAL fault=unchanged \
+             dup=shared rewind=fresh eof=zero"
+        );
+        assert_eq!(native_rows.next(), Some(cursor_row.as_str()));
+        common.push_str(&cursor_row);
+        common.push('\n');
+    }
+    common.push_str("getdents64 canonical-count boundary=16777216,16777217 guards=unchanged\n");
+    // The controlled directories have one common native/KVM oracle. Synthetic
+    // proc deliberately differs; require its exact policy row separately.
+    let native_expected = format!(
+        "{common}getdents64 policy=native-proc-opath open=success\n\
+         getdents64 policy=native-proc rows=100 records-and-errors checked\n\
+         getdents64 checked calls=874\n"
+    );
+    let guest_expected = format!(
+        "{common}getdents64 policy=synthetic-proc-opath open=EINVAL\n\
+         getdents64 policy=synthetic-proc rows=100 zero-before-buffer unchanged\n\
+         getdents64 checked calls=874\n"
+    );
+    // Retain the exact legacy prefix. The additive raw-count rows contain the
+    // complete native arena and continuation bytes, not a digest or filtered
+    // field comparison. C also compares each raw count to its canonical pair.
+    let raw_native = native_text.strip_prefix(native_expected.as_str()).unwrap();
+    assert!(raw_native.len() <= 512 * 1024, "bounded raw-count output");
+    let mut raw_prefixes = Vec::new();
+    let mut add_raw_prefix =
+        |kind: &str, upper: u64, low: u32, start: i32, pointer: i32, prefix: u32, protect: i32| {
+            let row = raw_prefixes.len();
+            raw_prefixes.push((
+                format!(
+                    "getdents64 raw-count row={row:03} kind={kind} upper={upper:016x} low={low} \
+                     start={start} pointer={pointer} prefix={prefix} protect={protect} "
+                ),
+                if protect < 0 { 288 } else { 8192 },
+            ));
+        };
+    for upper in [0_u64, 1_u64 << 32, 1_u64 << 63, 0xffff_ffff_0000_0000] {
+        for low in [0, 1, 23, 24, 128] {
+            for start in [0, 1] {
+                for pointer in [0, 1] {
+                    add_raw_prefix("directory", upper, low, start, pointer, 16, -1);
+                }
+            }
+        }
+    }
+    for upper in [0_u64, 1_u64 << 32, 1_u64 << 63, 0xffff_ffff_0000_0000] {
+        for low in [0, 1, 24, 128] {
+            for kind in ["closed", "opath", "regular"] {
+                for pointer in [0, 1] {
+                    add_raw_prefix(kind, upper, low, 0, pointer, 16, -1);
+                }
+            }
+        }
+    }
+    for protect in [0, 1] {
+        for prefix in [0, 24, 48] {
+            for start in [0, 1] {
+                add_raw_prefix("partial", 1_u64 << 32, 128, start, 0, prefix, protect);
+            }
+        }
+    }
+    assert_eq!(raw_prefixes.len(), 188);
+    let mut raw_lines = raw_native.split('\n');
+    let check_hex = |value: &str, digits: usize| {
+        assert_eq!(value.len(), digits);
+        assert!(
+            value
+                .bytes()
+                .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
+        );
+    };
+    for (prefix, arena_bytes) in &raw_prefixes {
+        let row = raw_lines
+            .next()
+            .unwrap()
+            .strip_prefix(prefix.as_str())
+            .unwrap();
+        let (returned, bytes) = row.split_once(" bytes=").unwrap();
+        let returned: Vec<_> = returned.split(' ').collect();
+        assert_eq!(returned.len(), 3);
+        let result = returned[0]
+            .strip_prefix("result=")
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert!((-1..=128).contains(&result));
+        let errno = returned[1]
+            .strip_prefix("errno=")
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert!(errno >= 0);
+        let cursor = returned[2].strip_prefix("cursor=").unwrap();
+        check_hex(cursor, 16);
+        assert!(u64::from_str_radix(cursor, 16).unwrap() <= i64::MAX as u64);
+        let (arena, retry) = bytes.split_once(" retry=").unwrap();
+        check_hex(arena, 2 * arena_bytes);
+        let (retried, retry_bytes) = retry.split_once(" retry_bytes=").unwrap();
+        let retried: Vec<_> = retried.split(' ').collect();
+        assert_eq!(retried.len(), 3);
+        let retry_result = retried[0].parse::<i64>().unwrap();
+        assert!((0..=256).contains(&retry_result));
+        assert_eq!(retried[1], "errno=0");
+        let retry_cursor = retried[2].strip_prefix("cursor=").unwrap();
+        check_hex(retry_cursor, 16);
+        assert!(u64::from_str_radix(retry_cursor, 16).unwrap() <= i64::MAX as u64);
+        check_hex(retry_bytes, 2 * 288);
+    }
+    assert_eq!(
+        raw_lines.next(),
+        Some("getdents64 raw-count checked rows=188 calls=754")
+    );
+    assert_eq!(raw_lines.next(), Some(""));
+    assert_eq!(raw_lines.next(), None);
+    let native_expected = format!("{native_expected}{raw_native}");
+    let guest_expected = format!("{guest_expected}{raw_native}");
+    assert_eq!(native.stdout, native_expected.as_bytes());
+    assert!(native.stderr.is_empty(), "{native:?}");
+    eprintln!(
+        "getdents64 native calls=874 raw_count_calls=754 total=1628 seconds={} stdout={}",
+        start.elapsed().as_secs_f64(),
+        String::from_utf8_lossy(&native.stdout)
+    );
+
+    let image = std::fs::read(&executable).unwrap();
+    for (tool_owned, repetition) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+        let start = std::time::Instant::now();
+        let mut backend =
+            KvmBackend::new_with_stdin(256 * 1024 * 1024, Some(proc_path_stdin())).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[
+                    executable.to_str().unwrap(),
+                    "kvm",
+                    primary.to_str().unwrap(),
+                    decoy.to_str().unwrap(),
+                    regular.to_str().unwrap(),
+                ],
+                &["PATH=/usr/bin:/bin"],
+                &directory.0,
+            )
+            .unwrap();
+        // StraceTool reinjects the syscall's unchanged raw arguments; typed
+        // getters do not rewrite their storage. Both modes therefore exercise
+        // high descriptor/count bits, with exact Tool callback totals checked.
+        let (code, stdout, stderr, tool_calls) = if tool_owned {
+            let (log, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            let calls = log
+                .entries()
+                .iter()
+                .filter(|entry| entry.name == "getdents64")
+                .count();
+            (code, stdout, stderr, Some(calls))
+        } else {
+            let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
+            (code, stdout, stderr, None)
+        };
+        assert_eq!(
+            code,
+            0,
+            "tool_owned={tool_owned} repetition={repetition} stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(
+            stdout,
+            guest_expected.as_bytes(),
+            "tool_owned={tool_owned} repetition={repetition}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "tool_owned={tool_owned} repetition={repetition}: {stderr:?}"
+        );
+        if let Some(calls) = tool_calls {
+            assert_eq!(
+                calls,
+                874 + 754,
+                "legacy plus raw-count getdents64 Tool callbacks"
+            );
+        }
+        eprintln!(
+            "getdents64 tool_owned={tool_owned} repetition={repetition} \
+             calls=874 raw_count_calls=754 total=1628 tool_calls={tool_calls:?} seconds={} stdout={}",
+            start.elapsed().as_secs_f64(),
+            String::from_utf8_lossy(&stdout)
+        );
+    }
+}
+
+#[test]
 fn read_and_pread64_consume_low_descriptor_words_on_kvm() {
     if !kvm_available("KVM read and pread64 fd low-word argument test") {
         return;
@@ -18862,6 +20137,10 @@ fn dropped_public_run_case(
         ("the VM fd", backend.vm_fd().map(drop)),
         ("a root pid", backend.set_root_pid(DROPPED_RUN_ROOT)),
         ("a random seed", backend.set_random_seed(1)),
+        (
+            "host metadata timestamps",
+            backend.set_host_metadata_timestamps(true),
+        ),
     ] {
         assert_refused(&case, entry, refused);
     }
@@ -19460,8 +20739,1968 @@ fn every_abandoned_public_run_refuses_its_backend() {
     assert_reaper_exits(case);
 }
 
+#[test]
+fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
+    const TEST: &str = "fstat_and_fstatfs_consume_low_descriptor_words_on_kvm";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+
+    fn expected_transcript(guest: bool) -> String {
+        let upper_words = [0_u64, 1 << 32, 1 << 63, 0xffff_ffff_0000_0000];
+        let mut expected = String::new();
+        let mut row = |operation: &str, object: &str, upper: u64, badptr: u8, error: i32| {
+            let result = if error == 0 { 0 } else { -1 };
+            expected.push_str(&format!(
+                "{operation} object={object} upper={upper:016x} badptr={badptr} result={result} errno={error}\n"
+            ));
+        };
+        for (operation, objects) in [
+            (
+                "fstat",
+                &[
+                    "stdout",
+                    "stdout-alias",
+                    "stderr",
+                    "file",
+                    "directory",
+                    "proc-root",
+                    "proc-uptime",
+                    "fdinfo",
+                ][..],
+            ),
+            ("fstatfs", &["file", "directory"][..]),
+        ] {
+            for object in objects {
+                for upper in upper_words {
+                    row(operation, object, upper, 0, 0);
+                    row(operation, object, upper, 1, libc::EFAULT);
+                }
+            }
+        }
+        for operation in ["fstat", "fstatfs"] {
+            for object in ["int-max", "int-min", "minus-one", "closed"] {
+                for upper in upper_words {
+                    for badptr in [0, 1] {
+                        row(operation, object, upper, badptr, libc::EBADF);
+                    }
+                }
+            }
+        }
+        expected.push_str("proc-policy\n");
+        for (object, refusal) in [("proc-root", libc::EACCES), ("fdinfo", libc::ENOSYS)] {
+            for upper in upper_words {
+                for badptr in [0, 1] {
+                    let error = if guest {
+                        refusal
+                    } else if badptr == 1 {
+                        libc::EFAULT
+                    } else {
+                        0
+                    };
+                    let result = if error == 0 { 0 } else { -1 };
+                    expected.push_str(&format!(
+                        "fstatfs object={object} upper={upper:016x} badptr={badptr} result={result} errno={error}\n"
+                    ));
+                }
+            }
+        }
+        expected
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program_with_args(
+        &directory.0,
+        "fstat-fd-width",
+        include_str!("fixtures/fstat_fd_width.c"),
+        &["-std=c11", "-Wall", "-Wextra", "-Werror"],
+    );
+    let native = std::process::Command::new("timeout")
+        .args(["--kill-after=2s", "10s"])
+        .arg(&executable)
+        .arg("native")
+        .arg(directory.0.join("native-fstat-fd-width"))
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "native fixture: {native:?}");
+    let native_stdout = std::str::from_utf8(&native.stdout).unwrap();
+    assert_eq!(native_stdout.lines().count(), 161);
+    assert_eq!(native_stdout, expected_transcript(false));
+    assert!(native.stderr.is_empty());
+    let (native_common, _) = native_stdout.split_once("proc-policy\n").unwrap();
+
+    let image = std::fs::read(&executable).unwrap();
+    let expected_guest = expected_transcript(true);
+    let mut first_guest = None;
+    for (tool_owned, repetition) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+        let guest_path = directory
+            .0
+            .join(format!("guest-fstat-fd-width-{tool_owned}-{repetition}"));
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[
+                    executable.to_str().unwrap(),
+                    "guest",
+                    guest_path.to_str().unwrap(),
+                ],
+                &["PATH=/usr/bin:/bin"],
+                &directory.0,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if tool_owned {
+            let (_, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(
+            code,
+            0,
+            "tool_owned={tool_owned} repetition={repetition} stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(
+            stdout,
+            expected_guest.as_bytes(),
+            "tool_owned={tool_owned} repetition={repetition}"
+        );
+        assert_eq!(stderr, native.stderr);
+        let (guest_common, _) = std::str::from_utf8(&stdout)
+            .unwrap()
+            .split_once("proc-policy\n")
+            .unwrap();
+        assert_eq!(guest_common, native_common);
+        if let Some(first) = &first_guest {
+            assert_eq!(&stdout, first);
+        } else {
+            first_guest = Some(stdout);
+        }
+    }
+}
+
+#[test]
+fn fchdir_consumes_low_descriptor_words_on_kvm() {
+    const TEST: &str = "fchdir_consumes_low_descriptor_words_on_kvm";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+
+    fn expected_transcript(guest: bool) -> String {
+        fn row(output: &mut String, object: &str, upper: u64, unused: u8, error: i32, state: &str) {
+            let result = if error == 0 { 0 } else { -1 };
+            output.push_str(&format!(
+                "fchdir object={object} upper={upper:016x} unused={unused} result={result} errno={error} state={state}\n"
+            ));
+        }
+
+        let upper_words = [0_u64, 1 << 32, 1 << 63, 0xffff_ffff_0000_0000];
+        let mut expected = String::new();
+        for (object, error, state) in [
+            ("directory", 0, "target"),
+            ("dup", 0, "target"),
+            ("fd257", 0, "target"),
+            ("closed", libc::EBADF, "base"),
+            ("regular-file", libc::ENOTDIR, "base"),
+            ("int-max", libc::EBADF, "base"),
+            ("int-min", libc::EBADF, "base"),
+            ("minus-one", libc::EBADF, "base"),
+            ("at-fdcwd", libc::EBADF, "base"),
+        ] {
+            for upper in upper_words {
+                for unused in [0, 1] {
+                    row(&mut expected, object, upper, unused, error, state);
+                }
+            }
+        }
+        expected.push_str("policy\n");
+        for (object, refusal, native_state) in [
+            ("opath-directory", libc::EBADF, "target"),
+            ("proc-root", libc::EACCES, "proc"),
+        ] {
+            for upper in upper_words {
+                for unused in [0, 1] {
+                    row(
+                        &mut expected,
+                        object,
+                        upper,
+                        unused,
+                        if guest { refusal } else { 0 },
+                        if guest { "base" } else { native_state },
+                    );
+                }
+            }
+        }
+        expected
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program_with_args(
+        &directory.0,
+        "fchdir-fd-width",
+        include_str!("fixtures/fchdir_fd_width.c"),
+        &["-std=c11", "-Wall", "-Wextra", "-Werror"],
+    );
+    let native_directory = directory.0.join("native-fchdir");
+    std::fs::create_dir(&native_directory).unwrap();
+    let native = std::process::Command::new("timeout")
+        .args(["--kill-after=2s", "10s"])
+        .arg(&executable)
+        .arg("native")
+        .current_dir(&native_directory)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "native fixture: {native:?}");
+    let native_stdout = std::str::from_utf8(&native.stdout).unwrap();
+    assert_eq!(native_stdout.lines().count(), 89);
+    assert_eq!(native_stdout, expected_transcript(false));
+    assert!(native.stderr.is_empty());
+    let (native_common, _) = native_stdout.split_once("policy\n").unwrap();
+    assert_eq!(native_common.lines().count(), 72);
+
+    let image = std::fs::read(&executable).unwrap();
+    let expected_guest = expected_transcript(true);
+    let mut first_guest = None;
+    // Direct and StraceTool runs both retain raw upper fd bits: typed syscall
+    // wrappers preserve their stored arguments when reinjected unchanged.
+    for (tool_owned, repetition) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+        let guest_directory = directory
+            .0
+            .join(format!("guest-fchdir-{tool_owned}-{repetition}"));
+        std::fs::create_dir(&guest_directory).unwrap();
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[executable.to_str().unwrap(), "guest"],
+                &["PATH=/usr/bin:/bin"],
+                &guest_directory,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if tool_owned {
+            let (_, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(
+            code,
+            0,
+            "tool_owned={tool_owned} repetition={repetition} stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(
+            stdout,
+            expected_guest.as_bytes(),
+            "tool_owned={tool_owned} repetition={repetition}"
+        );
+        assert_eq!(stderr, native.stderr);
+        let (guest_common, _) = std::str::from_utf8(&stdout)
+            .unwrap()
+            .split_once("policy\n")
+            .unwrap();
+        assert_eq!(guest_common, native_common);
+        let result = (code, stdout, stderr);
+        if let Some(first) = &first_guest {
+            assert_eq!(&result, first);
+        } else {
+            first_guest = Some(result);
+        }
+    }
+}
+
 #[path = "support/natural_retirement.rs"]
 mod natural_retirement;
 
 #[path = "support/exit_descriptor_ordering.rs"]
 mod exit_descriptor_ordering;
+
+#[test]
+fn shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native() {
+    const TEST: &str =
+        "shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-fork",
+        include_str!("fixtures/shared_file_fork.c"),
+    );
+    let image = std::fs::read(&program).unwrap();
+    let native_directory = directory.0.join("native");
+    std::fs::create_dir(&native_directory).unwrap();
+    let native = std::process::Command::new(&program)
+        .current_dir(&native_directory)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    assert_eq!(
+        native.stdout,
+        b"shared fork ordinary=ok memfd=ok offset=ok reuse=ok cow=ok child=0 syncs=2\n"
+    );
+    eprintln!("shared-file-fork completed native: child=0 syncs=2");
+    for (name, ownership) in [
+        ("direct", None),
+        ("host", Some(ThreadOwnership::Host)),
+        ("tool", Some(ThreadOwnership::Tool)),
+    ] {
+        let guest_directory = directory.0.join(name);
+        std::fs::create_dir(&guest_directory).unwrap();
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[program.to_str().unwrap()],
+                &[],
+                &guest_directory,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if let Some(ownership) = ownership {
+            backend.set_thread_ownership(ownership);
+            let (trace, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            for (syscall, expected) in [("fork", 1), ("msync", 2)] {
+                assert_eq!(
+                    trace
+                        .syscalls()
+                        .iter()
+                        .filter(|name| name.as_str() == syscall)
+                        .count(),
+                    expected,
+                    "ownership={ownership:?}: syscall={syscall} code={code} stdout={stdout:?} stderr={stderr:?}"
+                );
+            }
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(stdout, native.stdout, "mode={name}");
+        eprintln!("shared-file-fork completed {name}: child=0 syncs=2");
+    }
+}
+
+#[test]
+fn shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner() {
+    const TEST: &str = "shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner";
+    if !leader_self_exec_bounded_with_output(TEST, true) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-fork-clear-tid",
+        include_str!("fixtures/shared_file_fork_clear_tid.c"),
+    );
+    let image = std::fs::read(&program).unwrap();
+    let native_directory = directory.0.join("native");
+    std::fs::create_dir(&native_directory).unwrap();
+    let native = std::process::Command::new(&program)
+        .arg("native")
+        .current_dir(&native_directory)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    const SUMMARY: &str =
+        "shared clear-tid clone=2 fork-set=2 ordinary=ok memfd=ok markers=4 children=0\n";
+    let native_text = std::str::from_utf8(&native.stdout).unwrap();
+    let native_lines: Vec<_> = native_text.split_inclusive('\n').collect();
+    assert_eq!(native_lines.len(), 5, "{native:?}");
+    let mut expected_kvm = String::new();
+    for registration in 0..2 {
+        for backing in 0..2 {
+            let marker = 0x3152_6475_i32 + backing * 0x0101_0101 + registration;
+            let observation = |mode, actual| {
+                format!(
+                    "clear-tid mode={mode} registration={registration} backing={backing} expected={marker} actual={actual} waitstatus=0\n"
+                )
+            };
+            let native_line = native_lines[(registration * 2 + backing) as usize];
+            assert!(
+                native_line == observation("native", marker)
+                    || native_line == observation("native", 0),
+                "unexpected native clear-tid observation: {native_line:?}"
+            );
+            expected_kvm.push_str(&observation("kvm", marker));
+        }
+    }
+    assert_eq!(native_lines[4], SUMMARY);
+    expected_kvm.push_str(SUMMARY);
+    std::io::Write::write_all(&mut std::io::stdout().lock(), &native.stdout).unwrap();
+    eprintln!("shared-file-clear-tid completed native: markers=4 children=0");
+    for (name, ownership) in [
+        ("direct", None),
+        ("host", Some(ThreadOwnership::Host)),
+        ("tool", Some(ThreadOwnership::Tool)),
+    ] {
+        let guest_directory = directory.0.join(name);
+        std::fs::create_dir(&guest_directory).unwrap();
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[program.to_str().unwrap(), "kvm"],
+                &[],
+                &guest_directory,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if let Some(ownership) = ownership {
+            backend.set_thread_ownership(ownership);
+            let (trace, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            for (syscall, expected) in [("clone", 2), ("fork", 2)] {
+                assert_eq!(
+                    trace
+                        .syscalls()
+                        .iter()
+                        .filter(|name| name.as_str() == syscall)
+                        .count(),
+                    expected,
+                    "ownership={ownership:?}: syscall={syscall} code={code} stdout={stdout:?} stderr={stderr:?}"
+                );
+            }
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(stdout, expected_kvm.as_bytes(), "mode={name}");
+        std::io::Write::write_all(&mut std::io::stdout().lock(), &stdout).unwrap();
+        eprintln!("shared-file-clear-tid completed {name}: markers=4 children=0");
+    }
+}
+
+// Actual parent-thread death and pending/frame integration. This small Tool
+// consumes authentic backend receipts; it is not a Hermit scheduler model.
+mod pdeathsig {
+    use reverie::CallbackSignalSite;
+    use reverie::ParentDeathPublication;
+    use reverie::ParentDeathPublicationResult;
+    use reverie::PendingDomain;
+    use reverie::SignalBoundaryOutcome;
+    use reverie::SignalBoundaryReceipt;
+    use reverie::SignalDequeue;
+    use reverie::SignalObservationStop;
+    use reverie::SignalTaskIdentity;
+
+    use super::*;
+
+    const STATE: u8 = 0;
+    const MASKED: u8 = 1;
+    const CLEAR: u8 = 2;
+    const PAUSE: u8 = 3;
+    const NANOSLEEP: u8 = 4;
+    const NO_OPT_IN: u8 = 5;
+    const IGNORED_BLOCKED: u8 = 6;
+    const IGNORED_UNBLOCKED: u8 = 7;
+    const EXEC: u8 = 8;
+    const LINGER_PROCESS: u8 = 9;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    enum Request {
+        Exit(SignalTaskIdentity),
+        Park(CallbackSignalSite),
+        Dequeue(SignalDequeue),
+        Prctl,
+        IgnoredAction(SignalTaskIdentity),
+        ExecAdmission {
+            task: SignalTaskIdentity,
+            enrolled: bool,
+        },
+    }
+
+    #[derive(Default)]
+    struct ParkState {
+        site: Option<CallbackSignalSite>,
+        creator: Option<SignalTaskIdentity>,
+        child_waiter: Option<Waker>,
+        creator_waiter: Option<Waker>,
+        published: bool,
+        wake_calls: Arc<AtomicU64>,
+    }
+
+    struct WitnessWake {
+        inner: Waker,
+        calls: Arc<AtomicU64>,
+    }
+    impl futures::task::ArcWake for WitnessWake {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.calls.fetch_add(1, Ordering::SeqCst);
+            this.inner.wake_by_ref();
+        }
+    }
+
+    #[derive(Default)]
+    struct Global {
+        mode: u8,
+        control: Mutex<Option<BackendSignalControl>>,
+        permits: Mutex<BTreeMap<i32, SignalDeliveryPermit>>,
+        sequence: AtomicU64,
+        publications: Mutex<Vec<ParentDeathPublication>>,
+        boundaries: Mutex<Vec<SignalBoundaryReceipt>>,
+        dequeues: Mutex<Vec<SignalDequeue>>,
+        prctl_calls: AtomicU64,
+        ignored_action_calls: Mutex<BTreeMap<(i32, u64), usize>>,
+        initial_exec_calls: AtomicU64,
+        enrolled_exec: Mutex<Option<SignalTaskIdentity>>,
+        parks: Mutex<ParkState>,
+        failed: AtomicBool,
+        failure_waiters: Mutex<Vec<Waker>>,
+    }
+    impl Global {
+        fn control(&self) -> BackendSignalControl {
+            self.control
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("installed control")
+        }
+        fn reserve(&self, task: SignalTaskIdentity) -> SignalDeliveryPermit {
+            self.reserve_at(task, None)
+        }
+        fn reserve_at(
+            &self,
+            task: SignalTaskIdentity,
+            site: Option<CallbackSignalSite>,
+        ) -> SignalDeliveryPermit {
+            let permit = SignalDeliveryPermit {
+                task,
+                sequence: self.sequence.fetch_add(1, Ordering::SeqCst) + 1,
+                site,
+            };
+            let mut permits = self.permits.lock().unwrap();
+            assert!(!permits.contains_key(&task.tid.as_raw()));
+            self.control().process.reserve_delivery(permit).unwrap();
+            permits.insert(task.tid.as_raw(), permit);
+            permit
+        }
+    }
+    #[reverie::global_tool]
+    impl GlobalTool for Global {
+        type Request = Request;
+        type Response = Option<reverie::ParkedObservationLease>;
+        type Config = u8;
+
+        async fn init_global_state(mode: &u8) -> Self {
+            Self {
+                mode: *mode,
+                ..Self::default()
+            }
+        }
+        fn install_backend_signal_control(
+            &self,
+            control: Option<BackendSignalControl>,
+        ) -> Result<BackendSignalControlMode, reverie::Error> {
+            let control = control.ok_or(Errno::ENOSYS)?;
+            if self.mode != NO_OPT_IN {
+                control.process.enable_parent_death_control()?;
+            }
+            *self.control.lock().unwrap() = Some(control);
+            Ok(BackendSignalControlMode::ToolControlled)
+        }
+        async fn receive_rpc(&self, _: Pid, request: Request) -> Self::Response {
+            match request {
+                Request::Prctl => {
+                    self.prctl_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                Request::Dequeue(effect) => self.dequeues.lock().unwrap().push(effect),
+                Request::ExecAdmission { task, enrolled } => {
+                    if enrolled {
+                        assert!(self.enrolled_exec.lock().unwrap().replace(task).is_none());
+                        self.reserve(task);
+                    } else {
+                        assert_eq!(task.process.tgid, Pid::from_raw(17));
+                        assert_eq!(task.tid, task.process.tgid);
+                        self.initial_exec_calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Request::IgnoredAction(task) => {
+                    let key = (task.process.tgid.as_raw(), task.process.generation);
+                    let mut calls = self.ignored_action_calls.lock().unwrap();
+                    let count = calls.entry(key).or_default();
+                    *count += 1;
+                    assert!(
+                        *count <= 2,
+                        "only initial ignore and later handler installation"
+                    );
+                    if *count == 2 {
+                        // This RPC is at the actual second rt_sigaction hook,
+                        // BEFORE it replaces SIG_IGN. Observe the real retained
+                        // publication/dequeue; do not force delivery or invent
+                        // a return boundary from a syscall-count assumption.
+                        let publications = self.publications.lock().unwrap();
+                        let effects: Vec<_> = publications
+                            .iter()
+                            .flat_map(|publication| &publication.signals)
+                            .filter(|effect| effect.process == task.process)
+                            .collect();
+                        assert_eq!(effects.len(), 1, "creator death preceded replacement");
+                        assert!(!effects[0].discarded && !effects[0].coalesced);
+                        let expected = usize::from(self.mode == IGNORED_UNBLOCKED);
+                        assert_eq!(
+                            self.dequeues
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|event| event.process == task.process)
+                                .count(),
+                            expected
+                        );
+                        assert_eq!(
+                            self.boundaries
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|receipt| receipt.permit.task.process == task.process
+                                    && receipt.outcome == SignalBoundaryOutcome::NoHandler)
+                                .count(),
+                            expected
+                        );
+                    }
+                }
+                Request::Exit(task) => {
+                    if (matches!(self.mode, PAUSE | NANOSLEEP) && task.tid != task.process.tgid)
+                        || (self.mode == LINGER_PROCESS
+                            && task.tid == Pid::from_raw(17)
+                            && task.process.tgid == Pid::from_raw(17))
+                    {
+                        poll_fn(|cx| {
+                            assert!(
+                                !self.failed.load(Ordering::Acquire),
+                                "backend failed before creator exit"
+                            );
+                            let mut parks = self.parks.lock().unwrap();
+                            parks.creator = Some(task);
+                            if parks.site.is_some() {
+                                Poll::Ready(())
+                            } else {
+                                parks.creator_waiter = Some(cx.waker().clone());
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                    }
+                    self.reserve(task);
+                }
+                Request::Park(site) => {
+                    // Reserve the actual callback before exposing its parked
+                    // site to the creator. A nonce alone is not authority.
+                    let permit = self.reserve_at(
+                        SignalTaskIdentity {
+                            process: site.process,
+                            tid: site.tid,
+                            task_generation: site.task_generation,
+                        },
+                        Some(site),
+                    );
+                    poll_fn(|cx| {
+                        assert!(
+                            !self.failed.load(Ordering::Acquire),
+                            "backend failed during parked callback"
+                        );
+                        let mut parks = self.parks.lock().unwrap();
+                        if let Some(previous) = parks.site {
+                            assert_eq!(previous, site);
+                        }
+                        parks.site = Some(site);
+                        if parks.published {
+                            return Poll::Ready(());
+                        }
+                        parks.child_waiter = Some(futures::task::waker(Arc::new(WitnessWake {
+                            inner: cx.waker().clone(),
+                            calls: parks.wake_calls.clone(),
+                        })));
+                        let creator = parks.creator_waiter.take();
+                        drop(parks);
+                        if let Some(creator) = creator {
+                            creator.wake();
+                        }
+                        Poll::Pending
+                    })
+                    .await;
+                    return Some(reverie::ParkedObservationLease {
+                        nonce: permit.sequence,
+                    });
+                }
+            }
+            None
+        }
+        fn authorize_backend_signal_boundary(
+            &self,
+            task: SignalTaskIdentity,
+        ) -> Result<Option<SignalDeliveryPermit>, reverie::Error> {
+            if let Some(permit) = self
+                .permits
+                .lock()
+                .unwrap()
+                .get(&task.tid.as_raw())
+                .copied()
+            {
+                assert_eq!(permit.task, task);
+                return Ok(Some(permit));
+            }
+            if self
+                .control()
+                .process
+                .signal_recipients(task.process, libc::SIGUSR1)?
+                .into_iter()
+                .any(|recipient| recipient.task == task)
+            {
+                return Ok(Some(self.reserve(task)));
+            }
+            Ok(None)
+        }
+        async fn on_backend_signal_boundary(
+            &self,
+            boundary: SignalBoundaryReceipt,
+        ) -> Result<(), reverie::Error> {
+            assert_eq!(
+                self.permits
+                    .lock()
+                    .unwrap()
+                    .remove(&boundary.permit.task.tid.as_raw()),
+                Some(boundary.permit)
+            );
+            self.boundaries.lock().unwrap().push(boundary);
+            if !matches!(
+                boundary.outcome,
+                SignalBoundaryOutcome::Terminated { .. } | SignalBoundaryOutcome::ImageReplaced
+            ) {
+                return Ok(());
+            }
+            let publication = match self.control().process.publish_parent_death(boundary) {
+                ParentDeathPublicationResult::Committed(publication) => publication,
+                other => panic!("authentic boundary must publish exactly once: {other:?}"),
+            };
+            assert_eq!(publication.boundary, boundary);
+            assert!(
+                !publication.batches.is_empty(),
+                "even an empty death effect has an authenticated batch"
+            );
+            let creator = boundary.permit.task.tid != boundary.permit.task.process.tgid;
+            if (creator && matches!(self.mode, PAUSE | NANOSLEEP))
+                || (self.mode == LINGER_PROCESS
+                    && boundary.permit.task.tid == Pid::from_raw(17)
+                    && boundary.permit.task.process.tgid == Pid::from_raw(17))
+            {
+                assert_eq!(
+                    publication.signals.len(),
+                    1,
+                    "creator death must publish the real signal before wake"
+                );
+                let effect = publication.signals[0];
+                assert_eq!(effect.signal, libc::SIGUSR1);
+                assert!(!effect.coalesced && !effect.discarded);
+                assert!(
+                    self.control()
+                        .process
+                        .parent_death_enrolled(effect.process)?
+                );
+                let mut parks = self.parks.lock().unwrap();
+                let site = parks
+                    .site
+                    .expect("original callback parked before creator exit");
+                assert_eq!(parks.creator, Some(boundary.permit.task));
+                assert_eq!(site.process, effect.process);
+                assert_eq!(site.tid, effect.process.tgid);
+                assert!(!parks.published);
+                parks.published = true;
+                let wake = parks
+                    .child_waiter
+                    .take()
+                    .expect("real pending callback waker");
+                let calls = parks.wake_calls.clone();
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                drop(parks);
+                wake.wake();
+                // Removing the actual wake call fails this runtime assertion;
+                // it is not qualified by waiting for the outer timeout.
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            self.publications.lock().unwrap().push(publication);
+            Ok(())
+        }
+        fn report_backend_failure(&self, _: reverie::BackendFailure) {
+            self.failed.store(true, Ordering::Release);
+            let mut wakes = std::mem::take(&mut *self.failure_waiters.lock().unwrap());
+            let mut parks = self.parks.lock().unwrap();
+            wakes.extend(parks.child_waiter.take());
+            wakes.extend(parks.creator_waiter.take());
+            drop(parks);
+            for wake in wakes {
+                wake.wake();
+            }
+        }
+        async fn wait_for_backend_failure(&self) {
+            poll_fn(|cx| {
+                if self.failed.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                self.failure_waiters
+                    .lock()
+                    .unwrap()
+                    .push(cx.waker().clone());
+                if self.failed.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+    }
+
+    #[derive(Default)]
+    struct ControlledTool {
+        mode: u8,
+    }
+    #[reverie::tool]
+    impl Tool for ControlledTool {
+        type GlobalState = Global;
+        type ThreadState = ();
+        fn new(_: Pid, mode: &u8) -> Self {
+            Self { mode: *mode }
+        }
+        fn observe_signal_dequeues(_: &u8) -> bool {
+            true
+        }
+        async fn handle_signal_dequeue<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            effect: SignalDequeue,
+        ) -> Result<(), Errno> {
+            assert_eq!(
+                effect.domain,
+                PendingDomain::Process,
+                "parent death is shared pending"
+            );
+            assert_eq!(
+                effect.process,
+                guest.signal_task_identity().unwrap().process
+            );
+            let mut info = [0; reverie::SIGNAL_INFO_SIZE];
+            info[..4].copy_from_slice(&libc::SIGUSR1.to_ne_bytes());
+            info[8..12].copy_from_slice(&libc::SI_USER.to_ne_bytes());
+            info[16..20].copy_from_slice(&17_i32.to_ne_bytes());
+            assert_eq!(
+                effect.event,
+                SignalEvent::new(
+                    libc::SIGUSR1,
+                    info,
+                    SignalTarget::Process { pid: guest.pid() }
+                )
+                .unwrap()
+            );
+            let _ = guest.send_rpc(Request::Dequeue(effect)).await;
+            Ok(())
+        }
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            call: Syscall,
+        ) -> Result<i64, reverie::Error> {
+            let admission = guest.parent_death_syscall_preflight(call)?;
+            if self.mode == EXEC && matches!(call.number(), Sysno::execve | Sysno::execveat) {
+                let _ = guest
+                    .send_rpc(Request::ExecAdmission {
+                        task: guest.signal_task_identity().unwrap(),
+                        enrolled: matches!(
+                            admission,
+                            reverie::ParentDeathSyscallAdmission::Admitted
+                        ),
+                    })
+                    .await;
+            }
+            if matches!(self.mode, IGNORED_BLOCKED | IGNORED_UNBLOCKED)
+                && call.number() == Sysno::rt_sigaction
+            {
+                let (_, args) = call.into_parts();
+                if args.arg0 as i32 == libc::SIGUSR1 && args.arg1 != 0 {
+                    let _ = guest
+                        .send_rpc(Request::IgnoredAction(
+                            guest.signal_task_identity().unwrap(),
+                        ))
+                        .await;
+                }
+            }
+            if call.number() == Sysno::prctl {
+                let _ = guest.send_rpc(Request::Prctl).await;
+            }
+            if self.mode != NO_OPT_IN && matches!(call.number(), Sysno::exit | Sysno::exit_group) {
+                let _ = guest
+                    .send_rpc(Request::Exit(guest.signal_task_identity().unwrap()))
+                    .await;
+            }
+            if matches!(
+                (self.mode, call.number()),
+                (PAUSE, Sysno::pause)
+                    | (NANOSLEEP, Sysno::nanosleep)
+                    | (LINGER_PROCESS, Sysno::pause)
+            ) {
+                let site = guest
+                    .parked_signal_site()
+                    .expect("actual original wait callback");
+                let lease = guest
+                    .send_rpc(Request::Park(site))
+                    .await
+                    .expect("parked callback reserved its exact observation lease");
+                assert_eq!(
+                    guest.parked_signal_site(),
+                    Some(site),
+                    "RPC must preserve exact original callback"
+                );
+                let observation = guest.observe_parked_signal(site, lease).await.unwrap();
+                assert!(
+                    matches!(observation.stop, SignalObservationStop::Caught(_)),
+                    "{observation:?}"
+                );
+                assert_eq!(observation.steps.len(), 1);
+                assert_eq!(guest.parked_signal_failure_context().unwrap().site, site);
+                return Err(Errno::EINTR.into());
+            }
+            guest.tail_inject(call).await
+        }
+    }
+
+    fn controlled(
+        program: &std::path::Path,
+        directory: &std::path::Path,
+        argument: Option<&str>,
+        mode: u8,
+    ) -> (Global, i32, Vec<u8>, Vec<u8>) {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        if mode != NO_OPT_IN {
+            backend
+                .set_native_exit_broker(broker_test_client::client())
+                .unwrap();
+        }
+        backend.set_root_pid(17).unwrap();
+        let mut argv = vec![program.to_str().unwrap()];
+        if let Some(argument) = argument {
+            argv.push(argument);
+        }
+        backend
+            .install_static_elf_file_with_context(
+                std::fs::File::open(program).unwrap(),
+                &argv,
+                &[],
+                directory,
+            )
+            .unwrap();
+        backend.set_thread_ownership(ThreadOwnership::Tool);
+        futures::executor::block_on(backend.run_static_elf_with_tool::<ControlledTool>(mode, true))
+            .unwrap()
+    }
+
+    mod linger_process {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        use super::*;
+        const BOUND: Duration = Duration::from_secs(5);
+        const LIMIT: usize = 8 * 1024 * 1024;
+        const EXPECTED: &[u8] = b"pdeathsig process-linger child-completed=1\n";
+        type Record = [u8; 48];
+        fn record(path: &std::path::Path) -> Result<Record, String> {
+            std::fs::read(path)
+                .map_err(|e| e.to_string())?
+                .try_into()
+                .map_err(|_| "fixture record has wrong length".to_owned())
+        }
+        fn word(bytes: &Record, offset: usize) -> i32 {
+            i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        }
+        fn wide(bytes: &Record, offset: usize) -> u64 {
+            u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap())
+        }
+        fn release(path: &std::path::Path, offset: u64) -> Result<(), String> {
+            let fd = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|e| e.to_string())?;
+            if fd.write_at(&[1], offset).map_err(|e| e.to_string())? != 1 {
+                return Err("short setup gate write".to_owned());
+            }
+            Ok(())
+        }
+        fn listener() -> std::net::TcpListener {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let buffer = 4096_i32;
+            // SAFETY: the live listener and scalar option have the stated sizes.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        listener.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        (&buffer as *const i32).cast(),
+                        4,
+                    )
+                },
+                0
+            );
+            listener.set_nonblocking(true).unwrap();
+            listener
+        }
+        fn start_time(stat: &str) -> Option<(&str, &str)> {
+            let fields = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            Some((*fields.first()?, *fields.get(19)?))
+        }
+        fn close_witness(pid: u32, generation: &str, fd: i32) -> Option<String> {
+            let a = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let call = std::fs::read_to_string(format!("/proc/{pid}/syscall")).ok()?;
+            let b = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            if start_time(&a)? != ("S", generation) || start_time(&b)? != ("S", generation) {
+                return None;
+            }
+            let fields = call.split_whitespace().collect::<Vec<_>>();
+            if fields.first()?.parse::<i64>().ok()? != libc::SYS_close
+                || u64::from_str_radix(fields.get(1)?.strip_prefix("0x")?, 16).ok()? != fd as u64
+            {
+                return None;
+            }
+            Some(format!("stat-before={a}syscall={call}stat-after={b}"))
+        }
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct Endpoint {
+            local: [u8; 4],
+            local_port: u16,
+            remote: [u8; 4],
+            remote_port: u16,
+        }
+        fn endpoint(fd: i32) -> Option<Endpoint> {
+            let mut local: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut remote: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut llen = std::mem::size_of_val(&local) as libc::socklen_t;
+            let mut rlen = std::mem::size_of_val(&remote) as libc::socklen_t;
+            // Borrow numeric handles only; no dup, File, or lasting reference.
+            if unsafe {
+                libc::getsockname(fd, (&mut local as *mut libc::sockaddr_in).cast(), &mut llen)
+            } != 0
+                || unsafe {
+                    libc::getpeername(
+                        fd,
+                        (&mut remote as *mut libc::sockaddr_in).cast(),
+                        &mut rlen,
+                    )
+                } != 0
+                || llen as usize != std::mem::size_of_val(&local)
+                || rlen as usize != std::mem::size_of_val(&remote)
+                || local.sin_family as i32 != libc::AF_INET
+                || remote.sin_family as i32 != libc::AF_INET
+            {
+                return None;
+            }
+            Some(Endpoint {
+                local: local.sin_addr.s_addr.to_ne_bytes(),
+                local_port: u16::from_be(local.sin_port),
+                remote: remote.sin_addr.s_addr.to_ne_bytes(),
+                remote_port: u16::from_be(remote.sin_port),
+            })
+        }
+        fn cookie(fd: i32) -> Result<u64, String> {
+            let mut value = 0_u64;
+            let mut len = 8;
+            if unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_COOKIE,
+                    (&mut value as *mut u64).cast(),
+                    &mut len,
+                )
+            } != 0
+                || len != 8
+                || value == 0
+            {
+                return Err(format!(
+                    "SO_COOKIE fd={fd} len={len}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(value)
+        }
+        #[derive(Debug)]
+        struct Alias {
+            fd: i32,
+            endpoint: Endpoint,
+            cookie: u64,
+            outq: i32,
+            unsent: i32,
+            linger: [i32; 2],
+        }
+        fn aliases(wanted: Endpoint) -> Result<Vec<i32>, String> {
+            let mut found = Vec::new();
+            for item in std::fs::read_dir("/proc/self/fd").map_err(|e| e.to_string())? {
+                let item = item.map_err(|e| e.to_string())?;
+                let Some(fd) = item
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<i32>().ok())
+                else {
+                    continue;
+                };
+                if endpoint(fd) == Some(wanted) {
+                    found.push(fd);
+                }
+            }
+            found.sort_unstable();
+            Ok(found)
+        }
+        fn observe_sender(peer: &std::net::TcpStream, sent: u64) -> Result<Vec<Alias>, String> {
+            let receiver = endpoint(peer.as_raw_fd()).ok_or("cannot identify the accepted peer")?;
+            let wanted = Endpoint {
+                local: receiver.remote,
+                local_port: receiver.remote_port,
+                remote: receiver.local,
+                remote_port: receiver.local_port,
+            };
+            let fds = aliases(wanted)?;
+            if fds.is_empty() {
+                return Err("no sender alias for exact connected four-tuple".to_owned());
+            }
+            let mut observed = Vec::new();
+            for &fd in &fds {
+                let identity = cookie(fd)?;
+                let mut outq = 0_i32;
+                let mut unsent = 0_i32;
+                let mut linger = libc::linger {
+                    l_onoff: 0,
+                    l_linger: 0,
+                };
+                let mut len = std::mem::size_of_val(&linger) as libc::socklen_t;
+                if unsafe { libc::ioctl(fd, 0x5411, &mut outq) } != 0
+                    || unsafe { libc::ioctl(fd, 0x894b, &mut unsent) } != 0
+                    || unsafe {
+                        libc::getsockopt(
+                            fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_LINGER,
+                            (&mut linger as *mut libc::linger).cast(),
+                            &mut len,
+                        )
+                    } != 0
+                {
+                    return Err(format!(
+                        "sender fd={fd} query: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                if outq <= 0
+                    || unsent <= 0
+                    || outq as u64 > sent
+                    || unsent as u64 > sent
+                    || len as usize != std::mem::size_of_val(&linger)
+                    || linger.l_onoff != 1
+                    || linger.l_linger != 600
+                    || endpoint(fd) != Some(wanted)
+                    || cookie(fd)? != identity
+                {
+                    return Err(format!(
+                        "sender fd={fd} changed or wrong queue/linger: outq={outq} unsent={unsent} linger=({}, {})",
+                        linger.l_onoff, linger.l_linger
+                    ));
+                }
+                observed.push(Alias {
+                    fd,
+                    endpoint: wanted,
+                    cookie: identity,
+                    outq,
+                    unsent,
+                    linger: [linger.l_onoff, linger.l_linger],
+                });
+            }
+            if observed.iter().any(|a| a.cookie != observed[0].cookie) || aliases(wanted)? != fds {
+                return Err("sender alias set/cookie changed during setup gate".to_owned());
+            }
+            // Last identity check finishes before releasing the regular-file
+            // gate. The gate runs only pread/yield, never a table mutation.
+            for item in &observed {
+                if endpoint(item.fd) != Some(item.endpoint) || cookie(item.fd)? != item.cookie {
+                    return Err("sender identity changed on final revalidation".to_owned());
+                }
+            }
+            Ok(observed)
+        }
+        #[derive(Clone)]
+        enum Mode {
+            NativeClose { pid: u32, generation: String },
+            NativeExit,
+            Controlled,
+        }
+        impl Mode {
+            fn close(&self) -> bool {
+                matches!(self, Self::NativeClose { .. })
+            }
+            fn controlled(&self) -> bool {
+                matches!(self, Self::Controlled)
+            }
+        }
+        #[derive(Debug)]
+        struct Drain {
+            ready: bool,
+            before_gate: bool,
+            witness: Option<String>,
+            observation_seconds: f64,
+            setup_record: Option<Record>,
+            aliases: Vec<Alias>,
+            bytes: Vec<u8>,
+            error: Option<String>,
+        }
+        fn actor(
+            listener: std::net::TcpListener,
+            path: std::path::PathBuf,
+            mode: Mode,
+        ) -> std::thread::JoinHandle<Drain> {
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                let mut peer = None;
+                let mut setup_record = None;
+                let mut probes = Vec::new();
+                let setup = (|| -> Result<(), String> {
+                    while start.elapsed() < BOUND {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                peer = Some(stream);
+                                break;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1))
+                            }
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                    if peer.is_none() {
+                        return Err("no TCP connection within fixed setup bound".to_owned());
+                    }
+                    while start.elapsed() < BOUND {
+                        let bytes = record(&path)?;
+                        if bytes[4] != 0 {
+                            return Err(format!("fixture setup failure {}", bytes[4]));
+                        }
+                        if bytes[6] == 1 && (mode.close() || bytes[0] == 1) {
+                            setup_record = Some(bytes);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let bytes = setup_record
+                        .ok_or("queue/enrollment readiness missing at fixed setup bound")?;
+                    let sent = wide(&bytes, 16);
+                    if sent == 0 || sent > LIMIT as u64 || word(&bytes, 12) < 3 {
+                        return Err("invalid sent count/socket descriptor".to_owned());
+                    }
+                    if mode.controlled() {
+                        if bytes[24..].iter().any(|&b| b != 0) {
+                            return Err(
+                                "controlled guest fabricated unsupported queue query output"
+                                    .to_owned(),
+                            );
+                        }
+                        probes = observe_sender(peer.as_ref().unwrap(), sent)?;
+                    } else if word(&bytes, 24) <= 0
+                        || word(&bytes, 28) <= 0
+                        || word(&bytes, 24) as u64 > sent
+                        || word(&bytes, 28) as u64 > sent
+                        || word(&bytes, 32) != 1
+                        || word(&bytes, 36) != 600
+                        || wide(&bytes, 40) == 0
+                    {
+                        return Err("native socket query precondition failed".to_owned());
+                    }
+                    Ok(())
+                })();
+                let ready = setup.is_ok();
+                let mut error = setup.err();
+                // These gates are always released, including a setup refusal;
+                // no observer keeps the creator alive merely to force a red.
+                for offset in [5, 7] {
+                    if let Err(e) = release(&path, offset) {
+                        error.get_or_insert(e);
+                    }
+                }
+                let begin = Instant::now();
+                let mut before_gate = false;
+                let mut witness = None;
+                while ready && error.is_none() && begin.elapsed() < BOUND {
+                    if let Mode::NativeClose { pid, generation } = &mode {
+                        if let Some(raw) =
+                            close_witness(*pid, generation, word(&setup_record.unwrap(), 12))
+                        {
+                            witness = Some(raw);
+                            break;
+                        }
+                    } else {
+                        match record(&path) {
+                            Ok(bytes) if bytes[1] == 1 => {
+                                before_gate = true;
+                                break;
+                            }
+                            Ok(bytes) if bytes[4] != 0 => {
+                                error = Some(format!("fixture failure {}", bytes[4]));
+                                break;
+                            }
+                            Ok(_) => (),
+                            Err(e) => {
+                                error = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let observation_seconds = begin.elapsed().as_secs_f64();
+                let mut bytes = Vec::new();
+                if let Some(mut peer) = peer {
+                    if let Err(e) = peer.set_read_timeout(Some(BOUND)) {
+                        error.get_or_insert(e.to_string());
+                    }
+                    if let Err(e) = (&mut peer).take((LIMIT + 1) as u64).read_to_end(&mut bytes) {
+                        error.get_or_insert(e.to_string());
+                    }
+                    let _ = peer.shutdown(std::net::Shutdown::Both);
+                }
+                Drain {
+                    ready,
+                    before_gate,
+                    witness,
+                    observation_seconds,
+                    setup_record,
+                    aliases: probes,
+                    bytes,
+                    error,
+                }
+            })
+        }
+        fn assert_drain(drain: &Drain) {
+            eprintln!(
+                "drain ready={} completion_before_gate={} close_witness={} elapsed={:.6} setup={:?} aliases={:?} error={:?}",
+                drain.ready,
+                drain.before_gate,
+                drain.witness.is_some(),
+                drain.observation_seconds,
+                drain.setup_record,
+                drain.aliases,
+                drain.error
+            );
+            assert!(
+                drain.error.is_none(),
+                "drain/setup/reset failure: {drain:?}"
+            );
+            let count = wide(&drain.setup_record.unwrap(), 16) as usize;
+            let expected: Vec<_> = (0..count)
+                .map(|n| (n.wrapping_mul(131) + 17) as u8)
+                .collect();
+            assert_eq!(drain.bytes, expected, "complete byte stream through EOF");
+            for alias in &drain.aliases {
+                assert!(alias.outq > 0 && alias.unsent > 0);
+                assert_eq!(alias.linger, [1, 600]);
+            }
+        }
+        fn assert_record(bytes: Record, child: i32, close: bool, setup: Record) {
+            let mut expected = setup;
+            expected[..8].copy_from_slice(if close {
+                &[0, 0, 0, 1, 0, 1, 1, 1]
+            } else {
+                &[1, 1, 1, 0, 0, 1, 1, 1]
+            });
+            expected[8..12].copy_from_slice(&child.to_ne_bytes());
+            assert_eq!(
+                bytes, expected,
+                "all fixture bytes and exact completed status markers"
+            );
+        }
+        fn native(program: &std::path::Path, directory: &std::path::Path, close: bool) {
+            let path = directory.join("record");
+            std::fs::write(&path, [0; 48]).unwrap();
+            let listener = listener();
+            let port = listener.local_addr().unwrap().port().to_string();
+            let mut command = std::process::Command::new(program);
+            command
+                .arg(if close { "close" } else { "native" })
+                .arg(&path)
+                .arg(&port)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = command.spawn().unwrap();
+            drop(command);
+            let pid = child.id();
+            let generation = std::fs::read_to_string(format!("/proc/{pid}/stat")).and_then(|s| {
+                start_time(&s)
+                    .map(|(_, g)| g.to_owned())
+                    .ok_or_else(|| std::io::Error::other("invalid owned stat"))
+            });
+            let generation_error = generation.as_ref().err().map(ToString::to_string);
+            let mode = if close {
+                Mode::NativeClose {
+                    pid,
+                    generation: generation.unwrap_or_default(),
+                }
+            } else {
+                Mode::NativeExit
+            };
+            let actor = actor(listener, path.clone(), mode);
+            let gate = release(&path, 5);
+            let output = child.wait_with_output();
+            let drain = actor.join().unwrap();
+            let output = output.unwrap();
+            let bytes = record(&path).unwrap();
+            let recipient = word(&bytes, 8);
+            let status = if !close {
+                assert!(recipient > 0 && recipient != pid as i32);
+                let mut status = -1;
+                assert_eq!(
+                    unsafe { libc::waitpid(recipient, &mut status, 0) },
+                    recipient
+                );
+                Some(status)
+            } else {
+                None
+            };
+            eprintln!(
+                "native close={close} creator={pid} recipient={recipient} recipient_status={status:?} record={bytes:?}"
+            );
+            assert!(generation_error.is_none(), "{generation_error:?}");
+            gate.unwrap();
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(output.stderr.is_empty());
+            assert_drain(&drain);
+            assert_record(bytes, recipient, close, drain.setup_record.unwrap());
+            if close {
+                assert_eq!(recipient, 0);
+                assert!(output.stdout.is_empty());
+                assert!(
+                    drain.witness.is_some(),
+                    "native explicit close never affirmatively witnessed"
+                );
+                eprintln!("native close raw witness: {}", drain.witness.unwrap());
+            } else {
+                assert_eq!(status, Some(0));
+                assert_eq!(output.stdout, EXPECTED);
+                assert!(drain.before_gate, "native delivery required peer drainage");
+            }
+        }
+        #[test]
+        fn creator_process_queued_tcp_exit_publishes_before_peer_drain() {
+            const TEST: &str = "pdeathsig::linger_process::creator_process_queued_tcp_exit_publishes_before_peer_drain";
+            if !leader_self_exec_bounded_with_output(TEST, true) {
+                return;
+            }
+            let mut old = 0;
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut old) },
+                0
+            );
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+            let directory = TestDirectory::new();
+            let program = compile_c_program(
+                &directory.0,
+                "pdeathsig-linger-process",
+                include_str!("fixtures/pdeathsig_linger_process.c"),
+            );
+            for close in [true, false] {
+                let dir = directory
+                    .0
+                    .join(if close { "native-close" } else { "native-exit" });
+                std::fs::create_dir(&dir).unwrap();
+                native(&program, &dir, close);
+            }
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, old) }, 0);
+            let dir = directory.0.join("controlled");
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("record");
+            std::fs::write(&path, [0; 48]).unwrap();
+            let listener = listener();
+            let port = listener.local_addr().unwrap().port().to_string();
+            let actor = actor(listener, path.clone(), Mode::Controlled);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // No configured stdin: neither root nor fork snapshot can keep
+                // a hidden alias to the socket created later by the guest.
+                let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+                backend
+                    .set_native_exit_broker(broker_test_client::client())
+                    .unwrap();
+                backend.set_root_pid(17).unwrap();
+                backend
+                    .install_static_elf_file_with_context(
+                        std::fs::File::open(&program).unwrap(),
+                        &[
+                            program.to_str().unwrap(),
+                            "controlled",
+                            path.to_str().unwrap(),
+                            &port,
+                        ],
+                        &[],
+                        &dir,
+                    )
+                    .unwrap();
+                backend.set_thread_ownership(ThreadOwnership::Tool);
+                release(&path, 5).unwrap();
+                futures::executor::block_on(
+                    backend.run_static_elf_with_tool::<ControlledTool>(LINGER_PROCESS, true),
+                )
+            }));
+            let drain = actor.join().unwrap();
+            let (global, status, stdout, stderr) = match outcome {
+                Ok(result) => result.unwrap(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+            assert_eq!(status, 0, "{stderr:?}");
+            assert_eq!(stdout, EXPECTED);
+            assert!(stderr.is_empty());
+            assert_drain(&drain);
+            assert_record(
+                record(&path).unwrap(),
+                18,
+                false,
+                drain.setup_record.unwrap(),
+            );
+            let publications = global.publications.lock().unwrap();
+            let creator: Vec<_> = publications
+                .iter()
+                .filter(|p| p.boundary.permit.task.tid == Pid::from_raw(17))
+                .collect();
+            assert_eq!(creator.len(), 1);
+            assert_eq!(
+                creator[0].boundary.permit.task.process.tgid,
+                Pid::from_raw(17)
+            );
+            assert_eq!(
+                creator[0].boundary.outcome,
+                SignalBoundaryOutcome::Terminated {
+                    group: true,
+                    wait_status: 0
+                }
+            );
+            assert_eq!(creator[0].signals.len(), 1);
+            let effect = creator[0].signals[0];
+            assert_eq!(effect.process.tgid, Pid::from_raw(18));
+            assert_eq!(effect.signal, libc::SIGUSR1);
+            assert!(!effect.discarded && !effect.coalesced);
+            assert_eq!(
+                publications.iter().map(|p| p.signals.len()).sum::<usize>(),
+                1
+            );
+            let dequeues = global.dequeues.lock().unwrap();
+            assert_eq!(dequeues.len(), 1);
+            assert_eq!(dequeues[0].process, effect.process);
+            assert_eq!(dequeues[0].sequence, 1);
+            drop(dequeues);
+            let exits: Vec<_> = global
+                .boundaries
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|r| matches!(r.outcome, SignalBoundaryOutcome::Terminated { .. }))
+                .collect();
+            assert_eq!(exits.len(), 2);
+            assert_eq!(
+                exits
+                    .iter()
+                    .filter(|r| r.permit.task.tid == Pid::from_raw(18)
+                        && r.outcome
+                            == SignalBoundaryOutcome::Terminated {
+                                group: true,
+                                wait_status: 0
+                            })
+                    .count(),
+                1
+            );
+            assert!(global.parks.lock().unwrap().published);
+            assert_eq!(
+                global
+                    .parks
+                    .lock()
+                    .unwrap()
+                    .wake_calls
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(global.prctl_calls.load(Ordering::SeqCst), 4);
+            eprintln!(
+                "controlled creator=17 recipient=18 terminal_statuses=[0,0] publications=1 shared_dequeues=1 callback_wakes=1 sender_uid=0"
+            );
+            assert!(
+                drain.before_gate,
+                "creator publication/handler waited for peer drain; backend and peer are now finished"
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_six_check_state_matches_native_controlled() {
+        const TEST: &str = "pdeathsig::unchanged_six_check_state_matches_native_controlled";
+        if !leader_self_exec_bounded(TEST) {
+            return;
+        }
+        let directory = TestDirectory::new();
+        let program = compile_c_program(
+            &directory.0,
+            "pdeathsig-state",
+            include_str!("fixtures/pdeathsig_state.c"),
+        );
+        let native = std::process::Command::new(&program)
+            .current_dir(&directory.0)
+            .output()
+            .unwrap();
+        assert_eq!(native.status.code(), Some(0), "{native:?}");
+        assert_eq!(
+            native.stdout,
+            b"pdeathsig ok=6 set_usr1_readback=10 set_usr2_readback=12 cleared_readback=0\n"
+        );
+        assert!(native.stderr.is_empty());
+        let (global, status, stdout, stderr) = controlled(&program, &directory.0, None, STATE);
+        assert_eq!(status, 0, "{stderr:?}");
+        assert_eq!(stdout, native.stdout);
+        assert_eq!(stderr, native.stderr);
+        assert_eq!(global.prctl_calls.load(Ordering::SeqCst), 6);
+        assert!(global.dequeues.lock().unwrap().is_empty());
+        assert!(
+            global
+                .publications
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|p| p.signals.is_empty())
+        );
+    }
+
+    #[test]
+    fn direct_host_and_unopted_control_preserve_nonzero_refusal() {
+        const TEST: &str = "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal";
+        if !leader_self_exec_bounded(TEST) {
+            return;
+        }
+        let directory = TestDirectory::new();
+        let program = compile_c_program(
+            &directory.0,
+            "pdeathsig-refusal",
+            include_str!("fixtures/pdeathsig_refusal.c"),
+        );
+        let expected = b"pdeathsig nonzero-refused clear-and-query-zero width-invalid\n";
+        for host in [false, true] {
+            let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+            backend
+                .install_static_elf_file_with_context(
+                    std::fs::File::open(&program).unwrap(),
+                    &[program.to_str().unwrap()],
+                    &[],
+                    &directory.0,
+                )
+                .unwrap();
+            let (status, stdout, stderr) = if host {
+                backend.set_thread_ownership(ThreadOwnership::Host);
+                let (trace, status, stdout, stderr) = futures::executor::block_on(
+                    backend.run_static_elf_with_tool::<StraceTool>((), true),
+                )
+                .unwrap();
+                assert_eq!(
+                    trace
+                        .syscalls()
+                        .iter()
+                        .filter(|name| name.as_str() == "prctl")
+                        .count(),
+                    7
+                );
+                (status, stdout, stderr)
+            } else {
+                backend.run_static_elf_captured().unwrap()
+            };
+            assert_eq!(status, 0, "host={host} stderr={stderr:?}");
+            assert_eq!(stdout, expected);
+            assert!(stderr.is_empty());
+        }
+        let (global, status, stdout, stderr) = controlled(&program, &directory.0, None, NO_OPT_IN);
+        assert_eq!(status, 0, "{stderr:?}");
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+        assert_eq!(global.prctl_calls.load(Ordering::SeqCst), 7);
+        assert!(global.publications.lock().unwrap().is_empty());
+    }
+
+    fn assert_creator(global: &Global, delivered: bool, parked: bool) {
+        let publications = global.publications.lock().unwrap();
+        let creators: Vec<_> = publications
+            .iter()
+            .filter(|p| p.boundary.permit.task.tid != p.boundary.permit.task.process.tgid)
+            .collect();
+        assert_eq!(creators.len(), 1, "one actual nonleader creator exit");
+        let creator = creators[0];
+        assert_eq!(creator.boundary.permit.task.process.tgid, Pid::from_raw(17));
+        assert_eq!(
+            creator.boundary.outcome,
+            SignalBoundaryOutcome::Terminated {
+                group: false,
+                wait_status: 0
+            }
+        );
+        assert_eq!(creator.signals.len(), usize::from(delivered));
+        assert_eq!(
+            publications.iter().map(|p| p.signals.len()).sum::<usize>(),
+            usize::from(delivered)
+        );
+        let dequeues = global.dequeues.lock().unwrap();
+        assert_eq!(dequeues.len(), usize::from(delivered));
+        if delivered {
+            assert_eq!(dequeues[0].process, creator.signals[0].process);
+            assert_eq!(dequeues[0].sequence, 1);
+            assert!(!creator.signals[0].coalesced && !creator.signals[0].discarded);
+        }
+        let parks = global.parks.lock().unwrap();
+        assert_eq!(parks.site.is_some(), parked);
+        assert_eq!(parks.published, parked);
+        assert_eq!(parks.wake_calls.load(Ordering::SeqCst), u64::from(parked));
+        assert!(global.permits.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn creator_thread_death_and_clear_match_native_shared_pending() {
+        const TEST: &str = "pdeathsig::creator_thread_death_and_clear_match_native_shared_pending";
+        if !leader_self_exec_bounded(TEST) {
+            return;
+        }
+        let directory = TestDirectory::new();
+        let program = compile_c_program(
+            &directory.0,
+            "pdeathsig-creator",
+            include_str!("fixtures/pdeathsig_creator.c"),
+        );
+        for (argument, mode, delivered) in [("0", MASKED, true), ("1", CLEAR, false)] {
+            let native = std::process::Command::new(&program)
+                .arg(argument)
+                .current_dir(&directory.0)
+                .output()
+                .unwrap();
+            assert_eq!(
+                native.status.code(),
+                Some(0),
+                "mode={mode} native={native:?}"
+            );
+            assert!(native.stderr.is_empty());
+            assert_eq!(
+                native.stdout,
+                format!(
+                    "pdeathsig creator-thread mode={argument} parent-alive=1 child-completed=1\n"
+                )
+                .as_bytes()
+            );
+            let (global, status, stdout, stderr) =
+                controlled(&program, &directory.0, Some(argument), mode);
+            assert_eq!(status, 0, "mode={mode} stderr={stderr:?}");
+            assert_eq!(stdout, native.stdout);
+            assert_eq!(stderr, native.stderr);
+            assert_creator(&global, delivered, false);
+        }
+    }
+
+    #[test]
+    fn ignored_parent_death_retains_blocked_and_does_not_resurrect_unblocked() {
+        const TEST: &str =
+            "pdeathsig::ignored_parent_death_retains_blocked_and_does_not_resurrect_unblocked";
+        if !leader_self_exec_bounded(TEST) {
+            return;
+        }
+        let directory = TestDirectory::new();
+        let program = compile_c_program(
+            &directory.0,
+            "pdeathsig-ignored",
+            include_str!("fixtures/pdeathsig_creator.c"),
+        );
+        for (argument, mode, outcome) in [
+            ("4", IGNORED_BLOCKED, SignalBoundaryOutcome::Caught),
+            ("5", IGNORED_UNBLOCKED, SignalBoundaryOutcome::NoHandler),
+        ] {
+            let native = std::process::Command::new(&program)
+                .arg(argument)
+                .current_dir(&directory.0)
+                .output()
+                .unwrap();
+            assert_eq!(
+                native.status.code(),
+                Some(0),
+                "mode={mode} native={native:?}"
+            );
+            assert!(native.stderr.is_empty());
+            assert_eq!(
+                native.stdout,
+                format!(
+                    "pdeathsig creator-thread mode={argument} parent-alive=1 child-completed=1\n"
+                )
+                .as_bytes()
+            );
+            let (global, status, stdout, stderr) =
+                controlled(&program, &directory.0, Some(argument), mode);
+            assert_eq!(status, 0, "mode={mode} stderr={stderr:?}");
+            assert_eq!(stdout, native.stdout);
+            assert_eq!(stderr, native.stderr);
+            assert_eq!(global.prctl_calls.load(Ordering::SeqCst), 2);
+            // This Tool observes ignored signals: both modes queue and dequeue
+            // one real process event. Only mode4 invokes a guest handler. The
+            // C fixture separately proves Linux's exact pending/handler result;
+            // no native internal-dequeue equivalence is claimed for mode5.
+            assert_creator(&global, true, false);
+            let process = global.dequeues.lock().unwrap()[0].process;
+            assert_eq!(
+                global
+                    .ignored_action_calls
+                    .lock()
+                    .unwrap()
+                    .get(&(process.tgid.as_raw(), process.generation)),
+                Some(&2)
+            );
+            let completed: Vec<_> = global
+                .boundaries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|receipt| receipt.permit.task.process == process)
+                .filter(|receipt| {
+                    matches!(
+                        receipt.outcome,
+                        SignalBoundaryOutcome::Caught | SignalBoundaryOutcome::NoHandler
+                    )
+                })
+                .copied()
+                .collect();
+            assert_eq!(completed.len(), 1, "one actual observed event");
+            assert_eq!(completed[0].outcome, outcome);
+        }
+    }
+
+    #[test]
+    fn enrolled_retained_image_exec_preserves_setting_and_actual_creator_delivery() {
+        const TEST: &str =
+            "pdeathsig::enrolled_retained_image_exec_preserves_setting_and_actual_creator_delivery";
+        if !leader_self_exec_bounded(TEST) {
+            return;
+        }
+        let directory = TestDirectory::new();
+        // This positive exercises the admitted retained-static-image domain.
+        // Check the emitted image class rather than assuming the C helper's
+        // default compiler flags produce a static executable.
+        let program = compile_c_program_with_args(
+            &directory.0,
+            "pdeathsig-exec",
+            include_str!("fixtures/pdeathsig_retained_exec.c"),
+            &[
+                "-nostdlib",
+                "-static",
+                "-ffreestanding",
+                "-fno-builtin",
+                "-fno-stack-protector",
+                "-fno-pie",
+                "-no-pie",
+                "-mno-red-zone",
+                "-fno-asynchronous-unwind-tables",
+                "-fno-unwind-tables",
+                "-Wl,--build-id=none",
+                "-Wl,-e,_start",
+            ],
+        );
+        let emitted_image = std::fs::read(&program).unwrap();
+        let emitted_elf = goblin::elf::Elf::parse(&emitted_image).unwrap();
+        assert!(
+            emitted_elf
+                .program_headers
+                .iter()
+                .all(|header| { header.p_type != goblin::elf::program_header::PT_INTERP }),
+            "retained-static-image positive must not contain PT_INTERP"
+        );
+        let native = std::process::Command::new(&program)
+            .arg("6")
+            .current_dir(&directory.0)
+            .output()
+            .unwrap();
+        assert_eq!(native.status.code(), Some(0), "{native:?}");
+        assert!(native.stderr.is_empty());
+        assert_eq!(
+            native.stdout,
+            b"pdeathsig creator-thread mode=6 parent-alive=1 child-completed=1\n"
+        );
+        let (global, status, stdout, stderr) = controlled(&program, &directory.0, Some("6"), EXEC);
+        assert_eq!(status, 0, "{stderr:?}");
+        assert_eq!(stdout, native.stdout);
+        assert_eq!(stderr, native.stderr);
+        // Real /proc/self/exe retained-static-image exec, not generic path
+        // admission. Initial SET+GET, then GET only: no compensating re-arm.
+        assert_eq!(global.prctl_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(global.initial_exec_calls.load(Ordering::SeqCst), 1);
+        let exec = global
+            .enrolled_exec
+            .lock()
+            .unwrap()
+            .expect("actual enrolled exec admission");
+        let replacements: Vec<_> = global
+            .boundaries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|receipt| receipt.outcome == SignalBoundaryOutcome::ImageReplaced)
+            .copied()
+            .collect();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(replacements[0].permit.task, exec);
+        assert_creator(&global, true, false);
+        assert_eq!(global.dequeues.lock().unwrap()[0].process, exec.process);
+    }
+
+    #[test]
+    fn actual_creator_death_wakes_controlled_pause_and_nanosleep() {
+        const TEST: &str = "pdeathsig::actual_creator_death_wakes_controlled_pause_and_nanosleep";
+        if !leader_self_exec_bounded(TEST) {
+            return;
+        }
+        let directory = TestDirectory::new();
+        let program = compile_c_program(
+            &directory.0,
+            "pdeathsig-parked",
+            include_str!("fixtures/pdeathsig_creator.c"),
+        );
+        // No native blocked-wait claim: only the Tool observes the actual
+        // original callback before releasing creator exit. Hermit's resource
+        // selection/wake bridge must be qualified separately by its consumer.
+        for (argument, mode) in [("2", PAUSE), ("3", NANOSLEEP)] {
+            let (global, status, stdout, stderr) =
+                controlled(&program, &directory.0, Some(argument), mode);
+            assert_eq!(status, 0, "mode={mode} stderr={stderr:?}");
+            assert_eq!(
+                stdout,
+                format!(
+                    "pdeathsig creator-thread mode={argument} parent-alive=1 child-completed=1\n"
+                )
+                .as_bytes()
+            );
+            assert!(stderr.is_empty());
+            assert_creator(&global, true, true);
+        }
+    }
+}

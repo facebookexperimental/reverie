@@ -3,11 +3,16 @@
 [package]
 name = "reverie-core"
 description = "Deterministic user-space syscall and signal interception runtime — the core Reverie process-instrumentation framework."
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
 license = "BSD-2-Clause"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/reverie-core"
+keywords = ["linux", "instrumentation", "hermit"]
+categories = ["development-tools::debugging", "os::linux-apis"]
 
 # The package is published as `reverie-core`, but the compiled library keeps the
 # name `reverie`. This lets every dependent (in-repo crates, Hermit, and the
@@ -24,6 +29,7 @@ anyhow = "1.0.103"
 async-trait = "0.1.86"
 bitflags = { version = "2.13.1", features = ["serde", "std"], default-features = false }
 byteorder = "1.5"
+goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 libc = "0.2.186"
 linked-hash-map = { version = "0.5", features = ["serde_impl"] }
 memmap2 = "0.9.11"
@@ -32,9 +38,12 @@ nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "
 object = { version = "0.40.0", features = ["read", "write"] }
 procfs = "0.18.0"
 raw-cpuid = "10.7.0"
-reverie-process = { version = "0.4.0", path = "../reverie-process" }
-reverie-syscalls = { version = "0.4.0", path = "../reverie-syscalls" }
+reverie-process = { version = "0.4.1", path = "../reverie-process" }
+reverie-syscalls = { version = "0.4.1", path = "../reverie-syscalls" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 syscalls = { version = "0.6.18", features = ["serde"] }
 thiserror = "2.0.18"
 typed-arena = "2"
+
+[dev-dependencies]
+serde_json = { version = "1.0.140", features = ["alloc"] }
