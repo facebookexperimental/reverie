@@ -70,9 +70,17 @@ mod error;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod glibc_symbol;
 mod guest;
+/// Shared in-process retired-branch counter mechanics.
+pub mod in_guest_rcb;
 mod inherited_input;
+/// Shared Linux perf event mechanics; no tracer or timer policy.
+pub mod perf;
 #[cfg(target_arch = "x86_64")]
 pub mod pmu;
+/// Process-wide PMU configuration shared by counters and precise timers.
+pub mod pmu_config;
+pub use in_guest_rcb::InGuestRcbCounter;
+pub use perf::is_perf_supported;
 mod process_signal_control;
 pub mod provider;
 #[cfg(target_arch = "x86_64")]

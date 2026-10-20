@@ -28,6 +28,12 @@ pub(super) const PATCH_BAND: (usize, usize) = (
     (PATCH_BOTTOM + ARENA_BYTES - BASE) / PAGE + 1,
 );
 
+/// Permanent page envelope for both loader/runtime windows and their two
+/// exterior guards. This excludes claims; it neither maps images nor adopts
+/// a loader-owned region. The adjacent windows have no separate inner guard.
+/// Test-only checks bind these literal bounds to reverie-loader's layout.
+pub(super) const IMAGE_BAND: (usize, usize) = (917503, 1044481);
+
 #[repr(C)]
 struct FixedArenaMetadata {
     tool: ToolHeapMetadata,
@@ -50,6 +56,13 @@ const _: () = {
     assert!(PATCH_BAND.0 == 81919 && PATCH_BAND.1 == 90113);
     assert!(TOOL_BAND.0 >= DATA_FIRST && TOOL_BAND.1 <= PATCH_BAND.0);
     assert!(PATCH_BAND.1 <= DATA_END);
+    assert!(IMAGE_BAND.0 < IMAGE_BAND.1 && IMAGE_BAND.1 <= DATA_END);
+    assert!(PATCH_BAND.1 <= IMAGE_BAND.0);
+    assert!(constructor::STACK_EXTENT_END <= BASE + IMAGE_BAND.0 * PAGE);
+    assert!((BASE + IMAGE_BAND.0 * PAGE).is_multiple_of(PAGE));
+    assert!((BASE + IMAGE_BAND.1 * PAGE).is_multiple_of(PAGE));
+    assert!(BASE + IMAGE_BAND.0 * PAGE == 0x6000_dfff_f000);
+    assert!(BASE + IMAGE_BAND.1 * PAGE == 0x6000_ff00_1000);
     assert!(offset_of!(FixedArenaMetadata, tool) == 0);
     assert!(offset_of!(FixedArenaMetadata, patch_cursor) == 24);
     assert!(size_of::<FixedArenaBacking>() == 40 && align_of::<FixedArenaBacking>() == 8);
@@ -104,13 +117,13 @@ pub struct FixedArenaMetadataAddresses {
 
 /// Inspect or mark one statically bounded band of the fresh owner's bitmap.
 ///
-/// The only callers below supply TOOL_BAND or PATCH_BAND. Their compile-time
-/// bounds keep every scalar access inside Control. Array iteration would copy
-/// an aggregate through libc in unoptimized native preparation, before the
+/// The only callers below supply TOOL_BAND, PATCH_BAND or IMAGE_BAND. Their
+/// compile-time bounds keep every scalar access inside Control. Iterating over
+/// aggregate descriptors can copy through libc in native preparation, before the
 /// Tool is ready; keep this path scalar in every supported build profile.
 #[inline(never)]
 unsafe fn fixed_bitmap_range(control: *mut Control, start: usize, end: usize, mark: bool) -> bool {
-    // SAFETY: the fresh unpublished owner exclusively owns Control; the two
+    // SAFETY: the fresh unpublished owner exclusively owns Control; all three
     // statically checked bands contain only valid bitmap indices.
     let bitmap = unsafe { (*control).occupied.get().cast::<u64>() };
     let mut page = start;
@@ -133,19 +146,27 @@ unsafe fn fixed_bitmap_range(control: *mut Control, start: usize, end: usize, ma
     true
 }
 
-/// Complete both permanent extents using authenticated fresh ownership only.
+/// Complete three permanent extents using authenticated fresh ownership only.
 ///
-/// The caller owns a newly mapped, exact private anonymous region with writable
-/// Control; production publication is serialized by INITIALIZING. No live
-/// allocators or general
-/// leases in either band. Native callers have already authenticated their
+/// The caller owns an exact fresh reservation with writable pristine Control,
+/// acquired by ordinary/native no-replace reservation or by the unsafe trusted
+/// mapped-image adoption boundary. Production publication is serialized by
+/// INITIALIZING. No live
+/// allocators or general leases occupy any of the three bands. Native callers
+/// have already authenticated their
 /// origin, record, owned stack and complete bootstrap occupancy. This function
 /// neither publishes nor cleans up its caller's mapping/live native stack.
+/// Preflight all bands before changing protections, metadata or bitmap cells.
+/// Ordinary/native fresh owners retain initial PROT_NONE in the image envelope.
+/// An authenticated mapped-image owner may already have exact qualified images
+/// there: this function never changes any image or guard protection. Initializing
+/// permanent occupancy is not itself mapping ownership or runtime readiness.
 #[inline(never)]
 pub(super) unsafe fn initialize_fixed_arenas(control: *mut Control) -> Result<(), i32> {
     // SAFETY: each exact band is statically checked inside the owned bitmap.
     if !unsafe { fixed_bitmap_range(control, TOOL_BAND.0, TOOL_BAND.1, false) }
         || !unsafe { fixed_bitmap_range(control, PATCH_BAND.0, PATCH_BAND.1, false) }
+        || !unsafe { fixed_bitmap_range(control, IMAGE_BAND.0, IMAGE_BAND.1, false) }
     {
         return Err(libc::EINVAL);
     }
@@ -182,10 +203,13 @@ pub(super) unsafe fn initialize_fixed_arenas(control: *mut Control) -> Result<()
         core::ptr::addr_of_mut!((*metadata).patch_cursor).write(AtomicUsize::new(0));
     }
     // SAFETY: protections and metadata are complete; permanently mark exactly
-    // the same two checked bands before their owner can be published.
+    // the same three checked bands before their owner can be published. The
+    // image envelope retains its caller-owned protections; no image/guard
+    // mapping changes here.
     unsafe {
         fixed_bitmap_range(control, TOOL_BAND.0, TOOL_BAND.1, true);
         fixed_bitmap_range(control, PATCH_BAND.0, PATCH_BAND.1, true);
+        fixed_bitmap_range(control, IMAGE_BAND.0, IMAGE_BAND.1, true);
     }
     Ok(())
 }

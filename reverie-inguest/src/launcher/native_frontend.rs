@@ -7,10 +7,10 @@ use std::sync::atomic::Ordering;
 
 use crate::seccomp::SeccompFilter;
 
-/// Fixed native bootstrap gate address shared with the actual C/ASM producer.
-pub const GATE_BASE: usize = 0x5000_0000_0000;
+/// Selected fixed native gate; GNU matches the existing C/ASM producer ABI.
+pub const GATE_BASE: usize = crate::trap::FIXED_GATE_BASE as usize;
 /// Entire copied and verified gate PT_LOAD length, including padding.
-pub const GATE_BYTES: usize = 4096;
+pub const GATE_BYTES: usize = crate::trap::FIXED_GATE_BYTES as usize;
 
 unsafe extern "C" {
     fn reverie_native_launch_syscall(
@@ -41,13 +41,14 @@ core::arch::global_asm!(
     "mov r8,r9",
     "mov r9,[rsp+16]",
     "lea r12,[rip+.Lnative_launch_return]",
-    "mov rcx,0x50000000007c",
+    "mov rcx,{native_gate}",
     "jmp rcx",
     ".Lnative_launch_return:",
     "endbr64",
     "pop r12",
     "ret",
     ".size reverie_native_launch_syscall,.-reverie_native_launch_syscall",
+    native_gate = const crate::trap::FIXED_NATIVE_ENTRY,
 );
 
 /// Final target entry for Command's unchanged prepared path/argv/envp.

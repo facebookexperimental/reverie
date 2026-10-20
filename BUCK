@@ -30,10 +30,15 @@ rust_library(
     autocargo = {
         "cargo_toml_config": {
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-core"),
+            "features": {"default": [], "perf-fixture": []},
+            "dependencies_override": {"dev-dependencies": {"tracing-subscriber": {"features": ["env-filter"]}}},
         },
         "cargo_toml_dir": "reverie",
     },
+    # Same core crate identity; inert resource helpers, no eager activation.
+    features = ["perf-fixture"],
     test_rustc_flags = sanitized_feature,
+    test_deps = ["fbsource//third-party/rust:tracing-subscriber"],
     deps = [
         "fbsource//third-party/rust:addr2line",
         "fbsource//third-party/rust:anyhow",
@@ -47,6 +52,7 @@ rust_library(
         "fbsource//third-party/rust:never-say-never",
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:object",
+        "fbsource//third-party/rust:perf-event-open-sys",
         "fbsource//third-party/rust:procfs",
         "fbsource//third-party/rust:raw-cpuid",
         "fbsource//third-party/rust:serde",
@@ -141,6 +147,7 @@ rust_library(
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-ptrace", build = "build.rs"),
             "dependencies_override": {
                 "build-dependencies": {"pkg-config": {"version": "0.3"}},
+                "dev-dependencies": {"reverie": {"package": "reverie-core", "features": ["perf-fixture"]}},
                 "dependencies": {
                     "safeptrace": {
                         "features": [
@@ -150,7 +157,7 @@ rust_library(
                     },
                 },
             },
-            "features": {"default": [], "nightly": []},
+            "features": {"default": [], "nightly": [], "rcb-observation": []},
         },
         "cargo_toml_dir": "reverie-ptrace",
         "edge_features": [],
@@ -205,6 +212,7 @@ rust_library(
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-syscalls"),
             "dependencies_override": {
                 "dependencies": {
+                    "linux-raw-sys": {"default-features": False, "features": ["std", "general", "system", "net"]},
                     "bitflags": {
                         "features": [
                             "serde",
@@ -219,6 +227,7 @@ rust_library(
         "fbsource//third-party/rust:bitflags",
         "fbsource//third-party/rust:derive_more",
         "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:linux-raw-sys",
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:paste",
         "fbsource//third-party/rust:serde",
@@ -331,11 +340,13 @@ rust_library(
                 ],
                 "default": ["preload-constructor"],
                 "exec-stop": ["launcher", "dep:reverie-loader", "dep:safeptrace", "dep:reverie-memory", "dep:nix"],
+                "fixed-syscall-gates": [],
+                "exec-private-init": ["fixed-syscall-gates"],
+                "loader-private-runtime": ["exec-private-init", "dep:reverie-loader"],
                 "launcher": ["coordinator-rpc", "dep:tempfile", "dep:tokio", "dep:tracing"],
                 "preload-constructor": [],
                 "rcb-clock": [
                     "reverie",
-                    "reverie-ptrace",
                 ],
             },
         },
@@ -344,7 +355,10 @@ rust_library(
     features = [
         "coordinator-rpc",
         "exec-stop",
+        "exec-private-init",
+        "fixed-syscall-gates",
         "launcher",
+        "loader-private-runtime",
         "rcb-clock",
     ],
     test_deps = [
@@ -364,7 +378,6 @@ rust_library(
         ":reverie",
         ":reverie-loader",
         ":reverie-memory",
-        ":reverie-ptrace",
         ":reverie-rpc-transport",
         ":reverie-syscalls",
         ":safeptrace",

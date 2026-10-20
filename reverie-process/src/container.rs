@@ -1713,6 +1713,36 @@ const STARTUP_READY: u8 = 2;
 const STARTUP_FAILURE: u8 = 4;
 const STARTUP_FRAME_SIZE: usize = 64;
 
+// GNU and musl use different integer types for ancillary lengths. Keep
+// conversions checked without assuming a particular libc field type.
+fn startup_abi_len<T, U: TryFrom<T>>(value: T) -> Result<U, StartupError> {
+    U::try_from(value).map_err(|_| StartupError::Protocol)
+}
+
+fn startup_rights_lengths(count: usize) -> Result<(u32, u32), StartupError> {
+    // All callers use sixteen aligned words. Reserve a word for worst-case
+    // CMSG alignment; this also proves the bounded CMSG arithmetic fits u32.
+    const {
+        assert!(std::mem::size_of::<usize>() >= std::mem::size_of::<u32>());
+        assert!(
+            MAX_STARTUP_FDS
+                <= (std::mem::size_of::<[usize; 16]>()
+                    - std::mem::size_of::<libc::cmsghdr>()
+                    - std::mem::size_of::<usize>())
+                    / std::mem::size_of::<i32>()
+        );
+    }
+    if count > MAX_STARTUP_FDS {
+        return Err(StartupError::Protocol);
+    }
+    let bytes = count
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(StartupError::Protocol)?;
+    let bytes = startup_abi_len(bytes)?;
+    // SAFETY: the checked count and compile-time capacity bound prevent overflow.
+    Ok(unsafe { (libc::CMSG_SPACE(bytes), libc::CMSG_LEN(bytes)) })
+}
+
 struct StartupSocket {
     fd: Fd,
     deadline: std::time::Instant,
@@ -1775,15 +1805,17 @@ impl StartupSocket {
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
         if fds.len != 0 {
             message.msg_control = ancillary.as_mut_ptr().cast();
-            message.msg_controllen =
-                unsafe { libc::CMSG_SPACE((fds.len * std::mem::size_of::<i32>()) as u32) as usize };
-            assert!(message.msg_controllen <= std::mem::size_of_val(&ancillary));
+            let (space, length) = startup_rights_lengths(fds.len)?;
+            message.msg_controllen = startup_abi_len(space)?;
+            assert!(
+                startup_abi_len::<_, usize>(message.msg_controllen)?
+                    <= std::mem::size_of_val(&ancillary)
+            );
             unsafe {
                 let header = libc::CMSG_FIRSTHDR(&message);
                 (*header).cmsg_level = libc::SOL_SOCKET;
                 (*header).cmsg_type = libc::SCM_RIGHTS;
-                (*header).cmsg_len =
-                    libc::CMSG_LEN((fds.len * std::mem::size_of::<i32>()) as u32) as usize;
+                (*header).cmsg_len = startup_abi_len(length)?;
                 let data = libc::CMSG_DATA(header).cast::<i32>();
                 for index in 0..fds.len {
                     data.add(index)
@@ -1866,10 +1898,12 @@ impl StartupSocket {
             message.msg_iov = &mut iov;
             message.msg_iovlen = 1;
             message.msg_control = ancillary.as_mut_ptr().cast();
-            message.msg_controllen = unsafe {
-                libc::CMSG_SPACE((MAX_STARTUP_FDS * std::mem::size_of::<i32>()) as u32) as usize
-            };
-            assert!(message.msg_controllen <= std::mem::size_of_val(&ancillary));
+            let (space, _) = startup_rights_lengths(MAX_STARTUP_FDS)?;
+            message.msg_controllen = startup_abi_len(space)?;
+            assert!(
+                startup_abi_len::<_, usize>(message.msg_controllen)?
+                    <= std::mem::size_of_val(&ancillary)
+            );
             let size = match Errno::result(unsafe {
                 libc::recvmsg(self.fd.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC)
             }) {
@@ -1884,11 +1918,12 @@ impl StartupSocket {
             unsafe {
                 let mut header = libc::CMSG_FIRSTHDR(&message);
                 while !header.is_null() {
+                    let length: usize = startup_abi_len((*header).cmsg_len)?;
                     if (*header).cmsg_level == libc::SOL_SOCKET
                         && (*header).cmsg_type == libc::SCM_RIGHTS
-                        && (*header).cmsg_len >= libc::CMSG_LEN(0) as usize
+                        && length >= libc::CMSG_LEN(0) as usize
                     {
-                        let bytes = (*header).cmsg_len - libc::CMSG_LEN(0) as usize;
+                        let bytes = length - libc::CMSG_LEN(0) as usize;
                         malformed |= !bytes.is_multiple_of(std::mem::size_of::<i32>());
                         let data = libc::CMSG_DATA(header).cast::<i32>();
                         for index in 0..bytes / std::mem::size_of::<i32>() {
@@ -2821,6 +2856,42 @@ mod tests {
     use nix::sys::signal::sigaction;
 
     use super::*;
+
+    #[test]
+    fn ancillary_abi_lengths_are_checked_and_bounded() {
+        assert_eq!(startup_abi_len::<_, u32>(u32::MAX as usize), Ok(u32::MAX));
+        if let Some(overflow) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(
+                startup_abi_len::<_, u32>(overflow),
+                Err(StartupError::Protocol)
+            );
+        }
+        assert_eq!(
+            startup_rights_lengths(MAX_STARTUP_FDS + 1),
+            Err(StartupError::Protocol)
+        );
+        assert_eq!(
+            startup_rights_lengths(usize::MAX),
+            Err(StartupError::Protocol)
+        );
+        for count in 0..=MAX_STARTUP_FDS {
+            let (space, length) = startup_rights_lengths(count).unwrap();
+            assert!(length <= space);
+            assert!(space as usize <= std::mem::size_of::<[usize; 16]>());
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_controllen = startup_abi_len(space).unwrap();
+            assert_eq!(
+                startup_abi_len::<_, usize>(message.msg_controllen).unwrap(),
+                space as usize
+            );
+            let mut header: libc::cmsghdr = unsafe { std::mem::zeroed() };
+            header.cmsg_len = startup_abi_len(length).unwrap();
+            assert_eq!(
+                startup_abi_len::<_, usize>(header.cmsg_len).unwrap(),
+                length as usize
+            );
+        }
+    }
 
     include!("owned_deferred_tests.rs");
 

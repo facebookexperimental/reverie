@@ -28,6 +28,8 @@ rpc-io-fixture = ["reverie-inguest/rpc-io-fixture"]
 fixed-syscall-gates = ["reverie-inguest/fixed-syscall-gates"]
 # Private GNU loader InitialImage experiment; no successor exec admission.
 exec-private-init = ["fixed-syscall-gates", "reverie-inguest/exec-private-init"]
+# Forward the explicit private-loader layout; GNU keeps the legacy gate ABI.
+loader-private-runtime = ["exec-private-init", "reverie-inguest/loader-private-runtime"]
 # Inactive bounded native statistics transfer; no existing caller enables it.
 native-exec-state = ["exec-private-init", "reverie-inguest/native-exec-state"]
 # Inactive explicit successor installer; ordinary entry points stay unchanged.

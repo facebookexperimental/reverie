@@ -34,7 +34,7 @@ pub mod instruction;
 pub mod native_exec;
 #[cfg(feature = "exec-native-injection")]
 pub mod native_exec_arguments;
-#[cfg(feature = "exec-native-injection")]
+#[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
 pub mod native_exec_fds;
 #[cfg(feature = "exec-native-injection")]
 pub mod native_exec_mappings;

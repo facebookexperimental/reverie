@@ -13,6 +13,8 @@
 #![deny(unsafe_code)]
 
 mod control;
+#[cfg(feature = "loader-private-runtime")]
+mod mapped_preparation;
 #[path = "../../../tests/fixtures/probe_protocol.rs"]
 mod protocol;
 use std::fs::File;
@@ -648,6 +650,17 @@ fn cleanup_json(state: &CleanupState) -> Value {
 
 fn main() {
     let mut args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(feature = "loader-private-runtime")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--mapped-preparation-only")
+    {
+        if let Err(error) = mapped_preparation::run(&args) {
+            eprintln!("mapped preparation refused: {error}");
+            std::process::exit(REFUSAL_EXIT);
+        }
+        return;
+    }
     let pause_checkpoint = if args
         .first()
         .is_some_and(|a| a == "--pause-after-exec-drain")

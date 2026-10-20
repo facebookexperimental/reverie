@@ -295,6 +295,22 @@ mod tests {
             0
         }
 
+        fn on_initial_image_attached(
+            &self,
+            tid: reverie::Tid,
+            state: &mut u64,
+        ) -> Result<(), Error> {
+            if matches!(self.mode, 15 | 16) {
+                assert_eq!(tid, raw_pid(libc::SYS_gettid));
+                assert_eq!(*state, 0);
+                self.calls.lock().unwrap().push("attached");
+                if self.mode == 16 {
+                    return Err(Errno::EIO.into());
+                }
+            }
+            Ok(())
+        }
+
         async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
             self.calls.lock().unwrap().push("start");
             assert_eq!(guest.pid(), raw_pid(libc::SYS_getpid));
@@ -523,6 +539,70 @@ mod tests {
             )),
             worker,
         )
+    }
+
+    #[test]
+    fn attached_image_hook_precedes_registration_callbacks_and_is_single_use() {
+        isolated(
+            || {
+                let (_native, owner) = lifecycle_test_owner();
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let mut memory = Box::new([0_u8; 16]);
+                let (host, worker) = host(15, memory.as_mut_ptr() as usize, calls.clone());
+                unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                mark_lifecycle_test_frontend_installed(&owner);
+                host.initialize_initial_image_lifecycle(&owner).unwrap();
+                assert_eq!(
+                    *calls.lock().unwrap(),
+                    ["init", "attached", "start", "post-exec"]
+                );
+                assert_eq!(*memory, [0x5a; 16]);
+                assert_eq!(
+                    host.states.lock().get(&raw_pid(libc::SYS_gettid).as_raw()),
+                    Some(&2)
+                );
+                assert!(host.initialize_initial_image_lifecycle(&owner).is_err());
+                assert_eq!(
+                    *calls.lock().unwrap(),
+                    ["init", "attached", "start", "post-exec"]
+                );
+                drop(host);
+                assert_eq!(worker.join().unwrap(), [1, 2]);
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn attached_hook_error_or_missing_permit_cannot_register_or_publish() {
+        for installed in [false, true] {
+            isolated(
+                move || {
+                    let (_native, owner) = lifecycle_test_owner();
+                    let calls = Arc::new(Mutex::new(Vec::new()));
+                    let mut memory = Box::new([0_u8; 16]);
+                    let (host, worker) = host(16, memory.as_mut_ptr() as usize, calls.clone());
+                    unsafe { host.bind_initial_image_control(&owner) }.unwrap();
+                    if installed {
+                        mark_lifecycle_test_frontend_installed(&owner);
+                    }
+                    let error = host.initialize_initial_image_lifecycle(&owner).unwrap_err();
+                    if installed {
+                        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+                        assert_eq!(*calls.lock().unwrap(), ["init", "attached"]);
+                    } else {
+                        assert!(calls.lock().unwrap().is_empty());
+                    }
+                    assert!(host.states.lock().is_empty());
+                    assert_eq!(*memory, [0; 16]);
+                    assert!(owner.finish().is_err());
+                    assert!(host.initialize_initial_image_lifecycle(&owner).is_err());
+                    drop(host);
+                    assert!(worker.join().unwrap().is_empty());
+                },
+                0,
+            );
+        }
     }
 
     #[test]

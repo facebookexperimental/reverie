@@ -155,6 +155,14 @@ pub const SECCOMP_IOCTL_NOTIF_SEND: u64 = 0xc0182101;
 pub const SECCOMP_IOCTL_NOTIF_ID_VALID: u64 = 0x40082102;
 pub const SECCOMP_IOCTL_NOTIF_ADDFD: u64 = 0x40182103;
 
+// Linux ioctl request numbers are 32-bit bit patterns. GNU declares the
+// argument unsigned long, musl int. Preserve bit 31 without rejecting valid
+// requests as signed overflow, and refuse values outside the Linux ABI width.
+const fn seccomp_ioctl_request(request: u64) -> libc::Ioctl {
+    assert!(request <= u32::MAX as u64);
+    request as libc::Ioctl
+}
+
 /// Represents a stream and sink of seccomp notifications.
 #[derive(Debug)]
 pub struct SeccompNotif(AsyncFd<Fd>);
@@ -199,7 +207,7 @@ impl SeccompNotif {
         Errno::result(unsafe {
             libc::ioctl(
                 self.0.as_raw_fd(),
-                SECCOMP_IOCTL_NOTIF_SEND,
+                const { seccomp_ioctl_request(SECCOMP_IOCTL_NOTIF_SEND) },
                 response as *const _,
             )
         })
@@ -243,7 +251,7 @@ impl SeccompNotif {
         Errno::result(unsafe {
             libc::ioctl(
                 self.0.as_raw_fd(),
-                SECCOMP_IOCTL_NOTIF_ID_VALID,
+                const { seccomp_ioctl_request(SECCOMP_IOCTL_NOTIF_ID_VALID) },
                 &id as *const _,
             )
         })
@@ -268,7 +276,7 @@ impl SeccompNotif {
         Errno::result(unsafe {
             libc::ioctl(
                 self.0.as_raw_fd(),
-                SECCOMP_IOCTL_NOTIF_ADDFD,
+                const { seccomp_ioctl_request(SECCOMP_IOCTL_NOTIF_ADDFD) },
                 addfd as *const _,
             )
         })
@@ -296,7 +304,7 @@ fn seccomp_notif_recv(fd: &Fd) -> io::Result<seccomp_notif> {
     match Errno::result(unsafe {
         libc::ioctl(
             fd.as_raw_fd(),
-            SECCOMP_IOCTL_NOTIF_RECV,
+            const { seccomp_ioctl_request(SECCOMP_IOCTL_NOTIF_RECV) },
             &mut response as *mut _,
         )
     }) {
@@ -307,4 +315,28 @@ fn seccomp_notif_recv(fd: &Fd) -> io::Result<seccomp_notif> {
     }?;
 
     Ok(unsafe { response.assume_init() })
+}
+
+#[cfg(test)]
+mod portability_tests {
+    use super::*;
+
+    #[test]
+    fn seccomp_ioctl_request_preserves_all_linux_request_bits() {
+        for request in [
+            SECCOMP_IOCTL_NOTIF_RECV,
+            SECCOMP_IOCTL_NOTIF_SEND,
+            SECCOMP_IOCTL_NOTIF_ID_VALID,
+            SECCOMP_IOCTL_NOTIF_ADDFD,
+        ] {
+            // This intentional bit-pattern round trip includes bit 31.
+            assert_eq!(seccomp_ioctl_request(request) as u32 as u64, request);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn seccomp_ioctl_request_refuses_wider_than_linux_abi() {
+        let _ = seccomp_ioctl_request(1u64 << 32);
+    }
 }

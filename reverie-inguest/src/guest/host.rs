@@ -507,6 +507,14 @@ where
         if let Some(driver) = &self.native_exec_driver {
             driver.bind_initial_state(tool, &mut state, tid.as_raw())?;
         }
+        // The same live permit authenticates this already-completed initial
+        // image. Bind before any callback can register the freshly built state.
+        // Native physical binding above intentionally still sees initial state.
+        tool.on_initial_image_attached(tid, &mut state)
+            .map_err(|error| match error {
+                Error::Errno(errno) => io::Error::from_raw_os_error(errno.into_raw()),
+                other => io::Error::other(describe_reverie_error(&other)),
+            })?;
         let tail = TailResult::default();
         {
             let mut guest = image_guest::ImageGuest::<T, R>::new(
@@ -3298,6 +3306,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             syscall_args.arg4 as u64,
             syscall_args.arg5 as u64,
         ];
+        let tail_number = number;
         let number = number.id() as i64;
         #[cfg(feature = "exec-native-injection")]
         if let Err(error) = self.check_native_mapping(number, args) {
@@ -3323,6 +3332,11 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
                 ),
             );
         }
+        // Scope/filter/native-mapping refusals above produced no admitted tail.
+        // Observe before any actual effect and before stage_ending closes the
+        // callback's counted output cut. Result guards below are syscall errno
+        // outcomes, not a second tail operation.
+        reverie::observe_tail_start(self.tid, tail_number);
         if is_plain_fork(number, args) {
             let parent_tid = self.tid;
             let parent_pid = self.pid;
@@ -4101,5 +4115,168 @@ mod tests {
             libc::SYS_seccomp,
             [u64::from(libc::SECCOMP_GET_ACTION_AVAIL), 0, 0, 0, 0, 0]
         ));
+    }
+
+    #[cfg(test)]
+    mod tail_start_route_tests {
+        use std::future::Future;
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::task::Context;
+        use std::task::Poll;
+        use std::task::Waker;
+
+        use super::*;
+
+        /// The old ToolSyscallRuntime deliberately denies all signal admission
+        /// for its unrelated interception control. Reuse its other services,
+        /// but use the actual installed runtime's signal predicate here so an
+        /// ordinary exit reaches the production tail-ending path.
+        struct TailStartRuntime;
+        impl HostRuntime for TailStartRuntime {
+            fn fork_child_rebind(&self) {
+                super::ToolSyscallRuntime.fork_child_rebind()
+            }
+            fn emit_stage(&self, stage: &[u8]) {
+                super::ToolSyscallRuntime.emit_stage(stage)
+            }
+            fn fork_child_reset(&self, event: &SyscallEvent) {
+                super::ToolSyscallRuntime.fork_child_reset(event)
+            }
+            fn cpuid_interception_enabled(&self) -> bool {
+                super::ToolSyscallRuntime.cpuid_interception_enabled()
+            }
+            fn exit_process_stats(&self, tid: Pid) -> io::Result<()> {
+                super::ToolSyscallRuntime.exit_process_stats(tid)
+            }
+            fn read_clock(&self) -> io::Result<u64> {
+                super::ToolSyscallRuntime.read_clock()
+            }
+            fn signal_action_supported(&self, number: i64, args: [u64; 6]) -> bool {
+                crate::guest::signal::signal_action_supported(number, args)
+            }
+            fn reserved_signal_mask(&self) -> u64 {
+                super::ToolSyscallRuntime.reserved_signal_mask()
+            }
+        }
+
+        static EVENTS: AtomicUsize = AtomicUsize::new(0);
+        fn observe(tid: Pid, number: Sysno) {
+            assert!(tid.as_raw() > 0);
+            assert_eq!(number, Sysno::exit_group);
+            EVENTS.fetch_add(1, Ordering::SeqCst);
+            eprintln!("TAIL_START_OBSERVED");
+        }
+
+        #[test]
+        fn actual_tail_scope_and_ending_reentry_observe_once() {
+            const TEST: &str = "guest::host::tests::tail_start_route_tests::actual_tail_scope_and_ending_reentry_observe_once";
+            const MODE: &str = "REVERIE_TAIL_START_ROUTE_MODE";
+            let Some(mode) = std::env::var_os(MODE) else {
+                for mode in ["ending", "refused"] {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                        .env(MODE, mode)
+                        .output()
+                        .unwrap();
+                    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+                    if mode == "ending" {
+                        assert!(output.status.success(), "{output:?}");
+                        assert_eq!(
+                            stderr.matches("TAIL_START_OBSERVED").count(),
+                            1,
+                            "{output:?}"
+                        );
+                        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                    } else {
+                        assert_eq!(output.status.code(), Some(125), "{output:?}");
+                        assert!(!stderr.contains("TAIL_START_OBSERVED"), "{output:?}");
+                        assert!(
+                            stderr.contains("outside a syscall handler is unsupported"),
+                            "{output:?}"
+                        );
+                    }
+                }
+                return;
+            };
+            // Check real production admission, not a forced ending flag or
+            // a bypass of injected_syscall_guard. The scope-refusal child still
+            // fails earlier at the actual outside-handler check.
+            assert!(
+                injected_syscall_guard(&TailStartRuntime, libc::SYS_exit_group, [0; 6]).is_none()
+            );
+            assert!(injected_syscall_guard(&TailStartRuntime, libc::SYS_getpid, [0; 6]).is_none());
+            reverie::set_tail_start_forwarder(observe).unwrap();
+            let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let config = reverie_rpc_transport::codec::encode(&()).unwrap();
+            peer.write_all(&(config.len() as u32).to_be_bytes())
+                .unwrap();
+            peer.write_all(&config).unwrap();
+            let tid = raw_pid(libc::SYS_gettid);
+            let client = reverie_rpc_transport::BlockingRpcClient::<(), _>::from_connected_stream(
+                crate::guest::rpc::GuestRpcStream::from(client),
+                tid,
+            )
+            .unwrap();
+            let rpc = CoordinatorRpc::from_live_client("unused-tail-route-test", client, |_, _| {
+                panic!("tail control must not reconnect")
+            })
+            .unwrap();
+            let mut event = SyscallEvent {
+                number: libc::SYS_exit_group,
+                args: [0; 6],
+                instruction_pointer: 0,
+                result: 0,
+                context: 0,
+                dispatch: SyscallDispatch::InstalledHook,
+                guest_pkru: None,
+            };
+            let tail = TailResult::default();
+            let mut state = ();
+            let mut guest = InGuest::<(), _> {
+                event: &mut event,
+                tid,
+                pid: raw_pid(libc::SYS_getpid),
+                ppid: None,
+                state: &mut state,
+                rpc: &rpc,
+                tail: &tail,
+                cpuid_interception: false,
+                fork_parent_state: None,
+                runtime: &TailStartRuntime,
+                staged_signals: Vec::new(),
+                staged_signal_delivery: false,
+                in_syscall_handler: false,
+                #[cfg(feature = "exec-native-injection")]
+                exec: None,
+                #[cfg(feature = "exec-native-injection")]
+                mapping_driver: None,
+                unsupported_refusal: None,
+            };
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            if mode == "refused" {
+                let mut future =
+                    core::pin::pin!(guest.tail_inject(reverie::syscalls::Getpid::default()));
+                let _ = future.as_mut().poll(&mut context);
+                panic!("real scope refusal must terminate the isolated test child");
+            }
+            {
+                let mut future =
+                    core::pin::pin!(guest.tail_inject(reverie::syscalls::ExitGroup::default()));
+                assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+                assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+                assert_eq!(EVENTS.load(Ordering::SeqCst), 1);
+            }
+            assert!(tail.ending());
+            assert_eq!(EVENTS.load(Ordering::SeqCst), 1);
+            {
+                let mut future =
+                    core::pin::pin!(guest.tail_inject(reverie::syscalls::ExitGroup::default()));
+                assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+            }
+            assert_eq!(EVENTS.load(Ordering::SeqCst), 1);
+        }
     }
 }

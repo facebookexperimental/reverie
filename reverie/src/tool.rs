@@ -698,6 +698,24 @@ pub trait Tool: Send + Sync + Default {
         Default::default()
     }
 
+    /// Bind a fresh root state to an initial image whose launch exec has
+    /// already completed before this Tool's first registration.
+    ///
+    /// A backend may call this synchronous hook only under its existing
+    /// authenticated, one-use initial-image owner, after constructing this
+    /// exact state and before `handle_thread_start` or any registration/RPC.
+    /// A root TID, missing parent, image address or serialized flag alone is
+    /// not this fact. It is not used for a preserved or restored exec state.
+    /// The default changes nothing. An error is fatal initialization failure;
+    /// the backend must retain physical ownership and must not resume Guest.
+    fn on_initial_image_attached(
+        &self,
+        _tid: Tid,
+        _thread_state: &mut Self::ThreadState,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Similar to `handle_syscall_event`, except this traps the first
     /// instruction executed by a new thread. Typical uses of this method include
     /// delaying thread execution or running initialization actions (injections

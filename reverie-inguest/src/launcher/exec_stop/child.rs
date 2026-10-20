@@ -22,6 +22,35 @@ use super::CleanupOwner;
 use super::CleanupReceipt;
 use super::CleanupWaitFailure;
 
+// Descriptor-only observation in this existing audited unsafe boundary.
+#[cfg(feature = "loader-private-runtime")]
+pub(super) fn live_birth_pidfd(fd: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut descriptor = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live initialized pollfd, no borrowed target memory, timeout0.
+    let result = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let error = if descriptor.revents & libc::POLLNVAL != 0 {
+        Some(libc::EBADF)
+    } else if descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        Some(libc::ESRCH)
+    } else if descriptor.revents != 0 || result != 0 {
+        Some(libc::EIO)
+    } else {
+        None
+    };
+    match error {
+        Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+        None => Ok(()),
+    }
+}
+
 /// Atomic clone/pidfd ownership before safeptrace acquires its generation.
 /// Once transferred, only safeptrace may wait for this child.
 pub(super) struct PendingChild {
@@ -36,6 +65,13 @@ pub(super) struct PendingChild {
 impl PendingChild {
     pub fn pid(&self) -> Pid {
         self.pid
+    }
+
+    // Retain the actual atomic CLONE_PIDFD before the generation takes wait
+    // ownership. Failure leaves PendingChild responsible for kill/wait.
+    #[cfg(feature = "loader-private-runtime")]
+    pub(super) fn duplicate_birth_pidfd(&self) -> std::io::Result<OwnedFd> {
+        self.pidfd.try_clone()
     }
 
     pub fn transfer_to_ptracer(&mut self) {
@@ -148,9 +184,25 @@ pub struct PreparedExec<'fd> {
     environment: Vec<*const libc::c_char>,
     inherited: Vec<std::os::fd::BorrowedFd<'fd>>,
     cwd: Option<std::fs::File>,
+    ptrace_launch_facts: bool,
 }
 
 impl<'fd> PreparedExec<'fd> {
+    /// Match the ordinary ptrace child's deterministic address-space and
+    /// terminal job-control setup before exec, without changing this parent.
+    /// The default constructor preserves its existing inherited behavior.
+    pub fn with_ptrace_launch_facts(mut self) -> Self {
+        self.ptrace_launch_facts = true;
+        self
+    }
+
+    #[cfg(feature = "loader-private-runtime")]
+    pub(super) fn retains_descriptor(&self, fd: std::os::fd::BorrowedFd<'_>) -> bool {
+        self.inherited
+            .iter()
+            .any(|inherited| inherited.as_raw_fd() == fd.as_raw_fd())
+    }
+
     /// Prepare a direct exec before clone. No PATH or shell fallback is used.
     ///
     /// `arguments` includes argv0, independently of `program`. Environment is
@@ -225,6 +277,7 @@ impl<'fd> PreparedExec<'fd> {
             _environment: environment,
             inherited,
             cwd,
+            ptrace_launch_facts: false,
         })
     }
 
@@ -312,6 +365,37 @@ impl<'fd> PreparedExec<'fd> {
                 ) < 0
             {
                 exit_child();
+            }
+            if self.ptrace_launch_facts {
+                // Same request as reverie-ptrace::tracer::init_tracee. Raw
+                // syscalls keep this existing post-clone boundary allocation
+                // free; a refusal exits before executing the requested image.
+                const PER_LINUX_NO_RANDOMIZE: u64 = 0x0004_0000;
+                if syscall6(
+                    libc::SYS_personality as u64,
+                    [PER_LINUX_NO_RANDOMIZE, 0, 0, 0, 0, 0],
+                ) < 0
+                    || syscall6(
+                        libc::SYS_personality as u64,
+                        [u64::from(u32::MAX), 0, 0, 0, 0, 0],
+                    ) != PER_LINUX_NO_RANDOMIZE as i64
+                {
+                    exit_child();
+                }
+                // x86-64 kernel sigaction layout, matching the ordinary
+                // SIG_IGN/SA_RESTART/empty-mask request for both signals.
+                // No handler executes: exec retains SIG_IGN, clearing action
+                // flags/restorer/mask. No libc restorer address is transplanted.
+                let ignored = [libc::SIG_IGN as u64, libc::SA_RESTART as u64, 0_u64, 0_u64];
+                for signal in [libc::SIGTTIN, libc::SIGTTOU] {
+                    if syscall6(
+                        libc::SYS_rt_sigaction as u64,
+                        [signal as u64, ignored.as_ptr() as u64, 0, 8, 0, 0],
+                    ) < 0
+                    {
+                        exit_child();
+                    }
+                }
             }
             if let Some(cwd) = &self.cwd
                 && syscall6(

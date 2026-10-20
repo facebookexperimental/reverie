@@ -94,9 +94,11 @@ pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Hash the exact source compiled into this host proof library/module. Consumers
-/// compare it with Cargo metadata's canonical library target source, independent
-/// of the runtime artifact's package and source identity.
+/// Hash the exact lib.rs root compiled into this host proof library/module.
+/// External implementation modules have separate compiled-byte bindings; this
+/// root hash alone is not complete compiler-input closure. Consumers compare it
+/// with Cargo metadata's canonical library target source, independently of the
+/// runtime artifact's package and source identity.
 pub fn qualifier_source_sha256() -> String {
     sha256(include_bytes!("lib.rs"))
 }
@@ -737,7 +739,37 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 }
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 22] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 53] = [
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
+        20525,
+        "6784c9ff6433b3bc8ad1e81e0563352b7660f2931aad9bcab6f47cfc02f14759",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
+        33962,
+        "eead70fc90371dafaf4068785789854560687d6d3b9314f8b1db48020920955f",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
+        9263,
+        "a8c7e953c0b3d66aa5eb80455ef403d659121949cc7ce7441806b4c52f6492f1",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
+        17921,
+        "babd71dd22528d2a116cb74fd65844d3e7f2a14ee1abfd64634931df3f2a6905",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+        12121,
+        "881a7029e0bb50d33dcd177bb4f215d99e947e9cdd530a7798ab8dfa1986bfd2",
+    ),
     (
         "Cargo.toml",
         919,
@@ -749,24 +781,114 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 22] = [
         "9115b87c568b997424bb222ff2453bd4566154a70296e7ec7f16b0cb6efc9285",
     ),
     (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
+        52684,
+        "d0fc60d6be526aae972b69b1deb4b2d982e355dcf5b75ce2454d106aff44e992",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site/caller.rs",
+        53465,
+        "2c8bfb09a31113f150c44a3964046fc557be24ca5ff9dd078d932f29ad4bc5f3",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
+        41315,
+        "6cfc3c67d8485dff9463cff67be604f81fce9d7f92f63f93f118fc7b4a2e7ccb",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+        237052,
+        "7de6b421cd20b9be86ebac8adfcc52e827e968aabed455257b0506b956bc6dfc",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/native_leaves.rs",
+        30102,
+        "61df7de3a0b864b9ca40975dfc7500cae27bffcd16681f4b0748dd62b5e54eec",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/musl_memset_member.rs",
+        16456,
+        "ad476420b823fefdaa7c6d1d781af44b19a8e2ba93b2cdb7c475c27486defa20",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/musl_memset_source.txt",
+        1128,
+        "aa843bcfb5b75e232df8d26dab6e5cec4f7123b33bebe655ce957f95f839f2e1",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/musl_set_thread_area_member.rs",
+        15104,
+        "55a308d6862950454c4f2014473f33478dc220bca60e6427f21648ecf23a62b3",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/musl_set_thread_area_source.txt",
+        395,
+        "9a6299228be5f8f467652263e8f98c1f9ab2e0937243589b8c5642f0ebe3236d",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/musl_libc_common_map.txt",
+        323,
+        "dceebb278ea1d8eac22e4586cccb514515a0975094bdcf2a59cf7b6ce6832d07",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/musl_libc_common_member.rs",
+        12456,
+        "a09edf665fdef9480e559d6d88302c6055067df809494e89a4ab0c7dea40f5d5",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/optional-zero-a03.json",
+        130343,
+        "4463a36c54c10c986a68be0c3656ea21329de269bfe4a82488c89b4b1ef705a8",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
+        63386,
+        "a9229d250646b370024ce9f14f060b371b68cc33614099d408b02166545ea09d",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+        31597,
+        "18edf50c8eecde1471edbe9bb60c9f39f9874cbde8b8090b9531faaa550ca3c1",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/ordinary_preceding_gate_page.rs",
+        21838,
+        "2bfed2d5b5afacc74f1cf5aabc90f693e25c291859d34c06cfe8de1704d788a8",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/selected_init_v12.json",
+        14075,
+        "1813a5af6b45159a6dbb822aead73abe97c23f8049d57fec073098d89e599764",
+    ),
+    (
         "reverie-inguest/Cargo.toml",
-        5379,
-        "402c6c788ff480c2dca6851bd79bcab627c3d324474734022c4692a96a539308",
+        5569,
+        "71e2a295a5f59e3c129247c91b9beb84d19a07b0148153c884449af37d082aa7",
     ),
     (
         "reverie-inguest/src/lib.rs",
-        11558,
-        "e9307dfc7e9f2d7395cbb33d36ff4a955fc6ca581565fb638305c98a77435224",
+        11734,
+        "0fbf94503eac27b65e52967c11c675e23e7a2f50338ca32150002ff4c64fabbf",
     ),
     (
         "reverie-syscalls/Cargo.toml",
-        1180,
-        "57d1f6203c718fd4f5613a77b90df6aeacb41a0280779db76b9d905f80c41842",
+        1293,
+        "41d0e825558f8491ddaa06ec8eaf2afc0e79e1a53245131fef1662c26749c6a6",
     ),
     (
         "reverie-syscalls/src/lib.rs",
-        1145,
-        "b762c98d9cf3a8898e72be4fbc15f3997705c207613182661c429c99704d6ba6",
+        1164,
+        "76dfe6ee7a71bd618f4d0c77a8e8a8a55658972f1b8167447bfb49ec26d2cb3b",
+    ),
+    (
+        "reverie-syscalls/src/linux_abi.rs",
+        8696,
+        "ff08eaa565df48839bb298d7ee3eb72deca2cfd870a7453e05efd821b0b29dc6",
+    ),
+    (
+        "reverie-syscalls/src/linux_abi/socket.rs",
+        10201,
+        "80277acf8b49f71d8162518730cc3085bb6373b9a2889df08cab3126b1c538eb",
     ),
     (
         "reverie-syscalls/src/reserved_fds.rs",
@@ -775,13 +897,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 22] = [
     ),
     (
         "reverie-liteinst/Cargo.toml",
-        5164,
-        "11115159ab1830e7c53e040d8d9519c888ffd24aa579790453ea9cb4e1c64ae8",
+        5330,
+        "fc279871c9080a72f399090a16d08ab0ffb298301bf992375a46da0d844d8f14",
     ),
     (
         "reverie-liteinst/src/lib.rs",
-        23303,
-        "7c1363a338def1d00f83fff72605fd11ed7ef4cdbf7fd3630ce800530a360aed",
+        23426,
+        "311108e16c3b071bb762a64a467660dde936f5369009ce3ad759aa8b3900b679",
     ),
     (
         "reverie-liteinst-preload/Cargo.toml",
@@ -810,13 +932,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 22] = [
     ),
     (
         "reverie-inguest/src/guest/tool_region_arena.rs",
-        10111,
-        "adbb364c17a4b9e2dc8d576378050ef8ed11407c0440f31e0c47ba994460b5d8",
+        11715,
+        "5f4c7a0fb84241f2acea3f93315878d8f0b7649373f39131ef20f9a2890fee99",
     ),
     (
         "reverie-inguest/src/guest/tool_region.rs",
-        20158,
-        "523efccd5741480393f4d42a373efa58d13dee646d594aad192b389f5aee9f33",
+        47623,
+        "18148b180e0d67a745be1636e1eb9a556ca772171b29256178255ed7b41cfe66",
     ),
     (
         "reverie-inguest/src/guest/tool_region_keyed.rs",
@@ -825,18 +947,18 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 22] = [
     ),
     (
         "reverie-inguest/src/guest/installed_tool.rs",
-        24461,
-        "fa24f79b0a15bbbdc3e140e3685b308df6e2e7c646ca34926ba0a51cec683168",
+        25354,
+        "c57b6f61d8243dd797b215e310399a4364a920883303c71293b83c3fbdc0e033",
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
-        1891,
-        "b11626bae1b97c789e215737c33da43b56fedcce1cdbe8bad51e797cda5154a6",
+        1932,
+        "822c316e61dd1c53c3650544bb572decccca2bd82afa90cccb1a6adc1892768b",
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        166734,
-        "d9092b61fd7378f3194bc3b50077ad7278666fa07525a13eeeabd88ee5017af6",
+        175078,
+        "f5ec437fe5e8ed246abecafdbbdd23f32b5f77a23a3f36f0b44f40b7d3fc38b1",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
@@ -845,16 +967,51 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 22] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        45394,
-        "ff8493022bebdd5e88e026b730b57a8054310425f24892c8791358c7a5db20fa",
+        50362,
+        "ab33f9d70b7e5d3dad34bb3b14e1f78b45b36527eae9e8ca30f900c054869626",
+    ),
+    (
+        "reverie/Cargo.toml",
+        2373,
+        "46ebd1bba6d231683df7ec46e6b4e8c856e3822bba24fe2ec3f57b01f77c984b",
+    ),
+    (
+        "reverie/src/lib.rs",
+        6661,
+        "c7da5c4977c37d143b82b0b53eebd52a44b807cdeb0bec8869329eb76dc4e002",
+    ),
+    (
+        "reverie/src/perf.rs",
+        76845,
+        "6c43e97e6a0224c8b4786b40e437f0884a5dee90954a833ab5ba556b2e0a7b1c",
+    ),
+    (
+        "reverie/src/pmu_config.rs",
+        31505,
+        "88cfa9208b89eced277fd7ea964665f6a3c95cb60b9edeb2bc77c240d8a954d4",
+    ),
+    (
+        "reverie/src/in_guest_rcb.rs",
+        7381,
+        "c579c482a1c42901231cc931f55e299167a71cf20e1a8fc4ba8ae764e8698840",
+    ),
+    (
+        "reverie/src/pmu.rs",
+        5668,
+        "6866145a0c92bf70aa27ad432c2eddada55b34d582434f814f06032baed792bf",
+    ),
+    (
+        "reverie-inguest/src/guest/clock.rs",
+        16615,
+        "919998f36ce0267448284333f75da6d380a4f284ba11539e71c9c10cf5a7b91d",
     ),
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared
 // source premise. The ordinary Standalone cohort and Location roles stay frozen.
 const CONTENT_DETCORE_FIXED_GATE: (&str, u64, &str) = (
     "reverie-inguest/src/trap/fixed_gates.rs",
-    28338,
-    "5d062d8cedd22d5e1d29674a358fcee6eccba24a46540cc2ada193c052f4e4b3",
+    36554,
+    "ff3f6f6c46e872734ae921e869dbccc0ce1aeefe4bc3af8f29363cf276501e54",
 );
 fn content_catalog_matches(relative: &str, size: u64, digest: &str) -> Result<()> {
     require(
@@ -918,6 +1075,91 @@ fn content_reverie_inventory_for_image(
             require(
                 entry.sha256 == qualifier_source_sha256(),
                 "declared qualifier source differs from compiled host qualifier",
+            )?;
+        } else if entry.relative == "reverie-liteinst-artifact/src/private_static/tls_sources.rs" {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256 == private_static::tls_sources::implementation_sha256(),
+                "declared TLS source tuples differ from compiled host module",
+            )?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers.rs"
+        {
+            // Keep the reviewed literal AND bind the separately compiled module.
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256 == private_static::selected_initializers::implementation_sha256(),
+                "declared selected-initializer source differs from compiled host module",
+            )?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers/native_leaves.rs"
+        {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256
+                    == private_static::selected_initializers::native_leaf_implementation_sha256(),
+                "declared native-leaf source differs from compiled host module",
+            )?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs"
+        {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256 == private_static::selected_initializers::bootstrap_env_aux_implementation_sha256(),
+                "declared Bootstrap::env_aux_words checker differs from compiled host module",
+            )?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs"
+        {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(entry.sha256 == private_static::selected_initializers::bootstrap_descriptor_implementation_sha256(),
+                "declared Bootstrap::descriptor checker differs from compiled host module")?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs"
+        {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256
+                    == private_static::selected_initializers::bootstrap_role_implementation_sha256(
+                    ),
+                "declared Bootstrap::role checker differs from compiled host module",
+            )?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs"
+        {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256
+                    == private_static::selected_initializers::bootstrap_site_implementation_sha256(
+                    ),
+                "declared Bootstrap::site checker differs from compiled host module",
+            )?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs"
+        {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256
+                    == private_static::selected_initializers::view_site_implementation_sha256(),
+                "declared View::site checker differs from compiled host module",
+            )?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site/caller.rs"
+        {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256
+                    == private_static::selected_initializers::view_site_caller_implementation_sha256(),
+                "declared View::site caller checker differs from compiled host module",
+            )?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs"
+        {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256
+                    == private_static::selected_initializers::view_table_implementation_sha256(),
+                "declared View::table checker differs from compiled host module",
             )?;
         } else if entry.relative == CONTENT_DETCORE_FIXED_GATE.0 {
             require(
@@ -4755,32 +4997,35 @@ const FIXED_ARENA_BYTES_0: &[u8] = &[
     0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00, 0x48, 0x89, 0x7c, 0x24, 0x18, 0x48, 0x89, 0x7c, 0x24,
     0x30, 0xbe, 0xff, 0xff, 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x31, 0xc9, 0xe8, 0x00, 0x00,
     0x00, 0x00, 0xa8, 0x01, 0x75, 0x12, 0xc7, 0x44, 0x24, 0x24, 0x16, 0x00, 0x00, 0x00, 0xc7, 0x44,
-    0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x4c, 0x48, 0x8b, 0x7c, 0x24, 0x18, 0xbe, 0xff, 0x3f,
+    0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x68, 0x48, 0x8b, 0x7c, 0x24, 0x18, 0xbe, 0xff, 0x3f,
     0x01, 0x00, 0xba, 0x01, 0x60, 0x01, 0x00, 0x31, 0xc9, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xa8, 0x01,
-    0x75, 0x02, 0xeb, 0xd2, 0xbf, 0x0a, 0x00, 0x00, 0x00, 0x48, 0xbe, 0x00, 0x00, 0x00, 0x10, 0x00,
-    0x60, 0x00, 0x00, 0xba, 0x00, 0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00,
-    0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x10, 0x48, 0x89, 0x44, 0x24, 0x38, 0x48, 0x83, 0xf8, 0x00,
-    0x7c, 0x46, 0xeb, 0x10, 0x8b, 0x44, 0x24, 0x20, 0x8b, 0x54, 0x24, 0x24, 0x48, 0x81, 0xc4, 0x88,
-    0x00, 0x00, 0x00, 0xc3, 0xbf, 0x0a, 0x00, 0x00, 0x00, 0x48, 0xbe, 0x00, 0x00, 0x00, 0x14, 0x00,
-    0x60, 0x00, 0x00, 0xba, 0x00, 0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00,
-    0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x08, 0x48, 0x89, 0x44, 0x24, 0x40, 0x48, 0x83, 0xf8, 0x00,
-    0x0f, 0x8c, 0xd8, 0x00, 0x00, 0x00, 0xeb, 0x1d, 0x48, 0x8b, 0x4c, 0x24, 0x10, 0x48, 0x89, 0x4c,
-    0x24, 0x78, 0x31, 0xc0, 0x48, 0x29, 0xc8, 0x89, 0x44, 0x24, 0x24, 0xc7, 0x44, 0x24, 0x20, 0x01,
-    0x00, 0x00, 0x00, 0xeb, 0x9f, 0x48, 0xb8, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00, 0x48,
-    0x89, 0x44, 0x24, 0x48, 0x48, 0xbf, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00, 0xe8, 0x00,
-    0x00, 0x00, 0x00, 0x31, 0xc0, 0x89, 0xc7, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x7c, 0x24,
-    0x18, 0x48, 0x89, 0x44, 0x24, 0x50, 0x48, 0x8b, 0x44, 0x24, 0x50, 0x48, 0x89, 0x44, 0x24, 0x28,
-    0x48, 0x8b, 0x44, 0x24, 0x28, 0x48, 0x89, 0x44, 0x24, 0x58, 0x48, 0x8b, 0x44, 0x24, 0x58, 0x48,
-    0x89, 0x44, 0x24, 0x68, 0x48, 0x8b, 0x44, 0x24, 0x68, 0x48, 0x89, 0x44, 0x24, 0x60, 0x48, 0xb8,
-    0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00, 0x48, 0x83, 0xc0, 0x18, 0x48, 0x89, 0x44, 0x24,
-    0x70, 0x48, 0xb8, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00, 0x48, 0x8b, 0x4c, 0x24, 0x60,
-    0x48, 0x89, 0x48, 0x18, 0xbe, 0xff, 0xff, 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0xb9, 0x01,
-    0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x7c, 0x24, 0x18, 0xbe, 0xff, 0x3f,
-    0x01, 0x00, 0xba, 0x01, 0x60, 0x01, 0x00, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00,
-    0x00, 0xc7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00, 0xe9, 0xe6, 0xfe, 0xff, 0xff, 0x48, 0x8b,
-    0x4c, 0x24, 0x08, 0x48, 0x89, 0x8c, 0x24, 0x80, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x48, 0x29, 0xc8,
-    0x89, 0x44, 0x24, 0x24, 0xc7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xe9, 0xc3, 0xfe, 0xff,
-    0xff,
+    0x75, 0x02, 0xeb, 0xd2, 0x48, 0x8b, 0x7c, 0x24, 0x18, 0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba, 0x01,
+    0xf0, 0x0f, 0x00, 0x31, 0xc9, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xa8, 0x01, 0x75, 0x02, 0xeb, 0xb6,
+    0xbf, 0x0a, 0x00, 0x00, 0x00, 0x48, 0xbe, 0x00, 0x00, 0x00, 0x10, 0x00, 0x60, 0x00, 0x00, 0xba,
+    0x00, 0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89,
+    0x44, 0x24, 0x10, 0x48, 0x89, 0x44, 0x24, 0x38, 0x48, 0x83, 0xf8, 0x00, 0x7c, 0x46, 0xeb, 0x10,
+    0x8b, 0x44, 0x24, 0x20, 0x8b, 0x54, 0x24, 0x24, 0x48, 0x81, 0xc4, 0x88, 0x00, 0x00, 0x00, 0xc3,
+    0xbf, 0x0a, 0x00, 0x00, 0x00, 0x48, 0xbe, 0x00, 0x00, 0x00, 0x14, 0x00, 0x60, 0x00, 0x00, 0xba,
+    0x00, 0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89,
+    0x44, 0x24, 0x08, 0x48, 0x89, 0x44, 0x24, 0x40, 0x48, 0x83, 0xf8, 0x00, 0x0f, 0x8c, 0xf1, 0x00,
+    0x00, 0x00, 0xeb, 0x1d, 0x48, 0x8b, 0x4c, 0x24, 0x10, 0x48, 0x89, 0x4c, 0x24, 0x78, 0x31, 0xc0,
+    0x48, 0x29, 0xc8, 0x89, 0x44, 0x24, 0x24, 0xc7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xeb,
+    0x9f, 0x48, 0xb8, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x48,
+    0x48, 0xbf, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x31,
+    0xc0, 0x89, 0xc7, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x7c, 0x24, 0x18, 0x48, 0x89, 0x44,
+    0x24, 0x50, 0x48, 0x8b, 0x44, 0x24, 0x50, 0x48, 0x89, 0x44, 0x24, 0x28, 0x48, 0x8b, 0x44, 0x24,
+    0x28, 0x48, 0x89, 0x44, 0x24, 0x58, 0x48, 0x8b, 0x44, 0x24, 0x58, 0x48, 0x89, 0x44, 0x24, 0x68,
+    0x48, 0x8b, 0x44, 0x24, 0x68, 0x48, 0x89, 0x44, 0x24, 0x60, 0x48, 0xb8, 0x00, 0x30, 0x02, 0x00,
+    0x00, 0x60, 0x00, 0x00, 0x48, 0x83, 0xc0, 0x18, 0x48, 0x89, 0x44, 0x24, 0x70, 0x48, 0xb8, 0x00,
+    0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00, 0x48, 0x8b, 0x4c, 0x24, 0x60, 0x48, 0x89, 0x48, 0x18,
+    0xbe, 0xff, 0xff, 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8,
+    0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x7c, 0x24, 0x18, 0xbe, 0xff, 0x3f, 0x01, 0x00, 0xba, 0x01,
+    0x60, 0x01, 0x00, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x7c,
+    0x24, 0x18, 0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba, 0x01, 0xf0, 0x0f, 0x00, 0xb9, 0x01, 0x00, 0x00,
+    0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xc7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00, 0xe9, 0xcd,
+    0xfe, 0xff, 0xff, 0x48, 0x8b, 0x4c, 0x24, 0x08, 0x48, 0x89, 0x8c, 0x24, 0x80, 0x00, 0x00, 0x00,
+    0x31, 0xc0, 0x48, 0x29, 0xc8, 0x89, 0x44, 0x24, 0x24, 0xc7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00,
+    0x00, 0xe9, 0xaa, 0xfe, 0xff, 0xff,
 ];
 const FIXED_ARENA_OPERANDS_0: &[FixedArenaOperand] = &[
     FixedArenaOperand {
@@ -4800,49 +5045,65 @@ const FIXED_ARENA_OPERANDS_0: &[FixedArenaOperand] = &[
         kind: FixedArenaOperandKind::DirectCall,
     },
     FixedArenaOperand {
-        instruction: 109,
-        displacement: 110,
-        next: 114,
-        key: "fixed_scalar_syscall",
-        addend: 0,
-        kind: FixedArenaOperandKind::DirectCall,
-    },
-    FixedArenaOperand {
-        instruction: 173,
-        displacement: 174,
-        next: 178,
-        key: "fixed_scalar_syscall",
-        addend: 0,
-        kind: FixedArenaOperandKind::DirectCall,
-    },
-    FixedArenaOperand {
-        instruction: 254,
-        displacement: 255,
-        next: 259,
-        key: "fixed_heap_metadata_initialize",
-        addend: 0,
-        kind: FixedArenaOperandKind::DirectCall,
-    },
-    FixedArenaOperand {
-        instruction: 263,
-        displacement: 264,
-        next: 268,
-        key: "fixed_metadata_atomic_new_usize",
-        addend: 0,
-        kind: FixedArenaOperandKind::DirectCall,
-    },
-    FixedArenaOperand {
-        instruction: 371,
-        displacement: 372,
-        next: 376,
+        instruction: 101,
+        displacement: 102,
+        next: 106,
         key: "fixed_setup_bitmap_range",
         addend: 0,
         kind: FixedArenaOperandKind::DirectCall,
     },
     FixedArenaOperand {
-        instruction: 396,
-        displacement: 397,
-        next: 401,
+        instruction: 137,
+        displacement: 138,
+        next: 142,
+        key: "fixed_scalar_syscall",
+        addend: 0,
+        kind: FixedArenaOperandKind::DirectCall,
+    },
+    FixedArenaOperand {
+        instruction: 201,
+        displacement: 202,
+        next: 206,
+        key: "fixed_scalar_syscall",
+        addend: 0,
+        kind: FixedArenaOperandKind::DirectCall,
+    },
+    FixedArenaOperand {
+        instruction: 282,
+        displacement: 283,
+        next: 287,
+        key: "fixed_heap_metadata_initialize",
+        addend: 0,
+        kind: FixedArenaOperandKind::DirectCall,
+    },
+    FixedArenaOperand {
+        instruction: 291,
+        displacement: 292,
+        next: 296,
+        key: "fixed_metadata_atomic_new_usize",
+        addend: 0,
+        kind: FixedArenaOperandKind::DirectCall,
+    },
+    FixedArenaOperand {
+        instruction: 399,
+        displacement: 400,
+        next: 404,
+        key: "fixed_setup_bitmap_range",
+        addend: 0,
+        kind: FixedArenaOperandKind::DirectCall,
+    },
+    FixedArenaOperand {
+        instruction: 424,
+        displacement: 425,
+        next: 429,
+        key: "fixed_setup_bitmap_range",
+        addend: 0,
+        kind: FixedArenaOperandKind::DirectCall,
+    },
+    FixedArenaOperand {
+        instruction: 449,
+        displacement: 450,
+        next: 454,
         key: "fixed_setup_bitmap_range",
         addend: 0,
         kind: FixedArenaOperandKind::DirectCall,
@@ -5304,68 +5565,87 @@ const FIXED_ARENA_OPERANDS_9: &[FixedArenaOperand] = &[
 
 // Retained normal+diagnostic / fixed_arena_setup; all constant operands and internal branches are literal.
 const FIXED_ARENA_BYTES_10: &[u8] = &[
-    0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x50, 0x49, 0x89, 0xfe, 0xbe, 0xff, 0xff, 0x00, 0x00,
-    0xba, 0x01, 0x20, 0x01, 0x00, 0x31, 0xc9, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xbb, 0x01, 0x00, 0x00,
-    0x00, 0x41, 0xbf, 0x16, 0x00, 0x00, 0x00, 0x84, 0xc0, 0x0f, 0x84, 0xb7, 0x00, 0x00, 0x00, 0xbe,
-    0xff, 0x3f, 0x01, 0x00, 0xba, 0x01, 0x60, 0x01, 0x00, 0x4c, 0x89, 0xf7, 0x31, 0xc9, 0xe8, 0x00,
-    0x00, 0x00, 0x00, 0x84, 0xc0, 0x0f, 0x84, 0x9b, 0x00, 0x00, 0x00, 0x49, 0xbc, 0x00, 0x30, 0x02,
-    0x00, 0x00, 0x60, 0x00, 0x00, 0x49, 0x8d, 0xb4, 0x24, 0x00, 0xd0, 0xfd, 0x0f, 0xbf, 0x0a, 0x00,
-    0x00, 0x00, 0xba, 0x00, 0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00,
-    0x00, 0x48, 0x85, 0xc0, 0x78, 0x6a, 0x49, 0x8d, 0xb4, 0x24, 0x00, 0xd0, 0xfd, 0x13, 0xbf, 0x0a,
-    0x00, 0x00, 0x00, 0xba, 0x00, 0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00,
-    0x00, 0x00, 0x48, 0x85, 0xc0, 0x78, 0x49, 0x0f, 0x57, 0xc0, 0x41, 0x0f, 0x29, 0x04, 0x24, 0x41,
-    0xc6, 0x44, 0x24, 0x10, 0x00, 0x49, 0xc7, 0x44, 0x24, 0x18, 0x00, 0x00, 0x00, 0x00, 0xbe, 0xff,
-    0xff, 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x4c, 0x89, 0xf7, 0xb9, 0x01, 0x00, 0x00, 0x00,
-    0xe8, 0x00, 0x00, 0x00, 0x00, 0xbe, 0xff, 0x3f, 0x01, 0x00, 0xba, 0x01, 0x60, 0x01, 0x00, 0x4c,
-    0x89, 0xf7, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x31, 0xdb, 0xeb, 0x06,
-    0x49, 0x89, 0xc7, 0x41, 0xf7, 0xdf, 0x89, 0xd8, 0x44, 0x89, 0xfa, 0x48, 0x83, 0xc4, 0x08, 0x5b,
-    0x41, 0x5c, 0x41, 0x5e, 0x41, 0x5f, 0xc3,
+    0x55, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89, 0xfb, 0xbe, 0xff, 0xff, 0x00, 0x00, 0xba,
+    0x01, 0x20, 0x01, 0x00, 0x31, 0xc9, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xbd, 0x01, 0x00, 0x00, 0x00,
+    0x41, 0xbe, 0x16, 0x00, 0x00, 0x00, 0x84, 0xc0, 0x0f, 0x84, 0xe5, 0x00, 0x00, 0x00, 0xbe, 0xff,
+    0x3f, 0x01, 0x00, 0xba, 0x01, 0x60, 0x01, 0x00, 0x48, 0x89, 0xdf, 0x31, 0xc9, 0xe8, 0x00, 0x00,
+    0x00, 0x00, 0x84, 0xc0, 0x0f, 0x84, 0xc9, 0x00, 0x00, 0x00, 0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba,
+    0x01, 0xf0, 0x0f, 0x00, 0x48, 0x89, 0xdf, 0x31, 0xc9, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x84, 0xc0,
+    0x0f, 0x84, 0xad, 0x00, 0x00, 0x00, 0x49, 0xbf, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00,
+    0x49, 0x8d, 0xb7, 0x00, 0xd0, 0xfd, 0x0f, 0xbf, 0x0a, 0x00, 0x00, 0x00, 0xba, 0x00, 0x00, 0x00,
+    0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x78, 0x7d,
+    0x49, 0x8d, 0xb7, 0x00, 0xd0, 0xfd, 0x13, 0xbf, 0x0a, 0x00, 0x00, 0x00, 0xba, 0x00, 0x00, 0x00,
+    0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x78, 0x5d,
+    0x0f, 0x57, 0xc0, 0x41, 0x0f, 0x29, 0x07, 0x41, 0xc6, 0x47, 0x10, 0x00, 0x49, 0xc7, 0x47, 0x18,
+    0x00, 0x00, 0x00, 0x00, 0xbe, 0xff, 0xff, 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x48, 0x89,
+    0xdf, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xbe, 0xff, 0x3f, 0x01, 0x00,
+    0xba, 0x01, 0x60, 0x01, 0x00, 0x48, 0x89, 0xdf, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00,
+    0x00, 0x00, 0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba, 0x01, 0xf0, 0x0f, 0x00, 0x48, 0x89, 0xdf, 0xb9,
+    0x01, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x31, 0xed, 0xeb, 0x06, 0x49, 0x89, 0xc6,
+    0x41, 0xf7, 0xde, 0x89, 0xe8, 0x44, 0x89, 0xf2, 0x48, 0x83, 0xc4, 0x08, 0x5b, 0x41, 0x5e, 0x41,
+    0x5f, 0x5d, 0xc3,
 ];
 const FIXED_ARENA_OPERANDS_10: &[FixedArenaOperand] = &[
     FixedArenaOperand {
-        instruction: 23,
-        displacement: 24,
-        next: 28,
+        instruction: 22,
+        displacement: 23,
+        next: 27,
         key: "fixed_setup_bitmap_range",
         addend: 0,
         kind: FixedArenaOperandKind::DirectCall,
     },
     FixedArenaOperand {
-        instruction: 62,
-        displacement: 63,
-        next: 67,
+        instruction: 61,
+        displacement: 62,
+        next: 66,
         key: "fixed_setup_bitmap_range",
         addend: 0,
         kind: FixedArenaOperandKind::DirectCall,
     },
     FixedArenaOperand {
-        instruction: 108,
-        displacement: 109,
-        next: 113,
+        instruction: 89,
+        displacement: 90,
+        next: 94,
+        key: "fixed_setup_bitmap_range",
+        addend: 0,
+        kind: FixedArenaOperandKind::DirectCall,
+    },
+    FixedArenaOperand {
+        instruction: 134,
+        displacement: 135,
+        next: 139,
         key: "fixed_scalar_syscall",
         addend: 0,
         kind: FixedArenaOperandKind::DirectCall,
     },
     FixedArenaOperand {
-        instruction: 141,
-        displacement: 142,
-        next: 146,
+        instruction: 166,
+        displacement: 167,
+        next: 171,
         key: "fixed_scalar_syscall",
         addend: 0,
         kind: FixedArenaOperandKind::DirectCall,
     },
     FixedArenaOperand {
-        instruction: 192,
-        displacement: 193,
-        next: 197,
+        instruction: 214,
+        displacement: 215,
+        next: 219,
         key: "fixed_setup_bitmap_range",
         addend: 0,
         kind: FixedArenaOperandKind::DirectCall,
     },
     FixedArenaOperand {
-        instruction: 215,
-        displacement: 216,
-        next: 220,
+        instruction: 237,
+        displacement: 238,
+        next: 242,
+        key: "fixed_setup_bitmap_range",
+        addend: 0,
+        kind: FixedArenaOperandKind::DirectCall,
+    },
+    FixedArenaOperand {
+        instruction: 260,
+        displacement: 261,
+        next: 265,
         key: "fixed_setup_bitmap_range",
         addend: 0,
         kind: FixedArenaOperandKind::DirectCall,
@@ -9601,7 +9881,7 @@ const FIXED_READONLY_SPECS: &[FixedReadonlySpec] = &[
     FixedReadonlySpec {
         key: "publication_dev_data_369138",
         kind: "location",
-        hex: "00000000000000002e00000000000000cb00000013000000",
+        hex: "00000000000000002e00000000000000de00000013000000",
         file_hex: "726576657269652d696e67756573742f7372632f67756573742f746f6f6c5f726567696f6e5f6172656e612e7273",
         owner: "",
         switch: &[],
@@ -9697,7 +9977,7 @@ const FIXED_READONLY_SPECS: &[FixedReadonlySpec] = &[
     FixedReadonlySpec {
         key: "fixed_bitmap_reference_location",
         kind: "location",
-        hex: "00000000000000002e00000000000000730000001b000000",
+        hex: "00000000000000002e00000000000000800000001b000000",
         file_hex: "726576657269652d696e67756573742f7372632f67756573742f746f6f6c5f726567696f6e5f6172656e612e7273",
         owner: "",
         switch: &[],
@@ -9713,7 +9993,7 @@ const FIXED_READONLY_SPECS: &[FixedReadonlySpec] = &[
     FixedReadonlySpec {
         key: "fixed_metadata_reference_location",
         kind: "location",
-        hex: "00000000000000002e00000000000000cb00000013000000",
+        hex: "00000000000000002e00000000000000de00000013000000",
         file_hex: "726576657269652d696e67756573742f7372632f67756573742f746f6f6c5f726567696f6e5f6172656e612e7273",
         owner: "",
         switch: &[],
@@ -12818,7 +13098,7 @@ const PUBLICATION_WRAPPER_RECIPES: &[FixedWrapperRecipe] = &[
             (269, 270, "fixed_arena_setup", false),
         ],
     },
-    // eaa normal 0xb7610, exact291; canonical normal247 return join required below.
+    // eaa normal 0xb7610, exact291; canonical optimized three-band return join required below.
     FixedWrapperRecipe {
         role: "fixed_native_from_native",
         hex: FIXED_NORMAL_FROM_NATIVE_291,
@@ -18755,19 +19035,19 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_setup_bitmap_range_208_data",
         location: true,
-        hex: "00000000000000006b00000000000000730000001b000000",
+        hex: "00000000000000006b00000000000000800000001b000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/tool_region_arena.rs"),
-        line: 115,
+        line: 128,
         column: 27,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_setup_bitmap_range_226_data",
         location: true,
-        hex: "00000000000000006b00000000000000730000001b000000",
+        hex: "00000000000000006b00000000000000800000001b000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/tool_region_arena.rs"),
-        line: 115,
+        line: 128,
         column: 27,
     },
     DetcoreValidateDataSpec {
@@ -20050,49 +20330,70 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(110, 1), (173, 3), (265, 4), (289, 5), (323, 7)],
     },
-    // freshfc4b-normal 0x7290b0, SHA256 0e0aef1b57d6aee1be392d4c1a880c43651800d91d31403c6a4e2db37659d9a4.
+    // Source1e58 genuine Detcore liteinst-runtime normal at 0x95ff30; three-band setup.
     DetcoreValidateTemplate {
         role: "fixed_arena_setup",
-        hex: "41574156415453504989febeffff0000ba0120010031c9e8b4feffffbb0100000041bf1600000084c00f84b7000000beff3f0100ba016001004c89f731c9e88dfeffff84c00f849b00000049bc0030020000600000498db42400d0fd0fbf0a000000ba00000002b903000000e8aff9ffff4885c0786a498db42400d0fd13bf0a000000ba00000002b903000000e88ef9ffff4885c078490f57c0410f29042441c64424100049c744241800000000beffff0000ba012001004c89f7b901000000e80bfeffffbeff3f0100ba016001004c89f7b901000000e8f4fdffff31dbeb064989c741f7df89d84489fa4883c4085b415c415e415fc3",
+        hex: "554157415653504889fbbeffff0000ba0120010031c9e8b5feffffbd0100000041be1600000084c00f84e5000000beff3f0100ba016001004889df31c9e88efeffff84c00f84c9000000beffff0d00ba01f00f004889df31c9e872feffff84c00f84ad00000049bf0030020000600000498db700d0fd0fbf0a000000ba00000002b903000000e815f7ffff4885c0787d498db700d0fd13bf0a000000ba00000002b903000000e8f5f6ffff4885c0785d0f57c0410f290741c647100049c7471800000000beffff0000ba012001004889dfb901000000e8f5fdffffbeff3f0100ba016001004889dfb901000000e8defdffffbeffff0d00ba01f00f004889dfb901000000e8c7fdffff31edeb064989c641f7de89e84489f24883c4085b415e415f5dc3",
         operands: &[
             DetcoreValidateOperand {
-                displacement: 24,
-                next: 28,
+                displacement: 23,
+                next: 27,
                 key: "fixed_setup_bitmap_range",
                 got: false,
             },
             DetcoreValidateOperand {
-                displacement: 63,
-                next: 67,
+                displacement: 62,
+                next: 66,
                 key: "fixed_setup_bitmap_range",
                 got: false,
             },
             DetcoreValidateOperand {
-                displacement: 109,
-                next: 113,
+                displacement: 90,
+                next: 94,
+                key: "fixed_setup_bitmap_range",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 135,
+                next: 139,
                 key: "fixed_scalar_syscall",
                 got: false,
             },
             DetcoreValidateOperand {
-                displacement: 142,
-                next: 146,
+                displacement: 167,
+                next: 171,
                 key: "fixed_scalar_syscall",
                 got: false,
             },
             DetcoreValidateOperand {
-                displacement: 193,
-                next: 197,
+                displacement: 215,
+                next: 219,
                 key: "fixed_setup_bitmap_range",
                 got: false,
             },
             DetcoreValidateOperand {
-                displacement: 216,
-                next: 220,
+                displacement: 238,
+                next: 242,
+                key: "fixed_setup_bitmap_range",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 261,
+                next: 265,
                 key: "fixed_setup_bitmap_range",
                 got: false,
             },
         ],
-        transfers: &[(23, 0), (62, 1), (108, 2), (141, 3), (192, 4), (215, 5)],
+        transfers: &[
+            (22, 0),
+            (61, 1),
+            (89, 2),
+            (134, 3),
+            (166, 4),
+            (214, 5),
+            (237, 6),
+            (260, 7),
+        ],
     },
     // freshfc4b-normal 0x728f80, SHA256 09a4cd5a498f3d8bc5e25b203cee57609ee17adc5233f9f753d0b5b1d8812d22.
     DetcoreValidateTemplate {
@@ -22099,7 +22400,7 @@ fn fixed_detcore_publication_cohort(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FixedNormalReturnIdentity {
     Caller291,
-    Setup247,
+    ThreeBandSetup,
     OtherSetup,
 }
 struct AuthenticatedFixedNormalReturn {
@@ -22159,7 +22460,7 @@ fn fixed_normal_return_qualified_operation(
             "ambiguous qualified normal setup identity",
         )?;
         let identity = if matching[0].bytes == FIXED_ARENA_BYTES_10 {
-            FixedNormalReturnIdentity::Setup247
+            FixedNormalReturnIdentity::ThreeBandSetup
         } else {
             FixedNormalReturnIdentity::OtherSetup
         };
@@ -22191,8 +22492,8 @@ fn fixed_normal_return_contract(
     )?;
     let setup = witnesses
         .get("fixed_arena_setup")
-        .filter(|setup| setup.identity == FixedNormalReturnIdentity::Setup247)
-        .ok_or("new normal caller lacks authenticated canonical normal247 setup")?;
+        .filter(|setup| setup.identity == FixedNormalReturnIdentity::ThreeBandSetup)
+        .ok_or("new normal caller lacks authenticated canonical optimized three-band setup")?;
     for (role, witness) in [
         ("fixed_native_from_native", caller),
         ("fixed_arena_setup", setup),
@@ -22234,8 +22535,8 @@ fn fixed_normal_return_contract(
         "new normal caller lacks unique exact direct setup edge",
     )?;
     // Full291 bytes prove the fixed control receiver, payload and EDX error store.
-    // Full247 bytes prove EBX literal1, success XOR EBX,EBX and the sole full
-    // EAX/EDX epilogue. Its six actual bitmap/syscall edges remain recursively
+    // Full291 setup bytes prove EBP literal1, success XOR EBP,EBP and the sole full
+    // EAX/EDX epilogue. Its eight actual bitmap/syscall edges remain recursively
     // qualified by the production closure; no enum, extent or source type is ABI proof.
     Ok(())
 }
@@ -25046,6 +25347,16 @@ fn proof_function_bytes(
     functions: &BTreeMap<u64, u64>,
 ) -> Result<BTreeMap<u64, Vec<u8>>> {
     authenticate_loader_metadata(elf, bytes)?;
+    proof_function_bytes_after_metadata(elf, bytes, functions)
+}
+
+// Format-specific callers establish their own metadata contract first. Keep
+// the actual complete RX byte/mapping/writer checks identical for both formats.
+fn proof_function_bytes_after_metadata(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    functions: &BTreeMap<u64, u64>,
+) -> Result<BTreeMap<u64, Vec<u8>>> {
     let mut expected = BTreeMap::new();
     let mut total = 0usize;
     let writers = loader_writers(elf)?;
@@ -25713,6 +26024,14 @@ fn preparation_transfers(
     got: &BTreeMap<u64, u64>,
     helpers: &BTreeSet<u64>,
 ) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
+    preparation_transfers_with_static_tail(instructions, got, helpers, false)
+}
+
+// The static-image diagnostic may additionally resolve an exact FF25 tail
+// transfer. Existing DSO/default callers retain precisely their old policy.
+fn preparation_instruction_boundaries(
+    instructions: &[EncodedConstructorInstruction],
+) -> Result<(u64, BTreeSet<u64>)> {
     let first = instructions
         .first()
         .ok_or("empty complete prepare function")?
@@ -25729,157 +26048,186 @@ fn preparation_transfers(
             .checked_add(instruction.bytes.len() as u64)
             .ok_or("prepare instruction range overflows")?;
     }
+    Ok((first, boundaries))
+}
+
+// One shared instruction checker: strict admission and the observational
+// finite census use identical branch/indirect/system-instruction rules.
+fn preparation_instruction_transfer(
+    instruction: &EncodedConstructorInstruction,
+    first: u64,
+    boundaries: &BTreeSet<u64>,
+    got: &BTreeMap<u64, u64>,
+    helpers: &BTreeSet<u64>,
+    static_tail: bool,
+) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
+    let mut transfers = Vec::new();
+    let mut edges = Vec::new();
+    let bytes = &instruction.bytes;
+    let prefix = bytes
+        .iter()
+        .take_while(|byte| {
+            matches!(
+                **byte,
+                0xf0 | 0xf2 | 0xf3 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0x40
+                    ..=0x4f
+            )
+        })
+        .count();
+    let opcode = *bytes.get(prefix).ok_or("prefix-only prepare instruction")?;
+    let second = if opcode == 0x0f {
+        Some(
+            *bytes
+                .get(prefix + 1)
+                .ok_or("truncated prepare two-byte opcode")?,
+        )
+    } else {
+        None
+    };
+    let system_group = if second == Some(0x01) {
+        Some(
+            *bytes
+                .get(prefix + 2)
+                .ok_or("truncated prepare system-group opcode")?,
+        )
+    } else {
+        None
+    };
+    // Intentional kernel/system/interrupt transfers have no independently
+    // qualified helper target. Raw SYSCALL belongs only to the separately
+    // byte-qualified trusted gate, never to ordinary Rust preparation.
+    require(
+        !matches!(opcode, 0xcc | 0xcd | 0xce | 0xcf | 0xf1 | 0xf4)
+            && !matches!(second, Some(0x05 | 0x07 | 0x0b | 0x34 | 0x35 | 0x37 | 0xaa))
+            && !matches!(system_group, Some(0xc1..=0xc3 | 0xd9)),
+        "unqualified prepare kernel/system/interrupt transfer",
+    )?;
+    let relative = |offset: usize, width: usize| -> Result<u64> {
+        let displacement = match width {
+            1 => i64::from(*bytes.get(offset).ok_or("truncated prepare branch")? as i8),
+            4 => i64::from(i32::from_le_bytes(
+                bytes
+                    .get(offset..offset + 4)
+                    .ok_or("truncated prepare transfer")?
+                    .try_into()
+                    .unwrap(),
+            )),
+            _ => return Err("unsupported prepare displacement width".to_owned()),
+        };
+        instruction
+            .address
+            .checked_add(bytes.len() as u64)
+            .and_then(|end| end.checked_add_signed(displacement))
+            .ok_or("prepare transfer target overflows".to_owned())
+    };
+    if matches!(opcode, 0xe8 | 0xe9 | 0xeb | 0x70..=0x7f | 0xe0..=0xe3)
+        || (opcode == 0x0f
+            && bytes
+                .get(prefix + 1)
+                .is_some_and(|b| (0x80..=0x8f).contains(b)))
+    {
+        require(
+            prefix == 0,
+            "prefixed prepare direct transfer is unsupported",
+        )?;
+        let (offset, width, external) = match opcode {
+            0xe8 | 0xe9 => (1, 4, true),
+            0xeb => (1, 1, true),
+            0x0f => (2, 4, false),
+            _ => (1, 1, false),
+        };
+        require(
+            bytes.len() == offset + width,
+            "extra/truncated prepare direct transfer",
+        )?;
+        let target = relative(offset, width)?;
+        if boundaries.contains(&target) && opcode != 0xe8 {
+            return Ok((transfers, edges));
+        }
+        require(
+            external && helpers.contains(&target),
+            format!(
+                "prepare direct transfer is not an exact private preparation role/in-function branch: function {first:#x}, instruction {:#x}, target {target:#x}",
+                instruction.address,
+            ),
+        )?;
+        transfers.push(ConstructorTransfer {
+            instruction: instruction.address,
+            target,
+            local_got_slot: None,
+        });
+    } else if opcode == 0xff {
+        let modrm = *bytes
+            .get(prefix + 1)
+            .ok_or("truncated prepare FF instruction")?;
+        if !matches!((modrm >> 3) & 7, 2..=5) {
+            return Ok((transfers, edges));
+        }
+        require(
+            prefix == 0
+                && bytes.len() == 6
+                && (bytes.starts_with(&[0xff, 0x15])
+                    || (static_tail && bytes.starts_with(&[0xff, 0x25]))),
+            "unsupported prepare register/memory/prefixed indirect call/jump",
+        )?;
+        let slot = relative(2, 4)?;
+        let target = *got
+            .get(&slot)
+            .ok_or("prepare call GOT is unresolved/preemptible")?;
+        require(
+            helpers.contains(&target),
+            format!(
+                "prepare GOT target lacks exact private helper role: function {first:#x}, instruction {:#x}, slot {slot:#x}, target {target:#x}",
+                instruction.address,
+            ),
+        )?;
+        transfers.push(ConstructorTransfer {
+            instruction: instruction.address,
+            target,
+            local_got_slot: Some(slot),
+        });
+        edges.push(GotEdge {
+            source_function: first,
+            instruction: instruction.address,
+            slot,
+            target_function: target,
+        });
+    } else {
+        require(
+            !matches!(opcode, 0x9a | 0xea | 0xca | 0xcb | 0xcf),
+            "unsupported prepare far transfer/return",
+        )?;
+        if opcode == 0xc3 {
+            require(
+                prefix == 0 && bytes.len() == 1,
+                "prefixed/extra prepare RET",
+            )?;
+        }
+        require(opcode != 0xc2, "prepare RET with immediate is unsupported")?;
+    }
+    Ok((transfers, edges))
+}
+
+fn preparation_transfers_with_static_tail(
+    instructions: &[EncodedConstructorInstruction],
+    got: &BTreeMap<u64, u64>,
+    helpers: &BTreeSet<u64>,
+    static_tail: bool,
+) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
+    let (first, boundaries) = preparation_instruction_boundaries(instructions)?;
     let mut transfers = Vec::new();
     let mut edges = Vec::new();
     for instruction in instructions {
-        let bytes = &instruction.bytes;
-        let prefix = bytes
-            .iter()
-            .take_while(|byte| {
-                matches!(
-                    **byte,
-                    0xf0 | 0xf2
-                        | 0xf3
-                        | 0x26
-                        | 0x2e
-                        | 0x36
-                        | 0x3e
-                        | 0x64
-                        | 0x65
-                        | 0x66
-                        | 0x67
-                        | 0x40..=0x4f
-                )
-            })
-            .count();
-        let opcode = *bytes.get(prefix).ok_or("prefix-only prepare instruction")?;
-        let second = if opcode == 0x0f {
-            Some(
-                *bytes
-                    .get(prefix + 1)
-                    .ok_or("truncated prepare two-byte opcode")?,
-            )
-        } else {
-            None
-        };
-        let system_group = if second == Some(0x01) {
-            Some(
-                *bytes
-                    .get(prefix + 2)
-                    .ok_or("truncated prepare system-group opcode")?,
-            )
-        } else {
-            None
-        };
-        // Intentional kernel/system/interrupt transfers have no independently
-        // qualified helper target. Raw SYSCALL belongs only to the separately
-        // byte-qualified trusted gate, never to ordinary Rust preparation.
-        require(
-            !matches!(opcode, 0xcc | 0xcd | 0xce | 0xcf | 0xf1 | 0xf4)
-                && !matches!(second, Some(0x05 | 0x07 | 0x0b | 0x34 | 0x35 | 0x37 | 0xaa))
-                && !matches!(system_group, Some(0xc1..=0xc3 | 0xd9)),
-            "unqualified prepare kernel/system/interrupt transfer",
+        let (next, got_edges) = preparation_instruction_transfer(
+            instruction,
+            first,
+            &boundaries,
+            got,
+            helpers,
+            static_tail,
         )?;
-        let relative = |offset: usize, width: usize| -> Result<u64> {
-            let displacement = match width {
-                1 => i64::from(*bytes.get(offset).ok_or("truncated prepare branch")? as i8),
-                4 => i64::from(i32::from_le_bytes(
-                    bytes
-                        .get(offset..offset + 4)
-                        .ok_or("truncated prepare transfer")?
-                        .try_into()
-                        .unwrap(),
-                )),
-                _ => return Err("unsupported prepare displacement width".to_owned()),
-            };
-            instruction
-                .address
-                .checked_add(bytes.len() as u64)
-                .and_then(|end| end.checked_add_signed(displacement))
-                .ok_or("prepare transfer target overflows".to_owned())
-        };
-        if matches!(opcode, 0xe8 | 0xe9 | 0xeb | 0x70..=0x7f | 0xe0..=0xe3)
-            || (opcode == 0x0f
-                && bytes
-                    .get(prefix + 1)
-                    .is_some_and(|b| (0x80..=0x8f).contains(b)))
-        {
-            require(
-                prefix == 0,
-                "prefixed prepare direct transfer is unsupported",
-            )?;
-            let (offset, width, external) = match opcode {
-                0xe8 | 0xe9 => (1, 4, true),
-                0xeb => (1, 1, true),
-                0x0f => (2, 4, false),
-                _ => (1, 1, false),
-            };
-            require(
-                bytes.len() == offset + width,
-                "extra/truncated prepare direct transfer",
-            )?;
-            let target = relative(offset, width)?;
-            if boundaries.contains(&target) && opcode != 0xe8 {
-                continue;
-            }
-            require(
-                external && helpers.contains(&target),
-                format!(
-                    "prepare direct transfer is not an exact private preparation role/in-function branch: function {first:#x}, instruction {:#x}, target {target:#x}",
-                    instruction.address,
-                ),
-            )?;
-            transfers.push(ConstructorTransfer {
-                instruction: instruction.address,
-                target,
-                local_got_slot: None,
-            });
-        } else if opcode == 0xff {
-            let modrm = *bytes
-                .get(prefix + 1)
-                .ok_or("truncated prepare FF instruction")?;
-            if !matches!((modrm >> 3) & 7, 2..=5) {
-                continue;
-            }
-            require(
-                prefix == 0 && bytes.len() == 6 && bytes.starts_with(&[0xff, 0x15]),
-                "unsupported prepare register/memory/prefixed indirect call/jump",
-            )?;
-            let slot = relative(2, 4)?;
-            let target = *got
-                .get(&slot)
-                .ok_or("prepare call GOT is unresolved/preemptible")?;
-            require(
-                helpers.contains(&target),
-                format!(
-                    "prepare GOT target lacks exact private helper role: function {first:#x}, instruction {:#x}, slot {slot:#x}, target {target:#x}",
-                    instruction.address,
-                ),
-            )?;
-            transfers.push(ConstructorTransfer {
-                instruction: instruction.address,
-                target,
-                local_got_slot: Some(slot),
-            });
-            edges.push(GotEdge {
-                source_function: first,
-                instruction: instruction.address,
-                slot,
-                target_function: target,
-            });
-        } else {
-            require(
-                !matches!(opcode, 0x9a | 0xea | 0xca | 0xcb | 0xcf),
-                "unsupported prepare far transfer/return",
-            )?;
-            if opcode == 0xc3 {
-                require(
-                    prefix == 0 && bytes.len() == 1,
-                    "prefixed/extra prepare RET",
-                )?;
-            }
-            require(opcode != 0xc2, "prepare RET with immediate is unsupported")?;
-        }
+        transfers.extend(next);
+        edges.extend(got_edges);
     }
     Ok((transfers, edges))
 }
@@ -27858,8 +28206,56 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 24] = [
+        let compiled_files: [(&str, &[u8]); 55] = [
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
+                include_bytes!("private_static/selected_initializers/bootstrap_env_aux.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_descriptor.rs",
+                include_bytes!("private_static/selected_initializers/bootstrap_descriptor.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_role.rs",
+                include_bytes!("private_static/selected_initializers/bootstrap_role.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_site.rs",
+                include_bytes!("private_static/selected_initializers/bootstrap_site.rs"),
+            ),
+            (
+                "reverie-loader/src/mapped_inputs.rs",
+                include_bytes!("../../reverie-loader/src/mapped_inputs.rs"),
+            ),
             ("Cargo.toml", include_bytes!("../../Cargo.toml")),
+            (
+                "reverie/Cargo.toml",
+                include_bytes!("../../reverie/Cargo.toml"),
+            ),
+            (
+                "reverie/src/lib.rs",
+                include_bytes!("../../reverie/src/lib.rs"),
+            ),
+            (
+                "reverie/src/perf.rs",
+                include_bytes!("../../reverie/src/perf.rs"),
+            ),
+            (
+                "reverie/src/pmu_config.rs",
+                include_bytes!("../../reverie/src/pmu_config.rs"),
+            ),
+            (
+                "reverie/src/in_guest_rcb.rs",
+                include_bytes!("../../reverie/src/in_guest_rcb.rs"),
+            ),
+            (
+                "reverie/src/pmu.rs",
+                include_bytes!("../../reverie/src/pmu.rs"),
+            ),
+            (
+                "reverie-inguest/src/guest/clock.rs",
+                include_bytes!("../../reverie-inguest/src/guest/clock.rs"),
+            ),
             (
                 "reverie-liteinst-artifact/Cargo.toml",
                 include_bytes!("../../reverie-liteinst-artifact/Cargo.toml"),
@@ -27879,6 +28275,14 @@ mod tests {
             (
                 "reverie-syscalls/src/lib.rs",
                 include_bytes!("../../reverie-syscalls/src/lib.rs"),
+            ),
+            (
+                "reverie-syscalls/src/linux_abi.rs",
+                include_bytes!("../../reverie-syscalls/src/linux_abi.rs"),
+            ),
+            (
+                "reverie-syscalls/src/linux_abi/socket.rs",
+                include_bytes!("../../reverie-syscalls/src/linux_abi/socket.rs"),
             ),
             (
                 "reverie-syscalls/src/reserved_fds.rs",
@@ -27949,6 +28353,74 @@ mod tests {
                 include_bytes!("../../reverie-inguest/src/trap/fixed_gates.rs"),
             ),
             (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+                include_bytes!("private_static/selected_initializers.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+                include_bytes!("private_static/tls_sources.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
+                include_bytes!("private_static/selected_initializers/view_site.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site/caller.rs",
+                include_bytes!("private_static/selected_initializers/view_site/caller.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
+                include_bytes!("private_static/selected_initializers/view_table.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/native_leaves.rs",
+                include_bytes!("private_static/selected_initializers/native_leaves.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/musl_memset_member.rs",
+                include_bytes!("../tests/fixtures/musl_memset_member.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/musl_memset_source.txt",
+                include_bytes!("../tests/fixtures/musl_memset_source.txt"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/musl_set_thread_area_member.rs",
+                include_bytes!("../tests/fixtures/musl_set_thread_area_member.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/musl_set_thread_area_source.txt",
+                include_bytes!("../tests/fixtures/musl_set_thread_area_source.txt"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/musl_libc_common_map.txt",
+                include_bytes!("../tests/fixtures/musl_libc_common_map.txt"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/musl_libc_common_member.rs",
+                include_bytes!("../tests/fixtures/musl_libc_common_member.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/optional-zero-a03.json",
+                include_bytes!("private_static/optional-zero-a03.json"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
+                include_bytes!("private_static/selected_initializers/ordinary_gate.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+                include_bytes!("private_static/selected_initializers/terminal_observation.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/ordinary_preceding_gate_page.rs",
+                include_bytes!("../tests/fixtures/ordinary_preceding_gate_page.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/selected_init_v12.json",
+                include_bytes!("../tests/fixtures/selected_init_v12.json"),
+            ),
+            (
                 "reverie-liteinst-artifact/src/lib.rs",
                 include_bytes!("lib.rs"),
             ),
@@ -27960,10 +28432,10 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        assert_eq!(rv_inventory.len(), 23);
+        assert_eq!(rv_inventory.len(), 54);
         let (detcore_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
-        assert_eq!(detcore_inventory.len(), 24);
+        assert_eq!(detcore_inventory.len(), 55);
         assert_eq!(
             content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
                 .unwrap()
@@ -29392,7 +29864,70 @@ mod tests {
             }
         }
         {
-            // Physical dev fixed_arena_setup at 0x1e5a20
+            // Physical dev fixed_arena_setup at 0x2282a0; source 1e58d92f discovery ELF.
+            let bytes: &[u8] = &[
+                0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00, 0x48, 0x89, 0x7c, 0x24, 0x18, 0x48, 0x89,
+                0x7c, 0x24, 0x30, 0xbe, 0xff, 0xff, 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x31,
+                0xc9, 0xe8, 0x8e, 0xfb, 0xff, 0xff, 0xa8, 0x01, 0x75, 0x12, 0xc7, 0x44, 0x24, 0x24,
+                0x16, 0x00, 0x00, 0x00, 0xc7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x68,
+                0x48, 0x8b, 0x7c, 0x24, 0x18, 0xbe, 0xff, 0x3f, 0x01, 0x00, 0xba, 0x01, 0x60, 0x01,
+                0x00, 0x31, 0xc9, 0xe8, 0x62, 0xfb, 0xff, 0xff, 0xa8, 0x01, 0x75, 0x02, 0xeb, 0xd2,
+                0x48, 0x8b, 0x7c, 0x24, 0x18, 0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba, 0x01, 0xf0, 0x0f,
+                0x00, 0x31, 0xc9, 0xe8, 0x46, 0xfb, 0xff, 0xff, 0xa8, 0x01, 0x75, 0x02, 0xeb, 0xb6,
+                0xbf, 0x0a, 0x00, 0x00, 0x00, 0x48, 0xbe, 0x00, 0x00, 0x00, 0x10, 0x00, 0x60, 0x00,
+                0x00, 0xba, 0x00, 0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0xf2, 0xd6,
+                0xff, 0xff, 0x48, 0x89, 0x44, 0x24, 0x10, 0x48, 0x89, 0x44, 0x24, 0x38, 0x48, 0x83,
+                0xf8, 0x00, 0x7c, 0x46, 0xeb, 0x10, 0x8b, 0x44, 0x24, 0x20, 0x8b, 0x54, 0x24, 0x24,
+                0x48, 0x81, 0xc4, 0x88, 0x00, 0x00, 0x00, 0xc3, 0xbf, 0x0a, 0x00, 0x00, 0x00, 0x48,
+                0xbe, 0x00, 0x00, 0x00, 0x14, 0x00, 0x60, 0x00, 0x00, 0xba, 0x00, 0x00, 0x00, 0x02,
+                0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0xb2, 0xd6, 0xff, 0xff, 0x48, 0x89, 0x44, 0x24,
+                0x08, 0x48, 0x89, 0x44, 0x24, 0x40, 0x48, 0x83, 0xf8, 0x00, 0x0f, 0x8c, 0xf1, 0x00,
+                0x00, 0x00, 0xeb, 0x1d, 0x48, 0x8b, 0x4c, 0x24, 0x10, 0x48, 0x89, 0x4c, 0x24, 0x78,
+                0x31, 0xc0, 0x48, 0x29, 0xc8, 0x89, 0x44, 0x24, 0x24, 0xc7, 0x44, 0x24, 0x20, 0x01,
+                0x00, 0x00, 0x00, 0xeb, 0x9f, 0x48, 0xb8, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00,
+                0x00, 0x48, 0x89, 0x44, 0x24, 0x48, 0x48, 0xbf, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60,
+                0x00, 0x00, 0xe8, 0x01, 0xd5, 0xff, 0xff, 0x31, 0xc0, 0x89, 0xc7, 0xe8, 0x88, 0x5a,
+                0xfd, 0xff, 0x48, 0x8b, 0x7c, 0x24, 0x18, 0x48, 0x89, 0x44, 0x24, 0x50, 0x48, 0x8b,
+                0x44, 0x24, 0x50, 0x48, 0x89, 0x44, 0x24, 0x28, 0x48, 0x8b, 0x44, 0x24, 0x28, 0x48,
+                0x89, 0x44, 0x24, 0x58, 0x48, 0x8b, 0x44, 0x24, 0x58, 0x48, 0x89, 0x44, 0x24, 0x68,
+                0x48, 0x8b, 0x44, 0x24, 0x68, 0x48, 0x89, 0x44, 0x24, 0x60, 0x48, 0xb8, 0x00, 0x30,
+                0x02, 0x00, 0x00, 0x60, 0x00, 0x00, 0x48, 0x83, 0xc0, 0x18, 0x48, 0x89, 0x44, 0x24,
+                0x70, 0x48, 0xb8, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00, 0x48, 0x8b, 0x4c,
+                0x24, 0x60, 0x48, 0x89, 0x48, 0x18, 0xbe, 0xff, 0xff, 0x00, 0x00, 0xba, 0x01, 0x20,
+                0x01, 0x00, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x1c, 0xfa, 0xff, 0xff, 0x48, 0x8b,
+                0x7c, 0x24, 0x18, 0xbe, 0xff, 0x3f, 0x01, 0x00, 0xba, 0x01, 0x60, 0x01, 0x00, 0xb9,
+                0x01, 0x00, 0x00, 0x00, 0xe8, 0x03, 0xfa, 0xff, 0xff, 0x48, 0x8b, 0x7c, 0x24, 0x18,
+                0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba, 0x01, 0xf0, 0x0f, 0x00, 0xb9, 0x01, 0x00, 0x00,
+                0x00, 0xe8, 0xea, 0xf9, 0xff, 0xff, 0xc7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00,
+                0xe9, 0xcd, 0xfe, 0xff, 0xff, 0x48, 0x8b, 0x4c, 0x24, 0x08, 0x48, 0x89, 0x8c, 0x24,
+                0x80, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x48, 0x29, 0xc8, 0x89, 0x44, 0x24, 0x24, 0xc7,
+                0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xe9, 0xaa, 0xfe, 0xff, 0xff,
+            ];
+            let targets: BTreeMap<String, u64> = [
+                ("fixed_setup_bitmap_range".into(), 0x227e50),
+                ("fixed_scalar_syscall".into(), 0x225a20),
+                ("fixed_heap_metadata_initialize".into(), 0x2258c0),
+                ("fixed_metadata_atomic_new_usize".into(), 0x1fde50),
+            ]
+            .into_iter()
+            .collect();
+            let got: BTreeMap<u64, u64> = [].into_iter().collect();
+            let expected: &[(u64, u64, Option<u64>)] = &[
+                (0x2282bd, 0x227e50, None),
+                (0x2282e9, 0x227e50, None),
+                (0x228305, 0x227e50, None),
+                (0x228329, 0x225a20, None),
+                (0x228369, 0x225a20, None),
+                (0x2283ba, 0x2258c0, None),
+                (0x2283c3, 0x1fde50, None),
+                (0x22842f, 0x227e50, None),
+                (0x228448, 0x227e50, None),
+                (0x228461, 0x227e50, None),
+            ];
+            exercise("fixed_arena_setup", 0x2282a0, bytes, targets, got, expected);
+        }
+        {
+            // Refused historical two-band dev fixed_arena_setup at 0x1e5a20
             let bytes: &[u8] = &[
                 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00, 0x48, 0x89, 0x7c, 0x24, 0x18, 0x48, 0x89,
                 0x7c, 0x24, 0x30, 0xbe, 0xff, 0xff, 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x31,
@@ -29437,20 +29972,14 @@ mod tests {
             .into_iter()
             .collect();
             let got: BTreeMap<u64, u64> = [].into_iter().collect();
-            let expected: &[(u64, u64, Option<u64>)] = &[
-                (0x1e5a3d, 0x1e55d0, None),
-                (0x1e5a69, 0x1e55d0, None),
-                (0x1e5a8d, 0x1f6750, None),
-                (0x1e5acd, 0x1f6750, None),
-                (0x1e5b1e, 0x1ec7b0, None),
-                (0x1e5b27, 0x1ed6f0, None),
-                (0x1e5b93, 0x1e55d0, None),
-                (0x1e5bac, 0x1e55d0, None),
-            ];
-            exercise("fixed_arena_setup", 0x1e5a20, bytes, targets, got, expected);
+
+            assert!(
+                fixed_arena_recipe("fixed_arena_setup", 0x1e5a20, bytes, &targets, &got).is_err(),
+                "historical two-band setup must be refused"
+            );
         }
         {
-            // Physical dev fixed_setup_bitmap_range at 0x1e55d0
+            // Physical dev fixed_setup_bitmap_range at 0x227e50; source 1e58d92f discovery ELF.
             let bytes: &[u8] = &[
                 0x48, 0x81, 0xec, 0xf8, 0x00, 0x00, 0x00, 0x48, 0x89, 0x54, 0x24, 0x38, 0x48, 0x89,
                 0x74, 0x24, 0x40, 0x48, 0x89, 0x7c, 0x24, 0x48, 0x88, 0xc8, 0x88, 0x44, 0x24, 0x56,
@@ -29458,12 +29987,12 @@ mod tests {
                 0x70, 0x24, 0x01, 0x88, 0x44, 0x24, 0x7f, 0x48, 0x83, 0xe7, 0x07, 0x48, 0x83, 0xff,
                 0x00, 0x75, 0x16, 0x48, 0x8b, 0x44, 0x24, 0x48, 0x48, 0x83, 0xf8, 0x00, 0x0f, 0x94,
                 0xc0, 0x24, 0xff, 0x34, 0xff, 0xa8, 0x01, 0x75, 0x19, 0xeb, 0x49, 0x48, 0x8b, 0x74,
-                0x24, 0x48, 0xbf, 0x08, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x2e, 0x42, 0x18, 0x00,
-                0xff, 0x15, 0x00, 0x59, 0x1b, 0x00, 0x48, 0x8b, 0x44, 0x24, 0x40, 0x48, 0x8b, 0x4c,
+                0x24, 0x48, 0xbf, 0x08, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x15, 0xd6, 0x47, 0x15, 0x00,
+                0xff, 0x15, 0x40, 0x2f, 0x18, 0x00, 0x48, 0x8b, 0x44, 0x24, 0x40, 0x48, 0x8b, 0x4c,
                 0x24, 0x48, 0x48, 0x83, 0xc1, 0x08, 0x48, 0x89, 0x4c, 0x24, 0x30, 0x48, 0x89, 0x8c,
                 0x24, 0xf0, 0x00, 0x00, 0x00, 0x48, 0x89, 0x8c, 0x24, 0xa0, 0x00, 0x00, 0x00, 0x48,
                 0x89, 0x8c, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x58, 0xeb, 0x0d,
-                0x48, 0x8d, 0x3d, 0xef, 0x41, 0x18, 0x00, 0xff, 0x15, 0xc9, 0x58, 0x1b, 0x00, 0x48,
+                0x48, 0x8d, 0x3d, 0x97, 0x47, 0x15, 0x00, 0xff, 0x15, 0x09, 0x2f, 0x18, 0x00, 0x48,
                 0x8b, 0x44, 0x24, 0x38, 0x48, 0x39, 0x44, 0x24, 0x58, 0x72, 0x0a, 0xc6, 0x44, 0x24,
                 0x57, 0x01, 0xe9, 0xbc, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x44, 0x24, 0x30, 0x48, 0x8b,
                 0x4c, 0x24, 0x58, 0x48, 0xc1, 0xe9, 0x06, 0x48, 0x89, 0x4c, 0x24, 0x18, 0x48, 0x89,
@@ -29472,8 +30001,8 @@ mod tests {
                 0x84, 0x24, 0x88, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x44, 0x24, 0x58, 0x48, 0x83, 0xe0,
                 0x3f, 0x89, 0xc7, 0x48, 0xc7, 0x84, 0x24, 0xd0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
                 0x00, 0x89, 0xbc, 0x24, 0xd8, 0x00, 0x00, 0x00, 0x83, 0xe7, 0x3f, 0x89, 0x7c, 0x24,
-                0x0c, 0x89, 0xbc, 0x24, 0xdc, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x35, 0x51, 0x41, 0x18,
-                0x00, 0xe8, 0x34, 0xfd, 0xff, 0xff, 0x8b, 0x4c, 0x24, 0x0c, 0x48, 0x8b, 0x74, 0x24,
+                0x0c, 0x89, 0xbc, 0x24, 0xdc, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x35, 0x09, 0x45, 0x15,
+                0x00, 0xe8, 0xa4, 0x63, 0xff, 0xff, 0x8b, 0x4c, 0x24, 0x0c, 0x48, 0x8b, 0x74, 0x24,
                 0x10, 0x48, 0x8b, 0x54, 0x24, 0x18, 0x8a, 0x44, 0x24, 0x56, 0x89, 0xc9, 0xbf, 0x01,
                 0x00, 0x00, 0x00, 0x48, 0xd3, 0xe7, 0x48, 0x8b, 0x4c, 0x24, 0x30, 0x48, 0x89, 0x7c,
                 0x24, 0x20, 0x48, 0x89, 0xbc, 0x24, 0x90, 0x00, 0x00, 0x00, 0x48, 0x89, 0xb4, 0x24,
@@ -29490,25 +30019,25 @@ mod tests {
                 0x24, 0x57, 0x00, 0xeb, 0x8a,
             ];
             let targets: BTreeMap<String, u64> = [
-                ("fixed_bitmap_reference_location".into(), 0x369860),
-                ("fixed_panic_misaligned_reference".into(), 0x360107),
-                ("fixed_panic_null_reference".into(), 0x3600ee),
-                ("fixed_shift_location".into(), 0x369848),
-                ("fixed_setup_shift_guard".into(), 0x1e5430),
+                ("fixed_bitmap_reference_location".into(), 0x37c688),
+                ("fixed_panic_misaligned_reference".into(), 0x36f8d7),
+                ("fixed_panic_null_reference".into(), 0x36f8be),
+                ("fixed_shift_location".into(), 0x37c480),
+                ("fixed_setup_shift_guard".into(), 0x21e320),
             ]
             .into_iter()
             .collect();
-            let got: BTreeMap<u64, u64> = [(0x39af38, 0x360107), (0x39af40, 0x3600ee)]
+            let got: BTreeMap<u64, u64> = [(0x3aadf8, 0x36f8d7), (0x3aae00, 0x36f8be)]
                 .into_iter()
                 .collect();
             let expected: &[(u64, u64, Option<u64>)] = &[
-                (0x1e5632, 0x360107, Some(0x39af38)),
-                (0x1e5671, 0x3600ee, Some(0x39af40)),
-                (0x1e56f7, 0x1e5430, None),
+                (0x227eb2, 0x36f8d7, Some(0x3aadf8)),
+                (0x227ef1, 0x36f8be, Some(0x3aae00)),
+                (0x227f77, 0x21e320, None),
             ];
             exercise(
                 "fixed_setup_bitmap_range",
-                0x1e55d0,
+                0x227e50,
                 bytes,
                 targets,
                 got,
@@ -29800,7 +30329,51 @@ mod tests {
             exercise("fixed_patch_heap", 0x18a550, bytes, targets, got, expected);
         }
         {
-            // Physical normal fixed_arena_setup at 0xb4d90
+            // Physical normal fixed_arena_setup at 0xbf190; source 1e58d92f discovery ELF.
+            let bytes: &[u8] = &[
+                0x55, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89, 0xfb, 0xbe, 0xff, 0xff, 0x00,
+                0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x31, 0xc9, 0xe8, 0xf5, 0xfe, 0xff, 0xff, 0xbd,
+                0x01, 0x00, 0x00, 0x00, 0x41, 0xbe, 0x16, 0x00, 0x00, 0x00, 0x84, 0xc0, 0x0f, 0x84,
+                0xe5, 0x00, 0x00, 0x00, 0xbe, 0xff, 0x3f, 0x01, 0x00, 0xba, 0x01, 0x60, 0x01, 0x00,
+                0x48, 0x89, 0xdf, 0x31, 0xc9, 0xe8, 0xce, 0xfe, 0xff, 0xff, 0x84, 0xc0, 0x0f, 0x84,
+                0xc9, 0x00, 0x00, 0x00, 0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba, 0x01, 0xf0, 0x0f, 0x00,
+                0x48, 0x89, 0xdf, 0x31, 0xc9, 0xe8, 0xb2, 0xfe, 0xff, 0xff, 0x84, 0xc0, 0x0f, 0x84,
+                0xad, 0x00, 0x00, 0x00, 0x49, 0xbf, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00,
+                0x49, 0x8d, 0xb7, 0x00, 0xd0, 0xfd, 0x0f, 0xbf, 0x0a, 0x00, 0x00, 0x00, 0xba, 0x00,
+                0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x05, 0xd4, 0xff, 0xff, 0x48,
+                0x85, 0xc0, 0x78, 0x7d, 0x49, 0x8d, 0xb7, 0x00, 0xd0, 0xfd, 0x13, 0xbf, 0x0a, 0x00,
+                0x00, 0x00, 0xba, 0x00, 0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0xe5,
+                0xd3, 0xff, 0xff, 0x48, 0x85, 0xc0, 0x78, 0x5d, 0x0f, 0x57, 0xc0, 0x41, 0x0f, 0x29,
+                0x07, 0x41, 0xc6, 0x47, 0x10, 0x00, 0x49, 0xc7, 0x47, 0x18, 0x00, 0x00, 0x00, 0x00,
+                0xbe, 0xff, 0xff, 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x48, 0x89, 0xdf, 0xb9,
+                0x01, 0x00, 0x00, 0x00, 0xe8, 0x35, 0xfe, 0xff, 0xff, 0xbe, 0xff, 0x3f, 0x01, 0x00,
+                0xba, 0x01, 0x60, 0x01, 0x00, 0x48, 0x89, 0xdf, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8,
+                0x1e, 0xfe, 0xff, 0xff, 0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba, 0x01, 0xf0, 0x0f, 0x00,
+                0x48, 0x89, 0xdf, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x07, 0xfe, 0xff, 0xff, 0x31,
+                0xed, 0xeb, 0x06, 0x49, 0x89, 0xc6, 0x41, 0xf7, 0xde, 0x89, 0xe8, 0x44, 0x89, 0xf2,
+                0x48, 0x83, 0xc4, 0x08, 0x5b, 0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3,
+            ];
+            let targets: BTreeMap<String, u64> = [
+                ("fixed_setup_bitmap_range".into(), 0xbf0a0),
+                ("fixed_scalar_syscall".into(), 0xbc620),
+            ]
+            .into_iter()
+            .collect();
+            let got: BTreeMap<u64, u64> = [].into_iter().collect();
+            let expected: &[(u64, u64, Option<u64>)] = &[
+                (0xbf1a6, 0xbf0a0, None),
+                (0xbf1cd, 0xbf0a0, None),
+                (0xbf1e9, 0xbf0a0, None),
+                (0xbf216, 0xbc620, None),
+                (0xbf236, 0xbc620, None),
+                (0xbf266, 0xbf0a0, None),
+                (0xbf27d, 0xbf0a0, None),
+                (0xbf294, 0xbf0a0, None),
+            ];
+            exercise("fixed_arena_setup", 0xbf190, bytes, targets, got, expected);
+        }
+        {
+            // Refused historical two-band normal fixed_arena_setup at 0xb4d90
             let bytes: &[u8] = &[
                 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x50, 0x49, 0x89, 0xfe, 0xbe, 0xff, 0xff,
                 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x31, 0xc9, 0xe8, 0x04, 0xff, 0xff, 0xff,
@@ -29828,18 +30401,14 @@ mod tests {
             .into_iter()
             .collect();
             let got: BTreeMap<u64, u64> = [].into_iter().collect();
-            let expected: &[(u64, u64, Option<u64>)] = &[
-                (0xb4da7, 0xb4cb0, None),
-                (0xb4dce, 0xb4cb0, None),
-                (0xb4dfc, 0xb39b0, None),
-                (0xb4e1d, 0xb39b0, None),
-                (0xb4e50, 0xb4cb0, None),
-                (0xb4e67, 0xb4cb0, None),
-            ];
-            exercise("fixed_arena_setup", 0xb4d90, bytes, targets, got, expected);
+
+            assert!(
+                fixed_arena_recipe("fixed_arena_setup", 0xb4d90, bytes, &targets, &got).is_err(),
+                "historical two-band setup must be refused"
+            );
         }
         {
-            // Physical normal fixed_setup_bitmap_range at 0xb4cb0
+            // Physical normal fixed_setup_bitmap_range at 0xbf0a0; source 1e58d92f discovery ELF.
             let bytes: &[u8] = &[
                 0xb0, 0x01, 0x48, 0x39, 0xf2, 0x0f, 0x86, 0xa3, 0x00, 0x00, 0x00, 0x84, 0xc9, 0x74,
                 0x69, 0x89, 0xd1, 0x29, 0xf1, 0x4c, 0x8d, 0x46, 0x01, 0xf6, 0xc1, 0x01, 0x74, 0x17,
@@ -29860,7 +30429,7 @@ mod tests {
             let expected: &[(u64, u64, Option<u64>)] = &[];
             exercise(
                 "fixed_setup_bitmap_range",
-                0xb4cb0,
+                0xbf0a0,
                 bytes,
                 targets,
                 got,
@@ -29894,7 +30463,51 @@ mod tests {
             );
         }
         {
-            // Physical diagnostic fixed_arena_setup at 0xbcca0
+            // Physical diagnostic fixed_arena_setup at 0xbe9e0; source 1e58d92f discovery ELF.
+            let bytes: &[u8] = &[
+                0x55, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89, 0xfb, 0xbe, 0xff, 0xff, 0x00,
+                0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x31, 0xc9, 0xe8, 0xf5, 0xfe, 0xff, 0xff, 0xbd,
+                0x01, 0x00, 0x00, 0x00, 0x41, 0xbe, 0x16, 0x00, 0x00, 0x00, 0x84, 0xc0, 0x0f, 0x84,
+                0xe5, 0x00, 0x00, 0x00, 0xbe, 0xff, 0x3f, 0x01, 0x00, 0xba, 0x01, 0x60, 0x01, 0x00,
+                0x48, 0x89, 0xdf, 0x31, 0xc9, 0xe8, 0xce, 0xfe, 0xff, 0xff, 0x84, 0xc0, 0x0f, 0x84,
+                0xc9, 0x00, 0x00, 0x00, 0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba, 0x01, 0xf0, 0x0f, 0x00,
+                0x48, 0x89, 0xdf, 0x31, 0xc9, 0xe8, 0xb2, 0xfe, 0xff, 0xff, 0x84, 0xc0, 0x0f, 0x84,
+                0xad, 0x00, 0x00, 0x00, 0x49, 0xbf, 0x00, 0x30, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00,
+                0x49, 0x8d, 0xb7, 0x00, 0xd0, 0xfd, 0x0f, 0xbf, 0x0a, 0x00, 0x00, 0x00, 0xba, 0x00,
+                0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0x15, 0x28, 0x00, 0x00, 0x48,
+                0x85, 0xc0, 0x78, 0x7d, 0x49, 0x8d, 0xb7, 0x00, 0xd0, 0xfd, 0x13, 0xbf, 0x0a, 0x00,
+                0x00, 0x00, 0xba, 0x00, 0x00, 0x00, 0x02, 0xb9, 0x03, 0x00, 0x00, 0x00, 0xe8, 0xf5,
+                0x27, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x78, 0x5d, 0x0f, 0x57, 0xc0, 0x41, 0x0f, 0x29,
+                0x07, 0x41, 0xc6, 0x47, 0x10, 0x00, 0x49, 0xc7, 0x47, 0x18, 0x00, 0x00, 0x00, 0x00,
+                0xbe, 0xff, 0xff, 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x48, 0x89, 0xdf, 0xb9,
+                0x01, 0x00, 0x00, 0x00, 0xe8, 0x35, 0xfe, 0xff, 0xff, 0xbe, 0xff, 0x3f, 0x01, 0x00,
+                0xba, 0x01, 0x60, 0x01, 0x00, 0x48, 0x89, 0xdf, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8,
+                0x1e, 0xfe, 0xff, 0xff, 0xbe, 0xff, 0xff, 0x0d, 0x00, 0xba, 0x01, 0xf0, 0x0f, 0x00,
+                0x48, 0x89, 0xdf, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, 0x07, 0xfe, 0xff, 0xff, 0x31,
+                0xed, 0xeb, 0x06, 0x49, 0x89, 0xc6, 0x41, 0xf7, 0xde, 0x89, 0xe8, 0x44, 0x89, 0xf2,
+                0x48, 0x83, 0xc4, 0x08, 0x5b, 0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3,
+            ];
+            let targets: BTreeMap<String, u64> = [
+                ("fixed_setup_bitmap_range".into(), 0xbe8f0),
+                ("fixed_scalar_syscall".into(), 0xc1280),
+            ]
+            .into_iter()
+            .collect();
+            let got: BTreeMap<u64, u64> = [].into_iter().collect();
+            let expected: &[(u64, u64, Option<u64>)] = &[
+                (0xbe9f6, 0xbe8f0, None),
+                (0xbea1d, 0xbe8f0, None),
+                (0xbea39, 0xbe8f0, None),
+                (0xbea66, 0xc1280, None),
+                (0xbea86, 0xc1280, None),
+                (0xbeab6, 0xbe8f0, None),
+                (0xbeacd, 0xbe8f0, None),
+                (0xbeae4, 0xbe8f0, None),
+            ];
+            exercise("fixed_arena_setup", 0xbe9e0, bytes, targets, got, expected);
+        }
+        {
+            // Refused historical two-band diagnostic fixed_arena_setup at 0xbcca0
             let bytes: &[u8] = &[
                 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x50, 0x49, 0x89, 0xfe, 0xbe, 0xff, 0xff,
                 0x00, 0x00, 0xba, 0x01, 0x20, 0x01, 0x00, 0x31, 0xc9, 0xe8, 0x04, 0xff, 0xff, 0xff,
@@ -29922,18 +30535,14 @@ mod tests {
             .into_iter()
             .collect();
             let got: BTreeMap<u64, u64> = [].into_iter().collect();
-            let expected: &[(u64, u64, Option<u64>)] = &[
-                (0xbccb7, 0xbcbc0, None),
-                (0xbccde, 0xbcbc0, None),
-                (0xbcd0c, 0xb9d20, None),
-                (0xbcd2d, 0xb9d20, None),
-                (0xbcd60, 0xbcbc0, None),
-                (0xbcd77, 0xbcbc0, None),
-            ];
-            exercise("fixed_arena_setup", 0xbcca0, bytes, targets, got, expected);
+
+            assert!(
+                fixed_arena_recipe("fixed_arena_setup", 0xbcca0, bytes, &targets, &got).is_err(),
+                "historical two-band setup must be refused"
+            );
         }
         {
-            // Physical diagnostic fixed_setup_bitmap_range at 0xbcbc0
+            // Physical diagnostic fixed_setup_bitmap_range at 0xbe8f0; source 1e58d92f discovery ELF.
             let bytes: &[u8] = &[
                 0xb0, 0x01, 0x48, 0x39, 0xf2, 0x0f, 0x86, 0xa3, 0x00, 0x00, 0x00, 0x84, 0xc9, 0x74,
                 0x69, 0x89, 0xd1, 0x29, 0xf1, 0x4c, 0x8d, 0x46, 0x01, 0xf6, 0xc1, 0x01, 0x74, 0x17,
@@ -29954,7 +30563,7 @@ mod tests {
             let expected: &[(u64, u64, Option<u64>)] = &[];
             exercise(
                 "fixed_setup_bitmap_range",
-                0xbcbc0,
+                0xbe8f0,
                 bytes,
                 targets,
                 got,
@@ -35674,47 +36283,14 @@ mod tests {
         targets: BTreeMap<String, u64>,
     }
 
-    // Independent frozen a29/eaa normal whole bodies and real objdump boundaries.
+    // Independent source-1e58 release fixture/normal ELF bodies and real objdump boundaries.
     // Address operands retain their actual original bindings in these positives.
     fn fixed_normal_return_control_graph(sample: usize) -> FixedNormalReturnControlGraph {
         match sample {
             0 => FixedNormalReturnControlGraph {
-                caller_address: 0xb9150,
+                caller_address: 0xc60b0,
                 caller: fixed_hex(
-                    "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85950000000fb60590f0080249b800f0efffff9fffff4c01c24881faffff7f00777884c0747489cd4989febfba0000004989f731f631d231c9e875bfffff4885c07e7f4c89f94939474075764883795001756f488379380074688b0183e00f83f808755e488d3d38f00802e833bfffff4885c0754dba02000000b801000000f0490fb15748753b0fb60384c074144c89f741c7060b000000eb32c70716000000eb2a48c74424080001000048c744241002090000488d7c2408e825feffff84c0741b4c89f741c7061600000031ed40886f084883c4185b415e415f5dc34889dfe80e0100004c89f783f8017505418916ebda4d893eebd7",
-                ),
-                caller_offsets: &[
-                    0, 1, 3, 5, 6, 10, 20, 23, 28, 34, 38, 41, 44, 50, 57, 67, 70, 77, 79, 81, 83,
-                    85, 88, 93, 96, 98, 100, 102, 107, 110, 112, 115, 119, 121, 126, 128, 133, 135,
-                    137, 140, 143, 145, 152, 157, 160, 162, 167, 172, 178, 180, 183, 185, 187, 190,
-                    197, 199, 205, 207, 216, 225, 230, 235, 237, 239, 242, 249, 251, 255, 259, 260,
-                    262, 264, 265, 266, 269, 274, 277, 280, 282, 285, 287, 290,
-                ],
-                setup_address: 0xb9370,
-                setup: fixed_hex(
-                    "41574156415453504989febeffff0000ba0120010031c9e8f4feffffbb0100000041bf1600000084c00f84b7000000beff3f0100ba016001004c89f731c9e8cdfeffff84c00f849b00000049bc0030020000600000498db42400d0fd0fbf0a000000ba00000002b903000000e84fbdffff4885c0786a498db42400d0fd13bf0a000000ba00000002b903000000e82ebdffff4885c078490f57c0410f29042441c64424100049c744241800000000beffff0000ba012001004c89f7b901000000e84bfeffffbeff3f0100ba016001004c89f7b901000000e834feffff31dbeb064989c741f7df89d84489fa4883c4085b415c415e415fc3",
-                ),
-                setup_offsets: &[
-                    0, 2, 4, 6, 7, 8, 11, 16, 21, 23, 28, 33, 39, 41, 47, 52, 57, 60, 62, 67, 69,
-                    75, 85, 93, 98, 103, 108, 113, 116, 118, 126, 131, 136, 141, 146, 149, 151,
-                    154, 159, 165, 174, 179, 184, 187, 192, 197, 202, 207, 210, 215, 220, 222, 224,
-                    227, 230, 232, 235, 239, 240, 242, 244, 246,
-                ],
-                targets: BTreeMap::from([
-                    ("fixed_initializing".into(), 0x2148219),
-                    ("fixed_scalar_syscall".into(), 0xb5130),
-                    ("fixed_region".into(), 0x2148220),
-                    ("fixed_region_publication_get".into(), 0xb5120),
-                    ("fixed_native_bitmap_range".into(), 0xb9060),
-                    ("fixed_arena_setup".into(), 0xb9370),
-                    ("fixed_native_from_native".into(), 0xb9150),
-                    ("fixed_setup_bitmap_range".into(), 0xb9280),
-                ]),
-            },
-            1 => FixedNormalReturnControlGraph {
-                caller_address: 0xb7610,
-                caller: fixed_hex(
-                    "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85950000000fb605c73b090249b800f0efffff9fffff4c01c24881faffff7f00777884c0747489cd4989febfba0000004989f731f631d231c9e855daffff4885c07e7f4c89f94939474075764883795001756f488379380074688b0183e00f83f808755e488d3d703b0902e823ccffff4885c0754dba02000000b801000000f0490fb15748753b0fb60384c074144c89f741c7060b000000eb32c70716000000eb2a48c74424080001000048c744241002090000488d7c2408e8a5feffff84c0741b4c89f741c7061600000031ed40886f084883c4185b415e415f5dc34889dfe8aeccffff4c89f7a8017405418916ebdb4d893eebd8",
+                    "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85950000000fb605e7d3080249b800f0efffff9fffff4c01c24881faffff7f00777884c0747489cd4989febfba0000004989f731f631d231c9e865b1ffff4885c07e7f4c89f94939474075764883795001756f488379380074688b0183e00f83f808755e488d3d90d30802e87387ffff4885c0754dba02000000b801000000f0490fb15748753b0fb60384c074144c89f741c7060b000000eb32c70716000000eb2a48c74424080001000048c744241002090000488d7c2408e865f3ffff84c0741b4c89f741c7061600000031ed40886f084883c4185b415e415f5dc34889dfe81e88ffff4c89f7a8017405418916ebdb4d893eebd8",
                 ),
                 caller_offsets: &[
                     0, 1, 3, 5, 6, 10, 20, 23, 28, 34, 38, 41, 44, 50, 57, 67, 70, 77, 79, 81, 83,
@@ -35723,25 +36299,60 @@ mod tests {
                     197, 199, 205, 207, 216, 225, 230, 235, 237, 239, 242, 249, 251, 255, 259, 260,
                     262, 264, 265, 266, 269, 274, 277, 279, 281, 284, 286, 289,
                 ],
-                setup_address: 0xb43d0,
+                setup_address: 0xbe9e0,
                 setup: fixed_hex(
-                    "41574156415453504989febeffff0000ba0120010031c9e8f4feffffbb0100000041bf1600000084c00f84b7000000beff3f0100ba016001004c89f731c9e8cdfeffff84c00f849b00000049bc0030020000600000498db42400d0fd0fbf0a000000ba00000002b903000000e88f0c00004885c0786a498db42400d0fd13bf0a000000ba00000002b903000000e86e0c00004885c078490f57c0410f29042441c64424100049c744241800000000beffff0000ba012001004c89f7b901000000e84bfeffffbeff3f0100ba016001004c89f7b901000000e834feffff31dbeb064989c741f7df89d84489fa4883c4085b415c415e415fc3",
+                    "554157415653504889fbbeffff0000ba0120010031c9e8f5feffffbd0100000041be1600000084c00f84e5000000beff3f0100ba016001004889df31c9e8cefeffff84c00f84c9000000beffff0d00ba01f00f004889df31c9e8b2feffff84c00f84ad00000049bf0030020000600000498db700d0fd0fbf0a000000ba00000002b903000000e8152800004885c0787d498db700d0fd13bf0a000000ba00000002b903000000e8f52700004885c0785d0f57c0410f290741c647100049c7471800000000beffff0000ba012001004889dfb901000000e835feffffbeff3f0100ba016001004889dfb901000000e81efeffffbeffff0d00ba01f00f004889dfb901000000e807feffff31edeb064989c641f7de89e84489f24883c4085b415e415f5dc3",
                 ),
                 setup_offsets: &[
-                    0, 2, 4, 6, 7, 8, 11, 16, 21, 23, 28, 33, 39, 41, 47, 52, 57, 60, 62, 67, 69,
-                    75, 85, 93, 98, 103, 108, 113, 116, 118, 126, 131, 136, 141, 146, 149, 151,
-                    154, 159, 165, 174, 179, 184, 187, 192, 197, 202, 207, 210, 215, 220, 222, 224,
-                    227, 230, 232, 235, 239, 240, 242, 244, 246,
+                    0, 1, 3, 5, 6, 7, 10, 15, 20, 22, 27, 32, 38, 40, 46, 51, 56, 59, 61, 66, 68,
+                    74, 79, 84, 87, 89, 94, 96, 102, 112, 119, 124, 129, 134, 139, 142, 144, 151,
+                    156, 161, 166, 171, 174, 176, 179, 183, 188, 196, 201, 206, 209, 214, 219, 224,
+                    229, 232, 237, 242, 247, 252, 255, 260, 265, 267, 269, 272, 275, 277, 280, 284,
+                    285, 287, 289, 290,
                 ],
                 targets: BTreeMap::from([
-                    ("fixed_initializing".into(), 0x214b210),
-                    ("fixed_scalar_syscall".into(), 0xb50d0),
-                    ("fixed_region".into(), 0x214b218),
-                    ("fixed_region_publication_get".into(), 0xb42d0),
-                    ("fixed_native_bitmap_range".into(), 0xb75a0),
-                    ("fixed_arena_setup".into(), 0xb43d0),
-                    ("fixed_native_from_native".into(), 0xb7610),
-                    ("fixed_setup_bitmap_range".into(), 0xb42e0),
+                    ("fixed_initializing".into(), 0x21534d0),
+                    ("fixed_scalar_syscall".into(), 0xc1280),
+                    ("fixed_region".into(), 0x21534d8),
+                    ("fixed_region_publication_get".into(), 0xbe8c0),
+                    ("fixed_native_bitmap_range".into(), 0xc5500),
+                    ("fixed_arena_setup".into(), 0xbe9e0),
+                    ("fixed_native_from_native".into(), 0xc60b0),
+                    ("fixed_setup_bitmap_range".into(), 0xbe8f0),
+                ]),
+            },
+            1 => FixedNormalReturnControlGraph {
+                caller_address: 0xbdcc0,
+                caller: fixed_hex(
+                    "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85950000000fb605f7f4080249b800f0efffff9fffff4c01c24881faffff7f00777884c0747489cd4989febfba0000004989f731f631d231c9e8f5e8ffff4885c07e7f4c89f94939474075764883795001756f488379380074688b0183e00f83f808755e488d3da0f40802e873d2ffff4885c0754dba02000000b801000000f0490fb15748753b0fb60384c074144c89f741c7060b000000eb32c70716000000eb2a48c74424080001000048c744241002090000488d7c2408e865f3ffff84c0741b4c89f741c7061600000031ed40886f084883c4185b415e415f5dc34889dfe8be1300004c89f7a8017405418916ebdb4d893eebd8",
+                ),
+                caller_offsets: &[
+                    0, 1, 3, 5, 6, 10, 20, 23, 28, 34, 38, 41, 44, 50, 57, 67, 70, 77, 79, 81, 83,
+                    85, 88, 93, 96, 98, 100, 102, 107, 110, 112, 115, 119, 121, 126, 128, 133, 135,
+                    137, 140, 143, 145, 152, 157, 160, 162, 167, 172, 178, 180, 183, 185, 187, 190,
+                    197, 199, 205, 207, 216, 225, 230, 235, 237, 239, 242, 249, 251, 255, 259, 260,
+                    262, 264, 265, 266, 269, 274, 277, 279, 281, 284, 286, 289,
+                ],
+                setup_address: 0xbf190,
+                setup: fixed_hex(
+                    "554157415653504889fbbeffff0000ba0120010031c9e8f5feffffbd0100000041be1600000084c00f84e5000000beff3f0100ba016001004889df31c9e8cefeffff84c00f84c9000000beffff0d00ba01f00f004889df31c9e8b2feffff84c00f84ad00000049bf0030020000600000498db700d0fd0fbf0a000000ba00000002b903000000e805d4ffff4885c0787d498db700d0fd13bf0a000000ba00000002b903000000e8e5d3ffff4885c0785d0f57c0410f290741c647100049c7471800000000beffff0000ba012001004889dfb901000000e835feffffbeff3f0100ba016001004889dfb901000000e81efeffffbeffff0d00ba01f00f004889dfb901000000e807feffff31edeb064989c641f7de89e84489f24883c4085b415e415f5dc3",
+                ),
+                setup_offsets: &[
+                    0, 1, 3, 5, 6, 7, 10, 15, 20, 22, 27, 32, 38, 40, 46, 51, 56, 59, 61, 66, 68,
+                    74, 79, 84, 87, 89, 94, 96, 102, 112, 119, 124, 129, 134, 139, 142, 144, 151,
+                    156, 161, 166, 171, 174, 176, 179, 183, 188, 196, 201, 206, 209, 214, 219, 224,
+                    229, 232, 237, 242, 247, 252, 255, 260, 265, 267, 269, 272, 275, 277, 280, 284,
+                    285, 287, 289, 290,
+                ],
+                targets: BTreeMap::from([
+                    ("fixed_initializing".into(), 0x214d1f0),
+                    ("fixed_scalar_syscall".into(), 0xbc620),
+                    ("fixed_region".into(), 0x214d1f8),
+                    ("fixed_region_publication_get".into(), 0xbafd0),
+                    ("fixed_native_bitmap_range".into(), 0xbd110),
+                    ("fixed_arena_setup".into(), 0xbf190),
+                    ("fixed_native_from_native".into(), 0xbdcc0),
+                    ("fixed_setup_bitmap_range".into(), 0xbf0a0),
                 ]),
             },
             _ => unreachable!(),
@@ -35787,7 +36398,7 @@ mod tests {
                 &graph.targets,
                 &got,
             )
-            .expect("frozen canonical normal247 setup whole recipe");
+            .expect("frozen canonical optimized three-band setup whole recipe");
             assert_eq!(
                 caller
                     .iter()
@@ -35814,12 +36425,14 @@ mod tests {
                     ))
                     .collect::<Vec<_>>(),
                 [
-                    (23, graph.targets["fixed_setup_bitmap_range"], None),
-                    (62, graph.targets["fixed_setup_bitmap_range"], None),
-                    (108, graph.targets["fixed_scalar_syscall"], None),
-                    (141, graph.targets["fixed_scalar_syscall"], None),
-                    (192, graph.targets["fixed_setup_bitmap_range"], None),
-                    (215, graph.targets["fixed_setup_bitmap_range"], None),
+                    (22, graph.targets["fixed_setup_bitmap_range"], None),
+                    (61, graph.targets["fixed_setup_bitmap_range"], None),
+                    (89, graph.targets["fixed_setup_bitmap_range"], None),
+                    (134, graph.targets["fixed_scalar_syscall"], None),
+                    (166, graph.targets["fixed_scalar_syscall"], None),
+                    (214, graph.targets["fixed_setup_bitmap_range"], None),
+                    (237, graph.targets["fixed_setup_bitmap_range"], None),
+                    (260, graph.targets["fixed_setup_bitmap_range"], None),
                 ]
             );
             for (role, address, bytes, offsets, edges) in [
@@ -35937,7 +36550,7 @@ mod tests {
             }
             for tag in [2u32, 3, 0x101, 0x80000001] {
                 let mut bad = graph.setup.clone();
-                bad[29..33].copy_from_slice(&tag.to_le_bytes());
+                bad[28..32].copy_from_slice(&tag.to_le_bytes());
                 assert!(
                     fixed_arena_recipe(
                         "fixed_arena_setup",
@@ -35947,7 +36560,7 @@ mod tests {
                         &got
                     )
                     .is_err(),
-                    "noncanonical EBX error tag {tag:#x}"
+                    "noncanonical EBP error tag {tag:#x}"
                 );
             }
         }
@@ -36044,21 +36657,18 @@ mod tests {
         for sample in 0..2 {
             let graph = fixed_normal_return_control_graph(sample);
             let proof = fixed_normal_return_control_proof(&graph).unwrap();
-            if sample == 0 {
-                assert!(!proof.witnesses.contains_key("fixed_native_from_native"));
-            } else {
-                let caller = proof.witnesses.get("fixed_native_from_native").expect(
-                    "actual291 must produce a recipe/census witness through the full recipe union",
-                );
-                assert!(caller.identity == FixedNormalReturnIdentity::Caller291);
-            }
+            let caller = proof
+                .witnesses
+                .get("fixed_native_from_native")
+                .expect("both current291 callers must produce recipe/census witnesses");
+            assert!(caller.identity == FixedNormalReturnIdentity::Caller291);
             assert!(
                 proof.witnesses["fixed_arena_setup"].identity
-                    == FixedNormalReturnIdentity::Setup247
+                    == FixedNormalReturnIdentity::ThreeBandSetup
             );
             fixed_normal_return_control_join(&proof, &graph).unwrap();
         }
-        // The two authentic247 bodies share one proved contract, not a chronology label.
+        // Both authentic optimized three-band bodies share the same proved return contract.
         let mut compatible = fixed_normal_return_control_graph(1);
         let old = fixed_normal_return_control_graph(0);
         compatible.setup_address = old.setup_address;
@@ -36075,27 +36685,27 @@ mod tests {
         let proof = fixed_normal_return_control_proof(&compatible).unwrap();
         fixed_normal_return_control_join(&proof, &compatible).unwrap();
 
-        // Retained real DEV449 setup: individually whole-recipe/typed/census valid.
-        // Rebind ALL caller operands, so only the finite247 return-contract join refuses.
+        // Current real DEV502 setup: individually whole-recipe/typed/census valid.
+        // Rebind ALL caller operands so only the optimized return-contract join refuses.
         let mut outside = fixed_normal_return_control_graph(1);
-        outside.setup_address = 0x1e5a20;
+        outside.setup_address = 0x2282a0;
         outside.setup = fixed_hex(
-            "4881ec8800000048897c241848897c2430beffff0000ba0120010031c9e88efbffffa8017512c744242416000000c744242001000000eb4c488b7c2418beff3f0100ba0160010031c9e862fbffffa8017502ebd2bf0a00000048be0000001000600000ba00000002b903000000e8be0c0100488944241048894424384883f8007c46eb108b4424208b5424244881c488000000c3bf0a00000048be0000001400600000ba00000002b903000000e87e0c0100488944240848894424404883f8000f8cd8000000eb1d488b4c241048894c247831c04829c889442424c744242001000000eb9f48b80030020000600000488944244848bf0030020000600000e88d6c000031c089c7e8c47b0000488b7c24184889442450488b4424504889442428488b4424284889442458488b4424584889442468488b442468488944246048b800300200006000004883c018488944247048b80030020000600000488b4c246048894818beffff0000ba01200100b901000000e838faffff488b7c2418beff3f0100ba01600100b901000000e81ffaffffc744242000000000e9e6feffff488b4c240848898c248000000031c04829c889442424c744242001000000e9c3feffff",
+            "4881ec8800000048897c241848897c2430beffff0000ba0120010031c9e88efbffffa8017512c744242416000000c744242001000000eb68488b7c2418beff3f0100ba0160010031c9e862fbffffa8017502ebd2488b7c2418beffff0d00ba01f00f0031c9e846fbffffa8017502ebb6bf0a00000048be0000001000600000ba00000002b903000000e8f2d6ffff488944241048894424384883f8007c46eb108b4424208b5424244881c488000000c3bf0a00000048be0000001400600000ba00000002b903000000e8b2d6ffff488944240848894424404883f8000f8cf1000000eb1d488b4c241048894c247831c04829c889442424c744242001000000eb9f48b80030020000600000488944244848bf0030020000600000e801d5ffff31c089c7e8885afdff488b7c24184889442450488b4424504889442428488b4424284889442458488b4424584889442468488b442468488944246048b800300200006000004883c018488944247048b80030020000600000488b4c246048894818beffff0000ba01200100b901000000e81cfaffff488b7c2418beff3f0100ba01600100b901000000e803faffff488b7c2418beffff0d00ba01f00f00b901000000e8eaf9ffffc744242000000000e9cdfeffff488b4c240848898c248000000031c04829c889442424c744242001000000e9aafeffff",
         );
         outside.setup_offsets = &[
             0, 7, 12, 17, 22, 27, 29, 34, 36, 38, 46, 54, 56, 61, 66, 71, 73, 78, 80, 82, 84, 89,
-            99, 104, 109, 114, 119, 124, 128, 130, 132, 136, 140, 147, 148, 153, 163, 168, 173,
-            178, 183, 188, 192, 198, 200, 205, 210, 212, 215, 219, 227, 229, 239, 244, 254, 259,
-            261, 263, 268, 273, 278, 283, 288, 293, 298, 303, 308, 313, 318, 328, 332, 337, 347,
-            352, 356, 361, 366, 371, 376, 381, 386, 391, 396, 401, 409, 414, 419, 427, 429, 432,
-            436, 444,
+            94, 99, 101, 106, 108, 110, 112, 117, 127, 132, 137, 142, 147, 152, 156, 158, 160, 164,
+            168, 175, 176, 181, 191, 196, 201, 206, 211, 216, 220, 226, 228, 233, 238, 240, 243,
+            247, 255, 257, 267, 272, 282, 287, 289, 291, 296, 301, 306, 311, 316, 321, 326, 331,
+            336, 341, 346, 356, 360, 365, 375, 380, 384, 389, 394, 399, 404, 409, 414, 419, 424,
+            429, 434, 439, 444, 449, 454, 462, 467, 472, 480, 482, 485, 489, 497,
         ];
         for (key, address) in [
-            ("fixed_arena_setup", 0x1e5a20),
-            ("fixed_setup_bitmap_range", 0x1e55d0),
-            ("fixed_scalar_syscall", 0x1f6750),
-            ("fixed_heap_metadata_initialize", 0x1ec7b0),
-            ("fixed_metadata_atomic_new_usize", 0x1ed6f0),
+            ("fixed_arena_setup", 0x2282a0),
+            ("fixed_setup_bitmap_range", 0x227e50),
+            ("fixed_scalar_syscall", 0x225a20),
+            ("fixed_heap_metadata_initialize", 0x2258c0),
+            ("fixed_metadata_atomic_new_usize", 0x1fde50),
         ] {
             outside.targets.insert(key.into(), address);
         }
@@ -36112,7 +36722,7 @@ mod tests {
         );
         assert_eq!(
             fixed_normal_return_control_join(&proof, &outside).unwrap_err(),
-            "new normal caller lacks authenticated canonical normal247 setup"
+            "new normal caller lacks authenticated canonical optimized three-band setup"
         );
 
         // Still recipe/census valid: wrong same-size target and interior selected target.
@@ -36147,7 +36757,7 @@ mod tests {
         proof.witnesses.remove("fixed_arena_setup");
         assert_eq!(
             fixed_normal_return_control_join(&proof, &graph).unwrap_err(),
-            "new normal caller lacks authenticated canonical normal247 setup"
+            "new normal caller lacks authenticated canonical optimized three-band setup"
         );
         let mut proof = fixed_normal_return_control_proof(&graph).unwrap();
         proof
@@ -36219,12 +36829,12 @@ mod tests {
         assert!(fixed_normal_return_control_proof(&missing).is_err());
         // Explicit full/partial EAX, EDX errno, success clear and branch/store mutations.
         for (offset, value) in [
-            (220, 0x90),
-            (230, 0x88),
-            (231, 0xc8),
-            (234, 0xea),
-            (221, 0xc0),
-            (41, 0x75),
+            (265, 0x90), // success XOR EBP,EBP
+            (275, 0x88), // full EAX tag move
+            (276, 0xc8), // EBP source
+            (279, 0xea), // full EDX errno move
+            (266, 0xc0), // success clear register
+            (40, 0x75),  // preflight branch
         ] {
             let mut bad = fixed_normal_return_control_graph(1);
             bad.setup[offset] = value;
@@ -45895,9 +46505,259 @@ mod tests {
         }
     }
 
+    // Actual measured complete Detcore setup bodies; no template-derived positive bytes.
+    // These controls never construct VerifiedCompiledSources or an ELF PASS receipt.
+    fn fixed_three_band_detcore_setup_controls() {
+        let readonly = BTreeMap::new();
+        let context = BTreeMap::new();
+        let got = BTreeMap::new();
+        {
+            // loader-m1-detcore-normal-artifact-a02 retained ELF.
+            let address = 0x95ff30;
+            let bytes = fixed_hex(
+                "554157415653504889fbbeffff0000ba0120010031c9e8b5feffffbd0100000041be1600000084c00f84e5000000beff3f0100ba016001004889df31c9e88efeffff84c00f84c9000000beffff0d00ba01f00f004889df31c9e872feffff84c00f84ad00000049bf0030020000600000498db700d0fd0fbf0a000000ba00000002b903000000e815f7ffff4885c0787d498db700d0fd13bf0a000000ba00000002b903000000e8f5f6ffff4885c0785d0f57c0410f290741c647100049c7471800000000beffff0000ba012001004889dfb901000000e8f5fdffffbeff3f0100ba016001004889dfb901000000e8defdffffbeffff0d00ba01f00f004889dfb901000000e8c7fdffff31edeb064989c641f7de89e84489f24883c4085b415e415f5dc3",
+            );
+            let targets = BTreeMap::from([
+                ("fixed_setup_bitmap_range".into(), 0x95fe00),
+                ("fixed_scalar_syscall".into(), 0x95f6d0),
+            ]);
+            let offsets: &[usize] = &[
+                0, 1, 3, 5, 6, 7, 10, 15, 20, 22, 27, 32, 38, 40, 46, 51, 56, 59, 61, 66, 68, 74,
+                79, 84, 87, 89, 94, 96, 102, 112, 119, 124, 129, 134, 139, 142, 144, 151, 156, 161,
+                166, 171, 174, 176, 179, 183, 188, 196, 201, 206, 209, 214, 219, 224, 229, 232,
+                237, 242, 247, 252, 255, 260, 265, 267, 269, 272, 275, 277, 280, 284, 285, 287,
+                289, 290,
+            ];
+            let instructions = fixed_normal_return_control_instructions(address, &bytes, offsets);
+            let check = |actual: &[u8], targets: &BTreeMap<String, u64>| {
+                fixed_detcore_validate_recipe(
+                    "fixed_arena_setup",
+                    address,
+                    actual,
+                    DetcoreRecipeBindings {
+                        targets,
+                        got: &got,
+                        readonly: &readonly,
+                        context: &context,
+                    },
+                    0xa0,
+                )
+            };
+            let edges = check(&bytes, &targets).expect("actual three-band Detcore setup");
+            assert_eq!(
+                edges
+                    .iter()
+                    .map(|e| (e.instruction, e.target, e.local_got_slot))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0x95ff46, 0x95fe00, None),
+                    (0x95ff6d, 0x95fe00, None),
+                    (0x95ff89, 0x95fe00, None),
+                    (0x95ffb6, 0x95f6d0, None),
+                    (0x95ffd6, 0x95f6d0, None),
+                    (0x960006, 0x95fe00, None),
+                    (0x96001d, 0x95fe00, None),
+                    (0x960034, 0x95fe00, None),
+                ]
+            );
+            let witness = fixed_detcore_qualified_operation(
+                "fixed_arena_setup",
+                address,
+                (&bytes, &instructions),
+                DetcoreRecipeBindings {
+                    targets: &targets,
+                    got: &got,
+                    readonly: &readonly,
+                    context: &context,
+                },
+                0xa0,
+                false,
+            )
+            .expect("actual setup recipe and complete census");
+            assert!(witness.kind == AuthenticatedDetcoreOperationKind::ValidateTemplate(24));
+            assert_eq!(witness.edges, edges);
+            for offset in 0..bytes.len() {
+                for bit in 0..8 {
+                    let mut bad = bytes.clone();
+                    bad[offset] ^= 1 << bit;
+                    assert!(
+                        check(&bad, &targets).is_err(),
+                        "Detcore setup mutation {offset}/{bit}"
+                    );
+                }
+            }
+            for length in 0..bytes.len() {
+                assert!(check(&bytes[..length], &targets).is_err());
+            }
+            for suffix in [&[0x90][..], &[0xc3][..], &[0xe8, 0, 0, 0, 0][..]] {
+                let mut bad = bytes.clone();
+                bad.extend_from_slice(suffix);
+                assert!(check(&bad, &targets).is_err());
+            }
+            for key in targets.keys() {
+                let mut bad = targets.clone();
+                bad.insert(key.clone(), targets[key] + 1);
+                assert!(check(&bytes, &bad).is_err());
+                let mut bad = targets.clone();
+                bad.remove(key);
+                assert!(check(&bytes, &bad).is_err());
+            }
+        }
+        {
+            // loader-m1-detcore-fixture-artifact-a01 retained ELF.
+            let address = 0x95b430;
+            let bytes = fixed_hex(
+                "554157415653504889fbbeffff0000ba0120010031c9e8b5feffffbd0100000041be1600000084c00f84e5000000beff3f0100ba016001004889df31c9e88efeffff84c00f84c9000000beffff0d00ba01f00f004889df31c9e872feffff84c00f84ad00000049bf0030020000600000498db700d0fd0fbf0a000000ba00000002b903000000e8f5e1ffff4885c0787d498db700d0fd13bf0a000000ba00000002b903000000e8d5e1ffff4885c0785d0f57c0410f290741c647100049c7471800000000beffff0000ba012001004889dfb901000000e8f5fdffffbeff3f0100ba016001004889dfb901000000e8defdffffbeffff0d00ba01f00f004889dfb901000000e8c7fdffff31edeb064989c641f7de89e84489f24883c4085b415e415f5dc3",
+            );
+            let targets = BTreeMap::from([
+                ("fixed_setup_bitmap_range".into(), 0x95b300),
+                ("fixed_scalar_syscall".into(), 0x9596b0),
+            ]);
+            let offsets: &[usize] = &[
+                0, 1, 3, 5, 6, 7, 10, 15, 20, 22, 27, 32, 38, 40, 46, 51, 56, 59, 61, 66, 68, 74,
+                79, 84, 87, 89, 94, 96, 102, 112, 119, 124, 129, 134, 139, 142, 144, 151, 156, 161,
+                166, 171, 174, 176, 179, 183, 188, 196, 201, 206, 209, 214, 219, 224, 229, 232,
+                237, 242, 247, 252, 255, 260, 265, 267, 269, 272, 275, 277, 280, 284, 285, 287,
+                289, 290,
+            ];
+            let instructions = fixed_normal_return_control_instructions(address, &bytes, offsets);
+            let check = |actual: &[u8], targets: &BTreeMap<String, u64>| {
+                fixed_detcore_validate_recipe(
+                    "fixed_arena_setup",
+                    address,
+                    actual,
+                    DetcoreRecipeBindings {
+                        targets,
+                        got: &got,
+                        readonly: &readonly,
+                        context: &context,
+                    },
+                    0xa0,
+                )
+            };
+            let edges = check(&bytes, &targets).expect("actual three-band Detcore setup");
+            assert_eq!(
+                edges
+                    .iter()
+                    .map(|e| (e.instruction, e.target, e.local_got_slot))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0x95b446, 0x95b300, None),
+                    (0x95b46d, 0x95b300, None),
+                    (0x95b489, 0x95b300, None),
+                    (0x95b4b6, 0x9596b0, None),
+                    (0x95b4d6, 0x9596b0, None),
+                    (0x95b506, 0x95b300, None),
+                    (0x95b51d, 0x95b300, None),
+                    (0x95b534, 0x95b300, None),
+                ]
+            );
+            let witness = fixed_detcore_qualified_operation(
+                "fixed_arena_setup",
+                address,
+                (&bytes, &instructions),
+                DetcoreRecipeBindings {
+                    targets: &targets,
+                    got: &got,
+                    readonly: &readonly,
+                    context: &context,
+                },
+                0xa0,
+                false,
+            )
+            .expect("actual setup recipe and complete census");
+            assert!(witness.kind == AuthenticatedDetcoreOperationKind::ValidateTemplate(24));
+            assert_eq!(witness.edges, edges);
+            for offset in 0..bytes.len() {
+                for bit in 0..8 {
+                    let mut bad = bytes.clone();
+                    bad[offset] ^= 1 << bit;
+                    assert!(
+                        check(&bad, &targets).is_err(),
+                        "Detcore setup mutation {offset}/{bit}"
+                    );
+                }
+            }
+            for length in 0..bytes.len() {
+                assert!(check(&bytes[..length], &targets).is_err());
+            }
+            for suffix in [&[0x90][..], &[0xc3][..], &[0xe8, 0, 0, 0, 0][..]] {
+                let mut bad = bytes.clone();
+                bad.extend_from_slice(suffix);
+                assert!(check(&bad, &targets).is_err());
+            }
+            for key in targets.keys() {
+                let mut bad = targets.clone();
+                bad.insert(key.clone(), targets[key] + 1);
+                assert!(check(&bytes, &bad).is_err());
+                let mut bad = targets.clone();
+                bad.remove(key);
+                assert!(check(&bytes, &bad).is_err());
+            }
+        }
+        // Exact historical Detcore two-band body, with its authentic original targets.
+        // Neither direct Detcore admission, witness admission nor standalone union may credit it.
+        let address = 0x7290b0;
+        let old = fixed_hex(
+            "41574156415453504989febeffff0000ba0120010031c9e8b4feffffbb0100000041bf1600000084c00f84b7000000beff3f0100ba016001004c89f731c9e88dfeffff84c00f849b00000049bc0030020000600000498db42400d0fd0fbf0a000000ba00000002b903000000e8aff9ffff4885c0786a498db42400d0fd13bf0a000000ba00000002b903000000e88ef9ffff4885c078490f57c0410f29042441c64424100049c744241800000000beffff0000ba012001004c89f7b901000000e80bfeffffbeff3f0100ba016001004c89f7b901000000e8f4fdffff31dbeb064989c741f7df89d84489fa4883c4085b415c415e415fc3",
+        );
+        let targets = BTreeMap::from([
+            ("fixed_scalar_syscall".into(), 0x728ad0),
+            ("fixed_setup_bitmap_range".into(), 0x728f80),
+        ]);
+        let instructions = fixed_normal_return_control_instructions(
+            address,
+            &old,
+            &[
+                0, 2, 4, 6, 7, 8, 11, 16, 21, 23, 28, 33, 39, 41, 47, 52, 57, 60, 62, 67, 69, 75,
+                85, 93, 98, 103, 108, 113, 116, 118, 126, 131, 136, 141, 146, 149, 151, 154, 159,
+                165, 174, 179, 184, 187, 192, 197, 202, 207, 210, 215, 220, 222, 224, 227, 230,
+                232, 235, 239, 240, 242, 244, 246,
+            ],
+        );
+        assert!(
+            fixed_detcore_validate_recipe(
+                "fixed_arena_setup",
+                address,
+                &old,
+                DetcoreRecipeBindings {
+                    targets: &targets,
+                    got: &got,
+                    readonly: &readonly,
+                    context: &context
+                },
+                0xa0,
+            )
+            .is_err(),
+            "historical two-band Detcore recipe must be refused"
+        );
+        assert!(
+            fixed_detcore_qualified_operation(
+                "fixed_arena_setup",
+                address,
+                (&old, &instructions),
+                DetcoreRecipeBindings {
+                    targets: &targets,
+                    got: &got,
+                    readonly: &readonly,
+                    context: &context
+                },
+                0xa0,
+                false,
+            )
+            .is_err(),
+            "historical two-band Detcore witness must be refused"
+        );
+        assert!(
+            fixed_arena_recipe("fixed_arena_setup", address, &old, &targets, &got).is_err(),
+            "historical Detcore body cannot enter through standalone arena recipe"
+        );
+    }
+
     // Invoke once inside an existing host-control #[test]; no new libtest identity.
     // These are pure semantic-template controls, not physical ELF qualification.
     fn detcore_validate_template_controls() {
+        fixed_three_band_detcore_setup_controls();
         let mut context = BTreeMap::new();
         context.insert("rv:reverie-inguest/src/guest/alloc.rs".to_owned(),fixed_hex("2f6275696c642f2e636172676f2f6769742f636865636b6f7574732f726576657269652d326663373730663761396338303830332f666334623438642f726576657269652d696e67756573742f7372632f67756573742f616c6c6f632e7273"));
         context.insert("rv:reverie-inguest/src/guest/tool_region_arena.rs".to_owned(),fixed_hex("2f6275696c642f2e636172676f2f6769742f636865636b6f7574732f726576657269652d326663373730663761396338303830332f666334623438642f726576657269652d696e67756573742f7372632f67756573742f746f6f6c5f726567696f6e5f6172656e612e7273"));
@@ -46339,10 +47199,10 @@ mod tests {
             ),
             (
                 24,
-                0x7290b0,
+                0x95ff30,
                 &[
-                    ("fixed_scalar_syscall", 0x728ad0),
-                    ("fixed_setup_bitmap_range", 0x728f80),
+                    ("fixed_scalar_syscall", 0x95f6d0),
+                    ("fixed_setup_bitmap_range", 0x95fe00),
                 ],
                 &[],
                 0xa0,
@@ -47735,5 +48595,4304 @@ mod tests {
         assert!(detcore_validate_readonly_recipe(spec, 0x2000, &bad, &readonly, &context).is_err());
         // Writer/mapping/sole-RELATIVE controls continue exercising physical ELF
         // binder fixtures; synthetic readonly maps cannot earn that proof.
+    }
+}
+
+/// Private static-runtime build/source identity and bounded final-ELF inspection.
+/// This is deliberately disjoint from the DSO/M1 admission types. It does not
+/// prove pre-TLS machine closure, qualified relay sites, physical ownership or
+/// readiness. No serialized record can construct either verified type below.
+pub mod private_static {
+    use super::*;
+
+    /// Source-owned finite TLS/SSP definition joins; never entry qualification.
+    pub mod selected_initializers;
+
+    pub(super) mod tls_sources;
+
+    const TARGET: &str = "x86_64-unknown-linux-musl";
+    const LOW: u64 = 0x6000_e100_0000;
+    const HIGH: u64 = 0x6000_ff00_0000;
+    const GATE: u64 = LOW + 4096;
+    const ENTRY: &str = "detcore_liteinst_mapped_entry";
+    const LAYOUT: &str = "detcore_liteinst_mapped_layout";
+    const FEATURES: [&str; 3] = [
+        "exec-native-injection",
+        "exec-private-init",
+        "loader-private-runtime",
+    ];
+
+    /// Independently selected exact Git/compiler inputs, never receipt JSON.
+    pub struct SourceExpectation<'a> {
+        pub workspace: &'a Path,
+        pub workspace_head: &'a str,
+        pub reverie_pin: &'a str,
+        pub cargo: &'a Path,
+        pub rustc: &'a Path,
+        /// Explicit sole target. Its existence is not artifact provenance.
+        pub target_dir: &'a Path,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CacheBinding {
+        head: String,
+        tree: String,
+        contents: String,
+    }
+    enum RootBinding {
+        Ordinary((String, String)),
+        Cargo(CacheBinding),
+    }
+    fn empty_cargo_marker(path: &Path) -> Result<()> {
+        let m = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        require(
+            m.file_type().is_file() && m.len() == 0,
+            "static Cargo completion marker is not a regular zero-byte file",
+        )?;
+        require(
+            fs::read(path).map_err(|e| e.to_string())?.is_empty(),
+            "static Cargo completion marker changed",
+        )
+    }
+    // Rust adaptation of the existing maintained experiment authority in
+    // loader-musl-genuine-build-v2-binding.py::tracked_source. Cargo's synthetic
+    // submodule status is not source authority; every tracked byte/mode/gitlink
+    // is checked directly. This is used ONLY for the metadata-selected cache.
+    fn cached_source(
+        root: &Path,
+        expected: &str,
+        runner: &mut Runner,
+        depth: usize,
+    ) -> Result<CacheBinding> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        require(
+            depth <= 32 && source_pin_is_full(expected),
+            "static Cargo recursion/head bound",
+        )?;
+        require(
+            fs::canonicalize(root).map_err(|e| e.to_string())? == root,
+            "static Cargo source root is indirect",
+        )?;
+        let top = runner.text(
+            "git",
+            &["--no-replace-objects", "rev-parse", "--show-toplevel"],
+            root,
+        )?;
+        require(
+            Path::new(top.trim_end_matches('\n')) == root,
+            "static Cargo Git root differs",
+        )?;
+        let head = runner
+            .text("git", &["--no-replace-objects", "rev-parse", "HEAD"], root)?
+            .trim()
+            .to_owned();
+        let tree = runner
+            .text(
+                "git",
+                &["--no-replace-objects", "rev-parse", "HEAD^{tree}"],
+                root,
+            )?
+            .trim()
+            .to_owned();
+        require(
+            head == expected && source_pin_is_full(&tree),
+            "static Cargo head/tree differs",
+        )?;
+        let index = runner.text(
+            "git",
+            &[
+                "--no-replace-objects",
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--name-only",
+                "HEAD",
+                "--",
+            ],
+            root,
+        )?;
+        require(index.is_empty(), "static Cargo index differs from HEAD")?;
+        let raw = runner.run(
+            "git",
+            &[
+                "--no-replace-objects".into(),
+                "ls-tree".into(),
+                "-rz".into(),
+                "--full-tree".into(),
+                "HEAD".into(),
+            ],
+            root,
+        )?;
+        let mut ledger = Vec::new();
+        let mut regular = Vec::new();
+        for row in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            require(ledger.len() < 100_000, "static Cargo tree entry bound")?;
+            let at = row
+                .iter()
+                .position(|b| *b == b'\t')
+                .ok_or("static Cargo tree delimiter")?;
+            let header = std::str::from_utf8(&row[..at]).map_err(|e| e.to_string())?;
+            let fields: Vec<_> = header.split(' ').collect();
+            require(
+                fields.len() == 3 && source_pin_is_full(fields[2]),
+                "static Cargo tree header",
+            )?;
+            let (mode, kind, oid) = (fields[0], fields[1], fields[2]);
+            let name = std::str::from_utf8(&row[at + 1..]).map_err(|e| e.to_string())?;
+            require(
+                !name.is_empty()
+                    && Path::new(name)
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "static Cargo tree path",
+            )?;
+            let path = root.join(name);
+            let parent = path.parent().ok_or("static Cargo tree parent")?;
+            require(
+                fs::canonicalize(parent).map_err(|e| e.to_string())? == parent,
+                "static Cargo source parent is indirect",
+            )?;
+            let payload = if mode == "160000" && kind == "commit" {
+                match fs::symlink_metadata(&path) {
+                    Ok(m) => {
+                        require(
+                            m.file_type().is_dir(),
+                            "static Cargo gitlink is indirect/not directory",
+                        )?;
+                        match fs::symlink_metadata(path.join(".git")) {
+                            Ok(_) => {
+                                let child = cached_source(&path, oid, runner, depth + 1)?;
+                                format!(
+                                    "initialized:{}:{}:{}",
+                                    child.head, child.tree, child.contents
+                                )
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                require(
+                                    fs::read_dir(&path)
+                                        .map_err(|e| e.to_string())?
+                                        .next()
+                                        .is_none(),
+                                    "static Cargo uninitialized gitlink is nonempty",
+                                )?;
+                                format!("uninitialized:{oid}")
+                            }
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        format!("uninitialized:{oid}")
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            } else if mode == "120000" && kind == "blob" {
+                require(
+                    fs::symlink_metadata(&path)
+                        .map_err(|e| e.to_string())?
+                        .file_type()
+                        .is_symlink(),
+                    "static Cargo tracked symlink changed",
+                )?;
+                let target = fs::read_link(&path).map_err(|e| e.to_string())?;
+                let bytes = target.as_os_str().as_bytes();
+                let blob = runner.run(
+                    "git",
+                    &[
+                        "--no-replace-objects".into(),
+                        "cat-file".into(),
+                        "blob".into(),
+                        oid.into(),
+                    ],
+                    root,
+                )?;
+                require(
+                    bytes == blob.as_slice(),
+                    "static Cargo tracked symlink blob changed",
+                )?;
+                sha256(bytes)
+            } else {
+                require(
+                    kind == "blob" && matches!(mode, "100644" | "100755"),
+                    "static Cargo unsupported Git mode",
+                )?;
+                let m = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+                require(
+                    m.file_type().is_file()
+                        && (m.permissions().mode() & 0o111 != 0) == (mode == "100755"),
+                    "static Cargo tracked file type/executable mode changed",
+                )?;
+                let identity = exact_source_file(root, name)?;
+                regular.push((name.to_owned(), oid.to_owned(), identity.clone()));
+                identity.sha256
+            };
+            ledger.push((name.to_owned(), mode.to_owned(), oid.to_owned(), payload));
+        }
+        // Bounded argv batches avoid one Git process per source file. No filters,
+        // external diff or write-object option may alter the source comparison.
+        for batch in regular.chunks(128) {
+            let mut args = vec![
+                "--no-replace-objects".into(),
+                "hash-object".into(),
+                "--no-filters".into(),
+                "--".into(),
+            ];
+            args.extend(batch.iter().map(|(name, _, _)| name.clone()));
+            let output = runner.run("git", &args, root)?;
+            let output = std::str::from_utf8(&output).map_err(|e| e.to_string())?;
+            let ids: Vec<_> = output.lines().collect();
+            require(
+                ids.len() == batch.len(),
+                "static Cargo blob observation count",
+            )?;
+            for (actual, (_, expected, file)) in ids.iter().zip(batch) {
+                require(
+                    *actual == expected.as_str(),
+                    "static Cargo tracked blob differs from HEAD",
+                )?;
+                file.verify()?;
+            }
+        }
+        let extras = runner.run(
+            "git",
+            &[
+                "--no-replace-objects".into(),
+                "ls-files".into(),
+                "--others".into(),
+                "--exclude-standard".into(),
+                "-z".into(),
+            ],
+            root,
+        )?;
+        require(
+            extras.is_empty() || extras == b".cargo-ok\0",
+            "static Cargo source has extra untracked files",
+        )?;
+        // Validate even if a local ignore rule hid the marker from ls-files.
+        let marker = match fs::symlink_metadata(root.join(".cargo-ok")) {
+            Ok(_) => {
+                empty_cargo_marker(&root.join(".cargo-ok"))?;
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.to_string()),
+        };
+        let contents = sha256(&serde_json::to_vec(&(ledger, marker)).map_err(|e| e.to_string())?);
+        Ok(CacheBinding {
+            head,
+            tree,
+            contents,
+        })
+    }
+    struct Guard {
+        roots: Vec<(PathBuf, RootBinding)>,
+        files: Vec<FileIdentity>,
+        environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    }
+    impl Guard {
+        fn root(&mut self, path: &Path, head: &str, runner: &mut Runner) -> Result<()> {
+            require(
+                fs::canonicalize(path).map_err(|e| e.to_string())? == path,
+                "static source root is not canonical",
+            )?;
+            let identity = compiled_git_identity(path, runner)?;
+            require(
+                identity.0 == head,
+                "static source differs from independent expected head",
+            )?;
+            // An untracked module/build script must not enter this closed source
+            // transaction. Ignored/generated compiler inputs remain a separate
+            // compiled-closure proof obligation; this identity is not M1 proof.
+            let status = runner.text(
+                "git",
+                &[
+                    "--no-replace-objects",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                ],
+                path,
+            )?;
+            require(
+                status.is_empty(),
+                "static source has untracked or dirty files",
+            )?;
+            self.roots
+                .push((path.to_owned(), RootBinding::Ordinary(identity)));
+            Ok(())
+        }
+        fn cache_root(&mut self, path: &Path, head: &str, runner: &mut Runner) -> Result<()> {
+            let identity = cached_source(path, head, runner, 0)?;
+            self.roots
+                .push((path.to_owned(), RootBinding::Cargo(identity)));
+            Ok(())
+        }
+        fn close(&self, runner: &mut Runner) -> Result<()> {
+            let mut errors = Vec::new();
+            if std::env::vars_os().collect::<BTreeMap<_, _>>() != self.environment {
+                errors.push("static compiler environment changed during transaction".to_owned());
+            }
+            for file in &self.files {
+                if let Err(error) = file.verify() {
+                    errors.push(error);
+                }
+            }
+            for (root, expected) in &self.roots {
+                let result = match expected {
+                    RootBinding::Ordinary(expected) => (|| {
+                        require(
+                            compiled_git_identity(root, runner)? == *expected,
+                            "static source changed during transaction",
+                        )?;
+                        let status = runner.text(
+                            "git",
+                            &[
+                                "--no-replace-objects",
+                                "status",
+                                "--porcelain",
+                                "--untracked-files=all",
+                            ],
+                            root,
+                        )?;
+                        require(
+                            status.is_empty(),
+                            "static source acquired untracked/dirty input",
+                        )
+                    })(),
+                    RootBinding::Cargo(expected) => cached_source(root, &expected.head, runner, 0)
+                        .and_then(|actual| {
+                            require(
+                                actual == *expected,
+                                "static Cargo recursive source changed during transaction",
+                            )
+                        }),
+                };
+                if let Err(error) = result {
+                    errors.push(error);
+                }
+            }
+            require(errors.is_empty(), errors.join("; "))
+        }
+    }
+    fn close_result<T>(body: Result<T>, close: Result<()>) -> Result<T> {
+        match (body, close) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(format!("static source transaction close: {error}")),
+            (Err(error), Err(close)) => {
+                Err(format!("{error}; static source transaction close: {close}"))
+            }
+        }
+    }
+
+    // Non-ZST private allocation, NOT a source nonce/caller label. An escaped
+    // archive retains this allocation; a later context cannot reuse its owner.
+    struct ArchiveSourceOwner {
+        _reserved: u8,
+    }
+    fn require_same_archive_source(
+        context: &Arc<ArchiveSourceOwner>,
+        archive: &Arc<ArchiveSourceOwner>,
+        context_metadata: &str,
+        archive_metadata: &str,
+    ) -> Result<()> {
+        require(
+            Arc::ptr_eq(context, archive),
+            "static archive belongs to another source transaction",
+        )?;
+        require(
+            context_metadata == archive_metadata,
+            "static archive metadata differs from its source transaction",
+        )
+    }
+
+    /// Fresh source/metadata binding. Private construction, no Clone/Deserialize
+    /// and no conversion to VerifiedCompiledSources or existing M1 receipts.
+    pub struct VerifiedStaticSource {
+        workspace: PathBuf,
+        package: PackageIdentity,
+        target: Value,
+        build_targets: Vec<Value>,
+        guard: Guard,
+        cargo: FileIdentity,
+        target_dir: PathBuf,
+        metadata_sha256: String,
+        archive_owner: Arc<ArchiveSourceOwner>,
+    }
+    impl VerifiedStaticSource {
+        /// Metadata observation only; equal digests do not establish ownership.
+        pub fn metadata_sha256(&self) -> &str {
+            &self.metadata_sha256
+        }
+
+        fn require_archive_owner(&self, archive: &StaticArchive) -> Result<()> {
+            require_same_archive_source(
+                &self.archive_owner,
+                &archive.archive_owner,
+                &self.metadata_sha256,
+                &archive.metadata_sha256,
+            )
+        }
+        /// Fresh locked/offline metadata plus a source close on every Result
+        /// path, including failure. The body cannot take ownership of this
+        /// context or use it to construct a DSO source authority.
+        pub fn with_resolved<T>(
+            expected: &SourceExpectation<'_>,
+            runner: &mut Runner,
+            body: impl FnOnce(&Self, &mut Runner) -> Result<T>,
+        ) -> Result<T> {
+            require(
+                source_pin_is_full(expected.workspace_head)
+                    && source_pin_is_full(expected.reverie_pin),
+                "static source needs full independent H/R heads",
+            )?;
+            let cargo = FileIdentity::read(expected.cargo)?;
+            let rustc = FileIdentity::read(expected.rustc)?;
+            require(
+                cargo.path == expected.cargo && rustc.path == expected.rustc,
+                "static compiler paths must be canonical",
+            )?;
+            require(
+                std::env::var_os("RUSTC").as_deref() == Some(rustc.path.as_os_str()),
+                "static build requires explicit exact RUSTC",
+            )?;
+            for key in [
+                "RUSTC_WRAPPER",
+                "RUSTC_WORKSPACE_WRAPPER",
+                "CARGO_BUILD_RUSTC",
+                "CARGO_BUILD_RUSTC_WRAPPER",
+                "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            ] {
+                require(
+                    std::env::var_os(key).is_none(),
+                    format!("static compiler override forbidden: {key}"),
+                )?;
+            }
+            require(
+                expected.target_dir.is_absolute()
+                    && fs::canonicalize(expected.target_dir).map_err(|e| e.to_string())?
+                        == expected.target_dir
+                    && expected.target_dir == expected.workspace.join("target"),
+                "static producer requires canonical sole H/target",
+            )?;
+            let mut guard = Guard {
+                roots: Vec::new(),
+                files: vec![cargo.clone(), rustc],
+                environment: std::env::vars_os().collect(),
+            };
+            let result = (|| {
+                guard.root(expected.workspace, expected.workspace_head, runner)?;
+                guard.root(
+                    &expected.workspace.join("reverie"),
+                    expected.reverie_pin,
+                    runner,
+                )?;
+                let link = runner.text(
+                    "git",
+                    &["--no-replace-objects", "ls-tree", "HEAD", "--", "reverie"],
+                    expected.workspace,
+                )?;
+                require(
+                    link == format!("160000 commit {}\treverie\n", expected.reverie_pin),
+                    "static H gitlink mismatch",
+                )?;
+                for relative in [
+                    "Cargo.toml",
+                    "Cargo.lock",
+                    "detcore-liteinst/Cargo.toml",
+                    "detcore-liteinst/src/lib.rs",
+                ] {
+                    guard.files.push(compiled_blob_file(
+                        expected.workspace,
+                        expected.workspace_head,
+                        relative,
+                        runner,
+                    )?);
+                }
+                let manifest = expected.workspace.join("detcore-liteinst/Cargo.toml");
+                let output = runner.run(
+                    cargo.path.to_str().ok_or("non-UTF8 cargo")?,
+                    &[
+                        "metadata".into(),
+                        "--locked".into(),
+                        "--offline".into(),
+                        "--format-version=1".into(),
+                        "--manifest-path".into(),
+                        manifest.to_str().ok_or("non-UTF8 manifest")?.into(),
+                        "--filter-platform".into(),
+                        TARGET.into(),
+                        "--features".into(),
+                        FEATURES.join(","),
+                    ],
+                    expected.workspace,
+                )?;
+                let metadata: Value = serde_json::from_slice(&output).map_err(|e| e.to_string())?;
+                let packages = metadata["packages"]
+                    .as_array()
+                    .ok_or("static metadata lacks packages")?;
+                let mut roots = Vec::new();
+                let source = format!(
+                    "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}",
+                    expected.reverie_pin
+                );
+                for name in ["reverie-inguest", "reverie-liteinst", "reverie-loader"] {
+                    let rows: Vec<_> = packages.iter().filter(|p| p["name"] == name).collect();
+                    require(
+                        rows.len() == 1 && rows[0]["source"].as_str() == Some(source.as_str()),
+                        "static metadata R source/uniqueness mismatch",
+                    )?;
+                    let p = real_file(Path::new(
+                        rows[0]["manifest_path"]
+                            .as_str()
+                            .ok_or("static R manifest absent")?,
+                    ))?;
+                    let root = p
+                        .parent()
+                        .and_then(Path::parent)
+                        .ok_or("static R root absent")?
+                        .to_owned();
+                    require(
+                        p == root.join(name).join("Cargo.toml"),
+                        "static R manifest suffix mismatch",
+                    )?;
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                    }
+                }
+                require(
+                    roots.len() == 1,
+                    "static R dependencies use different source checkouts",
+                )?;
+                guard.cache_root(&roots[0], expected.reverie_pin, runner)?;
+                let rows: Vec<_> = packages
+                    .iter()
+                    .filter(|p| p["name"] == "detcore-liteinst")
+                    .collect();
+                require(rows.len() == 1, "static metadata leaf ambiguous")?;
+                let leaf = rows[0];
+                let id = format!(
+                    "path+file://{}#0.4.0",
+                    expected.workspace.join("detcore-liteinst").display()
+                );
+                require(
+                    leaf["id"] == id
+                        && leaf["source"].is_null()
+                        && leaf["version"] == "0.4.0"
+                        && leaf["manifest_path"].as_str() == manifest.to_str(),
+                    "static leaf package identity mismatch",
+                )?;
+                let targets = leaf["targets"]
+                    .as_array()
+                    .ok_or("static leaf targets absent")?;
+                let lib: Vec<_> = targets
+                    .iter()
+                    .filter(|t| t["name"] == "detcore_liteinst")
+                    .collect();
+                require(
+                    lib.len() == 1
+                        && strings(&lib[0]["kind"])? == ["cdylib"]
+                        && strings(&lib[0]["crate_types"])? == ["cdylib"]
+                        && lib[0]["src_path"].as_str()
+                            == expected
+                                .workspace
+                                .join("detcore-liteinst/src/lib.rs")
+                                .to_str(),
+                    "static explicit Cargo override requires actual cdylib metadata target",
+                )?;
+                let mut target = lib[0].clone();
+                // Exactly the maintained cargo rustc --crate-type staticlib
+                // override; do not broaden the existing DSO target selector.
+                target["kind"] = serde_json::json!(["staticlib"]);
+                target["crate_types"] = serde_json::json!(["staticlib"]);
+                let package = PackageIdentity {
+                    id,
+                    name: "detcore-liteinst".into(),
+                    manifest,
+                    source: None,
+                    target: "detcore_liteinst".into(),
+                    kind: vec!["staticlib".into()],
+                    crate_types: vec!["staticlib".into()],
+                    target_source: expected.workspace.join("detcore-liteinst/src/lib.rs"),
+                };
+                Ok((
+                    package,
+                    target,
+                    targets
+                        .iter()
+                        .filter(|t| t["kind"] == serde_json::json!(["custom-build"]))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    sha256(&output),
+                ))
+            })();
+            // Close even metadata/selection failures after initial acquisition.
+            let resolved = close_result(result, guard.close(runner))?;
+            let context = Self {
+                workspace: expected.workspace.to_owned(),
+                package: resolved.0,
+                target: resolved.1,
+                build_targets: resolved.2,
+                metadata_sha256: resolved.3,
+                guard,
+                cargo,
+                target_dir: expected.target_dir.to_owned(),
+                archive_owner: Arc::new(ArchiveSourceOwner { _reserved: 0 }),
+            };
+            let result = body(&context, runner);
+            close_result(result, context.guard.close(runner))
+        }
+
+        /// Run the actual fixed-profile Cargo producer now; no message file or
+        /// caller JSON can substitute for its fresh bounded Runner output.
+        /// Caller owns resource containment, offline cache, exact private native
+        /// input inventory/codegen config and the later real linker transaction.
+        pub fn build_archive(&self, runner: &mut Runner) -> Result<StaticArchive> {
+            let result = (|| {
+                self.guard.close(runner)?;
+                let output = runner.run(
+                    self.cargo.path.to_str().ok_or("non-UTF8 cargo")?,
+                    &[
+                        "rustc".into(),
+                        "--locked".into(),
+                        "--offline".into(),
+                        "--manifest-path".into(),
+                        self.package
+                            .manifest
+                            .to_str()
+                            .ok_or("non-UTF8 manifest")?
+                            .into(),
+                        "--lib".into(),
+                        "--target".into(),
+                        TARGET.into(),
+                        "--profile".into(),
+                        "liteinst-runtime".into(),
+                        "--features".into(),
+                        FEATURES.join(","),
+                        "--crate-type".into(),
+                        "staticlib".into(),
+                        "--message-format=json-render-diagnostics".into(),
+                        "--target-dir".into(),
+                        self.target_dir
+                            .to_str()
+                            .ok_or("non-UTF8 target directory")?
+                            .into(),
+                    ],
+                    &self.workspace,
+                )?;
+                select_archive(
+                    &output,
+                    &self.package,
+                    &self.target,
+                    &self.build_targets,
+                    &self.target_dir,
+                    &self.metadata_sha256,
+                    &self.archive_owner,
+                )
+            })();
+            close_result(result, self.guard.close(runner))
+        }
+    }
+
+    /// Actual freshly selected archive identity; not an ELF qualification.
+    pub struct StaticArchive {
+        archive_owner: Arc<ArchiveSourceOwner>,
+        file: FileIdentity,
+        metadata_sha256: String,
+        cargo_messages_sha256: String,
+        build_script_outputs: Vec<FileIdentity>,
+    }
+    impl StaticArchive {
+        pub fn file(&self) -> &FileIdentity {
+            &self.file
+        }
+        pub fn verify(&self) -> Result<()> {
+            self.file.verify()?;
+            for file in &self.build_script_outputs {
+                file.verify()?;
+            }
+            Ok(())
+        }
+        /// Digest observations only, not constructors accepting serialized data.
+        pub fn metadata_sha256(&self) -> &str {
+            &self.metadata_sha256
+        }
+        pub fn cargo_messages_sha256(&self) -> &str {
+            &self.cargo_messages_sha256
+        }
+    }
+    fn select_archive(
+        output: &[u8],
+        package: &PackageIdentity,
+        target: &Value,
+        build_targets: &[Value],
+        target_dir: &Path,
+        metadata_sha256: &str,
+        archive_owner: &Arc<ArchiveSourceOwner>,
+    ) -> Result<StaticArchive> {
+        let target_dir = fs::canonicalize(target_dir).map_err(|e| e.to_string())?;
+        let mut finished = Vec::new();
+        let mut roots = Vec::new();
+        let mut scripts = Vec::new();
+        for line in output.split(|b| *b == b'\n').filter(|s| !s.is_empty()) {
+            let row: Value = serde_json::from_slice(line).map_err(|e| e.to_string())?;
+            if row["reason"] == "build-finished" {
+                finished.push(row["success"].as_bool());
+            }
+            if row["reason"] != "compiler-artifact" {
+                continue;
+            }
+            if row["package_id"] != package.id
+                && row["manifest_path"].as_str() != package.manifest.to_str()
+            {
+                continue;
+            }
+            require(
+                row["package_id"] == package.id
+                    && row["manifest_path"].as_str() == package.manifest.to_str(),
+                "static package/manifest disagreement",
+            )?;
+            require(
+                strings(&row["features"])? == FEATURES
+                    && row["profile"]["test"] == false
+                    && row["executable"].is_null(),
+                "static feature/test/executable mismatch",
+            )?;
+            if row["target"] == *target {
+                require(
+                    row["profile"]["opt_level"] == "3"
+                        && row["profile"]["debuginfo"] == 0
+                        && row["profile"]["debug_assertions"] == true
+                        && row["profile"]["overflow_checks"] == true,
+                    "static liteinst-runtime profile differs",
+                )?;
+                roots.push(row);
+            } else {
+                require(
+                    build_targets.contains(&row["target"]),
+                    "unexpected same-package static target",
+                )?;
+                scripts.push(row);
+            }
+        }
+        require(
+            finished == [Some(true)] && roots.len() == 1,
+            "static producer lacks one successful current archive",
+        )?;
+        require(
+            scripts.len() == build_targets.len()
+                && build_targets
+                    .iter()
+                    .all(|t| scripts.iter().filter(|r| r["target"] == *t).count() == 1),
+            "static custom-build target missing/duplicate",
+        )?;
+        let mut retained = Vec::new();
+        for row in &scripts {
+            let files = strings(&row["filenames"])?;
+            require(files.len() == 1, "static custom-build output ambiguous")?;
+            let file = FileIdentity::read(Path::new(&files[0]))?;
+            require(
+                file.path.starts_with(&target_dir),
+                "static build script output outside target",
+            )?;
+            retained.push(file);
+        }
+        let files = strings(&roots[0]["filenames"])?;
+        require(
+            files.len() == 1
+                && Path::new(&files[0])
+                    .file_name()
+                    .is_some_and(|s| s == "libdetcore_liteinst.a"),
+            "static archive output ambiguous",
+        )?;
+        let file = FileIdentity::read(Path::new(&files[0]))?;
+        let profile = target_dir.join(TARGET).join("liteinst-runtime");
+        require(
+            file.path.starts_with(profile),
+            "static archive outside explicit musl profile",
+        )?;
+        Ok(StaticArchive {
+            archive_owner: Arc::clone(archive_owner),
+            file,
+            metadata_sha256: metadata_sha256.into(),
+            cargo_messages_sha256: sha256(output),
+            build_script_outputs: retained,
+        })
+    }
+
+    /// Checked numeric target-emitted layout, not host-native struct layout.
+    #[derive(Clone, Debug)]
+    pub struct TargetLayout {
+        control_bytes: u64,
+        control_alignment: u64,
+        relay_bytes: u64,
+        relay_alignment: u64,
+        header_bytes: u64,
+    }
+    impl TargetLayout {
+        pub fn control_bytes(&self) -> u64 {
+            self.control_bytes
+        }
+        pub fn control_alignment(&self) -> u64 {
+            self.control_alignment
+        }
+        pub fn relay_bytes(&self) -> u64 {
+            self.relay_bytes
+        }
+        pub fn relay_alignment(&self) -> u64 {
+            self.relay_alignment
+        }
+        pub fn header_bytes(&self) -> u64 {
+            self.header_bytes
+        }
+    }
+    /// Bounded actual final-file observations only. Private fields/constructor
+    /// forbid JSON reconstruction. This is NOT an admission token: linked object
+    /// provenance, reviewed source closure, pre-TLS machine proof, four libc
+    /// sites/ToolInit PCs and actual loader geometry remain mandatory next joins.
+    pub struct StaticImageInspection {
+        artifact: FileIdentity,
+        archive: FileIdentity,
+        entry: u64,
+        gate_sha256: String,
+        layout: TargetLayout,
+        program_headers: (u64, u64),
+        tls: (u64, u64, u64, u64),
+        strong_symbols: BTreeMap<String, SymbolEvidence>,
+    }
+    impl StaticImageInspection {
+        pub fn artifact(&self) -> &FileIdentity {
+            &self.artifact
+        }
+        pub fn archive(&self) -> &FileIdentity {
+            &self.archive
+        }
+        pub fn entry(&self) -> u64 {
+            self.entry
+        }
+        pub fn gate_sha256(&self) -> &str {
+            &self.gate_sha256
+        }
+        pub fn layout(&self) -> &TargetLayout {
+            &self.layout
+        }
+        pub fn program_headers(&self) -> (u64, u64) {
+            self.program_headers
+        }
+        /// Actual (address, file bytes, memory bytes, alignment).
+        pub fn tls(&self) -> (u64, u64, u64, u64) {
+            self.tls
+        }
+        pub fn strong_symbols(&self) -> &BTreeMap<String, SymbolEvidence> {
+            &self.strong_symbols
+        }
+    }
+
+    fn named(elf: &Elf<'_>, name: &str) -> Result<sym::Sym> {
+        let rows: Vec<_> = elf
+            .syms
+            .iter()
+            .filter(|s| elf.strtab.get_at(s.st_name) == Some(name))
+            .collect();
+        require(
+            rows.len() == 1
+                && rows[0].st_shndx != section_header::SHN_UNDEF as usize
+                && rows[0].st_shndx < elf.section_headers.len()
+                && rows[0].st_bind() != sym::STB_WEAK,
+            format!("static symbol absent/ambiguous/weak/special: {name}"),
+        )?;
+        Ok(rows[0])
+    }
+    fn mapped_bytes<'a>(
+        elf: &Elf<'_>,
+        bytes: &'a [u8],
+        address: u64,
+        length: u64,
+        flags: u32,
+    ) -> Result<&'a [u8]> {
+        let length = usize::try_from(length).map_err(|e| e.to_string())?;
+        require(length > 0, "empty static symbol mapping")?;
+        let (load, offset) = unique_file_mapping(elf, bytes, address, length)?;
+        require(load.p_flags == flags, "static symbol mapping flags differ")?;
+        bytes
+            .get(
+                offset
+                    ..offset
+                        .checked_add(length)
+                        .ok_or("static file slice overflow")?,
+            )
+            .ok_or_else(|| "static symbol file slice absent".into())
+    }
+    fn object<'a>(
+        elf: &Elf<'_>,
+        bytes: &'a [u8],
+        name: &str,
+        length: u64,
+        flags: u32,
+    ) -> Result<(sym::Sym, &'a [u8])> {
+        let section_flags = u64::from(flags & 2 != 0) * section_header::SHF_WRITE as u64
+            + section_header::SHF_ALLOC as u64
+            + u64::from(flags & 1 != 0) * section_header::SHF_EXECINSTR as u64;
+        object_with_section_flags(elf, bytes, name, length, flags, section_flags)
+    }
+    // Only the target-produced #[used] layout has SHF_GNU_RETAIN. This is an
+    // exact role-specific contract, not a mask applied to arbitrary objects.
+    fn layout_object<'a>(elf: &Elf<'_>, bytes: &'a [u8]) -> Result<(sym::Sym, &'a [u8])> {
+        object_with_section_flags(elf, bytes, LAYOUT, 96, 4, 0x200002)
+    }
+    fn object_with_section_flags<'a>(
+        elf: &Elf<'_>,
+        bytes: &'a [u8],
+        name: &str,
+        length: u64,
+        flags: u32,
+        section_flags: u64,
+    ) -> Result<(sym::Sym, &'a [u8])> {
+        let s = named(elf, name)?;
+        require(
+            s.st_type() == sym::STT_OBJECT && s.st_size == length,
+            format!("static object size/type differs: {name}"),
+        )?;
+        let section = &elf.section_headers[s.st_shndx];
+        require(
+            section.sh_type == section_header::SHT_PROGBITS && section.sh_flags == section_flags,
+            format!("static object section flags/type differs: {name}"),
+        )?;
+        let payload = mapped_bytes(elf, bytes, s.st_value, length, flags)?;
+        let (_, file_offset) = unique_file_mapping(
+            elf,
+            bytes,
+            s.st_value,
+            usize::try_from(length).map_err(|e| e.to_string())?,
+        )?;
+        require(
+            s.st_value
+                .checked_sub(section.sh_addr)
+                .and_then(|delta| section.sh_offset.checked_add(delta))
+                == Some(file_offset as u64),
+            "static object section/file coordinate mismatch",
+        )?;
+        require(
+            s.st_value >= section.sh_addr
+                && s.st_value.checked_add(length).is_some_and(|end| {
+                    section
+                        .sh_addr
+                        .checked_add(section.sh_size)
+                        .is_some_and(|last| end <= last)
+                }),
+            "static object exceeds section",
+        )?;
+        Ok((s, payload))
+    }
+    fn strong_kind(s: &sym::Sym) -> bool {
+        s.st_bind() == sym::STB_GLOBAL && s.st_type() == sym::STT_FUNC && s.st_size > 0
+    }
+    fn strong_function(elf: &Elf<'_>, bytes: &[u8], name: &str) -> Result<sym::Sym> {
+        let s = named(elf, name)?;
+        require(
+            strong_kind(&s),
+            format!("static strong Rust function binding/type differs: {name}"),
+        )?;
+        mapped_bytes(elf, bytes, s.st_value, s.st_size, 5)?;
+        Ok(s)
+    }
+    fn layout_words(bytes: &[u8]) -> Result<TargetLayout> {
+        require(bytes.len() == 96, "static layout descriptor length differs")?;
+        let mut words = [0u64; 12];
+        for (i, slot) in words.iter_mut().enumerate() {
+            *slot = u64::from_le_bytes(
+                bytes[i * 8..i * 8 + 8]
+                    .try_into()
+                    .map_err(|_| "layout word truncated")?,
+            );
+        }
+        require(
+            words[..6]
+                == [
+                    u64::from_le_bytes(*b"HLMLAY01"),
+                    1,
+                    96,
+                    1,
+                    120 * 8,
+                    1024 * 1024,
+                ],
+            "static layout revision/header/cap differs",
+        )?;
+        require(
+            words[6] == 3520
+                && words[7] == 64
+                && words[9] == 64
+                && words[8] > 0
+                && words[8] <= 1024 * 1024
+                && words[8] % words[9] == 0
+                && words[10] == GATE
+                && words[11] == GATE + 0x7c,
+            "static target-native layout/gate differs",
+        )?;
+        Ok(TargetLayout {
+            control_bytes: words[6],
+            control_alignment: words[7],
+            relay_bytes: words[8],
+            relay_alignment: words[9],
+            header_bytes: words[4],
+        })
+    }
+    type StaticGeometry = ((u64, u64), (u64, u64, u64, u64));
+
+    fn final_artifact_size(bytes: u64) -> Result<()> {
+        require(
+            bytes <= 128 * 1024 * 1024,
+            "static final artifact exceeds 128 MiB bound",
+        )
+    }
+
+    fn geometry(elf: &Elf<'_>, bytes: &[u8]) -> Result<StaticGeometry> {
+        geometry_impl(elf, bytes, None)
+    }
+    fn geometry_impl(
+        elf: &Elf<'_>,
+        bytes: &[u8],
+        optional: Option<&selected_initializers::OptionalZeroObservation>,
+    ) -> Result<StaticGeometry> {
+        require(
+            elf.header.e_type == header::ET_EXEC
+                && elf.header.e_machine == header::EM_X86_64
+                && elf.is_64
+                && elf.little_endian
+                && elf.header.e_phentsize == 56
+                && elf.header.e_phnum > 0
+                && elf.header.e_phnum <= 64,
+            "static ELF type/architecture/program-header format differs",
+        )?;
+        require(
+            elf.dynamic.is_none()
+                && elf.dynsyms.is_empty()
+                && elf.libraries.is_empty()
+                && elf.program_headers.iter().all(|p| {
+                    p.p_type != program_header::PT_INTERP && p.p_type != program_header::PT_DYNAMIC
+                }),
+            "static image contains interpreter/dynamic dependencies",
+        )?;
+        if let Some(observation) = optional {
+            selected_initializers::optional_final_rows(observation, elf, bytes)?;
+        } else {
+            require(
+                elf.syms
+                    .iter()
+                    .all(|s| s.st_shndx != section_header::SHN_UNDEF as usize || s.st_name == 0),
+                "static final ELF has unresolved symbols",
+            )?;
+        }
+        fixed_require_sane_loads(elf, bytes)?;
+        let loads: Vec<_> = elf
+            .program_headers
+            .iter()
+            .filter(|p| p.p_type == program_header::PT_LOAD)
+            .collect();
+        require(
+            loads.len() <= 16
+                && loads.iter().all(|p| {
+                    p.p_align == 4096
+                        && p.p_offset % 4096 == 0
+                        && p.p_vaddr % 4096 == 0
+                        && p.p_vaddr >= LOW
+                        && p.p_vaddr
+                            .checked_add(p.p_memsz)
+                            .is_some_and(|end| end <= HIGH)
+                        && matches!(p.p_flags, 4..=6)
+                }),
+            "static load window/alignment/W^X differs",
+        )?;
+        let phbytes = u64::from(elf.header.e_phnum) * 56;
+        let phend = elf
+            .header
+            .e_phoff
+            .checked_add(phbytes)
+            .ok_or("static PHDR file overflow")?;
+        let headers: Vec<_> = loads
+            .iter()
+            .filter(|p| {
+                p.p_flags == 4 && p.p_offset == 0 && p.p_vaddr == LOW && phend <= p.p_filesz
+            })
+            .collect();
+        require(
+            headers.len() == 1,
+            "static real headers lack first-page RO backing",
+        )?;
+        let phaddr = LOW
+            .checked_add(elf.header.e_phoff)
+            .ok_or("static PHDR address overflow")?;
+        mapped_bytes(elf, bytes, phaddr, phbytes, 4)?;
+        let tls: Vec<_> = elf
+            .program_headers
+            .iter()
+            .filter(|p| p.p_type == program_header::PT_TLS)
+            .collect();
+        require(
+            tls.len() == 1,
+            "static image needs exactly one TLS template",
+        )?;
+        let t = tls[0];
+        require(
+            t.p_memsz > 0
+                && t.p_filesz <= t.p_memsz
+                && t.p_align.is_power_of_two()
+                && t.p_vaddr % t.p_align == t.p_offset % t.p_align
+                && t.p_flags & 4 != 0
+                && t.p_flags & !6 == 0,
+            "static TLS geometry differs",
+        )?;
+        let containing = loads
+            .iter()
+            .filter(|p| {
+                p.p_flags & 4 != 0
+                    && p.p_flags & 1 == 0
+                    && t.p_vaddr >= p.p_vaddr
+                    && t.p_offset >= p.p_offset
+                    && t.p_vaddr.checked_add(t.p_memsz).is_some_and(|end| {
+                        p.p_vaddr
+                            .checked_add(p.p_memsz)
+                            .is_some_and(|last| end <= last)
+                    })
+                    && t.p_offset.checked_add(t.p_filesz).is_some_and(|end| {
+                        p.p_offset
+                            .checked_add(p.p_filesz)
+                            .is_some_and(|last| end <= last)
+                    })
+                    && t.p_vaddr - p.p_vaddr == t.p_offset - p.p_offset
+            })
+            .count();
+        require(
+            containing == 1,
+            "static TLS does not join one actual non-X load",
+        )?;
+        let stacks: Vec<_> = elf
+            .program_headers
+            .iter()
+            .filter(|p| p.p_type == program_header::PT_GNU_STACK)
+            .collect();
+        require(
+            stacks.len() == 1 && stacks[0].p_flags == 6,
+            "static GNU stack missing/ambiguous/executable",
+        )?;
+        require(
+            elf.program_headers
+                .iter()
+                .filter(|p| p.p_type == program_header::PT_PHDR)
+                .count()
+                <= 1,
+            "duplicate static PT_PHDR",
+        )?;
+        for p in elf
+            .program_headers
+            .iter()
+            .filter(|p| p.p_type == program_header::PT_PHDR)
+        {
+            require(
+                p.p_offset == elf.header.e_phoff
+                    && p.p_vaddr == phaddr
+                    && p.p_filesz == phbytes
+                    && p.p_memsz == phbytes
+                    && p.p_flags == 4,
+                "static PT_PHDR contradicts mapped file headers",
+            )?;
+        }
+        Ok((
+            (phaddr, phbytes),
+            (t.p_vaddr, t.p_filesz, t.p_memsz, t.p_align),
+        ))
+    }
+    impl VerifiedStaticSource {
+        /// Observe complete selected private-startup bodies under this actual
+        /// archive owner. This cannot grant source-to-machine qualification,
+        /// syscall-site authority, executable entry or readiness. Call on the
+        /// actual produced ELF/map even if the selected initializer join failed.
+        pub fn inspect_private_startup_census(
+            &self,
+            archive: &StaticArchive,
+            artifact: &FileIdentity,
+            link_map: &FileIdentity,
+            objdump: &FileIdentity,
+            runner: &mut Runner,
+        ) -> Result<super::private_machine_diagnostic::startup_census::PrivateStartupCensus>
+        {
+            if let Err(error) = self.require_archive_owner(archive) {
+                return close_result(Err(error), self.guard.close(runner));
+            }
+            let mut files = vec![artifact.clone(), link_map.clone(), objdump.clone()];
+            let result = (|| {
+                archive.verify()?;
+                self.guard.close(runner)?;
+                let roots = self
+                    .guard
+                    .roots
+                    .iter()
+                    .filter(|(_, kind)| matches!(kind, RootBinding::Cargo(_)))
+                    .map(|(path, _)| path)
+                    .collect::<Vec<_>>();
+                require(
+                    roots.len() == 1,
+                    "startup census resolved R source ambiguous",
+                )?;
+                let mut sources = BTreeMap::new();
+                let tls_variant = tls_sources::bind(roots[0], &mut files)?;
+                for (key, root, relative) in [
+                    (
+                        "entry",
+                        &self.workspace,
+                        "detcore-liteinst/src/exec_initial/mapped_entry.rs",
+                    ),
+                    (
+                        "exec_private",
+                        roots[0],
+                        "reverie-inguest/src/guest/exec_private.rs",
+                    ),
+                    (
+                        "mapped",
+                        roots[0],
+                        "reverie-inguest/src/guest/exec_private/mapped_initial.rs",
+                    ),
+                    (
+                        "scalar",
+                        roots[0],
+                        "reverie-inguest/src/guest/exec_private/mapped_initial/mapped_scalar.rs",
+                    ),
+                    (
+                        "mapped_inputs",
+                        roots[0],
+                        "reverie-loader/src/mapped_inputs.rs",
+                    ),
+                    ("handoff", roots[0], "reverie-loader/src/handoff.rs"),
+                    (
+                        "relay",
+                        roots[0],
+                        "reverie-inguest/src/guest/exec_private/mapped_initial/libc_relay.rs",
+                    ),
+                    (
+                        "frontend",
+                        roots[0],
+                        "reverie-inguest/src/guest/exec_private/mapped_initial/libc_relay/frontend.rs",
+                    ),
+                    ("frame", roots[0], "reverie-inguest/src/trap/frame.rs"),
+                    ("gate", roots[0], "reverie-inguest/src/trap/fixed_gates.rs"),
+                    ("trap", roots[0], "reverie-inguest/src/trap.rs"),
+                    (
+                        "private",
+                        roots[0],
+                        "reverie-inguest/src/private_runtime/mod.rs",
+                    ),
+                    (
+                        "tls",
+                        roots[0],
+                        "reverie-inguest/src/private_runtime/tls/mod.rs",
+                    ),
+                    (
+                        "tls_layout_wrapper",
+                        roots[0],
+                        "reverie-inguest/src/private_runtime/tls/layout.rs",
+                    ),
+                    (
+                        "tls_abi",
+                        roots[0],
+                        "reverie-inguest/src/private_runtime/tls/abi.rs",
+                    ),
+                ] {
+                    let file = FileIdentity::read(&root.join(relative))?;
+                    files.push(file.clone());
+                    sources.insert(key, file);
+                }
+                let geometry = FileIdentity::read(&roots[0].join(tls_variant.geometry_source()))?;
+                files.push(geometry.clone());
+                sources.insert("tls_layout", geometry);
+                super::private_machine_diagnostic::startup_census::inspect(
+                    tls_variant,
+                    &archive.file,
+                    artifact,
+                    link_map,
+                    objdump,
+                    sources,
+                    runner,
+                )
+            })();
+            let mut errors = Vec::new();
+            if let Err(error) = archive.verify() {
+                errors.push(error);
+            }
+            if let Err(error) = self.guard.close(runner) {
+                errors.push(error);
+            }
+            for file in files {
+                if let Err(error) = file.verify() {
+                    errors.push(error);
+                }
+            }
+            close_result(result, require(errors.is_empty(), errors.join("; ")))
+        }
+
+        /// Inspect the static root with the one exact existing native memcpy
+        /// member. All native source/member identities close on every Result
+        /// path inside this same source transaction. This is a diagnostic, not
+        /// reproduced native-build provenance, a whole pre-TLS proof or Ready.
+        pub fn inspect_entry_transfers_with_musl_memcpy(
+            &self,
+            inputs: &super::private_machine_diagnostic::NativeMemcpyInputs<'_>,
+            artifact: &FileIdentity,
+            objdump: &FileIdentity,
+            runner: &mut Runner,
+        ) -> Result<super::private_machine_diagnostic::EntryTransferDiagnostic> {
+            let result = super::private_machine_diagnostic::inspect_entry_transfers_with_memcpy(
+                inputs, artifact, objdump, runner,
+            );
+            close_result(result, self.guard.close(runner))
+        }
+        /// Inspect current bytes and close source/archive/file identities even
+        /// when inspection fails. A successful result is not linked-object
+        /// provenance: the maintained real-link transaction must still join this
+        /// archive and its exact native inputs via trace/map/selected definitions.
+        /// The outer producer must additionally call the actual reverie-loader
+        /// Image::validate + private_runtime_metadata on these SAME bytes. No
+        /// new dependency is added to Rust2021 include-by-source consumers here.
+        pub fn inspect_final(
+            &self,
+            archive: &StaticArchive,
+            path: &Path,
+            runner: &mut Runner,
+        ) -> Result<StaticImageInspection> {
+            self.inspect_final_impl(archive, path, None, None, runner)
+        }
+
+        /// Inspect final image structure using a genuine optional-zero
+        /// observation from this SAME live source/archive transaction. The
+        /// ordinary inspect_final method still rejects every named undefined
+        /// symbol. No source-machine, pre-FS, executable-entry or Ready authority
+        /// follows from either structural inspection result.
+        pub fn inspect_final_with_optional_zero(
+            &self,
+            archive: &StaticArchive,
+            path: &Path,
+            observation: &selected_initializers::OptionalZeroObservation,
+            runner: &mut Runner,
+        ) -> Result<StaticImageInspection> {
+            self.inspect_final_impl(archive, path, Some(observation), None, runner)
+        }
+
+        /// Inspect the same actual image using genuine selected-definition and
+        /// optional-zero observations from this live source/archive transaction.
+        /// Only the three explicitly joined Rust roles may be localized HIDDEN.
+        /// Default inspection and all other GLOBAL checks remain unchanged.
+        /// This is structural/source-definition evidence, never execution/Ready.
+        pub fn inspect_final_with_selected_and_optional_zero(
+            &self,
+            archive: &StaticArchive,
+            path: &Path,
+            definitions: &selected_initializers::SelectedInitializerDefinitions,
+            observation: &selected_initializers::OptionalZeroObservation,
+            runner: &mut Runner,
+        ) -> Result<StaticImageInspection> {
+            self.inspect_final_impl(archive, path, Some(observation), Some(definitions), runner)
+        }
+
+        fn inspect_final_impl(
+            &self,
+            archive: &StaticArchive,
+            path: &Path,
+            optional: Option<&selected_initializers::OptionalZeroObservation>,
+            selected: Option<&selected_initializers::SelectedInitializerDefinitions>,
+            runner: &mut Runner,
+        ) -> Result<StaticImageInspection> {
+            if let Err(error) = self.require_archive_owner(archive) {
+                return close_result(Err(error), self.guard.close(runner));
+            }
+            if let Err(error) = selected.map_or(Ok(()), |definitions| {
+                selected_initializers::selected_final_owner(self, archive, definitions)
+            }) {
+                // Refuse the owner before reading any foreign proof files.
+                let closes = [archive.verify(), self.guard.close(runner)];
+                let errors: Vec<_> = closes.into_iter().filter_map(|r| r.err()).collect();
+                return close_result(Err(error), require(errors.is_empty(), errors.join("; ")));
+            }
+            if let Err(error) = optional.map_or(Ok(()), |observation| {
+                selected_initializers::optional_final_owner(self, archive, observation)
+            }) {
+                // Close our selected proof if admitted, without reading
+                // foreign optional-observation files.
+                let closes = [
+                    archive.verify(),
+                    selected.map_or(
+                        Ok(()),
+                        selected_initializers::SelectedInitializerDefinitions::verify,
+                    ),
+                    self.guard.close(runner),
+                ];
+                let errors: Vec<_> = closes.into_iter().filter_map(|r| r.err()).collect();
+                return close_result(Err(error), require(errors.is_empty(), errors.join("; ")));
+            }
+            let mut artifact = None;
+            let body = (|| {
+                archive.verify()?;
+                if let Some(definitions) = selected {
+                    definitions.verify()?;
+                }
+                if let Some(observation) = optional {
+                    observation.verify()?;
+                }
+                final_artifact_size(fs::metadata(path).map_err(|e| e.to_string())?.len())?;
+                let file = FileIdentity::read(path)?;
+                artifact = Some(file.clone());
+                if let Some(definitions) = selected {
+                    selected_initializers::selected_final_artifact(definitions, &file)?;
+                }
+                if let Some(observation) = optional {
+                    selected_initializers::optional_final_artifact(observation, &file)?;
+                }
+                let artifact = file;
+                let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
+                let elf = Elf::parse(&bytes).map_err(|e| e.to_string())?;
+                let (program_headers, tls) = match optional {
+                    Some(observation) => geometry_impl(&elf, &bytes, Some(observation))?,
+                    None => geometry(&elf, &bytes)?,
+                };
+                let entry = strong_function(&elf, &bytes, ENTRY)?;
+                require(
+                    elf.entry == entry.st_value,
+                    "static ELF entry differs from genuine mapped entry",
+                )?;
+                let mut strong_symbols = BTreeMap::new();
+                for name in [
+                    ENTRY,
+                    "__init_tls",
+                    "malloc",
+                    "__libc_malloc",
+                    "__libc_malloc_impl",
+                    "calloc",
+                    "__libc_calloc",
+                    "free",
+                    "__libc_free",
+                    "realloc",
+                    "__libc_realloc",
+                    "reallocarray",
+                    "aligned_alloc",
+                    "memalign",
+                    "valloc",
+                    "posix_memalign",
+                    "malloc_usable_size",
+                    "__malloc_allzerop",
+                ] {
+                    let joined = match selected {
+                        Some(definitions) => selected_initializers::selected_final_function(
+                            definitions,
+                            &elf,
+                            &bytes,
+                            name,
+                        )?,
+                        None => None,
+                    };
+                    let s = match joined {
+                        Some(symbol) => symbol,
+                        None => strong_function(&elf, &bytes, name)?,
+                    };
+                    strong_symbols.insert(name.into(), symbol_evidence(name, &s));
+                }
+                let (gate, executed) =
+                    object(&elf, &bytes, "reverie_inguest_mapped_gate_page", 4096, 5)?;
+                let (reference, expected) =
+                    object(&elf, &bytes, "reverie_inguest_fixed_gate_template", 4096, 4)?;
+                let (_, gate_offset) = unique_file_mapping(&elf, &bytes, gate.st_value, 4096)?;
+                let (_, reference_offset) =
+                    unique_file_mapping(&elf, &bytes, reference.st_value, 4096)?;
+                require(
+                    gate_offset
+                        .checked_add(4096)
+                        .is_some_and(|end| end <= reference_offset)
+                        || reference_offset
+                            .checked_add(4096)
+                            .is_some_and(|end| end <= gate_offset),
+                    "static gate/reference alias same file bytes",
+                )?;
+                require(
+                    gate.st_value == GATE
+                        && reference.st_value % 4096 == 0
+                        && (reference
+                            .st_value
+                            .checked_add(4096)
+                            .is_some_and(|end| end <= gate.st_value)
+                            || gate
+                                .st_value
+                                .checked_add(4096)
+                                .is_some_and(|end| end <= reference.st_value))
+                        && executed == expected,
+                    "static gate/reference address/full-page identity differs",
+                )?;
+                for (symbol, begin) in [
+                    ("reverie_inguest_mapped_gate_page_end", gate.st_value),
+                    (
+                        "reverie_inguest_fixed_gate_template_end",
+                        reference.st_value,
+                    ),
+                ] {
+                    let end = named(&elf, symbol)?;
+                    require(
+                        end.st_value == begin + 4096 && end.st_size == 0,
+                        "static gate end label differs",
+                    )?;
+                }
+                require(
+                    executed.get(0x7c..0x85)
+                        == Some(&[0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x05, 0x41, 0xff, 0xe4]),
+                    "static native gate ABI differs",
+                )?;
+                // Equality + the ABI interval is observation, not qualification
+                // of both pages' remaining bytes against reviewed instructions.
+                let (_, descriptor) = layout_object(&elf, &bytes)?;
+                let layout = layout_words(descriptor)?;
+                Ok(StaticImageInspection {
+                    artifact: artifact.clone(),
+                    archive: archive.file.clone(),
+                    entry: entry.st_value,
+                    gate_sha256: sha256(executed),
+                    layout,
+                    program_headers,
+                    tls,
+                    strong_symbols,
+                })
+            })();
+            // Evaluate all closes even if the first one fails; preserve both
+            // the inspection error and every available custody error.
+            let closes = [
+                artifact.as_ref().map_or(Ok(()), FileIdentity::verify),
+                archive.verify(),
+                selected.map_or(
+                    Ok(()),
+                    selected_initializers::SelectedInitializerDefinitions::verify,
+                ),
+                optional.map_or(
+                    Ok(()),
+                    selected_initializers::OptionalZeroObservation::verify,
+                ),
+                self.guard.close(runner),
+            ];
+            let errors: Vec<_> = closes.into_iter().filter_map(|r| r.err()).collect();
+            close_result(body, require(errors.is_empty(), errors.join("; ")))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        struct CacheFixture {
+            base: PathBuf,
+            root: PathBuf,
+            head: String,
+            runner: Runner,
+        }
+        impl CacheFixture {
+            fn new() -> Self {
+                static SERIAL: AtomicUsize = AtomicUsize::new(0);
+                let base = std::env::temp_dir().join(format!(
+                    "hermit-private-static-cache-{}-{}",
+                    std::process::id(),
+                    SERIAL.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir(&base).unwrap();
+                let base = fs::canonicalize(base).unwrap();
+                let root = base.join("source");
+                fs::create_dir(&root).unwrap();
+                let mut runner =
+                    Runner::new(base.join("logs"), Duration::from_secs(120), 8 * 1024 * 1024)
+                        .unwrap();
+                runner.text("git", &["init", "--quiet"], &root).unwrap();
+                fs::write(root.join("source.rs"), b"pub fn source() {}\n").unwrap();
+                std::os::unix::fs::symlink("source.rs", root.join("source-link")).unwrap();
+                runner
+                    .text("git", &["add", "source.rs", "source-link"], &root)
+                    .unwrap();
+                runner
+                    .text(
+                        "git",
+                        &[
+                            "-c",
+                            "user.name=static-source-test",
+                            "-c",
+                            "user.email=static-source-test@invalid",
+                            "-c",
+                            "core.hooksPath=/dev/null",
+                            "-c",
+                            "commit.gpgsign=false",
+                            "commit",
+                            "--quiet",
+                            "-m",
+                            "source fixture",
+                        ],
+                        &root,
+                    )
+                    .unwrap();
+                let first = runner
+                    .text("git", &["rev-parse", "HEAD"], &root)
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                let info = format!("160000,{first},third-party/optional");
+                runner
+                    .text(
+                        "git",
+                        &["update-index", "--add", "--cacheinfo", &info],
+                        &root,
+                    )
+                    .unwrap();
+                runner
+                    .text(
+                        "git",
+                        &[
+                            "-c",
+                            "user.name=static-source-test",
+                            "-c",
+                            "user.email=static-source-test@invalid",
+                            "-c",
+                            "core.hooksPath=/dev/null",
+                            "-c",
+                            "commit.gpgsign=false",
+                            "commit",
+                            "--quiet",
+                            "-m",
+                            "gitlink fixture",
+                        ],
+                        &root,
+                    )
+                    .unwrap();
+                fs::create_dir_all(root.join("third-party/optional")).unwrap();
+                fs::write(root.join(".cargo-ok"), []).unwrap();
+                let head = runner
+                    .text("git", &["rev-parse", "HEAD"], &root)
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                Self {
+                    base,
+                    root,
+                    head,
+                    runner,
+                }
+            }
+            fn observe(&mut self) -> Result<CacheBinding> {
+                cached_source(&self.root, &self.head, &mut self.runner, 0)
+            }
+        }
+        impl Drop for CacheFixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.base);
+            }
+        }
+        #[test]
+        fn private_static_cache_snapshot_accepts_bound_blobs_symlink_and_empty_gitlink() {
+            let mut f = CacheFixture::new();
+            let first = f.observe().unwrap();
+            assert_eq!(f.observe().unwrap(), first);
+            let mut guard = Guard {
+                roots: Vec::new(),
+                files: Vec::new(),
+                environment: std::env::vars_os().collect(),
+            };
+            guard.cache_root(&f.root, &f.head, &mut f.runner).unwrap();
+            guard.close(&mut f.runner).unwrap();
+            // Cargo-only interpretation cannot weaken an ordinary source root.
+            let mut ordinary = Guard {
+                roots: Vec::new(),
+                files: Vec::new(),
+                environment: std::env::vars_os().collect(),
+            };
+            assert!(ordinary.root(&f.root, &f.head, &mut f.runner).is_err());
+        }
+        #[test]
+        fn private_static_cache_snapshot_refuses_blob_mode_symlink_index_and_gitlink_changes() {
+            use std::os::unix::fs::PermissionsExt;
+            let mut f = CacheFixture::new();
+            f.observe().unwrap();
+            fs::write(f.root.join("source.rs"), b"pub fn changed() {}\n").unwrap();
+            assert!(f.observe().is_err());
+            fs::write(f.root.join("source.rs"), b"pub fn source() {}\n").unwrap();
+            fs::set_permissions(f.root.join("source.rs"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+            assert!(f.observe().is_err());
+            fs::set_permissions(f.root.join("source.rs"), fs::Permissions::from_mode(0o644))
+                .unwrap();
+            fs::remove_file(f.root.join("source-link")).unwrap();
+            std::os::unix::fs::symlink("changed.rs", f.root.join("source-link")).unwrap();
+            assert!(f.observe().is_err());
+            fs::remove_file(f.root.join("source-link")).unwrap();
+            std::os::unix::fs::symlink("source.rs", f.root.join("source-link")).unwrap();
+            fs::write(f.root.join("third-party/optional/injected.rs"), b"unbound").unwrap();
+            assert!(f.observe().is_err());
+            fs::remove_file(f.root.join("third-party/optional/injected.rs")).unwrap();
+            let info = format!("160000,{},third-party/optional", f.head);
+            f.runner
+                .text("git", &["update-index", "--cacheinfo", &info], &f.root)
+                .unwrap();
+            assert!(f.observe().is_err());
+            f.runner
+                .text("git", &["read-tree", "HEAD"], &f.root)
+                .unwrap();
+            f.observe().unwrap();
+        }
+        #[test]
+        fn private_static_cache_marker_refuses_nonzero_symlink_and_extra_source() {
+            let mut f = CacheFixture::new();
+            f.observe().unwrap();
+            fs::write(f.root.join(".cargo-ok"), b"not-empty").unwrap();
+            assert!(f.observe().is_err());
+            fs::remove_file(f.root.join(".cargo-ok")).unwrap();
+            std::os::unix::fs::symlink("source.rs", f.root.join(".cargo-ok")).unwrap();
+            assert!(f.observe().is_err());
+            fs::remove_file(f.root.join(".cargo-ok")).unwrap();
+            fs::write(f.root.join(".cargo-ok"), []).unwrap();
+            fs::write(f.root.join("injected.rs"), b"unbound").unwrap();
+            assert!(f.observe().is_err());
+            fs::remove_file(f.root.join("injected.rs")).unwrap();
+            f.observe().unwrap();
+        }
+        #[test]
+        fn private_static_cache_close_refuses_changed_source_on_success_and_failure() {
+            let mut f = CacheFixture::new();
+            let mut guard = Guard {
+                roots: Vec::new(),
+                files: Vec::new(),
+                environment: std::env::vars_os().collect(),
+            };
+            guard.cache_root(&f.root, &f.head, &mut f.runner).unwrap();
+            fs::write(f.root.join("source.rs"), b"changed").unwrap();
+            assert!(close_result(Ok(()), guard.close(&mut f.runner)).is_err());
+            let error = close_result::<()>(
+                Err("original selection failure".into()),
+                guard.close(&mut f.runner),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("original selection failure")
+                    && error.contains("static Cargo tracked blob")
+            );
+        }
+        fn descriptor() -> Vec<u8> {
+            [
+                u64::from_le_bytes(*b"HLMLAY01"),
+                1,
+                96,
+                1,
+                960,
+                1024 * 1024,
+                3520,
+                64,
+                4096,
+                64,
+                GATE,
+                GATE + 0x7c,
+            ]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect()
+        }
+        // A parsed, file-backed ELF object fixture exercises the production
+        // symbol/section/load/file-coordinate path; it mints no source authority.
+        fn reference_object_fixture(name: &str, length: u64, flags: u64) -> Vec<u8> {
+            let mut bytes = vec![0; 8192];
+            bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            for (at, value) in [
+                (16, 2u16),
+                (18, 62),
+                (52, 64),
+                (54, 56),
+                (56, 1),
+                (58, 64),
+                (60, 4),
+            ] {
+                bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+            }
+            bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+            for (at, value) in [
+                (32, 64u64),
+                (40, 0x200),
+                (64 + 16, LOW),
+                (64 + 32, 8192),
+                (64 + 40, 8192),
+                (64 + 48, 4096),
+            ] {
+                bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+            bytes[68..72].copy_from_slice(&4u32.to_le_bytes());
+            let strings = format!("\0{name}\0").into_bytes();
+            bytes[0x400..0x400 + strings.len()].copy_from_slice(&strings);
+            for (index, kind, section_flags, address, offset, size, link, info, align, entsize) in [
+                (
+                    1usize,
+                    1u32,
+                    flags,
+                    LOW + 4096,
+                    4096u64,
+                    length,
+                    0u32,
+                    0u32,
+                    4096u64,
+                    0u64,
+                ),
+                (2, 3, 0, 0, 0x400, strings.len() as u64, 0, 0, 1, 0),
+                (3, 2, 0, 0, 0x500, 48, 2, 1, 8, 24),
+            ] {
+                let at = 0x200 + index * 64;
+                bytes[at + 4..at + 8].copy_from_slice(&kind.to_le_bytes());
+                bytes[at + 40..at + 44].copy_from_slice(&link.to_le_bytes());
+                bytes[at + 44..at + 48].copy_from_slice(&info.to_le_bytes());
+                for (field, value) in [
+                    (8, section_flags),
+                    (16, address),
+                    (24, offset),
+                    (32, size),
+                    (48, align),
+                    (56, entsize),
+                ] {
+                    bytes[at + field..at + field + 8].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            let symbol = 0x500 + 24;
+            bytes[symbol..symbol + 4].copy_from_slice(&1u32.to_le_bytes());
+            bytes[symbol + 4] = (sym::STB_GLOBAL << 4) | sym::STT_OBJECT;
+            bytes[symbol + 6..symbol + 8].copy_from_slice(&1u16.to_le_bytes());
+            bytes[symbol + 8..symbol + 16].copy_from_slice(&(LOW + 4096).to_le_bytes());
+            bytes[symbol + 16..symbol + 24].copy_from_slice(&length.to_le_bytes());
+            bytes[4096..4096 + usize::try_from(length).unwrap()].fill(0x5a);
+            bytes
+        }
+        #[test]
+        fn private_static_reference_roles_accept_exact_ro_and_retained_layout() {
+            let bytes = reference_object_fixture("reverie_inguest_fixed_gate_template", 4096, 2);
+            let elf = Elf::parse(&bytes).unwrap();
+            let (_, payload) =
+                object(&elf, &bytes, "reverie_inguest_fixed_gate_template", 4096, 4).unwrap();
+            assert_eq!(payload, &[0x5a; 4096]);
+            assert!(layout_object(&elf, &bytes).is_err());
+            let bytes = reference_object_fixture(LAYOUT, 96, 0x200002);
+            let elf = Elf::parse(&bytes).unwrap();
+            let (_, payload) = layout_object(&elf, &bytes).unwrap();
+            assert_eq!(payload, &[0x5a; 96]);
+            // The ordinary object path remains strict even for the same name.
+            assert!(object(&elf, &bytes, LAYOUT, 96, 4).is_err());
+        }
+        #[test]
+        fn private_static_reference_roles_refuse_extra_flags_and_wrong_role_retention() {
+            for extra in [1u64, 4, 0x10, 0x20, 0x400, 1u64 << 63] {
+                let bytes = reference_object_fixture(
+                    "reverie_inguest_fixed_gate_template",
+                    4096,
+                    2 | extra,
+                );
+                assert!(
+                    object(
+                        &Elf::parse(&bytes).unwrap(),
+                        &bytes,
+                        "reverie_inguest_fixed_gate_template",
+                        4096,
+                        4
+                    )
+                    .is_err(),
+                    "template flags {extra:#x}"
+                );
+                let bytes = reference_object_fixture(LAYOUT, 96, 0x200002 | extra);
+                assert!(
+                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes).is_err(),
+                    "layout flags {extra:#x}"
+                );
+            }
+            let bytes =
+                reference_object_fixture("reverie_inguest_fixed_gate_template", 4096, 0x200002);
+            assert!(
+                object(
+                    &Elf::parse(&bytes).unwrap(),
+                    &bytes,
+                    "reverie_inguest_fixed_gate_template",
+                    4096,
+                    4
+                )
+                .is_err()
+            );
+            let bytes = reference_object_fixture(LAYOUT, 96, 2);
+            assert!(layout_object(&Elf::parse(&bytes).unwrap(), &bytes).is_err());
+        }
+        #[test]
+        fn private_static_retained_layout_keeps_type_size_load_and_coordinate_checks() {
+            let original = reference_object_fixture(LAYOUT, 96, 0x200002);
+            for (at, width, value) in [
+                (68usize, 4usize, 6u64),    // W in PT_LOAD remains forbidden.
+                (0x200 + 64 + 4, 4, 8),     // NOBITS cannot back the descriptor.
+                (0x200 + 64 + 24, 8, 4097), // Section/file coordinate differs.
+                (0x200 + 64 + 32, 8, 95),   // Object exceeds section.
+                (
+                    0x500 + 24 + 4,
+                    1,
+                    u64::from((sym::STB_GLOBAL << 4) | sym::STT_FUNC),
+                ),
+                (0x500 + 24 + 16, 8, 95), // Exact object size remains 96.
+            ] {
+                let mut bytes = original.clone();
+                bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+                assert!(
+                    layout_object(&Elf::parse(&bytes).unwrap(), &bytes).is_err(),
+                    "field {at}"
+                );
+            }
+        }
+        #[test]
+        fn private_static_function_binding_refuses_weak_local_object_and_empty() {
+            let strong = sym::Sym {
+                st_name: 0,
+                st_info: (sym::STB_GLOBAL << 4) | sym::STT_FUNC,
+                st_other: 0,
+                st_shndx: 1,
+                st_value: GATE + 512,
+                st_size: 16,
+            };
+            assert!(strong_kind(&strong));
+            for info in [
+                (sym::STB_WEAK << 4) | sym::STT_FUNC,
+                (sym::STB_LOCAL << 4) | sym::STT_FUNC,
+                (sym::STB_GLOBAL << 4) | sym::STT_OBJECT,
+            ] {
+                let mut changed = strong;
+                changed.st_info = info;
+                assert!(!strong_kind(&changed));
+            }
+            let mut changed = strong;
+            changed.st_size = 0;
+            assert!(!strong_kind(&changed));
+        }
+        #[test]
+        fn private_static_layout_is_numeric_inspection_not_host_layout() {
+            let d = layout_words(&descriptor()).unwrap();
+            assert_eq!(d.control_bytes(), 3520);
+            assert_eq!(d.relay_bytes(), 4096);
+            assert_eq!(d.header_bytes(), 960);
+        }
+        #[test]
+        fn private_static_layout_rejects_old_header_and_corrupt_shape() {
+            for (word, value) in [
+                (0, 0),
+                (1, 2),
+                (2, 95),
+                (3, 2),
+                (4, 936),
+                (5, 1024 * 1024 + 1),
+                (6, 3519),
+                (7, 8),
+                (8, 0),
+                (8, 4097),
+                (9, 8),
+                (10, LOW),
+                (11, GATE + 0x80),
+            ] {
+                let mut bytes = descriptor();
+                bytes[word * 8..word * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                assert!(layout_words(&bytes).is_err(), "word {word}");
+            }
+            assert!(layout_words(&descriptor()[..95]).is_err());
+        }
+        pub(super) fn elf_fixture() -> Vec<u8> {
+            let mut bytes = vec![0; 3 * 4096];
+            bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+            bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+            bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+            bytes[24..32].copy_from_slice(&(GATE + 512).to_le_bytes());
+            bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+            bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+            bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+            bytes[56..58].copy_from_slice(&5u16.to_le_bytes());
+            for (index, (kind, flags, offset, address, file, memory, align)) in [
+                (1u32, 4u32, 0u64, LOW, 4096u64, 4096u64, 4096u64),
+                (1, 5, 4096, GATE, 4096, 4096, 4096),
+                (1, 6, 8192, LOW + 8192, 4096, 4096, 4096),
+                (7, 4, 8192, LOW + 8192, 16, 80, 16),
+                (0x6474e551, 6, 0, 0, 0, 0, 0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let at = 64 + index * 56;
+                bytes[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+                bytes[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+                for (field, value) in [
+                    (8, offset),
+                    (16, address),
+                    (32, file),
+                    (40, memory),
+                    (48, align),
+                ] {
+                    bytes[at + field..at + field + 8].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            bytes
+        }
+        #[test]
+        fn private_static_geometry_accepts_real_header_coordinates_and_rejects_mutations() {
+            let bytes = elf_fixture();
+            let observed = geometry(&Elf::parse(&bytes).unwrap(), &bytes).unwrap();
+            assert_eq!(observed.0, (LOW + 64, 280));
+            assert_eq!(observed.1, (LOW + 8192, 16, 80, 16));
+            for (at, value) in [
+                (16, 3u64),
+                (64 + 4, 5),
+                (64 + 56 + 4, 7),
+                (64 + 3 * 56 + 40, 8192),
+                (64 + 3 * 56 + 48, 3),
+                (64 + 4 * 56 + 4, 7),
+            ] {
+                let mut changed = bytes.clone();
+                // Mutate only the actual field width; unrelated fields remain.
+                let width = if at == 16 {
+                    2
+                } else if at == 68 || at == 124 || at == 292 {
+                    4
+                } else {
+                    8
+                };
+                changed[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+                let parsed = Elf::parse(&changed).unwrap();
+                assert!(geometry(&parsed, &changed).is_err(), "field {at}");
+            }
+        }
+        #[test]
+        fn private_static_archive_selector_refuses_zero_failed_and_duplicate_build_records() {
+            // Fabricated selector inputs are negative controls only. They do
+            // not construct VerifiedStaticSource or a successful archive.
+            let package = PackageIdentity {
+                id: "test".into(),
+                name: "detcore-liteinst".into(),
+                manifest: PathBuf::from("/not-a-source/Cargo.toml"),
+                source: None,
+                target: "detcore_liteinst".into(),
+                kind: vec!["staticlib".into()],
+                crate_types: vec!["staticlib".into()],
+                target_source: PathBuf::from("/not-a-source/src/lib.rs"),
+            };
+            for output in [
+                "",
+                "{\"reason\":\"build-finished\",\"success\":false}\n",
+                "{\"reason\":\"build-finished\",\"success\":true}\n",
+                "{\"reason\":\"build-finished\",\"success\":true}\n{\"reason\":\"build-finished\",\"success\":true}\n",
+            ] {
+                assert!(
+                    select_archive(
+                        output.as_bytes(),
+                        &package,
+                        &serde_json::json!({}),
+                        &[],
+                        Path::new("/"),
+                        "not-authority",
+                        &Arc::new(ArchiveSourceOwner { _reserved: 0 })
+                    )
+                    .is_err()
+                );
+            }
+        }
+        #[test]
+        fn private_static_archive_owner_rejects_another_context_with_identical_metadata() {
+            let metadata = "same actual metadata digest";
+            let first = Arc::new(ArchiveSourceOwner { _reserved: 0 });
+            let escaped = Arc::clone(&first);
+            require_same_archive_source(&first, &escaped, metadata, metadata).unwrap();
+            drop(first);
+            // The old archive keeps its owner allocation alive, so even equal
+            // source labels/digests cannot cause address reuse or rebinding.
+            let second = Arc::new(ArchiveSourceOwner { _reserved: 0 });
+            assert!(!Arc::ptr_eq(&second, &escaped));
+            assert_eq!(
+                require_same_archive_source(&second, &escaped, metadata, metadata).unwrap_err(),
+                "static archive belongs to another source transaction"
+            );
+            assert_eq!(
+                require_same_archive_source(&second, &second, metadata, "different").unwrap_err(),
+                "static archive metadata differs from its source transaction"
+            );
+            require_same_archive_source(&second, &second, metadata, metadata).unwrap();
+        }
+
+        #[test]
+        fn private_static_source_close_failure_cannot_return_success_or_hide_body_failure() {
+            assert!(
+                close_result(Ok(7), Err("changed".into()))
+                    .unwrap_err()
+                    .contains("changed")
+            );
+            let err = close_result::<()>(Err("body".into()), Err("close".into())).unwrap_err();
+            assert!(err.contains("body") && err.contains("close"));
+        }
+    }
+}
+
+/// Diagnostic-only complete root-byte and transfer census for the mapped image.
+/// This module produces no source, loader, syscall-site or readiness capability.
+pub mod private_machine_diagnostic {
+    pub mod startup_census {
+        //! Finite complete-body observations for private libc startup; no admission.
+        //! Source-path association is NOT an object
+        //! join, valid-input reachability proof, syscall-site permit or entry capability.
+        use super::*;
+
+        const MAX_BODY_BYTES: usize = 1024 * 1024;
+        const MAX_ROLES: usize = 64;
+
+        /// Observed finite startup bodies and explicit unresolved obligations.
+        /// This value carries no execution, source, syscall or readiness authority.
+        #[derive(Debug, Serialize)]
+        pub struct PrivateStartupCensus {
+            archive: FileIdentity,
+            artifact: FileIdentity,
+            link_map: FileIdentity,
+            objdump: FileIdentity,
+            sources: BTreeMap<&'static str, FileIdentity>,
+            bodies: Vec<StartupBody>,
+            scope: &'static str,
+            source_object_join: &'static str,
+            pre_fs_closure: &'static str,
+            inline_syscall_authority: &'static str,
+            entry_admission: &'static str,
+        }
+
+        impl PrivateStartupCensus {
+            /// Serialize observation/refusal data without giving a caller a constructor
+            /// or requiring it to link a separate serialization dependency.
+            pub fn to_json_pretty(&self) -> Result<Vec<u8>> {
+                serde_json::to_vec_pretty(self).map_err(|error| error.to_string())
+            }
+        }
+
+        #[derive(Debug, Serialize)]
+        struct StartupBody {
+            role: &'static str,
+            source: Option<FileIdentity>,
+            source_association: &'static str,
+            asynchronous_root: bool,
+            symbols: Vec<SymbolEvidence>,
+            map_rows: Vec<String>,
+            complete_bytes: usize,
+            bytes_sha256: Option<String>,
+            disassembly: Option<FileIdentity>,
+            instructions: usize,
+            complete_disassembly: bool,
+            transfers: Vec<ConstructorTransfer>,
+            got_edges: Vec<GotEdge>,
+            target_symbols: BTreeMap<u64, Vec<SymbolEvidence>>,
+            target_startup_roles: BTreeMap<u64, Vec<&'static str>>,
+            refusals: Vec<InstructionRefusal>,
+            phase_questions: Vec<&'static str>,
+        }
+
+        #[derive(Debug, Serialize)]
+        pub(super) struct InstructionRefusal {
+            pub(super) instruction: Option<u64>,
+            pub(super) reason: String,
+        }
+        #[derive(Default)]
+        pub(super) struct InstructionObservations {
+            pub(super) transfers: Vec<ConstructorTransfer>,
+            got_edges: Vec<GotEdge>,
+            pub(super) refusals: Vec<InstructionRefusal>,
+        }
+
+        // No new opcode admission logic. Every actual instruction gets the existing
+        // shared strict checker; the diagnostic retains each failure instead of ending
+        // the entire body at its first failing instruction. Whole-byte/CFG continuity
+        // remains checked before this traversal. FF transfers reuse static GOT checks.
+        pub(super) fn observe_instructions(
+            elf: &Elf<'_>,
+            bytes: &[u8],
+            instructions: &[EncodedConstructorInstruction],
+            targets: &BTreeSet<u64>,
+        ) -> Result<InstructionObservations> {
+            let (first, boundaries) = preparation_instruction_boundaries(instructions)?;
+            let mut result = InstructionObservations::default();
+            for instruction in instructions {
+                let opcode = instruction.bytes.iter().copied().find(|b| {
+                    !matches!(
+                        *b,
+                        0xf0 | 0xf2
+                            | 0xf3
+                            | 0x26
+                            | 0x2e
+                            | 0x36
+                            | 0x3e
+                            | 0x64
+                            | 0x65
+                            | 0x66
+                            | 0x67
+                            | 0x40..=0x4f
+                    )
+                });
+                let observed = if opcode == Some(0xff) {
+                    // FF has no conditional in-body branch. The same single-instruction
+                    // static wrapper proves actual RO slot/whole target or refuses it.
+                    static_census(elf, bytes, core::slice::from_ref(instruction), targets)
+                } else {
+                    preparation_instruction_transfer(
+                        instruction,
+                        first,
+                        &boundaries,
+                        &BTreeMap::new(),
+                        targets,
+                        true,
+                    )
+                };
+                match observed {
+                    Ok((transfers, mut got)) => {
+                        for edge in &mut got {
+                            edge.source_function = first;
+                        }
+                        result.transfers.extend(transfers);
+                        result.got_edges.extend(got);
+                    }
+                    Err(reason) => result.refusals.push(InstructionRefusal {
+                        instruction: Some(instruction.address),
+                        reason,
+                    }),
+                }
+            }
+            Ok(result)
+        }
+
+        struct Role {
+            name: &'static str,
+            source: Option<&'static str>,
+            symbol: &'static str,
+            asynchronous: bool,
+        }
+
+        // Exact emitted symbol spellings, normalized ONLY with the existing crate
+        // disambiguator/LLVM-clone normalizer. These are finite discovery selectors,
+        // not names granting semantics. A changed spelling/ambiguous clone is retained
+        // as a refusal; no substring, next-symbol or largest-body fallback exists.
+        // No V12 address, body template or old artifact identity is imported here.
+        const ROLES: &[Role] = &[
+            Role {
+                name: "entry",
+                source: Some("entry"),
+                symbol: "detcore_liteinst_mapped_entry",
+                asynchronous: false,
+            },
+            Role {
+                name: "mapped_decode",
+                source: Some("mapped"),
+                symbol: "_RNvMs0_NtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initialNtB5_19MappedInitialInputs6decode",
+                asynchronous: false,
+            },
+            Role {
+                name: "scalar_decode",
+                source: Some("scalar"),
+                symbol: "_RNvMNtNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial13mapped_scalarNtB2_22ProductionMappedInputs6decode",
+                asynchronous: false,
+            },
+            Role {
+                name: "handoff_parse",
+                source: Some("handoff"),
+                symbol: "_RNvMs1_NtCs_14reverie_loader7handoffNtB5_4View5parse",
+                asynchronous: false,
+            },
+            Role {
+                name: "handoff_validate_roles",
+                source: Some("handoff"),
+                symbol: "_RNvMs1_NtCs_14reverie_loader7handoffNtB5_4View14validate_roles",
+                asynchronous: false,
+            },
+            Role {
+                name: "capture",
+                source: Some("mapped"),
+                symbol: "_RNvNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial7capture",
+                asynchronous: false,
+            },
+            Role {
+                name: "relay_install",
+                source: Some("relay"),
+                symbol: "_RNvMs0_NtNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial10libc_relayNtB7_21CapturedMappedInitial18install_libc_relay",
+                asynchronous: false,
+            },
+            Role {
+                name: "libc_and_cleanup",
+                source: Some("relay"),
+                symbol: "_RNvMs1_NtNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial10libc_relayNtB5_18InstalledLibcRelay23initialize_private_libc",
+                asynchronous: false,
+            },
+            Role {
+                name: "bootstrap_sigsys",
+                source: Some("relay"),
+                symbol: "_RNvNtNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial10libc_relay16bootstrap_sigsys",
+                asynchronous: true,
+            },
+            Role {
+                name: "bootstrap_frame",
+                source: Some("frame"),
+                symbol: "_RNvMs2_NtNtCs_15reverie_inguest4trap5frameNtB5_15BootstrapPrefix18from_bootstrap_raw",
+                asynchronous: false,
+            },
+            Role {
+                name: "frontend_facts",
+                source: Some("frontend"),
+                symbol: "_RNvNtNtNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial10libc_relay8frontend11frame_facts",
+                asynchronous: false,
+            },
+            Role {
+                name: "fd_identity",
+                source: Some("relay"),
+                symbol: "_RNvNtNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial10libc_relay11fd_identity",
+                asynchronous: false,
+            },
+            Role {
+                name: "validate_aux",
+                source: Some("relay"),
+                symbol: "_RNvNtNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial10libc_relay12validate_aux",
+                asynchronous: false,
+            },
+            Role {
+                name: "read_fs",
+                source: Some("relay"),
+                symbol: "_RNvNtNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial10libc_relay7read_fs",
+                asynchronous: false,
+            },
+            Role {
+                name: "relay_kernel",
+                source: Some("relay"),
+                symbol: "_RNvNtNtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initial10libc_relay6kernel",
+                asynchronous: false,
+            },
+            Role {
+                name: "gate_adoption",
+                source: Some("trap"),
+                symbol: "_RNvNtCs_15reverie_inguest4trap25adopt_mapped_initial_gate",
+                asynchronous: false,
+            },
+            Role {
+                name: "raw_syscall",
+                source: Some("trap"),
+                symbol: "_RNvNtCs_15reverie_inguest4trap12raw_syscall6",
+                asynchronous: false,
+            },
+            Role {
+                name: "tls_wrapper",
+                source: Some("tls"),
+                symbol: "_RNvNtNtCs_15reverie_inguest15private_runtime3tls23initialize_private_libc",
+                asynchronous: false,
+            },
+            Role {
+                name: "tls_geometry",
+                source: Some("tls_layout"),
+                symbol: "_RNvNtNtNtCs_15reverie_inguest15private_runtime3tls6layout4plan",
+                asynchronous: false,
+            },
+            Role {
+                name: "tls_terminal",
+                source: Some("tls_abi"),
+                symbol: "_RNvNtNtNtCs_15reverie_inguest15private_runtime3tls3abi3die",
+                asynchronous: false,
+            },
+            Role {
+                name: "terminal",
+                source: Some("exec_private"),
+                symbol: "_RNvNtNtCs_15reverie_inguest5guest12exec_private16initial_terminal",
+                asynchronous: false,
+            },
+            Role {
+                name: "required_abort",
+                source: Some("private"),
+                symbol: "hermit_loader_bootstrap_abort",
+                asynchronous: false,
+            },
+            Role {
+                name: "strong_tls",
+                source: Some("tls_abi"),
+                symbol: "__init_tls",
+                asynchronous: false,
+            },
+            Role {
+                name: "libc_init",
+                source: None,
+                symbol: "__init_libc",
+                asynchronous: false,
+            },
+            Role {
+                name: "copy_tls",
+                source: None,
+                symbol: "__copy_tls",
+                asynchronous: false,
+            },
+            Role {
+                name: "init_tp",
+                source: None,
+                symbol: "__init_tp",
+                asynchronous: false,
+            },
+            Role {
+                name: "set_thread_area",
+                source: None,
+                symbol: "__set_thread_area",
+                asynchronous: false,
+            },
+            Role {
+                name: "ssp",
+                source: None,
+                symbol: "__init_ssp",
+                asynchronous: false,
+            },
+            Role {
+                name: "ssp_failure",
+                source: None,
+                symbol: "__stack_chk_fail",
+                asynchronous: false,
+            },
+        ];
+
+        // Closed selector cohorts for collection only. Neither a source digest
+        // nor a symbol spelling proves selected machine ownership or phase.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum SelectorCohort {
+            V9,
+            Step2,
+            Unknown,
+        }
+        const SELECTOR_KEYS: &[&str] = &[
+            "entry",
+            "mapped",
+            "scalar",
+            "handoff",
+            "relay",
+            "mapped_inputs",
+        ];
+        const V9_SELECTOR_SOURCES: &[(&str, &str)] = &[
+            (
+                "entry",
+                "bc140aaea9d598480cdabddd070ca4bc853ebfa0d7525789c85063988fa91f42",
+            ),
+            (
+                "mapped",
+                "0f33e4fa283a36b74125b8e70df0964b50b1d3222f9208878e9fccdf3fe28bdd",
+            ),
+            (
+                "scalar",
+                "901f5adec1e6f3b9dd2231c723538e0646651d132f1d8e4b4f603290bc02b250",
+            ),
+            (
+                "handoff",
+                "e8b70072083fc78771ecc405433a47254de01d2ea7d4dc0e5368ab0bfe8e4ccf",
+            ),
+            (
+                "relay",
+                "f89d3c9c7b1b7d2e3099c124fa5d15cb487894917c90247cdae4a5e699fc4222",
+            ),
+        ];
+        const STEP2_SELECTOR_SOURCES: &[(&str, &str)] = &[
+            (
+                "entry",
+                "34e21f21a41f2346889c242c869bc32c74821c625dd5b9cf9bd2181ca2d8d40e",
+            ),
+            (
+                "mapped",
+                "a28b8e9b8a8b3efdc70f39e11253a5525aff36c315d33cd3fbec99f0489845ad",
+            ),
+            (
+                "scalar",
+                "285f7f75bf9f388a771d685607ce65f7097c27d21869952d46b3a7ce70897612",
+            ),
+            (
+                "handoff",
+                "85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75",
+            ),
+            (
+                "relay",
+                "b3101215bb483aff4b82e80063b8e0a5419ce3f0fc3ba39c3e84675b8feafc26",
+            ),
+            (
+                "mapped_inputs",
+                "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+            ),
+        ];
+        fn selector_cohort(observed: &[(&str, &str)]) -> SelectorCohort {
+            let same = |expected: &[(&str, &str)]| {
+                observed.len() == expected.len()
+                    && expected
+                        .iter()
+                        .all(|row| observed.iter().filter(|v| *v == row).count() == 1)
+            };
+            match (same(V9_SELECTOR_SOURCES), same(STEP2_SELECTOR_SOURCES)) {
+                (true, false) => SelectorCohort::V9,
+                (false, true) => SelectorCohort::Step2,
+                _ => SelectorCohort::Unknown,
+            }
+        }
+        const BOOTSTRAP_PROJECT: Role = Role {
+            name: "bootstrap_project",
+            source: Some("handoff"),
+            symbol: "_RNvMs1_NtCs_14reverie_loader7handoffNtB5_9Bootstrap7project",
+            asynchronous: false,
+        };
+
+        fn selector(
+            cohort: SelectorCohort,
+            role: &Role,
+        ) -> Option<(&'static str, Option<&'static str>)> {
+            match (cohort, role.name) {
+                (SelectorCohort::Step2, "mapped_decode") => Some((
+                    "_RNvMs_NtNtNtCs_15reverie_inguest5guest12exec_private14mapped_initialNtB4_19MappedInitialInputs6decode",
+                    Some("mapped"),
+                )),
+                (SelectorCohort::Step2, "scalar_decode") => Some((
+                    "_RNvMNtCs_14reverie_loader13mapped_inputsNtB2_22ProductionMappedInputs9decode_at",
+                    Some("mapped_inputs"),
+                )),
+                (SelectorCohort::Step2, "handoff_parse") => Some((
+                    "_RNvMs2_NtCs_14reverie_loader7handoffNtB5_4View5parse",
+                    Some("handoff"),
+                )),
+                (SelectorCohort::Step2, "handoff_validate_roles") => Some((
+                    "_RNvMs2_NtCs_14reverie_loader7handoffNtB5_4View14validate_roles",
+                    Some("handoff"),
+                )),
+                (
+                    SelectorCohort::Unknown,
+                    "mapped_decode" | "scalar_decode" | "handoff_parse" | "handoff_validate_roles",
+                ) => None,
+                _ => Some((role.symbol, role.source)),
+            }
+        }
+
+        fn bounded_input(file: &FileIdentity) -> Result<Vec<u8>> {
+            let limit = 128 * 1024 * 1024;
+            let mut bytes = Vec::new();
+            fs::File::open(&file.path)
+                .map_err(|e| e.to_string())?
+                .take(limit + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            require(
+                bytes.len() as u64 <= limit,
+                "startup census ELF/map exceeds 128MiB bound",
+            )?;
+            Ok(bytes)
+        }
+
+        // Only the source factory calls this. All output is diagnostic data, including
+        // a successfully collected body. No variant can satisfy an executable API.
+        pub(in super::super) fn inspect(
+            tls_variant: super::super::private_static::tls_sources::Variant,
+            archive: &FileIdentity,
+            artifact: &FileIdentity,
+            link_map: &FileIdentity,
+            objdump: &FileIdentity,
+            sources: BTreeMap<&'static str, FileIdentity>,
+            runner: &mut Runner,
+        ) -> Result<PrivateStartupCensus> {
+            let mut files = vec![
+                archive.clone(),
+                artifact.clone(),
+                link_map.clone(),
+                objdump.clone(),
+            ];
+            files.extend(sources.values().cloned());
+            let result = (|| {
+                for file in &files {
+                    file.verify()?;
+                }
+                let observed_sources = SELECTOR_KEYS
+                    .iter()
+                    .filter_map(|key| sources.get(key).map(|file| (*key, file.sha256.as_str())))
+                    .collect::<Vec<_>>();
+                let cohort = selector_cohort(&observed_sources);
+                let project = (cohort == SelectorCohort::Step2).then_some(&BOOTSTRAP_PROJECT);
+                require(
+                    ROLES.len() + usize::from(project.is_some()) <= MAX_ROLES,
+                    "startup census role budget exceeded",
+                )?;
+                let bytes = bounded_input(artifact)?;
+                let elf = Elf::parse(&bytes).map_err(|e| e.to_string())?;
+                static_image_metadata(&elf, &bytes)?;
+                let map_bytes = bounded_input(link_map)?;
+                let map = std::str::from_utf8(&map_bytes).map_err(|e| e.to_string())?;
+                let mut symbols: BTreeMap<u64, Vec<SymbolEvidence>> = BTreeMap::new();
+                for symbol in elf.syms.iter().filter(|s| executable_symbol(&elf, s)) {
+                    let name = elf
+                        .strtab
+                        .get_at(symbol.st_name)
+                        .ok_or("startup symbol name invalid")?;
+                    symbols
+                        .entry(symbol.st_value)
+                        .or_default()
+                        .push(symbol_evidence(name, &symbol));
+                }
+                let targets = symbols.keys().copied().collect::<BTreeSet<_>>();
+                let mut roles_at: BTreeMap<u64, Vec<&'static str>> = BTreeMap::new();
+                let mut selected = Vec::new();
+                for role in ROLES.iter().chain(project) {
+                    let selected_selector = selector(cohort, role);
+                    let source = selected_selector.map_or(role.source, |(_, source)| source);
+                    let expected_symbol = selected_selector.map(|(symbol, _)| {
+                        if role.name == "tls_geometry" {
+                            tls_variant.geometry_symbol()
+                        } else {
+                            symbol
+                        }
+                    });
+                    let matches = elf
+                        .syms
+                        .iter()
+                        .filter(|s| s.st_shndx != 0)
+                        .filter(|s| {
+                            elf.strtab.get_at(s.st_name).is_some_and(|name| {
+                                expected_symbol.is_some_and(|expected| {
+                                    name == expected
+                                        || canonical_rust_symbol(name).as_deref() == Some(expected)
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if matches.len() == 1 {
+                        roles_at
+                            .entry(matches[0].st_value)
+                            .or_default()
+                            .push(role.name);
+                    }
+                    selected.push((role, source, expected_symbol, matches));
+                }
+                let mut bodies = Vec::new();
+                let mut total = 0usize;
+                for (role, source, expected_symbol, matches) in selected {
+                    let mut body = StartupBody {
+                        role: role.name,
+                        source: source.and_then(|key| sources.get(key)).cloned(),
+                        source_association: if source.is_some() {
+                            "GUARDED_SOURCE_PATH_ONLY_OBJECT_JOIN_NOT_PROVEN"
+                        } else {
+                            "NATIVE_SOURCE_JOIN_NOT_PROVEN"
+                        },
+                        asynchronous_root: role.asynchronous,
+                        symbols: matches
+                            .iter()
+                            .map(|s| symbol_evidence(elf.strtab.get_at(s.st_name).unwrap_or(""), s))
+                            .collect(),
+                        map_rows: Vec::new(),
+                        complete_bytes: 0,
+                        bytes_sha256: None,
+                        disassembly: None,
+                        instructions: 0,
+                        complete_disassembly: false,
+                        transfers: Vec::new(),
+                        got_edges: Vec::new(),
+                        target_symbols: BTreeMap::new(),
+                        target_startup_roles: BTreeMap::new(),
+                        refusals: Vec::new(),
+                        phase_questions: vec![
+                            "VALID_INPUT_REACHABILITY_NOT_PROVEN",
+                            "PRE_OR_POST_FS_USE_NOT_PROVEN",
+                            "SELECTED_BODY_OBSERVATIONS_ARE_NOT_SEMANTICS",
+                        ],
+                    };
+                    let observation: Result<()> = (|| {
+                        require(
+                            expected_symbol.is_some(),
+                            "startup selector source cohort unknown/mixed; no fallback",
+                        )?;
+                        require(
+                            matches.len() == 1,
+                            "startup role symbol absent/ambiguous; no extent fallback",
+                        )?;
+                        let root = &matches[0];
+                        require(
+                            root.st_type() == sym::STT_FUNC && executable_symbol(&elf, root),
+                            "startup role is not a nonzero complete executable function",
+                        )?;
+                        if role.name == "entry" {
+                            require(
+                                root.st_bind() == sym::STB_GLOBAL && root.st_value == elf.entry,
+                                "startup entry is not the actual GLOBAL ELF entry",
+                            )?;
+                        }
+                        // Aliases must agree on a real nonzero extent; neither adjacent
+                        // symbol distance nor allocated-section size fabricates st_size.
+                        let ranges =
+                            selected_function_ranges(&elf, BTreeSet::from([root.st_value]))?;
+                        let count = usize::try_from(ranges[&root.st_value])
+                            .map_err(|_| "startup extent exceeds usize")?;
+                        require(
+                            count <= MAX_BODY_BYTES,
+                            "startup complete body exceeds 1MiB budget",
+                        )?;
+                        total = total
+                            .checked_add(count)
+                            .ok_or("startup total byte count overflows")?;
+                        require(
+                            total <= MAX_OBJDUMP_BYTES,
+                            "startup total complete bodies exceed byte budget",
+                        )?;
+                        let expected = static_function_bytes(&elf, &bytes, &ranges)?;
+                        body.complete_bytes = count;
+                        body.bytes_sha256 = Some(sha256(&expected[&root.st_value]));
+                        // Actual map rows are retained observations only; names/rows do
+                        // not establish an object-to-final-byte join or source origin.
+                        let actual_name = elf
+                            .strtab
+                            .get_at(root.st_name)
+                            .ok_or("startup root name invalid")?;
+                        body.map_rows = map
+                            .lines()
+                            .filter(|line| line.split_whitespace().last() == Some(actual_name))
+                            .map(str::to_owned)
+                            .collect();
+                        let end = root
+                            .st_value
+                            .checked_add(root.st_size)
+                            .ok_or("startup body end overflows")?;
+                        let path = artifact
+                            .path
+                            .to_str()
+                            .ok_or("startup artifact path not UTF-8")?;
+                        let program = objdump
+                            .path
+                            .to_str()
+                            .ok_or("startup objdump path not UTF-8")?;
+                        let cwd = artifact
+                            .path
+                            .parent()
+                            .ok_or("startup artifact parent absent")?;
+                        let args = vec![
+                            "--disassemble".into(),
+                            "--show-raw-insn".into(),
+                            "--disassemble-zeroes".into(),
+                            "--insn-width=16".into(),
+                            "--wide".into(),
+                            format!("--start-address={:#x}", root.st_value),
+                            format!("--stop-address={end:#x}"),
+                            path.into(),
+                        ];
+                        objdump.verify()?;
+                        let limit = MAX_OBJDUMP_BYTES.min(runner.max_stream_bytes);
+                        let commands_before = runner.commands.len();
+                        let raw = runner.run_with_combined_limit(program, &args, cwd, Some(limit));
+                        // Preserve a failing tool's actual stdout identity when Runner
+                        // recorded it, while retaining the original failure as well.
+                        if runner.commands.len() > commands_before {
+                            let command = runner
+                                .commands
+                                .last()
+                                .ok_or("startup objdump evidence absent")?;
+                            body.disassembly = Some(command.stdout.clone());
+                            files.push(command.stdout.clone());
+                            files.push(command.stderr.clone());
+                        }
+                        let raw = raw?;
+                        let text = std::str::from_utf8(&raw).map_err(|e| e.to_string())?;
+                        verify_disassembly_bytes(text, &expected)?;
+                        let instructions = constructor_instructions(text, root.st_value)?;
+                        body.instructions = instructions.len();
+                        body.complete_disassembly = true;
+                        if instructions.iter().any(|instruction| {
+                            instruction
+                                .bytes
+                                .iter()
+                                .take_while(|b| {
+                                    matches!(
+                                        **b,
+                                        0xf0 | 0xf2
+                                            | 0xf3
+                                            | 0x26
+                                            | 0x2e
+                                            | 0x36
+                                            | 0x3e
+                                            | 0x64
+                                            | 0x65
+                                            | 0x66
+                                            | 0x67
+                                            | 0x40..=0x4f
+                                    )
+                                })
+                                .any(|b| matches!(*b, 0x64 | 0x65))
+                        }) {
+                            body.phase_questions
+                                .push("DECODED_FS_OR_GS_ACCESS_REQUIRES_PHASE_PROOF");
+                        }
+                        let observed = observe_instructions(&elf, &bytes, &instructions, &targets)?;
+                        body.transfers = observed.transfers;
+                        body.got_edges = observed.got_edges;
+                        body.refusals.extend(observed.refusals);
+                        for edge in &body.transfers {
+                            if let Some(aliases) = symbols.get(&edge.target) {
+                                body.target_symbols.insert(edge.target, aliases.clone());
+                            }
+                            if let Some(roles) = roles_at.get(&edge.target) {
+                                body.target_startup_roles.insert(edge.target, roles.clone());
+                            } else {
+                                body.phase_questions
+                                    .push("CALLEE_OUTSIDE_FINITE_SELECTED_ROLE_SET_NOT_PROVEN");
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(reason) = observation {
+                        body.refusals.push(InstructionRefusal {
+                            instruction: None,
+                            reason,
+                        });
+                    }
+                    bodies.push(body);
+                }
+                Ok(PrivateStartupCensus {
+                    archive: archive.clone(),
+                    artifact: artifact.clone(),
+                    link_map: link_map.clone(),
+                    objdump: objdump.clone(),
+                    sources,
+                    bodies,
+                    scope: "FINITE_SELECTED_COMPLETE_BODY_DIAGNOSTIC_ONLY",
+                    source_object_join: "NOT_PROVEN",
+                    pre_fs_closure: "NOT_PROVEN",
+                    inline_syscall_authority: "NOT_PRODUCED",
+                    entry_admission: "NOT_PRODUCED",
+                })
+            })();
+            // Close all bound identities even after tool/parse/selection failures.
+            let errors = files
+                .iter()
+                .filter_map(|f| f.verify().err())
+                .collect::<Vec<_>>();
+            // This diagnostic is a sibling of private_static. Keep its close handling
+            // local rather than exposing the source owner's private helper.
+            match (result, errors.is_empty()) {
+                (Ok(value), true) => Ok(value),
+                (Err(error), true) => Err(error),
+                (Ok(_), false) => Err(errors.join("; ")),
+                (Err(error), false) => Err(format!(
+                    "{error}; startup custody close: {}",
+                    errors.join("; ")
+                )),
+            }
+        }
+        #[cfg(test)]
+        mod selector_tests {
+            use super::*;
+
+            #[test]
+            fn recorded_v9_selectors_remain_exact() {
+                assert_eq!(selector_cohort(V9_SELECTOR_SOURCES), SelectorCohort::V9);
+                for role in ROLES {
+                    assert_eq!(
+                        selector(SelectorCohort::V9, role),
+                        Some((role.symbol, role.source))
+                    );
+                }
+                assert!(
+                    ROLES
+                        .iter()
+                        .find(|r| r.name == "bootstrap_sigsys")
+                        .unwrap()
+                        .asynchronous
+                );
+            }
+
+            #[test]
+            fn step2_selectors_match_retained_actual_defined_names() {
+                assert_eq!(
+                    selector_cohort(STEP2_SELECTOR_SOURCES),
+                    SelectorCohort::Step2
+                );
+                // Raw names transcribed from closed V10 symbol metadata; this tests
+                // discovery only, not an actual source-owned/final-body proof.
+                for (name, raw, source) in [
+                    (
+                        "mapped_decode",
+                        "_RNvMs_NtNtNtCs2crxjJ1cTuG_15reverie_inguest5guest12exec_private14mapped_initialNtB4_19MappedInitialInputs6decode",
+                        "mapped",
+                    ),
+                    (
+                        "scalar_decode",
+                        "_RNvMNtCsiQA3fNasB45_14reverie_loader13mapped_inputsNtB2_22ProductionMappedInputs9decode_at",
+                        "mapped_inputs",
+                    ),
+                    (
+                        "handoff_parse",
+                        "_RNvMs2_NtCsiQA3fNasB45_14reverie_loader7handoffNtB5_4View5parse",
+                        "handoff",
+                    ),
+                    (
+                        "handoff_validate_roles",
+                        "_RNvMs2_NtCsiQA3fNasB45_14reverie_loader7handoffNtB5_4View14validate_roles",
+                        "handoff",
+                    ),
+                ] {
+                    let role = ROLES.iter().find(|r| r.name == name).unwrap();
+                    let (symbol, key) = selector(SelectorCohort::Step2, role).unwrap();
+                    assert_eq!(canonical_rust_symbol(raw).as_deref(), Some(symbol));
+                    assert_eq!(key, Some(source));
+                    assert_ne!(symbol, role.symbol);
+                    assert_ne!(canonical_rust_symbol(raw).as_deref(), Some(role.symbol));
+                }
+                assert_eq!(
+                    canonical_rust_symbol(
+                        "_RNvMs1_NtCsiQA3fNasB45_14reverie_loader7handoffNtB5_9Bootstrap7project"
+                    )
+                    .as_deref(),
+                    Some(BOOTSTRAP_PROJECT.symbol)
+                );
+                assert_eq!(BOOTSTRAP_PROJECT.source, Some("handoff"));
+                assert!(ROLES.len() < MAX_ROLES);
+            }
+
+            #[test]
+            fn selector_cohorts_refuse_mixed_missing_duplicate_changed_and_extra() {
+                for expected in [V9_SELECTOR_SOURCES, STEP2_SELECTOR_SOURCES] {
+                    for index in 0..expected.len() {
+                        let mut changed = expected.to_vec();
+                        changed[index].1 = "unreviewed";
+                        assert_eq!(selector_cohort(&changed), SelectorCohort::Unknown);
+                        let mut missing = expected.to_vec();
+                        missing.remove(index);
+                        assert_eq!(selector_cohort(&missing), SelectorCohort::Unknown);
+                    }
+                    let mut duplicate = expected.to_vec();
+                    duplicate.push(expected[0]);
+                    assert_eq!(selector_cohort(&duplicate), SelectorCohort::Unknown);
+                    let mut extra = expected.to_vec();
+                    extra.push(("unexpected", "unreviewed"));
+                    assert_eq!(selector_cohort(&extra), SelectorCohort::Unknown);
+                }
+                let mut mixed = STEP2_SELECTOR_SOURCES.to_vec();
+                mixed[0] = V9_SELECTOR_SOURCES[0];
+                assert_eq!(selector_cohort(&mixed), SelectorCohort::Unknown);
+            }
+
+            #[test]
+            fn unknown_cohort_refuses_changed_roles_without_losing_common_roots() {
+                for role in ROLES {
+                    if [
+                        "mapped_decode",
+                        "scalar_decode",
+                        "handoff_parse",
+                        "handoff_validate_roles",
+                    ]
+                    .contains(&role.name)
+                    {
+                        assert_eq!(selector(SelectorCohort::Unknown, role), None);
+                    } else {
+                        assert_eq!(
+                            selector(SelectorCohort::Unknown, role),
+                            Some((role.symbol, role.source))
+                        );
+                        assert_eq!(
+                            selector(SelectorCohort::Step2, role),
+                            Some((role.symbol, role.source))
+                        );
+                    }
+                }
+                assert_eq!(ROLES.iter().filter(|r| r.name == "validate_aux").count(), 1);
+            }
+        }
+    }
+    use super::*;
+
+    /// Explicit fallible inputs for the one retained private-musl memcpy
+    /// diagnostic. Paths/JSON do not carry source or execution authority.
+    pub struct NativeMemcpyInputs<'a> {
+        pub archive: &'a Path,
+        pub source: &'a Path,
+        /// Exact retained release/patch/build-recipe inventory directory.
+        pub source_authority: &'a Path,
+        pub link_map: &'a Path,
+    }
+
+    const MEMCPY_BODY: &[u8; 50] = &[
+        0x48, 0x89, 0xf8, 0x48, 0x83, 0xfa, 0x08, 0x72, 0x14, 0xf7, 0xc7, 0x07, 0x00, 0x00, 0x00,
+        0x74, 0x0c, 0xa4, 0x48, 0xff, 0xca, 0xf7, 0xc7, 0x07, 0x00, 0x00, 0x00, 0x75, 0xf4, 0x48,
+        0x89, 0xd1, 0x48, 0xc1, 0xe9, 0x03, 0xf3, 0x48, 0xa5, 0x83, 0xe2, 0x07, 0x74, 0x05, 0xa4,
+        0xff, 0xca, 0x75, 0xfb, 0xc3,
+    ];
+
+    type NativeSymbolAlias = (String, u8, u8, u8, u64, u64);
+
+    #[derive(Debug, Serialize)]
+    struct NativeMemcpyObservation {
+        archive: FileIdentity,
+        source: FileIdentity,
+        source_inventory: FileIdentity,
+        link_map: FileIdentity,
+        member_header: u64,
+        member_ordinal: usize,
+        member_sha256: String,
+        input_section: usize,
+        complete_section_bytes: usize,
+        final_entry: u64,
+        // Keep actual ELF alias types/sizes; never manufacture SymbolEvidence.
+        aliases: Vec<NativeSymbolAlias>,
+        source_provenance: &'static str,
+        semantics: &'static str,
+    }
+
+    // Sole local role value, constructed only while the existing source factory
+    // owns all native input identities. No public constructor/Deserialize/Clone.
+    pub(super) struct NativeMemcpyRole {
+        observation: NativeMemcpyObservation,
+    }
+    impl NativeMemcpyRole {
+        pub(super) fn definition_address(&self) -> u64 {
+            self.observation.final_entry
+        }
+    }
+
+    fn memcpy_aliases(elf: &Elf<'_>, section: usize, entry: u64) -> Result<Vec<NativeSymbolAlias>> {
+        let mut aliases = Vec::new();
+        for s in elf.syms.iter().filter(|s| {
+            s.st_shndx == section && s.st_value == entry && s.st_type() != sym::STT_SECTION
+        }) {
+            aliases.push((
+                elf.strtab
+                    .get_at(s.st_name)
+                    .ok_or("native alias name invalid")?
+                    .to_owned(),
+                s.st_bind(),
+                s.st_type(),
+                s.st_visibility(),
+                s.st_value,
+                s.st_size,
+            ));
+        }
+        aliases.sort();
+        Ok(aliases)
+    }
+
+    fn memcpy_input_section(elf: &Elf<'_>, bytes: &[u8]) -> Result<usize> {
+        require(
+            elf.header.e_type == header::ET_REL
+                && elf.header.e_machine == header::EM_X86_64
+                && elf.is_64
+                && elf.little_endian,
+            "memcpy member is not actual x86-64 ET_REL",
+        )?;
+        let sections: Vec<_> = elf
+            .section_headers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| elf.shdr_strtab.get_at(s.sh_name) == Some(".text"))
+            .collect();
+        require(sections.len() == 1, "memcpy input .text absent/ambiguous")?;
+        let (index, s) = sections[0];
+        require(
+            s.sh_type == section_header::SHT_PROGBITS
+                && s.sh_flags == 6
+                && s.sh_addr == 0
+                && s.sh_size == 50
+                && s.sh_addralign == 1,
+            "memcpy whole input section differs",
+        )?;
+        let start = usize::try_from(s.sh_offset).map_err(|_| "memcpy input offset overflows")?;
+        require(
+            bytes.get(start..start.checked_add(50).ok_or("memcpy input end overflows")?)
+                == Some(MEMCPY_BODY.as_slice()),
+            "memcpy whole input code differs",
+        )?;
+        require(
+            elf.section_headers.iter().all(|r| {
+                !matches!(
+                    r.sh_type,
+                    section_header::SHT_REL | section_header::SHT_RELA
+                ) || r.sh_info as usize != index
+                    || r.sh_size == 0
+            }),
+            "memcpy input code has relocation",
+        )?;
+        require(
+            memcpy_aliases(elf, index, 0)?
+                == vec![
+                    ("__memcpy_fwd".into(), 1, 0, 2, 0, 0),
+                    ("memcpy".into(), 1, 2, 0, 0, 0),
+                ],
+            "memcpy input zero-size aliases differ",
+        )?;
+        require(
+            elf.syms
+                .iter()
+                .all(|s| s.st_shndx != index || s.st_value == 0),
+            "memcpy unaccounted interior/end input symbol",
+        )?;
+        Ok(index)
+    }
+
+    impl NativeMemcpyRole {
+        fn verify_final(&self, elf: &Elf<'_>, bytes: &[u8]) -> Result<()> {
+            static_image_metadata(elf, bytes)?;
+            let entry = self.observation.final_entry;
+            let end = entry.checked_add(50).ok_or("memcpy final end overflows")?;
+            let (load, offset) = unique_file_mapping(elf, bytes, entry, 50)?;
+            require(
+                load.p_flags == 5 && bytes.get(offset..offset + 50) == Some(MEMCPY_BODY.as_slice()),
+                "memcpy actual full RX bytes differ",
+            )?;
+            let sections: Vec<_> = elf
+                .section_headers
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    s.sh_type == section_header::SHT_PROGBITS
+                        && s.sh_flags == 6
+                        && s.sh_addr <= entry
+                        && s.sh_addr
+                            .checked_add(s.sh_size)
+                            .is_some_and(|last| end <= last)
+                })
+                .collect();
+            require(
+                sections.len() == 1,
+                "memcpy final allocated section ambiguous",
+            )?;
+            let (section, s) = sections[0];
+            require(
+                s.sh_offset.checked_add(entry - s.sh_addr) == Some(offset as u64),
+                "memcpy final section/PT_LOAD byte identity differs",
+            )?;
+            require(
+                elf.syms
+                    .iter()
+                    .all(|s| s.st_shndx == 0 || s.st_value != entry || s.st_shndx == section),
+                "memcpy same-address definition in another section",
+            )?;
+            require(
+                memcpy_aliases(elf, section, entry)?
+                    == vec![
+                        ("__memcpy_fwd".into(), 0, 0, 2, entry, 0),
+                        ("memcpy".into(), 1, 2, 0, entry, 0),
+                    ],
+                "memcpy final zero-size aliases differ",
+            )?;
+            require(
+                elf.syms
+                    .iter()
+                    .all(|s| s.st_shndx != section || s.st_value <= entry || s.st_value >= end),
+                "memcpy final interior symbol unaccounted",
+            )?;
+            // Emit-relocs metadata may remain, but no relocation may write this
+            // exact relocation-free input section. Conservatively cover up to
+            // eight-byte x86-64 writes starting just before the body too.
+            require(
+                elf.shdr_relocs.iter().all(|(_, rs)| {
+                    rs.iter()
+                        .all(|r| r.r_offset.saturating_add(8) <= entry || r.r_offset >= end)
+                }),
+                "memcpy final body has overlapping relocation",
+            )
+        }
+    }
+
+    pub(super) fn with_native_memcpy<T>(
+        inputs: &NativeMemcpyInputs<'_>,
+        artifact: &FileIdentity,
+        body: impl FnOnce(&NativeMemcpyRole) -> Result<T>,
+    ) -> Result<T> {
+        let mut files = vec![artifact.clone()];
+        let result = (|| {
+            artifact.verify()?;
+            require(
+                fs::metadata(&artifact.path)
+                    .map_err(|e| e.to_string())?
+                    .len()
+                    <= 128 * 1024 * 1024,
+                "native final artifact exceeds bound",
+            )?;
+            let mut bind =
+                |path: &Path, expected: Option<&str>, max: u64| -> Result<FileIdentity> {
+                    require(
+                        fs::metadata(path).map_err(|e| e.to_string())?.len() <= max,
+                        "native input exceeds bound",
+                    )?;
+                    let file = FileIdentity::read(path)?;
+                    // Keep custody even if the expected digest check refuses.
+                    files.push(file.clone());
+                    require(
+                        expected.is_none_or(|hash| file.sha256 == hash),
+                        "native input expected identity differs",
+                    )?;
+                    Ok(file)
+                };
+            let archive = bind(
+                inputs.archive,
+                Some("e699c64b0c6b427d89ad5bf767bf78beb30c19930c5dedff635951636e8f9f70"),
+                8 * 1024 * 1024,
+            )?;
+            let source = bind(
+                inputs.source,
+                Some("790bdd75f7736c83ed7a21f8813b20454ead1ccfc49e806a88692d2a471024eb"),
+                4096,
+            )?;
+            let inventory = bind(
+                &inputs.source_authority.join("inventory.json"),
+                Some("6aeea4469c8ba49c4c475a6694972e6a1ef3974954c9f986f99d7d1bce926275"),
+                128 * 1024,
+            )?;
+            let rows: Value =
+                serde_json::from_slice(&fs::read(&inventory.path).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            for row in rows["files"]
+                .as_array()
+                .ok_or("native source inventory files absent")?
+            {
+                let relative = Path::new(
+                    row["path"]
+                        .as_str()
+                        .ok_or("native source inventory path absent")?,
+                );
+                require(
+                    !relative.is_absolute()
+                        && relative
+                            .components()
+                            .all(|c| matches!(c, std::path::Component::Normal(_))),
+                    "native source inventory escape",
+                )?;
+                bind(
+                    &inputs.source_authority.join(relative),
+                    Some(
+                        row["sha256"]
+                            .as_str()
+                            .ok_or("native inventory hash absent")?,
+                    ),
+                    8 * 1024 * 1024,
+                )?;
+            }
+            let link_map = bind(inputs.link_map, None, 128 * 1024 * 1024)?;
+            let data = fs::read(&archive.path).map_err(|e| e.to_string())?;
+            let ar = goblin::archive::Archive::parse(&data).map_err(|e| e.to_string())?;
+            let selected: Vec<_> = (0..ar.len())
+                .filter_map(|i| ar.get_at(i).map(|m| (i, m)))
+                .filter(|(_, m)| m.extended_name() == "memcpy.lo")
+                .collect();
+            require(selected.len() == 1, "native memcpy member absent/duplicate")?;
+            let (ordinal, member) = selected[0];
+            require(
+                ordinal == 1075 && member.header_offset == 5272090 && member.size() == 2496,
+                "native memcpy physical member identity differs",
+            )?;
+            let start =
+                usize::try_from(member.offset).map_err(|_| "native member offset overflows")?;
+            let input = data
+                .get(
+                    start
+                        ..start
+                            .checked_add(member.size())
+                            .ok_or("native member end overflows")?,
+                )
+                .ok_or("native member outside archive")?;
+            require(
+                sha256(input) == "230ebc0b8eb7e8570667e0c2b4d60b5c3d704899ad5d11c7ab1fa2af61f4ca06",
+                "native memcpy complete member differs",
+            )?;
+            let parsed = Elf::parse(input).map_err(|e| e.to_string())?;
+            let section = memcpy_input_section(&parsed, input)?;
+            let map = fs::read_to_string(&link_map.path).map_err(|e| e.to_string())?;
+            let suffix = format!("{}(memcpy.lo):(.text)", archive.path.display());
+            let rows: Vec<_> = map
+                .lines()
+                .filter(|l| l.trim_end().ends_with(&suffix))
+                .collect();
+            require(
+                rows.len() == 1,
+                "native memcpy map section absent/ambiguous",
+            )?;
+            let fields: Vec<_> = rows[0].split_whitespace().collect();
+            require(
+                fields.len() == 5
+                    && fields[0] == fields[1]
+                    && fields[2] == "32"
+                    && fields[3] == "1",
+                "native memcpy whole section map shape differs",
+            )?;
+            let entry = u64::from_str_radix(fields[0], 16)
+                .map_err(|_| "native memcpy map address invalid")?;
+            let final_bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
+            let final_elf = Elf::parse(&final_bytes).map_err(|e| e.to_string())?;
+            let role = NativeMemcpyRole {
+                observation: NativeMemcpyObservation {
+                    archive,
+                    source,
+                    source_inventory: inventory,
+                    link_map,
+                    member_header: member.header_offset,
+                    member_ordinal: ordinal,
+                    member_sha256: sha256(input),
+                    input_section: section,
+                    complete_section_bytes: 50,
+                    final_entry: entry,
+                    aliases: memcpy_aliases(
+                        &final_elf,
+                        final_elf
+                            .syms
+                            .iter()
+                            .find(|s| {
+                                final_elf.strtab.get_at(s.st_name) == Some("memcpy")
+                                    && s.st_shndx != 0
+                            })
+                            .ok_or("final memcpy symbol absent")?
+                            .st_shndx,
+                        entry,
+                    )?,
+                    source_provenance: "Exact recipe/release/patch inventory and retained native member; not a reproduced native build",
+                    semantics: "Whole50B18-instruction SysV memcpy; DF0/valid disjoint buffers are caller obligations; noTLS/noalloc/nosyscall",
+                },
+            };
+            role.verify_final(&final_elf, &final_bytes)?;
+            body(&role)
+        })();
+        let errors: Vec<_> = files.iter().filter_map(|f| f.verify().err()).collect();
+        match (result, errors.is_empty()) {
+            (Ok(value), true) => Ok(value),
+            (Err(e), true) => Err(e),
+            (Ok(_), false) => Err(errors.join("; ")),
+            (Err(e), false) => Err(format!("{e}; native custody close: {}", errors.join("; "))),
+        }
+    }
+
+    const ENTRY: &str = "detcore_liteinst_mapped_entry";
+
+    /// Immutable observations only. Even a complete root transfer census leaves
+    /// every callee's semantics and pre-TLS closure explicitly unproved.
+    #[derive(Debug, Serialize)]
+    pub struct EntryTransferDiagnostic {
+        artifact: FileIdentity,
+        objdump_tool: FileIdentity,
+        disassembly: FileIdentity,
+        root: SymbolEvidence,
+        complete_root_bytes: usize,
+        complete_root_instructions: usize,
+        // The existing parser checks all root transfers or reports one refusal.
+        transfers: Option<Vec<ConstructorTransfer>>,
+        target_symbols: BTreeMap<u64, Vec<SymbolEvidence>>,
+        static_got_edges: Vec<GotEdge>,
+        transfer_refusal: Option<String>,
+        scope: &'static str,
+        pre_tls_closure: &'static str,
+        source_object_join: &'static str,
+        syscall_tables: &'static str,
+        native_memcpy: Option<NativeMemcpyObservation>,
+    }
+
+    #[cfg(test)]
+    fn census(
+        instructions: &[EncodedConstructorInstruction],
+        targets: &BTreeSet<u64>,
+    ) -> Result<Vec<ConstructorTransfer>> {
+        // No static GOT value is authenticated by this first diagnostic.
+        // Therefore every indirect slot/target is refused by the existing
+        // preparation parser, rather than disappearing from a positive graph.
+        let (transfers, edges) = preparation_transfers(instructions, &BTreeMap::new(), targets)?;
+        require(
+            edges.is_empty(),
+            "diagnostic unexpectedly admitted a GOT edge",
+        )?;
+        Ok(transfers)
+    }
+
+    /// A linked pointer observation, never a source-qualified helper. Unlike
+    /// local_got_targets this admits no dynamic relocation or writable RELRO.
+    pub(super) fn static_image_metadata(elf: &Elf<'_>, bytes: &[u8]) -> Result<()> {
+        require(
+            elf.header.e_type == header::ET_EXEC
+                && elf.header.e_machine == header::EM_X86_64
+                && elf.is_64
+                && elf.little_endian
+                && elf.dynamic.is_none()
+                && !elf.program_headers.iter().any(|p| {
+                    matches!(
+                        p.p_type,
+                        program_header::PT_INTERP | program_header::PT_DYNAMIC
+                    )
+                }),
+            "static GOT observation needs non-dynamic x86-64 ET_EXEC",
+        )?;
+        fixed_require_sane_loads(elf, bytes)?;
+        require(
+            loader_writers(elf)?.is_empty(),
+            "static GOT has runtime writers",
+        )
+    }
+
+    fn static_function_bytes(
+        elf: &Elf<'_>,
+        bytes: &[u8],
+        ranges: &BTreeMap<u64, u64>,
+    ) -> Result<BTreeMap<u64, Vec<u8>>> {
+        static_image_metadata(elf, bytes)?;
+        proof_function_bytes_after_metadata(elf, bytes, ranges)
+    }
+
+    fn static_got_target(elf: &Elf<'_>, bytes: &[u8], slot: u64) -> Result<u64> {
+        static_image_metadata(elf, bytes)?;
+        let (mapping, _) = unique_file_mapping(elf, bytes, slot, 8)?;
+        require(
+            mapping.p_flags == program_header::PF_R,
+            "static GOT slot lacks actual RO non-executable mapping",
+        )?;
+        let target = u64::from_le_bytes(
+            readonly_loaded_bytes(elf, bytes, slot, 8)?
+                .try_into()
+                .unwrap(),
+        );
+        require(target != 0, "static GOT target is zero")?;
+        // Reject interior targets and IFUNC/resolvers; aliases may agree on one
+        // complete physical function, but no name or global binding grants it.
+        let aliases: Vec<_> = elf
+            .syms
+            .iter()
+            .filter(|s| s.st_shndx != section_header::SHN_UNDEF as usize && s.st_value == target)
+            .collect();
+        require(
+            !aliases.is_empty()
+                && aliases
+                    .iter()
+                    .all(|s| s.st_type() == sym::STT_FUNC && executable_symbol(elf, s)),
+            "static GOT target is absent/interior/non-function/resolver",
+        )?;
+        let ranges = selected_function_ranges(elf, BTreeSet::from([target]))?;
+        let end = target
+            .checked_add(ranges[&target])
+            .ok_or("static target end overflows")?;
+        require(
+            elf.syms
+                .iter()
+                .filter(|s| executable_symbol(elf, s))
+                .all(|s| {
+                    s.st_value == target
+                        || s.st_value
+                            .checked_add(s.st_size)
+                            .is_some_and(|other_end| other_end <= target || s.st_value >= end)
+                }),
+            "static GOT target overlaps a distinct function extent",
+        )?;
+        let _complete_target = static_function_bytes(elf, bytes, &ranges)?;
+        Ok(target)
+    }
+
+    fn static_census(
+        elf: &Elf<'_>,
+        bytes: &[u8],
+        instructions: &[EncodedConstructorInstruction],
+        targets: &BTreeSet<u64>,
+    ) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
+        static_census_with_memcpy(elf, bytes, instructions, targets, None)
+    }
+
+    fn static_census_with_memcpy(
+        elf: &Elf<'_>,
+        bytes: &[u8],
+        instructions: &[EncodedConstructorInstruction],
+        targets: &BTreeSet<u64>,
+        native: Option<&NativeMemcpyRole>,
+    ) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
+        static_census_with_roles(elf, bytes, instructions, targets, native, None)
+    }
+
+    fn static_census_with_roles(
+        elf: &Elf<'_>,
+        bytes: &[u8],
+        instructions: &[EncodedConstructorInstruction],
+        targets: &BTreeSet<u64>,
+        native: Option<&NativeMemcpyRole>,
+        ordinary: Option<&private_static::selected_initializers::OrdinaryGateObservations>,
+    ) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
+        let mut got = BTreeMap::new();
+        for instruction in instructions {
+            let raw = &instruction.bytes;
+            // No byte search: these are previously checked whole instructions.
+            if raw.len() == 6 && (raw.starts_with(&[0xff, 0x15]) || raw.starts_with(&[0xff, 0x25]))
+            {
+                let disp = i32::from_le_bytes(raw[2..6].try_into().unwrap());
+                let slot = instruction
+                    .address
+                    .checked_add(6)
+                    .and_then(|next| next.checked_add_signed(i64::from(disp)))
+                    .ok_or("static GOT instruction displacement overflows")?;
+                static_image_metadata(elf, bytes)?;
+                let (mapping, _) = unique_file_mapping(elf, bytes, slot, 8)?;
+                require(
+                    mapping.p_flags == program_header::PF_R,
+                    "static GOT slot lacks actual RO non-executable mapping",
+                )?;
+                let target = u64::from_le_bytes(
+                    readonly_loaded_bytes(elf, bytes, slot, 8)?
+                        .try_into()
+                        .unwrap(),
+                );
+                if let Some(role) = native.filter(|role| role.observation.final_entry == target) {
+                    role.verify_final(elf, bytes)?;
+                    got.insert(slot, target);
+                } else if let Some(role) =
+                    ordinary.filter(|role| role.definition_address() == target)
+                {
+                    role.verify_slot(elf, bytes, slot)?;
+                    got.insert(slot, target);
+                } else {
+                    got.insert(slot, static_got_target(elf, bytes, slot)?);
+                }
+            }
+        }
+        preparation_transfers_with_static_tail(instructions, &got, targets, true)
+    }
+
+    /// Inspect actual e_entry bytes and the complete root's transfer syntax.
+    ///
+    /// Call inside the independent private-static source transaction. This
+    /// function checks only its own artifact/tool custody. Symbol records are
+    /// ELF observations, not source/object identities or qualified helper roles.
+    /// No returned value can be converted to an existing admission capability.
+    /// An unsupported transfer is retained as diagnostic refusal; NOT_PROVEN
+    /// remains unconditional even when all root transfers have known addresses.
+    pub fn inspect_entry_transfers(
+        artifact: &FileIdentity,
+        objdump: &FileIdentity,
+        runner: &mut Runner,
+    ) -> Result<EntryTransferDiagnostic> {
+        inspect_entry_transfers_impl(artifact, objdump, runner, None, None)
+    }
+
+    pub(super) fn inspect_entry_transfers_with_memcpy(
+        inputs: &NativeMemcpyInputs<'_>,
+        artifact: &FileIdentity,
+        objdump: &FileIdentity,
+        runner: &mut Runner,
+    ) -> Result<EntryTransferDiagnostic> {
+        with_native_memcpy(inputs, artifact, |role| {
+            inspect_entry_transfers_impl(artifact, objdump, runner, Some(role), None)
+        })
+    }
+
+    pub(crate) fn inspect_entry_transfers_with_ordinary(
+        role: &private_static::selected_initializers::OrdinaryGateObservations,
+        artifact: &FileIdentity,
+        objdump: &FileIdentity,
+        runner: &mut Runner,
+    ) -> Result<EntryTransferDiagnostic> {
+        inspect_entry_transfers_impl(artifact, objdump, runner, None, Some(role))
+    }
+
+    pub(crate) fn inspect_entry_transfers_with_ordinary_and_memcpy(
+        ordinary: &private_static::selected_initializers::OrdinaryGateObservations,
+        inputs: &NativeMemcpyInputs<'_>,
+        artifact: &FileIdentity,
+        objdump: &FileIdentity,
+        runner: &mut Runner,
+    ) -> Result<EntryTransferDiagnostic> {
+        with_native_memcpy(inputs, artifact, |native| {
+            inspect_entry_transfers_impl(artifact, objdump, runner, Some(native), Some(ordinary))
+        })
+    }
+
+    fn inspect_entry_transfers_impl(
+        artifact: &FileIdentity,
+        objdump: &FileIdentity,
+        runner: &mut Runner,
+        native: Option<&NativeMemcpyRole>,
+        ordinary: Option<&private_static::selected_initializers::OrdinaryGateObservations>,
+    ) -> Result<EntryTransferDiagnostic> {
+        artifact.verify()?;
+        objdump.verify()?;
+        let body = (|| -> Result<EntryTransferDiagnostic> {
+            let bytes = fs::read(&artifact.path).map_err(|e| e.to_string())?;
+            let elf = Elf::parse(&bytes).map_err(|e| e.to_string())?;
+            require(
+                elf.header.e_type == goblin::elf::header::ET_EXEC
+                    && elf.header.e_machine == goblin::elf::header::EM_X86_64
+                    && elf.is_64
+                    && elf.little_endian,
+                "root diagnostic requires x86-64 little-endian ET_EXEC",
+            )?;
+            let roots: Vec<_> = elf
+                .syms
+                .iter()
+                .filter(|s| elf.strtab.get_at(s.st_name) == Some(ENTRY))
+                .collect();
+            require(roots.len() == 1, "mapped root absent/ambiguous")?;
+            let root = roots[0];
+            require(
+                executable_symbol(&elf, &root)
+                    && root.st_bind() == sym::STB_GLOBAL
+                    && root.st_value == elf.entry,
+                "mapped root is not the actual global defined function entry",
+            )?;
+            // Retain complete ELF-root bytes through the existing unique RX
+            // mapping/writer/size-budget checks; never trust objdump headers.
+            let scope = BTreeMap::from([(root.st_value, root.st_size)]);
+            let expected = static_function_bytes(&elf, &bytes, &scope)?;
+            let end = root
+                .st_value
+                .checked_add(root.st_size)
+                .ok_or("root extent overflows")?;
+            let cwd = artifact.path.parent().ok_or("artifact has no parent")?;
+            let path = artifact.path.to_str().ok_or("artifact path is not UTF-8")?;
+            let program = objdump.path.to_str().ok_or("objdump path is not UTF-8")?;
+            let args = vec![
+                "--disassemble".into(),
+                "--show-raw-insn".into(),
+                "--disassemble-zeroes".into(),
+                "--insn-width=16".into(),
+                "--wide".into(),
+                format!("--start-address={:#x}", root.st_value),
+                format!("--stop-address={end:#x}"),
+                path.into(),
+            ];
+            let limit = MAX_OBJDUMP_BYTES.min(runner.max_stream_bytes);
+            let raw = runner.run_with_combined_limit(program, &args, cwd, Some(limit))?;
+            let disassembly = runner
+                .commands
+                .last()
+                .ok_or("objdump command absent")?
+                .stdout
+                .clone();
+            let text = std::str::from_utf8(&raw).map_err(|e| e.to_string())?;
+            // Unlike collect_proof_evidence, this root-only diagnostic does not
+            // import legacy DSO constructor gate labels/roles.
+            verify_disassembly_bytes(text, &expected)?;
+            let instructions = constructor_instructions(text, root.st_value)?;
+            let mut symbols: BTreeMap<u64, Vec<SymbolEvidence>> = BTreeMap::new();
+            for s in elf.syms.iter().filter(|s| executable_symbol(&elf, s)) {
+                let Some(name) = elf.strtab.get_at(s.st_name) else {
+                    return Err("function symbol has invalid name offset".into());
+                };
+                // The target inventory only supplies exact starts to the syntax
+                // parser. No symbol name grants semantics or object authority.
+                symbols
+                    .entry(s.st_value)
+                    .or_default()
+                    .push(symbol_evidence(name, &s));
+            }
+            if let Some(role) = native {
+                role.verify_final(&elf, &bytes)?;
+                // Raw zero-size observations, not invented SymbolEvidence size.
+                let aliases = elf
+                    .syms
+                    .iter()
+                    .filter(|s| s.st_value == role.observation.final_entry && s.st_shndx != 0)
+                    .map(|s| symbol_evidence(elf.strtab.get_at(s.st_name).unwrap_or(""), &s))
+                    .collect();
+                symbols.insert(role.observation.final_entry, aliases);
+            }
+            if let Some(role) = ordinary {
+                role.verify_final(&elf, &bytes)?;
+                let aliases = elf
+                    .syms
+                    .iter()
+                    .filter(|s| s.st_value == role.definition_address() && s.st_shndx != 0)
+                    .map(|s| symbol_evidence(elf.strtab.get_at(s.st_name).unwrap_or(""), &s))
+                    .collect();
+                symbols.insert(role.definition_address(), aliases);
+            }
+            let targets: BTreeSet<_> = symbols.keys().copied().collect();
+            let (transfers, static_got_edges, transfer_refusal, target_symbols) = match if native
+                .is_some()
+                || ordinary.is_some()
+            {
+                static_census_with_roles(&elf, &bytes, &instructions, &targets, native, ordinary)
+            } else {
+                static_census(&elf, &bytes, &instructions, &targets)
+            } {
+                Ok((transfers, edges)) => {
+                    let selected: BTreeMap<_, _> = transfers
+                        .iter()
+                        .map(|edge| (edge.target, symbols[&edge.target].clone()))
+                        .collect();
+                    (Some(transfers), edges, None, selected)
+                }
+                Err(error) => (None, Vec::new(), Some(error), BTreeMap::new()),
+            };
+            disassembly.verify()?;
+            Ok(EntryTransferDiagnostic {
+                artifact: artifact.clone(),
+                objdump_tool: objdump.clone(),
+                disassembly,
+                root: symbol_evidence(ENTRY, &root),
+                complete_root_bytes: usize::try_from(root.st_size)
+                    .map_err(|_| "root byte count exceeds usize")?,
+                complete_root_instructions: instructions.len(),
+                transfers,
+                target_symbols,
+                static_got_edges,
+                transfer_refusal,
+                scope: "ROOT_TRANSFER_DIAGNOSTIC_ONLY",
+                pre_tls_closure: "NOT_PROVEN",
+                source_object_join: "NOT_PROVEN",
+                syscall_tables: "NOT_PRODUCED",
+                native_memcpy: native.map(|role| NativeMemcpyObservation {
+                    archive: role.observation.archive.clone(),
+                    source: role.observation.source.clone(),
+                    source_inventory: role.observation.source_inventory.clone(),
+                    link_map: role.observation.link_map.clone(),
+                    member_header: role.observation.member_header,
+                    member_ordinal: role.observation.member_ordinal,
+                    member_sha256: role.observation.member_sha256.clone(),
+                    input_section: role.observation.input_section,
+                    complete_section_bytes: 50,
+                    final_entry: role.observation.final_entry,
+                    aliases: role.observation.aliases.clone(),
+                    source_provenance: role.observation.source_provenance,
+                    semantics: role.observation.semantics,
+                }),
+            })
+        })();
+        // Check both identities on every Result path, including tool failure.
+        // Preserve the body error if a concurrent input mutation also occurred.
+        let artifact_after = artifact.verify();
+        let tool_after = objdump.verify();
+        let mut errors = Vec::new();
+        if let Err(error) = artifact_after {
+            errors.push(error);
+        }
+        if let Err(error) = tool_after {
+            errors.push(error);
+        }
+        match (body, errors.is_empty()) {
+            (Ok(value), true) => Ok(value),
+            (Err(error), true) => Err(error),
+            (Ok(_), false) => Err(errors.join("; ")),
+            (Err(error), false) => Err(format!("{error}; custody close: {}", errors.join("; "))),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        const ACTUAL_MEMCPY_MEMBER: &[u8] = &include!("../tests/fixtures/musl_memcpy_member.rs");
+        #[test]
+        fn actual_native_memcpy_whole_section_and_perturbations() {
+            let raw = ACTUAL_MEMCPY_MEMBER;
+            assert_eq!(
+                sha256(raw),
+                "230ebc0b8eb7e8570667e0c2b4d60b5c3d704899ad5d11c7ab1fa2af61f4ca06"
+            );
+            let elf = Elf::parse(raw).unwrap();
+            assert_eq!(memcpy_input_section(&elf, raw).unwrap(), 1);
+            // Actual zero-sized FUNC+NOTYPE are still refused by the ordinary
+            // complete-function path; the new section path does not mint size.
+            assert!(
+                elf.syms
+                    .iter()
+                    .filter(|s| elf.strtab.get_at(s.st_name) == Some("memcpy"))
+                    .all(|s| s.st_size == 0)
+            );
+            let mut corrupt = raw.to_vec();
+            corrupt[64] = 0xcc;
+            assert!(memcpy_input_section(&Elf::parse(&corrupt).unwrap(), &corrupt).is_err());
+            for size in [49u64, 51] {
+                let mut decoded = Elf::parse(raw).unwrap();
+                decoded.section_headers[1].sh_size = size;
+                assert!(memcpy_input_section(&decoded, raw).is_err());
+            }
+            let mut decoded = Elf::parse(raw).unwrap();
+            decoded.section_headers[1].sh_flags |= 1;
+            assert!(memcpy_input_section(&decoded, raw).is_err());
+            let mut decoded = Elf::parse(raw).unwrap();
+            decoded.section_headers[2].sh_type = section_header::SHT_RELA;
+            decoded.section_headers[2].sh_info = 1;
+            decoded.section_headers[2].sh_size = 24;
+            assert!(memcpy_input_section(&decoded, raw).is_err());
+        }
+        fn instruction(address: u64, bytes: &[u8]) -> EncodedConstructorInstruction {
+            EncodedConstructorInstruction {
+                address,
+                bytes: bytes.to_vec(),
+            }
+        }
+        #[test]
+        fn direct_root_target_is_observation_not_helper_qualification() {
+            let v = [
+                instruction(0x1000, &[0xe8, 0xfb, 0x0f, 0, 0]),
+                instruction(0x1005, &[0xc3]),
+            ];
+            let transfers = census(&v, &BTreeSet::from([0x2000])).unwrap();
+            assert_eq!(transfers.len(), 1);
+            assert_eq!(transfers[0].instruction, 0x1000);
+            assert_eq!(transfers[0].target, 0x2000);
+            assert_eq!(transfers[0].local_got_slot, None);
+        }
+        #[test]
+        fn an_unrecorded_direct_target_is_refused() {
+            let v = [instruction(0x1000, &[0xe8, 0xfb, 0x0f, 0, 0])];
+            assert!(census(&v, &BTreeSet::new()).is_err());
+        }
+        #[test]
+        fn register_and_unproved_static_got_transfers_are_refused() {
+            for bytes in [
+                &[0xff, 0xd0][..],
+                &[0xff, 0x25, 0, 0, 0, 0][..],
+                &[0xff, 0x15, 0, 0, 0, 0][..],
+            ] {
+                assert!(census(&[instruction(0x1000, bytes)], &BTreeSet::from([0x1006])).is_err());
+            }
+        }
+        #[test]
+        fn interior_branch_and_incomplete_instruction_cursor_are_refused() {
+            let interior = [
+                instruction(0x1000, &[0xeb, 0xff]),
+                instruction(0x1002, &[0xc3]),
+            ];
+            assert!(census(&interior, &BTreeSet::new()).is_err());
+            let gap = [instruction(0x1000, &[0x90]), instruction(0x1002, &[0xc3])];
+            assert!(census(&gap, &BTreeSet::new()).is_err());
+        }
+        #[test]
+        fn a_root_inline_syscall_or_interrupt_is_not_a_gate() {
+            for bytes in [&[0x0f, 0x05][..], &[0xcc][..], &[0xcd, 0x80][..]] {
+                assert!(census(&[instruction(0x1000, bytes)], &BTreeSet::new()).is_err());
+            }
+        }
+        #[test]
+        fn complete_root_raw_evidence_cannot_be_truncated_or_changed() {
+            let expected = BTreeMap::from([(0x1000, vec![0x90, 0xc3])]);
+            let good = "1000 <root>:\n1000: 90 nop\n1001: c3 ret\n";
+            verify_disassembly_bytes(good, &expected).unwrap();
+            assert!(verify_disassembly_bytes("1000 <root>:\n1000: 90 nop\n", &expected).is_err());
+            assert!(
+                verify_disassembly_bytes("1000 <root>:\n1000: 90 nop\n1001: cc int3\n", &expected)
+                    .is_err()
+            );
+        }
+
+        // Real ELF records, but no real runtime/owner is manufactured by these
+        // pure parser controls. The eight-byte slot and RX target are separate.
+        fn static_fixture() -> Vec<u8> {
+            fn put(b: &mut [u8], at: usize, width: usize, n: u64) {
+                b[at..at + width].copy_from_slice(&n.to_le_bytes()[..width]);
+            }
+            let mut b = vec![0; 0x4000];
+            b[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1]);
+            for (at, width, n) in [
+                (16, 2, 2),
+                (18, 2, 62),
+                (20, 4, 1),
+                (24, 8, 0x1000),
+                (32, 8, 64),
+                (40, 8, 0x600),
+                (52, 2, 64),
+                (54, 2, 56),
+                (56, 2, 2),
+                (58, 2, 64),
+                (60, 2, 4),
+            ] {
+                put(&mut b, at, width, n);
+            }
+            for (index, flags, off, address) in [(0, 5, 0x1000, 0x1000), (1, 4, 0x3000, 0x3000)] {
+                let h = 64 + index * 56;
+                for (at, width, n) in [
+                    (0, 4, 1),
+                    (4, 4, flags),
+                    (8, 8, off),
+                    (16, 8, address),
+                    (32, 8, 0x100),
+                    (40, 8, 0x100),
+                    (48, 8, 1),
+                ] {
+                    put(&mut b, h + at, width, n);
+                }
+            }
+            b[0x1000] = 0xc3;
+            put(&mut b, 0x3000, 8, 0x1000);
+            b[0x480..0x488].copy_from_slice(b"\0target\0");
+            // Section 1 RX .text; section 2 strtab; section 3 symtab.
+            for (section, ty, flags, address, off, size, link, align, entsize) in [
+                (1, 1, 6, 0x1000, 0x1000, 0x100, 0, 1, 0),
+                (2, 3, 0, 0, 0x480, 8, 0, 1, 0),
+                (3, 2, 0, 0, 0x500, 48, 2, 8, 24),
+            ] {
+                let h = 0x600 + section * 64;
+                for (at, width, n) in [
+                    (4, 4, ty),
+                    (8, 8, flags),
+                    (16, 8, address),
+                    (24, 8, off),
+                    (32, 8, size),
+                    (40, 4, link),
+                    (48, 8, align),
+                    (56, 8, entsize),
+                ] {
+                    put(&mut b, h + at, width, n);
+                }
+            }
+            put(&mut b, 0x518, 4, 1);
+            b[0x51c] = 2;
+            put(&mut b, 0x51e, 2, 1);
+            put(&mut b, 0x520, 8, 0x1000);
+            put(&mut b, 0x528, 8, 1);
+            b
+        }
+        #[test]
+        fn combined_roles_account_for_both_exact_structural_targets_and_refuse_either_absence() {
+            // A constructed ELF around the measured page/ordinary/memcpy code,
+            // NOT a source/archive owner or a genuine runtime qualification.
+            use private_static::selected_initializers::composition_test_fixture;
+            let (mut raw, mut ordinary) = composition_test_fixture();
+            const BASE: u64 = 0x6000e1001000;
+            let native_entry = BASE + 0x1100;
+            raw[0x2100..0x2132].copy_from_slice(MEMCPY_BODY);
+            raw[0x6000 + 2 * 64 + 32..0x6000 + 2 * 64 + 40]
+                .copy_from_slice(&0x200u64.to_le_bytes());
+            raw[0x4008..0x4010].copy_from_slice(&native_entry.to_le_bytes());
+            let old_strings = u64::from_le_bytes(
+                raw[0x6000 + 3 * 64 + 32..0x6000 + 3 * 64 + 40]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let extra = b"__memcpy_fwd\0memcpy\0";
+            raw[0x5000 + old_strings..0x5000 + old_strings + extra.len()].copy_from_slice(extra);
+            raw[0x6000 + 3 * 64 + 32..0x6000 + 3 * 64 + 40]
+                .copy_from_slice(&((old_strings + extra.len()) as u64).to_le_bytes());
+            raw[0x6000 + 4 * 64 + 32..0x6000 + 4 * 64 + 40].copy_from_slice(&216u64.to_le_bytes());
+            raw[0x6000 + 4 * 64 + 44..0x6000 + 4 * 64 + 48].copy_from_slice(&8u32.to_le_bytes());
+            for (index, name, info, visibility) in
+                [(7, old_strings, 0, 2), (8, old_strings + 13, 18, 0)]
+            {
+                let at = 0x5400 + index * 24;
+                raw[at..at + 4].copy_from_slice(&(name as u32).to_le_bytes());
+                raw[at + 4] = info;
+                raw[at + 5] = visibility;
+                raw[at + 6..at + 8].copy_from_slice(&2u16.to_le_bytes());
+                raw[at + 8..at + 16].copy_from_slice(&native_entry.to_le_bytes());
+            }
+            // Ordinary's fixture uses BASE as the page base. Guard that joining
+            // the measured slices never silently depends on another geometry.
+            assert_eq!(ordinary.addresses().0, BASE + 4096);
+            let path = std::env::temp_dir().join(format!(
+                "ordinary-native-{}-{}.elf",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            struct Remove(PathBuf);
+            impl Drop for Remove {
+                fn drop(&mut self) {
+                    let _ = fs::remove_file(&self.0);
+                }
+            }
+            let _remove = Remove(path.clone());
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            fs::write(&path, &raw).unwrap();
+            let file = FileIdentity::read(&path).unwrap();
+            ordinary.bind_composition_test_file(&file);
+            let native = NativeMemcpyRole {
+                observation: NativeMemcpyObservation {
+                    archive: file.clone(),
+                    source: file.clone(),
+                    source_inventory: file.clone(),
+                    link_map: file,
+                    member_header: 0,
+                    member_ordinal: 0,
+                    member_sha256: String::new(),
+                    input_section: 1,
+                    complete_section_bytes: 50,
+                    final_entry: native_entry,
+                    aliases: vec![],
+                    source_provenance: "STRUCTURAL_TEST_ONLY",
+                    semantics: "NOT_QUALIFIED",
+                },
+            };
+            let elf = Elf::parse(&raw).unwrap();
+            let mut calls = Vec::new();
+            for (pc, slot) in [
+                (BASE + 0x1200, BASE + 0x3000),
+                (BASE + 0x1206, BASE + 0x3008),
+            ] {
+                let mut encoded = vec![0xff, 0x15];
+                encoded.extend_from_slice(
+                    &i32::try_from(slot as i64 - (pc + 6) as i64)
+                        .unwrap()
+                        .to_le_bytes(),
+                );
+                calls.push(instruction(pc, &encoded));
+            }
+            let targets = BTreeSet::from([ordinary.addresses().0, native_entry]);
+            let refuse = "static GOT target is absent/interior/non-function/resolver";
+            assert_eq!(
+                static_census_with_roles(&elf, &raw, &calls, &targets, None, Some(&ordinary))
+                    .unwrap_err(),
+                refuse
+            );
+            assert_eq!(
+                static_census_with_roles(&elf, &raw, &calls, &targets, Some(&native), None)
+                    .unwrap_err(),
+                refuse
+            );
+            let (transfers, slots) = static_census_with_roles(
+                &elf,
+                &raw,
+                &calls,
+                &targets,
+                Some(&native),
+                Some(&ordinary),
+            )
+            .unwrap();
+            assert_eq!(transfers.len(), 2);
+            assert_eq!(slots.len(), 2);
+            assert_eq!(transfers[0].target, ordinary.addresses().0);
+            assert_eq!(transfers[1].target, native_entry);
+            let mut changed = raw.clone();
+            changed[0x2000] ^= 1;
+            assert!(
+                static_census_with_roles(
+                    &Elf::parse(&changed).unwrap(),
+                    &changed,
+                    &calls,
+                    &targets,
+                    Some(&native),
+                    Some(&ordinary)
+                )
+                .is_err()
+            );
+            // The same production provider close rejects changed bound bytes.
+            fs::write(&path, &changed).unwrap();
+            assert!(
+                static_census_with_roles(
+                    &elf,
+                    &raw,
+                    &calls,
+                    &targets,
+                    Some(&native),
+                    Some(&ordinary)
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn ordinary_role_absence_retains_generic_nonfunction_alias_refusal() {
+            let mut raw = static_fixture();
+            assert_eq!(
+                static_got_target(&Elf::parse(&raw).unwrap(), &raw, 0x3000).unwrap(),
+                0x1000
+            );
+            // An additional exact-address NOTYPE boundary is not a generic FUNC.
+            // Only the independently derived ordinary role may account for its
+            // actual preceding-page boundary; this default API has no such role.
+            raw[0x600 + 3 * 64 + 32..0x600 + 3 * 64 + 40].copy_from_slice(&72u64.to_le_bytes());
+            raw[0x530..0x534].copy_from_slice(&1u32.to_le_bytes());
+            raw[0x534] = 0;
+            raw[0x536..0x538].copy_from_slice(&1u16.to_le_bytes());
+            raw[0x538..0x540].copy_from_slice(&0x1000u64.to_le_bytes());
+            assert_eq!(
+                static_got_target(&Elf::parse(&raw).unwrap(), &raw, 0x3000).unwrap_err(),
+                "static GOT target is absent/interior/non-function/resolver"
+            );
+        }
+
+        #[test]
+        fn static_exec_complete_byte_wrapper_positive_and_dyn_refusal() {
+            let b = static_fixture();
+            let elf = Elf::parse(&b).unwrap();
+            let ranges = BTreeMap::from([(0x1000, 1)]);
+            assert_eq!(
+                static_function_bytes(&elf, &b, &ranges).unwrap()[&0x1000],
+                vec![0xc3]
+            );
+            // The DSO policy remains separate and still refuses this ET_EXEC.
+            assert!(proof_function_bytes(&elf, &b, &ranges).is_err());
+            let mut dyn_bytes = b.clone();
+            dyn_bytes[16..18].copy_from_slice(&header::ET_DYN.to_le_bytes());
+            assert!(
+                static_function_bytes(&Elf::parse(&dyn_bytes).unwrap(), &dyn_bytes, &ranges)
+                    .is_err()
+            );
+            let expected = static_function_bytes(&elf, &b, &ranges).unwrap();
+            verify_disassembly_bytes("1000 <target>:\n1000: c3 ret\n", &expected).unwrap();
+            assert!(verify_disassembly_bytes("1000 <target>:\n1000: 90 nop\n", &expected).is_err());
+        }
+
+        #[test]
+        fn static_ro_slot_call_tail_and_direct_are_observations() {
+            let b = static_fixture();
+            let elf = Elf::parse(&b).unwrap();
+            assert_eq!(static_got_target(&elf, &b, 0x3000).unwrap(), 0x1000);
+            for op in [0x15, 0x25] {
+                // Next PC 0x2006 + 0xffa = slot 0x3000.
+                let ins = [instruction(0x2000, &[0xff, op, 0xfa, 0x0f, 0, 0])];
+                let (transfers, edges) =
+                    static_census(&elf, &b, &ins, &BTreeSet::from([0x1000])).unwrap();
+                assert_eq!(transfers.len(), 1);
+                assert_eq!(edges.len(), 1);
+                assert_eq!(edges[0].slot, 0x3000);
+                assert_eq!(edges[0].target_function, 0x1000);
+                if op == 0x25 {
+                    assert!(
+                        preparation_transfers(
+                            &ins,
+                            &BTreeMap::from([(0x3000, 0x1000)]),
+                            &BTreeSet::from([0x1000])
+                        )
+                        .is_err()
+                    );
+                }
+            }
+            let direct = [instruction(0x2000, &[0xe8, 0xfb, 0xef, 0xff, 0xff])];
+            assert_eq!(
+                static_census(&elf, &b, &direct, &BTreeSet::from([0x1000]))
+                    .unwrap()
+                    .0
+                    .len(),
+                1
+            );
+        }
+        #[test]
+        fn static_rw_nominal_relro_zero_interior_and_slot_overflow_refuse() {
+            for target in [0u64, 0x1001] {
+                let mut b = static_fixture();
+                b[0x3000..0x3008].copy_from_slice(&target.to_le_bytes());
+                assert!(static_got_target(&Elf::parse(&b).unwrap(), &b, 0x3000).is_err());
+            }
+            let mut b = static_fixture();
+            b[124..128].copy_from_slice(&6u32.to_le_bytes());
+            // A nominal RELRO header does not make this mapping physically RO.
+            b[56..58].copy_from_slice(&3u16.to_le_bytes());
+            let h = 176;
+            b[h..h + 4].copy_from_slice(&program_header::PT_GNU_RELRO.to_le_bytes());
+            b[h + 16..h + 24].copy_from_slice(&0x3000u64.to_le_bytes());
+            b[h + 40..h + 48].copy_from_slice(&0x100u64.to_le_bytes());
+            assert!(static_got_target(&Elf::parse(&b).unwrap(), &b, 0x3000).is_err());
+            let b = static_fixture();
+            let elf = Elf::parse(&b).unwrap();
+            assert!(static_got_target(&elf, &b, u64::MAX - 3).is_err());
+            assert!(
+                static_census(
+                    &elf,
+                    &b,
+                    &[instruction(u64::MAX - 3, &[0xff, 0x15, 0, 0, 0, 0])],
+                    &BTreeSet::from([0x1000])
+                )
+                .is_err()
+            );
+        }
+        #[test]
+        fn finite_startup_census_retains_all_instruction_refusals_without_admitting_them() {
+            let raw = static_fixture();
+            let elf = Elf::parse(&raw).unwrap();
+            let instructions = [
+                instruction(0x1000, &[0xe8, 0xfb, 0x0f, 0, 0]), // actual target arithmetic: 0x2000
+                instruction(0x1005, &[0x0f, 0x05]),
+                instruction(0x1007, &[0xff, 0xd0]),
+                instruction(0x1009, &[0xe8, 0xf2, 0x1f, 0, 0]), // unrecorded 0x3000
+                instruction(0x100e, &[0xc3]),
+            ];
+            let targets = BTreeSet::from([0x2000]);
+            let observed =
+                startup_census::observe_instructions(&elf, &raw, &instructions, &targets).unwrap();
+            assert_eq!(observed.transfers.len(), 1);
+            assert_eq!(observed.transfers[0].target, 0x2000);
+            assert_eq!(
+                observed
+                    .refusals
+                    .iter()
+                    .map(|r| r.instruction)
+                    .collect::<Vec<_>>(),
+                vec![Some(0x1005), Some(0x1007), Some(0x1009)]
+            );
+            // Same code remains refused by the existing strict API. A retained
+            // observation never turns the first error into admitted syntax.
+            assert_eq!(
+                static_census(&elf, &raw, &instructions, &targets).unwrap_err(),
+                observed.refusals[0].reason
+            );
+        }
+
+        #[test]
+        fn finite_startup_internal_branches_still_require_whole_body_boundaries() {
+            let raw = static_fixture();
+            let elf = Elf::parse(&raw).unwrap();
+            let good = [
+                instruction(0x1000, &[0x75, 1]),
+                instruction(0x1002, &[0x90]),
+                instruction(0x1003, &[0xc3]),
+            ];
+            assert!(
+                startup_census::observe_instructions(&elf, &raw, &good, &BTreeSet::new())
+                    .unwrap()
+                    .refusals
+                    .is_empty()
+            );
+            let mut interior = good.to_vec();
+            interior[0].bytes[1] = 0xff; // 0x1001: inside the branch itself
+            let refused =
+                startup_census::observe_instructions(&elf, &raw, &interior, &BTreeSet::new())
+                    .unwrap();
+            assert_eq!(refused.refusals.len(), 1);
+            assert_eq!(refused.refusals[0].instruction, Some(0x1000));
+            let gap = [instruction(0x1000, &[0x90]), instruction(0x1002, &[0xc3])];
+            assert!(
+                startup_census::observe_instructions(&elf, &raw, &gap, &BTreeSet::new()).is_err()
+            );
+        }
+
+        #[test]
+        fn finite_startup_got_refusal_does_not_hide_a_later_direct_edge() {
+            let raw = static_fixture();
+            let mut elf = Elf::parse(&raw).unwrap();
+            let instructions = [
+                instruction(0x1000, &[0xff, 0x15, 0xfa, 0x1f, 0, 0]),
+                instruction(0x1006, &[0xe8, 0xf5, 0x0f, 0, 0]),
+                instruction(0x100b, &[0xc3]),
+            ];
+            let targets = BTreeSet::from([0x1000, 0x2000]);
+            let good =
+                startup_census::observe_instructions(&elf, &raw, &instructions, &targets).unwrap();
+            assert_eq!(good.transfers.len(), 2);
+            assert!(good.refusals.is_empty());
+            elf.program_headers[1].p_flags |= program_header::PF_W;
+            let refused =
+                startup_census::observe_instructions(&elf, &raw, &instructions, &targets).unwrap();
+            assert_eq!(refused.refusals.len(), 1);
+            assert_eq!(refused.refusals[0].instruction, Some(0x1000));
+            assert_eq!(refused.transfers.len(), 1);
+            assert_eq!(refused.transfers[0].target, 0x2000);
+            assert!(static_census(&elf, &raw, &instructions, &targets).is_err());
+        }
+
+        #[test]
+        fn static_bad_decode_runtime_writer_and_pointer_mutation_refuse() {
+            let mut b = static_fixture();
+            b[0x3000..0x3008].copy_from_slice(&0x1001u64.to_le_bytes());
+            assert!(static_got_target(&Elf::parse(&b).unwrap(), &b, 0x3000).is_err());
+            let b = static_fixture();
+            let elf = Elf::parse(&b).unwrap();
+            for raw in [
+                &[0xff, 0x15, 0, 0][..],
+                &[0xff, 0xd0][..],
+                &[0x67, 0xff, 0x15, 0, 0, 0, 0][..],
+            ] {
+                assert!(
+                    static_census(
+                        &elf,
+                        &b,
+                        &[instruction(0x2000, raw)],
+                        &BTreeSet::from([0x1000])
+                    )
+                    .is_err()
+                );
+            }
+            let mut writer_bytes = b.clone();
+            writer_bytes[0x800..0x808].copy_from_slice(&0x3000u64.to_le_bytes());
+            writer_bytes[0x808..0x810]
+                .copy_from_slice(&u64::from(reloc::R_X86_64_RELATIVE).to_le_bytes());
+            writer_bytes[0x810..0x818].copy_from_slice(&0x1000u64.to_le_bytes());
+            let mut elf = Elf::parse(&writer_bytes).unwrap();
+            elf.dynrelas = goblin::elf::reloc::RelocSection::parse(
+                &writer_bytes,
+                0x800,
+                24,
+                true,
+                goblin::container::Ctx::new(
+                    goblin::container::Container::Big,
+                    goblin::container::Endian::Little,
+                ),
+            )
+            .unwrap();
+            assert!(static_got_target(&elf, &writer_bytes, 0x3000).is_err());
+            assert!(
+                static_function_bytes(&elf, &writer_bytes, &BTreeMap::from([(0x1000, 1)])).is_err()
+            );
+            // A PT_DYNAMIC header alone is also a refusal, never a static waiver.
+            let mut elf = Elf::parse(&b).unwrap();
+            elf.program_headers[1].p_type = program_header::PT_DYNAMIC;
+            assert!(static_got_target(&elf, &b, 0x3000).is_err());
+        }
     }
 }

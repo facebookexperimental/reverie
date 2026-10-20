@@ -13,8 +13,27 @@
 mod child;
 #[cfg(feature = "stage1a-probe")]
 pub mod images;
+/// Owned original child-input observations; no mapping or resume capability.
+pub mod initial_inputs;
+mod initial_stack_inputs;
+#[cfg(feature = "loader-private-runtime")]
+mod input_data;
+#[cfg(feature = "loader-private-runtime")]
+pub use input_data::CopiedInitialData;
+#[cfg(feature = "loader-private-runtime")]
+pub use input_data::CopiedInputLocations;
+#[cfg(feature = "loader-private-runtime")]
+pub use input_data::CopiedInputRequest;
 #[cfg(feature = "stage1a-probe")]
 pub mod inject;
+#[cfg(all(feature = "loader-private-runtime", not(feature = "stage1a-probe")))]
+mod inject;
+#[cfg(any(feature = "stage1a-probe", feature = "loader-private-runtime"))]
+mod mapping_plan;
+/// Owned mapping/filter and unsafe bootstrap observation; no Guest release.
+#[cfg(feature = "loader-private-runtime")]
+#[allow(unsafe_code)]
+pub mod physical;
 mod trace;
 
 use std::cell::RefCell;
@@ -22,6 +41,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 pub use child::PreparedExec;
+#[cfg(feature = "loader-private-runtime")]
+use child::live_birth_pidfd;
 use safeptrace::Event;
 use safeptrace::ExitStatus;
 use safeptrace::Options;
@@ -111,6 +132,9 @@ pub struct CleanupState {
 pub struct ChildOwner<'fd> {
     cleanup: safeptrace::PtracerTerminalCleanup,
     generation: safeptrace::TraceeGeneration,
+    // Duplicate of the original atomic clone pidfd, never pidfd_open(pid).
+    #[cfg(feature = "loader-private-runtime")]
+    birth_pidfd: std::os::fd::OwnedFd,
     _thread: Option<safeptrace::PtracerThreadGuard>,
     // Retains the exact borrowed descriptor leases and pre-clone buffers.
     _request: PreparedExec<'fd>,
@@ -122,6 +146,38 @@ impl<'fd> ChildOwner<'fd> {
     /// Same-generation shared signal/observation handle; it cannot wait here.
     pub fn cancellation_handle(&self) -> safeptrace::TerminalCleanup {
         self.generation.terminal_cleanup()
+    }
+
+    #[cfg(feature = "loader-private-runtime")]
+    fn duplicate_birth_pidfd(&self, task: &Stopped) -> Result<std::os::fd::OwnedFd> {
+        let guard = self
+            ._thread
+            .as_ref()
+            .ok_or("exec_stop_missing_original_ptracer")?;
+        guard.check_current()?;
+        if self.complete || task.generation() != self.generation {
+            return Err("exec_stop_birth_pidfd_retired_or_foreign_generation".into());
+        }
+        // A copied generation or a pidfd alone is not an actual held stop.
+        task.getregs()?;
+        let duplicate = duplicate_guarded_birth_pidfd(guard, &self.birth_pidfd)?;
+        task.getregs()?;
+        guard.check_current()?;
+        Ok(duplicate)
+    }
+
+    #[cfg(feature = "loader-private-runtime")]
+    fn duplicate_birth_pidfd_for_inherited(
+        &self,
+        task: &Stopped,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<std::os::fd::OwnedFd> {
+        // Validate current physical owner/generation before inspecting its request.
+        let birth = self.duplicate_birth_pidfd(task)?;
+        if !self._request.retains_descriptor(fd) {
+            return Err("exec_stop_descriptor_not_inherited".into());
+        }
+        Ok(birth)
     }
 
     /// Request kill and perform bounded retirement on the original ptracer.
@@ -174,6 +230,20 @@ impl<'fd> ChildOwner<'fd> {
         // Drop is only bounded best effort; the outer physical run owner must
         // reject an unconfirmed receipt rather than release its backing early.
         self.complete = self.receipt.snapshot().confirmed;
+    }
+
+    // Called only after an actual terminal event from this retained driver's
+    // generation. Never exposed as a caller-supplied status/retirement setter.
+    #[cfg(feature = "loader-private-runtime")]
+    fn record_detached_terminal(&mut self, status: ExitStatus) {
+        {
+            let mut receipt = self.receipt.borrow_mut();
+            receipt.confirmed = true;
+            receipt.confirmation = Some(CleanupConfirmation::NormalWait);
+            receipt.terminal_status = Some(status);
+            receipt.wait_error = None;
+        }
+        self.complete = true;
     }
 
     /// Wait for this same detached generation, retaining cleanup on every error.
@@ -240,6 +310,28 @@ pub struct ExecBoundary {
     pub exit_info: SyscallInfo,
 }
 
+#[cfg(feature = "loader-private-runtime")]
+fn duplicate_guarded_birth_pidfd(
+    guard: &safeptrace::PtracerThreadGuard,
+    fd: &std::os::fd::OwnedFd,
+) -> Result<std::os::fd::OwnedFd> {
+    guard.check_current()?;
+    let duplicate = duplicate_live_birth_pidfd(fd)?;
+    guard.check_current()?;
+    Ok(duplicate)
+}
+
+// Private kernel operation, called only after the retained host guard succeeds.
+#[cfg(feature = "loader-private-runtime")]
+fn duplicate_live_birth_pidfd(fd: &std::os::fd::OwnedFd) -> Result<std::os::fd::OwnedFd> {
+    live_birth_pidfd(fd)?;
+    // OwnedFd::try_clone uses a new CLOEXEC descriptor to the SAME kernel object.
+    let duplicate = fd.try_clone()?;
+    live_birth_pidfd(fd)?;
+    live_birth_pidfd(&duplicate)?;
+    Ok(duplicate)
+}
+
 /// The complete original entry context; restoration proves no runtime readiness.
 pub struct EntryContext {
     /// Kernel entry registers, including FS/GS.
@@ -292,6 +384,29 @@ impl EntryContext {
         })
     }
 
+    // Only the retained post-initializer path calls this. The preparation
+    // restore below intentionally continues to require the ORIGINAL stack.
+    // Snapshot CURRENT stack bytes: genuine Detcore may have changed AT_RANDOM.
+    // No write targets this stack, including its AT_RANDOM pointed-to bytes.
+    #[cfg(feature = "loader-private-runtime")]
+    fn restore_after_initializer(&self, task: &Stopped, mask: u64) -> Result<()> {
+        if task.generation() != self.generation {
+            return Err("mapped_handover_foreign_context".into());
+        }
+        let current_stack = trace::read(task, self.stack_start, self.stack_bytes.len())?;
+        task.setxstate(&self.xstate)?;
+        task.setregs(&self.regs)?;
+        task.setsigmask(mask)?;
+        if register_words(&task.getregs()?) != register_words(&self.regs)
+            || task.getxstate()? != self.xstate
+            || task.getsigmask()? != mask
+            || trace::read(task, self.stack_start, current_stack.len())? != current_stack
+        {
+            return Err("mapped_handover_context_readback".into());
+        }
+        Ok(())
+    }
+
     /// Check the untouched guest stack, restore and read back the exact context.
     /// This says nothing about whether the caller's runtime is ready to release.
     pub fn restore(&self, task: &Stopped) -> Result<()> {
@@ -333,6 +448,33 @@ impl<'fd> InitialExecStop<'fd> {
     pub fn stopped(&self) -> &Stopped {
         &self.task
     }
+    /// Duplicate this held birth's original kernel pidfd for coordinator admission.
+    /// Runs only on the original ptracer OS thread and checks the actual stopped
+    /// generation. This conveys descriptor identity only, never wait ownership,
+    /// image qualification, readiness or permission to resume. Use it with the
+    /// existing passive admission/watch; ChildOwner remains the sole ptrace waiter.
+    /// Liveness is checked around duplication, not guaranteed after return.
+    #[cfg(feature = "loader-private-runtime")]
+    pub fn duplicate_birth_pidfd(&self) -> Result<std::os::fd::OwnedFd> {
+        self.owner.duplicate_birth_pidfd(&self.task)
+    }
+
+    /// Duplicate this held birth only for a descriptor borrowed by its retained launch.
+    ///
+    /// This checks the exact borrowed descriptor in the immutable PreparedExec,
+    /// not an equal inode, path, or caller-supplied identity. The original lease
+    /// must remain valid without unsafe close/replacement or concurrent offset
+    /// mutation. The child has not run guest instructions; its exec inheritance
+    /// is still governed by that retained request. No resume capability is added.
+    #[cfg(feature = "loader-private-runtime")]
+    pub fn duplicate_birth_pidfd_for_inherited(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<std::os::fd::OwnedFd> {
+        self.owner
+            .duplicate_birth_pidfd_for_inherited(&self.task, fd)
+    }
+
     /// Inspect the original entry and initial stack without reading environ.
     pub fn entry(&self) -> &EntryContext {
         &self.context
@@ -431,6 +573,20 @@ impl ExecStop {
                 });
             }
         };
+        #[cfg(feature = "loader-private-runtime")]
+        let birth_pidfd = match pending.duplicate_birth_pidfd() {
+            Ok(fd) => fd,
+            Err(error) => {
+                pending.retire();
+                let deferred = pending.is_owned().then(|| Box::new((pending, request)));
+                return Err(LaunchFailure {
+                    error: format!("exec_stop_birth_pidfd_retention_failed: {error}").into(),
+                    receipt,
+                    owner: None,
+                    pending: deferred,
+                });
+            }
+        };
         let pid = pending.pid();
         let running = match Running::new_on_ptracer_thread(pid) {
             Ok(running) => running,
@@ -452,6 +608,8 @@ impl ExecStop {
         let mut owner = ChildOwner {
             cleanup,
             generation,
+            #[cfg(feature = "loader-private-runtime")]
+            birth_pidfd,
             _thread: None,
             _request: request,
             receipt: receipt.clone(),
@@ -561,3 +719,9 @@ pub fn register_words(r: &Regs) -> [u64; 27] {
         r.es, r.fs, r.gs,
     ]
 }
+
+#[cfg(all(test, feature = "loader-private-runtime"))]
+// Test-only raw FD queries and the explicit isolated rlimit control. Each raw
+// operation documents SAFETY; production unsafe remains in the child boundary.
+#[allow(unsafe_code)]
+mod birth_pidfd_tests;

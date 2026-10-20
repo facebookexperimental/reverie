@@ -52,6 +52,35 @@ pub enum InjectionPurpose {
     Pselect6WrapperValidation = 1,
 }
 
+/// An optional process-local delivery hook for the one shared tail-start event.
+/// It owns no sequence, subscriber or socket. A runtime may install it once;
+/// the callback must use that runtime's admitted logging cut synchronously,
+/// before an ending tail is published. Installing it grants no Guest authority.
+pub type TailStartForwarder = fn(Pid, Sysno);
+static TAIL_START_FORWARDER: std::sync::OnceLock<TailStartForwarder> = std::sync::OnceLock::new();
+
+/// Select explicit delivery for the shared tail-start diagnostic. Other Tools
+/// and runtimes retain the ordinary tracing event by default.
+pub fn set_tail_start_forwarder(forwarder: TailStartForwarder) -> Result<(), &'static str> {
+    TAIL_START_FORWARDER
+        .set(forwarder)
+        .map_err(|_| "tail-start forwarder installed twice")
+}
+
+/// Observe one admitted tail handoff, before its first effect or ending latch.
+/// Callers retain all their existing guards. Polls, ending re-entry and refused
+/// callback scopes must not call this function. This is not syscall completion.
+pub fn observe_tail_start(tid: Pid, number: Sysno) {
+    if let Some(forwarder) = TAIL_START_FORWARDER.get() {
+        forwarder(tid, number);
+    } else {
+        // This shared Guest operation owns its diagnostic independently of
+        // an ambient backend setup/dispatch span. The real TID is explicit.
+        tracing::info!(target: "reverie::guest", parent: None,
+            "[tool] (tid {}) admitted tail syscall: {}", tid, number);
+    }
+}
+
 /// Backend facts permitting a shared controller to inspect this physical task.
 ///
 /// The procfs identity names the authenticated root directory of the backend's

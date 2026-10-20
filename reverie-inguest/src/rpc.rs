@@ -47,7 +47,6 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -82,25 +81,8 @@ impl CoordinatorClient {
     /// Connect to the coordinator listening at `path` and read its config
     /// handshake frame.
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let mut stream = UnixStream::connect(path)?;
-        // The raw syscall, not libc's interposable fcntl.
-        let reserved_fd = crate::guest::support::raw_result(unsafe {
-            crate::trap::raw_syscall6(
-                libc::SYS_fcntl,
-                [
-                    stream.as_raw_fd() as u64,
-                    libc::F_DUPFD_CLOEXEC as u64,
-                    1024,
-                    0,
-                    0,
-                    0,
-                ],
-            )
-        })? as libc::c_int;
-        // SAFETY: fcntl returned a new owned descriptor on success.
-        let reserved_stream = unsafe { UnixStream::from_raw_fd(reserved_fd) };
-        drop(stream);
-        stream = reserved_stream;
+        let mut stream =
+            crate::guest::rpc::move_ordinary_coordinator_stream(UnixStream::connect(path)?)?;
         let config_bytes = read_frame(&mut stream, DEFAULT_MAX_FRAME_LEN)?;
         Ok(Self {
             stream,

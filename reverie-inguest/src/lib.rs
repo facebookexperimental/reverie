@@ -67,6 +67,9 @@ pub mod launcher;
 pub mod lifecycle;
 #[cfg(feature = "exec-native-injection")]
 pub mod native_exec_sources;
+/// Explicit private-musl libc/TLS mechanism; never enables startup or readiness.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub mod private_runtime;
 pub use reverie_syscalls::reserved_fds;
 pub mod seccomp;
 pub mod signal;

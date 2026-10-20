@@ -24,6 +24,22 @@ const FRAME_MAGIC: &[u8; 8] = b"HLNROOT1";
 const FRAME_BYTES: usize = 64;
 const ACK: &[u8; 8] = b"HLNACK01";
 
+// These are native libc ancillary fields, not raw kernel-wire structures.
+// Bound input casts to both libc field widths and preserve usize parsing.
+const _: () = {
+    assert!(core::mem::size_of::<usize>() >= core::mem::size_of::<libc::socklen_t>());
+    assert!(core::mem::size_of::<[u64; 16]>() <= libc::socklen_t::MAX as usize);
+    assert!(core::mem::size_of::<i32>() <= libc::c_uint::MAX as usize);
+    assert!(
+        unsafe { libc::CMSG_SPACE(core::mem::size_of::<i32>() as _) } as usize
+            <= core::mem::size_of::<[u64; 4]>()
+    );
+    assert!(
+        unsafe { libc::CMSG_LEN(core::mem::size_of::<i32>() as _) }
+            <= unsafe { libc::CMSG_SPACE(core::mem::size_of::<i32>() as _) }
+    );
+};
+
 /// Actual child/root observations; they never establish namespace authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeRootObservation {
@@ -451,12 +467,12 @@ fn send_root(fd: i32, root: BorrowedFd<'_>, observation: NativeRootObservation) 
     message.msg_iov = &raw mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = unsafe { libc::CMSG_SPACE(core::mem::size_of::<i32>() as _) } as usize;
+    message.msg_controllen = unsafe { libc::CMSG_SPACE(core::mem::size_of::<i32>() as _) } as _;
     unsafe {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(core::mem::size_of::<i32>() as _) as usize;
+        (*header).cmsg_len = libc::CMSG_LEN(core::mem::size_of::<i32>() as _) as _;
         libc::CMSG_DATA(header)
             .cast::<i32>()
             .write_unaligned(root.as_raw_fd());
@@ -513,7 +529,11 @@ fn receive_root(fd: i32, pid: i32) -> io::Result<(OwnedFd, NativeRootObservation
     message.msg_iov = &raw mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = core::mem::size_of_val(&control);
+    #[cfg(target_env = "musl")]
+    let control_length = core::mem::size_of_val(&control) as _;
+    #[cfg(not(target_env = "musl"))]
+    let control_length = core::mem::size_of_val(&control);
+    message.msg_controllen = control_length;
     let n = unsafe { libc::recvmsg(fd, &raw mut message, libc::MSG_CMSG_CLOEXEC) };
     let mut roots = Vec::new();
     let mut credentials = None;
@@ -521,6 +541,9 @@ fn receive_root(fd: i32, pid: i32) -> io::Result<(OwnedFd, NativeRootObservation
     unsafe {
         let mut header = libc::CMSG_FIRSTHDR(&message);
         while !header.is_null() {
+            #[cfg(target_env = "musl")]
+            let length = (*header).cmsg_len as usize;
+            #[cfg(not(target_env = "musl"))]
             let length = (*header).cmsg_len;
             if length < libc::CMSG_LEN(0) as usize {
                 unknown = true;

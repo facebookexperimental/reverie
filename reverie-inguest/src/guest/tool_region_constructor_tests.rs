@@ -53,6 +53,84 @@ fn native() -> ConstructorStack {
     stack
 }
 
+// Observe the actual owner after a genuine native prefix. Literal page
+// boundaries are independent of the production reservation constants.
+// This scalar observer is also safe in the existing quiescent raw-fork child.
+fn native_permanent_bitmap(region: &ToolRegion) -> bool {
+    let Ok(mut guard) = region.lock() else {
+        return false;
+    };
+    let bitmap = guard.bitmap();
+    for page in DATA_FIRST..DATA_END {
+        let expected = (DATA_FIRST..DATA_FIRST + STACK_PAGES).contains(&page)
+            || (65535..73729).contains(&page)
+            || (81919..90113).contains(&page)
+            || (917503..1044481).contains(&page);
+        if (bitmap[page / 64] & (1_u64 << (page % 64)) != 0) != expected {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(feature = "allocator-fixture")]
+#[test]
+fn generic_owned_stack_occupancy_guards_and_later_leases() {
+    isolated(
+        "constructor::generic_owned_stack_occupancy_guards_and_later_leases",
+        || {
+            assert!(constructor_stack().is_none());
+            let mut record = core::mem::MaybeUninit::<ConstructorStackRecord>::uninit();
+            assert_eq!(
+                unsafe { reverie_inguest_generic_stack_query(record.as_mut_ptr()) },
+                -1
+            );
+            // Execute the real native generic prefix; no synthetic ticket,
+            // publication cell write or ordinary-reserve substitute.
+            unsafe { generic_entry(body) };
+            assert_eq!(
+                unsafe { reverie_inguest_generic_stack_query(record.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: successful scalar query initialized the entire record.
+            let record = unsafe { record.assume_init() };
+            assert_eq!(record.layout_version, 1);
+            assert_eq!(record.phase, RETURNED as u64);
+            assert_eq!(record.record_address, GENERIC_RECORD_ADDRESS as u64);
+            assert_eq!(record.owner_tid as i64, raw(libc::SYS_gettid, [0; 6]));
+            assert_eq!(record.extent_start as usize, BASE + DATA_FIRST * PAGE);
+            assert_eq!(record.extent_end as usize, STACK_EXTENT_END);
+            assert_eq!(record.bottom as usize, STACK_BOTTOM);
+            assert_eq!(record.top as usize, STACK_TOP);
+            assert_eq!(record.body_entry as usize, body as *const () as usize);
+            assert_eq!(record.body_call_sample_rsp as usize, STACK_TOP - 16);
+            for rsp in [
+                record.first_rust_sample_rsp as usize,
+                record.body_call_sample_rsp as usize,
+                BODY_RSP.load(Ordering::Acquire),
+            ] {
+                assert!((STACK_BOTTOM..STACK_TOP).contains(&rsp));
+            }
+            assert!(
+                constructor_stack().is_none(),
+                "generic origin must remain distinct"
+            );
+            let region = ToolRegion::reserve().unwrap();
+            assert!(native_permanent_bitmap(region));
+            let later = region.stack(64 * 1024).unwrap();
+            assert!(BASE + later.start * PAGE >= STACK_EXTENT_END);
+            assert_eq!(permissions_at(STACK_BOTTOM), "rw-p");
+            assert_eq!(permissions_at(STACK_TOP - 1), "rw-p");
+            assert_eq!(permissions_at(BASE + DATA_FIRST * PAGE), "---p");
+            assert_eq!(permissions_at(STACK_TOP), "---p");
+            guard(BASE + DATA_FIRST * PAGE);
+            guard(STACK_TOP);
+            drop(later);
+            assert!(native_permanent_bitmap(region));
+        },
+    );
+}
+
 #[test]
 fn native_owned_stack_occupancy_guards_and_later_leases() {
     isolated(
@@ -62,6 +140,7 @@ fn native_owned_stack_occupancy_guards_and_later_leases() {
             let stack = native();
             let region = ToolRegion::reserve().unwrap();
             assert!(owns(region, DATA_FIRST, STACK_PAGES));
+            assert!(native_permanent_bitmap(region));
             let later = region.stack(64 * 1024).unwrap();
             assert!(BASE + later.start * PAGE >= stack.extent_end);
             assert_eq!(permissions_at(stack.bottom), "rw-p");
@@ -72,6 +151,7 @@ fn native_owned_stack_occupancy_guards_and_later_leases() {
             guard(stack.top);
             drop(later);
             assert!(owns(region, DATA_FIRST, STACK_PAGES));
+            assert!(native_permanent_bitmap(region));
         },
     );
 }
@@ -228,7 +308,8 @@ fn plain_fork_retains_bootstrap_occupancy_and_cow_contents() {
             assert!(child >= 0);
             if child == 0 {
                 let region = ToolRegion::reserve().unwrap();
-                if !owns(region, DATA_FIRST, STACK_PAGES)
+                if !native_permanent_bitmap(region)
+                    || !owns(region, DATA_FIRST, STACK_PAGES)
                     || unsafe { (stack.bottom as *const u8).read_volatile() } != 0x37
                 {
                     raw_exit(96);
@@ -241,10 +322,14 @@ fn plain_fork_retains_bootstrap_occupancy_and_cow_contents() {
                     raw_exit(98);
                 }
                 drop(later);
+                if !native_permanent_bitmap(region) {
+                    raw_exit(99);
+                }
                 raw_exit(0);
             }
             exited(wait_raw(child), 0);
             assert_eq!(unsafe { (stack.bottom as *const u8).read_volatile() }, 0x37);
+            assert!(native_permanent_bitmap(ToolRegion::reserve().unwrap()));
             assert!(owns(
                 ToolRegion::reserve().unwrap(),
                 DATA_FIRST,

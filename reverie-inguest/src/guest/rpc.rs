@@ -27,6 +27,7 @@ use crate::trap::raw_syscall6;
 
 mod stream;
 pub use stream::GuestRpcStream;
+pub use stream::move_ordinary_coordinator_stream;
 
 #[cfg(feature = "exec-private-successor")]
 mod native;
@@ -251,7 +252,8 @@ fn connect_ordinary<G: GlobalTool>(
     path: &Path,
     tid: Pid,
 ) -> Result<BlockingRpcClient<G, GuestRpcStream>, reverie_rpc_transport::RpcError> {
-    BlockingRpcClient::from_connected_stream(GuestRpcStream::from(UnixStream::connect(path)?), tid)
+    let stream = move_ordinary_coordinator_stream(UnixStream::connect(path)?)?;
+    BlockingRpcClient::from_connected_stream(GuestRpcStream::from(stream), tid)
 }
 
 fn current_id(number: i64) -> io::Result<Pid> {

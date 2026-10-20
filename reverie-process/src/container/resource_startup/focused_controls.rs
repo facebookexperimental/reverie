@@ -20,15 +20,18 @@ fn send_raw_rights(socket: &ResourceSocket, bytes: &[u8], owners: &[&OwnedFd]) {
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen =
-        unsafe { libc::CMSG_SPACE((owners.len() * std::mem::size_of::<i32>()) as u32) as usize };
+    let (space, length) = startup_rights_lengths(owners.len()).unwrap();
+    message.msg_controllen = startup_abi_len(space).unwrap();
+    assert!(
+        startup_abi_len::<_, usize>(message.msg_controllen).unwrap()
+            <= std::mem::size_of_val(&control)
+    );
     // SAFETY: two live owners and a sufficient aligned ancillary buffer.
     unsafe {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len =
-            libc::CMSG_LEN((owners.len() * std::mem::size_of::<i32>()) as u32) as usize;
+        (*header).cmsg_len = startup_abi_len(length).unwrap();
         for (index, fd) in owners.iter().enumerate() {
             libc::CMSG_DATA(header)
                 .cast::<i32>()

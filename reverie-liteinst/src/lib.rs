@@ -126,6 +126,8 @@ pub use tool_host::install_tool_quiescent;
 pub use tool_host::install_tool_successor_image;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::prepare_tool_initial_image;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::prepare_tool_mapped_initial_image;
 #[cfg(feature = "exec-native-injection")]
 pub use tool_host::prepare_tool_successor_image;
 

@@ -1389,6 +1389,33 @@ impl Stopped {
         self.finish_retained_resume(result)
     }
 
+    /// Resume to a syscall stop, retaining the same stopped capability on error.
+    ///
+    /// The error contract is the same as [`Self::resume_retaining`]: the errno
+    /// does not establish unchanged kernel state or terminal acknowledgement.
+    /// The original event owner must retain and settle the returned capability.
+    pub fn syscall_retaining<T: Into<Option<Signal>>>(
+        self,
+        sig: T,
+    ) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace::syscall(self.0.into(), sig).map_err(nix_errno));
+        self.finish_retained_resume(result)
+    }
+
+    /// Like [`Self::syscall_retaining`], delivering a raw signal number.
+    ///
+    /// This permits genuine realtime signals without converting them to an
+    /// absent signal. Invalid numbers are refused by the original kernel
+    /// request, with the same generation-bound capability returned on error.
+    pub fn syscall_raw_retaining(self, sig: i32) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SYSCALL, self.0, sig));
+        self.finish_retained_resume(result)
+    }
+
     /// Transfers the original capability into a retained notifier wait.
     ///
     /// This performs no resume and constructs no replacement running or stopped
@@ -1754,6 +1781,19 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace::getevent(self.0.into()).map_err(nix_errno))
             .map_err(|err| self.map_err(err))
+    }
+
+    /// Detach while retaining the original generation-bound stop on error.
+    /// An errno does not establish unchanged kernel state or terminal status;
+    /// the original owner must retain and settle that uncertainty.
+    pub fn detach_retaining<T: Into<Option<Signal>>>(
+        self,
+        sig: T,
+    ) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno));
+        self.finish_retained_resume(result)
     }
 
     /// Detaches from and then resumes the stopped tracee.
@@ -2391,6 +2431,117 @@ mod test {
                 unsafe { ::libc::_exit(exit_code) };
             }
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn exercise_retained_syscall_stops(raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let (pid, mut stopped) = trace(
+            || {
+                // No Rust work is required between this actual syscall and
+                // the test helper's ordinary _exit.
+                unsafe {
+                    libc::syscall(libc::SYS_getpid);
+                }
+                23
+            },
+            Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACESYSGOOD,
+        )?;
+        let generation = stopped.generation();
+        let mut found = false;
+        // libc raise's return may first expose its syscall exit or mask repair.
+        // Discover the actual GET_SYSCALL_INFO ENTRY, never alternate a phase bit.
+        for _ in 0..8 {
+            let running = if raw {
+                stopped.syscall_raw_retaining(0)
+            } else {
+                stopped.syscall_retaining(None)
+            }
+            .map_err(|(_, error)| error)?;
+            let (next, event) = running.wait()?.assume_stopped();
+            stopped = next;
+            assert_eq!(event, Event::Syscall);
+            assert_eq!(stopped.generation(), generation);
+            let info = stopped.getsyscallinfo()?;
+            assert_eq!(info.architecture, 0xc000_003e);
+            if matches!(info.operation, SyscallInfoOp::Entry { number, .. } if number == libc::SYS_getpid as u64)
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "did not observe the actual getpid entry within the fixture bound"
+        );
+        let entry = stopped.getsyscallinfo()?;
+        let running = if raw {
+            stopped.syscall_raw_retaining(0)
+        } else {
+            stopped.syscall_retaining(None)
+        }
+        .map_err(|(_, error)| error)?;
+        let (stopped, event) = running.wait()?.assume_stopped();
+        assert_eq!(event, Event::Syscall);
+        assert_eq!(stopped.generation(), generation);
+        let exit = stopped.getsyscallinfo()?;
+        assert_eq!(exit.architecture, entry.architecture);
+        assert_eq!(exit.instruction_pointer, entry.instruction_pointer);
+        assert_eq!(exit.stack_pointer, entry.stack_pointer);
+        assert_eq!(
+            exit.operation,
+            SyscallInfoOp::Exit {
+                return_value: i64::from(pid.as_raw()),
+                is_error: false,
+            }
+        );
+        assert_eq!(
+            stopped
+                .resume_retaining(None)
+                .map_err(|(_, error)| error)?
+                .wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(23)),
+        );
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_retaining_reaches_actual_entry_and_exit() -> Result<(), Box<dyn std::error::Error>> {
+        exercise_retained_syscall_stops(false)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_raw_retaining_reaches_actual_entry_and_exit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        exercise_retained_syscall_stops(true)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_raw_retaining_kernel_refusal_keeps_original_stop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (pid, stopped) = trace(|| 23, Options::PTRACE_O_EXITKILL)?;
+        let generation = stopped.generation();
+        let before = stopped.getregs()?;
+        let mask = stopped.getsigmask()?;
+        // Linux ptrace_resume rejects an invalid signal with EIO before resume.
+        // This is a real failed kernel request, not an injected mock errno.
+        let (stopped, error) = stopped.syscall_raw_retaining(i32::MAX).unwrap_err();
+        let after = stopped.getregs()?;
+        let after_mask = stopped.getsigmask()?;
+        let same_generation = stopped.generation() == generation;
+        // Confirm progress and terminal reap BEFORE assertions on the refusal.
+        let terminal = stopped
+            .resume_retaining(None)
+            .map_err(|(_, error)| error)?
+            .wait()?;
+        assert_eq!(terminal, Wait::Exited(pid, ExitStatus::Exited(23)));
+        assert_eq!(error, Errno::EIO);
+        assert!(same_generation);
+        assert_eq!(after, before);
+        assert_eq!(after_mask, mask);
+        Ok(())
     }
 
     #[test]

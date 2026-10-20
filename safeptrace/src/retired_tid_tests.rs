@@ -330,8 +330,12 @@ mod retired_tid {
         }
         #[cfg(feature = "memory")]
         {
-            use reverie_memory::{Addr, AddrMut, MemoryAccess, RemoteIoVec};
             use std::io::IoSlice;
+
+            use reverie_memory::Addr;
+            use reverie_memory::AddrMut;
+            use reverie_memory::MemoryAccess;
+            use reverie_memory::RemoteIoVec;
 
             // The replacement is parked on its genuine writable clone stack.
             // The stale token still names the same numeric TID, with its old
@@ -383,6 +387,12 @@ mod retired_tid {
                 0
             );
         }
+        // The same real retired-generation fixture must refuse syscall resume
+        // without losing the old capability or touching its live replacement.
+        let (old, error) = old.syscall_retaining(None).unwrap_err();
+        assert_eq!(error, Errno::ESRCH);
+        assert_eq!(old.generation(), generation);
+        assert_eq!(fresh.getregs().unwrap(), registers);
         let (retained, error) = old.resume_retaining(None).unwrap_err();
         assert_eq!(error, Errno::ESRCH);
         assert_eq!(retained.generation(), generation);
@@ -471,8 +481,8 @@ mod retired_tid {
             );
             emit_completion_marker("ACTUAL_WARM_AUTH_CACHE_TID_REUSE_REFUSED");
         }
-        println!(
+        emit_completion_marker(&format!(
             "RETIRED_EXPLICIT_TARGET_REFUSAL native={native} forced={forced} former_tid={former} exact_reuse=true same_ptracer=true old_gate_open=true old_worker_unstarted=true actual_original_retired=ESRCH retired_numeric_requests=ESRCH replacement_siginfo_and_registers_preserved=true actual_fresh_interrupt=EVENT_STOP actual_group_kill=SIGKILL root_and_member_reaped=true final_ECHILD=true"
-        );
+        ));
     }
 }

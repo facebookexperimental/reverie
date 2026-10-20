@@ -15,6 +15,7 @@ use std::os::fd::BorrowedFd;
 
 use reverie_loader::artifact::TOOL_REGION;
 use reverie_loader::image::PAGE_SIZE;
+#[cfg(feature = "stage1a-probe")]
 use reverie_loader::image::ValidatedImage;
 use safeptrace::Event;
 use safeptrace::Regs;
@@ -22,9 +23,14 @@ use safeptrace::Signal;
 use safeptrace::Stopped;
 
 use super::Result;
+#[cfg(feature = "stage1a-probe")]
 use super::images::SealedImage;
+use super::mapping_plan::Source;
+use super::mapping_plan::Step;
+use super::mapping_plan::{self};
 pub use super::trace::read;
 pub use super::trace::stopped;
+#[cfg(feature = "stage1a-probe")]
 pub use super::trace::wait;
 pub use super::trace::write;
 
@@ -40,6 +46,10 @@ pub struct Injector {
     arbitrary_syscall_used: bool,
     poisoned: bool,
     mapped: Vec<std::ops::Range<u64>>,
+    #[cfg(feature = "loader-private-runtime")]
+    ledger: Vec<[u64; 4]>,
+    #[cfg(feature = "loader-private-runtime")]
+    filter_installed: bool,
     /// Actual completed injected calls, retained even on a later refusal.
     pub calls: Vec<InjectedCall>,
 }
@@ -60,6 +70,10 @@ impl Injector {
             arbitrary_syscall_used: false,
             poisoned: false,
             mapped: Vec::new(),
+            #[cfg(feature = "loader-private-runtime")]
+            ledger: Vec::new(),
+            #[cfg(feature = "loader-private-runtime")]
+            filter_installed: false,
             calls: Vec::new(),
         })
     }
@@ -72,6 +86,7 @@ impl Injector {
     }
 
     /// Write/read a saved test slot while this transaction alone owns the stop.
+    #[cfg(feature = "stage1a-probe")]
     pub fn stopped_mut(&mut self) -> Result<&mut Stopped> {
         self.task
             .as_mut()
@@ -82,6 +97,7 @@ impl Injector {
     ///
     /// An arbitrary call could replace a reservation or a validated image fd.
     /// Keep this diagnostic transaction disjoint from mapping authority.
+    #[cfg(feature = "stage1a-probe")]
     pub fn syscall(&mut self, number: u64, args: [u64; 6]) -> Result<u64> {
         if self.reservation {
             self.poisoned = true;
@@ -94,6 +110,11 @@ impl Injector {
     }
 
     fn checked_syscall(&mut self, number: u64, args: [u64; 6]) -> Result<u64> {
+        #[cfg(feature = "loader-private-runtime")]
+        if self.filter_installed {
+            self.poisoned = true;
+            return Err("mapped_filter_last_forbids_further_injected_syscall".into());
+        }
         if self.poisoned {
             return Err("loader refused: poisoned injection transaction".into());
         }
@@ -234,7 +255,7 @@ impl Injector {
                 start,
                 length,
                 protection as u64,
-                (flags | libc::MAP_FIXED) as u64,
+                mapping_plan::effective_flags(flags) as u64,
                 fd as u64,
                 offset,
             ],
@@ -244,10 +265,14 @@ impl Injector {
             return Err("loader refused: mapping returned the wrong address".into());
         }
         self.mapped.push(start..start + length);
+        #[cfg(feature = "loader-private-runtime")]
+        self.ledger
+            .push(mapping_plan::mapping_row(start, length, protection, flags)?);
         Ok(())
     }
 
     /// Map exactly the immutable descriptor whose sealed bytes were validated.
+    #[cfg(feature = "stage1a-probe")]
     pub fn map_image(&mut self, image: &SealedImage) -> Result<()> {
         if self.poisoned {
             return Err("loader refused: poisoned injection transaction".into());
@@ -262,54 +287,80 @@ impl Injector {
         result
     }
 
+    #[cfg(feature = "loader-private-runtime")]
+    pub(super) fn map_production_plan(
+        &mut self,
+        steps: &[Step],
+        runtime_fd: BorrowedFd<'_>,
+        handoff_fd: BorrowedFd<'_>,
+    ) -> Result<()> {
+        let result = self.apply_steps(steps, runtime_fd.as_raw_fd(), Some(handoff_fd));
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    #[cfg(feature = "loader-private-runtime")]
+    pub(super) fn mapping_ledger(&self) -> Vec<[u64; 4]> {
+        let mut ledger = self.ledger.clone();
+        ledger.sort_unstable_by_key(|row| row[0]);
+        ledger
+    }
+
+    #[cfg(feature = "stage1a-probe")]
     fn map_checked_image(&mut self, image: &ValidatedImage<'_>, fd: i32) -> Result<()> {
-        for segment in image.segments() {
-            let pages = segment.pages().map_err(|e| format!("segment: {e:?}"))?;
-            let permissions = segment.permissions;
-            let protection = (if permissions.read { libc::PROT_READ } else { 0 })
-                | (if permissions.write {
-                    libc::PROT_WRITE
-                } else {
-                    0
-                })
-                | (if permissions.execute {
-                    libc::PROT_EXEC
-                } else {
-                    0
-                });
-            let file_bytes = segment.file.end - segment.file.start;
-            let file_pages = file_bytes.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-            if file_pages != 0 {
-                self.map_pages(
-                    pages.start,
-                    file_pages,
-                    protection,
-                    libc::MAP_PRIVATE,
-                    fd,
-                    segment.file.start,
-                )?;
-            }
-            let memory_pages = pages.end - pages.start;
-            if memory_pages > file_pages {
-                self.map_pages(
-                    pages.start + file_pages,
-                    memory_pages - file_pages,
-                    protection,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )?;
-            }
-            // Kernel file mappings expose a whole final page. The ELF contract
-            // requires zero after p_filesz; use ptrace's private-page write
-            // while stopped, without ever granting W to executable mappings.
-            if file_bytes != file_pages {
-                let zeros = vec![0; (file_pages - file_bytes) as usize];
-                write(
-                    self.task.as_mut().ok_or("lost stopped owner")?,
-                    pages.start + file_bytes,
-                    &zeros,
-                )?;
+        let steps = mapping_plan::image_steps(image)?;
+        self.apply_steps(&steps, fd, None)
+    }
+
+    fn apply_steps(
+        &mut self,
+        steps: &[Step],
+        runtime_fd: i32,
+        handoff_fd: Option<BorrowedFd<'_>>,
+    ) -> Result<()> {
+        #[cfg(not(feature = "loader-private-runtime"))]
+        let _ = handoff_fd;
+        for step in steps {
+            match *step {
+                Step::Map(mapping) => match mapping.source {
+                    Source::ImageFile | Source::ImageAnonymous => self.map_pages(
+                        mapping.start,
+                        mapping.length,
+                        mapping.protection,
+                        mapping.flags,
+                        if mapping.source == Source::ImageFile {
+                            runtime_fd
+                        } else {
+                            -1
+                        },
+                        mapping.offset,
+                    )?,
+                    #[cfg(feature = "loader-private-runtime")]
+                    Source::StorageAnonymous | Source::Handoff => self.map_storage(
+                        mapping.start,
+                        mapping.length,
+                        mapping.protection,
+                        mapping.flags,
+                        if mapping.source == Source::Handoff {
+                            Some(handoff_fd.ok_or("mapped_preparation_missing_handoff_backing")?)
+                        } else {
+                            None
+                        },
+                        mapping.offset,
+                    )?,
+                },
+                Step::ZeroTail { start, length } => {
+                    // Same ptrace private-page write after this load's maps:
+                    // never grant write permission to executable mappings.
+                    let zeros = vec![0; length];
+                    write(
+                        self.task.as_mut().ok_or("lost stopped owner")?,
+                        start,
+                        &zeros,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -360,6 +411,70 @@ impl Injector {
             fd.map_or(-1, |fd| fd.as_raw_fd()),
             offset,
         )
+    }
+
+    /// Final production operation. No arbitrary syscall or mapping can follow.
+    #[cfg(feature = "loader-private-runtime")]
+    pub(super) fn install_filter_last(&mut self, scratch: u64, program: &[u8]) -> Result<()> {
+        let result = (|| -> Result<()> {
+            if !self.reservation
+                || self.filter_installed
+                || self.poisoned
+                || program.len() != 23 * 8
+            {
+                return Err("mapped_filter_last_invalid_transaction".into());
+            }
+            let staging = super::physical::filter_staging(scratch, program)?;
+            let end = scratch
+                .checked_add(staging.len() as u64)
+                .ok_or("mapped_filter_staging_overflow")?;
+            if !self.ledger.iter().any(|row| {
+                row[0] <= scratch
+                    && end <= row[1]
+                    && row[2] == (libc::PROT_READ | libc::PROT_WRITE) as u64
+            }) {
+                return Err("mapped_filter_staging_not_owned_rw".into());
+            }
+            // PreparedExec already set this BEFORE genuine exec, preserving real
+            // secure aux facts. Here only query the same kernel state.
+            if self.checked_syscall(
+                libc::SYS_prctl as u64,
+                [libc::PR_GET_NO_NEW_PRIVS as u64, 0, 0, 0, 0, 0],
+            )? != 1
+            {
+                return Err("mapped_filter_no_new_privs_readback".into());
+            }
+            write(
+                self.task.as_mut().ok_or("lost stopped owner")?,
+                scratch,
+                &staging,
+            )?;
+            if read(self.stopped()?, scratch, staging.len())? != staging {
+                return Err("mapped_filter_staging_readback".into());
+            }
+            let result = self.checked_syscall(
+                libc::SYS_seccomp as u64,
+                [
+                    libc::SECCOMP_SET_MODE_FILTER as u64,
+                    libc::SECCOMP_FILTER_FLAG_TSYNC,
+                    scratch,
+                    0,
+                    0,
+                    0,
+                ],
+            )?;
+            if result != 0 {
+                return Err("mapped_filter_tsync_did_not_install".into());
+            }
+            // checked_syscall observed the completed syscall and exact INT3.
+            // No new child syscall is needed to restore bytes/registers.
+            self.filter_installed = true;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// Restore entry bytes/registers; a poisoned transaction cannot finish.

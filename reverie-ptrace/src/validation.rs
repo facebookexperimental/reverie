@@ -10,7 +10,6 @@ use core::mem;
 
 use perf_event_open_sys::bindings as perf;
 use reverie::Errno;
-use thiserror::Error;
 use tracing::warn;
 
 use crate::perf::PerfCounter;
@@ -21,127 +20,7 @@ use crate::timer::has_precise_ip;
 const IN_TXCP: u64 = 1 << 33;
 const NUM_BRANCHES: u64 = 500;
 
-/// Why this host's performance counters failed validation. See
-/// [`pmu_validation`](crate::pmu_validation).
-#[derive(Error, Debug)]
-#[non_exhaustive]
-pub enum PmuValidationError {
-    /// A counter could not be opened.
-    #[error("Failed to create timer: {errno:?} - {msg}")]
-    CouldNotCreateTimer {
-        /// The `perf_event_open` error.
-        errno: Errno,
-        /// What to check.
-        msg: &'static str,
-    },
-
-    /// A system call on a counter failed.
-    #[error("Unexpected error while checking for pmu bugs: {errno:?} - {msg}")]
-    UnexpectedTestingErrnoError {
-        /// The system call's error.
-        errno: Errno,
-        /// Which call failed.
-        msg: &'static str,
-    },
-
-    /// A counter read returned something unexpected.
-    #[error("Unexpected error while checking for pmu bugs: {0}")]
-    UnexpectedTestingError(String),
-
-    /// A period change took effect only after the next rollover.
-    #[error("The ioc-period bug was detected")]
-    IocPeriodBugDetected,
-
-    /// The CPU vendor is neither AMD nor Intel, so Reverie knows none of its
-    /// counting bugs.
-    #[cfg(target_arch = "x86_64")]
-    #[error("Unknown CPU vendor {0:?}: Reverie has no performance-counter checks for it")]
-    UnknownCpuVendor(String),
-
-    /// No PMU configuration was set and Reverie has no performance-counter
-    /// profile for this CPU, so it cannot choose a branch event.
-    #[cfg(target_arch = "x86_64")]
-    #[error(
-        "Unsupported CPU family {family:#x}, model {model:#x}: Reverie has no \
-        performance-counter profile for it"
-    )]
-    UnsupportedCpu {
-        /// The CPUID family.
-        family: u8,
-        /// The CPUID model.
-        model: u8,
-    },
-
-    #[cfg(target_arch = "x86_64")]
-    /// CPUID did not report the vendor or features.
-    #[error("Could not read cpu info")]
-    CouldNotReadCpuInfo,
-
-    /// The branch counter counted fewer branches than were executed.
-    #[error(
-        "Got {actual_events} branch events, expected at least {expected_min_events}. \
-        The hardware performance counter seems to not be working. Check \
-        that hardware performance counters are working by running \
-        \n`perf stat -e r{config:x} true`\n\
-        and checking that it reports a nonzero number of events. \
-        If performance counters seem to be working with 'perf', file a \
-        reverie issue, otherwise check your hardware/OS/VM configuration. Also \
-        check that other software is not using performance counters on \
-        this CPU."
-    )]
-    HardwareCountersNotWorking {
-        /// Branches counted.
-        actual_events: i64,
-        /// Branches executed.
-        expected_min_events: u64,
-        /// The raw event.
-        config: u64,
-    },
-
-    /// A second counter counted nothing.
-    #[error("Your CPU only supports one performance counter in its current configuration")]
-    OnlyOnePerformanceCounter,
-
-    /// AMD Zen SpecLockMap is enabled, so locked instructions can be miscounted.
-    #[cfg(target_arch = "x86_64")]
-    #[error(
-        "On AMD Zen CPUs, reverie timers will not work reliably unless you disable the \
-        hardware SpecLockMap optimization ({speclockmap_commits} of \
-        {locked_instructions} locked instructions were SpecLockMap commits). For \
-        instructions on how to do this, see https://github.com/rr-debugger/rr/wiki/Zen"
-    )]
-    AmdSpecLockMapShouldBeDisabled {
-        /// How many SpecLockMap commits the check counted.
-        speclockmap_commits: i64,
-        /// How many locked instructions the check counted.
-        locked_instructions: i64,
-    },
-
-    /// The SpecLockMap check counted no SpecLockMap commits, but fewer locked
-    /// instructions than it executed, so its zero shows nothing. This happens
-    /// when the retired-lock event (AMD PMCx025) counts nothing, as under a
-    /// hypervisor that filters it, and could happen on a Zen part whose
-    /// PMCx025 does not count every locked instruction.
-    #[cfg(target_arch = "x86_64")]
-    #[error(
-        "The AMD Zen SpecLockMap check is inconclusive: it executed {executed} locked \
-        instructions but the retired-lock counter (perf event r{RETIRED_LOCK_INSTRUCTIONS_EVENT:x}) \
-        counted {counted}, so it cannot show that SpecLockMap is disabled. See \
-        https://github.com/rr-debugger/rr/wiki/Zen"
-    )]
-    SpecLockMapCheckInconclusive {
-        /// How many locked instructions the retired-lock counter counted.
-        counted: i64,
-        /// How many locked instructions the check executed.
-        executed: usize,
-    },
-
-    #[cfg(target_arch = "x86_64")]
-    /// An `IN_TXCP` counter under KVM counted too few branches.
-    #[error("Intel Kvm-In-Txcp bug found")]
-    IntelKvmInTxcpBugDetected,
-}
-
+pub use reverie::pmu_config::PmuValidationError;
 fn init_perf_event_attr(
     perf_attr_type: u32,
     config: u64,
@@ -481,7 +360,7 @@ const _: () = assert!(
 /// may count fewer than every locked instruction even with SpecLockMap
 /// disabled; the check then refuses as inconclusive rather than pass.
 #[cfg(target_arch = "x86_64")]
-const RETIRED_LOCK_INSTRUCTIONS_EVENT: u64 = 0x510f25;
+use reverie::pmu_config::RETIRED_LOCK_INSTRUCTIONS_EVENT;
 
 /// AMD PMCx025 with unit mask 0x08, SpecLockMapCommit: the locked
 /// instructions that retired through SpecLockMap. rr's Zen check uses the

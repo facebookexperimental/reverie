@@ -1,10 +1,9 @@
 //! Narrow PMU clock primitive shared with in-guest Reverie backends.
 
-use reverie::Errno;
-
+use crate::Errno;
 use crate::perf::Builder;
 use crate::perf::PerfCounter;
-use crate::timer::PmuConfig;
+use crate::pmu_config::PmuConfig;
 
 /// A retired-conditional-branch counter owned and read by the current thread.
 ///
@@ -30,14 +29,16 @@ impl InGuestRcbCounter {
     /// # Safety
     ///
     /// The gate must preserve raw Linux syscall semantics and remain callable
-    /// for the counter's lifetime. Boundary controls and reads must run on the
+    /// for the counter's lifetime, including cleanup and Drop. It must satisfy
+    /// Builder::create_with_raw_syscall's mapping/descriptor contract. Boundary controls and reads must run on the
     /// owning thread with exclusive control of the event.
     /// Asynchronous reads additionally require a gate that does not allocate,
     /// lock, initialize TLS, panic or retry, and is safe in that signal context.
     pub unsafe fn current_thread_disabled_with_syscall_gate(
         raw_syscall: unsafe fn(i64, [u64; 6]) -> i64,
     ) -> Result<Self, Errno> {
-        Self::create_with_config(PmuConfig::try_new(), Some(raw_syscall))
+        // SAFETY: this public unsafe constructor requires the retained gate contract.
+        unsafe { Self::create_with_config(PmuConfig::try_new(), Some(raw_syscall)) }
     }
 
     /// Borrow this clock's descriptor for trusted assembly boundary controls.
@@ -70,7 +71,8 @@ impl InGuestRcbCounter {
 
     /// Create and enable an RCB clock for the calling thread.
     pub fn current_thread() -> Result<Self, Errno> {
-        Self::current_thread_with_optional_syscall_gate(None)
+        // SAFETY: None uses the ordinary native implementation, with no unsafe gate.
+        unsafe { Self::current_thread_with_optional_syscall_gate(None) }
     }
 
     /// Create the same current-thread RCB clock through a caller-supplied raw
@@ -81,30 +83,44 @@ impl InGuestRcbCounter {
     /// # Safety
     ///
     /// The gate must preserve Linux x86-64 syscall argument/result semantics
-    /// and remain callable for the lifetime of the returned counter.
+    /// and remain callable for the lifetime of the returned counter, including
+    /// cleanup and Drop. Its mappings/descriptors must satisfy
+    /// Builder::create_with_raw_syscall's complete resource contract.
     pub unsafe fn current_thread_with_syscall_gate(
         raw_syscall: unsafe fn(i64, [u64; 6]) -> i64,
     ) -> Result<Self, Errno> {
-        Self::current_thread_with_optional_syscall_gate(Some(raw_syscall))
+        // SAFETY: the public unsafe caller guarantees the gate through teardown.
+        unsafe { Self::current_thread_with_optional_syscall_gate(Some(raw_syscall)) }
     }
 
-    fn current_thread_with_optional_syscall_gate(
+    /// # Safety
+    /// Any supplied gate must satisfy Builder::create_with_raw_syscall's contract
+    /// throughout setup, use, failure cleanup and Drop. None uses native libc.
+    unsafe fn current_thread_with_optional_syscall_gate(
         raw_syscall: Option<unsafe fn(i64, [u64; 6]) -> i64>,
     ) -> Result<Self, Errno> {
-        Self::current_thread_with_config(PmuConfig::try_new(), raw_syscall)
+        // SAFETY: the caller guarantees the optional gate's retained contract.
+        unsafe { Self::current_thread_with_config(PmuConfig::try_new(), raw_syscall) }
     }
 
-    fn current_thread_with_config(
+    /// # Safety
+    /// Any supplied gate must satisfy Builder::create_with_raw_syscall's contract
+    /// throughout setup, use, failure cleanup and Drop. None uses native libc.
+    unsafe fn current_thread_with_config(
         config: Option<PmuConfig>,
         raw_syscall: Option<unsafe fn(i64, [u64; 6]) -> i64>,
     ) -> Result<Self, Errno> {
-        let clock = Self::create_with_config(config, raw_syscall)?;
+        // SAFETY: the optional gate contract is propagated from this unsafe caller.
+        let clock = unsafe { Self::create_with_config(config, raw_syscall) }?;
         clock.counter.reset()?;
         clock.counter.enable()?;
         Ok(clock)
     }
 
-    fn create_with_config(
+    /// # Safety
+    /// Any supplied gate must satisfy Builder::create_with_raw_syscall's contract
+    /// throughout setup, use, failure cleanup and Drop. None uses native libc.
+    unsafe fn create_with_config(
         config: Option<PmuConfig>,
         raw_syscall: Option<unsafe fn(i64, [u64; 6]) -> i64>,
     ) -> Result<Self, Errno> {
@@ -115,7 +131,8 @@ impl InGuestRcbCounter {
             .event(config.rcb_event())
             .fast_reads(true);
         let counter = if let Some(raw_syscall) = raw_syscall {
-            builder.create_with_raw_syscall(raw_syscall)?
+            // SAFETY: the constructor chain guarantees this gate's full contract.
+            unsafe { builder.create_with_raw_syscall(raw_syscall) }?
         } else {
             builder.create()?
         };
@@ -131,7 +148,7 @@ impl InGuestRcbCounter {
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
-#[path = "in_guest/tests.rs"]
+#[path = "in_guest_rcb/tests.rs"]
 mod boundary_tests;
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -141,7 +158,9 @@ mod tests {
     #[test]
     fn an_unknown_model_is_refused_before_perf_event_open() {
         let config = PmuConfig::try_from_family_model(0x06, 0x01);
-        let error = InGuestRcbCounter::current_thread_with_config(config, None).unwrap_err();
+        // SAFETY: None selects native libc; unknown configuration refuses before use.
+        let error =
+            unsafe { InGuestRcbCounter::current_thread_with_config(config, None) }.unwrap_err();
         assert_eq!(error, Errno::ENODEV);
     }
 }

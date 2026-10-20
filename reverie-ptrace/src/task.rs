@@ -4462,6 +4462,27 @@ impl<L: Tool> TracedTask<L> {
         task.setregs(regs)
     }
 
+    /// Read-only diagnostic on the existing ptracer's counting clock. Enabled
+    /// only with `rcb-observation` and its tracing target, never logging alone.
+    #[cfg(feature = "rcb-observation")]
+    fn observe_guest_rcb(
+        &self,
+        task: &Stopped,
+        boundary: &str,
+        number: i64,
+    ) -> Result<(), TraceError> {
+        if tracing::enabled!(target: "reverie_ptrace::guest_rcb", tracing::Level::DEBUG) {
+            let regs = task.getregs()?;
+            let (event, rcbs) = self.timer.observe_rcb()?;
+            tracing::debug!(target: "reverie_ptrace::guest_rcb",
+                metric = "retired_conditional_branches",
+                tid = self.tid.as_raw(), boundary, number, event, rcbs,
+                ip = regs.ip(), sp = regs.stack_ptr(),
+                "GUEST_RCB");
+        }
+        Ok(())
+    }
+
     fn get_syscall(&self, task: &Stopped) -> Result<Syscall, TraceError> {
         let regs = task.getregs()?;
         // A checked decode: the filter traces only numbers the syscall table
@@ -7097,6 +7118,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         };
         let exec_sigtrap_quiet = std::mem::take(&mut self.exec_sigtrap_quiet);
 
+        // The actual restored exec entry, before the new image's first opcode.
+        // The clock uses enable_on_exec; pre-init only executes branch-free
+        // syscall/int3 stubs. The observer requires this raw origin to be zero.
+        #[cfg(feature = "rcb-observation")]
+        self.observe_guest_rcb(&task, "exec_entry", -1)?;
+
         if initial_command {
             self.timer.finish_initial_exec();
         }
@@ -7246,6 +7273,11 @@ impl<L: Tool + 'static> TracedTask<L> {
             .get_syscall(&task)
             .tracee_context(tid, "read registers at seccomp stop")?;
         let (nr, args) = syscall.into_parts();
+        // Original syscall admission, including exit/exit_group, before Tool
+        // handling or any injected repair. Injection uses a separate owner path.
+        #[cfg(feature = "rcb-observation")]
+        self.observe_guest_rcb(&task, "syscall_entry", nr as i64)
+            .tracee_context(tid, "observe original syscall RCB")?;
         // Whatever this thread's own tracer filter state: a sibling sharing
         // the table may keep SIGTRAP.
         if self.global_state.keeps_sigtrap_state {
@@ -12384,11 +12416,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.restore_maybe_pending = true;
         }
 
-        tracing::info!(
-            "[tool] (tid {}) beginning tail_inject of syscall: {}",
-            &tid,
-            nr,
-        );
+        reverie::observe_tail_start(tid, nr);
 
         let task = self.assume_stopped();
 

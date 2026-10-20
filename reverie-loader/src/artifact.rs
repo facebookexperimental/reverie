@@ -20,11 +20,15 @@
 //!
 //! The opt-in stage-1a probe maps these images inside its own fresh complete
 //! reservation and uses only its separate test runtime. The production
-//! ToolRegion page allocator does not yet reserve these windows or adopt a
-//! loader-owned reservation. Production integration must first reserve both
-//! windows and their guards, authenticate adoption without replacing live
-//! mappings, and qualify the changed allocator with M1. The probe does not
-//! satisfy that prerequisite or activate a product backend.
+//! ToolRegion fresh-owner bitmap permanently excludes the combined windows
+//! and two exterior guard pages from general allocation. It leaves them
+//! PROT_NONE and does not adopt this probe's loader-owned reservation or map
+//! production images. The adjacent windows have no separate inner guard.
+//! Production integration still requires authenticated adoption without
+//! replacing live mappings, a precise mapped-image guard contract, genuine
+//! runtime readiness and qualification of changed allocator artifacts with M1.
+//! Bitmap exclusion and probe success do not satisfy those prerequisites or
+//! activate a product backend.
 //!
 //! The first page of each window is that image's syscall gate: the only page
 //! its `syscall` instructions may occupy, and so the only instruction

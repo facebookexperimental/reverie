@@ -3,7 +3,7 @@
 
 //! Internal observation primitives; no public production resume capability.
 use reverie_memory::Addr;
-#[cfg(feature = "stage1a-probe")]
+#[cfg(any(feature = "stage1a-probe", feature = "loader-private-runtime"))]
 use reverie_memory::AddrMut;
 use reverie_memory::MemoryAccess;
 use safeptrace::Event;
@@ -33,7 +33,7 @@ pub fn read(task: &Stopped, address: u64, length: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(feature = "stage1a-probe")]
+#[cfg(any(feature = "stage1a-probe", feature = "loader-private-runtime"))]
 pub fn write(task: &mut Stopped, address: u64, bytes: &[u8]) -> Result<()> {
     let mut offset = 0;
     while offset < bytes.len() {

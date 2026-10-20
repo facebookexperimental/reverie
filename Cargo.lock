@@ -1475,6 +1475,7 @@ dependencies = [
  "never-say-never",
  "nix 0.30.1",
  "object 0.40.0",
+ "perf-event-open-sys",
  "procfs",
  "raw-cpuid",
  "reverie-process",
@@ -1484,6 +1485,7 @@ dependencies = [
  "syscalls",
  "thiserror 2.0.21",
  "tracing",
+ "tracing-subscriber",
  "typed-arena",
 ]
 
@@ -1569,7 +1571,6 @@ dependencies = [
  "reverie-core",
  "reverie-loader",
  "reverie-memory",
- "reverie-ptrace",
  "reverie-rpc-transport",
  "reverie-syscalls",
  "safeptrace",
@@ -1836,6 +1837,7 @@ dependencies = [
  "bitflags 2.13.2",
  "derive_more",
  "libc",
+ "linux-raw-sys",
  "nix 0.30.1",
  "paste",
  "reverie-memory",

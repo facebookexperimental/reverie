@@ -1,0 +1,4 @@
+    6000e5af8520     6000e5af8520       68    32         /bound/libc.a(libc.lo):(COMMON)
+    6000e5af8520     6000e5af8520       68     1                 __libc
+    6000e5af85a8     6000e5af85a8        8     8         /bound/libc.a(libc.lo):(COMMON)
+    6000e5af85a8     6000e5af85a8        8     1                 __hwcap

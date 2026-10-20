@@ -12,6 +12,9 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use std::io;
 
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub mod mapped_initial;
+
 #[cfg(feature = "coordinator-rpc")]
 mod native_io;
 #[cfg(feature = "coordinator-rpc")]
@@ -573,8 +576,9 @@ unsafe extern "C" fn initial_terminal() -> ! {
         "mov eax, 231",
         "mov edi, 127",
         "lea r12, [rip + 2b]",
-        "movabs r11, 0x50000000007c",
+        "movabs r11, {native_gate}",
         "jmp r11",
+        native_gate = const crate::trap::FIXED_NATIVE_ENTRY,
     );
 }
 
@@ -622,6 +626,12 @@ unsafe fn publish_native_control(control: *mut NativeControl) -> io::Result<()> 
         crate::trap::adopt_authenticated_initial_gate()?;
         verify_bootstrap_signal(control)?;
     }
+    publish_control_slot(control)
+}
+
+// Same write-once physical pointer for both authenticated image origins.
+// Neither this helper nor the pointer value supplies coordinator admission.
+fn publish_control_slot(control: *mut NativeControl) -> io::Result<()> {
     reverie_inguest_private_exec_control
         .compare_exchange(0, control as usize, Ordering::Release, Ordering::Relaxed)
         .map_err(|_| io::Error::other("private Tool control published twice"))?;
@@ -867,7 +877,7 @@ reverie_inguest_private_lifecycle_call:
     mov edi, 0x1002
     mov rsi, [r13 + 24]
     lea r12, [rip + .Lprivate_fs_guest_ready]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
 .Lprivate_fs_guest_ready:
     endbr64
@@ -878,7 +888,7 @@ reverie_inguest_private_lifecycle_call:
     mov rdi, [rsp]
     mov rsi, [rsp + 8]
     mov rdx, [rsp + 16]
-    movabs r11, 0x500000000100
+    movabs r11, {guest_gate}
     call r11
     mov r14, rax
     mov r15, rdx
@@ -893,7 +903,7 @@ reverie_inguest_private_lifecycle_call:
     mov r8, [rbx + 32]
     mov r9, [rbx + 40]
     lea r12, [rip + .Lprivate_guest_scalar_return]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
 .Lprivate_guest_scalar_return:
     endbr64
@@ -904,7 +914,7 @@ reverie_inguest_private_lifecycle_call:
     mov edi, 0x1003
     lea rsi, [rsp + 32]
     lea r12, [rip + .Lprivate_captured_guest_fs]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
 .Lprivate_captured_guest_fs:
     endbr64
@@ -914,7 +924,7 @@ reverie_inguest_private_lifecycle_call:
     mov edi, 0x1002
     mov rsi, [r13 + 32]
     lea r12, [rip + .Lprivate_restored_tool_fs]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
 .Lprivate_restored_tool_fs:
     endbr64
@@ -939,10 +949,12 @@ reverie_inguest_private_lifecycle_call:
     mov eax, 231
     mov edi, 127
     lea r12, [rip + .Lprivate_terminal]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
     .size reverie_inguest_private_lifecycle_call, .-reverie_inguest_private_lifecycle_call
-"#
+"#,
+    native_gate = const crate::trap::FIXED_NATIVE_ENTRY,
+    guest_gate = const crate::trap::FIXED_GUEST_ENTRY,
 );
 
 pub(crate) type SignalHandler = unsafe extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void);
@@ -1019,6 +1031,32 @@ pub(crate) fn private_instruction(address: u64) -> bool {
     }
     false
 }
+
+// Classification only. A present mapped relay never grants callback authority;
+// its downstream validator requires the actual Running installed Tool scope.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub(super) fn mapped_callback_origin() -> bool {
+    mapped_initial::libc_relay::callback::present()
+}
+
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub(super) fn mapped_callback_candidate() -> bool {
+    let c = control_pointer();
+    mapped_callback_origin()
+        && !c.is_null()
+        && unsafe { (&raw const (*c).phase).read_volatile() } == 4
+}
+
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub(super) unsafe fn forward_mapped_callback(
+    event: &mut super::event::SyscallEvent,
+    frame: &mut crate::trap::frame::SignalFrame<'_>,
+    observe: impl FnOnce(&super::event::SyscallEvent),
+) {
+    // SAFETY: called only with the actual exclusive decoded SIGSYS frame.
+    unsafe { mapped_initial::libc_relay::callback::forward(event, frame, observe) };
+}
+
 // Only called after the normal SIGSYS provenance checks. Private libc has its
 // own physical effects; it does not recursively enter Detcore. The genuine
 // completion remains owned by continuation::complete, even inside Tool code.
@@ -1032,6 +1070,13 @@ pub(crate) unsafe fn relay_private_signal(
     };
     if super::continuation::is_completion_address(ip) || !private_instruction(ip.saturating_sub(2))
     {
+        return false;
+    }
+    // Phase4 mapped traps must reach the normal genuine frame/reentry and
+    // completion dispatcher, then the callback-only validator. Never call the
+    // retired startup handler or authorize this IP solely from a code range.
+    #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+    if mapped_callback_candidate() {
         return false;
     }
     let control = control_pointer();
@@ -1093,7 +1138,7 @@ core::arch::global_asm!(r#"
     mov edi, 0x1003
     mov rsi, rsp
     lea r12, [rip + .Lprivate_signal_have_fs]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
 .Lprivate_signal_have_fs:
     endbr64
@@ -1121,7 +1166,7 @@ core::arch::global_asm!(r#"
     mov edi, 0x1002
     mov rsi, [r13 + 32]
     lea r12, [rip + .Lprivate_signal_tool_ready]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
 .Lprivate_signal_tool_ready:
     endbr64
@@ -1150,7 +1195,7 @@ core::arch::global_asm!(r#"
     mov edi, 0x1002
     mov rsi, [r13 + 24]
     lea r12, [rip + .Lprivate_signal_guest_ready]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
 .Lprivate_signal_guest_ready:
     endbr64
@@ -1167,9 +1212,10 @@ core::arch::global_asm!(r#"
     mov eax, 231
     mov edi, 127
     lea r12, [rip + .Lprivate_signal_terminal]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
 "#,
+    native_gate = const crate::trap::FIXED_NATIVE_ENTRY,
     syscall_handler = sym crate::trap::sigsys_handler,
     instruction_handler = sym super::instruction::instruction_sigsegv_handler,
 );
@@ -1284,6 +1330,7 @@ impl InitialImageControl {
 
     /// Bind the actual stable installed ToolHost, before frontend installation.
     /// Only the backend's installed-handler bridge may supply this address.
+    #[cfg(any(feature = "coordinator-rpc", test))]
     pub(super) fn bind_lifecycle_host(&self, host: usize) -> io::Result<()> {
         if host == 0 || self.installation.load(Ordering::Acquire) != 0 {
             return Err(io::Error::other(
@@ -1297,6 +1344,7 @@ impl InitialImageControl {
         Ok(())
     }
 
+    #[cfg(any(feature = "coordinator-rpc", test))]
     pub(super) fn begin_lifecycle(&self, host: usize) -> io::Result<InitialLifecyclePermit<'_>> {
         if self
             .lifecycle
@@ -1451,6 +1499,12 @@ impl InitialImageControl {
         let region = unsafe { region.as_ref() }
             .ok_or_else(|| io::Error::other("private frontend has no owned signal stack"))?;
         unsafe { verify_final_frontend(control, region)? };
+        #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+        unsafe {
+            // Retire startup authority BEFORE genuine Ready; never carry it
+            // into Guest, phase-4 callbacks or successor/lifecycle domains.
+            mapped_initial::libc_relay::frontend::retire_if_mapped(self, region);
+        }
         unsafe {
             (&raw mut (*control).runtime_ready).write_volatile(1);
         }
@@ -1461,6 +1515,7 @@ impl InitialImageControl {
 
 /// A single synchronous lifecycle attempt on the installed host and native
 /// thread. Not exported: only the core host can mark successful completion.
+#[cfg(any(feature = "coordinator-rpc", test))]
 pub(super) struct InitialLifecyclePermit<'a> {
     owner: &'a InitialImageControl,
     host: usize,
@@ -1468,6 +1523,7 @@ pub(super) struct InitialLifecyclePermit<'a> {
     _same_thread: core::marker::PhantomData<*mut ()>,
 }
 
+#[cfg(any(feature = "coordinator-rpc", test))]
 impl InitialLifecyclePermit<'_> {
     pub(super) fn complete(mut self) -> io::Result<()> {
         if self.owner.installation.load(Ordering::Acquire) != 2
@@ -1485,6 +1541,7 @@ impl InitialLifecyclePermit<'_> {
     }
 }
 
+#[cfg(any(feature = "coordinator-rpc", test))]
 impl Drop for InitialLifecyclePermit<'_> {
     fn drop(&mut self) {
         if !self.completed {
@@ -1517,6 +1574,12 @@ impl crate::lifecycle::LifecycleController for InitialImageController<'_> {
         }
         unsafe {
             verify_bootstrap_signal(self.owner.control as *mut NativeControl)?;
+        }
+        #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+        if unsafe { mapped_initial::libc_relay::frontend::install_if_mapped(self.owner, region)? } {
+            // Same controller publications are completed under the relay's
+            // exclusive raw replacement interval. No second owner is created.
+            return Ok(());
         }
         // Prepare frame/PKRU/owned stack before the final single raw action
         // replacement. Bootstrap SIGSYS remains usable throughout preparation.

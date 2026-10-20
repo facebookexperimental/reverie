@@ -36,29 +36,32 @@ core::arch::global_asm!(
     raw6 = sym super::raw_syscall6,
 );
 
-core::arch::global_asm!(
-    r#"
+// One instruction source emits both pages. GNU/default invokes only its
+// original read-only template; the explicit musl cohort also emits an actual
+// executed AX page. Relative branches and .org bands stay page-local.
+macro_rules! emit_fixed_gate_pages {
+    ($executed:literal) => {
+        core::arch::global_asm!(
+            r#"
     .hidden reverie_inguest_fixed_gates_published
-    // Keep unrelated string/retention flags from the linker's .rodata.* collection.
-    .section .reverie_inguest_fixed_gate_template,"a",@progbits
-    .balign 4096
-    .global reverie_inguest_fixed_gate_template
-    .hidden reverie_inguest_fixed_gate_template
-    .type reverie_inguest_fixed_gate_template,@object
-reverie_inguest_fixed_gate_template:
+    .macro reverie_emit_fixed_gate_page begin, end
+    .global \begin
+    .hidden \begin
+    .type \begin,@object
+\begin:
     // .org fixes every ABI label and fails assembly if a preceding body grows
     // beyond its band. Every indirectly reached entry starts with ENDBR64.
-    .org 0x7c, 0xcc
-.Lfixed_native_entry:
+    .org \begin + 0x7c, 0xcc
+.Lfixed_native_entry\@:
     endbr64
-    .org 0x80, 0xcc
-.Lfixed_native_syscall:
+    .org \begin + 0x80, 0xcc
+.Lfixed_native_syscall\@:
     syscall
-    .org 0x82, 0xcc
-.Lfixed_native_return:
+    .org \begin + 0x82, 0xcc
+.Lfixed_native_return\@:
     jmp r12
-    .org 0x100, 0xcc
-.Lfixed_guest_entry:
+    .org \begin + 0x100, 0xcc
+.Lfixed_guest_entry\@:
     endbr64
     push r12
     push r13
@@ -82,12 +85,12 @@ reverie_inguest_fixed_gate_template:
     lfence
     mov rax, r13
     mov rdx, r14
-    jmp .Lfixed_guest_syscall
-    .org 0x200, 0xcc
-.Lfixed_guest_syscall:
+    jmp .Lfixed_guest_syscall\@
+    .org \begin + 0x200, 0xcc
+.Lfixed_guest_syscall\@:
     syscall
-    .org 0x202, 0xcc
-.Lfixed_guest_return:
+    .org \begin + 0x202, 0xcc
+.Lfixed_guest_return\@:
     mov r12, rax
     // Actual post-syscall PKRU, including negative returns; caller access is
     // reopened entirely in registers before the first stack access.
@@ -106,21 +109,29 @@ reverie_inguest_fixed_gate_template:
     pop r13
     pop r12
     ret
-    .org 0x300, 0xcc
-.Lfixed_signal_restorer:
+    .org \begin + 0x300, 0xcc
+.Lfixed_signal_restorer\@:
     endbr64
     mov eax, 15
-    .org 0x309, 0xcc
+    .org \begin + 0x309, 0xcc
     syscall
-    .org 0x30b, 0xcc
-.Lfixed_signal_return:
+    .org \begin + 0x30b, 0xcc
+.Lfixed_signal_return\@:
     ud2
-    .org 4096, 0xcc
-    .global reverie_inguest_fixed_gate_template_end
-    .hidden reverie_inguest_fixed_gate_template_end
-reverie_inguest_fixed_gate_template_end:
-    .size reverie_inguest_fixed_gate_template, .-reverie_inguest_fixed_gate_template
-
+    .org \begin + 4096, 0xcc
+    .global \end
+    .hidden \end
+\end:
+    .size \begin, .-\begin
+    .endm
+    // Keep unrelated string/retention flags out of the reference page.
+    .section .reverie_inguest_fixed_gate_template,"a",@progbits
+    .balign 4096
+    reverie_emit_fixed_gate_page reverie_inguest_fixed_gate_template, reverie_inguest_fixed_gate_template_end
+"#,
+            $executed,
+            r#"
+    .purgem reverie_emit_fixed_gate_page
     .text
     .p2align 4
     .global reverie_inguest_fixed_trusted_syscall
@@ -137,13 +148,28 @@ reverie_inguest_fixed_trusted_syscall:
     mov r10, r8
     mov r8, r9
     mov r9, [rsp + 16]
-    movabs r11, 0x50000000007c
+    movabs r11, {native_gate}
     jmp r11
 .Lfixed_trusted_continuation:
     endbr64
     pop r12
     ret
     .size reverie_inguest_fixed_trusted_syscall, .-reverie_inguest_fixed_trusted_syscall
+"#,
+            native_gate = const super::FIXED_NATIVE_ENTRY,
+        );
+    };
+}
+
+#[cfg(not(all(feature = "loader-private-runtime", target_env = "musl")))]
+emit_fixed_gate_pages!("");
+
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+emit_fixed_gate_pages!(
+    r#"
+    .section .reverie_inguest_mapped_gate_page,"ax",@progbits
+    .balign 4096
+    reverie_emit_fixed_gate_page reverie_inguest_mapped_gate_page, reverie_inguest_mapped_gate_page_end
 "#
 );
 
@@ -161,40 +187,141 @@ unsafe extern "C" {
     ) -> i64;
 }
 
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+unsafe extern "C" {
+    static reverie_inguest_mapped_gate_page: u8;
+    static reverie_inguest_mapped_gate_page_end: u8;
+}
+
+/// Borrow the independent assembler-emitted complete read-only expected page.
+///
+/// Performs no allocation, libc/TLS access, syscall or publication. This checks
+/// symbol geometry only, not mapping ownership or permissions. The final image
+/// qualifier and trusted producer must prove independent immutable R-only backing
+/// for this reference, the distinct actual RX gate and its full-page identity.
+/// This is never a snapshot/readback of the executed mapping.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub fn mapped_initial_gate_reference() -> Result<&'static [u8; 4096], i32> {
+    let reference = ptr::addr_of!(reverie_inguest_fixed_gate_template) as usize;
+    let reference_end = ptr::addr_of!(reverie_inguest_fixed_gate_template_end) as usize;
+    let executed = ptr::addr_of!(reverie_inguest_mapped_gate_page) as usize;
+    let executed_end = ptr::addr_of!(reverie_inguest_mapped_gate_page_end) as usize;
+    if FIXED_GATE_BYTES != 4096
+        || reference_end.checked_sub(reference) != Some(4096)
+        || executed_end.checked_sub(executed) != Some(4096)
+        || !reference.is_multiple_of(4096)
+        || executed != FIXED_GATE_BASE as usize
+        || !(reference_end <= executed || executed_end <= reference)
+    {
+        return Err(libc::EFAULT);
+    }
+    // SAFETY: the single assembly source defines an immutable, complete aligned
+    // 4096-byte object. Its final retained mapping must satisfy the documented
+    // qualifier/producer contract; no executed-page bytes are read here.
+    Ok(unsafe { &*ptr::addr_of!(reverie_inguest_fixed_gate_template).cast::<[u8; 4096]>() })
+}
+
 pub(super) fn published() -> bool {
     reverie_inguest_fixed_gates_published.load(Ordering::Acquire) != 0
 }
 
-fn template() -> io::Result<&'static [u8]> {
+// Scalar errors let the physical mapped-entry path refuse before the Tool
+// allocator exists. Legacy wrappers retain their exact existing io diagnostics.
+#[derive(Clone, Copy)]
+enum GateError {
+    TemplateExtent,
+    Entry,
+    SyscallOffset,
+    ReturnBytes,
+    #[cfg(feature = "exec-private-init")]
+    MappedBytes,
+}
+impl GateError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::TemplateExtent => "fixed gate template has an invalid extent",
+            Self::Entry => "fixed gate entry lacks ENDBR64",
+            Self::SyscallOffset => "fixed gate syscall has an invalid offset",
+            Self::ReturnBytes => "fixed gate return/restorer has invalid bytes",
+            #[cfg(feature = "exec-private-init")]
+            Self::MappedBytes => "adopted fixed gate bytes differ",
+        }
+    }
+}
+
+fn template_scalar() -> Result<&'static [u8], GateError> {
     let start = ptr::addr_of!(reverie_inguest_fixed_gate_template) as usize;
     let end = ptr::addr_of!(reverie_inguest_fixed_gate_template_end) as usize;
     if end.checked_sub(start) != Some(FIXED_GATE_BYTES as usize) {
-        return Err(io::Error::other(
-            "fixed gate template has an invalid extent",
-        ));
+        return Err(GateError::TemplateExtent);
     }
-    // SAFETY: the assembler owns this exact read-only, process-lifetime page.
-    let bytes =
-        unsafe { std::slice::from_raw_parts(start as *const u8, FIXED_GATE_BYTES as usize) };
-    for offset in [0x7c, 0x100, 0x300] {
-        if bytes[offset..offset + 4] != [0xf3, 0x0f, 0x1e, 0xfa] {
-            return Err(io::Error::other("fixed gate entry lacks ENDBR64"));
+    let base = start as *const u8;
+    // SAFETY: exact assembler-owned permanent template; every constant offset
+    // below lies inside its checked 4096-byte extent. Volatile scalar reads
+    // avoid an aggregate comparison/copy or an interposable libc dependency.
+    let byte = |offset| unsafe { base.add(offset).read_volatile() };
+    let mut index = 0_usize;
+    while index < 3 {
+        let entry = match index {
+            0 => 0x7c,
+            1 => 0x100,
+            _ => 0x300,
+        };
+        if byte(entry) != 0xf3
+            || byte(entry + 1) != 0x0f
+            || byte(entry + 2) != 0x1e
+            || byte(entry + 3) != 0xfa
+        {
+            return Err(GateError::Entry);
         }
-    }
-    for offset in [0x80, 0x200, 0x309] {
-        if bytes[offset..offset + 2] != [0x0f, 0x05] {
-            return Err(io::Error::other("fixed gate syscall has an invalid offset"));
+        let syscall = match index {
+            0 => 0x80,
+            1 => 0x200,
+            _ => 0x309,
+        };
+        if byte(syscall) != 0x0f || byte(syscall + 1) != 0x05 {
+            return Err(GateError::SyscallOffset);
         }
+        index = index.wrapping_add(1);
     }
-    if bytes[0x82..0x85] != [0x41, 0xff, 0xe4]
-        || bytes[0x304..0x309] != [0xb8, 15, 0, 0, 0]
-        || bytes[0x30b..0x30d] != [0x0f, 0x0b]
+    if byte(0x82) != 0x41
+        || byte(0x83) != 0xff
+        || byte(0x84) != 0xe4
+        || byte(0x304) != 0xb8
+        || byte(0x305) != 15
+        || byte(0x306) != 0
+        || byte(0x307) != 0
+        || byte(0x308) != 0
+        || byte(0x30b) != 0x0f
+        || byte(0x30c) != 0x0b
     {
-        return Err(io::Error::other(
-            "fixed gate return/restorer has invalid bytes",
-        ));
+        return Err(GateError::ReturnBytes);
     }
-    Ok(bytes)
+    // SAFETY: same exact permanent checked extent, no allocation or copy.
+    Ok(unsafe { core::slice::from_raw_parts(base, FIXED_GATE_BYTES as usize) })
+}
+
+fn template() -> io::Result<&'static [u8]> {
+    template_scalar().map_err(|error| io::Error::other(error.message()))
+}
+
+// SAFETY: caller retains readable immutable actual gate backing at the exact
+// compiled address for this whole comparison. Bytes alone do not prove RX,
+// ownership, filter authority or permission to publish a gate.
+#[cfg(feature = "exec-private-init")]
+unsafe fn verify_initial_bytes_scalar(bytes: &[u8]) -> Result<(), GateError> {
+    let mut offset = 0_usize;
+    while offset < FIXED_GATE_BYTES as usize {
+        // SAFETY: callers supply the checked permanent template and physical
+        // gate extent. Scalar reads cover ALL bytes, including trap padding.
+        let actual = unsafe { (FIXED_GATE_BASE as *const u8).add(offset).read_volatile() };
+        let expected = unsafe { bytes.as_ptr().add(offset).read_volatile() };
+        if actual != expected {
+            return Err(GateError::MappedBytes);
+        }
+        offset = offset.wrapping_add(1);
+    }
+    Ok(())
 }
 
 // Explicit legacy bootstrap: no selected helper is involved before publication.
@@ -335,11 +462,64 @@ pub(super) unsafe fn verify_initial_page() -> io::Result<()> {
         return Err(io::Error::other("adopted fixed gate is not private RX"));
     }
     let bytes = template()?;
-    for (offset, expected) in bytes.iter().enumerate() {
-        if unsafe { ((FIXED_GATE_BASE as *const u8).add(offset)).read_volatile() } != *expected {
-            return Err(io::Error::other("adopted fixed gate bytes differ"));
-        }
+    // SAFETY: unchanged legacy caller/map-protection contract above.
+    unsafe { verify_initial_bytes_scalar(bytes) }.map_err(|error| io::Error::other(error.message()))
+}
+
+/// Publish the existing compiled gate at the authenticated mapped-entry cut.
+///
+/// No mapping, procfs, libc, allocation, syscall or Tool publication occurs.
+/// This uses the SAME one-use gate selector and preparation exclusion as the
+/// ordinary and GNU InitialImage routes. It does not authenticate scalar input.
+///
+/// # Safety
+/// Only the actual mapped first-image producer may call, on its sole original
+/// leader before any guest/callback/thread or asynchronous allocator entry.
+/// It retains the real stopped generation, ChildOwner, sealed image backing,
+/// successful exact no-replace mapping/protection ledger and host kill/wait
+/// authority. The expected compiled layout/source/filter contract is joined to
+/// that same physical owner, not inferred from a hash, address or this verifier.
+/// FIXED_GATE_BASE names its actual complete immutable readable private RX
+/// page, with no concurrent writer, remapper or alias that can mutate backing.
+/// `expected` is a separately retained read-only 4096-byte reference emitted
+/// from the same assembly source and independently joined to the sealed image.
+/// It must not alias writable backing or the executed gate; no caller-written
+/// snapshot of the executed page is admissible as an independent reference.
+/// Candidate bytes may mismatch and are refused before any gate instruction is
+/// executed. The inherited filter already admits only the actual qualified
+/// gate/restorer coordinates and its lineage is genuinely retained. The entry
+/// is spent before this call; every error is terminal without retry/reset,
+/// fallback, allocation, unwind or releasing any live image/stack/TLS mapping.
+/// Actual private TLS/libc and kernel state must independently be established
+/// before the caller invokes ToolRegion adoption or an allocating initializer.
+#[cfg(all(
+    feature = "exec-private-init",
+    feature = "loader-private-runtime",
+    target_env = "musl"
+))]
+pub(super) unsafe fn adopt_mapped_initial_page(expected: &'static [u8; 4096]) -> Result<(), i32> {
+    if published()
+        || PREPARING
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+    {
+        return Err(libc::EAGAIN);
     }
+    let _preparing = Preparing;
+    // Executed template may itself occupy FIXED_GATE_BASE. Do not compare it
+    // with itself and call that independent verification. Producer supplies a
+    // separately qualified immutable reference from the SAME assembly source.
+    // This local check excludes aliases by virtual overlap; physical alias
+    // immutability and source identity remain the unsafe producer's obligation.
+    let first = expected.as_ptr() as usize;
+    let end = first.checked_add(4096).ok_or(libc::EINVAL)?;
+    if first < FIXED_GATE_BASE as usize + 4096 && (FIXED_GATE_BASE as usize) < end {
+        return Err(libc::EINVAL);
+    }
+    let _ = template_scalar().map_err(|_| libc::EINVAL)?;
+    // SAFETY: complete independent reference and retained physical contract.
+    unsafe { verify_initial_bytes_scalar(expected) }.map_err(|_| libc::EINVAL)?;
+    reverie_inguest_fixed_gates_published.store(1, Ordering::Release);
     Ok(())
 }
 

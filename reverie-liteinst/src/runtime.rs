@@ -552,19 +552,19 @@ pub(crate) fn initialize_from_selected_value(tool_value: Option<&OsStr>) -> io::
 }
 
 // Ordinary and legacy images retain the patcher's full preparation. The
-// authenticated no-patching native installer alone selects the trap-only
+// authenticated no-RCB/no-patching private installer selects the trap-only
 // resource path; this selection does not confer any native image authority.
 #[derive(Clone, Copy)]
 pub(crate) enum InstrumentationPreparation {
     Patcher,
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(feature = "exec-private-init")]
     NativeTrapOnly,
 }
 
 #[cfg(feature = "exec-private-init")]
 pub(crate) struct PrivateRuntimeImage<'a> {
     pub(crate) control: crate::tool_host::PrivateImageControl<'a>,
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(feature = "exec-private-init")]
     pub(crate) preparation: InstrumentationPreparation,
     #[cfg(feature = "exec-native-injection")]
     pub(crate) before_frontend: Option<Box<dyn FnOnce() -> io::Result<()> + 'a>>,
@@ -785,15 +785,15 @@ fn install_runtime(
         reverie_inguest::guest::tool_region::StackBacking::ToolRegion(region),
     );
     PATCH_PUBLICATION.store(publication as u8, Ordering::Release);
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(feature = "exec-private-init")]
     let preparation = initial
         .as_ref()
         .map_or(InstrumentationPreparation::Patcher, |image| {
             image.preparation
         });
-    #[cfg(not(feature = "exec-native-injection"))]
+    #[cfg(not(feature = "exec-private-init"))]
     let preparation = InstrumentationPreparation::Patcher;
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(feature = "exec-private-init")]
     if matches!(preparation, InstrumentationPreparation::NativeTrapOnly)
         && (SITE_PATCHING_ENABLED.load(Ordering::Acquire) || !vdso_sites.is_empty())
     {
@@ -1230,6 +1230,21 @@ unsafe fn restore_guard_default_action(
     unsafe { reverie_inguest::signal::raw_raise(signal) }
 }
 
+/// Select the private image's clock policy before any Tool callback is published.
+///
+/// # Safety
+/// `skip_pmu` requires the authenticated image's no-RCB/preemption contract and
+/// exclusive current-thread initialization, with no guest or callback active.
+#[cfg(feature = "exec-private-init")]
+pub(crate) unsafe fn prepare_private_rcb_clock(skip_pmu: bool) -> io::Result<()> {
+    if skip_pmu {
+        // SAFETY: the same private installer contract is required above.
+        unsafe { reverie_inguest::guest::clock::disable_rcb_clock_for_current_thread() }
+    } else {
+        initialize_rcb_clock()
+    }
+}
+
 fn prepare_instrumentation_state(_preparation: InstrumentationPreparation) -> io::Result<()> {
     let page_size = reverie_inguest::guest::support::page_size()?;
     PAGE_SIZE.store(page_size, Ordering::Release);
@@ -1242,7 +1257,7 @@ fn prepare_instrumentation_state(_preparation: InstrumentationPreparation) -> io
         .set(sites)
         .map_err(|_| io::Error::other("LiteInst site registry initialized twice"))?;
 
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(feature = "exec-private-init")]
     match _preparation {
         InstrumentationPreparation::Patcher => {}
         InstrumentationPreparation::NativeTrapOnly => {
@@ -4012,7 +4027,84 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(feature = "exec-private-init")]
+    fn initial_image_trap_preparation_has_no_arenas_or_lazy_pmu() {
+        const CHILD: &str = "REVERIE_LITEINST_INITIAL_TRAP_PREPARATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::tests::initial_image_trap_preparation_has_no_arenas_or_lazy_pmu",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("1 passed")
+            );
+            return;
+        }
+        fn perf_fds() -> Vec<std::path::PathBuf> {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::read_link(entry.unwrap().path()).ok())
+                .filter(|target| {
+                    target
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .windows(10)
+                        .any(|part| part == b"perf_event")
+                })
+                .collect()
+        }
+        assert!(
+            perf_fds().is_empty(),
+            "fresh preparation child already owns a PMU"
+        );
+        let before = super::read_runtime_maps().unwrap();
+        // SAFETY: isolated child; this tests only resource preparation, never
+        // publishes a control/frontend or claims a genuine admitted image.
+        unsafe { super::prepare_private_rcb_clock(true) }.unwrap();
+        super::prepare_instrumentation_state(super::InstrumentationPreparation::NativeTrapOnly)
+            .unwrap();
+        for _ in 0..2 {
+            super::enter_rcb_handler().unwrap();
+        }
+        assert_eq!(
+            super::read_guest_rcb_clock().unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        for _ in 0..2 {
+            super::leave_rcb_handler().unwrap();
+        }
+        assert!(
+            perf_fds().is_empty(),
+            "handler accounting lazily opened a PMU"
+        );
+        assert!(super::ARENAS.get().unwrap().is_empty());
+        assert_eq!(SITES.get().unwrap().len(), MAX_PATCH_SITES);
+        let after = super::read_runtime_maps().unwrap();
+        let before_exec = before
+            .iter()
+            .filter(|map| map.executable)
+            .collect::<Vec<_>>();
+        let after_exec = after
+            .iter()
+            .filter(|map| map.executable)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after_exec, before_exec,
+            "trap-only preparation added executable arenas"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "exec-private-init")]
     fn native_preparation_has_no_executable_arena_and_patcher_keeps_real_aliases() {
         const CHILD: &str = "REVERIE_LITEINST_PREPARATION_TEST_CHILD";
         let Some(mode) = std::env::var_os(CHILD) else {

@@ -5,6 +5,7 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
 #[cfg(feature = "exec-private-init")]
 use std::os::unix::ffi::OsStrExt;
@@ -19,6 +20,36 @@ use crate::guest::exec_private::NativeGateIoBinding;
 use crate::guest::support::raw_result;
 use crate::guest::support::tool_callback_active;
 use crate::trap::raw_syscall6;
+
+/// Move an owned ordinary coordinator socket above the guest's low descriptors.
+///
+/// This preserves the same open-file description and connection, setting
+/// close-on-exec on its new descriptor. It neither connects nor authenticates a
+/// client and does not reserve a protection slot. Call before publishing the
+/// coordinator descriptor or wrapping it in an authenticated client. Success
+/// drops the original owner exactly once; failure drops it and returns the
+/// actual duplication error. Native inherited-gate streams do not use this.
+pub fn move_ordinary_coordinator_stream(stream: UnixStream) -> io::Result<UnixStream> {
+    // The same raw-gate F_DUPFD_CLOEXEC operation used by the legacy client;
+    // an occupied high descriptor is skipped, never overwritten.
+    let reserved_fd = raw_result(unsafe {
+        raw_syscall6(
+            libc::SYS_fcntl,
+            [
+                stream.as_raw_fd() as u64,
+                libc::F_DUPFD_CLOEXEC as u64,
+                1024,
+                0,
+                0,
+                0,
+            ],
+        )
+    })? as libc::c_int;
+    // SAFETY: successful fcntl returned a fresh descriptor owned only here.
+    let reserved_stream = unsafe { UnixStream::from_raw_fd(reserved_fd) };
+    drop(stream);
+    Ok(reserved_stream)
+}
 
 /// One socket retained by the shared client; this adds no wire/admission owner.
 pub enum GuestRpcStream {
@@ -280,6 +311,173 @@ impl Drop for NativeGateStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Each exact test runs alone in a subprocess: descriptor-number and rlimit
+    // checks must not race other tests opening descriptors in the same process.
+    fn isolated_coordinator_move_test(name: &str, body: impl FnOnce()) {
+        const CHILD: &str = "REVERIE_ORDINARY_COORDINATOR_MOVE_TEST";
+        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+            body();
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name])
+            .env(CHILD, name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    status.success(),
+                    "{status}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line == format!("test {name} ... ok")),
+                    "selected relocation control did not execute: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let status = child.wait().unwrap();
+                panic!("coordinator relocation control exceeded its bound: {status}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn ordinary_coordinator_move_preserves_ofd_peer_and_closes_original() {
+        isolated_coordinator_move_test(
+            "guest::rpc::stream::tests::ordinary_coordinator_move_preserves_ofd_peer_and_closes_original",
+            || {
+                let (original, mut peer) = UnixStream::pair().unwrap();
+                let alias = original.try_clone().unwrap();
+                let low = original.as_raw_fd();
+                assert!(low < 1024);
+                let mut moved = move_ordinary_coordinator_stream(original).unwrap();
+                assert!(moved.as_raw_fd() >= 1024);
+                // SAFETY: queries do not acquire or close descriptor ownership.
+                assert_eq!(
+                    unsafe {
+                        raw_syscall6(
+                            libc::SYS_fcntl,
+                            [low as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
+                        )
+                    },
+                    -i64::from(libc::EBADF)
+                );
+                // CLOEXEC belongs to the new descriptor; O_NONBLOCK belongs to
+                // the OFD and therefore changes on the retained alias too.
+                assert_ne!(
+                    unsafe {
+                        raw_syscall6(
+                            libc::SYS_fcntl,
+                            [moved.as_raw_fd() as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
+                        )
+                    } & i64::from(libc::FD_CLOEXEC),
+                    0
+                );
+                alias.set_nonblocking(true).unwrap();
+                assert_ne!(
+                    unsafe {
+                        raw_syscall6(
+                            libc::SYS_fcntl,
+                            [moved.as_raw_fd() as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
+                        )
+                    } & i64::from(libc::O_NONBLOCK),
+                    0
+                );
+                moved.set_nonblocking(false).unwrap();
+                moved.write_all(b"same socket").unwrap();
+                let mut bytes = [0; 11];
+                peer.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, b"same socket");
+                peer.write_all(b"reply").unwrap();
+                let mut reply = [0; 5];
+                moved.read_exact(&mut reply).unwrap();
+                assert_eq!(&reply, b"reply");
+                drop(alias);
+                drop(moved);
+                assert_eq!(peer.read(&mut reply).unwrap(), 0);
+            },
+        );
+    }
+
+    #[test]
+    fn ordinary_coordinator_move_skips_occupied_high_descriptor() {
+        isolated_coordinator_move_test(
+            "guest::rpc::stream::tests::ordinary_coordinator_move_skips_occupied_high_descriptor",
+            || {
+                let (first, mut first_peer) = UnixStream::pair().unwrap();
+                let mut first = move_ordinary_coordinator_stream(first).unwrap();
+                let occupied = first.as_raw_fd();
+                let (second, mut second_peer) = UnixStream::pair().unwrap();
+                let mut second = move_ordinary_coordinator_stream(second).unwrap();
+                assert!(second.as_raw_fd() > occupied);
+                first.write_all(b"a").unwrap();
+                second.write_all(b"b").unwrap();
+                let mut byte = [0];
+                first_peer.read_exact(&mut byte).unwrap();
+                assert_eq!(byte, [b'a']);
+                second_peer.read_exact(&mut byte).unwrap();
+                assert_eq!(byte, [b'b']);
+                assert_eq!(first.as_raw_fd(), occupied);
+            },
+        );
+    }
+
+    #[test]
+    fn ordinary_coordinator_move_returns_real_duplication_error_and_cleans_owner() {
+        isolated_coordinator_move_test(
+            "guest::rpc::stream::tests::ordinary_coordinator_move_returns_real_duplication_error_and_cleans_owner",
+            || {
+                let (original, mut peer) = UnixStream::pair().unwrap();
+                let low = original.as_raw_fd();
+                let mut limits = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: this isolated process owns the soft limit change;
+                // both structures are live and the hard limit is unchanged.
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limits) },
+                    0
+                );
+                let restricted = libc::rlimit {
+                    rlim_cur: limits.rlim_cur.min(1024),
+                    rlim_max: limits.rlim_max,
+                };
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &restricted) },
+                    0
+                );
+                let result = move_ordinary_coordinator_stream(original);
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+                // Linux rejects an F_DUPFD minimum at/above RLIMIT_NOFILE.
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+                assert_eq!(
+                    unsafe {
+                        raw_syscall6(
+                            libc::SYS_fcntl,
+                            [low as u64, libc::F_GETFD as u64, 0, 0, 0, 0],
+                        )
+                    },
+                    -i64::from(libc::EBADF)
+                );
+                let mut byte = [0];
+                assert_eq!(peer.read(&mut byte).unwrap(), 0);
+            },
+        );
+    }
 
     #[test]
     fn ordinary_adapter_preserves_real_stream_partial_io_and_eof() {

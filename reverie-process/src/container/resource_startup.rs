@@ -919,16 +919,17 @@ impl ResourceSocket {
                 return Err(StartupError::Protocol);
             }
             message.msg_control = ancillary.as_mut_ptr().cast();
-            message.msg_controllen = unsafe {
-                libc::CMSG_SPACE((descriptors.len() * std::mem::size_of::<i32>()) as u32) as usize
-            };
+            let (space, length) = startup_rights_lengths(descriptors.len())?;
+            message.msg_controllen = startup_abi_len(space)?;
+            assert!(
+                startup_abi_len::<_, usize>(message.msg_controllen)?
+                    <= std::mem::size_of_val(&ancillary)
+            );
             unsafe {
                 let header = libc::CMSG_FIRSTHDR(&message);
                 (*header).cmsg_level = libc::SOL_SOCKET;
                 (*header).cmsg_type = libc::SCM_RIGHTS;
-                (*header).cmsg_len =
-                    libc::CMSG_LEN((descriptors.len() * std::mem::size_of::<i32>()) as u32)
-                        as usize;
+                (*header).cmsg_len = startup_abi_len(length)?;
                 for (index, fd) in descriptors.iter().enumerate() {
                     libc::CMSG_DATA(header)
                         .cast::<i32>()
@@ -988,7 +989,13 @@ impl ResourceSocket {
             message.msg_iov = &mut iov;
             message.msg_iovlen = 1;
             message.msg_control = ancillary.as_mut_ptr().cast();
-            message.msg_controllen = std::mem::size_of_val(&ancillary);
+            message.msg_controllen = match startup_abi_len(std::mem::size_of_val(&ancillary)) {
+                Ok(length) => length,
+                Err(error) => {
+                    frame.record_error(error);
+                    return frame;
+                }
+            };
             if let Err(error) = self.check_native_deadline() {
                 frame.record_error(error);
                 return frame;
@@ -1007,11 +1014,18 @@ impl ResourceSocket {
             unsafe {
                 let mut header = libc::CMSG_FIRSTHDR(&message);
                 while !header.is_null() {
+                    let length: usize = match startup_abi_len((*header).cmsg_len) {
+                        Ok(length) => length,
+                        Err(error) => {
+                            frame.record_error(error);
+                            break;
+                        }
+                    };
                     if (*header).cmsg_level == libc::SOL_SOCKET
                         && (*header).cmsg_type == libc::SCM_RIGHTS
-                        && (*header).cmsg_len >= libc::CMSG_LEN(0) as usize
+                        && length >= libc::CMSG_LEN(0) as usize
                     {
-                        let bytes = (*header).cmsg_len - libc::CMSG_LEN(0) as usize;
+                        let bytes = length - libc::CMSG_LEN(0) as usize;
                         if !bytes.is_multiple_of(std::mem::size_of::<i32>()) {
                             frame.record_error(StartupError::Protocol);
                         }

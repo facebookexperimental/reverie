@@ -170,7 +170,12 @@ impl<S: TrapSeam> InGuestDispatcher<S> {
         let trapped = event.source() == SyscallEventSource::SignalTrap;
         let resume_address = event.instruction_pointer();
         let trapped_number = event.number();
-        if tool_callback_active() {
+        #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+        let mapped_callback = super::exec_private::mapped_callback_candidate()
+            || (tool_callback_active() && super::exec_private::mapped_callback_origin());
+        #[cfg(not(all(feature = "loader-private-runtime", target_env = "musl")))]
+        let mapped_callback = false;
+        if tool_callback_active() || mapped_callback {
             continuation::enable_nested_runtime_access();
             self.seam.record_path(TrapPath::NestedSigsys);
             let mut nested = SyscallEvent {
@@ -188,7 +193,26 @@ impl<S: TrapSeam> InGuestDispatcher<S> {
             // safe dispatch_direct, whose caller may already run any syscall
             // through the safe TrapEvent::forward.
             unsafe {
-                forward_nested_tool_syscall(&mut nested, |event| self.seam.observe_nested(event))
+                #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+                if mapped_callback {
+                    // The candidate classification grants no permission. A
+                    // direct event or missing actual frame is terminal.
+                    if !trapped {
+                        crate::private_runtime::abort()
+                    }
+                    let Some(frame) = frame else {
+                        crate::private_runtime::abort()
+                    };
+                    super::exec_private::forward_mapped_callback(&mut nested, frame, |event| {
+                        self.seam.observe_nested(event)
+                    });
+                } else {
+                    forward_nested_tool_syscall(&mut nested, |event| {
+                        self.seam.observe_nested(event)
+                    });
+                }
+                #[cfg(not(all(feature = "loader-private-runtime", target_env = "musl")))]
+                forward_nested_tool_syscall(&mut nested, |event| self.seam.observe_nested(event));
             };
             event.set_native_result(NativeSyscallResult {
                 result: nested.result,
@@ -272,6 +296,58 @@ impl<S: TrapSeam> SyscallDispatcher for InGuestDispatcher<S> {
     }
 }
 
+// Pure shared refusal inventory; this grants no execution authority. The
+// mapped startup owner and ordinary callback route choose their own gate.
+pub(crate) fn nested_tool_control_result(number: i64, private_registrations: bool) -> Option<i64> {
+    if private_registrations
+        && matches!(
+            number,
+            libc::SYS_set_tid_address | libc::SYS_set_robust_list
+        )
+    {
+        return Some(-i64::from(libc::EPERM));
+    }
+    let unsupported_process =
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        number == libc::SYS_clone
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_clone3
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_fork
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_vfork
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_execve
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_execveat;
+    let unsupported_signal_state =
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        number == libc::SYS_rt_sigaction
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_rt_sigprocmask
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_sigaltstack
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_rt_sigsuspend
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_pselect6
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_ppoll
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_epoll_pwait
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == libc::SYS_epoll_pwait2
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        || number == SYS_IO_PGETEVENTS;
+    if unsupported_process {
+        Some(-i64::from(libc::ENOTSUP))
+    } else if unsupported_signal_state {
+        Some(-i64::from(libc::EPERM))
+    } else {
+        None
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-133): Review nested Tool syscall guards and raw forwarding.
 /// Runs a syscall a Tool callback makes itself (reached while the callback is
@@ -297,52 +373,28 @@ pub unsafe fn forward_nested_tool_syscall(
     event: &mut SyscallEvent,
     observe: impl FnOnce(&SyscallEvent),
 ) {
+    // Preserve the legacy/GNU execution leaf exactly. The private mapped
+    // callback supplies its Tool-FS gate only after its own owner validation.
+    unsafe {
+        forward_nested_tool_syscall_with(event, observe, |event| {
+            event.result = event.forward();
+        })
+    };
+}
+
+// Shared protections/order, private execution leaf: no Guest dispatch or second
+// syscall-policy table. Caller owns its authentic event and native authority.
+pub(super) unsafe fn forward_nested_tool_syscall_with(
+    event: &mut SyscallEvent,
+    observe: impl FnOnce(&SyscallEvent),
+    execute: impl FnOnce(&mut SyscallEvent),
+) {
     #[cfg(feature = "exec-private-init")]
-    if super::exec_private::active()
-        && matches!(
-            event.number,
-            libc::SYS_set_tid_address | libc::SYS_set_robust_list
-        )
-    {
-        event.result = -i64::from(libc::EPERM);
-        return;
-    }
-    let unsupported_process =
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        event.number == libc::SYS_clone
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_clone3
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_fork
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_vfork
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_execve
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_execveat;
-    let unsupported_signal_state =
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        event.number == libc::SYS_rt_sigaction
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_rt_sigprocmask
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_sigaltstack
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_rt_sigsuspend
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_pselect6
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_ppoll
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_epoll_pwait
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == libc::SYS_epoll_pwait2
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || event.number == SYS_IO_PGETEVENTS;
-    if unsupported_process {
-        event.result = -i64::from(libc::ENOTSUP);
-    } else if unsupported_signal_state {
-        event.result = -i64::from(libc::EPERM);
+    let private_registrations = super::exec_private::active();
+    #[cfg(not(feature = "exec-private-init"))]
+    let private_registrations = false;
+    if let Some(result) = nested_tool_control_result(event.number, private_registrations) {
+        event.result = result;
     } else if !(protect_runtime_control(event)
         || unsafe { protect_runtime_descriptors(event, false) })
     {
@@ -351,7 +403,7 @@ pub unsafe fn forward_nested_tool_syscall(
             event.result = result;
             return;
         }
-        event.result = unsafe { event.forward() };
+        execute(event);
         observe(event);
     }
 }
@@ -631,5 +683,31 @@ mod tests {
         let calls = calls(&dispatcher);
         assert_eq!(calls[2], "site 0x1002", "{calls:?}");
         assert_eq!(calls[3], "patch 0x1000", "{calls:?}");
+    }
+
+    #[test]
+    fn shared_nested_process_refusal_never_reaches_chosen_native_leaf() {
+        let mut event = SyscallEvent {
+            number: libc::SYS_clone,
+            args: [0; 6],
+            instruction_pointer: 0,
+            result: UNSET_RESULT,
+            context: 0,
+            dispatch: SyscallDispatch::Trap,
+            guest_pkru: None,
+        };
+        let executed = core::cell::Cell::new(false);
+        let observed = core::cell::Cell::new(false);
+        // SAFETY: the real shared process guard refuses before either closure;
+        // no fabricated event is ever executed by a kernel or Guest path.
+        unsafe {
+            forward_nested_tool_syscall_with(
+                &mut event,
+                |_| observed.set(true),
+                |_| executed.set(true),
+            )
+        };
+        assert_eq!(event.result, -i64::from(libc::ENOTSUP));
+        assert!(!executed.get() && !observed.get());
     }
 }

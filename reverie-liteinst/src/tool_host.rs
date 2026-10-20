@@ -59,7 +59,7 @@ const _: () = {
 /// LiteInst's services for the in-guest Tool host.
 pub(crate) struct LiteinstRuntime {
     stats: crate::stats::GuestStatsHooks,
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(feature = "exec-private-init")]
     no_rcb: bool,
 }
 
@@ -68,7 +68,7 @@ impl LiteinstRuntime {
     pub(crate) fn new(stats: crate::stats::GuestStatsHooks) -> Self {
         Self {
             stats,
-            #[cfg(feature = "exec-native-injection")]
+            #[cfg(feature = "exec-private-init")]
             no_rcb: false,
         }
     }
@@ -102,11 +102,11 @@ impl HostRuntime for LiteinstRuntime {
     }
 
     fn read_clock(&self) -> io::Result<u64> {
-        #[cfg(feature = "exec-native-injection")]
+        #[cfg(feature = "exec-private-init")]
         if self.no_rcb {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "native first-domain RCB clock is unsupported",
+                "private no-RCB image clock is unsupported",
             ));
         }
         runtime::read_guest_rcb_clock()
@@ -309,6 +309,31 @@ pub unsafe fn prepare_tool_initial_image<T: Tool>(
     })
 }
 
+/// Converge the mapped first image on the existing prepared InitialImage owner.
+/// This consumes the actual one-use coordinator client; no alternate ACK,
+/// Config, installed host, lifecycle or readiness mechanism is introduced.
+///
+/// # Safety
+/// The client redeemed the exact watched physical launch bound by `mapped`.
+/// Its genuine schema/Config checks and the ordinary InitialImage domain checks
+/// completed on that same stream. The caller retains the host mapping/terminal
+/// owner and all `MappedToolPrelude::publish_authenticated` obligations. Guest
+/// has not run; all errors remain terminal under the original retained owner.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub unsafe fn prepare_tool_mapped_initial_image<T: Tool>(
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+    mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
+) -> io::Result<PreparedInitialImage<T>> {
+    let fatal = unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
+    // SAFETY: actual admitted client and physical producer contract above.
+    let control = unsafe { mapped.publish_authenticated()? };
+    Ok(PreparedInitialImage {
+        fatal,
+        client,
+        control,
+    })
+}
+
 /// Install the actual Tool using the same authenticated client and native owner.
 /// The caller must finish DETLOG/OFD setup, run
 /// [`initialize_initial_image_lifecycle`], then consume the installed owner's
@@ -338,8 +363,7 @@ where
             Some(ImageInstall::Initial(client, &control, &fatal)),
             #[cfg(feature = "exec-native-injection")]
             None,
-            #[cfg(feature = "exec-native-injection")]
-            false,
+            true,
         )?;
     }
     Ok(InstalledInitialImage { control, fatal })
@@ -758,6 +782,105 @@ mod initial_vdso_tests {
     }
 }
 
+// Private initialization has an authenticated fatal owner outside this stack
+// frame. It must terminate before local RPC/Tool owners are dropped: their
+// descriptors may already be protected and their frontend partly installed.
+#[cfg(feature = "exec-private-init")]
+fn private_install_result<V>(result: io::Result<V>, private_initial: bool) -> io::Result<V> {
+    match result {
+        Err(_error) if private_initial => unsafe {
+            // SAFETY: install_tool_inner receives an authenticated Initial or
+            // Successor owner. Its existing fixed terminal gate is retained;
+            // no teardown, diagnostic I/O or guest continuation may intervene.
+            reverie_inguest::guest::exec_private::initialization_failed(core::ptr::null_mut())
+        },
+        result => result,
+    }
+}
+
+#[cfg(all(test, feature = "exec-private-init"))]
+mod private_install_result_tests {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    use super::*;
+
+    #[test]
+    fn ordinary_failure_preserves_real_errno() {
+        let error =
+            private_install_result::<()>(Err(io::Error::from_raw_os_error(libc::EIO)), false)
+                .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn private_success_is_unchanged() {
+        assert_eq!(private_install_result(Ok(17), true).unwrap(), 17);
+    }
+
+    #[test]
+    fn invalid_initial_endpoint_terminates_before_reserved_socket_owner_drop() {
+        let progress = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(progress, libc::MAP_FAILED);
+        let progress = progress.cast::<u64>();
+        unsafe { progress.write_volatile(0) };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            if unsafe { reverie_inguest::trap::prepare_fixed_gates() }.is_err() {
+                unsafe { libc::_exit(95) };
+            }
+            struct SocketOwner {
+                socket: UnixStream,
+                progress: *mut u64,
+            }
+            impl Drop for SocketOwner {
+                fn drop(&mut self) {
+                    // SAFETY: retained shared mapping spans this child.
+                    unsafe { self.progress.write_volatile(2) };
+                }
+            }
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let owner = SocketOwner { socket, progress };
+            runtime::reserve_coordinator_fd(owner.socket.as_raw_fd()).unwrap();
+            unsafe { progress.write_volatile(1) };
+            let error = crate::initial_image_stats::initial_image_stats_endpoint(Path::new(
+                "/owned/a.sock",
+            ));
+            assert_eq!(
+                error.as_ref().unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            // Do not arm an outer fatal Drop guard: only the actual helper's
+            // immediate terminal edge may yield the expected status 127.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                private_install_result(error, true)
+            }));
+            drop(owner);
+            unsafe { libc::_exit(94) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        let observed = unsafe { progress.read_volatile() };
+        assert_eq!(unsafe { libc::munmap(progress.cast(), 4096) }, 0);
+        assert!(libc::WIFEXITED(status), "child status {status}");
+        assert_eq!(libc::WEXITSTATUS(status), 127);
+        assert_eq!(
+            observed, 1,
+            "reserved RPC owner was dropped before terminal"
+        );
+    }
+}
+
 // The private-image installer; ordinary installation is the shared
 // `reverie_inguest::guest::tool_install::install_tool_with`.
 #[cfg(feature = "exec-private-init")]
@@ -769,14 +892,15 @@ unsafe fn install_tool_inner<T>(
     #[cfg(feature = "exec-native-injection")] native_driver: Option<
         std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
     >,
-    #[cfg(feature = "exec-native-injection")] skip_pmu: bool,
+    #[cfg(feature = "exec-private-init")] skip_pmu: bool,
 ) -> io::Result<()>
 where
     T: Tool + 'static,
 {
+    let private_initial = initial.is_some();
     macro_rules! install_try {
         ($operation:expr) => {
-            match $operation {
+            match private_install_result($operation, private_initial) {
                 Ok(value) => value,
                 Err(error) => {
                     #[cfg(feature = "exec-native-injection")]
@@ -800,10 +924,6 @@ where
     // runtime does not read the Tool's state as code addresses either.
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
     install_try!(crate::patch_alloc::preflight_allocator());
-    #[cfg(feature = "exec-private-init")]
-    let private_initial = initial.is_some();
-    #[cfg(not(feature = "exec-private-init"))]
-    let private_initial = false;
 
     #[cfg(feature = "fixed-syscall-gates")]
     let mut fixed_install = FixedGateInstallation { complete: false };
@@ -917,12 +1037,9 @@ where
     // guest counter starts. Later installation consumes only this proof;
     // allocating the pool there would charge Tool setup to guest progress.
     let prepared_callbacks = install_try!(runtime::prepare_installed_callbacks());
-    #[cfg(feature = "exec-native-injection")]
-    if !skip_pmu {
-        install_try!(runtime::initialize_rcb_clock());
-    }
-    #[cfg(not(feature = "exec-native-injection"))]
-    install_try!(runtime::initialize_rcb_clock());
+    // SAFETY: this private installer is called only with the authenticated
+    // no-RCB image contract when skip_pmu is true; no Guest or callback is active.
+    install_try!(unsafe { runtime::prepare_private_rcb_clock(skip_pmu) });
     // The raw syscall, not libc's interposable getpid.
     let pid = Pid::from_raw(unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) } as i32);
     let subscriptions = T::subscriptions(rpc.config());
@@ -997,7 +1114,7 @@ where
         instruction_subscriptions.cpuid,
         LiteinstRuntime {
             stats,
-            #[cfg(feature = "exec-native-injection")]
+            #[cfg(feature = "exec-private-init")]
             no_rcb: skip_pmu,
         },
     );
@@ -1050,10 +1167,9 @@ where
         #[cfg(feature = "exec-private-init")]
         initial_control.map(|control| runtime::PrivateRuntimeImage {
             control,
-            #[cfg(feature = "exec-native-injection")]
             preparation: if skip_pmu {
-                // The native entry has qualified the actual private image and
-                // its no-patching Config. Ordinary/legacy installation retains
+                // The authenticated entry requires a no-RCB/no-patching image.
+                // Ordinary/legacy installation retains
                 // all existing patcher preparation, even in feature-on builds.
                 runtime::InstrumentationPreparation::NativeTrapOnly
             } else {

@@ -250,7 +250,18 @@ pub unsafe fn finish_successor_image<G: reverie::GlobalTool + 'static>(
 pub unsafe fn dispatch(event: &mut SyscallEvent) {
     match HANDLER.get() {
         // SAFETY: the caller satisfies the actual ToolHost dispatch contract.
-        Some(handler) => unsafe { handler.dispatch(event) },
+        Some(handler) => {
+            #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+            // SAFETY: this is the actual stable installed Tool boundary; the
+            // scoped borrow additionally requires the real Running continuation.
+            let _scope = unsafe {
+                super::continuation::enter_mapped_callback(
+                    event.context as *mut RegisterContext,
+                    (handler.as_ref() as *const dyn ToolHandler).cast::<()>() as usize,
+                )
+            };
+            unsafe { handler.dispatch(event) };
+        }
         None => event.result = -i64::from(libc::ENOSYS),
     }
 }
@@ -265,6 +276,14 @@ pub unsafe fn dispatch(event: &mut SyscallEvent) {
 /// retention is allowed. This is not a pre-activation or synthetic-frame API.
 pub unsafe fn dispatch_instruction(kind: InstructionEventKind, context: &mut RegisterContext) {
     let handler = instruction_handler();
+    #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+    // SAFETY: the actual stable installed Tool and unique live context.
+    let _scope = unsafe {
+        super::continuation::enter_mapped_callback(
+            core::ptr::from_mut(context),
+            (handler as *const dyn ToolHandler).cast::<()>() as usize,
+        )
+    };
     // SAFETY: the caller establishes this instruction's actual provenance.
     unsafe { handler.dispatch_instruction(kind, context) };
 }

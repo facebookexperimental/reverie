@@ -80,16 +80,14 @@ pub(super) fn present() -> bool {
 /// Decode only a real kernel-created x86-64 signal frame, after provenance
 /// checks and after the entry prefix has made the whole signal stack readable.
 /// The original image remains untouched for the kernel's rt_sigreturn.
-pub(super) unsafe fn from_signal_frame(
-    fpstate: *const libc::_libc_fpstate,
-) -> Result<Option<u32>, ()> {
+pub(super) unsafe fn from_signal_frame(fpstate: *const u8) -> Result<Option<u32>, ()> {
     let Some(layout) = LAYOUT.get().ok_or(())? else {
         return Ok(None);
     };
     if fpstate.is_null() {
         return Err(());
     }
-    unsafe { decode(fpstate.cast(), *layout).map(Some) }
+    unsafe { decode(fpstate, *layout).map(Some) }
 }
 
 unsafe fn decode(base: *const u8, layout: Layout) -> Result<u32, ()> {

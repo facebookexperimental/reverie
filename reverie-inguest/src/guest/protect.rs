@@ -29,7 +29,7 @@ use crate::trap::raw_syscall6;
 
 static COORDINATOR_FD: AtomicI32 = AtomicI32::new(-1);
 
-#[cfg(feature = "exec-native-injection")]
+#[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
 pub(super) fn coordinator_fd() -> Option<libc::c_int> {
     let fd = COORDINATOR_FD.load(Ordering::Acquire);
     (fd >= 0).then_some(fd)
@@ -297,9 +297,9 @@ pub fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
 /// The runtime-owned descriptors a syscall is kept from, sorted: the
 /// coordinator connection, and for guest syscalls also the Tool output socket.
 /// Returns the array and how many of its leading entries are in use.
-#[cfg(feature = "exec-native-injection")]
+#[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
 const PROTECTED_FD_CAPACITY: usize = 9;
-#[cfg(not(feature = "exec-native-injection"))]
+#[cfg(not(any(feature = "exec-native-injection", feature = "loader-private-runtime")))]
 const PROTECTED_FD_CAPACITY: usize = 2;
 
 fn protected_descriptors(guest_syscall: bool) -> ([u64; PROTECTED_FD_CAPACITY], usize) {
@@ -317,7 +317,7 @@ fn protected_descriptors(guest_syscall: bool) -> ([u64; PROTECTED_FD_CAPACITY], 
             count += 1;
         }
     }
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
     if guest_syscall {
         super::native_exec_fds::append_protected(&mut protected, &mut count);
     }
@@ -344,7 +344,7 @@ fn protected_descriptors(guest_syscall: bool) -> ([u64; PROTECTED_FD_CAPACITY], 
 /// than the runtime's own protected descriptors, which it spares or moves
 /// through their slots; a descriptor the guest closes is the guest's to close.
 pub unsafe fn protect_runtime_descriptors(event: &mut SyscallEvent, guest_syscall: bool) -> bool {
-    unsafe { protect_runtime_descriptors_inner(event, guest_syscall, false) }
+    unsafe { protect_runtime_descriptors_inner(event, guest_syscall, false, None) }
 }
 
 /// [`protect_runtime_descriptors`] for a guest syscall that a Tool dispatches
@@ -359,7 +359,7 @@ pub unsafe fn protect_runtime_descriptors(event: &mut SyscallEvent, guest_syscal
 ///
 /// As [`protect_runtime_descriptors`].
 pub unsafe fn protect_runtime_descriptors_before_tool(event: &mut SyscallEvent) -> bool {
-    unsafe { protect_runtime_descriptors_inner(event, true, true) }
+    unsafe { protect_runtime_descriptors_inner(event, true, true, None) }
 }
 
 /// A guest `close` or `close_range` that a Tool forwards after
@@ -406,11 +406,21 @@ unsafe fn protect_runtime_descriptors_inner(
     event: &mut SyscallEvent,
     guest_syscall: bool,
     leave_descriptor_changes_to_tool: bool,
+    extra: Option<u64>,
 ) -> bool {
     if leave_descriptor_changes_to_tool && is_descriptor_change_left_to_tool(event.number) {
         return false;
     }
-    let (mut protected, count) = protected_descriptors(guest_syscall);
+    let (slots, mut count) = protected_descriptors(guest_syscall);
+    let mut protected = [u64::MAX; PROTECTED_FD_CAPACITY + 1];
+    protected[..count].copy_from_slice(&slots[..count]);
+    if let Some(fd) = extra
+        && !protected[..count].contains(&fd)
+    {
+        protected[count] = fd;
+        count += 1;
+    }
+    protected[..count].sort_unstable();
     let protected = &mut protected[..count];
     if protected.is_empty() {
         return false;
@@ -440,12 +450,27 @@ unsafe fn protect_runtime_descriptors_inner(
         syscall_targets_event_fd(event, fd)
             || (guest_syscall
                 && reserved_fds::socket_call_names_descriptor(event.number, &event.args, fd))
+            || (extra == Some(fd)
+                && reserved_fds::socket_call_names_descriptor(event.number, &event.args, fd))
     }) {
         event.result = -i64::from(libc::EBADF);
     } else {
         return false;
     }
     true
+}
+
+/// Same runtime descriptor protections plus the mapped owner's actual sealed
+/// input lease. The ordinary owned startup socket is not an extra reserved FD.
+/// # Safety
+/// Same ownership contract as protect_runtime_descriptors; `extra` is borrowed
+/// from the sole retained NativeControl, not a new descriptor close authority.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub(crate) unsafe fn protect_tool_init_descriptors(
+    event: &mut SyscallEvent,
+    extra: Option<u64>,
+) -> bool {
+    unsafe { protect_runtime_descriptors_inner(event, false, false, extra) }
 }
 
 /// What to do with a guest syscall that may be a `dup2`/`dup3` onto the Tool
@@ -696,5 +721,51 @@ mod tests {
             take_refused_signal_controls(),
             RefusedSignalControls::default()
         );
+    }
+}
+
+#[cfg(all(test, feature = "loader-private-runtime", target_env = "musl"))]
+mod mapped_input_lease_tests {
+    use super::*;
+    use crate::guest::event::SyscallDispatch;
+    #[test]
+    fn actual_input_lease_is_guarded_with_kernel_fd_width_before_publication() {
+        let fd = 0x7fff_fffdu64;
+        for (number, args) in [
+            (libc::SYS_close, [fd | (1u64 << 32), 0, 0, 0, 0, 0]),
+            (libc::SYS_dup2, [12, fd | (1u64 << 32), 0, 0, 0, 0]),
+            (libc::SYS_fcntl, [fd, libc::F_SETFD as u64, 0, 0, 0, 0]),
+            (libc::SYS_sendmsg, [fd, 0, 0, 0, 0, 0]),
+        ] {
+            let mut event = SyscallEvent {
+                number,
+                args,
+                instruction_pointer: 0,
+                result: 0,
+                context: 0,
+                dispatch: SyscallDispatch::Trap,
+                guest_pkru: None,
+            };
+            // Every case is numerically refused before any physical operation.
+            assert!(unsafe { protect_tool_init_descriptors(&mut event, Some(fd)) });
+            assert_eq!(event.result, -i64::from(libc::EBADF));
+        }
+        // An ordinary newly owned stream is not this extra input lease; neither
+        // source nor target field is broadened into an all-descriptor guard.
+        let stream = fd - 1;
+        assert!(!reserved_fds::socket_call_names_descriptor(
+            libc::SYS_connect,
+            &[stream, 0, 0, 0, 0, 0],
+            fd
+        ));
+        assert!(!reserved_fds::names_descriptor(
+            libc::SYS_close,
+            &[stream, 0, 0, 0, 0, 0],
+            fd
+        ));
+        assert!(reserved_fds::close_range_covers(
+            &[fd - 1, fd + 1, 0, 0, 0, 0],
+            &[fd]
+        ));
     }
 }

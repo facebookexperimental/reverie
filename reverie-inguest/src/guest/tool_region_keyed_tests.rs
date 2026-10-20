@@ -58,6 +58,39 @@ fn owner() -> Result<&'static KeyedToolRegion, i32> {
     unsafe { KeyedToolRegion::reserve_native() }.map_err(|_| 91)
 }
 
+// The real key must be open before even touching Control. This observes
+// the actual owner lock; no key-zero owner or synthetic bitmap is substituted.
+fn image_bits(owner: &KeyedToolRegion) -> Result<(), i32> {
+    let key = owner.key_descriptor().value();
+    check((1..16).contains(&key), 80)?;
+    check(rights() & (3_u32 << (2 * key)) == 0, 81)?;
+    let mut guard = keyed::fixture_hold_allocation(owner).map_err(|_| 82)?;
+    let bitmap = guard.bitmap();
+    for page in 917503..1044481 {
+        check(bitmap[page / 64] & (1_u64 << (page % 64)) != 0, 83)?;
+    }
+    for page in [917502, 1044481] {
+        check(bitmap[page / 64] & (1_u64 << (page % 64)) == 0, 84)?;
+    }
+    Ok(())
+}
+
+fn fresh_owner_bitmap(owner: &KeyedToolRegion) -> Result<(), i32> {
+    image_bits(owner)?;
+    let mut guard = keyed::fixture_hold_allocation(owner).map_err(|_| 82)?;
+    let bitmap = guard.bitmap();
+    for page in DATA_FIRST..DATA_END {
+        let expected = (65535..73729).contains(&page)
+            || (81919..90113).contains(&page)
+            || (917503..1044481).contains(&page);
+        check(
+            (bitmap[page / 64] & (1_u64 << (page % 64)) != 0) == expected,
+            85,
+        )?;
+    }
+    Ok(())
+}
+
 fn lease(owner: &'static KeyedToolRegion, bytes: usize) -> Result<KeyedStackLease, i32> {
     unsafe { owner.lease_stack(bytes) }.map_err(|_| 92)
 }
@@ -408,6 +441,7 @@ fn reuse_resets_keys_and_retention_keeps_owner_key() {
         || {
             leader(|| {
                 let owner = owner()?;
+                fresh_owner_bitmap(owner)?;
                 check(
                     published_owner().is_none() && fixed_arena_backing().is_none(),
                     1,
@@ -430,6 +464,7 @@ fn reuse_resets_keys_and_retention_keeps_owner_key() {
                     unsafe { ((base + offset) as *mut u8).write_volatile(0x4d) };
                 }
                 drop(large);
+                image_bits(owner)?;
                 let small = lease(owner, PAGE)?;
                 check(small.belongs_to(owner) && small.base() == base, 4)?;
                 for offset in 0..PAGE {
@@ -450,6 +485,7 @@ fn reuse_resets_keys_and_retention_keeps_owner_key() {
                     8,
                 )?;
                 drop(next);
+                image_bits(owner)?;
                 held_key_stays_owned(owner.key_descriptor().value())?;
                 check(
                     unsafe { (retained.base() as *const u8).read_volatile() } == 0x35,
@@ -644,6 +680,7 @@ fn ready_fork_preserves_cow_occupied_stack_and_key() {
         || {
             leader(|| {
                 let owner = owner()?;
+                fresh_owner_bitmap(owner)?;
                 let retained = lease(owner, PAGE)?.retain();
                 let base = retained.base();
                 let key = owner.key_descriptor();
@@ -653,6 +690,7 @@ fn ready_fork_preserves_cow_occupied_stack_and_key() {
                 if child == 0 {
                     let result = (|| {
                         let inherited = self::owner()?;
+                        image_bits(inherited)?;
                         check(
                             core::ptr::eq(owner, inherited)
                                 && inherited.key_descriptor() == key
@@ -664,6 +702,7 @@ fn ready_fork_preserves_cow_occupied_stack_and_key() {
                         let next = lease(inherited, PAGE)?;
                         check(next.base() == base + 3 * PAGE, 3)?;
                         let _retained = next.retain();
+                        image_bits(inherited)?;
                         held_key_stays_owned(key.value())
                     })();
                     raw_exit(result.err().unwrap_or(0));
@@ -673,6 +712,7 @@ fn ready_fork_preserves_cow_occupied_stack_and_key() {
                 let next = lease(owner, PAGE)?;
                 check(next.base() == base + 3 * PAGE, 5)?;
                 drop(next);
+                image_bits(owner)?;
                 held_key_stays_owned(key.value())
             })
         },

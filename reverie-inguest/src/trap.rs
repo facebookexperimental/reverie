@@ -32,11 +32,20 @@ use crate::seccomp::TrustedGate;
 use crate::signal;
 #[cfg(feature = "fixed-syscall-gates")]
 mod fixed_gates;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use fixed_gates::mapped_initial_gate_reference;
 pub mod frame;
 mod panic_report;
 mod pkru;
 
 /// Frozen optional gate ABI. These constants emit no default-path code.
+/// The explicit musl private-loader artifact selects its reserved runtime page;
+/// this coordinate selection does not authenticate or publish that mapping.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+#[doc(hidden)]
+pub const FIXED_GATE_BASE: u64 = 0x6000_e100_1000;
+/// Legacy gate ABI, including GNU builds with all features enabled.
+#[cfg(not(all(feature = "loader-private-runtime", target_env = "musl")))]
 #[doc(hidden)]
 pub const FIXED_GATE_BASE: u64 = 0x5000_0000_0000;
 #[doc(hidden)]
@@ -699,6 +708,29 @@ pub unsafe fn install_handler_with_backing(
     use_alt_stack: bool,
     backing: crate::guest::tool_region::StackBacking,
 ) -> io::Result<()> {
+    let prepared = prepare_handler()?;
+    let handler = prepared.entry();
+    if use_alt_stack {
+        unsafe { signal::install_alt_stack_with_backing(backing)? };
+    }
+    unsafe { signal::install_sigsys_handler(handler, use_alt_stack) }
+}
+
+/// Prepared real syscall-handler entry. This token owns no frontend or mapping.
+pub(crate) struct PreparedHandler {
+    entry: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void),
+}
+impl PreparedHandler {
+    /// The selected existing generic/private bridge after real frame/PKRU preparation.
+    pub(crate) fn entry(
+        &self,
+    ) -> unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) {
+        self.entry
+    }
+}
+/// Finish possibly allocating/trapping preparation before an owned frontend
+/// replacement interval. This does not register a stack or change a disposition.
+pub(crate) fn prepare_handler() -> io::Result<PreparedHandler> {
     panic_report::install();
     frame::initialize()?;
     let ospke = pkru::initialize()?;
@@ -713,15 +745,34 @@ pub unsafe fn install_handler_with_backing(
     } else {
         handler
     };
-    if use_alt_stack {
-        unsafe { signal::install_alt_stack_with_backing(backing)? };
-    }
-    unsafe { signal::install_sigsys_handler(handler, use_alt_stack) }
+    Ok(PreparedHandler { entry: handler })
 }
 
 #[cfg(feature = "exec-private-init")]
 pub(crate) unsafe fn adopt_authenticated_initial_gate() -> io::Result<()> {
     unsafe { fixed_gates::adopt_authenticated_initial_page() }
+}
+
+/// Adopt the same fixed gate before mapped ToolRegion publication.
+///
+/// # Safety
+/// The actual retained mapped first-image producer owns the complete immutable
+/// RX page and inherited qualified filter at the compiled layout coordinates,
+/// excludes concurrent/async/guest entry and spends its transition before this
+/// call. Bytes alone never authenticate that physical ownership. Every error
+/// requires immediate owned nonallocating terminal refusal with host kill/wait
+/// and live mappings retained; no retry, fallback or scalar-ready activation.
+/// Private TLS/kernel readbacks and subsequent region adoption remain separate.
+/// `expected` satisfies the independent immutable same-source reference contract
+/// of fixed_gates::adopt_mapped_initial_page; it is not an executed-page snapshot.
+#[cfg(all(
+    feature = "exec-private-init",
+    feature = "loader-private-runtime",
+    target_env = "musl"
+))]
+pub(crate) unsafe fn adopt_mapped_initial_gate(expected: &'static [u8; 4096]) -> Result<(), i32> {
+    // SAFETY: forwarded complete physical-producer contract.
+    unsafe { fixed_gates::adopt_mapped_initial_page(expected) }
 }
 
 /// Verify the controlled native bootstrap's physical page without publication.

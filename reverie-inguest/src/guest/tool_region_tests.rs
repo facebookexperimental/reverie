@@ -483,14 +483,28 @@ fn altstack() -> libc::stack_t {
 
 /// `reverie-loader` owns the windows its loader and runtime images are linked
 /// at; they must lie inside this reservation, clear of the control area, both
-/// fixed arenas with their guards, and the top guard page.
+/// fixed arenas with their guards, and the top guard page. The permanent
+/// bitmap envelope covers exactly both adjacent windows and exterior guards;
+/// this does not claim an independently guarded loaded image or adoption.
 #[test]
 fn loader_image_windows_fit_the_reservation_layout() {
     use reverie_loader::artifact::LOADER_WINDOW;
     use reverie_loader::artifact::RUNTIME_WINDOW;
     use reverie_loader::artifact::TOOL_REGION;
     assert_eq!(TOOL_REGION, BASE as u64..END as u64);
+    assert_eq!(PAGE as u64, reverie_loader::image::PAGE_SIZE);
+    assert_eq!(LOADER_WINDOW.end, RUNTIME_WINDOW.start);
+    assert_eq!(
+        BASE + arena::IMAGE_BAND.0 * PAGE,
+        LOADER_WINDOW.start as usize - PAGE,
+    );
+    assert_eq!(
+        BASE + arena::IMAGE_BAND.1 * PAGE,
+        RUNTIME_WINDOW.end as usize + PAGE,
+    );
     for window in [LOADER_WINDOW, RUNTIME_WINDOW] {
+        assert!(window.start.is_multiple_of(PAGE as u64));
+        assert!(window.end.is_multiple_of(PAGE as u64));
         let first = (window.start as usize - BASE) / PAGE;
         let end = (window.end as usize - BASE) / PAGE;
         assert!(DATA_FIRST <= first && end <= DATA_END, "{window:x?}");
@@ -630,10 +644,17 @@ fn rounding_invalid_sizes_and_real_bitmap_exhaustion() {
         );
         drop(one);
         drop(two);
-        // Exhaust the same complete real bitmap, now partitioned by the two
-        // permanent arena/guard bands. No searchable capacity is hidden.
-        let bands = [(65535, 73729), (81919, 90113)];
-        assert_eq!(bands, [arena::TOOL_BAND, arena::PATCH_BAND]);
+        // Exhaust the complete production bitmap, including the permanent
+        // image envelope and its two exterior guards. No capacity is hidden.
+        let bands = [(65535, 73729), (81919, 90113), (917503, 1044481)];
+        assert_eq!([bands[0], bands[1]], [arena::TOOL_BAND, arena::PATCH_BAND]);
+        assert_eq!(
+            bands[2],
+            (
+                (reverie_loader::artifact::LOADER_WINDOW.start as usize - BASE) / PAGE - 1,
+                (reverie_loader::artifact::RUNTIME_WINDOW.end as usize - BASE) / PAGE + 1,
+            )
+        );
         let searchable = DATA_END - DATA_FIRST;
         assert_eq!(searchable, 1048319);
         {
@@ -650,12 +671,17 @@ fn rounding_invalid_sizes_and_real_bitmap_exhaustion() {
                 );
             }
         }
-        let free = [(256, 65535), (73729, 81919), (90113, 1048575)];
-        let lengths = [65279, 8190, 958462];
+        let free = [
+            (256, 65535),
+            (73729, 81919),
+            (90113, 917503),
+            (1044481, 1048575),
+        ];
+        let lengths = [65279, 8190, 827390, 4094];
         let available: usize = lengths.iter().sum();
         let permanent: usize = bands.iter().map(|&(start, end)| end - start).sum();
-        assert_eq!(available, 1031931);
-        assert_eq!(permanent, 8194 + 8194);
+        assert_eq!(available, 904953);
+        assert_eq!(permanent, 8194 + 8194 + 126978);
         assert_eq!(available + permanent, searchable);
         assert_eq!(
             region.claim(searchable + 1).unwrap_err().raw_os_error(),
@@ -705,6 +731,210 @@ fn rounding_invalid_sizes_and_real_bitmap_exhaustion() {
             }
         }
     });
+}
+
+// Test-side literal geometry remains independent of the implementation under
+// test. The real bitmap/claim/protection assertions below are the admission.
+const IMAGE_ENVELOPE: (usize, usize) = (917503, 1044481);
+
+fn assert_image_envelope_owned(region: &ToolRegion) {
+    let mut held = region.lock().unwrap();
+    let bitmap = held.bitmap();
+    for page in IMAGE_ENVELOPE.0..IMAGE_ENVELOPE.1 {
+        assert_ne!(
+            bitmap[page / 64] & (1_u64 << (page % 64)),
+            0,
+            "image envelope lost permanent ownership at page {page}"
+        );
+    }
+}
+
+#[test]
+fn image_envelope_excludes_real_boundary_claims_and_stack_reuse() {
+    isolated(
+        "image_envelope_excludes_real_boundary_claims_and_stack_reuse",
+        || {
+            let region = ToolRegion::reserve().unwrap();
+            // Use real first-fit claims, not clearing permanent bits or moving
+            // a synthetic allocation cursor, to consume the preceding free runs.
+            assert_eq!(region.claim(65279).unwrap(), 256);
+            assert_eq!(region.claim(8190).unwrap(), 73729);
+            assert_eq!(region.claim(827388).unwrap(), 90113);
+            // Two pages remain immediately below the envelope. A three-page
+            // claim must skip the image band, but those two pages remain usable.
+            // This assertion independently fails the old production allocator.
+            assert_eq!(region.claim(3).unwrap(), 1044481);
+            assert_eq!(region.claim(2).unwrap(), 917501);
+            assert_image_envelope_owned(region);
+
+            let stack = region.stack(PAGE).unwrap();
+            assert_eq!(stack.start, 1044484);
+            assert_eq!(stack.pages, 3);
+            assert_eq!(stack.base(), BASE + 1044485 * PAGE);
+            assert_eq!(stack.usable_bytes(), PAGE);
+            assert_eq!(permissions_at(stack.base()), "rw-p");
+            zero_interior(&stack);
+            dirty_interior(&stack);
+            guard(stack.base() - PAGE);
+            guard(stack.top());
+            let reused = stack.start;
+            drop(stack);
+            assert_image_envelope_owned(region);
+            let replacement = region.stack(PAGE).unwrap();
+            assert_eq!(replacement.start, reused);
+            zero_interior(&replacement);
+            drop(replacement);
+            assert_image_envelope_owned(region);
+
+            // Claims do not enable image bytes or either exterior guard. The
+            // adjacent loader/runtime windows share one envelope in this slice;
+            // no independently protected inter-image guard is being claimed.
+            for page in [917503, 917504, 921599, 921600, 1044479, 1044480] {
+                assert_eq!(permissions_at(BASE + page * PAGE), "---p");
+                guard(BASE + page * PAGE);
+            }
+            assert_eq!(region.claim(4091).unwrap(), 1044484);
+            assert!(owns(region, DATA_FIRST, DATA_END - DATA_FIRST));
+            assert_eq!(
+                region.claim(1).unwrap_err().raw_os_error(),
+                Some(libc::ENOMEM)
+            );
+            assert_eq!(
+                region.stack(PAGE).unwrap_err().raw_os_error(),
+                Some(libc::ENOMEM)
+            );
+            assert_image_envelope_owned(region);
+        },
+    );
+}
+
+// Owns exactly the unpublished anonymous mapping acquired by the dirty-input
+// control. It never unmaps a published owner or an unrelated colliding mapping.
+struct FreshImageBandControlMapping {
+    address: usize,
+}
+
+impl Drop for FreshImageBandControlMapping {
+    fn drop(&mut self) {
+        assert_eq!(
+            raw(
+                libc::SYS_munmap,
+                [self.address as u64, BYTES as u64, 0, 0, 0, 0]
+            ),
+            0,
+            "release only this isolated control's original fresh mapping"
+        );
+    }
+}
+
+fn dirty_image_band_refuses_before_arena_side_effects(page: usize) {
+    assert!((IMAGE_ENVELOPE.0..IMAGE_ENVELOPE.1).contains(&page));
+    assert!(REGION.get().is_none());
+    let _initializing = InitializationGuard::acquire().unwrap();
+    let address = map(BASE, BYTES, libc::PROT_NONE, libc::MAP_FIXED_NOREPLACE);
+    let _mapping = FreshImageBandControlMapping { address };
+    assert_eq!(address, BASE);
+    assert_eq!(
+        protection(
+            BASE + PAGE,
+            CONTROL_BYTES - PAGE,
+            libc::PROT_READ | libc::PROT_WRITE
+        ),
+        0
+    );
+    let control = (BASE + PAGE) as *mut Control;
+    // SAFETY: this isolated process holds the real initialization gate and owns
+    // this exact fresh, unpublished, anonymous mapping. The writable Control is
+    // initially zero, as on the ordinary reserve path; no live allocator or
+    // lease exists. Seed only the chosen image-band ownership cell, and a byte
+    // sentinel in the uninitialized metadata storage, to exercise actual dirty
+    // input preflight. No published allocator state is altered.
+    unsafe {
+        core::ptr::addr_of_mut!((*control).held).write(AtomicBool::new(false));
+        (*control)
+            .occupied
+            .get()
+            .cast::<u64>()
+            .add(page / 64)
+            .write(1_u64 << (page % 64));
+        core::ptr::write_bytes(arena::METADATA_ADDRESS as *mut u8, 0xa5, PAGE);
+    }
+    // Snapshot the real complete control area, including all bitmap cells and
+    // arena metadata, not just the dirty word or a source-level constant.
+    // SAFETY: every byte belongs to this fresh mapping and is initialized.
+    let before =
+        unsafe { core::slice::from_raw_parts((BASE + PAGE) as *const u8, CONTROL_BYTES - PAGE) }
+            .to_vec();
+    for bottom in [arena::TOOL_BOTTOM, arena::PATCH_BOTTOM] {
+        assert_eq!(permissions_at(bottom), "---p");
+        assert_eq!(permissions_at(bottom + arena::ARENA_BYTES - 1), "---p");
+    }
+    // SAFETY: the exact fresh-owner/gate/Control conditions above satisfy the
+    // real initializer's contract. Its duty is to reject occupied image input,
+    // without changing any protection, bitmap word or metadata sentinel.
+    let result = unsafe { arena::initialize_fixed_arenas(control) };
+    assert_eq!(result, Err(libc::EINVAL), "dirty image-band page {page}");
+    assert!(
+        REGION.get().is_none(),
+        "dirty input must remain unpublished"
+    );
+    for (offset, byte) in before.into_iter().enumerate() {
+        // SAFETY: mapping remains live and readable until _mapping drops.
+        let after = unsafe { core::ptr::read_volatile((BASE + PAGE + offset) as *const u8) };
+        assert_eq!(
+            after, byte,
+            "dirty image-band refusal changed control byte {offset}"
+        );
+    }
+    for bottom in [arena::TOOL_BOTTOM, arena::PATCH_BOTTOM] {
+        for address in [
+            bottom - PAGE,
+            bottom,
+            bottom + arena::ARENA_BYTES - 1,
+            bottom + arena::ARENA_BYTES,
+        ] {
+            assert_eq!(permissions_at(address), "---p");
+            guard(address);
+        }
+    }
+    for address in [
+        BASE + (page * PAGE),
+        BASE + 917503 * PAGE,
+        BASE + 1044480 * PAGE,
+    ] {
+        assert_eq!(permissions_at(address), "---p");
+        guard(address);
+    }
+}
+
+#[test]
+fn dirty_image_band_lower_edge_refuses_before_arena_side_effects() {
+    isolated(
+        "dirty_image_band_lower_edge_refuses_before_arena_side_effects",
+        || {
+            dirty_image_band_refuses_before_arena_side_effects(917503);
+        },
+    );
+}
+
+#[test]
+fn dirty_image_band_full_word_interior_refuses_before_arena_side_effects() {
+    isolated(
+        "dirty_image_band_full_word_interior_refuses_before_arena_side_effects",
+        || {
+            dirty_image_band_refuses_before_arena_side_effects(950017);
+        },
+    );
+}
+
+#[test]
+fn dirty_image_band_upper_edge_refuses_before_arena_side_effects() {
+    isolated(
+        "dirty_image_band_upper_edge_refuses_before_arena_side_effects",
+        || {
+            dirty_image_band_refuses_before_arena_side_effects(1044480);
+        },
+    );
 }
 
 #[test]

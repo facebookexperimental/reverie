@@ -56,6 +56,8 @@ thread_local! {
     static READY: Cell<bool> = const { Cell::new(false) };
     static OWNER: Cell<*mut Continuation> = const { Cell::new(core::ptr::null_mut()) };
     static PENDING: Cell<Option<Pending>> = const { Cell::new(None) };
+    #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+    static MAPPED_CALLBACK: Cell<Option<MappedCallbackStamp>> = const { Cell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,12 +311,153 @@ struct Continuation {
     context: RegisterContext,
     owner_tid: i64,
     generation: u64,
+    // Authentic outer kernel mask, captured before the first sigreturn. SavedState
+    // intentionally has no mask; instruction callbacks need this fact too.
+    #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+    mapped_signal_mask: u64,
     #[cfg(feature = "exec-native-injection")]
     native_exec_resume: Option<NativeExecResumeReceipt>,
     phase: Phase,
     entries: u64,
     callbacks: u64,
     completions: u64,
+}
+
+// Scoped borrow of the existing Running continuation, not a transferable
+// permission/owner. Only the actual installed Tool dispatch boundary sets it.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct MappedCallbackStamp {
+    owner: usize,
+    generation: u64,
+    host: usize,
+}
+
+#[cfg(all(
+    feature = "loader-private-runtime",
+    target_env = "musl",
+    feature = "coordinator-rpc"
+))]
+pub(super) struct MappedCallbackScope {
+    stamp: MappedCallbackStamp,
+    _thread: core::marker::PhantomData<*mut ()>,
+}
+
+#[cfg(all(
+    feature = "loader-private-runtime",
+    target_env = "musl",
+    feature = "coordinator-rpc"
+))]
+impl Drop for MappedCallbackScope {
+    fn drop(&mut self) {
+        if MAPPED_CALLBACK.get() != Some(self.stamp) {
+            fatal();
+        }
+        MAPPED_CALLBACK.set(None);
+    }
+}
+
+// Used by both the real entry and nested frame validator. No reference to the
+// full Continuation or its mutably borrowed RegisterContext crosses Tool code.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+fn mapped_running_owner(pointer: *mut Continuation) -> Option<u64> {
+    if pointer.is_null() || PENDING.get().is_none() {
+        return None;
+    }
+    // SAFETY: OWNER is this thread's retained continuation; these disjoint
+    // fields are not the live mutable Tool RegisterContext.
+    unsafe {
+        let generation = (&raw const (*pointer).generation).read();
+        let tid = (&raw const (*pointer).owner_tid).read();
+        if (&raw const (*pointer).phase).read() != Phase::Running
+            || generation == 0
+            || tid != current_tid()
+            || super::exec_private::callback_native_tid().map(i64::from) != Some(tid)
+        {
+            return None;
+        }
+        Some(generation)
+    }
+}
+
+// Private unsafe API: actual installed Tool caller, never a numeric callback
+// token. Legacy/unmapped callers retain their previous behavior. The bounded
+// first implementation refuses patched-hook contexts not owned by Running.
+#[cfg(all(
+    feature = "loader-private-runtime",
+    target_env = "musl",
+    feature = "coordinator-rpc"
+))]
+pub(super) unsafe fn enter_mapped_callback(
+    context: *mut RegisterContext,
+    host: usize,
+) -> Option<MappedCallbackScope> {
+    if !super::exec_private::mapped_callback_origin() {
+        return None;
+    }
+    let pointer = OWNER.get();
+    let Some(generation) = mapped_running_owner(pointer) else {
+        fatal()
+    };
+    // SAFETY: genuine retained OWNER, raw address comparison forms no alias.
+    if host == 0
+        || context != unsafe { &raw mut (*pointer).context }
+        || MAPPED_CALLBACK.get().is_some()
+    {
+        fatal();
+    }
+    let stamp = MappedCallbackStamp {
+        owner: pointer as usize,
+        generation,
+        host,
+    };
+    MAPPED_CALLBACK.set(Some(stamp));
+    Some(MappedCallbackScope {
+        stamp,
+        _thread: core::marker::PhantomData,
+    })
+}
+
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub(super) struct MappedCallbackFacts {
+    pub(super) host: usize,
+    pub(super) mask: u64,
+}
+
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+fn same_mapped_scope(stamp: MappedCallbackStamp, owner: usize, generation: u64) -> bool {
+    stamp.owner != 0
+        && stamp.host != 0
+        && stamp.generation != 0
+        && stamp.owner == owner
+        && stamp.generation == generation
+}
+
+// Actual saved Tool RSP must belong to the Running continuation's lease in the
+// one published region. An active ToolCallbackGuard alone is insufficient.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub(super) fn mapped_callback_facts(
+    saved_rsp: usize,
+    region: &'static super::tool_region::ToolRegion,
+) -> Option<MappedCallbackFacts> {
+    let stamp = MAPPED_CALLBACK.get()?;
+    let pointer = OWNER.get();
+    let generation = mapped_running_owner(pointer)?;
+    if !same_mapped_scope(stamp, pointer as usize, generation) {
+        return None;
+    }
+    // SAFETY: disjoint immutable stack metadata and saved mask; no context
+    // reference is formed while Tool holds its unique mutable register block.
+    unsafe {
+        let lease = (&*(&raw const (*pointer).stack)).region.as_ref()?;
+        if !lease.belongs_to(region) || saved_rsp < lease.base() || saved_rsp >= lease.top() {
+            return None;
+        }
+        Some(MappedCallbackFacts {
+            host: stamp.host,
+            mask: (&raw const (*pointer).mapped_signal_mask).read(),
+        })
+    }
 }
 
 fn current_tid() -> i64 {
@@ -405,6 +548,8 @@ pub fn initialize_with_stack_backing(backing: StackBacking) -> io::Result<()> {
             context: RegisterContext::default(),
             owner_tid: current_tid(),
             generation: 0,
+            #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+            mapped_signal_mask: 0,
             #[cfg(feature = "exec-native-injection")]
             native_exec_resume: None,
             phase: Phase::Idle,
@@ -537,6 +682,10 @@ fn prepare_signal_for(
         return Err(FrameError);
     }
     owner.context = context_from_image(&owner.saved, instruction);
+    #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+    {
+        owner.mapped_signal_mask = frame.signal_mask();
+    }
     #[cfg(feature = "exec-native-injection")]
     {
         // SavedState has no mask. Only the kernel uc_sigmask is the desired
@@ -1141,6 +1290,8 @@ mod tests {
             context: RegisterContext::default(),
             owner_tid: current_tid(),
             generation: 0,
+            #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+            mapped_signal_mask: 0,
             #[cfg(feature = "exec-native-injection")]
             native_exec_resume: None,
             phase: Phase::Idle,
@@ -1153,5 +1304,31 @@ mod tests {
         assert_eq!(owner.saved.registers[libc::REG_RIP as usize], 0x7003);
         owner.context.instruction_pointer = u64::MAX - 1;
         assert!(commit_context(&mut owner, 3).is_err());
+    }
+
+    #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+    #[test]
+    fn mapped_callback_scope_requires_exact_live_owner_generation_and_host() {
+        let stamp = MappedCallbackStamp {
+            owner: 0x1000,
+            generation: 7,
+            host: 0x2000,
+        };
+        assert!(same_mapped_scope(stamp, 0x1000, 7));
+        assert!(!same_mapped_scope(stamp, 0x1000, 8));
+        assert!(!same_mapped_scope(stamp, 0x3000, 7));
+        assert!(!same_mapped_scope(
+            MappedCallbackStamp { host: 0, ..stamp },
+            0x1000,
+            7
+        ));
+        assert!(!same_mapped_scope(
+            MappedCallbackStamp {
+                generation: 0,
+                ..stamp
+            },
+            0x1000,
+            0
+        ));
     }
 }

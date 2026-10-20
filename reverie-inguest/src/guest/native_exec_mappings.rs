@@ -4,6 +4,8 @@
 //! a current mapping observation; the unsafe installed owner supplies immutable
 //! catalog identity, the protected address ranges and writer exclusion.
 
+use reverie_syscalls::linux_abi;
+
 use super::native_exec_arguments::ArgumentRange;
 
 const PAGE: u64 = 4096;
@@ -374,14 +376,14 @@ fn check_backing(
             if !backing_shape(backing) || stat.st_mode != mode {
                 return Err("native root executable mode differs");
             }
-            let mut sx = core::mem::MaybeUninit::<libc::statx>::zeroed();
+            let mut sx = core::mem::MaybeUninit::<linux_abi::Statx>::zeroed();
             if raw(
                 libc::SYS_statx,
                 [
                     fd as u64,
                     c"".as_ptr() as u64,
                     (libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) as u64,
-                    libc::STATX_MNT_ID as u64,
+                    linux_abi::STATX_MNT_ID as u64,
                     sx.as_mut_ptr() as u64,
                     0,
                 ],
@@ -390,7 +392,7 @@ fn check_backing(
                 return Err("native root executable mount identity unavailable");
             }
             let sx = unsafe { sx.assume_init() };
-            if sx.stx_mask & libc::STATX_MNT_ID == 0 || sx.stx_mnt_id != mount_id {
+            if sx.stx_mask & linux_abi::STATX_MNT_ID == 0 || sx.stx_mnt_id != mount_id {
                 return Err("native root executable mount identity differs");
             }
             // Linux x86_64 uses this exact layout for SYS_fstatfs;
@@ -398,6 +400,7 @@ fn check_backing(
             const {
                 assert!(core::mem::size_of::<libc::statfs64>() == 120);
                 assert!(core::mem::align_of::<libc::statfs64>() == 8);
+                assert!(core::mem::offset_of!(libc::statfs64, f_type) == 0);
                 assert!(core::mem::offset_of!(libc::statfs64, f_flags) == 80);
             }
             let mut fs = core::mem::MaybeUninit::<libc::statfs64>::zeroed();
@@ -412,10 +415,15 @@ fn check_backing(
                 return Err("native root executable filesystem policy unavailable");
             }
             let fs = unsafe { fs.assume_init() };
-            let required = (libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV) as i64;
-            if fs.f_type != libc::TMPFS_MAGIC
-                || fs.f_flags & required != required
-                || fs.f_flags & libc::ST_NOEXEC as i64 != 0
+            // These kernel words have the same eight-byte representation in
+            // GNU and musl, which expose different signedness. Preserve every
+            // bit before comparing the existing mount-type and policy masks.
+            let filesystem_type = u64::from_ne_bytes(fs.f_type.to_ne_bytes());
+            let mount_flags = u64::from_ne_bytes(fs.f_flags.to_ne_bytes());
+            let required = libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV;
+            if filesystem_type != libc::TMPFS_MAGIC as u64
+                || mount_flags & required != required
+                || mount_flags & libc::ST_NOEXEC != 0
             {
                 return Err("native root executable filesystem policy differs");
             }
@@ -641,21 +649,21 @@ mod tests {
                 let file = std::fs::File::open(&target).unwrap();
                 let fd = file.as_raw_fd();
                 let metadata = file.metadata().unwrap();
-                let mut sx = core::mem::MaybeUninit::<libc::statx>::zeroed();
+                let mut sx = core::mem::MaybeUninit::<linux_abi::Statx>::zeroed();
                 assert_eq!(
                     unsafe {
-                        libc::statx(
+                        linux_abi::statx(
                             fd,
                             c"".as_ptr(),
                             libc::AT_EMPTY_PATH,
-                            libc::STATX_MNT_ID,
+                            linux_abi::STATX_MNT_ID,
                             sx.as_mut_ptr(),
                         )
                     },
                     0
                 );
                 let sx = unsafe { sx.assume_init() };
-                assert_ne!(sx.stx_mask & libc::STATX_MNT_ID, 0);
+                assert_ne!(sx.stx_mask & linux_abi::STATX_MNT_ID, 0);
                 let backing = ExecutableBacking::ReadonlyRoot {
                     mount_id: sx.stx_mnt_id,
                     mode: metadata.mode(),

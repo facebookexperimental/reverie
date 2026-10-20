@@ -303,6 +303,35 @@ impl<'signal> SignalFrame<'signal> {
         })
     }
 
+    // Additional ownership check for an already genuine parsed frame. This
+    // neither accepts synthetic frames nor exports their raw addresses.
+    #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+    pub(crate) fn on_owned_signal_stack(&self, lo: usize, hi: usize, restorer: usize) -> bool {
+        let address = self.context as usize;
+        if lo >= hi
+            || address.checked_sub(8).is_none_or(|start| start < lo)
+            || address
+                .checked_add(CONTEXT_BYTES + 128)
+                .is_none_or(|end| end > hi)
+        {
+            return false;
+        }
+        // SAFETY: from_kernel_frame owns this genuine kernel frame prefix.
+        if unsafe { self.context.sub(8).cast::<usize>().read_unaligned() } != restorer {
+            return false;
+        }
+        let bytes = match self.kind {
+            FpKind::Absent => return true,
+            FpKind::Legacy => LEGACY_BYTES,
+            FpKind::Xsave { bytes, .. } => match bytes.checked_add(4) {
+                Some(bytes) => bytes,
+                None => return false,
+            },
+        };
+        let fp = self.fp as usize;
+        fp >= lo && fp.checked_add(bytes).is_some_and(|end| end <= hi)
+    }
+
     /// Read an architectural greg, without borrowing libc's oversized context.
     pub fn register(&self, index: usize) -> i64 {
         assert!(index < 19);
@@ -720,5 +749,223 @@ mod tests {
         assert_eq!(frame.pkru(), Ok(None));
         assert_eq!(frame.set_pkru(None), Ok(()));
         assert_eq!(frame.set_pkru(Some(0)), Err(FrameError));
+    }
+}
+
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub(crate) struct BootstrapPrefix<'a> {
+    context: *mut u8,
+    _borrow: core::marker::PhantomData<&'a mut ()>,
+}
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+impl<'a> BootstrapPrefix<'a> {
+    /// # Safety
+    /// Exclusive actual kernel SA_SIGINFO pointers for this invocation; complete
+    /// frame/FP backing remains kernel-owned and live within the qualified
+    /// bootstrap altstack. Memory access is enabled before any Rust entry.
+    pub(crate) unsafe fn from_bootstrap_raw(
+        context: *mut core::ffi::c_void,
+        info: *const core::ffi::c_void,
+        stack_lo: usize,
+        stack_hi: usize,
+        expected_restorer: usize,
+        expected_mask: u64,
+    ) -> Result<Self, FrameError> {
+        let c = context as usize;
+        if c & 7 != 0
+            || c.checked_sub(8).is_none_or(|n| n < stack_lo)
+            || c.checked_add(CONTEXT_BYTES) != Some(info as usize)
+            || c.checked_add(CONTEXT_BYTES + 128)
+                .is_none_or(|n| n > stack_hi)
+        {
+            return Err(FrameError);
+        }
+        let context = context.cast::<u8>();
+        let info = info.cast::<u8>();
+        // SAFETY: genuine pointers and checked owned prefix/info interval.
+        unsafe {
+            if context.sub(8).cast::<usize>().read_unaligned() != expected_restorer
+                || info.cast::<i32>().read_unaligned() != libc::SIGSYS
+                || info.add(4).cast::<i32>().read_unaligned() != 0
+                || info.add(8).cast::<i32>().read_unaligned() != 1 // SYS_SECCOMP
+                || info.add(28).cast::<u32>().read_unaligned() != 0xc000_003e
+                || context.add(SIGMASK_OFFSET).cast::<u64>().read_unaligned() != expected_mask
+            {
+                return Err(FrameError);
+            }
+            let f = Self {
+                context,
+                _borrow: core::marker::PhantomData,
+            };
+            if info.add(16).cast::<u64>().read_unaligned() != f.rip()
+                || f.rax() != info.add(24).cast::<i32>().read_unaligned() as u64
+            {
+                return Err(FrameError);
+            }
+            // uc_stack is the real installed owned alternate stack descriptor.
+            if context.add(STACK_OFFSET).cast::<usize>().read_unaligned() != stack_lo
+                || context.add(STACK_OFFSET + 8).cast::<i32>().read_unaligned() != 0
+                || context
+                    .add(STACK_OFFSET + 16)
+                    .cast::<usize>()
+                    .read_unaligned()
+                    != stack_hi - stack_lo
+            {
+                return Err(FrameError);
+            }
+            Ok(f)
+        }
+    }
+    fn greg(&self, index: usize) -> u64 {
+        // Only fixed internal register constants call this; no index assertion
+        // or potential panic path belongs in the pre-TLS handler.
+        unsafe {
+            self.context
+                .add(GREG_OFFSET + index * 8)
+                .cast::<u64>()
+                .read_unaligned()
+        }
+    }
+    pub(crate) fn rip(&self) -> u64 {
+        self.greg(libc::REG_RIP as usize)
+    }
+    pub(crate) fn rax(&self) -> u64 {
+        self.greg(libc::REG_RAX as usize)
+    }
+    pub(crate) fn rsp(&self) -> u64 {
+        self.greg(libc::REG_RSP as usize)
+    }
+    pub(crate) fn args(&self) -> [u64; 6] {
+        [
+            self.greg(libc::REG_RDI as usize),
+            self.greg(libc::REG_RSI as usize),
+            self.greg(libc::REG_RDX as usize),
+            self.greg(libc::REG_R10 as usize),
+            self.greg(libc::REG_R8 as usize),
+            self.greg(libc::REG_R9 as usize),
+        ]
+    }
+    pub(crate) fn set_post_setfs_selector(&mut self, selector: u16) {
+        let old = self.greg(libc::REG_CSGSFS as usize);
+        let updated = (old & !(0xffff_u64 << 32)) | (u64::from(selector) << 32);
+        // FS is the third packed 16-bit selector. Actual successful SET_FS
+        // changes it; retaining a stale interrupted selector could destroy the
+        // new base during signal return. CS/GS/SS and all other state stay put.
+        unsafe {
+            self.context
+                .add(GREG_OFFSET + libc::REG_CSGSFS as usize * 8)
+                .cast::<u64>()
+                .write_unaligned(updated)
+        }
+    }
+    pub(crate) fn set_result(&mut self, result: i64) {
+        // SAFETY: exclusive genuine context prefix; no FP/mask/FS mutation.
+        unsafe {
+            self.context
+                .add(GREG_OFFSET + libc::REG_RAX as usize * 8)
+                .cast::<i64>()
+                .write_unaligned(result)
+        }
+    }
+}
+
+// The host observer reuses the SAME prefix constants as SignalFrame. These
+// copied bytes grant no kernel-frame provenance and never borrow FP memory.
+#[cfg(all(feature = "loader-private-runtime", feature = "exec-stop"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RemoteKernelPrefix {
+    pub(crate) registers: [u64; 19],
+    pub(crate) mask: u64,
+    pub(crate) fp_pointer: u64,
+    pub(crate) stack: (u64, u64, u32),
+}
+#[cfg(all(feature = "loader-private-runtime", feature = "exec-stop"))]
+pub(crate) const REMOTE_KERNEL_FRAME_BYTES: usize = 8 + CONTEXT_BYTES + 128;
+#[cfg(all(feature = "loader-private-runtime", feature = "exec-stop"))]
+impl RemoteKernelPrefix {
+    // Linux x86-64 rt_sigreturn takes frame = rsp - sizeof(long); the
+    // existing runtime's return pops that pretcode word, so uc starts at rsp.
+    // Caller has an actual rt_sigreturn ENTRY stop at the bound restorer.
+    pub(crate) fn decode(
+        bytes: &[u8; REMOTE_KERNEL_FRAME_BYTES],
+        context_address: u64,
+        expected_restorer: u64,
+        expected_info: &[u8; 128],
+    ) -> Result<Self, FrameError> {
+        let word =
+            |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let frame_lo = context_address.checked_sub(8).ok_or(FrameError)?;
+        let frame_hi = context_address
+            .checked_add((CONTEXT_BYTES + 128) as u64)
+            .ok_or(FrameError)?;
+        if context_address & 7 != 0
+            || frame_hi >= (1_u64 << 47)
+            || word(0) != expected_restorer
+            || &bytes[8 + CONTEXT_BYTES..] != expected_info
+        {
+            return Err(FrameError);
+        }
+        let stack_lo = word(8 + STACK_OFFSET);
+        let flags = u32::from_le_bytes(
+            bytes[8 + STACK_OFFSET + 8..8 + STACK_OFFSET + 12]
+                .try_into()
+                .unwrap(),
+        );
+        let size = word(8 + STACK_OFFSET + 16);
+        let stack_hi = stack_lo.checked_add(size).ok_or(FrameError)?;
+        // This finite experiment admits only the actual installed alternate
+        // stack form, not nested/on-stack, disabled or autodisarmed contexts.
+        if flags != 0 || size == 0 || stack_lo > frame_lo || frame_hi > stack_hi {
+            return Err(FrameError);
+        }
+        let fp = word(8 + FP_POINTER_OFFSET);
+        if fp == 0 || fp & 15 != 0 || fp < frame_hi || fp >= stack_hi {
+            return Err(FrameError);
+        }
+        Ok(Self {
+            registers: core::array::from_fn(|index| word(8 + GREG_OFFSET + index * 8)),
+            mask: word(8 + SIGMASK_OFFSET),
+            fp_pointer: fp,
+            stack: (stack_lo, stack_hi, flags),
+        })
+    }
+}
+#[cfg(all(test, feature = "loader-private-runtime", feature = "exec-stop"))]
+mod remote_prefix_tests {
+    use super::*;
+    fn valid() -> ([u8; REMOTE_KERNEL_FRAME_BYTES], [u8; 128]) {
+        let mut b = [0; REMOTE_KERNEL_FRAME_BYTES];
+        let i = [0x35; 128];
+        b[0..8].copy_from_slice(&0x1234_u64.to_le_bytes());
+        b[8 + STACK_OFFSET..16 + STACK_OFFSET].copy_from_slice(&0x1000_u64.to_le_bytes());
+        b[24 + STACK_OFFSET..32 + STACK_OFFSET].copy_from_slice(&0x10000_u64.to_le_bytes());
+        b[8 + FP_POINTER_OFFSET..16 + FP_POINTER_OFFSET].copy_from_slice(&0x3000_u64.to_le_bytes());
+        b[8 + CONTEXT_BYTES..].copy_from_slice(&i);
+        (b, i)
+    }
+    #[test]
+    fn bounded_prefix_uses_actual_kernel_layout_without_following_fp() {
+        let (b, i) = valid();
+        let p = RemoteKernelPrefix::decode(&b, 0x2000, 0x1234, &i).unwrap();
+        assert_eq!(p.stack, (0x1000, 0x11000, 0));
+        assert_eq!(p.fp_pointer, 0x3000);
+    }
+    #[test]
+    fn wrong_restorer_info_stack_and_fp_are_refused() {
+        let (b, i) = valid();
+        assert!(RemoteKernelPrefix::decode(&b, 0x2000, 0x1235, &i).is_err());
+        assert!(RemoteKernelPrefix::decode(&b, 0x2001, 0x1234, &i).is_err());
+        let mut info = i;
+        info[0] ^= 1;
+        assert!(RemoteKernelPrefix::decode(&b, 0x2000, 0x1234, &info).is_err());
+        for (offset, value) in [
+            (8 + STACK_OFFSET + 8, 1_u64),
+            (8 + STACK_OFFSET, 0x2100),
+            (8 + FP_POINTER_OFFSET, 0x2000),
+        ] {
+            let mut bad = b;
+            bad[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            assert!(RemoteKernelPrefix::decode(&bad, 0x2000, 0x1234, &i).is_err());
+        }
     }
 }

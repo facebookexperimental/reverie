@@ -21,6 +21,11 @@
 
 use core::ops::Range;
 
+mod private_runtime;
+pub use private_runtime::PrivateRuntimeMetadata;
+pub use private_runtime::PrivateRuntimeMetadataError;
+pub use private_runtime::TlsTemplate;
+
 /// The page size the loader maps with.
 pub const PAGE_SIZE: u64 = 4096;
 

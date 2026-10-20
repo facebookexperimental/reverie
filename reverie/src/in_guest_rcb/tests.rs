@@ -67,9 +67,13 @@ fn disabled_creation_preserves_enabled_setup_and_owns_its_descriptor() {
         SETUP_CALLS.with_borrow_mut(Vec::clear);
         let config = PmuConfig::try_from_family_model(0x06, 0x3c);
         let clock = if enabled {
-            InGuestRcbCounter::current_thread_with_config(config, Some(setup_gate))
+            // SAFETY: setup_gate supplies a real owned memfd/mapping, validates
+            // setup arguments, and preserves all read/release semantics and state.
+            unsafe { InGuestRcbCounter::current_thread_with_config(config, Some(setup_gate)) }
         } else {
-            InGuestRcbCounter::create_with_config(config, Some(setup_gate))
+            // SAFETY: setup_gate supplies a real owned memfd/mapping, validates
+            // setup arguments, and preserves all read/release semantics and state.
+            unsafe { InGuestRcbCounter::create_with_config(config, Some(setup_gate)) }
         }
         .unwrap();
         let fd = unsafe { clock.boundary_fd() }.as_raw_fd();

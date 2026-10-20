@@ -209,14 +209,14 @@ impl SeccompFilter {
         assert_eq!(prefix.len(), 46);
         let suffix = Self::for_trusted_gates_with_signal_return(
             TrustedGate {
-                syscall_ip: 0x5000_0000_0080,
-                return_ip: 0x5000_0000_0082,
+                syscall_ip: crate::trap::FIXED_GATE_BASE + 0x80,
+                return_ip: crate::trap::FIXED_GATE_BASE + 0x82,
             },
             TrustedGate {
-                syscall_ip: 0x5000_0000_0200,
-                return_ip: 0x5000_0000_0202,
+                syscall_ip: crate::trap::FIXED_GATE_BASE + 0x200,
+                return_ip: crate::trap::FIXED_GATE_BASE + 0x202,
             },
-            Some(0x5000_0000_030b),
+            Some(crate::trap::FIXED_SIGNAL_RESTORER_RETURN_IP),
         )?;
         assert_eq!(suffix.program.len(), 23);
         prefix.extend(suffix.program);
@@ -246,6 +246,20 @@ impl SeccompFilter {
             len: self.program.len() as u16,
             filter: self.program.as_mut_ptr(),
         }
+    }
+
+    /// Canonical kernel instruction bytes; numeric serialization grants no
+    /// filter installation or image qualification authority.
+    #[cfg(all(feature = "exec-stop", feature = "loader-private-runtime"))]
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.program.len() * 8);
+        for instruction in &self.program {
+            bytes.extend_from_slice(&instruction.code.to_le_bytes());
+            bytes.push(instruction.jt);
+            bytes.push(instruction.jf);
+            bytes.extend_from_slice(&instruction.k.to_le_bytes());
+        }
+        bytes
     }
 
     /// The number of BPF instructions in the program.
@@ -368,6 +382,82 @@ mod tests {
                 .to_string()
                 .contains("could not synchronize thread 4242"),
             "{error}"
+        );
+    }
+
+    #[cfg(all(feature = "exec-stop", feature = "loader-private-runtime"))]
+    #[test]
+    fn mapped_serialized_filter_preserves_exact_target_sites_and_rejects_guest_patch() {
+        let gate = reverie_loader::artifact::RUNTIME_WINDOW.start + 4096;
+        let original = SeccompFilter::for_trusted_gates_with_signal_return(
+            TrustedGate {
+                syscall_ip: gate + 0x80,
+                return_ip: gate + 0x82,
+            },
+            TrustedGate {
+                syscall_ip: gate + 0x200,
+                return_ip: gate + 0x202,
+            },
+            Some(gate + 0x30b),
+        )
+        .unwrap();
+        let bytes = original.canonical_bytes();
+        assert_eq!(bytes.len(), 23 * 8);
+        let decoded = SeccompFilter {
+            program: bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| libc::sock_filter {
+                    code: u16::from_le_bytes(chunk[..2].try_into().unwrap()),
+                    jt: chunk[2],
+                    jf: chunk[3],
+                    k: u32::from_le_bytes(chunk[4..].try_into().unwrap()),
+                })
+                .collect(),
+        };
+        for address in [gate + 0x80, gate + 0x82, gate + 0x200, gate + 0x202] {
+            assert_eq!(
+                evaluate(&decoded, AUDIT_ARCH_X86_64, libc::SYS_gettid, address),
+                SECCOMP_RET_ALLOW
+            );
+            assert_eq!(
+                evaluate(&decoded, AUDIT_ARCH_X86_64, libc::SYS_rt_sigreturn, address),
+                SECCOMP_RET_TRAP
+            );
+        }
+        for address in [
+            0x401003,
+            0x5000_0000_0082,
+            gate + 0x83,
+            gate ^ (1_u64 << 32),
+        ] {
+            assert_eq!(
+                evaluate(&decoded, AUDIT_ARCH_X86_64, libc::SYS_gettid, address),
+                SECCOMP_RET_TRAP
+            );
+        }
+        assert_eq!(
+            evaluate(
+                &decoded,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_rt_sigreturn,
+                gate + 0x30b
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate(
+                &decoded,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_rt_sigreturn,
+                gate + 0x30a
+            ),
+            SECCOMP_RET_TRAP
+        );
+        assert_eq!(
+            evaluate(&decoded, 0x4000_0003, libc::SYS_gettid, gate + 0x82),
+            SECCOMP_RET_KILL_PROCESS
         );
     }
 

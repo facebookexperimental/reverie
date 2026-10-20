@@ -20,7 +20,7 @@ const C_SHA256: &str = "25a174f075282ff23bbfaafe94b9a618d993fcb33440a1ae265e594a
 const C_SOURCE: &[u8] = include_bytes!("fixtures/fixed_arena_guest.c");
 const ADMISSION: &str =
     "source bindings only; Fixed admission requires the complete verified runtime receipt";
-const SOURCES: [&str; 10] = [
+const SOURCES: [&str; 22] = [
     "reverie-inguest/src/guest/alloc.rs",
     "reverie-inguest/src/guest/tool_region.rs",
     "reverie-inguest/src/guest/tool_region_arena.rs",
@@ -30,6 +30,18 @@ const SOURCES: [&str; 10] = [
     "reverie-liteinst/src/allocator_fixture.rs",
     "reverie-liteinst/src/fixed_arena_fixture.rs",
     "reverie-liteinst-artifact/src/lib.rs",
+    "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+    "reverie-liteinst-artifact/src/private_static/selected_initializers/native_leaves.rs",
+    "reverie-liteinst-artifact/tests/fixtures/musl_memset_member.rs",
+    "reverie-liteinst-artifact/tests/fixtures/musl_memset_source.txt",
+    "reverie-liteinst-artifact/tests/fixtures/musl_set_thread_area_member.rs",
+    "reverie-liteinst-artifact/tests/fixtures/musl_set_thread_area_source.txt",
+    "reverie-liteinst-artifact/tests/fixtures/musl_libc_common_map.txt",
+    "reverie-liteinst-artifact/tests/fixtures/musl_libc_common_member.rs",
+    "reverie-liteinst-artifact/src/private_static/optional-zero-a03.json",
+    "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
+    "reverie-liteinst-artifact/tests/fixtures/ordinary_preceding_gate_page.rs",
+    "reverie-liteinst-artifact/tests/fixtures/selected_init_v12.json",
     "scripts/fixed_arena_fixture.rs",
 ];
 
