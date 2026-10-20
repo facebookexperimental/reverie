@@ -2369,7 +2369,11 @@ fn leader_self_exec_bounded_with_output(test: &str, forward_output: bool) -> boo
     let mut command = std::process::Command::new("timeout");
     command.args(["--kill-after=2s", "30s"]);
     if broker_test_protocol::selected(test) {
-        command.arg(env!("CARGO_BIN_EXE_reverie-kvm-broker-test-launcher"));
+        // Test runners can locate the helper at execution time on another host.
+        command.arg(match std::env::var_os("REVERIE_KVM_TEST_BROKER_LAUNCHER") {
+            Some(path) => std::env::current_dir().unwrap().join(path),
+            None => env!("CARGO_BIN_EXE_reverie-kvm-broker-test-launcher").into(),
+        });
     }
     let output = command
         .arg(std::env::current_exe().unwrap())

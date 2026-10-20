@@ -329,6 +329,7 @@ fn executor_is_instance_owned_and_debug_and_scalar_bypasses_are_stable() {
     assert_forwarded(Ok(4));
 }
 
+#[cfg(target_arch = "x86_64")] // This test exercises the raw SYS_fork syscall.
 #[test]
 fn inherited_executor_handle_uses_child_pid_after_a_real_fork() {
     if !isolated("inherited_executor_handle_uses_child_pid_after_a_real_fork") {

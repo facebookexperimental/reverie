@@ -90,6 +90,14 @@ pub(crate) fn selected_child(test: &str) -> Option<BrokerClient> {
 fn launcher_path(executable: &std::path::Path) -> PathBuf {
     let path = if let Some(value) = std::env::var_os(LAUNCHER_ENV) {
         let path = PathBuf::from(value);
+        // Test runners may provide the helper relative to their working directory.
+        let path = if path.is_relative() {
+            std::env::current_dir()
+                .expect("test working directory")
+                .join(path)
+        } else {
+            path
+        };
         assert!(
             path.is_absolute(),
             "{LAUNCHER_ENV} must be an absolute helper path"

@@ -108,7 +108,9 @@ pub(crate) fn step_kind(nr: Sysno, swaps_mask: bool) -> StepKind {
     }
     match nr {
         Sysno::rt_sigprocmask => StepKind::SetsMask,
-        Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork => StepKind::Clones,
+        Sysno::clone | Sysno::clone3 => StepKind::Clones,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::fork | Sysno::vfork => StepKind::Clones,
         Sysno::rt_sigreturn => StepKind::Sigreturn,
         _ => StepKind::KeepsMask,
     }
@@ -188,7 +190,11 @@ mod tests {
         assert_eq!(step_kind(Sysno::getppid, false), StepKind::KeepsMask);
         assert_eq!(step_kind(Sysno::ppoll, true), StepKind::SwapsMask);
         assert_eq!(step_kind(Sysno::rt_sigprocmask, false), StepKind::SetsMask);
-        for nr in [Sysno::clone, Sysno::clone3, Sysno::fork, Sysno::vfork] {
+        for nr in [Sysno::clone, Sysno::clone3] {
+            assert_eq!(step_kind(nr, false), StepKind::Clones, "{nr}");
+        }
+        #[cfg(target_arch = "x86_64")]
+        for nr in [Sysno::fork, Sysno::vfork] {
             assert_eq!(step_kind(nr, false), StepKind::Clones, "{nr}");
         }
         assert_eq!(step_kind(Sysno::rt_sigreturn, false), StepKind::Sigreturn);
