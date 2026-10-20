@@ -4859,6 +4859,8 @@ mod tests {
                 *guest.thread_state_mut() = true;
                 self.blocked_start.store(true, Ordering::SeqCst);
                 let _pending = PendingStart(&self.blocked_start);
+                publish_fatal_pending_start(guest.tid())
+                    .expect("actual pending callback must precede the failure worker");
                 future::pending::<()>().await;
             }
             Ok(())
@@ -4925,6 +4927,21 @@ mod tests {
                 }
             }
             if *guest.config() == 2 {
+                FATAL_PENDING_START_WORDS.with(|slot| {
+                    let pointer = slot.get() as *mut std::sync::atomic::AtomicUsize;
+                    assert!(!pointer.is_null(), "pending-start fixture scope missing");
+                    // SAFETY: the scoped borrow retains the shared FatalWords mapping.
+                    let pending = unsafe { &*pointer.add(2) }.load(Ordering::SeqCst);
+                    let worker_created = unsafe { &*pointer.add(3) }.load(Ordering::SeqCst);
+                    assert_ne!(pending, 0, "actual pending callback was not observed");
+                    assert_eq!(
+                        worker_created, pending,
+                        "worker preceded its pending callback"
+                    );
+                    assert_ne!(guest.tid().as_raw() as usize, pending);
+                    unsafe { &*pointer.add(4) }
+                        .store(guest.tid().as_raw() as usize, Ordering::SeqCst);
+                });
                 assert!(
                     self.blocked_start.load(Ordering::SeqCst),
                     "newborn must still be in its start callback at failure"
@@ -4993,6 +5010,90 @@ mod tests {
         }
     }
 
+    thread_local! {
+        // Nonzero only while an actual shared mapping is borrowed by this test.
+        static FATAL_PENDING_START_WORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    struct FatalPendingStartScope<'a> {
+        previous: usize,
+        _words: &'a FatalWords,
+    }
+
+    impl<'a> FatalPendingStartScope<'a> {
+        fn new(words: &'a FatalWords) -> Self {
+            let previous = FATAL_PENDING_START_WORDS.with(|slot| slot.replace(words.0 as usize));
+            Self {
+                previous,
+                _words: words,
+            }
+        }
+    }
+
+    impl Drop for FatalPendingStartScope<'_> {
+        fn drop(&mut self) {
+            FATAL_PENDING_START_WORDS.with(|slot| slot.set(self.previous));
+        }
+    }
+
+    // Called only by the real callback, after its PendingStart guard exists.
+    fn publish_fatal_pending_start(tid: Pid) -> Result<(), &'static str> {
+        if tid.as_raw() <= 0 {
+            return Err("invalid pending TID");
+        }
+        FATAL_PENDING_START_WORDS.with(|slot| {
+            let pointer = slot.get() as *mut std::sync::atomic::AtomicUsize;
+            if pointer.is_null() {
+                return Err("missing pending-start mapping scope");
+            }
+            // SAFETY: the active scope borrows the mapping for all callback polls.
+            let worker_created = unsafe { &*pointer.add(3) };
+            if worker_created.load(Ordering::SeqCst) != 0 {
+                return Err("failure worker already created");
+            }
+            unsafe { &*pointer.add(2) }
+                .compare_exchange(0, tid.as_raw() as usize, Ordering::SeqCst, Ordering::SeqCst)
+                .map(|_| ())
+                .map_err(|_| "pending callback already published")
+        })
+    }
+
+    #[test]
+    fn pending_newborn_predecessor_refuses_late_or_duplicate_publication_and_restores_scope() {
+        let previous = FATAL_PENDING_START_WORDS.with(|slot| slot.get());
+        {
+            let words = FatalWords::new();
+            let _scope = FatalPendingStartScope::new(&words);
+            assert_eq!(publish_fatal_pending_start(Pid::from_raw(44)), Ok(()));
+            assert_eq!(words.read(2), 44);
+            assert_eq!(
+                publish_fatal_pending_start(Pid::from_raw(45)),
+                Err("pending callback already published")
+            );
+            assert_eq!(words.read(2), 44);
+        }
+        assert_eq!(FATAL_PENDING_START_WORDS.with(|slot| slot.get()), previous);
+        let unwind = std::panic::catch_unwind(|| {
+            let words = FatalWords::new();
+            let _scope = FatalPendingStartScope::new(&words);
+            // A worker-created marker without callback publication is refused.
+            unsafe { &*words.0.add(3) }.store(44, Ordering::SeqCst);
+            assert_eq!(
+                publish_fatal_pending_start(Pid::from_raw(44)),
+                Err("failure worker already created")
+            );
+            assert_eq!(words.read(2), 0);
+            panic!("exercise scoped pointer restoration");
+        });
+        let payload = unwind.expect_err("the deliberate unwind must occur");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("exercise scoped pointer restoration"),
+            "an earlier assertion failure must not satisfy the unwind control"
+        );
+        assert_eq!(FATAL_PENDING_START_WORDS.with(|slot| slot.get()), previous);
+    }
+
     async fn ordinary_nonleader_control(fail: bool, fork_descendant: bool, blocked_newborn: bool) {
         let handed_deadline = std::env::var("REVERIE_FATAL_HANDED_DEADLINE_NS")
             .ok()
@@ -5020,6 +5121,8 @@ mod tests {
         });
         let _observations = FatalReapObservationScope::new();
         let words = FatalWords::new();
+        // Declared after words, so unwinding restores TLS before unmapping.
+        let _pending_start_scope = blocked_newborn.then(|| FatalPendingStartScope::new(&words));
         let address = words.0 as usize;
         let sentinel_child = fork_paused_child(deadline);
         let sentinel = sentinel_child.pid();
@@ -5051,6 +5154,25 @@ mod tests {
                 }
                 let newborn = blocked_newborn
                     .then(|| std::thread::spawn(|| panic!("cancelled newborn reached guest code")));
+                if blocked_newborn {
+                    // The first newborn executes NO guest body. Its real host
+                    // callback publishes its TID while holding PendingStart.
+                    let pending =
+                        unsafe { &*((address as *const std::sync::atomic::AtomicUsize).add(2)) };
+                    let pending_tid = loop {
+                        let tid = pending.load(Ordering::SeqCst);
+                        if tid != 0 {
+                            break tid;
+                        }
+                        std::thread::yield_now();
+                    };
+                    assert_eq!(
+                        unsafe { &*((address as *const std::sync::atomic::AtomicUsize).add(3)) }
+                            .compare_exchange(0, pending_tid, Ordering::SeqCst, Ordering::SeqCst),
+                        Ok(0),
+                        "failure worker creation must follow the actual pending callback"
+                    );
+                }
                 std::thread::spawn(move || {
                     unsafe { libc::syscall(libc::SYS_getpgid, 0) };
                     unsafe { &*(address as *const std::sync::atomic::AtomicUsize) }
@@ -5324,6 +5446,20 @@ mod tests {
                     2
                 }
             );
+            if blocked_newborn {
+                let pending = words.read(2);
+                let worker_created = words.read(3);
+                let error_tid = words.read(4);
+                assert_ne!(pending, 0);
+                assert_eq!(worker_created, pending);
+                assert_ne!(
+                    error_tid, 0,
+                    "the actual failing syscall callback never ran"
+                );
+                assert_ne!(error_tid, pending);
+                assert!(starts.contains(&Pid::from_raw(i32::try_from(pending).unwrap())));
+                assert!(starts.contains(&Pid::from_raw(i32::try_from(error_tid).unwrap())));
+            }
             for tid in starts {
                 assert_reaped("ordinary task", tid);
                 assert_eq!(

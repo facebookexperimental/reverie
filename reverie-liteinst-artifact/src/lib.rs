@@ -49170,13 +49170,13 @@ pub mod private_static {
                 require(rows.len() == 1, "static metadata leaf ambiguous")?;
                 let leaf = rows[0];
                 let id = format!(
-                    "path+file://{}#0.4.0",
+                    "path+file://{}#0.5.1",
                     expected.workspace.join("detcore-liteinst").display()
                 );
                 require(
                     leaf["id"] == id
                         && leaf["source"].is_null()
-                        && leaf["version"] == "0.4.0"
+                        && leaf["version"] == "0.5.1"
                         && leaf["manifest_path"].as_str() == manifest.to_str(),
                     "static leaf package identity mismatch",
                 )?;
