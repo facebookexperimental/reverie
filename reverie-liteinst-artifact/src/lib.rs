@@ -767,8 +767,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 53] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        12121,
-        "881a7029e0bb50d33dcd177bb4f215d99e947e9cdd530a7798ab8dfa1986bfd2",
+        15895,
+        "2e8c776411de4ecc9937bd340420185e8786f770eb96a2c8390504bfea9b0705",
     ),
     (
         "Cargo.toml",
