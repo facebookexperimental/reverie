@@ -2235,11 +2235,10 @@ impl KvmBackend {
     /// Declare that the Tool rewrites every timestamp that `stat`, `fstat`,
     /// `newfstatat` and `statx` return, as Detcore does with virtual
     /// metadata. The backend then classifies the carriers it makes for its
-    /// own data (virtual files such as `/proc/self/loginuid`, `/proc`
-    /// snapshots, the virtual signalfd's eventfd and the self-pidfd proxy),
-    /// including one received over a socket, so that they report fixed
-    /// timestamps through every alias. Without it, those carriers report the
-    /// kernel's timestamps.
+    /// own data (`/proc` snapshots, the virtual signalfd's eventfd and the
+    /// self-pidfd proxy), including one received over a socket, so that they
+    /// report fixed timestamps through every alias. Without it, those
+    /// carriers report the kernel's timestamps.
     ///
     /// Real host files and descriptors report the kernel's timestamps whether
     /// or not this is enabled, as the kernel reports them to a ptrace guest;
@@ -2257,16 +2256,11 @@ impl KvmBackend {
     /// rewritten, so the backend leaves only fixed timestamps in the part of
     /// a buffer that a faulting copy reached.
     ///
-    /// While enabled, a guest cannot change the mode of a file the backend
-    /// serves from its own data: `fchmod` and empty-path `fchmodat` and
-    /// `fchmodat2` fail with `EPERM` on a synthetic `/proc` file and on a
-    /// virtual file such as `/proc/self/loginuid` or a CPU-frequency file
-    /// under `/sys/devices/system/cpu`. Linux refuses a mode change on a
-    /// process `/proc` file with `EPERM` too, but lets the owner change the
-    /// mode of a writable sysfs file, so for those files this is a
-    /// compatibility restriction. The backend recognizes such a file received
-    /// over a socket by reopening it, which a mode without read permission
-    /// would prevent.
+    /// While enabled, a guest cannot change the mode of a synthetic `/proc`
+    /// file: `fchmod` and empty-path `fchmodat` and `fchmodat2` fail with
+    /// `EPERM`, as Linux refuses a mode change on a process `/proc` file. The
+    /// backend recognizes such a file received over a socket by reopening it,
+    /// which a mode without read permission would prevent.
     pub fn set_host_metadata_timestamps(&mut self, enabled: bool) -> Result<()> {
         AbandonedRuns::admit(&self.abandoned_runs)?;
         let loaded = self

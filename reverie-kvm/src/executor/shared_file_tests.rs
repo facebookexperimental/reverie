@@ -707,11 +707,11 @@ mod shared_file_dispatch_tests {
         }
     }
 
-    // Only a run that reports host metadata timestamps creates a memfd named
-    // reverie-kvm-virtual-file. Elsewhere a guest memfd with that name is an
-    // ordinary shared file backing.
+    // The backend no longer creates a memfd named reverie-kvm-virtual-file, so
+    // in every run a guest memfd with that name is an ordinary shared file
+    // backing.
     #[test]
-    fn virtual_file_carrier_name_is_reserved_only_when_the_backend_creates_it() {
+    fn removed_virtual_file_carrier_name_is_an_ordinary_backing() {
         for host_metadata_timestamps in [false, true] {
             let mut f = Fixture::new();
             f.state.host_metadata_timestamps = host_metadata_timestamps;
@@ -719,31 +719,10 @@ mod shared_file_dispatch_tests {
             file.write_all(&f.expected).unwrap();
             let fd = insert_file_with_flags(&mut f.state, file, false, None);
             assert!(fd >= 3);
-            if !host_metadata_timestamps {
-                let address = f.shared(fd, 0, 0, true);
-                let mut actual = vec![0; PAGE_SIZE as usize];
-                f.memory.user().read(address, &mut actual).unwrap();
-                assert_eq!(actual, f.expected[..PAGE_SIZE as usize]);
-                continue;
-            }
-            let before = layout(&f.memory, &f.state);
-            let error = failure(execute_basic_syscall(
-                &mut f.memory,
-                &mut f.state,
-                &SyscallRequest::new(
-                    libc::SYS_mmap as u64,
-                    [
-                        0,
-                        PAGE_SIZE,
-                        (libc::PROT_READ | libc::PROT_WRITE) as u64,
-                        libc::MAP_SHARED as u64,
-                        fd as u64,
-                        0,
-                    ],
-                ),
-            ));
-            capability(&error, "mmap", "reserved private memfd backing");
-            assert_eq!(layout(&f.memory, &f.state), before);
+            let address = f.shared(fd, 0, 0, true);
+            let mut actual = vec![0; PAGE_SIZE as usize];
+            f.memory.user().read(address, &mut actual).unwrap();
+            assert_eq!(actual, f.expected[..PAGE_SIZE as usize]);
         }
     }
 

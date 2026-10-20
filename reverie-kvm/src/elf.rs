@@ -305,11 +305,6 @@ pub(crate) struct GuestFileIdentity {
 pub(crate) enum IdentityTimestamps {
     /// The times the kernel stored for the host object.
     Host,
-    /// A virtual file the backend made, such as the carrier for
-    /// `/proc/self/loginuid`. It reports the fixed
-    /// `DETERMINISTIC_METADATA_SECONDS`, because its host times are those of
-    /// the carrier rather than of any guest-visible file.
-    VirtualFile,
     /// A synthetic `/proc` snapshot carrier, such as the one for
     /// `/proc/self/maps`. It reports timestamp 0, like every synthetic
     /// `/proc` file.

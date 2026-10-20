@@ -37,11 +37,10 @@ fn classify_shared_mmap_file(
     }
     let path = canonical_fd_path(file.as_raw_fd())
         .map_err(|_| unsupported_mmap("cannot classify retained file backing"))?;
-    // Same deny-only predicate as ordinary syncfs. This also catches virtual
-    // files and received private descriptions whose side-table identity was
-    // lost. It does not adopt the authentication protocol of PR610.
+    // Same deny-only predicate as ordinary syncfs. This also catches received
+    // private descriptions whose side-table identity was lost. It does not adopt the authentication protocol of PR610.
     // https://github.com/rrnewton/reverie/pull/610
-    if syncfs_private_memfd_name(path.as_os_str().as_bytes(), state.host_metadata_timestamps) {
+    if syncfs_private_memfd_name(path.as_os_str().as_bytes()) {
         return Err(unsupported_mmap("reserved private memfd backing"));
     }
     if capture_output {

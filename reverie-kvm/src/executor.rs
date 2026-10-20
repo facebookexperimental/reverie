@@ -10739,11 +10739,10 @@ fn truncate(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i
         let Some(host_fd) = host_fd(state, guest_fd) else {
             return negative_errno(libc::ENOENT);
         };
+        // The random device's carrier, by its exact name, as syncfs and
+        // shared mmap refuse it; a guest memfd of another name is ordinary.
         if canonical_fd_path(host_fd).is_ok_and(|target| {
-            target
-                .as_os_str()
-                .as_bytes()
-                .starts_with(b"/memfd:reverie-kvm-virtual")
+            target.as_os_str().as_bytes() == b"/memfd:reverie-kvm-virtual (deleted)"
         }) {
             return negative_errno(libc::EINVAL);
         }
@@ -11059,9 +11058,6 @@ fn open_file(
     if relative_proc_path.is_some() {
         return negative_errno(libc::ENOENT);
     }
-    if let Some(content) = synthetic_cpu_frequency_content(state, guest_dirfd, path) {
-        return open_virtual_file(state, content, flags, close_on_exec);
-    }
     let guest_cloexec = close_on_exec;
     if let Some(guest_fd) = guest_fd_path(state, path) {
         return open_guest_fd_path(state, guest_fd, flags, guest_cloexec);
@@ -11073,9 +11069,6 @@ fn open_file(
             guest_cloexec,
             if path == b"/dev/random" { 8 } else { 9 },
         );
-    }
-    if path == b"/proc/self/loginuid" {
-        return open_virtual_file(state, b"0", flags, guest_cloexec);
     }
     let Ok((host_dirfd, path)) = host_dirfd_and_path(state, guest_dirfd, path) else {
         return negative_errno(libc::EBADF);
@@ -11263,125 +11256,6 @@ fn open_random_device(
 }
 
 include!("executor/random_device.rs");
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-92): Review deterministic random-device and procfs virtual files.
-fn open_virtual_file(
-    state: &mut LoadedStaticElf,
-    contents: &[u8],
-    flags: u64,
-    close_on_exec: bool,
-) -> i64 {
-    let unsupported = (libc::O_CREAT
-        | libc::O_DIRECTORY
-        | libc::O_EXCL
-        | libc::O_PATH
-        | libc::O_TMPFILE
-        | libc::O_TRUNC) as u64;
-    if flags & unsupported != 0 {
-        return negative_errno(libc::EINVAL);
-    }
-    if flags as libc::c_int & libc::O_ACCMODE != libc::O_RDONLY {
-        return negative_errno(libc::EACCES);
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/933):
-    // Review the fixed-timestamp classes of backend-made carriers.
-    // A run that reports host metadata timestamps gives the carrier its own
-    // name and a full seal set, so that a receiver recognizes it from the
-    // carrier alone (see `received_carrier_timestamps`) and keeps its fixed
-    // timestamps. Every other run keeps the original unsealed carrier.
-    let (name, memfd_flags) = if state.host_metadata_timestamps {
-        (
-            VIRTUAL_FILE_CARRIER_NAME,
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    } else {
-        (c"reverie-kvm-virtual", libc::MFD_CLOEXEC)
-    };
-    let host_fd = unsafe { libc::memfd_create(name.as_ptr(), memfd_flags) };
-    if host_fd < 0 {
-        return io_error(std::io::Error::last_os_error());
-    }
-    // SAFETY: memfd_create returned a new owned descriptor.
-    let mut file = unsafe { std::fs::File::from_raw_fd(host_fd) };
-    if let Err(error) = file.write_all(contents) {
-        return io_error(error);
-    }
-    if state.host_metadata_timestamps {
-        // Seal the populated contents before any guest-visible handle exists.
-        // SAFETY: file owns a live sealable memfd and the seal mask is valid.
-        if unsafe {
-            libc::fcntl(
-                file.as_raw_fd(),
-                libc::F_ADD_SEALS,
-                SYNTHETIC_PROC_REQUIRED_SEALS,
-            )
-        } != 0
-        {
-            return io_error(std::io::Error::last_os_error());
-        }
-        // SAFETY: file owns a live descriptor and F_GET_SEALS has no third argument.
-        let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
-        if seals < 0 {
-            return io_error(std::io::Error::last_os_error());
-        }
-        if !supported_synthetic_proc_seals(seals) {
-            return negative_errno(libc::EOPNOTSUPP);
-        }
-    }
-    let read_only = match std::fs::OpenOptions::new()
-        .read(true)
-        .open(format!("/proc/self/fd/{}", file.as_raw_fd()))
-    {
-        Ok(read_only) => read_only,
-        Err(error) => return io_error(error),
-    };
-    drop(file);
-    insert_virtual_file(state, read_only, close_on_exec)
-}
-
-// TODO-HUMAN-REVIEW(PR-205): Review the deterministic read-only CPU frequency surface.
-fn synthetic_cpu_frequency_content(
-    state: &LoadedStaticElf,
-    guest_dirfd: libc::c_int,
-    path: &[u8],
-) -> Option<&'static [u8]> {
-    const CPU_ROOT: &[u8] = b"/sys/devices/system/cpu";
-    let relative = if let Some(relative) = path.strip_prefix(b"/sys/devices/system/cpu/") {
-        relative
-    } else if !path.starts_with(b"/") {
-        let host_fd = host_fd(state, guest_dirfd)?;
-        let base = canonical_fd_path(host_fd).ok()?;
-        if base.as_os_str().as_bytes() != CPU_ROOT {
-            return None;
-        }
-        path
-    } else {
-        return None;
-    };
-
-    if relative == b"cpufreq/boost" {
-        return Some(b"1\n");
-    }
-
-    let mut components = relative.split(|byte| *byte == b'/');
-    let cpu = components.next()?;
-    if !cpu
-        .strip_prefix(b"cpu")
-        .is_some_and(|index| !index.is_empty() && index.iter().all(u8::is_ascii_digit))
-        || components.next()? != b"cpufreq"
-    {
-        return None;
-    }
-    let content = match components.next()? {
-        b"cpuinfo_max_freq" => b"3000000\n".as_slice(),
-        b"cpuinfo_min_freq" => b"1000000\n".as_slice(),
-        b"scaling_cur_freq" => b"2000000\n".as_slice(),
-        _ => return None,
-    };
-    components.next().is_none().then_some(content)
-}
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
 // TODO-HUMAN-REVIEW(PR-114): Review /proc/thread-self/fd guest descriptor resolution.
@@ -11951,25 +11825,6 @@ fn insert_file_with_flags(
         close_on_exec,
         output_alias,
         IdentityTimestamps::Host,
-    )
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
-// Review host metadata timestamps for Tool runs.
-/// Inserts the carrier of a virtual file the backend made. Its identity is
-/// marked so that every alias keeps fixed timestamps.
-fn insert_virtual_file(
-    state: &mut LoadedStaticElf,
-    file: std::fs::File,
-    close_on_exec: bool,
-) -> i64 {
-    insert_file_with_identity(
-        state,
-        file,
-        close_on_exec,
-        None,
-        IdentityTimestamps::VirtualFile,
     )
 }
 
@@ -17428,28 +17283,19 @@ fn fchmod(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/933):
 // Review the fixed-timestamp classes of backend-made carriers.
-/// Whether `guest_fd` is a virtual-file or `/proc` snapshot carrier in a run
-/// that reports host metadata timestamps, whose mode a guest may not change.
+/// Whether `guest_fd` is a `/proc` snapshot carrier in a run that reports
+/// host metadata timestamps, whose mode a guest may not change.
 /// The receiver of an O_PATH right for such a carrier reopens it to read its
 /// seals (see `carrier_seals`), which a mode without read permission would
 /// prevent, and the carrier would then report its host timestamps. Linux
 /// refuses a mode change on a `/proc` file with EPERM. A received snapshot
 /// has no `proc_files` entry, so its identity answers here.
-///
-/// For a virtual sysfs file, such as a CPU-frequency file, this is a
-/// compatibility restriction rather than Linux behavior: Linux lets the
-/// owner change its mode. `set_host_metadata_timestamps` discloses it.
 fn mode_locked_carrier(state: &LoadedStaticElf, guest_fd: libc::c_int) -> bool {
     state.host_metadata_timestamps
         && state
             .fd_object_inodes
             .get(&guest_fd)
-            .is_some_and(|identity| {
-                matches!(
-                    identity.timestamps,
-                    IdentityTimestamps::VirtualFile | IdentityTimestamps::ProcSnapshot
-                )
-            })
+            .is_some_and(|identity| identity.timestamps == IdentityTimestamps::ProcSnapshot)
 }
 
 fn fchmodat(
@@ -18466,8 +18312,8 @@ fn sanitize_guest_fd_statx(state: &LoadedStaticElf, guest_fd: libc::c_int, stat:
 /// host object, or a run with that setting off, and the descriptor reports
 /// the kernel's timestamps.
 ///
-/// A virtual file and a `/proc` snapshot are classified by their identity,
-/// which every alias shares. The virtual signalfd's private eventfd and the
+/// A `/proc` snapshot is classified by its identity, which every alias
+/// shares. The virtual signalfd's private eventfd and the
 /// self-pidfd proxy are classified by the descriptor instead: on a kernel
 /// without pidfs, every anonymous-inode descriptor shares one host inode, so
 /// their identity is shared with native descriptors and cannot carry a class.
@@ -18485,7 +18331,6 @@ fn synthetic_descriptor_seconds(
         .get(&guest_fd)
         .map(|identity| identity.timestamps)
     {
-        Some(IdentityTimestamps::VirtualFile) => return Some(DETERMINISTIC_METADATA_SECONDS),
         Some(IdentityTimestamps::ProcSnapshot) => return Some(0),
         Some(IdentityTimestamps::Host) | None => {}
     }
@@ -18613,16 +18458,11 @@ fn parse_pidfd_fdinfo_pid(text: &str) -> Option<libc::pid_t> {
         .and_then(|pid| pid.trim().parse().ok())
 }
 
-/// The memfd name of a virtual-file carrier in a run that reports host
-/// metadata timestamps. It keeps the `reverie-kvm-virtual` prefix that path
-/// checks such as `truncate` match.
-const VIRTUAL_FILE_CARRIER_NAME: &std::ffi::CStr = c"reverie-kvm-virtual-file";
-
 /// Classifies a carrier received in an SCM_RIGHTS message from the carrier
 /// itself, so that the class survives every sender descriptor closing before
 /// the receive, with nothing to account for while the right is in flight. A
-/// virtual-file or `/proc` snapshot carrier is a memfd with its own name and
-/// the full synthetic seal set. A guest that makes such a memfd itself gets
+/// `/proc` snapshot carrier is a memfd with its own name and the full
+/// synthetic seal set. A guest that makes such a memfd itself gets
 /// only fixed timestamps for it. Anything else, including a failed probe, is a
 /// real host object, except a probe that fails only because no descriptor or
 /// memory was left to reopen an O_PATH right (see [`CarrierSealProbe`]): the
@@ -18642,7 +18482,6 @@ fn received_carrier_timestamps(
         return IdentityTimestamps::Host;
     };
     let timestamps = match target.as_os_str().as_bytes() {
-        b"/memfd:reverie-kvm-virtual-file (deleted)" => IdentityTimestamps::VirtualFile,
         b"/memfd:reverie-kvm-proc (deleted)" => IdentityTimestamps::ProcSnapshot,
         _ => return IdentityTimestamps::Host,
     };
@@ -21041,16 +20880,9 @@ fn readlink_at_impl(
             Err(_) => negative_errno(libc::EFAULT),
         };
     }
-    // /proc/self (and /proc/<pid>) is a symlink to the numeric pid directory.
-    if path == b"/proc/self" || path == format!("/proc/{}", state.pid).as_bytes() {
-        let target = state.pid.to_string().into_bytes();
-        let count = capacity.min(target.len());
-        return match memory.user().write(output_address, &target[..count]) {
-            Ok(()) => count as i64,
-            Err(_) => negative_errno(libc::EFAULT),
-        };
-    }
-
+    // Any other procfs link, `/proc/self` included, is the supervisor's, not
+    // the guest's: open_metadata_path refuses it with EACCES. The Tool
+    // decides the guest's links (Detcore renders `/proc/self` itself).
     let opened_file;
     let link_fd = if path.is_empty() {
         if guest_dirfd == libc::AT_FDCWD {
@@ -27748,45 +27580,52 @@ mod tests {
         ));
     }
 
+    /// The executor has no copy of `/proc/self/loginuid` or of the cpufreq
+    /// files. A guest open of a cpufreq file reaches the host's sysfs, as on
+    /// ptrace, and the Tool decides what the guest reads (Detcore rewrites
+    /// the frequencies and boost on every backend). loginuid is a procfs file
+    /// that only the Tool may decide (Detcore omits it), so a guest that runs
+    /// without the Tool meets the real-procfs refusal, or the host's ENOENT
+    /// where the host kernel has no audit support and so no such file.
     #[test]
-    fn cpu_frequency_surface_is_fixed_for_absolute_and_relative_paths() {
+    fn loginuid_and_cpufreq_files_have_no_kvm_copy() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-
-        for (path, expected) in [
-            (
-                b"/sys/devices/system/cpu/cpu7/cpufreq/cpuinfo_max_freq".as_slice(),
-                b"3000000\n".as_slice(),
-            ),
-            (
-                b"/sys/devices/system/cpu/cpu7/cpufreq/cpuinfo_min_freq".as_slice(),
-                b"1000000\n".as_slice(),
-            ),
-            (
-                b"/sys/devices/system/cpu/cpu7/cpufreq/scaling_cur_freq".as_slice(),
-                b"2000000\n".as_slice(),
-            ),
-            (
-                b"/sys/devices/system/cpu/cpufreq/boost".as_slice(),
-                b"1\n".as_slice(),
-            ),
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let refusal = if std::fs::symlink_metadata("/proc/self/loginuid").is_ok() {
+            libc::EACCES
+        } else {
+            libc::ENOENT
+        };
+        assert_eq!(
+            open_readonly(&mut memory, &mut state, "/proc/self/loginuid"),
+            negative_errno(refusal)
+        );
+        for path in [
+            "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+            "/sys/devices/system/cpu/cpufreq/boost",
         ] {
+            let fd = open_readonly(&mut memory, &mut state, path);
+            let host = match std::fs::read(path) {
+                Ok(host) => host,
+                Err(error) => {
+                    assert_eq!(fd, negative_errno(error.raw_os_error().unwrap()), "{path}");
+                    continue;
+                }
+            };
+            assert!(fd >= 0, "{path}: {fd}");
+            let fd = fd as libc::c_int;
             assert_eq!(
-                synthetic_cpu_frequency_content(&state, libc::AT_FDCWD, path),
-                Some(expected)
+                state.fd_object_inodes[&fd].timestamps,
+                IdentityTimestamps::Host,
+                "{path}"
             );
+            assert!(!state.proc_files.contains_key(&fd), "{path}");
+            let host_fd = host_fd(&state, fd).unwrap();
+            let forwarded = std::fs::read(format!("/proc/self/fd/{host_fd}")).unwrap();
+            assert_eq!(forwarded, host, "{path}");
+            assert_eq!(close(&mut state, fd as u64), 0);
         }
-
-        let cpu_root = std::fs::File::open("/sys/devices/system/cpu").unwrap();
-        state.files.insert(3, cpu_root);
-        assert_eq!(
-            synthetic_cpu_frequency_content(&state, 3, b"cpu19/cpufreq/scaling_cur_freq"),
-            Some(b"2000000\n".as_slice())
-        );
-        assert_eq!(
-            synthetic_cpu_frequency_content(&state, 3, b"cpuX/cpufreq/scaling_cur_freq"),
-            None
-        );
     }
 
     #[test]
@@ -27894,7 +27733,8 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
-        for (path, first_byte) in [("/dev/urandom", 41), ("/proc/self/loginuid", b'0')] {
+        let maps_first_byte = proc_self_maps_content(&state)[0];
+        for (path, first_byte) in [("/dev/urandom", 41), ("/proc/self/maps", maps_first_byte)] {
             write_c_string(&mut memory, 0x100, path);
             let writable = syscall_result(
                 &mut memory,
@@ -27960,53 +27800,6 @@ mod tests {
                 ),
                 negative_errno(libc::EBADF)
             );
-        }
-    }
-
-    #[test]
-    fn generic_virtual_file_procfd_reopen_is_a_writable_unsealed_residual() {
-        const BUFFER: u64 = 0x200;
-        for path in [
-            "/proc/self/loginuid",
-            "/sys/devices/system/cpu/cpufreq/boost",
-        ] {
-            let root = TestDir::new();
-            let mut state = test_state(&root.0);
-            let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-            memory.write(BUFFER, b"z").unwrap();
-            let direct = open_readonly(&mut memory, &mut state, path);
-            assert!(direct >= 0, "direct open failed for {path}: {direct}");
-            assert!(
-                !state.proc_files.contains_key(&(direct as libc::c_int)),
-                "generic virtual carrier was accidentally classified as sealed proc: {path}"
-            );
-            let host = host_fd(&state, direct as libc::c_int).unwrap();
-            // memfd_create without MFD_ALLOW_SEALING starts with only
-            // F_SEAL_SEAL, so these generic carriers lack all mutation seals.
-            // SAFETY: host is a live generic virtual-file carrier.
-            assert_eq!(
-                unsafe { libc::fcntl(host, libc::F_GET_SEALS) },
-                libc::F_SEAL_SEAL
-            );
-
-            let procfd = format!("/proc/self/fd/{direct}");
-            let writable = open_with_flags(&mut memory, &mut state, &procfd, libc::O_RDWR);
-            assert!(
-                writable >= 0,
-                "generic virtual proc-fd writable-reopen residual changed for {path}: {writable}"
-            );
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_write,
-                    [writable as u64, BUFFER, 1, 0, 0, 0],
-                ),
-                1,
-                "generic virtual proc-fd carrier ceased to be writable for {path}"
-            );
-            assert_eq!(close(&mut state, writable as u64), 0);
-            assert_eq!(close(&mut state, direct as u64), 0);
         }
     }
 
@@ -46939,9 +46732,7 @@ mod tests {
     }
 
     #[test]
-    fn host_metadata_timestamps_keep_virtual_files_fixed_through_every_alias() {
-        const LOGINUID_ADDRESS: u64 = 0x100;
-        const FREQUENCY_ADDRESS: u64 = 0x140;
+    fn host_metadata_timestamps_keep_proc_snapshots_fixed_through_every_alias() {
         const SELF_MAPS_ADDRESS: u64 = 0x180;
         const PAIR_FDS: u64 = 0x1c0;
         const REOPEN_ADDRESS: u64 = 0x340;
@@ -46958,12 +46749,6 @@ mod tests {
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = true;
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-        write_c_string(&mut memory, LOGINUID_ADDRESS, "/proc/self/loginuid");
-        write_c_string(
-            &mut memory,
-            FREQUENCY_ADDRESS,
-            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
-        );
         write_c_string(&mut memory, SELF_MAPS_ADDRESS, "/proc/self/maps");
 
         let open = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, path: u64| {
@@ -46976,37 +46761,14 @@ mod tests {
             assert!(fd >= 0, "open failed: {fd}");
             fd as libc::c_int
         };
-        let loginuid = open(&mut memory, &mut state, LOGINUID_ADDRESS);
-        let frequency = open(&mut memory, &mut state, FREQUENCY_ADDRESS);
         let self_maps = open(&mut memory, &mut state, SELF_MAPS_ADDRESS);
-        // loginuid and the CPU frequency are the backend's virtual files;
-        // /proc/self/maps is a synthetic /proc file.
-        for fd in [loginuid, frequency] {
-            assert_eq!(
-                state.fd_object_inodes[&fd].timestamps,
-                IdentityTimestamps::VirtualFile
-            );
-        }
         assert_eq!(
             state.fd_object_inodes[&self_maps].timestamps,
             IdentityTimestamps::ProcSnapshot
         );
 
-        // A synthetic /proc file reports the epoch; a virtual file reports the
-        // backend's fixed metadata time.
-        let carriers = [
-            (
-                loginuid,
-                DETERMINISTIC_METADATA_SECONDS,
-                "/proc/self/loginuid",
-            ),
-            (
-                frequency,
-                DETERMINISTIC_METADATA_SECONDS,
-                "cpu0 scaling_cur_freq",
-            ),
-            (self_maps, 0, "/proc/self/maps"),
-        ];
+        // A synthetic /proc file reports the epoch.
+        let carriers = [(self_maps, 0, "/proc/self/maps")];
         let mut aliases = Vec::new();
         for (fd, fixed, name) in carriers {
             assert_fixed_descriptor_timestamps(&mut memory, &mut state, fd, fixed, name);
@@ -47089,7 +46851,7 @@ mod tests {
             write_struct(&mut ProviderMemory(&memory), SEND_IOV, &send_iov),
             0
         );
-        let send_control = rights_control(&[loginuid]);
+        let send_control = rights_control(&[self_maps]);
         memory.write(SEND_CONTROL, &send_control).unwrap();
         // SAFETY: libc::msghdr is plain data; a zeroed value is valid.
         let mut send_msg = unsafe { std::mem::zeroed::<libc::msghdr>() };
@@ -47117,10 +46879,10 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .proc_transfers
                 .is_empty(),
-            "a virtual-file right in flight holds no registration"
+            "a /proc snapshot right in flight holds no registration"
         );
-        let (_, loginuid_duplicate, loginuid_reopened) = aliases[0];
-        for fd in [loginuid, loginuid_duplicate, loginuid_reopened] {
+        let (_, maps_duplicate, maps_reopened) = aliases[0];
+        for fd in [self_maps, maps_duplicate, maps_reopened] {
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -47166,14 +46928,14 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(
             state.fd_object_inodes[&received[0]].timestamps,
-            IdentityTimestamps::VirtualFile
+            IdentityTimestamps::ProcSnapshot
         );
         assert_fixed_descriptor_timestamps(
             &mut memory,
             &mut state,
             received[0],
-            DETERMINISTIC_METADATA_SECONDS,
-            "/proc/self/loginuid received after the sender closed",
+            0,
+            "/proc/self/maps received after the sender closed",
         );
         let table = state
             .file_identity_table
@@ -47410,20 +47172,20 @@ mod tests {
         ReceiverClose,
     }
 
-    /// In a run that reports host metadata timestamps, sends a virtual file's
-    /// right and lets Linux discard it, more than [`PROC_TRANSFER_LIMIT`]
-    /// times. A discarded right must leave nothing counted against the limit,
-    /// so a virtual file and a process /proc description can both still be
-    /// sent and received afterwards.
-    fn assert_discarded_virtual_file_rights_hold_nothing(discard: RightDiscard) {
-        const LOGINUID_ADDRESS: u64 = 0x100;
+    /// In a run that reports host metadata timestamps, sends a `/proc`
+    /// snapshot's right and lets Linux discard it, more than
+    /// [`PROC_TRANSFER_LIMIT`] times. A discarded right must leave nothing
+    /// counted against the limit, so a snapshot and a process /proc
+    /// description can both still be sent and received afterwards.
+    fn assert_discarded_snapshot_rights_hold_nothing(discard: RightDiscard) {
+        const SELF_MAPS_ADDRESS: u64 = 0x100;
         const PROC_STAT_ADDRESS: u64 = 0x140;
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = true;
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-        write_c_string(&mut memory, LOGINUID_ADDRESS, "/proc/self/loginuid");
+        write_c_string(&mut memory, SELF_MAPS_ADDRESS, "/proc/self/maps");
         write_c_string(&mut memory, PROC_STAT_ADDRESS, "/proc/self/stat");
         let open = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, path: u64| {
             let fd = syscall_result(
@@ -47435,14 +47197,14 @@ mod tests {
             assert!(fd >= 0, "open failed: {fd}");
             fd as libc::c_int
         };
-        let loginuid = open(&mut memory, &mut state, LOGINUID_ADDRESS);
+        let self_maps = open(&mut memory, &mut state, SELF_MAPS_ADDRESS);
 
         for cycle in 0..PROC_TRANSFER_LIMIT + 2 {
             let [sender, receiver] = guest_datagram_pair(&mut memory, &mut state);
             assert_eq!(
-                send_guest_rights(&mut memory, &mut state, sender, &[loginuid]),
+                send_guest_rights(&mut memory, &mut state, sender, &[self_maps]),
                 1,
-                "{discard:?} cycle {cycle}: send /proc/self/loginuid"
+                "{discard:?} cycle {cycle}: send /proc/self/maps"
             );
             match discard {
                 RightDiscard::Read => assert_eq!(
@@ -47474,7 +47236,7 @@ mod tests {
 
         let proc_stat = open(&mut memory, &mut state, PROC_STAT_ADDRESS);
         for (fd, what) in [
-            (loginuid, "/proc/self/loginuid"),
+            (self_maps, "/proc/self/maps"),
             (proc_stat, "/proc/self/stat"),
         ] {
             let [sender, receiver] = guest_datagram_pair(&mut memory, &mut state);
@@ -47487,13 +47249,13 @@ mod tests {
                 receive_guest_rights(&mut memory, &mut state, receiver, RIGHTS_CONTROL_CAPACITY);
             assert_eq!(result, 1, "{discard:?}: receive {what}");
             assert_eq!(received.len(), 1, "{discard:?}: receive {what}");
-            if fd == loginuid {
+            if fd == self_maps {
                 assert_fixed_descriptor_timestamps(
                     &mut memory,
                     &mut state,
                     received[0],
-                    DETERMINISTIC_METADATA_SECONDS,
-                    "/proc/self/loginuid received after the discarded rights",
+                    0,
+                    "/proc/self/maps received after the discarded rights",
                 );
             }
             for fd in [received[0], receiver, sender] {
@@ -47511,18 +47273,18 @@ mod tests {
     }
 
     #[test]
-    fn host_metadata_timestamps_hold_nothing_for_virtual_file_rights_discarded_by_read() {
-        assert_discarded_virtual_file_rights_hold_nothing(RightDiscard::Read);
+    fn host_metadata_timestamps_hold_nothing_for_proc_snapshot_rights_discarded_by_read() {
+        assert_discarded_snapshot_rights_hold_nothing(RightDiscard::Read);
     }
 
     #[test]
-    fn host_metadata_timestamps_hold_nothing_for_virtual_file_rights_truncated_by_recvmsg() {
-        assert_discarded_virtual_file_rights_hold_nothing(RightDiscard::ZeroCapacityRecvmsg);
+    fn host_metadata_timestamps_hold_nothing_for_proc_snapshot_rights_truncated_by_recvmsg() {
+        assert_discarded_snapshot_rights_hold_nothing(RightDiscard::ZeroCapacityRecvmsg);
     }
 
     #[test]
-    fn host_metadata_timestamps_hold_nothing_for_virtual_file_rights_dropped_by_receiver_close() {
-        assert_discarded_virtual_file_rights_hold_nothing(RightDiscard::ReceiverClose);
+    fn host_metadata_timestamps_hold_nothing_for_proc_snapshot_rights_dropped_by_receiver_close() {
+        assert_discarded_snapshot_rights_hold_nothing(RightDiscard::ReceiverClose);
     }
 
     #[test]
@@ -47828,9 +47590,7 @@ mod tests {
     /// fixed timestamps. With the setting off, chmod behaves as it always has.
     #[test]
     fn host_metadata_timestamps_refuse_mode_changes_that_would_hide_a_carrier() {
-        const LOGINUID_ADDRESS: u64 = 0x100;
         const SELF_MAPS_ADDRESS: u64 = 0x180;
-        const FREQUENCY_ADDRESS: u64 = 0x200;
         const EMPTY_ADDRESS: u64 = 0x2c0;
         const LINK_ADDRESS: u64 = 0x300;
 
@@ -47844,13 +47604,7 @@ mod tests {
             let mut state = test_state(&root.0);
             state.host_metadata_timestamps = host_metadata_timestamps;
             let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-            write_c_string(&mut memory, LOGINUID_ADDRESS, "/proc/self/loginuid");
             write_c_string(&mut memory, SELF_MAPS_ADDRESS, "/proc/self/maps");
-            write_c_string(
-                &mut memory,
-                FREQUENCY_ADDRESS,
-                "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
-            );
             write_c_string(&mut memory, EMPTY_ADDRESS, "");
             let open = |memory: &mut GuestMemory,
                         state: &mut LoadedStaticElf,
@@ -47867,12 +47621,6 @@ mod tests {
             };
             let [sender, receiver] = guest_datagram_pair(&mut memory, &mut state);
 
-            let loginuid = open(&mut memory, &mut state, LOGINUID_ADDRESS, libc::O_RDONLY);
-            // A CPU-frequency file is a virtual sysfs file. Linux lets its
-            // owner change its mode; refusing that while the setting is on is
-            // a disclosed compatibility restriction, see
-            // `set_host_metadata_timestamps`.
-            let frequency = open(&mut memory, &mut state, FREQUENCY_ADDRESS, libc::O_RDONLY);
             // A /proc snapshot received after its sender closed has no
             // proc_files entry, only its snapshot identity.
             let self_maps = open(&mut memory, &mut state, SELF_MAPS_ADDRESS, libc::O_RDONLY);
@@ -47888,19 +47636,7 @@ mod tests {
             let snapshot = snapshot[0];
             assert!(!state.proc_files.contains_key(&snapshot));
 
-            for (fd, fixed, what) in [
-                (
-                    loginuid,
-                    DETERMINISTIC_METADATA_SECONDS,
-                    "/proc/self/loginuid",
-                ),
-                (
-                    frequency,
-                    DETERMINISTIC_METADATA_SECONDS,
-                    "cpu0 scaling_cur_freq",
-                ),
-                (snapshot, 0, "a received /proc/self/maps"),
-            ] {
+            for (fd, fixed, what) in [(snapshot, 0, "a received /proc/self/maps")] {
                 if !host_metadata_timestamps {
                     assert_eq!(
                         syscall_result(
@@ -48405,7 +48141,6 @@ mod tests {
     fn received_o_path_carriers_keep_their_class_when_descriptors_run_out() {
         const TEST: &str =
             "executor::tests::received_o_path_carriers_keep_their_class_when_descriptors_run_out";
-        const LOGINUID_ADDRESS: u64 = 0x100;
         const SELF_MAPS_ADDRESS: u64 = 0x180;
         if !in_descriptor_exhaustion_child(TEST) {
             return;
@@ -48415,47 +48150,42 @@ mod tests {
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = true;
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
-        write_c_string(&mut memory, LOGINUID_ADDRESS, "/proc/self/loginuid");
         write_c_string(&mut memory, SELF_MAPS_ADDRESS, "/proc/self/maps");
-        let mut carriers = Vec::new();
-        for (path, class) in [
-            (LOGINUID_ADDRESS, IdentityTimestamps::VirtualFile),
-            (SELF_MAPS_ADDRESS, IdentityTimestamps::ProcSnapshot),
-        ] {
-            let fd = syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_openat,
-                [libc::AT_FDCWD as u64, path, libc::O_RDONLY as u64, 0, 0, 0],
-            );
-            assert!(fd >= 0, "open failed: {fd}");
-            let fd = fd as libc::c_int;
-            assert_eq!(state.fd_object_inodes[&fd].timestamps, class);
-            let path_only = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_PATH)
-                .open(format!("/proc/self/fd/{}", host_fd(&state, fd).unwrap()))
-                .unwrap();
-            // Every sender alias is gone, as for a right received late.
-            guest_close(&mut memory, &mut state, fd);
-            assert_eq!(received_carrier_timestamps(&state, &path_only), class);
-            carriers.push((path_only, class));
-        }
+        let fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                SELF_MAPS_ADDRESS,
+                libc::O_RDONLY as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert!(fd >= 0, "open failed: {fd}");
+        let fd = fd as libc::c_int;
+        let class = IdentityTimestamps::ProcSnapshot;
+        assert_eq!(state.fd_object_inodes[&fd].timestamps, class);
+        let path_only = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(format!("/proc/self/fd/{}", host_fd(&state, fd).unwrap()))
+            .unwrap();
+        // Every sender alias is gone, as for a right received late.
+        guest_close(&mut memory, &mut state, fd);
+        assert_eq!(received_carrier_timestamps(&state, &path_only), class);
         let (exhausted, observed) = with_full_descriptor_table(|| {
             let probe = descriptor_allocation_errno();
-            let classes = carriers
-                .iter()
-                .map(|(file, _)| received_carrier_timestamps(&state, file))
-                .collect::<Vec<_>>();
-            (probe, classes)
+            (probe, received_carrier_timestamps(&state, &path_only))
         });
         assert_eq!(exhausted, Some(libc::EMFILE));
-        let (probe, classes) = observed.unwrap();
+        let (probe, observed) = observed.unwrap();
         assert_eq!(probe, Some(libc::EMFILE), "the table must be full");
         assert_eq!(
-            classes,
-            carriers.iter().map(|(_, class)| *class).collect::<Vec<_>>(),
-            "carrier classes with no descriptor left for the seal probe"
+            observed, class,
+            "carrier class with no descriptor left for the seal probe"
         );
         eprintln!("{DESCRIPTOR_EXHAUSTION_COMPLETE}");
     }
@@ -65430,6 +65160,30 @@ mod tests {
         set_signal_test_name(&mut state, b"abcdefghijklmnop");
         assert_eq!(proc_comm(&state), b"abcdefghijklmno");
         assert_eq!(proc_comm(&state).len(), 15);
+    }
+
+    /// The executor has no copy of the `/proc/self` link, nor of
+    /// `/proc/<pid>`, which Linux does not make a link at all. The host's are
+    /// the supervisor's, so a guest that runs without the Tool meets the
+    /// real-procfs refusal and its buffer is left alone. Detcore renders
+    /// `/proc/self` itself on every backend.
+    #[test]
+    fn proc_self_link_is_refused_rather_than_read_from_the_supervisor() {
+        let dir = TestDir::new();
+        let state = test_state(&dir.0);
+        let mut memory = GuestMemory::new(0, 8192).unwrap();
+        for path in ["/proc/self".to_owned(), format!("/proc/{}", state.pid)] {
+            write_c_string(&mut memory, 0x100, &path);
+            memory.write(0x1000, &[0xa5; 64]).unwrap();
+            assert_eq!(
+                readlink_at_impl(&mut memory, &state, libc::AT_FDCWD, 0x100, 0x1000, 64, None),
+                negative_errno(libc::EACCES),
+                "{path}"
+            );
+            let mut output = [0; 64];
+            memory.read(0x1000, &mut output).unwrap();
+            assert_eq!(output, [0xa5; 64], "{path}");
+        }
     }
 
     #[test]

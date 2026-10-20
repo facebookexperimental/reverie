@@ -121,11 +121,11 @@ fn syncfs_closed_and_path_only_precede_private_refusal_without_host_call() {
     }
 }
 
-// The backend creates a memfd named reverie-kvm-virtual-file only in a run that
-// reports host metadata timestamps. In any other run the name belongs to the
-// guest, and the guest's memfd is an ordinary file that Linux syncfs serves.
+// The backend no longer creates a memfd named reverie-kvm-virtual-file, so in
+// every run the name belongs to the guest, and the guest's memfd is an ordinary
+// file that Linux syncfs serves.
 #[test]
-fn syncfs_reserves_the_virtual_file_carrier_name_only_when_the_backend_creates_it() {
+fn syncfs_serves_a_guest_memfd_named_like_the_removed_virtual_file_carrier() {
     let root = TestDir::new();
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
     for host_metadata_timestamps in [false, true] {
@@ -142,22 +142,48 @@ fn syncfs_reserves_the_virtual_file_carrier_name_only_when_the_backend_creates_i
             observed.set(observed.get() + 1);
             0
         });
-        let (expected, calls) = if host_metadata_timestamps {
-            (negative_errno(libc::ENOSYS), 0)
-        } else {
-            (0, 1)
-        };
         assert_eq!(
             syncfs_call(&mut memory, &mut state, fd as u64),
-            expected,
+            0,
             "host_metadata_timestamps={host_metadata_timestamps}"
         );
         assert_eq!(
             seen.get(),
-            calls,
+            1,
             "host_metadata_timestamps={host_metadata_timestamps}"
         );
         drop(hook);
+        assert_eq!(close(&mut state, fd as u64), 0);
+    }
+}
+
+// truncate through a /proc/self/fd link refuses only the random device's
+// carrier, by its exact name; a guest memfd named like the removed
+// virtual-file carrier, or another reverie-kvm-virtual name, is truncated.
+#[test]
+fn truncate_refuses_only_the_random_device_carrier_name() {
+    let root = TestDir::new();
+    let mut state = test_state(&root.0);
+    let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    for (name, expected) in [
+        ("reverie-kvm-virtual", negative_errno(libc::EINVAL)),
+        ("reverie-kvm-virtual-file", 0),
+        ("reverie-kvm-virtual-ordinary", 0),
+    ] {
+        let mut file = syncfs_memfd(name);
+        file.write_all(b"guest bytes\n").unwrap();
+        let fd = insert_file_with_flags(&mut state, file, false, None);
+        write_c_string(&mut memory, 0x100, &format!("/proc/self/fd/{fd}"));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_truncate,
+                [0x100, 0, 0, 0, 0, 0]
+            ),
+            expected,
+            "{name}"
+        );
         assert_eq!(close(&mut state, fd as u64), 0);
     }
 }
@@ -293,12 +319,7 @@ fn syncfs_private_rights_remain_refused_after_sender_reuse_dup_fork_exec() {
     let root = TestDir::new();
     let replacement = root.0.join("replacement");
     std::fs::write(&replacement, SELF_MAPS_CONTENT).unwrap();
-    for path in [
-        "/proc/self/maps",
-        "/proc/self/loginuid",
-        "/proc/self/stat",
-        "/proc/self/status",
-    ] {
+    for path in ["/proc/self/maps", "/proc/self/stat", "/proc/self/status"] {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         let original = open_readonly(&mut memory, &mut state, path) as i32;
@@ -309,10 +330,10 @@ fn syncfs_private_rights_remain_refused_after_sender_reuse_dup_fork_exec() {
             host_file_key(host_fd(&state, received).unwrap()).unwrap(),
             original_key
         );
-        if matches!(path, "/proc/self/maps" | "/proc/self/loginuid") {
+        if path == "/proc/self/maps" {
             assert!(
                 !state.proc_files.contains_key(&received),
-                "real transfer loses fixed/virtual metadata"
+                "real transfer loses fixed metadata"
             );
             assert!(!state.fdinfo_files.contains_key(&received));
         }
@@ -362,7 +383,6 @@ fn syncfs_known_private_descriptions_are_refused_without_host_call() {
         "/proc/self/status",
         "/proc",
         "/dev/urandom",
-        "/proc/self/loginuid",
     ] {
         let fd = open_readonly(&mut memory, &mut state, path);
         assert!(fd >= 0, "{path}: {fd}");
