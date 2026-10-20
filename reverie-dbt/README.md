@@ -81,6 +81,16 @@ allocated by DynamoRIO and stored in `drmgr` TLS. The Rust runtime receives
 that state through an explicit C ABI pointer, avoiding dynamic Rust TLS inside
 DynamoRIO's private loader.
 
+Private client images and their dependencies require an owned VMM reservation
+before their segments are mapped. If a fixed mapping or owned-range restoration
+fails, the loader emits a named fatal diagnostic and exits with status 255,
+retaining the claim instead of retrying unsafe cleanup. A failure during exit-time
+unloading therefore overrides the application's ordinary exit status. Optional
+auxiliary-load refusals that retain known ownership can still return NULL after
+safe cleanup; mandatory startup ownership refusals terminate without running the
+guest uninstrumented. The bootstrap DynamoRIO core keeps its existing owner;
+this does not establish independence from changes to that core image's size.
+
 The native `-branch-facts` option enables a separate per-task count of completed
 original application conditional instructions from the first application
 instruction, including the interpreter and loaded modules. It is disabled by

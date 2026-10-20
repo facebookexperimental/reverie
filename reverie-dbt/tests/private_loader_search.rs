@@ -824,6 +824,23 @@ fn footprint_variants(environment_search: bool) {
         "{observations:#?}"
     );
     for observation in &observations {
+        // These options forbid arena relocation or shrinking. Require the whole
+        // rounded image and guard page to stay in that fixed arena, including
+        // escapes below it that would not move the guest's top-down mmap.
+        for (base, image) in [
+            (observation.client_base, observation.client),
+            (observation.runtime_base, observation.runtime),
+        ] {
+            let end = base
+                .checked_add(image.span)
+                .unwrap()
+                .checked_add(4096)
+                .unwrap();
+            assert!(
+                base >= 0x4000_0000 && end <= 0x4400_0000,
+                "image and guard escaped the fixed VMM arena: {observation:#?}"
+            );
+        }
         // Emit actual bases/extents for a separate reservation/containment trace.
         // Arena membership is deliberately not inferred from an internal-address bit.
         eprintln!(
