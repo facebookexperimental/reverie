@@ -1827,18 +1827,22 @@ impl VerifiedCompiledSources {
         Ok(verified)
     }
 
-    /// Run the two fixture consumers' receipt-only qualification before closing
-    /// its independently resolved sources. This test-only helper coalesces the
-    /// intermediate resolution close with the close after receipt qualification;
-    /// ordinary callers of `resolve` retain their existing closing check.
+    /// Run receipt-only qualification within an independently resolved source
+    /// transaction. Fixture consumers use this through the library dependency;
+    /// they do not need to compile the library's unit tests into their binaries.
+    /// This coalesces the intermediate close with the close after qualification.
+    /// Ordinary callers of `resolve` retain their existing closing check.
     ///
-    /// The audited body must not launch a guest or publish success. It receives
-    /// no runner, cannot reset the closing deadline, and may only return owned
-    /// results. No result escapes before the source close succeeds. Both phases
-    /// of a fixture still resolve fresh Cargo metadata and perform the full ELF
-    /// proof; no source authority or cached proof crosses guest execution.
-    #[cfg(test)]
-    pub(crate) fn with_resolved<T>(
+    /// The body receives a borrowed context and no runner; it cannot reset the
+    /// closing deadline or return the context. Both normal `Ok` and `Err` paths
+    /// close sources before this method returns. A panic or abort does not
+    /// promise that close. Closure side effects are not restricted by the type
+    /// system: callers must not launch a guest or publish success within it, or
+    /// use its results until the outer transaction succeeds. The returned record
+    /// is data, not execution authority. Each fixture phase still resolves fresh
+    /// Cargo metadata and performs the full ELF proof; no cached proof crosses
+    /// guest execution.
+    pub fn with_resolved<T>(
         expected: &CompiledSourceExpectation<'_>,
         runner: &mut Runner,
         body: impl FnOnce(&Self) -> Result<T>,
@@ -1857,8 +1861,9 @@ impl VerifiedCompiledSources {
         }
     }
 
-    // Only the closed public factory and the audited test transaction above
-    // can construct this context. Neither returns it before a successful close.
+    // Only the closed public factory and the source transaction above construct
+    // this context. The transaction lends it to its receipt-only body, then
+    // closes sources before returning an owned result.
     fn resolve_candidate(
         expected: &CompiledSourceExpectation<'_>,
         runner: &mut Runner,

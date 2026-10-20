@@ -252,8 +252,12 @@ fn connect_ordinary<G: GlobalTool>(
     path: &Path,
     tid: Pid,
 ) -> Result<BlockingRpcClient<G, GuestRpcStream>, reverie_rpc_transport::RpcError> {
-    let stream = move_ordinary_coordinator_stream(UnixStream::connect(path)?)?;
-    BlockingRpcClient::from_connected_stream(GuestRpcStream::from(stream), tid)
+    // Preserve the ordinary connection's descriptor allocation. Moving it into
+    // the high Tool-output range changes guest dup2 results: the output socket
+    // can relocate, while the coordinator descriptor is fixed and protected.
+    // Authenticated initial-image callers opt into the high descriptor helper
+    // explicitly, before publishing their separate descriptor contract.
+    BlockingRpcClient::from_connected_stream(GuestRpcStream::from(UnixStream::connect(path)?), tid)
 }
 
 fn current_id(number: i64) -> io::Result<Pid> {

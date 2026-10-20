@@ -30,8 +30,8 @@ use crate::trap::raw_syscall6;
 /// drops the original owner exactly once; failure drops it and returns the
 /// actual duplication error. Native inherited-gate streams do not use this.
 pub fn move_ordinary_coordinator_stream(stream: UnixStream) -> io::Result<UnixStream> {
-    // The same raw-gate F_DUPFD_CLOEXEC operation used by the legacy client;
-    // an occupied high descriptor is skipped, never overwritten.
+    // Explicit InitialImage placement; the ordinary connection does not opt in.
+    // An occupied high descriptor is skipped, never overwritten.
     let reserved_fd = raw_result(unsafe {
         raw_syscall6(
             libc::SYS_fcntl,
@@ -352,6 +352,126 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[derive(Default)]
+    struct OrdinaryConnectionModel;
+
+    #[reverie::tool]
+    impl reverie::GlobalTool for OrdinaryConnectionModel {
+        type Request = u64;
+        type Response = u64;
+        type Config = u64;
+
+        async fn receive_rpc(&self, _: reverie::Pid, request: u64) -> u64 {
+            request
+        }
+    }
+
+    #[test]
+    fn ordinary_coordinator_connect_and_rpc_do_not_require_high_descriptors() {
+        isolated_coordinator_move_test(
+            "guest::rpc::stream::tests::ordinary_coordinator_connect_and_rpc_do_not_require_high_descriptors",
+            || {
+                use std::os::unix::net::UnixListener;
+                use std::time::Duration;
+
+                use reverie::GlobalRPC;
+                use reverie_rpc_transport::RequestEnvelope;
+                use reverie_rpc_transport::codec::encode;
+
+                // The production connection must work below the opt-in move's
+                // minimum. The existing high-FD move error control separately
+                // requires the real EINVAL under this same soft limit.
+                let mut original = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: only this isolated subprocess changes its soft limit.
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut original) },
+                    0
+                );
+                assert!(original.rlim_max >= 1024);
+                let restricted = libc::rlimit {
+                    rlim_cur: 1024,
+                    rlim_max: original.rlim_max,
+                };
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &restricted) },
+                    0
+                );
+                let mut actual = original;
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut actual) },
+                    0
+                );
+                assert_eq!(actual.rlim_cur, 1024);
+                assert_eq!(actual.rlim_max, original.rlim_max);
+
+                let directory =
+                    std::env::temp_dir().join(format!("ordinary-rpc-lowfd-{}", std::process::id()));
+                std::fs::create_dir(&directory).unwrap();
+                let directory_owner = std::fs::File::open(&directory).unwrap();
+                // Keep the socket inside the caller's TMPDIR even when its
+                // literal pathname exceeds sockaddr_un's bounded sun_path.
+                let path = std::path::PathBuf::from(format!(
+                    "/proc/self/fd/{}/socket",
+                    directory_owner.as_raw_fd()
+                ));
+                let listener = UnixListener::bind(&path).unwrap();
+                // SAFETY: gettid reads the actual test thread identity.
+                let tid = reverie::Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+                let peer = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let config = encode(&73_u64).unwrap();
+                    socket
+                        .write_all(&(config.len() as u32).to_be_bytes())
+                        .unwrap();
+                    socket.write_all(&config).unwrap();
+                    let expected = encode(&RequestEnvelope {
+                        from: tid,
+                        request: 19_u64,
+                    })
+                    .unwrap();
+                    let mut prefix = [0; 4];
+                    socket.read_exact(&mut prefix).unwrap();
+                    assert_eq!(u32::from_be_bytes(prefix) as usize, expected.len());
+                    let mut request = vec![0; expected.len()];
+                    socket.read_exact(&mut request).unwrap();
+                    assert_eq!(request, expected);
+                    let response = encode(&91_u64).unwrap();
+                    socket
+                        .write_all(&(response.len() as u32).to_be_bytes())
+                        .unwrap();
+                    socket.write_all(&response).unwrap();
+                    assert_eq!(socket.read(&mut [0]).unwrap(), 0);
+                });
+                let rpc = crate::guest::rpc::CoordinatorRpc::<OrdinaryConnectionModel>::connect(
+                    &path,
+                    |_, _| panic!("ordinary connection unexpectedly reconnected"),
+                )
+                .unwrap();
+                assert!((0..1024).contains(&rpc.raw_fd()));
+                assert_eq!(*rpc.config(), 73);
+                assert_eq!(rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
+                drop(rpc);
+                peer.join().unwrap();
+                std::fs::remove_file(directory.join("socket")).unwrap();
+                drop(directory_owner);
+                std::fs::remove_dir(&directory).unwrap();
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
+                    0
+                );
+            },
+        );
     }
 
     #[test]
