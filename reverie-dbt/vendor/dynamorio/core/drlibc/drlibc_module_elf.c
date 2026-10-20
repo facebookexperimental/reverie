@@ -356,7 +356,10 @@ elf_loader_read_phdrs(elf_loader_t *elf)
         return NULL;
     ph_off = elf->ehdr->e_phoff;
     ph_size = elf->ehdr->e_phnum * elf->ehdr->e_phentsize;
-    if (elf->file_map == NULL && ph_off + ph_size < sizeof(elf->buf)) {
+    if (elf->ehdr->e_phentsize != sizeof(ELF_PROGRAM_HEADER_TYPE) || ph_size == 0 ||
+        ph_off > (size_t)-1 - ph_size)
+        return NULL;
+    if (elf->file_map == NULL && ph_off + ph_size <= sizeof(elf->buf)) {
         /* We already read phdrs, and they are in buf. */
         elf->phdrs = (ELF_PROGRAM_HEADER_TYPE *)(elf->buf + elf->ehdr->e_phoff);
     } else {
@@ -365,6 +368,8 @@ elf_loader_read_phdrs(elf_loader_t *elf)
          * but that would introduce a dependency on DR's heap.
          */
         if (elf_loader_map_file(elf, false /*!reachable*/) == NULL)
+            return NULL;
+        if (ph_off + ph_size > elf->file_size)
             return NULL;
         elf->phdrs = (ELF_PROGRAM_HEADER_TYPE *)(elf->file_map + elf->ehdr->e_phoff);
     }
@@ -383,6 +388,36 @@ elf_loader_read_headers(elf_loader_t *elf, const char *filename)
     return true;
 }
 
+static bool
+private_image_layout_valid(elf_loader_t *elf)
+{
+    uint64 file_size;
+    bool has_load = false;
+    if (!os_get_file_size_by_handle(elf->fd, &file_size))
+        return false;
+    for (uint i = 0; i < elf->ehdr->e_phnum; ++i) {
+        const ELF_PROGRAM_HEADER_TYPE *ph = &elf->phdrs[i];
+        if (ph->p_type != PT_LOAD)
+            continue;
+        has_load = true;
+        if (ph->p_filesz > ph->p_memsz || ph->p_offset > file_size ||
+            ph->p_filesz > file_size - ph->p_offset ||
+            ph->p_vaddr > (ptr_uint_t)-1 - ph->p_memsz ||
+            ph->p_vaddr + ph->p_memsz > (ptr_uint_t)-1 - (PAGE_SIZE - 1) ||
+            (ph->p_vaddr & (PAGE_SIZE - 1)) != (ph->p_offset & (PAGE_SIZE - 1)))
+            return false;
+    }
+    return has_load;
+}
+
+static bool
+private_image_contains(const elf_loader_t *elf, app_pc address, size_t size)
+{
+    const private_image_reservation_t *r = &elf->reservation;
+    return r->active && !r->indeterminate && address >= r->base && size <= r->size &&
+        (ptr_uint_t)address - (ptr_uint_t)r->base <= r->size - size;
+}
+
 app_pc
 elf_loader_map_phdrs(elf_loader_t *elf, bool fixed, map_fn_t map_func,
                      unmap_fn_t unmap_func, prot_fn_t prot_func,
@@ -396,10 +431,18 @@ elf_loader_map_phdrs(elf_loader_t *elf, bool fixed, map_fn_t map_func,
     uint seg_prot, i;
     ptr_int_t delta;
     size_t initial_map_size;
+    bool owned = TEST(MODLOAD_PRIVATE_VMM, flags);
 
     ASSERT(elf->phdrs != NULL && "call elf_loader_read_phdrs() first");
     if (elf->phdrs == NULL)
         return NULL;
+    if (owned && (fixed || TESTANY(MODLOAD_IS_APP | MODLOAD_NOT_PRIVLIB |
+                                      MODLOAD_SKIP_WRITABLE | MODLOAD_SEPARATE_PROCESS,
+                                  flags) ||
+                  !private_image_layout_valid(elf))) {
+        elf->private_error = "private image has invalid ELF bounds or mapping flags";
+        return NULL;
+    }
 
     map_base = module_vaddr_from_prog_header((app_pc)elf->phdrs, elf->ehdr->e_phnum, NULL,
                                              &map_end);
@@ -408,6 +451,11 @@ elf_loader_map_phdrs(elf_loader_t *elf, bool fixed, map_fn_t map_func,
         (*check_bounds_func)(elf, map_base, map_end);
 
     elf->image_size = map_end - map_base;
+    if (owned && (map_end <= map_base ||
+                  elf->image_size > (size_t)-1 - PAGE_SIZE)) {
+        elf->private_error = "private image extent overflow";
+        return NULL;
+    }
 
     /* reserve the memory from os for library */
     initial_map_size = elf->image_size;
@@ -423,9 +471,22 @@ elf_loader_map_phdrs(elf_loader_t *elf, bool fixed, map_fn_t map_func,
                                 */
                                ((fixed && map_base != NULL) ? MAP_FILE_FIXED : 0) |
                                (TEST(MODLOAD_REACHABLE, flags) ? MAP_FILE_REACHABLE : 0) |
+                               (owned ? MAP_FILE_PRIVATE_VMM : 0) |
                                (TEST(MODLOAD_IS_APP, flags) ? MAP_FILE_APP : 0));
-    if (lib_base == NULL)
+    if (lib_base == NULL) {
+        if (owned)
+            elf->private_error = "private image VMM reservation failed";
         return NULL;
+    }
+    if (owned) {
+        elf->reservation.base = lib_base;
+        elf->reservation.size = initial_map_size;
+        elf->reservation.active = true;
+        if (initial_map_size > (ptr_uint_t)-1 - (ptr_uint_t)lib_base) {
+            elf->private_error = "private image reservation extent overflow";
+            goto private_failure;
+        }
+    }
     LOG(GLOBAL, LOG_LOADER, 3,
         "%s: initial reservation " PFX "-" PFX " vs preferred " PFX "\n", __FUNCTION__,
         lib_base, lib_base + initial_map_size, map_base);
@@ -471,10 +532,21 @@ elf_loader_map_phdrs(elf_loader_t *elf, bool fixed, map_fn_t map_func,
                 (app_pc)ALIGN_FORWARD(prog_hdr->p_vaddr + prog_hdr->p_memsz, PAGE_SIZE) +
                 delta;
             seg_size = seg_end - seg_base;
-            if (seg_base != last_end) {
+            if (owned &&
+                (!private_image_contains(elf, seg_base, seg_size) ||
+                 mem_end < seg_base ||
+                 !private_image_contains(elf, seg_base, mem_end - seg_base))) {
+                elf->private_error = "private image segment escapes owned reservation";
+                goto private_failure;
+            }
+            if (seg_base != last_end && (!owned || seg_base > last_end)) {
                 /* XXX: a hole, I reserve this space instead of unmap it */
                 size_t hole_size = seg_base - last_end;
-                (*prot_func)(last_end, hole_size, MEMPROT_NONE);
+                bool ok = (*prot_func)(last_end, hole_size, MEMPROT_NONE);
+                if (owned && !ok) {
+                    elf->private_error = "private image hole protection failed";
+                    goto private_failure;
+                }
             }
             seg_prot = module_segment_prot_to_osprot(prog_hdr);
             pg_offs = ALIGN_BACKWARD(prog_hdr->p_offset, PAGE_SIZE);
@@ -489,7 +561,21 @@ elf_loader_map_phdrs(elf_loader_t *elf, bool fixed, map_fn_t map_func,
             }
             if (seg_size > 0) { /* i#1872: handle empty segments */
                 if (do_mmap) {
-                    if (overlap_map_func != NULL) {
+                    if (owned) {
+                        /* Keep the entire image claim while atomically replacing
+                         * this segment.  Never free bitmap blocks between maps. */
+                        elf->reservation.indeterminate = true;
+                        map = (*map_func)(
+                            elf->fd, &seg_size, pg_offs, seg_base,
+                            seg_prot | MEMPROT_WRITE,
+                            MAP_FILE_COPY_ON_WRITE | MAP_FILE_IMAGE | MAP_FILE_FIXED |
+                                MAP_FILE_PRIVATE_VMM | MAP_FILE_VMM_COMMIT);
+                        if (map != seg_base) {
+                            elf->private_error = "private image segment mapping failed";
+                            goto private_failure;
+                        }
+                        elf->reservation.indeterminate = false;
+                    } else if (overlap_map_func != NULL) {
                         /* The relevant part of the anonymous map obtained above is
                          * expected to automatically and atomically get unmapped because
                          * we use overlap_map_func (which requires MAP_FILE_FIXED).
@@ -543,15 +629,33 @@ elf_loader_map_phdrs(elf_loader_t *elf, bool fixed, map_fn_t map_func,
                 (app_pc)ALIGN_FORWARD(prog_hdr->p_vaddr + prog_hdr->p_memsz, PAGE_SIZE) +
                 delta;
             seg_size = seg_end - seg_base;
-            if (seg_size > 0 && do_mmap)
-                (*prot_func)(seg_base, seg_size, seg_prot);
-            last_end = seg_end;
+            if (seg_size > 0 && do_mmap) {
+                bool ok = (*prot_func)(seg_base, seg_size, seg_prot);
+                if (owned && !ok) {
+                    elf->private_error = "private image segment protection failed";
+                    goto private_failure;
+                }
+            }
+            last_end = owned && last_end > seg_end ? last_end : seg_end;
         }
     }
     ASSERT(last_end == lib_end);
     /* XXX: recover from map failure rather than relying on asserts. */
 
     return lib_base;
+
+private_failure:
+    /* A failed fixed map may have removed the old mapping before failing.
+     * Do not overwrite a possible new application mapping in that hole.  The
+     * caller terminates with the claim retained.  Pre-effect/protection failures
+     * preserve ownership and may restore the known-owned allocation once. */
+    if (!elf->reservation.indeterminate) {
+        elf->reservation.indeterminate = true;
+        if ((*unmap_func)(elf->reservation.base, elf->reservation.size))
+            memset(&elf->reservation, 0, sizeof(elf->reservation));
+    }
+    elf->load_base = NULL;
+    return NULL;
 }
 
 /* Iterate program headers of a mapped ELF image and find the string that

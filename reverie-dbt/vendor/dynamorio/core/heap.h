@@ -90,6 +90,8 @@ typedef enum {
     MAP_FILE_REACHABLE = 0x0008,  /* Map at location reachable from vmcode */
     MAP_FILE_VMM_COMMIT = 0x0010, /* Map address is pre-reserved inside VMM. */
     MAP_FILE_APP = 0x0020,        /* Mapping is for the app, not DR/client. */
+    /* Initial private-image claim; never spill outside the existing VMM. */
+    MAP_FILE_PRIVATE_VMM = 0x0040,
 } map_flags_t;
 
 typedef byte *heap_pc;

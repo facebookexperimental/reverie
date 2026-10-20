@@ -95,6 +95,8 @@ typedef struct elf_loader_t {
     app_pc load_base;               /* Load base. */
     ptr_int_t load_delta;           /* Delta from preferred base. */
     size_t image_size;              /* Size of the mapped image. */
+    private_image_reservation_t reservation; /* Pending private-image allocation. */
+    const char *private_error;      /* Named private-load refusal, if any. */
     void *file_map;                 /* Whole file map, if needed. */
     size_t file_size;               /* Size of the file map. */
 

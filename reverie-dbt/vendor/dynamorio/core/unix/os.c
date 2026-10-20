@@ -4777,6 +4777,54 @@ os_map_file(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc addr, uin
 {
     int flags;
     byte *map = NULL;
+#ifdef LINUX
+    if (TEST(MAP_FILE_PRIVATE_VMM, map_flags)) {
+        if (TEST(MAP_FILE_VMM_COMMIT, map_flags)) {
+            /* The loader checks the exact live image claim before this call.
+             * Arena membership here is an additional mechanism check only. */
+            if (!TEST(MAP_FILE_FIXED, map_flags) || addr == NULL || *size == 0 ||
+                *size > (ptr_uint_t)-1 - (ptr_uint_t)addr ||
+                !is_vmm_reserved_address(addr, *size, NULL, NULL)) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM commit has invalid bounds");
+                return NULL;
+            }
+        } else {
+            if (!DYNAMO_OPTION(vm_reserve) || DYNAMO_OPTION(satisfy_w_xor_x)) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM requires vm_reserve without "
+                                      "satisfy_w_xor_x");
+                return NULL;
+            }
+            if (f != INVALID_FILE || offs != 0 || prot != MEMPROT_NONE ||
+                TESTANY(MAP_FILE_FIXED | MAP_FILE_APP, map_flags)) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM reservation has invalid flags");
+                return NULL;
+            }
+            byte *reserved = heap_reserve_for_external_mapping(
+                addr, *size, VMM_SPECIAL_MMAP | VMM_REACHABLE);
+            if (reserved == NULL) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM unavailable or exhausted");
+                return NULL; /* Never spill into the application's mmap space. */
+            }
+            /* Linux heap decommit leaves the old pages/protection in place.
+             * Normalize this exact owned allocation before using its BSS/guard.
+             * A failed MAP_FIXED may have removed pages: retain the claim and
+             * terminate without attempting a destructive restoration or free. */
+            map = mmap_syscall(reserved, *size, PROT_NONE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (map != reserved) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM ownership indeterminate after "
+                                      "initial normalization failure");
+                os_terminate(NULL, TERMINATE_PROCESS);
+            }
+            return map;
+        }
+    }
+#endif
 #if defined(X64)
     bool loop = false;
     uint iters = 0;
@@ -4879,7 +4927,7 @@ os_unmap_file(byte *map, size_t size)
          */
         byte *addr = mmap_syscall(map, size, PROT_NONE,
                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (!mmap_syscall_succeeded(addr))
+        if (addr != map)
             return false;
         return heap_unreserve_for_external_mapping(map, size,
                                                    VMM_SPECIAL_MMAP | VMM_REACHABLE);

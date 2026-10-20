@@ -406,6 +406,20 @@ module_digests_equal(const module_digest_t *calculated_digest,
  * The list is kept in reverse-dependent order so we can unload from the
  * front without breaking dependencies.
  */
+/* A single allocation in the existing private-image VMM.  Segment replacement
+ * does not relinquish this claim.  accounted records the original mapping route,
+ * including images loaded before the general heap exists. */
+typedef struct _private_image_reservation_t {
+    app_pc base;
+    size_t size;
+    bool active;
+    bool accounted;
+    /* A failed fixed replacement may have removed pages.  Keep the bitmap
+     * claim, but never restore or reuse this range: another thread may already
+     * have mapped into the resulting hole.  This state requires termination. */
+    bool indeterminate;
+} private_image_reservation_t;
+
 typedef struct _privmod_t {
     app_pc base;
     size_t size;
@@ -413,6 +427,10 @@ typedef struct _privmod_t {
     char path[MAXIMUM_PATH];
     uint ref_count;
     bool externally_loaded;
+#ifdef LINUX
+    private_image_reservation_t reservation;
+    bool bootstrap_dr_owner;
+#endif
     /* XXX i#6982: Perhaps replace is_client with is_top_level_client. */
     bool is_top_level_client; /* set for command-line clients */
     bool is_client;           /* set for command-line client or extension */
@@ -469,12 +487,28 @@ typedef enum {
      * distortions for app mappings (e.g., early inject mapping the interpreter).
      */
     MODLOAD_IS_APP = 0x0020,
+    /* Linux private image: reserve the entire image in the existing VMM, with
+     * no ordinary mmap fallback.  Independent of relative-branch reachability. */
+    MODLOAD_PRIVATE_VMM = 0x0040,
 } modload_flags_t;
 
 /* This function is used for loading non-private libs as well as private. */
 app_pc
 privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
                           modload_flags_t flags);
+
+#ifdef LINUX
+app_pc
+privload_map_private_image(const char *filename, size_t *size DR_PARAM_OUT,
+                          modload_flags_t flags,
+                          private_image_reservation_t *reservation DR_PARAM_OUT);
+
+bool
+privload_has_private_owner(const privmod_t *mod);
+
+void
+privload_release_private_image(private_image_reservation_t *reservation);
+#endif
 
 /* returns whether they all fit */
 bool

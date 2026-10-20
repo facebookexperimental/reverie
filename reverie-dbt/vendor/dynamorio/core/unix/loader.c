@@ -281,6 +281,11 @@ os_loader_init_prologue(void)
         }
     });
     mod->externally_loaded = true;
+#    ifdef LINUX
+    /* This exact bootstrap image has an established owner before client loading.
+     * No other externally_loaded module acquires this exception. */
+    mod->bootstrap_dr_owner = true;
+#    endif
 #    ifdef LINUX /*i#1285*/
     if (DYNAMO_OPTION(early_inject)) {
         /* libdynamorio isn't visible to gdb so add to the cmd list */
@@ -410,6 +415,13 @@ privload_unmap_file(privmod_t *privmod)
     uint i;
     os_privmod_data_t *opd = (os_privmod_data_t *)privmod->os_privmod_data;
 
+#ifdef LINUX
+    if (privmod->reservation.active) {
+        privload_release_private_image(&privmod->reservation);
+        goto free_segments;
+    }
+#endif
+
     /* unmap segments */
     IF_DEBUG(size_t size_unmapped = 0);
     for (i = 0; i < opd->os_data.num_segments; i++) {
@@ -440,6 +452,7 @@ privload_unmap_file(privmod_t *privmod)
         d_r_unmap_file(privmod->base + privmod->size, PAGE_SIZE);
         DODEBUG({ size_unmapped += PAGE_SIZE; });
     }
+free_segments:
     /* free segments */
     HEAP_ARRAY_FREE(GLOBAL_DCONTEXT, opd->os_data.segments, module_segment_t,
                     opd->os_data.alloc_segments, ACCT_OTHER, PROTECTED);
@@ -520,9 +533,10 @@ overlap_map_file_func(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc
 /* This only maps, as relocation for ELF requires processing imports first,
  * which we have to delay at init time at least.
  */
-app_pc
-privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
-                          modload_flags_t flags)
+static app_pc
+privload_map_image(const char *filename, size_t *size DR_PARAM_OUT,
+                  modload_flags_t flags,
+                  private_image_reservation_t *reservation DR_PARAM_OUT)
 {
 #ifdef LINUX
     map_fn_t map_func;
@@ -572,6 +586,7 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
             SYSLOG(SYSLOG_ERROR, CLIENT_LIBRARY_WRONG_BITWIDTH, 3, get_application_name(),
                    get_application_pid(), filename);
         }
+        elf_loader_destroy(&loader);
         return NULL;
     }
     base = elf_loader_map_phdrs(&loader, false /* fixed */, map_func, unmap_func,
@@ -580,9 +595,32 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
     if (base != NULL) {
         if (size != NULL)
             *size = loader.image_size;
+        if (reservation != NULL) {
+            loader.reservation.accounted = map_func == d_r_map_file;
+            *reservation = loader.reservation;
+            memset(&loader.reservation, 0, sizeof(loader.reservation));
+        }
 
         if (!TEST(MODLOAD_NOT_PRIVLIB, flags))
             privload_add_gdb_cmd(&loader, filename, TEST(MODLOAD_REACHABLE, flags));
+    } else if (TEST(MODLOAD_PRIVATE_VMM, flags)) {
+        if (loader.reservation.active) {
+            SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                 "private image VMM ownership indeterminate after "
+                                  "fixed mapping or restoration failure: %s", filename);
+            os_terminate(NULL, TERMINATE_PROCESS);
+        }
+        SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0, "%s: %s",
+                             loader.private_error != NULL ? loader.private_error
+                                                          : "private image load failed",
+                             filename);
+        /* Initial clients are loaded before heap initialization.  Returning NULL
+         * here would let add_client_lib's release-build error path run the app
+         * without its requested client.  Optional auxiliary loads after startup
+         * may still report a known-owned refusal to their caller.
+         */
+        if (!dynamo_heap_initialized && !standalone_library)
+            os_terminate(NULL, TERMINATE_PROCESS);
     }
     elf_loader_destroy(&loader);
 
@@ -592,6 +630,63 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
     return NULL;
 #endif
 }
+
+app_pc
+privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
+                         modload_flags_t flags)
+{
+    return privload_map_image(filename, size, flags, NULL);
+}
+
+#ifdef LINUX
+app_pc
+privload_map_private_image(const char *filename, size_t *size DR_PARAM_OUT,
+                          modload_flags_t flags,
+                          private_image_reservation_t *reservation DR_PARAM_OUT)
+{
+    memset(reservation, 0, sizeof(*reservation));
+    return privload_map_image(filename, size, flags | MODLOAD_PRIVATE_VMM, reservation);
+}
+
+bool
+privload_has_private_owner(const privmod_t *mod)
+{
+    const private_image_reservation_t *r = &mod->reservation;
+    if (mod->bootstrap_dr_owner && mod->externally_loaded &&
+        mod->base == get_dynamorio_dll_start() &&
+        mod->size == (size_t)(get_dynamorio_dll_end() - get_dynamorio_dll_start()))
+        return true;
+    if (r->active && !r->indeterminate && !mod->externally_loaded && r->base == mod->base &&
+        r->size >= mod->size && r->size <= (ptr_uint_t)-1 - (ptr_uint_t)r->base &&
+        is_vmm_reserved_address(r->base, r->size, NULL, NULL))
+        return true;
+    SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                         "private image reuse lacks an allocation owner: %s", mod->path);
+    return false;
+}
+
+void
+privload_release_private_image(private_image_reservation_t *reservation)
+{
+    if (!reservation->active)
+        return;
+    if (reservation->indeterminate) {
+        SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                             "private image VMM release refused: ownership indeterminate");
+        os_terminate(NULL, TERMINATE_PROCESS);
+    }
+    reservation->indeterminate = true;
+    bool restored = reservation->accounted
+        ? d_r_unmap_file(reservation->base, reservation->size)
+        : os_unmap_file(reservation->base, reservation->size);
+    if (!restored) {
+        SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                             "private image VMM whole-allocation release failed");
+        os_terminate(NULL, TERMINATE_PROCESS);
+    }
+    memset(reservation, 0, sizeof(*reservation));
+}
+#endif
 
 bool
 privload_process_imports(privmod_t *mod)
@@ -613,7 +708,10 @@ privload_process_imports(privmod_t *mod)
             name = strtab + dyn->d_un.d_val;
             LOG(GLOBAL, LOG_LOADER, 2, "%s: %s imports from %s\n", __FUNCTION__,
                 mod->name, name);
-            if (privload_lookup(name) == NULL) {
+            privmod_t *existing = privload_lookup(name);
+            if (existing != NULL && !privload_has_private_owner(existing))
+                return false;
+            if (existing == NULL) {
                 privmod_t *impmod =
                     privload_locate_and_load(name, mod, false /*client dir=>true*/);
                 if (impmod == NULL)
@@ -910,6 +1008,12 @@ privload_load_private_library(const char *name, bool reachable)
     app_pc res = NULL;
     acquire_recursive_lock(&privload_lock);
     newmod = privload_lookup(name);
+#ifdef LINUX
+    if (newmod != NULL && !privload_has_private_owner(newmod)) {
+        release_recursive_lock(&privload_lock);
+        return NULL;
+    }
+#endif
     if (newmod == NULL)
         newmod = privload_locate_and_load(name, NULL, reachable);
     else

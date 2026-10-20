@@ -180,6 +180,12 @@ loader_init_prologue(void)
                             privmod_static[i].name, privmod_static[i].path);
         mod->is_top_level_client = true;
         mod->is_client = true;
+#ifdef LINUX
+        mod->reservation = privmod_static[i].reservation;
+        mod->bootstrap_dr_owner = privmod_static[i].bootstrap_dr_owner;
+        memset(&privmod_static[i].reservation, 0,
+               sizeof(privmod_static[i].reservation));
+#endif
     }
 
 #ifdef WINDOWS
@@ -348,6 +354,12 @@ load_private_library(const char *filename, bool reachable)
     acquire_recursive_lock(&privload_lock);
 
     privmod = privload_lookup(filename);
+#ifdef LINUX
+    if (privmod != NULL && !privload_has_private_owner(privmod)) {
+        release_recursive_lock(&privload_lock);
+        return NULL;
+    }
+#endif
     /* XXX: If the private lib has been loaded, shall we increase the counter
      * or report error?
      */
@@ -521,6 +533,10 @@ privload_insert(privmod_t *after, app_pc base, size_t size, const char *name,
     }
     mod->ref_count = 1;
     mod->externally_loaded = false;
+#ifdef LINUX
+    memset(&mod->reservation, 0, sizeof(mod->reservation));
+    mod->bootstrap_dr_owner = false;
+#endif
     mod->is_top_level_client = false; /* up to caller to set later */
     mod->is_client = false;           /* up to caller to set later */
     mod->called_proc_entry = false;
@@ -630,6 +646,9 @@ privload_load(const char *filename, privmod_t *dependent, bool client)
     app_pc map;
     size_t size;
     privmod_t *privmod;
+#ifdef LINUX
+    private_image_reservation_t reservation;
+#endif
 
     /* i#350: it would be nice to have no-dcontext try/except support:
      * then we could wrap the whole load process, like ntdll!Ldr does
@@ -643,7 +662,12 @@ privload_load(const char *filename, privmod_t *dependent, bool client)
 
     LOG(GLOBAL, LOG_LOADER, 2, "%s: loading %s\n", __FUNCTION__, filename);
 
+#ifdef LINUX
+    map = privload_map_private_image(filename, &size,
+                                    client ? MODLOAD_REACHABLE : 0, &reservation);
+#else
     map = privload_map_and_relocate(filename, &size, client ? MODLOAD_REACHABLE : 0);
+#endif
     if (map == NULL) {
         LOG(GLOBAL, LOG_LOADER, 1, "%s: failed to map %s\n", __FUNCTION__, filename);
         return NULL;
@@ -676,6 +700,17 @@ privload_load(const char *filename, privmod_t *dependent, bool client)
      */
     /* Add after its dependent to preserve forward-can-unload order */
     privmod = privload_insert(dependent, map, size, get_shared_lib_name(map), filename);
+#ifdef LINUX
+    if (privmod == NULL) {
+        privload_release_private_image(&reservation);
+        SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                             "private image module insertion failed: %s", filename);
+        if (!privload_modlist_initialized() && !standalone_library)
+            os_terminate(NULL, TERMINATE_PROCESS);
+        return NULL;
+    }
+    privmod->reservation = reservation;
+#endif
 
     /* If no heap yet, we'll call finalize later in loader_init() */
     dcontext_t *dcontext = get_thread_private_dcontext();

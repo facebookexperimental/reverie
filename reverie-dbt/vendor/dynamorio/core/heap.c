@@ -2749,11 +2749,21 @@ heap_reserve_for_external_mapping(byte *preferred, size_t size, which_vmm_t whic
 #endif
     vm_addr_t p = NULL;
     vm_heap_t *vmh = vmheap_for_which(which);
-    ASSERT(size > 0);
-    size = ALIGN_FORWARD(size, PAGE_SIZE);
-    if (!DYNAMO_OPTION(vm_reserve))
+    /* This is also used before the general heap is initialized.  The VMM's
+     * actual reservation and bitmap, not that later phase, establish readiness.
+     * Refuse before either alignment can wrap or a block count can truncate. */
+    if (!DYNAMO_OPTION(vm_reserve) || vmh->blocks == NULL ||
+        vmh->start_addr == NULL || vmh->end_addr <= vmh->start_addr || size == 0 ||
+        size > (size_t)-1 - (PAGE_SIZE - 1))
         return NULL;
-    if (preferred >= vmh->start_addr && preferred + size <= vmh->end_addr)
+    size = ALIGN_FORWARD(size, PAGE_SIZE);
+    if (size > (size_t)-1 - (DYNAMO_OPTION(vmm_block_size) - 1) ||
+        ALIGN_FORWARD(size, DYNAMO_OPTION(vmm_block_size)) >
+            (size_t)(vmh->end_addr - vmh->start_addr))
+        return NULL;
+    if (preferred >= vmh->start_addr && preferred < vmh->end_addr &&
+        size <= (size_t)(vmh->end_addr - preferred) &&
+        ALIGNED((preferred - vmh->start_addr), DYNAMO_OPTION(vmm_block_size)))
         p = vmm_heap_reserve_blocks(vmh, size, preferred, which);
     if (p == NULL)
         p = vmm_heap_reserve_blocks(vmh, size, NULL, which);
@@ -3396,7 +3406,8 @@ d_r_map_file(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc addr, ui
     /* memory alloc/dealloc and updating DR list must be atomic */
     dynamo_vm_areas_lock(); /* if already hold lock this is a nop */
     view = os_map_file(f, size, offs, addr, prot, map_flags);
-    if (view != NULL) {
+    if (view != NULL &&
+        !TESTALL(MAP_FILE_PRIVATE_VMM | MAP_FILE_VMM_COMMIT, map_flags)) {
         STATS_ADD_PEAK(file_map_capacity, *size);
         account_for_memory((void *)view, *size, prot, true /*add now*/,
                            true /*image*/
