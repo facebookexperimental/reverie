@@ -539,6 +539,9 @@ pub mod mapping_fixture;
 
 // First-image adoption is separate from ordinary fresh reservation. The unsafe
 // entry contract supplies physical provenance; these scalar checks do not.
+// Keep its callers out of the ordinary preload; adoption belongs to the
+// explicit loader runtime. Tests retain the scalar geometry controls.
+#[cfg(any(feature = "loader-private-runtime", test))]
 mod mapped_image {
     use super::*;
 
@@ -992,9 +995,13 @@ mod mapped_image {
     }
 }
 
+#[cfg(any(feature = "loader-private-runtime", test))]
 pub use mapped_image::MappedImageBinding;
+#[cfg(any(feature = "loader-private-runtime", test))]
 pub use mapped_image::MappedImageExtent;
+#[cfg(any(feature = "loader-private-runtime", test))]
 pub use mapped_image::MappedImageLayout;
+#[cfg(any(feature = "loader-private-runtime", test))]
 pub use mapped_image::adopt_mapped_image;
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
 pub(crate) use mapped_image::adopt_mapped_scalar;

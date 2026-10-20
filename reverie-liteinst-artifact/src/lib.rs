@@ -937,8 +937,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 53] = [
     ),
     (
         "reverie-inguest/src/guest/tool_region.rs",
-        47623,
-        "18148b180e0d67a745be1636e1eb9a556ca772171b29256178255ed7b41cfe66",
+        48037,
+        "e75061d51660197b7642edd5e9d5623dd0009e272ef2dd7d9843a6de7887e178",
     ),
     (
         "reverie-inguest/src/guest/tool_region_keyed.rs",
@@ -21313,6 +21313,62 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
         transfers: &[(8, 1)],
     },
+    // Actual default Detcore cfg repair: complete330, SHA256 c0484e3f71e5455efdfab9d78ceca3ed3470ffb02663a55e2e9977b11e478cce.
+    DetcoreValidateTemplate {
+        role: "fixed_native_from_native",
+        hex: "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85a90000000fb605677e120249b800f0efffff9fffff4c01c24881faffff7f000f878800000084c00f848000000089cd4989febfba0000004989f731f631d231c9e89dd7feff4c89fe40f6c6070f85b80000004885c04c89f77e5348394640754d48837e5001754648837e3800743f8b0683e00f83f8087535488d3dfb7d1202e8fe87feff4c89f74885c07521ba02000000b801000000f0490fb15748750f0fb60384c0741fc7070b000000eb06c7071600000031ed40886f084883c4185b415e415f5dc348c74424080001000048c744241002090000488d7c2408e852f6ffff84c0740c4c89f741c70616000000ebc34889dfe8ea0900004c89f783f8017505418916ebae4d893eebab488d1579d11000bf08000000ff150ea31100",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 53,
+                next: 57,
+                key: "fixed_initializing",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 111,
+                next: 115,
+                key: "fixed_scalar_syscall",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 169,
+                next: 173,
+                key: "fixed_region",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 174,
+                next: 178,
+                key: "fixed_region_publication_get",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 266,
+                next: 270,
+                key: "fixed_native_bitmap_range",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 290,
+                next: 294,
+                key: "fixed_arena_setup",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 315,
+                next: 319,
+                key: "fixed_detcore_validate_fixed_native_from_native_311_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 326,
+                next: 330,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+        ],
+        transfers: &[(110, 1), (173, 3), (265, 4), (289, 5), (324, 7)],
+    },
 ];
 struct DetcoreRecipeBindings<'a> {
     targets: &'a BTreeMap<String, u64>,
@@ -22396,6 +22452,83 @@ fn fixed_detcore_publication_cohort(
     Ok(())
 }
 
+// Appended identities preserve every historical table index. This conditional
+// join covers only the new full-EAX caller; historical329 keeps its old contract.
+const DETCORE_FULL_RESULT_CALLER: usize = 44;
+const DETCORE_THREE_BAND_SETUP: usize = 24;
+
+fn fixed_detcore_full_result_contract(
+    witnesses: &BTreeMap<String, AuthenticatedDetcoreOperation>,
+    transfers: &BTreeMap<String, Vec<ConstructorTransfer>>,
+    selected: &BTreeMap<String, u64>,
+    targets: &BTreeMap<String, u64>,
+) -> Result<()> {
+    let Some(caller) = witnesses.get("fixed_native_from_native") else {
+        return Ok(());
+    };
+    if !matches!(
+        caller.kind,
+        AuthenticatedDetcoreOperationKind::ValidateTemplate(DETCORE_FULL_RESULT_CALLER)
+    ) {
+        return Ok(());
+    }
+    let setup = witnesses
+        .get("fixed_arena_setup")
+        .filter(|w| {
+            matches!(
+                w.kind,
+                AuthenticatedDetcoreOperationKind::ValidateTemplate(DETCORE_THREE_BAND_SETUP)
+            )
+        })
+        .ok_or("full-EAX Detcore caller lacks authenticated three-band result ABI")?;
+    for (role, witness) in [
+        ("fixed_native_from_native", caller),
+        ("fixed_arena_setup", setup),
+    ] {
+        require(
+            witness.role == role
+                && witness.address != 0
+                && selected.get(role) == Some(&witness.address)
+                && targets.get(role) == Some(&witness.address)
+                && transfers.get(role) == Some(&witness.edges),
+            "Detcore result witness loses actual role/address/census",
+        )?;
+    }
+    let region = *targets
+        .get("fixed_region")
+        .ok_or("Detcore result REGION absent")?;
+    let initializing = *targets
+        .get("fixed_initializing")
+        .ok_or("Detcore result INITIALIZING absent")?;
+    require(
+        region != 0
+            && initializing != 0
+            && BTreeSet::from([caller.address, setup.address, region, initializing]).len() == 4,
+        "Detcore result receiver/function identities alias",
+    )?;
+    let incoming: Vec<_> = caller
+        .edges
+        .iter()
+        .filter(|edge| edge.target == setup.address)
+        .collect();
+    require(
+        incoming.len() == 1
+            && incoming[0].instruction
+                == caller
+                    .address
+                    .checked_add(289)
+                    .ok_or("Detcore result call overflow")?
+            && incoming[0].local_got_slot.is_none(),
+        "full-EAX Detcore caller lacks exact direct setup edge",
+    )?;
+    // Complete330 proves fixed Control in RDI, CMP EAX,1 / JNE success,
+    // error EDX -> [R14], and success R15 -> [R14]. Complete291 proves
+    // EBP=1 on every error, EBP=0 on success, and sole EAX=EBP/EDX=R14D
+    // return. The eight bitmap/syscall edges are recursively census-qualified.
+    // Source Result enums and symbol extents alone never prove this ABI.
+    Ok(())
+}
+
 // Private whole-body/census witnesses; never serialized or caller-authored.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FixedNormalReturnIdentity {
@@ -22879,6 +23012,12 @@ fn qualify_fixed_operation_closure(
             .map(|(role, symbol)| (role.clone(), symbol.st_value))
             .collect();
         fixed_detcore_publication_cohort(
+            &detcore_witnesses,
+            &transfers,
+            &selected,
+            &context.targets,
+        )?;
+        fixed_detcore_full_result_contract(
             &detcore_witnesses,
             &transfers,
             &selected,
@@ -46756,7 +46895,174 @@ mod tests {
 
     // Invoke once inside an existing host-control #[test]; no new libtest identity.
     // These are pure semantic-template controls, not physical ELF qualification.
+    fn fixed_detcore_full_result_controls() {
+        let caller_address = 0x9b3520u64;
+        let setup_address = 0x9b4030u64;
+        let caller = fixed_hex(
+            "5541574156534883ec1848bb001000000060000080f901b83000020041b8a00002004c0f44c04909d84939f00f85a90000000fb605677e120249b800f0efffff9fffff4c01c24881faffff7f000f878800000084c00f848000000089cd4989febfba0000004989f731f631d231c9e89dd7feff4c89fe40f6c6070f85b80000004885c04c89f77e5348394640754d48837e5001754648837e3800743f8b0683e00f83f8087535488d3dfb7d1202e8fe87feff4c89f74885c07521ba02000000b801000000f0490fb15748750f0fb60384c0741fc7070b000000eb06c7071600000031ed40886f084883c4185b415e415f5dc348c74424080001000048c744241002090000488d7c2408e852f6ffff84c0740c4c89f741c70616000000ebc34889dfe8ea0900004c89f783f8017505418916ebae4d893eebab488d1579d11000bf08000000ff150ea31100",
+        );
+        let setup = fixed_hex(
+            "554157415653504889fbbeffff0000ba0120010031c9e8b5feffffbd0100000041be1600000084c00f84e5000000beff3f0100ba016001004889df31c9e88efeffff84c00f84c9000000beffff0d00ba01f00f004889df31c9e872feffff84c00f84ad00000049bf0030020000600000498db700d0fd0fbf0a000000ba00000002b903000000e875ccfeff4885c0787d498db700d0fd13bf0a000000ba00000002b903000000e855ccfeff4885c0785d0f57c0410f290741c647100049c7471800000000beffff0000ba012001004889dfb901000000e8f5fdffffbeff3f0100ba016001004889dfb901000000e8defdffffbeffff0d00ba01f00f004889dfb901000000e8c7fdffff31edeb064989c641f7de89e84489f24883c4085b415e415f5dc3",
+        );
+        let caller_offsets: &[usize] = &[
+            0, 1, 3, 5, 6, 10, 20, 23, 28, 34, 38, 41, 44, 50, 57, 67, 70, 77, 83, 85, 91, 93, 96,
+            101, 104, 106, 108, 110, 115, 118, 122, 128, 131, 134, 136, 140, 142, 147, 149, 154,
+            156, 158, 161, 164, 166, 173, 178, 181, 184, 186, 191, 196, 202, 204, 207, 209, 211,
+            217, 219, 225, 227, 231, 235, 236, 238, 240, 241, 242, 251, 260, 265, 270, 272, 274,
+            277, 284, 286, 289, 294, 297, 300, 302, 305, 307, 310, 312, 319, 324,
+        ];
+        let setup_offsets: &[usize] = &[
+            0, 1, 3, 5, 6, 7, 10, 15, 20, 22, 27, 32, 38, 40, 46, 51, 56, 59, 61, 66, 68, 74, 79,
+            84, 87, 89, 94, 96, 102, 112, 119, 124, 129, 134, 139, 142, 144, 151, 156, 161, 166,
+            171, 174, 176, 179, 183, 188, 196, 201, 206, 209, 214, 219, 224, 229, 232, 237, 242,
+            247, 252, 255, 260, 265, 267, 269, 272, 275, 277, 280, 284, 285, 287, 289, 290,
+        ];
+        assert_eq!(caller.len(), 330);
+        assert_eq!(setup.len(), 291);
+        let context = detcore_validate_control_context("8bff17f");
+        let mut targets = BTreeMap::from([
+            ("fixed_native_from_native".to_owned(), caller_address),
+            ("fixed_arena_setup".to_owned(), setup_address),
+        ]);
+        let mut got = BTreeMap::new();
+        let mut readonly = BTreeMap::new();
+        // Bind independent captured operands; the panic GOT value is a test
+        // endpoint, not an assertion about a running ELF or source authority.
+        for (index, address, bytes) in [
+            (DETCORE_FULL_RESULT_CALLER, caller_address, &caller),
+            (DETCORE_THREE_BAND_SETUP, setup_address, &setup),
+        ] {
+            for op in DETCORE_VALIDATE_TEMPLATES[index].operands {
+                let operand = fixed_rip_target(address, bytes, op.displacement, op.next).unwrap();
+                let target = if op.got { 0x11223344 } else { operand };
+                if op.got {
+                    got.insert(operand, target);
+                }
+                if let Some(previous) = targets.insert(op.key.to_owned(), target) {
+                    assert_eq!(previous, target);
+                }
+                if let Some(spec) = DETCORE_VALIDATE_DATA.iter().find(|spec| spec.key == op.key) {
+                    let (data, file) = detcore_validate_expected_data(spec, &context).unwrap();
+                    fixed_insert_readonly(&mut readonly, target, &data).unwrap();
+                    if let Some(file) = file {
+                        let file_address = 0x100000000;
+                        targets.insert(format!("{}_file", spec.key), file_address);
+                        fixed_insert_readonly(&mut readonly, file_address, &file).unwrap();
+                    }
+                }
+            }
+        }
+        let prove = |caller: &[u8], setup: &[u8], caller_offsets: &[usize]| -> Result<_> {
+            let mut witnesses = BTreeMap::new();
+            let mut transfers = BTreeMap::new();
+            let mut selected = BTreeMap::new();
+            for (role, address, bytes, offsets) in [
+                (
+                    "fixed_native_from_native",
+                    caller_address,
+                    caller,
+                    caller_offsets,
+                ),
+                ("fixed_arena_setup", setup_address, setup, setup_offsets),
+            ] {
+                let instructions =
+                    fixed_normal_return_control_instructions(address, bytes, offsets);
+                let witness = fixed_detcore_qualified_operation(
+                    role,
+                    address,
+                    (bytes, &instructions),
+                    DetcoreRecipeBindings {
+                        targets: &targets,
+                        got: &got,
+                        readonly: &readonly,
+                        context: &context,
+                    },
+                    0xa0,
+                    false,
+                )?;
+                transfers.insert(role.to_owned(), witness.edges.clone());
+                selected.insert(role.to_owned(), address);
+                witnesses.insert(role.to_owned(), witness);
+            }
+            fixed_detcore_full_result_contract(&witnesses, &transfers, &selected, &targets)?;
+            Ok((witnesses, transfers, selected))
+        };
+        let (mut witnesses, transfers, selected) =
+            prove(&caller, &setup, caller_offsets).expect("actual330 plus complete291 ABI/census");
+        assert!(matches!(
+            witnesses["fixed_native_from_native"].kind,
+            AuthenticatedDetcoreOperationKind::ValidateTemplate(DETCORE_FULL_RESULT_CALLER)
+        ));
+        assert!(matches!(
+            witnesses["fixed_arena_setup"].kind,
+            AuthenticatedDetcoreOperationKind::ValidateTemplate(DETCORE_THREE_BAND_SETUP)
+        ));
+        // Exact CMP width/immediate, conditional branch, payload destination,
+        // callee error/success discriminant and returned register moves.
+        for offset in [297, 298, 299, 300, 301, 302, 303, 304, 307, 308, 309] {
+            let mut bad = caller.clone();
+            bad[offset] ^= 1;
+            assert!(
+                prove(&bad, &setup, caller_offsets).is_err(),
+                "caller ABI mutation {offset}"
+            );
+        }
+        for offset in [27, 28, 29, 30, 31, 267, 268, 269, 275, 276, 277, 278, 279] {
+            let mut bad = setup.clone();
+            bad[offset] ^= 1;
+            assert!(
+                prove(&caller, &bad, caller_offsets).is_err(),
+                "callee ABI mutation {offset}"
+            );
+        }
+        let offsets: Vec<_> = caller_offsets
+            .iter()
+            .copied()
+            .filter(|offset| *offset != 289)
+            .collect();
+        assert!(
+            prove(&caller, &setup, &offsets).is_err(),
+            "missing actual call census"
+        );
+        for key in ["fixed_native_from_native", "fixed_arena_setup"] {
+            let mut bad = selected.clone();
+            *bad.get_mut(key).unwrap() += 1;
+            assert!(
+                fixed_detcore_full_result_contract(&witnesses, &transfers, &bad, &targets).is_err()
+            );
+            let mut bad = targets.clone();
+            *bad.get_mut(key).unwrap() += 1;
+            assert!(
+                fixed_detcore_full_result_contract(&witnesses, &transfers, &selected, &bad)
+                    .is_err()
+            );
+            let mut bad = transfers.clone();
+            bad.get_mut(key).unwrap().clear();
+            assert!(
+                fixed_detcore_full_result_contract(&witnesses, &bad, &selected, &targets).is_err()
+            );
+        }
+        let setup_witness = witnesses.remove("fixed_arena_setup").unwrap();
+        assert!(
+            fixed_detcore_full_result_contract(&witnesses, &transfers, &selected, &targets)
+                .is_err()
+        );
+        witnesses.insert("fixed_arena_setup".into(), setup_witness);
+        let witness = witnesses.get_mut("fixed_arena_setup").unwrap();
+        witness.kind = AuthenticatedDetcoreOperationKind::ValidateTemplate(23);
+        assert!(
+            fixed_detcore_full_result_contract(&witnesses, &transfers, &selected, &targets)
+                .is_err(),
+            "wrong authenticated callee identity"
+        );
+        // The historical329 identity acquires no new pairing restriction.
+        witnesses.get_mut("fixed_native_from_native").unwrap().kind =
+            AuthenticatedDetcoreOperationKind::ValidateTemplate(23);
+        fixed_detcore_full_result_contract(&witnesses, &transfers, &selected, &targets).unwrap();
+    }
+
     fn detcore_validate_template_controls() {
+        fixed_detcore_full_result_controls();
         fixed_three_band_detcore_setup_controls();
         let mut context = BTreeMap::new();
         context.insert("rv:reverie-inguest/src/guest/alloc.rs".to_owned(),fixed_hex("2f6275696c642f2e636172676f2f6769742f636865636b6f7574732f726576657269652d326663373730663761396338303830332f666334623438642f726576657269652d696e67756573742f7372632f67756573742f616c6c6f632e7273"));
