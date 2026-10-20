@@ -342,55 +342,14 @@ impl Runner {
             let stop_reading = Arc::clone(&stop_reading);
             let cap = self.max_stream_bytes;
             readers.push(thread::spawn(move || -> Result<Vec<u8>> {
-                let mut kept = Vec::new();
-                let mut bytes = [0u8; 8192];
-                let mut drain_started = None;
-                loop {
-                    if stop_reading.load(Ordering::Acquire) {
-                        let at = drain_started.get_or_insert_with(Instant::now);
-                        if at.elapsed() >= Duration::from_millis(250) {
-                            overflow.store(true, Ordering::Release);
-                            break;
-                        }
-                    }
-                    let n = match pipe.read(&mut bytes) {
-                        Ok(n) => n,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if stop_reading.load(Ordering::Acquire) {
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(format!("read child stream: {e}")),
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                    let combined_room = if let Some(limit) = combined_limit {
-                        let mut before = combined_bytes.load(Ordering::Acquire);
-                        loop {
-                            match combined_bytes.compare_exchange_weak(
-                                before,
-                                before.saturating_add(n),
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            ) {
-                                Ok(_) => break limit.saturating_sub(before),
-                                Err(observed) => before = observed,
-                            }
-                        }
-                    } else {
-                        usize::MAX
-                    };
-                    let room = cap.saturating_sub(kept.len()).min(combined_room);
-                    kept.extend_from_slice(&bytes[..n.min(room)]);
-                    if n > room {
-                        overflow.store(true, Ordering::Release);
-                    }
-                }
-                Ok(kept)
+                read_child_stream(
+                    &mut *pipe,
+                    &stop_reading,
+                    &overflow,
+                    &combined_bytes,
+                    combined_limit,
+                    cap,
+                )
             }));
         }
         let mut bounds_failure = None;
@@ -496,6 +455,75 @@ impl Runner {
         String::from_utf8(self.run(program, &args, cwd)?)
             .map_err(|e| format!("{program} output is not UTF-8: {e}"))
     }
+}
+
+/// Read one nonblocking child stream until EOF, or until the stream is empty
+/// after the child's exit was published through `stop_reading`.
+///
+/// The stop flag is sampled BEFORE each read. An empty read proves the child's
+/// output is complete only when the child had already exited before that read
+/// began: a child may flush all of its output and exit between an empty read
+/// and a later look at the flag, and that output is still in the pipe. A
+/// stream that keeps producing bytes after the exit, through a descriptor some
+/// other process still holds, is still cut off after 250 ms of draining.
+fn read_child_stream(
+    pipe: &mut dyn Read,
+    stop_reading: &AtomicBool,
+    overflow: &AtomicBool,
+    combined_bytes: &AtomicUsize,
+    combined_limit: Option<usize>,
+    cap: usize,
+) -> Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    let mut bytes = [0u8; 8192];
+    let mut drain_started = None;
+    loop {
+        let child_exited = stop_reading.load(Ordering::Acquire);
+        if child_exited {
+            let at = drain_started.get_or_insert_with(Instant::now);
+            if at.elapsed() >= Duration::from_millis(250) {
+                overflow.store(true, Ordering::Release);
+                break;
+            }
+        }
+        let n = match pipe.read(&mut bytes) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if child_exited {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("read child stream: {e}")),
+        };
+        if n == 0 {
+            break;
+        }
+        let combined_room = if let Some(limit) = combined_limit {
+            let mut before = combined_bytes.load(Ordering::Acquire);
+            loop {
+                match combined_bytes.compare_exchange_weak(
+                    before,
+                    before.saturating_add(n),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break limit.saturating_sub(before),
+                    Err(observed) => before = observed,
+                }
+            }
+        } else {
+            usize::MAX
+        };
+        let room = cap.saturating_sub(kept.len()).min(combined_room);
+        kept.extend_from_slice(&bytes[..n.min(room)]);
+        if n > room {
+            overflow.store(true, Ordering::Release);
+        }
+    }
+    Ok(kept)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27724,6 +27752,84 @@ pub fn verify_runtime_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child stream scripted read by read. `on_read` runs before the
+    /// scripted result is returned, standing in for the child process and the
+    /// waiting thread acting while the reader is between two steps.
+    struct ScriptedStream<'a> {
+        steps: VecDeque<std::io::Result<Vec<u8>>>,
+        on_read: Box<dyn FnMut(usize) + 'a>,
+        reads: usize,
+    }
+    impl Read for ScriptedStream<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            (self.on_read)(self.reads);
+            self.reads += 1;
+            match self.steps.pop_front().unwrap_or(Ok(Vec::new())) {
+                Ok(bytes) => {
+                    buffer[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+    fn would_block() -> std::io::Result<Vec<u8>> {
+        Err(std::io::ErrorKind::WouldBlock.into())
+    }
+
+    // The validation of Hermit 6123fef1 lost one objdump's whole stdout this
+    // way: the stream was empty, objdump then flushed and exited, the waiting
+    // thread published the exit, and only then did the reader look at the
+    // flag. The bytes were still in the pipe and must be read.
+    #[test]
+    fn child_stream_reads_output_flushed_after_an_empty_read() {
+        let stop = AtomicBool::new(false);
+        let overflow = AtomicBool::new(false);
+        let combined = AtomicUsize::new(0);
+        let mut stream = ScriptedStream {
+            steps: VecDeque::from([would_block(), Ok(b"disassembly".to_vec()), Ok(Vec::new())]),
+            on_read: Box::new(|read| {
+                if read == 0 {
+                    // Returns empty, then the child exits before the reader
+                    // continues.
+                    stop.store(true, Ordering::Release);
+                }
+            }),
+            reads: 0,
+        };
+        let kept = read_child_stream(
+            &mut stream,
+            &stop,
+            &overflow,
+            &combined,
+            Some(1 << 20),
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(kept, b"disassembly");
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    // An empty read that began after the exit was published ends the stream:
+    // a descriptor held open elsewhere cannot keep the reader waiting.
+    #[test]
+    fn child_stream_ends_on_an_empty_read_after_the_exit() {
+        let stop = AtomicBool::new(true);
+        let overflow = AtomicBool::new(false);
+        let combined = AtomicUsize::new(0);
+        let mut stream = ScriptedStream {
+            steps: VecDeque::from([Ok(b"tail".to_vec()), would_block(), Ok(b"late".to_vec())]),
+            on_read: Box::new(|_| {}),
+            reads: 0,
+        };
+        let kept =
+            read_child_stream(&mut stream, &stop, &overflow, &combined, None, 1 << 20).unwrap();
+        assert_eq!(kept, b"tail");
+        assert_eq!(stream.reads, 2);
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
     // Additional controls in the existing current-artifact test. These exercise
     // production catalog/mapping/readback predicates without creating opaque
     // source authority or pretending test JSON is fresh Cargo metadata.
