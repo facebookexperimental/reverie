@@ -19,7 +19,7 @@
 
 [package]
 name = "reverie-examples"
-version = "0.4.0"
+version = "0.5.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -91,14 +91,14 @@ anyhow = "1.0.103"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["ptrace", "signal"] }
-reverie = { version = "0.4.0", path = "../reverie", package = "reverie-core" }
-reverie-dbt = { version = "0.4.0", path = "../reverie-dbt", default-features = false }
-reverie-e9patch = { version = "0.4.0", path = "../reverie-e9patch", default-features = false }
-reverie-host = { version = "0.4.0", path = "../experimental/reverie-host" }
-reverie-kvm = { version = "0.4.0", path = "../reverie-kvm" }
-reverie-liteinst = { version = "0.4.0", path = "../reverie-liteinst", default-features = false }
-reverie-ptrace = { version = "0.4.0", path = "../reverie-ptrace" }
-reverie-util = { version = "0.4.0", path = "../reverie-util" }
+reverie = { version = "0.5.1", path = "../reverie", package = "reverie-core" }
+reverie-dbt = { version = "0.5.1", path = "../reverie-dbt", default-features = false }
+reverie-e9patch = { version = "0.5.1", path = "../reverie-e9patch", default-features = false }
+reverie-host = { version = "0.5.1", path = "../experimental/reverie-host" }
+reverie-kvm = { version = "0.5.1", path = "../reverie-kvm" }
+reverie-liteinst = { version = "0.5.1", path = "../reverie-liteinst", default-features = false }
+reverie-ptrace = { version = "0.5.1", path = "../reverie-ptrace" }
+reverie-util = { version = "0.5.1", path = "../reverie-util" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
