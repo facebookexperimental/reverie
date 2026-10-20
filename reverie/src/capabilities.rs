@@ -214,6 +214,61 @@ pub struct BackendCapabilities {
     /// being interrupted by signals.
     pub supports_blocked_wait_signal_interruption: bool,
 
+    /// The kernel's signal state for a guest thread (actions, mask, pending
+    /// sets), outside any signal the backend reserves for its own use, is the
+    /// guest's own: the thread is a host task, and nothing the backend runs in
+    /// the guest's process changes an action, mask bit or pending bit of an
+    /// unreserved signal. A tool may then keep a copy of that state, compare
+    /// it with the kernel outside the reserved signals, and decide a
+    /// process-directed signal to the guest's own process from the kernel's
+    /// per-thread signal sets.
+    ///
+    /// Until 2026-10 tools read this from
+    /// `supports_blocked_wait_signal_interruption`, and every backend keeps
+    /// the value that field has. False is not a statement that a backend's
+    /// runtime changes the guest's signal state: a backend whose guest threads
+    /// are not host tasks states false too. In-guest runtimes do install a
+    /// mask of their own today, and state false until they keep it to their
+    /// reserved signals.
+    pub kernel_signal_state_is_guests: bool,
+
+    /// A tool can predict which guest thread the kernel gives a
+    /// process-directed signal, from each thread's guest signal mask (read
+    /// from the kernel, or, where the kernel's mask is a runtime's, as that
+    /// runtime publishes the guest's mask to the tool), when guest threads are
+    /// serialized, so that a mask the tool reads cannot change before the
+    /// kernel acts on it.
+    ///
+    /// Until 2026-10 tools read this from
+    /// `supports_blocked_wait_signal_interruption`, and every backend keeps
+    /// the value that field has. False is not a statement that the kernel's
+    /// choice is unpredictable on that backend, only that no tool may rely on
+    /// predicting it there yet.
+    pub kernel_signal_targets_are_predictable: bool,
+
+    /// A tool may read or signal a guest thread through the host task of the
+    /// same ID (its `/proc/<tid>` entries and memory maps, or a host signal
+    /// the tool sends it), and get the guest thread's own answer.
+    ///
+    /// Until 2026-10 tools read this from
+    /// `supports_blocked_wait_signal_interruption`, and every backend keeps
+    /// the value that field has. False is not a statement that guest threads are not host
+    /// tasks: in-guest LiteInst and SaBRe run them as host tasks, but no tool
+    /// read through them has been validated there.
+    pub host_task_reads_reach_guest_threads: bool,
+
+    /// Signals that Linux sends at host-chosen moments (a terminal's signals,
+    /// a child's exit signal, those an orphaned process group receives, and
+    /// those an `fcntl`, `ioctl`, `open` or `prctl` arms) reach the guest's
+    /// threads as the kernel sends them, so a tool treats them as input from
+    /// the host and makes no scheduler decision depend on when they arrive.
+    ///
+    /// Until 2026-10 tools read this from
+    /// `supports_blocked_wait_signal_interruption`, and every backend keeps
+    /// the value that field has. False is not a statement that such signals do not reach
+    /// the guest.
+    pub host_timed_signals_are_physical: bool,
+
     /// The backend arms a preemption timer and delivers its events, so a
     /// tool's time slice really preempts a thread that makes no syscall
     /// (<https://github.com/rrnewton/hermit/issues/4068>).
@@ -288,6 +343,10 @@ impl BackendCapabilities {
         emulates_child_waits: false,
         virtualizes_guest_sigalrm: false,
         supports_blocked_wait_signal_interruption: true,
+        kernel_signal_state_is_guests: true,
+        kernel_signal_targets_are_predictable: true,
+        host_task_reads_reach_guest_threads: true,
+        host_timed_signals_are_physical: true,
         delivers_preemption_timer_events: true,
         runs_guest_code_between_injections: false,
         promotes_open_files_before_native_lifecycle: false,
@@ -317,6 +376,10 @@ impl BackendCapabilities {
         reports_kernel_child_exit_signals: false,
         virtualizes_guest_sigalrm: true,
         supports_blocked_wait_signal_interruption: false,
+        kernel_signal_state_is_guests: false,
+        kernel_signal_targets_are_predictable: false,
+        host_task_reads_reach_guest_threads: false,
+        host_timed_signals_are_physical: false,
         delivers_preemption_timer_events: false,
         runs_guest_code_between_injections: true,
         promotes_open_files_before_native_lifecycle: true,
@@ -340,6 +403,10 @@ impl BackendCapabilities {
         supports_parked_write_signal_interruption: false,
         reports_child_exit_publication: false,
         supports_blocked_wait_signal_interruption: false,
+        kernel_signal_state_is_guests: false,
+        kernel_signal_targets_are_predictable: false,
+        host_task_reads_reach_guest_threads: false,
+        host_timed_signals_are_physical: false,
         delivers_preemption_timer_events: false,
         runs_guest_code_between_injections: true,
         reports_sigreturns: false,
@@ -361,6 +428,10 @@ impl BackendCapabilities {
         // run has yet shown the kernel's own child-exit copy reaching it.
         reports_kernel_child_exit_signals: false,
         supports_blocked_wait_signal_interruption: false,
+        kernel_signal_state_is_guests: false,
+        kernel_signal_targets_are_predictable: false,
+        host_task_reads_reach_guest_threads: false,
+        host_timed_signals_are_physical: false,
         delivers_preemption_timer_events: false,
         promotes_open_files_before_native_lifecycle: true,
         reports_sigreturns: false,
@@ -380,6 +451,10 @@ impl BackendCapabilities {
         // No run has shown the kernel's own child-exit copy reaching the tool.
         reports_kernel_child_exit_signals: false,
         supports_blocked_wait_signal_interruption: false,
+        kernel_signal_state_is_guests: false,
+        kernel_signal_targets_are_predictable: false,
+        host_task_reads_reach_guest_threads: false,
+        host_timed_signals_are_physical: false,
         delivers_preemption_timer_events: false,
         reports_sigreturns: false,
         ..Self::PTRACE
@@ -423,6 +498,10 @@ mod tests {
             "emulates_child_waits": false,
             "virtualizes_guest_sigalrm": false,
             "supports_blocked_wait_signal_interruption": true,
+            "kernel_signal_state_is_guests": true,
+            "kernel_signal_targets_are_predictable": true,
+            "host_task_reads_reach_guest_threads": true,
+            "host_timed_signals_are_physical": true,
             "delivers_preemption_timer_events": true,
             "runs_guest_code_between_injections": false,
             "promotes_open_files_before_native_lifecycle": false,
@@ -481,6 +560,10 @@ mod tests {
                 "reports_kernel_child_exit_signals": false,
                 "virtualizes_guest_sigalrm": true,
                 "supports_blocked_wait_signal_interruption": false,
+                "kernel_signal_state_is_guests": false,
+                "kernel_signal_targets_are_predictable": false,
+                "host_task_reads_reach_guest_threads": false,
+                "host_timed_signals_are_physical": false,
                 "delivers_preemption_timer_events": false,
                 "runs_guest_code_between_injections": true,
                 "promotes_open_files_before_native_lifecycle": true,
@@ -507,6 +590,10 @@ mod tests {
                 "supports_parked_write_signal_interruption": false,
                 "reports_child_exit_publication": false,
                 "supports_blocked_wait_signal_interruption": false,
+                "kernel_signal_state_is_guests": false,
+                "kernel_signal_targets_are_predictable": false,
+                "host_task_reads_reach_guest_threads": false,
+                "host_timed_signals_are_physical": false,
                 "delivers_preemption_timer_events": false,
                 "runs_guest_code_between_injections": true,
                 "reports_sigreturns": false,
@@ -529,6 +616,10 @@ mod tests {
                 "reports_child_exit_publication": false,
                 "reports_kernel_child_exit_signals": false,
                 "supports_blocked_wait_signal_interruption": false,
+                "kernel_signal_state_is_guests": false,
+                "kernel_signal_targets_are_predictable": false,
+                "host_task_reads_reach_guest_threads": false,
+                "host_timed_signals_are_physical": false,
                 "delivers_preemption_timer_events": false,
                 "promotes_open_files_before_native_lifecycle": true,
                 "reports_sigreturns": false,
@@ -550,6 +641,10 @@ mod tests {
                 "reports_child_exit_publication": false,
                 "reports_kernel_child_exit_signals": false,
                 "supports_blocked_wait_signal_interruption": false,
+                "kernel_signal_state_is_guests": false,
+                "kernel_signal_targets_are_predictable": false,
+                "host_task_reads_reach_guest_threads": false,
+                "host_timed_signals_are_physical": false,
                 "delivers_preemption_timer_events": false,
                 "reports_sigreturns": false,
             }))
