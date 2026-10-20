@@ -659,8 +659,8 @@ impl HeldSignalReads for StoppedHeldReads<'_> {
 }
 
 /// Why `report_or_pass_held_signal` passes a held signal on unreported, with
-/// whether the pass gives a reported instance's count back
-/// (`pass_held_signal_unreported_unless_filtered`'s `restore_count`), or
+/// whether the pass gives back the count a report of this signal's number
+/// took (`pass_held_signal_unreported_unless_filtered`'s `restore_count`), or
 /// `None` when it reports the signal. The checks run in this order, and each
 /// read is made only once the checks before it pass:
 /// - the early checks ([`held_early_reason`]);
@@ -686,8 +686,8 @@ impl HeldSignalReads for StoppedHeldReads<'_> {
 ///   (EMFILE) and a later one succeed;
 /// - another pending signal ([`held_pending_reason`]).
 ///
-/// Up to the restart block, the pass gives the count back if the instance
-/// was reported (`reported`); from there on it does not.
+/// Up to the restart block, the pass gives the count back if a report of this
+/// number is counted (`reported`); from there on it does not.
 fn held_signal_unreported(
     facts: &HeldSignalFacts,
     reads: &mut impl HeldSignalReads,

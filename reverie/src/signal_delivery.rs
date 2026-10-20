@@ -69,14 +69,19 @@ impl SignalAction {
 /// it at each guest event it sees: [`Interruption::Return`] or
 /// [`Interruption::KernelRun`] when a guest syscall ends,
 /// [`Interruption::NotInSyscall`] at a preemption, a trapped instruction or
-/// another stop the guest makes, and [`Interruption::AfterFrame`] whenever it
-/// lets a caught delivery go ahead, approved or not, since the kernel then
-/// builds that handler's frame as the guest resumes. The tool's own
+/// another stop the guest makes, and [`Interruption::AfterFrame`] whenever a
+/// caught delivery goes ahead, approved or not, since the kernel then builds
+/// that handler's frame as the guest resumes. When the backend answers that
+/// the kernel will not deliver the signal at this resume
+/// ([`crate::SignalDeliveryUnavailable::BlockedAtResume`] or
+/// [`crate::SignalDeliveryUnavailable::NotADeliveryStop`]), no frame follows
+/// and the record stays as it was. The tool's own
 /// injections inside a callback are not guest events and leave the record as
 /// it is. Between events the guest runs unseen, so a record can be stale: the
 /// guest may have returned to user code since. A tool can tell from the
-/// registers alone (`orig_ax` -1 after a syscall record; a frame record away
-/// from the handler's first instruction) and should then send what the
+/// registers alone (`orig_ax` -1 after a syscall record; a frame record at a
+/// stop that does not show the registers Linux leaves for that frame, see
+/// [`Interruption::AfterFrame`]) and should then send what the
 /// registers show instead, which the check then verifies only as far as the
 /// registers themselves.
 ///
@@ -109,10 +114,30 @@ pub enum Interruption {
     },
     /// A caught delivery already went ahead at this stop, and the kernel
     /// takes a further signal before any guest instruction runs. The
-    /// registers then describe the first frame, so they are not checked. A
-    /// tool binds this to the first frame by the handler's address (the
-    /// stopped thread's `rip`); the backend offers no token that names the
-    /// stop itself.
+    /// registers then describe the first frame, so they are not checked.
+    ///
+    /// The backend offers no token that names the stop itself. A tool can
+    /// narrow it to the first frame by what Linux leaves when it has just
+    /// built one, but cannot prove it. On x86-64 (Linux v6.12
+    /// `x64_setup_rt_frame` and `get_sigframe`, `arch/x86/kernel/signal_64.c`
+    /// and `signal.c`): `rip` is the handler, `rdi` the signal, `rdx` the
+    /// frame's ucontext at `rsp + 8`, `rsi` its siginfo right after that
+    /// ucontext (304 bytes), and `rsp` is 8 below a 16-byte boundary. Neither
+    /// writes `orig_ax`, which every later entry other than by a syscall sets
+    /// to -1, so it is still the first frame's stop's. A fault an
+    /// instruction raised needs the thread back in user code and is never
+    /// chained. A tool that tells it by a synchronous signal with a positive
+    /// `si_code` also sends the registers' answer for two chained ones: a
+    /// SIGSEGV for a frame Linux failed to build after an earlier one
+    /// (`SI_KERNEL`), and a signal the guest queued to itself with a positive
+    /// code. `rax`, which Linux sets to 0, holds an injection's result
+    /// after a syscall the tool injects at the stop.
+    ///
+    /// What still matches without being chained: an asynchronous signal at
+    /// the handler's first instruction after the handler's own code came back
+    /// to it with those registers unchanged, when the first frame's stop had
+    /// `orig_ax` -1. An address-only test would also match a handler that
+    /// changed those registers, and a fault there.
     AfterFrame,
 }
 

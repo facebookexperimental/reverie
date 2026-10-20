@@ -935,8 +935,8 @@ pub trait Tool: Send + Sync + Default {
     /// thread's mask blocks it (a later stop can take the same instance again
     /// and pass it once more), queues a new instance with a kernel siginfo
     /// (a syscall stop), or discards it (an ignored signal, or a ptrace event
-    /// stop or group stop); a dropped one is not resumed. So the hook sees passes, not deliveries.
-    /// The signal's
+    /// stop or group stop); a dropped one is not resumed. So the hook sees
+    /// passes, not deliveries. The signal's
     /// [`crate::UnreportedSignal::reason`] says why it was not reported, so
     /// that a Tool can count what its signal callback never saw.
     ///
