@@ -299,8 +299,8 @@ pub(crate) struct GuestFileIdentity {
 // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/933):
 // Review the fixed-timestamp classes of backend-made carriers.
 /// The timestamps an object reports in a run that reports host metadata
-/// timestamps. A run that does not report them uses the fixed
-/// `DETERMINISTIC_METADATA_SECONDS` for every object.
+/// timestamps. A run that does not report them does not use these classes:
+/// a carrier then reports the kernel's timestamps, like every host object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IdentityTimestamps {
     /// The times the kernel stored for the host object.
@@ -998,10 +998,12 @@ pub(crate) struct LoadedStaticElf {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
     // Review host metadata timestamps for Tool runs.
-    /// Whether `stat`, `fstat`, `newfstatat` and `statx` report the kernel's
-    /// timestamps for real host files and descriptors. When false (the
-    /// default) every timestamp in those results is the fixed
-    /// `DETERMINISTIC_METADATA_SECONDS`. Synthetic objects keep fixed
+    /// Whether a Tool rewrites every timestamp that `stat`, `fstat`,
+    /// `newfstatat` and `statx` return, so that the carriers the backend makes
+    /// for its own data are classified and keep fixed timestamps (see
+    /// [`IdentityTimestamps`]). False by default. Real host files and
+    /// descriptors report the kernel's timestamps either way, and captured
+    /// output, synthetic `/proc` files and virtual random devices keep fixed
     /// timestamps either way. Set through
     /// [`crate::KvmBackend::set_host_metadata_timestamps`]; fork, clone and
     /// exec carry it unchanged.

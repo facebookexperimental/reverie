@@ -175,15 +175,15 @@ static void assert_same(unsigned operation, int guest, int proc_root,
     CHECK(same_fstat(guest, proc_root, plain, wide));
     return;
   }
-  if (guest || plain->result != 0) {
+  if (plain->result != 0) {
     CHECK(memcmp(&plain->output, &wide->output, sizeof(plain->output)) == 0);
     return;
   }
 
-  // Native free-space counters can change between adjacent host syscalls.
-  // Compare every stable statfs field and bound each live count independently.
-  // Guest statfs has canonical counters and must pass the full-byte comparison
-  // above, including those counters, fsid, reserved bytes and output canaries.
+  // Free-space counters can change between adjacent host syscalls, natively
+  // and in the guest, which gets the host's answer (the Tool canonicalizes
+  // it). Compare every stable statfs field and bound each live count
+  // independently.
   const struct statfs *left = &plain->output.statfs;
   const struct statfs *right = &wide->output.statfs;
   CHECK(left->f_type == right->f_type && left->f_bsize == right->f_bsize);
@@ -216,28 +216,24 @@ static void check_guest_stat(const struct stat *value, int captured, int proc,
     if (directory)
       CHECK(value->st_size == 0);
     check_timestamps(value, 0);
-  } else {
+  } else if (captured) {
+    // Captured output is synthetic; a host file or directory reports the
+    // kernel's timestamps, which the Tool decides about.
     check_timestamps(value, 1640995199);
-    if (captured) {
-      CHECK(value->st_dev != 0 && value->st_ino != 0);
-      CHECK(value->st_mode == (S_IFIFO | 0600));
-      CHECK(value->st_nlink == 1 && value->st_uid == 0 && value->st_gid == 0);
-      CHECK(value->st_rdev == 0 && value->st_size == 0);
-      CHECK(value->st_blocks == 0 && value->st_blksize == 4096);
-    }
+    CHECK(value->st_dev != 0 && value->st_ino != 0);
+    CHECK(value->st_mode == (S_IFIFO | 0600));
+    CHECK(value->st_nlink == 1 && value->st_uid == 0 && value->st_gid == 0);
+    CHECK(value->st_rdev == 0 && value->st_size == 0);
+    CHECK(value->st_blocks == 0 && value->st_blksize == 4096);
   }
 }
 
+// The executor forwards the host's statfs answer: the Tool canonicalizes the
+// free counts and f_fsid.
 static void check_guest_statfs(const struct statfs *value) {
   CHECK(value->f_type != 0 && value->f_bsize > 0 && value->f_frsize > 0);
   CHECK(value->f_namelen > 0);
-  const fsblkcnt_t blocks = value->f_blocks < 1000000 ? value->f_blocks : 1000000;
-  const fsfilcnt_t files = value->f_files < 500000 ? value->f_files : 500000;
-  CHECK(value->f_bfree == blocks && value->f_bavail == blocks);
-  CHECK(value->f_ffree == files);
-  const unsigned char *fsid = (const unsigned char *)&value->f_fsid;
-  for (size_t index = 0; index < sizeof(value->f_fsid); ++index)
-    CHECK(fsid[index] == 0);
+  check_free_counts(value);
 }
 
 int main(int argc, char **argv) {

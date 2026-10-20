@@ -436,8 +436,8 @@ pub enum Error {
     #[error("KVM signal dequeue observation requires Tool-owned threads")]
     SignalObservationRequiresToolThreads,
 
-    /// Host metadata timestamps would reach the guest without a Tool to
-    /// rewrite them: the run has no Tool, or its threads are host-owned.
+    /// The run declares that a Tool rewrites every metadata timestamp, but it
+    /// has no Tool, or its threads are host-owned.
     #[error("KVM host metadata timestamps require a Tool that owns every guest thread")]
     HostMetadataTimestampsRequireToolThreads,
 

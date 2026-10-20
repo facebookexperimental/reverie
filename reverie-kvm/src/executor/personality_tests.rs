@@ -25,40 +25,13 @@ fn test_personality_uname(
     bytes
 }
 
-/// The host's release, and the release the host kernel reports with the
-/// UNAME26 personality, read in a forked child so that this process's own
-/// personality is untouched.
-fn host_releases() -> ([u8; 65], [u8; 65]) {
+/// The host's `uname(2)` answer, as the six 65-byte fields the guest reads.
+fn host_utsname() -> [u8; 65 * 6] {
     // SAFETY: zero is a valid utsname, and the pointer names a live one.
     let mut host = unsafe { std::mem::zeroed::<libc::utsname>() };
     assert_eq!(unsafe { libc::uname(&mut host) }, 0);
-    let mut fds = [0; 2];
-    // SAFETY: fds names two live ints.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: the child makes only async-signal-safe calls before _exit.
-    let child = unsafe { libc::fork() };
-    assert!(child >= 0);
-    if child == 0 {
-        unsafe {
-            let current = libc::personality(0xffff_ffff) as libc::c_ulong;
-            libc::personality(current | 0x0002_0000);
-            let mut compatible = std::mem::zeroed::<libc::utsname>();
-            libc::uname(&mut compatible);
-            libc::write(fds[1], compatible.release.as_ptr().cast(), 65);
-            libc::_exit(0);
-        }
-    }
-    let mut compatible = [0u8; 65];
-    // SAFETY: the buffer is 65 writable bytes.
-    assert_eq!(unsafe { libc::read(fds[0], compatible.as_mut_ptr().cast(), 65) }, 65);
-    let mut status = 0;
-    // SAFETY: child is this process's child.
-    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-    unsafe {
-        libc::close(fds[0]);
-        libc::close(fds[1]);
-    }
-    (host.release.map(|c| c as u8), compatible)
+    // SAFETY: utsname is six 65-byte character arrays with no padding.
+    unsafe { std::mem::transmute::<libc::utsname, [u8; 65 * 6]>(host) }
 }
 
 #[test]
@@ -113,8 +86,10 @@ fn personality_fixed_profile_round_trip_uses_low_word_and_refuses_unmodeled_flag
     }
 }
 
+// The executor forwards uname to the host and leaves the release to the Tool:
+// Detcore replaces it on every backend, so a guest's UNAME26 never shows.
 #[test]
-fn personality_fixed_profile_uname26_changes_release_and_restores_it() {
+fn uname_forwards_the_hosts_answer_under_every_personality() {
     let root = TestDir::new();
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
@@ -122,16 +97,13 @@ fn personality_fixed_profile_uname26_changes_release_and_restores_it() {
         test_personality_call(&mut memory, &mut state, TEST_PERSONALITY_QUERY),
         TEST_FIXED_PERSONALITY as i64,
     );
-    let (host_release, host_compatible_release) = host_releases();
-    let baseline = test_personality_uname(&mut memory, &mut state);
-    assert_eq!(baseline[2 * 65..3 * 65], host_release);
+    let host = host_utsname();
+    assert_eq!(test_personality_uname(&mut memory, &mut state), host);
     assert_eq!(
         test_personality_call(&mut memory, &mut state, TEST_UNAME26_PERSONALITY),
         TEST_FIXED_PERSONALITY as i64,
     );
-    let mut compatible = baseline;
-    compatible[2 * 65..3 * 65].copy_from_slice(&host_compatible_release);
-    assert_eq!(test_personality_uname(&mut memory, &mut state), compatible);
+    assert_eq!(test_personality_uname(&mut memory, &mut state), host);
     for address in [u64::MAX, PAGE_SIZE - (65 * 6 - 1)] {
         assert_eq!(
             syscall_result(
@@ -147,12 +119,11 @@ fn personality_fixed_profile_uname26_changes_release_and_restores_it() {
             TEST_UNAME26_PERSONALITY as i64,
         );
     }
-    assert_eq!(test_personality_uname(&mut memory, &mut state), compatible);
     assert_eq!(
         test_personality_call(&mut memory, &mut state, TEST_FIXED_PERSONALITY),
         TEST_UNAME26_PERSONALITY as i64,
     );
-    assert_eq!(test_personality_uname(&mut memory, &mut state), baseline);
+    assert_eq!(test_personality_uname(&mut memory, &mut state), host);
 }
 
 #[test]
@@ -164,7 +135,6 @@ fn personality_fixed_profile_is_task_local_and_survives_fork_thread_exec() {
         test_personality_call(&mut memory, &mut state, TEST_UNAME26_PERSONALITY),
         TEST_FIXED_PERSONALITY as i64,
     );
-    let compatible = test_personality_uname(&mut memory, &mut state);
     let mut forked = state.try_clone_for_fork(2).unwrap();
     assert_eq!(
         test_personality_call(&mut memory, &mut forked, TEST_PERSONALITY_QUERY),
@@ -174,14 +144,12 @@ fn personality_fixed_profile_is_task_local_and_survives_fork_thread_exec() {
         test_personality_call(&mut memory, &mut state, TEST_FIXED_PERSONALITY),
         TEST_UNAME26_PERSONALITY as i64,
     );
-    assert_eq!(test_personality_uname(&mut memory, &mut forked), compatible);
     let mut replacement = test_state(&root.0);
     replacement.inherit_process_state(forked);
     assert_eq!(
         test_personality_call(&mut memory, &mut replacement, TEST_PERSONALITY_QUERY),
         TEST_UNAME26_PERSONALITY as i64,
     );
-    assert_eq!(test_personality_uname(&mut memory, &mut replacement), compatible);
     assert_eq!(
         test_personality_call(&mut memory, &mut state, TEST_UNAME26_PERSONALITY),
         TEST_FIXED_PERSONALITY as i64,
@@ -196,13 +164,11 @@ fn personality_fixed_profile_is_task_local_and_survives_fork_thread_exec() {
         test_personality_call(&mut memory, &mut leader.state, TEST_PERSONALITY_QUERY),
         TEST_UNAME26_PERSONALITY as i64,
     );
-    assert_eq!(test_personality_uname(&mut memory, &mut leader.state), compatible);
     let mut worker_fork = sibling.state.try_clone_for_fork(4).unwrap();
     assert_eq!(
         test_personality_call(&mut memory, &mut worker_fork, TEST_PERSONALITY_QUERY),
         TEST_FIXED_PERSONALITY as i64,
     );
-    assert_ne!(test_personality_uname(&mut memory, &mut worker_fork), compatible);
     let mut worker_replacement = test_state(&root.0);
     worker_replacement.inherit_process_state(worker_fork);
     assert_eq!(

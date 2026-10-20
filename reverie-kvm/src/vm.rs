@@ -2232,19 +2232,22 @@ impl KvmBackend {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
     // Review host metadata timestamps for Tool runs.
-    /// Report the kernel's timestamps from `stat`, `fstat`, `newfstatat` and
-    /// `statx` on real host files and descriptors, instead of the fixed
-    /// timestamp the backend uses by default. Captured output, synthetic
-    /// `/proc` files, guest descriptor links and virtual random devices keep
-    /// their fixed timestamps.
+    /// Declare that the Tool rewrites every timestamp that `stat`, `fstat`,
+    /// `newfstatat` and `statx` return, as Detcore does with virtual
+    /// metadata. The backend then classifies the carriers it makes for its
+    /// own data (virtual files such as `/proc/self/loginuid`, `/proc`
+    /// snapshots, the virtual signalfd's eventfd and the self-pidfd proxy),
+    /// including one received over a socket, so that they report fixed
+    /// timestamps through every alias. Without it, those carriers report the
+    /// kernel's timestamps.
     ///
-    /// Host timestamps are host wall-clock values, so enable this only for a
-    /// Tool that rewrites every timestamp it returns to the guest, such as
-    /// Detcore with virtual metadata. The Tool can then read the values the
-    /// kernel stored, for example to confirm that `utimensat` stored the
-    /// requested time. A run without a Tool, or with host-owned threads
-    /// (see [`Self::unmonitored_threads`]), refuses to start while this is
-    /// enabled, because those syscalls would reach the guest unrewritten.
+    /// Real host files and descriptors report the kernel's timestamps whether
+    /// or not this is enabled, as the kernel reports them to a ptrace guest;
+    /// what the guest sees is the Tool's decision. Captured output, synthetic
+    /// `/proc` files, guest descriptor links and virtual random devices keep
+    /// their fixed timestamps either way. A run without a Tool, or with
+    /// host-owned threads (see [`Self::unmonitored_threads`]), refuses to
+    /// start while this is enabled, because nothing would rewrite them.
     ///
     /// A successful call writes the stored values into the guest's buffer
     /// before the Tool rewrites them. The backend cannot see whether another
