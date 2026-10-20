@@ -82,7 +82,7 @@
 #define SIOCGPGRP 0x8904
 #endif
 
-typedef int64_t (*syscall_invoker_t)(uintptr_t, int64_t, const uint64_t*);
+typedef int64_t (*syscall_invoker_t)(uintptr_t, int64_t, const uint64_t*, uint32_t);
 typedef int32_t (*register_reader_t)(uintptr_t, struct user_regs_struct*);
 typedef int32_t (*register_writer_t)(uintptr_t, const struct user_regs_struct*);
 typedef int32_t (*memory_reader_t)(uintptr_t, uint8_t*, size_t);
@@ -299,7 +299,7 @@ typedef struct {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 12u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 13u
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -2599,7 +2599,7 @@ static uint64_t next_virtual_tsc(void) {
 }
 
 static int64_t
-invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args);
+invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args, uint32_t purpose);
 static int32_t read_registers(uintptr_t context, struct user_regs_struct* out);
 static int32_t write_registers(
     uintptr_t context,
@@ -2789,7 +2789,7 @@ static void mark_compat_syscall_gateway(void) {
 }
 
 static int64_t
-invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args);
+invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args, uint32_t purpose);
 static int32_t read_registers(uintptr_t context, struct user_regs_struct* out);
 static int32_t write_registers(
     uintptr_t context,
@@ -3410,7 +3410,8 @@ static bool validate_task_argument(uint64_t* argument) {
 static void cancel_clone_birth(prototype_counters_t* counters);
 
 static int64_t
-invoke_raw_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
+invoke_raw_syscall_with_purpose(
+    uintptr_t context, int64_t sysnum, const uint64_t* args, uint32_t purpose) {
   prototype_counters_t* counters = drmgr_get_tls_field(
       (void*)context, thread_state_index);
   reg_t raw_args[6];
@@ -3422,14 +3423,13 @@ invoke_raw_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
   if (sysnum == SYS_write || sysnum == SYS_writev || sysnum == SYS_pwrite64 ||
       sysnum == SYS_pwritev || sysnum == SYS_pwritev2)
     sigpipe_pid = (int32_t)dr_get_process_id();
-  dr_syscall_invoke_status_t status;
-  if (branch_counter_enabled) {
-    status = dr_invoke_syscall_as_app_with_shared_vm_guard(
-        (void*)context, (int)sysnum, 6, raw_args, sigpipe_pid, &invocation);
-  } else {
-    status = dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
-                 (void*)context, (int)sysnum, 6, raw_args, sigpipe_pid, &invocation)
-        ? DR_SYSCALL_INVOKE_COMPLETED : DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED;
+  dr_syscall_invoke_status_t status = dr_invoke_syscall_as_app_with_purpose(
+      (void*)context, (int)sysnum, 6, raw_args, sigpipe_pid,
+      branch_counter_enabled, (dr_syscall_injection_purpose_t)purpose, &invocation);
+  if (status == DR_SYSCALL_INVOKE_PURPOSE_REFUSED) {
+    dr_fprintf(diagnostic_file, "reverie-dbt: unknown returning injection purpose\n");
+    exit_runtime_tree(101);
+    return -EIO;
   }
   if (status == DR_SYSCALL_INVOKE_SHARED_VM_REFUSED) {
     // No child or DR clone record exists. Cancel the already reserved native
@@ -3461,6 +3461,12 @@ invoke_raw_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
     counters->syscall_interruption_tid = dr_get_thread_id((void*)context);
   }
   return (int64_t)invocation.value;
+}
+
+static int64_t
+invoke_raw_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
+  return invoke_raw_syscall_with_purpose(
+      context, sysnum, args, DR_SYSCALL_INJECTION_APPLICATION);
 }
 
 static bool is_exec_syscall(int sysnum);
@@ -4361,13 +4367,19 @@ forbidden:
 }
 
 static int64_t
-invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
+invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args, uint32_t purpose) {
   prototype_counters_t* counters = (prototype_counters_t*)drmgr_get_tls_field(
       (void*)context, thread_state_index);
   uint64_t translated[6];
   int64_t result;
   bool is_clone;
   DR_ASSERT(counters != NULL);
+  if (purpose != DR_SYSCALL_INJECTION_APPLICATION &&
+      purpose != DR_SYSCALL_INJECTION_PSELECT6_WRAPPER_VALIDATION) {
+    dr_fprintf(diagnostic_file, "reverie-dbt: unknown returning injection purpose\n");
+    exit_runtime_tree(101);
+    return -EIO;
+  }
   capture_observe_lifecycle((int)sysnum, args);
   if (protect_evidence_socket_syscall(context, (int)sysnum, args, &result))
     return result;
@@ -4391,7 +4403,7 @@ invoke_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
         (void*)context,
         sysnum == SYS_exit,
         sysnum == SYS_exit_group);
-  result = invoke_raw_syscall(context, sysnum, translated);
+  result = invoke_raw_syscall_with_purpose(context, sysnum, translated, purpose);
   if (is_exec_syscall((int)sysnum) && result < 0) {
     require_evidence_flush(EVIDENCE_FRAME_EXEC_CANCEL);
   }
@@ -4867,7 +4879,8 @@ static bool fd_matches_stdin(void* drcontext, int fd) {
   uint64_t stat_args[6] = {(uint64_t)fd, (uint64_t)(uintptr_t)&candidate_stat};
   if (!task_state->initial_stdin_valid)
     return false;
-  if (invoke_syscall((uintptr_t)drcontext, SYS_fstat, stat_args) < 0)
+  if (invoke_syscall((uintptr_t)drcontext, SYS_fstat, stat_args,
+                     DR_SYSCALL_INJECTION_APPLICATION) < 0)
     return false;
   return task_state->initial_stdin.st_dev ==
       candidate_stat.st_dev &&
@@ -7050,6 +7063,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
   bool external_global = false;
   bool test_direct_evidence_entry = false;
   bool test_runtime_abi_mismatch = false;
+  bool test_runtime_abi12_mismatch = false;
   bool evidence_socket_seen = false;
   bool evidence_token_seen = false;
   unsigned char evidence_address[EVIDENCE_ADDRESS_LEN] = {0};
@@ -7064,6 +7078,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       test_direct_evidence_entry = true;
     else if (strcmp(argv[i], "-test-runtime-abi-mismatch") == 0)
       test_runtime_abi_mismatch = true;
+    else if (strcmp(argv[i], "-test-runtime-abi12-mismatch") == 0)
+      test_runtime_abi12_mismatch = true;
     else if (strcmp(argv[i], "-test-wait-for-background") == 0)
       test_wait_for_background = true;
     else if (strcmp(argv[i], "-test-delay-exec-helper-exit") == 0)
@@ -7148,6 +7164,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
     // Both historical ABI-10 tables had the same size but incompatible final
     // slots. Reject version 10 even with the current runtime's correct size.
     runtime_abi_version = 10;
+  if (test_runtime_abi12_mismatch)
+    runtime_abi_version = 12; // Same-size callback table, incompatible invoker signature.
   if (runtime_abi_version != REVERIE_DBT_RUNTIME_ABI_VERSION ||
       reverie_dbt_runtime_callbacks_size() != sizeof(runtime_callbacks_t)) {
     dr_fprintf(
@@ -7228,7 +7246,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       runtime_callbacks_page.value.panic_on_unsupported_syscalls = 1;
     else if (strcmp(argv[i], "-test-direct-evidence-entry") == 0) {
       /* Handled before application initialization. */
-    } else if (strcmp(argv[i], "-test-runtime-abi-mismatch") == 0) {
+    } else if (strcmp(argv[i], "-test-runtime-abi-mismatch") == 0 ||
+               strcmp(argv[i], "-test-runtime-abi12-mismatch") == 0) {
       /* Handled before application initialization. */
     } else if (strcmp(argv[i], "-test-private-memory") == 0) {
       ++i; /* Mode was checked before application initialization. */

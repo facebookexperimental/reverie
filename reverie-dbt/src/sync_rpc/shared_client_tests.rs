@@ -98,7 +98,13 @@ impl Callback {
 
 // Real Linux socket I/O, reached only through the supplied callback context.
 // Force short I/O and EINTR without substituting a transport or a mock response.
-unsafe extern "C" fn invoke_callback(context: usize, number: i64, args: *const u64) -> i64 {
+unsafe extern "C" fn invoke_callback(
+    context: usize,
+    number: i64,
+    args: *const u64,
+    purpose: u32,
+) -> i64 {
+    assert_eq!(purpose, reverie::InjectionPurpose::Application as u32);
     let state = unsafe { &mut *(context as *mut Callback) };
     let mut args = unsafe { args.cast::<[u64; 6]>().read() };
     state.calls.push((number, args[0] as i32));

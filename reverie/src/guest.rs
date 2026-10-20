@@ -26,6 +26,32 @@ use crate::tool::GlobalRPC;
 use crate::tool::GlobalTool;
 use crate::tool::Tool;
 
+/// The interception semantics of one returning Tool injection.
+///
+/// This is a closed contract, not a general "read-only syscall" mode.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionPurpose {
+    /// Preserve ordinary application syscall interposition.
+    Application = 0,
+    /// Validate only a pselect6 outer signal-mask wrapper.
+    ///
+    /// The trusted Tool must supply pselect6 with nfds zero, null fdsets, the
+    /// original outer-wrapper pointer, and readable Guest::stack scratch
+    /// containing { tv_sec: 0, tv_nsec: 1_000_000_000 }. The scratch and its
+    /// unchanged contents must remain live through the awaited injection.
+    /// Linux then rejects after copying the outer wrapper and before reading
+    /// the inner mask, installing it, waiting, copying output or changing state.
+    ///
+    /// Instrumentation must not apply the application's temporary mask or
+    /// consume/deliver pending signals because of this probe. Genuine async
+    /// arrivals and authenticated pre-entry interruption keep their existing
+    /// semantics. This purpose is invalid for other syscall families or a
+    /// valid timeout. The backend trusts this construction; it does not
+    /// duplicate Linux argument validation.
+    Pselect6WrapperValidation = 1,
+}
+
 /// Backend facts permitting a shared controller to inspect this physical task.
 ///
 /// The procfs identity names the authenticated root directory of the backend's
@@ -413,6 +439,30 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// file, and the syscall has had no effect; [`Guest::inject_with_retry`]
     /// injects it again.
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno>;
+
+    /// Inject with the closed interception purpose described by [InjectionPurpose].
+    ///
+    /// The actual task/provider, ownership checks and register restoration are
+    /// the same as [Guest::inject]. Kernel errno is returned as Error::Errno;
+    /// unsupported interception semantics are a non-errno mechanism failure.
+    ///
+    /// Explicit ptrace, KVM, InGuest/LiteInst, SaBRe, successor-image and e9patch
+    /// implementations delegate their existing guarded injection. This API
+    /// adds no measured coverage claim for those backends. DBT needs a scoped
+    /// interposition disposition for the validation purpose.
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Error> {
+        match purpose {
+            InjectionPurpose::Application => self.inject(syscall).await.map_err(Error::from),
+            InjectionPurpose::Pselect6WrapperValidation => Err(Error::Tool(anyhow::anyhow!(
+                "pselect6-wrapper-validation-unsupported: {}",
+                std::any::type_name::<Self>()
+            ))),
+        }
+    }
 
     /// Similar to [`Guest::inject`], except that it never returns. Since it does
     /// not return to the caller, the syscall return value cannot be altered or
@@ -1168,6 +1218,14 @@ where
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         self.inner.inject(syscall).await
+    }
+
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Error> {
+        self.inner.inject_with_purpose(syscall, purpose).await
     }
 
     async fn inject_restartable<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {

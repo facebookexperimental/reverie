@@ -1350,11 +1350,24 @@ dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
     void *drcontext, int sysnum, int arg_count, const reg_t *args,
     int guest_process_id, dr_syscall_invoke_result_t *result);
 
+/**
+ * Closed purpose for one returning invocation. The trusted client constructs
+ * PSELECT6_WRAPPER_VALIDATION only for pselect6 with nfds=0, null fdsets, the
+ * original outer mask wrapper and readable private timeout {0, 1000000000}
+ * retained unchanged through this call. Linux rejects before inner-mask,
+ * wait, copyout or persistent-state effects. DR does not validate this proof.
+ */
+typedef enum {
+    DR_SYSCALL_INJECTION_APPLICATION = 0,
+    DR_SYSCALL_INJECTION_PSELECT6_WRAPPER_VALIDATION = 1,
+} dr_syscall_injection_purpose_t;
+
 /** Outcome of the guarded returning mechanism, separate from Linux results. */
 typedef enum {
     DR_SYSCALL_INVOKE_COMPLETED,
     DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED,
     DR_SYSCALL_INVOKE_SHARED_VM_REFUSED,
+    DR_SYSCALL_INVOKE_PURPOSE_REFUSED,
 } dr_syscall_invoke_status_t;
 
 DR_API
@@ -1374,6 +1387,22 @@ dr_syscall_invoke_status_t
 dr_invoke_syscall_as_app_with_shared_vm_guard(
     void *drcontext, int sysnum, int arg_count, const reg_t *args,
     int guest_process_id, dr_syscall_invoke_result_t *result);
+
+DR_API
+/**
+ * The existing returning-injection contract with explicit purpose, shared-VM
+ * guard and SIGPIPE identity. All ordinary APIs select APPLICATION.
+ * PSELECT6_WRAPPER_VALIDATION preserves the full ownership/bookkeeping path,
+ * but declines DR's paired pselect mask interposition for this invocation.
+ * The kernel sees the original wrapper and owns copy/error precedence.
+ * Pending signal queues and genuine asynchronous arrivals are untouched.
+ * Unknown purpose refuses as a mechanism error, never a guest errno.
+ */
+dr_syscall_invoke_status_t
+dr_invoke_syscall_as_app_with_purpose(
+    void *drcontext, int sysnum, int arg_count, const reg_t *args,
+    int guest_process_id, bool guard_shared_vm, dr_syscall_injection_purpose_t purpose,
+    dr_syscall_invoke_result_t *result);
 
 DR_API
 /**

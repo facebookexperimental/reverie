@@ -17,6 +17,8 @@ typedef struct {
 } state_t;
 static int tls_index;
 static bool legacy;
+static bool validation_post;
+static unsigned validation_checks;
 static bool inject_wait;
 static bool transform_result;
 static bool terminal_result;
@@ -226,6 +228,49 @@ static bool pre_syscall(void *dc, int number) {
   return false;
 }
 
+static void post_syscall(void *dc, int number) {
+  if (!validation_post || number != SYS_pselect6) return;
+  require(validation_checks++ == 0 && dr_syscall_get_result(dc) == 0,
+          "one real ordinary application pselect seed");
+  uint64_t old_mask = 0, current = 0;
+  reg_t query[4] = { SIG_SETMASK, 0, (reg_t)&old_mask, sizeof(old_mask) };
+  dr_syscall_invoke_result_t result;
+  require(dr_invoke_syscall_as_app_with_result(dc, SYS_rt_sigprocmask, 4,
+                                             query, &result) && result.value == 0,
+          "read application mask after real pselect posthandling");
+  uint64_t changed = old_mask | (UINT64_C(1) << (SIGUSR2 - 1));
+  require(changed != old_mask, "nonvacuous changed mask");
+  reg_t set[4] = { SIG_SETMASK, (reg_t)&changed, 0, sizeof(changed) };
+  require(dr_invoke_syscall_as_app_with_result(dc, SYS_rt_sigprocmask, 4,
+                                             set, &result) && result.value == 0,
+          "set distinct application mask in post callback");
+  uint64_t temporary = 0;
+  struct { int64_t sec, nsec; } malformed = { 0, 1000000000 };
+  struct { uint64_t *mask; size_t bytes; } wrapper = { &temporary, sizeof(temporary) };
+  reg_t args[6] = { 0, 0, 0, 0, (reg_t)&malformed, (reg_t)&wrapper };
+  require(dr_invoke_syscall_as_app_with_purpose(
+              dc, SYS_pselect6, 6, args, 0, false,
+              (dr_syscall_injection_purpose_t)99, &result) ==
+              DR_SYSCALL_INVOKE_PURPOSE_REFUSED,
+          "unknown purpose is a mechanism refusal");
+  require(dr_invoke_syscall_as_app_with_purpose(
+              dc, SYS_pselect6, 6, args, 0, false,
+              DR_SYSCALL_INJECTION_PSELECT6_WRAPPER_VALIDATION, &result) ==
+              DR_SYSCALL_INVOKE_COMPLETED &&
+              (ptr_int_t)result.value == -22 && result.interruption == 0,
+          "tagged validation reaches kernel EINVAL");
+  query[2] = (reg_t)&current;
+  require(dr_invoke_syscall_as_app_with_result(dc, SYS_rt_sigprocmask, 4,
+                                             query, &result) && result.value == 0 &&
+              current == changed && wrapper.mask == &temporary &&
+              malformed.sec == 0 && malformed.nsec == 1000000000,
+          "validation post does not restore stale ordinary pselect metadata");
+  set[1] = (reg_t)&old_mask;
+  require(dr_invoke_syscall_as_app_with_result(dc, SYS_rt_sigprocmask, 4,
+                                             set, &result) && result.value == 0,
+          "restore fixture application mask");
+}
+
 static void finish_admission(void) {
   void *dc = dr_get_current_drcontext();
   state_t *s = drmgr_get_tls_field(dc, tls_index);
@@ -268,6 +313,10 @@ static dr_emit_flags_t instrument(void *dc, void *tag, instrlist_t *bb,
 
 static void exit_event(void) {
   int mode = read_int(case_address);
+  if (validation_post) {
+    require(validation_checks == 1, "post validation control executed");
+    dr_fprintf(STDOUT, "pselect validation post=ok\n");
+  }
   unsigned expected = mode == CONTROL || mode == RESTART_CONTROL ? 0 : 1;
   if (terminal_result) expected = 0;
   if (mode == MASK_SUPPRESS) {
@@ -298,6 +347,7 @@ static void exit_event(void) {
              legacy, ordinary_signals, admissions, commits, restart_contexts);
   drmgr_unregister_bb_insertion_event(instrument);
   drmgr_unregister_pre_syscall_event(pre_syscall);
+  if (validation_post) drmgr_unregister_post_syscall_event(post_syscall);
   drmgr_unregister_filter_syscall_event(filter_syscall);
   drmgr_unregister_signal_event(ordinary_signal);
   if (!legacy) require(dr_unregister_signal_admission_event(admission), "unregister admission");
@@ -313,12 +363,14 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   (void)id;
   require((argc == 2 || (argc == 3 && !strcmp(argv[2], "require-emulated-mask"))) &&
               (!strcmp(argv[1], "owned") || !strcmp(argv[1], "legacy") ||
+               !strcmp(argv[1], "validation-post") ||
                !strcmp(argv[1], "owned-inject") ||
                !strcmp(argv[1], "owned-inject-result") ||
                !strcmp(argv[1], "owned-inject-signal-result") ||
                !strcmp(argv[1], "owned-inject-terminal")),
           "exact client mode");
-  legacy = !strcmp(argv[1], "legacy");
+  validation_post = !strcmp(argv[1], "validation-post");
+  legacy = !strcmp(argv[1], "legacy") || validation_post;
   transform_result = !strcmp(argv[1], "owned-inject-result");
   terminal_result = !strcmp(argv[1], "owned-inject-terminal");
   transform_signal_result = !strcmp(argv[1], "owned-inject-signal-result");
@@ -347,5 +399,6 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
               drmgr_register_signal_event(ordinary_signal) &&
               drmgr_register_exit_event(exit_event),
           "register actual native events");
+  if (validation_post) require(drmgr_register_post_syscall_event(post_syscall), "post control");
   if (!legacy) require(dr_register_signal_admission_event(admission), "register owned API");
 }

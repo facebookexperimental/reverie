@@ -393,6 +393,20 @@ static void check_suspend_retry(uint64_t original, uint64_t blocked) {
 
 int main(int argc, char **argv) {
   require(argc == 2, "one exact case argument");
+  if (strcmp(argv[1], "validation-post") == 0) {
+    sigset_t mask, old;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    require(sigprocmask(SIG_SETMASK, &mask, &old) == 0, "seed blocked mask");
+    uint64_t temporary = 0;
+    struct { const void *mask; size_t bytes; } wrapper = { &temporary, sizeof(temporary) };
+    struct timespec zero = { 0, 0 };
+    require(syscall(SYS_pselect6, 0, NULL, NULL, NULL, &zero, &wrapper) == 0,
+            "ordinary pselect seeds actual post metadata");
+    require(sigprocmask(SIG_SETMASK, &old, NULL) == 0, "restore original mask");
+    puts("pselect validation guest=ok");
+    return 0;
+  }
   if (strcmp(argv[1], "mask-readonly") == 0) {
     check_readonly_sigprocmask();
     return 0;

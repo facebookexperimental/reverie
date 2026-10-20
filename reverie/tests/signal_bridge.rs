@@ -328,3 +328,28 @@ fn child_exit_signal_default_refuses_before_publication() {
         }
     );
 }
+
+#[test]
+fn validation_injection_default_refuses_without_an_errno_fallback() {
+    let mut guest = TestGuest::default();
+    let unsupported = ready(<TestGuest as Guest<()>>::inject_with_purpose(
+        &mut guest,
+        reverie::syscalls::Pselect6::new(),
+        reverie::InjectionPurpose::Pselect6WrapperValidation,
+    ))
+    .unwrap_err();
+    assert!(matches!(unsupported, Error::Tool(_)));
+    assert!(
+        unsupported
+            .to_string()
+            .starts_with("pselect6-wrapper-validation-unsupported: ")
+    );
+    assert!(matches!(
+        ready(<TestGuest as Guest<()>>::inject_with_purpose(
+            &mut guest,
+            reverie::syscalls::Getpid::new(),
+            reverie::InjectionPurpose::Application,
+        )),
+        Err(Error::Errno(Errno::ENOSYS))
+    ));
+}

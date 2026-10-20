@@ -421,6 +421,9 @@ typedef struct _client_data_t {
      * pointer names that invocation's stack-owned refusal result, not a guest
      * errno or a general syscall policy. Nested invocations restore it. */
     bool *returning_shared_vm_refused;
+    /* Current dr_syscall_injection_purpose_t; zero is ordinary application
+     * interposition. Each returning/legacy invocation restores its caller. */
+    uint returning_syscall_purpose;
 #endif
 } client_data_t;
 

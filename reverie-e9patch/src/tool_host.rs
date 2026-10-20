@@ -509,6 +509,20 @@ impl<T: Tool> Guest<T> for E9patchGuest<'_, T> {
 
     async fn daemonize(&mut self) {}
 
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: reverie::InjectionPurpose,
+    ) -> std::result::Result<i64, reverie::Error> {
+        // This route keeps its existing guarded injection behavior.
+        match purpose {
+            reverie::InjectionPurpose::Application
+            | reverie::InjectionPurpose::Pselect6WrapperValidation => {
+                self.inject(syscall).await.map_err(reverie::Error::from)
+            }
+        }
+    }
+
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         let (number, args) = syscall.into_parts();
         let number = number.id() as i64;

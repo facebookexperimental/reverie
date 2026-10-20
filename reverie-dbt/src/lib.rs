@@ -76,6 +76,7 @@ use reverie::Frame;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
+use reverie::InjectionPurpose;
 use reverie::Never;
 use reverie::Pid;
 use reverie::Signal;
@@ -97,7 +98,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// Native callback used to issue a syscall with DynamoRIO bookkeeping.
-pub type SyscallInvoker = unsafe extern "C" fn(usize, i64, *const u64) -> i64;
+/// The final ABI13 argument is the fixed-width [InjectionPurpose] discriminant.
+pub type SyscallInvoker = unsafe extern "C" fn(usize, i64, *const u64, u32) -> i64;
 
 /// Native callback used to translate DynamoRIO's machine context.
 pub type RegisterReader = unsafe extern "C" fn(usize, *mut libc::user_regs_struct) -> i32;
@@ -348,7 +350,9 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// private-memory ABI-10 layout is incompatible and is not accepted.
 /// Version 12 appends the optional image/task-scoped instruction-fact query
 /// at offset 72. It does not change the shared clock or timer contract.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 12;
+/// Version 13 adds the injection purpose as the syscall invoker's fourth
+/// argument. The callback table remains 80 bytes; version 12 is incompatible.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 13;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -646,6 +650,44 @@ where
         }
     }
 
+    fn inject_for_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Errno> {
+        let (number, args) = syscall.into_parts();
+        let args = [
+            args.arg0 as u64,
+            args.arg1 as u64,
+            args.arg2 as u64,
+            args.arg3 as u64,
+            args.arg4 as u64,
+            args.arg5 as u64,
+        ];
+        if let Some(result) = sync_rpc::protect_guest_operation(
+            self.context,
+            self.invoke_syscall,
+            number.id() as i64,
+            &args,
+            false,
+        ) {
+            return Errno::from_ret(result as usize).map(|value| value as i64);
+        }
+        // The native bridge classifies this as an injected syscall: clone
+        // identity bookkeeping still completes synchronously, while the
+        // original-syscall post-event latch remains disarmed because the raw
+        // result is returned directly to this Tool call.
+        let result = unsafe {
+            (self.invoke_syscall)(
+                self.context,
+                number.id() as i64,
+                args.as_ptr(),
+                purpose as u32,
+            )
+        };
+        Errno::from_ret(result as usize).map(|value| value as i64)
+    }
+
     /// Reads optional image/task-scoped original-conditional facts. This is
     /// DBT-internal observation transport, not a shared clock capability.
     pub fn branch_fact(&self) -> Result<BranchFact, BranchFactUnavailable> {
@@ -934,31 +976,16 @@ where
     async fn daemonize(&mut self) {}
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
-        let (number, args) = syscall.into_parts();
-        let args = [
-            args.arg0 as u64,
-            args.arg1 as u64,
-            args.arg2 as u64,
-            args.arg3 as u64,
-            args.arg4 as u64,
-            args.arg5 as u64,
-        ];
-        if let Some(result) = sync_rpc::protect_guest_operation(
-            self.context,
-            self.invoke_syscall,
-            number.id() as i64,
-            &args,
-            false,
-        ) {
-            return Errno::from_ret(result as usize).map(|value| value as i64);
-        }
-        // The native bridge classifies this as an injected syscall: clone
-        // identity bookkeeping still completes synchronously, while the
-        // original-syscall post-event latch remains disarmed because the raw
-        // result is returned directly to this Tool call.
-        let result =
-            unsafe { (self.invoke_syscall)(self.context, number.id() as i64, args.as_ptr()) };
-        Errno::from_ret(result as usize).map(|value| value as i64)
+        self.inject_for_purpose(syscall, InjectionPurpose::Application)
+    }
+
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Error> {
+        self.inject_for_purpose(syscall, purpose)
+            .map_err(Error::from)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3163,7 +3190,7 @@ mod tests {
 
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 12);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 13);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
         assert_eq!(reverie_dbt_runtime_callbacks_size(), 80);
@@ -3254,7 +3281,13 @@ mod tests {
         );
     }
 
-    unsafe extern "C" fn invoke(_context: usize, sysnum: i64, args: *const u64) -> i64 {
+    unsafe extern "C" fn invoke(
+        _context: usize,
+        sysnum: i64,
+        args: *const u64,
+        purpose: u32,
+    ) -> i64 {
+        assert_eq!(purpose, InjectionPurpose::Application as u32);
         assert_eq!(sysnum, libc::SYS_write);
         unsafe { *args.add(2) as i64 }
     }
@@ -3265,7 +3298,13 @@ mod tests {
         result: i64,
     }
 
-    unsafe extern "C" fn invoke_expected(context: usize, sysnum: i64, args: *const u64) -> i64 {
+    unsafe extern "C" fn invoke_expected(
+        context: usize,
+        sysnum: i64,
+        args: *const u64,
+        purpose: u32,
+    ) -> i64 {
+        assert_eq!(purpose, InjectionPurpose::Application as u32);
         let expected = unsafe { &*(context as *const ExpectedInvocation) };
         let actual_args = unsafe { std::slice::from_raw_parts(args, 6) };
         assert_eq!(sysnum, expected.sysnum);
@@ -3380,6 +3419,79 @@ mod tests {
         let tail_result = TailInjectResult::default();
         assert_eq!(run_ready(future, &tail_result), Some(1234));
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn into_guest_forwards_validation_purpose_and_restores_ordinary_injection() {
+        unsafe extern "C" fn observe(
+            context: usize,
+            number: i64,
+            _args: *const u64,
+            purpose: u32,
+        ) -> i64 {
+            let calls = unsafe { &mut *(context as *mut Vec<(i64, u32)>) };
+            calls.push((number, purpose));
+            -i64::from(libc::EINVAL)
+        }
+        let mut calls = Vec::<(i64, u32)>::new();
+        let mut counters = PrototypeCounters::default();
+        let mut guest = DbtGuest::<PrototypeTool>::new(
+            &mut calls as *mut _ as usize,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            observe,
+            read_regs,
+            write_regs_noop,
+        );
+        let tail = Arc::clone(&guest.tail_inject_result);
+        // The native mock observes routing only; this is not Linux semantics.
+        // Use a valid closed-purpose operation with live scratch nevertheless.
+        let mut stack = run_ready(guest.stack(), &tail).unwrap();
+        let timeout = stack.reserve::<reverie::syscalls::Timespec>();
+        let _guard = stack.commit().unwrap();
+        guest
+            .memory()
+            .write_value(
+                timeout,
+                &reverie::syscalls::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000_000,
+                },
+            )
+            .unwrap();
+        let call = reverie::syscalls::Pselect6::new().with_timeout(Some(timeout));
+        {
+            let mut adapted = guest.into_guest();
+            let result = run_ready(
+                <_ as Guest<PrototypeTool>>::inject_with_purpose(
+                    &mut adapted,
+                    call,
+                    InjectionPurpose::Pselect6WrapperValidation,
+                ),
+                &tail,
+            )
+            .unwrap();
+            assert!(matches!(result, Err(Error::Errno(Errno::EINVAL))));
+        }
+        assert_eq!(
+            run_ready(guest.inject(call), &tail),
+            Some(Err(Errno::EINVAL))
+        );
+        assert_eq!(
+            calls,
+            [
+                (
+                    libc::SYS_pselect6,
+                    InjectionPurpose::Pselect6WrapperValidation as u32
+                ),
+                (libc::SYS_pselect6, InjectionPurpose::Application as u32),
+            ]
+        );
     }
 
     #[test]

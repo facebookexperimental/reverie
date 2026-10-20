@@ -523,7 +523,12 @@ pub(crate) fn protect_guest_operation(
         // the connection owner holds only the one descriptor being spared.
         Some(unsafe {
             reserved_fds::close_range_sparing(args, &[fd], |number, args| {
-                invoke_syscall(context, number, args.as_ptr())
+                invoke_syscall(
+                    context,
+                    number,
+                    args.as_ptr(),
+                    reverie::InjectionPurpose::Application as u32,
+                )
             })
         })
     } else if let Some(result) = reserved_fds::epoll_wait_result(number, args, fd) {
@@ -712,7 +717,14 @@ fn invoke(
     number: libc::c_long,
     arguments: [u64; 6],
 ) -> std::io::Result<i64> {
-    let result = unsafe { invoke_syscall(context, number, arguments.as_ptr()) };
+    let result = unsafe {
+        invoke_syscall(
+            context,
+            number,
+            arguments.as_ptr(),
+            reverie::InjectionPurpose::Application as u32,
+        )
+    };
     if result < 0 {
         Err(std::io::Error::from_raw_os_error((-result) as i32))
     } else {
@@ -953,7 +965,13 @@ mod tests {
         }
     }
 
-    unsafe extern "C" fn socket_syscall(context: usize, number: i64, args: *const u64) -> i64 {
+    unsafe extern "C" fn socket_syscall(
+        context: usize,
+        number: i64,
+        args: *const u64,
+        purpose: u32,
+    ) -> i64 {
+        assert_eq!(purpose, reverie::InjectionPurpose::Application as u32);
         let probe = unsafe { &mut *(context as *mut SocketProbe) };
         let args = unsafe { std::ptr::read(args.cast::<[u64; 6]>()) };
         probe.calls.push((number, args));

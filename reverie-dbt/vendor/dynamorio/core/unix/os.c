@@ -5966,6 +5966,11 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
     va_end(ap);
     MCXT_SYSNUM_REG(mc) = sysnum;
     reg_t res;
+#ifdef LINUX
+    uint saved_purpose = dcontext->client_data->returning_syscall_purpose;
+    dcontext->client_data->returning_syscall_purpose =
+        DR_SYSCALL_INJECTION_APPLICATION;
+#endif
     /* Skip client syscall events. */
     dcontext->client_data->skip_client_syscall_events = true;
     if (!pre_system_call(dcontext)) {
@@ -5984,6 +5989,9 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
     }
     MCXT_SYSCALL_RES(mc) = saved_res;
     MCXT_SYSNUM_REG(mc) = saved_sysnum;
+#ifdef LINUX
+    dcontext->client_data->returning_syscall_purpose = saved_purpose;
+#endif
     return res;
 }
 
@@ -5992,6 +6000,7 @@ static dr_syscall_invoke_status_t
 invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
                                   const reg_t *args, int guest_process_id,
                                   bool guard_shared_vm,
+                                  dr_syscall_injection_purpose_t purpose,
                                   dr_syscall_invoke_result_t *result)
 {
     dcontext_t *dcontext = (dcontext_t *)drcontext;
@@ -5999,6 +6008,9 @@ invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
         dcontext != get_thread_private_dcontext() || result == NULL ||
         arg_count < 0 || arg_count > 6 || (arg_count != 0 && args == NULL))
         return DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED;
+    if (purpose != DR_SYSCALL_INJECTION_APPLICATION &&
+        purpose != DR_SYSCALL_INJECTION_PSELECT6_WRAPPER_VALIDATION)
+        return DR_SYSCALL_INVOKE_PURPOSE_REFUSED;
     priv_mcontext_t *mc = get_mcontext(dcontext);
     bool suspend = sysnum == SYS_rt_sigsuspend;
     if (!signal_injection_permitted(dcontext, sysnum))
@@ -6013,6 +6025,8 @@ invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
     reg_t saved_params[5] = { dcontext->sys_param0, dcontext->sys_param1,
                              dcontext->sys_param2, dcontext->sys_param3,
                              dcontext->sys_param4 };
+    uint saved_purpose = dcontext->client_data->returning_syscall_purpose;
+    dcontext->client_data->returning_syscall_purpose = purpose;
     bool saved_skip = dcontext->client_data->skip_client_syscall_events;
     bool shared_vm_refused = false;
     bool *saved_guard = dcontext->client_data->returning_shared_vm_refused;
@@ -6064,6 +6078,7 @@ invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
     MCXT_SYSCALL_RES(mc) = saved_result;
     MCXT_SYSNUM_REG(mc) = saved_sysnum;
     dcontext->client_data->returning_shared_vm_refused = saved_guard;
+    dcontext->client_data->returning_syscall_purpose = saved_purpose;
     if (shared_vm_refused) {
         result->value = 0;
         result->interruption = 0;
@@ -6079,7 +6094,7 @@ dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
                                     dr_syscall_invoke_result_t *result)
 {
     return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args, 0,
-                                             false, result) ==
+                                             false, DR_SYSCALL_INJECTION_APPLICATION, result) ==
         DR_SYSCALL_INVOKE_COMPLETED;
 }
 
@@ -6090,7 +6105,7 @@ dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
     int guest_process_id, dr_syscall_invoke_result_t *result)
 {
     return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args,
-                                             guest_process_id, false, result) ==
+                                             guest_process_id, false, DR_SYSCALL_INJECTION_APPLICATION, result) ==
         DR_SYSCALL_INVOKE_COMPLETED;
 }
 
@@ -6101,7 +6116,18 @@ dr_invoke_syscall_as_app_with_shared_vm_guard(
     int guest_process_id, dr_syscall_invoke_result_t *result)
 {
     return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args,
-                                             guest_process_id, true, result);
+                                             guest_process_id, true, DR_SYSCALL_INJECTION_APPLICATION, result);
+}
+DR_API
+dr_syscall_invoke_status_t
+dr_invoke_syscall_as_app_with_purpose(
+    void *drcontext, int sysnum, int arg_count, const reg_t *args,
+    int guest_process_id, bool guard_shared_vm, dr_syscall_injection_purpose_t purpose,
+    dr_syscall_invoke_result_t *result)
+{
+    return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args,
+                                             guest_process_id, guard_shared_vm,
+                                             purpose, result);
 }
 #endif
 
@@ -8574,6 +8600,9 @@ pre_system_call(dcontext_t *dcontext)
     case SYS_pselect6_time64:
 #    endif
     case SYS_pselect6: {
+        if (dcontext->client_data->returning_syscall_purpose ==
+            DR_SYSCALL_INJECTION_PSELECT6_WRAPPER_VALIDATION)
+            break;
         typedef struct {
             kernel_sigset_t *sigmask;
             size_t sizemask;
@@ -10009,6 +10038,9 @@ post_system_call(dcontext_t *dcontext)
     case SYS_pselect6_time64:
 #    endif
     case SYS_pselect6: {
+        if (dcontext->client_data->returning_syscall_purpose ==
+            DR_SYSCALL_INJECTION_PSELECT6_WRAPPER_VALIDATION)
+            break;
         if (dcontext->sys_param4 == (reg_t)NULL)
             break;
         typedef struct {

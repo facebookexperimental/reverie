@@ -15,6 +15,7 @@ typedef struct {
 } state_t;
 static int tls_index;
 static bool replace_info;
+static bool purpose_api;
 static byte *stub;
 static unsigned admissions, commits;
 
@@ -74,9 +75,13 @@ static bool pre_syscall(void *dc, int number) {
   for (int i = 0; i < 6; ++i) args[i] = dr_syscall_get_param(dc, i);
   s->injecting = true;
   dr_syscall_invoke_result_t result;
-  require(dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
-              dc, number, 6, args, PROJECTED_PID, &result) && !result.interruption,
-          "real returning syscall");
+  bool completed = purpose_api
+      ? dr_invoke_syscall_as_app_with_purpose(
+            dc, number, 6, args, PROJECTED_PID, false,
+            DR_SYSCALL_INJECTION_APPLICATION, &result) == DR_SYSCALL_INVOKE_COMPLETED
+      : dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
+            dc, number, 6, args, PROJECTED_PID, &result);
+  require(completed && !result.interruption, "real returning syscall");
   s->injecting = false;
   dr_syscall_set_result(dc, result.value);
   return false;
@@ -109,9 +114,11 @@ static void exit_event(void) {
 }
 DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   (void)id;
-  require(argc == 2 && (!strcmp(argv[1], "project") || !strcmp(argv[1], "replace")),
+  require((argc == 2 || (argc == 3 && !strcmp(argv[2], "purpose"))) &&
+              (!strcmp(argv[1], "project") || !strcmp(argv[1], "replace")),
           "exact mode");
   replace_info = !strcmp(argv[1], "replace");
+  purpose_api = argc == 3;
   require(drmgr_init(), "drmgr");
   tls_index = drmgr_register_tls_field();
   require(tls_index >= 0, "TLS index");

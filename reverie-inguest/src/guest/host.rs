@@ -3067,6 +3067,20 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         self.unsupported_refusal.take()
     }
 
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: reverie::InjectionPurpose,
+    ) -> std::result::Result<i64, reverie::Error> {
+        // This route keeps its existing guarded injection behavior.
+        match purpose {
+            reverie::InjectionPurpose::Application
+            | reverie::InjectionPurpose::Pselect6WrapperValidation => {
+                self.inject(syscall).await.map_err(reverie::Error::from)
+            }
+        }
+    }
+
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         self.unsupported_refusal = None;
         if self.tail.ending() {

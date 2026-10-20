@@ -3756,37 +3756,39 @@ mod tests {
     #[test]
     #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
     fn native_runtime_abi_mismatch_fails_before_guest_execution() {
-        let mut file = tempfile::tempfile().unwrap();
-        let runner = DbtRunner::from_env()
-            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
-            .evidence_file(&file)
-            .unwrap()
-            .client_argument("-test-runtime-abi-mismatch");
-        let guest = Command::new("/bin/true");
-        let mut command = runner.command(&guest, None);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = runner.spawn_command(&mut command).unwrap();
-        runner.finish_launch_setup(None).unwrap();
-        let process_group = child.id() as i32;
-        let output = child.wait_with_output().unwrap();
-        wait_for_process_group_no_live_members(process_group).unwrap();
-        assert!(runner.finish_evidence(true).is_err());
-        file.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        assert_eq!(output.status.code(), Some(101));
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("native/runtime ABI version or callback size mismatch"),
-            "runtime ABI mismatch failed for the wrong reason: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            bytes.is_empty(),
-            "runtime ABI mismatch published an evidence artifact"
-        );
+        for argument in ["-test-runtime-abi-mismatch", "-test-runtime-abi12-mismatch"] {
+            let mut file = tempfile::tempfile().unwrap();
+            let runner = DbtRunner::from_env()
+                .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+                .evidence_file(&file)
+                .unwrap()
+                .client_argument(argument);
+            let guest = Command::new("/bin/true");
+            let mut command = runner.command(&guest, None);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let child = runner.spawn_command(&mut command).unwrap();
+            runner.finish_launch_setup(None).unwrap();
+            let process_group = child.id() as i32;
+            let output = child.wait_with_output().unwrap();
+            wait_for_process_group_no_live_members(process_group).unwrap();
+            assert!(runner.finish_evidence(true).is_err());
+            file.seek(std::io::SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(output.status.code(), Some(101));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("native/runtime ABI version or callback size mismatch"),
+                "runtime ABI mismatch failed for the wrong reason: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                bytes.is_empty(),
+                "runtime ABI mismatch published an evidence artifact"
+            );
+        }
     }
 }

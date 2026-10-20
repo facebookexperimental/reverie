@@ -64,7 +64,7 @@ fn returning_identity_injections_match_application_kernel_ids() {
     let runner = DbtRunner::from_env()
         .expect("DYNAMORIO_HOME (or DynamoRIO_DIR) and REVERIE_DBT_CLIENT must be set")
         .client_argument("-test-wait-for-background");
-    let mut guest = Command::new(fixture);
+    let mut guest = Command::new(&fixture);
     guest.env("HERMIT_DBT_TEST_SET_REG", "1");
     let output = runner
         .output(&guest)
@@ -102,4 +102,16 @@ fn returning_identity_injections_match_application_kernel_ids() {
     }
     assert!(output.status.success(), "guest failed: {output:?}");
     assert_eq!(output.stdout, b"kernel-identity-inject=ok\n");
+    let mut guest = Command::new(&fixture);
+    guest
+        .arg("pselect-validation")
+        .env("HERMIT_DBT_TEST_SET_REG", "1");
+    let output = runner
+        .output(&guest)
+        .expect("returning validation fixture must run");
+    assert!(
+        output.status.success(),
+        "returning validation failed: {output:?}"
+    );
+    assert_eq!(output.stdout, b"returning-pselect-validation=ok\n");
 }

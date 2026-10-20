@@ -51,6 +51,21 @@ fn owned_signal_preserves_native_fp_restart_and_masks() {
     );
     let guest = directory.path().join("signal_admission_state_guest");
     let client = directory.path().join("libsignal_admission_state_client.so");
+    // An actual application pselect leaves nonzero saved mask metadata.
+    // The tagged probe runs from its post callback after changing the mask.
+    let output = bounded(
+        Command::new(reverie_dbt::bundled_drrun_path())
+            .arg("-c")
+            .arg(&client)
+            .arg("validation-post")
+            .arg("--")
+            .arg(&guest)
+            .arg("validation-post"),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("validation post stdout");
+    assert!(stdout.contains("pselect validation post=ok"));
+    assert!(stdout.contains("pselect validation guest=ok"));
+
     // Real Linux controls establish the guest's permitted signal/restart/mask
     // behavior. Suppression is a DR client operation, so its control below is
     // DR's existing DR_SIGNAL_SUPPRESS path, not an invented Linux outcome.
@@ -300,21 +315,23 @@ fn injected_sigpipe_projects_only_fresh_epipe_and_preserves_replacements() {
         .path()
         .join("libsignal_admission_sigpipe_client.so");
     bounded(Command::new(&guest).arg("native"));
-    for mode in ["project", "replace"] {
-        let output = bounded(
-            Command::new(reverie_dbt::bundled_drrun_path())
-                .arg("-c")
-                .arg(&client)
-                .arg(mode)
-                .arg("--")
-                .arg(&guest)
-                .arg(mode),
-        );
-        let stdout = String::from_utf8(output.stdout).expect("SIGPIPE fixture stdout");
-        assert!(
-            stdout
-                .contains("SIGPIPE guest: EPIPE handler/read/readv and queued collision preserved")
-        );
-        assert!(stdout.contains("SIGPIPE client: raw admissions=5 commits=5"));
+    for purpose_api in [false, true] {
+        for mode in ["project", "replace"] {
+            let output = bounded(
+                Command::new(reverie_dbt::bundled_drrun_path())
+                    .arg("-c")
+                    .arg(&client)
+                    .arg(mode)
+                    .args(purpose_api.then_some("purpose"))
+                    .arg("--")
+                    .arg(&guest)
+                    .arg(mode),
+            );
+            let stdout = String::from_utf8(output.stdout).expect("SIGPIPE fixture stdout");
+            assert!(stdout.contains(
+                "SIGPIPE guest: EPIPE handler/read/readv and queued collision preserved"
+            ));
+            assert!(stdout.contains("SIGPIPE client: raw admissions=5 commits=5"));
+        }
     }
 }

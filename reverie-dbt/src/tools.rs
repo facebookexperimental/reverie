@@ -76,6 +76,7 @@ use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
+use reverie::Stack;
 use reverie::Tid;
 use reverie::Tool;
 use reverie::syscalls::Addr;
@@ -622,6 +623,72 @@ impl Tool for SetRegTool {
             };
         }
         let (number, args) = syscall.into_parts();
+        if number == Sysno::prctl && args.arg0 as u64 == 0x5053_5631 {
+            // Test-only request. The guest supplies a live malformed timeout,
+            // an empty temporary mask wrapper and the handler counter.
+            let call = reverie::syscalls::Pselect6::new()
+                .with_timeout(reverie::syscalls::AddrMut::from_raw(args.arg2))
+                .with_sigmask(reverie::syscalls::Addr::from_raw(args.arg1));
+            let validation = guest
+                .inject_with_purpose(call, reverie::InjectionPurpose::Pselect6WrapperValidation)
+                .await;
+            if !matches!(
+                validation,
+                Err(Error::Errno(reverie::syscalls::Errno::EINVAL))
+            ) {
+                return Err(std::io::Error::other(format!(
+                    "validation must reach kernel EINVAL: {validation:?}"
+                ))
+                .into());
+            }
+            let mut mask = 0_u64;
+            let mut pending = 0_u64;
+            guest
+                .inject(Syscall::from_raw(
+                    Sysno::rt_sigprocmask,
+                    SyscallArgs::new(
+                        libc::SIG_SETMASK as usize,
+                        0,
+                        &mut mask as *mut _ as usize,
+                        8,
+                        0,
+                        0,
+                    ),
+                ))
+                .await?;
+            guest
+                .inject(Syscall::from_raw(
+                    Sysno::rt_sigpending,
+                    SyscallArgs::new(&mut pending as *mut _ as usize, 8, 0, 0, 0, 0),
+                ))
+                .await?;
+            let handled: i32 = guest.memory().read_value(Addr::from(args.arg3))?;
+            let chld = 1_u64 << (libc::SIGCHLD - 1);
+            if mask & chld == 0 || pending & chld == 0 || handled != 0 {
+                return Err(std::io::Error::other(
+                    "tagged validation changed blocked/pending/handler state",
+                )
+                .into());
+            }
+            let mut stack = guest.stack().await;
+            let timeout = stack.reserve::<reverie::syscalls::Timespec>();
+            let _guard = stack.commit()?;
+            guest.memory().write_value(
+                timeout,
+                &reverie::syscalls::Timespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                },
+            )?;
+            let ordinary = guest.inject(call.with_timeout(Some(timeout))).await;
+            if ordinary != Err(reverie::syscalls::Errno::EINTR) {
+                return Err(std::io::Error::other(format!(
+                    "ordinary returning pselect must still admit pending signal: {ordinary:?}"
+                ))
+                .into());
+            }
+            return Ok(0);
+        }
         if number == Sysno::prctl && args.arg0 as u64 == KERNEL_IDENTITY_PRCTL {
             if args.arg1 as i64 == libc::SYS_get_robust_list {
                 let target = args.arg2 as libc::c_long;
@@ -2595,7 +2662,13 @@ fn dispatch_counter2(
 mod tests {
     use super::*;
 
-    unsafe extern "C" fn fake_invoke(_context: usize, _number: i64, _args: *const u64) -> i64 {
+    unsafe extern "C" fn fake_invoke(
+        _context: usize,
+        _number: i64,
+        _args: *const u64,
+        purpose: u32,
+    ) -> i64 {
+        assert_eq!(purpose, reverie::InjectionPurpose::Application as u32);
         0
     }
 
