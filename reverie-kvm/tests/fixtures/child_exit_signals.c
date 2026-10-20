@@ -12,6 +12,17 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool (Detcore) and refuses it in a run without one, and its signals
+   then carry uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
+
 _Static_assert(sizeof(siginfo_t) == 128, "siginfo ABI");
 _Static_assert(offsetof(siginfo_t, si_pid) == 16, "child pid ABI");
 _Static_assert(offsetof(siginfo_t, si_status) == 24, "child status ABI");
@@ -76,7 +87,7 @@ int main(int argc, char** argv) {
         "boundary disposition");
   }
   int fd = -1;
-  uid_t uid = getuid();
+  uid_t uid = sender_uid();
   pid_t child = fork();
   REQUIRE(child >= 0, "fork");
   if (child == 0)

@@ -213,7 +213,10 @@ __attribute__((used, noreturn)) static void start_c(word *initial_stack) {
   if (argc != 2) fail(10);
   if (!equal(argv[1], "6")) fail(11);
   parent_pid = (int)call0(SYS_getpid);
-  parent_uid = (u32)call0(SYS_getuid);
+  /* KVM leaves getuid to the Tool and refuses it (-ENOSYS) in a run without
+     one; its signals then carry uid 0. */
+  long uid = call0(SYS_getuid);
+  parent_uid = uid == -38 ? 0 : (u32)uid;
   record_fd = (int)call4(SYS_openat, -100 /* AT_FDCWD */, "creator.record",
                         0x242 /* O_CREAT | O_TRUNC | O_RDWR */, 0600);
   if (record_fd < 0 || call2(SYS_ftruncate, record_fd, 3)) fail(12);

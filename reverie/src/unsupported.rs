@@ -53,7 +53,7 @@ pub enum UnsupportedOperation {
     /// task, `ioprio_set` or `ioprio_get`) for a task other than the caller,
     /// a process group or a user, on a backend that can perform it only for
     /// the calling task. A backend that refuses it changed no scheduling
-    /// state and read none.
+    /// state and read none. No backend currently records it.
     Scheduling,
     /// `rt_sigaction` installing a handler, or `SIG_IGN`, for a signal the
     /// backend reserves for its own use, so the guest's disposition could not
@@ -66,6 +66,13 @@ pub enum UnsupportedOperation {
     /// signals that way. Nothing was delivered or changed; the backend's own
     /// delivery path is unchanged.
     SignalDelivery,
+    /// A call whose answer the tool decides on every backend, on a backend
+    /// that therefore keeps no copy of that answer: for example the CPU,
+    /// scheduling and priority queries and changes, `getrandom`,
+    /// `prlimit64`, the user and group id calls, `seccomp` or `getpgrp`. A
+    /// backend that refuses one performed none of the call's own effects. A
+    /// tool that answers the call itself never sees this refusal.
+    ToolDecided,
 }
 
 /// A backend's refusal of an injected syscall, or of a `Guest` operation,

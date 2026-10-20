@@ -17,6 +17,17 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool (Detcore) and refuses it in a run without one, and its signals
+   then carry uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
+
 #define PATTERN_LIMIT (8u * 1024u * 1024u)
 #define SIOCOUTQ_TEST 0x5411
 #define SIOCOUTQNSD_TEST 0x894b
@@ -143,7 +154,7 @@ int main(int argc, char **argv) {
   REQUIRE(native || !strcmp(argv[1], "controlled"), 13);
   await(5);
   if (!explicit_close) {
-    creator_pid = getpid(); creator_uid = getuid();
+    creator_pid = getpid(); creator_uid = sender_uid();
     int setting = -1;
     REQUIRE(prctl(PR_GET_PDEATHSIG, &setting, 0, 0, 0) == 0 && setting == 0, 14);
     pid_t child = fork();

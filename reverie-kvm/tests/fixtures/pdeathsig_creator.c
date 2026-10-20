@@ -18,6 +18,17 @@
 #include <time.h>
 #include <unistd.h>
 
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool (Detcore) and refuses it in a run without one, and its signals
+   then carry uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
+
 static int record_fd;
 static int mode;
 static int resumed;
@@ -160,7 +171,7 @@ int main(int argc, char **argv) {
   if (argc != 2) return 10;
   mode = atoi(argv[1]);
   if (mode < 0 || mode > 6) return 11;
-  parent_pid = getpid(); parent_uid = getuid();
+  parent_pid = getpid(); parent_uid = sender_uid();
   record_fd = open("creator.record", O_CREAT | O_TRUNC | O_RDWR, 0600);
   if (record_fd < 0 || ftruncate(record_fd, 3)) return 12;
   pthread_t worker;

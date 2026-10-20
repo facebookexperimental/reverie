@@ -3203,7 +3203,10 @@ int main(int argc, char **argv) {
     CHECK(close(cmdline) == 0);
     EXPECT_ERROR(ftruncate(descriptor, 0), EINVAL);
     EXPECT_ERROR(syscall(SYS_fallocate, descriptor, 0, 0, 1), EBADF);
-    CHECK(getuid() == 0 && geteuid() == 0);
+    /* KVM leaves the identity calls to the Tool (Detcore answers root); a
+       run without a Tool sees the backend's refusal. */
+    EXPECT_ERROR(syscall(SYS_getuid), ENOSYS);
+    EXPECT_ERROR(syscall(SYS_geteuid), ENOSYS);
     EXPECT_ERROR(fchmod(descriptor, 0666), EPERM);
     CHECK(fstat(descriptor, &metadata) == 0);
     CHECK((metadata.st_mode & 0777) == 0444);
@@ -5765,93 +5768,73 @@ fn static_elf_forks_execs_and_waits_for_child() {
     assert!(stderr.is_empty());
 }
 
-/// setpriority reaches the host for the calling task, whose host thread a
-/// forked child's thread inherits, as Linux's fork inherits the nice value:
-/// the guest lowers its own nice value to 19, forks, and the child exits with
-/// its getpriority answer (raw 20 - nice = 1), which the parent passes on.
-/// Run without a tool and with one that injects every call, each on a fresh
-/// thread whose nice value starts as the test process's.
-///
-/// The test must start below nice 19, or lowering to 19 changes nothing and
-/// its precondition fails. So it fails under a harness that runs the tests
-/// with `nice -n 19` and passes at nice 0: a property of the harness's
-/// environment, not of the backend.
+/// setpriority is decided by the Tool (Detcore) on every backend, so this
+/// backend refuses it: the guest asks for a nice value the host thread does
+/// not have (19, or 18 when it already runs at 19) and exits with the negated
+/// result, ENOSYS (38), and the host thread that ran the guest keeps its nice
+/// value. Run without a tool and with one that injects every call, each on a
+/// fresh thread.
 #[test]
-fn forked_child_inherits_the_nice_value_set_on_the_host() {
+fn setpriority_is_refused_without_changing_the_host_nice_value() {
     match Kvm::new() {
         Ok(_) => {}
         Err(error) if kvm_is_unavailable(&error) => {
-            eprintln!("skipping KVM nice inheritance test: cannot open /dev/kvm: {error}");
+            eprintln!("skipping KVM setpriority refusal test: cannot open /dev/kvm: {error}");
             return;
         }
         Err(error) => panic!("failed to probe /dev/kvm: {error}"),
     }
-    let mut root = vec![
+    // getpriority answers 20 - nice. A spawned thread starts with this
+    // thread's nice value.
+    // SAFETY: getpriority takes no pointer.
+    let current = 20 - unsafe { libc::syscall(libc::SYS_getpriority, libc::PRIO_PROCESS, 0) };
+    let requested: u8 = if current == 19 { 18 } else { 19 };
+    let image = static_elf(&[
         0x31, 0xff, // xor edi, edi (PRIO_PROCESS)
         0x31, 0xf6, // xor esi, esi (the caller)
-        0xba, 0x13, 0x00, 0x00, 0x00, // mov edx, 19
+        0xba, requested, 0x00, 0x00, 0x00, // mov edx, requested
         0xb8, 0x8d, 0x00, 0x00, 0x00, // mov eax, SYS_setpriority
         0x0f, 0x05, // syscall
-        0xb8, 0x39, 0x00, 0x00, 0x00, // mov eax, SYS_fork
-        0x0f, 0x05, // syscall
-        0x85, 0xc0, // test eax, eax
-        0x74, 0x00, // jz child
-    ];
-    let child_jump = root.len() - 1;
-    root.extend_from_slice(&[
-        0x89, 0xc7, // mov edi, eax
-        0x48, 0x83, 0xec, 0x10, // sub rsp, 16
-        0x48, 0x89, 0xe6, // mov rsi, rsp
-        0x31, 0xd2, // xor edx, edx
-        0x45, 0x31, 0xd2, // xor r10d, r10d
-        0xb8, 0x3d, 0x00, 0x00, 0x00, // mov eax, SYS_wait4
-        0x0f, 0x05, // syscall
-        0x8b, 0x3c, 0x24, // mov edi, dword ptr [rsp]
-        0xc1, 0xef, 0x08, // shr edi, 8
-        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
-        0x0f, 0x05, // syscall
-        0x0f, 0x0b, // ud2
-    ]);
-    root[child_jump] = u8::try_from(root.len() - (child_jump + 1)).unwrap();
-    root.extend_from_slice(&[
-        0x31, 0xff, // xor edi, edi (PRIO_PROCESS)
-        0x31, 0xf6, // xor esi, esi (the caller)
-        0xb8, 0x8c, 0x00, 0x00, 0x00, // mov eax, SYS_getpriority
-        0x0f, 0x05, // syscall
+        0xf7, 0xd8, // neg eax
         0x89, 0xc7, // mov edi, eax
         0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
         0x0f, 0x05, // syscall
         0x0f, 0x0b, // ud2
     ]);
-    let image = static_elf(&root);
-    // SAFETY: getpriority takes no pointer.
-    let starting = unsafe { libc::syscall(libc::SYS_getpriority, libc::PRIO_PROCESS, 0) };
-    assert_ne!(starting, 1, "the test must start below nice 19");
-
-    let tool_less = image.clone();
-    let code = std::thread::spawn(move || {
-        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
-        backend
-            .install_static_elf(&tool_less, "/bin/nice-fork-test")
-            .unwrap();
-        backend.run_static_elf_captured().unwrap().0
-    })
-    .join()
-    .unwrap();
-    assert_eq!(code, 1, "without a tool");
-
-    let code = std::thread::spawn(move || {
-        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
-        backend
-            .install_static_elf(&image, "/bin/nice-fork-test")
-            .unwrap();
-        futures::executor::block_on(backend.run_static_elf_with_tool::<StraceTool>((), true))
-            .unwrap()
-            .1
-    })
-    .join()
-    .unwrap();
-    assert_eq!(code, 1, "with a tool");
+    for with_tool in [false, true] {
+        let image = image.clone();
+        let (code, before, after) = std::thread::spawn(move || {
+            // SAFETY: getpriority takes no pointer.
+            let nice = || unsafe { libc::syscall(libc::SYS_getpriority, libc::PRIO_PROCESS, 0) };
+            let before = nice();
+            assert_ne!(
+                20 - before,
+                i64::from(requested),
+                "the request must differ from the thread's nice value"
+            );
+            let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+            backend
+                .install_static_elf(&image, "/bin/setpriority-test")
+                .unwrap();
+            let code = if with_tool {
+                futures::executor::block_on(
+                    backend.run_static_elf_with_tool::<StraceTool>((), true),
+                )
+                .unwrap()
+                .1
+            } else {
+                backend.run_static_elf_captured().unwrap().0
+            };
+            (code, before, nice())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(code, libc::ENOSYS, "with_tool={with_tool}");
+        assert_eq!(
+            after, before,
+            "with_tool={with_tool}: the host nice value changed"
+        );
+    }
 }
 
 #[test]
@@ -7689,12 +7672,19 @@ fn kvm_static_elf_getppid_follows_pid_namespace_contract() {
     // A second fixture pins the process group after root-PID configuration.
     // Both configuration orderings are production paths and must rebuild the
     // loaded lifecycle table with a PGID distinct from its default value.
+    // getpgrp is Detcore's and refused here, so the probe asks kill instead:
+    // a signal-0 probe of group `expected_pgid` finds a member only if the
+    // table holds that group, and one of the caller's own group (pid 0) only
+    // if the caller's PGID is a group in the table.
     #[rustfmt::skip]
-    fn getpgrp_probe(expected_pgid: u8) -> [u8; 52] {
+    fn group_probe(expected_pgid: u8) -> [u8; 58] {
+        let [g0, g1, g2, g3] = (-i32::from(expected_pgid)).to_le_bytes();
         [
-            0xb8, 0x6f, 0x00, 0x00, 0x00,   // mov eax, SYS_getpgrp (111)
+            0xbf, g0, g1, g2, g3,           // mov edi, -expected_pgid
+            0x31, 0xf6,                     // xor esi, esi (signal 0 probe)
+            0xb8, 0x3e, 0x00, 0x00, 0x00,   // mov eax, SYS_kill (62)
             0x0f, 0x05,                     // syscall
-            0x48, 0x83, 0xf8, expected_pgid, // cmp rax, expected_pgid
+            0x48, 0x85, 0xc0,               // test rax, rax
             0x75, 0x19,                     // jne failure
             0x31, 0xff,                     // xor edi, edi (current process group)
             0x31, 0xf6,                     // xor esi, esi (signal 0 probe)
@@ -7730,7 +7720,7 @@ fn kvm_static_elf_getppid_follows_pid_namespace_contract() {
             backend.set_root_pid(3).unwrap();
         }
         backend
-            .install_static_elf(&static_elf(&getpgrp_probe(3)), "/bin/true")
+            .install_static_elf(&static_elf(&group_probe(3)), "/bin/true")
             .unwrap();
         if !set_before_install {
             backend.set_root_pid(3).unwrap();
@@ -7738,7 +7728,7 @@ fn kvm_static_elf_getppid_follows_pid_namespace_contract() {
         assert_eq!(
             backend.run_static_elf().unwrap(),
             0,
-            "root guest pid=3 must report getpgrp()==3 and make kill(0,0) find its group when \
+            "root guest pid=3 must make kill(-3,0) and kill(0,0) find its group when \
              set_root_pid runs {} install",
             if set_before_install {
                 "before"
@@ -9198,6 +9188,50 @@ fn counter_tools_aggregate_intercepted_static_elf_syscalls() {
     );
 }
 
+/// Answers the user and group id calls as Detcore does (uid and gid 0, every
+/// change a no-op success) without injecting them. KVM leaves these calls to
+/// the Tool and refuses them in a run without one.
+#[derive(Clone, Copy, Debug, Default)]
+struct RootIdentityTool;
+
+#[reverie::tool]
+impl Tool for RootIdentityTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscalls([
+            Sysno::getuid,
+            Sysno::geteuid,
+            Sysno::getgid,
+            Sysno::getegid,
+            Sysno::setuid,
+            Sysno::setgid,
+            Sysno::setreuid,
+            Sysno::setregid,
+            Sysno::setresuid,
+            Sysno::setresgid,
+            Sysno::setfsuid,
+            Sysno::setfsgid,
+            Sysno::setgroups,
+        ]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        _syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        Ok(0)
+    }
+}
+
+/// make runs its recipe's shell through glibc's posix_spawn (clone3 with
+/// CLONE_VFORK). The spawn needs the user and group ids (getuid, getgid,
+/// setresuid, setresgid), which KVM leaves to the Tool, so the run supplies
+/// a Tool that decides them as Detcore does.
 #[test]
 fn real_make_runs_a_shell_recipe_through_clone3_vfork() {
     match Kvm::new() {
@@ -9214,7 +9248,21 @@ fn real_make_runs_a_shell_recipe_through_clone3_vfork() {
         "all: result.txt\nresult.txt:\n\tprintf 'make:42\\n' > result.txt\n",
     )
     .unwrap();
-    run_host_program("/usr/bin/make", &["make", "-s"], &root.0);
+    let image = std::fs::read("/usr/bin/make").unwrap();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_with_context(&image, &["make", "-s"], &["PATH=/usr/bin:/bin"], &root.0)
+        .unwrap();
+    let (_, code, stdout, stderr) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<RootIdentityTool>((), true))
+            .unwrap();
+    assert_eq!(
+        code,
+        0,
+        "make exited {code}; stdout={}; stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+    );
     assert_eq!(
         std::fs::read(root.0.join("result.txt")).unwrap(),
         b"make:42\n"
@@ -16359,14 +16407,26 @@ fn signalfd_positioned_vector_flags_match_native_linux() {
 #include <stdio.h>
 #include <string.h>
 #include <sys/signalfd.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool and refuses it in a run without one, and its signals then carry
+   uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
 
 static int check_record(const struct signalfd_siginfo *info) {
   struct signalfd_siginfo expected = {0};
   expected.ssi_signo = SIGUSR1;
   expected.ssi_pid = getpid();
-  expected.ssi_uid = getuid();
+  expected.ssi_uid = sender_uid();
   return memcmp(info, &expected, sizeof(expected)) == 0;
 }
 
@@ -16671,6 +16731,18 @@ const SIBLING_SIGNAL_PROGRAM: &str = r#"#define _GNU_SOURCE
 #include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool and refuses it in a run without one, and its signals then carry
+   uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
+
 static atomic_int target_tid, phase, handled, handler_tid;
 static int mode;
 static pthread_t target_pthread;
@@ -16679,7 +16751,7 @@ static void handler(int number, siginfo_t *info, void *context) {
   (void)context;
   if (number != SIGUSR1 || info->si_signo != SIGUSR1 ||
       info->si_code != SI_TKILL || info->si_pid != getpid() ||
-      info->si_uid != getuid()) _exit(81);
+      info->si_uid != sender_uid()) _exit(81);
   atomic_store(&handler_tid, (int)syscall(SYS_gettid));
   atomic_fetch_add(&handled, 1);
 }
@@ -16715,7 +16787,7 @@ static void *receiver(void *unused) {
     int expected_code = mode == 8 ? SI_TKILL : SI_USER;
     if (received != SIGUSR1 || info.si_signo != SIGUSR1 ||
         info.si_code != expected_code || info.si_pid != getpid() ||
-        info.si_uid != getuid()) _exit(86);
+        info.si_uid != sender_uid()) _exit(86);
     errno = 0;
     if (sigtimedwait(&selected, NULL, &zero) != -1 || errno != EAGAIN) _exit(87);
     if (atomic_load(&handled)) _exit(88);
@@ -16938,6 +17010,7 @@ fn sibling_signal_delivery_native_plain_and_tool() {
 }
 
 const SIBLING_ENTRY_SIGNAL_PROGRAM: &str = r#"#define _GNU_SOURCE
+#include <errno.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -16945,13 +17018,25 @@ const SIBLING_ENTRY_SIGNAL_PROGRAM: &str = r#"#define _GNU_SOURCE
 #include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool and refuses it in a run without one, and its signals then carry
+   uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
+
 static unsigned char stack[65536] __attribute__((aligned(16)));
 static atomic_int handled, done, result;
 static int mode;
 static void handler(int number, siginfo_t *info, void *context) {
   (void)context;
   if (info->si_signo != number || info->si_code != SI_TKILL ||
-      info->si_pid != getpid() || info->si_uid != getuid() ||
+      info->si_pid != getpid() || info->si_uid != sender_uid() ||
       syscall(SYS_gettid) == getpid()) _exit(71);
   if (atomic_exchange(&handled, number)) _exit(72);
 }

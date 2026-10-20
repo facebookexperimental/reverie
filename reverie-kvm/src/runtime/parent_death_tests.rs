@@ -239,7 +239,9 @@ fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
     let mut executor = executor();
     let mut memory = GuestMemory::new(0, 4096).unwrap();
     let mut completed = false;
-    let original = SyscallRequest::new(libc::SYS_getuid as u64, [0; 6]);
+    // getpid, which the executor answers itself (pid 1 here); getuid, which
+    // this test used before, is now Detcore's alone and refused here.
+    let original = SyscallRequest::new(libc::SYS_getpid as u64, [0; 6]);
     let site = executor.begin_signal_callback().unwrap();
     {
         let mut e = StaticElfSyscallExecutor {
@@ -269,7 +271,7 @@ fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
                 )
             })
             .unwrap(),
-            ProviderOutcome::Return(0)
+            ProviderOutcome::Return(1)
         );
     }
     for (signal, expected) in [(0, 0), (libc::SIGUSR1, -i64::from(libc::ENOSYS))] {

@@ -708,17 +708,23 @@ fn provider_disposition(error: Error) -> Result<ProviderOutcome> {
 ///   is duplicated by `KvmGuest::inject`'s ordinary admission check, as a
 ///   fail-closed backstop. Moving them to the backend side is left to a later
 ///   step so that this one changes no result.
-/// - The executor does not yet meet the error model's refusal rule. It
-///   records a typed refusal for one case only, `execve`/`execveat` from a
-///   thread that is not the thread-group leader. About 128 other unsupported
+/// - The executor does not yet meet the error model's refusal rule
+///   everywhere. It records a typed refusal for a non-leader
+///   `execve`/`execveat` (`NonLeaderExec`), `flock` (`Flock`), the signal
+///   deliveries it cannot make (`Signal`), `setsid` and `setpgid`
+///   (`ProcessGroups`), and the calls Detcore decides on every backend
+///   (`ToolDecided`, listed in `TOOL_DECIDED_SYSCALLS`). Other unsupported
 ///   requests (the unsupported-syscall fallback, `rseq`, unsupported `fcntl`
 ///   commands and `prctl` options, among others) answer a bare `-ENOSYS`
 ///   without a refusal, as do the admission checks above. An absent refusal
 ///   therefore does not establish that a request was supported.
-/// - The executor still produces some values for determinism itself (its
-///   own clock, random source, uname and credentials) instead of taking them
-///   from the Tool. That deviates from the provider contract and is
-///   scheduled for deletion, not for preservation.
+/// - The clock reads and `uname` go to the host. The executor still makes up
+///   some values a guest sees: the `/dev/random` and `/dev/urandom` bytes,
+///   the synthetic `/proc` files, and its signal model's decisions, which
+///   Detcore owns too and which are scheduled for deletion; and a fixed
+///   identity persona that Detcore passes through: getgroups' fixed group
+///   list, the capability sets of `capget`/`capset`, and `prctl`
+///   `PR_CAPBSET_READ` up to a fixed last capability.
 #[reverie::provider]
 impl LinuxProvider for StaticElfSyscallExecutor<'_> {
     type Context = GuestMemory;

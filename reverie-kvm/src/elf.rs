@@ -1110,11 +1110,6 @@ pub(crate) struct LoadedStaticElf {
     /// same syscall boundary, which turns it into the typed refusal
     /// `UnsupportedOperation::Signal`. Never carried across fork or exec.
     pub(crate) signal_refusal: Option<&'static str>,
-    /// Why the scheduling, priority or I/O-priority call just executed was
-    /// refused with ENOSYS, if it was; the executor takes it at the same
-    /// syscall boundary as the typed refusal `UnsupportedOperation::Scheduling`.
-    /// Never carried across fork or exec.
-    pub(crate) scheduling_refusal: Option<&'static str>,
 }
 
 impl LoadedStaticElf {
@@ -1254,7 +1249,6 @@ impl LoadedStaticElf {
                 .collect(),
             file_retirement: FileRetirement::default(),
             signal_refusal: None,
-            scheduling_refusal: None,
             pipe_owners: self.pipe_owners.clone(),
             fd_entry_ids: self.fd_entry_ids.clone(),
             epoll_domain: self.epoll_domain.clone(),
@@ -2024,7 +2018,6 @@ fn load_executable(
         files: std::collections::BTreeMap::new(),
         file_retirement: FileRetirement::default(),
         signal_refusal: None,
-        scheduling_refusal: None,
         pipe_owners: Default::default(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
