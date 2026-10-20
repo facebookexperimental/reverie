@@ -881,10 +881,16 @@ pub trait Tool: Send + Sync + Default {
     ///    It settles every announcement, and makes no other Tool call between
     ///    the final read and the return.
     /// 4. Any `Err` from either half ends the run: the backend fails closed.
-    ///    The one exception is `EOPNOTSUPP` from the first announcement the
-    ///    backend makes to a Tool, which means that the Tool has not opted in
-    ///    (below): the backend then refuses the run by name, because it
-    ///    cannot report its deliveries to that Tool.
+    ///    Two errors from an announcement tell the backend why, so that it
+    ///    can name the refusal:
+    ///    - `EOPNOTSUPP`: the Tool has not opted in (below), so the backend
+    ///      cannot report its deliveries to it;
+    ///    - `EPROTONOSUPPORT`: the Tool has opted in, but cannot keep the
+    ///      protocol in this run's configuration or for this thread's state;
+    ///      the Tool names the reason itself.
+    ///
+    ///    A Tool that implements the hooks never returns `EOPNOTSUPP` from
+    ///    them, so that the backend can tell the two apart.
     ///
     /// Neither half may read or rewrite the delivery's siginfo: the kernel
     /// has not dequeued it, and the backend answers [`Guest::signal_info`]
@@ -904,10 +910,7 @@ pub trait Tool: Send + Sync + Default {
         _guest: &mut T,
         signal: i32,
     ) -> Result<Option<crate::SignalAnnouncement>, Errno> {
-        if !(1..=64).contains(&signal) {
-            return Err(Errno::EINVAL);
-        }
-        Err(Errno::EOPNOTSUPP)
+        not_opted_in_announcement(signal)
     }
 
     /// The second half of a two-phase delivery
@@ -1301,4 +1304,13 @@ pub trait GlobalRPC<G: GlobalTool>: Sync {
 
     /// Return the read-only tool configuration
     fn config(&self) -> &G::Config;
+}
+
+/// The default [`Tool::announce_signal_event`]: `EINVAL` for a number that is
+/// not a signal, then `EOPNOTSUPP`, the Tool has not opted in.
+fn not_opted_in_announcement(signal: i32) -> Result<Option<crate::SignalAnnouncement>, Errno> {
+    if !(1..=64).contains(&signal) {
+        return Err(Errno::EINVAL);
+    }
+    Err(Errno::EOPNOTSUPP)
 }

@@ -245,6 +245,36 @@ fn ready<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// A Tool that does not implement the two-phase hooks refuses through the
+/// trait's defaults: an announcement with `EINVAL` for a number that is not a
+/// signal, checked first, and otherwise with `EOPNOTSUPP` (not opted in), as
+/// does a commit.
+#[test]
+fn two_phase_defaults_refuse_as_not_opted_in() {
+    let mut guest = TestGuest::default();
+    let tool = LegacyTool::default();
+    for signal in [1, libc::SIGUSR1, 34, 64] {
+        assert_eq!(
+            ready(tool.announce_signal_event(&mut guest, signal)),
+            Err(Errno::EOPNOTSUPP),
+        );
+    }
+    for signal in [0, 65, -1, i32::MIN, i32::MAX] {
+        assert_eq!(
+            ready(tool.announce_signal_event(&mut guest, signal)),
+            Err(Errno::EINVAL),
+        );
+    }
+    assert_eq!(
+        ready(tool.commit_signal_event(
+            &mut guest,
+            reverie::SignalAnnouncement::new(libc::SIGUSR1, 0)
+        )),
+        Err(Errno::EOPNOTSUPP),
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn legacy_bridge_preserves_unchanged_event_bytes_and_suppression() {
     let input = event(libc::SIGUSR1);

@@ -734,8 +734,11 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     ///   builds the frame when the runtime returns, so nothing is installed),
     ///   and must not wait for a turn in the Tool's schedule. The approval is
     ///   consumed by that commit returning `Ok(())`, and must be the last
-    ///   thing the commit does; a commit that made an approval and returns an
-    ///   `Err` ends the run, as every commit `Err` does.
+    ///   `Guest` operation that changes the guest the commit makes: an
+    ///   injection or a register write after it would change what the kernel
+    ///   delivers. The Tool may still read the guest and update its own state
+    ///   after it. A commit that made an approval and
+    ///   returns an `Err` ends the run, as every commit `Err` does.
     async fn deliver_signal(
         &mut self,
         _delivery: crate::SignalDelivery,
