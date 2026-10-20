@@ -699,6 +699,14 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     ///   composes with an approval; the signal is then delivered with the
     ///   replacement siginfo.
     /// - After a check fails, the callback cannot approve that signal again.
+    /// - In a two-phase delivery ([`Tool::commit_signal_event`]) it is offered
+    ///   only the announced signal, from its commit, after the backend's
+    ///   final read. There it checks the backend's prediction (the kernel
+    ///   builds the frame when the runtime returns, so nothing is installed),
+    ///   and must not wait for a turn in the Tool's schedule. The approval is
+    ///   consumed by that commit returning `Ok(())`, and must be the last
+    ///   thing the commit does; a commit that made an approval and returns an
+    ///   `Err` ends the run, as every commit `Err` does.
     async fn deliver_signal(
         &mut self,
         _delivery: crate::SignalDelivery,

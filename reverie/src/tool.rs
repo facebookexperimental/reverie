@@ -838,6 +838,86 @@ pub trait Tool: Send + Sync + Default {
         Ok(Some(signal))
     }
 
+    /// The first half of a signal delivery reported in two phases, by a
+    /// backend that knows of a delivery before the kernel dequeues the signal:
+    /// an in-guest backend predicts the deliveries the kernel will make when
+    /// its runtime returns to guest code. `signal` is the raw number, 1 to 64;
+    /// any other is `EINVAL`.
+    ///
+    /// The protocol, at one return to guest code:
+    /// 1. Before its final read of the thread's pending signals, the backend
+    ///    announces each delivery it predicts. The Tool may wait for its turn
+    ///    in its schedule here. It must not assume that the kernel has
+    ///    dequeued `signal`, and must do nothing that only a delivery
+    ///    justifies.
+    /// 2. An announcement may return `Ok(None)`: the Tool suppresses that
+    ///    delivery. The backend removes that pending instance from the
+    ///    kernel's queue and predicts again; announcements already made stay
+    ///    outstanding. Suppression is decided here, before the final read,
+    ///    so that no commit ever rests on a read a suppression voids.
+    /// 3. After the final read, the backend calls
+    ///    [`Tool::commit_signal_event`] for each outstanding announcement the
+    ///    read confirms the kernel delivers at the return, in the order the
+    ///    kernel delivers them (the read's predicted order), and
+    ///    [`Tool::withdraw_signal_event`], in any order, for each other one.
+    ///    It settles every announcement, and makes no other Tool call between
+    ///    the final read and the return.
+    /// 4. Any `Err` from either half ends the run: the backend fails closed.
+    ///    The one exception is `EOPNOTSUPP` from the first announcement the
+    ///    backend makes to a Tool, which means that the Tool has not opted in
+    ///    (below): the backend then refuses the run by name, because it
+    ///    cannot report its deliveries to that Tool.
+    ///
+    /// Neither half may read or rewrite the delivery's siginfo: the kernel
+    /// has not dequeued it, and the backend answers [`Guest::signal_info`]
+    /// and [`Guest::set_signal_info`] as having none.
+    ///
+    /// A backend that reports each delivery once, after the kernel dequeued
+    /// it (the ptrace backend's signal-delivery stop), calls
+    /// [`Tool::handle_signal_event`] or [`Tool::handle_raw_signal_event`]
+    /// instead, and never these.
+    ///
+    /// A Tool opts in by implementing all three hooks. The default checks the
+    /// signal's range, then refuses with `EOPNOTSUPP`: a delivery reported
+    /// whole cannot be split without the Tool's knowledge of which of its
+    /// effects only a delivery justifies.
+    async fn announce_signal_event<T: Guest<Self>>(
+        &self,
+        _guest: &mut T,
+        signal: i32,
+    ) -> Result<Option<crate::SignalAnnouncement>, Errno> {
+        if !(1..=64).contains(&signal) {
+            return Err(Errno::EINVAL);
+        }
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// The second half of a two-phase delivery
+    /// ([`Tool::announce_signal_event`]): the backend's final read confirmed
+    /// that the kernel delivers the announced signal when the runtime returns
+    /// to guest code, and the Tool records the delivery. It must not wait for
+    /// a turn in its schedule, and cannot suppress or replace the signal; an
+    /// `Err` ends the run. The default refuses with `EOPNOTSUPP`.
+    async fn commit_signal_event<T: Guest<Self>>(
+        &self,
+        _guest: &mut T,
+        _announcement: crate::SignalAnnouncement,
+    ) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// Settles an announcement ([`Tool::announce_signal_event`]) whose
+    /// delivery does not happen at the runtime's return: another signal
+    /// pushed it out. The signal stays pending in the kernel, to be announced
+    /// again at a later return. It can only record: it gets the thread's
+    /// state and no access to the guest. The default records nothing.
+    fn withdraw_signal_event(
+        &self,
+        _thread_state: &mut Self::ThreadState,
+        _announcement: crate::SignalAnnouncement,
+    ) {
+    }
+
     /// Decides whether a signal that the backend passes to the guest without
     /// reporting it to [`Tool::handle_signal_event`] reaches the guest at all.
     ///

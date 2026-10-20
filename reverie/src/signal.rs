@@ -252,6 +252,38 @@ impl SigreturnReport {
     }
 }
 
+/// One signal delivery a backend has announced to the Tool
+/// ([`crate::Tool::announce_signal_event`]) and must settle before it returns
+/// to guest code, with [`crate::Tool::commit_signal_event`] if its final read
+/// confirms the delivery, or [`crate::Tool::withdraw_signal_event`] if it does
+/// not. `token` is the Tool's own: the backend hands it back unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalAnnouncement {
+    signal: i32,
+    token: u64,
+}
+
+impl SignalAnnouncement {
+    /// An announcement of the raw signal `signal`, with the Tool's `token`.
+    /// The Tool makes it, in [`crate::Tool::announce_signal_event`], for the
+    /// signal it was asked to announce: a number from 1 to 64, which that
+    /// hook checks before anything else. The backend hands it back
+    /// unchanged.
+    pub const fn new(signal: i32, token: u64) -> Self {
+        Self { signal, token }
+    }
+
+    /// The raw signal number.
+    pub const fn signal(&self) -> i32 {
+        self.signal
+    }
+
+    /// The Tool's token.
+    pub const fn token(&self) -> u64 {
+        self.token
+    }
+}
+
 /// Receiver state after accepting one process-directed child-exit event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ChildExitSignalDisposition {
@@ -474,6 +506,16 @@ impl SignalEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An announcement hands back the signal and the Tool's token unchanged.
+    #[test]
+    fn signal_announcement_keeps_signal_and_token() {
+        let announcement = SignalAnnouncement::new(34, u64::MAX - 1);
+        assert_eq!(announcement.signal(), 34);
+        assert_eq!(announcement.token(), u64::MAX - 1);
+        assert_eq!(announcement, SignalAnnouncement::new(34, u64::MAX - 1));
+        assert_ne!(announcement, SignalAnnouncement::new(35, u64::MAX - 1));
+    }
 
     fn siginfo(signal: i32) -> [u8; SIGNAL_INFO_SIZE] {
         let mut info = [0; SIGNAL_INFO_SIZE];
