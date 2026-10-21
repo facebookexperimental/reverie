@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use reverie_syscalls::Errno;
 use reverie_syscalls::MemoryAccess;
 use reverie_syscalls::SyscallInfo;
+use reverie_syscalls::Sysno;
 
 use crate::Never;
 use crate::Pid;
@@ -24,6 +25,95 @@ use crate::timer::TimerSchedule;
 use crate::tool::GlobalRPC;
 use crate::tool::GlobalTool;
 use crate::tool::Tool;
+
+/// The interception semantics of one returning Tool injection.
+///
+/// This is a closed contract, not a general "read-only syscall" mode.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionPurpose {
+    /// Preserve ordinary application syscall interposition.
+    Application = 0,
+    /// Validate only a pselect6 outer signal-mask wrapper.
+    ///
+    /// The trusted Tool must supply pselect6 with nfds zero, null fdsets, the
+    /// original outer-wrapper pointer, and readable Guest::stack scratch
+    /// containing { tv_sec: 0, tv_nsec: 1_000_000_000 }. The scratch and its
+    /// unchanged contents must remain live through the awaited injection.
+    /// Linux then rejects after copying the outer wrapper and before reading
+    /// the inner mask, installing it, waiting, copying output or changing state.
+    ///
+    /// Instrumentation must not apply the application's temporary mask or
+    /// consume/deliver pending signals because of this probe. Genuine async
+    /// arrivals and authenticated pre-entry interruption keep their existing
+    /// semantics. This purpose is invalid for other syscall families or a
+    /// valid timeout. The backend trusts this construction; it does not
+    /// duplicate Linux argument validation.
+    Pselect6WrapperValidation = 1,
+}
+
+/// An optional process-local delivery hook for the one shared tail-start event.
+/// It owns no sequence, subscriber or socket. A runtime may install it once;
+/// the callback must use that runtime's admitted logging cut synchronously,
+/// before an ending tail is published. Installing it grants no Guest authority.
+pub type TailStartForwarder = fn(Pid, Sysno);
+static TAIL_START_FORWARDER: std::sync::OnceLock<TailStartForwarder> = std::sync::OnceLock::new();
+
+/// Select explicit delivery for the shared tail-start diagnostic. Other Tools
+/// and runtimes retain the ordinary tracing event by default.
+pub fn set_tail_start_forwarder(forwarder: TailStartForwarder) -> Result<(), &'static str> {
+    TAIL_START_FORWARDER
+        .set(forwarder)
+        .map_err(|_| "tail-start forwarder installed twice")
+}
+
+/// Observe one admitted tail handoff, before its first effect or ending latch.
+/// Callers retain all their existing guards. Polls, ending re-entry and refused
+/// callback scopes must not call this function. This is not syscall completion.
+pub fn observe_tail_start(tid: Pid, number: Sysno) {
+    if let Some(forwarder) = TAIL_START_FORWARDER.get() {
+        forwarder(tid, number);
+    } else {
+        // This shared Guest operation owns its diagnostic independently of
+        // an ambient backend setup/dispatch span. The real TID is explicit.
+        tracing::info!(target: "reverie::guest", parent: None,
+            "[tool] (tid {}) admitted tail syscall: {}", tid, number);
+    }
+}
+
+/// Backend facts permitting a shared controller to inspect this physical task.
+///
+/// The procfs identity names the authenticated root directory of the backend's
+/// initial procfs view, not a task directory. A controller must match that view
+/// and its registered task incarnation, and exclude all other guest execution,
+/// before opening a temporary metadata descriptor. This is not itself a
+/// scheduling grant or permission to inspect an arbitrary process.
+///
+/// `Some` also attests that RPCs use an external controller and that no native
+/// child admission or copied-execution uncertainty remains. Under the shared
+/// controller's exclusive-execution guard, that certainty lasts through a
+/// non-yielding synchronous request; the caller must not inject a lifecycle or
+/// namespace operation between obtaining the fact and sending that request.
+/// The numeric fields alone convey none of this authority.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct ControllerCaptureFact {
+    /// Physical process ID in the authenticated procfs view.
+    pub physical_pid: Pid,
+    /// Physical thread ID in the authenticated procfs view.
+    pub physical_tid: Pid,
+    /// Device of the authenticated procfs root directory.
+    pub procfs_device: u64,
+    /// Inode of the authenticated procfs root directory.
+    pub procfs_inode: u64,
+}
 
 /// The logical kind of a guest memory region reported by
 /// [`Guest::detlog_memory_regions`].
@@ -53,6 +143,97 @@ pub struct DetlogMemoryRegion {
     pub end: u64,
 }
 
+/// Why [`Guest::set_blocked_signals`] did not set the mask. `Unsupported` and
+/// `RestorePending` are refusals made before anything changed; `Gone` and
+/// `Failed` can follow a write.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    thiserror::Error,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub enum MaskChangeRefused {
+    /// The backend cannot change the mask at this stop. Nothing was changed.
+    #[error("the backend cannot set the blocked-signal mask at this stop")]
+    Unsupported,
+    /// A mask-swapping syscall's temporary mask (`effective`) is in effect and
+    /// its restore of `saved` is pending; changing the mask would discard that
+    /// restore. Nothing was changed.
+    #[error("a temporary signal mask {effective:#x} is in effect, restoring {saved:#x}")]
+    RestorePending {
+        /// The mask the pending restore would put back.
+        saved: u64,
+        /// The mask the kernel dequeues under now.
+        effective: u64,
+    },
+    /// The thread is gone. Nothing will resume it.
+    #[error("the thread is gone")]
+    Gone,
+    /// The change failed with `errno`, possibly after the new mask was
+    /// written. The backend then tried to put the old mask back: when
+    /// `mask_unknown` is false, the thread's mask is the one before the call;
+    /// when it is true, the mask could not be confirmed, and the caller must
+    /// not resume the guest as if it were known.
+    #[error("setting the blocked-signal mask failed ({errno}); mask unknown: {mask_unknown}")]
+    Failed {
+        /// The error that stopped the change.
+        errno: Errno,
+        /// Whether the thread's mask may be neither the old nor the new one.
+        mask_unknown: bool,
+    },
+}
+
+/// An exclusively runtime-owned half-open interval in a guest address space.
+///
+/// These facts do not describe a complete guest VMA inventory. Tools decide
+/// how to project them into observations without hiding adjacent guest bytes.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct RuntimePrivateMemoryRegion {
+    /// Inclusive virtual address.
+    pub start: u64,
+    /// Exclusive virtual address.
+    pub end: u64,
+}
+
+/// A bounded set of private intervals belonging to one address-space image.
+///
+/// The opaque owner and version are meaningful only within the authenticated
+/// run that supplied them. They must not be reconstructed from a PID or an
+/// address. A Tool may retain the snapshot for a bound target, but must validate
+/// it before and after observing that target. Validation cannot silently
+/// substitute the calling task's image.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuntimePrivateMemorySnapshot {
+    /// Backend-owned lifetime identity, opaque to the Tool.
+    pub owner: [u64; 4],
+    /// Non-reused revision of this owner's authority.
+    pub version: u64,
+    /// Exclusively owned intervals; no allocator lock is retained.
+    pub regions: Vec<RuntimePrivateMemoryRegion>,
+}
+
+/// Result from a backend that advertises private-memory ownership facts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RuntimePrivateMemory {
+    /// Current authoritative facts, subject to live validation.
+    Ready(RuntimePrivateMemorySnapshot),
+    /// The provider cannot establish current ownership. This is not the
+    /// absence of a provider and must not authorize a best-effort projection.
+    Unavailable,
+}
+
 /// A representation of a guest task (thread).
 #[async_trait]
 pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
@@ -67,6 +248,17 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
 
     /// Process ID of the process containing the guest task.
     fn pid(&self) -> Pid;
+
+    /// Facts for a synchronous controller capture while this task is stopped.
+    ///
+    /// `Some` additionally certifies that no backend-native child is outside
+    /// Tool admission. It remains valid only while the caller retains its
+    /// exclusive shared execution turn and does not resume or inject a guest
+    /// lifecycle operation. Unknown ownership, lost state, or an unmediated
+    /// execution history must return `None`. Other backends default to no fact.
+    fn controller_capture_fact(&self) -> Option<ControllerCaptureFact> {
+        None
+    }
 
     /// Process ID of the parent process. Returns `None` if this is the root of
     /// the traced process tree. A return value of `None` does not necessarily
@@ -134,6 +326,57 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         false
     }
 
+    /// Whether `fd` in this task's current descriptor table is owned by the
+    /// backend runtime rather than the guest application.
+    ///
+    /// This reports an actual live ownership fact, not a reserved numeric
+    /// range. A backend must not report a descriptor after releasing its slot
+    /// for application reuse, or apply another process's ownership to this
+    /// task. Tools decide how to project these facts into guest observations.
+    /// Backends without guest-resident private descriptors return false.
+    fn is_runtime_owned_fd(&self, _fd: i32) -> bool {
+        false
+    }
+
+    /// Reports this image's known runtime-private memory intervals.
+    ///
+    /// The default has no provider and preserves the Tool's existing behavior.
+    /// A provider must return `Some(Unavailable)` when its authority is lost,
+    /// including a retired image, rather than masquerading as this default.
+    /// Returned intervals must remain exclusively owned while their token is
+    /// valid; internal commitment/protection changes do not alter that fact.
+    fn runtime_private_memory_regions(&self) -> Option<RuntimePrivateMemory> {
+        None
+    }
+
+    /// Validates a previously supplied target's ownership snapshot in this run.
+    ///
+    /// This may be a different task's image. The backend must validate the
+    /// supplied opaque owner and version, not the caller's current addresses.
+    /// A false result forbids using the snapshot. Calls must not retain a lock
+    /// or borrowed runtime storage across subsequent Tool work.
+    fn runtime_private_memory_is_current(&self, _snapshot: &RuntimePrivateMemorySnapshot) -> bool {
+        false
+    }
+
+    /// The guest's stack pointer at the current image's first instruction:
+    /// the address of `argc`, above which the kernel (or a loader standing
+    /// in for it) laid out `argv`, `envp` and the auxiliary vector. `Some`
+    /// only when the backend observed that stack pointer itself, at the exec
+    /// stop or the image's entry, before any guest instruction ran; a task
+    /// forked or cloned from such an image reports the same value, as it
+    /// shares that image. `None` where the backend did not observe it, for
+    /// example where the post-exec callback runs only at the image's first
+    /// syscall, by which point the stack pointer has moved.
+    ///
+    /// A Tool that reads the initial stack through `Guest::memory` must take
+    /// its address from here and never from `regs()` in the post-exec
+    /// callback, which on some backends is not the image's first
+    /// instruction.
+    fn initial_stack_pointer(&self) -> Option<u64> {
+        None
+    }
+
     /// Reads and returns the auxv table for this process.
     fn auxv(&self) -> Auxv {
         Auxv::new(self.pid()).expect("failed to read auxv table")
@@ -142,6 +385,26 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// Returns a representation of the address space associated with this guest
     /// thread.
     fn memory(&self) -> Self::Memory;
+
+    /// Execute one synchronous syscall on behalf of the Tool, on the calling
+    /// operating-system thread. This is a host operation, not guest injection:
+    /// the syscall number, six arguments, result and errno pass through unchanged.
+    /// The executor adds no allocation, lock, RPC, callback dispatch, retry or
+    /// caching, and retains no pointers after returning to the original stack.
+    /// Normal syscall interception and kernel-delivered signals still apply.
+    ///
+    /// # Safety
+    ///
+    /// The caller must supply valid Tool-owned addresses and physical file
+    /// descriptors, with every memory access and other syscall effect respecting
+    /// Rust's invariants. Guest addresses and logical descriptors must first be
+    /// resolved by their owning abstractions. The call must return normally on
+    /// this thread and stack: replacement-stack clone, `rt_sigreturn`, and other
+    /// operations that invalidate the calling Rust context are not supported.
+    /// Kernel-delivered signals and an `EINTR` result retain their normal meaning.
+    unsafe fn tool_syscall(&self, number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+        unsafe { syscalls::syscall6(number, args[0], args[1], args[2], args[3], args[4], args[5]) }
+    }
 
     /// Returns a mutable reference to thread state.
     fn thread_state_mut(&mut self) -> &mut T::ThreadState;
@@ -199,7 +462,36 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     ///    handle successful calls to `execve`, use [`Tool::handle_post_exec`].
     ///    Failed calls to `execve` will still return, however. Thus, it is safe to
     ///    use [`Result::unwrap_err`] on the result of the `inject`.
+    ///
+    /// A signal can stop the injected syscall before it runs. The call then
+    /// returns `Err(ERESTARTSYS)` rather than a value read from the register
+    /// file, and the syscall has had no effect; [`Guest::inject_with_retry`]
+    /// injects it again.
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno>;
+
+    /// Inject with the closed interception purpose described by [InjectionPurpose].
+    ///
+    /// The actual task/provider, ownership checks and register restoration are
+    /// the same as [Guest::inject]. Kernel errno is returned as Error::Errno;
+    /// unsupported interception semantics are a non-errno mechanism failure.
+    ///
+    /// Explicit ptrace, KVM, InGuest/LiteInst, SaBRe, successor-image and e9patch
+    /// implementations delegate their existing guarded injection. This API
+    /// adds no measured coverage claim for those backends. DBT needs a scoped
+    /// interposition disposition for the validation purpose.
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Error> {
+        match purpose {
+            InjectionPurpose::Application => self.inject(syscall).await.map_err(Error::from),
+            InjectionPurpose::Pselect6WrapperValidation => Err(Error::Tool(anyhow::anyhow!(
+                "pselect6-wrapper-validation-unsupported: {}",
+                std::any::type_name::<Self>()
+            ))),
+        }
+    }
 
     /// Similar to [`Guest::inject`], except that it never returns. Since it does
     /// not return to the caller, the syscall return value cannot be altered or
@@ -291,6 +583,23 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         Err(Errno::ENOSYS.into())
     }
 
+    /// Like [`Guest::defer_signal_delivery`], but from a syscall's entry: the
+    /// current syscall has not run and the Tool must not run it. The backend
+    /// delivers the signal first and the syscall then starts from the
+    /// beginning, with its registers as the guest left them; whatever the
+    /// callback returns is discarded.
+    ///
+    /// This is a pending signal that became deliverable without passing a
+    /// delivery point: Linux delivers it before the next guest instruction,
+    /// so before this syscall. Backends without a virtual guest signal frame
+    /// keep the default `ENOSYS`, and the Tool then runs the syscall as usual.
+    async fn defer_signal_delivery_before_syscall(
+        &mut self,
+        _event: SignalEvent,
+    ) -> Result<(), Error> {
+        Err(Errno::ENOSYS.into())
+    }
+
     /// Queues a Tool-selected terminal child event for the current process.
     ///
     /// The caller supplies a complete process-directed `SIGCHLD` event with
@@ -346,9 +655,120 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         }
     }
 
+    /// The siginfo of the signal [`Tool::handle_signal_event`] is reporting,
+    /// while that callback runs: the Linux `siginfo_t` bytes the kernel
+    /// delivered with it, as in [`crate::SignalEvent`]. `None` outside that
+    /// callback, and where the backend cannot read it.
+    fn signal_info(&self) -> Option<[u8; crate::SIGNAL_INFO_SIZE]> {
+        None
+    }
+
+    /// From inside [`Tool::handle_signal_event`], replaces the siginfo that the
+    /// reported signal is delivered with, if the callback returns it to be
+    /// delivered. A later call replaces an earlier one. Fails, and changes
+    /// nothing, with `EINVAL` outside that callback or for a siginfo whose
+    /// `si_signo` is not the reported signal's, with `ENOSYS` where the
+    /// backend cannot set a siginfo, and with the backend's error where it
+    /// cannot set this one now (the ptrace backend: `EBUSY` after an
+    /// injection left the thread at a stop other than a signal-delivery stop,
+    /// or `PTRACE_SETSIGINFO`'s error). The backend fails the guest's resume,
+    /// rather than deliver another siginfo, if an injection after a successful
+    /// call makes the replacement impossible.
+    fn set_signal_info(&mut self, _info: [u8; crate::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// From inside [`Tool::handle_signal_event`] (or
+    /// [`Tool::handle_raw_signal_event`]), approves the reported signal for
+    /// delivery with what Linux will do with it, as the tool computed from its
+    /// own copy of the thread's signal state: its caught action, the mask the
+    /// frame saves, the mask in effect now, the handler's mask, and what the
+    /// thread was doing ([`crate::SignalDelivery`]).
+    ///
+    /// A backend whose kernel delivers the signal (ptrace) checks the
+    /// approval against the kernel at the stop, reading only, and answers
+    /// [`crate::SignalDeliveryOutcome::Accepted`] when every check passes; the
+    /// callback then returns the signal, and the kernel delivers exactly that
+    /// instance, with masks equal to the approved ones on every checked bit;
+    /// the handler's mask holds as far as the tool's copy of the action is
+    /// right.
+    /// A check that fails answers
+    /// [`crate::SignalDeliveryOutcome::Mismatch`] naming the field, and a
+    /// point where it cannot check answers
+    /// [`crate::SignalDeliveryOutcome::Unavailable`] naming why. Neither
+    /// approves anything or changes the guest. A backend that builds the
+    /// handler's frame itself answers
+    /// [`crate::SignalDeliveryOutcome::Installed`] or
+    /// [`crate::SignalDeliveryOutcome::FrameFault`], and its callback returns
+    /// no signal. The default refuses
+    /// ([`crate::UnsupportedOperation::SignalDelivery`]) and changes nothing.
+    ///
+    /// The contract, for every backend:
+    /// - It never replaces, emulates or reorders a kernel mask-swapping
+    ///   syscall (`rt_sigsuspend`, `ppoll`, `pselect6`, `epoll_pwait`).
+    /// - It is offered only the signal instance the backend reported, from
+    ///   the callback that reports it: at that signal's own stop or at its
+    ///   held-signal report, or at a later signal-delivery stop an injection
+    ///   of that callback ended at, from which the backend resumes the
+    ///   recorded instance. A held signal whose temporary mask's restore is
+    ///   pending is not reported, so it is never offered; the backend passes
+    ///   it on unreported, and [`Tool::note_unreported_signal`] records it
+    ///   with [`crate::UnreportedSignalReason::HeldRestorePending`] unless an
+    ///   earlier reason applies (for example, the temporary mask blocks it:
+    ///   [`crate::UnreportedSignalReason::HeldBlocked`]).
+    /// - An approval is consumed at most once, by the resume of the callback
+    ///   it was made in, and only from the stop it was checked at. It must be
+    ///   the last thing the callback does before it returns the signal. An
+    ///   injection or a register write after it voids it, and a tail
+    ///   injection after it ends the run before it injects. A callback that
+    ///   made an approval and then returns anything but that signal, returns
+    ///   it after the approval was voided, or executes a program, fails
+    ///   rather than deliver something unchecked: the backend ends the run.
+    ///   [`Guest::set_signal_info`] changes neither registers nor masks and
+    ///   composes with an approval; the signal is then delivered with the
+    ///   replacement siginfo.
+    /// - After a check fails, the callback cannot approve that signal again.
+    /// - In a two-phase delivery ([`Tool::commit_signal_event`]) it is offered
+    ///   only the announced signal, from its commit, after the backend's
+    ///   final read. There it checks the backend's prediction (the kernel
+    ///   builds the frame when the runtime returns, so nothing is installed),
+    ///   and must not wait for a turn in the Tool's schedule. The approval is
+    ///   consumed by that commit returning `Ok(())`, and must be the last
+    ///   thing the commit does; a commit that made an approval and returns an
+    ///   `Err` ends the run, as every commit `Err` does.
+    async fn deliver_signal(
+        &mut self,
+        _delivery: crate::SignalDelivery,
+    ) -> crate::SignalDeliveryOutcome {
+        crate::SignalDeliveryOutcome::Refused(crate::UnsupportedRefusal::new(
+            crate::UnsupportedOperation::SignalDelivery,
+            Errno::ENOSYS,
+            "Guest::deliver_signal: this backend keeps its own signal delivery (the default refusal)",
+        ))
+    }
+
+    /// From inside [`Tool::handle_signal_event`] (or
+    /// [`Tool::handle_raw_signal_event`]), how the backend reports the signal
+    /// the callback is handling ([`crate::SignalReportPath`]): at its own
+    /// stop, or held during a Tool's injection and reported after the
+    /// callback that held it. `None` outside a signal callback, and from a
+    /// backend that does not tell (the default).
+    fn signal_report_path(&self) -> Option<crate::SignalReportPath> {
+        None
+    }
+
     /// Backend process/task lifetime identity, including at thread start.
     fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
         None
+    }
+
+    /// The process signal control mode installed for this run: what
+    /// [`GlobalTool::install_backend_signal_control`] returned when the
+    /// backend offered its control. The answer is fixed before the first
+    /// guest hook and is the same for every task of the run. A backend that
+    /// offers no control answers `Unchanged`.
+    fn signal_control_mode(&self) -> crate::BackendSignalControlMode {
+        crate::BackendSignalControlMode::Unchanged
     }
 
     /// Current parked-observation capability, bound to this exact callback.
@@ -452,6 +872,40 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         })
     }
 
+    /// Sets the stopped thread's blocked-signal mask to `mask`, without
+    /// running any guest code, and returns the mask it replaced. Bit `n - 1`
+    /// stands for signal `n`.
+    ///
+    /// No instruction runs, so no pending signal is dequeued: every signal
+    /// pending when this is called is still pending afterwards, and is
+    /// delivered by the kernel, in its own order, once the guest runs with a
+    /// mask that admits it. The caller owns putting the returned mask back
+    /// before the guest resumes. That second call is refused under the same
+    /// rules: for example with `RestorePending` after the caller injected a
+    /// mask-swapping syscall that ended with its restore pending, or with
+    /// `Unsupported` outside a syscall callback. So a caller that blocks
+    /// must also handle a refused restore, typically by restoring another
+    /// way or by ending the run before the guest resumes.
+    ///
+    /// The signals a backend needs for itself (on ptrace: SIGTRAP and the
+    /// timer signal, besides SIGKILL and SIGSTOP, which cannot be blocked) are
+    /// never added, and a guest's own block of them is kept: their bits in the
+    /// new mask are those of the replaced one. Putting the returned mask back
+    /// therefore restores exactly the mask that was there.
+    ///
+    /// Both refusals happen before anything is changed. A backend refuses
+    /// ([`MaskChangeRefused::Unsupported`]) outside the stops where it can
+    /// make the change atomically, and when the thread runs under a
+    /// mask-swapping syscall's temporary mask whose restore is still pending
+    /// ([`MaskChangeRefused::RestorePending`]): changing the mask then would
+    /// discard that restore. The default refuses always and changes nothing.
+    /// A failure after the write is reported as [`MaskChangeRefused::Failed`],
+    /// which says whether the old mask could be put back, or as
+    /// [`MaskChangeRefused::Gone`].
+    async fn set_blocked_signals(&mut self, _mask: u64) -> Result<u64, MaskChangeRefused> {
+        Err(MaskChangeRefused::Unsupported)
+    }
+
     /// Like [`Guest::inject`], but will retry the syscall if `EINTR` or
     /// `ERESTARTSYS` are returned.
     ///
@@ -467,6 +921,24 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
                 Err(other) => return Err(other),
             }
         }
+    }
+
+    /// Like [`Guest::inject_with_retry`], but for a call whose callback can be
+    /// re-run: a backend may return `EINTR` or `ERESTARTSYS` from a syscall
+    /// that ran, instead of retrying it, when it will deliver a signal as the
+    /// guest resumes. The caller must return that code unchanged as the
+    /// guest's syscall result. For `ERESTARTSYS`, Linux then restarts the
+    /// guest's syscall or fails it with `EINTR`, by the handler's
+    /// `SA_RESTART`; a returned `EINTR` stays `EINTR`. A restart runs
+    /// the whole callback again, including every injection before this one,
+    /// so those must be safe to repeat.
+    ///
+    /// A syscall that a signal stopped before it ran is retried, as by
+    /// `inject_with_retry`. The default retries every interrupted call; the
+    /// ptrace backend returns the code when a signal is held for delivery
+    /// (<https://github.com/rrnewton/reverie/issues/998>).
+    async fn inject_restartable<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        self.inject_with_retry(syscall).await
     }
 
     /// Converts this `Guest<T>` such that it implements `Guest<U>`. This is
@@ -571,6 +1043,75 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     fn detlog_memory_regions(&self) -> Option<Vec<DetlogMemoryRegion>> {
         None
     }
+
+    /// Takes the backend's typed refusal of the most recent syscall that this
+    /// handler injected, if the backend refused it as an operation it cannot
+    /// perform.
+    ///
+    /// A refused injection returns the errno named in the refusal, which can
+    /// also be an ordinary Linux failure of the same syscall. This query is how
+    /// a tool tells the two apart without knowing which backend it runs on.
+    ///
+    /// Every injection through this guest replaces the record, whether or not
+    /// it was refused, and taking it clears it, so a second call returns
+    /// `None`. Call it before injecting anything else. Backends that perform
+    /// every operation they accept always return `None`, which is the default.
+    fn take_unsupported_refusal(&mut self) -> Option<crate::UnsupportedRefusal> {
+        None
+    }
+
+    /// Returns half-open guest address ranges, `(start, end)`, that together
+    /// contain every address at which a syscall could store its output into
+    /// guest memory, as Linux's `put_user` does for `time(2)`'s `tloc`.
+    ///
+    /// A tool uses this to rule out a store it cannot observe: a word that
+    /// does not lie wholly inside these ranges cannot have been stored by a
+    /// syscall, because a syscall's store to any of its bytes faults. The
+    /// ranges may also contain addresses at which such a store faults, so a
+    /// word inside them proves nothing. They may be unsorted, overlapping or
+    /// adjacent.
+    ///
+    /// The default lists every mapping in `/proc/<pid>/maps` for the process
+    /// returned by [`Guest::pid`], whatever its protection. That is correct
+    /// when `pid()` is the guest process. Backends whose `pid()` is not the
+    /// guest (for example the KVM backend, where it is the host VMM process)
+    /// override this with their own record of the guest's address space.
+    fn storable_memory_ranges(&self) -> Result<Vec<(u64, u64)>, crate::Error> {
+        let maps = {
+            let _open = crate::process::launch_window::TransientOpen::begin();
+            procfs::process::Process::new(self.pid().as_raw()).and_then(|process| process.maps())
+        };
+        match maps {
+            Ok(maps) => Ok(maps.into_iter().map(|map| map.address).collect()),
+            Err(procfs::ProcError::Io(err, _)) => Err(crate::Error::Io(err)),
+            Err(err) => Err(crate::Error::Tool(anyhow::anyhow!(err))),
+        }
+    }
+
+    /// Returns how the guest's kernel checks a range of guest memory before a
+    /// syscall reads or writes it: the user address limit that Linux's
+    /// `access_ok` enforces (a syscall accepts `[base, base + len)` exactly
+    /// when `base + len` does not overflow and is at most
+    /// [`max_end`](crate::UserAddressLimit::max_end)), and whether a lone I/O
+    /// vector is shortened to `MAX_RW_COUNT` bytes before that check
+    /// ([`caps_single_vector`](crate::UserAddressLimit::caps_single_vector)).
+    /// On x86-64 Linux the limit is `TASK_SIZE_MAX`, which is
+    /// [`X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT`](crate::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT)
+    /// under four-level paging.
+    ///
+    /// The limit says nothing about what is mapped: copying a range within it
+    /// can still fault.
+    ///
+    /// The default asks the running kernel and caches the answer for the
+    /// tool's process after the first successful measurement, which is
+    /// correct when the guest runs as a host process: both facts belong to
+    /// the kernel, so the tool's process and the guest's share them. Backends
+    /// whose guest address space has its own bound (for example the KVM
+    /// backend, whose guest page tables are four-level whatever the host's
+    /// are) override this with the rule their own syscall emulation applies.
+    fn user_address_limit(&self) -> Result<crate::UserAddressLimit, crate::Error> {
+        crate::user_address::host_user_address_limit()
+    }
 }
 
 /// Wraps a `Guest<T>` such that it implements `Guest<U>`.
@@ -607,6 +1148,14 @@ where
         self.inner.send_rpc(message).await
     }
 
+    fn try_send_rpc_sync(
+        &self,
+        message: <U::GlobalState as GlobalTool>::Request,
+    ) -> Result<<U::GlobalState as GlobalTool>::Response, <U::GlobalState as GlobalTool>::Request>
+    {
+        self.inner.try_send_rpc_sync(message)
+    }
+
     fn config(&self) -> &<U::GlobalState as GlobalTool>::Config {
         self.inner.config()
     }
@@ -631,6 +1180,10 @@ where
         self.inner.pid()
     }
 
+    fn controller_capture_fact(&self) -> Option<ControllerCaptureFact> {
+        self.inner.controller_capture_fact()
+    }
+
     fn ppid(&self) -> Option<Pid> {
         self.inner.ppid()
     }
@@ -641,6 +1194,18 @@ where
 
     fn is_backend_runtime_bootstrap(&self) -> bool {
         self.inner.is_backend_runtime_bootstrap()
+    }
+
+    fn is_runtime_owned_fd(&self, fd: i32) -> bool {
+        self.inner.is_runtime_owned_fd(fd)
+    }
+
+    fn runtime_private_memory_regions(&self) -> Option<RuntimePrivateMemory> {
+        self.inner.runtime_private_memory_regions()
+    }
+
+    fn runtime_private_memory_is_current(&self, snapshot: &RuntimePrivateMemorySnapshot) -> bool {
+        self.inner.runtime_private_memory_is_current(snapshot)
     }
 
     fn is_main_thread(&self) -> bool {
@@ -657,6 +1222,11 @@ where
 
     fn memory(&self) -> Self::Memory {
         self.inner.memory()
+    }
+
+    unsafe fn tool_syscall(&self, number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+        // SAFETY: forwarding preserves the caller's syscall and safety obligations.
+        unsafe { self.inner.tool_syscall(number, args) }
     }
 
     fn thread_state_mut(&mut self) -> &mut L::ThreadState {
@@ -685,6 +1255,18 @@ where
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         self.inner.inject(syscall).await
+    }
+
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Error> {
+        self.inner.inject_with_purpose(syscall, purpose).await
+    }
+
+    async fn inject_restartable<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        self.inner.inject_restartable(syscall).await
     }
 
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
@@ -718,8 +1300,26 @@ where
         self.inner.queue_process_alarm_signal(event).await
     }
 
+    fn signal_info(&self) -> Option<[u8; crate::SIGNAL_INFO_SIZE]> {
+        self.inner.signal_info()
+    }
+    fn set_signal_info(&mut self, info: [u8; crate::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
+        self.inner.set_signal_info(info)
+    }
+    async fn deliver_signal(
+        &mut self,
+        delivery: crate::SignalDelivery,
+    ) -> crate::SignalDeliveryOutcome {
+        self.inner.deliver_signal(delivery).await
+    }
+    fn signal_report_path(&self) -> Option<crate::SignalReportPath> {
+        self.inner.signal_report_path()
+    }
     fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
         self.inner.signal_task_identity()
+    }
+    fn signal_control_mode(&self) -> crate::BackendSignalControlMode {
+        self.inner.signal_control_mode()
     }
     fn parked_signal_site(&self) -> Option<crate::CallbackSignalSite> {
         self.inner.parked_signal_site()
@@ -768,6 +1368,10 @@ where
         self.inner.cancel_parked_signal(context).await
     }
 
+    async fn set_blocked_signals(&mut self, mask: u64) -> Result<u64, MaskChangeRefused> {
+        self.inner.set_blocked_signals(mask).await
+    }
+
     fn set_timer(&mut self, sched: TimerSchedule) -> Result<(), Error> {
         self.inner.set_timer(sched)
     }
@@ -790,5 +1394,17 @@ where
 
     fn detlog_memory_regions(&self) -> Option<Vec<DetlogMemoryRegion>> {
         self.inner.detlog_memory_regions()
+    }
+
+    fn take_unsupported_refusal(&mut self) -> Option<crate::UnsupportedRefusal> {
+        self.inner.take_unsupported_refusal()
+    }
+
+    fn storable_memory_ranges(&self) -> Result<Vec<(u64, u64)>, crate::Error> {
+        self.inner.storable_memory_ranges()
+    }
+
+    fn user_address_limit(&self) -> Result<crate::UserAddressLimit, crate::Error> {
+        self.inner.user_address_limit()
     }
 }

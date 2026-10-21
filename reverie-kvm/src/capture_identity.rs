@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Private identities for the in-memory capture streams. An owned anonymous
 // pipe endpoint reserves each native inode for the whole capture lifetime.
 use std::os::fd::AsRawFd;

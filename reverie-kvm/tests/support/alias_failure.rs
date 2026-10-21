@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Shared by unit and KVM integration controls. Each selected case runs in a
 // separate bounded process; the interposer remains dormant until explicitly armed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

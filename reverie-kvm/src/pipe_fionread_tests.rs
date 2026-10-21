@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Included in executor::tests so these controls exercise the actual decoder,
 // executor dispatch and complete guest-memory image.
 fn pipe_fionread_call(executor: &mut ElfExecutor, memory: &GuestMemory, args: [u64; 6]) -> i64 {
@@ -186,7 +178,7 @@ fn pipe_fionread_capture_objects_and_unavailable_identity_are_refused() {
         assert_eq!(unsafe { libc::close(2) }, 0);
         assert_eq!(
             pipe_fionread(
-                &memory,
+                &ProviderMemory(&memory),
                 &executor.state,
                 10,
                 executor.state.files[&10].as_raw_fd(),

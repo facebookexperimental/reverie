@@ -93,20 +93,42 @@ pub(super) fn mmap_with_shared_files(
     let Some(length) = align_up(args[1], PAGE_SIZE) else {
         return Ok(negative_errno(libc::ENOMEM));
     };
-    let fixed = flags & libc::MAP_FIXED as u64 != 0;
-    if fixed && !args[0].is_multiple_of(PAGE_SIZE) {
-        return Ok(negative_errno(libc::EINVAL));
-    }
+    // MAP_FIXED_NOREPLACE places as MAP_FIXED does and refuses an occupied
+    // range (EEXIST) rather than replace it.
+    let noreplace = flags & libc::MAP_FIXED_NOREPLACE as u64 != 0;
+    let fixed = flags & libc::MAP_FIXED as u64 != 0 || noreplace;
     if !is_anonymous && !args[5].is_multiple_of(PAGE_SIZE) {
         return Ok(negative_errno(libc::EINVAL));
+    }
+    if let Some(errno) = super::fixed_mapping_address_error(fixed, args[0], length) {
+        return Ok(negative_errno(errno));
     }
     if !is_anonymous && signalfd_mask(state, args[4] as libc::c_int).is_some() {
         return Ok(negative_errno(libc::ENODEV));
     }
-    let address = if fixed {
-        args[0]
+    let kind = if is_anonymous {
+        super::MappingKind::Anonymous
     } else {
-        let Some(address) = find_mmap_address(memory, state, length) else {
+        match state
+            .files
+            .get(&(args[4] as libc::c_int))
+            .map(std::fs::File::metadata)
+        {
+            Some(Ok(metadata)) if metadata.is_file() => super::MappingKind::RegularFile(args[5]),
+            _ => super::MappingKind::Other,
+        }
+    };
+    // A MAP_FIXED address is a user address; the bookkeeping below is by
+    // physical address, and the result is the user address.
+    let address = if fixed {
+        let Some(address) = memory.user_range_to_guest(args[0], length) else {
+            return Ok(negative_errno(libc::ENOMEM));
+        };
+        address
+    } else {
+        let map_32bit = args[3] & libc::MAP_32BIT as u64 != 0;
+        let Some(address) = super::place_mapping(memory, state, length, args[0], kind, map_32bit)
+        else {
             return Ok(negative_errno(libc::ENOMEM));
         };
         address
@@ -114,6 +136,9 @@ pub(super) fn mmap_with_shared_files(
     let Some(end) = address.checked_add(length) else {
         return Ok(negative_errno(libc::ENOMEM));
     };
+    if noreplace && let Some(errno) = super::noreplace_error(memory, state, args, address, end) {
+        return Ok(negative_errno(errno));
+    }
     if address < BOOT_RESERVED_END || end > state.mmap_limit {
         return Ok(negative_errno(libc::ENOMEM));
     }
@@ -121,15 +146,19 @@ pub(super) fn mmap_with_shared_files(
         return Ok(negative_errno(libc::ENOMEM));
     };
     let ordinary_shared = !is_anonymous && is_shared;
-    let replaces_file = memory.range_contains_shared_file(address, length);
-    if is_anonymous && is_shared && replaces_file {
+    if is_anonymous && is_shared && memory.range_contains_shared_file(address, length) {
         // Retiring the last ordinary file releases its single-vCPU domain.
-        // A shared anonymous replacement would then need separate fork-sharing
-        // ownership; a private replacement must not silently stand in for it.
+        // This bounded path does not establish that replacing a file view by
+        // shared anonymous memory preserves every guarantee of that domain.
         return Err(unsupported_mmap(
             "shared anonymous replacement requires independent fork-sharing ownership",
         ));
     }
+    // Replacing a fork-shared anonymous view by shared anonymous memory gets
+    // fresh private backing marked shared; the next fork moves it into its own
+    // shmem object, as for a new shared anonymous mapping (see
+    // `GuestMemory::share_anonymous_memory_for_fork`).
+    let replaces_file = memory.range_contains_retained_shared(address, length);
     if !ordinary_shared && !replaces_file {
         // This branch cannot zero an outgoing file view. Keep the existing
         // private/anonymous personality, including its flag and errno rules.
@@ -139,12 +168,14 @@ pub(super) fn mmap_with_shared_files(
         return Ok(result);
     }
 
-    // These ignored compatibility flags require no extra VM semantics. Other
-    // flags (locking, population, huge pages, grows-down, NOREPLACE, and so on)
+    // These ignored compatibility flags require no extra VM semantics, and
+    // MAP_FIXED_NOREPLACE's range is vacant by now, so it maps as MAP_FIXED.
+    // Other flags (locking, population, huge pages, grows-down, and so on)
     // require their own faithful implementation before file-view replacement.
     let supported_flags = (libc::MAP_PRIVATE
         | libc::MAP_SHARED
         | libc::MAP_FIXED
+        | libc::MAP_FIXED_NOREPLACE
         | libc::MAP_ANONYMOUS
         | libc::MAP_DENYWRITE
         | libc::MAP_EXECUTABLE) as u64;
@@ -271,8 +302,14 @@ pub(super) fn mmap_with_shared_files(
             },
         )?;
     }
+    memory.record_page_backing(
+        address,
+        length as u64,
+        kind.file_offset(),
+        is_anonymous && is_shared,
+    );
     state.mmap_next = cursors.mmap_next;
-    Ok(address as i64)
+    Ok(memory.physical_to_user(address).unwrap_or(address) as i64)
 }
 
 /// Preserve legacy invalid-argument precedence before a valid file history
@@ -281,6 +318,7 @@ pub(super) fn remap_requires_shared_capability(
     memory: &GuestMemory,
     state: &LoadedStaticElf,
     args: &[u64; 6],
+    contains: fn(&GuestMemory, u64, usize) -> bool,
 ) -> bool {
     let Some(old_length) = align_up(args[1], PAGE_SIZE) else {
         return false;
@@ -296,25 +334,37 @@ pub(super) fn remap_requires_shared_capability(
         || !args[0].is_multiple_of(PAGE_SIZE)
         || flags & !allowed != 0
         || (fixed && flags & libc::MREMAP_MAYMOVE as u64 == 0)
-        || !range_is_valid(memory, args[0], old_length)
-        || !memory.user_range_is_mapped(args[0], old_length)
+        || !range_is_valid(&ProviderMemory(memory), args[0], old_length)
     {
         return false;
     }
+    // The source and destination are user addresses (a window's, in Linux's
+    // layout); the mapping metadata below is by physical address.
+    let Some(source) = memory.user_range_to_guest(args[0], old_length) else {
+        return false;
+    };
+    if !memory.user_range_is_mapped(source, old_length) {
+        return false;
+    }
+    let mut destination = None;
     if fixed {
-        let Some(end) = args[4].checked_add(new_length) else {
+        if !args[4].is_multiple_of(PAGE_SIZE) {
+            return false;
+        }
+        let Some(start) = memory.user_range_to_guest(args[4], new_length) else {
             return false;
         };
-        if args[4] < BOOT_RESERVED_END
-            || !args[4].is_multiple_of(PAGE_SIZE)
+        let end = start + new_length;
+        if start < BOOT_RESERVED_END
             || end > state.mmap_limit
-            || (args[4] < args[0] + old_length && args[0] < end)
+            || (start < source + old_length && source < end)
         {
             return false;
         }
+        destination = Some(start);
     }
-    memory.range_contains_shared_file(args[0], old_length as usize)
-        || (fixed && memory.range_contains_shared_file(args[4], new_length as usize))
+    contains(memory, source, old_length as usize)
+        || destination.is_some_and(|start| contains(memory, start, new_length as usize))
 }
 
 #[cfg(test)]

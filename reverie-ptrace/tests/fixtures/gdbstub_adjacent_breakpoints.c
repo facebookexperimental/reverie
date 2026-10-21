@@ -13,11 +13,12 @@
  * stops after one nop, short of the second, as GDB's step over a breakpoint
  * would. The program then exits 0.
  *
- * Reverie neither delivers nor reports a SIGTRAP that no breakpoint accounts
- * for, so a stray int3 left at a site makes the guest run on from the byte
- * after it, inside the site's instruction. That byte is an invalid opcode at
- * each site, so the guest dies of SIGILL rather than exiting 0: 0x1f at the
- * first, and 0x0f 0x0b (ud2) at the second, whose instruction is a mov.
+ * A stray int3 left at a site is taken for the guest's own and reported to
+ * GDB as a SIGTRAP stop, so the session does not see the guest exit 0. (When
+ * Reverie neither delivered nor reported such a trap, the guest ran on from
+ * the byte after it, inside the site's instruction, an invalid opcode at each
+ * site: 0x1f at the first, and 0x0f 0x0b (ud2) at the second, whose
+ * instruction is a mov.)
  *
  * The labels are global symbols. The test builds this file with -no-pie, so
  * their symbol values are their run-time addresses.

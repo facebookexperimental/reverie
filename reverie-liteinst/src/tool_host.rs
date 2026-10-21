@@ -1,83 +1,139 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+//! Installs a Reverie Tool in this guest on reverie-inguest's Tool host
+//! ([`reverie_inguest::guest::host::ToolHost`]) and supplies LiteInst's
+//! runtime services to it.
 
-//! Generic in-guest host for Reverie tools.
-
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
 use liteinst2::trampoline::HookContext;
-use reverie::Error;
+#[cfg(feature = "exec-private-init")]
 use reverie::GlobalRPC;
-use reverie::GlobalTool;
-use reverie::Guest;
-use reverie::Never;
 use reverie::Pid;
-use reverie::Rdtsc;
-use reverie::Stack;
-use reverie::TimerSchedule;
 use reverie::Tool;
-use reverie::syscalls::Addr;
-use reverie::syscalls::AddrMut;
-use reverie::syscalls::Errno;
-use reverie::syscalls::LocalMemory;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::SyscallArgs;
-use reverie::syscalls::SyscallInfo;
-use reverie::syscalls::Sysno;
-use reverie_preload::tool_host::DrivenSyscall;
-use reverie_preload::tool_host::TailResult;
-use reverie_preload::tool_host::drive_ready;
-use reverie_preload::tool_host::drive_tool_syscall;
-use reverie_preload::trap::raw_syscall6;
+use reverie_inguest::guest::context::RegisterContext;
+use reverie_inguest::guest::host::HostRuntime;
+#[cfg(feature = "exec-private-init")]
+use reverie_inguest::guest::host::ToolHost;
+use reverie_inguest::guest::installed_tool;
+#[cfg(feature = "exec-private-init")]
+use reverie_inguest::guest::rpc::GuestRpcStream;
+#[cfg(feature = "exec-private-init")]
+use reverie_inguest::trap::raw_syscall6;
 
+#[cfg(feature = "exec-private-init")]
 use crate::rpc::CoordinatorRpc;
-use crate::rpc::SpinMutex;
 use crate::runtime;
 use crate::runtime::SyscallEvent;
 
-const STACK_CAPACITY: usize = 4096;
+// Patched trampolines save HookContext; the shared entry reads RegisterContext.
+// The shared fallback continuation already owns RegisterContext.
+const _: () = {
+    use core::mem::align_of;
+    use core::mem::offset_of;
+    use core::mem::size_of;
+    assert!(size_of::<HookContext>() == size_of::<RegisterContext>());
+    assert!(align_of::<HookContext>() == align_of::<RegisterContext>());
+    assert!(
+        offset_of!(HookContext, instruction_pointer)
+            == offset_of!(RegisterContext, instruction_pointer)
+    );
+    assert!(offset_of!(HookContext, stack_pointer) == offset_of!(RegisterContext, stack_pointer));
+    assert!(offset_of!(HookContext, r15) == offset_of!(RegisterContext, r15));
+    assert!(offset_of!(HookContext, r14) == offset_of!(RegisterContext, r14));
+    assert!(offset_of!(HookContext, r13) == offset_of!(RegisterContext, r13));
+    assert!(offset_of!(HookContext, r12) == offset_of!(RegisterContext, r12));
+    assert!(offset_of!(HookContext, r11) == offset_of!(RegisterContext, r11));
+    assert!(offset_of!(HookContext, r10) == offset_of!(RegisterContext, r10));
+    assert!(offset_of!(HookContext, r9) == offset_of!(RegisterContext, r9));
+    assert!(offset_of!(HookContext, r8) == offset_of!(RegisterContext, r8));
+    assert!(offset_of!(HookContext, rdi) == offset_of!(RegisterContext, rdi));
+    assert!(offset_of!(HookContext, rsi) == offset_of!(RegisterContext, rsi));
+    assert!(offset_of!(HookContext, rbp) == offset_of!(RegisterContext, rbp));
+    assert!(offset_of!(HookContext, rbx) == offset_of!(RegisterContext, rbx));
+    assert!(offset_of!(HookContext, rdx) == offset_of!(RegisterContext, rdx));
+    assert!(offset_of!(HookContext, rcx) == offset_of!(RegisterContext, rcx));
+    assert!(offset_of!(HookContext, rax) == offset_of!(RegisterContext, rax));
+    assert!(offset_of!(HookContext, rflags) == offset_of!(RegisterContext, rflags));
+};
 
-static COMMITTED_STACKS: SpinMutex<Vec<Box<[u8]>>> = SpinMutex::new(Vec::new());
-
-struct DispatchScratchScope {
-    _allocation_scope: crate::patch_alloc::DispatchAllocationScope,
+/// LiteInst's services for the in-guest Tool host.
+pub(crate) struct LiteinstRuntime {
+    stats: crate::stats::GuestStatsHooks,
+    #[cfg(feature = "exec-private-init")]
+    no_rcb: bool,
 }
 
-impl DispatchScratchScope {
-    fn enter() -> Self {
-        COMMITTED_STACKS.lock().clear();
+impl LiteinstRuntime {
+    /// The services of an ordinary installation.
+    pub(crate) fn new(stats: crate::stats::GuestStatsHooks) -> Self {
         Self {
-            _allocation_scope: crate::patch_alloc::enter_dispatch(),
+            stats,
+            #[cfg(feature = "exec-private-init")]
+            no_rcb: false,
         }
     }
 }
 
-impl Drop for DispatchScratchScope {
-    fn drop(&mut self) {
-        COMMITTED_STACKS.lock().clear();
+impl HostRuntime for LiteinstRuntime {
+    fn fork_child_rebind(&self) {
+        crate::syscall_fallback::rebind_fork_child();
+    }
+
+    fn emit_stage(&self, stage: &[u8]) {
+        runtime::emit_in_guest_stage(stage);
+    }
+
+    fn fork_child_reset(&self, event: &SyscallEvent) {
+        runtime::reset_fallback_observability();
+        self.stats.reset_after_fork();
+        runtime::record_fork_child_dispatch(event, self.stats);
+    }
+
+    fn cpuid_interception_enabled(&self) -> bool {
+        runtime::cpuid_interception_enabled()
+    }
+
+    fn exit_process_stats(&self, tid: Pid) -> io::Result<()> {
+        if self.stats.is_enabled() {
+            runtime::submit_process_stats(tid, self.stats)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_clock(&self) -> io::Result<u64> {
+        #[cfg(feature = "exec-private-init")]
+        if self.no_rcb {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "private no-RCB image clock is unsupported",
+            ));
+        }
+        runtime::read_guest_rcb_clock()
+    }
+
+    fn signal_action_supported(&self, number: i64, args: [u64; 6]) -> bool {
+        runtime::signal_action_supported(number, args)
+    }
+
+    fn reserved_signal_mask(&self) -> u64 {
+        runtime::reserved_signal_mask()
     }
 }
-
-trait ToolHandler: Send + Sync {
-    fn dispatch(&self, event: &mut SyscallEvent);
-    fn dispatch_instruction(&self, kind: runtime::InstructionEventKind, context: &mut HookContext);
-}
-
-static HANDLER: std::sync::OnceLock<Box<dyn ToolHandler>> = std::sync::OnceLock::new();
 
 // TODO-HUMAN-REVIEW(PR-127): Review generic in-guest Tool hosting.
 /// Install a concrete Reverie tool in this guest and connect it to its coordinator.
 ///
 /// The caller is normally a tool-specific preload DSO. It must invoke this
 /// before application threads start and before any seccomp filter is active.
+/// Use [`crate::declare_fixed_tool_allocator!`] in a true preload root, after
+/// authenticated fixed-region startup, or an explicit legacy allocator
+/// declaration for an embedded Tool. Missing or duplicate per-image backing
+/// declarations are link errors. Fixed backing not yet published returns
+/// `EAGAIN` before any compiler allocation. The shared core is allocator
+/// neutral. A compiler-selected allocator that does not own the
+/// dispatch preflight allocation is refused with `EOPNOTSUPP` before any Tool,
+/// coordinator connection or filter is installed; exhaustion returns `ENOMEM`.
 ///
 /// # Safety
 ///
@@ -88,10 +144,12 @@ where
     T: Tool + 'static,
 {
     unsafe {
-        install_tool_inner::<T>(
+        reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
             true,
-            runtime::PatchPublication::Concurrent,
+            runtime::LiteinstPatchHost {
+                publication: runtime::PatchPublication::Concurrent,
+            },
         )
     }
 }
@@ -102,6 +160,9 @@ where
 /// concurrent instruction-tearing and straddler protocol when publishing a new
 /// site. The caller must keep every other application thread from fetching
 /// guest text for the full lifetime of the installed tool.
+/// The root must use the fixed or legacy allocator declaration described by
+/// [`install_tool`]; the same pre-activation allocator check and
+/// errors as [`install_tool`] apply.
 ///
 /// # Safety
 ///
@@ -112,10 +173,12 @@ where
     T: Tool + 'static,
 {
     unsafe {
-        install_tool_inner::<T>(
+        reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
             true,
-            runtime::PatchPublication::Quiescent,
+            runtime::LiteinstPatchHost {
+                publication: runtime::PatchPublication::Quiescent,
+            },
         )
     }
 }
@@ -125,6 +188,9 @@ where
 ///
 /// Unlike the legacy install entry point, this does not remove its coordinator
 /// environment variable because the bootstrap path did not introduce one.
+/// The root must use the fixed or legacy allocator declaration described by
+/// [`install_tool`]; the same pre-activation allocator check and
+/// errors as [`install_tool`] apply.
 ///
 /// # Safety
 ///
@@ -134,1096 +200,1016 @@ where
     T: Tool + 'static,
 {
     unsafe {
-        install_tool_inner::<T>(
+        reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
             false,
-            runtime::PatchPublication::Concurrent,
+            runtime::LiteinstPatchHost {
+                publication: runtime::PatchPublication::Concurrent,
+            },
         )
     }
 }
 
+#[cfg(feature = "exec-private-init")]
+#[derive(Clone, Copy)]
+pub(crate) enum PrivateImageControl<'a> {
+    Initial(&'a reverie_inguest::guest::exec_private::InitialImageControl),
+    #[cfg(feature = "exec-native-injection")]
+    Successor(&'a reverie_inguest::guest::exec_private::SuccessorImageControl),
+}
+
+#[cfg(feature = "exec-private-init")]
+impl PrivateImageControl<'_> {
+    fn check_vdso_context(self) -> io::Result<()> {
+        match self {
+            Self::Initial(control) => control.check_initial_vdso_context(),
+            #[cfg(feature = "exec-native-injection")]
+            Self::Successor(control) => control.check_successor_vdso_context(),
+        }
+    }
+
+    fn prepare_signal_state(
+        self,
+        instructions: runtime::InstructionSubscriptions,
+    ) -> io::Result<()> {
+        match self {
+            Self::Initial(control) => control.prepare_signal_state(instructions),
+            #[cfg(feature = "exec-native-injection")]
+            Self::Successor(control) => control.prepare_signal_state(instructions),
+        }
+    }
+}
+
+#[cfg(feature = "exec-private-init")]
+enum ImageInstall<'a, T: Tool> {
+    Initial(
+        reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+        &'a reverie_inguest::guest::exec_private::InitialImageControl,
+        &'a reverie_inguest::guest::exec_private::InitialImageAbortGuard,
+    ),
+    #[cfg(feature = "exec-native-injection")]
+    Successor {
+        client: reverie_rpc_transport::BlockingRpcClient<T::GlobalState, GuestRpcStream>,
+        control: &'a reverie_inguest::guest::exec_private::SuccessorImageControl,
+        tool: T,
+        state: T::ThreadState,
+        consumer: &'a mut dyn NativeSuccessorConsumer<T>,
+    },
+}
+
+/// Authenticated client and one native control prepared before Detcore setup.
+/// This affine owner must be consumed by the actual Tool installer.
+#[cfg(feature = "exec-private-init")]
+pub struct PreparedInitialImage<T: Tool> {
+    // Fields drop in declaration order: abandon before any generic Config or
+    // client destructor can run, allocate, block, or panic.
+    fatal: reverie_inguest::guest::exec_private::InitialImageAbortGuard,
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+    control: reverie_inguest::guest::exec_private::InitialImageControl,
+}
+
+/// Installed InitialImage, retaining fatal ownership through eager lifecycle.
+#[cfg(feature = "exec-private-init")]
+pub struct InstalledInitialImage {
+    fatal: reverie_inguest::guest::exec_private::InitialImageAbortGuard,
+    control: reverie_inguest::guest::exec_private::InitialImageControl,
+}
+
+#[cfg(feature = "exec-private-init")]
+impl InstalledInitialImage {
+    /// Complete all existing native frontend and lifecycle checks exactly once.
+    /// Any error terminates the owned image; successful return permits only the
+    /// native runner's existing handover, not an independent Guest entry.
+    pub fn finish(self) -> io::Result<()> {
+        self.fatal.finish(&self.control)
+    }
+}
+
+/// Prepare authenticated fixed gates before caller-context Detcore setup.
+/// Ordinary preload initialization does not use this entry.
+///
+/// # Safety
+/// The consumed client must have redeemed the launching coordinator's one-use
+/// authorization for this exact watched image/filter lineage. Native control,
+/// private loader and mapping provenance must satisfy
+/// `publish_authenticated_control`. No guest code may have run. The Tool's
+/// config must not require RCB time, preemption, threads, forks or exec yet.
+#[cfg(feature = "exec-private-init")]
+pub unsafe fn prepare_tool_initial_image<T: Tool>(
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+    native: *mut reverie_inguest::guest::exec_private::NativeControl,
+) -> io::Result<PreparedInitialImage<T>> {
+    let fatal = unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
+    let control =
+        unsafe { reverie_inguest::guest::exec_private::publish_authenticated_control(native)? };
+    Ok(PreparedInitialImage {
+        client,
+        control,
+        fatal,
+    })
+}
+
+/// Converge the mapped first image on the existing prepared InitialImage owner.
+/// This consumes the actual one-use coordinator client; no alternate ACK,
+/// Config, installed host, lifecycle or readiness mechanism is introduced.
+///
+/// # Safety
+/// The client redeemed the exact watched physical launch bound by `mapped`.
+/// Its genuine schema/Config checks and the ordinary InitialImage domain checks
+/// completed on that same stream. The caller retains the host mapping/terminal
+/// owner and all `MappedToolPrelude::publish_authenticated` obligations. Guest
+/// has not run; all errors remain terminal under the original retained owner.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub unsafe fn prepare_tool_mapped_initial_image<T: Tool>(
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+    mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
+) -> io::Result<PreparedInitialImage<T>> {
+    let fatal = unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
+    // SAFETY: actual admitted client and physical producer contract above.
+    let control = unsafe { mapped.publish_authenticated()? };
+    Ok(PreparedInitialImage {
+        fatal,
+        client,
+        control,
+    })
+}
+
+/// Install the actual Tool using the same authenticated client and native owner.
+/// The caller must finish DETLOG/OFD setup, run
+/// [`initialize_initial_image_lifecycle`], then consume the installed owner's
+/// `finish` before the runner can resume the guest. No second adoption occurs.
+///
+/// # Safety
+/// The prepared native image must still be in its exclusive initialization
+/// phase on the private Tool FS/stack. No Guest code may have run.
+#[cfg(feature = "exec-private-init")]
+pub unsafe fn install_tool_initial_image<T>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedInitialImage<T>,
+) -> io::Result<InstalledInitialImage>
+where
+    T: Tool + 'static,
+{
+    let PreparedInitialImage {
+        client,
+        control,
+        fatal,
+    } = prepared;
+    unsafe {
+        install_tool_inner::<T>(
+            coordinator.as_ref(),
+            false,
+            runtime::PatchPublication::Quiescent,
+            Some(ImageInstall::Initial(client, &control, &fatal)),
+            #[cfg(feature = "exec-native-injection")]
+            None,
+            true,
+        )?;
+    }
+    Ok(InstalledInitialImage { control, fatal })
+}
+
+/// Trusted consumer for an actual admitted native successor image.
+///
+/// # Safety
+/// The implementation must retain real watched-birth/Issued/kernel-exec and
+/// immutable bootstrap/allocator/Config/source-closure authority. Qualification
+/// must inspect the same actual Config and reject every PMU/RCB/preemption/time,
+/// thread/fork, guest-handler or site-patching requirement outside this first
+/// domain; skipping PMU setup never disables a requested feature. Decode must
+/// consume the full bounded authenticated composite exactly, validate every
+/// Tool/thread/runtime/Config/cut identity, and return the actual saved Tool and
+/// thread state. Neither digests nor request IDs create capability.
+/// Restore must use actual fresh collectors and checked sequence once, refuse
+/// existing activity, and prove the genuine DETLOG cut before any observer or
+/// guest work. Complete must send the real typed CompleteNativeExec on the
+/// provided installed RPC, retain consumption on error, and return only the
+/// exact received response binding. No local matching value or boolean is ACK.
+/// Trusted qualification, decode/restore and Tool setup must not unwind or
+/// permit guest/observer work. Tool/Config/state teardown during failed native
+/// setup must not mutate physical/runtime ownership or unwind; ordinary Tool
+/// installation contracts remain unchanged. Explicit returned failures take
+/// the fixed terminal edge before installer-owned teardown.
+/// Destruction after successful finish must not invalidate retained mappings,
+/// FDs, frontend or launch authority; hand off such ownership before returning.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe trait NativeSuccessorConsumer<T: Tool>: Send {
+    fn qualify_config(
+        &self,
+        config: &<T::GlobalState as reverie::GlobalTool>::Config,
+    ) -> io::Result<()>;
+
+    fn decode_verified(
+        &mut self,
+        config: &<T::GlobalState as reverie::GlobalTool>::Config,
+        state: &reverie_rpc_transport::successor::VerifiedSuccessorState,
+        binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    ) -> io::Result<(T, T::ThreadState)>;
+
+    fn restore_fresh_runtime(
+        &mut self,
+        binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    ) -> io::Result<()>;
+
+    fn complete(
+        &mut self,
+        rpc: &CoordinatorRpc<T::GlobalState>,
+        binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    ) -> io::Result<reverie_inguest::guest::exec_private::SuccessorBinding>;
+}
+
+#[cfg(feature = "exec-native-injection")]
+fn require_native_success<V>(result: io::Result<V>) -> V {
+    match result {
+        Ok(value) => value,
+        Err(_) => unsafe {
+            // Native initialization cannot return to generic owned teardown
+            // after a failed authenticated operation. The fixed terminal gate
+            // is owned before these explicit entry points are invoked.
+            reverie_inguest::guest::exec_private::initialization_failed(core::ptr::null_mut())
+        },
+    }
+}
+
+#[cfg(feature = "exec-native-injection")]
+struct SuccessorAbortGuard {
+    active: bool,
+}
+
+#[cfg(feature = "exec-native-injection")]
+impl Drop for SuccessorAbortGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: only authenticated native preparation constructs this
+            // guard, owning the actual inherited fixed terminal gate.
+            unsafe {
+                reverie_inguest::guest::exec_private::initialization_failed(core::ptr::null_mut())
+            }
+        }
+    }
+}
+
+/// One affine authenticated successor, with its complete decoded Tool/state.
+#[cfg(feature = "exec-native-injection")]
+pub struct PreparedSuccessorImage<T: Tool> {
+    // Terminal before generic client, Tool/state, consumer or control drops.
+    fatal: SuccessorAbortGuard,
+    client: reverie_rpc_transport::BlockingRpcClient<T::GlobalState, GuestRpcStream>,
+    tool: T,
+    state: T::ThreadState,
+    consumer: Box<dyn NativeSuccessorConsumer<T>>,
+    control: reverie_inguest::guest::exec_private::SuccessorImageControl,
+}
+
+/// Actual installed successor retaining fatal ownership until exact completion.
+#[cfg(feature = "exec-native-injection")]
+pub struct InstalledSuccessorImage<T: Tool> {
+    fatal: SuccessorAbortGuard,
+    consumer: Box<dyn NativeSuccessorConsumer<T>>,
+    control: reverie_inguest::guest::exec_private::SuccessorImageControl,
+}
+
+#[cfg(feature = "exec-native-injection")]
+impl<T: Tool + 'static> InstalledSuccessorImage<T> {
+    /// Run the real post-exec once on actual restored Tool/state. Guest/observer
+    /// work remains forbidden; the entry must be the actual native resume.
+    pub fn run_post_exec_before_loader(
+        &self,
+        entry: &mut reverie_inguest::guest::exec_private::ImageGuestEntry,
+    ) -> io::Result<()> {
+        // SAFETY: this affine installed successor retains the actual control,
+        // entry/fatal ownership and exclusive pre-loader interval.
+        unsafe { installed_tool::run_successor_post_exec(entry, &self.control) }
+    }
+
+    /// Consume after the real lifecycle and exact received completion ACK.
+    /// Existing physical control checks run before and after the exchange.
+    ///
+    /// # Safety
+    /// Retain the native bootstrap/leases and exclude guest/observer work until
+    /// successful return and the runner's existing native handover. The unsafe
+    /// consumer must satisfy its real completion and resource-handoff contract.
+    pub unsafe fn finish(mut self) -> io::Result<()> {
+        unsafe {
+            installed_tool::finish_successor_image::<T::GlobalState>(
+                &self.control,
+                |rpc, binding| self.consumer.complete(rpc, binding),
+            )?;
+        }
+        self.fatal.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "exec-native-injection")]
+fn check_successor_binding(
+    state: &reverie_rpc_transport::successor::VerifiedSuccessorState,
+    binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+) -> io::Result<()> {
+    if binding.generation == 0
+        || binding.ticket == [0; 32]
+        || binding.state == [0; 32]
+        || binding.config == [0; 32]
+        || state.ticket_digest() != binding.ticket
+        || state.expected().state != binding.state
+        || state.expected().config != binding.config
+    {
+        return Err(io::Error::other(
+            "successor admitted transport binding differs",
+        ));
+    }
+    Ok(())
+}
+
+/// Decode a genuinely redeemed successor before publishing its native control.
+///
+/// # Safety
+/// The actual SuccessorClient and independent binding must name this genuine
+/// successful kernel exec and retained watched birth. The inherited fixed
+/// terminal gate, private loader/Tool FS/control extents and fresh allocator
+/// must already be authenticated; no guest code may have run. The consumer
+/// must uphold every unsafe trait contract. Errors or abandonment are terminal.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe fn prepare_tool_successor_image<T: Tool + 'static>(
+    client: reverie_rpc_transport::SuccessorClient<T::GlobalState, GuestRpcStream>,
+    native: *mut reverie_inguest::guest::exec_private::NativeControl,
+    binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    mut consumer: Box<dyn NativeSuccessorConsumer<T>>,
+) -> io::Result<PreparedSuccessorImage<T>> {
+    let fatal = SuccessorAbortGuard { active: true };
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    require_native_success(crate::patch_alloc::preflight_allocator());
+    require_native_success(check_successor_binding(client.state(), binding));
+    require_native_success(consumer.qualify_config(client.config()));
+    let (tool, state) =
+        require_native_success(consumer.decode_verified(client.config(), client.state(), binding));
+    let control = require_native_success(unsafe {
+        reverie_inguest::guest::exec_private::publish_authenticated_successor_control(
+            native, binding,
+        )
+    });
+    let (client, verified) = client.into_parts();
+    drop(verified);
+    Ok(PreparedSuccessorImage {
+        fatal,
+        client,
+        tool,
+        state,
+        consumer,
+        control,
+    })
+}
+
+/// Install the actual native successor Tool/frontend from the prepared image.
+/// Real post-exec and finish remain mandatory before loader entry.
+///
+/// # Safety
+/// Keep the authenticated exclusive private Tool FS/stack/bootstrap interval;
+/// no guest, handler or observer work may run. The driver must retain genuine
+/// native authority and satisfy its unsafe contracts, without reacquiring the
+/// host's Tool/state locks. The runtime consumer owns exact fresh restoration.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe fn install_tool_successor_image<T: Tool + 'static>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedSuccessorImage<T>,
+    driver: std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
+) -> io::Result<InstalledSuccessorImage<T>> {
+    // Keep the affine prepared owner intact while trusted qualification runs.
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    require_native_success(prepared.consumer.qualify_config(prepared.client.config()));
+    let PreparedSuccessorImage {
+        fatal,
+        client,
+        tool,
+        state,
+        mut consumer,
+        control,
+    } = prepared;
+    unsafe {
+        install_tool_inner::<T>(
+            coordinator.as_ref(),
+            false,
+            runtime::PatchPublication::Quiescent,
+            Some(ImageInstall::Successor {
+                client,
+                control: &control,
+                tool,
+                state,
+                consumer: &mut *consumer,
+            }),
+            Some(driver),
+            true,
+        )?;
+    }
+    Ok(InstalledSuccessorImage {
+        fatal,
+        consumer,
+        control,
+    })
+}
+
+/// Install an authenticated initial image with its concrete native exec driver
+/// before the first dispatch. Ordinary InitialImage installation is unchanged.
+///
+/// # Safety
+/// All InitialImage and NativeExecDriver contracts apply. `qualify` must inspect
+/// this same actual Config and explicitly reject unsupported PMU/RCB/time,
+/// preemption, threads/forks, guest handlers and site-patching requirements
+/// before PMU initialization is skipped. It must not disable requested features
+/// or accept a synthetic Config. Retain real native birth/launch authority.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe fn install_tool_initial_image_with_native_exec<T: Tool + 'static>(
+    coordinator: impl AsRef<Path>,
+    prepared: PreparedInitialImage<T>,
+    driver: std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
+    qualify: impl FnOnce(&<T::GlobalState as reverie::GlobalTool>::Config) -> io::Result<()>,
+) -> io::Result<InstalledInitialImage> {
+    let PreparedInitialImage {
+        fatal,
+        client,
+        control,
+    } = prepared;
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    require_native_success(qualify(client.config()));
+    unsafe {
+        install_tool_inner::<T>(
+            coordinator.as_ref(),
+            false,
+            runtime::PatchPublication::Quiescent,
+            Some(ImageInstall::Initial(client, &control, &fatal)),
+            Some(driver),
+            true,
+        )?;
+    }
+    Ok(InstalledInitialImage { fatal, control })
+}
+
+/// Run genuine eager lifecycle on the actual installed InitialImage Tool.
+/// Call after DETLOG/shared-OFD setup and before `InitialImageControl::finish`.
+/// An error permanently refuses this initialization; the explicit native
+/// initializer must terminate instead of resuming guest code. This does not
+/// enter Guest, authenticate a new image or create another coordinator client.
+#[cfg(feature = "exec-private-init")]
+pub fn initialize_initial_image_lifecycle(image: &InstalledInitialImage) -> io::Result<()> {
+    // SAFETY: these borrows belong to the same private affine installed owner.
+    // Its live fatal guard spans the already bound host/frontend and this real
+    // eager lifecycle; the caller completes DETLOG/OFD setup before finish.
+    unsafe { installed_tool::initialize_initial_image_lifecycle(&image.control, &image.fatal) }
+}
+
+#[cfg(feature = "exec-private-init")]
+fn initial_vdso_mprotect_result(result: i64, restoring: bool) -> Result<(), reverie::Errno> {
+    if result == 0 {
+        return Ok(());
+    }
+    if restoring {
+        // RX restoration failed while the actual kernel vDSO is NX. Do not
+        // allocate, format, log or unwind before the owned fixed terminal gate.
+        unsafe {
+            reverie_inguest::guest::exec_private::initialization_failed(core::ptr::null_mut())
+        }
+    }
+    Err(reverie::Errno::new(result.wrapping_neg() as i32))
+}
+
+#[cfg(feature = "exec-private-init")]
+unsafe fn patch_initial_image_vdso(
+    subscriptions: &reverie::Subscription,
+    control: PrivateImageControl<'_>,
+) -> Result<(), reverie::Error> {
+    control.check_vdso_context()?;
+    let mut owned_extent = None;
+    let mut step = 0_u8;
+    // SAFETY: the same authenticated control/fatal owner spans this call.
+    // Guest has not run; bootstrap blocks asynchronous signals. The callback
+    // admits only the qualified immutable extent and the RW -> RX sequence,
+    // through the already adopted Tool raw gate, and cannot unwind under NX.
+    unsafe {
+        reverie::vdso::patch_current_vdso_trapping_owned(
+            subscriptions,
+            |address, len, protection| {
+                let restoring = step == 1;
+                if step == 0
+                    && owned_extent.is_none()
+                    && protection == libc::PROT_READ | libc::PROT_WRITE
+                {
+                    owned_extent = Some((address, len));
+                } else if !restoring
+                    || owned_extent != Some((address, len))
+                    || protection != libc::PROT_READ | libc::PROT_EXEC
+                {
+                    reverie_inguest::guest::exec_private::initialization_failed(
+                        core::ptr::null_mut(),
+                    );
+                }
+                let result = raw_syscall6(
+                    libc::SYS_mprotect,
+                    [address as u64, len as u64, protection as u64, 0, 0, 0],
+                );
+                initial_vdso_mprotect_result(result, restoring)?;
+                step = if restoring { 2 } else { 1 };
+                Ok(())
+            },
+        )?;
+    }
+    control.check_vdso_context()?;
+    Ok(())
+}
+
+#[cfg(all(test, feature = "exec-private-init"))]
+mod initial_vdso_tests {
+    use super::*;
+
+    #[test]
+    fn failed_initial_vdso_rx_terminates_before_owner_drop_or_error_formatting() {
+        // A component fixture owns an actual fixed terminal gate and actual
+        // kernel vDSO. It does not redeem InitialImage authorization or prove a
+        // native frontend. Shared progress proves RW succeeded and RX was
+        // attempted; a returned error or panic must exit 94, not pass via Drop.
+        let progress = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(progress, libc::MAP_FAILED);
+        let progress = progress.cast::<u64>();
+        unsafe { progress.write_volatile(0) };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            if unsafe { reverie_inguest::trap::prepare_fixed_gates() }.is_err() {
+                unsafe { libc::_exit(95) };
+            }
+            let _fatal =
+                unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
+            // The fatal guard is outside catch_unwind: a panic cannot turn
+            // into the expected terminal status by unwinding this owner.
+            let _ = std::panic::catch_unwind(|| unsafe {
+                reverie::vdso::patch_current_vdso_trapping_owned(
+                    &reverie::Subscription::all(),
+                    |address, len, protection| {
+                        if protection == libc::PROT_READ | libc::PROT_EXEC {
+                            progress.write_volatile(2);
+                            initial_vdso_mprotect_result(-(libc::EIO as i64), true)
+                        } else {
+                            let result = raw_syscall6(
+                                libc::SYS_mprotect,
+                                [address as u64, len as u64, protection as u64, 0, 0, 0],
+                            );
+                            initial_vdso_mprotect_result(result, false)?;
+                            progress.write_volatile(1);
+                            Ok(())
+                        }
+                    },
+                )
+            });
+            // Never drop the owner here. Only the production result helper's
+            // direct fixed terminal call may produce the expected exit 127.
+            unsafe { libc::_exit(94) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        let reached = unsafe { progress.read_volatile() };
+        assert_eq!(unsafe { libc::munmap(progress.cast(), 4096) }, 0);
+        assert!(libc::WIFEXITED(status), "child wait status {status}");
+        assert_eq!(libc::WEXITSTATUS(status), 127);
+        assert_eq!(reached, 2);
+    }
+}
+
+// Private initialization has an authenticated fatal owner outside this stack
+// frame. It must terminate before local RPC/Tool owners are dropped: their
+// descriptors may already be protected and their frontend partly installed.
+#[cfg(feature = "exec-private-init")]
+fn private_install_result<V>(result: io::Result<V>, private_initial: bool) -> io::Result<V> {
+    match result {
+        Err(_error) if private_initial => unsafe {
+            // SAFETY: install_tool_inner receives an authenticated Initial or
+            // Successor owner. Its existing fixed terminal gate is retained;
+            // no teardown, diagnostic I/O or guest continuation may intervene.
+            reverie_inguest::guest::exec_private::initialization_failed(core::ptr::null_mut())
+        },
+        result => result,
+    }
+}
+
+#[cfg(all(test, feature = "exec-private-init"))]
+mod private_install_result_tests {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    use super::*;
+
+    #[test]
+    fn ordinary_failure_preserves_real_errno() {
+        let error =
+            private_install_result::<()>(Err(io::Error::from_raw_os_error(libc::EIO)), false)
+                .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn private_success_is_unchanged() {
+        assert_eq!(private_install_result(Ok(17), true).unwrap(), 17);
+    }
+
+    #[test]
+    fn invalid_initial_endpoint_terminates_before_reserved_socket_owner_drop() {
+        let progress = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(progress, libc::MAP_FAILED);
+        let progress = progress.cast::<u64>();
+        unsafe { progress.write_volatile(0) };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            if unsafe { reverie_inguest::trap::prepare_fixed_gates() }.is_err() {
+                unsafe { libc::_exit(95) };
+            }
+            struct SocketOwner {
+                socket: UnixStream,
+                progress: *mut u64,
+            }
+            impl Drop for SocketOwner {
+                fn drop(&mut self) {
+                    // SAFETY: retained shared mapping spans this child.
+                    unsafe { self.progress.write_volatile(2) };
+                }
+            }
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let owner = SocketOwner { socket, progress };
+            runtime::reserve_coordinator_fd(owner.socket.as_raw_fd()).unwrap();
+            unsafe { progress.write_volatile(1) };
+            let error = crate::initial_image_stats::initial_image_stats_endpoint(Path::new(
+                "/owned/a.sock",
+            ));
+            assert_eq!(
+                error.as_ref().unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            // Do not arm an outer fatal Drop guard: only the actual helper's
+            // immediate terminal edge may yield the expected status 127.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                private_install_result(error, true)
+            }));
+            drop(owner);
+            unsafe { libc::_exit(94) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        let observed = unsafe { progress.read_volatile() };
+        assert_eq!(unsafe { libc::munmap(progress.cast(), 4096) }, 0);
+        assert!(libc::WIFEXITED(status), "child status {status}");
+        assert_eq!(libc::WEXITSTATUS(status), 127);
+        assert_eq!(
+            observed, 1,
+            "reserved RPC owner was dropped before terminal"
+        );
+    }
+}
+
+// The private-image installer; ordinary installation is the shared
+// `reverie_inguest::guest::tool_install::install_tool_with`.
+#[cfg(feature = "exec-private-init")]
 unsafe fn install_tool_inner<T>(
     coordinator: &Path,
     remove_legacy_environment: bool,
     publication: runtime::PatchPublication,
+    #[cfg(feature = "exec-private-init")] initial: Option<ImageInstall<'_, T>>,
+    #[cfg(feature = "exec-native-injection")] native_driver: Option<
+        std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
+    >,
+    #[cfg(feature = "exec-private-init")] skip_pmu: bool,
 ) -> io::Result<()>
 where
     T: Tool + 'static,
 {
-    crate::syscall_fallback::initialize()?;
-    let rpc = CoordinatorRpc::<T::GlobalState>::connect(coordinator)?;
-    runtime::reserve_coordinator_fd(rpc.raw_fd())?;
-    let stats =
-        if let Some(stats_coordinator) = std::env::var_os(crate::backend::STATS_COORDINATOR_ENV) {
-            let stats = crate::stats::initialize_guest_stats(Path::new(&stats_coordinator))?;
+    let private_initial = initial.is_some();
+    macro_rules! install_try {
+        ($operation:expr) => {
+            match private_install_result($operation, private_initial) {
+                Ok(value) => value,
+                Err(error) => {
+                    #[cfg(feature = "exec-native-injection")]
+                    if skip_pmu {
+                        require_native_success::<()>(Err(error));
+                        unreachable!();
+                    }
+                    return Err(error);
+                }
+            }
+        };
+    }
+    // Everything installation allocates (the coordinator's configuration,
+    // the Tool, the runtime's /proc/self/maps snapshots and site tables)
+    // lives in the runtime's private Tool heap, never in the guest's own
+    // malloc heap, where it would stay before `main` runs. Its sizes follow
+    // host state, such as the number of mounts the configuration lists, so
+    // the guest's heap layout, and every heap address its syscalls pass,
+    // would otherwise differ between two runs of one program. The Tool heap
+    // is anonymous memory, so the entry census of the object that links this
+    // runtime does not read the Tool's state as code addresses either.
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    install_try!(crate::patch_alloc::preflight_allocator());
+
+    #[cfg(feature = "fixed-syscall-gates")]
+    let mut fixed_install = FixedGateInstallation { complete: false };
+    #[cfg(feature = "fixed-syscall-gates")]
+    unsafe {
+        if !private_initial && reverie_inguest::guest::sigalrm::seccomp_filter_count() != Some(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fixed syscall gates refuse an inherited or unreadable seccomp filter state",
+            ));
+        }
+        // All runtime signal actions and their filter must select the same
+        // fixed page. Prepare it before any callback or handler is published.
+        if !private_initial {
+            install_try!(reverie_inguest::trap::prepare_fixed_gates());
+        }
+    }
+    install_try!(crate::syscall_fallback::initialize());
+    #[cfg(feature = "exec-native-injection")]
+    let mut restored_tool = None;
+    #[cfg(feature = "exec-native-injection")]
+    let mut restored_state = None;
+    #[cfg(feature = "exec-native-injection")]
+    let mut runtime_restore: Option<Box<dyn FnOnce() -> io::Result<()> + '_>> = None;
+    #[cfg(feature = "exec-private-init")]
+    let (rpc, initial_control, initial_fatal) = match initial {
+        Some(ImageInstall::Initial(client, control, fatal)) => (
+            install_try!(CoordinatorRpc::<T::GlobalState>::from_live_client(
+                coordinator,
+                client.into_client(),
+                runtime::replace_coordinator_fd,
+            )),
+            Some(PrivateImageControl::Initial(control)),
+            Some(fatal),
+        ),
+        #[cfg(feature = "exec-native-injection")]
+        Some(ImageInstall::Successor {
+            client,
+            control,
+            tool,
+            state,
+            consumer,
+        }) => {
+            let binding = control.binding();
+            restored_tool = Some(tool);
+            restored_state = Some(state);
+            runtime_restore = Some(Box::new(move || consumer.restore_fresh_runtime(binding)));
+            (
+                install_try!(CoordinatorRpc::<T::GlobalState>::from_live_client(
+                    coordinator,
+                    client,
+                    runtime::replace_coordinator_fd,
+                )),
+                Some(PrivateImageControl::Successor(control)),
+                None,
+            )
+        }
+        None => (
+            install_try!(CoordinatorRpc::<T::GlobalState>::connect(
+                coordinator,
+                runtime::replace_coordinator_fd,
+            )),
+            None,
+            None,
+        ),
+    };
+    #[cfg(not(feature = "exec-private-init"))]
+    let rpc = install_try!(CoordinatorRpc::<T::GlobalState>::connect(
+        coordinator,
+        runtime::replace_coordinator_fd
+    ));
+    install_try!(runtime::reserve_coordinator_fd(rpc.raw_fd()));
+    let stats = if private_initial {
+        #[cfg(feature = "exec-private-init")]
+        {
+            let control = install_try!(initial_control.ok_or_else(|| {
+                io::Error::other("InitialImage statistics requires authenticated control")
+            }));
+            // The existing narrow context check requires this same published
+            // control, initial thread, Tool FS, phase 2 and installation 0.
+            // The caller retains its fatal owner across collector setup.
+            install_try!(control.check_vdso_context());
+            let endpoint = install_try!(crate::initial_image_stats::initial_image_stats_endpoint(
+                coordinator
+            ));
+            let stats = install_try!(crate::stats::initialize_guest_stats(&endpoint));
+            install_try!(control.check_vdso_context());
+            stats
+        }
+        #[cfg(not(feature = "exec-private-init"))]
+        {
+            crate::stats::GuestStatsHooks::DISABLED
+        }
+    } else {
+        if let Some(stats_coordinator) = reverie_inguest::bootstrap::bootstrap_stats_coordinator() {
+            install_try!(crate::stats::initialize_guest_stats(stats_coordinator))
+        } else if let Some(stats_coordinator) =
+            std::env::var_os(crate::backend::STATS_COORDINATOR_ENV)
+        {
+            let stats = install_try!(crate::stats::initialize_guest_stats(Path::new(
+                &stats_coordinator
+            )));
             // SAFETY: tool installation runs before application-created threads.
             unsafe { std::env::remove_var(crate::backend::STATS_COORDINATOR_ENV) };
             stats
         } else {
             crate::stats::GuestStatsHooks::DISABLED
-        };
-    runtime::initialize_rcb_clock()?;
-    COMMITTED_STACKS.lock().clear();
-    let pid = Pid::from_raw(unsafe { libc::getpid() });
+        }
+    };
+    // Complete the new fixed callback pool and route publication before the
+    // guest counter starts. Later installation consumes only this proof;
+    // allocating the pool there would charge Tool setup to guest progress.
+    let prepared_callbacks = install_try!(runtime::prepare_installed_callbacks());
+    // SAFETY: this private installer is called only with the authenticated
+    // no-RCB image contract when skip_pmu is true; no Guest or callback is active.
+    install_try!(unsafe { runtime::prepare_private_rcb_clock(skip_pmu) });
+    // The raw syscall, not libc's interposable getpid.
+    let pid = Pid::from_raw(unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) } as i32);
     let subscriptions = T::subscriptions(rpc.config());
     let instruction_subscriptions = runtime::InstructionSubscriptions {
         cpuid: subscriptions.has_cpuid(),
         rdtsc: subscriptions.has_rdtsc(),
     };
-    runtime::preflight_instruction_faulting(instruction_subscriptions)?;
-    let site_patching = runtime::site_patching_from_env_value(
-        std::env::var_os(runtime::SITE_PATCHING_ENV).as_deref(),
-    )?;
+    install_try!(runtime::preflight_instruction_faulting(
+        instruction_subscriptions
+    ));
+    // A launcher that sends tool data puts the selection in the bootstrap,
+    // which guest code cannot change; the environment is the selector for
+    // launchers that do not.
+    let site_patching = if private_initial {
+        false
+    } else if let Some(site_patching) = reverie_inguest::bootstrap::bootstrap_site_patching() {
+        site_patching
+    } else {
+        install_try!(runtime::site_patching_from_env_value(
+            std::env::var_os(runtime::SITE_PATCHING_ENV).as_deref(),
+        ))
+    };
     // With site patching off, the vDSO gets ptrace's full trapping stubs and no
     // hooks, so its fast paths reach the Tool through the SIGSYS fallback too.
-    let vdso_sites = if site_patching {
-        reverie_ptrace::patch_current_vdso(&subscriptions)
+    #[cfg(feature = "exec-private-init")]
+    let initial_vdso =
+        initial_control.map(|control| unsafe { patch_initial_image_vdso(&subscriptions, control) });
+    #[cfg(not(feature = "exec-private-init"))]
+    let initial_vdso: Option<Result<(), reverie::Error>> = None;
+    let vdso_sites = install_try!(
+        (if let Some(result) = initial_vdso {
+            result.map(|()| Vec::new())
+        } else if site_patching {
+            reverie::vdso::patch_current_vdso(&subscriptions)
+        } else {
+            reverie::vdso::patch_current_vdso_trapping(&subscriptions).map(|()| Vec::new())
+        })
+        .map_err(|error| {
+            io::Error::other(reverie_inguest::guest::host::describe_reverie_error(&error))
+        })
+    );
+    #[cfg(feature = "exec-private-init")]
+    let _signal_state = if let Some(control) = initial_control {
+        install_try!(control.prepare_signal_state(instruction_subscriptions));
+        None
     } else {
-        reverie_ptrace::patch_current_vdso_trapping(&subscriptions).map(|()| Vec::new())
-    }
-    .map_err(|error| io::Error::other(error.to_string()))?;
-    let _signal_state = runtime::prepare_guest_signal_state(instruction_subscriptions)?;
+        Some(install_try!(runtime::prepare_guest_signal_state(
+            instruction_subscriptions,
+        )))
+    };
+    #[cfg(not(feature = "exec-private-init"))]
+    let _signal_state = install_try!(runtime::prepare_guest_signal_state(
+        instruction_subscriptions
+    ));
     let syscall_subscriptions = subscriptions.iter_syscalls().collect();
     if remove_legacy_environment {
         // SAFETY: legacy tool installation runs before application-created threads.
         unsafe { std::env::remove_var(crate::backend::COORDINATOR_ENV) };
     }
+    #[cfg(feature = "exec-native-injection")]
+    let tool = match restored_tool {
+        Some(tool) => tool,
+        None => T::new(pid, rpc.config()),
+    };
+    #[cfg(not(feature = "exec-native-injection"))]
     let tool = T::new(pid, rpc.config());
-    HANDLER
-        .set(Box::new(ToolHost::<T> {
-            tool: SpinMutex::new(Some(tool)),
-            rpc,
-            root_pid: pid,
-            subscriptions: syscall_subscriptions,
-            instruction_subscriptions,
-            states: SpinMutex::new(HashMap::new()),
+    let host = ToolHost::<T, LiteinstRuntime>::new(
+        tool,
+        rpc,
+        pid,
+        syscall_subscriptions,
+        instruction_subscriptions.cpuid,
+        LiteinstRuntime {
             stats,
-        }))
-        .map_err(|_| {
-            io::Error::new(io::ErrorKind::AlreadyExists, "Reverie tool installed twice")
-        })?;
-    runtime::initialize_reverie_tool(
+            #[cfg(feature = "exec-private-init")]
+            no_rcb: skip_pmu,
+        },
+    );
+    #[cfg(feature = "exec-native-injection")]
+    let host = {
+        let mut host = host;
+        if let Some(driver) = native_driver {
+            // SAFETY: only the explicitly authenticated native entry supplies
+            // this concrete driver, before publication or any dispatch.
+            unsafe {
+                install_try!(host.install_native_exec_driver(driver));
+            }
+        }
+        host
+    };
+    // SAFETY: preserve one shared installed owner and the actual same private
+    // control/client/fatal lineage; ordinary publication arity is unchanged.
+    #[cfg(feature = "exec-private-init")]
+    unsafe {
+        match initial_control {
+            Some(PrivateImageControl::Initial(control)) => {
+                let fatal = install_try!(initial_fatal.ok_or_else(|| io::Error::other(
+                    "InitialImage installer lacks its fatal owner"
+                )));
+                install_try!(installed_tool::publish_initial_tool(host, control, fatal));
+            }
+            #[cfg(feature = "exec-native-injection")]
+            Some(PrivateImageControl::Successor(control)) => {
+                let state = install_try!(restored_state.take().ok_or_else(|| io::Error::other(
+                    "successor installer lacks authenticated pending Tool state"
+                )));
+                install_try!(installed_tool::publish_successor_tool(host, state, control));
+            }
+            None => {
+                install_try!(installed_tool::publish_tool(host));
+            }
+        }
+    }
+    #[cfg(not(feature = "exec-private-init"))]
+    unsafe {
+        installed_tool::publish_tool(host)?;
+    }
+    let result = runtime::initialize_reverie_tool(
         stats,
         publication,
         instruction_subscriptions,
         site_patching,
         &vdso_sites,
-    )
-}
-
-pub(crate) fn dispatch(event: &mut SyscallEvent) {
-    match HANDLER.get() {
-        Some(handler) => handler.dispatch(event),
-        None => event.result = -i64::from(libc::ENOSYS),
+        prepared_callbacks,
+        #[cfg(feature = "exec-private-init")]
+        initial_control.map(|control| runtime::PrivateRuntimeImage {
+            control,
+            preparation: if skip_pmu {
+                // The authenticated entry requires a no-RCB/no-patching image.
+                // Ordinary/legacy installation retains
+                // all existing patcher preparation, even in feature-on builds.
+                runtime::InstrumentationPreparation::NativeTrapOnly
+            } else {
+                runtime::InstrumentationPreparation::Patcher
+            },
+            #[cfg(feature = "exec-native-injection")]
+            before_frontend: runtime_restore,
+        }),
+    );
+    #[cfg(feature = "fixed-syscall-gates")]
+    {
+        fixed_install.complete = result.is_ok();
     }
-}
-
-pub(crate) fn dispatch_instruction(kind: runtime::InstructionEventKind, context: &mut HookContext) {
-    match HANDLER.get() {
-        Some(handler) => handler.dispatch_instruction(kind, context),
-        None => fatal(126),
-    }
-}
-
-struct ToolHost<T: Tool> {
-    tool: SpinMutex<Option<T>>,
-    rpc: CoordinatorRpc<T::GlobalState>,
-    root_pid: Pid,
-    subscriptions: HashSet<Sysno>,
-    instruction_subscriptions: runtime::InstructionSubscriptions,
-    states: SpinMutex<HashMap<i32, T::ThreadState>>,
-    stats: crate::stats::GuestStatsHooks,
-}
-
-impl<T> ToolHandler for ToolHost<T>
-where
-    T: Tool + 'static,
-{
-    fn dispatch(&self, event: &mut SyscallEvent) {
-        let _scratch_scope = DispatchScratchScope::enter();
-        let tid = raw_pid(libc::SYS_gettid);
-        let pid = raw_pid(libc::SYS_getpid);
-        let ppid = (pid != self.root_pid).then(|| raw_pid(libc::SYS_getppid));
-
-        // These process-wide locks are valid only while thread creation stays
-        // fail-closed. A scheduler RPC may block until a sibling runs, so MT
-        // support requires per-thread RPC/state ownership before relaxing the
-        // clone guard below.
-        let mut tool_slot = self.tool.lock();
-        let tool = tool_slot.as_ref().unwrap_or_else(|| fatal(126));
-        let mut states = self.states.lock();
-        let is_new = !states.contains_key(&tid.as_raw());
-        let state = states
-            .entry(tid.as_raw())
-            .or_insert_with(|| tool.init_thread_state(tid, None));
-        let tail = TailResult::default();
-        let mut guest = LiteinstGuest::<T> {
-            event,
-            tid,
-            pid,
-            ppid,
-            state,
-            rpc: &self.rpc,
-            tail: &tail,
-            cpuid_interception: self.instruction_subscriptions.cpuid,
-            fork_parent_state: None,
-        };
-
-        if is_new && let Err(error) = drive_ready(tool.handle_thread_start(&mut guest)) {
-            tool_fatal(124, &error);
-        }
-
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-liteinst-post-exec): The kernel exec'd the guest
-        // image before this LD_PRELOAD backend attached, so — unlike the ptrace
-        // backend — the `Tool::handle_post_exec` lifecycle callback never fired.
-        // A Tool such as Detcore relies on it to determinize the auxv AT_RANDOM
-        // vector and to advance per-thread state (e.g. its seeded PRNG) exactly
-        // as the ptrace backend does; without it the guest-visible getrandom(2)
-        // stream is offset relative to ptrace and cross-backend parity fails.
-        // The guest genuinely did execve into this image, so emitting the event
-        // once for the root process's main thread restores contract parity. It
-        // is intentionally not emitted for child threads (there is none in the
-        // current single-process/thread tool mode) nor re-emitted per dispatch.
-        if is_new
-            && tid.as_raw() == self.root_pid.as_raw()
-            && let Err(error) = drive_ready(tool.handle_post_exec(&mut guest))
-        {
-            // handle_post_exec returns Errno; tool_fatal expects reverie::Error.
-            tool_fatal(124, &Error::from(error));
-        }
-
-        let Some(number) = usize::try_from(guest.event.number)
-            .ok()
-            .and_then(Sysno::new)
-        else {
-            guest.event.result = -i64::from(libc::ENOSYS);
-            return;
-        };
-        if !self.subscriptions.contains(&number) {
-            let number = guest.event.number;
-            let args = guest.event.args;
-            if is_plain_fork(number, args) {
-                guest.prepare_fork_parent_state();
-                let result = forward_plain_fork(number, args, Some(&mut guest.event.guest_pkru));
-                if result == 0 {
-                    let parent_state = guest.take_fork_parent_state();
-                    drop(guest);
-                    finish_fork_child(
-                        &mut tool_slot,
-                        &mut states,
-                        &self.rpc,
-                        self.stats,
-                        event,
-                        parent_state,
-                        ForkChildContext {
-                            parent_tid: tid,
-                            parent_pid: pid,
-                            child_tid: raw_pid(libc::SYS_gettid),
-                            child_pid: raw_pid(libc::SYS_getpid),
-                        },
-                    );
-                } else {
-                    event.result = result;
-                }
-                return;
-            } else if is_exit_syscall(number) {
-                finish_tool_exit(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    self.stats,
-                    ToolExitContext {
-                        tid,
-                        pid,
-                        number,
-                        args,
-                    },
-                );
-            } else if let Some(error) = injected_syscall_guard(number, args) {
-                event.result = -i64::from(error.into_raw());
-                return;
-            }
-            // This is the original unsubscribed guest operation. Private
-            // inject/tail_inject below deliberately keep caller rights.
-            match stripped_signal_mask(number, args) {
-                Err(error) => event.result = -i64::from(error.into_raw()),
-                Ok(None) => event.result = unsafe { event.forward() },
-                Ok(Some(mask)) => {
-                    // The stripped copy is runtime-private, so the call runs
-                    // through the ordinary raw gate, as on inject and
-                    // tail_inject, with the thread's current keys rather than
-                    // the guest's saved PKRU (see stripped_signal_mask).
-                    let mut stripped_args = args;
-                    stripped_args[1] = (&raw const mask) as u64;
-                    event.result = unsafe { raw_syscall6(number, stripped_args) };
-                }
-            }
-            return;
-        }
-        let args = guest.event.args.map(|arg| arg as usize);
-        let syscall = Syscall::from_raw(
-            number,
-            SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
-        );
-
-        // Drive the Tool handler to a terminal outcome. The shared driver owns
-        // the ERESTARTSYS restart protocol (Reverie #362) so it cannot
-        // drift between the in-guest backends; this host maps each terminal
-        // outcome onto its own per-thread lifecycle (exit/fork-child) state.
-        match drive_tool_syscall(tool, &mut guest, syscall, &tail) {
-            DrivenSyscall::Result(value) => {
-                guest.event.result = value;
-            }
-            DrivenSyscall::Exit { number, args } => {
-                finish_tool_exit(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    self.stats,
-                    ToolExitContext {
-                        tid,
-                        pid,
-                        number,
-                        args,
-                    },
-                );
-                event.result = unsafe { raw_syscall6(number, args) };
-            }
-            DrivenSyscall::ForkChild {
-                parent_tid,
-                parent_pid,
-                child_tid,
-                child_pid,
-            } => {
-                let parent_state = guest.take_fork_parent_state();
-                drop(guest);
-                finish_fork_child(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    self.stats,
-                    event,
-                    parent_state,
-                    ForkChildContext {
-                        parent_tid,
-                        parent_pid,
-                        child_tid,
-                        child_pid,
-                    },
-                );
-            }
-            DrivenSyscall::Fatal(error) => tool_fatal(125, &error),
-        }
-    }
-
-    fn dispatch_instruction(&self, kind: runtime::InstructionEventKind, context: &mut HookContext) {
-        let _scratch_scope = DispatchScratchScope::enter();
-        let tid = raw_pid(libc::SYS_gettid);
-        let pid = raw_pid(libc::SYS_getpid);
-        let ppid = (pid != self.root_pid).then(|| raw_pid(libc::SYS_getppid));
-        let tool_slot = self.tool.lock();
-        let tool = tool_slot.as_ref().unwrap_or_else(|| fatal(126));
-        let mut states = self.states.lock();
-        let is_new = !states.contains_key(&tid.as_raw());
-        let state = states
-            .entry(tid.as_raw())
-            .or_insert_with(|| tool.init_thread_state(tid, None));
-        let tail = TailResult::default();
-        let mut event = SyscallEvent {
-            number: -1,
-            args: [0; 6],
-            instruction_pointer: context.instruction_pointer,
-            result: 0,
-            context: context as *mut HookContext as usize,
-            dispatch: runtime::SyscallDispatch::InstalledHook,
-            guest_pkru: None,
-        };
-        let mut guest = LiteinstGuest::<T> {
-            event: &mut event,
-            tid,
-            pid,
-            ppid,
-            state,
-            rpc: &self.rpc,
-            tail: &tail,
-            cpuid_interception: self.instruction_subscriptions.cpuid,
-            fork_parent_state: None,
-        };
-        if is_new && let Err(error) = drive_ready(tool.handle_thread_start(&mut guest)) {
-            tool_fatal(124, &error);
-        }
-        if is_new
-            && tid.as_raw() == self.root_pid.as_raw()
-            && let Err(error) = drive_ready(tool.handle_post_exec(&mut guest))
-        {
-            tool_fatal(124, &Error::from(error));
-        }
-
-        match kind {
-            runtime::InstructionEventKind::Cpuid => {
-                let result = drive_ready(tool.handle_cpuid_event(
-                    &mut guest,
-                    context.rax as u32,
-                    context.rcx as u32,
-                ))
-                .unwrap_or_else(|error| tool_fatal(125, &Error::from(error)));
-                context.rax = u64::from(result.eax);
-                context.rbx = u64::from(result.ebx);
-                context.rcx = u64::from(result.ecx);
-                context.rdx = u64::from(result.edx);
-            }
-            runtime::InstructionEventKind::Rdtsc | runtime::InstructionEventKind::Rdtscp => {
-                let request = if kind == runtime::InstructionEventKind::Rdtscp {
-                    Rdtsc::Tscp
-                } else {
-                    Rdtsc::Tsc
-                };
-                let result = drive_ready(tool.handle_rdtsc_event(&mut guest, request))
-                    .unwrap_or_else(|error| tool_fatal(125, &Error::from(error)));
-                context.rax = result.tsc as u32 as u64;
-                context.rdx = result.tsc.checked_shr(32).unwrap_or(0);
-                if let Some(aux) = result.aux {
-                    context.rcx = u64::from(aux);
-                }
-            }
-        }
-    }
-}
-
-fn finish_fork_child<T: Tool>(
-    tool_slot: &mut Option<T>,
-    states: &mut HashMap<i32, T::ThreadState>,
-    rpc: &CoordinatorRpc<T::GlobalState>,
-    stats: crate::stats::GuestStatsHooks,
-    event: &mut SyscallEvent,
-    parent_snapshot: T::ThreadState,
-    context: ForkChildContext,
-) {
-    let ForkChildContext {
-        parent_tid,
-        parent_pid,
-        child_tid,
-        child_pid,
-    } = context;
-    crate::syscall_fallback::rebind_fork_child();
-    runtime::emit_in_guest_stage(b"fork-child-thread-start-begin");
-    // This child inherited the parent's coordinator connection. Flag it before
-    // any child-side callback can issue an RPC (`handle_thread_start` below is
-    // the first such opportunity) so the next `send_rpc` reconnects under the
-    // child's own identity. Doing it here rather than from a `pthread_atfork`
-    // hook also covers forks that never enter libc, such as a raw `SYS_fork` or
-    // a raw plain `SYS_clone`.
-    crate::rpc::note_fork_in_child();
-    let inherited_parent_state = states
-        .remove(&parent_tid.as_raw())
-        .unwrap_or_else(|| fatal(126));
-    drop(inherited_parent_state);
-    let child_tool = T::new(child_pid, rpc.config());
-    let child_state = child_tool.init_thread_state(child_tid, Some((parent_tid, &parent_snapshot)));
-    states.clear();
-    states.insert(child_tid.as_raw(), child_state);
-    *tool_slot = Some(child_tool);
-    runtime::reset_fallback_observability();
-    stats.reset_after_fork();
-    // Both installed hooks and deferred fallback carry a register context.
-    // Attribute the child's first event to the path that actually entered it.
-    runtime::record_fork_child_dispatch(event, stats);
-
-    let tool = tool_slot.as_ref().unwrap_or_else(|| fatal(126));
-    let state = states
-        .get_mut(&child_tid.as_raw())
-        .unwrap_or_else(|| fatal(126));
-    let child_tail = TailResult::default();
-    let mut child_guest = LiteinstGuest::<T> {
-        event,
-        tid: child_tid,
-        pid: child_pid,
-        ppid: Some(parent_pid),
-        state,
-        rpc,
-        tail: &child_tail,
-        cpuid_interception: runtime::cpuid_interception_enabled(),
-        fork_parent_state: None,
-    };
-    if let Err(error) = drive_ready(tool.handle_thread_start(&mut child_guest)) {
-        tool_fatal(124, &error);
-    }
-    runtime::emit_in_guest_stage(b"fork-child-thread-start-complete");
-    child_guest.event.result = 0;
-}
-
-struct ForkChildContext {
-    parent_tid: Pid,
-    parent_pid: Pid,
-    child_tid: Pid,
-    child_pid: Pid,
-}
-
-// TODO-HUMAN-REVIEW(PR-143): Review single-process Tool exit lifecycle.
-fn finish_tool_exit<T: Tool>(
-    tool_slot: &mut Option<T>,
-    states: &mut HashMap<i32, T::ThreadState>,
-    rpc: &CoordinatorRpc<T::GlobalState>,
-    stats: crate::stats::GuestStatsHooks,
-    context: ToolExitContext,
-) {
-    let ToolExitContext {
-        tid,
-        pid,
-        number,
-        args,
-    } = context;
-    let state = states
-        .remove(&tid.as_raw())
-        .expect("LiteInst thread state disappeared before exit");
-    let status = reverie::ExitStatus::Exited((args[0] & 0xff) as i32);
-    let tool = tool_slot.as_ref().unwrap_or_else(|| fatal(126));
-    if let Err(error) = drive_ready(tool.on_exit_thread(tid, rpc, state, status)) {
-        tool_fatal(125, &error);
-    }
-    if is_process_exit(number, tid, pid) {
-        let tool = tool_slot.take().unwrap_or_else(|| fatal(126));
-        if let Err(error) = drive_ready(tool.on_exit_process(pid, rpc, status)) {
-            tool_fatal(125, &error);
-        }
-        if stats.is_enabled()
-            && let Err(error) = runtime::submit_process_stats(tid, stats)
-        {
-            tool_fatal(125, &Error::from(error));
-        }
-    }
-}
-
-struct ToolExitContext {
-    tid: Pid,
-    pid: Pid,
-    number: i64,
-    args: [u64; 6],
-}
-
-// TODO-HUMAN-REVIEW(PR-143): Review exit syscall lifecycle classification.
-fn is_exit_syscall(number: i64) -> bool {
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    matches!(number, libc::SYS_exit | libc::SYS_exit_group)
-}
-
-// TODO-HUMAN-REVIEW(PR-143): Review single-process exit classification.
-fn is_process_exit(number: i64, tid: Pid, pid: Pid) -> bool {
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    number == libc::SYS_exit_group || tid == pid
-}
-
-fn raw_pid(number: i64) -> Pid {
-    let value = unsafe { raw_syscall6(number, [0; 6]) };
-    if value <= 0 {
-        fatal(126);
-    }
-    Pid::from_raw(value as i32)
-}
-
-struct LiteinstGuest<'a, T: Tool> {
-    event: &'a mut SyscallEvent,
-    tid: Pid,
-    pid: Pid,
-    ppid: Option<Pid>,
-    state: &'a mut T::ThreadState,
-    rpc: &'a CoordinatorRpc<T::GlobalState>,
-    tail: &'a TailResult,
-    cpuid_interception: bool,
-    fork_parent_state: Option<T::ThreadState>,
-}
-
-impl<T: Tool> LiteinstGuest<'_, T> {
-    /// Materialize the parent view while every synchronization owner still
-    /// exists. A raw process fork can otherwise copy a locked Tool-state mutex
-    /// into the child after its owning thread disappeared. Round-tripping via
-    /// the existing ThreadState migration contract gives the child private,
-    /// unlocked synchronization primitives without a backend-specific Tool API.
-    fn prepare_fork_parent_state(&mut self) {
-        let encoded = bincode::serde::encode_to_vec(&*self.state, bincode::config::standard())
-            .unwrap_or_else(|_| fatal(126));
-        let (snapshot, consumed) = bincode::serde::decode_from_slice::<T::ThreadState, _>(
-            &encoded,
-            bincode::config::standard(),
-        )
-        .unwrap_or_else(|_| fatal(126));
-        if consumed != encoded.len() {
-            fatal(126);
-        }
-        self.fork_parent_state = Some(snapshot);
-    }
-
-    fn take_fork_parent_state(&mut self) -> T::ThreadState {
-        self.fork_parent_state.take().unwrap_or_else(|| fatal(126))
-    }
-}
-
-#[reverie::tool]
-impl<T: Tool> GlobalRPC<T::GlobalState> for LiteinstGuest<'_, T> {
-    async fn send_rpc(
-        &self,
-        message: <T::GlobalState as GlobalTool>::Request,
-    ) -> <T::GlobalState as GlobalTool>::Response {
-        self.rpc.send_rpc(message).await
-    }
-
-    fn config(&self) -> &<T::GlobalState as GlobalTool>::Config {
-        self.rpc.config()
-    }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-326): Review the plain-fork injection boundary.
-fn is_plain_fork(number: i64, args: [u64; 6]) -> bool {
-    if number == libc::SYS_fork {
-        return true;
-    }
-    if number == libc::SYS_vfork {
-        return true;
-    }
-    if number == libc::SYS_clone3 {
-        return clone3_is_plain_fork(args[0], args[1]);
-    }
-    if number != libc::SYS_clone {
-        return false;
-    }
-    const SIGNAL_MASK: u64 = 0xff;
-    let allowed_flags =
-        (libc::CLONE_CHILD_CLEARTID | libc::CLONE_CHILD_SETTID | libc::CLONE_PARENT_SETTID) as u64;
-    args[1] == 0
-        && args[0] & SIGNAL_MASK == libc::SIGCHLD as u64
-        && args[0] & !(SIGNAL_MASK | allowed_flags) == 0
-}
-
-fn clone3_is_plain_fork(address: u64, size: u64) -> bool {
-    const CLONE_ARGS_SIZE_VER0: usize = 64;
-    const CLONE_ARGS_SIZE_VER2: usize = 88;
-    if address == 0 || size < CLONE_ARGS_SIZE_VER0 as u64 {
-        return false;
-    }
-    let mut fields = [0_u64; CLONE_ARGS_SIZE_VER2 / core::mem::size_of::<u64>()];
-    let read_len = usize::try_from(size)
-        .unwrap_or(usize::MAX)
-        .min(core::mem::size_of_val(&fields));
-    let local = libc::iovec {
-        iov_base: fields.as_mut_ptr().cast(),
-        iov_len: read_len,
-    };
-    let remote = libc::iovec {
-        iov_base: address as usize as *mut libc::c_void,
-        iov_len: read_len,
-    };
-    let pid = unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) };
-    let read = unsafe {
-        raw_syscall6(
-            libc::SYS_process_vm_readv,
-            [
-                pid as u64,
-                (&raw const local) as u64,
-                1,
-                (&raw const remote) as u64,
-                1,
-                0,
-            ],
-        )
-    };
-    if read != read_len as i64 {
-        return false;
-    }
-
-    let allowed_flags =
-        (libc::CLONE_CHILD_CLEARTID | libc::CLONE_CHILD_SETTID | libc::CLONE_PARENT_SETTID) as u64;
-    let flags = fields[0];
-    flags & !allowed_flags == 0
-        && fields[4] == libc::SIGCHLD as u64
-        && fields[5] == 0
-        && fields[6] == 0
-        && fields[8..].iter().all(|field| *field == 0)
-}
-
-fn forward_plain_fork(number: i64, args: [u64; 6], guest_pkru: Option<&mut Option<u32>>) -> i64 {
-    let permissions = guest_pkru.as_ref().and_then(|value| **value);
-    let physical = if number == libc::SYS_vfork {
-        // A real vfork child would run the instrumentation callback on the
-        // parent's shared stack. Use a COW fork and preserve vfork's parent
-        // suspension until the child exits. Exec remains fail-closed, so exit
-        // is the only supported vfork completion boundary for now.
-        unsafe {
-            reverie_preload::trap::raw_syscall6_with_result(libc::SYS_fork, [0; 6], permissions)
-        }
-    } else {
-        unsafe { reverie_preload::trap::raw_syscall6_with_result(number, args, permissions) }
-    };
-    if let Some(output) = guest_pkru {
-        *output = physical.pkru;
-    }
-    let result = physical.result;
-    if number == libc::SYS_vfork && result > 0 {
-        let mut info = core::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        loop {
-            let waited = unsafe {
-                raw_syscall6(
-                    libc::SYS_waitid,
-                    [
-                        libc::P_PID as u64,
-                        result as u64,
-                        info.as_mut_ptr() as u64,
-                        (libc::WEXITED | libc::WNOWAIT) as u64,
-                        0,
-                        0,
-                    ],
-                )
-            };
-            if waited == -i64::from(libc::EINTR) {
-                continue;
-            }
-            if waited < 0 {
-                return waited;
-            }
-            break;
-        }
+    #[cfg(feature = "exec-native-injection")]
+    if skip_pmu {
+        require_native_success(result);
+        return Ok(());
     }
     result
 }
 
-// TODO-HUMAN-REVIEW(PR-127): Review injected process/signal safety policy.
-fn injected_syscall_guard(number: i64, args: [u64; 6]) -> Option<Errno> {
-    let unsupported_process =
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        (matches!(number, libc::SYS_clone | libc::SYS_clone3 | libc::SYS_vfork)
-            && !is_plain_fork(number, args))
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || matches!(number, libc::SYS_execve | libc::SYS_execveat);
-    let protected_signal =
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-133): Review fail-closed guest signal-handler policy.
-        !runtime::signal_action_supported(number, args)
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || (number == libc::SYS_sigaltstack && args[0] != 0);
-
-    if unsupported_process {
-        Some(Errno::EOPNOTSUPP)
-    } else if protected_signal {
-        Some(Errno::EPERM)
-    } else {
-        None
-    }
+/// A published fixed gate cannot be rolled back while an installed action or
+/// filter can still name it. A failed install must not resume guest code.
+#[cfg(all(feature = "fixed-syscall-gates", feature = "exec-private-init"))]
+struct FixedGateInstallation {
+    complete: bool,
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-913): Review stripping reserved signals from
-// rt_sigprocmask sets instead of refusing them.
-/// For an `rt_sigprocmask` that installs a set, returns a copy of that set
-/// without [`runtime::reserved_signal_mask`], to forward in its place.
-///
-/// Linux silently drops SIGKILL and SIGSTOP from such a set; the reserved
-/// signals are dropped the same way. A guest, or a Tool such as Detcore that
-/// blocks every signal around a blocking `wait4`, can then block everything
-/// else and keep running, instead of failing with EPERM. A later read of the
-/// mask shows the reserved signals unblocked, which Linux would not. A reserved
-/// signal that the guest asked to block also stays deliverable: one sent with
-/// `kill`, `tgkill` or `sigqueue` reaches the runtime's handler, which ends the
-/// process with status 126 for SIGSYS and applies the default action to
-/// SIGSEGV, where Linux would hold it pending for `rt_sigpending`,
-/// `rt_sigtimedwait` or `signalfd` to observe. Both deviations are tracked in
-/// <https://github.com/rrnewton/reverie/issues/915>.
-///
-/// `Ok(None)` forwards the call unchanged: it installs no set, or its size is
-/// not 8, which Linux rejects with EINVAL before reading the set. A set that
-/// cannot be read returns `Err(EFAULT)`, as Linux would, and nothing is
-/// forwarded, so an unstripped set never reaches Linux.
-///
-/// The set is copied by `process_vm_writev` from this process to itself: the
-/// kernel reads the source with the same user copy `rt_sigprocmask` uses, so
-/// any set Linux could read is read here, including one on a write-only page,
-/// and an unreadable one fails without a fault in the runtime.
-///
-/// The copy, and the stripped call that writes the old set, run with the
-/// calling thread's current protection-key rights; neither switches PKRU. At an
-/// installed hook those are the guest's rights, so a set or old set in memory
-/// whose key the guest's PKRU denies fails with EFAULT, as on Linux. On the
-/// SIGSYS fallback path the runtime has opened every key, so the same call is
-/// accepted there and the old set is written.
-///
-/// A seccomp filter the guest added sees calls Linux would not make. If it
-/// refuses `gettid` or `process_vm_writev` with an error, that error is returned
-/// instead of EFAULT; if it kills or traps on either, that happens to a call
-/// Linux would have accepted. A filter that inspects `rt_sigprocmask`'s
-/// arguments sees the runtime's set pointer in place of the guest's, so one
-/// that allows only the guest's pointer refuses the stripped call. Each case
-/// fails closed: no unstripped set is installed.
-fn stripped_signal_mask(number: i64, args: [u64; 6]) -> Result<Option<u64>, Errno> {
-    const SIGSET_SIZE: u64 = core::mem::size_of::<u64>() as u64;
-    if number != libc::SYS_rt_sigprocmask || args[1] == 0 || args[3] != SIGSET_SIZE {
-        return Ok(None);
-    }
-    let mut requested = 0_u64;
-    // The guest's set is the local source; this runtime's copy is the remote
-    // destination, written into the same address space.
-    let source = libc::iovec {
-        iov_base: args[1] as usize as *mut libc::c_void,
-        iov_len: SIGSET_SIZE as usize,
-    };
-    let destination = libc::iovec {
-        iov_base: (&raw mut requested).cast(),
-        iov_len: SIGSET_SIZE as usize,
-    };
-    // A thread id names this address space even after the thread-group leader
-    // has exited, when its process id no longer does.
-    let tid = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) };
-    if tid < 0 {
-        return Err(Errno::new(-tid as i32));
-    }
-    let copied = unsafe {
-        raw_syscall6(
-            libc::SYS_process_vm_writev,
-            [
-                tid as u64,
-                (&raw const source) as u64,
-                1,
-                (&raw const destination) as u64,
-                1,
-                0,
-            ],
-        )
-    };
-    if copied == SIGSET_SIZE as i64 {
-        Ok(Some(requested & !runtime::reserved_signal_mask()))
-    } else if copied >= 0 || copied == -i64::from(libc::EFAULT) {
-        // Part of the set, or none of it, could be read.
-        Err(Errno::EFAULT)
-    } else {
-        Err(Errno::new(-copied as i32))
-    }
-}
-
-#[reverie::tool]
-impl<T: Tool> Guest<T> for LiteinstGuest<'_, T> {
-    type Memory = LocalMemory;
-    type Stack = LocalStack;
-
-    fn tid(&self) -> Pid {
-        self.tid
-    }
-
-    fn pid(&self) -> Pid {
-        self.pid
-    }
-
-    fn ppid(&self) -> Option<Pid> {
-        self.ppid
-    }
-
-    // This in-process host has no begin/ready runtime window: install_runtime
-    // prepares instrumentation before reverie_preload::install arms the
-    // seccomp filter through which the Tool receives syscalls, so the
-    // runtime's own preparation is never delivered to it.
-    fn is_backend_runtime_bootstrap(&self) -> bool {
-        false
-    }
-
-    fn memory(&self) -> Self::Memory {
-        LocalMemory::new()
-    }
-
-    fn thread_state_mut(&mut self) -> &mut T::ThreadState {
-        self.state
-    }
-
-    fn thread_state(&self) -> &T::ThreadState {
-        self.state
-    }
-
-    async fn regs(&mut self) -> libc::user_regs_struct {
-        let mut regs = unsafe { core::mem::zeroed::<libc::user_regs_struct>() };
-        if self.event.context != 0 {
-            let context =
-                unsafe { &*(self.event.context as *const liteinst2::trampoline::HookContext) };
-            regs.r15 = context.r15;
-            regs.r14 = context.r14;
-            regs.r13 = context.r13;
-            regs.r12 = context.r12;
-            regs.rbp = context.rbp;
-            regs.rbx = context.rbx;
-            regs.r11 = context.r11;
-            regs.r10 = context.r10;
-            regs.r9 = context.r9;
-            regs.r8 = context.r8;
-            regs.rax = context.rax;
-            regs.rcx = context.rcx;
-            regs.rdx = context.rdx;
-            regs.rsi = context.rsi;
-            regs.rdi = context.rdi;
-            regs.orig_rax = context.rax;
-            regs.rip = context.instruction_pointer;
-            regs.rsp = context.stack_pointer;
-            regs.eflags = context.rflags;
-            return regs;
-        }
-        regs.rax = self.event.number as u64;
-        regs.orig_rax = self.event.number as u64;
-        regs.rdi = self.event.args[0];
-        regs.rsi = self.event.args[1];
-        regs.rdx = self.event.args[2];
-        regs.r10 = self.event.args[3];
-        regs.r8 = self.event.args[4];
-        regs.r9 = self.event.args[5];
-        regs.rip = self.event.instruction_pointer;
-        regs
-    }
-    async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), Error> {
-        self.event.number = regs.rax as i64;
-        self.event.args = [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9];
-        if self.event.context != 0 {
-            let context =
-                unsafe { &mut *(self.event.context as *mut liteinst2::trampoline::HookContext) };
-            context.r15 = regs.r15;
-            context.r14 = regs.r14;
-            context.r13 = regs.r13;
-            context.r12 = regs.r12;
-            context.rbp = regs.rbp;
-            context.rbx = regs.rbx;
-            context.r11 = regs.r11;
-            context.r10 = regs.r10;
-            context.r9 = regs.r9;
-            context.r8 = regs.r8;
-            context.rax = regs.rax;
-            context.rcx = regs.rcx;
-            context.rdx = regs.rdx;
-            context.rsi = regs.rsi;
-            context.rdi = regs.rdi;
-            context.stack_pointer = regs.rsp;
-            context.rflags = regs.eflags;
-        }
-        Ok(())
-    }
-    async fn stack(&mut self) -> Self::Stack {
-        LocalStack::new()
-    }
-
-    async fn daemonize(&mut self) {}
-
-    async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
-        let (number, args) = syscall.into_parts();
-        let number = number.id() as i64;
-        let mut raw_args = [
-            args.arg0 as u64,
-            args.arg1 as u64,
-            args.arg2 as u64,
-            args.arg3 as u64,
-            args.arg4 as u64,
-            args.arg5 as u64,
-        ];
-
-        if is_plain_fork(number, raw_args) {
-            let parent_tid = self.tid;
-            let parent_pid = self.pid;
-            self.prepare_fork_parent_state();
-            let result = forward_plain_fork(number, raw_args, None);
-            if result == 0 {
-                let child_tid = raw_pid(libc::SYS_gettid);
-                let child_pid = raw_pid(libc::SYS_getpid);
-                self.tail
-                    .set_fork_child(parent_tid, parent_pid, child_tid, child_pid);
-                return std::future::pending().await;
-            }
-            return Errno::from_ret(result as usize).map(|value| value as i64);
-        }
-
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        if matches!(number, libc::SYS_clone | libc::SYS_clone3 | libc::SYS_vfork) {
-            const MESSAGE: &[u8] = b"reverie-liteinst: clone injection requires ptrace fallback\n";
-            unsafe {
-                let _ = raw_syscall6(
-                    libc::SYS_write,
-                    [
-                        libc::STDERR_FILENO as u64,
-                        MESSAGE.as_ptr() as u64,
-                        MESSAGE.len() as u64,
-                        0,
-                        0,
-                        0,
-                    ],
-                );
-            }
-            return Err(Errno::EOPNOTSUPP);
-        }
-        if let Some(error) = injected_syscall_guard(number, raw_args) {
-            return Err(error);
-        }
-        if is_exit_syscall(number) {
-            self.tail.set_exit(number, raw_args);
-            return std::future::pending().await;
-        }
-        let kernel_signal_mask = stripped_signal_mask(number, raw_args)?;
-        if let Some(mask) = kernel_signal_mask.as_ref() {
-            raw_args[1] = mask as *const u64 as u64;
-        }
-
-        let result = unsafe { raw_syscall6(number, raw_args) };
-        Errno::from_ret(result as usize).map(|value| value as i64)
-    }
-
-    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
-        let (number, syscall_args) = syscall.into_parts();
-        let args = [
-            syscall_args.arg0 as u64,
-            syscall_args.arg1 as u64,
-            syscall_args.arg2 as u64,
-            syscall_args.arg3 as u64,
-            syscall_args.arg4 as u64,
-            syscall_args.arg5 as u64,
-        ];
-        let number = number.id() as i64;
-        if is_plain_fork(number, args) {
-            let parent_tid = self.tid;
-            let parent_pid = self.pid;
-            self.prepare_fork_parent_state();
-            let result = forward_plain_fork(number, args, None);
-            if result == 0 {
-                self.tail.set_fork_child(
-                    parent_tid,
-                    parent_pid,
-                    raw_pid(libc::SYS_gettid),
-                    raw_pid(libc::SYS_getpid),
-                );
-            } else {
-                self.tail.set_result(result);
-            }
-        } else if let Some(error) = injected_syscall_guard(number, args) {
-            self.tail.set_result(-i64::from(error.into_raw()));
-        } else if is_exit_syscall(number) {
-            self.tail.set_exit(number, args);
-        } else {
-            let value = match stripped_signal_mask(number, args) {
-                Err(error) => -i64::from(error.into_raw()),
-                Ok(None) => unsafe { raw_syscall6(number, args) },
-                Ok(Some(mask)) => {
-                    let mut args = args;
-                    args[1] = (&raw const mask) as u64;
-                    unsafe { raw_syscall6(number, args) }
-                }
-            };
-            self.tail.set_result(value);
-        }
-        std::future::pending().await
-    }
-
-    // TODO-HUMAN-REVIEW(PR-326): Review the coarse
-    // syscall-boundary clock until the minimal ptrace supervisor wires PMU delivery.
-    fn set_timer(&mut self, _sched: TimerSchedule) -> Result<(), Error> {
-        // Nothing in the guest arms an RCB threshold or dispatches
-        // `Tool::handle_timer_event`. Accepting the request would let a Tool
-        // believe a CPU-bound thread is bounded while it runs unpreempted to
-        // its next syscall, so refuse, as reverie-dbt does, and let a Tool
-        // that needs preemption fail closed. Clock reads still work.
-        Err(Errno::ENOSYS.into())
-    }
-
-    fn set_timer_precise(&mut self, _sched: TimerSchedule) -> Result<(), Error> {
-        // Same refusal as set_timer; never synthesize host time.
-        Err(Errno::ENOSYS.into())
-    }
-
-    fn read_clock(&mut self) -> Result<u64, Error> {
-        runtime::read_guest_rcb_clock().map_err(Error::from)
-    }
-
-    fn has_cpuid_interception(&self) -> bool {
-        self.cpuid_interception
-    }
-}
-
-pub struct LocalStack {
-    arena: Box<[u8]>,
-    offset: usize,
-}
-
-impl LocalStack {
-    fn new() -> Self {
-        Self {
-            arena: vec![0; STACK_CAPACITY].into_boxed_slice(),
-            offset: 0,
-        }
-    }
-
-    fn allocate<'stack, V>(&mut self, value: V) -> AddrMut<'stack, V> {
-        let align = core::mem::align_of::<V>();
-        let base = self.arena.as_ptr() as usize;
-        let start = (base + self.offset + align - 1) & !(align - 1);
-        let offset = start - base;
-        let end = offset + core::mem::size_of::<V>();
-        assert!(end <= self.arena.len(), "LiteInst guest stack overflow");
-        let pointer = unsafe { self.arena.as_mut_ptr().add(offset).cast::<V>() };
-        unsafe { pointer.write(value) };
-        self.offset = end;
-        AddrMut::from_raw(pointer as usize).expect("LiteInst stack produced a null address")
-    }
-}
-
-pub struct LocalStackGuard {
-    arena: Option<Box<[u8]>>,
-}
-
-impl Drop for LocalStackGuard {
+#[cfg(all(feature = "fixed-syscall-gates", feature = "exec-private-init"))]
+impl Drop for FixedGateInstallation {
     fn drop(&mut self) {
-        if let Some(arena) = self.arena.take() {
-            COMMITTED_STACKS.lock().push(arena);
+        if !self.complete && reverie_inguest::trap::fixed_gates_published() {
+            unsafe {
+                // Even stderr may be a full blocking pipe. Publication has
+                // made returning unsafe, so diagnostics cannot precede exit.
+                raw_syscall6(libc::SYS_exit_group, [127, 0, 0, 0, 0, 0]);
+                core::arch::asm!("ud2", options(noreturn));
+            }
         }
     }
 }
 
-impl Stack for LocalStack {
-    type StackGuard = LocalStackGuard;
-
-    fn size(&self) -> usize {
-        self.offset
-    }
-
-    fn capacity(&self) -> usize {
-        self.arena.len()
-    }
-
-    fn push<'stack, V>(&mut self, value: V) -> Addr<'stack, V> {
-        self.allocate(value).into()
-    }
-
-    fn reserve<'stack, V>(&mut self) -> AddrMut<'stack, V> {
-        let value = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
-        self.allocate(value)
-    }
-
-    fn commit(self) -> Result<Self::StackGuard, Errno> {
-        Ok(LocalStackGuard {
-            arena: Some(self.arena),
-        })
-    }
-}
-
-fn tool_fatal(status: i32, error: &Error) -> ! {
-    let message = format!("reverie-liteinst tool error: {error:?}\n");
-    unsafe {
-        let _ = raw_syscall6(
-            libc::SYS_write,
-            [
-                libc::STDERR_FILENO as u64,
-                message.as_ptr() as u64,
-                message.len() as u64,
-                0,
-                0,
-                0,
-            ],
-        );
-    }
-    fatal(status)
-}
-
-fn fatal(status: i32) -> ! {
-    unsafe {
-        let _ = raw_syscall6(libc::SYS_exit_group, [status as u64, 0, 0, 0, 0, 0]);
-    }
-    loop {
-        core::hint::spin_loop();
-    }
-}
+pub use installed_tool::blocking_global_rpc;

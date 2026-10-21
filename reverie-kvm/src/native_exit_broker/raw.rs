@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Native child implementation: raw syscalls, fixed stack messages and mmap
 //! bookkeeping only. No allocator, Rust destructors, locks, logging or callbacks
 //! run after fork. This candidate is for the crate's x86-64 Linux host ABI.

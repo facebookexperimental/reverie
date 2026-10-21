@@ -30,10 +30,13 @@ mod memory;
 #[cfg(feature = "notifier")]
 mod notifier;
 mod regs;
+mod syscall_info;
 mod waitid;
 
 use core::mem::MaybeUninit;
 use std::fmt;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use nix::sys::ptrace;
 // Re-exports so that nothing else needs to depend on `nix`.
@@ -90,8 +93,11 @@ pub use crate::notifier::SupersededStopRefusal;
 #[cfg(feature = "notifier")]
 pub use crate::notifier::TerminalCleanup;
 pub use crate::regs::*;
+pub use crate::syscall_info::SyscallInfo;
+pub use crate::syscall_info::SyscallInfoError;
+pub use crate::syscall_info::SyscallInfoOp;
 use crate::waitid::IdType;
-use crate::waitid::waitid;
+use crate::waitid::wait_status;
 
 /// Immutable generation token carried through every typed tracee state.
 #[derive(Clone, Debug)]
@@ -342,6 +348,67 @@ pub enum ChildOp {
     Clone,
 }
 
+/// A signal number, including one `nix`'s [`Signal`] cannot name: Linux's
+/// signals run from 1 to 64, and `nix` names only 1 to 31. Realtime signals
+/// (32 to 64; glibc reserves 32 and 33, so `SIGRTMIN()` is 34) are real and
+/// deliverable. It compares equal to the `nix` signal with the same number
+/// (<https://github.com/rrnewton/reverie/issues/207>).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AnySignal(i32);
+
+impl AnySignal {
+    /// The signal numbered `raw`, if Linux has one (1 to 64).
+    pub fn new(raw: i32) -> Option<Self> {
+        (1..=64).contains(&raw).then_some(Self(raw))
+    }
+
+    /// The raw signal number.
+    pub fn raw(self) -> i32 {
+        self.0
+    }
+
+    /// The `nix` signal, `None` for one it cannot name.
+    pub fn as_nix(self) -> Option<Signal> {
+        Signal::try_from(self.0).ok()
+    }
+}
+
+impl From<Signal> for AnySignal {
+    fn from(signal: Signal) -> Self {
+        Self(signal as i32)
+    }
+}
+
+impl PartialEq<Signal> for AnySignal {
+    fn eq(&self, other: &Signal) -> bool {
+        self.0 == *other as i32
+    }
+}
+
+impl PartialEq<AnySignal> for Signal {
+    fn eq(&self, other: &AnySignal) -> bool {
+        *self as i32 == other.0
+    }
+}
+
+impl std::fmt::Debug for AnySignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.as_nix() {
+            Some(signal) => write!(f, "{signal:?}"),
+            None => write!(f, "SIG{}", self.0),
+        }
+    }
+}
+
+impl std::fmt::Display for AnySignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.as_nix() {
+            Some(signal) => write!(f, "{signal}"),
+            None => write!(f, "SIG{}", self.0),
+        }
+    }
+}
+
 /// A stop event. Documentation is from `ptrace(2)`.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Event {
@@ -381,9 +448,37 @@ pub enum Event {
 
     /// The tracee was stopped by delivery of a signal.
     Signal(Signal),
+
+    /// The tracee was stopped by delivery of a signal that `nix`'s `Signal`
+    /// cannot name: a realtime signal, 32 to 64 (glibc reserves 32 and 33,
+    /// so `SIGRTMIN()` is 34). It is the raw signal number, always 32 to 64.
+    /// Resume with [`Stopped::resume_raw`] or [`Stopped::syscall_raw`] to
+    /// deliver it. Before, such a stop failed to decode with EINVAL, or, on
+    /// the wait paths without the `notifier` feature, was reported as a
+    /// SIGSTOP (<https://github.com/rrnewton/reverie/issues/207>).
+    RawSignal(i32),
 }
 
 impl Event {
+    /// The signal of a signal-delivery stop ([`Event::Signal`] or
+    /// [`Event::RawSignal`]), or `None` for any other stop.
+    pub fn signal(&self) -> Option<AnySignal> {
+        match *self {
+            Event::Signal(sig) => Some(sig.into()),
+            Event::RawSignal(raw) => AnySignal::new(raw),
+            _ => None,
+        }
+    }
+
+    /// The signal-delivery stop event for `sig`: [`Event::Signal`] when nix
+    /// names it, else [`Event::RawSignal`].
+    pub fn from_signal(sig: AnySignal) -> Self {
+        match sig.as_nix() {
+            Some(sig) => Event::Signal(sig),
+            None => Event::RawSignal(sig.raw()),
+        }
+    }
+
     /// Converts a raw i32 to a ptrace event and gets any associated data.
     fn from_ptrace_event(task: &Stopped, event: i32) -> Result<Self, Error> {
         // Note that there is no danger in calling ptrace here because the
@@ -457,16 +552,46 @@ impl Event {
     }
 }
 
-/// Helper function for waiting on one or more processes. Returns `None` if
-/// `WaitPidFlag::WNOHANG` was specified and the process is still running.
-fn wait(id: IdType, flags: WaitPidFlag) -> Result<Option<WaitStatus>, Errno> {
+/// `ptrace(request, pid, 0, sig)` for a resuming request, with the signal as a
+/// raw number so that one `nix` cannot name can be delivered.
+/// `PTRACE_SINGLEBLOCK` (arch/x86/include/uapi/asm/ptrace-abi.h), which the
+/// libc crate does not define. Linux accepts it on every x86-64 processor
+/// (`arch_has_block_step`).
+#[cfg(target_arch = "x86_64")]
+const PTRACE_SINGLEBLOCK: libc::c_uint = 33;
+
+fn ptrace_resume_raw(request: libc::c_uint, pid: Pid, sig: i32) -> Result<(), Errno> {
+    Errno::result(unsafe {
+        libc::ptrace(
+            request,
+            pid.as_raw(),
+            std::ptr::null_mut::<libc::c_void>(),
+            sig as libc::c_long as *mut libc::c_void,
+        )
+    })
+    .map(drop)
+}
+
+/// Helper function for waiting on one or more processes: the PID that
+/// changed state and its raw wait status, which `Wait::from_wait_helper`
+/// decodes.
+/// Returns `None` if `WaitPidFlag::WNOHANG` was specified and the process is
+/// still running.
+///
+/// A raw status keeps a realtime signal's number, which `nix`'s `WaitStatus`
+/// cannot hold (<https://github.com/rrnewton/reverie/issues/207>). A stop
+/// whose signal is 0 is reported as a SIGSTOP, as through `WaitStatus`: the
+/// status can sometimes be 0 when using PTRACE_SEIZE.
+fn wait(id: IdType, flags: WaitPidFlag) -> Result<Option<(Pid, i32)>, Errno> {
     loop {
-        let result = waitid(id, flags).map(|status| {
-            if status == WaitStatus::StillAlive {
-                None
-            } else {
-                Some(status)
-            }
+        let result = wait_status(id, flags).map(|changed| {
+            changed.map(|(pid, status)| {
+                if libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == 0 {
+                    (pid.into(), status | (libc::SIGSTOP << 8))
+                } else {
+                    (pid.into(), status)
+                }
+            })
         });
 
         if result == Err(Errno::EINTR) {
@@ -619,34 +744,62 @@ impl Wait {
     fn from_raw_with_token(pid: Pid, status: i32, token: TraceeToken) -> Result<Self, Error> {
         #[cfg(feature = "notifier")]
         token.event().invalidate_numeric_auth();
+        let wait = Self::decode_raw(pid, status, token)?;
+        #[cfg(all(test, feature = "notifier"))]
+        if let Wait::Stopped(task, Event::NewChild(..)) = &wait {
+            notifier::pause_sync_new_child_decode(task.1.event());
+        }
+        Ok(wait)
+    }
+
+    /// Decodes a status that one of the plain wait helpers (`wait_all`,
+    /// `wait_group`, `peek_all` and the like) returned. It is decoded as
+    /// [`Wait::from_raw`] decodes it, but without the notifier's bookkeeping
+    /// on the tracee's event handle, which these helpers never did.
+    fn from_wait_helper(pid: Pid, status: i32) -> Result<Self, Error> {
+        let token = if libc::WIFSTOPPED(status) {
+            TraceeToken::current_or_fresh(pid)
+        } else {
+            TraceeToken::new()
+        };
+        Self::decode_raw(pid, status, token)
+    }
+
+    /// Decodes a raw wait status, keeping a realtime stop signal's number
+    /// (`Event::RawSignal`).
+    fn decode_raw(pid: Pid, status: i32, token: TraceeToken) -> Result<Self, Error> {
         Ok(if libc::WIFEXITED(status) {
             Wait::Exited(pid, ExitStatus::Exited(libc::WEXITSTATUS(status)))
         } else if libc::WIFSIGNALED(status) {
-            let sig = Signal::try_from(libc::WTERMSIG(status)).map_err(|_| Errno::EINVAL)?;
-            Wait::Exited(pid, ExitStatus::Signaled(sig, libc::WCOREDUMP(status)))
+            // A realtime signal is `ExitStatus::SignaledRaw`
+            // (<https://github.com/rrnewton/reverie/issues/997>).
+            Wait::Exited(
+                pid,
+                ExitStatus::signaled(libc::WTERMSIG(status), libc::WCOREDUMP(status)),
+            )
         } else if libc::WIFSTOPPED(status) {
             let task = Stopped::from_token(pid, token);
 
             let event = if libc::WSTOPSIG(status) == libc::SIGTRAP | 0x80 {
                 Event::Syscall
             } else if (status >> 16) == 0 {
-                let sig = Signal::try_from(libc::WSTOPSIG(status)).map_err(|_| Errno::EINVAL)?;
-                Event::Signal(sig)
+                let raw = libc::WSTOPSIG(status);
+                match (Signal::try_from(raw), AnySignal::new(raw)) {
+                    (Ok(sig), _) => Event::Signal(sig),
+                    (Err(_), Some(_)) => Event::RawSignal(raw),
+                    (Err(_), None) => return Err(Errno::EINVAL.into()),
+                }
             } else {
-                let sig = Signal::try_from(libc::WSTOPSIG(status)).map_err(|_| Errno::EINVAL)?;
-
                 let event = status >> 16;
 
                 // PTRACE_EVENT_STOP is not guaranteed to return the correct
-                // signal, so we ignore it here.
-                debug_assert!(event == libc::PTRACE_EVENT_STOP || sig == Signal::SIGTRAP);
+                // signal, so we ignore it here. Compare raw numbers: the signal
+                // of a PTRACE_EVENT_STOP can be one nix cannot name.
+                debug_assert!(
+                    event == libc::PTRACE_EVENT_STOP || libc::WSTOPSIG(status) == libc::SIGTRAP
+                );
 
-                let event = Event::from_ptrace_event(&task, event)?;
-                #[cfg(all(test, feature = "notifier"))]
-                if matches!(event, Event::NewChild(..)) {
-                    notifier::pause_sync_new_child_decode(task.1.event());
-                }
-                event
+                Event::from_ptrace_event(&task, event)?
             };
 
             Wait::Stopped(task, event)
@@ -1146,8 +1299,10 @@ impl Stopped {
         self.getregset(libc::NT_PRFPREG)
     }
 
-    /// Sets the floating point registers.
+    /// Sets the floating point registers. Fails with `EPERM` once
+    /// [`forbid_fpu_register_writes`] has been called.
     pub fn setfpregs(&self, regs: &FpRegs) -> Result<(), Error> {
+        check_fpu_register_write()?;
         self.setregset(libc::NT_PRFPREG, regs)
     }
 
@@ -1183,10 +1338,12 @@ impl Stopped {
     }
 
     /// Restores a complete x86 XSAVE state previously returned by
-    /// [`Stopped::getxstate`].
+    /// [`Stopped::getxstate`]. Fails with `EPERM` once
+    /// [`forbid_fpu_register_writes`] has been called.
     // TODO-HUMAN-REVIEW(PR-270): Review complete ptrace XSTATE preservation API.
     #[cfg(target_arch = "x86_64")]
     pub fn setxstate(&self, state: &XState) -> Result<(), Error> {
+        check_fpu_register_write()?;
         let iov = libc::iovec {
             iov_base: state.0.as_ptr() as *mut libc::c_void,
             iov_len: state.0.len(),
@@ -1232,6 +1389,33 @@ impl Stopped {
         self.finish_retained_resume(result)
     }
 
+    /// Resume to a syscall stop, retaining the same stopped capability on error.
+    ///
+    /// The error contract is the same as [`Self::resume_retaining`]: the errno
+    /// does not establish unchanged kernel state or terminal acknowledgement.
+    /// The original event owner must retain and settle the returned capability.
+    pub fn syscall_retaining<T: Into<Option<Signal>>>(
+        self,
+        sig: T,
+    ) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace::syscall(self.0.into(), sig).map_err(nix_errno));
+        self.finish_retained_resume(result)
+    }
+
+    /// Like [`Self::syscall_retaining`], delivering a raw signal number.
+    ///
+    /// This permits genuine realtime signals without converting them to an
+    /// absent signal. Invalid numbers are refused by the original kernel
+    /// request, with the same generation-bound capability returned on error.
+    pub fn syscall_raw_retaining(self, sig: i32) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SYSCALL, self.0, sig));
+        self.finish_retained_resume(result)
+    }
+
     /// Transfers the original capability into a retained notifier wait.
     ///
     /// This performs no resume and constructs no replacement running or stopped
@@ -1271,6 +1455,53 @@ impl Stopped {
                 Err((self, error))
             }
         }
+    }
+
+    /// Resumes the process, delivering the raw signal `sig`, which may be one
+    /// `nix`'s `Signal` cannot name (a realtime signal; see
+    /// [`Event::RawSignal`]). `0` delivers nothing.
+    pub fn resume_raw(self, sig: i32) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_CONT, self.0, sig))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Like [`Stopped::syscall`], delivering the raw signal `sig` (see
+    /// [`Stopped::resume_raw`]).
+    pub fn syscall_raw(self, sig: i32) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SYSCALL, self.0, sig))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Like [`Stopped::step`], delivering the raw signal `sig` (see
+    /// [`Stopped::resume_raw`]).
+    pub fn step_raw(self, sig: i32) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(libc::PTRACE_SINGLESTEP, self.0, sig))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
+    }
+
+    /// Runs the process until it next takes a branch, with
+    /// `PTRACE_SINGLEBLOCK`, delivering no signal.
+    ///
+    /// x86 traps after each taken branch (jump, call, return, or conditional
+    /// branch that is taken) when the trap flag is set with DEBUGCTL.BTF, and
+    /// Linux reports the stop as a single step's: SIGTRAP with TRAP_TRACE.
+    /// The step can end earlier, at any stop a single step would also meet
+    /// (a signal, a syscall or seccomp stop, a fault), but never later than
+    /// just past the first taken branch. Conditional branches that are not
+    /// taken do not end it. A processor or hypervisor that ignores BTF steps
+    /// a single instruction instead, which is earlier still.
+    #[cfg(target_arch = "x86_64")]
+    pub fn block_step(self) -> Result<Running, Error> {
+        self.1
+            .on_held_tid(|| ptrace_resume_raw(PTRACE_SINGLEBLOCK, self.0, 0))
+            .map_err(|err| self.map_err(err))?;
+        Ok(self.into_running())
     }
 
     /// Advances the execution of the process by a single step optionally
@@ -1349,6 +1580,42 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace::setsiginfo(self.0.into(), siginfo).map_err(nix_errno))
             .map_err(|err| self.map_err(err))
+    }
+
+    /// The bytes of the siginfo of the signal that stopped the tracee
+    /// (`PTRACE_GETSIGINFO`), exactly as the kernel wrote them, into storage
+    /// that is initialized before the request. Unlike [`Stopped::getsiginfo`],
+    /// whose `siginfo_t` a typed move may leave with undefined padding (64-bit
+    /// musl's has four bytes after `si_code`), every byte is defined.
+    pub fn getsiginfo_bytes(&self) -> Result<[u8; SIGINFO_BYTES], Error> {
+        let mut bytes = [0u8; SIGINFO_BYTES];
+        self.1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_GETSIGINFO,
+                        self.0.as_raw(),
+                        0,
+                        bytes.as_mut_ptr(),
+                    )
+                })
+            })
+            .map_err(|err| self.map_err(err))?;
+        Ok(bytes)
+    }
+
+    /// Sets the siginfo of the signal that stopped the tracee
+    /// (`PTRACE_SETSIGINFO`) from `bytes`, the kernel's layout, without
+    /// building a `siginfo_t`.
+    pub fn setsiginfo_bytes(&self, bytes: &[u8; SIGINFO_BYTES]) -> Result<(), Error> {
+        self.1
+            .on_held_tid(|| {
+                Errno::result(unsafe {
+                    libc::ptrace(libc::PTRACE_SETSIGINFO, self.0.as_raw(), 0, bytes.as_ptr())
+                })
+            })
+            .map_err(|err| self.map_err(err))
+            .map(drop)
     }
 
     /// Gets the tracee's blocked signal mask (`PTRACE_GETSIGMASK`). Bit `n - 1`
@@ -1461,6 +1728,51 @@ impl Stopped {
         }
     }
 
+    /// Whether any queued signal matches `matches`, read like
+    /// `peeksiginfo_all` but 64 entries at a time with no more kept, and
+    /// stopping at the first match.
+    pub fn peeksiginfo_any<T, F>(&self, flags: T, mut matches: F) -> Result<bool, Error>
+    where
+        T: Into<Option<PeekSigInfoFlags>>,
+        F: FnMut(&libc::siginfo_t) -> bool,
+    {
+        const CHUNK: usize = 64;
+        let flags = flags.into().map_or(0, |x| x.bits());
+        let mut data = MaybeUninit::<[libc::siginfo_t; CHUNK]>::zeroed();
+        let mut off = 0u64;
+        loop {
+            let mut siginfo_args = ptrace_peeksiginfo_args {
+                off,
+                flags,
+                nr: CHUNK as u32,
+            };
+            let count = self
+                .1
+                .on_held_tid(|| {
+                    Errno::result(unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_PEEKSIGINFO,
+                            self.0.as_raw(),
+                            &mut siginfo_args as *mut _,
+                            data.as_mut_ptr() as *const _ as *const libc::c_void,
+                        )
+                    })
+                })
+                .map_err(|err| self.map_err(err))? as usize;
+            if count == 0 {
+                return Ok(false);
+            }
+            // SAFETY: zero-initialized, and the kernel wrote the first `count`.
+            if unsafe { data.assume_init_ref() }[..count]
+                .iter()
+                .any(&mut matches)
+            {
+                return Ok(true);
+            }
+            off += count as u64;
+        }
+    }
+
     /// Retrieve a message about the ptrace event that just happened.
     ///
     /// It shouldn't be necessary to call this in most cases because `Event`
@@ -1469,6 +1781,19 @@ impl Stopped {
         self.1
             .on_held_tid(|| ptrace::getevent(self.0.into()).map_err(nix_errno))
             .map_err(|err| self.map_err(err))
+    }
+
+    /// Detach while retaining the original generation-bound stop on error.
+    /// An errno does not establish unchanged kernel state or terminal status;
+    /// the original owner must retain and settle that uncertainty.
+    pub fn detach_retaining<T: Into<Option<Signal>>>(
+        self,
+        sig: T,
+    ) -> Result<Running, (Self, Errno)> {
+        let result = self
+            .1
+            .on_held_tid(|| ptrace::detach(self.0.into(), sig).map_err(nix_errno));
+        self.finish_retained_resume(result)
     }
 
     /// Detaches from and then resumes the stopped tracee.
@@ -1492,7 +1817,8 @@ pub fn wait_all() -> Result<Option<Wait>, Error> {
         .and_then(|status| {
             // Unwrap is OK because the process cannot be left in a running
             // state without WNOHANG.
-            Wait::try_from(status.unwrap())
+            let (pid, status) = status.unwrap();
+            Wait::from_wait_helper(pid, status)
         });
 
     match result {
@@ -1516,7 +1842,7 @@ pub fn try_wait_all() -> Result<Option<Wait>, Error> {
         IdType::All,
         WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED | WaitPidFlag::WNOHANG,
     )?
-    .map(Wait::try_from)
+    .map(|(pid, status)| Wait::from_wait_helper(pid, status))
     .transpose()
 }
 
@@ -1535,7 +1861,8 @@ pub fn wait_group(pid: Pid) -> Result<Option<Wait>, Error> {
     .and_then(|status| {
         // Unwrap is OK because the process cannot be left in a running
         // state without WNOHANG.
-        Wait::try_from(status.unwrap())
+        let (pid, status) = status.unwrap();
+        Wait::from_wait_helper(pid, status)
     });
 
     match result {
@@ -1582,7 +1909,7 @@ pub fn peek_all() -> Result<Option<Running>, Errno> {
     });
 
     match result {
-        Ok(status) => Ok(status.pid().map(|pid| Running::new(pid.into()))),
+        Ok((pid, _)) => Ok(Some(Running::new(pid))),
         Err(Errno::ECHILD) => {
             // waitpid(-1) only returns ECHILD when there are no more children
             // to wait for. Returning `None` here makes it easy to write a while
@@ -1603,7 +1930,7 @@ pub fn try_peek_all() -> Result<Option<Running>, Errno> {
         WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
     )?;
 
-    Ok(next.and_then(|state| state.pid().map(|pid| Running::new(pid.into()))))
+    Ok(next.map(|(pid, _)| Running::new(pid)))
 }
 
 /// A running child.
@@ -1785,7 +2112,8 @@ impl Running {
             .and_then(|status| {
                 // Unwrap is OK because the process cannot be in a running state without
                 // WNOHANG.
-                Wait::from_wait_status_with_token(status.unwrap(), token)
+                let (_, status) = status.unwrap();
+                Wait::decode_raw(pid, status, token)
             })
         }
     }
@@ -1811,11 +2139,15 @@ impl Running {
                 Wait::Stopped(stopped, event) => {
                     if pred(&event) {
                         break Ok(Wait::Stopped(stopped, event));
-                    } else if let Event::Signal(sig) = event {
-                        self = stopped.resume(Some(sig))?;
-                    } else {
-                        self = stopped.resume(None)?;
                     }
+                    // Forward a signal, named or not
+                    // (<https://github.com/rrnewton/reverie/issues/207>): a
+                    // resume without one would suppress it.
+                    self = match event {
+                        Event::Signal(sig) => stopped.resume(Some(sig))?,
+                        Event::RawSignal(raw) => stopped.resume_raw(raw)?,
+                        _ => stopped.resume(None)?,
+                    };
                 }
                 task => break Ok(task),
             }
@@ -1989,6 +2321,45 @@ pub fn traceme_and_stop() -> Result<(), Errno> {
     Ok(())
 }
 
+/// The size of Linux's `siginfo_t`, the unit of [`Stopped::getsiginfo_bytes`]
+/// and [`Stopped::setsiginfo_bytes`].
+pub const SIGINFO_BYTES: usize = 128;
+
+static FPU_REGISTER_WRITES_FORBIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Makes every later [`Stopped::setfpregs`] and [`Stopped::setxstate`] in this
+/// process fail with `EPERM`. It cannot be undone.
+///
+/// A tool calls this when a write to a tracee's floating-point or extended
+/// state would void a guarantee it gives. Hermit's x86-64-v3 CPU profile
+/// qualifies a host on the in-use bits a guest's own XSAVE reads, and the
+/// kernel's regset write forces some of those bits
+/// (<https://github.com/rrnewton/hermit/issues/4243>). The check sits at this
+/// layer, where every such write passes, so a caller added later cannot bypass
+/// it.
+///
+/// A caller that writes several register sets can be left part way: the
+/// gdbstub's `G` packet writes the general registers before the FP registers,
+/// so after this call such a packet is partly applied before it fails with
+/// EPERM. Hermit refuses `--gdbserver` under that profile, so it never reaches
+/// this.
+pub fn forbid_fpu_register_writes() {
+    FPU_REGISTER_WRITES_FORBIDDEN.store(true, Ordering::SeqCst);
+}
+
+/// Whether [`forbid_fpu_register_writes`] has been called in this process.
+pub fn fpu_register_writes_forbidden() -> bool {
+    FPU_REGISTER_WRITES_FORBIDDEN.load(Ordering::SeqCst)
+}
+
+fn check_fpu_register_write() -> Result<(), Error> {
+    if fpu_register_writes_forbidden() {
+        Err(Error::Errno(Errno::EPERM))
+    } else {
+        Ok(())
+    }
+}
+
 /// These tests are meant to test this API but also to show how ptrace works.
 #[cfg(test)]
 mod test {
@@ -2023,6 +2394,8 @@ mod test {
                                 break stopped;
                             } else if let Event::Signal(sig) = event {
                                 running = stopped.resume(Some(sig))?;
+                            } else if let Event::RawSignal(raw) = event {
+                                running = stopped.resume_raw(raw)?;
                             } else {
                                 running = stopped.resume(None)?;
                             }
@@ -2058,6 +2431,149 @@ mod test {
                 unsafe { ::libc::_exit(exit_code) };
             }
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn exercise_retained_syscall_stops(raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let (pid, mut stopped) = trace(
+            || {
+                // No Rust work is required between this actual syscall and
+                // the test helper's ordinary _exit.
+                unsafe {
+                    libc::syscall(libc::SYS_getpid);
+                }
+                23
+            },
+            Options::PTRACE_O_EXITKILL | Options::PTRACE_O_TRACESYSGOOD,
+        )?;
+        let generation = stopped.generation();
+        let mut found = false;
+        // libc raise's return may first expose its syscall exit or mask repair.
+        // Discover the actual GET_SYSCALL_INFO ENTRY, never alternate a phase bit.
+        for _ in 0..8 {
+            let running = if raw {
+                stopped.syscall_raw_retaining(0)
+            } else {
+                stopped.syscall_retaining(None)
+            }
+            .map_err(|(_, error)| error)?;
+            let (next, event) = running.wait()?.assume_stopped();
+            stopped = next;
+            assert_eq!(event, Event::Syscall);
+            assert_eq!(stopped.generation(), generation);
+            let info = stopped.getsyscallinfo()?;
+            assert_eq!(info.architecture, 0xc000_003e);
+            if matches!(info.operation, SyscallInfoOp::Entry { number, .. } if number == libc::SYS_getpid as u64)
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "did not observe the actual getpid entry within the fixture bound"
+        );
+        let entry = stopped.getsyscallinfo()?;
+        let running = if raw {
+            stopped.syscall_raw_retaining(0)
+        } else {
+            stopped.syscall_retaining(None)
+        }
+        .map_err(|(_, error)| error)?;
+        let (stopped, event) = running.wait()?.assume_stopped();
+        assert_eq!(event, Event::Syscall);
+        assert_eq!(stopped.generation(), generation);
+        let exit = stopped.getsyscallinfo()?;
+        assert_eq!(exit.architecture, entry.architecture);
+        assert_eq!(exit.instruction_pointer, entry.instruction_pointer);
+        assert_eq!(exit.stack_pointer, entry.stack_pointer);
+        assert_eq!(
+            exit.operation,
+            SyscallInfoOp::Exit {
+                return_value: i64::from(pid.as_raw()),
+                is_error: false,
+            }
+        );
+        assert_eq!(
+            stopped
+                .resume_retaining(None)
+                .map_err(|(_, error)| error)?
+                .wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(23)),
+        );
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_retaining_reaches_actual_entry_and_exit() -> Result<(), Box<dyn std::error::Error>> {
+        exercise_retained_syscall_stops(false)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_raw_retaining_reaches_actual_entry_and_exit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        exercise_retained_syscall_stops(true)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_raw_retaining_kernel_refusal_keeps_original_stop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (pid, stopped) = trace(|| 23, Options::PTRACE_O_EXITKILL)?;
+        let generation = stopped.generation();
+        let before = stopped.getregs()?;
+        let mask = stopped.getsigmask()?;
+        // Linux ptrace_resume rejects an invalid signal with EIO before resume.
+        // This is a real failed kernel request, not an injected mock errno.
+        let (stopped, error) = stopped.syscall_raw_retaining(i32::MAX).unwrap_err();
+        let after = stopped.getregs()?;
+        let after_mask = stopped.getsigmask()?;
+        let same_generation = stopped.generation() == generation;
+        // Confirm progress and terminal reap BEFORE assertions on the refusal.
+        let terminal = stopped
+            .resume_retaining(None)
+            .map_err(|(_, error)| error)?
+            .wait()?;
+        assert_eq!(terminal, Wait::Exited(pid, ExitStatus::Exited(23)));
+        assert_eq!(error, Errno::EIO);
+        assert!(same_generation);
+        assert_eq!(after, before);
+        assert_eq!(after_mask, mask);
+        Ok(())
+    }
+
+    #[test]
+    fn fpu_register_writes_fail_once_forbidden() -> Result<(), Box<dyn std::error::Error + 'static>>
+    {
+        // No other test in this binary writes FP registers, so forbidding them
+        // process-wide here does not disturb one.
+        let (pid, tracee) = trace(|| 0, Options::PTRACE_O_EXITKILL)?;
+        let fpregs = tracee.getfpregs()?;
+        tracee.setfpregs(&fpregs)?;
+        #[cfg(target_arch = "x86_64")]
+        let xstate = tracee.getxstate()?;
+        #[cfg(target_arch = "x86_64")]
+        tracee.setxstate(&xstate)?;
+        forbid_fpu_register_writes();
+        assert!(fpu_register_writes_forbidden());
+        assert!(matches!(
+            tracee.setfpregs(&fpregs),
+            Err(Error::Errno(Errno::EPERM))
+        ));
+        #[cfg(target_arch = "x86_64")]
+        assert!(matches!(
+            tracee.setxstate(&xstate),
+            Err(Error::Errno(Errno::EPERM))
+        ));
+        // Reads are unaffected.
+        tracee.getfpregs()?;
+        assert_eq!(
+            tracee.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(0))
+        );
+        Ok(())
     }
 
     #[test]
@@ -3082,6 +3598,233 @@ mod test {
         // The parent should have exited last
         assert_eq!(exited.pop(), Some((parent_pid, ExitStatus::Exited(0))));
 
+        Ok(())
+    }
+
+    static RT_HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    extern "C" fn note_realtime(signal: libc::c_int) {
+        RT_HANDLED.fetch_or(1 << (signal - 1), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A realtime signal-delivery stop decodes as `Event::RawSignal` with its
+    /// number, 32 and 33 included, and `resume_raw` delivers it to the
+    /// tracee's handler or, with 0, suppresses it
+    /// (<https://github.com/rrnewton/reverie/issues/207>). Standard signals
+    /// still decode as `Event::Signal`.
+    #[cfg(not(sanitized))]
+    #[test]
+    fn realtime_signal_stops_decode_raw_and_resume_raw_delivers_them()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let delivered = [34, 50, 64];
+        let (pid, tracee) = trace(
+            move || {
+                for signal in delivered {
+                    let mut action: libc::sigaction =
+                        unsafe { MaybeUninit::zeroed().assume_init() };
+                    action.sa_sigaction = note_realtime as *const () as usize;
+                    assert_eq!(
+                        unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) },
+                        0
+                    );
+                }
+                for signal in [32, 33, 34, 50, 64] {
+                    let ret = unsafe {
+                        let pid = libc::syscall(libc::SYS_getpid);
+                        let tid = libc::syscall(libc::SYS_gettid);
+                        libc::syscall(libc::SYS_tgkill, pid, tid, signal)
+                    };
+                    assert_eq!(ret, 0);
+                }
+                stop_self_with_raw_tgkill();
+                let want = delivered.iter().fold(0, |bits, s| bits | 1 << (s - 1));
+                if RT_HANDLED.load(std::sync::atomic::Ordering::SeqCst) == want {
+                    0
+                } else {
+                    1
+                }
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let mut running = tracee.resume(None)?;
+        for signal in [32, 33, 34, 50, 64] {
+            let stopped = match running.wait()? {
+                Wait::Stopped(stopped, Event::RawSignal(got)) if got == signal => stopped,
+                other => panic!("expected a raw {signal} delivery stop, got {other:?}"),
+            };
+            let any = AnySignal::new(signal).unwrap();
+            assert_eq!(Event::RawSignal(signal).signal(), Some(any));
+            assert_eq!(Event::from_signal(any), Event::RawSignal(signal));
+            assert_eq!(any.as_nix(), None);
+            assert_eq!(format!("{any}"), format!("SIG{signal}"));
+            // 32 and 33 are suppressed: their default action would end the
+            // tracee. The others reach the handler.
+            let deliver = if signal < 34 { 0 } else { signal };
+            running = stopped.resume_raw(deliver)?;
+        }
+        let stopped = expect_signal_stop(running, Signal::SIGSTOP);
+        assert_eq!(
+            Event::Signal(Signal::SIGSTOP).signal(),
+            Some(AnySignal::from(Signal::SIGSTOP))
+        );
+        assert_eq!(
+            stopped.resume(None)?.wait()?,
+            Wait::Exited(pid, ExitStatus::Exited(0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn any_signal_names_only_1_to_64() {
+        assert_eq!(AnySignal::new(0), None);
+        assert_eq!(AnySignal::new(65), None);
+        assert_eq!(AnySignal::new(-1), None);
+        assert_eq!(AnySignal::new(31).unwrap().as_nix(), Some(Signal::SIGSYS));
+        assert_eq!(AnySignal::new(32).unwrap().as_nix(), None);
+        assert_eq!(AnySignal::new(64).unwrap().raw(), 64);
+        assert_eq!(AnySignal::from(Signal::SIGUSR1), Signal::SIGUSR1);
+        assert_eq!(Event::Seccomp.signal(), None);
+        assert_eq!(
+            Event::from_signal(Signal::SIGUSR1.into()),
+            Event::Signal(Signal::SIGUSR1)
+        );
+    }
+
+    /// The plain wait helpers decode a realtime stop as `Event::RawSignal`
+    /// too, with and without the `notifier` feature. Before, they reported
+    /// it as a SIGSTOP (<https://github.com/rrnewton/reverie/issues/207>).
+    /// `wait_all` and `try_wait_all` decode as `wait_group` does
+    /// (`Wait::from_wait_helper`); the peeks return only the PID. Waiting
+    /// by process group keeps this test to its own tracee.
+    #[cfg(not(sanitized))]
+    #[test]
+    fn wait_group_decodes_a_realtime_stop() -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || {
+                let mut action: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
+                action.sa_sigaction = libc::SIG_IGN;
+                assert_eq!(
+                    unsafe { libc::sigaction(40, &action, std::ptr::null_mut()) },
+                    0
+                );
+                let ret = unsafe {
+                    let pid = libc::syscall(libc::SYS_getpid);
+                    let tid = libc::syscall(libc::SYS_gettid);
+                    libc::syscall(libc::SYS_tgkill, pid, tid, 40)
+                };
+                if ret == 0 { 0 } else { 1 }
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let _running = tracee.resume(None)?;
+        let stopped = match wait_group(pid)? {
+            Some(Wait::Stopped(stopped, Event::RawSignal(40))) => stopped,
+            other => panic!("expected a raw 40 delivery stop, got {other:?}"),
+        };
+        let _running = stopped.resume_raw(40)?;
+        assert_eq!(
+            wait_group(pid)?,
+            Some(Wait::Exited(pid, ExitStatus::Exited(0)))
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "notifier", not(sanitized)))]
+    static FIRST_SIGNAL_DELIVERIES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(all(feature = "notifier", not(sanitized)))]
+    extern "C" fn count_first_signal(_signal: libc::c_int) {
+        FIRST_SIGNAL_DELIVERIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(all(feature = "notifier", not(sanitized)))]
+    extern "C" fn ignore_target_signal(_signal: libc::c_int) {}
+
+    /// `wait_for_signal` forwards a signal it passes over, named or realtime,
+    /// rather than suppress it (from the Codex review of
+    /// <https://github.com/rrnewton/reverie/pull/995>). The tracee sends
+    /// itself a caught `first` signal, then SIGUSR1; the wait selects
+    /// SIGUSR1, and the tracee exits 0 only if `first`'s handler ran once.
+    /// Before, a realtime `first` was resumed with no signal and dropped
+    /// (exit 42); SIGUSR2 is the named control.
+    #[cfg(all(feature = "notifier", not(sanitized)))]
+    #[test]
+    fn wait_for_signal_forwards_an_intervening_signal_named_or_realtime()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        for first in [libc::SIGUSR2, 40] {
+            let (pid, tracee) = trace(
+                move || {
+                    for (signal, handler) in [
+                        (first, count_first_signal as *const () as usize),
+                        (libc::SIGUSR1, ignore_target_signal as *const () as usize),
+                    ] {
+                        let mut action: libc::sigaction =
+                            unsafe { MaybeUninit::zeroed().assume_init() };
+                        action.sa_sigaction = handler;
+                        assert_eq!(
+                            unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) },
+                            0
+                        );
+                    }
+                    for signal in [first, libc::SIGUSR1] {
+                        let ret = unsafe {
+                            let pid = libc::syscall(libc::SYS_getpid);
+                            let tid = libc::syscall(libc::SYS_gettid);
+                            libc::syscall(libc::SYS_tgkill, pid, tid, signal)
+                        };
+                        assert_eq!(ret, 0);
+                    }
+                    let calls = FIRST_SIGNAL_DELIVERIES.load(std::sync::atomic::Ordering::SeqCst);
+                    if calls == 1 { 0 } else { 42 }
+                },
+                Options::PTRACE_O_EXITKILL,
+            )?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let status = runtime.block_on(async {
+                let selected = tracee
+                    .resume(None)?
+                    .wait_for_signal(Signal::SIGUSR1)
+                    .await?;
+                let stopped = match selected {
+                    Wait::Stopped(stopped, Event::Signal(Signal::SIGUSR1)) => stopped,
+                    other => panic!("expected the SIGUSR1 stop, got {other:?}"),
+                };
+                stopped.resume(Some(Signal::SIGUSR1))?.next_state().await
+            })?;
+            assert_eq!(
+                status,
+                Wait::Exited(pid, ExitStatus::Exited(0)),
+                "first signal {first}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A tracee that a realtime signal kills decodes as
+    /// `ExitStatus::SignaledRaw` with its number; it failed with EINVAL
+    /// (<https://github.com/rrnewton/reverie/issues/997>).
+    #[cfg(not(sanitized))]
+    #[test]
+    fn a_tracee_killed_by_a_realtime_signal_exits_signaled_raw()
+    -> Result<(), Box<dyn std::error::Error + 'static>> {
+        let (pid, tracee) = trace(
+            || {
+                unsafe { libc::raise(40) };
+                0
+            },
+            Options::PTRACE_O_EXITKILL,
+        )?;
+        let stopped = match tracee.resume(None)?.wait()? {
+            Wait::Stopped(stopped, Event::RawSignal(40)) => stopped,
+            other => panic!("expected a raw 40 delivery stop, got {other:?}"),
+        };
+        assert_eq!(
+            stopped.resume_raw(40)?.wait()?,
+            Wait::Exited(pid, ExitStatus::SignaledRaw(40, false))
+        );
         Ok(())
     }
 }

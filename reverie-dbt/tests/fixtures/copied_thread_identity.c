@@ -1,5 +1,4 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
+/* Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -12,12 +11,15 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "kernel_task_identity.h"
 
 static long observed;
+static kernel_task_identity_t kernel;
 
 static void* observe_identity(void* unused) {
   (void)unused;
   observed = syscall(SYS_gettid);
+  kernel = kernel_task_identity();
   return NULL;
 }
 
@@ -31,9 +33,10 @@ int main(void) {
       return 2;
     if (pthread_join(thread, NULL) != 0)
       return 3;
-    if (syscall(SYS_getpid) != 4 || observed != 5)
+    if (syscall(SYS_getpid) != kernel.pid || observed != kernel.tid ||
+        observed <= 0 || observed == kernel.pid)
       return 4;
-    puts("copied-thread-identity=ok pid=4 tid=5");
+    puts("copied-thread-identity=ok");
     return 0;
   }
   int status = 0;

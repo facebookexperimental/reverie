@@ -66,7 +66,13 @@ impl Tool for CounterTool {
     }
 }
 
-unsafe extern "C" fn invoke_host_syscall(_context: usize, sysnum: i64, args: *const u64) -> i64 {
+unsafe extern "C" fn invoke_host_syscall(
+    _context: usize,
+    sysnum: i64,
+    args: *const u64,
+    purpose: u32,
+) -> i64 {
+    assert_eq!(purpose, reverie::InjectionPurpose::Application as u32);
     let args = unsafe { std::slice::from_raw_parts(args, 6) };
     unsafe { libc::syscall(sysnum, args[0], args[1], args[2], args[3], args[4], args[5]) as i64 }
 }

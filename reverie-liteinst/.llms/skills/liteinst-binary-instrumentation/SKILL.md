@@ -1,9 +1,6 @@
 ---
 name: liteinst-binary-instrumentation
 description: "Use when changing LiteInst syscall discovery, text patching, trampolines, executable-map tracking, trap fallback, or allocator scopes."
-metadata:
-  oncalls:
-    - hermit
 ---
 
 # LiteInst Binary Instrumentation

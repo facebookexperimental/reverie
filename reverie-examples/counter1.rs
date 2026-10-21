@@ -6,26 +6,44 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Ptrace launcher for the shared counter1 tool.
+//! Launcher for the shared counter1 tool on any Reverie backend (`--backend`).
 
 mod counter1_tool;
 
+#[path = "backend.rs"]
+mod backend;
+
 use clap::Parser;
 use counter1_tool::CounterLocal;
-use reverie::Error;
 use reverie_util::CommonToolArguments;
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    let args = CommonToolArguments::parse();
-    let log_guard = args.init_tracing();
-    let tracer = reverie_ptrace::TracerBuilder::<CounterLocal>::new(args.into())
-        .spawn()
-        .await?;
-    let (status, global_state) = tracer.wait().await?;
-    eprintln!("counter1-global syscalls={}", global_state.total());
+/// Run PROGRAM under the counter1 tool on BACKEND.
+#[derive(Debug, Parser)]
+struct Args {
+    /// The Reverie backend to run the program on.
+    #[clap(long, value_enum, default_value = "ptrace", alias = "runner")]
+    backend: backend::BackendKind,
+    /// The example preload the in-guest backends host the tool in; by
+    /// default `libreverie_examples.so` beside this binary.
+    #[clap(long)]
+    preload: Option<std::path::PathBuf>,
+    #[clap(flatten)]
+    common: CommonToolArguments,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let log_guard = args.common.init_tracing();
+    let run = backend::run_blocking::<CounterLocal>(
+        args.backend,
+        &args.common,
+        (),
+        "counter1",
+        args.preload.clone(),
+    )?;
+    eprintln!("counter1-global syscalls={}", run.global_state.total());
     drop(log_guard);
-    status.raise_or_exit()
+    run.status.raise_or_exit()
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]

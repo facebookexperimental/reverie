@@ -1,76 +1,135 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use std::env;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("reverie-liteinst requires Linux x86-64");
 
+mod allocator_backing;
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod allocator_fixture;
 mod backend;
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod fixed_arena_fixture;
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod generic_fixture;
+#[cfg(feature = "exec-private-init")]
+mod initial_image_stats;
 mod interior_entry;
+mod liteinst_census;
+#[cfg(feature = "native-exec-state")]
+pub mod native_exec_state;
 mod patch_alloc;
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod stack_fixture;
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod standalone_fixture;
 mod stats;
 mod straddler;
 mod syscall_fallback;
 
 pub use backend::COORDINATOR_ENV;
+#[cfg(feature = "exec-private-init")]
+pub use backend::InitialImageStatsCollector;
+#[cfg(feature = "exec-private-init")]
+pub use backend::InitialImageStatsServer;
 pub use backend::LiteinstBackend;
 pub use backend::PreloadBootstrap;
 pub use backend::STATS_COORDINATOR_ENV;
 pub use backend::TOOL_PRELOAD_ENV;
 pub use backend::take_preload_bootstrap;
-pub use reverie_ptrace::LiteinstInstrumentationStats;
 pub use stats::InheritedEntries;
 pub use stats::LiteinstBackendStatsSnapshot;
 pub use stats::LiteinstBackendStatsSource;
 pub use stats::LiteinstDispatchPath;
 pub use stats::LiteinstPatchDecision;
+pub use stats::guest_stats_enabled;
 pub mod rpc;
 mod runtime;
 mod tool_host;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-252): Review shared reverie-preload built-in re-exports.
-/// Shared `reverie-preload` built-in tool enum and getpid spoof constant.
+// TODO-HUMAN-REVIEW(PR-252): Review shared reverie-inguest built-in re-exports.
+#[doc(hidden)]
+pub use allocator_backing::AllocatorBackingDescriptor;
+pub use patch_alloc::FixedPrivatePatchAllocator as FixedToolAllocator;
+pub use patch_alloc::PatchAllocator as ScopedToolAllocator;
+pub use patch_alloc::PrivatePatchAllocator as PrivateToolAllocator;
+/// Shared `reverie-inguest` built-in tool enum and getpid spoof constant.
 ///
 /// These are re-exported verbatim so LiteInst and e9patch present the same
 /// built-in surface; the same [`BuiltinTool`] value installs the same dispatcher
-/// in both backends via `reverie_preload::install_builtin`.
-pub use reverie_preload::BuiltinTool;
-pub use reverie_preload::SPOOF_PID;
+/// in both backends via `reverie_inguest::install_builtin`.
+pub use reverie_inguest::BuiltinTool;
+pub use reverie_inguest::SPOOF_PID;
+pub use reverie_inguest::guest::host::CreationHookError;
+pub use reverie_inguest::guest::host::CreationRefusal;
+pub use reverie_inguest::guest::host::PhysicalCreation;
+pub use reverie_inguest::guest::host::PhysicalCreationHook;
+pub use reverie_inguest::guest::host::RefusedChild;
+pub use reverie_inguest::guest::host::set_physical_creation_hook;
+/// Native fixed-stack entry used by the owned standalone leaf.
+#[doc(hidden)]
+pub use reverie_inguest::guest::tool_region::constructor_entry;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-254): Review shared RuntimeConfig alt-stack re-exports.
 /// `REVERIE_LITEINST_ALT_STACK` selector and parser for the shared
-/// `reverie-preload` `RuntimeConfig` alt-stack knob.
+/// `reverie-inguest` `RuntimeConfig` alt-stack knob.
 pub use runtime::ALT_STACK_ENV;
 pub use runtime::IN_GUEST_STAGE_STREAM_ENV;
 pub use runtime::PROCESS_FORK_ENV;
+pub use runtime::SIGALRM_HANDLERS_ENV;
 pub use runtime::SITE_PATCHING_ENV;
 /// `REVERIE_LITEINST_TOOL` values and parser for shared built-in selection.
 pub use runtime::TOOL_PASSTHROUGH;
 pub use runtime::TOOL_SPOOF_GETPID;
 pub use runtime::alt_stack_from_env_value;
 pub use runtime::builtin_tool_from_env_value;
+pub use runtime::reserve_tool_output_fd;
+pub use runtime::site_patching_enabled;
 pub use runtime::site_patching_from_env_value;
+pub use runtime::tool_output_fd;
 pub use straddler::STRADDLER_STALENESS_TICKS_ENV;
 pub use straddler::straddler_staleness_from_env_value;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::InstalledInitialImage;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::InstalledSuccessorImage;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::NativeSuccessorConsumer;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::PreparedInitialImage;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::PreparedSuccessorImage;
+pub use tool_host::blocking_global_rpc;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::initialize_initial_image_lifecycle;
 pub use tool_host::install_tool;
 pub use tool_host::install_tool_from_bootstrap;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::install_tool_initial_image;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::install_tool_initial_image_with_native_exec;
 pub use tool_host::install_tool_quiescent;
-
-#[global_allocator]
-static PATCH_ALLOCATOR: patch_alloc::PatchAllocator = patch_alloc::PatchAllocator;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::install_tool_successor_image;
+#[cfg(feature = "exec-private-init")]
+pub use tool_host::prepare_tool_initial_image;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use tool_host::prepare_tool_mapped_initial_image;
+#[cfg(feature = "exec-native-injection")]
+pub use tool_host::prepare_tool_successor_image;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-87): Review the inherited compatibility event channel.
@@ -117,17 +176,23 @@ pub fn preload_library_path() -> io::Result<PathBuf> {
         });
     }
 
-    let executable = env::current_exe()?;
+    preload_library_beside(&env::current_exe()?)
+}
+
+fn preload_library_beside(executable: &std::path::Path) -> io::Result<PathBuf> {
     let parent = executable.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
     })?;
     [
-        parent.join("libreverie_liteinst.so"),
-        parent.join("deps/libreverie_liteinst.so"),
+        parent.join("libreverie_liteinst_preload.so"),
+        parent.join("deps/libreverie_liteinst_preload.so"),
         parent
             .parent()
             .unwrap_or(parent)
-            .join("libreverie_liteinst.so"),
+            .join("libreverie_liteinst_preload.so"),
+        // A warm pre-split Cargo tree may retain the old core cdylib under this
+        // canonical installed name. Prefer every new leaf before that fallback.
+        parent.join("libreverie_liteinst.so"),
     ]
     .into_iter()
     .find(|path| path.is_file())
@@ -168,9 +233,9 @@ fn builtin_tool_env_value(tool: BuiltinTool) -> &'static str {
 /// Configures a guest command to load the runtime and select a shared built-in.
 ///
 /// This is the built-in analog of [`configure_command`]: it sets `LD_PRELOAD`
-/// and `REVERIE_LITEINST_TOOL` to a shared `reverie-preload` [`BuiltinTool`]
+/// and `REVERIE_LITEINST_TOOL` to a shared `reverie-inguest` [`BuiltinTool`]
 /// selector, so the runtime installs the built-in verbatim through
-/// `reverie_preload::install_builtin` (no LiteInst patching). It mirrors
+/// `reverie_inguest::install_builtin` (no LiteInst patching). It mirrors
 /// e9patch's launcher-side built-in configuration.
 pub fn configure_command_builtin(command: &mut Command, tool: BuiltinTool) -> io::Result<()> {
     let mut preload = preload_library_path()?.into_os_string();
@@ -186,12 +251,12 @@ pub fn configure_command_builtin(command: &mut Command, tool: BuiltinTool) -> io
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-254): Review launcher-side shared RuntimeConfig alt-stack selector.
-/// Selects the shared `reverie-preload` `RuntimeConfig` alt-stack knob for a guest.
+/// Selects the shared `reverie-inguest` `RuntimeConfig` alt-stack knob for a guest.
 ///
 /// Sets [`ALT_STACK_ENV`] so the in-guest runtime installs its `SIGSYS` handler
 /// with or without an alternate signal stack (`RuntimeConfig::use_alt_stack`).
 /// The `RuntimeConfig` and the controller honoring it are shared with e9patch in
-/// `reverie-preload`; only the env-var spelling is LiteInst's. Leaving this
+/// `reverie-inguest`; only the env-var spelling is LiteInst's. Leaving this
 /// unset preserves the shared default (alt stack on). It composes with
 /// [`configure_command`] and [`configure_command_builtin`]; the written value
 /// round-trips through [`alt_stack_from_env_value`].
@@ -222,100 +287,112 @@ pub fn set_guest_site_patching(command: &mut Command, enabled: bool) {
 // TODO-HUMAN-REVIEW(#61): this constructor installs process-wide signal and seccomp state.
 /// Initializes the preload runtime when selected by the launcher environment.
 ///
+/// The actual preload leaf owns the constructor and uses
+/// [`declare_fixed_tool_allocator!`]. An embedded legacy root uses
+/// [`declare_legacy_scoped_tool_allocator!`] or
+/// [`declare_legacy_private_tool_allocator!`] for its existing policy. Each
+/// declaration couples the compiler allocator with its immutable backing
+/// contract; a missing or duplicate declaration is a link error. The core
+/// installs neither a default allocator nor its own
+/// LiteInst constructor. The independent legacy `reverie-inguest` constructor
+/// can still be enabled by that dependency's `preload-constructor` feature.
+/// A caller whose allocator does not own the dispatch preflight allocation is
+/// refused before runtime activation. This explicit call first reserves a fixed
+/// guarded scalar stack, even when its environment getter selects no Tool. Such
+/// a call returns with that reservation retained and without runtime activation.
+/// A repeated call, or an already-owned/colliding region, refuses before a
+/// second getter/body invocation. The selector-absent standalone constructor
+/// remains a separate inert path and does not call this entry.
+///
 /// # Safety
 ///
-/// The dynamic loader must call this exactly once before application threads
-/// start. Calling it again would stack an irreversible seccomp filter.
+/// Call once during trusted single-threaded startup, with clear DF and no
+/// active runtime filter. Repeated calls refuse before reading the selector
+/// or installing another runtime.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_liteinst_initialize() {
-    if let Err(error) = runtime::initialize_from_environment() {
-        eprintln!("reverie-liteinst initialization failed: {error}");
-        unsafe {
-            libc::_exit(127);
-        }
-    }
+    core::arch::naked_asm!(
+        "endbr64",
+        "lea rdi, [rip + {body}]",
+        "jmp {entry}",
+        body = sym reverie_liteinst_generic_body,
+        entry = sym reverie_inguest::guest::tool_region::generic_entry,
+    );
 }
 
-/// Version of the explicit host-runtime configuration layout.
-pub const HOST_RUNTIME_CONFIG_VERSION: u64 = 1;
-
-/// Configuration for controller-owned host-runtime initialization.
-///
-/// This selects the existing ptrace host runtime, not an in-process Tool. The
-/// initializer does not inspect or mutate guest environment selectors.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(C)]
-pub struct HostRuntimeConfig {
-    /// Must equal [`HOST_RUNTIME_CONFIG_VERSION`].
-    pub version: u64,
-    /// Calibrated WordPatch++ delay in TSC ticks; zero disables concurrent
-    /// cross-cache-line publication, just as an absent environment setting does.
-    /// Concurrent publication would require a delay above this machine's
-    /// measured staleness bound. The ptrace helper retains caller-verified
-    /// quiescent publication; this configuration does not authorize concurrency.
-    pub straddler_staleness_ticks: u64,
-}
-
-impl Default for HostRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            version: HOST_RUNTIME_CONFIG_VERSION,
-            straddler_staleness_ticks: 0,
-        }
-    }
-}
-
-/// Initializes the host runtime from explicit controller configuration.
-///
-/// Returns zero after the existing Begin/Ready handshake and instrumentation
-/// preparation, or a negative errno on failure. A preparation failure after
-/// Begin is first reported at the Ready trap site with the distinct failed
-/// marker in RAX, closing the handshake without activating the runtime. Null
-/// or unsupported-version configuration is rejected before initialization
-/// starts. A repeated or reentrant valid host attempt returns `-EALREADY`,
-/// including after a preparation failure: partially published runtime state
-/// cannot be rolled back here.
-/// The existing constructor continues to select behavior from the environment.
-///
-/// # Safety
-///
-/// A non-null `config` must point to a readable, aligned [`HostRuntimeConfig`]
-/// for this call. The runtime must already be loaded and its TLS usable. The
-/// caller must keep other application threads stopped or absent, have no other
-/// runtime mode installed, and service the exact existing host handshake traps.
-/// This neither loads the runtime nor transfers an in-process Tool or scheduler.
+// Distinct local Rust body: the existing dispatch/preflight/getter order stays
+// intact, and only the native entry may supply this body to its fresh bootstrap.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_liteinst_initialize_host(
-    config: *const HostRuntimeConfig,
-) -> libc::c_int {
-    if config.is_null() {
-        return -libc::EINVAL;
-    }
-    // SAFETY: required by the caller contract above; copy before initialization.
-    let config = unsafe { *config };
-    host_initialize_status(runtime::initialize_host_runtime_explicit(config))
+#[inline(never)]
+unsafe extern "C" fn reverie_liteinst_generic_body() {
+    let _scope = reverie_inguest::guest::alloc::enter_dispatch();
+    initialization_or_exit(
+        patch_alloc::preflight_allocator().and_then(|()| runtime::initialize_from_environment()),
+    );
 }
 
-/// Zero, or the negative errno that [`reverie_liteinst_initialize_host`] returns.
-fn host_initialize_status(result: std::io::Result<()>) -> libc::c_int {
-    match result {
-        Ok(()) => 0,
-        Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => {
-            // A constructor-heap miss carries a message, not an errno.
-            -error.raw_os_error().unwrap_or(libc::ENOMEM)
-        }
+core::arch::global_asm!(".hidden reverie_liteinst_generic_body");
+
+/// Establish an ordinary region owner for the explicit-entry refusal control.
+/// This setup operation is separate from all read-only placement queries.
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub extern "C" fn m4_generic_ordinary_owner_setup() -> i32 {
+    match reverie_inguest::guest::tool_region::ToolRegion::reserve() {
+        Ok(_) => 0,
         Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
     }
 }
 
-/// Bytes ever carved from the host-runtime constructor heap.
+/// Initialize the actual standalone leaf after native fixed-stack adoption.
 ///
-/// The Begin..Ready window allocates from a dedicated reclaiming heap so the
-/// guest's allocator is untouched at `main`. This is its peak footprint, for
-/// tests and diagnostics; it does not change after Ready.
-#[unsafe(no_mangle)]
-pub extern "C" fn reverie_liteinst_host_init_heap_high_water() -> u64 {
-    patch_alloc::init_heap_high_water() as u64
+/// This private leaf control reads the first exact selector from the current
+/// `environ` vector. It deliberately does not consult an interposed `getenv`;
+/// [`reverie_liteinst_initialize`] retains that generic embedding behavior.
+/// The owned value is copied before initialization calls other providers.
+///
+/// # Safety
+///
+/// Call once from the actual leaf's authenticated constructor body, before
+/// application threads start. The environment must remain valid and stable
+/// from the native selector scan through this copy. No active runtime may
+/// precede this initialization. The caller invokes its compatibility resolver
+/// only after this function returns and its dispatch scope has been dropped.
+#[doc(hidden)]
+#[inline(never)]
+#[unsafe(export_name = "reverie_liteinst_standalone_initialize")]
+pub unsafe extern "C" fn initialize_standalone() {
+    let _scope = reverie_inguest::guest::alloc::enter_dispatch();
+    let result = patch_alloc::preflight_allocator().and_then(|()| {
+        let selected = reverie_inguest::guest::support::environment_value(b"REVERIE_LITEINST_TOOL")
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "REVERIE_LITEINST_TOOL disappeared during standalone initialization",
+                )
+            })?;
+        let selected = OsString::from_vec(selected.to_vec());
+        runtime::initialize_from_selected_value(Some(&selected))
+    });
+    initialization_or_exit(result);
+}
+
+// The actual leaf cannot be redirected through another object's initializer.
+// This does not change the separately exported generic initializer.
+core::arch::global_asm!(".hidden reverie_liteinst_standalone_initialize");
+
+fn initialization_or_exit(result: io::Result<()>) {
+    if let Err(error) = result {
+        eprintln!("reverie-liteinst initialization failed: {error}");
+        // libc's _exit, not a raw exit_group from this library: an exit_group
+        // issued from the runtime's own code bypasses the runtime's exit path,
+        // so an installed runtime would not report the process's statistics
+        // to the coordinator. The process ends here, so an interposed _exit
+        // can change only a heap that is about to disappear.
+        unsafe { libc::_exit(127) };
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-127): Review public per-site instrumentation counters.
@@ -371,11 +448,6 @@ pub extern "C" fn reverie_liteinst_fallback_syscall_refusal_count(number: i64) -
     runtime::fallback_syscall_refusal_count(number)
 }
 
-#[cfg(feature = "preload-constructor")]
-#[used]
-#[unsafe(link_section = ".init_array")]
-static REVERIE_LITEINST_INIT: unsafe extern "C" fn() = reverie_liteinst_initialize;
-
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -387,6 +459,41 @@ mod tests {
     use super::set_guest_alt_stack;
     use super::set_guest_site_patching;
     use super::site_patching_from_env_value;
+
+    #[test]
+    fn generated_preload_leaves_precede_a_stale_canonical_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let debug = root.path().join("debug");
+        let deps = debug.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let executable = debug.join("reverie-liteinst-strace");
+        let installed = debug.join("libreverie_liteinst.so");
+        std::fs::write(&installed, b"old core artifact or installed runtime").unwrap();
+        // Canonical installation still works when there is no generated leaf.
+        assert_eq!(
+            super::preload_library_beside(&executable).unwrap(),
+            installed
+        );
+        // Reproduce a warm Cargo tree after the package split: the old core
+        // artifact must not hide the newly produced private-allocator leaf.
+        let generated = deps.join("libreverie_liteinst_preload.so");
+        std::fs::write(&generated, b"fresh preload leaf").unwrap();
+        assert_eq!(
+            super::preload_library_beside(&executable).unwrap(),
+            generated
+        );
+        std::fs::remove_file(&generated).unwrap();
+        // A test executable under deps must also prefer the new parent leaf
+        // over a legacy artifact beside that executable.
+        let test_executable = deps.join("strace-test");
+        std::fs::write(deps.join("libreverie_liteinst.so"), b"stale core").unwrap();
+        let parent_leaf = debug.join("libreverie_liteinst_preload.so");
+        std::fs::write(&parent_leaf, b"fresh preload leaf").unwrap();
+        assert_eq!(
+            super::preload_library_beside(&test_executable).unwrap(),
+            parent_leaf
+        );
+    }
 
     /// The value the launcher writes must parse back to the same boolean it
     /// selected, for both polarities. This closes the loop between the setter
@@ -444,3 +551,8 @@ mod tests {
         }
     }
 }
+
+/// Bounded spare-lease diagnostics for the separate mapping integrity fixture.
+#[cfg(feature = "allocator-fixture")]
+#[doc(hidden)]
+pub mod mapping_integrity_fixture;

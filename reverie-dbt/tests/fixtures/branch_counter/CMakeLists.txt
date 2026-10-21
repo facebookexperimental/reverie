@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.14)
+project(branch_counter_controls C ASM)
+find_package(DynamoRIO REQUIRED)
+add_library(cache_invalidation_client SHARED cache_invalidation_client.c)
+configure_DynamoRIO_client(cache_invalidation_client)
+use_DynamoRIO_extension(cache_invalidation_client drmgr)
+use_DynamoRIO_extension(cache_invalidation_client drreg)
+target_include_directories(cache_invalidation_client PRIVATE ../../../native)
+add_executable(cache_invalidation_guest cache_invalidation_guest.S)
+target_link_options(cache_invalidation_guest PRIVATE -nostdlib -static -no-pie)
+
+add_library(returning_guard_client SHARED returning_guard_client.c)
+configure_DynamoRIO_client(returning_guard_client)

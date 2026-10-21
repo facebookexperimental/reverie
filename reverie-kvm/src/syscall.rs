@@ -21,46 +21,67 @@ pub(crate) const RESULT_WORD: usize = 7;
 pub(crate) const RETURN_RIP_WORD: usize = 8;
 pub(crate) const RETURN_FLAGS_WORD: usize = 9;
 pub(crate) const SAVED_RBX_WORD: usize = 10;
-const FRAME_WORDS: usize = 11;
+/// Nonzero when the trampoline must return with IRETQ rather than SYSRETQ,
+/// because the staged user context has RCX/R11 values that SYSRETQ would
+/// replace with RIP/RFLAGS (see `stage_process_signal_return`).
+pub(crate) const FULL_RETURN_WORD: usize = 11;
+pub(crate) const RETURN_RCX_WORD: usize = 12;
+pub(crate) const RETURN_R11_WORD: usize = 13;
+/// The five-word IRETQ frame (RIP, CS, RFLAGS, RSP, SS) for a full return.
+pub(crate) const IRET_FRAME_WORD: usize = 14;
+const FRAME_WORDS: usize = 19;
 pub(crate) const FRAME_SIZE: usize = WORD_SIZE * FRAME_WORDS;
 
 /// A Linux syscall request transported from guest to host memory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SyscallRequest {
-    number: u64,
-    args: [u64; 6],
+///
+/// Since step U6a of the provider seam this wraps the provider-neutral
+/// [`reverie::provider::SyscallRequest`] (`repr(transparent)`), so the
+/// backend hands a request to a provider by reference, with no copy, while
+/// reverie-kvm's public API stays inherent and unchanged. `Debug` prints the
+/// wrapped request, which has the same name and fields as before.
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct SyscallRequest(reverie::provider::SyscallRequest);
+
+impl std::fmt::Debug for SyscallRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, formatter)
+    }
 }
 
 impl SyscallRequest {
     /// Creates a request from a Linux syscall number and its six ABI arguments.
     pub const fn new(number: u64, args: [u64; 6]) -> Self {
-        Self { number, args }
+        Self(reverie::provider::SyscallRequest::new(number, args))
     }
 
     /// Creates a transport request from a shared Reverie syscall.
     pub fn from_syscall<S: SyscallInfo>(syscall: S) -> Self {
-        let (number, args) = syscall.into_parts();
-        Self::new(
-            number as u64,
-            [
-                args.arg0 as u64,
-                args.arg1 as u64,
-                args.arg2 as u64,
-                args.arg3 as u64,
-                args.arg4 as u64,
-                args.arg5 as u64,
-            ],
-        )
+        Self(reverie::provider::SyscallRequest::from_syscall(syscall))
     }
 
     /// Returns the Linux syscall number.
     pub const fn number(&self) -> u64 {
-        self.number
+        self.0.number()
     }
 
     /// Returns the six Linux syscall arguments.
     pub const fn args(&self) -> &[u64; 6] {
-        &self.args
+        self.0.args()
+    }
+
+    /// The provider-neutral request this wraps, for a provider call.
+    pub(crate) const fn as_provider(&self) -> &reverie::provider::SyscallRequest {
+        &self.0
+    }
+
+    /// Views a provider-neutral request as reverie-kvm's request, without a
+    /// copy.
+    pub(crate) fn from_provider(request: &reverie::provider::SyscallRequest) -> &Self {
+        // SAFETY: `SyscallRequest` is `repr(transparent)` over
+        // `reverie::provider::SyscallRequest`, so both have the same
+        // layout and alignment, and the returned reference borrows `request`.
+        unsafe { &*std::ptr::from_ref(request).cast::<Self>() }
     }
 
     /// Decodes this raw transport frame through Reverie's complete syscall table.
@@ -68,11 +89,11 @@ impl SyscallRequest {
     /// A number outside the architecture syscall table is rejected instead of
     /// being forwarded as an untyped request.
     pub fn into_syscall(self) -> Result<Syscall> {
-        let number = usize::try_from(self.number)
+        let number = usize::try_from(self.number())
             .ok()
             .and_then(Sysno::new)
-            .ok_or(Error::InvalidSyscallNumber(self.number))?;
-        let args = self.args.map(|argument| argument as usize);
+            .ok_or(Error::InvalidSyscallNumber(self.number()))?;
+        let args = self.args().map(|argument| argument as usize);
         Ok(Syscall::from_raw(
             number,
             SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
@@ -83,13 +104,13 @@ impl SyscallRequest {
     pub fn write_to(self, memory: &mut GuestMemory, guest_address: u64) -> Result<()> {
         let mut frame = [0; FRAME_SIZE];
         let words = [
-            self.number,
-            self.args[0],
-            self.args[1],
-            self.args[2],
-            self.args[3],
-            self.args[4],
-            self.args[5],
+            self.number(),
+            self.args()[0],
+            self.args()[1],
+            self.args()[2],
+            self.args()[3],
+            self.args()[4],
+            self.args()[5],
         ];
         for (index, value) in words.into_iter().enumerate() {
             let start = index * WORD_SIZE;

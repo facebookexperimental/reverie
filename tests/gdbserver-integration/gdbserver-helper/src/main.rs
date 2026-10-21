@@ -6,11 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![allow(
-    unexpected_cfgs,
-    reason = "`fbcode_build` is supplied by the internal Buck build"
-)]
-
 use std::fs;
 use std::io;
 use std::io::BufRead;
@@ -281,10 +276,6 @@ mod test {
     /// Here we break in the libc `uname` function (called by the `uname`
     /// coreutil), `finish` back out to its caller, and then `continue` to exit.
     /// The session must complete cleanly and still produce the expected output.
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-    )]
     #[tokio::test(flavor = "current_thread")]
     async fn debug_uname_finish_then_continue() {
         let session = RemoteGdbSession::new("gdb", "/bin/uname", vec!["-s"]);

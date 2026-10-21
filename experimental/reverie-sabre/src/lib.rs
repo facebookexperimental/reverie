@@ -14,15 +14,20 @@ mod callbacks;
 pub mod ffi;
 #[doc(hidden)]
 pub mod internal;
+pub use reverie_sabre_stats::launch;
 mod paths;
 mod protected_files;
 mod reverie_adapter;
 mod rpc;
+pub mod shared_entry;
+#[cfg(feature = "shared-runtime")]
+pub mod shared_runtime;
 mod signal;
 mod slot_map;
 pub mod stats;
 mod thread;
 mod tool;
+mod tool_output;
 mod utils;
 pub mod vdso;
 
@@ -31,6 +36,21 @@ pub use paths::*;
 pub use reverie_adapter::*;
 pub use reverie_sabre_macros::tool;
 pub use tool::*;
+pub use tool_output::TOOL_OUTPUT_ENV;
+pub use tool_output::TOOL_OUTPUT_FD_MIN;
+pub use tool_output::set_retirement_message;
+pub use tool_output::tool_output_env_value;
+pub use tool_output::tool_output_fd;
+pub use tool_output::tool_output_requested;
+pub use tool_output::with_tool_output;
+
+/// The static facts about how a SaBRe plugin runs a guest that a tool may need,
+/// in the same form [`reverie::Backend::capabilities`] reports them for backends
+/// that implement that trait. A SaBRe plugin runs its tool inside each guest
+/// process, so a host that launches one reads this before the run.
+pub const fn capabilities() -> reverie::BackendCapabilities {
+    reverie::BackendCapabilities::SABRE
+}
 
 /// Returns the SaBRe loader built from the source vendored in this package.
 pub fn bundled_sabre_path() -> &'static std::path::Path {
@@ -45,11 +65,12 @@ pub fn bundled_sabre_source_dir() -> &'static std::path::Path {
 // Tracing programs that use jemalloc will hang if we allocate when jemalloc
 // calls readlinkat. Using a different allocator works around this problem.
 //
-// NOTE: Even though we set the global allocator here, anything that depends on
-// this library will use this global allocator. Thus, it will apply to all
-// tools/plugins automatically.
-#[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// Each plugin built with `#[sabre::tool]` selects this allocator in its own
+// crate (reverie-sabre-macros). The library no longer sets the global
+// allocator itself, so a shared in-guest runtime that is loaded as the SaBRe
+// plugin (`shared_runtime_plugin!`) keeps its own allocator.
+#[doc(hidden)]
+pub use mimalloc;
 
 #[cfg(test)]
 mod bundled_source_tests {

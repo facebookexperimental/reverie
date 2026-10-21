@@ -17,12 +17,12 @@
 //!
 //! e9patch is a sibling of the LiteInst backend, deliberately kept **closely
 //! matched** to it. Both are ld-preload backends built on the shared
-//! `reverie-preload` runtime, which owns the seccomp filter, the `SIGSYS`
+//! `reverie-inguest` runtime, which owns the seccomp filter, the `SIGSYS`
 //! handler, the trusted syscall gate, the fork/signal policy, and the
-//! [`SyscallDispatcher`](reverie_preload::dispatch::SyscallDispatcher) seam.
+//! [`SyscallDispatcher`](reverie_inguest::dispatch::SyscallDispatcher) seam.
 //! Both use the same guest-half trap installer through
-//! [`InProcessSeccomp`](reverie_preload::lifecycle::InProcessSeccomp) or
-//! [`HybridPtrace`](reverie_preload::lifecycle::HybridPtrace); neither
+//! [`InProcessSeccomp`](reverie_inguest::lifecycle::InProcessSeccomp) or
+//! [`HybridPtrace`](reverie_inguest::lifecycle::HybridPtrace); neither
 //! controller constructs a launcher. E9patch's AOT trampoline calls the
 //! registered dispatcher directly in ordinary guest context. Shared built-ins
 //! use the common preload dispatcher; an opt-in tool-specific DSO calls
@@ -71,8 +71,8 @@ pub use dispatch::E9patchDispatcher;
 // Re-exported from the shared crate so a consumer selecting an e9patch built-in
 // tool imports the *same* enum both ld-preload backends use. The tool is shared,
 // not e9patch-private (only the env-var spelling differs).
-pub use reverie_preload::BuiltinTool;
-pub use reverie_preload::SPOOF_PID;
+pub use reverie_inguest::BuiltinTool;
+pub use reverie_inguest::SPOOF_PID;
 pub use rewrite::E9PATCH_BACKEND_ENV;
 pub use rewrite::E9TOOL_ENV;
 pub use rewrite::E9patchRewriter;
@@ -121,8 +121,8 @@ pub const COORDINATOR_ENV: &str = "REVERIE_E9PATCH_COORDINATOR";
 
 /// Environment variable overriding the located e9patch preload library path.
 ///
-/// Mirrors LiteInst's `REVERIE_LITEINST_PRELOAD` and `reverie-preload`'s
-/// `REVERIE_PRELOAD_LIB` contract.
+/// Mirrors LiteInst's `REVERIE_LITEINST_PRELOAD` and `reverie-inguest`'s
+/// `REVERIE_INGUEST_LIB` contract.
 pub const PRELOAD_LIB_ENV: &str = "REVERIE_E9PATCH_PRELOAD";
 
 /// Locates the e9patch preload cdylib produced beside the current executable.
@@ -224,7 +224,7 @@ pub fn configure_guest_command(
 ///
 /// This is the launcher-side half of built-in-tool selection — the direct analog
 /// of LiteInst's `configure_command(command, PreloadTool)`, differing only in
-/// that the tool is one of reverie-preload's shared built-ins (installed via the
+/// that the tool is one of reverie-inguest's shared built-ins (installed via the
 /// shared `install_builtin`) rather than a backend-private one. It prepends the
 /// located cdylib to any inherited `LD_PRELOAD` and sets [`TOOL_ENV`], which the
 /// in-guest constructor reads with priority over the controller-mode
@@ -246,14 +246,14 @@ pub fn configure_guest_builtin(
     Ok(())
 }
 
-/// Selects the shared [`RuntimeConfig`](reverie_preload::lifecycle::RuntimeConfig)
+/// Selects the shared [`RuntimeConfig`](reverie_inguest::lifecycle::RuntimeConfig)
 /// `use_alt_stack` knob on a guest command via [`ALT_STACK_ENV`].
 ///
 /// Additive to [`configure_guest_command`]/[`configure_guest_builtin`]: those arm
 /// the runtime, while this tunes the shared config the controller-mode install
 /// paths honor. The value is spelled so the in-guest [`alt_stack_from_env_value`]
 /// parser round-trips it. The config struct and the controller that honors it are
-/// shared reverie-preload code, reviewed once; only this env spelling is
+/// shared reverie-inguest code, reviewed once; only this env spelling is
 /// e9patch's — the same shared-vs-local split as tool and controller selection.
 // TODO-HUMAN-REVIEW(PR-250): Review launcher-side alt-stack config setter.
 pub fn set_guest_alt_stack(command: &mut reverie::process::Command, use_alt_stack: bool) {
@@ -266,7 +266,7 @@ pub fn set_guest_alt_stack(command: &mut reverie::process::Command, use_alt_stac
 /// Kept beside [`configure_guest_builtin`] so the launcher and the in-guest
 /// [`builtin_tool_from_env_value`] parser agree on the exact spelling.
 fn builtin_tool_env_value(tool: BuiltinTool) -> &'static str {
-    // Exhaustive on purpose: if reverie-preload adds a built-in, e9patch must map
+    // Exhaustive on purpose: if reverie-inguest adds a built-in, e9patch must map
     // it here rather than silently arming an unintended tool.
     match tool {
         BuiltinTool::Passthrough => TOOL_PASSTHROUGH,
@@ -305,7 +305,7 @@ static REVERIE_E9PATCH_INIT: unsafe extern "C" fn() = reverie_e9patch_initialize
 ///
 /// This is the e9patch analog of LiteInst's `reverie_liteinst_site_trap_count`:
 /// a C-ABI counter that makes the instrumentation surface observable from the
-/// guest. It counts only [`SignalTrap`](reverie_preload::dispatch::SyscallEventSource::SignalTrap)
+/// guest. It counts only [`SignalTrap`](reverie_inguest::dispatch::SyscallEventSource::SignalTrap)
 /// events delivered to [`E9patchDispatcher`]: direct AOT built-in events and
 /// generic ptrace events are both excluded. In built-in mode this therefore
 /// measures the residual un-rewritten surface (loader/startup, vDSO, uncovered

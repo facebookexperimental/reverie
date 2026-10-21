@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Ordinary discovered driver for the fixture's actual main-thread fork.
 use std::os::unix::process::CommandExt;
 use std::process::Command;

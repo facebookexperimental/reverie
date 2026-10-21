@@ -10,7 +10,6 @@ use core::mem;
 
 use perf_event_open_sys::bindings as perf;
 use reverie::Errno;
-use thiserror::Error;
 use tracing::warn;
 
 use crate::perf::PerfCounter;
@@ -21,58 +20,7 @@ use crate::timer::has_precise_ip;
 const IN_TXCP: u64 = 1 << 33;
 const NUM_BRANCHES: u64 = 500;
 
-/// Way to keep track of the validation error when checking for pmu bugs
-#[derive(Error, Debug)]
-pub(crate) enum PmuValidationError {
-    #[error("Failed to create timer: {errno:?} - {msg}")]
-    CouldNotCreateTimer { errno: Errno, msg: &'static str },
-
-    #[error("Unexpected error while checking for pmu bugs: {errno:?} - {msg}")]
-    UnexpectedTestingErrnoError { errno: Errno, msg: &'static str },
-
-    #[error("Unexpected error while checking for pmu bugs: {0}")]
-    UnexpectedTestingError(String),
-
-    #[error("The ioc-period bug was detected")]
-    IocPeriodBugDetected,
-
-    #[cfg(target_arch = "x86_64")]
-    #[error("Could not read cpu info")]
-    CouldNotReadCpuInfo,
-
-    #[error(
-        "Got {actual_events} branch events, expected at least {expected_min_events}. \
-        The hardware performance counter seems to not be working. Check \
-        that hardware performance counters are working by running \
-        \n`perf stat -e r{config:x} true`\n\
-        and checking that it reports a nonzero number of events. \
-        If performance counters seem to be working with 'perf', file a \
-        reverie issue, otherwise check your hardware/OS/VM configuration. Also \
-        check that other software is not using performance counters on \
-        this CPU."
-    )]
-    HardwareCountersNotWorking {
-        actual_events: i64,
-        expected_min_events: u64,
-        config: u64,
-    },
-
-    #[error("Your CPU only supports one performance counter in its current configuration")]
-    OnlyOnePerformanceCounter,
-
-    #[cfg(target_arch = "x86_64")]
-    #[error(
-        "On AMD Zen CPUs, reverie timers will not work reliably unless you disable the \
-        hardware SpecLockMap optimization. For instructions on how to \
-        do this, see https://github.com/rr-debugger/rr/wiki/Zen"
-    )]
-    AmdSpecLockMapShouldBeDisabled,
-
-    #[cfg(target_arch = "x86_64")]
-    #[error("Intel Kvm-In-Txcp bug found")]
-    IntelKvmInTxcpBugDetected,
-}
-
+pub use reverie::pmu_config::PmuValidationError;
 fn init_perf_event_attr(
     perf_attr_type: u32,
     config: u64,
@@ -121,8 +69,9 @@ fn cycles_attr(precise_ip: bool) -> perf::perf_event_attr {
 
 /// A counter's descriptor, a transient open from [`start_counter`] to its
 /// close here. Each check builds its counters' attributes before it opens the
-/// first one, so nothing but system calls on the counters runs under the
-/// guard.
+/// first one, so only system calls on the counters and the check's own
+/// counted work run under the guard; the longest is the SpecLockMap check's
+/// locked-instruction loop, about a millisecond.
 struct ScopedFd(i32, crate::launch_window::TransientOpen);
 
 impl Drop for ScopedFd {
@@ -145,12 +94,36 @@ fn warn_after_guards(message: String) {
 /// It checks for a collection of processor features that ensure that the pmu features
 /// required from Reverie to function correctly are available and trustworthy
 pub(crate) fn check_for_pmu_bugs() -> Result<(), PmuValidationError> {
+    require_pmu_config(crate::timer::try_get_pmu_config().is_some())?;
     check_for_ioc_period_bug(false)?;
     check_working_counters(false)?;
-    check_for_arch_bugs(false)?;
     check_for_ioc_period_bug(true)?;
     check_working_counters(true)?;
-    check_for_arch_bugs(true)
+    // The architecture checks build their own counters and ignore precise_ip,
+    // so one pass covers both settings.
+    check_for_arch_bugs(false)
+}
+
+/// Refuses a CPU with no PMU configuration, which the checks below would
+/// otherwise reach through [`get_pmu_config`] and panic on.
+#[cfg(target_arch = "x86_64")]
+fn require_pmu_config(configured: bool) -> Result<(), PmuValidationError> {
+    if configured {
+        return Ok(());
+    }
+    let features = raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .ok_or(PmuValidationError::CouldNotReadCpuInfo)?;
+    Err(PmuValidationError::UnsupportedCpu {
+        family: features.family_id(),
+        model: features.model_id(),
+    })
+}
+
+/// Every aarch64 CPU gets a configuration.
+#[cfg(target_arch = "aarch64")]
+fn require_pmu_config(_configured: bool) -> Result<(), PmuValidationError> {
+    Ok(())
 }
 
 /// This function is transcribed from the function with the same name in
@@ -352,7 +325,7 @@ fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
             check_for_kvm_in_txcp_bug()?;
             Ok(())
         }
-        s => panic!("Unknown CPU vendor: {}", s),
+        s => Err(PmuValidationError::UnknownCpuVendor(s.to_owned())),
     }
 }
 
@@ -362,40 +335,128 @@ fn check_for_arch_bugs(_precise_ip: bool) -> Result<(), PmuValidationError> {
     Ok(())
 }
 
+/// How many locked instructions [`check_for_zen_speclockmap`] executes. On an
+/// AMD EPYC 9D64 (family 0x19, model 0xA0) with SpecLockMap enabled, a single
+/// locked instruction left the SpecLockMap counter unchanged in 15 of 16 runs,
+/// while 100,000 moved it by 91 to 2,374 in 16 of 16, and the retired-branch
+/// counter over-counted by 2 to 4 branches around locked instructions. Where
+/// SpecLockMap is disabled the counter stayed at 0 over 100,000. See
+/// https://github.com/rrnewton/hermit/issues/3794. The loop takes about a
+/// millisecond and runs once per process.
+#[cfg(target_arch = "x86_64")]
+const SPECLOCKMAP_LOCKED_INSTRUCTIONS: usize = 100_000;
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    SPECLOCKMAP_LOCKED_INSTRUCTIONS >= 100_000,
+    "fewer locked instructions miss SpecLockMap on some Zen CPUs"
+);
+
+/// AMD PMCx025, retired locked instructions, with every unit mask. User
+/// mode only, as rr's `0x5100xx` events are. With SpecLockMap disabled it
+/// counted exactly 100,000 of 100,000 locked instructions on AMD EPYC 9D25
+/// (family 0x1A, model 0x11; 186 runs) and 9D85 hosts. With SpecLockMap
+/// enabled, an AMD EPYC 9D64 (family 0x19, model 0xA0) counted only 59 to
+/// 56,833 (51 runs). It is unmeasured on other Zen 2, 3 and 4 parts, where it
+/// may count fewer than every locked instruction even with SpecLockMap
+/// disabled; the check then refuses as inconclusive rather than pass.
+#[cfg(target_arch = "x86_64")]
+use reverie::pmu_config::RETIRED_LOCK_INSTRUCTIONS_EVENT;
+
+/// AMD PMCx025 with unit mask 0x08, SpecLockMapCommit: the locked
+/// instructions that retired through SpecLockMap. rr's Zen check uses the
+/// same event.
+#[cfg(target_arch = "x86_64")]
+const SPECLOCKMAP_COMMIT_EVENT: u64 = 0x510825;
+
+/// What [`count_speclockmap_commits`] counted over its locked-instruction loop.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpecLockMapCounts {
+    /// Retired locked instructions, [`RETIRED_LOCK_INSTRUCTIONS_EVENT`].
+    locked_instructions: i64,
+    /// SpecLockMap commits among them, [`SPECLOCKMAP_COMMIT_EVENT`].
+    speclockmap_commits: i64,
+}
+
 #[cfg(target_arch = "x86_64")]
 fn check_for_zen_speclockmap() -> Result<(), PmuValidationError> {
+    speclockmap_verdict(count_speclockmap_commits()?)
+}
+
+/// Executes [`SPECLOCKMAP_LOCKED_INSTRUCTIONS`] locked instructions and counts
+/// them, and the SpecLockMap commits among them, on two counters opened
+/// together.
+#[cfg(target_arch = "x86_64")]
+fn count_speclockmap_commits() -> Result<SpecLockMapCounts, PmuValidationError> {
     // When the SpecLockMap optimization is not disabled, rr will not work
     // reliably (e.g. it would work fine on a single process with a single
     // thread, but not more). When the optimization is disabled, the
     // perf counter for retired lock instructions of type SpecLockMapCommit
     // (on PMC 0x25) stays at 0.
     // See more details at https://github.com/rr-debugger/rr/issues/2034.
+    //
+    // A locked instruction is not always committed through SpecLockMap, so
+    // one locked instruction can leave the counter at 0 on a CPU where the
+    // optimization is enabled. Execute many, and count them, so a zero is
+    // only believed when the locked instructions were seen.
+    let mut locked_attr =
+        init_perf_event_attr(perf::PERF_TYPE_RAW, RETIRED_LOCK_INSTRUCTIONS_EVENT, false);
+    let mut commit_attr =
+        init_perf_event_attr(perf::PERF_TYPE_RAW, SPECLOCKMAP_COMMIT_EVENT, false);
 
-    // 0x25 == RETIRED_LOCK_INSTRUCTIONS - Counts the number of retired locked instructions
-    // + 0x08 == SPECLOCKMAPCOMMIT
-    let mut attr = init_perf_event_attr(perf::PERF_TYPE_RAW, 0x510825, false);
+    let locked_fd = start_counter(0, -1, &mut locked_attr, None)?;
+    let commit_fd = start_counter(0, -1, &mut commit_attr, None)?;
 
-    let fd = start_counter(0, -1, &mut attr, None)?;
+    let locked_before = read_counter(&locked_fd)?;
+    let commits_before = read_counter(&commit_fd)?;
+    execute_locked_instructions(SPECLOCKMAP_LOCKED_INSTRUCTIONS);
+    let speclockmap_commits = read_counter(&commit_fd)? - commits_before;
+    let locked_instructions = read_counter(&locked_fd)? - locked_before;
+    Ok(SpecLockMapCounts {
+        locked_instructions,
+        speclockmap_commits,
+    })
+}
 
-    let val = 20_usize;
-    let to_add = 22_usize;
-    let count = read_counter(&fd)?;
-
-    // A lock add is known to increase the perf counter we're looking at.
-    unsafe {
-        let mut _prev: *mut usize;
-        core::arch::asm!(
-            "lock",
-            "xadd [{}], {}",
-            inout(reg) &to_add => _prev,
-            in(reg) val,
-        )
-    }
-
-    if read_counter(&fd)? != count {
-        Err(PmuValidationError::AmdSpecLockMapShouldBeDisabled)
+/// Accepts the host only if none of the loop's locked instructions committed
+/// through SpecLockMap and all of them were counted. Commits are checked
+/// first: with SpecLockMap enabled, the AMD EPYC 9D64 counted only 59 to
+/// 56,833 of the 100,000 locked instructions.
+#[cfg(target_arch = "x86_64")]
+fn speclockmap_verdict(counts: SpecLockMapCounts) -> Result<(), PmuValidationError> {
+    let SpecLockMapCounts {
+        locked_instructions,
+        speclockmap_commits,
+    } = counts;
+    if speclockmap_commits > locked_instructions {
+        Err(PmuValidationError::UnexpectedTestingError(format!(
+            "counted {speclockmap_commits} SpecLockMap commits among only \
+             {locked_instructions} locked instructions"
+        )))
+    } else if speclockmap_commits != 0 {
+        Err(PmuValidationError::AmdSpecLockMapShouldBeDisabled {
+            speclockmap_commits,
+            locked_instructions,
+        })
+    } else if locked_instructions < SPECLOCKMAP_LOCKED_INSTRUCTIONS as i64 {
+        Err(PmuValidationError::SpecLockMapCheckInconclusive {
+            counted: locked_instructions,
+            executed: SPECLOCKMAP_LOCKED_INSTRUCTIONS,
+        })
     } else {
         Ok(())
+    }
+}
+
+/// Executes `count` locked instructions.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn execute_locked_instructions(count: usize) {
+    let word = core::sync::atomic::AtomicUsize::new(0);
+    for _ in 0..count {
+        // `fetch_add` is a `lock xadd` on x86_64; `black_box` keeps the
+        // result, so the compiler can neither drop nor merge the additions.
+        core::hint::black_box(word.fetch_add(1, core::sync::atomic::Ordering::SeqCst));
     }
 }
 
@@ -429,6 +490,116 @@ fn check_for_kvm_in_txcp_bug() -> Result<(), PmuValidationError> {
 mod test {
     use super::*;
     use crate::perf::is_perf_supported;
+
+    /// The SpecLockMap check must execute and count its locked instructions;
+    /// a single one misses the bug on CPUs where only some locked
+    /// instructions commit through SpecLockMap
+    /// (https://github.com/rrnewton/hermit/issues/3794).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn speclockmap_check_counts_its_locked_instructions() {
+        let c = raw_cpuid::CpuId::new();
+        let amd_zen = c.get_vendor_info().map(|v| v.as_str() == "AuthenticAMD") == Some(true)
+            && c.get_feature_info().is_some_and(is_amd_zen);
+        if !is_perf_supported() || !amd_zen {
+            return;
+        }
+        let counts = count_speclockmap_commits().unwrap();
+        assert!(
+            (0..=counts.locked_instructions).contains(&counts.speclockmap_commits),
+            "{counts:?}"
+        );
+        // Where SpecLockMap is on, the locked-instruction event can count far
+        // fewer than the loop executed (9 to 18,886 of 100,000 on a 9D64), so
+        // the full count is required only where nothing committed.
+        if counts.speclockmap_commits == 0 {
+            assert!(
+                counts.locked_instructions >= SPECLOCKMAP_LOCKED_INSTRUCTIONS as i64,
+                "{counts:?}: expected at least {SPECLOCKMAP_LOCKED_INSTRUCTIONS} locked instructions"
+            );
+        }
+        // Whatever this host's SpecLockMap setting, the check reports these
+        // same counts, not some other verdict.
+        match check_for_zen_speclockmap() {
+            Ok(()) => assert_eq!(
+                counts.speclockmap_commits, 0,
+                "{counts:?}: the check passed on a host whose count saw SpecLockMap commits"
+            ),
+            Err(PmuValidationError::AmdSpecLockMapShouldBeDisabled {
+                speclockmap_commits,
+                locked_instructions,
+            }) => assert!(
+                (1..=locked_instructions).contains(&speclockmap_commits),
+                "{speclockmap_commits} of {locked_instructions}"
+            ),
+            Err(error) => panic!("SpecLockMap check failed - {error}"),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn speclockmap_verdict_refuses_any_commit_and_an_uncounted_loop() {
+        let n = SPECLOCKMAP_LOCKED_INSTRUCTIONS as i64;
+        let counts = |locked_instructions, speclockmap_commits| SpecLockMapCounts {
+            locked_instructions,
+            speclockmap_commits,
+        };
+        assert!(speclockmap_verdict(counts(n, 0)).is_ok());
+        assert!(speclockmap_verdict(counts(n + 723, 0)).is_ok());
+        for commits in [1, 91, n] {
+            match speclockmap_verdict(counts(n, commits)) {
+                Err(PmuValidationError::AmdSpecLockMapShouldBeDisabled {
+                    speclockmap_commits,
+                    locked_instructions,
+                }) => assert_eq!((speclockmap_commits, locked_instructions), (commits, n)),
+                other => panic!("{commits} commits: {other:?}"),
+            }
+        }
+        // Counts seen together on an AMD EPYC 9D64 with SpecLockMap enabled,
+        // whose retired-lock counter under-counts.
+        for (locked, commits) in [(9, 8), (230, 89), (18886, 15570)] {
+            match speclockmap_verdict(counts(locked, commits)) {
+                Err(PmuValidationError::AmdSpecLockMapShouldBeDisabled {
+                    speclockmap_commits,
+                    locked_instructions,
+                }) => assert_eq!(
+                    (speclockmap_commits, locked_instructions),
+                    (commits, locked)
+                ),
+                other => panic!("{locked} locked, {commits} commits: {other:?}"),
+            }
+        }
+        for locked in [0, 1, n - 1] {
+            match speclockmap_verdict(counts(locked, 0)) {
+                Err(PmuValidationError::SpecLockMapCheckInconclusive { counted, executed }) => {
+                    assert_eq!(
+                        (counted, executed),
+                        (locked, SPECLOCKMAP_LOCKED_INSTRUCTIONS)
+                    )
+                }
+                other => panic!("{locked} locked: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            speclockmap_verdict(counts(n, n + 1)),
+            Err(PmuValidationError::UnexpectedTestingError(_))
+        ));
+    }
+
+    /// A CPU with no profile is refused with its family and model, where the
+    /// checks would otherwise panic in `get_pmu_config`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn unconfigured_cpu_is_refused_not_panicked_on() {
+        assert!(require_pmu_config(true).is_ok());
+        let features = raw_cpuid::CpuId::new().get_feature_info().unwrap();
+        match require_pmu_config(false) {
+            Err(PmuValidationError::UnsupportedCpu { family, model }) => {
+                assert_eq!((family, model), (features.family_id(), features.model_id()))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn test_check_for_ioc_period_bug() {
@@ -468,7 +639,7 @@ mod test {
             // runners may leave it enabled, so treat that specific condition as a
             // skip while still failing on any other (unexpected) validation error.
             #[cfg(target_arch = "x86_64")]
-            Err(PmuValidationError::AmdSpecLockMapShouldBeDisabled) => {
+            Err(PmuValidationError::AmdSpecLockMapShouldBeDisabled { .. }) => {
                 eprintln!(
                     "skipping arch-bug check: host has AMD Zen SpecLockMap enabled \
                      (a firmware setting, not a code bug); see \
@@ -517,7 +688,7 @@ mod test {
                 // See test_check_for_arch_bugs: SpecLockMap is a host firmware
                 // setting, so tolerate that specific condition here as well.
                 #[cfg(target_arch = "x86_64")]
-                Err(PmuValidationError::AmdSpecLockMapShouldBeDisabled) => {
+                Err(PmuValidationError::AmdSpecLockMapShouldBeDisabled { .. }) => {
                     eprintln!(
                         "skipping arch-bug check (precise_ip): host has AMD Zen \
                          SpecLockMap enabled (a firmware setting, not a code bug)"

@@ -13,15 +13,29 @@ use core::str::FromStr;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::OsStr;
+use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 pub use nix::mount::MsFlags as MountFlags;
 use syscalls::Errno;
 
+use super::fd::Fd;
 use super::fd::FileType;
 use super::fd::create_dir_all;
 use super::fd::touch_path;
+use super::pinned_mount::PinnedMountSource;
+use super::pinned_mount::descriptor_path;
+
+/// Additional restrictions on the top mount of a checked bind. Recursive
+/// binds retain the existing policy of their descendant mounts.
+pub(super) const BIND_RESTRICTIONS: MountFlags = MountFlags::from_bits_retain(
+    MountFlags::MS_RDONLY.bits()
+        | MountFlags::MS_NOSUID.bits()
+        | MountFlags::MS_NODEV.bits()
+        | MountFlags::MS_NOEXEC.bits(),
+);
 
 /// A mount.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +47,7 @@ pub struct Mount {
     data: Option<CString>,
     touch_target: bool,
     allow_readonly_fallback: bool,
+    pinned_source: Option<PinnedMountSource>,
     /// A path, fstype or data string that could not be represented as a C
     /// string, recorded at BUILD time and reported at [`Mount::mount`] time.
     ///
@@ -92,6 +107,7 @@ impl Mount {
             data: None,
             touch_target: false,
             allow_readonly_fallback: false,
+            pinned_source: None,
         }
     }
 
@@ -106,6 +122,28 @@ impl Mount {
         Self::new(destination)
             .source(source)
             .flags(MountFlags::MS_BIND)
+    }
+
+    /// Binds a held source object after checking its child-namespace identity.
+    ///
+    /// Perform this ordered mount before covering the source path. The object,
+    /// symlink bytes and complete mount flags must match the parent pin; missing
+    /// or changed sources refuse. Unlike a pathname bind, a final symlink is
+    /// installed as the link object. Target parents must not redirect through
+    /// symlinks. Only recursive binding and an explicit readonly seal may be
+    /// added; propagation isolation is a separate preceding operation.
+    ///
+    /// Keep the source's parent guard until reaping and retire all local source
+    /// handles in the child after setup, before starting any workers. Pinned
+    /// mounts refuse shared-memory or shared-descriptor clone configurations.
+    pub fn bind_pinned<S: AsRef<OsStr>>(source: &PinnedMountSource, destination: S) -> Self {
+        let mut mount = Self::bind(OsStr::from_bytes(source.path().to_bytes()), destination);
+        mount.pinned_source = Some(source.clone());
+        mount
+    }
+
+    pub(super) fn has_pinned_source(&self) -> bool {
+        self.pinned_source.is_some()
     }
 
     /// Move/rename a mount.
@@ -213,6 +251,8 @@ impl Mount {
         let (v, ok) = checked_cstring(path);
         self.source = Some(v);
         self.unrepresentable |= !ok;
+        // A new lexical source cannot silently replace a pinned object.
+        self.unrepresentable |= self.pinned_source.is_some();
         self
     }
 
@@ -223,8 +263,12 @@ impl Mount {
             .map(|s| Path::new(OsStr::from_bytes(s.to_bytes())))
     }
 
-    /// Indicates that the target of a bind mount should be created
-    /// automatically.
+    /// Creates a missing target for a bind mount or a new tmpfs mount.
+    ///
+    /// New tmpfs targets must be absolute directories with no symlink path
+    /// components. Creation happens after preceding mounts, so a nested target
+    /// can live in a fresh filesystem. Tmpfs remount, move, recursive and
+    /// propagation operations do not create targets. Bind behavior is unchanged.
     pub fn touch_target(mut self) -> Self {
         self.touch_target = true;
         self
@@ -422,6 +466,136 @@ impl Mount {
         .then_some(self.flags | MountFlags::MS_RDONLY)
     }
 
+    fn mount_pinned(&self, source: &PinnedMountSource) -> Result<(), Errno> {
+        let allowed = MountFlags::MS_BIND | MountFlags::MS_REC | BIND_RESTRICTIONS;
+        if !self.flags.contains(MountFlags::MS_BIND)
+            || !(self.flags - allowed).is_empty()
+            || self.fstype.is_some()
+            || self.data.is_some()
+        {
+            return Err(Errno::EINVAL);
+        }
+        // This nonblocking ownership lease remains alive through all mount
+        // effects and destination validation. A concurrent retire must refuse.
+        let lease = source.lease()?;
+        let reopened = lease.reopen()?;
+        self.prepare_pinned_target(lease.identity().is_dir())?;
+        let mut path = [0; 64];
+        let path = descriptor_path(b"/proc/self/fd/", reopened.as_raw_fd(), &mut path)?;
+        // SAFETY: both paths are live NUL-terminated buffers, and reopened owns
+        // the verified current-namespace object for this entire operation.
+        Errno::result(unsafe {
+            libc::mount(
+                path.as_ptr(),
+                self.target_ptr(),
+                ptr::null(),
+                self.flags.bits(),
+                ptr::null(),
+            )
+        })?;
+        let destination = Fd::open_c(
+            self.target_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        lease.validate(destination.as_raw_fd(), MountFlags::empty())?;
+        let restrictions = self.flags & BIND_RESTRICTIONS;
+        if !restrictions.is_empty() {
+            // Use the destination descriptor so a bound symlink's referent is
+            // never mistaken for the mount being sealed.
+            let mut path = [0; 64];
+            let path = descriptor_path(b"/proc/self/fd/", destination.as_raw_fd(), &mut path)?;
+            let mut flags = MountFlags::MS_BIND | MountFlags::MS_REMOUNT | restrictions;
+            for (probe, flag) in [
+                (libc::ST_RDONLY, MountFlags::MS_RDONLY),
+                (libc::ST_NOSUID, MountFlags::MS_NOSUID),
+                (libc::ST_NODEV, MountFlags::MS_NODEV),
+                (libc::ST_NOEXEC, MountFlags::MS_NOEXEC),
+                (libc::ST_NOATIME, MountFlags::MS_NOATIME),
+                (libc::ST_NODIRATIME, MountFlags::MS_NODIRATIME),
+            ] {
+                if lease.identity().flags & probe != 0 {
+                    flags |= flag;
+                }
+            }
+            // SAFETY: the descriptor's magic path names the actual bound mount.
+            Errno::result(unsafe {
+                libc::mount(
+                    ptr::null(),
+                    path.as_ptr(),
+                    ptr::null(),
+                    flags.bits(),
+                    ptr::null(),
+                )
+            })?;
+        }
+        lease.validate(destination.as_raw_fd(), restrictions)?;
+        // The final bound link was checked through its nofollow descriptor.
+        // Parent components must still be directories, including for links.
+        self.verify_pinned_target(None, false)?;
+        Ok(())
+    }
+
+    fn prepare_pinned_target(&self, directory: bool) -> Result<(), Errno> {
+        self.verify_pinned_target(Some(directory), self.touch_target)?;
+        if self.touch_target {
+            if directory {
+                create_dir_all(&self.target, 0o777)?;
+            } else {
+                touch_path(&self.target, 0o666, 0o777)?;
+            }
+        }
+        self.verify_pinned_target(Some(directory), false)
+    }
+
+    fn verify_pinned_target(&self, directory: Option<bool>, missing: bool) -> Result<(), Errno> {
+        let bytes = self.target.as_bytes_with_nul();
+        if bytes.first() != Some(&b'/') {
+            return Err(Errno::EINVAL);
+        }
+        let mut path = [0 as libc::c_char; libc::PATH_MAX as usize];
+        if bytes.len() > path.len() {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        for (target, source) in path.iter_mut().zip(bytes) {
+            *target = *source as libc::c_char;
+        }
+        for index in 1..bytes.len() {
+            let final_component = index == bytes.len() - 1;
+            if !final_component && bytes[index] != b'/' {
+                continue;
+            }
+            if final_component && directory.is_none() {
+                continue;
+            }
+            let saved = path[index];
+            path[index] = 0;
+            let mut object = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: this prefix is NUL-terminated and the output is local.
+            let result = unsafe { libc::lstat(path.as_ptr(), object.as_mut_ptr()) };
+            path[index] = saved;
+            if result != 0 {
+                let error = Errno::last();
+                if missing && error == Errno::ENOENT {
+                    continue;
+                }
+                return Err(error);
+            }
+            // SAFETY: lstat succeeded and initialized object.
+            let kind = unsafe { object.assume_init() }.st_mode & libc::S_IFMT;
+            if kind == libc::S_IFLNK {
+                return Err(Errno::ELOOP);
+            }
+            if !final_component || directory == Some(true) {
+                if kind != libc::S_IFDIR {
+                    return Err(Errno::ENOTDIR);
+                }
+            } else if kind == libc::S_IFDIR {
+                return Err(Errno::EISDIR);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn mount(&mut self) -> Result<(), Errno> {
         // ⚠️ REFUSE, DO NOT PANIC. A path/fstype/data string that is not a valid
         // C string was recorded at build time (see `unrepresentable`). This is
@@ -431,6 +605,28 @@ impl Mount {
         // the caller's existing error path already knows what to do with it.
         if self.unrepresentable {
             return Err(Errno::EINVAL);
+        }
+        if let Some(source) = &self.pinned_source {
+            return self.mount_pinned(source);
+        }
+        let other_operations = MountFlags::MS_BIND
+            | MountFlags::MS_REMOUNT
+            | MountFlags::MS_MOVE
+            | MountFlags::MS_SHARED
+            | MountFlags::MS_PRIVATE
+            | MountFlags::MS_SLAVE
+            | MountFlags::MS_UNBINDABLE
+            | MountFlags::MS_REC;
+        if self.touch_target
+            && self
+                .fstype
+                .as_ref()
+                .is_some_and(|fstype| fstype.as_bytes() == b"tmpfs")
+            && !self.flags.intersects(other_operations)
+        {
+            // The same allocation-free nofollow checks used for pinned targets
+            // refuse links and non-directories before and after creation.
+            self.prepare_pinned_target(true)?;
         }
         // NOTE: Although we can't allocate here, we can safely *modify* `self`.
         // When this function is called, we have forked virtual memory and any
@@ -517,6 +713,7 @@ impl From<Bind> for Mount {
             data: None,
             touch_target: false,
             allow_readonly_fallback: false,
+            pinned_source: None,
             // A Bind built from a path that was not representable as a C string
             // holds an EMPTY CString (see `checked_cstring`). Empty source or
             // target is never a valid bind mount, so it carries the refusal

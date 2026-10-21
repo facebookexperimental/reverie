@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Run the non-CI counter2 cross-backend performance shootout."""
 
 from __future__ import annotations
@@ -239,7 +233,10 @@ def backend_command(
         if not Path("/dev/kvm").exists():
             fail("/dev/kvm is unavailable")
         return [
-            str(require_file(target / "reverie-kvm-counter2", "KVM counter2")),
+            str(require_file(target / "counter2", "counter2")),
+            "--backend",
+            "kvm",
+            "--",
             str(artifact),
             *arguments,
         ]
@@ -284,7 +281,9 @@ def backend_command(
         ]
     if backend == "e9patch":
         return [
-            str(require_file(target / "reverie-e9patch-counter2", "e9patch counter2")),
+            str(require_file(target / "counter2", "counter2")),
+            "--backend",
+            "e9patch",
             "--",
             str(artifact),
             *arguments,

@@ -15,6 +15,13 @@ use syscalls::Errno;
 
 use super::fd::Fd;
 
+// libc keeps interface-request constants as unsigned long even when its ioctl
+// function takes a signed int. Linux consumes a 32-bit request bit pattern.
+fn interface_ioctl_request(request: libc::c_ulong) -> Result<libc::Ioctl, Errno> {
+    let bits = u32::try_from(request).map_err(|_| Errno::EINVAL)?;
+    Ok(bits as libc::Ioctl)
+}
+
 /// Interface name.
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(C)]
@@ -73,12 +80,14 @@ impl IfName {
     }
 
     fn ioctl_get<T>(self, ioctl: libc::c_ulong, socket: &Fd) -> Result<T, Errno> {
+        let ioctl = interface_ioctl_request(ioctl)?;
         let mut req = IfReq::new(self, MaybeUninit::uninit());
         Errno::result(unsafe { libc::ioctl(socket.as_raw_fd(), ioctl, &mut req as *mut _) })?;
         Ok(unsafe { req.into_req().assume_init() })
     }
 
     fn ioctl_set<T>(self, ioctl: libc::c_ulong, socket: &Fd, value: T) -> Result<(), Errno> {
+        let ioctl = interface_ioctl_request(ioctl)?;
         let req = IfReq::new(self, value);
         Errno::result(unsafe { libc::ioctl(socket.as_raw_fd(), ioctl, &req as *const _) })?;
         Ok(())
@@ -195,6 +204,21 @@ mod tests {
     use nix::net::if_::InterfaceFlags;
 
     use super::*;
+
+    #[test]
+    fn interface_ioctl_requests_preserve_kernel_bits_and_reject_wider_values() {
+        for request in [
+            libc::SIOCGIFFLAGS,
+            libc::SIOCSIFFLAGS,
+            u32::MAX as libc::c_ulong,
+        ] {
+            assert_eq!(
+                interface_ioctl_request(request).unwrap() as u32 as u64,
+                request
+            );
+        }
+        assert_eq!(interface_ioctl_request(1u64 << 32), Err(Errno::EINVAL));
+    }
 
     #[test]
     fn ifname() {

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! LiteInst coverage for CPUID/RDTSC/RDTSCP in code mapped after the runtime
 //! started.
 //!
@@ -42,6 +34,7 @@ const GP_FAULT_OFFSET: usize = 10;
 const NULL_LOAD_STUB: usize = 80;
 const NULL_LOAD_OFFSET: usize = 2;
 const REPEATS: usize = 32;
+const STRADDLER_REPEATS: usize = 8;
 const LEAVES: [(u32, u32); 5] = [(0, 0), (1, 0), (7, 0), (0xd, 1), (0x8000_0000, 0)];
 
 static CPUID_CALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -144,12 +137,16 @@ const fn sentinel(index: u64) -> u64 {
 }
 
 fn invoke(page: *mut u8, offset: usize, rax: u64, rcx: u64) -> Registers {
+    invoke_at(unsafe { page.add(offset) }, rax, rcx)
+}
+
+fn invoke_at(code: *const u8, rax: u64, rcx: u64) -> Registers {
     let mut registers = Registers {
         rax,
         rcx,
         ..Registers::default()
     };
-    unsafe { late_code_invoke(page.add(offset), &mut registers) };
+    unsafe { late_code_invoke(code, &mut registers) };
     registers
 }
 
@@ -228,7 +225,9 @@ fn delta(after: [u64; 3], before: [u64; 3]) -> [u64; 3] {
 }
 
 /// CPUID/RDTSC/RDTSCP in an anonymous executable page mapped after startup.
-pub(super) fn run_instruction(path: &Path) {
+/// `trap_only`: the runtime runs with site patching off, so the in-arena
+/// ("patched path") instructions take the continuation too.
+pub(super) fn run_instruction(path: &Path, trap_only: bool) {
     install(path);
     let page = map_late_code();
     let fallback_before = observations();
@@ -288,15 +287,24 @@ pub(super) fn run_instruction(path: &Path) {
     assert_eq!((tscp, aux), (tool_tsc(first + 5), tool_aux(first + 5)));
     assert_eq!(TSC_CALLBACKS.load(Ordering::Relaxed) - first, 5);
 
+    // The in-arena instructions above: one CPUID per leaf, one RDTSC and one
+    // RDTSCP. With site patching off they take the continuation as well.
+    let in_arena = if trap_only {
+        LEAVES.len() as u64 + 2
+    } else {
+        0
+    };
     let fallback = delta(observations(), fallback_before);
     assert_eq!(
-        fallback, [late; 3],
-        "each late instruction is one continuation entry, callback and completion"
+        fallback,
+        [late + in_arena; 3],
+        "each continued instruction is one continuation entry, callback and completion"
     );
     let owned = OWNED_STACK_CALLBACKS.load(Ordering::Relaxed) - owned_before;
     assert_eq!(
-        owned, late,
-        "exactly the late instructions run the Tool on the owned continuation stack"
+        owned,
+        late + in_arena,
+        "exactly the continued instructions run the Tool on the owned continuation stack"
     );
     let sites = [CPUID_STUB, RDTSC_STUB, RDTSCP_STUB]
         .into_iter()
@@ -307,9 +315,15 @@ pub(super) fn run_instruction(path: &Path) {
         })
         .sum::<u64>();
     assert_eq!(sites, 0, "code without an arena must never claim a site");
-    println!(
-        "late-code cpuid=tool rdtsc=tool rdtscp=tool equals-patched=1 continuation={late} owned-stack={owned} sites={sites} registers=preserved"
-    );
+    if trap_only {
+        println!(
+            "late-code trap-only cpuid=tool rdtsc=tool rdtscp=tool equals-in-arena=1 continuation={late}+{in_arena} owned-stack={owned} sites={sites} registers=preserved"
+        );
+    } else {
+        println!(
+            "late-code cpuid=tool rdtsc=tool rdtscp=tool equals-patched=1 continuation={late} owned-stack={owned} sites={sites} registers=preserved"
+        );
+    }
     std::io::stdout().flush().unwrap();
 }
 
@@ -397,6 +411,642 @@ pub(super) fn run_dlopen_system(path: &Path, library: &OsStr) {
     std::io::stdout().flush().unwrap();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(liteinst-straddler-cpuid): Review the cross-line instruction guest.
+/// CPUID/RDTSC/RDTSCP inside this executable's text, where an arena exists,
+/// each placed so LiteInst's 8-byte word patch would cross a 64-byte cache
+/// line. With cross-line publication disabled the hook is refused before any
+/// byte changes, so every execution must trap and reach the Tool through the
+/// continuation. Nix's coreutils runs the same shape in `__cpu_indicator_init`
+/// (CPUID at line offset 58) before `main`.
+pub(super) fn run_straddler(path: &Path) {
+    install(path);
+    let stubs = [
+        (straddler_cpuid as *const u8, 58),
+        (straddler_rdtsc as *const u8, 61),
+        (straddler_rdtscp as *const u8, 63),
+    ];
+    for (stub, offset) in stubs {
+        assert_eq!(stub as usize % 64, offset, "stub {stub:?} is misplaced");
+    }
+    let [(cpuid, _), (rdtsc, _), (rdtscp, _)] = stubs;
+    let fallback_before = observations();
+    let owned_before = OWNED_STACK_CALLBACKS.load(Ordering::Relaxed);
+    let cpuid_before = CPUID_CALLBACKS.load(Ordering::Relaxed);
+    let mut calls = [0_u64; 3];
+
+    for (leaf, subleaf) in LEAVES {
+        let expected = tool_cpuid(leaf, subleaf);
+        for _ in 0..STRADDLER_REPEATS {
+            let registers = invoke_at(cpuid, u64::from(leaf), u64::from(subleaf));
+            calls[0] += 1;
+            assert_eq!(
+                [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+                [expected.eax, expected.ebx, expected.ecx, expected.edx].map(u64::from),
+                "cross-line CPUID({leaf:#x}, {subleaf:#x}) must return the Tool's result"
+            );
+            assert_untouched(&registers, "cpuid");
+        }
+    }
+    assert_eq!(
+        CPUID_CALLBACKS.load(Ordering::Relaxed) - cpuid_before,
+        calls[0],
+        "every cross-line CPUID must reach the Tool exactly once"
+    );
+
+    let first = TSC_CALLBACKS.load(Ordering::Relaxed);
+    let rcx_input = 0x0123_4567_89ab_cdef;
+    for _ in 0..STRADDLER_REPEATS {
+        let registers = invoke_at(rdtsc, 0, rcx_input);
+        calls[1] += 1;
+        let callback = TSC_CALLBACKS.load(Ordering::Relaxed);
+        assert_eq!(callback - first, calls[1] + calls[2]);
+        assert_eq!((registers.rdx << 32) | registers.rax, tool_tsc(callback));
+        assert_eq!(registers.rbx, sentinel(1), "RDTSC must not define rbx");
+        assert_eq!(registers.rcx, rcx_input, "RDTSC must not define rcx");
+        assert_untouched(&registers, "rdtsc");
+
+        let registers = invoke_at(rdtscp, 0, rcx_input);
+        calls[2] += 1;
+        let callback = TSC_CALLBACKS.load(Ordering::Relaxed);
+        assert_eq!(callback - first, calls[1] + calls[2]);
+        assert_eq!((registers.rdx << 32) | registers.rax, tool_tsc(callback));
+        assert_eq!(registers.rcx, u64::from(tool_aux(callback)));
+        assert_eq!(registers.rbx, sentinel(1), "RDTSCP must not define rbx");
+        assert_untouched(&registers, "rdtscp");
+    }
+
+    let total = calls.iter().sum::<u64>();
+    let fallback = delta(observations(), fallback_before);
+    assert_eq!(
+        fallback, [total; 3],
+        "each cross-line instruction is one continuation entry, callback and completion"
+    );
+    let owned = OWNED_STACK_CALLBACKS.load(Ordering::Relaxed) - owned_before;
+    assert_eq!(
+        owned, total,
+        "every cross-line instruction runs the Tool on the owned continuation stack"
+    );
+    for ((stub, offset), expected) in stubs.into_iter().zip(calls) {
+        let address = stub as u64;
+        assert_eq!(
+            reverie_liteinst::reverie_liteinst_site_trap_count(address),
+            expected,
+            "the site at line offset {offset} must trap on every execution"
+        );
+        assert_eq!(
+            reverie_liteinst::reverie_liteinst_site_hook_count(address),
+            0,
+            "the site at line offset {offset} must never be patched"
+        );
+    }
+    println!(
+        "straddler cpuid=tool rdtsc=tool rdtscp=tool calls={total} continuation={} owned-stack={owned} hooks=0 registers=preserved",
+        fallback[0]
+    );
+    run_straddler_neighbour();
+    run_stale_jump_neighbour();
+    std::io::stdout().flush().unwrap();
+}
+
+/// A CPUID whose patch would overwrite the start of a neighbour's jump that
+/// survived a no-op mremap (the neighbour is then STALE, but its jump bytes
+/// are unchanged) must not be patched: the stale jump still counts as
+/// published. It runs through the continuation and falls into the
+/// neighbour's surviving jump, which still reaches the Tool.
+fn run_stale_jump_neighbour() {
+    let before = straddler_stale_before as *const u8;
+    let patched = straddler_stale_patched as *const u8;
+    assert_eq!(before as usize % 64, 16, "stale-jump stub is misplaced");
+    assert_eq!(patched as usize, before as usize + 4);
+    let (leaf, subleaf) = (1, 0);
+    let first = tool_cpuid(leaf, subleaf);
+    let second = tool_cpuid(first.eax, first.ecx);
+    for _ in 0..STRADDLER_REPEATS {
+        let registers = invoke_at(patched, u64::from(leaf), u64::from(subleaf));
+        assert_eq!(
+            [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+            [first.eax, first.ebx, first.ecx, first.edx].map(u64::from),
+        );
+        assert_untouched(&registers, "patched");
+    }
+    let patched_hooks = reverie_liteinst::reverie_liteinst_site_hook_count(patched as u64);
+    assert!(patched_hooks > 0, "the neighbour must be patched first");
+    let page = (patched as usize & !4095) as *mut libc::c_void;
+    let remapped = unsafe { libc::mremap(page, 4096, 4096, 0) };
+    assert_eq!(remapped, page, "no-op mremap must keep the page in place");
+    let cpuid_before = CPUID_CALLBACKS.load(Ordering::Relaxed);
+    for _ in 0..STRADDLER_REPEATS {
+        let registers = invoke_at(before, u64::from(leaf), u64::from(subleaf));
+        assert_eq!(
+            [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+            [second.eax, second.ebx, second.ecx, second.edx].map(u64::from),
+            "both CPUIDs must return the Tool's results"
+        );
+        assert_untouched(&registers, "before");
+    }
+    let calls = STRADDLER_REPEATS as u64;
+    assert_eq!(
+        CPUID_CALLBACKS.load(Ordering::Relaxed) - cpuid_before,
+        2 * calls,
+        "every CPUID must reach the Tool once"
+    );
+    let address = before as u64;
+    let traps = reverie_liteinst::reverie_liteinst_site_trap_count(address);
+    let hooks = reverie_liteinst::reverie_liteinst_site_hook_count(address);
+    assert_eq!(
+        (traps, hooks),
+        (calls, 0),
+        "the site before the stale jump must trap every time and never be patched"
+    );
+    println!("straddler-stale-jump cpuid=tool traps={traps} hooks=0");
+}
+
+/// A patchable CPUID whose word patch would cover a cross-line CPUID that
+/// already executes through the continuation. A thread there resumes after
+/// that instruction, which would then be inside the neighbour's jump, so the
+/// neighbour must not be patched either, even after a no-op mremap of the
+/// page: both keep reaching the Tool, and entering the covered site directly
+/// afterwards still runs its original bytes.
+fn run_straddler_neighbour() {
+    let neighbour = straddler_neighbour as *const u8;
+    let covered = straddler_covered as *const u8;
+    assert_eq!(neighbour as usize % 64, 54, "neighbour stub is misplaced");
+    assert_eq!(covered as usize, neighbour as usize + 4);
+    let cpuid_before = CPUID_CALLBACKS.load(Ordering::Relaxed);
+    let (leaf, subleaf) = (1, 0);
+    let first = tool_cpuid(leaf, subleaf);
+    // The neighbour runs CPUID twice: its own, then the covered one on the
+    // first one's outputs.
+    let second = tool_cpuid(first.eax, first.ecx);
+    let check_covered = |label: &str| {
+        let registers = invoke_at(covered, u64::from(leaf), u64::from(subleaf));
+        assert_eq!(
+            [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+            [first.eax, first.ebx, first.ecx, first.edx].map(u64::from),
+            "{label}: the covered CPUID must return the Tool's result"
+        );
+        assert_untouched(&registers, label);
+    };
+    for _ in 0..STRADDLER_REPEATS {
+        check_covered("covered before");
+    }
+    // A no-op mremap of the page invalidates every site in it; that must
+    // not lift the covered site's reservation against the neighbour's patch.
+    let page = (covered as usize & !4095) as *mut libc::c_void;
+    let remapped = unsafe { libc::mremap(page, 4096, 4096, 0) };
+    assert_eq!(remapped, page, "no-op mremap must keep the page in place");
+    for _ in 0..STRADDLER_REPEATS {
+        let registers = invoke_at(neighbour, u64::from(leaf), u64::from(subleaf));
+        assert_eq!(
+            [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+            [second.eax, second.ebx, second.ecx, second.edx].map(u64::from),
+            "both CPUIDs in the neighbour must return the Tool's results"
+        );
+        assert_untouched(&registers, "neighbour");
+    }
+    for _ in 0..STRADDLER_REPEATS {
+        check_covered("covered after");
+    }
+    let calls = STRADDLER_REPEATS as u64;
+    let callbacks = CPUID_CALLBACKS.load(Ordering::Relaxed) - cpuid_before;
+    assert_eq!(callbacks, 4 * calls, "every CPUID must reach the Tool once");
+    let traps = [neighbour, covered]
+        .map(|site| reverie_liteinst::reverie_liteinst_site_trap_count(site as u64));
+    let hooks = [neighbour, covered]
+        .map(|site| reverie_liteinst::reverie_liteinst_site_hook_count(site as u64));
+    assert_eq!(
+        traps,
+        [calls, 3 * calls],
+        "both sites must trap on every execution"
+    );
+    assert_eq!(hooks, [0, 0], "neither site may be patched");
+    println!(
+        "straddler-neighbour cpuid=tool callbacks={callbacks} traps={}+{} hooks=0",
+        traps[0], traps[1]
+    );
+}
+
+#[derive(Default)]
+struct SyscallReservationTool;
+
+#[reverie::tool]
+impl Tool for SyscallReservationTool {
+    type GlobalState = super::CounterGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &()) -> Subscription {
+        let mut subscriptions: Subscription =
+            [reverie::syscalls::Sysno::getpid].into_iter().collect();
+        subscriptions.cpuid().rdtsc();
+        subscriptions
+    }
+
+    async fn handle_cpuid_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        eax: u32,
+        ecx: u32,
+    ) -> Result<CpuIdResult, reverie::Errno> {
+        Ok(tool_cpuid(eax, ecx))
+    }
+
+    async fn handle_rdtsc_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        request: Rdtsc,
+    ) -> Result<RdtscResult, reverie::Errno> {
+        let callback = TSC_CALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(RdtscResult {
+            tsc: tool_tsc(callback),
+            aux: (request == Rdtsc::Tscp).then_some(tool_aux(callback)),
+        })
+    }
+}
+/// Map `code` into a fresh private anonymous executable page, before the
+/// runtime starts, and return the page.
+fn map_startup_code(code: &[u8]) -> *mut u8 {
+    let page = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(page, libc::MAP_FAILED, "private mmap failed");
+    let page = page.cast::<u8>();
+    unsafe {
+        core::ptr::write_bytes(page, 0xcc, 4096);
+        core::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len());
+    }
+    assert_eq!(
+        unsafe { libc::mprotect(page.cast(), 4096, libc::PROT_READ | libc::PROT_EXEC) },
+        0
+    );
+    page
+}
+
+/// A getpid syscall at line offset 63 cannot be patched (its word would cross
+/// the line) and is refused before anything is written, so it runs through
+/// the SIGSYS continuation and leaves no footprint. The RDTSC right after it
+/// (offset 65, starting exactly at the syscall's resume point) fits in the
+/// next line and must still be patched, as before this commit.
+pub(super) fn run_syscall_then_rdtsc(path: &Path) {
+    let mut code = vec![0xcc_u8; 74];
+    // mov eax, 39; syscall; rdtsc; six NOPs; ret
+    code[58..74].copy_from_slice(&[
+        0xb8, 0x27, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x31, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0xc3,
+    ]);
+    let page = map_startup_code(&code);
+    if let Err(error) = unsafe { reverie_liteinst::install_tool::<SyscallReservationTool>(path) } {
+        super::fail_instruction_install(error);
+    }
+    let stub = unsafe { page.add(58) };
+    let rdtsc_site = unsafe { page.add(65) } as u64;
+    let first = TSC_CALLBACKS.load(Ordering::Relaxed);
+    for call in 1..=STRADDLER_REPEATS as u64 {
+        let registers = invoke_at(stub, 0, 0);
+        assert_eq!(
+            (registers.rdx << 32) | registers.rax,
+            tool_tsc(first + call),
+            "the RDTSC after the syscall must return the Tool's value"
+        );
+        assert_untouched(&registers, "syscall then rdtsc");
+    }
+    let traps = reverie_liteinst::reverie_liteinst_site_trap_count(rdtsc_site);
+    let hooks = reverie_liteinst::reverie_liteinst_site_hook_count(rdtsc_site);
+    assert_eq!(traps, 1, "the RDTSC must trap once and then be patched");
+    assert!(hooks > 0, "the RDTSC must be patched");
+    println!("fallback-syscall-then-rdtsc rdtsc=tool traps=1 patched=1");
+    std::io::stdout().flush().unwrap();
+}
+
+/// One memfd page mapped twice before the runtime starts: private X and
+/// shared Y. Y+56 is a CPUID whose word fits the line; X+58 is one whose word
+/// would cross it. Y executes first: LiteInst must not publish into the
+/// shared mapping (that would change the page cache that clean X still
+/// executes), so Y+56 traps every time. X+58 then runs through the
+/// continuation on its original bytes, and neither page changes.
+pub(super) fn run_private_alias(path: &Path) {
+    let fd = unsafe { libc::memfd_create(c"liteinst-alias-code".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create failed");
+    let mut code = vec![0xcc_u8; 4096];
+    // cpuid; cpuid; six NOPs; ret
+    let original = [0x0f, 0xa2, 0x0f, 0xa2, 0x90, 0x90, 0x90, 0x90];
+    code[56..64].copy_from_slice(&original);
+    code[64..67].copy_from_slice(&[0x90, 0x90, 0xc3]);
+    let written = unsafe { libc::pwrite(fd, code.as_ptr().cast(), 4096, 0) };
+    assert_eq!(written, 4096, "pwrite to the memfd failed");
+    let map = |flags| {
+        let page = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+                flags,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED, "memfd mmap failed");
+        page.cast::<u8>()
+    };
+    let private = map(libc::MAP_PRIVATE);
+    let shared = map(libc::MAP_SHARED);
+    install(path);
+    let (leaf, subleaf) = (1, 0);
+    let first = tool_cpuid(leaf, subleaf);
+    let second = tool_cpuid(first.eax, first.ecx);
+    let alias = unsafe { shared.add(56) };
+    for _ in 0..STRADDLER_REPEATS {
+        let registers = invoke_at(alias, u64::from(leaf), u64::from(subleaf));
+        assert_eq!(
+            [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+            [second.eax, second.ebx, second.ecx, second.edx].map(u64::from),
+            "both CPUIDs through the shared alias must return the Tool's results"
+        );
+    }
+    let alias_traps = reverie_liteinst::reverie_liteinst_site_trap_count(alias as u64);
+    let alias_hooks = reverie_liteinst::reverie_liteinst_site_hook_count(alias as u64);
+    assert_eq!(
+        (alias_traps, alias_hooks),
+        (STRADDLER_REPEATS as u64, 0),
+        "the shared alias must trap every time and never be patched"
+    );
+    let covered = unsafe { private.add(58) };
+    for _ in 0..STRADDLER_REPEATS {
+        let registers = invoke_at(covered, u64::from(leaf), u64::from(subleaf));
+        assert_eq!(
+            [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+            [first.eax, first.ebx, first.ecx, first.edx].map(u64::from),
+            "the private CPUID must return the Tool's result"
+        );
+        assert_untouched(&registers, "private cpuid");
+    }
+    for (label, page) in [("shared", shared), ("private", private)] {
+        let bytes = unsafe { core::ptr::read_unaligned(page.add(56).cast::<[u8; 8]>()) };
+        assert_eq!(
+            bytes, original,
+            "the {label} page must keep the original bytes"
+        );
+    }
+    let traps = reverie_liteinst::reverie_liteinst_site_trap_count(covered as u64);
+    println!(
+        "private-alias shared=unpatched private=original cpuid=tool traps={alias_traps}+{traps}"
+    );
+    std::io::stdout().flush().unwrap();
+}
+
+/// A subscribed syscall at line offset 59 cannot be patched (its word would
+/// cross the line) and runs through the SIGSYS continuation, which resumes
+/// after it. A no-op mremap makes that site STALE; a CPUID at offset 52,
+/// whose patch would cover the syscall, must still not be patched, and both
+/// keep working when entered directly afterwards.
+pub(super) fn run_syscall_reservation(path: &Path) {
+    if let Err(error) = unsafe { reverie_liteinst::install_tool::<SyscallReservationTool>(path) } {
+        super::fail_instruction_install(error);
+    }
+    let cpuid_site = reservation_cpuid as *const u8;
+    let syscall_site = reservation_syscall as *const u8;
+    assert_eq!(
+        cpuid_site as usize % 64,
+        52,
+        "reservation stub is misplaced"
+    );
+    assert_eq!(syscall_site as usize, cpuid_site as usize + 7);
+    let pid = unsafe { libc::getpid() } as u64;
+    let call_syscall = || {
+        let registers = invoke_at(syscall_site, libc::SYS_getpid as u64, 0);
+        assert_eq!(registers.rax, pid, "the syscall must return getpid");
+        assert_untouched(&registers, "syscall");
+    };
+    for _ in 0..STRADDLER_REPEATS {
+        call_syscall();
+    }
+    let count = |site: *const u8| {
+        (
+            reverie_liteinst::reverie_liteinst_site_trap_count(site as u64),
+            reverie_liteinst::reverie_liteinst_site_hook_count(site as u64),
+        )
+    };
+    let (syscall_traps, syscall_hooks) = count(syscall_site);
+    assert!(syscall_traps > 0, "the syscall site must have trapped");
+    assert_eq!(syscall_hooks, 0, "the syscall site must not be patched");
+    let page = (syscall_site as usize & !4095) as *mut libc::c_void;
+    let remapped = unsafe { libc::mremap(page, 4096, 4096, 0) };
+    assert_eq!(remapped, page, "no-op mremap must keep the page in place");
+    let expected = tool_cpuid(1, 0);
+    for _ in 0..STRADDLER_REPEATS {
+        let registers = invoke_at(cpuid_site, 1, 0);
+        assert_eq!(
+            registers.rax, pid,
+            "the syscall after the CPUID must return getpid"
+        );
+        assert_eq!(
+            [registers.rbx, registers.rdx],
+            [expected.ebx, expected.edx].map(u64::from),
+            "the CPUID must return the Tool's result"
+        );
+        assert_untouched(&registers, "cpuid then syscall");
+    }
+    for _ in 0..STRADDLER_REPEATS {
+        call_syscall();
+    }
+    let (cpuid_traps, cpuid_hooks) = count(cpuid_site);
+    let (_, syscall_hooks) = count(syscall_site);
+    assert_eq!(cpuid_traps, STRADDLER_REPEATS as u64);
+    assert_eq!(
+        (cpuid_hooks, syscall_hooks),
+        (0, 0),
+        "neither site may be patched"
+    );
+    println!(
+        "straddler-syscall-reservation cpuid=tool syscall=getpid traps={cpuid_traps} hooks=0+0"
+    );
+    std::io::stdout().flush().unwrap();
+}
+
+/// A CPUID two bytes before a page end is patched with a cross-line jump
+/// that spans into the next page. Replacing only its first page with the
+/// original bytes restores the CPUID while the jump's displacement survives
+/// on the second page. Executing the CPUID again reclaims the site; it must
+/// fail closed (the earlier patch may survive) instead of resuming through
+/// the continuation into the surviving displacement.
+pub(super) fn run_reclaim_partial(path: &Path) -> ! {
+    install(path);
+    let site = straddler_page_end as *const u8;
+    let page = site as usize & !4095;
+    assert_eq!(site as usize - page, 4094, "page-end stub is misplaced");
+    let mut original = vec![0_u8; 4096];
+    unsafe { core::ptr::copy_nonoverlapping(page as *const u8, original.as_mut_ptr(), 4096) };
+    let expected = tool_cpuid(1, 0);
+    let registers = invoke_at(site, 1, 0);
+    assert_eq!(
+        [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+        [expected.eax, expected.ebx, expected.ecx, expected.edx].map(u64::from),
+    );
+    let hooks = || reverie_liteinst::reverie_liteinst_site_hook_count(site as u64);
+    let _ = invoke_at(site, 1, 0);
+    assert!(hooks() > 0, "the page-end CPUID must be patched first");
+    let tail = unsafe { core::ptr::read_unaligned((page + 4096) as *const u16) };
+    assert_ne!(tail, 0x9090, "the jump must reach into the second page");
+    let mapped = unsafe {
+        libc::mmap(
+            page as *mut libc::c_void,
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_eq!(
+        mapped as usize, page,
+        "MAP_FIXED must replace the first page"
+    );
+    unsafe { core::ptr::copy_nonoverlapping(original.as_ptr(), page as *mut u8, 4096) };
+    assert_eq!(
+        unsafe {
+            libc::mprotect(
+                page as *mut libc::c_void,
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        },
+        0
+    );
+    println!("reclaim-partial ready");
+    std::io::stdout().flush().unwrap();
+    let registers = invoke_at(site, 1, 0);
+    println!("survived {registers:?}");
+    std::process::exit(1);
+}
+
+/// A shared executable mapping, present when the runtime starts (so it has
+/// an arena), holding a CPUID at line offset 16 (its word fits the line) and
+/// one at offset 58 (its word would cross the line). LiteInst publishes only
+/// into private mappings, because a write through a shared one would change
+/// the page cache that every alias and every other process executes. Both
+/// sites must therefore trap on every execution, return the Tool's results
+/// through the continuation, and leave the shared page unchanged.
+pub(super) fn run_shared_mapping(path: &Path) {
+    let fd = unsafe { libc::memfd_create(c"liteinst-shared-code".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create failed");
+    let mut code = vec![0xcc_u8; 4096];
+    let stub = [0x0f, 0xa2, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xc3];
+    code[16..25].copy_from_slice(&stub);
+    code[58..67].copy_from_slice(&stub);
+    let written = unsafe { libc::pwrite(fd, code.as_ptr().cast(), code.len(), 0) };
+    assert_eq!(written, 4096, "pwrite to the memfd failed");
+    let page = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    assert_ne!(page, libc::MAP_FAILED, "shared executable mmap failed");
+    let page = page.cast::<u8>();
+    install(path);
+    let expected = tool_cpuid(1, 0);
+    for offset in [16, 58] {
+        let site = unsafe { page.add(offset) };
+        for _ in 0..STRADDLER_REPEATS {
+            let registers = invoke_at(site, 1, 0);
+            assert_eq!(
+                [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+                [expected.eax, expected.ebx, expected.ecx, expected.edx].map(u64::from),
+                "the shared CPUID at offset {offset} must return the Tool's result"
+            );
+            assert_untouched(&registers, "shared cpuid");
+        }
+        let traps = reverie_liteinst::reverie_liteinst_site_trap_count(site as u64);
+        let hooks = reverie_liteinst::reverie_liteinst_site_hook_count(site as u64);
+        assert_eq!(
+            (traps, hooks),
+            (STRADDLER_REPEATS as u64, 0),
+            "the shared CPUID at offset {offset} must trap every time and never be patched"
+        );
+    }
+    let now = unsafe { core::slice::from_raw_parts(page, 4096) };
+    assert_eq!(now, &code[..], "the shared page must stay unchanged");
+    println!("shared-mapping cpuid=tool traps=8+8 hooks=0+0 page=unchanged");
+    std::io::stdout().flush().unwrap();
+}
+
+/// A CPUID in the last two bytes of a private executable page whose next
+/// page is a shared executable mapping, both mapped before the runtime
+/// starts. The CPUID cannot be patched (fewer than eight bytes remain in its
+/// mapping) and resumes in the shared page; because LiteInst never publishes
+/// into a shared mapping, those bytes are the original ones and the
+/// continuation must work.
+pub(super) fn run_split_mapping(path: &Path) {
+    let fd = unsafe { libc::memfd_create(c"liteinst-split-code".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create failed");
+    let mut shared_code = vec![0xcc_u8; 4096];
+    shared_code[..7].copy_from_slice(&[0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xc3]);
+    let written = unsafe { libc::pwrite(fd, shared_code.as_ptr().cast(), 4096, 0) };
+    assert_eq!(written, 4096, "pwrite to the memfd failed");
+    let private = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            8192,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(private, libc::MAP_FAILED, "private mmap failed");
+    let private = private.cast::<u8>();
+    unsafe {
+        core::ptr::write_bytes(private, 0xcc, 4096);
+        core::ptr::copy_nonoverlapping([0x0f_u8, 0xa2].as_ptr(), private.add(4094), 2);
+    }
+    assert_eq!(
+        unsafe { libc::mprotect(private.cast(), 4096, libc::PROT_READ | libc::PROT_EXEC) },
+        0
+    );
+    let shared = unsafe {
+        libc::mmap(
+            private.add(4096).cast(),
+            4096,
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            fd,
+            0,
+        )
+    };
+    assert_eq!(
+        shared,
+        unsafe { private.add(4096) }.cast(),
+        "shared MAP_FIXED failed"
+    );
+    install(path);
+    let site = unsafe { private.add(4094) };
+    let expected = tool_cpuid(1, 0);
+    for _ in 0..STRADDLER_REPEATS {
+        let registers = invoke_at(site, 1, 0);
+        assert_eq!(
+            [registers.rax, registers.rbx, registers.rcx, registers.rdx],
+            [expected.eax, expected.ebx, expected.ecx, expected.edx].map(u64::from),
+            "the page-end CPUID must return the Tool's result"
+        );
+        assert_untouched(&registers, "page-end cpuid");
+    }
+    let traps = reverie_liteinst::reverie_liteinst_site_trap_count(site as u64);
+    assert_eq!(traps, STRADDLER_REPEATS as u64);
+    println!("split-mapping cpuid=tool traps={traps}");
+    std::io::stdout().flush().unwrap();
+}
+
 /// An undecodable fault in late code must still kill the guest with SIGSEGV.
 pub(super) fn run_fault(path: &Path, null_load: bool) -> ! {
     install(path);
@@ -415,6 +1065,16 @@ pub(super) fn run_fault(path: &Path, null_load: bool) -> ! {
 
 unsafe extern "C" {
     fn late_code_invoke(code: *const u8, registers: *mut Registers);
+    fn straddler_cpuid();
+    fn straddler_rdtsc();
+    fn straddler_rdtscp();
+    fn straddler_neighbour();
+    fn straddler_covered();
+    fn straddler_stale_before();
+    fn straddler_stale_patched();
+    fn straddler_page_end();
+    fn reservation_cpuid();
+    fn reservation_syscall();
     fn reverie_liteinst_on_owned_fallback_stack(address: usize) -> bool;
     fn reverie_liteinst_owned_fallback_observation(selector: u32) -> u64;
 }
@@ -474,5 +1134,145 @@ late_code_invoke:
     pop rbx
     ret
     .size late_code_invoke, .-late_code_invoke
+"#
+);
+
+// Each stub starts at the named offset of a 64-byte line, so the 8-byte word
+// patch at its first byte would cross into the next line; the neighbour at
+// offset 54 fits in its line, and its patch would cover the CPUID at 58. The
+// stale-jump pair at offsets 16 and 20 fits in its line: the CPUID at 20 is
+// patched first, and the one at 16 would overwrite the start of its jump. The INT3 padding
+// before a stub is never executed; the NOPs after it give the patcher whole
+// instructions to cover, as ordinary code would.
+core::arch::global_asm!(
+    r#"
+    .text
+    .p2align 6
+    .skip 58, 0xcc
+    .global straddler_cpuid
+    .hidden straddler_cpuid
+    .type straddler_cpuid,@function
+straddler_cpuid:
+    cpuid
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    ret
+    .size straddler_cpuid, .-straddler_cpuid
+
+    .p2align 6
+    .skip 61, 0xcc
+    .global straddler_rdtsc
+    .hidden straddler_rdtsc
+    .type straddler_rdtsc,@function
+straddler_rdtsc:
+    rdtsc
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    ret
+    .size straddler_rdtsc, .-straddler_rdtsc
+
+    .p2align 6
+    .skip 63, 0xcc
+    .global straddler_rdtscp
+    .hidden straddler_rdtscp
+    .type straddler_rdtscp,@function
+straddler_rdtscp:
+    rdtscp
+    nop
+    nop
+    nop
+    nop
+    nop
+    ret
+    .size straddler_rdtscp, .-straddler_rdtscp
+
+    .p2align 6
+    .skip 54, 0xcc
+    .global straddler_neighbour
+    .hidden straddler_neighbour
+    .type straddler_neighbour,@function
+straddler_neighbour:
+    cpuid
+    nop
+    nop
+    .global straddler_covered
+    .hidden straddler_covered
+straddler_covered:
+    cpuid
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    ret
+    .size straddler_neighbour, .-straddler_neighbour
+
+    .p2align 6
+    .skip 16, 0xcc
+    .global straddler_stale_before
+    .hidden straddler_stale_before
+    .type straddler_stale_before,@function
+straddler_stale_before:
+    cpuid
+    nop
+    nop
+    .global straddler_stale_patched
+    .hidden straddler_stale_patched
+straddler_stale_patched:
+    cpuid
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    ret
+    .size straddler_stale_before, .-straddler_stale_before
+
+    .p2align 12
+    .skip 4094, 0xcc
+    .global straddler_page_end
+    .hidden straddler_page_end
+    .type straddler_page_end,@function
+straddler_page_end:
+    cpuid
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    ret
+    .size straddler_page_end, .-straddler_page_end
+
+    .p2align 6
+    .skip 52, 0xcc
+    .global reservation_cpuid
+    .hidden reservation_cpuid
+    .type reservation_cpuid,@function
+reservation_cpuid:
+    cpuid
+    mov eax, 39
+    .global reservation_syscall
+    .hidden reservation_syscall
+reservation_syscall:
+    syscall
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    ret
+    .size reservation_cpuid, .-reservation_cpuid
 "#
 );

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::ffi::CString;
 use std::io;
 use std::process::Command;
@@ -590,6 +582,22 @@ fn user_access_writes_match_native_counts_and_every_destination_byte() {
                     &[iovec(source.as_ptr() as usize, source.len())],
                     &[iovec(control.address(offset), source.len())],
                 );
+                // Kernel-independent oracle for the control: only the bytes
+                // before the protected second page can be copied.
+                let accessible = if offset < page {
+                    (page - offset).min(length)
+                } else {
+                    0
+                };
+                assert_eq!(
+                    expected,
+                    if accessible != 0 || length == 0 {
+                        Ok(accessible)
+                    } else {
+                        Err(Errno::EFAULT)
+                    },
+                    "control prot={protection} offset={offset} len={length}"
+                );
                 let observed = LocalMemory::new().write_with_user_access(
                     AddrMut::from_raw(candidate.address(offset)).unwrap(),
                     source,
@@ -598,7 +606,23 @@ fn user_access_writes_match_native_counts_and_every_destination_byte() {
                     observed, expected,
                     "prot={protection} offset={offset} len={length}"
                 );
-                assert_eq!(candidate.snapshot(), control.snapshot());
+                // Kernel-independent image: the accessible prefix holds the
+                // source, every other byte keeps Mapping::new's fill.
+                let image: Vec<u8> = (0..page * 3)
+                    .map(|index| {
+                        if index >= offset && index - offset < accessible {
+                            source[index - offset]
+                        } else {
+                            (index % 251 + 1) as u8
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    candidate.snapshot(),
+                    image,
+                    "prot={protection} offset={offset} len={length}"
+                );
+                assert_eq!(control.snapshot(), image);
             }
         }
     }
@@ -617,3 +641,113 @@ fn user_access_empty_invalid_and_wrapping_addresses_are_bounded() {
         }
     }
 }
+
+#[test]
+fn exact_copies_round_trip_and_invalid_writes_leave_memory_unchanged() {
+    let mut memory = LocalMemory::new();
+    let source = *b"sabre";
+    let mut copy = [0; 5];
+    memory
+        .read_exact(Addr::from_ptr(source.as_ptr()).unwrap(), &mut copy)
+        .unwrap();
+    assert_eq!(copy, source);
+    let mut destination = [0; 5];
+    memory
+        .write_exact(
+            AddrMut::from_ptr(destination.as_mut_ptr()).unwrap(),
+            b"guest",
+        )
+        .unwrap();
+    assert_eq!(&destination, b"guest");
+
+    // An invalid destination must not reach any mapping, through any write.
+    let canary = Mapping::new();
+    let before = canary.snapshot();
+    for address in [1, usize::MAX - 3, usize::MAX] {
+        let address = AddrMut::from_raw(address).unwrap();
+        for source in [&b"x"[..], &b"rejected"[..]] {
+            assert_eq!(memory.write_exact(address, source), Err(Errno::EFAULT));
+            assert_eq!(
+                memory.write_with_user_access(address, source),
+                Err(Errno::EFAULT)
+            );
+            assert_eq!(canary.snapshot(), before);
+        }
+    }
+}
+
+/// Installs, on the calling thread only, a seccomp filter under which the
+/// kernel fails every `process_vm_writev` with `errno`, so a test can observe
+/// a genuine non-fault kernel error through an unmodified `LocalMemory`.
+#[cfg(target_arch = "x86_64")]
+fn fail_process_vm_writev_with(errno: libc::c_int) {
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    const ARCH_OFFSET: u32 = 4;
+    const NR_OFFSET: u32 = 0;
+    let statement = |code: u32, k: u32| libc::sock_filter {
+        code: code as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k,
+    };
+    let load = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+    let ret = libc::BPF_RET | libc::BPF_K;
+    let mut filter = [
+        statement(load, ARCH_OFFSET),
+        jump(AUDIT_ARCH_X86_64, 0, 3),
+        statement(load, NR_OFFSET),
+        jump(libc::SYS_process_vm_writev as u32, 0, 1),
+        statement(ret, libc::SECCOMP_RET_ERRNO | errno as u32),
+        statement(ret, libc::SECCOMP_RET_ALLOW),
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &program as *const libc::sock_fprog,
+            )
+        },
+        0
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn user_access_writes_preserve_a_non_fault_errno() {
+    // The filter cannot be removed, so it is installed in an isolated child.
+    if !in_isolated_process("local::transfer_tests::user_access_writes_preserve_a_non_fault_errno")
+    {
+        return;
+    }
+    fail_process_vm_writev_with(libc::ESRCH);
+    let mut memory = LocalMemory::new();
+    let mut destination = [0xa5u8; 8];
+    let address = AddrMut::from_ptr(destination.as_mut_ptr()).unwrap();
+    assert_eq!(
+        memory.write_with_user_access(address, b"rejected"),
+        Err(Errno::ESRCH)
+    );
+    assert_eq!(destination, [0xa5; 8]);
+    assert_eq!(
+        memory.write_with_user_access(AddrMut::from_raw(usize::MAX).unwrap(), &[]),
+        Ok(0)
+    );
+}
+
+#[path = "executor_tests.rs"]
+mod executor_tests;

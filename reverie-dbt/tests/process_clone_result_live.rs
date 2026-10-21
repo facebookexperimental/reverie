@@ -1,5 +1,4 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
+/* Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -88,6 +87,7 @@ fn process_clone_result_delivery_matches_the_public_contract() {
 
     let results = callback_results(&output.stderr);
     let mut expected = vec![
+        (libc::SYS_clone, -libc::EINVAL as i64),
         (libc::SYS_clone, -libc::EINVAL as i64),
         (libc::SYS_clone, -libc::EINVAL as i64),
         (libc::SYS_fork, 1),

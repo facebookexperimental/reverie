@@ -103,6 +103,7 @@ pub struct StatxTimestamp {
     __statx_timestamp_pad1: [i32; 1],
 }
 
+#[cfg(not(target_env = "musl"))]
 impl From<StatxTimestamp> for libc::statx_timestamp {
     fn from(buf: StatxTimestamp) -> libc::statx_timestamp {
         // The layout and size is exactly the same, so this transmute is safe to
@@ -111,6 +112,7 @@ impl From<StatxTimestamp> for libc::statx_timestamp {
     }
 }
 
+#[cfg(not(target_env = "musl"))]
 impl From<libc::statx_timestamp> for StatxTimestamp {
     fn from(buf: libc::statx_timestamp) -> StatxTimestamp {
         // The layout and size is exactly the same, so this transmute is safe to
@@ -152,6 +154,7 @@ pub struct StatxBuf {
     __statx_pad3: [u64; 12],
 }
 
+#[cfg(not(target_env = "musl"))]
 impl From<StatxBuf> for libc::statx {
     fn from(buf: StatxBuf) -> libc::statx {
         // The layout and size is exactly the same, so this transmute is safe to
@@ -160,6 +163,7 @@ impl From<StatxBuf> for libc::statx {
     }
 }
 
+#[cfg(not(target_env = "musl"))]
 impl From<libc::statx> for StatxBuf {
     fn from(buf: libc::statx) -> StatxBuf {
         // The layout and size is exactly the same, so this transmute is safe to
@@ -178,7 +182,9 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(size_of::<StatBuf>(), size_of::<libc::stat>());
+        #[cfg(not(target_env = "musl"))]
         assert_eq!(size_of::<StatxBuf>(), size_of::<libc::statx>());
+        #[cfg(not(target_env = "musl"))]
         assert_eq!(
             size_of::<StatxTimestamp>(),
             size_of::<libc::statx_timestamp>()
@@ -188,10 +194,171 @@ mod tests {
     #[test]
     fn alignment() {
         assert_eq!(align_of::<StatBuf>(), align_of::<libc::stat>());
+        #[cfg(not(target_env = "musl"))]
         assert_eq!(align_of::<StatxBuf>(), align_of::<libc::statx>());
+        #[cfg(not(target_env = "musl"))]
         assert_eq!(
             align_of::<StatxTimestamp>(),
             align_of::<libc::statx_timestamp>()
         );
+    }
+}
+
+// The adapter deliberately preserves the entire 256-byte image, including newer
+// kernel fields carried in its private reserved tail. Never rebuild this
+// image field by field and silently discard those bytes.
+const _: () = {
+    assert!(
+        core::mem::size_of::<StatxBuf>() == core::mem::size_of::<crate::linux_abi::KernelStatx>()
+    );
+    assert!(
+        core::mem::align_of::<StatxBuf>() == core::mem::align_of::<crate::linux_abi::KernelStatx>()
+    );
+    assert!(
+        core::mem::size_of::<StatxTimestamp>()
+            == core::mem::size_of::<crate::linux_abi::KernelStatxTimestamp>()
+    );
+    assert!(
+        core::mem::align_of::<StatxTimestamp>()
+            == core::mem::align_of::<crate::linux_abi::KernelStatxTimestamp>()
+    );
+    assert!(
+        core::mem::offset_of!(StatxTimestamp, tv_sec)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatxTimestamp, tv_sec)
+    );
+    assert!(
+        core::mem::offset_of!(StatxTimestamp, tv_nsec)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatxTimestamp, tv_nsec)
+    );
+    assert!(
+        core::mem::offset_of!(StatxTimestamp, __statx_timestamp_pad1)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatxTimestamp, __reserved)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_mask)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_mask)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_blksize)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_blksize)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_attributes)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_attributes)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_nlink)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_nlink)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_uid)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_uid)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_gid)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_gid)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_mode)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_mode)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_ino)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_ino)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_size)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_size)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_blocks)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_blocks)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_attributes_mask)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_attributes_mask)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_atime)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_atime)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_btime)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_btime)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_ctime)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_ctime)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_mtime)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_mtime)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_rdev_major)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_rdev_major)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_rdev_minor)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_rdev_minor)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_dev_major)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_dev_major)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_dev_minor)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_dev_minor)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, stx_mnt_id)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_mnt_id)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, __statx_pad1)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, __spare0)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, __statx_pad2)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_dio_mem_align)
+    );
+    assert!(
+        core::mem::offset_of!(StatxBuf, __statx_pad3)
+            == core::mem::offset_of!(crate::linux_abi::KernelStatx, stx_subvol)
+    );
+};
+
+impl From<StatxBuf> for crate::linux_abi::KernelStatx {
+    fn from(value: StatxBuf) -> Self {
+        // SAFETY: integer-only representations; size, alignment and all named
+        // field offsets are checked above. The reserved tail is copied intact.
+        unsafe { core::mem::transmute(value) }
+    }
+}
+
+impl From<crate::linux_abi::KernelStatx> for StatxBuf {
+    fn from(value: crate::linux_abi::KernelStatx) -> Self {
+        // SAFETY: the same integer-only layout checks apply in reverse.
+        unsafe { core::mem::transmute(value) }
+    }
+}
+
+#[cfg(test)]
+mod kernel_abi_tests {
+    use super::*;
+
+    #[test]
+    fn statx_all_bytes_round_trip_including_new_kernel_tail() {
+        for fill in [0u8, 0x55, 0xaa, 0xff] {
+            let bytes: [u8; 256] = core::array::from_fn(|i| fill ^ i as u8);
+            // SAFETY: the generated UAPI consists entirely of integer fields;
+            // every bit pattern is valid, and its size is checked above.
+            let kernel: crate::linux_abi::KernelStatx = unsafe { core::mem::transmute(bytes) };
+            let adapted = StatxBuf::from(kernel);
+            let kernel = crate::linux_abi::KernelStatx::from(adapted);
+            // SAFETY: same integer-only representation, without implicit holes.
+            let actual: [u8; 256] = unsafe { core::mem::transmute(kernel) };
+            assert_eq!(actual, bytes);
+        }
     }
 }

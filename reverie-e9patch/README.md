@@ -58,12 +58,12 @@ malformed output.
 
 e9patch is deliberately kept a close sibling of the LiteInst backend
 (`reverie-liteinst`). Both are **ld-preload backends** that share the
-`reverie-preload` runtime and fall back to the ptrace lifecycle owner for full
+`reverie-inguest` runtime and fall back to the ptrace lifecycle owner for full
 `Guest` semantics. The convergence is deliberate: correctness-critical code is
-written and reviewed exactly once, in `reverie-preload`, and both backends reuse
+written and reviewed exactly once, in `reverie-inguest`, and both backends reuse
 it.
 
-**Shared (identical code, from `reverie-preload`):**
+**Shared (identical code, from `reverie-inguest`):**
 
 - **ld-preload injection substrate.** The crate is now built as a `cdylib`
   (`libreverie_e9patch.so`) plus `rlib`, with a `preload-constructor` feature
@@ -75,16 +75,16 @@ it.
 - **Fallback ptracer.** `E9patchBackend` runs the guest under Reverie's ptrace
   lifecycle controller, the same correctness-first owner LiteInst falls back to.
 - **The same Reverie hooks.** `E9patchDispatcher` plugs into the shared
-  `reverie_preload::dispatch::SyscallDispatcher` seam and reuses LiteInst's
+  `reverie_inguest::dispatch::SyscallDispatcher` seam and reuses LiteInst's
   `PassthroughDispatcher` **verbatim**, so the SIGSYS handler, seccomp filter,
   trusted syscall gate, and fail-closed guard policy (execve, `SIGSYS`
   reservation, `sigaltstack`/`rt_sigprocmask` mutation, non-null `clone` stacks)
   are the same code in both backends.
 - **The same lifecycle-controller seam.** Both backends install their runtime
-  through reverie-preload's `LifecycleController` seam. Selecting a controller is
+  through reverie-inguest's `LifecycleController` seam. Selecting a controller is
   a *config choice on one shared seam*, not a mechanism fork (see `RuntimeMode`).
 - **The same shared `RuntimeConfig`.** The in-guest runtime installs through
-  reverie-preload's shared `RuntimeConfig` (today the `use_alt_stack` knob that
+  reverie-inguest's shared `RuntimeConfig` (today the `use_alt_stack` knob that
   governs whether the `SIGSYS` handler runs on an alternate signal stack). The
   config struct and the controller that honors it are shared-crate code reviewed
   once; the e9patch launcher selects a non-default value with `set_guest_alt_stack`
@@ -92,17 +92,17 @@ it.
   Only the env-var spelling is e9patch's — the same shared-vs-local split as tool
   and controller selection.
 - **The same shared built-in tools.** e9patch's in-guest runtime can install
-  reverie-preload's shared `BuiltinTool`s (`passthrough`, `spoof-getpid`)
-  **verbatim** via the shared `reverie_preload::install_builtin`, selected by
+  reverie-inguest's shared `BuiltinTool`s (`passthrough`, `spoof-getpid`)
+  **verbatim** via the shared `reverie_inguest::install_builtin`, selected by
   `REVERIE_E9PATCH_TOOL`. This is the analog of LiteInst's built-in
   `strace`/`compat` selection (`configure_command(cmd, PreloadTool)`), except the
   tool — including the *mutating* `spoof-getpid` demo that returns
-  `reverie_preload::SPOOF_PID` from `getpid` — is shared-crate code reviewed
+  `reverie_inguest::SPOOF_PID` from `getpid` — is shared-crate code reviewed
   once, not backend-private. Only the env-var spelling is e9patch's. This proves
   the e9patch direct AOT path can *mutate* a syscall result, while residual
   un-rewritten sites still use the shared signal fallback.
 - **The same fork-following seam.** The production dispatcher
-  (`E9patchDispatcher::with_fork_reset`) arms reverie-preload's shared
+  (`E9patchDispatcher::with_fork_reset`) arms reverie-inguest's shared
   `fork::ForkHook` through `PassthroughDispatcher::with_fork_hook`, so each
   `fork`/`clone` child re-establishes its per-process runtime state in the child
   immediately after the fork-like syscall returns `0`. This is the *same* seam,
@@ -134,7 +134,7 @@ it.
    still ptrace-visible as signal delivery. The loader-before-constructor and
    vDSO windows remain uncovered.
 4. **How a generic tool is selected.** Shared built-ins live in
-   `reverie-preload`. A generic `T: Tool` instead lives in a tool-specific DSO,
+   `reverie-inguest`. A generic `T: Tool` instead lives in a tool-specific DSO,
    matching LiteInst: its constructor calls `install_tool::<T>`, connects to the
    coordinator, and publishes the AOT callback. Tool-data launchers use the
    same sealed inherited-memfd bootstrap pattern as LiteInst, so neither the
@@ -177,7 +177,7 @@ the guest through two C-ABI counters:
 The per-site counter is the **address-keyed** analog of LiteInst's
 `reverie_liteinst_site_trap_count(address)`. Earlier the e9patch fallback was
 observable only by **syscall number**; the shared
-`reverie_preload::dispatch::SyscallEvent` also exposes the trapping
+`reverie_inguest::dispatch::SyscallEvent` also exposes the trapping
 `instruction_pointer()`, so the residual sites e9patch could not rewrite ahead of
 time (loader/startup, vDSO, uncovered or JIT-emitted code) *do* have addresses to
 key on. There is no `hook`-count analog: the fallback never installs a runtime
@@ -208,7 +208,7 @@ mechanism LiteInst uses on fork, applied to e9patch's per-process state.
 
 ## Preload And RPC Boundary
 
-The shared `reverie-preload` runtime and `reverie-rpc-transport` transport are
+The shared `reverie-inguest` runtime and `reverie-rpc-transport` transport are
 now wired into the crate: the dispatcher, the `install_runtime`/
 `install_hybrid_runtime` paths, and the `.init_array` preload constructor build
 as part of the cdylib. The launcher-side injection is also wired into the active
@@ -226,15 +226,15 @@ launcher: the default `Backend::run<T>` path retains its generic host Tool,
 while the legacy direct environment path separately selects the unit-tool
 lifecycle reaper described above.
 
-The in-guest runtime also exposes reverie-preload's shared **built-in tools**.
+The in-guest runtime also exposes reverie-inguest's shared **built-in tools**.
 `configure_guest_builtin(command, tool)` prepends the cdylib and sets
 `REVERIE_E9PATCH_TOOL` (which the constructor reads with priority over
 `REVERIE_E9PATCH_RUNTIME`); the constructor then calls the shared
-`reverie_preload::install_builtin`, so the dispatcher is shared-crate code. The
-`spoof-getpid` built-in returns `reverie_preload::SPOOF_PID` from a rewritten
+`reverie_inguest::install_builtin`, so the dispatcher is shared-crate code. The
+`spoof-getpid` built-in returns `reverie_inguest::SPOOF_PID` from a rewritten
 `getpid`, demonstrating end to end that the direct AOT path can *mutate* a result.
 Built-in tools run under the shared isolated in-process controller (the
-demo/testing path, matching reverie-preload's standalone cdylib), not the
+demo/testing path, matching reverie-inguest's standalone cdylib), not the
 ptrace-hosted production controller.
 
 Generic Tool dispatch is now available through the same typed-DSO model as

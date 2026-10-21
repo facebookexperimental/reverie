@@ -1,6 +1,5 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
@@ -18,6 +17,7 @@ use reverie::CpuIdResult;
 
 use crate::Error;
 use crate::Result;
+use crate::error::ErrorExt;
 
 const PLATFORM_INFO: u32 = 0xce;
 const MISC_FEATURES_ENABLES: u32 = 0x140;

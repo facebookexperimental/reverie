@@ -12,6 +12,10 @@
 // The reused production tool sources each declare the same test-only KVM helper.
 #![allow(clippy::duplicate_mod)]
 
+// This legacy example cdylib also exports an rlib. Preserve its prior scoped
+// allocation policy explicitly, including example binaries that link the rlib.
+reverie_liteinst::declare_legacy_scoped_tool_allocator!();
+
 use std::ffi::CStr;
 use std::ffi::OsStr;
 use std::mem::MaybeUninit;
@@ -42,6 +46,9 @@ mod counter2;
 #[allow(dead_code)]
 #[path = "../noop.rs"]
 mod noop;
+#[allow(dead_code)]
+#[path = "../recorder_tool.rs"]
+mod recorder_tool;
 #[allow(dead_code)]
 #[path = "../strace/main.rs"]
 pub(crate) mod strace;
@@ -224,6 +231,11 @@ unsafe extern "C" fn initialize(
                     &bootstrap.coordinator,
                 )
             },
+            recorder_tool::NAME => unsafe {
+                reverie_e9patch::install_tool_from_bootstrap::<recorder_tool::Recorder>(
+                    &bootstrap.coordinator,
+                )
+            },
             other => fail(&format!("unknown e9patch bootstrap tool {other:?}")),
         };
         if let Err(error) = result {
@@ -292,6 +304,9 @@ unsafe extern "C" fn initialize(
         },
         "noop" => unsafe {
             reverie_liteinst::install_tool_from_bootstrap::<noop::NoopTool>(&socket)
+        },
+        recorder_tool::NAME => unsafe {
+            reverie_liteinst::install_tool_from_bootstrap::<recorder_tool::Recorder>(&socket)
         },
         other => fail(&format!("unknown example tool {other:?}")),
     };

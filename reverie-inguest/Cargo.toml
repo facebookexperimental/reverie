@@ -1,0 +1,129 @@
+[package]
+name = "reverie-inguest"
+version = "0.5.1"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/reverie-inguest"
+keywords = ["linux", "instrumentation", "hermit"]
+categories = ["development-tools::debugging", "os::linux-apis"]
+description = "Shared LD_PRELOAD + seccomp/SIGSYS instrumentation runtime for Reverie in-guest backends (e9patch, LiteInst, SaBRe)"
+
+# Both an rlib (so e9patch/liteinst embed the runtime and register their own
+# dispatcher) and a cdylib (a standalone `LD_PRELOAD=libreverie_inguest.so`
+# skeleton usable on its own and by the integration tests).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["preload-constructor"]
+# Allocation diagnostics for the real-preload ownership regression. This does
+# not select or alter the allocator.
+allocator-fixture = []
+# Observations of real RPC connections and dispatch counters for installed tests.
+# Does not enable a constructor, native exec, or callback authority.
+rpc-io-fixture = ["coordinator-rpc"]
+# Install the runtime from a `.init_array` constructor the moment the dynamic
+# loader maps the cdylib. Disable to embed the runtime and drive it manually
+# (for example from a backend that installs it after its own bootstrap).
+preload-constructor = []
+# Host process launch/RPC lifetime owner. Guest bootstrap and typed statistics
+# remain usable without this feature; it never registers a constructor.
+launcher = ["coordinator-rpc", "dep:tempfile", "dep:tokio", "dep:tracing"]
+# First-image exec-stop mechanics; no runtime or backend activation.
+exec-stop = ["launcher", "dep:reverie-loader", "dep:safeptrace", "dep:reverie-memory", "dep:nix"]
+# Separate mechanics fixture executable and real-kernel integration tests.
+stage1a-probe = ["exec-stop", "dep:serde_json", "dep:sha2"]
+# Explicit FullTool-only fixed syscall/restorer ABI; off by default.
+fixed-syscall-gates = []
+# Private GNU loader InitialImage experiment; no successor exec admission.
+exec-private-init = ["fixed-syscall-gates"]
+# Explicit private-loader gate layout; effective only with target_env=musl.
+# GNU builds, including all-features, retain the legacy fixed gate ABI.
+# This selects coordinates only; it does not admit or initialize an image.
+loader-private-runtime = ["exec-private-init", "dep:reverie-loader"]
+# Inactive continuity for the actual shared scalar collector.
+native-exec-state = ["coordinator-rpc"]
+# Real collector test adapters; only cross-crate dev dependencies enable this.
+native-exec-state-fixture = ["native-exec-state"]
+# Inactive successor lifecycle component; no exec consumer or admission.
+exec-private-successor = ["exec-private-init", "coordinator-rpc"]
+# Inactive installer-only original-dispatch native exec injection seam.
+exec-native-injection = ["exec-private-successor", "dep:sha2"]
+
+# Synchronous coordinator RPC client, wire-compatible with the async
+# `reverie-rpc-transport` `RpcServer<G>` (u32-BE length prefix + bincode2
+# `config::legacy`). Opt-in so the default cdylib does not include the coordinator transport.
+coordinator-rpc = ["dep:serde", "dep:bincode", "dep:reverie", "dep:reverie-rpc-transport"]
+# The in-guest RCB clock, built on the one shared core branch counter.
+rcb-clock = ["dep:reverie"]
+
+[dependencies]
+reverie-loader = { version = "0.5.1", path = "../reverie-loader", optional = true }
+safeptrace = { version = "0.5.1", path = "../safeptrace", features = ["memory", "notifier"], optional = true }
+reverie-memory = { version = "0.5.1", path = "../reverie-memory", optional = true }
+nix = { version = "0.30.1", features = ["fs", "process", "signal"], optional = true }
+serde_json = { version = "1.0.149", optional = true }
+sha2 = { version = "0.10.9", optional = true }
+libc = "0.2.186"
+syscalls = "0.6.18"
+reverie-syscalls = { version = "0.5.1", path = "../reverie-syscalls" }
+serde = { version = "1.0.219", features = ["derive"], optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
+reverie = { version = "0.5.1", path = "../reverie", optional = true, package = "reverie-core" }
+reverie-rpc-transport = { version = "0.5.1", path = "../reverie-rpc-transport", optional = true }
+
+tempfile = { version = "3.27.0", optional = true }
+tokio = { version = "1.52.4", features = ["macros", "net", "rt", "time"], optional = true }
+tracing = { version = "0.1.41", optional = true }
+
+[dev-dependencies]
+reverie-loader = { version = "0.5.1", path = "../reverie-loader" }
+tokio = { version = "1.52.4", features = ["test-util"] }
+tracing-subscriber = "0.3.23"
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
+
+[[bin]]
+name = "reverie-inguest-probe"
+path = "src/bin/preload_probe.rs"
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+
+[[test]]
+name = "pkeys"
+path = "tests/pkeys.rs"
+
+[[test]]
+name = "libc_identity"
+path = "tests/libc_identity.rs"
+
+[[test]]
+name = "libc_identity_allocations"
+path = "tests/libc_identity_allocations.rs"
+
+[[test]]
+name = "seccomp_tsync"
+path = "tests/seccomp_tsync.rs"
+
+[[test]]
+name = "clock_allocations"
+path = "tests/clock_allocations.rs"
+required-features = ["rcb-clock"]
+
+[[bin]]
+name = "reverie-inguest-pkey-buffers"
+path = "src/bin/pkey_buffers.rs"
+
+[[bin]]
+name = "reverie-inguest-native-syscall-result"
+path = "src/bin/native_syscall_result.rs"
+
+[[bin]]
+name = "reverie-loader-stage1a-probe"
+path = "src/bin/stage1a_probe/main.rs"
+required-features = ["stage1a-probe"]

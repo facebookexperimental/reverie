@@ -119,13 +119,21 @@ struct Args {
     #[clap(flatten)]
     chaos_options: ChaosCliOptions,
 
+    /// Print the path of the SaBRe loader reverie-sabre built, and exit.
+    #[clap(long, exclusive = true)]
+    print_sabre: bool,
+
     /// Program and arguments to trace.
-    #[clap(required = true, num_args = 1.., allow_hyphen_values = true)]
+    #[clap(required_unless_present = "print_sabre", num_args = 1.., allow_hyphen_values = true)]
     command: Vec<String>,
 }
 
 impl Args {
     async fn run(self) -> Result<ExitStatus> {
+        if self.print_sabre {
+            println!("{}", reverie_sabre::bundled_sabre_path().display());
+            return Ok(ExitStatus::Exited(0));
+        }
         if self.tool != ToolKind::ChromeTrace && self.out.is_some() {
             bail!("--out is only valid with --tool chrome-trace");
         }

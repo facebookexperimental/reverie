@@ -8,14 +8,7 @@
 
 //! `Tracer` type, plus ways to spawn it and retrieve its output.
 
-#![allow(
-    unexpected_cfgs,
-    reason = "`fbcode_build` is supplied by the internal Buck build"
-)]
-
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -28,9 +21,9 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
-use std::sync::OnceLock as StdOnceLock;
 use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
@@ -84,31 +77,17 @@ use safeptrace::Wait;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
-use crate::LiteinstInstrumentationStats;
-use crate::LiteinstInstrumentationStatsHandle;
 use crate::PtraceBackendStatsSource;
 use crate::cp;
 use crate::gdbstub::GdbServer;
-use crate::liteinst_trap_only::LiteinstTrapOnlyConfig;
-use crate::liteinst_trap_only::LiteinstTrapOnlyHandle;
-use crate::liteinst_trap_only::SitePatching;
-use crate::liteinst_trap_only::require_ia32_emulation;
 use crate::poll_on_wake::PollOnWake;
 use crate::poll_on_wake::WakeGate;
 use crate::task::Child;
 use crate::task::FatalSession;
 use crate::task::InjectedSyscallProvenance;
 use crate::task::InjectedSyscallTrap;
-use crate::task::LiteinstRuntimeConfig;
-#[cfg(test)]
-use crate::task::NewbornDisplacement;
-#[cfg(test)]
-use crate::task::NewbornDisplacementOutcome;
-#[cfg(test)]
-use crate::task::NewbornDisplacementStage;
+use crate::task::PostspawnPreinit;
 use crate::task::PreinitOutcome;
-#[cfg(test)]
-use crate::task::RootStopPause;
 use crate::task::TracedTask;
 use crate::task::TracedTaskOptions;
 
@@ -135,30 +114,13 @@ pub struct Tracer<G> {
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
 
-    // Dynamic LiteInst keeps its established session guard. Static injected
-    // traps use ordinary stopped-task ownership internally, while their public
-    // completion API remains explicitly unsupported.
-    liteinst_cleanup: Option<LiteinstTraceeCleanup>,
-    liteinst_instrumentation_stats: Option<Arc<StdMutex<LiteinstInstrumentationStats>>>,
-    // Present only for a runtime-free (trap-only) LiteInst launch.
-    liteinst_trap_only: Option<LiteinstTrapOnlyHandle>,
-
     // Present only when the caller requested general ptrace activity stats.
     backend_stats: Option<PtraceBackendStatsSource>,
     ordinary_session: Arc<FatalSession>,
     ptracer_thread: ThreadId,
+    // Static injected traps use ordinary stopped-task ownership internally,
+    // while their public completion API remains explicitly unsupported.
     ordinary_completion_supported: bool,
-}
-
-struct LegacyInjectedOwner<G> {
-    tracer: Tracer<G>,
-    local: tokio::task::LocalSet,
-    stdout: crate::capture::CaptureDrain,
-    stderr: crate::capture::CaptureDrain,
-    permit: Option<QuarantinePermit>,
-    // The diagnostic may be dropped while cleanup is still unconfirmed. Keep
-    // the identical primary, secondary errors, and captured bytes with its owner.
-    failure: Option<Arc<crate::PtraceRunFailure>>,
 }
 
 /// An injected-mode run failed and its original guard could not confirm cleanup.
@@ -183,48 +145,6 @@ impl InjectedCleanupUnconfirmed {
     }
 }
 
-// Test-only side observations keep the exact returned value and error intact.
-// The non-test expansion is precisely the original expression.
-macro_rules! legacy_cleanup_observe {
-    ($phase:literal, $tid:expr, $generation:expr, $expression:expr) => {{
-        #[cfg(all(test, target_arch = "x86_64"))]
-        {
-            let observation = injected_error_tests::RefusalPhase::enter($phase, $tid, $generation);
-            let result = $expression;
-            observation.finish(&result);
-            result
-        }
-        #[cfg(not(all(test, target_arch = "x86_64")))]
-        {
-            $expression
-        }
-    }};
-}
-
-struct LiteinstTraceeCleanup {
-    identity: TraceeIdentity,
-    newborn_tracees: Arc<StdMutex<HashMap<Pid, NewbornTracee>>>,
-    armed: bool,
-    terminal: Option<TerminalCleanup>,
-    notifier_owner: Option<ThreadId>,
-    retained_descendants: HashMap<Pid, RegisteredTraceeCleanup>,
-    retained_terminal_descendants: HashMap<Pid, TraceeIdentity>,
-    // Fatal injected callbacks request stronger confirmation than the legacy
-    // ownership policy. These generations are already notifier-terminal and
-    // confer no further signaling, ptrace, or natural-parent wait authority.
-    fatal_terminal_observations: Option<HashMap<Pid, TraceeIdentity>>,
-    held_root_stop: Arc<StdMutex<Option<HeldRootStop>>>,
-    root_frozen: bool,
-    #[cfg(test)]
-    fail_discovery_once: Option<Arc<AtomicBool>>,
-    #[cfg(test)]
-    fail_discovery_while: Option<Arc<AtomicBool>>,
-    #[cfg(test)]
-    fail_after_scan_once: Option<Arc<AtomicBool>>,
-    #[cfg(test)]
-    force_task_scan_once: Option<Arc<AtomicBool>>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TraceeSnapshot {
     tgid: Pid,
@@ -237,19 +157,13 @@ struct TraceeSnapshot {
 pub(crate) struct TraceeIdentity {
     tid: Pid,
     snapshot: TraceeSnapshot,
+    /// Only test assertions (`same_process`) read the retained procfs handle
+    /// and inode; production still captures them as before.
+    #[cfg_attr(not(test), allow(dead_code))]
     proc_dir: OwnedFd,
+    #[cfg_attr(not(test), allow(dead_code))]
     proc_inode: u64,
     pidfd: Option<OwnedFd>,
-    parent: Option<(Pid, Pid, Option<ChildOp>)>,
-}
-
-pub(crate) struct NewbornTracee {
-    link: EventChildLink,
-    identity: Option<TraceeIdentity>,
-    terminal: TerminalCleanup,
-    /// Every other generation registered under this TID, with its own event
-    /// link, in registration order. None of them owns the TID.
-    history: Vec<(EventChildLink, TerminalCleanup)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,8 +178,10 @@ pub(crate) struct HeldRootStop {
     observation: safeptrace::StoppedObservation,
     root_tid: Pid,
     status: HeldRootStopStatus,
-    /// The child generation a held `NewChild` stop names. A later child may
-    /// own its TID by cleanup, so validation looks for this exact generation.
+    /// The child generation a held `NewChild` stop names. Nothing reads it
+    /// now; the held stop still retains the child's cleanup handle for as long
+    /// as it did before.
+    #[allow(dead_code)]
     child: Option<TerminalCleanup>,
     armed: bool,
 }
@@ -1583,7 +1499,12 @@ async fn finish_ordinary_terminal(
                         });
                         match observed_event {
                             Ok(raw) => {
-                                exit_status = Some(ExitStatus::from_raw(raw as i32));
+                                let status = ExitStatus::from_raw(raw as i32);
+                                exit_status = Some(status);
+                                // Still held at the exit stop, after the
+                                // fatal decision: nothing done here can
+                                // change the status read above.
+                                session.offer_fatal_signal_exit(&stopped, status);
                                 #[cfg(test)]
                                 if let Some(control) =
                                     EXIT_RESUME_CONTROL.with(|slot| slot.borrow().clone())
@@ -2170,6 +2091,8 @@ fn resume_group_sigstop_retaining(task: Stopped) -> Result<Running, (Stopped, Er
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeldRootStopStatus {
     Signal(Signal),
+    /// A signal nix cannot name (`Event::RawSignal`).
+    RawSignal(i32),
     NewChild(EventChildLink),
     Exec(Pid),
     VforkDone,
@@ -2183,6 +2106,7 @@ impl HeldRootStop {
     pub(crate) fn from_event(task: &Stopped, event: &Event) -> Self {
         let status = match event {
             Event::Signal(signal) => HeldRootStopStatus::Signal(*signal),
+            Event::RawSignal(signal) => HeldRootStopStatus::RawSignal(*signal),
             Event::NewChild(op, child) => HeldRootStopStatus::NewChild(EventChildLink {
                 tid: child.pid(),
                 parent_tid: task.pid(),
@@ -2209,21 +2133,6 @@ impl HeldRootStop {
         }
     }
 
-    /// Whether the newborn table records the exact child generation and event
-    /// link this held `NewChild` stop names, as its TID's owner or in its
-    /// history. Cleanup must hold that record before it revokes the stop.
-    fn newborn_recorded(
-        &self,
-        link: EventChildLink,
-        newborns: &HashMap<Pid, NewbornTracee>,
-    ) -> bool {
-        self.child.as_ref().is_some_and(|child| {
-            newborns
-                .get(&link.tid)
-                .is_some_and(|newborn| newborn.records_child(link, child))
-        })
-    }
-
     pub(crate) fn callback_observation(
         &self,
         tid: Pid,
@@ -2242,6 +2151,7 @@ impl HeldRootStop {
         }
         let class = match self.status {
             HeldRootStopStatus::Signal(signal) => Stop::Signal(signal as i32),
+            HeldRootStopStatus::RawSignal(signal) => Stop::Signal(signal),
             HeldRootStopStatus::NewChild(link) => Stop::Event(match link.op {
                 ChildOp::Fork => libc::PTRACE_EVENT_FORK,
                 ChildOp::Vfork => libc::PTRACE_EVENT_VFORK,
@@ -2324,7 +2234,7 @@ impl HeldRootStop {
     }
 }
 
-/// Exclusive transition capability for a stopped LiteInst root generation.
+/// Exclusive transition capability for a stopped root generation.
 ///
 /// Dropping this value without a transition intentionally leaves the shared
 /// cleanup lease armed. Every transition consumes the value and disarms only
@@ -2396,11 +2306,38 @@ impl RootStopLease {
         self.take_for_transition()?.syscall(signal)
     }
 
-    pub(crate) fn detach<T: Into<Option<Signal>>>(
-        mut self,
-        signal: T,
+    /// Runs the stopped root until it next takes a branch
+    /// (`Stopped::block_step`), delivering no signal.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn block_step(mut self) -> Result<Running, TraceError> {
+        self.take_for_transition()?.block_step()
+    }
+
+    /// `resume` for a signal that may be one nix cannot name.
+    pub(crate) fn resume_any(
+        self,
+        signal: Option<safeptrace::AnySignal>,
     ) -> Result<Running, TraceError> {
-        self.take_for_transition()?.detach(signal)
+        match signal {
+            Some(signal) if signal.as_nix().is_none() => self.resume_raw(signal.raw()),
+            signal => self.resume(signal.and_then(safeptrace::AnySignal::as_nix)),
+        }
+    }
+
+    /// `resume`, delivering a raw signal number nix cannot name
+    /// (`Stopped::resume_raw`).
+    pub(crate) fn resume_raw(mut self, signal: i32) -> Result<Running, TraceError> {
+        self.take_for_transition()?.resume_raw(signal)
+    }
+
+    /// `step`, delivering a raw signal number (`Stopped::step_raw`).
+    pub(crate) fn step_raw(mut self, signal: i32) -> Result<Running, TraceError> {
+        self.take_for_transition()?.step_raw(signal)
+    }
+
+    /// `syscall`, delivering a raw signal number (`Stopped::syscall_raw`).
+    pub(crate) fn syscall_raw(mut self, signal: i32) -> Result<Running, TraceError> {
+        self.take_for_transition()?.syscall_raw(signal)
     }
 }
 
@@ -2415,149 +2352,6 @@ impl std::ops::Deref for RootStopLease {
 impl std::ops::DerefMut for RootStopLease {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.task.as_mut().expect("root stop lease consumed once")
-    }
-}
-
-impl NewbornTracee {
-    pub(crate) fn from_event(parent_tid: Pid, op: ChildOp, task: &Running) -> Self {
-        Self {
-            link: EventChildLink {
-                tid: task.pid(),
-                parent_tid,
-                op,
-            },
-            identity: None,
-            terminal: task.terminal_cleanup(),
-            history: Vec::new(),
-        }
-    }
-
-    /// Records the decoded child's current generation under its TID. Every
-    /// LiteInst `Event::NewChild` registration goes through here.
-    pub(crate) fn register(
-        newborns: &StdMutex<HashMap<Pid, NewbornTracee>>,
-        parent_tid: Pid,
-        op: ChildOp,
-        child: &Running,
-    ) {
-        Self::from_event(parent_tid, op, child).retain(&mut newborns.lock().unwrap());
-    }
-
-    /// Registers `terminal` under `tid` through the same ownership rule as
-    /// `register`, for a generation that is not the decoded child's.
-    #[cfg(test)]
-    pub(crate) fn register_generation_for_test(
-        newborns: &StdMutex<HashMap<Pid, NewbornTracee>>,
-        tid: Pid,
-        parent_tid: Pid,
-        op: ChildOp,
-        terminal: TerminalCleanup,
-    ) {
-        Self {
-            link: EventChildLink {
-                tid,
-                parent_tid,
-                op,
-            },
-            identity: None,
-            terminal,
-            history: Vec::new(),
-        }
-        .retain(&mut newborns.lock().unwrap());
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_identity_for_test(&self) -> bool {
-        self.identity.is_some()
-    }
-
-    /// Whether the entry records `terminal` without it owning the TID.
-    #[cfg(test)]
-    pub(crate) fn records_in_history_for_test(&self, terminal: &TerminalCleanup) -> bool {
-        !self.same_generation(terminal) && self.records_generation(terminal)
-    }
-
-    /// The table is keyed by TID alone, and the kernel reuses a TID once the
-    /// child that held it is reaped
-    /// (https://github.com/rrnewton/reverie/issues/852). One generation owns
-    /// the entry; every other generation registered under the TID is kept in
-    /// its history with its own event link. Registering a recorded generation
-    /// again is a no-op, so a nested handler and the run loop can both
-    /// register one stop and the stored identity survives.
-    ///
-    /// Ownership follows the owner's own state. The owner has released its
-    /// TID once its reaper has marked the notifier's TID gate, which happens
-    /// before the reaping wait, or once the notifier has retired it, which
-    /// follows its reap or a registration that found its task gone or
-    /// replaced. Until then, another generation under its TID is an earlier
-    /// child that was reaped, so the owner stays. After that, the incoming
-    /// generation takes the TID: it is the child that reused the TID, or an
-    /// earlier child decoded late, and then both are dead. An owner reaped
-    /// by a wait that marks no gate keeps the TID until it is retired, and
-    /// meanwhile `handle_new_task` refuses the child that reused the TID
-    /// instead of attaching it to the wrong entry.
-    fn retain(self, newborns: &mut HashMap<Pid, NewbornTracee>) {
-        let mut entry = match newborns.entry(self.link.tid) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(self);
-                return;
-            }
-            std::collections::hash_map::Entry::Occupied(entry) => entry,
-        };
-        let stored = entry.get_mut();
-        if stored.records_generation(&self.terminal) {
-            return;
-        }
-        if !stored.terminal.reaping_started() && !stored.terminal.wait(Duration::ZERO) {
-            stored.history.push((self.link, self.terminal));
-            return;
-        }
-        let NewbornTracee {
-            link,
-            terminal,
-            history,
-            ..
-        } = std::mem::replace(stored, self);
-        stored
-            .history
-            .splice(0..0, history.into_iter().chain([(link, terminal)]));
-    }
-
-    fn records_generation(&self, terminal: &TerminalCleanup) -> bool {
-        self.terminal.same_generation(terminal)
-            || self
-                .history
-                .iter()
-                .any(|(_, recorded)| recorded.same_generation(terminal))
-    }
-
-    fn records_child(&self, link: EventChildLink, child: &TerminalCleanup) -> bool {
-        (self.link == link && self.terminal.same_generation(child))
-            || self.history.iter().any(|(recorded_link, recorded)| {
-                *recorded_link == link && recorded.same_generation(child)
-            })
-    }
-
-    pub(crate) fn same_generation(&self, terminal: &TerminalCleanup) -> bool {
-        self.terminal.same_generation(terminal)
-    }
-
-    pub(crate) fn set_identity(&mut self, identity: TraceeIdentity) {
-        self.identity = Some(identity);
-    }
-
-    pub(crate) fn registration_error(&self) -> Option<Errno> {
-        self.terminal.registration_error()
-    }
-
-    pub(crate) fn terminate_vfork_child(&self) -> Result<(), TraceError> {
-        let identity = self.identity.as_ref().ok_or(Errno::ESRCH)?;
-        match identity.send_signal(Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => {}
-            Err(error) => return Err(error.into()),
-        }
-
-        self.terminal.wait_after_sigkill()
     }
 }
 
@@ -2600,141 +2394,53 @@ impl TraceeIdentity {
         Self::capture(link.tid, Some((link.parent_tid, Some(link.op))), false)
     }
 
-    fn open_task_tid(tid: Pid, root_tgid: Pid) -> std::io::Result<Option<Self>> {
-        let identity = match Self::capture(tid, None, false) {
-            Ok(identity) => identity,
-            Err(error) if skippable_tracee_open_error(tid, error) => return Ok(None),
-            Err(error) => return Err(std::io::Error::from_raw_os_error(error.into_raw())),
-        };
-        if tid == root_tgid || identity.snapshot.tgid != root_tgid || !identity.is_our_tracee() {
-            return Ok(None);
-        }
-        Ok(Some(identity))
-    }
-
-    fn open_discovered(tid: Pid, parent_tid: Pid) -> std::io::Result<Option<Self>> {
-        let identity = match Self::capture(tid, Some((parent_tid, None)), true) {
-            Ok(identity) => identity,
-            Err(error) if skippable_tracee_open_error(tid, error) => return Ok(None),
-            Err(error) => return Err(std::io::Error::from_raw_os_error(error.into_raw())),
-        };
-
-        // Re-read the kernel children relationship after opening the procfs
-        // identity and pidfd. A list/open race may otherwise bind a replacement
-        // tracee that reused the numeric child PID.
-        if !direct_children(parent_tid)?.contains(&tid) {
-            if !identity.is_our_tracee() || tracee_absent_or_replaced(parent_tid) {
-                return Ok(None);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("tracee {tid} no longer belongs to listed parent {parent_tid}"),
-            ));
-        }
-        Ok(Some(identity))
-    }
-
     fn capture(
         tid: Pid,
         parent: Option<(Pid, Option<ChildOp>)>,
         validate_proc_parent: bool,
     ) -> Result<Self, Errno> {
-        let before = legacy_cleanup_observe!(
-            "identity-proc-snapshot-site1",
-            tid,
-            None,
-            tracee_snapshot(tid)
-        )
-        .map_err(io_errno)?;
+        let before = tracee_snapshot(tid).map_err(io_errno)?;
         let parent_snapshot = parent
-            .map(|(parent_tid, _)| {
-                legacy_cleanup_observe!(
-                    "identity-parent-snapshot-site1",
-                    parent_tid,
-                    None,
-                    tracee_snapshot(parent_tid)
-                )
-                .map_err(io_errno)
-            })
+            .map(|(parent_tid, _)| tracee_snapshot(parent_tid).map_err(io_errno))
             .transpose()?;
-        let proc_dir = legacy_cleanup_observe!(
-            "identity-proc-open",
-            tid,
-            None,
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-                .open(format!("/proc/{tid}"))
-        )
-        .map_err(io_errno)?;
-        let proc_inode = legacy_cleanup_observe!(
-            "identity-retained-proc-metadata",
-            tid,
-            None,
-            proc_dir.metadata()
-        )
-        .map_err(io_errno)?
-        .ino();
+        let proc_dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(format!("/proc/{tid}"))
+            .map_err(io_errno)?;
+        let proc_inode = proc_dir.metadata().map_err(io_errno)?.ino();
         let pidfd = if tid == before.tgid {
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, tid.as_raw(), 0) };
             if fd == -1 {
                 let error = Errno::last();
-                return legacy_cleanup_observe!("identity-pidfd-open", tid, None, Err(error));
+                return Err(error);
             }
             Some(unsafe { OwnedFd::from_raw_fd(fd as i32) })
         } else {
             None
         };
-        let after = legacy_cleanup_observe!(
-            "identity-proc-snapshot-site2",
-            tid,
-            None,
-            tracee_snapshot(tid)
-        )
-        .map_err(io_errno)?;
-        let current_inode = legacy_cleanup_observe!(
-            "identity-current-proc-metadata",
-            tid,
-            None,
-            fs::metadata(format!("/proc/{tid}"))
-        )
-        .map_err(io_errno)?
-        .ino();
+        let after = tracee_snapshot(tid).map_err(io_errno)?;
+        let current_inode = fs::metadata(format!("/proc/{tid}"))
+            .map_err(io_errno)?
+            .ino();
         if before != after || current_inode != proc_inode || !tracer_is_current(after.tracer_pid) {
-            return legacy_cleanup_observe!(
-                "identity-stability-check-site1",
-                tid,
-                None,
-                Err(Errno::ESRCH)
-            );
+            return Err(Errno::ESRCH);
         }
 
-        let parent = match (parent, parent_snapshot) {
-            (Some((parent_tid, op)), Some(parent_snapshot)) => {
-                let parent_after = legacy_cleanup_observe!(
-                    "identity-parent-snapshot-site2",
-                    parent_tid,
-                    None,
-                    tracee_snapshot(parent_tid)
-                )
-                .map_err(io_errno)?;
+        match (parent, parent_snapshot) {
+            (Some((parent_tid, _)), Some(parent_snapshot)) => {
+                let parent_after = tracee_snapshot(parent_tid).map_err(io_errno)?;
                 if parent_after != parent_snapshot
                     || (validate_proc_parent
                         && after.tgid != parent_snapshot.tgid
                         && after.ppid != parent_snapshot.tgid)
                 {
-                    return legacy_cleanup_observe!(
-                        "identity-stability-check-site2",
-                        tid,
-                        None,
-                        Err(Errno::ESRCH)
-                    );
+                    return Err(Errno::ESRCH);
                 }
-                Some((parent_tid, parent_snapshot.tgid, op))
             }
-            (None, None) => None,
+            (None, None) => {}
             _ => unreachable!("parent snapshot and relation must be paired"),
-        };
+        }
 
         Ok(Self {
             tid,
@@ -2742,7 +2448,6 @@ impl TraceeIdentity {
             proc_dir: proc_dir.into(),
             proc_inode,
             pidfd,
-            parent,
         })
     }
 
@@ -2773,6 +2478,7 @@ impl TraceeIdentity {
         self.send_raw_signal(signal as i32)
     }
 
+    #[cfg(test)]
     fn same_process(&self) -> bool {
         let path = format!("/proc/{}", self.tid);
         let Some(current) = tracee_snapshot(self.tid).ok() else {
@@ -2782,33 +2488,6 @@ impl TraceeIdentity {
             && fs::metadata(path).ok().map(|metadata| metadata.ino()) == Some(self.proc_inode)
             && current.tgid == self.snapshot.tgid
             && current.start_time == self.snapshot.start_time
-    }
-
-    fn observe_same_process(&self) -> std::io::Result<bool> {
-        let observe = || -> std::io::Result<bool> {
-            let current = tracee_snapshot(self.tid)?;
-            Ok(fd_inode(&self.proc_dir)? == self.proc_inode
-                && fs::metadata(format!("/proc/{}", self.tid))?.ino() == self.proc_inode
-                && current.tgid == self.snapshot.tgid
-                && current.start_time == self.snapshot.start_time)
-        };
-        match observe() {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            result => result,
-        }
-    }
-
-    fn is_our_tracee(&self) -> bool {
-        self.same_process()
-            && tracee_snapshot(self.tid).ok().is_some_and(|current| {
-                current.tracer_pid == self.snapshot.tracer_pid
-                    && tracer_is_current(current.tracer_pid)
-            })
-            && self.parent.is_none_or(|(_, parent_tgid, event_op)| {
-                event_op.is_some()
-                    || self.snapshot.tgid == parent_tgid
-                    || self.snapshot.ppid == parent_tgid
-            })
     }
 
     fn send_raw_signal(&self, signal: i32) -> Result<(), Errno> {
@@ -2832,960 +2511,13 @@ impl TraceeIdentity {
     }
 }
 
-struct RegisteredTraceeCleanup {
-    identity: TraceeIdentity,
-    terminal: TerminalCleanup,
-    event_link: Option<EventChildLink>,
-}
-
-fn terminal_descendant_remains_owned(identity: &TraceeIdentity) -> bool {
-    if identity.is_our_tracee() {
-        return true;
-    }
-    let Some((_, parent_tgid, _)) = identity.parent else {
-        return false;
-    };
-    identity.same_process()
-        && tracee_snapshot(identity.tid)
-            .ok()
-            .is_some_and(|current| current.ppid == parent_tgid)
-}
-
-impl LiteinstTraceeCleanup {
-    fn new(
-        pid: Pid,
-        newborn_tracees: Arc<StdMutex<HashMap<Pid, NewbornTracee>>>,
-        held_root_stop: Arc<StdMutex<Option<HeldRootStop>>>,
-    ) -> Result<Self, Errno> {
-        Ok(Self {
-            identity: TraceeIdentity::open_root(pid)?,
-            newborn_tracees,
-            armed: true,
-            terminal: None,
-            notifier_owner: None,
-            retained_descendants: HashMap::new(),
-            retained_terminal_descendants: HashMap::new(),
-            fatal_terminal_observations: None,
-            held_root_stop,
-            root_frozen: false,
-            #[cfg(test)]
-            fail_discovery_once: None,
-            #[cfg(test)]
-            fail_discovery_while: None,
-            #[cfg(test)]
-            fail_after_scan_once: None,
-            #[cfg(test)]
-            force_task_scan_once: None,
-        })
-    }
-
-    fn pid(&self) -> Pid {
-        self.identity.tid
-    }
-
-    fn register_notifier(&mut self, task: &Running) {
-        debug_assert!(self.terminal.is_none());
-        self.notifier_owner = Some(std::thread::current().id());
-        self.terminal = Some(task.terminal_cleanup());
-    }
-
-    fn capture_pending_children(&self, terminal: &TerminalCleanup) -> std::io::Result<()> {
-        while let Some(reservation) = terminal.reserve_pending_for_cleanup(Duration::ZERO) {
-            let state = match reservation.decode() {
-                Ok(state) => state,
-                Err(error) => match reservation.consume_dead_exec() {
-                    Ok(()) => continue,
-                    Err(_) => {
-                        #[cfg(all(test, target_arch = "x86_64"))]
-                        injected_error_tests::refusal_leaf_error(
-                            Some("queued-state-decode"),
-                            &error,
-                            None,
-                        );
-                        return Err(std::io::Error::other(format!(
-                            "decode queued cancellation state: {error}"
-                        )));
-                    }
-                },
-            };
-            if let Wait::Stopped(stopped, Event::NewChild(op, child)) = state {
-                NewbornTracee::register(&self.newborn_tracees, stopped.pid(), op, &child);
-            }
-            // The raw FIFO front remains present until any child cleanup
-            // ownership above is durably stored.
-            reservation.commit();
-        }
-        Ok(())
-    }
-
-    fn freeze_root_generation(&mut self, deadline: Option<Instant>) -> std::io::Result<()> {
-        let terminal = self
-            .terminal
-            .as_ref()
-            .expect("registered LiteInst cleanup has a root terminal handle");
-        legacy_cleanup_observe!(
-            "root-ensure-registration",
-            self.pid(),
-            Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-            terminal.ensure_registered()
-        )
-        .map_err(|error| std::io::Error::from_raw_os_error(error.into_raw()))?;
-        if self.root_frozen {
-            return legacy_cleanup_observe!(
-                "root-pending-children-site1",
-                self.pid(),
-                Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                self.capture_pending_children(terminal)
-            );
-        }
-        if let Some(mut held) = self.held_root_stop.lock().unwrap().take() {
-            let owns_claimed_exit = matches!(held.status, HeldRootStopStatus::Exit);
-            let matching_status = match held.status {
-                HeldRootStopStatus::Signal(signal) => {
-                    let _exact_signal = signal;
-                    true
-                }
-                HeldRootStopStatus::NewChild(link) => {
-                    held.newborn_recorded(link, &self.newborn_tracees.lock().unwrap())
-                }
-                HeldRootStopStatus::Exec(replaced_tid) => {
-                    let _exact_replaced_tid = replaced_tid;
-                    true
-                }
-                HeldRootStopStatus::VforkDone
-                | HeldRootStopStatus::Exit
-                | HeldRootStopStatus::Seccomp
-                | HeldRootStopStatus::Stop
-                | HeldRootStopStatus::Syscall => true,
-            };
-            if !held.armed
-                || held.root_tid != self.pid()
-                || !terminal.same_generation(&held.terminal)
-                || !matching_status
-            {
-                return legacy_cleanup_observe!(
-                    "held-root-validation",
-                    self.pid(),
-                    Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "held root stop lease did not match the exact event generation/status",
-                    ))
-                );
-            }
-            legacy_cleanup_observe!(
-                "held-root-revocation",
-                self.pid(),
-                Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                if owns_claimed_exit {
-                    // SAFETY: taking the exact-generation held lease is the
-                    // cancellation handoff for the ExitFuture-minted Stopped. The
-                    // handler future has been dropped, so no independent Stopped
-                    // capability survives this exclusive slot transfer.
-                    unsafe { terminal.revoke_owned_exit_stop() }
-                } else {
-                    terminal.revoke_unclaimed_exit_stop()
-                }
-            )
-            .map_err(|error| std::io::Error::from_raw_os_error(error.into_raw()))?;
-            held.disarm();
-            self.root_frozen = true;
-            return legacy_cleanup_observe!(
-                "root-pending-children-site2",
-                self.pid(),
-                Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                self.capture_pending_children(terminal)
-            );
-        }
-
-        match legacy_cleanup_observe!(
-            "root-stop-signal-delivery",
-            self.pid(),
-            Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-            self.identity.send_signal(Signal::SIGSTOP)
-        ) {
-            Ok(()) | Err(Errno::ESRCH) => {}
-            Err(error) => return Err(std::io::Error::from_raw_os_error(error.into_raw())),
-        }
-
-        let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(2));
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if let Some(reservation) = terminal.reserve_pending_for_cleanup(remaining) {
-                let decoded = legacy_cleanup_observe!(
-                    "queued-state-decode",
-                    self.pid(),
-                    Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                    match reservation.decode() {
-                        Ok(state) => Ok(Some((reservation, state))),
-                        // A dead Exec names a stop the root has left, so it
-                        // proves no freeze; it is consumed and the statuses
-                        // behind it follow.
-                        Err(error) => reservation
-                            .consume_dead_exec()
-                            .map(|()| None)
-                            .map_err(|_| error),
-                    }
-                )
-                .map_err(|error| {
-                    std::io::Error::other(format!(
-                        "decode exact root freeze state for {}: {error}",
-                        self.pid()
-                    ))
-                })?;
-                if let Some((reservation, state)) = decoded {
-                    if let Wait::Stopped(stopped, Event::NewChild(op, child)) = state {
-                        NewbornTracee::register(&self.newborn_tracees, stopped.pid(), op, &child);
-                    }
-                    legacy_cleanup_observe!(
-                        "root-freeze-revocation-site1",
-                        self.pid(),
-                        Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                        terminal.revoke_unclaimed_exit_stop()
-                    )
-                    .map_err(|error| std::io::Error::from_raw_os_error(error.into_raw()))?;
-                    reservation.commit();
-                    // Any exact-generation nonterminal wait status means the root
-                    // is kernel-stopped. Drain the remaining FIFO while it cannot
-                    // execute and create another child.
-                    legacy_cleanup_observe!(
-                        "root-pending-children-site3",
-                        self.pid(),
-                        Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                        self.capture_pending_children(terminal)
-                    )?;
-                    self.root_frozen = true;
-                    return Ok(());
-                }
-                // The consumed dead Exec may have been the last queued
-                // status; its exit stop is published outside the FIFO.
-                if !terminal.pending_is_empty() {
-                    continue;
-                }
-            }
-            if terminal.exit_stop_observed() {
-                legacy_cleanup_observe!(
-                    "root-freeze-revocation-site2",
-                    self.pid(),
-                    Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                    terminal.revoke_unclaimed_exit_stop()
-                )
-                .map_err(|error| std::io::Error::from_raw_os_error(error.into_raw()))?;
-                self.root_frozen = true;
-                return Ok(());
-            }
-            if terminal.wait(Duration::ZERO) && terminal.pending_is_empty() {
-                self.root_frozen = true;
-                return Ok(());
-            }
-            if remaining.is_zero() {
-                return legacy_cleanup_observe!(
-                    "root-freeze-timeout",
-                    self.pid(),
-                    Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("root {} did not enter an exact notifier stop", self.pid()),
-                    ))
-                );
-            }
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-
-    fn confirm_reaped(&mut self) -> std::io::Result<()> {
-        if !self.armed {
-            return Ok(());
-        }
-        let notifier_finished = self
-            .terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.wait(Duration::ZERO) && terminal.pending_is_empty());
-        let identity_absent = !self.identity.same_process();
-        let unregistered_absent = self.terminal.is_none() && identity_absent;
-        let newborns_empty = self.newborn_tracees.lock().unwrap().is_empty();
-        let retained_empty = self.retained_descendants.is_empty()
-            && self.retained_terminal_descendants.is_empty()
-            && self
-                .fatal_terminal_observations
-                .as_ref()
-                .is_none_or(HashMap::is_empty);
-        if newborns_empty
-            && retained_empty
-            && ((notifier_finished && identity_absent) || unregistered_absent)
-        {
-            self.armed = false;
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "LiteInst root still exists after typed task cleanup",
-            ))
-        }
-    }
-
-    fn terminate_and_confirm(&mut self) -> std::io::Result<()> {
-        self.terminate_and_confirm_before(None)
-    }
-
-    fn terminate_fatal_and_confirm(
-        &mut self,
-        deadline: Instant,
-        mut record_refusal: impl FnMut(std::io::Error),
-    ) -> bool {
-        self.fatal_terminal_observations
-            .get_or_insert_with(HashMap::new);
-        // The original failure deadline covers freezing, physical cleanup,
-        // retries, and external terminal observation. Every refused attempt
-        // restores its ownership records before another attempt can begin.
-        loop {
-            match self.terminate_and_confirm_before(Some(deadline)) {
-                Ok(()) => return true,
-                Err(error) => record_refusal(error),
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(1)));
-        }
-    }
-
-    fn terminate_and_confirm_before(&mut self, deadline: Option<Instant>) -> std::io::Result<()> {
-        #[cfg(all(test, target_arch = "x86_64"))]
-        injected_error_tests::refusal_attempt();
-        if self.confirm_reaped().is_ok() {
-            return Ok(());
-        }
-
-        let mut descendants = std::mem::take(&mut self.retained_descendants);
-        let mut terminal_descendants = std::mem::take(&mut self.retained_terminal_descendants);
-        let result = self.terminate_and_confirm_attempt(
-            &mut descendants,
-            &mut terminal_descendants,
-            deadline,
-        );
-        if result.is_err() {
-            self.retained_descendants.extend(descendants);
-            self.retained_terminal_descendants
-                .extend(terminal_descendants);
-        }
-        #[cfg(all(test, target_arch = "x86_64"))]
-        injected_error_tests::refusal_attempt_result(self.pid(), &result);
-        result
-    }
-
-    fn terminate_and_confirm_attempt(
-        &mut self,
-        descendants: &mut HashMap<Pid, RegisteredTraceeCleanup>,
-        terminal_descendants: &mut HashMap<Pid, TraceeIdentity>,
-        deadline: Option<Instant>,
-    ) -> std::io::Result<()> {
-        if self.terminal.is_none() {
-            legacy_cleanup_observe!(
-                "pre-registration-cleanup",
-                self.pid(),
-                Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                terminate_and_reap_new_child_with_identity(
-                    Running::new(self.pid()),
-                    &self.identity
-                )
-            )
-            .map_err(|error| {
-                std::io::Error::other(format!("pre-registration LiteInst cleanup: {error}"))
-            })?;
-            self.armed = false;
-            return Ok(());
-        }
-
-        if self.identity.same_process() {
-            legacy_cleanup_observe!(
-                "root-freeze",
-                self.pid(),
-                Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                self.freeze_root_generation(deadline)
-            )?;
-        } else {
-            // The exact root generation is already gone, so it cannot create
-            // another descendant. Drain any child event the notifier published
-            // before terminal acknowledgment and continue with the retained
-            // generation-bound descendants; trying to freeze a completed root
-            // would only collide with its consumed exit capability.
-            if let Some(terminal) = self.terminal.as_ref() {
-                legacy_cleanup_observe!(
-                    "root-pending-children-site4",
-                    self.pid(),
-                    Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                    self.capture_pending_children(terminal)
-                )?;
-            }
-            self.root_frozen = true;
-        }
-        #[cfg(test)]
-        if self
-            .force_task_scan_once
-            .as_ref()
-            .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
-        {
-            self.newborn_tracees.lock().unwrap().clear();
-        }
-        self.discover_descendants(descendants, terminal_descendants)?;
-        let root_terminal = self.terminal.as_ref().unwrap();
-        legacy_cleanup_observe!(
-            "root-pending-children-site5",
-            self.pid(),
-            Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-            self.capture_pending_children(root_terminal)
-        )?;
-        if !root_terminal.pending_is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "root notifier FIFO changed while frozen",
-            ));
-        }
-        match legacy_cleanup_observe!(
-            "root-kill-signal-delivery",
-            self.pid(),
-            Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-            self.identity.send_signal(Signal::SIGKILL)
-        ) {
-            Ok(()) | Err(Errno::ESRCH) => {}
-            Err(error) => return Err(std::io::Error::from_raw_os_error(error.into_raw())),
-        }
-        for tracee in descendants.values() {
-            legacy_cleanup_observe!(
-                "descendant-ensure-registration-site1",
-                tracee.identity.tid,
-                Some(injected_error_tests::RefusalGeneration::of(
-                    &tracee.identity
-                )),
-                tracee.terminal.ensure_registered()
-            )
-            .map_err(|error| std::io::Error::from_raw_os_error(error.into_raw()))?;
-            legacy_cleanup_observe!(
-                "descendant-kill-signal-delivery-site1",
-                tracee.identity.tid,
-                Some(injected_error_tests::RefusalGeneration::of(
-                    &tracee.identity
-                )),
-                send_identity_sigkill(&tracee.identity)
-            )?;
-        }
-
-        let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(2));
-        while Instant::now() < deadline {
-            if let Some(terminal) = self.terminal.as_ref() {
-                legacy_cleanup_observe!(
-                    "root-pending-children-site6",
-                    self.pid(),
-                    Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                    self.capture_pending_children(terminal)
-                )?;
-            }
-            for tracee in descendants.values() {
-                legacy_cleanup_observe!(
-                    "descendant-pending-children-site1",
-                    tracee.identity.tid,
-                    Some(injected_error_tests::RefusalGeneration::of(
-                        &tracee.identity
-                    )),
-                    self.capture_pending_children(&tracee.terminal)
-                )?;
-            }
-            self.discover_descendants(descendants, terminal_descendants)?;
-            for tracee in descendants.values() {
-                legacy_cleanup_observe!(
-                    "descendant-ensure-registration-site2",
-                    tracee.identity.tid,
-                    Some(injected_error_tests::RefusalGeneration::of(
-                        &tracee.identity
-                    )),
-                    tracee.terminal.ensure_registered()
-                )
-                .map_err(|error| std::io::Error::from_raw_os_error(error.into_raw()))?;
-                legacy_cleanup_observe!(
-                    "descendant-kill-signal-delivery-site2",
-                    tracee.identity.tid,
-                    Some(injected_error_tests::RefusalGeneration::of(
-                        &tracee.identity
-                    )),
-                    send_identity_sigkill(&tracee.identity)
-                )?;
-            }
-
-            let root_done = self
-                .terminal
-                .as_ref()
-                .is_some_and(|terminal| terminal.wait(Duration::ZERO));
-            let completed = descendants
-                .iter()
-                .filter_map(|(pid, tracee)| tracee.terminal.wait(Duration::ZERO).then_some(*pid))
-                .collect::<Vec<_>>();
-            for pid in completed {
-                if let Some(tracee) = descendants.get(&pid) {
-                    legacy_cleanup_observe!(
-                        "descendant-pending-children-site2",
-                        tracee.identity.tid,
-                        Some(injected_error_tests::RefusalGeneration::of(
-                            &tracee.identity
-                        )),
-                        self.capture_pending_children(&tracee.terminal)
-                    )?;
-                    #[cfg(all(test, target_arch = "x86_64"))]
-                    injected_error_tests::refusal_borrow_retired(tracee)?;
-                }
-                let tracee = descendants
-                    .remove(&pid)
-                    .expect("completed descendant must remain registered");
-                terminal_descendants.insert(pid, tracee.identity);
-            }
-            // Once the exact notifier generation is terminal, retain its proc
-            // identity as ownership only while it remains our tracee or its
-            // recorded parent still owns the zombie. Reparenting cannot grant
-            // natural-parent wait authority. Fatal injected cleanup separately
-            // retains read-only observation for its stronger confirmation.
-            let released = terminal_descendants
-                .iter()
-                .filter_map(|(pid, identity)| {
-                    (!terminal_descendant_remains_owned(identity)).then_some(*pid)
-                })
-                .collect::<Vec<_>>();
-            for pid in released {
-                let identity = terminal_descendants
-                    .remove(&pid)
-                    .expect("retained terminal generation");
-                if let Some(observations) = self.fatal_terminal_observations.as_mut() {
-                    observations.insert(pid, identity);
-                }
-            }
-            #[cfg(all(test, target_arch = "x86_64"))]
-            injected_error_tests::refusal_cleanup_progress(self)?;
-            if let Some(observations) = self.fatal_terminal_observations.as_mut() {
-                // This map never authorizes a signal or wait: Linux may leave a
-                // terminal zombie for a different natural parent after our
-                // ptracer wait. Only observe that same retained generation.
-                let mut absent = Vec::new();
-                for (pid, identity) in observations.iter() {
-                    if !legacy_cleanup_observe!(
-                        "fatal-terminal-identity-observe",
-                        *pid,
-                        Some(injected_error_tests::RefusalGeneration::of(identity)),
-                        identity.observe_same_process()
-                    )? {
-                        absent.push(*pid);
-                    }
-                }
-                for pid in absent {
-                    observations.remove(&pid);
-                }
-            }
-            let root_absent = !self.identity.same_process();
-            let newborns_empty = self.newborn_tracees.lock().unwrap().is_empty();
-            if root_done
-                && root_absent
-                && descendants.is_empty()
-                && terminal_descendants.is_empty()
-                && self
-                    .fatal_terminal_observations
-                    .as_ref()
-                    .is_none_or(HashMap::is_empty)
-                && newborns_empty
-            {
-                self.armed = false;
-                return Ok(());
-            }
-
-            if self.notifier_owner == Some(std::thread::current().id()) {
-                // The pidfd-bound SIGKILL is already pending. Numeric ptrace
-                // operations only advance an extant ptrace relationship and
-                // never inject a signal into a potentially reused PID.
-                // Preserve parentage until every descendant is terminal and
-                // reaped. Otherwise an auto-attached child can be reparented
-                // before its notifier consumes the final wait status.
-                if !root_done && descendants.is_empty() && self.identity.is_our_tracee() {
-                    legacy_cleanup_observe!(
-                        "root-cleanup-exit-revocation",
-                        self.pid(),
-                        Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                        root_terminal.revoke_unclaimed_exit_stop()
-                    )
-                    .map_err(|error| std::io::Error::from_raw_os_error(error.into_raw()))?;
-                    let _ = legacy_cleanup_observe!(
-                        "root-cleanup-cont",
-                        self.pid(),
-                        Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                        ptrace::cont(self.pid().into(), None)
-                    );
-                }
-                for tracee in descendants.values() {
-                    if tracee.identity.is_our_tracee() {
-                        legacy_cleanup_observe!(
-                            "descendant-cleanup-exit-revocation",
-                            tracee.identity.tid,
-                            Some(injected_error_tests::RefusalGeneration::of(
-                                &tracee.identity
-                            )),
-                            tracee.terminal.revoke_unclaimed_exit_stop()
-                        )
-                        .map_err(|error| std::io::Error::from_raw_os_error(error.into_raw()))?;
-                        let _ = legacy_cleanup_observe!(
-                            "descendant-cleanup-cont",
-                            tracee.identity.tid,
-                            Some(injected_error_tests::RefusalGeneration::of(
-                                &tracee.identity
-                            )),
-                            ptrace::cont(tracee.identity.tid.into(), None)
-                        );
-                    }
-                }
-            }
-            if let Some(terminal) = self.terminal.as_ref() {
-                terminal.wait(Duration::from_millis(1));
-            }
-        }
-
-        legacy_cleanup_observe!(
-            "cleanup-confirmation-timeout",
-            self.pid(),
-            Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                if self.fatal_terminal_observations.is_some() {
-                    format!(
-                        "LiteInst tracee {} cleanup or fatal terminal-disappearance confirmation timed out",
-                        self.pid()
-                    )
-                } else {
-                    format!(
-                        "notifier did not acknowledge terminal cleanup for LiteInst tracee {}",
-                        self.pid()
-                    )
-                },
-            ))
-        )
-    }
-
-    fn discover_descendants(
-        &self,
-        descendants: &mut HashMap<Pid, RegisteredTraceeCleanup>,
-        terminal_descendants: &HashMap<Pid, TraceeIdentity>,
-    ) -> std::io::Result<()> {
-        let mut queue = VecDeque::from([self.pid()]);
-        queue.extend(descendants.keys().copied());
-        let newborn_tids = self
-            .newborn_tracees
-            .lock()
-            .unwrap()
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        let mut transferred = Vec::new();
-        let mut absorbed = Vec::new();
-        for tid in newborn_tids {
-            if tid == self.pid() || terminal_descendants.contains_key(&tid) {
-                self.newborn_tracees.lock().unwrap().remove(&tid);
-                continue;
-            }
-            if let Some(existing) = descendants.get_mut(&tid) {
-                let newborn = self
-                    .newborn_tracees
-                    .lock()
-                    .unwrap()
-                    .remove(&tid)
-                    .expect("listed newborn must remain registered");
-                existing.event_link.get_or_insert(newborn.link);
-                absorbed.push((tid, newborn));
-                continue;
-            }
-
-            let mut newborn = self
-                .newborn_tracees
-                .lock()
-                .unwrap()
-                .remove(&tid)
-                .expect("listed newborn must remain registered");
-            let identity = match newborn.identity.take() {
-                Some(identity) => identity,
-                None => match legacy_cleanup_observe!(
-                    "event-child-identity",
-                    tid,
-                    None,
-                    TraceeIdentity::capture_event_child(
-                        newborn.link.tid,
-                        newborn.link.parent_tid,
-                        newborn.link.op,
-                    )
-                ) {
-                    Ok(identity) => identity,
-                    Err(error) => {
-                        self.newborn_tracees.lock().unwrap().insert(tid, newborn);
-                        self.restore_transferred_newborns(
-                            descendants,
-                            &mut transferred,
-                            &mut absorbed,
-                        );
-                        return Err(std::io::Error::from_raw_os_error(error.into_raw()));
-                    }
-                },
-            };
-            if identity.snapshot.tgid == tid {
-                queue.push_back(tid);
-            }
-            descendants.insert(
-                tid,
-                RegisteredTraceeCleanup {
-                    identity,
-                    terminal: newborn.terminal,
-                    event_link: Some(newborn.link),
-                },
-            );
-            transferred.push(tid);
-        }
-
-        #[cfg(test)]
-        if self
-            .fail_discovery_while
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::SeqCst))
-        {
-            self.restore_transferred_newborns(descendants, &mut transferred, &mut absorbed);
-            return legacy_cleanup_observe!(
-                "discovery-persistent-refusal",
-                self.pid(),
-                Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                Err(std::io::Error::from_raw_os_error(libc::EIO))
-            );
-        }
-        #[cfg(test)]
-        if self
-            .fail_discovery_once
-            .as_ref()
-            .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
-        {
-            self.restore_transferred_newborns(descendants, &mut transferred, &mut absorbed);
-            return legacy_cleanup_observe!(
-                "discovery-one-shot-refusal",
-                self.pid(),
-                Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                Err(std::io::Error::from_raw_os_error(libc::EIO))
-            );
-        }
-
-        let task_tids = match legacy_cleanup_observe!(
-            "task-directory-scan",
-            self.pid(),
-            Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-            task_tids(self.pid())
-        ) {
-            Ok(tids) => tids,
-            Err(error) => {
-                self.restore_transferred_newborns(descendants, &mut transferred, &mut absorbed);
-                return Err(error);
-            }
-        };
-        for tid in task_tids {
-            if tid == self.pid()
-                || descendants.contains_key(&tid)
-                || terminal_descendants.contains_key(&tid)
-            {
-                continue;
-            }
-            let identity = match legacy_cleanup_observe!(
-                "task-identity-capture",
-                tid,
-                None,
-                TraceeIdentity::open_task_tid(tid, self.identity.snapshot.tgid)
-            ) {
-                Ok(Some(identity)) => identity,
-                Ok(None) => continue,
-                Err(error) => {
-                    self.restore_transferred_newborns(descendants, &mut transferred, &mut absorbed);
-                    return Err(error);
-                }
-            };
-            let terminal = legacy_cleanup_observe!(
-                "task-notifier-capture",
-                tid,
-                None,
-                Stopped::try_new_current_unchecked(tid)
-            )
-            .map_err(|error| std::io::Error::from_raw_os_error(error.into_raw()))?
-            .terminal_cleanup();
-            descendants.insert(
-                tid,
-                RegisteredTraceeCleanup {
-                    identity,
-                    terminal,
-                    event_link: None,
-                },
-            );
-        }
-
-        let mut visited = HashSet::new();
-        while let Some(parent) = queue.pop_front() {
-            if !visited.insert(parent) {
-                continue;
-            }
-            let children = match legacy_cleanup_observe!(
-                "children-list-read",
-                parent,
-                None,
-                direct_children(parent)
-            ) {
-                Ok(children) => children,
-                Err(error) => {
-                    let error = std::io::Error::new(
-                        error.kind(),
-                        format!("read direct children of bound tracee {parent}: {error}"),
-                    );
-                    self.restore_transferred_newborns(descendants, &mut transferred, &mut absorbed);
-                    return Err(error);
-                }
-            };
-            for child in children {
-                if child == self.pid()
-                    || descendants.contains_key(&child)
-                    || terminal_descendants.contains_key(&child)
-                {
-                    continue;
-                }
-                let identity = match legacy_cleanup_observe!(
-                    "listed-child-identity",
-                    child,
-                    None,
-                    TraceeIdentity::open_discovered(child, parent)
-                ) {
-                    Ok(Some(identity)) => identity,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        let error = std::io::Error::new(
-                            error.kind(),
-                            format!("bind listed tracee {child} under parent {parent}: {error}"),
-                        );
-                        self.restore_transferred_newborns(
-                            descendants,
-                            &mut transferred,
-                            &mut absorbed,
-                        );
-                        return Err(error);
-                    }
-                };
-                queue.push_back(child);
-                let terminal = Running::new(child).terminal_cleanup();
-                descendants.insert(
-                    child,
-                    RegisteredTraceeCleanup {
-                        identity,
-                        terminal,
-                        event_link: None,
-                    },
-                );
-            }
-        }
-        #[cfg(test)]
-        if self
-            .fail_after_scan_once
-            .as_ref()
-            .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
-        {
-            self.restore_transferred_newborns(descendants, &mut transferred, &mut absorbed);
-            return legacy_cleanup_observe!(
-                "post-scan-one-shot-refusal",
-                self.pid(),
-                Some(injected_error_tests::RefusalGeneration::of(&self.identity)),
-                Err(std::io::Error::from_raw_os_error(libc::EIO))
-            );
-        }
-        Ok(())
-    }
-
-    fn restore_transferred_newborns(
-        &self,
-        descendants: &mut HashMap<Pid, RegisteredTraceeCleanup>,
-        transferred: &mut Vec<Pid>,
-        absorbed: &mut Vec<(Pid, NewbornTracee)>,
-    ) {
-        let mut newborns = self.newborn_tracees.lock().unwrap();
-        newborns.extend(absorbed.drain(..));
-        for tid in transferred.drain(..) {
-            let registered = descendants
-                .remove(&tid)
-                .expect("transferred newborn must remain in local cleanup map");
-            newborns.insert(
-                tid,
-                NewbornTracee {
-                    link: registered
-                        .event_link
-                        .expect("transferred newborn retains kernel event link"),
-                    identity: Some(registered.identity),
-                    terminal: registered.terminal,
-                    // Cleanup validates a held creation stop before it
-                    // discovers descendants, so a restored entry needs no
-                    // history.
-                    history: Vec::new(),
-                },
-            );
-        }
-    }
-}
-
-fn send_identity_sigkill(identity: &TraceeIdentity) -> std::io::Result<()> {
-    if identity.pidfd.is_none() {
-        // Nonleader TIDs are terminated by their TGID leader's pidfd. They are
-        // never signaled numerically; their bound ptrace statuses are drained
-        // separately on the owning tracer thread.
-        return Ok(());
-    }
-    match legacy_cleanup_observe!(
-        "descendant-kill-signal-delivery-site3",
-        identity.tid,
-        Some(injected_error_tests::RefusalGeneration::of(identity)),
-        identity.send_signal(Signal::SIGKILL)
-    ) {
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(error) => Err(std::io::Error::from_raw_os_error(error.into_raw())),
-    }
-}
-
-impl Drop for LiteinstTraceeCleanup {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        #[cfg(all(test, target_arch = "x86_64"))]
-        injected_error_tests::refusal_armed_drop(self.pid());
-        // Cancellation cannot await an orderly drain, so synchronously request
-        // termination and wait for the notifier-owned final reap. Before async
-        // registration, the bounded raw-wait fallback owns cleanup instead.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match self.terminate_and_confirm() {
-                Ok(()) => return,
-                Err(error) if Instant::now() < deadline => {
-                    // Every failed attempt restores all descendant/newborn
-                    // ownership to this guard. Retry transient discovery and
-                    // registration errors without dropping cleanup records.
-                    std::thread::sleep(Duration::from_millis(1));
-                    tracing::debug!(pid = %self.pid(), %error, "retrying LiteInst cancellation cleanup");
-                }
-                Err(error) => {
-                    tracing::error!(pid = %self.pid(), %error, "LiteInst cancellation cleanup failed");
-                    return;
-                }
-            }
-        }
-    }
-}
-
 fn io_errno(error: std::io::Error) -> Errno {
     Errno::new(error.raw_os_error().unwrap_or(libc::EIO))
 }
 
 fn process_start_time(tid: Pid) -> std::io::Result<u64> {
-    let stat = crate::launch_window::read_to_string(format!("/proc/{tid}/stat"))?;
+    let stat = crate::launch_window::read(format!("/proc/{tid}/stat"))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
     let fields = stat
         .rsplit_once(") ")
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed stat"))?
@@ -3814,7 +2546,8 @@ fn status_pid(status: &str, name: &str) -> std::io::Result<Pid> {
 
 fn tracee_snapshot(tid: Pid) -> std::io::Result<TraceeSnapshot> {
     let start_time = process_start_time(tid)?;
-    let status = crate::launch_window::read_to_string(format!("/proc/{tid}/status"))?;
+    let status = crate::launch_window::read(format!("/proc/{tid}/status"))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
     let snapshot = TraceeSnapshot {
         tgid: status_pid(&status, "Tgid:")?,
         ppid: status_pid(&status, "PPid:")?,
@@ -3830,138 +2563,31 @@ fn tracee_snapshot(tid: Pid) -> std::io::Result<TraceeSnapshot> {
     Ok(snapshot)
 }
 
+/// For a newborn reported by `PTRACE_EVENT_CLONE` that leads its own thread
+/// group, its real parent process; `None` for a thread of its creator.
+/// Linux reports every clone whose exit signal is not `SIGCHLD` as
+/// `PTRACE_EVENT_CLONE`, whether or not it passed `CLONE_THREAD`, so the
+/// event alone does not say thread. The kernel's own record does: a child
+/// created without `CLONE_THREAD` is its own `Tgid`, and its `PPid` is its
+/// parent, which `CLONE_PARENT` makes the creator's parent rather than the
+/// creator.
+pub(crate) fn newborn_own_process_parent(child: Pid) -> std::io::Result<Option<Pid>> {
+    let status = crate::launch_window::read(format!("/proc/{child}/status"))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())?;
+    if status_pid(&status, "Tgid:")? != child {
+        return Ok(None);
+    }
+    Ok(Some(status_pid(&status, "PPid:")?))
+}
+
 fn tracer_is_current(tracer_tid: Pid) -> bool {
     tracer_tid.as_raw() > 0
         && std::path::Path::new(&format!("/proc/self/task/{tracer_tid}")).exists()
 }
 
+#[cfg(test)]
 fn fd_inode(fd: &OwnedFd) -> std::io::Result<u64> {
     fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).map(|metadata| metadata.ino())
-}
-
-fn tracee_absent_or_replaced(tid: Pid) -> bool {
-    let path = format!("/proc/{tid}");
-    if !std::path::Path::new(&path).exists() {
-        return true;
-    }
-    tracee_snapshot(tid)
-        .ok()
-        .is_some_and(|snapshot| !tracer_is_current(snapshot.tracer_pid))
-}
-
-fn skippable_tracee_open_error(tid: Pid, error: Errno) -> bool {
-    matches!(error, Errno::ENOENT | Errno::ESRCH) && tracee_absent_or_replaced(tid)
-}
-
-static PROC_CHILDREN_SUPPORTED: LazyLock<bool> = LazyLock::new(|| {
-    let _open = crate::launch_window::TransientOpen::begin();
-    fs::read_dir("/proc/self/task")
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .any(|task| task.path().join("children").exists())
-});
-
-fn task_tids(root: Pid) -> std::io::Result<Vec<Pid>> {
-    let _open = crate::launch_window::TransientOpen::begin();
-    let process_path = format!("/proc/{root}");
-    let tasks = match fs::read_dir(format!("{process_path}/task")) {
-        Ok(tasks) => tasks,
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && !std::path::Path::new(&process_path).exists() =>
-        {
-            return Ok(Vec::new());
-        }
-        Err(error) => return Err(error),
-    };
-    tasks
-        .map(|task| {
-            let task = task?;
-            let tid = task.file_name().into_string().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF8 task TID")
-            })?;
-            tid.parse::<i32>()
-                .map(Pid::from_raw)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        })
-        .collect()
-}
-
-fn direct_children(pid: Pid) -> std::io::Result<Vec<Pid>> {
-    // Held across the task directory and each `children` read below.
-    let _open = crate::launch_window::TransientOpen::begin();
-    let process_path = format!("/proc/{pid}");
-    let task_dir = match fs::read_dir(format!("{process_path}/task")) {
-        Ok(task_dir) => task_dir,
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && !std::path::Path::new(&process_path).exists() =>
-        {
-            #[cfg(all(test, target_arch = "x86_64"))]
-            injected_error_tests::refusal_handled_children_absence(pid, &error);
-            return Ok(Vec::new());
-        }
-        Err(error) => {
-            #[cfg(all(test, target_arch = "x86_64"))]
-            {
-                let _phase = injected_error_tests::RefusalPhase::enter(
-                    "children-task-directory-open",
-                    pid,
-                    None,
-                );
-                injected_error_tests::refusal_leaf_error(None, &error, None);
-            }
-            return Err(std::io::Error::new(
-                error.kind(),
-                format!("read {process_path}/task: {error}"),
-            ));
-        }
-    };
-    let mut children = Vec::new();
-    for task in task_dir {
-        let task = legacy_cleanup_observe!("children-task-directory-entry", pid, None, task)?;
-        let contents = match legacy_cleanup_observe!(
-            "children-file-read",
-            pid,
-            None,
-            fs::read_to_string(task.path().join("children"))
-        ) {
-            Ok(contents) => contents,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound && !*PROC_CHILDREN_SUPPORTED =>
-            {
-                continue;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !task.path().exists() => {
-                continue;
-            }
-            Err(error) => {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!("read {}: {error}", task.path().join("children").display()),
-                ));
-            }
-        };
-        for child in contents.split_ascii_whitespace() {
-            children.push(Pid::from_raw(child.parse::<i32>().map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-            })?));
-        }
-    }
-    Ok(children)
-}
-
-fn terminate_and_reap_new_child_with_identity(
-    task: Running,
-    identity: &TraceeIdentity,
-) -> Result<(), TraceError> {
-    match identity.send_signal(Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) => {}
-        Err(error) => return Err(error.into()),
-    }
-    drain_unregistered_child(task)
 }
 
 fn drain_unregistered_child(task: Running) -> Result<(), TraceError> {
@@ -4005,16 +2631,9 @@ fn drain_unregistered_child(task: Running) -> Result<(), TraceError> {
     Err(Errno::ETIMEDOUT.into())
 }
 
-fn capture_ptracer_child(pid: Pid, native_only: bool) -> Result<Running, reverie::Error> {
-    // Optional injected/LiteInst guards retain their established native SDK
-    // cleanup contract; the ordinary ptrace path explicitly opts into legacy
-    // owner-thread waits. No legacy token enters a native-only guard.
-    let capture = if native_only {
-        Running::try_new(pid)
-    } else {
-        Running::new_on_ptracer_thread(pid)
-    };
-    match capture {
+fn capture_ptracer_child(pid: Pid) -> Result<Running, reverie::Error> {
+    // The ordinary ptrace path explicitly opts into legacy owner-thread waits.
+    match Running::new_on_ptracer_thread(pid) {
         Ok(child) => Ok(child),
         Err(error) => {
             // This private call is made only for our just-spawned unreaped
@@ -4027,30 +2646,6 @@ fn capture_ptracer_child(pid: Pid, native_only: bool) -> Result<Running, reverie
                 "failed to capture original ptracer child {pid}: {error}; setup cleanup kill={kill_error:?}, drain={drained:?}"
             ).into())
         }
-    }
-}
-
-fn liteinst_pidfd_setup_error(
-    pid: Pid,
-    setup_error: Errno,
-    kill_error: Option<Errno>,
-    drain_result: Result<(), TraceError>,
-) -> anyhow::Error {
-    let setup_failure = if setup_error == Errno::ETIMEDOUT {
-        format!(
-            "LiteInst tracee {pid} root identity did not become a stable traced thread-group leader with a pidfd within the 2,000-attempt retry budget"
-        )
-    } else {
-        format!("failed to open pidfd for LiteInst tracee {pid}: {setup_error}")
-    };
-    match (kill_error, drain_result) {
-        (Some(kill_error), drain_result) => anyhow::anyhow!(
-            "{setup_failure}; numeric setup-failure kill also failed: {kill_error}; drain result: {drain_result:?}"
-        ),
-        (None, Err(drain_error)) => {
-            anyhow::anyhow!("{setup_failure}; cleanup drain also failed: {drain_error}")
-        }
-        (None, Ok(())) => anyhow::anyhow!(setup_failure),
     }
 }
 
@@ -4469,8 +3064,8 @@ pub enum ToolRunOutcome<G, R = ExitStatus> {
     /// This instrumentation route does not support starting the public ordinary
     /// completion contract. The original tracer and its pipes remain untouched.
     /// Legacy static-injected waits nevertheless retain failed cleanup through
-    /// [`CleanupUnconfirmed`]; dynamic LiteInst uses [`InjectedCleanupUnconfirmed`].
-    /// Neither route makes normal completion or supervisor setup supported.
+    /// [`CleanupUnconfirmed`]. That does not make normal completion or
+    /// supervisor setup supported.
     UnsupportedBackend(Box<Tracer<G>>),
 }
 
@@ -4807,18 +3402,6 @@ impl<G: Default + 'static> Tracer<G> {
         self.guest_pid
     }
 
-    /// Returns a live observer for this tracer's LiteInst patch-site statistics.
-    pub fn liteinst_instrumentation_stats(&self) -> Option<LiteinstInstrumentationStatsHandle> {
-        self.liteinst_instrumentation_stats
-            .as_ref()
-            .map(|stats| LiteinstInstrumentationStatsHandle::from_shared(Arc::clone(stats)))
-    }
-
-    /// Returns the trap-only LiteInst state when this tracer was launched in that mode.
-    pub fn liteinst_trap_only(&self) -> Option<LiteinstTrapOnlyHandle> {
-        self.liteinst_trap_only.clone()
-    }
-
     /// Returns the live ptrace activity-statistics source when collection was enabled.
     pub fn backend_stats(&self) -> Option<PtraceBackendStatsSource> {
         self.backend_stats.clone()
@@ -4840,27 +3423,22 @@ impl<G: Default + 'static> Tracer<G> {
     /// This legacy result projects away nonfatal callback diagnostics. Use the
     /// additive completion API when those raw errors and owner outcomes matter.
     pub async fn wait_with_output(self) -> Result<(Output, G), Error> {
-        if self.liteinst_cleanup.is_none() {
-            let outcome = self
-                .completion(1, |status, stdout, stderr| Output {
-                    status,
-                    stdout,
-                    stderr,
-                })
-                .drive()
-                .await;
-            return match outcome {
-                ToolRunOutcome::Complete(completion) => completion
-                    .result
-                    .map(|result| (result, completion.global_state))
-                    .map_err(crate::PtraceRunFailure::into_legacy_error),
-                ToolRunOutcome::CleanupPending(pending) => Err(pending.quarantine()),
-                ToolRunOutcome::UnsupportedBackend(tracer) => {
-                    Box::pin(tracer.wait_with_output()).await
-                }
-            };
+        let outcome = self
+            .completion(1, |status, stdout, stderr| Output {
+                status,
+                stdout,
+                stderr,
+            })
+            .drive()
+            .await;
+        match outcome {
+            ToolRunOutcome::Complete(completion) => completion
+                .result
+                .map(|result| (result, completion.global_state))
+                .map_err(crate::PtraceRunFailure::into_legacy_error),
+            ToolRunOutcome::CleanupPending(pending) => Err(pending.quarantine()),
+            ToolRunOutcome::UnsupportedBackend(tracer) => Box::pin(tracer.wait_with_output()).await,
         }
-        self.wait_injected_legacy(1).await
     }
 
     /// Waits for the tracee to exit while concurrently draining and discarding
@@ -4878,22 +3456,17 @@ impl<G: Default + 'static> Tracer<G> {
     /// in `write(2)` forever while the parent waits for a process that can
     /// never exit.
     pub async fn wait_discarding_output(self) -> Result<(ExitStatus, G), Error> {
-        if self.liteinst_cleanup.is_none() {
-            let outcome = self.completion(2, |status, _, _| status).drive().await;
-            return match outcome {
-                ToolRunOutcome::Complete(completion) => completion
-                    .result
-                    .map(|result| (result, completion.global_state))
-                    .map_err(crate::PtraceRunFailure::into_legacy_error),
-                ToolRunOutcome::CleanupPending(pending) => Err(pending.quarantine()),
-                ToolRunOutcome::UnsupportedBackend(tracer) => {
-                    Box::pin(tracer.wait_discarding_output()).await
-                }
-            };
+        let outcome = self.completion(2, |status, _, _| status).drive().await;
+        match outcome {
+            ToolRunOutcome::Complete(completion) => completion
+                .result
+                .map(|result| (result, completion.global_state))
+                .map_err(crate::PtraceRunFailure::into_legacy_error),
+            ToolRunOutcome::CleanupPending(pending) => Err(pending.quarantine()),
+            ToolRunOutcome::UnsupportedBackend(tracer) => {
+                Box::pin(tracer.wait_discarding_output()).await
+            }
         }
-        self.wait_injected_legacy(2)
-            .await
-            .map(|(output, state)| (output.status, state))
     }
 
     /// Waits for the tracee to exit and returns its exit status and global
@@ -4907,198 +3480,15 @@ impl<G: Default + 'static> Tracer<G> {
     /// This legacy result projects away nonfatal callback diagnostics. Use the
     /// additive completion API when those raw errors and owner outcomes matter.
     pub async fn wait(self) -> Result<(ExitStatus, G), Error> {
-        if self.liteinst_cleanup.is_none() {
-            let outcome = self.completion(0, |status, _, _| status).drive().await;
-            return match outcome {
-                ToolRunOutcome::Complete(completion) => completion
-                    .result
-                    .map(|result| (result, completion.global_state))
-                    .map_err(crate::PtraceRunFailure::into_legacy_error),
-                ToolRunOutcome::CleanupPending(pending) => Err(pending.quarantine()),
-                ToolRunOutcome::UnsupportedBackend(tracer) => Box::pin(tracer.wait()).await,
-            };
+        let outcome = self.completion(0, |status, _, _| status).drive().await;
+        match outcome {
+            ToolRunOutcome::Complete(completion) => completion
+                .result
+                .map(|result| (result, completion.global_state))
+                .map_err(crate::PtraceRunFailure::into_legacy_error),
+            ToolRunOutcome::CleanupPending(pending) => Err(pending.quarantine()),
+            ToolRunOutcome::UnsupportedBackend(tracer) => Box::pin(tracer.wait()).await,
         }
-        self.wait_injected_legacy(0)
-            .await
-            .map(|(output, state)| (output.status, state))
-    }
-
-    async fn wait_injected_legacy(mut self, mode: u8) -> Result<(Output, G), Error> {
-        use std::task::Poll;
-
-        use crate::capture::BoxedRead;
-        use crate::capture::CaptureDrain;
-        use crate::capture::DrainEvent;
-
-        assert_eq!(self.ptracer_thread, std::thread::current().id());
-        if mode != 0 {
-            drop(self.stdin.take());
-        }
-        let stdout = (mode != 0)
-            .then(|| self.stdout.take())
-            .flatten()
-            .map(|io| Box::pin(io) as BoxedRead);
-        let stderr = (mode != 0)
-            .then(|| self.stderr.take())
-            .flatten()
-            .map(|io| Box::pin(io) as BoxedRead);
-        let mut owner = LegacyInjectedOwner {
-            tracer: self,
-            local: tokio::task::LocalSet::new(),
-            stdout: if mode == 1 {
-                CaptureDrain::capture(stdout)
-            } else {
-                CaptureDrain::discard(stdout)
-            },
-            stderr: if mode == 1 {
-                CaptureDrain::capture(stderr)
-            } else {
-                CaptureDrain::discard(stderr)
-            },
-            permit: None,
-            failure: None,
-        };
-        let session = owner.tracer.ordinary_session.clone();
-        let mut status = None;
-        let work = future::poll_fn(|cx| {
-            if session.is_failed() {
-                return Poll::Ready(());
-            }
-            if status.is_none() {
-                match owner.tracer.tracer.as_mut().poll(cx) {
-                    Poll::Ready(Ok(value)) => status = Some(value),
-                    Poll::Ready(Err(error)) => session.fail(error),
-                    Poll::Pending => {}
-                }
-            }
-            if session.is_failed() {
-                return Poll::Ready(());
-            }
-            for (drain, phase) in [
-                (&mut owner.stdout, "injected stdout capture"),
-                (&mut owner.stderr, "injected stderr capture"),
-            ] {
-                match drain.poll(cx) {
-                    Poll::Ready(DrainEvent::Error(error)) => session.fail_at(
-                        reverie::BackendFailure {
-                            pid: owner.tracer.guest_pid,
-                            tid: owner.tracer.guest_pid,
-                            phase,
-                        },
-                        error.into(),
-                    ),
-                    Poll::Ready(DrainEvent::Progress) => cx.waker().wake_by_ref(),
-                    _ => {}
-                }
-            }
-            if session.is_failed()
-                || (status.is_some() && owner.stdout.is_finished() && owner.stderr.is_finished())
-            {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        });
-        // Register a failure wake independently of the root: a descendant can
-        // fail while the root is blocked in a guest wait or consuming callback.
-        owner
-            .local
-            .run_until(async {
-                tokio::select! {
-                    biased;
-                    () = session.cancelled() => {},
-                    () = work => {},
-                }
-            })
-            .await;
-        if session.is_failed() {
-            // Cancel the root run-loop before transferring its held-stop lease
-            // to the guard. Child futures stay owned by this same LocalSet and
-            // cannot run while synchronous physical cleanup is in progress.
-            owner.tracer.tracer = Box::pin(future::pending());
-            let origin = reverie::BackendFailure {
-                pid: owner.tracer.guest_pid,
-                tid: owner.tracer.guest_pid,
-                phase: "injected tracee cleanup confirmation",
-            };
-            if !owner
-                .tracer
-                .liteinst_cleanup
-                .as_mut()
-                .expect("legacy injected owner has its original guard")
-                .terminate_fatal_and_confirm(session.deadline(), |error| {
-                    session.fail_at(origin, error.into());
-                })
-            {
-                let mut failure = session
-                    .failure_snapshot()
-                    .expect("published original failure");
-                if mode == 1 {
-                    failure.captured_prefix = Some(crate::CapturedPrefix {
-                        stdout: owner
-                            .stdout
-                            .take_prefix()
-                            .expect("one stdout owner")
-                            .unwrap(),
-                        stderr: owner
-                            .stderr
-                            .take_prefix()
-                            .expect("one stderr owner")
-                            .unwrap(),
-                    });
-                }
-                let permit = QuarantinePermit::new();
-                let id = permit.id;
-                owner.permit = Some(permit);
-                let failure = Arc::new(failure);
-                owner.failure = Some(failure.clone());
-                let error = InjectedCleanupUnconfirmed { id, failure };
-                CLEANUP_QUARANTINE.with(|owners| {
-                    assert!(
-                        owners
-                            .borrow_mut()
-                            .insert(id, std::mem::ManuallyDrop::new(Box::new(owner)))
-                            .is_none()
-                    );
-                });
-                return Err(anyhow::Error::new(error).into());
-            }
-            // Only confirmed physical cleanup permits destruction of remaining
-            // child handlers/global state. No fabricated guest status is used.
-            drop(owner);
-            return Err(session
-                .take_public_failure()
-                .await
-                .expect("published failure")
-                .into_legacy_error());
-        }
-        owner
-            .tracer
-            .liteinst_cleanup
-            .as_mut()
-            .expect("original guard")
-            .disarm();
-        let stdout = owner
-            .stdout
-            .take_prefix()
-            .expect("one stdout owner")
-            .unwrap_or_default();
-        let stderr = owner
-            .stderr
-            .take_prefix()
-            .expect("one stderr owner")
-            .unwrap_or_default();
-        let global = Arc::try_unwrap(owner.tracer.gref).unwrap_or_else(|_| {
-            panic!("Reverie internal invariant broken. Arc::try_unwrap on global state failed.")
-        });
-        Ok((
-            Output {
-                status: status.expect("completed tree has a real status"),
-                stdout,
-                stderr,
-            },
-            global,
-        ))
     }
 }
 
@@ -5111,7 +3501,12 @@ fn from_nix_error(err: nix::Error) -> Errno {
 #[derive(Debug)]
 enum PostspawnError {
     Trace(TraceError),
-    Exited { pid: Pid, exit_status: ExitStatus },
+    Exited {
+        pid: Pid,
+        exit_status: ExitStatus,
+    },
+    /// The GlobalTool reported a failed run during initialization.
+    GlobalToolFailed,
 }
 
 impl From<TraceError> for PostspawnError {
@@ -5187,6 +3582,10 @@ async fn postspawn_error(pid: Pid, error: PostspawnError, owner: &Arc<PtracerWai
         },
         PostspawnError::Trace(error) => initialization_error(pid, error).await,
         PostspawnError::Exited { pid, exit_status } => initialization_exit_error(pid, exit_status),
+        PostspawnError::GlobalToolFailed => anyhow::anyhow!(
+            "GlobalTool reported a failed ptrace run during ptrace initialization of tracee {pid}"
+        )
+        .into(),
     }
 }
 
@@ -5385,32 +3784,20 @@ async fn run_task_tree<T: Tool + 'static>(
     root: TracedTask<T>,
     child: Stopped,
     orphanage: mpsc::Receiver<Child>,
-    liteinst_fail_closed: bool,
-    ordinary_owned: bool,
 ) -> Result<ExitStatus, Error> {
     let failure = root.fatal_session();
     let root = root.run(child);
-    let orphans = run_orphaned(orphanage, ordinary_owned.then(|| failure.clone()));
+    let orphans = run_orphaned(orphanage, Some(failure.clone()));
     futures::pin_mut!(root, orphans);
     let result = match future::select(root, orphans).await {
         future::Either::Left((result, orphans)) => {
-            if result.is_ok() || !liteinst_fail_closed {
-                // A successful root, and every non-LiteInst backend, still
-                // owns orderly orphan completion.
-                orphans.await;
-            }
-            // A failed LiteInst root must return control to its session cleanup
-            // guard immediately. A failed descendant can retain an orphanage
-            // sender while its Tool exit callback is pending, and waiting for
-            // that channel to close would prevent the guard from terminating
-            // the exact tracee generations which make the callback pending.
+            // The root still owns orderly orphan completion.
+            orphans.await;
             result
         }
         future::Either::Right(((), root)) => root.await,
     };
-    if ordinary_owned {
-        failure.join_owned().await;
-    }
+    failure.join_owned().await;
     result
 }
 
@@ -5472,8 +3859,6 @@ async fn postspawn<L: Tool + 'static>(
 
     let (orphan_sender, orphan_receiver) = mpsc::channel(1);
     let (daemon_kill, _) = broadcast::channel(1);
-    let liteinst_fail_closed = options.liteinst_runtime.is_some();
-    let ordinary_owned = options.liteinst_runtime.is_none();
 
     // This is the root task, so there's no reason to make run its init routine
     // asynchronously, as there isn't any other work to do.
@@ -5494,72 +3879,34 @@ async fn postspawn<L: Tool + 'static>(
     #[cfg(test)]
     tests::retain_fatal_root_observer_for_test(&child);
     tracer.arm_liteinst_root_stop(&child, &Event::Signal(Signal::SIGSTOP));
-    if ordinary_owned {
-        ordinary_session.capture_root(&child);
-    }
+    ordinary_session.capture_root(&child);
     if !ordinary_session.is_failed() {
         child = match tracer.postspawn_preinit(child).await? {
-            PreinitOutcome::Ready(child) => child,
-            PreinitOutcome::Exited(pid, exit_status) => {
+            // A refused initialization has published its named primary
+            // failure. The ordinary driver must still consume the owned tree;
+            // returning a bare spawn errno here would bypass that cleanup.
+            PostspawnPreinit::Outcome(
+                PreinitOutcome::Ready(child) | PreinitOutcome::Refused(child),
+            ) => child,
+            PostspawnPreinit::Outcome(PreinitOutcome::Exited(pid, exit_status)) => {
                 return Err(PostspawnError::Exited { pid, exit_status });
             }
+            PostspawnPreinit::GlobalToolFailed => return Err(PostspawnError::GlobalToolFailed),
         };
     }
 
-    let tracer = Box::pin(run_task_tree(
-        tracer,
-        child,
-        orphan_receiver,
-        liteinst_fail_closed,
-        ordinary_owned,
-    ));
+    let tracer = Box::pin(run_task_tree(tracer, child, orphan_receiver));
     Ok((tracer, ordinary_session))
 }
 
-/// Whether a launch rewrites guest syscall sites: its trap-only configuration
-/// patches (`SitePatching::On`) *and* its Tool subscribes to every syscall
-/// except `rt_sigreturn` (P2 spec O4 rule 2). A patched site that carried an
-/// unsubscribed number would need an invisible run that plain ptrace performs
-/// without any stop, so a partial subscription never patches: it gets plain
-/// ptrace's filter and no per-task trap-only state
-/// (`LiteinstTrapOnlyConfig::root_task` records
-/// `Disabled(PartialSubscription)` in the root table).
-fn trap_only_rewrites_sites(
-    trap_only: Option<&crate::liteinst_trap_only::LiteinstTrapOnlyConfig>,
-    events: &Subscription,
-) -> bool {
-    trap_only.is_some_and(|trap_only| trap_only.patching().rewrites_sites())
-        && crate::liteinst_trap_only::has_full_subscription(events)
-}
-
 /// Creates the seccomp filter. This lets us control which syscalls are traced
-/// and which ones are allowed through.
-///
-/// With `trap_only_patching` false the filter is plain ptrace's, byte for byte
-/// (pinned by `seccomp_filter_tests`). With it true, and only then, the filter
-/// also:
-/// - returns `Trace(TAG_I386)` for every `AUDIT_ARCH_I386` syscall (a patched
-///   `int 0x80` site) instead of killing the process;
-/// - returns `Trace(TAG_SLOT)` for every x86_64 syscall whose instruction
-///   pointer is `SLOT_RET`, whatever its number, before any other rule.
-fn seccomp_filter(events: &Subscription, trap_only_patching: bool) -> seccomp::Filter {
+/// and which ones are allowed through. `observes_sigreturns` is
+/// [`Tool::observes_sigreturns`]: the guest's own `rt_sigreturn` is traced
+/// only then.
+fn seccomp_filter(events: &Subscription, observes_sigreturns: bool) -> seccomp::Filter {
     use reverie::process::seccomp::Action;
 
-    use crate::liteinst_trap_only::SLOT_RET;
-    use crate::liteinst_trap_only::TAG_I386;
-    use crate::liteinst_trap_only::TAG_SLOT;
-
-    let mut builder = seccomp::FilterBuilder::new();
-    if trap_only_patching {
-        builder
-            .alternate_arch(seccomp::TargetArch::x86, Action::Trace(TAG_I386))
-            // An exact 64-bit match on the one address, checked before every
-            // `ip_range` and syscall rule, so a syscall at SLOT_RET stops with
-            // TAG_SLOT whatever its number. The untraced `ip_range` below is
-            // `[0x7100_0002, 0x7100_0003)` and does not contain SLOT_RET.
-            .instruction_pointer(SLOT_RET, Action::Trace(TAG_SLOT));
-    }
-    builder
+    seccomp::FilterBuilder::new()
         // By default, all syscalls are allowed through untraced. Then, we can
         // intercept only the syscalls we are interested in.
         .default_action(Action::Allow)
@@ -5568,11 +3915,21 @@ fn seccomp_filter(events: &Subscription, trap_only_patching: bool) -> seccomp::F
                 .iter_syscalls()
                 .map(|syscall| (syscall, Action::Trace(0))),
         )
-        // rt_sigreturn must execute from Reverie's private page while restoring
-        // a signal frame. restart_syscall deliberately has no unconditional
-        // override: like every ordinary syscall, it is traced exactly when the
-        // Tool subscribes to it and otherwise falls through to the Allow default.
-        .syscall(Sysno::rt_sigreturn, Action::Allow)
+        // The guest's rt_sigreturn is never shown to handle_syscall_event. It
+        // is traced only to report it to Tool::handle_sigreturn, and Reverie's
+        // own, run from its private page, is allowed by the ip_range rule
+        // below, which seccomp checks first. restart_syscall deliberately has
+        // no unconditional override: like every ordinary syscall, it is traced
+        // exactly when the Tool subscribes to it and otherwise falls through
+        // to the Allow default.
+        .syscall(
+            Sysno::rt_sigreturn,
+            if observes_sigreturns {
+                Action::Trace(0)
+            } else {
+                Action::Allow
+            },
+        )
         // Allow untraced syscalls through without tracing them.
         .ip_range(
             (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE) as u64,
@@ -5628,13 +3985,6 @@ pub struct TracerBuilder<T: Tool + 'static> {
     /// Marker and exact RIP identifying an injected syscall trap, when enabled.
     injected_syscall_trap: Option<InjectedSyscallTrap>,
 
-    /// Dynamic LiteInst runtime handshake and hot-site configuration.
-    liteinst_runtime: Option<LiteinstRuntimeConfig>,
-
-    /// Runtime-free LiteInst launch configuration. It never sets
-    /// `liteinst_runtime`, so every runtime branch keeps its ptrace arm.
-    liteinst_trap_only: Option<LiteinstTrapOnlyConfig>,
-
     /// Whether to collect general ptrace activity statistics.
     backend_stats_request: BackendStatsRequest,
 
@@ -5660,8 +4010,6 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             gdbserver: None,
             sequentialized_guest: false,
             injected_syscall_trap: None,
-            liteinst_runtime: None,
-            liteinst_trap_only: None,
             backend_stats_request: BackendStatsRequest::DISABLED,
             #[cfg(all(test, target_arch = "x86_64"))]
             clock_test_launcher_branches: 0,
@@ -5723,176 +4071,16 @@ impl<T: Tool + 'static> TracerBuilder<T> {
         self
     }
 
-    /// Enables the dynamic LiteInst runtime handshake and injected hot-site path.
-    ///
-    /// The preload path validates handshake instruction pointers against the
-    /// expected executable mapping. Distinct markers, exact return sites, and
-    /// mapping generations reject accidental collisions; they are not a
-    /// security boundary against arbitrary code already running in the tracee.
-    /// Dynamic mode follows threads and child processes under the ordinary
-    /// ptrace lifecycle, but hook installation is single-task only: the patch
-    /// helper runs on a process-global stack and the installer is not
-    /// re-entrant across tasks, so the hook set freezes at the first task
-    /// creation. It still fails closed on a vfork child and on an exec after
-    /// start, neither of which can preserve the preload runtime.
-    ///
-    /// `failed_marker` identifies the runtime's report, at the ready trap
-    /// site, that its preparation failed after the begin trap. It ends the
-    /// runtime-bootstrap window without activating the runtime; the process
-    /// can then no longer complete activation, and its exit, exec, signal, or
-    /// arrival at the executable entry fails the session.
-    // TODO-HUMAN-REVIEW(PR-270): Review dynamic LiteInst provenance API.
-    pub fn liteinst_runtime(
-        self,
-        preload: impl Into<PathBuf>,
-        begin_marker: u64,
-        ready_marker: u64,
-        helper_return_marker: u64,
-        syscall_marker: u64,
-        failed_marker: u64,
-    ) -> Self {
-        self.liteinst_runtime_with_stats(
-            preload,
-            begin_marker,
-            ready_marker,
-            helper_return_marker,
-            syscall_marker,
-            failed_marker,
-            BackendStatsRequest::DISABLED,
-        )
-    }
-
-    /// Enables the dynamic LiteInst runtime and optionally collects patch statistics.
-    // Each marker is a distinct protocol constant that the preload runtime
-    // defines; grouping them would only move the same five values.
-    #[allow(clippy::too_many_arguments)]
-    pub fn liteinst_runtime_with_stats(
-        mut self,
-        preload: impl Into<PathBuf>,
-        begin_marker: u64,
-        ready_marker: u64,
-        helper_return_marker: u64,
-        syscall_marker: u64,
-        failed_marker: u64,
-        stats_request: BackendStatsRequest,
-    ) -> Self {
-        self.liteinst_runtime = Some(LiteinstRuntimeConfig {
-            preload: preload.into(),
-            begin_marker,
-            ready_marker,
-            helper_return_marker,
-            syscall_marker,
-            failed_marker,
-            newborn_tracees: Arc::new(StdMutex::new(HashMap::new())),
-            held_root_stop: Arc::new(StdMutex::new(None)),
-            root_tid: Arc::new(StdOnceLock::new()),
-            multi_task: Arc::new(AtomicBool::new(false)),
-            session_failure: Arc::new(StdMutex::new(None)),
-            session_failure_changed: Arc::new(tokio::sync::Notify::new()),
-            instrumentation_stats: stats_request
-                .is_enabled()
-                .then(|| Arc::new(StdMutex::new(LiteinstInstrumentationStats::default()))),
-            #[cfg(test)]
-            fail_preinit: false,
-            #[cfg(test)]
-            fail_new_task: false,
-            #[cfg(test)]
-            pause_new_task: None,
-            #[cfg(test)]
-            pause_after_new_task: false,
-            #[cfg(test)]
-            pause_before_new_task: None,
-            #[cfg(test)]
-            fail_discovery_once: None,
-            #[cfg(test)]
-            fail_after_scan_once: None,
-            #[cfg(test)]
-            force_task_scan_once: None,
-            #[cfg(test)]
-            pause_root_stop: None,
-            #[cfg(test)]
-            pause_preinit_step: None,
-            #[cfg(test)]
-            pause_precise_timer_step: None,
-            #[cfg(test)]
-            activate_without_handshake: false,
-            #[cfg(test)]
-            queue_pending_signal_once: None,
-            #[cfg(test)]
-            force_skip_signal_once: None,
-            #[cfg(test)]
-            force_context_none_signal_once: None,
-            #[cfg(test)]
-            force_context_signal_once: None,
-            #[cfg(test)]
-            force_preinit_signal_once: None,
-            #[cfg(test)]
-            force_post_exec_signal_once: None,
-            #[cfg(test)]
-            force_private_stub_mutation_once: None,
-            #[cfg(test)]
-            displace_newborn: None,
-        });
-        self
-    }
-
-    /// Selects the runtime-free ("trap-only") LiteInst launch.
-    ///
-    /// Nothing is loaded into the guest: no preload, no runtime, and no
-    /// handshake. The launch uses the ordinary ptrace environment and
-    /// lifecycle, and the dynamic runtime configuration stays absent, so vfork,
-    /// exec by any thread, static images, and multi-task programs behave as
-    /// they do under plain ptrace. Patching state lives in a separate
-    /// per-address-space [`crate::SiteTable`].
-    ///
-    /// Trap-only patching needs the kernel's IA-32 syscall entry. `spawn`
-    /// probes whether `int 0x80` is serviced and fails closed with
-    /// [`crate::Ia32EmulationUnavailable`] when it is not. A launch that
-    /// rewrites sites is also refused, with
-    /// [`crate::Ia32EntryClobbersRegisters`], when the entry changes rcx or
-    /// r8-r11. The mode cannot be combined with [`Self::liteinst_runtime`].
-    ///
-    /// With [`SitePatching::Off`] no guest byte is ever written and the run is
-    /// the ordinary ptrace run.
-    // TODO-HUMAN-REVIEW(liteinst-trap-only-P1): Review the trap-only launch API.
-    pub fn liteinst_trap_only(self, patching: SitePatching) -> Self {
-        self.liteinst_trap_only_with_stats(patching, BackendStatsRequest::DISABLED)
-    }
-
-    /// Selects the trap-only LiteInst launch and optionally collects patch statistics.
-    ///
-    /// With [`SitePatching::Off`] the collected statistics stay empty.
-    pub fn liteinst_trap_only_with_stats(
-        mut self,
-        patching: SitePatching,
-        stats_request: BackendStatsRequest,
-    ) -> Self {
-        self.liteinst_trap_only = Some(LiteinstTrapOnlyConfig::new(
-            patching,
-            stats_request.is_enabled(),
-        ));
-        self
-    }
-
-    #[cfg(test)]
-    fn liteinst_trap_only_ia32_probe_for_test(mut self, probe: crate::Ia32EmulationProbe) -> Self {
-        self.liteinst_trap_only
-            .as_mut()
-            .expect("trap-only mode must be selected before overriding its probe")
-            .ia32_probe_override = Some(probe);
-        self
-    }
-
-    /// Leaves the signal `hook` picks pending for the final resume of each
-    /// seccomp stop it selects, under either backend.
+    /// Shows `hook` the registers at the final resume of each Tool-visible
+    /// seccomp stop, and leaves the signal it picks pending for that resume.
     #[cfg(test)]
     fn final_resume_signal_for_test(mut self, hook: crate::task::FinalResumeSignalForTest) -> Self {
         self.final_resume_signal_for_test = Some(hook);
         self
     }
 
-    /// Awaits `hook` immediately before each Tool-visible syscall runs,
-    /// under either backend (see [`crate::task::PreSyscallForTest`]).
+    /// Awaits `hook` immediately before each Tool-visible syscall runs (see
+    /// [`crate::task::PreSyscallForTest`]).
     #[cfg(test)]
     fn pre_syscall_for_test(mut self, hook: crate::task::PreSyscallForTest) -> Self {
         self.pre_syscall_for_test = Some(hook);
@@ -5904,288 +4092,6 @@ impl<T: Tool + 'static> TracerBuilder<T> {
     #[cfg(test)]
     fn preinit_point_for_test(mut self, hook: crate::task::PreinitPointForTest) -> Self {
         self.preinit_point_for_test = Some(hook);
-        self
-    }
-
-    /// Makes every trap-only patch write a no-op, so the readback finds the
-    /// original bytes.
-    #[cfg(test)]
-    fn liteinst_trap_only_skip_patch_write_for_test(self) -> Self {
-        self.liteinst_trap_only
-            .as_ref()
-            .expect("trap-only mode must be selected before skipping its patch writes")
-            .hooks
-            .skip_patch_write
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self
-    }
-
-    /// Makes every trap-only new-child stop forget the clone flags recorded
-    /// at its creating stop, so it takes the undecided path.
-    #[cfg(test)]
-    fn liteinst_trap_only_forget_clone_flags_for_test(self) -> Self {
-        self.liteinst_trap_only
-            .as_ref()
-            .expect("trap-only mode must be selected before forgetting its clone flags")
-            .hooks
-            .forget_clone_flags
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self
-    }
-
-    /// Makes every trap-only new-child stop see the clone flags recorded at
-    /// its creating stop with `CLONE_VM` flipped, so that they disagree with
-    /// `kcmp(KCMP_VM)` and the stop takes the undecided path.
-    #[cfg(test)]
-    fn liteinst_trap_only_flip_recorded_clone_vm_for_test(self) -> Self {
-        self.liteinst_trap_only
-            .as_ref()
-            .expect("trap-only mode must be selected before flipping its clone flags")
-            .hooks
-            .flip_recorded_clone_vm
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self
-    }
-
-    /// Makes every trap-only new-child stop see the clone flags recorded at
-    /// its creating stop with `CLONE_VFORK` flipped, so that they disagree
-    /// with the kind of new-child stop and the stop takes the undecided path.
-    #[cfg(test)]
-    fn liteinst_trap_only_flip_recorded_clone_vfork_for_test(self) -> Self {
-        self.liteinst_trap_only
-            .as_ref()
-            .expect("trap-only mode must be selected before flipping its clone flags")
-            .hooks
-            .flip_recorded_clone_vfork
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self
-    }
-
-    /// Makes the masked hop see every slot exit stop's rip displaced by one
-    /// byte, so that H4 must fail closed.
-    #[cfg(test)]
-    fn liteinst_trap_only_displace_hop_exit_rip_for_test(self) -> Self {
-        self.liteinst_trap_only
-            .as_ref()
-            .expect("trap-only mode must be selected before displacing its hop exit rip")
-            .hooks
-            .displace_hop_exit_rip
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self
-    }
-
-    #[cfg(test)]
-    fn fail_liteinst_preinit_for_test(mut self) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before preinit failure injection")
-            .fail_preinit = true;
-        self
-    }
-
-    #[cfg(test)]
-    fn fail_liteinst_new_task_for_test(mut self) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before new-task failure injection")
-            .fail_new_task = true;
-        self
-    }
-
-    #[cfg(test)]
-    fn pause_liteinst_new_task_for_test(mut self, sender: mpsc::UnboundedSender<Pid>) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before child-event pause")
-            .pause_new_task = Some(sender);
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before child-event pause")
-            .pause_after_new_task = true;
-        self
-    }
-
-    #[cfg(test)]
-    fn observe_liteinst_new_task_for_test(mut self, sender: mpsc::UnboundedSender<Pid>) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before child-event observation")
-            .pause_new_task = Some(sender);
-        self
-    }
-
-    #[cfg(test)]
-    fn displace_liteinst_newborn_for_test(
-        mut self,
-        stage: NewbornDisplacementStage,
-        foreign: Running,
-        outcome: mpsc::UnboundedSender<NewbornDisplacementOutcome>,
-    ) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before newborn displacement")
-            .displace_newborn = Some(Arc::new(NewbornDisplacement {
-            stage,
-            foreign,
-            displaced_child: StdOnceLock::new(),
-            displaced_generation: StdOnceLock::new(),
-            outcome,
-        }));
-        self
-    }
-
-    #[cfg(test)]
-    fn pause_before_liteinst_new_task_for_test(
-        mut self,
-        sender: mpsc::UnboundedSender<Pid>,
-    ) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before pre-handler pause")
-            .pause_before_new_task = Some(sender);
-        self
-    }
-
-    #[cfg(test)]
-    fn fail_liteinst_discovery_once_for_test(mut self, flag: Arc<AtomicBool>) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before discovery failure injection")
-            .fail_discovery_once = Some(flag);
-        self
-    }
-
-    #[cfg(test)]
-    fn fail_liteinst_after_task_scan_once_for_test(
-        mut self,
-        fail: Arc<AtomicBool>,
-        force_scan: Arc<AtomicBool>,
-    ) -> Self {
-        let runtime = self
-            .liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before scan failure injection");
-        runtime.fail_after_scan_once = Some(fail);
-        runtime.force_task_scan_once = Some(force_scan);
-        self
-    }
-
-    #[cfg(test)]
-    fn pause_liteinst_root_stop_for_test(
-        mut self,
-        stop: RootStopPause,
-        sender: mpsc::UnboundedSender<Pid>,
-    ) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before root-stop pause")
-            .pause_root_stop = Some((stop, sender));
-        self
-    }
-
-    #[cfg(test)]
-    fn pause_liteinst_preinit_step_for_test(
-        mut self,
-        step: usize,
-        sender: mpsc::UnboundedSender<Pid>,
-    ) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before preinit pause")
-            .pause_preinit_step = Some((step, sender));
-        self
-    }
-
-    #[cfg(test)]
-    fn pause_liteinst_precise_timer_step_for_test(
-        mut self,
-        sender: mpsc::UnboundedSender<Pid>,
-    ) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before precise-timer pause")
-            .pause_precise_timer_step = Some(sender);
-        self
-    }
-
-    #[cfg(test)]
-    fn activate_liteinst_without_handshake_for_test(mut self) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before test-only activation")
-            .activate_without_handshake = true;
-        self
-    }
-
-    #[cfg(test)]
-    fn queue_liteinst_pending_signal_once_for_test(mut self, queue_once: Arc<AtomicBool>) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before pending-signal injection")
-            .queue_pending_signal_once = Some(queue_once);
-        self
-    }
-
-    #[cfg(test)]
-    fn force_liteinst_skip_signal_once_for_test(mut self, force_once: Arc<AtomicBool>) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before skip-signal injection")
-            .force_skip_signal_once = Some(force_once);
-        self
-    }
-
-    #[cfg(test)]
-    fn force_liteinst_context_none_signal_once_for_test(
-        mut self,
-        force_once: Arc<AtomicBool>,
-    ) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before reinjection-signal injection")
-            .force_context_none_signal_once = Some(force_once);
-        self
-    }
-
-    #[cfg(test)]
-    fn force_liteinst_context_signal_once_for_test(mut self, force_once: Arc<AtomicBool>) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before injection-signal injection")
-            .force_context_signal_once = Some(force_once);
-        self
-    }
-
-    #[cfg(test)]
-    fn force_liteinst_preinit_signal_once_for_test(mut self, force_once: Arc<AtomicBool>) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before preinit-signal injection")
-            .force_preinit_signal_once = Some(force_once);
-        self
-    }
-
-    #[cfg(test)]
-    fn force_liteinst_post_exec_signal_once_for_test(
-        mut self,
-        force_once: Arc<AtomicBool>,
-    ) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before post-exec-signal injection")
-            .force_post_exec_signal_once = Some(force_once);
-        self
-    }
-
-    #[cfg(test)]
-    fn force_liteinst_private_stub_mutation_once_for_test(
-        mut self,
-        force_once: Arc<AtomicBool>,
-    ) -> Self {
-        self.liteinst_runtime
-            .as_mut()
-            .expect("LiteInst runtime must be configured before private-stub mutation")
-            .force_private_stub_mutation_once = Some(force_once);
         self
     }
 
@@ -6234,65 +4140,15 @@ impl<T: Tool + 'static> TracerBuilder<T> {
     pub async fn spawn(self) -> Result<Tracer<T::GlobalState>, Error> {
         // A retained failed tree must not acquire peers through another mode.
         let _ordinary_admission = OrdinaryAdmission::acquire()?;
-        if self.liteinst_runtime.is_some() && self.gdbserver.is_some() {
-            return Err(Error::Tool(anyhow::anyhow!(
-                "LiteInst runtime activation with a GDB server is unsupported ({}): both controllers would own the executable-entry software breakpoint",
-                Errno::ENOTSUPP
-            )));
-        }
-        if self.liteinst_runtime.is_some() && self.liteinst_trap_only.is_some() {
-            return Err(Error::Tool(anyhow::anyhow!(
-                "LiteInst runtime activation and trap-only LiteInst are mutually exclusive ({})",
-                Errno::EINVAL
-            )));
-        }
-        if let Some(trap_only) = self.liteinst_trap_only.as_ref() {
-            // A trap-only run must never degrade to plain ptrace under the
-            // LiteInst label.
-            // An entry that changes rcx or r8-r11 refuses only site patching.
-            require_ia32_emulation(trap_only.ia32_probe(), trap_only.patching())?;
-        }
-        let liteinst_trap_only = self
-            .liteinst_trap_only
-            .as_ref()
-            .map(LiteinstTrapOnlyHandle::from_config);
         let backend_stats = PtraceBackendStatsSource::from_request(self.backend_stats_request);
         let mut command = self.command;
         let config = self.config.unwrap_or_default();
-        let liteinst_fail_closed = self.liteinst_runtime.is_some();
-        let ordinary_completion_supported =
-            self.liteinst_runtime.is_none() && self.injected_syscall_trap.is_none();
+        let ordinary_completion_supported = self.injected_syscall_trap.is_none();
 
         // Because this ptrace backend is CENTRALIZED, it can keep all the
         // tool's state here in a single address space.
         let global_state = <T::GlobalState as GlobalTool>::init_global_state(&config).await;
         let events = T::subscriptions(&config);
-        // Only a patching run carries per-task trap-only state; with patching
-        // off every task runs the ordinary ptrace path unchanged. P2 spec O4
-        // rule 2: a run whose Tool does not subscribe to every syscall is
-        // treated exactly as patching Off (plain filter, no per-task state, no
-        // site ever patched), with the root table recording why.
-        let trap_only_patching =
-            trap_only_rewrites_sites(self.liteinst_trap_only.as_ref(), &events);
-        let trap_only_task = self
-            .liteinst_trap_only
-            .as_ref()
-            .filter(|trap_only| trap_only.patching().rewrites_sites())
-            .map(|trap_only| trap_only.root_task(&events))
-            .filter(|_| trap_only_patching);
-        let mut traced_events = events.clone();
-        if self.liteinst_runtime.is_some() {
-            // Mapping operations are controller-only lifecycle observations:
-            // trace them so successful VMA churn can invalidate patched-site
-            // provenance, without adding them to the Tool's subscription set.
-            traced_events.syscalls([
-                Sysno::mmap,
-                Sysno::munmap,
-                Sysno::mremap,
-                Sysno::mprotect,
-                Sysno::pkey_mprotect,
-            ]);
-        }
         let gref = Arc::new(global_state);
 
         // Get the full path to the program and change the command to use it. This
@@ -6330,94 +4186,23 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             });
         }
 
-        command.seccomp(seccomp_filter(&traced_events, trap_only_patching));
+        // As `GlobalState::reports_sigreturns`: x86-64 only, and not while a
+        // gdbserver is attached.
+        command.seccomp(seccomp_filter(
+            &events,
+            cfg!(target_arch = "x86_64")
+                && T::observes_sigreturns(&config)
+                && self.gdbserver.is_none(),
+        ));
 
         // Command::spawn holds the launch lock from the child's first pipe
         // until clone returns, and not while it waits for the child to start
         // (`launch_window`).
         let mut child = command.spawn().context("Failed to spawn tracee")?;
         let guest_pid = child.id();
-        if let Some(runtime) = self.liteinst_runtime.as_ref() {
-            // Publish the session root before any task can observe the config.
-            // Everything LiteInst-root-scoped keys off this exact TID rather
-            // than the `tid == pid` shape, which a forked child also has.
-            runtime
-                .root_tid
-                .set(guest_pid)
-                .expect("LiteInst root TID is published exactly once per spawn");
-        }
-        let running_child = capture_ptracer_child(guest_pid, liteinst_fail_closed)?;
+        let running_child = capture_ptracer_child(guest_pid)?;
         let root_waits = Arc::new(PtracerWaitOwner::default());
         root_waits.bind_running(&running_child);
-        let liteinst_newborn_tracees = self
-            .liteinst_runtime
-            .as_ref()
-            .map(|runtime| Arc::clone(&runtime.newborn_tracees));
-        let liteinst_held_root_stop = self
-            .liteinst_runtime
-            .as_ref()
-            .map(|runtime| Arc::clone(&runtime.held_root_stop));
-        let liteinst_instrumentation_stats = self
-            .liteinst_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.instrumentation_stats.as_ref().map(Arc::clone))
-            .or_else(|| {
-                self.liteinst_trap_only
-                    .as_ref()
-                    .and_then(|trap_only| trap_only.instrumentation_stats.as_ref().map(Arc::clone))
-            });
-        #[cfg(test)]
-        let fail_discovery_once = self
-            .liteinst_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.fail_discovery_once.clone());
-        #[cfg(test)]
-        let fail_after_scan_once = self
-            .liteinst_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.fail_after_scan_once.clone());
-        #[cfg(test)]
-        let force_task_scan_once = self
-            .liteinst_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.force_task_scan_once.clone());
-        let mut liteinst_cleanup = if liteinst_fail_closed {
-            match LiteinstTraceeCleanup::new(
-                guest_pid,
-                liteinst_newborn_tracees.expect("LiteInst runtime config must exist"),
-                liteinst_held_root_stop.expect("LiteInst runtime config must exist"),
-            ) {
-                Ok(cleanup) => {
-                    #[cfg(test)]
-                    let cleanup = {
-                        let mut cleanup = cleanup;
-                        cleanup.fail_discovery_once = fail_discovery_once;
-                        cleanup.fail_after_scan_once = fail_after_scan_once;
-                        cleanup.force_task_scan_once = force_task_scan_once;
-                        cleanup
-                    };
-                    Some(cleanup)
-                }
-                Err(error) => {
-                    // pidfd is a required LiteInst cleanup capability. The
-                    // just-spawned, unreaped PID cannot have been reused yet,
-                    // so a one-time numeric kill is safe only on this setup
-                    // failure path; all active guards signal through pidfd.
-                    let kill_result = unsafe { libc::kill(guest_pid.as_raw(), libc::SIGKILL) };
-                    let kill_error = (kill_result == -1).then(Errno::last);
-                    let drain_result = drain_unregistered_child(Running::new(guest_pid));
-                    return Err(liteinst_pidfd_setup_error(
-                        guest_pid,
-                        error,
-                        kill_error,
-                        drain_result,
-                    )
-                    .into());
-                }
-            }
-        } else {
-            None
-        };
 
         // Configure the gdb server (if any).
         let gdbserver = match self.gdbserver {
@@ -6440,14 +4225,6 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             }
         };
 
-        // From this point on, every wait status belongs to safeptrace's
-        // notifier. Cancellation and initialization errors must request
-        // termination through the guard and await notifier unregistration;
-        // they must never call raw waitpid for this PID.
-        if let Some(cleanup) = liteinst_cleanup.as_mut() {
-            cleanup.register_notifier(&running_child);
-        }
-
         let (tracer, ordinary_session) = match postspawn::<T>(
             running_child,
             root_waits.clone(),
@@ -6457,8 +4234,6 @@ impl<T: Tool + 'static> TracerBuilder<T> {
                 command_bootstrap: true,
                 events: &events,
                 injected_syscall_trap: self.injected_syscall_trap,
-                liteinst_runtime: self.liteinst_runtime,
-                liteinst_trap_only: trap_only_task,
                 backend_stats: backend_stats.clone(),
                 #[cfg(test)]
                 final_resume_signal_for_test: self.final_resume_signal_for_test,
@@ -6472,18 +4247,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
         .await
         {
             Ok(tracer) => tracer,
-            Err(err) => {
-                let error = postspawn_error(guest_pid, err, &root_waits).await;
-                if let Some(cleanup) = liteinst_cleanup.as_mut()
-                    && let Err(cleanup_error) = cleanup.terminate_and_confirm()
-                {
-                    return Err(anyhow::anyhow!(
-                        "LiteInst tracee cleanup failed after {error}: {cleanup_error}"
-                    )
-                    .into());
-                }
-                return Err(error);
-            }
+            Err(err) => return Err(postspawn_error(guest_pid, err, &root_waits).await),
         };
 
         let stdin = child.stdin.take();
@@ -6507,9 +4271,6 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             stdin,
             stdout,
             stderr,
-            liteinst_cleanup,
-            liteinst_instrumentation_stats,
-            liteinst_trap_only,
             backend_stats,
         })
     }
@@ -6609,8 +4370,10 @@ where
     let events = L::subscriptions(&config);
     let gref = Arc::new(global_state);
 
-    // This path never runs trap-only LiteInst (`liteinst_trap_only: None`).
-    let seccomp_filter = seccomp_filter(&events, false);
+    let seccomp_filter = seccomp_filter(
+        &events,
+        cfg!(target_arch = "x86_64") && L::observes_sigreturns(&config),
+    );
 
     // While the pipes are made, no transient open of another thread may be
     // in flight: its descriptor would take a number from the pipes' budget.
@@ -6668,7 +4431,7 @@ where
             std::io::set_output_capture(output_capture);
 
             let guest_pid = Pid::from(child);
-            let child = capture_ptracer_child(guest_pid, false)?;
+            let child = capture_ptracer_child(guest_pid)?;
             let root_waits = Arc::new(PtracerWaitOwner::default());
             root_waits.bind_running(&child);
             write1.close()?;
@@ -6685,8 +4448,6 @@ where
                     command_bootstrap: false,
                     events: &events,
                     injected_syscall_trap: None,
-                    liteinst_runtime: None,
-                    liteinst_trap_only: None,
                     backend_stats: None,
                     #[cfg(test)]
                     final_resume_signal_for_test: None,
@@ -6713,9 +4474,6 @@ where
                 stdin: None,
                 stdout: Some(stdout),
                 stderr: Some(stderr),
-                liteinst_cleanup: None,
-                liteinst_instrumentation_stats: None,
-                liteinst_trap_only: None,
                 backend_stats: None,
             })
         }
@@ -6735,16 +4493,16 @@ mod injection_stop_tests;
 mod injected_error_tests;
 
 #[cfg(all(test, target_arch = "x86_64"))]
-#[path = "liteinst_trap_only_tests.rs"]
-mod liteinst_trap_only_tests;
-
-#[cfg(all(test, target_arch = "x86_64"))]
 #[path = "seccomp_ip_window_tests.rs"]
 mod seccomp_ip_window_tests;
 
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "seccomp_filter_tests.rs"]
 mod seccomp_filter_tests;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "plain_guest_regression_tests.rs"]
+mod plain_guest_regression_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7101,6 +4859,8 @@ mod tests {
                 *guest.thread_state_mut() = true;
                 self.blocked_start.store(true, Ordering::SeqCst);
                 let _pending = PendingStart(&self.blocked_start);
+                publish_fatal_pending_start(guest.tid())
+                    .expect("actual pending callback must precede the failure worker");
                 future::pending::<()>().await;
             }
             Ok(())
@@ -7167,6 +4927,21 @@ mod tests {
                 }
             }
             if *guest.config() == 2 {
+                FATAL_PENDING_START_WORDS.with(|slot| {
+                    let pointer = slot.get() as *mut std::sync::atomic::AtomicUsize;
+                    assert!(!pointer.is_null(), "pending-start fixture scope missing");
+                    // SAFETY: the scoped borrow retains the shared FatalWords mapping.
+                    let pending = unsafe { &*pointer.add(2) }.load(Ordering::SeqCst);
+                    let worker_created = unsafe { &*pointer.add(3) }.load(Ordering::SeqCst);
+                    assert_ne!(pending, 0, "actual pending callback was not observed");
+                    assert_eq!(
+                        worker_created, pending,
+                        "worker preceded its pending callback"
+                    );
+                    assert_ne!(guest.tid().as_raw() as usize, pending);
+                    unsafe { &*pointer.add(4) }
+                        .store(guest.tid().as_raw() as usize, Ordering::SeqCst);
+                });
                 assert!(
                     self.blocked_start.load(Ordering::SeqCst),
                     "newborn must still be in its start callback at failure"
@@ -7235,6 +5010,90 @@ mod tests {
         }
     }
 
+    thread_local! {
+        // Nonzero only while an actual shared mapping is borrowed by this test.
+        static FATAL_PENDING_START_WORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    struct FatalPendingStartScope<'a> {
+        previous: usize,
+        _words: &'a FatalWords,
+    }
+
+    impl<'a> FatalPendingStartScope<'a> {
+        fn new(words: &'a FatalWords) -> Self {
+            let previous = FATAL_PENDING_START_WORDS.with(|slot| slot.replace(words.0 as usize));
+            Self {
+                previous,
+                _words: words,
+            }
+        }
+    }
+
+    impl Drop for FatalPendingStartScope<'_> {
+        fn drop(&mut self) {
+            FATAL_PENDING_START_WORDS.with(|slot| slot.set(self.previous));
+        }
+    }
+
+    // Called only by the real callback, after its PendingStart guard exists.
+    fn publish_fatal_pending_start(tid: Pid) -> Result<(), &'static str> {
+        if tid.as_raw() <= 0 {
+            return Err("invalid pending TID");
+        }
+        FATAL_PENDING_START_WORDS.with(|slot| {
+            let pointer = slot.get() as *mut std::sync::atomic::AtomicUsize;
+            if pointer.is_null() {
+                return Err("missing pending-start mapping scope");
+            }
+            // SAFETY: the active scope borrows the mapping for all callback polls.
+            let worker_created = unsafe { &*pointer.add(3) };
+            if worker_created.load(Ordering::SeqCst) != 0 {
+                return Err("failure worker already created");
+            }
+            unsafe { &*pointer.add(2) }
+                .compare_exchange(0, tid.as_raw() as usize, Ordering::SeqCst, Ordering::SeqCst)
+                .map(|_| ())
+                .map_err(|_| "pending callback already published")
+        })
+    }
+
+    #[test]
+    fn pending_newborn_predecessor_refuses_late_or_duplicate_publication_and_restores_scope() {
+        let previous = FATAL_PENDING_START_WORDS.with(|slot| slot.get());
+        {
+            let words = FatalWords::new();
+            let _scope = FatalPendingStartScope::new(&words);
+            assert_eq!(publish_fatal_pending_start(Pid::from_raw(44)), Ok(()));
+            assert_eq!(words.read(2), 44);
+            assert_eq!(
+                publish_fatal_pending_start(Pid::from_raw(45)),
+                Err("pending callback already published")
+            );
+            assert_eq!(words.read(2), 44);
+        }
+        assert_eq!(FATAL_PENDING_START_WORDS.with(|slot| slot.get()), previous);
+        let unwind = std::panic::catch_unwind(|| {
+            let words = FatalWords::new();
+            let _scope = FatalPendingStartScope::new(&words);
+            // A worker-created marker without callback publication is refused.
+            unsafe { &*words.0.add(3) }.store(44, Ordering::SeqCst);
+            assert_eq!(
+                publish_fatal_pending_start(Pid::from_raw(44)),
+                Err("failure worker already created")
+            );
+            assert_eq!(words.read(2), 0);
+            panic!("exercise scoped pointer restoration");
+        });
+        let payload = unwind.expect_err("the deliberate unwind must occur");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("exercise scoped pointer restoration"),
+            "an earlier assertion failure must not satisfy the unwind control"
+        );
+        assert_eq!(FATAL_PENDING_START_WORDS.with(|slot| slot.get()), previous);
+    }
+
     async fn ordinary_nonleader_control(fail: bool, fork_descendant: bool, blocked_newborn: bool) {
         let handed_deadline = std::env::var("REVERIE_FATAL_HANDED_DEADLINE_NS")
             .ok()
@@ -7262,8 +5121,11 @@ mod tests {
         });
         let _observations = FatalReapObservationScope::new();
         let words = FatalWords::new();
+        // Declared after words, so unwinding restores TLS before unmapping.
+        let _pending_start_scope = blocked_newborn.then(|| FatalPendingStartScope::new(&words));
         let address = words.0 as usize;
-        let sentinel = fork_paused_child(deadline);
+        let sentinel_child = fork_paused_child(deadline);
+        let sentinel = sentinel_child.pid();
         let sentinel_identity = untraced_process_identity(sentinel);
         let tracer = spawn_fn_with_config::<FatalTool, _>(
             move || {
@@ -7292,6 +5154,25 @@ mod tests {
                 }
                 let newborn = blocked_newborn
                     .then(|| std::thread::spawn(|| panic!("cancelled newborn reached guest code")));
+                if blocked_newborn {
+                    // The first newborn executes NO guest body. Its real host
+                    // callback publishes its TID while holding PendingStart.
+                    let pending =
+                        unsafe { &*((address as *const std::sync::atomic::AtomicUsize).add(2)) };
+                    let pending_tid = loop {
+                        let tid = pending.load(Ordering::SeqCst);
+                        if tid != 0 {
+                            break tid;
+                        }
+                        std::thread::yield_now();
+                    };
+                    assert_eq!(
+                        unsafe { &*((address as *const std::sync::atomic::AtomicUsize).add(3)) }
+                            .compare_exchange(0, pending_tid, Ordering::SeqCst, Ordering::SeqCst),
+                        Ok(0),
+                        "failure worker creation must follow the actual pending callback"
+                    );
+                }
                 std::thread::spawn(move || {
                     unsafe { libc::syscall(libc::SYS_getpgid, 0) };
                     unsafe { &*(address as *const std::sync::atomic::AtomicUsize) }
@@ -7313,7 +5194,6 @@ mod tests {
         )
         .await
         .expect("spawn ordinary ptrace control");
-        assert!(tracer.liteinst_cleanup.is_none());
         let root = tracer.guest_pid;
         let log = fail.then(|| Arc::clone(&tracer.gref.0));
         let original_root = FATAL_ROOT_OBSERVER.with(|slot| {
@@ -7351,18 +5231,9 @@ mod tests {
         }
         // Test-only emergency cleanup is invoked *after* recording the actual
         // result and survivor state. It cannot satisfy the product assertions.
-        let mut emergency = LiteinstTraceeCleanup::new(
-            root,
-            Arc::new(StdMutex::new(HashMap::new())),
-            Arc::new(StdMutex::new(None)),
-        )
-        .unwrap();
-        emergency.notifier_owner = Some(tracer.ptracer_thread);
-        emergency.terminal = Some(original_root.emergency);
-        let emergency_registration = emergency.terminal.as_ref().unwrap().ensure_registered();
-        let emergency_same_generation = original_root
-            .original
-            .same_generation(emergency.terminal.as_ref().unwrap());
+        let emergency = original_root.emergency;
+        let emergency_registration = emergency.ensure_registered();
+        let emergency_same_generation = original_root.original.same_generation(&emergency);
         eprintln!(
             "emergency root observer: root={root}, same_generation={emergency_same_generation}, registration={emergency_registration:?}, original_native={:?}",
             original_root.original.has_thread_pidfd()
@@ -7507,9 +5378,10 @@ mod tests {
         } else {
             false
         };
-        emergency
-            .terminate_and_confirm()
-            .expect("emergency test cleanup");
+        match emergency.request_sigkill() {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(error) => panic!("emergency test cleanup: {error}"),
+        }
         if fork_descendant && descendant != 0 && fatal_subreaper_state() == 1 {
             let pid = Pid::from_raw(i32::try_from(descendant).unwrap());
             // The controlled diagnostic wrapper adopts the zombie but does not
@@ -7574,6 +5446,20 @@ mod tests {
                     2
                 }
             );
+            if blocked_newborn {
+                let pending = words.read(2);
+                let worker_created = words.read(3);
+                let error_tid = words.read(4);
+                assert_ne!(pending, 0);
+                assert_eq!(worker_created, pending);
+                assert_ne!(
+                    error_tid, 0,
+                    "the actual failing syscall callback never ran"
+                );
+                assert_ne!(error_tid, pending);
+                assert!(starts.contains(&Pid::from_raw(i32::try_from(pending).unwrap())));
+                assert!(starts.contains(&Pid::from_raw(i32::try_from(error_tid).unwrap())));
+            }
             for tid in starts {
                 assert_reaped("ordinary task", tid);
                 assert_eq!(
@@ -7607,8 +5493,8 @@ mod tests {
         );
         assert_eq!(emergency_registration, Ok(()));
         assert!(original_root.original.wait(Duration::ZERO));
-        assert!(emergency.terminal.as_ref().unwrap().wait(Duration::ZERO));
-        assert!(emergency.terminal.as_ref().unwrap().pending_is_empty());
+        assert!(emergency.wait(Duration::ZERO));
+        assert!(emergency.pending_is_empty());
         assert_eq!(
             original_root.original.observed_exit_status().unwrap(),
             Some(if fail {
@@ -9481,13 +7367,7 @@ mod tests {
         .unwrap();
         let root = tracer.guest_pid;
         let log = tracer.gref.0.clone();
-        let mut emergency = LiteinstTraceeCleanup::new(
-            root,
-            Arc::new(StdMutex::new(HashMap::new())),
-            Arc::new(StdMutex::new(None)),
-        )
-        .unwrap();
-        emergency.register_notifier(&Running::new(root));
+        let emergency = Running::new(root).terminal_cleanup();
         let result = tokio::time::timeout(Duration::from_secs(3), tracer.wait()).await;
         crate::task::FATAL_SETUP_CONTROL.with(|slot| *slot.borrow_mut() = None);
         let (child, terminal) = control
@@ -9503,7 +7383,7 @@ mod tests {
             "newborn setup refusal: root={root}, child={child}, root_absent={root_absent}, child_absent={child_absent}, terminal_ack={acknowledged}, resumed={}",
             words.read(0)
         );
-        let emergency_result = emergency.terminate_and_confirm();
+        let emergency_result = emergency.request_sigkill();
         eprintln!("newborn setup emergency cleanup: {emergency_result:?}");
         assert!(root_absent && child_absent && acknowledged);
         assert_eq!(words.read(0), 0, "unstarted child reached guest code");
@@ -10029,7 +7909,8 @@ mod tests {
         let address = words.0 as usize;
         pause.waiting_word.store(address, Ordering::SeqCst);
         crate::task::FATAL_FORK_PAUSE.with(|slot| *slot.borrow_mut() = Some(pause.clone()));
-        let sentinel = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let sentinel_child = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let sentinel = sentinel_child.pid();
         let sentinel_identity = untraced_process_identity(sentinel);
         let tracer = spawn_fn_with_config::<FatalTool, _>(
             move || {
@@ -10859,33 +8740,6 @@ mod tests {
     use reverie::syscalls::SyscallInfo;
 
     use super::*;
-    use crate::error::LiteinstActivationFailureCategory;
-    use crate::error::LiteinstActivationFailureReason;
-    use crate::error::LiteinstActivationOperation;
-    use crate::error::LiteinstActivationStage;
-    use crate::error::liteinst_activation_failure_category;
-    use crate::error::liteinst_activation_failure_reason;
-
-    fn assert_liteinst_activation_failure(
-        error: &Error,
-        expected: LiteinstActivationFailureReason,
-    ) {
-        assert_eq!(
-            liteinst_activation_failure_reason(error),
-            Some(expected),
-            "{error}"
-        );
-    }
-
-    fn assert_general_pre_ready_liteinst_activation_failure(error: &Error) {
-        assert_eq!(
-            liteinst_activation_failure_category(error),
-            Some(LiteinstActivationFailureCategory::General(
-                LiteinstActivationStage::PreReady,
-            )),
-            "{error}"
-        );
-    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -11076,7 +8930,8 @@ mod tests {
                 "FIFO discriminator must retain CLOEXEC across fork",
             ));
         }
-        let pid = fork_paused_child(predicate_deadline);
+        // FifoSentinel reaps the child itself, also on unwind.
+        let pid = fork_paused_child(predicate_deadline).into_pid();
         let mut sentinel = FifoSentinel {
             pid,
             pidfd: None,
@@ -11202,9 +9057,154 @@ mod tests {
     }
 
     // The caller's existing absolute deadline stays authoritative. Simple
-    // identity fixtures use an explicit new 100 ms setup-only deadline.
-    fn fork_paused_child(deadline: Instant) -> Pid {
-        try_fork_paused_child(deadline, 0).expect("sentinel descriptor setup refused")
+    // identity fixtures use an explicit new 100 ms setup-only deadline. The
+    // child is owned from the moment it exists ([`PausedChild`]).
+    fn fork_paused_child(deadline: Instant) -> PausedChild {
+        PausedChild::new(
+            try_fork_paused_child(deadline, 0).expect("sentinel descriptor setup refused"),
+        )
+    }
+
+    /// A paused child this test process forked (`fork_paused_child`). Dropped,
+    /// also during a panic's unwind, it kills and reaps the child unless the
+    /// test already reaped it, so a test that fails before its own teardown
+    /// leaves no process behind; otherwise the child is reparented when the
+    /// test process exits and pauses for ever.
+    ///
+    /// Taking ownership cannot panic: the pidfd is opened without unwrapping.
+    /// The kill goes through that pidfd, which names this child and no
+    /// process that later reuses its pid, and finds a child already reaped
+    /// (ESRCH); without one the child is left in place, with a diagnostic.
+    /// Only this child's pid is waited for, and only after the pidfd showed
+    /// it unreaped, so another child's status is never taken. A copy
+    /// inherited by a process forked from the test (a guest that unwinds)
+    /// does nothing.
+    struct PausedChild {
+        pid: Pid,
+        pidfd: Option<OwnedFd>,
+        owner: u32,
+    }
+
+    impl PausedChild {
+        fn new(pid: Pid) -> Self {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
+            Self {
+                pid,
+                pidfd: (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as i32) }),
+                owner: std::process::id(),
+            }
+        }
+
+        fn pid(&self) -> Pid {
+            self.pid
+        }
+
+        /// Hands the child to an owner that reaps it itself.
+        fn into_pid(self) -> Pid {
+            let mut this = std::mem::ManuallyDrop::new(self);
+            drop(this.pidfd.take());
+            this.pid
+        }
+
+        /// Kills the child if it is still this process's unreaped child,
+        /// through its pidfd; returns whether it was. Without a pidfd that
+        /// accepts the signal it leaves the child alone and says so: the
+        /// numeric pid could by then name another child of this process.
+        fn kill_if_unreaped(&self) -> bool {
+            let Some(pidfd) = &self.pidfd else {
+                cleanup_unconfirmed(self.pid, "no pidfd names it");
+                return false;
+            };
+            let sent = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            if sent == 0 {
+                return true;
+            }
+            match Errno::last() {
+                // Already reaped by the test.
+                Errno::ESRCH => {}
+                errno => cleanup_unconfirmed(self.pid, &format!("pidfd kill failed: {errno}")),
+            }
+            false
+        }
+    }
+
+    /// One stderr line for a paused child left in place; never panics, so it
+    /// cannot abort a test that is already unwinding.
+    fn cleanup_unconfirmed(pid: Pid, why: &str) {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "PAUSED_CHILD_CLEANUP_UNCONFIRMED: pid {pid}: {why}"
+        );
+    }
+
+    impl Drop for PausedChild {
+        fn drop(&mut self) {
+            if std::process::id() != self.owner || !self.kill_if_unreaped() {
+                return;
+            }
+            // A killed child is reaped at once; the bound only keeps a
+            // broken one from holding the test.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let reaped = unsafe {
+                    libc::waitpid(self.pid.as_raw(), std::ptr::null_mut(), libc::WNOHANG)
+                };
+                if reaped == self.pid.as_raw() {
+                    return;
+                }
+                let errno = Errno::last();
+                if reaped == -1 && errno == Errno::ECHILD {
+                    return;
+                }
+                if reaped == -1 && errno != Errno::EINTR {
+                    cleanup_unconfirmed(self.pid, &format!("wait failed: {errno}"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    cleanup_unconfirmed(self.pid, "not reaped within 2 s");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// A paused child does not outlive a test that panics before its own
+    /// teardown: its owner kills and reaps it during the unwind.
+    #[test]
+    fn a_paused_child_does_not_outlive_a_test_that_panics() {
+        let mut child = None;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owned = fork_paused_child(Instant::now() + Duration::from_millis(100));
+            child = Some(untraced_process_identity(owned.pid()));
+            panic!("the test fails before its own teardown");
+        }));
+        assert!(outcome.is_err());
+        let child = child.expect("the child was created");
+        let survived = child.same_process();
+        let waited =
+            unsafe { libc::waitpid(child.tid.as_raw(), std::ptr::null_mut(), libc::WNOHANG) };
+        let errno = Errno::last();
+        if survived {
+            // Never leave the child of a failed check behind either.
+            let _ = child.send_signal(Signal::SIGKILL);
+            unsafe { libc::waitpid(child.tid.as_raw(), std::ptr::null_mut(), 0) };
+        }
+        assert!(!survived, "the paused child survived its test");
+        assert_eq!(
+            (waited, errno),
+            (-1, Errno::ECHILD),
+            "the paused child was reaped"
+        );
     }
 
     #[derive(Debug)]
@@ -11585,41 +9585,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
-    fn fork_paused_grandchild() -> (Pid, Pid, std::os::unix::net::UnixStream) {
-        let (mut control, mut child_control) =
-            std::os::unix::net::UnixStream::pair().expect("create parent control socket");
-        match unsafe { unistd::fork() }.expect("fork recorded parent") {
-            ForkResult::Child => {
-                drop(control);
-                match unsafe { unistd::fork() }.expect("fork retained descendant") {
-                    ForkResult::Child => loop {
-                        unsafe { libc::pause() };
-                    },
-                    ForkResult::Parent { child } => {
-                        child_control
-                            .write_all(&child.as_raw().to_ne_bytes())
-                            .expect("publish retained descendant pid");
-                        let mut release = [0];
-                        std::io::Read::read_exact(&mut child_control, &mut release)
-                            .expect("wait for recorded-parent release");
-                        unsafe { libc::_exit(0) };
-                    }
-                }
-            }
-            ForkResult::Parent { child } => {
-                drop(child_control);
-                let mut raw_pid = [0; std::mem::size_of::<i32>()];
-                std::io::Read::read_exact(&mut control, &mut raw_pid)
-                    .expect("read retained descendant pid");
-                (
-                    Pid::from(child),
-                    Pid::from_raw(i32::from_ne_bytes(raw_pid)),
-                    control,
-                )
-            }
-        }
-    }
-
     fn untraced_process_identity(pid: Pid) -> TraceeIdentity {
         let snapshot = tracee_snapshot(pid).expect("read child identity");
         let proc_dir = OpenOptions::new()
@@ -11636,7 +9601,6 @@ mod tests {
             proc_dir: proc_dir.into(),
             proc_inode,
             pidfd: Some(unsafe { OwnedFd::from_raw_fd(fd as i32) }),
-            parent: None,
         }
     }
 
@@ -11804,340 +9768,6 @@ mod tests {
             resume_held_stop_child("first generation child", first).await;
             resume_held_stop_child("second generation child", second).await;
         }
-    }
-
-    /// A generation retired by its own registration: its task was reaped
-    /// outside the notifier first, so registration found it gone and retired
-    /// it with ECHILD without marking its TID gate.
-    fn gone_at_registration_generation() -> Running {
-        let pid = match unsafe { unistd::fork() }.expect("fork gone generation") {
-            ForkResult::Child => loop {
-                unsafe { libc::pause() };
-            },
-            ForkResult::Parent { child } => Pid::from(child),
-        };
-        let token = Running::new(pid);
-        assert_eq!(unsafe { libc::kill(pid.as_raw(), libc::SIGKILL) }, 0);
-        let status = nix::sys::wait::waitpid(unistd::Pid::from_raw(pid.as_raw()), None);
-        assert!(
-            matches!(
-                status,
-                Ok(nix::sys::wait::WaitStatus::Signaled(_, Signal::SIGKILL, _))
-            ),
-            "gone generation {pid} ended with {status:?}"
-        );
-        let terminal = token.terminal_cleanup();
-        assert!(
-            terminal.wait(Duration::ZERO),
-            "registration did not retire the gone generation"
-        );
-        assert!(!terminal.reaping_started());
-        token
-    }
-
-    /// Like `spawn_held_stop_child`, but the child stops a second time after
-    /// it is resumed.
-    fn spawn_restopping_child(role: &str) -> (Pid, Stopped) {
-        let pid = match unsafe { unistd::fork() }
-            .unwrap_or_else(|error| panic!("fork {role}: {error}"))
-        {
-            ForkResult::Child => {
-                safeptrace::traceme_and_stop()
-                    .unwrap_or_else(|error| panic!("TRACEME {role}: {error}"));
-                unsafe {
-                    libc::raise(libc::SIGSTOP);
-                    libc::_exit(0)
-                };
-            }
-            ForkResult::Parent { child } => Pid::from(child),
-        };
-        let (stopped, event) = Running::new(pid)
-            .wait()
-            .unwrap_or_else(|error| panic!("wait {role}: {error}"))
-            .assume_stopped();
-        assert_eq!(event, Event::Signal(Signal::SIGSTOP));
-        (pid, stopped)
-    }
-
-    /// Resumes a child from `spawn_restopping_child`, kills it, and runs
-    /// `check` while its generation is between its reap and its retirement:
-    /// the notifier's worker has marked the TID gate and reaped the child,
-    /// but a held reservation of the second stop keeps it from publishing
-    /// the terminal status, so the generation is not retired. `check` gets an
-    /// owned handle and a reference for comparisons, made before the
-    /// reservation because registering a handle needs the reserved lock.
-    /// Returns a handle once the generation is retired.
-    fn reap_under_reservation(
-        role: &str,
-        stopped: Stopped,
-        check: impl FnOnce(TerminalCleanup, &TerminalCleanup),
-    ) -> TerminalCleanup {
-        let running = stopped
-            .resume(None)
-            .unwrap_or_else(|error| panic!("resume {role}: {error}"));
-        let terminal = running.terminal_cleanup();
-        let owned = running.terminal_cleanup();
-        let reservation = terminal
-            .reserve_pending_for_cleanup(Duration::from_secs(2))
-            .unwrap_or_else(|| panic!("{role} did not stop again"));
-        terminal
-            .request_sigkill()
-            .unwrap_or_else(|error| panic!("kill {role}: {error}"));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !terminal.reaping_started() {
-            assert!(
-                Instant::now() < deadline,
-                "the notifier did not start reaping {role}"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            !terminal.wait(Duration::ZERO),
-            "{role} was retired while its terminal status was held"
-        );
-        check(owned, &terminal);
-        drop(reservation);
-        assert!(
-            terminal.wait(Duration::from_secs(2)),
-            "the notifier did not retire {role}"
-        );
-        terminal
-    }
-
-    fn assert_newborn_records(
-        newborns: &StdMutex<HashMap<Pid, NewbornTracee>>,
-        tid: Pid,
-        owner: (EventChildLink, &TerminalCleanup),
-        history: &[(EventChildLink, &TerminalCleanup)],
-    ) {
-        let newborns = newborns.lock().unwrap();
-        assert_eq!(newborns.len(), 1);
-        let stored = &newborns[&tid];
-        assert_eq!(stored.link, owner.0);
-        assert!(
-            stored.terminal.same_generation(owner.1),
-            "the TID's owner is another generation"
-        );
-        let recorded = stored
-            .history
-            .iter()
-            .map(|(link, _)| *link)
-            .collect::<Vec<_>>();
-        let expected = history.iter().map(|(link, _)| *link).collect::<Vec<_>>();
-        assert_eq!(recorded, expected);
-        for ((link, terminal), (_, generation)) in stored.history.iter().zip(history) {
-            assert!(
-                terminal.same_generation(generation),
-                "the history names another generation for {link:?}"
-            );
-        }
-    }
-
-    /// https://github.com/rrnewton/reverie/issues/852: the kernel reuses a TID
-    /// only after reaping its holder, which a test cannot force, so other
-    /// children's generations are stored under one live child's TID instead.
-    #[tokio::test(flavor = "current_thread")]
-    async fn newborn_registration_follows_the_owner_state() {
-        let (_reaped_pid, reaped) = spawn_held_stop_child("reaped newborn generation");
-        let reaped_generation = reaped.terminal_cleanup();
-        let reaped_terminal = reaped.terminal_cleanup();
-        resume_held_stop_child("reaped newborn generation", reaped).await;
-        assert!(
-            reaped_generation.wait(Duration::from_secs(2)),
-            "the notifier did not retire the reaped generation"
-        );
-        assert!(reaped_generation.reaping_started());
-        let gone = gone_at_registration_generation();
-        let gone_generation = gone.terminal_cleanup();
-
-        let (tid, live) = spawn_restopping_child("live newborn generation");
-        let live_generation = live.terminal_cleanup();
-        assert!(!live_generation.reaping_started());
-        assert!(!live_generation.wait(Duration::ZERO));
-        let link = |parent: i32, op| EventChildLink {
-            tid,
-            parent_tid: Pid::from_raw(parent),
-            op,
-        };
-        let newborns = StdMutex::new(HashMap::from([(
-            tid,
-            NewbornTracee {
-                link: link(11, ChildOp::Fork),
-                identity: None,
-                terminal: gone.terminal_cleanup(),
-                history: Vec::new(),
-            },
-        )]));
-
-        // A generation that was retired without marking its gate yields the
-        // TID to the live generation.
-        NewbornTracee::register(
-            &newborns,
-            Pid::from_raw(22),
-            ChildOp::Clone,
-            &Running::new(tid),
-        );
-        let gone_record = (link(11, ChildOp::Fork), &gone_generation);
-        let live_owner = (link(22, ChildOp::Clone), &live_generation);
-        assert_newborn_records(&newborns, tid, live_owner, &[gone_record]);
-
-        // A repeated registration of the live generation keeps its first link.
-        NewbornTracee::register(
-            &newborns,
-            Pid::from_raw(33),
-            ChildOp::Vfork,
-            &Running::new(tid),
-        );
-        assert_newborn_records(&newborns, tid, live_owner, &[gone_record]);
-
-        // A reaped and retired generation does not displace the live owner.
-        NewbornTracee {
-            link: link(44, ChildOp::Fork),
-            identity: None,
-            terminal: reaped_terminal,
-            history: Vec::new(),
-        }
-        .retain(&mut newborns.lock().unwrap());
-        let reaped_record = (link(44, ChildOp::Fork), &reaped_generation);
-        assert_newborn_records(&newborns, tid, live_owner, &[gone_record, reaped_record]);
-
-        // Neither does a reaped generation that is not yet retired.
-        let (_reaping_pid, reaping) = spawn_restopping_child("reaping newborn generation");
-        let reaping_generation = reap_under_reservation(
-            "reaping newborn generation",
-            reaping,
-            |owned, generation| {
-                NewbornTracee {
-                    link: link(55, ChildOp::Fork),
-                    identity: None,
-                    terminal: owned,
-                    history: Vec::new(),
-                }
-                .retain(&mut newborns.lock().unwrap());
-                assert_newborn_records(
-                    &newborns,
-                    tid,
-                    live_owner,
-                    &[
-                        gone_record,
-                        reaped_record,
-                        (link(55, ChildOp::Fork), generation),
-                    ],
-                );
-            },
-        );
-        let reaping_record = (link(55, ChildOp::Fork), &reaping_generation);
-
-        // A late registration of a generation in the history changes nothing.
-        NewbornTracee {
-            link: link(66, ChildOp::Clone),
-            identity: None,
-            terminal: gone.terminal_cleanup(),
-            history: Vec::new(),
-        }
-        .retain(&mut newborns.lock().unwrap());
-        assert_newborn_records(
-            &newborns,
-            tid,
-            live_owner,
-            &[gone_record, reaped_record, reaping_record],
-        );
-
-        // Once the owner's gate is marked, before it is retired, the next
-        // generation takes the TID and the history keeps every earlier record.
-        let (_later_pid, later) = spawn_held_stop_child("later newborn generation");
-        let later_generation = later.terminal_cleanup();
-        let later_terminal = later.terminal_cleanup();
-        reap_under_reservation("live newborn generation", live, |_, _| {
-            NewbornTracee {
-                link: link(77, ChildOp::Clone),
-                identity: None,
-                terminal: later_terminal,
-                history: Vec::new(),
-            }
-            .retain(&mut newborns.lock().unwrap());
-            assert_newborn_records(
-                &newborns,
-                tid,
-                (link(77, ChildOp::Clone), &later_generation),
-                &[gone_record, reaped_record, reaping_record, live_owner],
-            );
-        });
-
-        drop(newborns);
-        resume_held_stop_child("later newborn generation", later).await;
-    }
-
-    /// https://github.com/rrnewton/reverie/issues/852: a held creation stop
-    /// stays valid after a later child takes its child's TID, and only for
-    /// the exact generation and event link it names.
-    #[tokio::test(flavor = "current_thread")]
-    async fn held_creation_stop_validates_its_child_after_replacement() {
-        let (root_pid, root) = spawn_held_stop_child("held root");
-        let (tid, child) = spawn_held_stop_child("held newborn");
-        let child_generation = child.terminal_cleanup();
-        let held =
-            HeldRootStop::from_event(&root, &Event::NewChild(ChildOp::Fork, Running::new(tid)));
-        let link = EventChildLink {
-            tid,
-            parent_tid: root_pid,
-            op: ChildOp::Fork,
-        };
-        let newborns = StdMutex::new(HashMap::new());
-        NewbornTracee::register(&newborns, root_pid, ChildOp::Fork, &Running::new(tid));
-        assert!(held.newborn_recorded(link, &newborns.lock().unwrap()));
-
-        resume_held_stop_child("held newborn", child).await;
-        assert!(child_generation.reaping_started());
-        let (later_pid, later) = spawn_held_stop_child("later newborn");
-        let later_generation = later.terminal_cleanup();
-        let later_link = EventChildLink {
-            tid,
-            parent_tid: Pid::from_raw(22),
-            op: ChildOp::Clone,
-        };
-        NewbornTracee {
-            link: later_link,
-            identity: None,
-            terminal: later.terminal_cleanup(),
-            history: Vec::new(),
-        }
-        .retain(&mut newborns.lock().unwrap());
-        let later_held = HeldRootStop::from_event(
-            &root,
-            &Event::NewChild(ChildOp::Clone, Running::new(later_pid)),
-        );
-        {
-            let newborns = newborns.lock().unwrap();
-            assert!(
-                newborns[&tid].same_generation(&later_generation),
-                "the later child does not own the TID"
-            );
-            assert!(
-                held.newborn_recorded(link, &newborns),
-                "the replacement invalidated the held creation stop"
-            );
-            assert!(later_held.newborn_recorded(later_link, &newborns));
-            // Each generation validates only with its own link.
-            for wrong in [
-                later_link,
-                EventChildLink {
-                    op: ChildOp::Clone,
-                    ..link
-                },
-                EventChildLink {
-                    parent_tid: Pid::from_raw(22),
-                    ..link
-                },
-            ] {
-                assert!(!held.newborn_recorded(wrong, &newborns), "{wrong:?}");
-            }
-            assert!(!later_held.newborn_recorded(link, &newborns));
-        }
-
-        drop(newborns);
-        resume_held_stop_child("later newborn", later).await;
-        resume_held_stop_child("held root", root).await;
     }
 
     #[derive(Default)]
@@ -12333,14 +9963,14 @@ mod tests {
     /// Kills `/bin/true` at `point` after its exec, and requires the run to
     /// report the kill, with no task aborting on a bare errno. The points of
     /// `tracee_preinit` are hit before the exec too, so the kill is at their
-    /// second hit; the post-exec step's points are hit only after it.
+    /// second hit; the exec-return drain's points are hit only after it.
     async fn exec_preinit_killed_at<T: Tool<GlobalState = ()> + Default + 'static>(
         point: crate::task::PreinitPoint,
         mode: PreinitKillMode,
     ) -> Result<(), String> {
         use crate::task::PreinitPoint::*;
         let nth = match point {
-            ExecStopped | PostExecStepped => 1,
+            ExecStopped | PostExecDrained => 1,
             RegsSaved
             | CodeRead
             | MmapStepped
@@ -12460,8 +10090,8 @@ mod tests {
         exec_preinit_kill_vdso_writable_exited: exec_preinit_killed_at::<AllSyscallsTool>(VdsoWritable, Exited);
         exec_stopped_kill_exit_stop_vdso: exec_preinit_killed_at::<AllSyscallsTool>(ExecStopped, ExitStop);
         exec_stopped_kill_exit_stop_no_vdso: exec_preinit_killed_at::<InitFailureTool>(ExecStopped, ExitStop);
-        post_exec_stepped_kill_exited_vdso: exec_preinit_killed_at::<AllSyscallsTool>(PostExecStepped, Exited);
-        post_exec_stepped_kill_exited_no_vdso: exec_preinit_killed_at::<InitFailureTool>(PostExecStepped, Exited);
+        post_exec_drained_kill_exited_vdso: exec_preinit_killed_at::<AllSyscallsTool>(PostExecDrained, Exited);
+        post_exec_drained_kill_exited_no_vdso: exec_preinit_killed_at::<InitFailureTool>(PostExecDrained, Exited);
         postspawn_preinit_kill_regs_saved_exit_stop: postspawn_preinit_killed_at::<AllSyscallsTool>(RegsSaved, ExitStop);
         postspawn_preinit_kill_code_read_exit_stop: postspawn_preinit_killed_at::<AllSyscallsTool>(CodeRead, ExitStop);
         postspawn_preinit_kill_regs_saved_exited: postspawn_preinit_killed_at::<AllSyscallsTool>(RegsSaved, Exited);
@@ -12494,6 +10124,321 @@ mod tests {
         exec_preinit_kill_code_read_esrch_at_exit_stop: exec_preinit_killed_at::<AllSyscallsTool>(CodeRead, EsrchAtExitStop);
         exec_preinit_kill_mmap_returned_esrch_at_exit_stop: exec_preinit_killed_at::<AllSyscallsTool>(MmapReturned, EsrchAtExitStop);
         exec_preinit_kill_page_populated_esrch_at_exit_stop: exec_preinit_killed_at::<AllSyscallsTool>(PagePopulated, EsrchAtExitStop);
+    }
+
+    /// How many times `FilterAwaitingAFailedGlobal`'s filter has run.
+    static FAILED_GLOBAL_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A GlobalTool that reports a failed run once an RPC reaches it, and
+    /// never answers that RPC.
+    #[derive(Default)]
+    struct FailedGlobal {
+        failed: AtomicBool,
+        failure: tokio::sync::Notify,
+    }
+
+    #[reverie::global_tool]
+    impl GlobalTool for FailedGlobal {
+        type Config = ();
+        type Request = ();
+        type Response = ();
+
+        async fn receive_rpc(&self, _from: Pid, _request: ()) {
+            self.failed.store(true, Ordering::SeqCst);
+            self.failure.notify_waiters();
+            future::pending::<()>().await
+        }
+
+        async fn wait_for_backend_failure(&self) {
+            loop {
+                let notified = self.failure.notified();
+                if self.failed.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    /// A Tool whose `filter_unreported_signal` counts its calls and then
+    /// awaits an RPC to `FailedGlobal`, which never answers.
+    #[derive(Default)]
+    struct FilterAwaitingAFailedGlobal;
+
+    #[reverie::tool]
+    impl Tool for FilterAwaitingAFailedGlobal {
+        type GlobalState = FailedGlobal;
+        type ThreadState = ();
+
+        async fn filter_unreported_signal<R: reverie::GlobalRPC<Self::GlobalState>>(
+            &self,
+            rpc: &R,
+            _signal: reverie::UnreportedSignal,
+        ) -> bool {
+            FAILED_GLOBAL_FILTER_CALLS.fetch_add(1, Ordering::SeqCst);
+            rpc.send_rpc(()).await;
+            true
+        }
+    }
+
+    /// A preinit hook that, as the root's registers are saved in its first
+    /// initialization, runs `act` once on the root's pid.
+    fn at_first_regs_saved(
+        act: impl Fn(Pid) + Send + Sync + 'static,
+    ) -> (crate::task::PreinitPointForTest, Arc<StdMutex<Option<Pid>>>) {
+        let acted: Arc<StdMutex<Option<Pid>>> = Arc::default();
+        let state = Arc::clone(&acted);
+        let hook: crate::task::PreinitPointForTest = Arc::new(move |pid, _terminal, point| {
+            let mut acted = state.lock().unwrap();
+            if point != crate::task::PreinitPoint::RegsSaved || acted.is_some() {
+                return;
+            }
+            act(pid);
+            *acted = Some(pid);
+        });
+        (hook, acted)
+    }
+
+    /// A signal the root takes during its first initialization, before its
+    /// exec, is shown to `Tool::filter_unreported_signal`, whose RPC can then
+    /// outlast a GlobalTool failure: the spawn watches for that failure, as
+    /// the run loop does. The hook sends the root SIGWINCH as its registers
+    /// are saved, so the special-page mmap's step stops for it; the filter's
+    /// RPC makes the GlobalTool report a failed run and is never answered.
+    /// The spawn ends within 5 s, failing on the GlobalTool's failure, instead
+    /// of hanging with the root stopped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_global_tool_failure_during_first_initialization_ends_the_spawn() {
+        FAILED_GLOBAL_FILTER_CALLS.store(0, Ordering::SeqCst);
+        let (hook, signalled) = at_first_regs_saved(|pid| {
+            // SAFETY: sends a signal to the stopped tracee.
+            let sent = unsafe {
+                libc::syscall(libc::SYS_tgkill, pid.as_raw(), pid.as_raw(), libc::SIGWINCH)
+            };
+            assert_eq!(sent, 0, "SIGWINCH {pid}: {}", Errno::last());
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            TracerBuilder::<FilterAwaitingAFailedGlobal>::new(Command::new("/bin/true"))
+                .preinit_point_for_test(hook)
+                .spawn(),
+        )
+        .await
+        .expect("spawn ends within 5 s")
+        .err()
+        .expect("the spawn fails");
+        let pid = signalled
+            .lock()
+            .unwrap()
+            .expect("the hook signalled the root");
+        assert_eq!(
+            FAILED_GLOBAL_FILTER_CALLS.load(Ordering::SeqCst),
+            1,
+            "the root's SIGWINCH is shown to the filter"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "GlobalTool reported a failed ptrace run during ptrace initialization of tracee {pid}"
+            ),
+        );
+        assert_eventually_reaped("GlobalTool failure in preinit", pid);
+    }
+
+    /// The signals `RecordUnreported`'s filter was shown, as (process,
+    /// signal number, `si_code`).
+    static RECORDED_UNREPORTED: StdMutex<Vec<(i32, i32, i32, reverie::UnreportedSignalReason)>> =
+        StdMutex::new(Vec::new());
+
+    /// The (signal number, `si_code`, reason) of each signal
+    /// `RecordUnreported`'s filter was shown for process `pid`, so tests
+    /// sharing the record in one process see only their own.
+    fn recorded_unreported_for(pid: Pid) -> Vec<(i32, i32, reverie::UnreportedSignalReason)> {
+        RECORDED_UNREPORTED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(process, ..)| *process == pid.as_raw())
+            .map(|&(_, signal, code, reason)| (signal, code, reason))
+            .collect()
+    }
+
+    /// A Tool whose `filter_unreported_signal` records each signal and keeps
+    /// it.
+    #[derive(Default)]
+    struct RecordUnreported;
+
+    #[reverie::tool]
+    impl Tool for RecordUnreported {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        async fn filter_unreported_signal<R: reverie::GlobalRPC<Self::GlobalState>>(
+            &self,
+            _rpc: &R,
+            signal: reverie::UnreportedSignal,
+        ) -> bool {
+            let code = signal.siginfo().map_or(0, |info| {
+                i32::from_ne_bytes(info[8..12].try_into().unwrap())
+            });
+            RECORDED_UNREPORTED.lock().unwrap().push((
+                signal.pid().as_raw(),
+                signal.number(),
+                code,
+                signal.reason(),
+            ));
+            true
+        }
+    }
+
+    /// The root can have a child during its first initialization: a caller's
+    /// `pre_exec` callback runs before Reverie's and can fork. That child's
+    /// exit SIGCHLD, taken while the root sets up its special page, is shown
+    /// to `Tool::filter_unreported_signal` like any other. The `pre_exec`
+    /// callback forks a child that waits; as the root's registers are saved,
+    /// the hook kills it and waits until it is a zombie, so the root's SIGCHLD
+    /// is pending when the special-page mmap's step runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pre_exec_childs_exit_during_first_initialization_is_filtered() {
+        let mut command = Command::new("/bin/true");
+        // SAFETY: the callback only forks; the child asks to die with its
+        // parent, closes the descriptors it inherited and waits. It must close the spawn's close-on-exec
+        // status pipe, which it would otherwise hold open, never exec'ing,
+        // and the spawn would wait on it forever: where `close_range` fails,
+        // it closes each descriptor up to its limit.
+        unsafe {
+            command.pre_exec(|| {
+                let parent = libc::getpid();
+                if libc::fork() == 0 {
+                    // Untraced: dies with its parent, so a failed spawn does
+                    // not leave it paused for ever.
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+                        || libc::getppid() != parent
+                    {
+                        libc::_exit(0);
+                    }
+                    if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
+                        let mut limit: libc::rlimit = std::mem::zeroed();
+                        let max = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                            limit.rlim_cur.min(1 << 20) as libc::c_int
+                        } else {
+                            1 << 20
+                        };
+                        for fd in 3..max {
+                            libc::close(fd);
+                        }
+                    }
+                    loop {
+                        libc::pause();
+                    }
+                }
+                Ok(())
+            });
+        }
+        let (hook, acted) = at_first_regs_saved(|pid| {
+            // The root's one child, by its parent in /proc/<pid>/stat (the
+            // kernel need not provide /proc/<pid>/task/<tid>/children).
+            let parent_of = |stat: &str| {
+                stat.rsplit_once(") ")
+                    .and_then(|(_, rest)| rest.split(' ').nth(1))
+                    .and_then(|ppid| ppid.parse::<i32>().ok())
+            };
+            let child: i32 = std::fs::read_dir("/proc")
+                .unwrap()
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+                .find(|candidate| {
+                    std::fs::read_to_string(format!("/proc/{candidate}/stat"))
+                        .is_ok_and(|stat| parent_of(&stat) == Some(pid.as_raw()))
+                })
+                .expect("the pre_exec child");
+            // SAFETY: kills the root's own waiting child.
+            assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
+            wait_for_test_condition(&format!("{pid}'s child {child} is a zombie"), || {
+                std::fs::read_to_string(format!("/proc/{child}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                })
+            });
+        });
+        let tracer = tokio::time::timeout(
+            Duration::from_secs(5),
+            TracerBuilder::<RecordUnreported>::new(command)
+                .preinit_point_for_test(hook)
+                .spawn(),
+        )
+        .await
+        .expect("spawn ends within 5 s")
+        .expect("spawn");
+        let root = acted.lock().unwrap().expect("the hook killed the child");
+        let (status, ()) = tokio::time::timeout(Duration::from_secs(5), tracer.wait())
+            .await
+            .expect("the run ends within 5 s")
+            .expect("the run");
+        assert_eq!(status, ExitStatus::Exited(0));
+        assert_eq!(
+            recorded_unreported_for(root),
+            vec![(
+                libc::SIGCHLD,
+                libc::CLD_KILLED,
+                reverie::UnreportedSignalReason::DuringInitialization
+            )],
+            "the pre_exec child's exit SIGCHLD is shown to the filter once, as taken during initialization"
+        );
+    }
+
+    /// A realtime signal passed on unreported is shown to
+    /// `Tool::filter_unreported_signal` with its number, as any other signal
+    /// is (<https://github.com/rrnewton/reverie/issues/207>). As the root's
+    /// registers are saved, the hook sends it signal 40, so the special-page
+    /// mmap's step stops for it. A `pre_exec` callback makes the root ignore
+    /// signal 40: a traced thread still stops for an ignored signal, and the
+    /// kernel discards it once passed on, so `/bin/true` exits 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_realtime_signal_during_first_initialization_is_filtered() {
+        const REALTIME: i32 = 40;
+        let mut command = Command::new("/bin/true");
+        // SAFETY: the callback only sets one signal's disposition.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(REALTIME, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(Errno::last());
+                }
+                Ok(())
+            });
+        }
+        let (hook, signalled) = at_first_regs_saved(|pid| {
+            // SAFETY: sends a signal to the stopped tracee.
+            let sent =
+                unsafe { libc::syscall(libc::SYS_tgkill, pid.as_raw(), pid.as_raw(), REALTIME) };
+            assert_eq!(sent, 0, "signal {REALTIME} to {pid}: {}", Errno::last());
+        });
+        let tracer = tokio::time::timeout(
+            Duration::from_secs(5),
+            TracerBuilder::<RecordUnreported>::new(command)
+                .preinit_point_for_test(hook)
+                .spawn(),
+        )
+        .await
+        .expect("spawn ends within 5 s")
+        .expect("spawn");
+        let root = signalled
+            .lock()
+            .unwrap()
+            .expect("the hook signalled the root");
+        let (status, ()) = tokio::time::timeout(Duration::from_secs(5), tracer.wait())
+            .await
+            .expect("the run ends within 5 s")
+            .expect("the run");
+        assert_eq!(status, ExitStatus::Exited(0));
+        assert_eq!(
+            recorded_unreported_for(root),
+            vec![(
+                REALTIME,
+                libc::SI_TKILL,
+                reverie::UnreportedSignalReason::DuringInitialization
+            )],
+            "the realtime signal is shown to the filter once, with its number, as taken during initialization"
+        );
     }
 
     /// Selects the inner run of [`preinit_page_population_never_writes_a_replacement`].
@@ -12585,10 +10530,6 @@ mod tests {
     /// same address. Initialization must still fail with the kill, and its
     /// page population must not reach the replacement. Runs in a fresh user
     /// and PID namespace, where the PID can be reused exactly.
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-    )]
     #[tokio::test(flavor = "current_thread")]
     async fn preinit_page_population_never_writes_a_replacement() {
         if std::env::var_os(POPULATE_REUSE_INNER).is_none() {
@@ -12728,10 +10669,6 @@ mod tests {
     /// its injection must not reach the replacement: its registers must be
     /// unchanged. Runs in a fresh user and PID namespace, where the PID can be
     /// reused exactly.
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-    )]
     #[tokio::test(flavor = "current_thread")]
     async fn preinit_injection_never_reaches_a_replacement() {
         if std::env::var_os(INJECTION_REUSE_INNER).is_none() {
@@ -12933,103 +10870,6 @@ mod tests {
         assert_eventually_reaped("dead_or killed child", pid);
     }
 
-    #[test]
-    fn liteinst_stats_collector_is_allocated_only_when_requested() {
-        let disabled = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5);
-        assert!(
-            disabled
-                .liteinst_runtime
-                .as_ref()
-                .unwrap()
-                .instrumentation_stats
-                .is_none()
-        );
-
-        let enabled = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime_with_stats(
-                PathBuf::from("/not/used.so"),
-                1,
-                2,
-                3,
-                4,
-                5,
-                BackendStatsRequest::ENABLED,
-            );
-        assert!(
-            enabled
-                .liteinst_runtime
-                .as_ref()
-                .unwrap()
-                .instrumentation_stats
-                .is_some()
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn liteinst_runtime_rejects_gdbserver_before_spawning_tracee() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock predates Unix epoch")
-            .as_nanos();
-        let side_effect = std::env::temp_dir().join(format!(
-            "reverie-liteinst-gdb-rejected-{}-{nonce}",
-            std::process::id()
-        ));
-        let socket = side_effect.with_extension("sock");
-        assert!(!side_effect.exists());
-        assert!(!socket.exists());
-        let mut command = Command::new("/usr/bin/touch");
-        command.arg(&side_effect);
-
-        let error = match TracerBuilder::<InitFailureTool>::new(command)
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .gdbserver(socket.clone())
-            .spawn()
-            .await
-        {
-            Ok(_) => panic!("LiteInst plus GDB unexpectedly spawned a tracee"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("ENOTSUPP"), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains("executable-entry software breakpoint"),
-            "{error}"
-        );
-        assert!(
-            !side_effect.exists(),
-            "rejected configuration ran the tracee"
-        );
-        assert!(
-            !socket.exists(),
-            "rejected configuration opened a GDB server"
-        );
-    }
-
-    #[derive(Default)]
-    struct RootStopTool;
-
-    #[reverie::tool]
-    impl Tool for RootStopTool {
-        type GlobalState = ();
-        type ThreadState = ();
-
-        fn subscriptions(_config: &()) -> Subscription {
-            [Sysno::getpid].into_iter().collect()
-        }
-
-        async fn handle_syscall_event<G: Guest<Self>>(
-            &self,
-            guest: &mut G,
-            syscall: Syscall,
-        ) -> Result<i64, Error> {
-            Ok(guest.inject(syscall).await?)
-        }
-    }
-
     #[derive(Default)]
     struct AllSyscallsTool;
 
@@ -13104,277 +10944,6 @@ mod tests {
             .expect("unsubscribed restart_syscall guest hung")
             .expect("unsubscribed restart_syscall guest failed");
         assert_eq!(status, ExitStatus::Exited(0));
-    }
-
-    #[derive(Default)]
-    struct TimedExecTransitionTool;
-
-    #[reverie::tool]
-    impl Tool for TimedExecTransitionTool {
-        type GlobalState = ();
-        type ThreadState = ();
-
-        fn subscriptions(_config: &()) -> Subscription {
-            Subscription::all()
-        }
-
-        async fn handle_syscall_event<G: Guest<Self>>(
-            &self,
-            guest: &mut G,
-            syscall: Syscall,
-        ) -> Result<i64, Error> {
-            guest.set_timer_precise(reverie::TimerSchedule::Rcbs(20_000_000))?;
-            Ok(guest.inject(syscall).await?)
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_ready_exec_skip_accepts_exact_kernel_breakpoint_transition() {
-        let tracer = TracerBuilder::<TimedExecTransitionTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .spawn()
-            .await
-            .expect("spawn timed exec-transition activation tracee");
-        let root_pid = tracer.guest_pid();
-        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
-            .await
-            .expect("timed exec-transition activation tracee hung")
-            .expect_err("missing LiteInst runtime unexpectedly activated");
-
-        // The exact fail-closed reason depends on which activation signal wins
-        // after the valid syscall-skip transition. What matters here is that
-        // the skip itself did not fail and activation remained pre-Ready.
-        assert_general_pre_ready_liteinst_activation_failure(&error);
-        assert_reaped("timed exec-transition activation", root_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_ready_pending_signal_is_rejected_before_seccomp_resume() {
-        let queue_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<AllSyscallsTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .queue_liteinst_pending_signal_once_for_test(Arc::clone(&queue_once))
-            .spawn()
-            .await
-            .expect("spawn pending-signal activation tracee");
-        let root_pid = tracer.guest_pid();
-        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
-            .await
-            .expect("pending-signal activation tracee hung")
-            .expect_err("queued pre-Ready signal unexpectedly resumed the tracee");
-
-        assert!(!queue_once.load(Ordering::SeqCst));
-        assert_liteinst_activation_failure(
-            &error,
-            LiteinstActivationFailureReason::SignalBeforeHandshake(
-                LiteinstActivationOperation::ResumeAfterSeccompStop,
-            ),
-        );
-        assert_reaped("pending-signal activation", root_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_ready_nested_signal_is_rejected_during_context_none_reinjection() {
-        let force_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<AllSyscallsTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .force_liteinst_context_none_signal_once_for_test(Arc::clone(&force_once))
-            .spawn()
-            .await
-            .expect("spawn context-none activation tracee");
-        let root_pid = tracer.guest_pid();
-        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
-            .await
-            .expect("context-none activation tracee hung")
-            .expect_err("nested pre-Ready reinjection signal was silently dropped");
-
-        assert!(!force_once.load(Ordering::SeqCst), "{error}");
-        assert_liteinst_activation_failure(
-            &error,
-            LiteinstActivationFailureReason::UnexpectedControllerProvenance(
-                LiteinstActivationOperation::FinishReinjectedSyscall,
-            ),
-        );
-        assert_reaped("context-none activation", root_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_ready_external_sigtrap_is_rejected_during_injected_syscall_step() {
-        let force_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<ReplaceMmapTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .force_liteinst_context_signal_once_for_test(Arc::clone(&force_once))
-            .spawn()
-            .await
-            .expect("spawn injected-step activation tracee");
-        let root_pid = tracer.guest_pid();
-        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
-            .await
-            .expect("injected-step activation tracee hung")
-            .expect_err("external pre-Ready SIGTRAP impersonated injected-step completion");
-
-        assert!(!force_once.load(Ordering::SeqCst), "{error}");
-        assert_liteinst_activation_failure(
-            &error,
-            LiteinstActivationFailureReason::UnexpectedControllerProvenance(
-                LiteinstActivationOperation::FinishInjectedSyscall,
-            ),
-        );
-        assert_reaped("injected-step activation", root_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_ready_mutated_private_stub_cannot_impersonate_injected_syscall_completion() {
-        let mutate_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<ReplaceMmapTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .force_liteinst_private_stub_mutation_once_for_test(Arc::clone(&mutate_once))
-            .spawn()
-            .await
-            .expect("spawn private-stub-mutation activation tracee");
-        let root_pid = tracer.guest_pid();
-        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
-            .await
-            .expect("private-stub-mutation activation tracee hung")
-            .expect_err("mutated private stub impersonated injected-syscall completion");
-
-        assert!(!mutate_once.load(Ordering::SeqCst), "{error}");
-        let ptrace_write_rejected = matches!(
-            &error,
-            Error::Tool(error)
-                if matches!(
-                    error.downcast_ref::<crate::error::Error>(),
-                    Some(crate::error::Error::Internal(TraceError::Errno(Errno::EFAULT)))
-                )
-        );
-        // Some kernels reject the forced ptrace write before the mutated stub
-        // executes. Otherwise, the exact-stub provenance check must reject it.
-        assert!(
-            ptrace_write_rejected
-                || liteinst_activation_failure_reason(&error)
-                    == Some(
-                        LiteinstActivationFailureReason::UnexpectedControllerProvenance(
-                            LiteinstActivationOperation::FinishInjectedSyscall,
-                        ),
-                    ),
-            "{error}"
-        );
-        assert_reaped("private-stub-mutation activation", root_pid);
-    }
-
-    #[derive(Default)]
-    struct ReplaceMmapTool;
-
-    #[reverie::tool]
-    impl Tool for ReplaceMmapTool {
-        type GlobalState = ();
-        type ThreadState = ();
-
-        fn subscriptions(_config: &()) -> Subscription {
-            [Sysno::mmap].into_iter().collect()
-        }
-
-        async fn handle_syscall_event<G: Guest<Self>>(
-            &self,
-            guest: &mut G,
-            syscall: Syscall,
-        ) -> Result<i64, Error> {
-            assert_eq!(syscall.number(), Sysno::mmap);
-            Ok(guest.inject(reverie::syscalls::Getpid::new()).await?)
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_ready_nested_signal_is_rejected_while_skipping_seccomp_syscall() {
-        let force_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<ReplaceMmapTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .force_liteinst_skip_signal_once_for_test(Arc::clone(&force_once))
-            .spawn()
-            .await
-            .expect("spawn skip-seccomp activation tracee");
-        let root_pid = tracer.guest_pid();
-        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
-            .await
-            .expect("skip-seccomp activation tracee hung")
-            .expect_err("nested pre-Ready skip signal was delivered by single-step");
-
-        assert!(!force_once.load(Ordering::SeqCst));
-        assert_liteinst_activation_failure(
-            &error,
-            LiteinstActivationFailureReason::UnexpectedControllerProvenance(
-                LiteinstActivationOperation::SkipInterceptedSyscall,
-            ),
-        );
-        assert_reaped("skip-seccomp activation", root_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_ready_nested_signal_is_rejected_during_tracee_preinit() {
-        let force_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .force_liteinst_preinit_signal_once_for_test(Arc::clone(&force_once))
-            .spawn()
-            .await
-            .expect("spawn preinit-signal activation tracee");
-        let root_pid = tracer.guest_pid();
-        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
-            .await
-            .expect("preinit-signal activation tracee hung")
-            .expect_err("nested pre-Ready preinit signal unexpectedly resumed the tracee");
-
-        assert!(!force_once.load(Ordering::SeqCst));
-        assert_liteinst_activation_failure(
-            &error,
-            LiteinstActivationFailureReason::UnexpectedPreinitSignal,
-        );
-        assert_reaped("preinit-signal activation", root_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_ready_external_sigtrap_is_rejected_after_exec_event() {
-        let force_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .force_liteinst_post_exec_signal_once_for_test(Arc::clone(&force_once))
-            .spawn()
-            .await
-            .expect("spawn post-exec-signal activation tracee");
-        let root_pid = tracer.guest_pid();
-        let error = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
-            .await
-            .expect("post-exec-signal activation tracee hung")
-            .expect_err("external SIGTRAP impersonated the required post-exec trap");
-
-        assert!(!force_once.load(Ordering::SeqCst));
-        assert_liteinst_activation_failure(
-            &error,
-            LiteinstActivationFailureReason::UnexpectedControllerProvenance(
-                LiteinstActivationOperation::WaitForPostExecTrap,
-            ),
-        );
-        assert_reaped("post-exec-signal activation", root_pid);
-    }
-
-    #[derive(Default)]
-    struct PreciseTimerTool;
-
-    #[reverie::tool]
-    impl Tool for PreciseTimerTool {
-        type GlobalState = ();
-        type ThreadState = ();
-
-        fn subscriptions(_config: &()) -> Subscription {
-            Subscription::none()
-        }
-
-        async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
-            guest
-                .set_timer_precise(reverie::TimerSchedule::RcbsAndInstructions(100, 8))
-                .expect("configure precise timer after exec");
-            Ok(())
-        }
     }
 
     #[derive(Default)]
@@ -13515,319 +11084,6 @@ mod tests {
         );
     }
 
-    fn root_stop_guest_command(mode: &str) -> Command {
-        if mode == "timer" {
-            return Command::new("/bin/true");
-        }
-        if mode == "signal" {
-            let mut command = Command::new("/usr/bin/tail");
-            command.args(["-f", "/dev/null"]);
-            return command;
-        }
-        let mut command = Command::new(std::env::current_exe().expect("locate test binary"));
-        command.args([
-            "--exact",
-            "tracer::tests::liteinst_root_stop_pause_guest",
-            "--nocapture",
-        ]);
-        command.env("REVERIE_LITEINST_ROOT_STOP_GUEST", mode);
-        command
-    }
-
-    #[test]
-    fn liteinst_root_stop_pause_guest() {
-        let Some(mode) = std::env::var_os("REVERIE_LITEINST_ROOT_STOP_GUEST") else {
-            return;
-        };
-        match mode.to_str().expect("root-stop mode is UTF-8") {
-            "syscall" => {
-                unsafe { libc::syscall(libc::SYS_getpid) };
-            }
-            "signal" => {
-                signal::raise(Signal::SIGUSR1).expect("raise root-stop signal");
-            }
-            // The subscribed marker arms a precise timer, and no conditional
-            // branch precedes the raw fork, so a timer step decodes the fork.
-            // Neither side of the fork continues: the test cancels first.
-            #[cfg(target_arch = "x86_64")]
-            "timer_fork" => unsafe {
-                core::arch::asm!(
-                    "syscall",
-                    "mov eax, {fork_number}",
-                    "syscall",
-                    "2:",
-                    "pause",
-                    "jmp 2b",
-                    fork_number = const libc::SYS_fork,
-                    inlateout("rax") libc::SYS_getpgid => _,
-                    inlateout("rdi") 0usize => _,
-                    out("rcx") _,
-                    out("r11") _,
-                );
-            },
-            mode => panic!("unknown root-stop guest mode {mode}"),
-        }
-        loop {
-            unsafe { libc::pause() };
-        }
-    }
-
-    async fn cancel_at_root_stop(pause: RootStopPause, mode: &str) {
-        let injected_signal = match pause {
-            RootStopPause::Signal(signal) => Some(signal),
-            RootStopPause::Seccomp => None,
-        };
-        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
-        let tracer = TracerBuilder::<RootStopTool>::new(root_stop_guest_command(mode))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .pause_liteinst_root_stop_for_test(pause, stop_tx)
-            .spawn()
-            .await
-            .expect("spawn root-stop cancellation tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        if let Some(signal) = injected_signal {
-            signal::kill(root_pid.into(), signal).expect("send root-stop test signal");
-        }
-        let stopped_pid = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => panic!("root-stop tracee completed before cancellation: {result:?}"),
-                pid = stop_rx.recv() => pid.expect("root-stop pause channel closed"),
-            }
-        })
-        .await
-        .expect("tracee did not reach requested root stop");
-        assert_eq!(stopped_pid, root_pid);
-
-        drop(wait);
-        assert_reaped("cancelled root stop", root_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancellation_at_generic_syscall_handler_reaps_root() {
-        cancel_at_root_stop(RootStopPause::Seccomp, "syscall").await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancellation_at_signal_handler_reaps_root() {
-        cancel_at_root_stop(RootStopPause::Signal(Signal::SIGUSR1), "signal").await;
-    }
-
-    /// Arms a one-branch precise timer at the `timer_fork` guest's marker.
-    #[cfg(target_arch = "x86_64")]
-    #[derive(Default)]
-    struct TimerForkTool;
-
-    #[cfg(target_arch = "x86_64")]
-    #[reverie::tool]
-    impl Tool for TimerForkTool {
-        type GlobalState = ();
-        type ThreadState = ();
-
-        fn subscriptions(_config: &()) -> Subscription {
-            [Sysno::getpgid].into_iter().collect()
-        }
-
-        async fn handle_syscall_event<G: Guest<Self>>(
-            &self,
-            guest: &mut G,
-            syscall: Syscall,
-        ) -> Result<i64, Error> {
-            let value = guest.inject(syscall).await?;
-            guest.set_timer_precise(reverie::TimerSchedule::Rcbs(1))?;
-            Ok(value)
-        }
-    }
-
-    /// The LiteInst counterpart of
-    /// `ordinary_timer_decoded_fork_is_owned_before_loop_consumption`: a fork
-    /// decoded by a precise-timer step must be in the session cleanup guard's
-    /// newborn table while the run loop still holds it queued, and a
-    /// cancellation at that point must reap both the root and the child.
-    #[cfg(target_arch = "x86_64")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn liteinst_timer_decoded_fork_is_registered_before_loop_consumption() {
-        if !crate::perf::is_perf_supported() {
-            // The same perf gate that precise_timer_delivery_reaches_tool uses.
-            eprintln!("SKIPPED: precise timers need perf counters, which this host lacks");
-            return;
-        }
-        let pause = Arc::new(crate::task::FatalForkPause {
-            timer: true,
-            ..Default::default()
-        });
-        crate::task::FATAL_FORK_PAUSE.with(|slot| *slot.borrow_mut() = Some(pause.clone()));
-        let builder = TracerBuilder::<TimerForkTool>::new(root_stop_guest_command("timer_fork"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test();
-        let newborns = Arc::clone(
-            &builder
-                .liteinst_runtime
-                .as_ref()
-                .expect("LiteInst runtime configured")
-                .newborn_tracees,
-        );
-        let tracer = builder.spawn().await.expect("spawn timer-fork tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                let ready = pause.ready.notified();
-                if pause.timer_receive_blocked.load(Ordering::SeqCst) {
-                    break;
-                }
-                tokio::select! {
-                    result = &mut wait => panic!("timer-fork tracee completed before cancellation: {result:?}"),
-                    () = ready => {}
-                }
-            }
-        })
-        .await
-        .expect("run loop did not hold a queued timer-decoded fork");
-        assert!(pause.timer_published.load(Ordering::SeqCst));
-        let parent = Pid::from_raw(pause.timer_parent.load(Ordering::SeqCst));
-        let child = pause
-            .timer_child
-            .lock()
-            .unwrap()
-            .take()
-            .expect("timer decoded a real fork");
-        let registered = newborns
-            .lock()
-            .unwrap()
-            .get(&child.pid)
-            .map(|newborn| (newborn.link.parent_tid, newborn.link.op));
-        eprintln!(
-            "LiteInst timer fork: root={root_pid}, parent={parent}, child={}, registered={registered:?}",
-            child.pid
-        );
-        assert_eq!(
-            registered,
-            Some((parent, ChildOp::Fork)),
-            "timer-decoded fork was not in the LiteInst newborn table before loop consumption"
-        );
-
-        drop(wait);
-        crate::task::FATAL_FORK_PAUSE.with(|slot| *slot.borrow_mut() = None);
-        assert_reaped("cancelled timer-fork root", root_pid);
-        assert!(
-            child.terminal.wait(Duration::ZERO),
-            "cleanup did not retire the timer-decoded child's terminal state"
-        );
-        assert_eventually_reaped("cancelled timer-fork child", child.pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pre_ready_liteinst_precise_timer_is_controller_handled_and_reaped() {
-        if !crate::perf::is_perf_supported() {
-            return;
-        }
-        let (step_tx, mut step_rx) = mpsc::unbounded_channel();
-        let builder = TracerBuilder::<PreciseTimerTool>::new(root_stop_guest_command("timer"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .pause_liteinst_precise_timer_step_for_test(step_tx);
-        let held = Arc::clone(
-            &builder
-                .liteinst_runtime
-                .as_ref()
-                .expect("LiteInst runtime configured")
-                .held_root_stop,
-        );
-        let tracer = builder.spawn().await.expect("spawn precise-timer tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let stopped_pid = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => panic!("precise-timer tracee completed before cancellation: {result:?}"),
-                pid = step_rx.recv() => pid.expect("precise-timer pause channel closed"),
-            }
-        })
-        .await
-        .expect("precise timer did not reach its lease-backed step");
-        assert_eq!(stopped_pid, root_pid);
-        assert!(
-            matches!(
-                held.lock().unwrap().as_ref().map(|held| &held.status),
-                Some(HeldRootStopStatus::Signal(Signal::SIGTRAP))
-            ),
-            "precise-timer step did not rearm the returned SIGTRAP stop"
-        );
-
-        drop(wait);
-        assert_reaped("cancelled precise-timer step", root_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn normal_liteinst_precise_timer_completion_clears_root_lease() {
-        if !crate::perf::is_perf_supported() {
-            return;
-        }
-        let builder = TracerBuilder::<PreciseTimerTool>::new(root_stop_guest_command("timer"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test();
-        let held = Arc::clone(
-            &builder
-                .liteinst_runtime
-                .as_ref()
-                .expect("LiteInst runtime configured")
-                .held_root_stop,
-        );
-        let tracer = builder.spawn().await.expect("spawn precise-timer tracee");
-        let (status, ()) = tokio::time::timeout(Duration::from_secs(5), tracer.wait())
-            .await
-            .expect("normal precise-timer tracee timed out")
-            .expect("wait normal precise-timer tracee");
-        assert_eq!(status, ExitStatus::Exited(0));
-        assert!(
-            held.lock().unwrap().is_none(),
-            "normal precise-timer path left a stale lease"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancellation_at_each_preinit_step_reaps_root() {
-        for step in 0..=4 {
-            let (step_tx, mut step_rx) = mpsc::unbounded_channel();
-            let builder = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
-                .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-                .pause_liteinst_preinit_step_for_test(step, step_tx);
-            let mut spawn = Box::pin(builder.spawn());
-            let root_pid = tokio::time::timeout(Duration::from_secs(3), async {
-                tokio::select! {
-                    _result = &mut spawn => panic!("preinit completed before step {step}"),
-                    pid = step_rx.recv() => pid.expect("preinit pause channel closed"),
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("tracee did not reach preinit step {step}"));
-
-            drop(spawn);
-            assert_reaped("cancelled preinit root", root_pid);
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn normal_liteinst_completion_leaves_no_stale_root_stop_lease() {
-        let builder = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test();
-        let held = Arc::clone(
-            &builder
-                .liteinst_runtime
-                .as_ref()
-                .expect("LiteInst runtime configured")
-                .held_root_stop,
-        );
-        let tracer = builder.spawn().await.expect("spawn normal LiteInst tracee");
-        let (status, ()) = tracer.wait().await.expect("wait normal LiteInst tracee");
-        assert_eq!(status, ExitStatus::Exited(0));
-        assert!(
-            held.lock().unwrap().is_none(),
-            "normal path left stale lease"
-        );
-    }
-
     #[test]
     fn resolving_program_preserves_explicit_arg0() {
         let mut command = Command::new("/bin/echo");
@@ -13837,81 +11093,18 @@ mod tests {
         assert_eq!(command.get_arg0(), "chosen-name");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn liteinst_preinit_failure_reaps_and_unregisters_root() {
-        let error = match TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .fail_liteinst_preinit_for_test()
-            .spawn()
-            .await
-        {
-            Ok(_) => panic!("injected LiteInst preinit failure unexpectedly succeeded"),
-            Err(error) => error,
-        };
-        let message = error.to_string();
-        let pid = message
-            .split("tracee ")
-            .nth(1)
-            .and_then(|suffix| suffix.split(':').next())
-            .and_then(|pid| pid.parse::<i32>().ok())
-            .unwrap_or_else(|| panic!("preinit error omitted tracee PID: {message}"));
-
-        assert!(
-            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-            "failed LiteInst preinit left tracee {pid} in procfs: {message}"
-        );
-        let mut status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
-            -1
-        );
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ECHILD),
-            "failed LiteInst preinit left tracee {pid} waitable"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn direct_drop_retries_first_discovery_failure() {
-        let fail_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<InitFailureTool>::new(Command::new("/bin/true"))
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .fail_liteinst_discovery_once_for_test(Arc::clone(&fail_once))
-            .spawn()
-            .await
-            .expect("spawn direct-Drop cleanup tracee");
-        let root_pid = tracer.guest_pid();
-
-        drop(tracer);
-        let reaped_by_drop = !std::path::Path::new(&format!("/proc/{root_pid}")).exists();
-        if !reaped_by_drop {
-            // Preserve a clean host after recording the pre-fix failure.
-            unsafe { libc::kill(root_pid.as_raw(), libc::SIGKILL) };
-            for _ in 0..2_000 {
-                if !std::path::Path::new(&format!("/proc/{root_pid}")).exists() {
-                    break;
-                }
-                let _ = ptrace::cont(root_pid.into(), None);
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-
-        assert!(!fail_once.load(Ordering::SeqCst));
-        assert!(reaped_by_drop, "direct Drop stopped after its first error");
-        assert_reaped("direct-Drop root", root_pid);
-    }
-
     #[test]
     fn stale_pidfd_identity_never_signals_reused_numeric_pid() {
-        let old_pid = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let old = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let old_pid = old.pid();
         let mut identity = untraced_process_identity(old_pid);
         identity
             .send_signal(Signal::SIGKILL)
             .expect("kill old child");
         Running::new(old_pid).wait().expect("reap old child");
 
-        let unrelated_pid = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let unrelated = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let unrelated_pid = unrelated.pid();
         identity.tid = unrelated_pid;
         assert_eq!(identity.send_signal(Signal::SIGKILL), Err(Errno::ESRCH));
         assert_eq!(unsafe { libc::kill(unrelated_pid.as_raw(), 0) }, 0);
@@ -13923,65 +11116,9 @@ mod tests {
     }
 
     #[test]
-    fn discovery_skips_only_confirmed_absence_or_replacement() {
-        let absent = Pid::from_raw(i32::MAX - 71);
-        assert!(skippable_tracee_open_error(absent, Errno::ENOENT));
-        assert!(skippable_tracee_open_error(absent, Errno::ESRCH));
-        for error in [Errno::EMFILE, Errno::ENFILE, Errno::EIO] {
-            assert!(
-                !skippable_tracee_open_error(absent, error),
-                "resource/read error {error} was silently skipped"
-            );
-        }
-
-        let replacement = fork_paused_child(Instant::now() + Duration::from_millis(100));
-        assert!(skippable_tracee_open_error(replacement, Errno::ESRCH));
-        assert!(!skippable_tracee_open_error(replacement, Errno::EMFILE));
-        unsafe { libc::kill(replacement.as_raw(), libc::SIGKILL) };
-        Running::new(replacement)
-            .wait()
-            .expect("reap replacement fixture");
-    }
-
-    #[test]
-    fn pidfd_setup_error_retains_cleanup_drain_failure() {
-        let message = liteinst_pidfd_setup_error(
-            Pid::from_raw(42),
-            Errno::EMFILE,
-            None,
-            Err(TraceError::Errno(Errno::EIO)),
-        )
-        .to_string();
-        assert!(
-            message.contains("failed to open pidfd for LiteInst tracee 42"),
-            "genuine pidfd failure lost its cause: {message}"
-        );
-        assert!(
-            message.contains("EMFILE"),
-            "missing pidfd failure: {message}"
-        );
-        assert!(message.contains("EIO"), "missing drain failure: {message}");
-    }
-
-    #[test]
-    fn pidfd_setup_timeout_names_thread_group_leader_retry_exhaustion() {
-        let message = liteinst_pidfd_setup_error(Pid::from_raw(42), Errno::ETIMEDOUT, None, Ok(()))
-            .to_string();
-        assert!(
-            message.contains(
-                "root identity did not become a stable traced thread-group leader with a pidfd within the 2,000-attempt retry budget"
-            ),
-            "missing root-identity retry exhaustion: {message}"
-        );
-        assert!(
-            !message.contains("failed to open pidfd"),
-            "timeout still blames pidfd_open: {message}"
-        );
-    }
-
-    #[test]
     fn tracee_generation_survives_zombie_until_real_reap() {
-        let pid = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let child = fork_paused_child(Instant::now() + Duration::from_millis(100));
+        let pid = child.pid();
         let identity = untraced_process_identity(pid);
         identity
             .send_signal(Signal::SIGKILL)
@@ -13998,142 +11135,12 @@ mod tests {
         };
         assert_eq!(result, 0, "observe child zombie without reaping");
         assert!(identity.same_process(), "zombie lost generation identity");
-        assert!(
-            !identity.is_our_tracee(),
-            "untraced zombie became active tracee"
-        );
-        assert!(
-            !terminal_descendant_remains_owned(&identity),
-            "terminal cleanup retained a zombie after its ptrace relationship ended"
-        );
 
         Running::new(pid).wait().expect("reap child");
         assert!(
             !identity.same_process(),
             "reaped child still matched identity"
         );
-    }
-
-    #[test]
-    fn terminal_descendant_retention_does_not_touch_an_untraced_process() {
-        let (traced_pid, stopped) = spawn_held_stop_child("terminal descendant retention child");
-        let traced_identity =
-            TraceeIdentity::open_root(traced_pid).expect("capture traced child identity");
-        assert!(
-            terminal_descendant_remains_owned(&traced_identity),
-            "cleanup dropped a live tracee"
-        );
-        let wait = stopped
-            .resume(None)
-            .expect("resume traced child")
-            .wait()
-            .expect("reap traced child");
-        assert_eq!(wait.assume_exited().1, ExitStatus::Exited(0));
-
-        let unrelated_pid = fork_paused_child(Instant::now() + Duration::from_millis(100));
-        let unrelated_identity = untraced_process_identity(unrelated_pid);
-        assert!(
-            !terminal_descendant_remains_owned(&unrelated_identity),
-            "cleanup treated an untraced process as its descendant"
-        );
-        assert_eq!(unsafe { libc::kill(unrelated_pid.as_raw(), 0) }, 0);
-        let mut status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(unrelated_pid.as_raw(), &mut status, libc::WNOHANG) },
-            0,
-            "retention check changed an unrelated process"
-        );
-
-        unsafe { libc::kill(unrelated_pid.as_raw(), libc::SIGKILL) };
-        Running::new(unrelated_pid)
-            .wait()
-            .expect("reap unrelated child");
-    }
-
-    #[test]
-    fn terminal_descendant_remains_owned_until_recorded_parent_exits() {
-        let (parent_pid, descendant_pid, mut control) = fork_paused_grandchild();
-        ptrace::attach(descendant_pid.into()).expect("attach retained descendant");
-        let (stopped, event) = Running::new(descendant_pid)
-            .wait()
-            .expect("wait for retained descendant attach")
-            .assume_stopped();
-        assert_eq!(event, Event::Signal(Signal::SIGSTOP));
-        let identity = TraceeIdentity::capture(
-            descendant_pid,
-            Some((parent_pid, Some(ChildOp::Fork))),
-            true,
-        )
-        .expect("capture production-shaped descendant identity");
-        stopped
-            .detach(None)
-            .expect("detach retained descendant after identity capture");
-
-        assert!(identity.same_process(), "descendant identity changed");
-        assert!(
-            !identity.is_our_tracee(),
-            "detached descendant still reports this process as tracer"
-        );
-        assert_eq!(
-            tracee_snapshot(descendant_pid)
-                .expect("read retained descendant parent")
-                .ppid,
-            parent_pid
-        );
-        let retained_while_parent_alive = terminal_descendant_remains_owned(&identity);
-
-        control.write_all(&[1]).expect("release recorded parent");
-        drop(control);
-        Running::new(parent_pid)
-            .wait()
-            .expect("reap recorded parent");
-        for _ in 0..2_000 {
-            if tracee_snapshot(descendant_pid).is_ok_and(|snapshot| snapshot.ppid != parent_pid) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_ne!(
-            tracee_snapshot(descendant_pid)
-                .expect("read reparented descendant")
-                .ppid,
-            parent_pid,
-            "descendant did not leave its recorded parent"
-        );
-        let released_after_reparenting = !terminal_descendant_remains_owned(&identity);
-
-        identity
-            .send_signal(Signal::SIGKILL)
-            .expect("kill reparented descendant through pidfd");
-        for _ in 0..2_000 {
-            let mut status = 0;
-            let waited = unsafe {
-                libc::waitpid(
-                    descendant_pid.as_raw(),
-                    &mut status,
-                    libc::WNOHANG | libc::__WALL,
-                )
-            };
-            if waited == descendant_pid.as_raw()
-                || !std::path::Path::new(&format!("/proc/{descendant_pid}")).exists()
-            {
-                assert!(
-                    retained_while_parent_alive,
-                    "cleanup released a terminal descendant while its recorded parent still owned it"
-                );
-                assert!(
-                    released_after_reparenting,
-                    "cleanup retained a terminal descendant after reparenting"
-                );
-                return;
-            }
-            assert!(
-                waited == 0 || (waited == -1 && Errno::last() == Errno::ECHILD),
-                "unexpected wait result while cleaning reparented descendant: {waited}"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("reparented descendant {descendant_pid} was not reaped");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14154,564 +11161,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), initialization_error(pid, died))
             .await
             .expect("initialization_error hung reaping an already terminal child");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelling_at_new_child_event_reaps_root_and_child() {
-        let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 60 & wait"]);
-        let tracer = TracerBuilder::<InitFailureTool>::new(command)
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .pause_liteinst_new_task_for_test(child_tx)
-            .spawn()
-            .await
-            .expect("spawn fork-cancellation tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let child_pid = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => panic!("tracee completed before cancellation: {result:?}"),
-                child = child_rx.recv() => child.expect("new-child hook closed"),
-            }
-        })
-        .await
-        .expect("tracee did not reach new-child cancellation window");
-
-        drop(wait);
-        assert_reaped("root", root_pid);
-        // A terminal child may have been reparented before the notifier
-        // releases its identity. At that point this process cannot reap it;
-        // require the new parent to finish reaping it within the same bounded
-        // interval used by fail-closed cleanup instead of racing procfs.
-        assert_eventually_reaped("child", child_pid);
-        for (role, pid) in [("root", root_pid), ("child", child_pid)] {
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(1), Running::new(pid).next_state())
-                    .await
-                    .unwrap_or_else(|_| panic!("late {role} notifier wait hung")),
-                Err(TraceError::Errno(Errno::ECHILD))
-            );
-        }
-    }
-
-    fn newborn_vfork_guest_command() -> Command {
-        static GUEST: LazyLock<PathBuf> = LazyLock::new(|| {
-            let source = fixture("newborn_vfork.c");
-            let output =
-                std::env::temp_dir().join(format!("reverie-newborn-vfork-{}", std::process::id()));
-            let status = std::process::Command::new("cc")
-                .args(["-O0", "-g"])
-                .arg(&source)
-                .arg("-o")
-                .arg(&output)
-                .status()
-                .expect("invoke cc for the newborn vfork fixture");
-            assert!(status.success(), "compile {}", source.display());
-            output
-        });
-        Command::new(GUEST.as_path())
-    }
-
-    /// The processes whose `on_exit_process` ran under [`ExitWitnessTool`].
-    /// Only the displaced-newborn tests use that tool.
-    static EXIT_WITNESS_PROCESSES: StdMutex<Vec<Pid>> = StdMutex::new(Vec::new());
-
-    #[derive(Default)]
-    struct ExitWitnessTool;
-
-    #[reverie::tool]
-    impl Tool for ExitWitnessTool {
-        type GlobalState = ();
-        type ThreadState = ();
-
-        fn subscriptions(_config: &()) -> Subscription {
-            Subscription::none()
-        }
-
-        async fn on_exit_process<G: reverie::GlobalRPC<Self::GlobalState>>(
-            self,
-            pid: Pid,
-            _global: &G,
-            _status: ExitStatus,
-        ) -> Result<(), Error> {
-            EXIT_WITNESS_PROCESSES.lock().unwrap().push(pid);
-            Ok(())
-        }
-    }
-
-    /// Runs `command` while `handle_new_task` holds a generation that its
-    /// child's entry records only in its history, from `stage` on. Returns
-    /// what the handler did, the session error, and the root TID.
-    async fn run_with_displaced_newborn(
-        command: Command,
-        stage: NewbornDisplacementStage,
-        fail_new_task: bool,
-    ) -> (NewbornDisplacementOutcome, Error, Pid) {
-        let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel();
-        let mut builder = TracerBuilder::<ExitWitnessTool>::new(command)
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .displace_liteinst_newborn_for_test(
-                stage,
-                gone_at_registration_generation(),
-                outcome_tx,
-            );
-        if fail_new_task {
-            builder = builder.fail_liteinst_new_task_for_test();
-        }
-        let tracer = builder
-            .spawn()
-            .await
-            .expect("spawn displaced-newborn tracee");
-        let root_pid = tracer.guest_pid();
-        let result = tokio::time::timeout(Duration::from_secs(3), tracer.wait())
-            .await
-            .expect("displaced-newborn session hung");
-        let error = result.expect_err("displaced-newborn session unexpectedly succeeded");
-        let outcome = outcome_rx
-            .try_recv()
-            .expect("no child reached the displacement stage");
-        (outcome, error, root_pid)
-    }
-
-    // The new-task failure injection follows the identity store and precedes
-    // the vfork block. It does not fire in either test below unless its guard
-    // is missing, and then it ends the run with ENOTSUPP instead of ESRCH,
-    // rather than leaving the guest to wait for `sleep 60`.
-    #[tokio::test(flavor = "current_thread")]
-    async fn new_task_refuses_a_generation_that_does_not_own_the_registration() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 60 & wait"]);
-        let (outcome, error, root_pid) =
-            run_with_displaced_newborn(command, NewbornDisplacementStage::RegistrationLookup, true)
-                .await;
-        assert_eq!(outcome.errno, Some(Errno::ESRCH), "{error}");
-        assert!(outcome.child_owns_entry, "{outcome:?}");
-        assert!(!outcome.child_identity_stored, "{outcome:?}");
-        assert!(outcome.foreign_in_history, "{outcome:?}");
-        assert_liteinst_activation_failure(
-            &error,
-            LiteinstActivationFailureReason::NewbornRegistration,
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("event ownership names another generation"),
-            "{error}"
-        );
-        assert_reaped("root", root_pid);
-        assert_eventually_reaped("child", outcome.child);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn new_task_refuses_to_store_identity_for_a_generation_that_does_not_own_the_entry() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 60 & wait"]);
-        let (outcome, error, root_pid) =
-            run_with_displaced_newborn(command, NewbornDisplacementStage::IdentityStore, true)
-                .await;
-        assert_eq!(outcome.errno, Some(Errno::ESRCH), "{error}");
-        assert!(outcome.child_owns_entry, "{outcome:?}");
-        assert!(!outcome.child_identity_stored, "{outcome:?}");
-        assert!(outcome.foreign_in_history, "{outcome:?}");
-        assert_liteinst_activation_failure(
-            &error,
-            LiteinstActivationFailureReason::NewbornRegistration,
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("event ownership disappeared before identity storage"),
-            "{error}"
-        );
-        assert_reaped("root", root_pid);
-        assert_eventually_reaped("child", outcome.child);
-    }
-
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: sandcastle-env: the newborn_vfork.c fixture does not compile in the test environment (upstream deleted it after v0.4.1)"
-    )]
-    // The refusal runs in the forked child's task, so the root reports it as
-    // a non-root failure: the message survives but the typed reason does not.
-    // Without the guard the vfork child is terminated and the handler returns
-    // ENOTSUPP with the same recorded failure, so only the handler's own
-    // ESRCH tells the two apart.
-    //
-    // The refusal records no reason of its own, so VforkUnsupported is still
-    // the forked child's latest one at task exit. That task therefore leaves
-    // through the session cleanup, as the ordinary vfork refusal does, and the
-    // Tool gets no exit hook with a made-up status for a process that is still
-    // held behind its vfork child.
-    #[tokio::test(flavor = "current_thread")]
-    async fn new_task_refuses_to_terminate_a_vfork_generation_that_does_not_own_the_entry() {
-        let (outcome, error, root_pid) = run_with_displaced_newborn(
-            newborn_vfork_guest_command(),
-            NewbornDisplacementStage::VforkTermination,
-            false,
-        )
-        .await;
-        assert_eq!(outcome.errno, Some(Errno::ESRCH), "{error}");
-        assert!(outcome.child_owns_entry, "{outcome:?}");
-        assert!(outcome.child_identity_stored, "{outcome:?}");
-        assert!(outcome.foreign_in_history, "{outcome:?}");
-        let message = error.to_string();
-        assert!(
-            message.contains("LiteInst session failed closed in a non-root task")
-                && message.contains("refused: exec cannot preserve the preload runtime"),
-            "{error}"
-        );
-        assert_ne!(outcome.parent, root_pid, "{outcome:?}");
-        assert!(
-            !EXIT_WITNESS_PROCESSES
-                .lock()
-                .unwrap()
-                .contains(&outcome.parent),
-            "the vfork parent {} ran the Tool's exit hooks",
-            outcome.parent
-        );
-        assert_reaped("root", root_pid);
-        assert_eventually_reaped("vfork child", outcome.child);
-    }
-
-    fn clone_thread_guest_command() -> Command {
-        let mut command = Command::new(std::env::current_exe().expect("locate test binary"));
-        command.args([
-            "--exact",
-            "tracer::tests::liteinst_clone_thread_guest",
-            "--nocapture",
-        ]);
-        command.env("REVERIE_LITEINST_CLONE_THREAD_GUEST", "1");
-        command
-    }
-
-    fn clone_parent_guest_command() -> Command {
-        static GUEST: LazyLock<PathBuf> = LazyLock::new(|| {
-            let source = fixture("clone_parent.c");
-            let output =
-                std::env::temp_dir().join(format!("reverie-clone-parent-{}", std::process::id()));
-            let status = std::process::Command::new("cc")
-                .args(["-O0", "-g"])
-                .arg(&source)
-                .arg("-o")
-                .arg(&output)
-                .status()
-                .expect("invoke cc for CLONE_PARENT fixture");
-            assert!(status.success(), "compile {}", source.display());
-            output
-        });
-        Command::new(GUEST.as_path())
-    }
-
-    #[test]
-    fn liteinst_clone_thread_guest() {
-        if std::env::var_os("REVERIE_LITEINST_CLONE_THREAD_GUEST").is_none() {
-            return;
-        }
-        let thread = std::thread::spawn(|| {
-            loop {
-                std::thread::park();
-            }
-        });
-        thread.join().unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn liteinst_clone_thread_fails_closed_and_reaps_group() {
-        let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-        let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .fail_liteinst_new_task_for_test()
-            .observe_liteinst_new_task_for_test(child_tx)
-            .spawn()
-            .await
-            .expect("spawn CLONE_THREAD fail-closed tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let first = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => Either::Left(result),
-                child = child_rx.recv() => Either::Right(child.expect("new-thread observer closed")),
-            }
-        })
-        .await
-        .expect("tracee did not report CLONE_THREAD identity");
-        let (child_tid, completed) = match first {
-            Either::Left(result) => (
-                child_rx
-                    .recv()
-                    .await
-                    .expect("completed tracee omitted bound thread identity"),
-                Some(result),
-            ),
-            Either::Right(child_tid) => (child_tid, None),
-        };
-        assert_ne!(root_pid, child_tid, "thread event reused root TID");
-
-        let result = match completed {
-            Some(result) => result,
-            None => tokio::time::timeout(Duration::from_secs(3), &mut wait)
-                .await
-                .expect("CLONE_THREAD fail-closed cleanup hung"),
-        };
-        let error = result.expect_err("CLONE_THREAD LiteInst tracee unexpectedly succeeded");
-        assert!(
-            error.to_string().contains("ENOTSUPP"),
-            "fail-closed error omitted unsupported-thread cause: {error}"
-        );
-        assert_reaped("root", root_pid);
-        assert_reaped("thread", child_tid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelling_at_clone_thread_event_reaps_group() {
-        let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-        let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .pause_liteinst_new_task_for_test(child_tx)
-            .spawn()
-            .await
-            .expect("spawn CLONE_THREAD cancellation tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let child_tid = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => panic!("CLONE_THREAD tracee completed before cancellation: {result:?}"),
-                child = child_rx.recv() => child.expect("new-thread hook closed"),
-            }
-        })
-        .await
-        .expect("tracee did not reach CLONE_THREAD cancellation window");
-        assert_ne!(root_pid, child_tid, "thread event reused root TID");
-
-        drop(wait);
-        assert_reaped("root", root_pid);
-        assert_reaped("thread", child_tid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelling_before_clone_thread_handler_reaps_group() {
-        let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-        let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .pause_before_liteinst_new_task_for_test(child_tx)
-            .spawn()
-            .await
-            .expect("spawn pre-handler CLONE_THREAD cancellation tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let child_tid = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => panic!("CLONE_THREAD tracee completed before pre-handler cancellation: {result:?}"),
-                child = child_rx.recv() => child.expect("pre-handler new-thread hook closed"),
-            }
-        })
-        .await
-        .expect("tracee did not reach pre-handler CLONE_THREAD window");
-
-        drop(wait);
-        assert_reaped("root", root_pid);
-        assert_reaped("thread", child_tid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn discovery_error_restores_newborn_for_cleanup_retry() {
-        let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-        let fail_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .fail_liteinst_new_task_for_test()
-            .observe_liteinst_new_task_for_test(child_tx)
-            .fail_liteinst_discovery_once_for_test(Arc::clone(&fail_once))
-            .spawn()
-            .await
-            .expect("spawn discovery-retry tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let first = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => Either::Left(result),
-                child = child_rx.recv() => Either::Right(child.expect("new-thread observer closed")),
-            }
-        })
-        .await
-        .expect("tracee did not reach discovery-retry event");
-        let (child_tid, completed) = match first {
-            Either::Left(result) => (
-                child_rx
-                    .recv()
-                    .await
-                    .expect("completed tracee omitted retry child identity"),
-                Some(result),
-            ),
-            Either::Right(child_tid) => (child_tid, None),
-        };
-        let result = match completed {
-            Some(result) => result,
-            None => tokio::time::timeout(Duration::from_secs(3), &mut wait)
-                .await
-                .expect("discovery cleanup retry hung"),
-        };
-        let error = result.expect_err("unsupported CLONE_THREAD unexpectedly succeeded");
-        assert!(
-            error.to_string().contains("Input/output error"),
-            "injected discovery failure was not reported: {error}"
-        );
-        assert!(!fail_once.load(Ordering::SeqCst));
-        assert_reaped("root", root_pid);
-        assert_reaped("thread", child_tid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn post_task_scan_error_retains_exact_cleanup_for_retry() {
-        let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-        let fail_once = Arc::new(AtomicBool::new(true));
-        let force_scan_once = Arc::new(AtomicBool::new(true));
-        let tracer = TracerBuilder::<InitFailureTool>::new(clone_thread_guest_command())
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .fail_liteinst_new_task_for_test()
-            .observe_liteinst_new_task_for_test(child_tx)
-            .fail_liteinst_after_task_scan_once_for_test(
-                Arc::clone(&fail_once),
-                Arc::clone(&force_scan_once),
-            )
-            .spawn()
-            .await
-            .expect("spawn post-task-scan retry tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let first = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => Either::Left(result),
-                child = child_rx.recv() => Either::Right(child.expect("task-scan observer closed")),
-            }
-        })
-        .await
-        .expect("tracee did not reach post-task-scan event");
-        let (child_tid, completed) = match first {
-            Either::Left(result) => (
-                child_rx
-                    .recv()
-                    .await
-                    .expect("completed tracee omitted task-scan TID"),
-                Some(result),
-            ),
-            Either::Right(child_tid) => (child_tid, None),
-        };
-        let result = match completed {
-            Some(result) => result,
-            None => tokio::time::timeout(Duration::from_secs(3), &mut wait)
-                .await
-                .expect("post-task-scan cleanup retry hung"),
-        };
-        let error = result.expect_err("injected post-task-scan error unexpectedly succeeded");
-        assert!(error.to_string().contains("Input/output error"), "{error}");
-        assert!(!fail_once.load(Ordering::SeqCst));
-        assert!(!force_scan_once.load(Ordering::SeqCst));
-        assert_reaped("root", root_pid);
-        assert_reaped("task-scan thread", child_tid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn clone_parent_fails_closed_and_reaps_sibling() {
-        let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-        let tracer = TracerBuilder::<InitFailureTool>::new(clone_parent_guest_command())
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .fail_liteinst_new_task_for_test()
-            .observe_liteinst_new_task_for_test(child_tx)
-            .spawn()
-            .await
-            .expect("spawn CLONE_PARENT fail-closed tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let first = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => Either::Left(result),
-                child = child_rx.recv() => Either::Right(child.expect("CLONE_PARENT observer closed")),
-            }
-        })
-        .await
-        .expect("tracee did not report CLONE_PARENT event");
-        let (sibling_pid, completed) = match first {
-            Either::Left(result) => (
-                child_rx
-                    .recv()
-                    .await
-                    .expect("completed tracee omitted CLONE_PARENT identity"),
-                Some(result),
-            ),
-            Either::Right(child_pid) => (child_pid, None),
-        };
-        let result = match completed {
-            Some(result) => result,
-            None => tokio::time::timeout(Duration::from_secs(3), &mut wait)
-                .await
-                .expect("CLONE_PARENT fail-closed cleanup hung"),
-        };
-        let error = result.expect_err("CLONE_PARENT LiteInst tracee unexpectedly succeeded");
-        assert!(error.to_string().contains("ENOTSUPP"), "{error}");
-        assert_reaped("root", root_pid);
-        assert_reaped("CLONE_PARENT sibling", sibling_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelling_at_clone_parent_event_reaps_sibling() {
-        let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-        let tracer = TracerBuilder::<InitFailureTool>::new(clone_parent_guest_command())
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .pause_liteinst_new_task_for_test(child_tx)
-            .spawn()
-            .await
-            .expect("spawn CLONE_PARENT cancellation tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let sibling_pid = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => panic!("CLONE_PARENT tracee completed before cancellation: {result:?}"),
-                child = child_rx.recv() => child.expect("CLONE_PARENT hook closed"),
-            }
-        })
-        .await
-        .expect("tracee did not reach CLONE_PARENT cancellation window");
-
-        drop(wait);
-        assert_reaped("root", root_pid);
-        assert_reaped("CLONE_PARENT sibling", sibling_pid);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelling_before_clone_parent_handler_reaps_sibling() {
-        let (child_tx, mut child_rx) = mpsc::unbounded_channel();
-        let tracer = TracerBuilder::<InitFailureTool>::new(clone_parent_guest_command())
-            .liteinst_runtime(PathBuf::from("/not/used.so"), 1, 2, 3, 4, 5)
-            .activate_liteinst_without_handshake_for_test()
-            .pause_before_liteinst_new_task_for_test(child_tx)
-            .spawn()
-            .await
-            .expect("spawn pre-handler CLONE_PARENT tracee");
-        let root_pid = tracer.guest_pid();
-        let mut wait = Box::pin(tracer.wait());
-        let sibling_pid = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::select! {
-                result = &mut wait => panic!("CLONE_PARENT tracee completed before pre-handler cancellation: {result:?}"),
-                child = child_rx.recv() => child.expect("pre-handler CLONE_PARENT hook closed"),
-            }
-        })
-        .await
-        .expect("tracee did not reach pre-handler CLONE_PARENT window");
-
-        drop(wait);
-        assert_reaped("root", root_pid);
-        assert_reaped("CLONE_PARENT sibling", sibling_pid);
     }
 
     // Start from a real consumed SIGSTOP, retain that capability, and make the

@@ -1,9 +1,6 @@
 ---
 name: liteinst-testing
 description: "Use when adding LiteInst regressions, selecting focused test coverage, diagnosing guest hangs, or reporting backend and determinism evidence."
-metadata:
-  oncalls:
-    - hermit
 ---
 
 # LiteInst Testing

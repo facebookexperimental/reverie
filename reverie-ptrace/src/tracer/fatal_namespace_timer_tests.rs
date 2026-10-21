@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// Included into tracer.rs, whose crate-level allow covers `fbcode_build`.
 mod fatal_namespace_timer_tests {
     use super::*;
 
@@ -134,7 +133,8 @@ mod fatal_namespace_timer_tests {
         let marker_log = Arc::new(StdMutex::new(Vec::new()));
         crate::timer::EXEC_SIGNAL_OBSERVATIONS
             .with(|slot| *slot.borrow_mut() = Some(marker_log.clone()));
-        let sentinel = fork_paused_child(deadline);
+        let sentinel_child = fork_paused_child(deadline);
+        let sentinel = sentinel_child.pid();
         let sentinel_identity = untraced_process_identity(sentinel);
         let mut command = Command::new(payload());
         command
@@ -318,10 +318,6 @@ mod fatal_namespace_timer_tests {
         control(true, "query-failure").await;
     }
 
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-    )]
     #[tokio::test(flavor = "current_thread")]
     async fn descendant_guest_pid_equal_to_controller_pid_is_not_controller() {
         const NAME: &str = "tracer::tests::fatal_namespace_timer_tests::descendant_guest_pid_equal_to_controller_pid_is_not_controller";

@@ -145,6 +145,32 @@ impl<T: Tool<GlobalState = (), ThreadState = ()>> Guest<T> for TestGuest {
     }
 }
 
+/// Reuse this file's existing Guest fake without overriding the new mechanism,
+/// so the native default remains covered when a backend adds its own override.
+#[test]
+fn tool_syscall_default_preserves_native_success_and_errno() {
+    let guest = TestGuest::default();
+    // SAFETY: getpid has no pointer effects, and -1 is an invalid physical fd.
+    unsafe {
+        assert_eq!(
+            <TestGuest as Guest<()>>::tool_syscall(
+                &guest,
+                reverie::syscalls::Sysno::getpid,
+                [0; 6]
+            ),
+            Ok(libc::getpid() as usize),
+        );
+        assert_eq!(
+            <TestGuest as Guest<()>>::tool_syscall(
+                &guest,
+                reverie::syscalls::Sysno::close,
+                [usize::MAX, 0, 0, 0, 0, 0],
+            ),
+            Err(Errno::EBADF),
+        );
+    }
+}
+
 struct LegacyTool {
     response: Option<Signal>,
     calls: AtomicUsize,
@@ -301,4 +327,29 @@ fn child_exit_signal_default_refuses_before_publication() {
             errno: Errno::ENOSYS,
         }
     );
+}
+
+#[test]
+fn validation_injection_default_refuses_without_an_errno_fallback() {
+    let mut guest = TestGuest::default();
+    let unsupported = ready(<TestGuest as Guest<()>>::inject_with_purpose(
+        &mut guest,
+        reverie::syscalls::Pselect6::new(),
+        reverie::InjectionPurpose::Pselect6WrapperValidation,
+    ))
+    .unwrap_err();
+    assert!(matches!(unsupported, Error::Tool(_)));
+    assert!(
+        unsupported
+            .to_string()
+            .starts_with("pselect6-wrapper-validation-unsupported: ")
+    );
+    assert!(matches!(
+        ready(<TestGuest as Guest<()>>::inject_with_purpose(
+            &mut guest,
+            reverie::syscalls::Getpid::new(),
+            reverie::InjectionPurpose::Application,
+        )),
+        Err(Error::Errno(Errno::ENOSYS))
+    ));
 }

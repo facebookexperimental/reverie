@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Raw daemon: no Rust allocation/Drop and no guest descriptors. Job rights go
 //! directly to a private worker; this process receives only internal channels.
 use super::*;

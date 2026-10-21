@@ -58,6 +58,8 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const CANONICAL_RECORD_PREFIX: &[u8] = b"1970-01-01T00:00:00.000000Z ";
 const INITIALIZATION_RECORD: &[u8] =
     b"1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n";
+/// The initialization record with its length prefix, as it enters the stream.
+const ENCODED_INITIALIZATION_LEN: usize = 4 + INITIALIZATION_RECORD.len();
 const INITIALIZATION_MESSAGE_PREFIX: &[u8] = b"reverie_dbt::evidence: protected evidence init";
 const SESSION_NEW: u8 = 0;
 const SESSION_RUNNING: u8 = 1;
@@ -159,23 +161,25 @@ pub struct DbtEvidence {
 }
 
 impl DbtEvidence {
-    /// Comparable tracing-callback records in authenticated arrival order.
+    /// Comparable tracing-callback records in authenticated stream order.
     ///
     /// Process image initialization records remain authenticated in the
     /// artifact but are represented by [`Self::initialization_records`]
-    /// instead. [`Self::all_records`] keeps them at their arrival positions.
+    /// instead. [`Self::all_records`] keeps them at their stream positions.
     pub fn records(&self) -> &[Vec<u8>] {
         &self.records
     }
 
-    /// Every authenticated record in arrival order, with each process image
-    /// initialization record at the position where it arrived.
+    /// Every authenticated record in stream order, with each process image
+    /// initialization record at its position in the artifact.
     ///
     /// The decoder admits only initialization records that are byte-for-byte
     /// the protocol constant, so this returns the authenticated bytes and
-    /// invents no record or position. Across process images, positions follow
-    /// the order in which the host accepted their frames, so comparing this
-    /// stream between runs also compares that order.
+    /// invents no record or position. The collector that wrote the artifact
+    /// placed each initialization record immediately before the first
+    /// comparable record of its process image, or at the end of the stream
+    /// when that image wrote none, so its position does not depend on when
+    /// the host accepted the frame that carried it.
     ///
     /// Initialization records prove that the transport started, not that the
     /// guest did anything. A stream holding only initialization records is
@@ -185,7 +189,7 @@ impl DbtEvidence {
         let mut all = Vec::with_capacity(self.records.len() + self.initialization_positions.len());
         let mut records = self.records.iter().map(Vec::as_slice);
         for &position in &self.initialization_positions {
-            // The comparable records that arrived before this initialization.
+            // The comparable records that precede this initialization.
             all.extend(records.by_ref().take(position - all.len()));
             all.push(INITIALIZATION_RECORD);
         }
@@ -300,19 +304,83 @@ pub fn decode_evidence(bytes: &[u8]) -> io::Result<DbtEvidence> {
     })
 }
 
+/// The collector the socket worker and the coordinator's in-process appender
+/// share. Both absorb under this one lock, so the collected stream is the
+/// order in which records were absorbed. `None` once the worker has finished.
+#[derive(Clone)]
+struct SharedCollector(Arc<Mutex<Option<Collector>>>);
+
+impl SharedCollector {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Some(Collector::new()))))
+    }
+
+    fn with<T>(&self, absorb: impl FnOnce(&mut Collector) -> io::Result<T>) -> io::Result<T> {
+        match self.0.lock().unwrap().as_mut() {
+            Some(collector) => absorb(collector),
+            None => Err(io::Error::other(
+                "DBT evidence collector was already finished",
+            )),
+        }
+    }
+
+    fn take(&self) -> io::Result<Collector> {
+        self.0
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| io::Error::other("DBT evidence collector was already finished"))
+    }
+}
+
+impl std::fmt::Debug for SharedCollector {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedCollector")
+    }
+}
+
+/// Appends records emitted by the coordinator, the host process that owns a
+/// coordinated DBT run's global state, to that run's protected evidence.
+///
+/// The coordinator's tool emits records too (under Detcore, the scheduler's),
+/// and they belong in the run's stream at the point they happened. Each guest
+/// record is absorbed before the guest callback that emitted it returns, and a
+/// guest that asks the coordinator for something waits for the reply. So a
+/// coordinator record appended when it is emitted lands after every guest
+/// record that preceded the request and before every guest record that follows
+/// the reply: appending at emission time is the order in which they happened.
+#[derive(Clone, Debug)]
+pub struct CoordinatorEvidence {
+    collector: SharedCollector,
+}
+
+impl CoordinatorEvidence {
+    /// Appends one record: a canonical tracing record with exactly one
+    /// terminal newline, as a guest emits. A record that imitates a process
+    /// image initialization record is refused, as is any record after the
+    /// run's evidence was finished.
+    pub fn append(&self, record: &[u8]) -> io::Result<()> {
+        self.collector
+            .with(|collector| collector.absorb_coordinator_record(record))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct EvidenceSession {
     address_hex: String,
     token_hex: String,
     root_process: Arc<Mutex<Option<ProcessKey>>>,
     stop: Arc<AtomicBool>,
-    #[cfg(test)]
     acknowledgement_drops: AcknowledgementDropControl,
     lifecycle: AtomicU8,
     finish_lock: Mutex<()>,
     output: Mutex<Option<File>>,
+    pending_listener: Mutex<Option<(UnixListener, [u8; CHANNEL_TOKEN_LEN])>>,
     worker: Mutex<Option<JoinHandle<io::Result<CollectedEvidence>>>>,
     result: Mutex<Option<Result<(), String>>>,
+    collector: SharedCollector,
+    /// Set when the run's finish was deferred: whether publication is allowed.
+    deferred_publication: Mutex<Option<bool>>,
 }
 
 impl EvidenceSession {
@@ -335,35 +403,45 @@ impl EvidenceSession {
 
         let root_process = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_root_process = Arc::clone(&root_process);
-        let worker_stop = Arc::clone(&stop);
         let acknowledgement_drops = AcknowledgementDropControl::default();
-        let worker_acknowledgement_drops = acknowledgement_drops.clone();
-        let worker = std::thread::Builder::new()
-            .name("reverie-dbt-evidence".into())
-            .spawn(move || {
-                serve(
-                    listener,
-                    token,
-                    worker_root_process,
-                    worker_stop,
-                    worker_acknowledgement_drops,
-                )
-            })?;
+        let collector = SharedCollector::new();
 
         Ok(Self {
             address_hex: encode_hex(address),
             token_hex: encode_hex(&token),
             root_process,
             stop,
-            #[cfg(test)]
             acknowledgement_drops,
             lifecycle: AtomicU8::new(SESSION_NEW),
             finish_lock: Mutex::new(()),
             output: Mutex::new(Some(output)),
-            worker: Mutex::new(Some(worker)),
+            pending_listener: Mutex::new(Some((listener, token))),
+            worker: Mutex::new(None),
             result: Mutex::new(None),
+            collector,
+            deferred_publication: Mutex::new(None),
         })
+    }
+
+    /// The appender for records the coordinator emits into this run.
+    pub(crate) fn coordinator_evidence(&self) -> CoordinatorEvidence {
+        CoordinatorEvidence {
+            collector: self.collector.clone(),
+        }
+    }
+
+    /// Records the launcher's publication decision for a finish deferred
+    /// until [`Self::finish_deferred`].
+    pub(crate) fn defer_finish(&self, publication_allowed: bool) {
+        *self.deferred_publication.lock().unwrap() = Some(publication_allowed);
+    }
+
+    /// Finishes a deferred run with the publication decision recorded by
+    /// [`Self::defer_finish`]; a run whose decision was never recorded did not
+    /// prove its process-tree cleanup and is not published.
+    pub(crate) fn finish_deferred(&self) -> io::Result<()> {
+        let publication_allowed = self.deferred_publication.lock().unwrap().unwrap_or(false);
+        self.finish(publication_allowed)
     }
 
     pub(crate) fn client_arguments(&self) -> [String; 4] {
@@ -417,6 +495,49 @@ impl EvidenceSession {
         Ok(())
     }
 
+    /// Start consuming frames after the guest and the launcher's I/O tasks exist.
+    /// The bound socket queues the client's initial START, whose acknowledgement
+    /// already precedes application execution and native helper creation.
+    pub(crate) fn start(&self) -> io::Result<()> {
+        let _finish_guard = self.finish_lock.lock().unwrap();
+        if self.lifecycle.load(Ordering::Acquire) != SESSION_RUNNING
+            || self.root_process.lock().unwrap().is_none()
+        {
+            return Err(io::Error::other(
+                "DBT evidence collector started before root publication or after finalization",
+            ));
+        }
+        let (listener, token) = self
+            .pending_listener
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "DBT evidence collector was already started",
+                )
+            })?;
+        let root_process = Arc::clone(&self.root_process);
+        let stop = Arc::clone(&self.stop);
+        let acknowledgement_drops = self.acknowledgement_drops.clone();
+        let collector = self.collector.clone();
+        let worker = std::thread::Builder::new()
+            .name("reverie-dbt-evidence".into())
+            .spawn(move || {
+                serve(
+                    listener,
+                    token,
+                    root_process,
+                    stop,
+                    acknowledgement_drops,
+                    collector,
+                )
+            })?;
+        *self.worker.lock().unwrap() = Some(worker);
+        Ok(())
+    }
+
     pub(crate) fn finish(&self, publication_allowed: bool) -> io::Result<()> {
         let _finish_guard = self.finish_lock.lock().unwrap();
         if let Some(result) = self.result.lock().unwrap().as_ref() {
@@ -444,13 +565,14 @@ impl EvidenceSession {
         let final_result =
             (|| {
                 self.stop.store(true, Ordering::Release);
+                self.pending_listener.lock().unwrap().take();
                 let worker = self.worker.lock().unwrap().take();
                 let collected = match worker {
                     Some(worker) => worker
                         .join()
                         .map_err(|_| io::Error::other("DBT evidence collector thread panicked"))?,
                     None => Err(io::Error::other(
-                        "DBT evidence collector was already consumed without a result",
+                        "DBT evidence collector never started or was consumed without a result",
                     )),
                 };
                 let mut output =
@@ -487,6 +609,9 @@ struct ImageState {
     next_sequence: u64,
     pending_exec: bool,
     initialized: bool,
+    /// The image's initialization record was accepted but not yet placed in
+    /// the stream, because the image has written no comparable record.
+    initialization_unplaced: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,11 +628,34 @@ struct CollectedEvidence {
     hash: u64,
 }
 
+/// Collects the run's evidence stream.
+///
+/// Guest and coordinator records enter the stream in the order they are
+/// absorbed. A process image's initialization record is the exception: the
+/// image's runtime emits it when it starts, and nothing orders that moment
+/// against the records other images are writing, so the host can accept it
+/// anywhere among them. The collector holds it back and places it immediately
+/// before the image's first comparable record, which the run's own ordering
+/// positions. An image that ends, or execs, without writing a
+/// comparable record has its initialization record placed at the end of the
+/// stream. Every such record is the same protocol constant, so their order
+/// there carries nothing.
+///
+/// A held-back record counts against the memory bound from the moment it is
+/// accepted, so the collected stream plus every record still to be placed
+/// never exceeds `byte_limit`.
 struct Collector {
     images: BTreeMap<ProcessKey, ImageState>,
     expected_processes: BTreeSet<ProcessKey>,
     terminal_processes: BTreeSet<ProcessKey>,
     last_receipts: BTreeMap<ProcessKey, FrameReceipt>,
+    /// Initialization records of images that ended without writing a
+    /// comparable record; [`Collector::finish`] places them at the end.
+    trailing_initializations: u64,
+    /// Encoded bytes of the accepted initialization records not yet in
+    /// `encoded_records`: those held by live images and the trailing ones.
+    held_initialization_bytes: usize,
+    byte_limit: usize,
     encoded_records: Vec<u8>,
     record_count: u64,
     payload_bytes: u64,
@@ -518,11 +666,18 @@ struct Collector {
 
 impl Collector {
     fn new() -> Self {
+        Self::with_byte_limit(MAX_EVIDENCE_BYTES)
+    }
+
+    fn with_byte_limit(byte_limit: usize) -> Self {
         Self {
             images: BTreeMap::new(),
             expected_processes: BTreeSet::new(),
             terminal_processes: BTreeSet::new(),
             last_receipts: BTreeMap::new(),
+            trailing_initializations: 0,
+            held_initialization_bytes: 0,
+            byte_limit,
             encoded_records: Vec::new(),
             record_count: 0,
             payload_bytes: 0,
@@ -556,18 +711,24 @@ impl Collector {
                         "DBT evidence exceeded its process/image state bound",
                     ));
                 }
-                let epoch = match self.images.get(&process) {
-                    Some(previous) if previous.pending_exec => previous
-                        .epoch
-                        .checked_add(1)
-                        .ok_or_else(|| invalid_data("DBT evidence image epoch overflowed"))?,
+                let (epoch, replaced_unplaced) = match self.images.get(&process) {
+                    Some(previous) if previous.pending_exec => (
+                        previous
+                            .epoch
+                            .checked_add(1)
+                            .ok_or_else(|| invalid_data("DBT evidence image epoch overflowed"))?,
+                        previous.initialization_unplaced,
+                    ),
                     Some(_) => {
                         return Err(invalid_data(
                             "DBT evidence image restarted without a pending exec",
                         ));
                     }
-                    None => 0,
+                    None => (0, false),
                 };
+                if replaced_unplaced {
+                    self.defer_to_end()?;
+                }
                 self.images.insert(
                     process,
                     ImageState {
@@ -575,6 +736,7 @@ impl Collector {
                         next_sequence: 1,
                         pending_exec: false,
                         initialized: false,
+                        initialization_unplaced: false,
                     },
                 );
                 self.saw_start = true;
@@ -627,7 +789,13 @@ impl Collector {
                 if image.pending_exec {
                     return Err(invalid_data("DBT evidence finalized with exec pending"));
                 }
-                self.images.remove(&process);
+                let image = self
+                    .images
+                    .remove(&process)
+                    .expect("validated image remains live");
+                if image.initialization_unplaced {
+                    self.defer_to_end()?;
+                }
                 self.terminal_processes.insert(process);
                 self.backend_failure |= outcome == FinalOutcome::BackendFailure;
             }
@@ -744,16 +912,30 @@ impl Collector {
         }
     }
 
+    /// Counts one held-back initialization record for the end of the stream.
+    fn defer_to_end(&mut self) -> io::Result<()> {
+        self.trailing_initializations = self
+            .trailing_initializations
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("DBT evidence record count overflowed"))?;
+        Ok(())
+    }
+
     fn absorb_records(&mut self, process: ProcessKey, payload: &[u8]) -> io::Result<()> {
         if payload.is_empty() {
             return Err(invalid_data("DBT DATA frame carried no records"));
         }
         let mut cursor = 0;
-        let mut initialized = self
+        let image = self
             .images
             .get(&process)
-            .expect("DATA sequence validation requires a live image")
-            .initialized;
+            .expect("DATA sequence validation requires a live image");
+        let mut initialized = image.initialized;
+        let mut unplaced = image.initialization_unplaced;
+        // The frame's records as they enter the stream: an initialization
+        // record is held back until the image's first comparable record.
+        let mut placed = Vec::with_capacity(payload.len());
+        let mut held_bytes = self.held_initialization_bytes;
         let mut record_count = 0_u64;
         let mut payload_bytes = 0_u64;
         while cursor < payload.len() {
@@ -778,7 +960,13 @@ impl Collector {
                         "DBT evidence process image repeated its initialization record",
                     ));
                 }
-                InitializationRecord::Exact => initialized = true,
+                InitializationRecord::Exact => {
+                    initialized = true;
+                    unplaced = true;
+                    held_bytes = held_bytes
+                        .checked_add(ENCODED_INITIALIZATION_LEN)
+                        .ok_or_else(|| invalid_data("DBT evidence exceeded its memory bound"))?;
+                }
                 InitializationRecord::Lookalike => {
                     return Err(invalid_data(
                         "DBT evidence contains a malformed initialization record",
@@ -789,26 +977,93 @@ impl Collector {
                         "DBT evidence process image data preceded its initialization record",
                     ));
                 }
-                InitializationRecord::Other => {}
+                InitializationRecord::Other => {
+                    if unplaced {
+                        unplaced = false;
+                        held_bytes -= ENCODED_INITIALIZATION_LEN;
+                        encode_initialization_record(&mut placed);
+                        record_count = record_count
+                            .checked_add(1)
+                            .ok_or_else(|| invalid_data("DBT evidence record count overflowed"))?;
+                        payload_bytes = payload_bytes
+                            .checked_add(INITIALIZATION_RECORD.len() as u64)
+                            .ok_or_else(|| {
+                                invalid_data("DBT evidence payload length overflowed")
+                            })?;
+                    }
+                    placed.extend_from_slice(&payload[cursor..record_end]);
+                    record_count = record_count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("DBT evidence record count overflowed"))?;
+                    payload_bytes = payload_bytes
+                        .checked_add(length as u64)
+                        .ok_or_else(|| invalid_data("DBT evidence payload length overflowed"))?;
+                }
             }
-            record_count = record_count
-                .checked_add(1)
-                .ok_or_else(|| invalid_data("DBT evidence record count overflowed"))?;
-            payload_bytes = payload_bytes
-                .checked_add(length as u64)
-                .ok_or_else(|| invalid_data("DBT evidence payload length overflowed"))?;
             cursor = record_end;
         }
 
+        self.append_encoded(&placed, record_count, payload_bytes, held_bytes)?;
+        let image = self
+            .images
+            .get_mut(&process)
+            .expect("validated DATA process remains live");
+        image.initialized = initialized;
+        image.initialization_unplaced = unplaced;
+        Ok(())
+    }
+
+    /// Absorbs one record the coordinator emitted. It belongs to no guest
+    /// process image, so it is checked as a record and never as image
+    /// lifecycle: it must be one canonical tracing record and must not imitate
+    /// an initialization record, which only a guest image may emit.
+    fn absorb_coordinator_record(&mut self, record: &[u8]) -> io::Result<()> {
+        validate_record(record)?;
+        if !matches!(
+            classify_initialization_record(record),
+            InitializationRecord::Other
+        ) {
+            return Err(invalid_data(
+                "DBT coordinator record imitates a process image initialization record",
+            ));
+        }
+        let length = u32::try_from(record.len())
+            .map_err(|_| invalid_data("DBT coordinator record is too long"))?;
+        let mut payload = Vec::with_capacity(4 + record.len());
+        payload.extend_from_slice(&length.to_le_bytes());
+        payload.extend_from_slice(record);
+        self.append_encoded(
+            &payload,
+            1,
+            u64::from(length),
+            self.held_initialization_bytes,
+        )
+    }
+
+    /// Appends length-prefixed records to the collected stream, leaving
+    /// `held_bytes` of accepted initialization records still to be placed.
+    /// The stream and the held records together must fit the memory bound.
+    fn append_encoded(
+        &mut self,
+        payload: &[u8],
+        record_count: u64,
+        payload_bytes: u64,
+        held_bytes: usize,
+    ) -> io::Result<()> {
         let new_len = self
             .encoded_records
             .len()
             .checked_add(payload.len())
-            .filter(|length| *length <= MAX_EVIDENCE_BYTES)
+            .filter(|length| {
+                length
+                    .checked_add(held_bytes)
+                    .is_some_and(|total| total <= self.byte_limit)
+            })
             .ok_or_else(|| invalid_data("DBT evidence exceeded its memory bound"))?;
         self.encoded_records
             .reserve(new_len - self.encoded_records.len());
         self.encoded_records.extend_from_slice(payload);
+        self.held_initialization_bytes = held_bytes;
         self.hash = fnv_update(self.hash, payload);
         self.record_count = self
             .record_count
@@ -818,16 +1073,10 @@ impl Collector {
             .payload_bytes
             .checked_add(payload_bytes)
             .ok_or_else(|| invalid_data("DBT evidence payload length overflowed"))?;
-        if initialized {
-            self.images
-                .get_mut(&process)
-                .expect("validated DATA process remains live")
-                .initialized = true;
-        }
         Ok(())
     }
 
-    fn finish(self) -> io::Result<CollectedEvidence> {
+    fn finish(mut self) -> io::Result<CollectedEvidence> {
         if !self.saw_start {
             return Err(invalid_data("DBT evidence received no image START"));
         }
@@ -853,6 +1102,28 @@ impl Collector {
                 "DBT evidence is missing a child process START or FINAL frame",
             ));
         }
+        // Every image is final, so the held records are exactly the trailing
+        // ones. Size the tail and check it against the bound before
+        // allocating it.
+        let trailing_len = usize::try_from(self.trailing_initializations)
+            .ok()
+            .and_then(|count| count.checked_mul(ENCODED_INITIALIZATION_LEN))
+            .filter(|length| {
+                self.encoded_records
+                    .len()
+                    .checked_add(*length)
+                    .is_some_and(|total| total <= self.byte_limit)
+            })
+            .ok_or_else(|| invalid_data("DBT evidence exceeded its memory bound"))?;
+        let trailing_bytes = self
+            .trailing_initializations
+            .checked_mul(INITIALIZATION_RECORD.len() as u64)
+            .ok_or_else(|| invalid_data("DBT evidence payload length overflowed"))?;
+        let mut trailing = Vec::with_capacity(trailing_len);
+        for _ in 0..self.trailing_initializations {
+            encode_initialization_record(&mut trailing);
+        }
+        self.append_encoded(&trailing, self.trailing_initializations, trailing_bytes, 0)?;
         Ok(CollectedEvidence {
             encoded_records: self.encoded_records,
             record_count: self.record_count,
@@ -862,14 +1133,20 @@ impl Collector {
     }
 }
 
+/// Appends the length-prefixed initialization record to a collected stream.
+fn encode_initialization_record(stream: &mut Vec<u8>) {
+    stream.extend_from_slice(&(INITIALIZATION_RECORD.len() as u32).to_le_bytes());
+    stream.extend_from_slice(INITIALIZATION_RECORD);
+}
+
 fn serve(
     listener: UnixListener,
     token: [u8; CHANNEL_TOKEN_LEN],
     root_process: Arc<Mutex<Option<ProcessKey>>>,
     stop: Arc<AtomicBool>,
     acknowledgement_drops: AcknowledgementDropControl,
+    collector: SharedCollector,
 ) -> io::Result<CollectedEvidence> {
-    let mut collector = Collector::new();
     let mut shutdown_connections = 0_u32;
     loop {
         let stopping = stop.load(Ordering::Acquire);
@@ -889,7 +1166,7 @@ fn serve(
                     &mut stream,
                     &token,
                     &root_process,
-                    &mut collector,
+                    &collector,
                     &acknowledgement_drops,
                 ) {
                     let _ = stream.write_all(&[1]);
@@ -905,14 +1182,14 @@ fn serve(
             Err(error) => return Err(error),
         }
     }
-    collector.finish()
+    collector.take()?.finish()
 }
 
 fn handle_connection(
     stream: &mut UnixStream,
     token: &[u8; CHANNEL_TOKEN_LEN],
     root_process: &Mutex<Option<ProcessKey>>,
-    collector: &mut Collector,
+    collector: &SharedCollector,
     acknowledgement_drops: &AcknowledgementDropControl,
 ) -> io::Result<()> {
     let mut header = [0_u8; CHANNEL_HEADER_LEN];
@@ -950,7 +1227,9 @@ fn handle_connection(
         pid,
         start_time: process_start_time(pid)?,
     };
-    if !collector.has_admitted(process) && !initial_peer_is_admissible(process, root) {
+    if !collector.with(|collector| Ok(collector.has_admitted(process)))?
+        && !initial_peer_is_admissible(process, root)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "DBT evidence peer is outside the launched process tree",
@@ -973,7 +1252,9 @@ fn handle_connection(
     if !constant_time_equal(&digest, &expected_digest) {
         return Err(invalid_data("DBT evidence frame digest is invalid"));
     }
-    collector.absorb_or_acknowledge_retry(kind, process, sequence, digest, &payload)?;
+    collector.with(|collector| {
+        collector.absorb_or_acknowledge_retry(kind, process, sequence, digest, &payload)
+    })?;
     // The frame is durable in collector state before the ACK. If the peer
     // times out and closes here, its exact retry is acknowledged idempotently.
     if acknowledgement_drops.should_drop() {
@@ -1108,11 +1389,30 @@ fn is_isolated_process_group_member(process: ProcessKey, root_pid: u32) -> bool 
     stat.start_time == process.start_time && stat.process_group == root_pid as i32
 }
 
+/// Whether `process` is a process of the run that lost its parent and was
+/// adopted by this process: where the launcher is its PID namespace's init,
+/// the namespace holds only the run, so every orphan of the run becomes its
+/// child, whatever process group or session the guest put it in.
+fn is_reparented_run_process(process: ProcessKey, root: ProcessKey) -> bool {
+    let Ok(stat) = process_stat(process.pid) else {
+        return false;
+    };
+    stat.start_time == process.start_time
+        && process.pid != root.pid
+        && stat.parent == std::process::id()
+        && process.start_time >= root.start_time
+}
+
 fn initial_peer_is_admissible(process: ProcessKey, root: ProcessKey) -> bool {
-    // Evidence mode forces a dedicated process group and the native client
-    // rejects setpgid/setsid. Descendants inherit that group, and reparenting
-    // does not change it; pid+starttime prevents reuse from inheriting admission.
-    is_process_descendant(process, root) || is_isolated_process_group_member(process, root.pid)
+    // A process of the run is the root's descendant. Once its parent exited:
+    // where the launcher is its PID namespace's init (as under Hermit), it is
+    // the launcher's child, whatever process group or session the guest put
+    // it in; elsewhere the launcher put the run in a dedicated process group,
+    // which reparenting does not change. pid+starttime prevents reuse from
+    // inheriting admission.
+    is_process_descendant(process, root)
+        || (std::process::id() == 1 && is_reparented_run_process(process, root))
+        || is_isolated_process_group_member(process, root.pid)
 }
 
 fn publish(output: &mut File, collected: CollectedEvidence) -> io::Result<()> {
@@ -1537,8 +1837,91 @@ mod tests {
         assert_eq!(evidence.records(), [FIRST_RECORD, SECOND_RECORD]);
     }
 
+    const COORDINATOR_RECORD: &[u8] =
+        b"1970-01-01T00:00:00.000000Z INFO detcore::scheduler: [scheduler] guest in queue\n";
+
     #[test]
-    fn all_records_keeps_each_initialization_record_at_its_arrival_position() {
+    fn coordinator_records_land_where_they_were_absorbed() {
+        let process = ProcessKey {
+            pid: 41,
+            start_time: 43,
+        };
+        let shared = SharedCollector::new();
+        let coordinator = CoordinatorEvidence {
+            collector: shared.clone(),
+        };
+        // Before the guest starts, between two guest records, and after the
+        // guest's FINAL frame: each lands at its absorption point.
+        coordinator.append(COORDINATOR_RECORD).unwrap();
+        shared
+            .with(|collector| {
+                start_and_initialize(collector, process);
+                collector.absorb(FRAME_DATA, process, 2, &encode_records(&[FIRST_RECORD]))
+            })
+            .unwrap();
+        coordinator.append(COORDINATOR_RECORD).unwrap();
+        shared
+            .with(|collector| {
+                collector.absorb(FRAME_DATA, process, 3, &encode_records(&[SECOND_RECORD]))?;
+                collector.absorb(FRAME_FINAL, process, 4, &[FINAL_GUEST_COMPLETED])
+            })
+            .unwrap();
+        coordinator.append(COORDINATOR_RECORD).unwrap();
+
+        let collected = shared.take().unwrap().finish().unwrap();
+        assert_eq!(collected.record_count, 6);
+        let mut output = tempfile::tempfile().unwrap();
+        publish(&mut output, collected).unwrap();
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).unwrap();
+        let evidence = decode_evidence(&bytes).unwrap();
+        assert_eq!(
+            evidence.all_records(),
+            [
+                COORDINATOR_RECORD,
+                INITIALIZATION_RECORD,
+                FIRST_RECORD,
+                COORDINATOR_RECORD,
+                SECOND_RECORD,
+                COORDINATOR_RECORD,
+            ]
+        );
+        assert_eq!(evidence.initialization_records(), 1);
+    }
+
+    #[test]
+    fn coordinator_records_are_refused_unless_canonical_and_comparable() {
+        let shared = SharedCollector::new();
+        let coordinator = CoordinatorEvidence {
+            collector: shared.clone(),
+        };
+        // Only a guest image may announce an image initialization.
+        assert!(coordinator.append(INITIALIZATION_RECORD).is_err());
+        let mut lookalike = INITIALIZATION_RECORD.to_vec();
+        lookalike.insert(lookalike.len() - 1, b'!');
+        assert!(coordinator.append(&lookalike).is_err());
+        for malformed in [
+            b"".as_slice(),
+            b"INFO detcore: no canonical prefix\n",
+            b"1970-01-01T00:00:00.000000Z INFO detcore: no newline",
+            b"1970-01-01T00:00:00.000000Z INFO detcore: two\nlines\n",
+            b"1970-01-01T00:00:00.000000Z NOTICE detcore: unknown level\n",
+        ] {
+            assert!(coordinator.append(malformed).is_err(), "{malformed:?}");
+        }
+        // Nothing refused reached the stream.
+        assert_eq!(
+            shared.with(|collector| Ok(collector.record_count)).unwrap(),
+            0
+        );
+        // After the worker finishes, an append is refused rather than lost.
+        let _ = shared.take().unwrap();
+        assert!(coordinator.append(COORDINATOR_RECORD).is_err());
+    }
+
+    #[test]
+    fn all_records_keeps_each_initialization_record_at_its_stream_position() {
         let streams: [&[&[u8]]; 5] = [
             &[INITIALIZATION_RECORD, FIRST_RECORD, SECOND_RECORD],
             &[
@@ -1559,8 +1942,9 @@ mod tests {
                 SECOND_RECORD,
                 INITIALIZATION_RECORD,
             ],
-            // The decoder also accepts a comparable record before the first
-            // initialization record, which the collector never writes.
+            // A comparable record before the first initialization record: the
+            // collector writes one when the coordinator emits before the guest
+            // starts.
             &[FIRST_RECORD, INITIALIZATION_RECORD, SECOND_RECORD],
         ];
         for raw_records in streams {
@@ -1615,9 +1999,37 @@ mod tests {
         assert_ne!(early, late);
     }
 
-    #[test]
-    fn all_records_keeps_the_collector_accept_order_across_parent_and_child_images() {
-        const CHILD_RECORD: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: child\n";
+    fn published_artifact(collector: Collector) -> Vec<u8> {
+        let collected = collector.finish().unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        publish(&mut output, collected).unwrap();
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// Where the host accepts a child's initialization frame among the
+    /// parent's records, in the parent-and-child run below.
+    #[derive(Clone, Copy, Debug)]
+    enum ChildInitialization {
+        /// Alone, right after the parent announces the child.
+        AfterAnnouncement,
+        /// Alone, after the parent's next record.
+        AfterParentRecord,
+        /// In the same frame as the child's first comparable record.
+        WithFirstChildRecord,
+    }
+
+    const CHILD_RECORD: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: child\n";
+
+    /// A parent writes FIRST, forks a child, and writes SECOND; then the child
+    /// writes CHILD_RECORD (or, when `child_first`, before SECOND). Only the
+    /// point where the host accepts the child's initialization varies.
+    fn parent_and_child_artifact(
+        initialization: ChildInitialization,
+        child_first: bool,
+    ) -> Vec<u8> {
         let parent = ProcessKey {
             pid: 41,
             start_time: 43,
@@ -1637,43 +2049,240 @@ mod tests {
         collector
             .absorb(FRAME_CHILD, parent, 3, &child_payload)
             .unwrap();
-        start_and_initialize(&mut collector, child);
+        let mut child_sequence = 1;
+        let mut child_data = |collector: &mut Collector, records: &[&[u8]]| {
+            collector
+                .absorb(FRAME_DATA, child, child_sequence, &encode_records(records))
+                .unwrap();
+            child_sequence += 1;
+        };
+        if matches!(initialization, ChildInitialization::AfterAnnouncement) {
+            collector.absorb(FRAME_START, child, 0, &[]).unwrap();
+            child_data(&mut collector, &[INITIALIZATION_RECORD]);
+        }
+        let parent_second = |collector: &mut Collector| {
+            collector
+                .absorb(FRAME_DATA, parent, 4, &encode_records(&[SECOND_RECORD]))
+                .unwrap();
+        };
+        if !child_first {
+            parent_second(&mut collector);
+        }
+        match initialization {
+            ChildInitialization::AfterAnnouncement => {}
+            ChildInitialization::AfterParentRecord => {
+                collector.absorb(FRAME_START, child, 0, &[]).unwrap();
+                child_data(&mut collector, &[INITIALIZATION_RECORD]);
+            }
+            ChildInitialization::WithFirstChildRecord => {
+                collector.absorb(FRAME_START, child, 0, &[]).unwrap();
+            }
+        }
+        if matches!(initialization, ChildInitialization::WithFirstChildRecord) {
+            child_data(&mut collector, &[INITIALIZATION_RECORD, CHILD_RECORD]);
+        } else {
+            child_data(&mut collector, &[CHILD_RECORD]);
+        }
+        if child_first {
+            parent_second(&mut collector);
+        }
         collector
-            .absorb(FRAME_DATA, parent, 4, &encode_records(&[SECOND_RECORD]))
-            .unwrap();
-        collector
-            .absorb(FRAME_DATA, child, 2, &encode_records(&[CHILD_RECORD]))
-            .unwrap();
-        collector
-            .absorb(FRAME_FINAL, child, 3, &[FINAL_GUEST_COMPLETED])
+            .absorb(FRAME_FINAL, child, child_sequence, &[FINAL_GUEST_COMPLETED])
             .unwrap();
         collector
             .absorb(FRAME_FINAL, parent, 5, &[FINAL_GUEST_COMPLETED])
             .unwrap();
+        published_artifact(collector)
+    }
 
-        let collected = collector.finish().unwrap();
-        let mut output = tempfile::tempfile().unwrap();
-        publish(&mut output, collected).unwrap();
-        output.seek(SeekFrom::Start(0)).unwrap();
-        let mut bytes = Vec::new();
-        output.read_to_end(&mut bytes).unwrap();
-        let evidence = decode_evidence(&bytes).unwrap();
+    #[test]
+    fn collector_places_a_child_initialization_wherever_the_host_accepted_it() {
+        // Two runs of one guest differ only in where the host accepted the
+        // child's initialization frame; see
+        // https://github.com/rrnewton/hermit/issues/3838. The artifacts must
+        // be identical, with the child's initialization record immediately
+        // before the child's first comparable record.
+        let canonical = parent_and_child_artifact(ChildInitialization::AfterAnnouncement, false);
+        for initialization in [
+            ChildInitialization::AfterParentRecord,
+            ChildInitialization::WithFirstChildRecord,
+        ] {
+            assert_eq!(
+                parent_and_child_artifact(initialization, false),
+                canonical,
+                "{initialization:?}"
+            );
+        }
+        let evidence = decode_evidence(&canonical).unwrap();
+        assert_eq!(
+            evidence.all_records(),
+            [
+                INITIALIZATION_RECORD,
+                FIRST_RECORD,
+                SECOND_RECORD,
+                INITIALIZATION_RECORD,
+                CHILD_RECORD,
+            ]
+        );
+        assert_eq!(evidence.initialization_records(), 2);
+    }
 
+    #[test]
+    fn collector_keeps_the_order_of_comparable_records_across_images() {
+        // Placing initialization records does not hide where the comparable
+        // records were written: the child writing before the parent's second
+        // record is a different stream.
+        let parent_first = parent_and_child_artifact(ChildInitialization::AfterAnnouncement, false);
+        let child_first = parent_and_child_artifact(ChildInitialization::AfterAnnouncement, true);
+        assert_ne!(parent_first, child_first);
+        assert_eq!(
+            decode_evidence(&child_first).unwrap().all_records(),
+            [
+                INITIALIZATION_RECORD,
+                FIRST_RECORD,
+                INITIALIZATION_RECORD,
+                CHILD_RECORD,
+                SECOND_RECORD,
+            ]
+        );
+    }
+
+    #[test]
+    fn collector_places_initializations_of_images_with_no_comparable_record_at_the_end() {
+        let process = ProcessKey {
+            pid: 59,
+            start_time: 61,
+        };
+        let silent = ProcessKey {
+            pid: 67,
+            start_time: 71,
+        };
+        let mut collector = Collector::new();
+        // An image that execs before writing a comparable record, then a
+        // second image of the same process that writes one.
+        start_and_initialize(&mut collector, process);
+        collector.absorb(FRAME_EXEC, process, 2, &[]).unwrap();
+        start_and_initialize(&mut collector, process);
+        // A process that ends without writing a comparable record.
+        start_and_initialize(&mut collector, silent);
+        collector
+            .absorb(FRAME_FINAL, silent, 2, &[FINAL_GUEST_COMPLETED])
+            .unwrap();
+        collector
+            .absorb(FRAME_DATA, process, 2, &encode_records(&[FIRST_RECORD]))
+            .unwrap();
+        collector
+            .absorb(FRAME_FINAL, process, 3, &[FINAL_GUEST_COMPLETED])
+            .unwrap();
+
+        let evidence = decode_evidence(&published_artifact(collector)).unwrap();
         assert_eq!(
             evidence.all_records(),
             [
                 INITIALIZATION_RECORD,
                 FIRST_RECORD,
                 INITIALIZATION_RECORD,
-                SECOND_RECORD,
-                CHILD_RECORD,
+                INITIALIZATION_RECORD,
             ]
         );
+        // Every initialization record is still counted.
+        assert_eq!(evidence.initialization_records(), 3);
+    }
+
+    #[test]
+    fn collector_charges_held_initializations_against_the_memory_bound_when_accepted() {
+        const IMAGES: usize = 12;
+        let process = ProcessKey {
+            pid: 73,
+            start_time: 79,
+        };
+        let initialize = encode_records(&[INITIALIZATION_RECORD]);
+        // Images of one process that each exec, and finally exit, without
+        // writing a comparable record. The process key stays known, so the
+        // process-state bound never limits how many there are.
+        let mut collector = Collector::with_byte_limit(IMAGES * ENCODED_INITIALIZATION_LEN);
+        for image in 0..IMAGES {
+            collector.absorb(FRAME_START, process, 0, &[]).unwrap();
+            collector
+                .absorb(FRAME_DATA, process, 1, &initialize)
+                .unwrap();
+            if image + 1 < IMAGES {
+                collector.absorb(FRAME_EXEC, process, 2, &[]).unwrap();
+            }
+        }
+        collector
+            .absorb(FRAME_FINAL, process, 2, &[FINAL_GUEST_COMPLETED])
+            .unwrap();
+        let collected = collector.finish().unwrap();
+        assert_eq!(collected.record_count, IMAGES as u64);
         assert_eq!(
-            evidence.records(),
-            [FIRST_RECORD, SECOND_RECORD, CHILD_RECORD]
+            collected.encoded_records.len(),
+            IMAGES * ENCODED_INITIALIZATION_LEN
         );
-        assert_eq!(evidence.initialization_records(), 2);
+
+        // One byte less: the last image's initialization record is refused
+        // when it arrives, not after it was held and the tail was built.
+        let mut collector = Collector::with_byte_limit(IMAGES * ENCODED_INITIALIZATION_LEN - 1);
+        for _ in 1..IMAGES {
+            collector.absorb(FRAME_START, process, 0, &[]).unwrap();
+            collector
+                .absorb(FRAME_DATA, process, 1, &initialize)
+                .unwrap();
+            collector.absorb(FRAME_EXEC, process, 2, &[]).unwrap();
+        }
+        collector.absorb(FRAME_START, process, 0, &[]).unwrap();
+        let refused = collector
+            .absorb(FRAME_DATA, process, 1, &initialize)
+            .unwrap_err();
+        assert!(refused.to_string().contains("memory bound"), "{refused}");
+    }
+
+    #[test]
+    fn comparable_records_cannot_spend_the_room_held_initializations_reserve() {
+        let silent = ProcessKey {
+            pid: 83,
+            start_time: 89,
+        };
+        let writer = ProcessKey {
+            pid: 97,
+            start_time: 101,
+        };
+        let first = encode_records(&[FIRST_RECORD]);
+        // Room for both images' initialization records and the writer's one
+        // comparable record.
+        let room = 2 * ENCODED_INITIALIZATION_LEN + first.len();
+
+        let mut collector = Collector::with_byte_limit(room);
+        start_and_initialize(&mut collector, silent);
+        start_and_initialize(&mut collector, writer);
+        collector.absorb(FRAME_DATA, writer, 2, &first).unwrap();
+        collector
+            .absorb(FRAME_FINAL, writer, 3, &[FINAL_GUEST_COMPLETED])
+            .unwrap();
+        collector
+            .absorb(FRAME_FINAL, silent, 2, &[FINAL_GUEST_COMPLETED])
+            .unwrap();
+        assert_eq!(collector.finish().unwrap().encoded_records.len(), room);
+
+        // One byte less: the silent image's held record keeps its room, so
+        // the writer's record is refused rather than the tail later.
+        let mut collector = Collector::with_byte_limit(room - 1);
+        start_and_initialize(&mut collector, silent);
+        start_and_initialize(&mut collector, writer);
+        let refused = collector.absorb(FRAME_DATA, writer, 2, &first).unwrap_err();
+        assert!(refused.to_string().contains("memory bound"), "{refused}");
+
+        // A coordinator record is charged against the same reserved room.
+        let coordinator_room = ENCODED_INITIALIZATION_LEN + first.len();
+        let mut collector = Collector::with_byte_limit(coordinator_room);
+        start_and_initialize(&mut collector, silent);
+        collector.absorb_coordinator_record(FIRST_RECORD).unwrap();
+        let mut collector = Collector::with_byte_limit(coordinator_room - 1);
+        start_and_initialize(&mut collector, silent);
+        let refused = collector
+            .absorb_coordinator_record(FIRST_RECORD)
+            .unwrap_err();
+        assert!(refused.to_string().contains("memory bound"), "{refused}");
     }
 
     #[test]
@@ -2016,6 +2625,99 @@ mod tests {
         collector.finish().unwrap();
     }
 
+    /// A process of the run that left its process group and session and
+    /// whose parent exited is recognised as the run's once this process has
+    /// adopted it, as a PID namespace init adopts every orphan.
+    #[test]
+    fn an_adopted_orphan_that_left_its_session_is_the_runs() {
+        use std::io::BufRead as _;
+        use std::process::Command;
+        use std::process::Stdio;
+
+        /// Restores the test process's child-subreaper setting, and kills and
+        /// reaps the orphan it adopted, however the test ends.
+        struct Adoption {
+            previous: libc::c_int,
+            orphan: Option<i32>,
+        }
+        impl Drop for Adoption {
+            fn drop(&mut self) {
+                if let Some(orphan) = self.orphan {
+                    // SAFETY: a positive pid names exactly the orphan, which
+                    // this process adopted, so it is this process's child to
+                    // reap.
+                    unsafe {
+                        libc::kill(orphan, libc::SIGKILL);
+                        libc::waitpid(orphan, std::ptr::null_mut(), 0);
+                    }
+                }
+                // SAFETY: prctl with integer arguments only.
+                unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.previous, 0, 0, 0) };
+            }
+        }
+
+        let mut previous: libc::c_int = 0;
+        // SAFETY: PR_GET_CHILD_SUBREAPER writes one int through the pointer.
+        assert_eq!(
+            unsafe {
+                libc::prctl(
+                    libc::PR_GET_CHILD_SUBREAPER,
+                    &mut previous as *mut libc::c_int,
+                    0,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        let mut adoption = Adoption {
+            previous,
+            orphan: None,
+        };
+        // SAFETY: prctl with integer arguments only. This test's process
+        // adopts orphans as an init would, until `adoption` is dropped.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        let mut root_child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "setsid sleep 30 >/dev/null 2>&1 & echo $!; sleep 0.1; exit 0",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let root = ProcessKey {
+            pid: root_child.id(),
+            start_time: process_start_time(root_child.id()).unwrap(),
+        };
+        let mut pid_line = String::new();
+        std::io::BufReader::new(root_child.stdout.take().unwrap())
+            .read_line(&mut pid_line)
+            .unwrap();
+        let orphan_pid: u32 = pid_line.trim().parse().unwrap();
+        adoption.orphan = Some(orphan_pid as i32);
+        let orphan = ProcessKey {
+            pid: orphan_pid,
+            start_time: process_start_time(orphan_pid).unwrap(),
+        };
+        root_child.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !is_reparented_run_process(orphan, root) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(is_reparented_run_process(orphan, root));
+        assert!(!is_isolated_process_group_member(orphan, root.pid));
+        // A process that was not the run's: this one.
+        let me = ProcessKey {
+            pid: std::process::id(),
+            start_time: process_start_time(std::process::id()).unwrap(),
+        };
+        assert!(!is_reparented_run_process(me, root));
+        drop(adoption);
+    }
+
     #[test]
     fn reparented_group_member_can_send_its_first_start_and_data() {
         use std::io::BufRead as _;
@@ -2148,6 +2850,39 @@ mod tests {
     }
 
     #[test]
+    fn evidence_preparation_does_not_allocate_a_collector_task() {
+        let file = tempfile::tempfile().unwrap();
+        let session = EvidenceSession::new(&file).unwrap();
+        assert!(
+            session.worker.lock().unwrap().is_none(),
+            "preparing evidence must not consume a task ID before the guest is spawned"
+        );
+        session.claim_run().unwrap();
+        assert!(session.worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn unstarted_evidence_is_closed_without_publication() {
+        let mut file = tempfile::tempfile().unwrap();
+        let session = EvidenceSession::new(&file).unwrap();
+        file.write_all(b"unpublished bytes").unwrap();
+        let address = session
+            .pending_listener
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .0
+            .local_addr()
+            .unwrap();
+        session.claim_run().unwrap();
+        assert!(session.start().is_err());
+        assert!(session.finish(false).is_err());
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert!(UnixStream::connect_addr(&address).is_err());
+    }
+
+    #[test]
     fn evidence_session_can_be_claimed_only_before_one_run() {
         let file = tempfile::tempfile().unwrap();
         let session = EvidenceSession::new(&file).unwrap();
@@ -2193,10 +2928,10 @@ mod tests {
         );
 
         let complete_clone = source
-            .split_once("static int32_t complete_clone_identity(")
+            .split_once("static int32_t complete_clone_birth(")
             .unwrap()
             .1
-            .split_once("static bool pending_identity_is_process")
+            .split_once("\n}\n")
             .unwrap()
             .0;
         assert!(
@@ -2318,9 +3053,16 @@ mod tests {
             .find("evidence_emit_image_initialization();")
             .unwrap();
         let background_runtime = background
-            .find("reverie_dbt_runtime_background_init_v2(&runtime_callbacks_page.value);")
+            .find("reverie_dbt_runtime_background_init_v3(\n      &runtime_callbacks_page.value, native_mode);")
             .unwrap();
-        let background_callback_leave = background.find("evidence_callback_leave();").unwrap();
+        let background_callback_leave = background_runtime
+            + background[background_runtime..]
+                .find("evidence_callback_leave();")
+                .unwrap();
+        let mode_validation = background
+            .find("task_state->magic != TASK_STATE_MAGIC")
+            .unwrap();
+        let startup_refusal = background.find("if (startup_status != 0)").unwrap();
         let background_final = background
             .find("require_evidence_flush(EVIDENCE_FRAME_FINAL);")
             .unwrap();
@@ -2328,7 +3070,15 @@ mod tests {
             .find("atomic_store_explicit(&runtime_background_state, 3")
             .unwrap();
         assert!(background_initialization < background_runtime);
+        assert!(mode_validation < background_runtime);
+        assert!(background.contains("uint32_t native_mode = runtime_uses_external_global()"));
         assert!(background_runtime < background_callback_leave);
+        assert!(background_callback_leave < startup_refusal);
+        assert!(startup_refusal < background_final);
+        assert!(
+            background[startup_refusal..background_final]
+                .contains("exit_runtime_tree(CLIENT_THREAD_START_FAILURE_EXIT_CODE);")
+        );
         assert!(background_callback_leave < background_final);
         assert!(background_final < background_quiescent);
         assert!(event_exit.contains("finalize_runtime_process();"));
@@ -2367,12 +3117,10 @@ mod tests {
         let first_runtime_callback = main.find("reverie_dbt_runtime_image_init()").unwrap();
         assert!(version_check < first_runtime_callback);
         assert!(source.contains("reverie_dbt_runtime_thread_created_v2("));
-        assert!(source.contains("reverie_dbt_runtime_background_init_v2("));
+        assert!(source.contains("reverie_dbt_runtime_background_init_v3("));
     }
 
-    #[test]
-    fn native_internal_exits_mark_the_final_outcome() {
-        let source = include_str!("../native/client.c");
+    fn check_native_internal_exits(source: &str) {
         let failure_marker = source
             .split_once("static void mark_backend_failure(void) {")
             .unwrap()
@@ -2408,6 +3156,21 @@ mod tests {
         assert!(
             exit_runtime_tree.find("mark_backend_failure();").unwrap()
                 < exit_runtime_tree
+                    .find("terminate_runtime_tree(exit_code);")
+                    .unwrap()
+        );
+        let terminate_runtime_tree = source
+            .split_once("static void terminate_runtime_tree(int exit_code) {")
+            .unwrap()
+            .1
+            .split_once("static void exit_runtime_tree(int exit_code) {")
+            .unwrap()
+            .0;
+        assert!(
+            terminate_runtime_tree
+                .find("kill((pid_t)runtime_process_group, SIGKILL);")
+                .unwrap()
+                < terminate_runtime_tree
                     .find("dr_exit_process(exit_code);")
                     .unwrap()
         );
@@ -2423,19 +3186,111 @@ mod tests {
             background_start.contains("exit_runtime_tree(CLIENT_THREAD_START_FAILURE_EXIT_CODE);")
         );
 
-        // The other direct call is the ABI refusal before the evidence transport
-        // and exit callback exist. It cannot report a terminal outcome and must
-        // continue to fail as missing evidence.
-        assert_eq!(source.matches("dr_exit_process(").count(), 2);
+        // Enumerate every direct exit. Only termination itself and explicit
+        // startup refusals may bypass the failure-marking entry point. In
+        // particular, an active exec fault control must mark FINAL as failed.
+        let region = |start: &str, end: &str| {
+            source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0
+        };
+        let exec_retirement = region(
+            "static void retire_private_memory_for_exec(void) {",
+            "static int32_t runtime_private_memory(",
+        );
+        assert!(!exec_retirement.contains("dr_exit_process("));
+        assert!(exec_retirement.contains("exit_runtime_tree(101);"));
+        let startup_check = region(
+            "static bool private_memory_test_check(bool condition, const char* check) {",
+            "static bool private_memory_test_unavailable(",
+        );
+        let options = region(
+            "else if (strcmp(argv[i], \"-test-private-memory\") == 0) {",
+            "} else if (strcmp(argv[i], \"-test-compare-exchange\") == 0)",
+        );
+        for diagnostic in ["missing-mode", "invalid-mode"] {
+            let refusal = options
+                .split_once(&format!("PRIVATE_MEMORY_TEST {diagnostic}\\n"))
+                .unwrap()
+                .1
+                .split_once("return;")
+                .unwrap()
+                .0;
+            assert_eq!(refusal.matches("dr_exit_process(101);").count(), 1);
+        }
         let main = source
             .split_once("DR_EXPORT void dr_client_main")
             .unwrap()
             .1;
-        let abi_refusal = main.find("dr_exit_process(101);").unwrap();
+        let abi_refusal = main.find(NATIVE_ABI_REFUSAL).unwrap();
+        let abi_block = &main[abi_refusal..];
+        let abi_block = abi_block.split_once("\n  }\n").unwrap().0;
+        assert!(abi_block.contains("native/runtime ABI version or callback size mismatch"));
+        for (block, call, count) in [
+            (terminate_runtime_tree, "dr_exit_process(exit_code);", 1),
+            (startup_check, "dr_exit_process(101);", 1),
+            (options, "dr_exit_process(101);", 2),
+            (abi_block, "dr_exit_process(101);", 1),
+        ] {
+            assert_eq!(block.matches(call).count(), count);
+            assert_eq!(block.matches("dr_exit_process(").count(), count);
+        }
+        assert_eq!(source.matches("dr_exit_process(").count(), 5);
+
+        // Missing/invalid options and ABI refusal precede evidence setup.
+        // The startup self-test runs before the exit callback is registered.
+        // None can claim a completed terminal evidence stream.
         let evidence_initialization = main.find("initialize_evidence_transport();").unwrap();
         let exit_registration = main.find("drmgr_register_exit_event(event_exit);").unwrap();
+        let option_refusal = main.find("PRIVATE_MEMORY_TEST invalid-mode").unwrap();
+        let startup_test = main.find("run_private_memory_self_test()").unwrap();
+        assert!(option_refusal < evidence_initialization);
         assert!(abi_refusal < evidence_initialization);
         assert!(abi_refusal < exit_registration);
+        assert!(startup_test < exit_registration);
+    }
+
+    const NATIVE_ABI_REFUSAL: &str =
+        "if (runtime_abi_version != REVERIE_DBT_RUNTIME_ABI_VERSION ||";
+
+    #[test]
+    fn native_internal_exits_mark_the_final_outcome() {
+        check_native_internal_exits(include_str!("../native/client.c"));
+    }
+
+    #[test]
+    fn native_exit_guard_rejects_an_unclassified_runtime_exit() {
+        let source = include_str!("../native/client.c").replacen(
+            "static void retire_private_memory_for_exec(void) {",
+            "static void retire_private_memory_for_exec(void) {\n  dr_exit_process(101);",
+            1,
+        );
+        assert!(std::panic::catch_unwind(|| check_native_internal_exits(&source)).is_err());
+    }
+
+    #[test]
+    fn native_exit_guard_rejects_abi_refusal_after_evidence_initialization() {
+        let source = include_str!("../native/client.c");
+        let start = source.find(NATIVE_ABI_REFUSAL).unwrap();
+        let end = start
+            + source[start..]
+                .find("  DR_ASSERT(evidence_socket_seen == evidence_token_seen);")
+                .unwrap();
+        let block = &source[start..end];
+        let without = format!("{}{}", &source[..start], &source[end..]);
+        let source = without.replacen(
+            "initialize_evidence_transport();",
+            &format!("initialize_evidence_transport();\n  {block}"),
+            1,
+        );
+        // This mutation preserves all five exits and both earlier option
+        // refusals. A first-match ABI check would incorrectly accept it.
+        assert_eq!(source.matches("dr_exit_process(").count(), 5);
+        assert!(std::panic::catch_unwind(|| check_native_internal_exits(&source)).is_err());
     }
 
     #[test]
@@ -2456,7 +3311,7 @@ mod tests {
         );
 
         let original = source
-            .split_once("static bool prepare_original_identity_syscall(")
+            .split_once("static bool prepare_original_task_syscall(")
             .unwrap()
             .1
             .split_once("static void post_syscall")
@@ -2488,7 +3343,7 @@ mod tests {
             .find("int32_t registration = reverie_dbt_runtime_process_clone_result(")
             .unwrap();
         let identity = post
-            .find("complete_clone_identity(counters, syscall_result)")
+            .find("complete_clone_birth(counters, syscall_result)")
             .unwrap();
         assert!(result < invariant);
         assert!(invariant < guard);
@@ -2513,7 +3368,7 @@ mod tests {
         let callback = pre.find("reverie_dbt_runtime_pre_syscall(").unwrap();
         let suppressed = pre.find("if (action == 1)").unwrap();
         let deferred = pre.find("if (action == 2)").unwrap();
-        let original = pre.find("prepare_original_identity_syscall(").unwrap();
+        let original = pre.find("prepare_original_task_syscall(").unwrap();
         assert!(stale < scrub);
         assert!(stale < arguments);
         assert!(stale < clone_metadata);
@@ -2523,10 +3378,10 @@ mod tests {
         assert!(stale < original);
 
         let prepare = source
-            .split_once("static bool prepare_clone_identity(")
+            .split_once("static bool prepare_clone_birth(")
             .unwrap()
             .1
-            .split_once("static int32_t complete_clone_identity")
+            .split_once("static int32_t complete_clone_birth")
             .unwrap()
             .0;
         let defensive_stale = prepare
@@ -2552,7 +3407,7 @@ mod tests {
         ));
         assert!(
             source
-                .contains("reverie_dbt_runtime_background_init_v2(&runtime_callbacks_page.value);")
+                .contains("reverie_dbt_runtime_background_init_v3(\n      &runtime_callbacks_page.value, native_mode);")
         );
 
         let main = source

@@ -1,6 +1,5 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
@@ -57,8 +56,14 @@ fn descriptor_abi_cases(test: &str, modes: &[u8]) {
                     .iter()
                     .filter(|name| name.as_str() == if ppoll { "ppoll" } else { "poll" })
                     .count();
-                // This prerequisite preserves current backend ownership of ppoll.
-                assert_eq!(callbacks, usize::from(!ppoll), "mode={mode} {ownership:?}");
+                // ppoll is backend-owned only with host-owned workers; with
+                // Tool-owned threads it reaches the Tool like poll.
+                let reaches_tool = !ppoll || ownership == ThreadOwnership::Tool;
+                assert_eq!(
+                    callbacks,
+                    usize::from(reaches_tool),
+                    "mode={mode} {ownership:?}"
+                );
                 (code, stdout, stderr)
             } else {
                 backend.run_static_elf_captured().unwrap()

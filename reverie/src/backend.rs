@@ -49,6 +49,7 @@
 
 use async_trait::async_trait;
 
+use crate::BackendCapabilities;
 use crate::BackendStatsSnapshot;
 use crate::Error;
 use crate::ExitStatus;
@@ -104,6 +105,10 @@ use crate::process::Output;
 ///    exit status, as a single [`Output`]. It reports statistics as well, so a
 ///    caller never has to choose between observing what the guest printed and
 ///    observing what the backend did.
+/// 10. **Describe itself.** [`capabilities`](Backend::capabilities) reports the
+///    static facts about how the backend runs a guest that a tool may need (for
+///    example whether a guest thread is a host task). It is the same for every
+///    run, so a host can copy it into the tool's configuration before the run.
 ///
 /// The associated `GlobalState` a backend must return is exactly
 /// [`T::GlobalState`](Tool::GlobalState); returning `(ExitStatus,
@@ -116,7 +121,7 @@ use crate::process::Output;
 /// essentially what `reverie-ptrace`'s `PtraceBackend` does):
 ///
 /// ```ignore
-/// use reverie::{Backend, Error, ExitStatus, GlobalTool, Tool};
+/// use reverie::{Backend, BackendCapabilities, Error, ExitStatus, GlobalTool, Tool};
 /// use reverie::process::{Command, Output};
 ///
 /// struct MyBackend;
@@ -124,6 +129,11 @@ use crate::process::Output;
 /// #[reverie::backend(?Send)]
 /// impl Backend for MyBackend {
 ///     type Stats = MyBackendStats;
+///
+///     fn capabilities() -> BackendCapabilities {
+///         // A tracer built on ptrace inherits ptrace's run-time facts.
+///         BackendCapabilities::PTRACE
+///     }
 ///
 ///     async fn run<T: Tool + 'static>(
 ///         command: Command,
@@ -223,6 +233,15 @@ pub trait Backend {
     /// measure is absent from its schema instead of being reported as a
     /// misleading zero.
     type Stats: BackendStatsSnapshot;
+
+    /// The static facts about how this backend runs a guest that a tool may
+    /// need to model it correctly.
+    ///
+    /// The answer is the same for every run of this backend, so a host can read
+    /// it before starting a run and copy it into the tool's configuration.
+    /// There is deliberately no default implementation: a backend that inherited
+    /// another backend's answer would silently misinform the tool.
+    fn capabilities() -> BackendCapabilities;
 
     /// Run `command` as the root of a guest process tree, instrumented by the
     /// tool `T`, and drive it to completion.

@@ -18,6 +18,7 @@ use std::task::Waker;
 use futures::channel::oneshot;
 
 use super::*;
+use crate::error::ErrorExt;
 use crate::failure::owned_future::PanicPayload;
 use crate::failure::tool_panics::ToolPanics;
 

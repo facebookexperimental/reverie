@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use reverie::ChildExitSignalDisposition;
 use reverie::ChildExitSignalErrorKind;
 use reverie::ChildExitSignalOutcome;
@@ -36,6 +28,36 @@ struct QueueExecutor {
     outcome: ChildExitSignalOutcome,
     calls: usize,
 }
+#[reverie::provider]
+impl LinuxProvider for QueueExecutor {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        panic!("queue operation executed a guest syscall")
+    }
+}
+
+impl LinuxEmuSignalControl for QueueExecutor {
+    fn defer_signal_delivery(&mut self, _: SignalEvent) -> std::result::Result<(), Errno> {
+        panic!("queue operation used private signal deferral")
+    }
+
+    fn queue_child_exit_signal(&mut self, event: SignalEvent) -> ChildExitSignalOutcome {
+        assert_eq!(event, self.expected);
+        self.calls += 1;
+        self.outcome
+    }
+}
+
+impl LinuxEmuMemoryMap for QueueExecutor {}
+
 impl GuestSyscallExecutor<AdapterTool> for QueueExecutor {
     fn read_clock(&self) -> Result<u64> {
         Err(Error::GuestClock(
@@ -43,20 +65,10 @@ impl GuestSyscallExecutor<AdapterTool> for QueueExecutor {
         ))
     }
 
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("queue operation executed a guest syscall")
-    }
-    fn defer_signal_delivery(&mut self, _: SignalEvent) -> std::result::Result<(), Errno> {
-        panic!("queue operation used private signal deferral")
-    }
-    fn queue_child_exit_signal(&mut self, event: SignalEvent) -> ChildExitSignalOutcome {
-        assert_eq!(event, self.expected);
-        self.calls += 1;
-        self.outcome
-    }
     fn complete_injection<'a>(
         &'a mut self,
         _: ToolContext<'a, AdapterTool>,
+        _plan: Option<crate::executor::StagedProcessAction>,
     ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
     where
         AdapterTool: 'a,

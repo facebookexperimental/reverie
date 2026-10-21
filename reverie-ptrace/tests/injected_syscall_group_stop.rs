@@ -109,6 +109,13 @@ const EXEC_ARGS_TAIL_AFTER_EXEC_FD: i32 = 913;
 /// zero-length write here (`tracer_without_descriptors`) until its injected
 /// `getppid` returns; the tool returns 0 to the guest.
 const NO_DESCRIPTORS_FD: i32 = 914;
+/// Like `UNBLOCK_THEN_GETPID_FD`, followed by an injected
+/// `rt_sigprocmask(SIG_BLOCK, buf, NULL)`, reported; the tool returns the
+/// `getpid` result.
+const UNBLOCK_GETPID_THEN_BLOCK_FD: i32 = 915;
+/// Like `UNBLOCK_GETPID_THEN_BLOCK_FD`, but the tool returns 0 to the guest
+/// instead of the `getpid` result, so the guest's syscall is not restarted.
+const UNBLOCK_GETPID_BLOCK_THEN_ZERO_FD: i32 = 916;
 
 /// Guest memory for the injected `ppoll`.
 #[repr(C)]
@@ -138,6 +145,16 @@ enum Report {
     Rdtsc,
     /// The guest's original syscall number and return register at a stop.
     Regs(i64, i64),
+    /// A signal shown to `Tool::filter_unreported_signal`, with its
+    /// siginfo's `si_code` (or 0 without one).
+    Filtered(i32, i32),
+    /// A `Guest::set_signal_info` result, as 0 or the errno.
+    SetInfo(i32),
+    /// A signal recorded by `Tool::note_unreported_signal`: its number, the
+    /// name of its `UnreportedSignalReason`, and whether the filter kept it.
+    Noted(i32, String, bool),
+    /// Whether `Guest::signal_info` returned a siginfo outside a signal hook.
+    InfoOutside(bool),
 }
 
 #[derive(Default)]
@@ -145,6 +162,10 @@ struct Log {
     injected: Mutex<Vec<Result<i64, i32>>>,
     signals: Mutex<Vec<i32>>,
     regs: Mutex<Vec<(i64, i64)>>,
+    filtered: Mutex<Vec<(i32, i32)>>,
+    noted: Mutex<Vec<(i32, String, bool)>>,
+    set_info: Mutex<Vec<i32>>,
+    info_outside: Mutex<Vec<bool>>,
     timers: AtomicUsize,
     rdtscs: AtomicUsize,
 }
@@ -166,6 +187,14 @@ impl GlobalTool for Log {
                 self.rdtscs.fetch_add(1, Ordering::Relaxed);
             }
             Report::Regs(orig_syscall, ret) => self.regs.lock().unwrap().push((orig_syscall, ret)),
+            Report::Filtered(signal, si_code) => {
+                self.filtered.lock().unwrap().push((signal, si_code))
+            }
+            Report::SetInfo(result) => self.set_info.lock().unwrap().push(result),
+            Report::Noted(signal, reason, kept) => {
+                self.noted.lock().unwrap().push((signal, reason, kept))
+            }
+            Report::InfoOutside(present) => self.info_outside.lock().unwrap().push(present),
         }
     }
 }
@@ -199,6 +228,192 @@ impl Tool for ReplaceMarker {
     ) -> Result<Option<Signal>, Errno> {
         guest.send_rpc(Report::Signal(signal as i32)).await;
         Ok(Some(signal))
+    }
+}
+
+/// `ReplaceMarker`, and drops every SIGCHLD and SIGSTKFLT that the backend
+/// would pass to the guest unreported (`Tool::filter_unreported_signal`),
+/// recording each signal shown to that hook.
+#[derive(Clone, Copy, Debug, Default)]
+struct DropUnreportedSigchld;
+
+#[reverie::tool]
+impl Tool for DropUnreportedSigchld {
+    type GlobalState = Log;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::write);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        replace_marker(guest, syscall).await
+    }
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        guest.send_rpc(Report::Signal(signal as i32)).await;
+        Ok(Some(signal))
+    }
+
+    async fn filter_unreported_signal<R: reverie::GlobalRPC<Self::GlobalState>>(
+        &self,
+        rpc: &R,
+        unreported: reverie::UnreportedSignal,
+    ) -> bool {
+        // `si_code` follows `si_signo` and `si_errno` in `siginfo_t`.
+        let si_code = unreported.siginfo().map_or(0, |info| {
+            i32::from_ne_bytes(info[8..12].try_into().unwrap())
+        });
+        let signal = unreported.signal();
+        rpc.send_rpc(Report::Filtered(unreported.number(), si_code))
+            .await;
+        !matches!(signal, Some(Signal::SIGCHLD | Signal::SIGSTKFLT))
+    }
+}
+
+/// The `si_code` and `si_pid` that `ReplaceSiginfo` gives a reported SIGUSR1.
+const REPLACED_SI_CODE: i32 = 42;
+const REPLACED_SI_PID: i32 = 4242;
+
+/// `ReplaceMarker`, whose signal hook reads each reported SIGUSR1's siginfo
+/// (`Guest::signal_info`, recorded as `Filtered`) and tries a replacement
+/// naming SIGUSR2 (refused); for the first SIGUSR1 only, it then replaces the
+/// siginfo with `REPLACED_SI_CODE` and `REPLACED_SI_PID`. Outside a signal
+/// hook, at every write the guest makes to stdout, it records whether
+/// `signal_info` returns a siginfo and what `set_signal_info` returns for an
+/// otherwise valid SIGUSR1 siginfo.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReplaceSiginfo;
+
+/// The guest processes whose first SIGUSR1 `ReplaceSiginfo`'s signal hook has
+/// seen, so each test's guest has its own first signal however the tests share
+/// a process.
+static REPLACE_SIGINFO_FIRST_SEEN: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// The errno of `result`, or 0 for success.
+fn errno_of(result: Result<(), Errno>) -> i32 {
+    result.err().map_or(0, Errno::into_raw)
+}
+
+/// A siginfo naming `signal` and nothing else.
+fn bare_siginfo(signal: libc::c_int) -> [u8; reverie::SIGNAL_INFO_SIZE] {
+    let mut info = [0; reverie::SIGNAL_INFO_SIZE];
+    info[0..4].copy_from_slice(&signal.to_ne_bytes());
+    info
+}
+
+#[reverie::tool]
+impl Tool for ReplaceSiginfo {
+    type GlobalState = Log;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::write);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        if let Syscall::Write(write) = syscall
+            && write.fd() == libc::STDOUT_FILENO
+        {
+            let present = guest.signal_info().is_some();
+            guest.send_rpc(Report::InfoOutside(present)).await;
+            let result = guest.set_signal_info(bare_siginfo(libc::SIGUSR1));
+            guest.send_rpc(Report::SetInfo(errno_of(result))).await;
+        }
+        replace_marker(guest, syscall).await
+    }
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        guest.send_rpc(Report::Signal(signal as i32)).await;
+        if signal == Signal::SIGUSR1 {
+            let first = {
+                let pid = guest.pid().as_raw();
+                let mut seen = REPLACE_SIGINFO_FIRST_SEEN.lock().unwrap();
+                let first = !seen.contains(&pid);
+                if first {
+                    seen.push(pid);
+                }
+                first
+            };
+            // A tracer under a seccomp filter records no siginfo; report
+            // `si_code` 0 for it then, and build the replacement from scratch.
+            let recorded = guest.signal_info();
+            let si_code = recorded.map_or(0, |info| {
+                i32::from_ne_bytes(info[8..12].try_into().unwrap())
+            });
+            let mut info = recorded.unwrap_or_else(|| bare_siginfo(libc::SIGUSR1));
+            guest
+                .send_rpc(Report::Filtered(signal as i32, si_code))
+                .await;
+            let mut mismatched = info;
+            mismatched[0..4].copy_from_slice(&libc::SIGUSR2.to_ne_bytes());
+            let refused = guest.set_signal_info(mismatched);
+            guest.send_rpc(Report::SetInfo(errno_of(refused))).await;
+            if first {
+                info[8..12].copy_from_slice(&REPLACED_SI_CODE.to_ne_bytes());
+                // `si_pid` is the first field of the union after the three
+                // ints and their padding.
+                info[16..20].copy_from_slice(&REPLACED_SI_PID.to_ne_bytes());
+                let replaced = guest.set_signal_info(info);
+                guest.send_rpc(Report::SetInfo(errno_of(replaced))).await;
+            }
+        }
+        Ok(Some(signal))
+    }
+}
+
+/// A signal hook that, for a reported SIGUSR1, replaces its siginfo
+/// (`REPLACED_SI_CODE`), injects a `getpid` and then delivers SIGUSR2 in
+/// SIGUSR1's place. The replacement was chosen for SIGUSR1, so it must not
+/// constrain the resume with SIGUSR2.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReplaceThenRedirect;
+
+#[reverie::tool]
+impl Tool for ReplaceThenRedirect {
+    type GlobalState = Log;
+    type ThreadState = ();
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        guest.send_rpc(Report::Signal(signal as i32)).await;
+        if signal != Signal::SIGUSR1 {
+            return Ok(Some(signal));
+        }
+        let mut info = guest
+            .signal_info()
+            .unwrap_or_else(|| bare_siginfo(libc::SIGUSR1));
+        info[8..12].copy_from_slice(&REPLACED_SI_CODE.to_ne_bytes());
+        let replaced = guest.set_signal_info(info);
+        guest.send_rpc(Report::SetInfo(errno_of(replaced))).await;
+        let result = guest.inject(Getpid::new()).await;
+        guest
+            .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+            .await;
+        Ok(Some(Signal::SIGUSR2))
     }
 }
 
@@ -236,7 +451,10 @@ where
             Ok(result?)
         }
         Syscall::Write(write)
-            if (write.fd() == UNBLOCK_FD || write.fd() == UNBLOCK_THEN_GETPID_FD)
+            if (write.fd() == UNBLOCK_FD
+                || write.fd() == UNBLOCK_THEN_GETPID_FD
+                || write.fd() == UNBLOCK_GETPID_THEN_BLOCK_FD
+                || write.fd() == UNBLOCK_GETPID_BLOCK_THEN_ZERO_FD)
                 && write.len() == 0 =>
         {
             let set = write.buf().and_then(|buf| Addr::from_raw(buf.as_raw()));
@@ -279,6 +497,25 @@ where
             guest
                 .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
                 .await;
+            if write.fd() == UNBLOCK_GETPID_THEN_BLOCK_FD
+                || write.fd() == UNBLOCK_GETPID_BLOCK_THEN_ZERO_FD
+            {
+                let blocked = guest
+                    .inject(
+                        RtSigprocmask::new()
+                            .with_how(libc::SIG_BLOCK)
+                            .with_set(set)
+                            .with_oldset(None)
+                            .with_sigsetsize(8),
+                    )
+                    .await;
+                guest
+                    .send_rpc(Report::Injected(blocked.map_err(Errno::into_raw)))
+                    .await;
+            }
+            if write.fd() == UNBLOCK_GETPID_BLOCK_THEN_ZERO_FD {
+                return Ok(0);
+            }
             Ok(result?)
         }
         Syscall::Write(write)
@@ -791,6 +1028,49 @@ fn injected_syscall_completed_before_group_stop_reports_its_result_once() {
 }
 
 static SIGSYS_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SIGCHLD_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SIGURG_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SIGSTKFLT_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn count_sigstkflt(_signal: libc::c_int) {
+    SIGSTKFLT_HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+extern "C" fn count_sigchld(_signal: libc::c_int) {
+    SIGCHLD_HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+extern "C" fn count_sigurg(_signal: libc::c_int) {
+    SIGURG_HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The `si_code` and `si_pid` of each SIGUSR1 delivery, in order.
+static SIGUSR1_SIGINFO: Mutex<Vec<(i32, i32)>> = Mutex::new(Vec::new());
+
+extern "C" fn record_sigusr1_siginfo(
+    _signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _context: *mut libc::c_void,
+) {
+    // SAFETY: the kernel passes a valid siginfo to an SA_SIGINFO handler. The
+    // guest raises each SIGUSR1 itself, synchronously, and never while it
+    // holds the lock, so the handler cannot deadlock on it.
+    let (code, pid) = unsafe { ((*info).si_code, (*info).si_pid()) };
+    SIGUSR1_SIGINFO.lock().unwrap().push((code, pid));
+}
+
+/// The `si_code` of each SIGUSR2 delivery, in order.
+static SIGUSR2_SI_CODES: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+extern "C" fn record_sigusr2_si_code(
+    _signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _context: *mut libc::c_void,
+) {
+    // SAFETY: as in `record_sigusr1_siginfo`.
+    let code = unsafe { (*info).si_code };
+    SIGUSR2_SI_CODES.lock().unwrap().push(code);
+}
 
 extern "C" fn count_sigsys(_signal: libc::c_int) {
     SIGSYS_HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1064,6 +1344,351 @@ fn signal_pending_before_injected_syscall_interrupts_it() {
         vec![libc::SIGUSR1],
         "the held signal is reported to the tool once before it is delivered"
     );
+}
+
+/// As `signal_pending_before_injected_syscall_interrupts_it`, with SIGCHLD
+/// (queued with `si_code` CLD_EXITED) and SIGURG pending. The injected
+/// `getpid` stops before its `syscall` on SIGCHLD, the lower-numbered, which
+/// is held while SIGURG stays queued, and a held signal is passed on
+/// unreported while another is pending
+/// (https://github.com/rrnewton/reverie/issues/845). The tool's
+/// `filter_unreported_signal` is shown that SIGCHLD, with its siginfo, and
+/// drops it: it never reaches the guest, whose SIGCHLD handler does not run,
+/// while SIGURG is reported and delivered as before. Without the hook the
+/// held SIGCHLD reached the guest with no Tool seeing it.
+#[test]
+fn a_held_sigchld_the_tool_drops_never_reaches_the_guest() {
+    let (output, log) = test_fn::<DropUnreportedSigchld, _>(|| unsafe {
+        SIGCHLD_HANDLER_CALLS.store(0, Ordering::Relaxed);
+        SIGURG_HANDLER_CALLS.store(0, Ordering::Relaxed);
+        install_counter(libc::SIGCHLD, count_sigchld);
+        install_counter(libc::SIGURG, count_sigurg);
+        let set = block(&[libc::SIGCHLD, libc::SIGURG]);
+        queue_to_self(libc::SIGCHLD, libc::CLD_EXITED);
+        queue_to_self(libc::SIGURG, libc::SI_QUEUE);
+        let ret = libc::syscall(
+            libc::SYS_write,
+            UNBLOCK_THEN_GETPID_FD,
+            &set as *const libc::sigset_t,
+            0usize,
+        );
+        let errno = *libc::__errno_location();
+        println!(
+            "{ret} {errno} {} {}",
+            SIGCHLD_HANDLER_CALLS.load(Ordering::Relaxed),
+            SIGURG_HANDLER_CALLS.load(Ordering::Relaxed),
+        );
+    })
+    .expect("run dropped-held-SIGCHLD guest");
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let injected = log.injected.lock().unwrap();
+    let signals = log.signals.lock().unwrap();
+    let filtered = log.filtered.lock().unwrap();
+    eprintln!(
+        "PROBE dropped-held-sigchld guest={} injected={:?} signals={:?} filtered={:?}",
+        stdout.trim(),
+        *injected,
+        *signals,
+        *filtered
+    );
+    assert_eq!(
+        *injected,
+        vec![Ok(0), Err(Errno::ERESTARTSYS.into_raw())],
+        "the unblock completes; SIGCHLD interrupts getpid before it runs"
+    );
+    assert_eq!(
+        *filtered,
+        vec![(libc::SIGCHLD, libc::CLD_EXITED)],
+        "the held SIGCHLD is shown to the hook once, with its siginfo"
+    );
+    assert_eq!(
+        stdout.trim(),
+        format!("-1 {} 0 1", libc::EINTR),
+        "EINTR, the dropped SIGCHLD's handler never runs, SIGURG's runs once"
+    );
+    assert_eq!(*signals, vec![libc::SIGURG], "SIGURG is reported");
+}
+
+/// A tool that reports a signal can read the siginfo it arrived with
+/// (`Guest::signal_info`) and replace the one it is delivered with
+/// (`Guest::set_signal_info`). The guest sends itself SIGUSR1 twice
+/// (`si_code` SI_TKILL). Its SA_SIGINFO handler sees the tool's `si_code` and
+/// `si_pid` for the first and the kernel's own for the second, whose only
+/// replacement, naming another signal, was refused. Outside a signal hook
+/// there is no siginfo to read and an otherwise valid SIGUSR1 replacement is
+/// refused, so no hook's state leaks past it.
+#[test]
+fn a_reporting_tool_reads_and_replaces_a_signals_siginfo() {
+    let (output, log) = test_fn::<ReplaceSiginfo, _>(|| unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = record_sigusr1_siginfo as *const () as usize;
+        action.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut action.sa_mask);
+        assert_eq!(
+            libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+            0
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::syscall(libc::SYS_gettid),
+                    libc::SIGUSR1
+                ),
+                0
+            );
+        }
+        let seen = SIGUSR1_SIGINFO.lock().unwrap().clone();
+        let own = libc::getpid();
+        let shown: Vec<String> = seen
+            .iter()
+            .map(|&(code, pid)| {
+                if pid == own {
+                    format!("{code}:self")
+                } else {
+                    format!("{code}:{pid}")
+                }
+            })
+            .collect();
+        println!("{}", shown.join(" "));
+    })
+    .expect("run siginfo-replacing guest");
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        format!(
+            "{REPLACED_SI_CODE}:{REPLACED_SI_PID} {}:self",
+            libc::SI_TKILL
+        ),
+        "the first delivery has the tool's siginfo, the second the kernel's"
+    );
+    assert_eq!(
+        *log.signals.lock().unwrap(),
+        vec![libc::SIGUSR1, libc::SIGUSR1]
+    );
+    assert_eq!(
+        *log.filtered.lock().unwrap(),
+        vec![
+            (libc::SIGUSR1, libc::SI_TKILL),
+            (libc::SIGUSR1, libc::SI_TKILL)
+        ],
+        "each hook reads the siginfo its signal arrived with"
+    );
+    let set_info = log.set_info.lock().unwrap();
+    assert_eq!(
+        set_info[..3],
+        [libc::EINVAL, 0, libc::EINVAL],
+        "another signal's siginfo is refused and the signal's own is taken"
+    );
+    assert!(
+        !set_info[3..].is_empty() && set_info[3..].iter().all(|&errno| errno == libc::EINVAL),
+        "a valid SIGUSR1 siginfo is refused outside a hook: {set_info:?}"
+    );
+    let info_outside = log.info_outside.lock().unwrap();
+    assert!(
+        !info_outside.is_empty() && info_outside.iter().all(|present| !present),
+        "no siginfo is readable outside a hook: {info_outside:?}"
+    );
+}
+
+/// `a_reporting_tool_reads_and_replaces_a_signals_siginfo` with a tracer that
+/// cannot write a siginfo (`PTRACE_SETSIGINFO` fails with EACCES): the
+/// otherwise valid replacement fails with that error, reported to the tool,
+/// and both deliveries carry the kernel's siginfo. Before, the replacement was
+/// accepted and its failure only logged when the guest resumed.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_refused_siginfo_replacement_is_reported_to_the_tool() {
+    let (output, log, _tracer) = test_tool_under_tracer_filter::<ReplaceSiginfo, _>(
+        Some((
+            libc::PTRACE_SETSIGINFO,
+            libc::SECCOMP_RET_ERRNO | libc::EACCES as u32,
+        )),
+        || unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_sigusr1_siginfo as *const () as usize;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    libc::syscall(
+                        libc::SYS_tgkill,
+                        libc::getpid(),
+                        libc::syscall(libc::SYS_gettid),
+                        libc::SIGUSR1
+                    ),
+                    0
+                );
+            }
+            let seen = SIGUSR1_SIGINFO.lock().unwrap().clone();
+            let own = libc::getpid();
+            let shown: Vec<String> = seen
+                .iter()
+                .map(|&(code, pid)| {
+                    if pid == own {
+                        format!("{code}:self")
+                    } else {
+                        format!("{code}:{pid}")
+                    }
+                })
+                .collect();
+            println!("{}", shown.join(" "));
+        },
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        format!("{0}:self {0}:self", libc::SI_TKILL),
+        "both deliveries carry the kernel's siginfo"
+    );
+    let set_info = log.set_info.lock().unwrap();
+    assert_eq!(
+        set_info[..3],
+        [libc::EINVAL, libc::EACCES, libc::EINVAL],
+        "the valid replacement fails with the tracer's error"
+    );
+}
+
+/// A hook that replaces a SIGUSR1's siginfo, injects a `getpid` and then
+/// delivers SIGUSR2 in SIGUSR1's place: SIGUSR2 is delivered once, with
+/// Linux's own siginfo, and SIGUSR1 never is. The resume applies a
+/// replacement only to the signal it was chosen for. This test does not tell
+/// that apart from enforcing it for any signal: the injection ends at a
+/// SIGTRAP stop, where Linux replaces a siginfo naming another signal either
+/// way. Enforcing it fails the resume (EBUSY) only after an injection that
+/// ends at a stop other than a signal-delivery stop, which no injection from
+/// a signal hook here does.
+#[test]
+fn a_siginfo_replacement_does_not_bind_a_different_resumed_signal() {
+    let (output, log) = test_fn::<ReplaceThenRedirect, _>(|| unsafe {
+        SIGUSR1_SIGINFO.lock().unwrap().clear();
+        SIGUSR2_SI_CODES.lock().unwrap().clear();
+        for (signal, handler) in [
+            (libc::SIGUSR1, record_sigusr1_siginfo as *const () as usize),
+            (libc::SIGUSR2, record_sigusr2_si_code as *const () as usize),
+        ] {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(libc::sigaction(signal, &action, std::ptr::null_mut()), 0);
+        }
+        // tgkill returns the hook's `getpid` result, the known gap pinned by
+        // `signal_hook_injecting_at_a_delivery_stop_requeues_its_signal`.
+        libc::syscall(
+            libc::SYS_tgkill,
+            libc::getpid(),
+            libc::syscall(libc::SYS_gettid),
+            libc::SIGUSR1,
+        );
+        let usr1 = SIGUSR1_SIGINFO.lock().unwrap().len();
+        let usr2 = SIGUSR2_SI_CODES.lock().unwrap().clone();
+        println!("{usr1} {usr2:?}");
+    })
+    .expect("run siginfo-redirecting guest");
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (usr1, usr2) = stdout.trim().split_once(' ').expect("guest output");
+    assert_eq!(usr1, "0", "SIGUSR1 is never delivered");
+    let usr2: Vec<i32> = usr2
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(", ")
+        .map(|code| code.parse().expect("si_code"))
+        .collect();
+    assert_eq!(usr2.len(), 1, "SIGUSR2 is delivered once: {usr2:?}");
+    assert_ne!(
+        usr2[0], REPLACED_SI_CODE,
+        "SIGUSR2 does not carry SIGUSR1's replacement"
+    );
+    assert_eq!(*log.set_info.lock().unwrap(), vec![0]);
+    let injected = log.injected.lock().unwrap();
+    assert!(
+        matches!(injected[..], [Ok(_)]),
+        "the hook's getpid runs once: {injected:?}"
+    );
+    assert_eq!(
+        log.signals.lock().unwrap().first(),
+        Some(&libc::SIGUSR1),
+        "SIGUSR1 is reported first"
+    );
+}
+
+/// As `a_held_sigchld_the_tool_drops_never_reaches_the_guest`, with a
+/// SIGSTKFLT the guest queues itself (`si_code` SI_QUEUE) in place of
+/// SIGCHLD. The number is the ptrace backend's timer signal, which Linux
+/// does not tell from the guest's own, so it is shown to
+/// `filter_unreported_signal` like any other and dropped. Before, every held
+/// SIGSTKFLT was passed on unreported without asking the hook.
+#[test]
+fn a_held_guest_sigstkflt_is_shown_to_the_filter() {
+    let (output, log) = test_fn::<DropUnreportedSigchld, _>(|| unsafe {
+        SIGSTKFLT_HANDLER_CALLS.store(0, Ordering::Relaxed);
+        SIGURG_HANDLER_CALLS.store(0, Ordering::Relaxed);
+        install_counter(libc::SIGSTKFLT, count_sigstkflt);
+        install_counter(libc::SIGURG, count_sigurg);
+        let set = block(&[libc::SIGSTKFLT, libc::SIGURG]);
+        queue_to_self(libc::SIGSTKFLT, libc::SI_QUEUE);
+        queue_to_self(libc::SIGURG, libc::SI_QUEUE);
+        let ret = libc::syscall(
+            libc::SYS_write,
+            UNBLOCK_THEN_GETPID_FD,
+            &set as *const libc::sigset_t,
+            0usize,
+        );
+        let errno = *libc::__errno_location();
+        println!(
+            "{ret} {errno} {} {}",
+            SIGSTKFLT_HANDLER_CALLS.load(Ordering::Relaxed),
+            SIGURG_HANDLER_CALLS.load(Ordering::Relaxed),
+        );
+    })
+    .expect("run dropped-held-SIGSTKFLT guest");
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        *log.filtered.lock().unwrap(),
+        vec![(libc::SIGSTKFLT, libc::SI_QUEUE)],
+        "the guest's SIGSTKFLT is shown to the hook, with its siginfo"
+    );
+    assert_eq!(
+        stdout.trim(),
+        format!("-1 {} 0 1", libc::EINTR),
+        "the dropped SIGSTKFLT's handler never runs, SIGURG's runs once"
+    );
+    assert_eq!(*log.signals.lock().unwrap(), vec![libc::SIGURG]);
 }
 
 /// `ppoll` swaps in a temporary signal mask and leaves the kernel to restore
@@ -1989,6 +2614,46 @@ fn held_sigstop_is_not_reported() {
         "tgkill succeeds, SIGSTOP interrupts getpid before it runs, and the restarted marker's getpid runs"
     );
     assert_eq!(*signals, Vec::<i32>::new(), "SIGSTOP is not reported");
+}
+
+/// `held_sigstop_is_not_reported` with a tool that filters unreported
+/// signals: the held SIGSTOP is shown to `Tool::filter_unreported_signal`
+/// once, with its siginfo, like any other signal. Reverie sends SIGSTOP
+/// itself (a gdb freeze), but Linux does not tell its SIGSTOP from a
+/// guest's, so none is exempt. The hook keeps it, and the guest's outcome is
+/// unchanged.
+#[test]
+fn held_sigstop_is_shown_to_the_filter() {
+    let (output, log) = test_fn::<DropUnreportedSigchld, _>(|| unsafe {
+        let mut sent: i32 = 0;
+        let ret = libc::syscall(
+            libc::SYS_write,
+            SIGSTOP_THEN_GETPID_FD,
+            &mut sent as *mut i32,
+            0usize,
+        );
+        println!("{ret} {}", libc::getpid());
+    })
+    .expect("run filtered held-SIGSTOP guest");
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (ret, pid) = stdout.trim().split_once(' ').expect("guest pid");
+    assert_eq!(ret, pid, "the guest gets the getpid result");
+    assert_eq!(
+        *log.filtered.lock().unwrap(),
+        vec![(libc::SIGSTOP, libc::SI_TKILL)],
+        "the held SIGSTOP is shown to the hook once, with its siginfo"
+    );
+    assert_eq!(
+        *log.signals.lock().unwrap(),
+        Vec::<i32>::new(),
+        "SIGSTOP is not reported"
+    );
 }
 
 /// The ordinary route of a default-action SIGTSTP: its delivery stop is
@@ -5322,10 +5987,23 @@ fn tracer_without_descriptors() {
     *SAVED_NOFILE.lock().unwrap() = Some(limit);
 }
 
+/// A marker's result from its injection's: `EINTR` where the injection
+/// reports that a signal stopped its syscall before it ran (`ERESTARTSYS`),
+/// as for a syscall a handler without `SA_RESTART` interrupts. Returned
+/// as is, `ERESTARTSYS` would have Linux restart the marker, and the tool
+/// would send its SIGTRAP again for the restarted one.
+fn without_restart(result: Result<i64, Errno>) -> Result<i64, Error> {
+    match result {
+        Err(Errno::ERESTARTSYS) => Err(Errno::EINTR.into()),
+        result => Ok(result?),
+    }
+}
+
 /// `ReplaceMarker`, whose hook for `GETPPID_FD` first injects `getpid`, then
 /// sends SIGTRAP to the guest's thread from the tracer, then SIGTSTP when
 /// `TSTP_AFTER_TRAP` is set. Linux dequeues the SIGTRAP when the injected `getppid` is stepped,
-/// before its `syscall` runs.
+/// before its `syscall` runs. The marker gets the `getppid`'s result
+/// (`without_restart`).
 #[derive(Clone, Copy, Debug, Default)]
 struct TrapBeforeGetppid;
 
@@ -5373,19 +6051,20 @@ impl Tool for TrapBeforeGetppid {
                 };
                 assert_eq!(sent, 0, "send signal {signal} to the guest");
             }
-            if GETPPID_WITHOUT_DESCRIPTORS.load(Ordering::Relaxed) {
-                if SAVED_NOFILE.lock().unwrap().is_none() {
-                    tracer_without_descriptors();
-                }
-                let result = guest.inject(Getppid::new()).await;
+            let limited = GETPPID_WITHOUT_DESCRIPTORS.load(Ordering::Relaxed);
+            if limited && SAVED_NOFILE.lock().unwrap().is_none() {
+                tracer_without_descriptors();
+            }
+            let result = guest.inject(Getppid::new()).await;
+            if limited {
                 let limit = SAVED_NOFILE.lock().unwrap().take().unwrap();
                 // SAFETY: restores the limit `tracer_without_descriptors` read.
                 unsafe { assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0) };
-                guest
-                    .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
-                    .await;
-                return Ok(result?);
             }
+            guest
+                .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+                .await;
+            return without_restart(result);
         }
         replace_marker(guest, syscall).await
     }
@@ -5575,15 +6254,15 @@ fn sigtrap_before_an_injected_syscall_is_taken_as_on_main_with_no_descriptor_fro
 /// guest filter's SIGSYS, the `PTRACE_GETSIGMASK` that checks it; at the
 /// SIGTSTP, the `PTRACE_GETSIGINFO` that tells its delivery from a group
 /// stop. Under a tracer filter the trap is taken for the step's report
-/// instead, as on main, and the guest runs as on main: the `getppid` does
-/// not run, and the injection returns the syscall number left in RAX (110),
-/// a known gap (https://github.com/rrnewton/reverie/issues/845). A pending
-/// SIGTSTP is then reported, and its handler runs once. With `prctl` set,
-/// no descriptor can be opened during the injected `getppid`, so procfs
-/// cannot report the tracer thread's mode, and every `prctl` of the tracer
-/// gets that action from then on. With `from_first_sigsys` also set, that
-/// starts before the guest's first SIGSYS, whose delivery stop is then the
-/// first at which the tracer could open procfs to read its mode.
+/// instead, as on main: the `getppid` does not run, and the injection
+/// reports that (`ERESTARTSYS`) rather than the syscall number left in RAX
+/// (110). A pending SIGTSTP is then reported, and its handler runs once.
+/// With `prctl` set, no descriptor can be opened during the injected
+/// `getppid`, so procfs cannot report the tracer thread's mode, and every
+/// `prctl` of the tracer gets that action from then on. With
+/// `from_first_sigsys` also set, that starts before the guest's first
+/// SIGSYS, whose delivery stop is then the first at which the tracer could
+/// open procfs to read its mode.
 #[cfg(target_arch = "x86_64")]
 fn sigtrap_before_an_injected_syscall_runs_as_on_main_under_a_tracer_filter(
     request: u32,
@@ -5604,10 +6283,11 @@ fn sigtrap_before_an_injected_syscall_runs_as_on_main_under_a_tracer_filter(
     check_trap_before_getppid_taken_as_on_main(&output, &log, tstp, probe);
 }
 
-/// Checks main's outcome for `trap_before_getppid_guest(tstp)`: the SIGTRAP
-/// is taken for the step's report, so the injected `getppid` does not run
-/// and returns the syscall number left in RAX (110), and a SIGTSTP handler
-/// runs once.
+/// Checks the outcome for `trap_before_getppid_guest(tstp)` when the SIGTRAP
+/// is taken for the step's report, as on main: the injected `getppid` does
+/// not run, the injection reports that (`ERESTARTSYS`) rather than the
+/// syscall number left in RAX (110), the marker fails with `EINTR`
+/// (`without_restart`), and a SIGTSTP handler runs once.
 #[cfg(target_arch = "x86_64")]
 fn check_trap_before_getppid_taken_as_on_main(
     output: &reverie::process::Output,
@@ -5631,23 +6311,18 @@ fn check_trap_before_getppid_taken_as_on_main(
     );
     assert_eq!(
         *log.injected.lock().unwrap(),
-        vec![Ok(libc::SYS_getppid)],
-        "the SIGTRAP is taken for the step's report, as on main"
+        vec![Err(Errno::ERESTARTSYS.into_raw())],
+        "the SIGTRAP is taken for the step's report, as on main, which reports that the getppid did not run"
     );
     let lines: Vec<&str> = stdout.trim().lines().collect();
     assert_eq!(
         lines,
         [
             format!("4242 1 1 {} {}", libc::SYS_getppid, libc::SYS_getppid),
-            format!(
-                "{} 1 1 {} {}",
-                libc::SYS_getppid,
-                libc::SYS_getppid,
-                libc::SYS_getppid
-            ),
+            format!("-1 1 1 {} {}", libc::SYS_getppid, libc::SYS_getppid),
             usize::from(tstp).to_string(),
         ],
-        "the injected getppid does not run, and a SIGTSTP handler runs once"
+        "the injected getppid does not run, the marker fails, and a SIGTSTP handler runs once"
     );
     let mut signals = vec![libc::SIGSYS];
     if tstp {
@@ -5964,6 +6639,10 @@ const FILTER: u32 = 2;
 const RESTORE: u32 = 4;
 /// `GETPPID_FD` markers `TrapBeforeEachGetppid` has handled.
 static EACH_GETPPID_MARKERS: AtomicUsize = AtomicUsize::new(0);
+/// Whether `TrapBeforeEachGetppid` returns each injection's result to the
+/// guest unchanged, `ERESTARTSYS` included, rather than through
+/// `without_restart`.
+static EACH_GETPPID_FORWARD: AtomicBool = AtomicBool::new(false);
 
 /// Sets the tracer's soft `RLIMIT_NOFILE` to 0, so no descriptor can be
 /// opened, and returns the limit to restore.
@@ -6099,7 +6778,10 @@ impl Tool for TrapBeforeEachGetppid {
         guest
             .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
             .await;
-        Ok(result?)
+        if EACH_GETPPID_FORWARD.load(Ordering::Relaxed) {
+            return Ok(result?);
+        }
+        without_restart(result)
     }
 
     async fn handle_signal_event<G: Guest<Self>>(
@@ -6118,12 +6800,15 @@ impl Tool for TrapBeforeEachGetppid {
 /// each marker, checks whether the step is retried (`true`: the trap is
 /// discarded, and the guest's filter traps the `getppid`, which returns
 /// `ENOSYS` to the tool, and whose SIGSYS the guest handles) or the trap is
-/// taken for the step's report, as on main (`false`: the injection returns
-/// the syscall number left in RAX, and nothing runs in the guest).
+/// taken for the step's report, as on main (`false`: the injection reports
+/// that the `getppid` did not run, `ERESTARTSYS` rather than the syscall
+/// number left in RAX, nothing runs in the guest, and the marker fails with
+/// `EINTR`).
 #[cfg(target_arch = "x86_64")]
 fn sigtrap_before_each_injected_syscall(script: [u32; 2], retried: [bool; 2], probe: &str) {
     assert_tracer_unfiltered();
     EACH_GETPPID_MARKERS.store(0, Ordering::Relaxed);
+    EACH_GETPPID_FORWARD.store(false, Ordering::Relaxed);
     for (entry, value) in EACH_GETPPID_SCRIPT.iter().zip(script) {
         entry.store(value, Ordering::Relaxed);
     }
@@ -6163,8 +6848,8 @@ fn sigtrap_before_each_injected_syscall(script: [u32; 2], retried: [bool; 2], pr
             injected.push(Err(libc::ENOSYS));
             signals.push(libc::SIGSYS);
         } else {
-            lines.push(format!("{getppid} {traps} 1 {getppid} {rax}"));
-            injected.push(Ok(getppid));
+            lines.push(format!("-1 {traps} 1 {getppid} {rax}"));
+            injected.push(Err(Errno::ERESTARTSYS.into_raw()));
         }
     }
     let got: Vec<&str> = stdout.trim().lines().collect();
@@ -6290,6 +6975,74 @@ fn sigtrap_before_an_injected_syscall_is_discarded_until_a_filter_is_added_with_
             [true, false],
             "trap-each-late-filter-emfile",
         )
+    });
+}
+
+/// A handler that returns an injection's `ERESTARTSYS`, as `?` does, has
+/// Linux restart the guest's syscall, which the tool then handles again. The
+/// trap before the first injected `getppid` is taken as on main, with no
+/// descriptor left to read the tracer thread's mode, and the tool returns
+/// the injection's `ERESTARTSYS` unchanged (`EACH_GETPPID_FORWARD`). The
+/// marker is restarted rather than failed: the tool handles it a second
+/// time, with descriptors, so that trap is discarded and the `getppid` runs,
+/// which the guest's filter traps, and whose SIGSYS the guest handles.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn guest_syscall_is_restarted_when_its_handler_returns_an_injection_that_did_not_run() {
+    const NAME: &str =
+        "guest_syscall_is_restarted_when_its_handler_returns_an_injection_that_did_not_run";
+    in_child_process(NAME, || {
+        assert_tracer_unfiltered();
+        EACH_GETPPID_MARKERS.store(0, Ordering::Relaxed);
+        EACH_GETPPID_FORWARD.store(true, Ordering::Relaxed);
+        for (entry, value) in EACH_GETPPID_SCRIPT.iter().zip([LOWER | RESTORE, 0]) {
+            entry.store(value, Ordering::Relaxed);
+        }
+        let (output, log) = test_fn::<TrapBeforeEachGetppid, _>(|| unsafe {
+            trap_getppid();
+            print_seccomp_trap(libc::syscall(libc::SYS_getppid));
+            let ret = libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
+            print_seccomp_trap(ret);
+        })
+        .expect("run restarted-getppid guest");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!(
+            "PROBE trap-restart status={:?} guest={:?} injected={:?} signals={:?}",
+            output.status,
+            stdout.trim(),
+            *log.injected.lock().unwrap(),
+            *log.signals.lock().unwrap()
+        );
+        assert_eq!(
+            output.status,
+            ExitStatus::Exited(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            EACH_GETPPID_MARKERS.load(Ordering::Relaxed),
+            2,
+            "the tool handles the marker, then the restarted marker"
+        );
+        assert_eq!(
+            *log.injected.lock().unwrap(),
+            vec![Err(Errno::ERESTARTSYS.into_raw()), Err(libc::ENOSYS)],
+            "the first getppid does not run, and the second is trapped by the guest's filter"
+        );
+        let getppid = libc::SYS_getppid;
+        let lines: Vec<&str> = stdout.trim().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                format!("4242 1 1 {getppid} {getppid}"),
+                format!("4242 2 1 {getppid} {}", -libc::ENOSYS),
+            ],
+            "the guest's SIGSYS handler emulates the restarted marker's getppid once"
+        );
+        assert_eq!(
+            *log.signals.lock().unwrap(),
+            vec![libc::SIGSYS, libc::SIGSYS]
+        );
     });
 }
 
@@ -8147,6 +8900,1075 @@ fn requeued_signal_recaptured_by_an_injection_is_not_reported_again() {
     );
 }
 
+/// The set `BlockInFirstSignalHookDropUnreported` blocks for SIGSYS. A
+/// static, so the forked guest has it at the same address.
+static SIGSYS_SET: u64 = 1 << (libc::SIGSYS - 1);
+
+/// Like `BlockInFirstSignalHook`, but the first hook blocks the signal it
+/// reports, SIGUSR1 (`SIGUSR1_SET`) or SIGSYS (`SIGSYS_SET`); and drops every
+/// SIGUSR1 and SIGSYS that the backend would pass to the guest unreported
+/// (`Tool::filter_unreported_signal`), recording each signal shown to that
+/// hook. Each signal `Tool::note_unreported_signal` records is reported
+/// when its thread exits (`Report::Noted`).
+#[derive(Clone, Copy, Debug, Default)]
+struct BlockInFirstSignalHookDropUnreported;
+
+/// `BlockInFirstSignalHookDropUnreported`'s thread state.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HookedAndNoted {
+    /// Whether a signal hook has run on this thread.
+    hooked: bool,
+    /// The signals `Tool::note_unreported_signal` recorded, as
+    /// `Report::Noted` carries them.
+    noted: Vec<(i32, String, bool)>,
+}
+
+#[reverie::tool]
+impl Tool for BlockInFirstSignalHookDropUnreported {
+    type GlobalState = Log;
+    type ThreadState = HookedAndNoted;
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::write);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        replace_marker(guest, syscall).await
+    }
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        guest.send_rpc(Report::Signal(signal as i32)).await;
+        if !std::mem::replace(&mut guest.thread_state_mut().hooked, true) {
+            let set = if signal == Signal::SIGSYS {
+                &SIGSYS_SET
+            } else {
+                &SIGUSR1_SET
+            };
+            let set = Addr::from_raw(set as *const u64 as usize);
+            let result = guest
+                .inject(
+                    RtSigprocmask::new()
+                        .with_how(libc::SIG_BLOCK)
+                        .with_set(set)
+                        .with_oldset(None)
+                        .with_sigsetsize(8),
+                )
+                .await;
+            guest
+                .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+                .await;
+        }
+        Ok(Some(signal))
+    }
+
+    async fn filter_unreported_signal<R: reverie::GlobalRPC<Self::GlobalState>>(
+        &self,
+        rpc: &R,
+        unreported: reverie::UnreportedSignal,
+    ) -> bool {
+        let si_code = unreported.siginfo().map_or(0, |info| {
+            i32::from_ne_bytes(info[8..12].try_into().unwrap())
+        });
+        let signal = unreported.signal();
+        rpc.send_rpc(Report::Filtered(unreported.number(), si_code))
+            .await;
+        !matches!(signal, Some(Signal::SIGUSR1 | Signal::SIGSYS))
+    }
+
+    fn note_unreported_signal(
+        &self,
+        thread_state: &mut HookedAndNoted,
+        signal: &reverie::UnreportedSignal,
+        kept: bool,
+    ) {
+        thread_state
+            .noted
+            .push((signal.number(), signal.reason().name().to_string(), kept));
+    }
+
+    async fn on_exit_thread<G: reverie::GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: reverie::Tid,
+        global_state: &G,
+        thread_state: HookedAndNoted,
+        _exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        for (signal, reason, kept) in thread_state.noted {
+            global_state
+                .send_rpc(Report::Noted(signal, reason, kept))
+                .await;
+        }
+        Ok(())
+    }
+}
+
+/// A dropped held signal does not hide a later one. As in
+/// `requeued_signal_recaptured_by_an_injection_is_not_reported_again`, the
+/// first hook of a queued SIGUSR1 blocks it and passes it through, so Linux
+/// requeues the instance the tool has seen. A marker then unblocks it, its
+/// `getpid` holds it, and the marker blocks it again before returning, so
+/// the held instance is passed on unreported and the tool's filter drops
+/// it: the instance the tool saw is gone. A fresh SIGUSR1, held by the
+/// unblock marker's `getpid` with nothing blocking it, is one the tool has
+/// not seen: it is reported, and its handler runs once with its queued
+/// siginfo. Before, the dropped instance kept its count, the fresh SIGUSR1
+/// took it, went to the filter unreported and was dropped as well.
+#[test]
+fn a_dropped_held_signal_does_not_hide_a_later_one() {
+    let (output, log) = test_fn_bounded::<BlockInFirstSignalHookDropUnreported, _>(
+        || unsafe {
+            install_recorder(libc::SIGUSR1);
+            queue_value_to_self(libc::SIGUSR1, libc::SI_QUEUE);
+            let dropped = libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_GETPID_THEN_BLOCK_FD,
+                &SIGUSR1_SET as *const u64,
+                0usize,
+            );
+            println!(
+                "{dropped} {} {}",
+                is_pending(libc::SIGUSR1),
+                is_blocked(libc::SIGUSR1)
+            );
+            queue_value_to_self(libc::SIGUSR1, libc::SI_QUEUE);
+            let ret = libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_THEN_GETPID_FD,
+                &SIGUSR1_SET as *const u64,
+                0usize,
+            );
+            let errno = *libc::__errno_location();
+            print_recorded(ret, errno, libc::SIGUSR1);
+        },
+        "dropped held signal",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!(
+        "PROBE dropped-held guest={:?} injected={:?} signals={:?} filtered={:?}",
+        stdout.trim(),
+        *log.injected.lock().unwrap(),
+        *log.signals.lock().unwrap(),
+        *log.filtered.lock().unwrap()
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (dropped, recorded) = stdout.trim().split_once('\n').expect("two lines");
+    let (fields, pid) = recorded.rsplit_once(' ').expect("guest pid");
+    let pid: i64 = pid.parse().expect("guest pid");
+    assert_eq!(
+        dropped,
+        format!("{pid} 0 1"),
+        "the marker restarts after the dropped signal and returns the pid; SIGUSR1 is blocked and no longer pending"
+    );
+    assert_eq!(
+        fields,
+        format!(
+            "-1 {} 1 {} {pid} {QUEUED_VALUE} 0 0 1",
+            libc::EINTR,
+            libc::SI_QUEUE
+        ),
+        "the fresh SIGUSR1 interrupts getpid and runs the handler once with its queued siginfo"
+    );
+    assert_eq!(
+        *log.signals.lock().unwrap(),
+        vec![libc::SIGUSR1, libc::SIGUSR1],
+        "the first SIGUSR1 is reported at its delivery and the fresh one when held"
+    );
+    assert_eq!(
+        *log.filtered.lock().unwrap(),
+        vec![(libc::SIGUSR1, libc::SI_QUEUE)],
+        "only the recaptured instance is passed on unreported, and dropped"
+    );
+    assert_eq!(
+        *log.noted.lock().unwrap(),
+        vec![(libc::SIGUSR1, "held, blocked".to_string(), false)],
+        "the thread records the dropped instance, held while its mask blocks it"
+    );
+    let restart = Err(Errno::ERESTARTSYS.into_raw());
+    assert_eq!(
+        *log.injected.lock().unwrap(),
+        vec![
+            // The first hook's block.
+            Ok(0),
+            // The marker: unblock, the getpid the recaptured SIGUSR1
+            // interrupts, block; restarted: unblock, getpid, block.
+            Ok(0),
+            restart,
+            Ok(0),
+            Ok(0),
+            Ok(pid),
+            Ok(0),
+            // The unblock marker and the getpid the fresh SIGUSR1 interrupts.
+            Ok(0),
+            restart,
+        ]
+    );
+}
+
+/// As `a_dropped_held_signal_does_not_hide_a_later_one`, with the drop on a
+/// direct path. The first hook of a SIGSYS queued with a positive `si_code`
+/// blocks it and passes it through, so Linux requeues the instance the tool
+/// has seen. The guest's next marker is replaced (`GETPPID_FD`), so its own
+/// `write` is skipped, and Linux's synchronous dequeue takes the
+/// still-blocked SIGSYS at that skip's step
+/// (`guest_blocked_signal_dequeued_after_injected_syscall_stays_blocked`).
+/// That signal is passed on unreported, and the tool's filter drops it. A
+/// fresh SIGSYS, held by the unblock marker's `getpid`, is one the tool has
+/// not seen: it is reported, and its handler runs once. Before, the direct
+/// drop kept the count, the fresh SIGSYS took it, went to the filter
+/// unreported and was dropped as well.
+#[test]
+fn a_signal_dropped_while_a_skipped_syscall_steps_does_not_hide_a_later_one() {
+    let (output, log) = test_fn_bounded::<BlockInFirstSignalHookDropUnreported, _>(
+        || unsafe {
+            SIGSYS_HANDLER_CALLS.store(0, Ordering::Relaxed);
+            install_counter(libc::SIGSYS, count_sigsys);
+            queue_to_self(libc::SIGSYS, 1);
+            let requeued = (is_pending(libc::SIGSYS), is_blocked(libc::SIGSYS));
+            let ppid = libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
+            let dropped = (is_pending(libc::SIGSYS), is_blocked(libc::SIGSYS));
+            queue_to_self(libc::SIGSYS, libc::SI_QUEUE);
+            let ret = libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_THEN_GETPID_FD,
+                &SIGSYS_SET as *const u64,
+                0usize,
+            );
+            let errno = *libc::__errno_location();
+            println!(
+                "{} {} | {} {} {} | {ret} {errno} {} {}",
+                requeued.0,
+                requeued.1,
+                ppid == libc::getppid() as i64,
+                dropped.0,
+                dropped.1,
+                SIGSYS_HANDLER_CALLS.load(Ordering::Relaxed),
+                libc::getpid()
+            );
+        },
+        "signal dropped while a skipped syscall steps",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!(
+        "PROBE skipped-drop guest={:?} injected={:?} signals={:?} filtered={:?}",
+        stdout.trim(),
+        *log.injected.lock().unwrap(),
+        *log.signals.lock().unwrap(),
+        *log.filtered.lock().unwrap()
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (fields, _pid) = stdout.trim().rsplit_once(' ').expect("guest pid");
+    assert_eq!(
+        fields,
+        format!("1 1 | true 0 1 | -1 {} 1", libc::EINTR),
+        "the first SIGSYS is requeued blocked, then gone after the skipped write; the fresh one interrupts getpid and runs the handler once"
+    );
+    assert_eq!(
+        *log.signals.lock().unwrap(),
+        vec![libc::SIGSYS, libc::SIGSYS],
+        "the first SIGSYS is reported at its delivery and the fresh one when held"
+    );
+    assert_eq!(
+        *log.filtered.lock().unwrap(),
+        vec![(libc::SIGSYS, 1)],
+        "only the requeued instance is passed on unreported, at the skip's step, and dropped"
+    );
+    assert_eq!(
+        *log.noted.lock().unwrap(),
+        vec![(libc::SIGSYS, "during a syscall skip".to_string(), false)],
+        "the thread records the dropped instance, taken while a skipped syscall steps"
+    );
+    let injected = log.injected.lock().unwrap();
+    assert!(
+        matches!(
+            injected[..],
+            [Ok(0), Ok(_), Ok(0), Err(errno)] if errno == Errno::ERESTARTSYS.into_raw()
+        ),
+        "the first hook's block, the getppid marker, the unblock, and the getpid the fresh SIGSYS interrupts: {injected:?}"
+    );
+}
+
+/// The guest processes whose first unreported SIGUSR1
+/// `QueueAndBlockSigusr1InFirstHook` has dropped.
+static FIRST_UNREPORTED_SIGUSR1_DROPPED: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Like `ReplaceMarker`, but the first signal hook of SIGUSR1 on each thread
+/// queues another SIGUSR1 to the thread from the tracer (`SI_QUEUE`, the
+/// guest's PID and `QUEUED_VALUE`), injects a `getpid`, which that second
+/// SIGUSR1 stops and which holds it, then injects
+/// `rt_sigprocmask(SIG_BLOCK, {SIGUSR1})`, each reported, and passes the
+/// first SIGUSR1 through. Its `filter_unreported_signal` drops the first
+/// unreported SIGUSR1 of each guest process and keeps every other signal,
+/// recording each one.
+#[derive(Clone, Copy, Debug, Default)]
+struct QueueAndBlockSigusr1InFirstHook;
+
+#[reverie::tool]
+impl Tool for QueueAndBlockSigusr1InFirstHook {
+    type GlobalState = Log;
+    /// Whether a SIGUSR1 hook has run on this thread.
+    type ThreadState = bool;
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::write);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        replace_marker(guest, syscall).await
+    }
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        queue_and_block_sigusr1_in_first_hook(guest, signal).await
+    }
+
+    async fn filter_unreported_signal<R: reverie::GlobalRPC<Self::GlobalState>>(
+        &self,
+        rpc: &R,
+        unreported: reverie::UnreportedSignal,
+    ) -> bool {
+        let si_code = unreported.siginfo().map_or(0, |info| {
+            i32::from_ne_bytes(info[8..12].try_into().unwrap())
+        });
+        rpc.send_rpc(Report::Filtered(unreported.number(), si_code))
+            .await;
+        if unreported.signal() != Some(Signal::SIGUSR1) {
+            return true;
+        }
+        let pid = unreported.pid().as_raw();
+        let mut dropped = FIRST_UNREPORTED_SIGUSR1_DROPPED.lock().unwrap();
+        if dropped.contains(&pid) {
+            return true;
+        }
+        dropped.push(pid);
+        false
+    }
+}
+
+/// The signal hook of `QueueAndBlockSigusr1InFirstHook` and
+/// `QueueAndBlockSigusr1InFirstHookKeeping`.
+async fn queue_and_block_sigusr1_in_first_hook<T, G>(
+    guest: &mut G,
+    signal: Signal,
+) -> Result<Option<Signal>, Errno>
+where
+    T: Tool<GlobalState = Log, ThreadState = bool>,
+    G: Guest<T>,
+{
+    guest.send_rpc(Report::Signal(signal as i32)).await;
+    if signal == Signal::SIGUSR1 && !std::mem::replace(guest.thread_state_mut(), true) {
+        // SAFETY: a zeroed siginfo is valid; the fields written open its
+        // union after the three ints, as in `queue_value_to_self`.
+        let queued = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            info.si_signo = libc::SIGUSR1;
+            info.si_code = libc::SI_QUEUE;
+            let fields = (&mut info as *mut libc::siginfo_t).cast::<u8>().add(16);
+            fields.cast::<libc::pid_t>().write(guest.pid().as_raw());
+            fields.add(8).cast::<usize>().write(QUEUED_VALUE);
+            libc::syscall(
+                libc::SYS_rt_tgsigqueueinfo,
+                guest.pid().as_raw(),
+                guest.tid().as_raw(),
+                libc::SIGUSR1,
+                &mut info as *mut libc::siginfo_t,
+            )
+        };
+        assert_eq!(queued, 0, "queue a second SIGUSR1 to the guest");
+        let result = guest.inject(Getpid::new()).await;
+        guest
+            .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+            .await;
+        let set = Addr::from_raw(&SIGUSR1_SET as *const u64 as usize);
+        let result = guest
+            .inject(
+                RtSigprocmask::new()
+                    .with_how(libc::SIG_BLOCK)
+                    .with_set(set)
+                    .with_oldset(None)
+                    .with_sigsetsize(8),
+            )
+            .await;
+        guest
+            .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+            .await;
+    }
+    Ok(Some(signal))
+}
+
+/// `QueueAndBlockSigusr1InFirstHook`, keeping every signal the backend would
+/// pass on unreported (`filter_unreported_signal`'s default).
+#[derive(Clone, Copy, Debug, Default)]
+struct QueueAndBlockSigusr1InFirstHookKeeping;
+
+#[reverie::tool]
+impl Tool for QueueAndBlockSigusr1InFirstHookKeeping {
+    type GlobalState = Log;
+    /// Whether a SIGUSR1 hook has run on this thread.
+    type ThreadState = bool;
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::write);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        replace_marker(guest, syscall).await
+    }
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        queue_and_block_sigusr1_in_first_hook(guest, signal).await
+    }
+}
+
+/// A reported instance delivered at its own stop does not lend its count to a
+/// later instance. As in
+/// `dropping_an_unreported_held_signal_keeps_a_reported_instances_count`,
+/// with a Tool that keeps every signal: the first hook of P queues Q, whose
+/// stop holds the hook's `getpid`, blocks SIGUSR1 and passes P through, so
+/// Linux requeues P. The guest's unblock marker resumes Q, passed on
+/// unreported while P is pending, and P is then delivered at its own stop,
+/// where it is reported again (as on main,
+/// https://github.com/rrnewton/reverie/issues/845). A fresh SIGUSR1 R, held
+/// by the unblock marker's `getpid`, is one the Tool has not seen: it is
+/// reported. Before, P's count outlived P's delivery and R took it, passing
+/// on unreported.
+#[test]
+fn a_reported_signal_delivered_at_its_own_stop_lends_no_count() {
+    let (output, log) = test_fn_bounded::<QueueAndBlockSigusr1InFirstHookKeeping, _>(
+        || unsafe {
+            install_recorder(libc::SIGUSR1);
+            assert_eq!(
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::syscall(libc::SYS_gettid),
+                    libc::SIGUSR1
+                ),
+                0
+            );
+            let unblocked = libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_FD,
+                &SIGUSR1_SET as *const u64,
+                0usize,
+            );
+            let after_pq = RECORDED_CALLS.load(Ordering::Relaxed);
+            block(&[libc::SIGUSR1]);
+            queue_value_to_self(libc::SIGUSR1, libc::SI_QUEUE);
+            let ret = libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_THEN_GETPID_FD,
+                &SIGUSR1_SET as *const u64,
+                0usize,
+            );
+            let errno = *libc::__errno_location();
+            println!("{unblocked} {after_pq}");
+            print_recorded(ret, errno, libc::SIGUSR1);
+        },
+        "reported signal delivered at its own stop",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!(
+        "PROBE pqr guest={:?} injected={:?} signals={:?}",
+        stdout.trim(),
+        *log.injected.lock().unwrap(),
+        *log.signals.lock().unwrap()
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (before, recorded) = stdout.trim().split_once('\n').expect("two lines");
+    assert_eq!(
+        before, "0 2",
+        "the unblock succeeds; Q's and P's handlers ran"
+    );
+    let (fields, pid) = recorded.rsplit_once(' ').expect("guest pid");
+    assert_eq!(
+        fields,
+        format!(
+            "-1 {} 3 {} {pid} {QUEUED_VALUE} 0 0 3",
+            libc::EINTR,
+            libc::SI_QUEUE
+        ),
+        "R interrupts the getpid and runs the handler, with its queued siginfo"
+    );
+    assert_eq!(
+        *log.signals.lock().unwrap(),
+        vec![libc::SIGUSR1; 3],
+        "P at its hook, P again at its own delivery stop (known gap), and R"
+    );
+    let restart = Err(Errno::ERESTARTSYS.into_raw());
+    assert_eq!(
+        *log.injected.lock().unwrap(),
+        vec![
+            // The hook: the getpid Q interrupts, and the block.
+            restart,
+            Ok(0),
+            // The unblock marker.
+            Ok(0),
+            // The unblock marker and the getpid R interrupts.
+            Ok(0),
+            restart,
+        ]
+    );
+}
+
+/// Dropping a held instance that the Tool was never told about does not
+/// cost a reported instance its count. The first hook of a tgkill'd SIGUSR1
+/// (P) queues a second SIGUSR1 (Q), whose stop holds the hook's `getpid`,
+/// blocks SIGUSR1 and passes P through, so Linux requeues P, which counts as
+/// reported, while Q waits in the hold slot. The guest's next marker resumes
+/// Q, which its mask blocks, so it is passed on unreported and the filter
+/// drops it. The unblock marker's `getpid` then holds P: the Tool saw it, so
+/// it is passed on unreported, kept, and its handler runs once, with P's
+/// siginfo (SI_TKILL). The Tool is told about SIGUSR1 once. Before, Q's drop
+/// took P's count, and P was reported a second time.
+#[test]
+fn dropping_an_unreported_held_signal_keeps_a_reported_instances_count() {
+    let (output, log) = test_fn_bounded::<QueueAndBlockSigusr1InFirstHook, _>(
+        || unsafe {
+            install_recorder(libc::SIGUSR1);
+            assert_eq!(
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::syscall(libc::SYS_gettid),
+                    libc::SIGUSR1
+                ),
+                0
+            );
+            let blocked = is_blocked(libc::SIGUSR1);
+            libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
+            let pending = is_pending(libc::SIGUSR1);
+            println!("{blocked} {pending}");
+            let ret = libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_THEN_GETPID_FD,
+                &SIGUSR1_SET as *const u64,
+                0usize,
+            );
+            let errno = *libc::__errno_location();
+            print_recorded(ret, errno, libc::SIGUSR1);
+        },
+        "dropped unreported held signal",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!(
+        "PROBE drop-q guest={:?} injected={:?} signals={:?} filtered={:?}",
+        stdout.trim(),
+        *log.injected.lock().unwrap(),
+        *log.signals.lock().unwrap(),
+        *log.filtered.lock().unwrap()
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (before, recorded) = stdout.trim().split_once('\n').expect("two lines");
+    assert_eq!(
+        before, "1 1",
+        "SIGUSR1 blocked, and P pending, after the hook"
+    );
+    let (fields, pid) = recorded.rsplit_once(' ').expect("guest pid");
+    let pid: i64 = pid.parse().expect("guest pid");
+    assert_eq!(
+        fields,
+        format!("-1 {} 1 {} {pid} 0 0 0 1", libc::EINTR, libc::SI_TKILL),
+        "P interrupts the getpid and runs the handler once, with its own siginfo"
+    );
+    assert_eq!(
+        *log.signals.lock().unwrap(),
+        vec![libc::SIGUSR1],
+        "the Tool is told about SIGUSR1 once, for P"
+    );
+    assert_eq!(
+        *log.filtered.lock().unwrap(),
+        vec![
+            (libc::SIGUSR1, libc::SI_QUEUE),
+            (libc::SIGUSR1, libc::SI_TKILL)
+        ],
+        "Q is shown to the filter and dropped, then P, which is kept"
+    );
+    let restart = Err(Errno::ERESTARTSYS.into_raw());
+    assert_eq!(
+        *log.injected.lock().unwrap(),
+        vec![
+            // The hook: the getpid Q interrupts, and the block.
+            restart,
+            Ok(0),
+            // The getppid marker.
+            Ok(std::process::id() as i64),
+            // The unblock marker and the getpid P interrupts.
+            Ok(0),
+            restart,
+        ]
+    );
+}
+
+/// A reported instance that a fallback passes on again keeps its count. As in
+/// `requeued_signal_recaptured_by_an_injection_is_not_reported_again`, the
+/// first hook of a queued SIGUSR1 blocks it and passes it through, so Linux
+/// requeues the instance the Tool saw. A marker unblocks it, its `getpid`
+/// holds it, and the marker blocks it again and returns 0 (so the guest does
+/// not restart it), so it is passed on unreported (the Tool keeps it) and
+/// Linux requeues it once more. The unblock marker's
+/// `getpid` then holds it a third time: it is still the instance the Tool
+/// saw, so it is delivered without a second report, and its handler runs
+/// once. Before instances carried their count, this already held; the test
+/// fails if a kept instance does not give its count back.
+///
+/// The handler sees the instance's own siginfo (SI_QUEUE, the guest as
+/// sender, its value): the held signal passed on unreported gets its recorded
+/// siginfo written back (https://github.com/rrnewton/reverie/issues/999).
+/// Before, it saw the one Linux made up for the stop it was resumed from
+/// (SI_USER, the tracer as sender, no value), a case of
+/// https://github.com/rrnewton/reverie/issues/845.
+#[test]
+fn a_reported_signal_kept_by_a_fallback_is_not_reported_again() {
+    let (output, log) = test_fn_bounded::<BlockInFirstSignalHook, _>(
+        || unsafe {
+            install_recorder(libc::SIGUSR1);
+            queue_value_to_self(libc::SIGUSR1, libc::SI_QUEUE);
+            let first = libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_GETPID_BLOCK_THEN_ZERO_FD,
+                &SIGUSR1_SET as *const u64,
+                0usize,
+            );
+            println!(
+                "{first} {} {} {}",
+                RECORDED_CALLS.load(Ordering::Relaxed),
+                is_pending(libc::SIGUSR1),
+                is_blocked(libc::SIGUSR1)
+            );
+            let ret = libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_THEN_GETPID_FD,
+                &SIGUSR1_SET as *const u64,
+                0usize,
+            );
+            let errno = *libc::__errno_location();
+            print_recorded(ret, errno, libc::SIGUSR1);
+        },
+        "reported signal kept by a fallback",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!(
+        "PROBE kept-fallback guest={:?} injected={:?} signals={:?}",
+        stdout.trim(),
+        *log.injected.lock().unwrap(),
+        *log.signals.lock().unwrap()
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (first, recorded) = stdout.trim().split_once('\n').expect("two lines");
+    let (fields, pid) = recorded.rsplit_once(' ').expect("guest pid");
+    assert_eq!(
+        first, "0 0 1 1",
+        "the first marker returns 0; no handler ran, SIGUSR1 pending and blocked"
+    );
+    let fields: Vec<&str> = fields.split(' ').collect();
+    assert_eq!(
+        format!(
+            "{} {} {} {} {}",
+            fields[0],
+            fields[1],
+            fields[2],
+            fields[3],
+            fields[5..].join(" ")
+        ),
+        format!(
+            "-1 {} 1 {} {} 0 0 1",
+            libc::EINTR,
+            libc::SI_QUEUE,
+            QUEUED_VALUE
+        ),
+        "the handler runs once, with the instance's own siginfo (SI_QUEUE and its value)"
+    );
+    assert_eq!(fields[4], pid, "the sender is the guest, as queued");
+    assert_eq!(
+        *log.signals.lock().unwrap(),
+        vec![libc::SIGUSR1],
+        "the one queued instance is reported once"
+    );
+}
+
+/// The set `BlockSigsegvInFirstHook` blocks. A static, so the forked guest
+/// has it at the same address.
+static SIGSEGV_SET: u64 = 1 << (libc::SIGSEGV - 1);
+
+/// Like `ReplaceMarker`, with RDTSC intercepted and reported, and the first
+/// SIGSEGV hook on each thread injecting `rt_sigprocmask(SIG_BLOCK,
+/// {SIGSEGV})`, reported, before passing its signal through.
+#[derive(Clone, Copy, Debug, Default)]
+struct BlockSigsegvInFirstHook;
+
+#[reverie::tool]
+impl Tool for BlockSigsegvInFirstHook {
+    type GlobalState = Log;
+    /// Whether a SIGSEGV hook has run on this thread.
+    type ThreadState = bool;
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::write);
+        #[cfg(target_arch = "x86_64")]
+        subscription.rdtsc();
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        replace_marker(guest, syscall).await
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn handle_rdtsc_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        request: reverie::Rdtsc,
+    ) -> Result<reverie::RdtscResult, Errno> {
+        guest.send_rpc(Report::Rdtsc).await;
+        Ok(reverie::RdtscResult::new(request))
+    }
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        guest.send_rpc(Report::Signal(signal as i32)).await;
+        if signal == Signal::SIGSEGV && !std::mem::replace(guest.thread_state_mut(), true) {
+            let set = Addr::from_raw(&SIGSEGV_SET as *const u64 as usize);
+            let result = guest
+                .inject(
+                    RtSigprocmask::new()
+                        .with_how(libc::SIG_BLOCK)
+                        .with_set(set)
+                        .with_oldset(None)
+                        .with_sigsetsize(8),
+                )
+                .await;
+            guest
+                .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+                .await;
+        }
+        Ok(Some(signal))
+    }
+}
+
+/// A reported instance that the backend consumes itself does not lend its
+/// count to a later instance. The first hook of a queued SIGSEGV (P) blocks
+/// it and passes it through, so Linux requeues P. The guest then executes
+/// RDTSC, which the Tool intercepts: Linux forces a SIGSEGV, which unblocks
+/// SIGSEGV, resets its handler and coalesces into the pending P, and the
+/// backend emulates the RDTSC and suppresses that delivery, P with it. The
+/// guest reinstalls its handler and queues a fresh SIGSEGV (R), which the
+/// unblock marker's `getpid` holds: the Tool has not seen it, so it is
+/// reported, and its handler runs once. Before, the suppressed delivery left
+/// P's count, R took it and went unreported.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_reported_signal_the_backend_suppresses_lends_no_count() {
+    let (output, log) = test_fn_bounded::<BlockSigsegvInFirstHook, _>(
+        || unsafe {
+            install_recorder(libc::SIGSEGV);
+            queue_value_to_self(libc::SIGSEGV, libc::SI_QUEUE);
+            let pending = is_pending(libc::SIGSEGV);
+            let low: u64;
+            let high: u64;
+            std::arch::asm!("rdtsc", out("rax") low, out("rdx") high);
+            let counted = (high << 32 | low) != 0;
+            let after = (
+                is_pending(libc::SIGSEGV),
+                RECORDED_CALLS.load(Ordering::Relaxed),
+            );
+            install_recorder(libc::SIGSEGV);
+            block(&[libc::SIGSEGV]);
+            queue_value_to_self(libc::SIGSEGV, libc::SI_QUEUE);
+            let ret = libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_THEN_GETPID_FD,
+                &SIGSEGV_SET as *const u64,
+                0usize,
+            );
+            let errno = *libc::__errno_location();
+            println!("{pending} {counted} {} {}", after.0, after.1);
+            print_recorded(ret, errno, libc::SIGSEGV);
+        },
+        "reported signal the backend suppresses",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!(
+        "PROBE segv-rdtsc guest={:?} injected={:?} signals={:?} rdtscs={}",
+        stdout.trim(),
+        *log.injected.lock().unwrap(),
+        *log.signals.lock().unwrap(),
+        log.rdtscs.load(Ordering::Relaxed)
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (before, recorded) = stdout.trim().split_once('\n').expect("two lines");
+    assert_eq!(
+        before, "1 true 0 0",
+        "P pending after the hook; RDTSC emulated; P consumed with it, no handler run"
+    );
+    let (fields, pid) = recorded.rsplit_once(' ').expect("guest pid");
+    assert_eq!(
+        fields,
+        format!(
+            "-1 {} 1 {} {pid} {QUEUED_VALUE} 0 0 1",
+            libc::EINTR,
+            libc::SI_QUEUE
+        ),
+        "R interrupts the getpid and runs the handler once, with its queued siginfo"
+    );
+    assert_eq!(
+        *log.signals.lock().unwrap(),
+        vec![libc::SIGSEGV, libc::SIGSEGV],
+        "P at its hook, and R"
+    );
+    assert_eq!(
+        log.rdtscs.load(Ordering::Relaxed),
+        1,
+        "the RDTSC is emulated"
+    );
+    assert_eq!(
+        *log.injected.lock().unwrap(),
+        vec![Ok(0), Ok(0), Err(Errno::ERESTARTSYS.into_raw())],
+        "the hook's block, the unblock marker, and the getpid R interrupts"
+    );
+}
+
+/// The set `QueueAndBlockSigtstpInFirstHook` blocks. A static, so the forked
+/// guest has it at the same address.
+static SIGTSTP_SET: u64 = 1 << (libc::SIGTSTP - 1);
+
+/// Like `ReplaceMarker`, but the first SIGTSTP hook on each thread queues
+/// another SIGTSTP to the thread from the tracer (`SI_QUEUE`), injects a
+/// `getpid`, which that second SIGTSTP stops and which holds it, then
+/// injects `rt_sigprocmask(SIG_BLOCK, {SIGTSTP})`, and passes the first
+/// through; the second SIGTSTP hook injects a `getpid`. Each injection is
+/// reported, and each SIGTSTP report as `Filtered` with its `si_code`, or 0
+/// where it has no siginfo (a group stop).
+#[derive(Clone, Copy, Debug, Default)]
+struct QueueAndBlockSigtstpInFirstHook;
+
+#[reverie::tool]
+impl Tool for QueueAndBlockSigtstpInFirstHook {
+    type GlobalState = Log;
+    /// SIGTSTP hooks run on this thread so far.
+    type ThreadState = u64;
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscription = Subscription::none();
+        subscription.syscall(Sysno::write);
+        subscription
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        replace_marker(guest, syscall).await
+    }
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        guest.send_rpc(Report::Signal(signal as i32)).await;
+        if signal != Signal::SIGTSTP {
+            return Ok(Some(signal));
+        }
+        let si_code = guest.signal_info().map_or(0, |info| {
+            i32::from_ne_bytes(info[8..12].try_into().unwrap())
+        });
+        guest
+            .send_rpc(Report::Filtered(signal as i32, si_code))
+            .await;
+        *guest.thread_state_mut() += 1;
+        let hooks = *guest.thread_state();
+        if hooks == 1 {
+            // SAFETY: a zeroed siginfo is valid; the fields written open its
+            // union after the three ints, as in `queue_value_to_self`.
+            let queued = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                info.si_signo = libc::SIGTSTP;
+                info.si_code = libc::SI_QUEUE;
+                let fields = (&mut info as *mut libc::siginfo_t).cast::<u8>().add(16);
+                fields.cast::<libc::pid_t>().write(guest.pid().as_raw());
+                libc::syscall(
+                    libc::SYS_rt_tgsigqueueinfo,
+                    guest.pid().as_raw(),
+                    guest.tid().as_raw(),
+                    libc::SIGTSTP,
+                    &mut info as *mut libc::siginfo_t,
+                )
+            };
+            assert_eq!(queued, 0, "queue a second SIGTSTP to the guest");
+        }
+        if hooks <= 2 {
+            let result = guest.inject(Getpid::new()).await;
+            guest
+                .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+                .await;
+        }
+        if hooks == 1 {
+            let set = Addr::from_raw(&SIGTSTP_SET as *const u64 as usize);
+            let result = guest
+                .inject(
+                    RtSigprocmask::new()
+                        .with_how(libc::SIG_BLOCK)
+                        .with_set(set)
+                        .with_oldset(None)
+                        .with_sigsetsize(8),
+                )
+                .await;
+            guest
+                .send_rpc(Report::Injected(result.map_err(Errno::into_raw)))
+                .await;
+        }
+        Ok(Some(signal))
+    }
+}
+
+/// A reported group stop does not end a reported instance's count. The
+/// first hook of a tgkill'd SIGTSTP (P) queues a second SIGTSTP (Q), whose
+/// stop holds the hook's `getpid`, blocks SIGTSTP and passes P through, so
+/// Linux requeues P, counted as reported. The guest's unblock marker
+/// resumes Q, passed on unreported while P is pending, and Q's delivery
+/// starts a group stop, which is reported in its place. That callback's
+/// `getpid` holds P, which waits in the hold slot until the guest's next
+/// marker (`getppid`, whose injection ends at a signal-delivery stop, so
+/// the held signal is not passed on early): the Tool has seen P, so it is
+/// passed on unreported, and its delivery starts a group stop of its own,
+/// which is reported. The Tool sees P, Q's group stop and P's group stop.
+/// Before, the reported group stop of Q ended P's count, and P was
+/// reported a second time.
+#[test]
+fn a_reported_group_stop_keeps_a_reported_instances_count() {
+    let (output, log) = test_fn_bounded::<QueueAndBlockSigtstpInFirstHook, _>(
+        || unsafe {
+            // As in `guest`: a stop signal is discarded in an orphaned group.
+            assert_eq!(libc::setpgid(0, 0), 0);
+            assert_eq!(
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::syscall(libc::SYS_gettid),
+                    libc::SIGTSTP
+                ),
+                0
+            );
+            libc::syscall(
+                libc::SYS_write,
+                UNBLOCK_FD,
+                &SIGTSTP_SET as *const u64,
+                0usize,
+            );
+            let ppid = libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
+            println!(
+                "{} {}",
+                ppid == libc::getppid() as libc::c_long,
+                is_blocked(libc::SIGTSTP)
+            );
+        },
+        "reported group stop",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!(
+        "PROBE group-stop-count guest={:?} injected={:?} reports={:?}",
+        stdout.trim(),
+        *log.injected.lock().unwrap(),
+        *log.filtered.lock().unwrap()
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout.trim(),
+        "true 0",
+        "the getppid marker runs; SIGTSTP is unblocked"
+    );
+    assert_eq!(
+        *log.filtered.lock().unwrap(),
+        vec![
+            (libc::SIGTSTP, libc::SI_TKILL),
+            (libc::SIGTSTP, 0),
+            (libc::SIGTSTP, 0),
+        ],
+        "P at its own stop, then Q's group stop and P's, each without siginfo; P is not reported again"
+    );
+    let restart = Err(Errno::ERESTARTSYS.into_raw());
+    let injected = log.injected.lock().unwrap();
+    assert_eq!(
+        injected[..4],
+        [restart, Ok(0), Ok(0), restart],
+        "the first hook's getpid (Q) and block, the unblock marker, and the group-stop hook's getpid (P)"
+    );
+    assert_eq!(injected.len(), 5, "and the getppid marker: {injected:?}");
+}
+
 /// Like `InjectInSigusr1Hook`, but the signal hook of SIGUSR1 first queues
 /// SIGUSR2 to the guest's thread from the tracer, with `SI_QUEUE`, the
 /// guest's PID and `QUEUED_VALUE`, as a signal that arrives while the hook
@@ -9441,8 +11263,7 @@ fn held_trap_guest() -> ! {
 /// with the marker in RAX, and the helper's SIGTRAP reaches the guest's
 /// handler: exit 11. The Tool sees only the delivered SIGTRAP. Known gap:
 /// the held SIGUSR1 is not reported under this configuration, nor under
-/// gdb, a breakpoint, or a LiteInst runtime that is not Ready
-/// (https://github.com/rrnewton/reverie/issues/845).
+/// gdb or a breakpoint (https://github.com/rrnewton/reverie/issues/845).
 #[test]
 fn held_signal_is_not_reported_under_the_injected_syscall_trap() {
     const NAME: &str = "held_signal_is_not_reported_under_the_injected_syscall_trap";

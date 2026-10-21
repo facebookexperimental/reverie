@@ -443,13 +443,13 @@ fn run_case(mode: &str, executable: &std::path::Path, directory: &std::path::Pat
     });
     // Keep backend and the captured global alive through all assertions: their
     // Drop cleanup cannot supply the EOF that the callback was required to see.
-    let (code, stdout, stderr) = completion.result.unwrap();
+    let (status, stdout, stderr) = completion.result.unwrap();
     assert_eq!(
-        code,
+        status,
         if control.fatal && !control.orphan {
-            128 + libc::SIGTERM
+            reverie::ExitStatus::signaled(libc::SIGTERM, false)
         } else {
-            0
+            reverie::ExitStatus::Exited(0)
         }
     );
     assert!(

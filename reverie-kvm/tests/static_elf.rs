@@ -7,10 +7,6 @@
  */
 
 #![cfg(target_arch = "x86_64")]
-#![allow(
-    unexpected_cfgs,
-    reason = "`fbcode_build` is supplied by the internal Buck build"
-)]
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::FileTypeExt;
@@ -335,11 +331,11 @@ fn getdents64_alias_failure_case_selected(
             &directory.0,
         )
         .unwrap();
-    // The loader maps the stack through guest_end(), while its strings and
-    // initial stack grow down from guest_end() - 4096. This fixture never
-    // writes the zero-filled top-page headroom. Probe one real mapped byte
-    // before arming, then require the same access/value after completion.
-    let memory_probe_address = backend.memory().unwrap().guest_end() - 1;
+    // The loader puts the stack at the top of the user address space, as Linux
+    // does: its strings end with an 8-byte NULL just below 0x7fff_ffff_f000,
+    // which this fixture never writes. Probe that mapped byte before arming,
+    // then require the same access/value after completion.
+    let memory_probe_address = 0x7fff_ffff_efff;
     let mut before_run_memory = [0xff];
     backend
         .memory()
@@ -834,6 +830,9 @@ mod msync;
 
 #[path = "support/msync_lifecycle.rs"]
 mod msync_lifecycle;
+
+#[path = "support/hardware_traps.rs"]
+mod hardware_traps;
 
 #[test]
 fn file_script_exec_plain() {
@@ -2370,8 +2369,7 @@ fn leader_self_exec_bounded_with_output(test: &str, forward_output: bool) -> boo
     let mut command = std::process::Command::new("timeout");
     command.args(["--kill-after=2s", "30s"]);
     if broker_test_protocol::selected(test) {
-        // Buck builds and runs tests on different hosts, so it names the
-        // helper at run time, relative to the test's working directory.
+        // Test runners can locate the helper at execution time on another host.
         command.arg(match std::env::var_os("REVERIE_KVM_TEST_BROKER_LAUNCHER") {
             Some(path) => std::env::current_dir().unwrap().join(path),
             None => env!("CARGO_BIN_EXE_reverie-kvm-broker-test-launcher").into(),
@@ -3035,7 +3033,7 @@ fn real_kvm_synthetic_proc_snapshot_is_immutable_and_opath_correct() {
         libc::O_RDONLY | libc::O_CREAT | libc::O_DIRECTORY,
     );
     let create_directory = native_open_errno(
-        "/proc/uptime",
+        "/proc/self/maps",
         libc::O_RDONLY | libc::O_CREAT | libc::O_DIRECTORY,
     );
     assert_eq!(create_directory, policy_error);
@@ -3109,7 +3107,8 @@ static void *failed_mapping(int descriptor, int protection, int flags) {
 }
 
 int main(int argc, char **argv) {
-    static const char expected[] = "0.00 0.00\n";
+    static const char expected[] =
+        "7fffff800000-7ffffffff000 rw-p 00000000 00:00 0 [stack]\n";
     char actual[sizeof(expected)] = {0};
     struct stat metadata;
 
@@ -3121,7 +3120,7 @@ int main(int argc, char **argv) {
     CHECK(expected_create_directory_exclusive > 0);
     CHECK(expected_mounts_create_directory_nofollow > 0);
 
-    int descriptor = open("/proc/uptime", O_RDONLY | O_CLOEXEC);
+    int descriptor = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
     CHECK(descriptor >= 0);
     CHECK((fcntl(descriptor, F_GETFL) & O_ACCMODE) == O_RDONLY);
     CHECK((fcntl(descriptor, F_GETFD) & FD_CLOEXEC) != 0);
@@ -3208,7 +3207,10 @@ int main(int argc, char **argv) {
     CHECK(close(cmdline) == 0);
     EXPECT_ERROR(ftruncate(descriptor, 0), EINVAL);
     EXPECT_ERROR(syscall(SYS_fallocate, descriptor, 0, 0, 1), EBADF);
-    CHECK(getuid() == 0 && geteuid() == 0);
+    /* KVM leaves the identity calls to the Tool (Detcore answers root); a
+       run without a Tool sees the backend's refusal. */
+    EXPECT_ERROR(syscall(SYS_getuid), ENOSYS);
+    EXPECT_ERROR(syscall(SYS_geteuid), ENOSYS);
     EXPECT_ERROR(fchmod(descriptor, 0666), EPERM);
     CHECK(fstat(descriptor, &metadata) == 0);
     CHECK((metadata.st_mode & 0777) == 0444);
@@ -3348,19 +3350,19 @@ int main(int argc, char **argv) {
     CHECK(close(ordinary) == 0);
     CHECK(unlink("fdinfo-target") == 0);
 
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_DIRECTORY), ENOTDIR);
-    EXPECT_ERROR(open("/proc/uptime", O_PATH | O_DIRECTORY), ENOTDIR);
-    EXPECT_ERROR(open("/proc/uptime", O_WRONLY), EACCES);
-    EXPECT_ERROR(open("/proc/uptime", O_RDWR), EACCES);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_TRUNC), EACCES);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_DIRECT), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_CREAT | O_EXCL, 0600), EEXIST);
-    EXPECT_ERROR(open("/proc/uptime", O_WRONLY | O_CREAT | O_EXCL, 0600), EEXIST);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_CREAT | O_EXCL | O_TRUNC, 0600), EEXIST);
-    EXPECT_ERROR(open("/proc/uptime", O_WRONLY | O_CREAT | O_EXCL | O_DIRECT | O_NOFOLLOW, 0600), EEXIST);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_DIRECTORY), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_PATH | O_DIRECTORY), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY), EACCES);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDWR), EACCES);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TRUNC), EACCES);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_DIRECT), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_CREAT | O_EXCL, 0600), EEXIST);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | O_CREAT | O_EXCL, 0600), EEXIST);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_CREAT | O_EXCL | O_TRUNC, 0600), EEXIST);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | O_CREAT | O_EXCL | O_DIRECT | O_NOFOLLOW, 0600), EEXIST);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
                  expected_create_directory);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY, 0600),
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY, 0600),
                  expected_create_directory_exclusive);
     EXPECT_ERROR(open("/proc/mounts", O_RDONLY | O_CREAT | O_DIRECTORY | O_NOFOLLOW, 0600),
                  expected_mounts_create_directory_nofollow);
@@ -3368,25 +3370,25 @@ int main(int argc, char **argv) {
                       O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY | O_NOFOLLOW,
                       0600),
                  expected_create_directory_exclusive);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_TMPFILE | O_NOFOLLOW, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_TMPFILE | O_TRUNC, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_TMPFILE | O_DIRECT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_TMPFILE | O_EXCL, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_RDONLY | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_RDWR | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_ACCMODE | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/uptime", O_WRONLY | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open("/proc/uptime", O_RDWR | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open("/proc/uptime", O_ACCMODE | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open("/proc/uptime", O_PATH | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open("/proc/uptime", O_PATH | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), ENOTDIR);
-    int ignored_create = open("/proc/uptime", O_PATH | O_CREAT | O_EXCL, 0600);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_NOFOLLOW, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_TRUNC, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_DIRECT, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_EXCL, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDWR | O_TMPFILE | O_CREAT, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_ACCMODE | O_TMPFILE | O_CREAT, 0600), EINVAL);
+    EXPECT_ERROR(open("/proc/self/maps", O_WRONLY | O_TMPFILE, 0600), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_RDWR | O_TMPFILE, 0600), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_ACCMODE | O_TMPFILE, 0600), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_PATH | O_TMPFILE, 0600), ENOTDIR);
+    EXPECT_ERROR(open("/proc/self/maps", O_PATH | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), ENOTDIR);
+    int ignored_create = open("/proc/self/maps", O_PATH | O_CREAT | O_EXCL, 0600);
     CHECK(ignored_create >= 0 && (fcntl(ignored_create, F_GETFL) & O_PATH) != 0);
     CHECK(close(ignored_create) == 0);
-    int regular_nofollow = open("/proc/uptime", O_RDONLY | O_NOFOLLOW);
+    int regular_nofollow = open("/proc/self/maps", O_RDONLY | O_NOFOLLOW);
     CHECK(regular_nofollow >= 0);
     CHECK((fcntl(regular_nofollow, F_GETFL) & O_NOFOLLOW) != 0);
     CHECK(close(regular_nofollow) == 0);
@@ -3398,14 +3400,14 @@ int main(int argc, char **argv) {
     EXPECT_ERROR(open("/proc/mounts", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600), EEXIST);
     EXPECT_ERROR(open("/proc/mounts", O_RDONLY | O_DIRECTORY | O_NOFOLLOW), ENOTDIR);
     EXPECT_ERROR(open("/proc/mounts", O_PATH | O_DIRECTORY | O_NOFOLLOW), ENOTDIR);
-    int status = open("/proc/uptime", O_RDONLY | O_NONBLOCK | O_APPEND | O_SYNC);
+    int status = open("/proc/self/maps", O_RDONLY | O_NONBLOCK | O_APPEND | O_SYNC);
     CHECK(status >= 0);
     CHECK((fcntl(status, F_GETFL) & (O_NONBLOCK | O_APPEND | O_SYNC)) ==
           (O_NONBLOCK | O_APPEND | O_SYNC));
     CHECK(close(status) == 0);
 
     int path = open(
-        "/proc/uptime",
+        "/proc/self/maps",
         O_PATH | O_CLOEXEC | O_TRUNC | O_DIRECT | O_APPEND | O_SYNC | O_NONBLOCK
     );
     CHECK(path >= 0);
@@ -3421,7 +3423,7 @@ int main(int argc, char **argv) {
     mapping = failed_mapping(path, PROT_READ, MAP_PRIVATE);
     CHECK(mapping == MAP_FAILED && errno == EBADF);
 
-    int nofollow = open("/proc/uptime", O_PATH | O_NOFOLLOW);
+    int nofollow = open("/proc/self/maps", O_PATH | O_NOFOLLOW);
     CHECK(nofollow >= 0);
     CHECK((fcntl(nofollow, F_GETFL) & (O_PATH | O_NOFOLLOW)) == (O_PATH | O_NOFOLLOW));
     CHECK(fstat(nofollow, &metadata) == 0 && S_ISREG(metadata.st_mode));
@@ -3700,22 +3702,39 @@ static int enumeration(int descriptor, int guest) {
 }
 
 static int contents(int descriptor, int baseline, int guest) {
-    const char *paths[] = {"version", "sys/kernel/osrelease", "self/cmdline"};
+    const char *paths[] = {"self/maps", "self/cmdline"};
     for (unsigned index = 0; index < sizeof(paths) / sizeof(paths[0]); ++index) {
         int actual = openat(descriptor, paths[index], O_RDONLY);
         int expected = openat(baseline, paths[index], O_RDONLY);
         CHECK(actual >= 0 && expected >= 0);
-        unsigned char actual_bytes[16384], expected_bytes[16384];
-        memset(actual_bytes, 0xa5, sizeof(actual_bytes));
-        memset(expected_bytes, 0xa5, sizeof(expected_bytes));
-        ssize_t actual_size = read(actual, actual_bytes, sizeof(actual_bytes));
-        ssize_t expected_size = read(expected, expected_bytes, sizeof(expected_bytes));
-        CHECK(actual_size > 0 && actual_size < sizeof(actual_bytes));
-        CHECK(actual_size == expected_size && memcmp(actual_bytes, expected_bytes, sizeof(actual_bytes)) == 0);
+        /* Read each file to EOF and compare the complete contents. */
+        enum { CONTENT_BYTES = 1 << 20 };
+        unsigned char *actual_bytes = malloc(CONTENT_BYTES), *expected_bytes = malloc(CONTENT_BYTES);
+        CHECK(actual_bytes != NULL && expected_bytes != NULL);
+        size_t actual_size = 0, expected_size = 0;
+        for (;;) {
+            CHECK(actual_size < CONTENT_BYTES);
+            ssize_t got = read(actual, actual_bytes + actual_size, CONTENT_BYTES - actual_size);
+            CHECK(got >= 0);
+            if (got == 0) break;
+            actual_size += (size_t)got;
+        }
+        for (;;) {
+            CHECK(expected_size < CONTENT_BYTES);
+            ssize_t got = read(expected, expected_bytes + expected_size, CONTENT_BYTES - expected_size);
+            CHECK(got >= 0);
+            if (got == 0) break;
+            expected_size += (size_t)got;
+        }
+        CHECK(actual_size > 0);
+        CHECK(actual_size == expected_size && memcmp(actual_bytes, expected_bytes, actual_size) == 0);
+        free(actual_bytes);
+        free(expected_bytes);
         CHECK(close(actual) == 0 && close(expected) == 0);
     }
     if (guest) {
-        const char *unlisted[] = {"../etc/passwd", "self/environ", "thread-self/environ", "self/task", "self/fd", "1/environ"};
+        /* The mount tables are Detcore's to render; the backend keeps no copy. */
+        const char *unlisted[] = {"../etc/passwd", "self/environ", "thread-self/environ", "self/task", "self/fd", "1/environ", "mounts", "self/mountinfo"};
         for (unsigned index = 0; index < sizeof(unlisted) / sizeof(unlisted[0]); ++index) {
             errno = 0;
             CHECK(openat(descriptor, unlisted[index], O_RDONLY) == -1 && errno == ENOENT);
@@ -4794,6 +4813,7 @@ struct WorkerExecOverlapLog {
     worker_errno: Mutex<Option<i32>>,
     worker_ready: Condvar,
     root_value_preserved: AtomicBool,
+    worker_refusal_checks: Mutex<Option<i64>>,
 }
 
 impl Default for WorkerExecOverlapLog {
@@ -4803,9 +4823,21 @@ impl Default for WorkerExecOverlapLog {
             worker_errno: Mutex::new(None),
             worker_ready: Condvar::new(),
             root_value_preserved: AtomicBool::new(false),
+            worker_refusal_checks: Mutex::new(None),
         }
     }
 }
+
+/// The worker's refused exec reported the typed refusal exactly when the
+/// backend refused the operation as unsupported (ENOSYS), and nothing for an
+/// ordinary failure.
+const REFUSAL_MATCHES_ERRNO: i64 = 1 << 0;
+/// Taking the refusal cleared it.
+const REFUSAL_TAKEN_ONCE: i64 = 1 << 1;
+/// A later injection replaced an untaken refusal.
+const REFUSAL_REPLACED_BY_NEXT_INJECTION: i64 = 1 << 2;
+const ALL_REFUSAL_CHECKS: i64 =
+    REFUSAL_MATCHES_ERRNO | REFUSAL_TAKEN_ONCE | REFUSAL_REPLACED_BY_NEXT_INJECTION;
 
 impl WorkerExecOverlapLog {
     fn worker_errno(&self) -> Option<i32> {
@@ -4817,6 +4849,13 @@ impl WorkerExecOverlapLog {
 
     fn root_value_preserved(&self) -> bool {
         self.root_value_preserved.load(Ordering::SeqCst)
+    }
+
+    fn worker_refusal_checks(&self) -> Option<i64> {
+        *self
+            .worker_refusal_checks
+            .lock()
+            .expect("worker refusal result lock poisoned")
     }
 }
 
@@ -4866,6 +4905,14 @@ impl GlobalTool for WorkerExecOverlapLog {
                     .store(value != 0, Ordering::SeqCst);
                 0
             }
+            // Record which typed-refusal checks the worker observed passing.
+            4 => {
+                *self
+                    .worker_refusal_checks
+                    .lock()
+                    .expect("worker refusal result lock poisoned") = Some(value);
+                0
+            }
             _ => panic!("unexpected worker exec test operation {operation}"),
         }
     }
@@ -4907,7 +4954,7 @@ impl Tool for WorkerExecOverlapTool {
             }
         } else {
             assert_ne!(guest.tid(), guest.pid());
-            let (path, argv, envp, execveat, _) = *guest.config();
+            let (path, argv, envp, execveat, expected_errno) = *guest.config();
             let request = Execve::new()
                 .with_path(PathPtr::from_ptr(path as *const libc::c_char))
                 .with_argv(Option::<CArrayPtr<CStrPtr>>::from_raw(argv))
@@ -4920,6 +4967,44 @@ impl Tool for WorkerExecOverlapTool {
                 guest.inject(request).await
             };
             let error = result.expect_err("worker image replacement unexpectedly succeeded");
+
+            let mut checks = 0;
+            let refusal = guest.take_unsupported_refusal();
+            let expected_refusal = (expected_errno == libc::ENOSYS).then(|| {
+                reverie::UnsupportedRefusal::new(
+                    reverie::UnsupportedOperation::NonLeaderExec,
+                    Errno::ENOSYS,
+                    "KVM nonleader exec is unsupported",
+                )
+            });
+            if refusal == expected_refusal {
+                checks |= REFUSAL_MATCHES_ERRNO;
+            }
+            if guest.take_unsupported_refusal().is_none() {
+                checks |= REFUSAL_TAKEN_ONCE;
+            }
+            // Refuse the same exec again and leave the record untaken: the
+            // next injection, which the backend performs, must replace it.
+            let again = if execveat {
+                guest
+                    .inject(reverie::syscalls::Execveat::from(request))
+                    .await
+            } else {
+                guest.inject(request).await
+            };
+            assert_eq!(
+                again,
+                Err(error),
+                "a repeated worker exec changed its errno"
+            );
+            guest
+                .inject(reverie::syscalls::Getpid::new())
+                .await
+                .expect("getpid after a refused exec");
+            if guest.take_unsupported_refusal().is_none() {
+                checks |= REFUSAL_REPLACED_BY_NEXT_INJECTION;
+            }
+            guest.send_rpc((4, checks)).await;
             guest.send_rpc((1, i64::from(error.into_raw()))).await;
         }
 
@@ -5021,18 +5106,11 @@ fn unwrap_shared_guest_exception(error: Error) -> Error {
     }
 }
 
-fn assert_invalid_opcode(error: Error) {
-    match unwrap_shared_guest_exception(error) {
-        Error::GuestException {
-            vector,
-            instruction_pointer,
-            ..
-        } => {
-            assert_eq!(vector, 6);
-            assert_eq!(instruction_pointer, LOAD_ADDRESS);
-        }
-        error => panic!("expected invalid-opcode exception, got {error}"),
-    }
+/// A user-mode #UD is the guest's own fault, not a backend error: Linux's
+/// `exc_invalid_op` raises SIGILL, whose default action terminates the process
+/// and dumps core.
+fn assert_invalid_opcode_signal(status: ExitStatus) {
+    assert_eq!(status, ExitStatus::from_raw(libc::SIGILL | 0x80));
 }
 
 fn assert_page_fault(error: Error) {
@@ -5088,9 +5166,14 @@ fn fault_only_assertion_rejects_actual_tool_exit_cleanup_failure() {
     if !kvm_available("fault_only_assertion_rejects_actual_tool_exit_cleanup_failure") {
         return;
     }
+    // A load outside the page tables stays a backend-reported exception. A
+    // #UD would instead be delivered to the guest as SIGILL.
     let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     backend
-        .install_static_elf(&static_elf(&[0x0f, 0x0b]), "/bin/fault-with-cleanup")
+        .install_static_elf(
+            &static_elf(&[0x48, 0xa1, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00]),
+            "/bin/fault-with-cleanup",
+        )
         .unwrap();
     let error = match futures::executor::block_on(
         backend.run_static_elf_with_tool::<FailingFaultExitTool>((), true),
@@ -5108,9 +5191,9 @@ fn fault_only_assertion_rejects_actual_tool_exit_cleanup_failure() {
     assert!(matches!(
         fault.as_ref(),
         Error::GuestException {
-            vector: 6,
+            vector: 14,
             instruction_pointer: LOAD_ADDRESS,
-            ..
+            fault_address: 0x4000_0000,
         }
     ));
     assert_eq!(cleanup.len(), 1, "unexpected cleanup causes: {cleanup:?}");
@@ -5122,9 +5205,10 @@ fn fault_only_assertion_rejects_actual_tool_exit_cleanup_failure() {
         Error::Reverie(reverie::Error::Errno(errno)) if *errno == Errno::EIO
     ));
     // Only the assertion is caught. The actual run above must retain both
-    // failures, and the unchanged vector/RIP oracle is satisfied by its primary.
+    // failures, and the unchanged vector/RIP/CR2 oracle is satisfied by its
+    // primary.
     let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_invalid_opcode(error);
+        assert_page_fault(error);
     }));
     assert!(
         rejected.is_err(),
@@ -5143,27 +5227,29 @@ fn static_elf_faults_are_reported_by_direct_and_tool_runtimes() {
         Err(error) => panic!("failed to probe /dev/kvm: {error}"),
     }
 
+    // A user-mode #UD is delivered to the guest as SIGILL by both runtimes.
     let image = static_elf(&[0x0f, 0x0b]);
 
     let mut direct_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     direct_backend
         .install_static_elf(&image, "/bin/fault")
         .unwrap();
-    assert_invalid_opcode(direct_backend.run_static_elf().unwrap_err());
+    assert_eq!(direct_backend.run_static_elf().unwrap(), 128 + libc::SIGILL);
 
     let mut tool_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     tool_backend
         .install_static_elf(&image, "/bin/fault")
         .unwrap();
-    let error = match futures::executor::block_on(
-        tool_backend.run_static_elf_with_tool::<StraceTool>((), true),
-    ) {
-        Ok(_) => panic!("tool runtime reported a guest exception as success"),
-        Err(error) => error,
-    };
-    assert_invalid_opcode(error);
+    let completion = futures::executor::block_on(
+        tool_backend.run_static_elf_with_tool_completion::<StraceTool>((), true),
+    )
+    .unwrap();
+    let (status, stdout, stderr) = completion.result.unwrap();
+    assert_invalid_opcode_signal(status);
+    assert!(stdout.is_empty() && stderr.is_empty());
 
     // movabs rax, qword ptr [0x40000000], an address outside the page tables.
+    // Both runtimes still report this backend layout gap as an exception.
     let page_fault_image =
         static_elf(&[0x48, 0xa1, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00]);
     let mut page_fault_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
@@ -5172,11 +5258,220 @@ fn static_elf_faults_are_reported_by_direct_and_tool_runtimes() {
         .unwrap();
     assert_page_fault(page_fault_backend.run_static_elf().unwrap_err());
 
+    let mut tool_page_fault_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    tool_page_fault_backend
+        .install_static_elf(&page_fault_image, "/bin/fault")
+        .unwrap();
+    let error = match futures::executor::block_on(
+        tool_page_fault_backend.run_static_elf_with_tool::<StraceTool>((), true),
+    ) {
+        Ok(_) => panic!("tool runtime reported a guest exception as success"),
+        Err(error) => error,
+    };
+    assert_page_fault(error);
+
     let mut io_fault_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     io_fault_backend
         .install_static_elf(&static_elf(&[0xed]), "/bin/fault")
         .unwrap();
     assert_general_protection(io_fault_backend.run_static_elf().unwrap_err());
+}
+
+/// With Hermit's ptrace-reference numbering (`reverie::task_ids`), a guest
+/// whose root is pid 3 sees the IDs Hermit's ptrace backend gives it, and the
+/// step carries into the tasks it creates: the first child (5) forks a
+/// grandchild (7), so the root's next fork is 9; a thread (11) starts a nested
+/// thread (13); after exec the forks are 15 and 17. With Linux's default the
+/// same guest sees 4, 5, 6, 7, 8, 9, 10, whether set explicitly or by
+/// default. The step applies whether it is set before or after the image is
+/// installed.
+#[test]
+fn guest_task_ids_follow_the_configured_numbering() {
+    let test = "guest_task_ids_follow_the_configured_numbering";
+    if !kvm_available(test) {
+        return;
+    }
+    let root = TestDirectory::new();
+    let program = compile_c_program(
+        &root.0,
+        "numbering",
+        r#"
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void *nested(void *arg) {
+  (void)arg;
+  printf("nested %ld\n", (long)syscall(SYS_gettid));
+  return NULL;
+}
+
+static void *thread(void *arg) {
+  (void)arg;
+  printf("thread %ld\n", (long)syscall(SYS_gettid));
+  pthread_t t;
+  pthread_create(&t, NULL, nested, NULL);
+  pthread_join(t, NULL);
+  return NULL;
+}
+
+static void fork_once(const char *label, int grandchild) {
+  fflush(stdout);
+  pid_t child = fork();
+  if (child == 0) {
+    if (grandchild) {
+      pid_t inner = fork();
+      if (inner == 0) _exit(0);
+      waitpid(inner, NULL, 0);
+      printf("grandchild %d\n", inner);
+      fflush(stdout);
+    }
+    _exit(0);
+  }
+  waitpid(child, NULL, 0);
+  printf("%s %d\n", label, child);
+}
+
+int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "after-exec") == 0) {
+    fork_once("fork-after-exec", 0);
+    fork_once("fork-after-exec", 0);
+    return 0;
+  }
+  printf("root %d\n", getpid());
+  fork_once("fork", 1);
+  fork_once("fork", 0);
+  pthread_t t;
+  pthread_create(&t, NULL, thread, NULL);
+  pthread_join(t, NULL);
+  fflush(stdout);
+  char *next[] = {argv[0], "after-exec", NULL};
+  execv("/proc/self/exe", next);
+  return 99;
+}
+"#,
+    );
+    let program = program.to_str().unwrap();
+    let reference = "root 3\ngrandchild 7\nfork 5\nfork 9\nthread 11\nnested 13\n\
+                     fork-after-exec 15\nfork-after-exec 17\n";
+    let linux = "root 3\ngrandchild 5\nfork 4\nfork 6\nthread 7\nnested 8\n\
+                 fork-after-exec 9\nfork-after-exec 10\n";
+    let hermit_step = Some(reverie::task_ids::HERMIT_PTRACE_IDS_PER_TASK);
+    let linux_step = Some(reverie::task_ids::LINUX_IDS_PER_TASK);
+    for (before_install, after_install, expected) in [
+        (hermit_step, None, reference),
+        (None, hermit_step, reference),
+        (linux_step, None, linux),
+        (None, None, linux),
+    ] {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend.set_root_pid(3).unwrap();
+        if let Some(step) = before_install {
+            backend.set_ids_per_task(step).unwrap();
+        }
+        backend
+            .install_static_elf_file_with_context(
+                std::fs::File::open(program).unwrap(),
+                &[program],
+                &["PATH=/usr/bin:/bin"],
+                &root.0,
+            )
+            .unwrap();
+        if let Some(step) = after_install {
+            backend.set_ids_per_task(step).unwrap();
+        }
+        let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
+        assert_eq!(
+            (code, String::from_utf8_lossy(&stdout).into_owned()),
+            (0, expected.to_owned()),
+            "before={before_install:?} after={after_install:?} stderr={}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    assert!(
+        KvmBackend::new(16 * 1024 * 1024)
+            .unwrap()
+            .set_ids_per_task(0)
+            .is_err()
+    );
+}
+
+/// Exec replaces the guest's whole address-space layout. A program with a
+/// large image raises the identity end (in a 256 MiB guest, above the 182 MiB
+/// a small program gets) and touches a page above the small program's
+/// identity end; the small program it then executes faults on that address,
+/// because the new page tables leave it unmapped and the old translation is
+/// not reused.
+#[test]
+fn exec_to_a_lower_identity_end_unmaps_the_old_identity_pages() {
+    let test = "exec_to_a_lower_identity_end_unmaps_the_old_identity_pages";
+    if !kvm_available(test) {
+        return;
+    }
+    let root = TestDirectory::new();
+    let reader = compile_c_program(
+        &root.0,
+        "reader",
+        r#"
+#include <stdlib.h>
+
+int main(int argc, char **argv) {
+  if (argc != 2) return 70;
+  volatile char *page = (volatile char *)strtoull(argv[1], NULL, 0);
+  return *page;
+}
+"#,
+    );
+    let writer_source = format!(
+        r#"
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static char big[200 << 20];
+
+int main(void) {{
+  volatile char *page = big + (190 << 20);
+  *page = 1;
+  if (*page != 1) return 71;
+  char address[32];
+  snprintf(address, sizeof address, "%p", (void *)page);
+  char *argv[] = {{"reader", address, NULL}};
+  char *envp[] = {{NULL}};
+  execve("{}", argv, envp);
+  return errno;
+}}
+"#,
+        reader.display()
+    );
+    let writer = compile_c_program(&root.0, "writer", &writer_source);
+    let writer = writer.to_str().unwrap();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_file_with_context(
+            std::fs::File::open(writer).unwrap(),
+            &[writer],
+            &["PATH=/usr/bin:/bin"],
+            &root.0,
+        )
+        .unwrap();
+    match unwrap_shared_guest_exception(backend.run_static_elf_captured().unwrap_err()) {
+        Error::GuestException {
+            vector,
+            fault_address,
+            ..
+        } => {
+            assert_eq!(vector, 14);
+            assert!(
+                (182 << 20..208 << 20).contains(&fault_address),
+                "fault address {fault_address:#x}"
+            );
+        }
+        error => panic!("expected a page fault in the executed program, got {error}"),
+    }
 }
 
 #[test]
@@ -5222,6 +5517,67 @@ fn static_elf_vmware_probe_reports_non_vmware_in_direct_and_tool_runtimes() {
     assert_eq!(code, 0);
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
+}
+
+/// Guest memory that is whole pages but not whole large pages still runs a
+/// program: its stack window starts off a large-page boundary (at 9 MiB here).
+#[test]
+fn static_elf_runs_when_guest_memory_is_not_whole_large_pages() {
+    if !kvm_available("static_elf_runs_when_guest_memory_is_not_whole_large_pages") {
+        return;
+    }
+    let code = [
+        0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+        0xc6, 0x04, 0x24, 0x2a, // mov byte [rsp], 42
+        0x0f, 0xb6, 0x3c, 0x24, // movzx edi, byte [rsp]
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, SYS_exit
+        0x0f, 0x05, // syscall
+    ];
+    let image = static_elf(&code);
+    let mut backend = KvmBackend::new(17 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf(&image, "/bin/odd-memory")
+        .unwrap();
+    assert_eq!(backend.run_static_elf().unwrap(), 42);
+}
+
+/// The VMware probe resolves when it runs from the stack, whose user addresses
+/// (at the top of the user address space) differ from its physical addresses.
+#[test]
+fn static_elf_vmware_probe_runs_from_the_stack() {
+    if !kvm_available("static_elf_vmware_probe_runs_from_the_stack") {
+        return;
+    }
+
+    let probe = [
+        0xbb, 0x68, 0x58, 0x4d, 0x56, // mov ebx, 0x564d5868
+        0xb9, 0x58, 0x56, 0x00, 0x00, // mov ecx, 0x5658
+        0x31, 0xd2, // xor edx, edx
+        0xed, // in eax, dx
+        0x85, 0xdb, // test ebx, ebx
+        0x75, 0x09, // jne failure
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, SYS_exit
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // failure: mov eax, SYS_exit
+        0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+        0x0f, 0x05, // syscall
+    ];
+    // Copy the probe below the stack pointer and jump to it.
+    let mut code = vec![0x48, 0x8d, 0x35, 19, 0, 0, 0]; // lea rsi, [rip + 19]
+    code.extend_from_slice(&[0xb9, probe.len() as u8, 0, 0, 0]); // mov ecx, len
+    code.extend_from_slice(&[0x48, 0x81, 0xec, 0x00, 0x01, 0x00, 0x00]); // sub rsp, 256
+    code.extend_from_slice(&[0x48, 0x89, 0xe7]); // mov rdi, rsp
+    code.extend_from_slice(&[0xf3, 0xa4]); // rep movsb
+    code.extend_from_slice(&[0xff, 0xe4]); // jmp rsp
+    code.extend_from_slice(&probe);
+    let image = static_elf(&code);
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf(&image, "/bin/vmware-probe-stack")
+        .unwrap();
+    assert_eq!(backend.run_static_elf().unwrap(), 0);
 }
 
 #[test]
@@ -5414,6 +5770,75 @@ fn static_elf_forks_execs_and_waits_for_child() {
     assert_eq!(code, 0);
     assert_eq!(stdout, message);
     assert!(stderr.is_empty());
+}
+
+/// setpriority is decided by the Tool (Detcore) on every backend, so this
+/// backend refuses it: the guest asks for a nice value the host thread does
+/// not have (19, or 18 when it already runs at 19) and exits with the negated
+/// result, ENOSYS (38), and the host thread that ran the guest keeps its nice
+/// value. Run without a tool and with one that injects every call, each on a
+/// fresh thread.
+#[test]
+fn setpriority_is_refused_without_changing_the_host_nice_value() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM setpriority refusal test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+    // getpriority answers 20 - nice. A spawned thread starts with this
+    // thread's nice value.
+    // SAFETY: getpriority takes no pointer.
+    let current = 20 - unsafe { libc::syscall(libc::SYS_getpriority, libc::PRIO_PROCESS, 0) };
+    let requested: u8 = if current == 19 { 18 } else { 19 };
+    let image = static_elf(&[
+        0x31, 0xff, // xor edi, edi (PRIO_PROCESS)
+        0x31, 0xf6, // xor esi, esi (the caller)
+        0xba, requested, 0x00, 0x00, 0x00, // mov edx, requested
+        0xb8, 0x8d, 0x00, 0x00, 0x00, // mov eax, SYS_setpriority
+        0x0f, 0x05, // syscall
+        0xf7, 0xd8, // neg eax
+        0x89, 0xc7, // mov edi, eax
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ]);
+    for with_tool in [false, true] {
+        let image = image.clone();
+        let (code, before, after) = std::thread::spawn(move || {
+            // SAFETY: getpriority takes no pointer.
+            let nice = || unsafe { libc::syscall(libc::SYS_getpriority, libc::PRIO_PROCESS, 0) };
+            let before = nice();
+            assert_ne!(
+                20 - before,
+                i64::from(requested),
+                "the request must differ from the thread's nice value"
+            );
+            let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+            backend
+                .install_static_elf(&image, "/bin/setpriority-test")
+                .unwrap();
+            let code = if with_tool {
+                futures::executor::block_on(
+                    backend.run_static_elf_with_tool::<StraceTool>((), true),
+                )
+                .unwrap()
+                .1
+            } else {
+                backend.run_static_elf_captured().unwrap().0
+            };
+            (code, before, nice())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(code, libc::ENOSYS, "with_tool={with_tool}");
+        assert_eq!(
+            after, before,
+            "with_tool={with_tool}: the host nice value changed"
+        );
+    }
 }
 
 #[test]
@@ -6943,6 +7368,124 @@ fn static_elf_executes_syscall_and_exits() {
     assert_eq!(backend.run_static_elf().unwrap(), 0);
 }
 
+/// A Tool whose run requires process signal control. Its configuration says
+/// whether it takes the control the static-ELF runner offers.
+#[derive(Default)]
+struct RequiredControlGlobal {
+    take: bool,
+    installs: std::sync::atomic::AtomicUsize,
+    thread_starts: std::sync::atomic::AtomicUsize,
+    failures: Mutex<Vec<reverie::BackendFailure>>,
+}
+
+#[reverie::global_tool]
+impl GlobalTool for RequiredControlGlobal {
+    type Request = ();
+    type Response = ();
+    type Config = bool;
+
+    async fn init_global_state(take: &bool) -> Self {
+        Self {
+            take: *take,
+            ..Self::default()
+        }
+    }
+
+    fn install_backend_signal_control(
+        &self,
+        control: Option<BackendSignalControl>,
+    ) -> Result<BackendSignalControlMode, reverie::Error> {
+        assert!(
+            control.is_some(),
+            "the static-ELF runner offers the control"
+        );
+        self.installs.fetch_add(1, Ordering::SeqCst);
+        Ok(if self.take {
+            BackendSignalControlMode::ToolControlled
+        } else {
+            BackendSignalControlMode::Unchanged
+        })
+    }
+
+    async fn receive_rpc(&self, _from: Pid, _: ()) {
+        self.thread_starts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn report_backend_failure(&self, event: reverie::BackendFailure) {
+        self.failures.lock().unwrap().push(event);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RequiredControlTool;
+
+#[reverie::tool]
+impl Tool for RequiredControlTool {
+    type GlobalState = RequiredControlGlobal;
+    type ThreadState = ();
+
+    fn requires_signal_control(_: &bool) -> bool {
+        true
+    }
+
+    async fn handle_thread_start<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::Error> {
+        guest.send_rpc(()).await;
+        Ok(())
+    }
+}
+
+#[test]
+fn static_elf_refuses_a_required_signal_control_the_tool_declined() {
+    if !kvm_available("KVM required signal control test") {
+        return;
+    }
+    // exit_group(0): the program itself cannot fail.
+    let code = [
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    for take in [false, true] {
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_static_elf(&static_elf(&code), "/bin/true")
+            .unwrap();
+        let completion = futures::executor::block_on(
+            backend.run_static_elf_with_tool_completion::<RequiredControlTool>(take, true),
+        )
+        .unwrap();
+        let global = completion.global_state;
+        assert_eq!(global.installs.load(Ordering::SeqCst), 1, "take={take}");
+        if take {
+            // Taking the offered control satisfies the requirement.
+            let (status, stdout, stderr) = completion.result.unwrap();
+            assert_eq!(status, reverie::ExitStatus::Exited(0));
+            assert!(stdout.is_empty() && stderr.is_empty());
+            assert_eq!(global.thread_starts.load(Ordering::SeqCst), 1);
+            assert!(global.failures.lock().unwrap().is_empty());
+            continue;
+        }
+        // Declining it is refused with EINVAL before the first thread starts,
+        // through the installation failure path, which publishes once.
+        let error = completion.result.unwrap_err();
+        assert!(
+            matches!(
+                error.primary(),
+                Error::Reverie(reverie::Error::Errno(errno)) if *errno == Errno::EINVAL
+            ),
+            "{error}"
+        );
+        assert_eq!(global.thread_starts.load(Ordering::SeqCst), 0);
+        let failures = global.failures.lock().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].phase, "process signal control installation");
+    }
+}
+
 #[test]
 fn static_elf_host_futex_wait_observes_finite_timeout() {
     if !kvm_available("KVM host futex timeout test") {
@@ -7133,12 +7676,19 @@ fn kvm_static_elf_getppid_follows_pid_namespace_contract() {
     // A second fixture pins the process group after root-PID configuration.
     // Both configuration orderings are production paths and must rebuild the
     // loaded lifecycle table with a PGID distinct from its default value.
+    // getpgrp is Detcore's and refused here, so the probe asks kill instead:
+    // a signal-0 probe of group `expected_pgid` finds a member only if the
+    // table holds that group, and one of the caller's own group (pid 0) only
+    // if the caller's PGID is a group in the table.
     #[rustfmt::skip]
-    fn getpgrp_probe(expected_pgid: u8) -> [u8; 52] {
+    fn group_probe(expected_pgid: u8) -> [u8; 58] {
+        let [g0, g1, g2, g3] = (-i32::from(expected_pgid)).to_le_bytes();
         [
-            0xb8, 0x6f, 0x00, 0x00, 0x00,   // mov eax, SYS_getpgrp (111)
+            0xbf, g0, g1, g2, g3,           // mov edi, -expected_pgid
+            0x31, 0xf6,                     // xor esi, esi (signal 0 probe)
+            0xb8, 0x3e, 0x00, 0x00, 0x00,   // mov eax, SYS_kill (62)
             0x0f, 0x05,                     // syscall
-            0x48, 0x83, 0xf8, expected_pgid, // cmp rax, expected_pgid
+            0x48, 0x85, 0xc0,               // test rax, rax
             0x75, 0x19,                     // jne failure
             0x31, 0xff,                     // xor edi, edi (current process group)
             0x31, 0xf6,                     // xor esi, esi (signal 0 probe)
@@ -7174,7 +7724,7 @@ fn kvm_static_elf_getppid_follows_pid_namespace_contract() {
             backend.set_root_pid(3).unwrap();
         }
         backend
-            .install_static_elf(&static_elf(&getpgrp_probe(3)), "/bin/true")
+            .install_static_elf(&static_elf(&group_probe(3)), "/bin/true")
             .unwrap();
         if !set_before_install {
             backend.set_root_pid(3).unwrap();
@@ -7182,7 +7732,7 @@ fn kvm_static_elf_getppid_follows_pid_namespace_contract() {
         assert_eq!(
             backend.run_static_elf().unwrap(),
             0,
-            "root guest pid=3 must report getpgrp()==3 and make kill(0,0) find its group when \
+            "root guest pid=3 must make kill(-3,0) and kill(0,0) find its group when \
              set_root_pid runs {} install",
             if set_before_install {
                 "before"
@@ -7573,6 +8123,7 @@ fn check_worker_exec_preserves_shared_memory(
     assert!(stderr.is_empty());
     assert_eq!(log.worker_errno(), Some(expected_errno));
     assert!(log.root_value_preserved());
+    assert_eq!(log.worker_refusal_checks(), Some(ALL_REFUSAL_CHECKS));
 }
 
 #[test]
@@ -7632,37 +8183,19 @@ static struct registers cpuid_xstate(uint32_t subleaf) {
   return result;
 }
 
-static int matches(struct registers actual, struct registers expected) {
-  return actual.eax == expected.eax && actual.ebx == expected.ebx &&
-         actual.ecx == expected.ecx && actual.edx == expected.edx;
-}
 
 int main(void) {
-  struct registers xstate = cpuid_xstate(0);
-  /* KVM recomputes subleaf 0 EBX from XCR0 and the host-supported component
-     layout. With x87, SSE, and AVX enabled, the guest-visible size is 0x340. */
-  if (xstate.eax != 0x00000007 || xstate.ebx != 0x00000340 ||
-      xstate.ecx != 0x00000340 || xstate.edx != 0) {
-    return 10;
-  }
-
-  static const struct {
-    uint32_t subleaf;
-    struct registers expected;
-  } cases[] = {
-      {1, {0, 0, 0, 0}},
-      {2, {0x00000100, 0x00000240, 0, 0}},
-      {17, {0, 0, 0, 0}},
-      {18, {0, 0, 0, 0}},
-      {19, {0, 0, 0, 0}},
-  };
-
-  for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-    if (!matches(cpuid_xstate(cases[i].subleaf), cases[i].expected)) {
-      return 11 + (int)i;
+  /* This run has no Tool, so nothing traps CPUID and the vCPU's table
+     answers: KVM's host-supported rows with the extended state limited to the
+     x87, SSE and YMM components the backend's signal frames carry. */
+  static const uint32_t subleaves[] = {0, 1, 2, 17, 18, 19};
+  for (uint32_t i = 0; i < sizeof(subleaves) / sizeof(subleaves[0]); ++i) {
+    struct registers row = cpuid_xstate(subleaves[i]);
+    if (printf("0xd.%u: %08x %08x %08x %08x\n", subleaves[i], row.eax, row.ebx,
+               row.ecx, row.edx) < 0) {
+      return 10;
     }
   }
-
   /* The executable is linked for lazy binding, so this first puts call makes
      the dynamic linker resolve its PLT entry after all CPUID checks pass. */
   if (puts("indexed xstate cpuid ok") < 0) {
@@ -7708,8 +8241,35 @@ int main(void) {
     );
 
     let executable = executable.to_str().unwrap();
+    let native = std::process::Command::new(executable)
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "{native:?}");
     let (stdout, stderr) = run_host_program_captured(executable, &[executable], &directory.0);
-    assert_eq!(stdout, b"indexed xstate cpuid ok\n");
+    let stdout = String::from_utf8(stdout).unwrap();
+    let native = String::from_utf8(native.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    let native_lines: Vec<&str> = native.lines().collect();
+    assert_eq!(
+        lines.len(),
+        native_lines.len(),
+        "{stdout}\nnative:\n{native}"
+    );
+    // Subleaf 0 advertises only x87, SSE and YMM; KVM recomputes EBX, the
+    // size those enabled components need, as 0x340.
+    assert!(
+        lines[0].starts_with("0xd.0: 00000007 00000340 "),
+        "{stdout}"
+    );
+    // The YMM row and the absent components' rows are the host's.
+    for index in 2..lines.len() {
+        assert_eq!(
+            lines[index], native_lines[index],
+            "{stdout}\nnative:\n{native}"
+        );
+    }
+    assert_eq!(lines.last(), Some(&"indexed xstate cpuid ok"), "{stdout}");
     assert!(stderr.is_empty());
 }
 
@@ -7813,6 +8373,94 @@ fn tool_receives_post_exec_with_guest_auxv() {
         .read(address as u64, &mut random)
         .unwrap();
     assert_eq!(random, POST_EXEC_RANDOM);
+}
+
+/// What `InitialStackTool`'s post-exec hook saw: the reported initial stack
+/// pointer, the registers' stack pointer, argc read at the reported address,
+/// and the first byte of argv[0] there.
+#[derive(Default)]
+struct InitialStackLog {
+    seen: Mutex<Vec<InitialStackSeen>>,
+}
+
+/// The reported initial stack pointer, the registers' stack pointer, argc,
+/// and argv[0]'s first byte.
+type InitialStackSeen = (Option<u64>, u64, u64, u8);
+
+#[reverie::global_tool]
+impl GlobalTool for InitialStackLog {
+    type Request = InitialStackSeen;
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, _from: Pid, seen: InitialStackSeen) {
+        self.seen
+            .lock()
+            .expect("initial stack log lock poisoned")
+            .push(seen);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InitialStackTool;
+
+#[reverie::tool]
+impl Tool for InitialStackTool {
+    type GlobalState = InitialStackLog;
+    type ThreadState = ();
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        let reported = guest.initial_stack_pointer();
+        let rsp = guest.regs().await.rsp;
+        let (argc, first) = match reported {
+            Some(stack) => {
+                let argc: u64 = guest
+                    .memory()
+                    .read_value(AddrMut::<u64>::from_raw(stack as usize).ok_or(Errno::EFAULT)?)?;
+                let argv0: u64 = guest.memory().read_value(
+                    AddrMut::<u64>::from_raw(stack as usize + 8).ok_or(Errno::EFAULT)?,
+                )?;
+                let first: u8 = guest
+                    .memory()
+                    .read_value(AddrMut::<u8>::from_raw(argv0 as usize).ok_or(Errno::EFAULT)?)?;
+                (argc, first)
+            }
+            None => (0, 0),
+        };
+        guest.send_rpc((reported, rsp, argc, first)).await;
+        Ok(())
+    }
+}
+
+/// The KVM loader builds the image's initial stack itself and reports its
+/// stack pointer (`Guest::initial_stack_pointer`): at the post-exec hook, which
+/// runs before the entry point, it is the registers' stack pointer, and argc
+/// and argv[0] are there.
+#[test]
+fn post_exec_reports_the_loaders_initial_stack_pointer() {
+    if !kvm_available("initial stack pointer test") {
+        return;
+    }
+    let code = [
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, SYS_exit_group
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_static_elf_with_args(&static_elf(&code), &["prog", "one", "two"], &[])
+        .unwrap();
+    let (log, exit_code, _, _) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<InitialStackTool>((), true))
+            .unwrap();
+    assert_eq!(exit_code, 0);
+    let seen = log.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (reported, rsp, argc, first) = seen[0];
+    assert_eq!(reported, Some(rsp));
+    assert_eq!(argc, 3);
+    assert_eq!(first, b'p');
 }
 
 #[test]
@@ -8544,6 +9192,50 @@ fn counter_tools_aggregate_intercepted_static_elf_syscalls() {
     );
 }
 
+/// Answers the user and group id calls as Detcore does (uid and gid 0, every
+/// change a no-op success) without injecting them. KVM leaves these calls to
+/// the Tool and refuses them in a run without one.
+#[derive(Clone, Copy, Debug, Default)]
+struct RootIdentityTool;
+
+#[reverie::tool]
+impl Tool for RootIdentityTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscalls([
+            Sysno::getuid,
+            Sysno::geteuid,
+            Sysno::getgid,
+            Sysno::getegid,
+            Sysno::setuid,
+            Sysno::setgid,
+            Sysno::setreuid,
+            Sysno::setregid,
+            Sysno::setresuid,
+            Sysno::setresgid,
+            Sysno::setfsuid,
+            Sysno::setfsgid,
+            Sysno::setgroups,
+        ]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        _syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        Ok(0)
+    }
+}
+
+/// make runs its recipe's shell through glibc's posix_spawn (clone3 with
+/// CLONE_VFORK). The spawn needs the user and group ids (getuid, getgid,
+/// setresuid, setresgid), which KVM leaves to the Tool, so the run supplies
+/// a Tool that decides them as Detcore does.
 #[test]
 fn real_make_runs_a_shell_recipe_through_clone3_vfork() {
     match Kvm::new() {
@@ -8560,7 +9252,21 @@ fn real_make_runs_a_shell_recipe_through_clone3_vfork() {
         "all: result.txt\nresult.txt:\n\tprintf 'make:42\\n' > result.txt\n",
     )
     .unwrap();
-    run_host_program("/usr/bin/make", &["make", "-s"], &root.0);
+    let image = std::fs::read("/usr/bin/make").unwrap();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_with_context(&image, &["make", "-s"], &["PATH=/usr/bin:/bin"], &root.0)
+        .unwrap();
+    let (_, code, stdout, stderr) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<RootIdentityTool>((), true))
+            .unwrap();
+    assert_eq!(
+        code,
+        0,
+        "make exited {code}; stdout={}; stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+    );
     assert_eq!(
         std::fs::read(root.0.join("result.txt")).unwrap(),
         b"make:42\n"
@@ -9718,10 +10424,12 @@ int main(int argc, char **argv) {
   int hold[2] = {-1, -1};
   if ((mode == 0 || (mode >= 6 && mode <= 9)) && pipe(ready) != 0) return 10;
   if (mode == 9 && (pipe(verdict) != 0 || pipe(release) != 0 || pipe(hold) != 0)) return 26;
+  /* Read before fork: once this process exits the child is reparented, and
+     its getppid() names the namespace init, which never exits. */
+  pid_t root = getpid();
   pid_t child = fork();
   if (child < 0) return 11;
   if (child == 0) {
-    pid_t root = getppid();
     if (mode == 4 || mode == 5 || mode == 7 || mode == 8) {
       struct sigaction action = {0};
       action.sa_handler = (mode == 4 || mode == 7) ? SIG_IGN : SIG_DFL;
@@ -11253,6 +11961,7 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "msync_lifecycle::shared_coherence_and_mapping_lifetime_match_native",
         "shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native",
         "shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner",
+        "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native",
         "pdeathsig::unchanged_six_check_state_matches_native_controlled",
         "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
         "pdeathsig::creator_thread_death_and_clear_match_native_shared_pending",
@@ -11281,6 +11990,10 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "getdents64_alias_suffix_cleanup_stops_tool_and_guest",
         "getdents64_alias_eof_cleanup_stops_direct_guest",
         "getdents64_alias_eof_cleanup_stops_tool_and_guest",
+        "static_elf_runs_when_guest_memory_is_not_whole_large_pages",
+        "static_elf_vmware_probe_runs_from_the_stack",
+        "exec_to_a_lower_identity_end_unmaps_the_old_identity_pages",
+        "guest_task_ids_follow_the_configured_numbering",
     ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([test, "--exact", "--test-threads=1", "--nocapture"])
@@ -12552,7 +13265,7 @@ int main(void) {
     let completion = completion.unwrap();
     let global = completion.global_state;
     let (status, stdout, stderr) = completion.result.unwrap();
-    assert_eq!(status, 0);
+    assert_eq!(status, reverie::ExitStatus::Exited(0));
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
     assert!(global.permit.into_inner().unwrap().is_none());
@@ -15698,14 +16411,26 @@ fn signalfd_positioned_vector_flags_match_native_linux() {
 #include <stdio.h>
 #include <string.h>
 #include <sys/signalfd.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool and refuses it in a run without one, and its signals then carry
+   uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
 
 static int check_record(const struct signalfd_siginfo *info) {
   struct signalfd_siginfo expected = {0};
   expected.ssi_signo = SIGUSR1;
   expected.ssi_pid = getpid();
-  expected.ssi_uid = getuid();
+  expected.ssi_uid = sender_uid();
   return memcmp(info, &expected, sizeof(expected)) == 0;
 }
 
@@ -16010,6 +16735,18 @@ const SIBLING_SIGNAL_PROGRAM: &str = r#"#define _GNU_SOURCE
 #include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool and refuses it in a run without one, and its signals then carry
+   uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
+
 static atomic_int target_tid, phase, handled, handler_tid;
 static int mode;
 static pthread_t target_pthread;
@@ -16018,7 +16755,7 @@ static void handler(int number, siginfo_t *info, void *context) {
   (void)context;
   if (number != SIGUSR1 || info->si_signo != SIGUSR1 ||
       info->si_code != SI_TKILL || info->si_pid != getpid() ||
-      info->si_uid != getuid()) _exit(81);
+      info->si_uid != sender_uid()) _exit(81);
   atomic_store(&handler_tid, (int)syscall(SYS_gettid));
   atomic_fetch_add(&handled, 1);
 }
@@ -16054,7 +16791,7 @@ static void *receiver(void *unused) {
     int expected_code = mode == 8 ? SI_TKILL : SI_USER;
     if (received != SIGUSR1 || info.si_signo != SIGUSR1 ||
         info.si_code != expected_code || info.si_pid != getpid() ||
-        info.si_uid != getuid()) _exit(86);
+        info.si_uid != sender_uid()) _exit(86);
     errno = 0;
     if (sigtimedwait(&selected, NULL, &zero) != -1 || errno != EAGAIN) _exit(87);
     if (atomic_load(&handled)) _exit(88);
@@ -16277,6 +17014,7 @@ fn sibling_signal_delivery_native_plain_and_tool() {
 }
 
 const SIBLING_ENTRY_SIGNAL_PROGRAM: &str = r#"#define _GNU_SOURCE
+#include <errno.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -16284,13 +17022,25 @@ const SIBLING_ENTRY_SIGNAL_PROGRAM: &str = r#"#define _GNU_SOURCE
 #include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool and refuses it in a run without one, and its signals then carry
+   uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
+
 static unsigned char stack[65536] __attribute__((aligned(16)));
 static atomic_int handled, done, result;
 static int mode;
 static void handler(int number, siginfo_t *info, void *context) {
   (void)context;
   if (info->si_signo != number || info->si_code != SI_TKILL ||
-      info->si_pid != getpid() || info->si_uid != getuid() ||
+      info->si_pid != getpid() || info->si_uid != sender_uid() ||
       syscall(SYS_gettid) == getpid()) _exit(71);
   if (atomic_exchange(&handled, number)) _exit(72);
 }
@@ -16902,15 +17652,18 @@ fn subscribed_timestamp_dispatch_refuses_unrelated_exceptions() {
         return;
     }
 
+    // An unrelated #UD reaches the guest as SIGILL, never as a timestamp
+    // callback.
     let mut invalid_opcode_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     invalid_opcode_backend
         .install_static_elf(&static_elf(&[0x0f, 0x0b]), "/bin/fault")
         .unwrap();
-    let error = futures::executor::block_on(
-        invalid_opcode_backend.run_static_elf_with_tool::<TimestampTool>(true, true),
+    let completion = futures::executor::block_on(
+        invalid_opcode_backend.run_static_elf_with_tool_completion::<TimestampTool>(true, true),
     )
-    .unwrap_err();
-    assert_invalid_opcode(error);
+    .unwrap();
+    assert_invalid_opcode_signal(completion.result.unwrap().0);
+    assert!(completion.global_state.calls().is_empty());
 
     let mut general_protection_backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     general_protection_backend
@@ -17030,7 +17783,7 @@ fn repeated_timestamp_reads_evolve_once_per_instruction() {
 }
 
 #[test]
-fn static_elf_unsubscribed_rdtscp_remains_guest_exception() {
+fn static_elf_unsubscribed_rdtscp_runs_as_on_the_host() {
     if !kvm_available("KVM unsubscribed RDTSCP test") {
         return;
     }
@@ -17045,10 +17798,20 @@ fn static_elf_unsubscribed_rdtscp_remains_guest_exception() {
     backend
         .install_static_elf(&image, "/bin/unsubscribed-rdtscp")
         .unwrap();
-    let error =
-        futures::executor::block_on(backend.run_static_elf_with_tool::<TimestampTool>(false, true))
-            .unwrap_err();
-    assert_invalid_opcode(error);
+    // The vCPU's CPUID table holds the host's rows, so RDTSCP is available
+    // exactly when the host has it, as for a native program. Unsubscribed, it
+    // runs in the guest with no callback; without it, it is a genuine #UD.
+    let host_has_rdtscp = core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 27) != 0;
+    let completion = futures::executor::block_on(
+        backend.run_static_elf_with_tool_completion::<TimestampTool>(false, true),
+    )
+    .unwrap();
+    if host_has_rdtscp {
+        assert_eq!(completion.result.unwrap().0, ExitStatus::SUCCESS);
+    } else {
+        assert_invalid_opcode_signal(completion.result.unwrap().0);
+    }
+    assert!(completion.global_state.calls().is_empty());
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -17112,10 +17875,6 @@ impl Tool for ClockTimestampTool {
     }
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
-)]
 #[test]
 fn timestamp_callbacks_observe_retired_branches_without_counting_rpc_work() {
     if !kvm_available("KVM timestamp callback clock test") {
@@ -17418,7 +18177,8 @@ fn locked_and_overlength_timestamp_encodings_remain_faults() {
             backend.run_static_elf_with_tool_completion::<TimestampTool>(true, true),
         )
         .unwrap();
-        assert_invalid_opcode(completion.result.unwrap_err());
+        // LOCK makes the encoding a genuine #UD, delivered as SIGILL.
+        assert_invalid_opcode_signal(completion.result.unwrap().0);
         assert!(completion.global_state.calls().is_empty());
     }
     let mut code = vec![0x66; 14];
@@ -17440,9 +18200,7 @@ fn timestamp_tool_preserves_results_with_host_supported_cpuid() {
     if !kvm_available("KVM host-supported timestamp profile test") {
         return;
     }
-    let mut backend =
-        KvmBackend::new_with_cpuid_policy(MEMORY_SIZE, reverie_kvm::CpuidPolicy::host_supported())
-            .unwrap();
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
     backend
         .install_static_elf(
             &static_elf(&timestamp_assertion_program()),
@@ -18809,10 +19567,6 @@ int main(int argc, char **argv) {
     }
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
-)]
 #[test]
 fn storage_fd_syscalls_consume_low_words_on_kvm() {
     if !kvm_available("KVM storage fd low-word argument test") {
@@ -20367,7 +21121,7 @@ fn returned_public_run_case(
     DROPPED_RUN_CONFIGS.lock().unwrap().remove(&config);
     let completion = completion.expect("the returning run failed to start");
     let (status, _, _) = completion.result.expect("the returning run failed");
-    assert_eq!(status, 7);
+    assert_eq!(status, reverie::ExitStatus::Exited(7));
     let calls = std::mem::take(&mut *calls.lock().unwrap());
     let exits = calls
         .iter()
@@ -20765,7 +21519,7 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
                     "file",
                     "directory",
                     "proc-root",
-                    "proc-uptime",
+                    "proc-maps",
                     "fdinfo",
                 ][..],
             ),
@@ -21093,6 +21847,72 @@ fn shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native(
         assert_eq!(stderr, native.stderr, "mode={name}");
         assert_eq!(stdout, native.stdout, "mode={name}");
         eprintln!("shared-file-fork completed {name}: child=0 syncs=2");
+    }
+}
+
+#[test]
+fn shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native() {
+    const TEST: &str =
+        "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-anonymous-fork",
+        include_str!("fixtures/shared_anonymous_fork.c"),
+    );
+    let image = std::fs::read(&program).unwrap();
+    let native = std::process::Command::new(&program)
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    assert_eq!(
+        native.stdout,
+        b"shared anonymous fork child=ok grandchild=ok cow=ok unmap=ok exec=ok\n"
+    );
+    for (name, ownership) in [
+        ("direct", None),
+        ("host", Some(ThreadOwnership::Host)),
+        ("tool", Some(ThreadOwnership::Tool)),
+    ] {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[program.to_str().unwrap()],
+                &[],
+                &directory.0,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if let Some(ownership) = ownership {
+            backend.set_thread_ownership(ownership);
+            let (trace, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            // The exec is proven by the exec child's zero status, which only
+            // the new image can return.
+            assert_eq!(
+                trace
+                    .syscalls()
+                    .iter()
+                    .filter(|name| name.as_str() == "fork")
+                    .count(),
+                3,
+                "ownership={ownership:?}: code={code} stdout={stdout:?} stderr={stderr:?}"
+            );
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(stdout, native.stdout, "mode={name}");
+        eprintln!("shared-anonymous-fork completed {name}: forks=3");
     }
 }
 
@@ -21581,7 +22401,7 @@ mod pdeathsig {
         fn new(_: Pid, mode: &u8) -> Self {
             Self { mode: *mode }
         }
-        fn observe_signal_dequeues(_: &u8) -> bool {
+        fn may_observe_signal_dequeues(_: &u8) -> bool {
             true
         }
         async fn handle_signal_dequeue<G: Guest<Self>>(

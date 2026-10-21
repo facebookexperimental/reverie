@@ -418,7 +418,7 @@ mod entry_multi_owner_tests {
             subscriptions.syscall(Sysno::getpid);
             subscriptions
         }
-        fn observe_signal_dequeues(_: &()) -> bool {
+        fn may_observe_signal_dequeues(_: &()) -> bool {
             true
         }
         fn init_thread_state(&self, tid: Pid, parent: Option<(Pid, &Arc<u64>)>) -> Arc<u64> {
@@ -909,7 +909,7 @@ mod entry_multi_owner_tests {
         causes.sort();
         causes
     }
-    fn verify(observed: &Observed, result: crate::Result<(i32, Vec<u8>, Vec<u8>)>) {
+    fn verify(observed: &Observed, result: crate::Result<(ExitStatus, Vec<u8>, Vec<u8>)>) {
         let state = observed.snapshot();
         for role in ROLES {
             for event in [
@@ -981,7 +981,7 @@ mod entry_multi_owner_tests {
             );
         }
         if observed.case == Case::Healthy {
-            assert_eq!(result.unwrap(), (0, Vec::new(), Vec::new()));
+            assert_eq!(result.unwrap(), (ExitStatus::Exited(0), Vec::new(), Vec::new()));
             assert!(
                 !state
                     .events

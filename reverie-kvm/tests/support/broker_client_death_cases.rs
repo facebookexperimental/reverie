@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Exported-client death control for the ordinary-main broker test launcher.
 //! The launcher supplies the broker; this module does not bootstrap one.
 //! The caller owns BrokerOwner through shutdown and actual __WCLONE wait.

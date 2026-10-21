@@ -45,6 +45,10 @@
 mod counter1_exact;
 #[path = "../../reverie-examples/counter2_tool.rs"]
 mod counter2_exact;
+// The runtime hosts the tool; the record's text form is the launcher's.
+#[allow(dead_code)]
+#[path = "../../reverie-examples/recorder_tool.rs"]
+pub(crate) mod recorder_exact;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -72,6 +76,7 @@ use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
+use reverie::Stack;
 use reverie::Tid;
 use reverie::Tool;
 use reverie::syscalls::Addr;
@@ -102,6 +107,7 @@ const STRACE_ENV: &str = "HERMIT_DBT_STRACE";
 const NOOP_ENV: &str = "HERMIT_DBT_NOOP";
 const TEST_REWRITE_EXIT_ENV: &str = "HERMIT_DBT_TEST_REWRITE_EXIT";
 const TEST_SET_REG_ENV: &str = "HERMIT_DBT_TEST_SET_REG";
+const TEST_COMPARE_EXCHANGE_ENV: &str = "HERMIT_DBT_TEST_COMPARE_EXCHANGE";
 const TEST_PPID_ENV: &str = "HERMIT_DBT_TEST_PPID";
 const TEST_BACKTRACE_ENV: &str = "HERMIT_DBT_TEST_BACKTRACE";
 const TEST_INJECT_INVALID_CLONE_ENV: &str = "HERMIT_DBT_TEST_INJECT_INVALID_CLONE";
@@ -116,6 +122,62 @@ const CHAOS_NO_RECV_ENV: &str = "HERMIT_DBT_CHAOS_NO_RECV";
 const CHAOS_INTERRUPT_ENV: &str = "HERMIT_DBT_CHAOS_INTERRUPT";
 const COUNTER1_EXACT_ENV: &str = "HERMIT_DBT_COUNTER1_EXACT";
 const COUNTER2_EXACT_ENV: &str = "HERMIT_DBT_COUNTER2_EXACT";
+
+use crate::TOOL_ENV;
+
+/// A shared example tool the runtime hosts by name ([`TOOL_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostedTool {
+    Counter1,
+    Counter2,
+    Recorder,
+}
+
+impl HostedTool {
+    /// The tool [`TOOL_ENV`] names. counter2 is not among them: its exit hooks
+    /// send their totals to the GlobalState from the process-exit callback,
+    /// which the prototype runtime cannot route to the launcher's coordinator
+    /// yet (it crashes there), so it runs only uncoordinated, through
+    /// `HERMIT_DBT_COUNTER2_EXACT`.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "counter1" => Some(Self::Counter1),
+            recorder_exact::NAME => Some(Self::Recorder),
+            _ => None,
+        }
+    }
+}
+
+/// The hosted tool [`TOOL_ENV`] (or its two older flags) names. An unknown
+/// name ends the run by name rather than running no tool.
+static HOSTED_TOOL: LazyLock<Option<HostedTool>> = LazyLock::new(|| {
+    if let Some(name) = std::env::var_os(TOOL_ENV) {
+        let name = name.to_string_lossy();
+        return Some(HostedTool::from_name(&name).unwrap_or_else(|| {
+            let line = format!(
+                "reverie-dbt: REFUSED: {TOOL_ENV}={name:?} names no tool the prototype runtime hosts with a coordinator (counter1, recorder)\n"
+            );
+            // This can run before DynamoRIO's emit callback is installed, so
+            // write to the program's stderr, which the launcher captures.
+            if !emit_raw(&EMITTER, line.as_bytes()) {
+                // SAFETY: writes a live buffer to descriptor 2.
+                unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+            }
+            std::process::exit(127)
+        }));
+    }
+    if env_flag(COUNTER1_EXACT_ENV) {
+        Some(HostedTool::Counter1)
+    } else if env_flag(COUNTER2_EXACT_ENV) {
+        Some(HostedTool::Counter2)
+    } else {
+        None
+    }
+});
+
+pub(crate) fn hosted_tool() -> Option<HostedTool> {
+    *HOSTED_TOOL
+}
 
 fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| {
@@ -138,6 +200,13 @@ static NOOP_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(NOOP_ENV));
 static TEST_REWRITE_EXIT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag(TEST_REWRITE_EXIT_ENV));
 static TEST_SET_REG_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_SET_REG_ENV));
+// The existing explicit test Tool also checks a mixed injection route without
+// changing its register/completed-result sentinel mode selected by `1`.
+static TEST_RETURNING_GETTID: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os(TEST_SET_REG_ENV).is_some_and(|value| value == OsStr::new("returning-gettid"))
+});
+static TEST_COMPARE_EXCHANGE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_flag(TEST_COMPARE_EXCHANGE_ENV));
 static TEST_PPID_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_PPID_ENV));
 static TEST_BACKTRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(TEST_BACKTRACE_ENV));
 static TEST_INJECT_INVALID_CLONE_ENABLED: LazyLock<bool> =
@@ -206,11 +275,13 @@ fn chrome_now_us() -> u64 {
         .unwrap_or_default()
         .as_micros() as u64
 }
-static COUNTER1_EXACT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER1_EXACT_ENV));
 static COUNTER1_EXACT_TOOL: LazyLock<ExactCounter1Tool> = LazyLock::new(ExactCounter1Tool::default);
 static COUNTER1_EXACT_GLOBAL: LazyLock<ExactCounter1Global> =
     LazyLock::new(ExactCounter1Global::default);
-static COUNTER2_EXACT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(COUNTER2_EXACT_ENV));
+static RECORDER_TOOL: LazyLock<recorder_exact::Recorder> =
+    LazyLock::new(recorder_exact::Recorder::default);
+static RECORDER_GLOBAL: LazyLock<recorder_exact::Recorded> =
+    LazyLock::new(recorder_exact::Recorded::default);
 static COUNTER2_EXACT_TOOL: LazyLock<ExactCounter2Tool> = LazyLock::new(|| {
     <ExactCounter2Tool as Tool>::new(reverie::Pid::from_raw(unsafe { libc::getpid() }), &())
         .with_thread_exit_reporter(|tid, syscalls| {
@@ -258,7 +329,7 @@ fn emit_raw(slot: &AtomicUsize, bytes: &[u8]) -> bool {
 
 /// Whether the exact backend-neutral counter1 tool is selected.
 pub(crate) fn counter1_exact_enabled() -> bool {
-    *COUNTER1_EXACT_ENABLED
+    hosted_tool() == Some(HostedTool::Counter1)
 }
 
 /// Exact counter1 process-local tool instance.
@@ -281,7 +352,23 @@ pub(crate) fn emit_counter1_exact_summary() {
 
 /// Whether the exact backend-neutral counter2 tool is selected.
 pub(crate) fn counter2_exact_enabled() -> bool {
-    *COUNTER2_EXACT_ENABLED
+    hosted_tool() == Some(HostedTool::Counter2)
+}
+
+/// Whether the shared pass-through recorder is selected.
+pub(crate) fn recorder_enabled() -> bool {
+    hosted_tool() == Some(HostedTool::Recorder)
+}
+
+/// The recorder's process-local tool instance.
+pub(crate) fn recorder_tool() -> &'static recorder_exact::Recorder {
+    &RECORDER_TOOL
+}
+
+/// The recorder's in-process GlobalState, used only without a coordinator; with
+/// one (`DbtRunner::output_with_global`), every event goes to the launcher's.
+pub(crate) fn recorder_global() -> &'static recorder_exact::Recorded {
+    &RECORDER_GLOBAL
 }
 
 /// Exact counter2 process-local tool instance.
@@ -502,12 +589,17 @@ impl Tool for RewriteExitTool {
 /// `set_reg_probe` fixture, which loads a different value and reads it back).
 const SET_REG_SENTINEL: u64 = 0xDEAD_BEEF_CAFE_F00D;
 
+// Test request handled only by the already-selected SetRegTool. It leaves the
+// completed-result sentinel probe below independent of the injection oracle.
+const KERNEL_IDENTITY_PRCTL: u64 = 0x4b49_4421;
+
 /// Regression tool that exercises the DBT `Guest::set_regs` path: on the guest's
 /// `getpid`, overwrite the callee-saved `r15` register with [`SET_REG_SENTINEL`]
 /// via `set_regs`, then suppress the syscall. Because `r15` is preserved across
 /// the syscall boundary, a correct `set_regs` implementation lets the guest read
-/// the sentinel back after the call returns. This is the first DBT tool to write
-/// the guest register file rather than only read it.
+/// the sentinel back after the call returns. The three own-identity getters
+/// also return distinct values so the guest can check that completed Tool
+/// results survive the native callback boundary.
 #[derive(Clone, Copy, Debug, Default)]
 struct SetRegTool;
 
@@ -523,17 +615,450 @@ impl Tool for SetRegTool {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
+        if *TEST_RETURNING_GETTID {
+            return if syscall.number() == Sysno::gettid {
+                Ok(guest.inject(syscall).await?)
+            } else {
+                guest.tail_inject(syscall).await
+            };
+        }
+        let (number, args) = syscall.into_parts();
+        if number == Sysno::prctl && args.arg0 as u64 == 0x5053_5631 {
+            // Test-only request. The guest supplies a live malformed timeout,
+            // an empty temporary mask wrapper and the handler counter.
+            let call = reverie::syscalls::Pselect6::new()
+                .with_timeout(reverie::syscalls::AddrMut::from_raw(args.arg2))
+                .with_sigmask(reverie::syscalls::Addr::from_raw(args.arg1));
+            let validation = guest
+                .inject_with_purpose(call, reverie::InjectionPurpose::Pselect6WrapperValidation)
+                .await;
+            if !matches!(
+                validation,
+                Err(Error::Errno(reverie::syscalls::Errno::EINVAL))
+            ) {
+                return Err(std::io::Error::other(format!(
+                    "validation must reach kernel EINVAL: {validation:?}"
+                ))
+                .into());
+            }
+            let mut mask = 0_u64;
+            let mut pending = 0_u64;
+            guest
+                .inject(Syscall::from_raw(
+                    Sysno::rt_sigprocmask,
+                    SyscallArgs::new(
+                        libc::SIG_SETMASK as usize,
+                        0,
+                        &mut mask as *mut _ as usize,
+                        8,
+                        0,
+                        0,
+                    ),
+                ))
+                .await?;
+            guest
+                .inject(Syscall::from_raw(
+                    Sysno::rt_sigpending,
+                    SyscallArgs::new(&mut pending as *mut _ as usize, 8, 0, 0, 0, 0),
+                ))
+                .await?;
+            let handled: i32 = guest.memory().read_value(Addr::from(args.arg3))?;
+            let chld = 1_u64 << (libc::SIGCHLD - 1);
+            if mask & chld == 0 || pending & chld == 0 || handled != 0 {
+                return Err(std::io::Error::other(
+                    "tagged validation changed blocked/pending/handler state",
+                )
+                .into());
+            }
+            let mut stack = guest.stack().await;
+            let timeout = stack.reserve::<reverie::syscalls::Timespec>();
+            let _guard = stack.commit()?;
+            guest.memory().write_value(
+                timeout,
+                &reverie::syscalls::Timespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                },
+            )?;
+            let ordinary = guest.inject(call.with_timeout(Some(timeout))).await;
+            if ordinary != Err(reverie::syscalls::Errno::EINTR) {
+                return Err(std::io::Error::other(format!(
+                    "ordinary returning pselect must still admit pending signal: {ordinary:?}"
+                ))
+                .into());
+            }
+            return Ok(0);
+        }
+        if number == Sysno::prctl && args.arg0 as u64 == KERNEL_IDENTITY_PRCTL {
+            if args.arg1 as i64 == libc::SYS_get_robust_list {
+                let target = args.arg2 as libc::c_long;
+                let head_valid = args.arg3 > 1;
+                let length_valid = args.arg4 > 1;
+                // Each valid output points to the middle of its own guarded
+                // three-word fixture buffer. Address1 is passed literally and
+                // is never read by this observer.
+                let before_head: Option<[u64; 3]> = if head_valid {
+                    Some(guest.memory().read_value(Addr::from(args.arg3 - 8))?)
+                } else {
+                    None
+                };
+                let before_length: Option<[u64; 3]> = if length_valid {
+                    Some(guest.memory().read_value(Addr::from(args.arg4 - 8))?)
+                } else {
+                    None
+                };
+                let mut kernel_head = [
+                    0x2468_ace0_2468_ace0_u64,
+                    0x1357_9bdf_1357_9bdf,
+                    0xfdb9_7531_fdb9_7531,
+                ];
+                let mut kernel_length = [
+                    0x2468_ace0_2468_ace0_u64,
+                    0xfedc_ba98_7654_3210,
+                    0xfdb9_7531_fdb9_7531,
+                ];
+                let head_address = if head_valid {
+                    (&mut kernel_head[1] as *mut u64) as usize
+                } else {
+                    args.arg3
+                };
+                let length_address = if length_valid {
+                    (&mut kernel_length[1] as *mut u64) as usize
+                } else {
+                    args.arg4
+                };
+                let caller_pid = unsafe { libc::syscall(libc::SYS_getpid) };
+                let caller_tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                // This query establishes permission in the actual returning
+                // callback's kernel task, not in the test-parent process.
+                // A NULL robust head is a legal successful output.
+                let kernel = unsafe {
+                    libc::syscall(
+                        libc::SYS_get_robust_list,
+                        target,
+                        head_address,
+                        length_address,
+                    )
+                };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::get_robust_list,
+                        SyscallArgs::new(args.arg2, args.arg3, args.arg4, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                // Read both independently after every result, including
+                // failures: Linux can complete one put_user before EFAULT.
+                let after_head: Option<[u64; 3]> = if head_valid {
+                    Some(guest.memory().read_value(Addr::from(args.arg3 - 8))?)
+                } else {
+                    None
+                };
+                let after_length: Option<[u64; 3]> = if length_valid {
+                    Some(guest.memory().read_value(Addr::from(args.arg4 - 8))?)
+                } else {
+                    None
+                };
+                let words = |value: Option<[u64; 3]>| {
+                    value.map_or_else(
+                        || "unaddressed".to_owned(),
+                        |words| format!("{:016x}:{:016x}:{:016x}", words[0], words[1], words[2]),
+                    )
+                };
+                let kernel_canaries = u8::from(
+                    kernel_head[0] == 0x2468_ace0_2468_ace0
+                        && kernel_length[0] == 0x2468_ace0_2468_ace0
+                        && kernel_head[2] == 0xfdb9_7531_fdb9_7531
+                        && kernel_length[2] == 0xfdb9_7531_fdb9_7531,
+                );
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-robust-query sysnum={} target={target} caller_pid={caller_pid} caller_tid={caller_tid} head_pointer={} length_pointer={} kernel={kernel} injected={injected} kernel_head={:016x} kernel_length={:016x} guest_head_before={} guest_head_after={} guest_length_before={} guest_length_after={} kernel_canaries={kernel_canaries}",
+                    args.arg1,
+                    if head_valid { "valid" } else { "bad" },
+                    if length_valid { "valid" } else { "bad" },
+                    kernel_head[1],
+                    kernel_length[1],
+                    words(before_head),
+                    words(after_head),
+                    words(before_length),
+                    words(after_length),
+                ));
+                // Keep the actual result: the fixture runs all seven cases
+                // before its final verdict, retaining admission/error order.
+                return Ok(injected);
+            }
+            if args.arg1 as i64 == libc::SYS_sched_getaffinity {
+                const CAPACITY: usize = 128;
+                let target = args.arg2 as libc::c_long;
+                let length = args.arg3;
+                if length > CAPACITY {
+                    return Err(reverie::syscalls::Errno::EINVAL.into());
+                }
+                let pointer = match args.arg4 {
+                    0 => "null",
+                    1 => "bad",
+                    _ => "valid",
+                };
+                let hex = |bytes: &[u8]| -> String {
+                    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+                    bytes
+                        .iter()
+                        .flat_map(|&byte| {
+                            [
+                                DIGITS[(byte >> 4) as usize] as char,
+                                DIGITS[(byte & 15) as usize] as char,
+                            ]
+                        })
+                        .collect()
+                };
+                // Independent native storage, with all capacity bytes and both
+                // canaries reset before the syscall. Retain its raw byte count.
+                let mut kernel_output = [0x7f_u8; CAPACITY + 16];
+                kernel_output[..8].fill(0xa5);
+                kernel_output[CAPACITY + 8..].fill(0x5a);
+                let kernel_address = if pointer == "valid" {
+                    kernel_output.as_mut_ptr().wrapping_add(8) as usize
+                } else {
+                    args.arg4
+                };
+                let guest_before = if pointer == "valid" {
+                    let mut bytes = [0_u8; CAPACITY];
+                    guest
+                        .memory()
+                        .read_exact(Addr::from(args.arg4), &mut bytes)?;
+                    hex(&bytes)
+                } else {
+                    "unaddressed".to_owned()
+                };
+                // NULL/address1 are passed literally to both calls and never
+                // dereferenced by this observer.
+                let kernel = unsafe {
+                    libc::syscall(libc::SYS_sched_getaffinity, target, length, kernel_address)
+                };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::sched_getaffinity,
+                        SyscallArgs::new(args.arg2, args.arg3, args.arg4, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                let guest_after = if pointer == "valid" {
+                    let mut bytes = [0_u8; CAPACITY];
+                    guest
+                        .memory()
+                        .read_exact(Addr::from(args.arg4), &mut bytes)?;
+                    hex(&bytes)
+                } else {
+                    "unaddressed".to_owned()
+                };
+                let kernel_canaries = u8::from(
+                    kernel_output[..8] == [0xa5; 8] && kernel_output[CAPACITY + 8..] == [0x5a; 8],
+                );
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-affinity-query sysnum={} target={target} len={length} pointer={pointer} kernel={kernel} injected={injected} kernel_mask={} guest_before={guest_before} guest_after={guest_after} kernel_canaries={kernel_canaries}",
+                    args.arg1,
+                    hex(&kernel_output[8..CAPACITY + 8]),
+                ));
+                // Return the real result so the complete C matrix remains
+                // visible even when membership admission rejects the live PID.
+                return Ok(injected);
+            }
+            if args.arg1 as i64 == libc::SYS_sched_getparam {
+                let target = args.arg2 as libc::c_long;
+                let pointer = match args.arg3 {
+                    0 => "null",
+                    1 => "bad",
+                    _ => "valid",
+                };
+                // A separate reset kernel buffer prevents a successful native
+                // write from masking an injected error or missing output write.
+                let mut kernel_output = [0x2468_ace0_u32, 0x1357_9bdf, 0xfdb9_7531];
+                let kernel_address = if pointer == "valid" {
+                    (&mut kernel_output[1] as *mut u32) as usize
+                } else {
+                    args.arg3
+                };
+                let guest_before = if pointer == "valid" {
+                    let value: u32 = guest.memory().read_value(Addr::from(args.arg3))?;
+                    format!("{value:08x}")
+                } else {
+                    "unaddressed".to_owned()
+                };
+                // NULL and address 1 remain literal kernel error probes; the
+                // observer never reads either invalid guest address.
+                let kernel =
+                    unsafe { libc::syscall(libc::SYS_sched_getparam, target, kernel_address) };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::sched_getparam,
+                        SyscallArgs::new(args.arg2, args.arg3, 0, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                let guest_after = if pointer == "valid" {
+                    let value: u32 = guest.memory().read_value(Addr::from(args.arg3))?;
+                    format!("{value:08x}")
+                } else {
+                    "unaddressed".to_owned()
+                };
+                let kernel_canaries =
+                    u8::from(kernel_output[0] == 0x2468_ace0 && kernel_output[2] == 0xfdb9_7531);
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-parameter-query sysnum={} target={target} pointer={pointer} kernel={kernel} injected={injected} kernel_bytes={:08x} guest_before={guest_before} guest_after={guest_after} kernel_canaries={kernel_canaries}",
+                    args.arg1, kernel_output[1],
+                ));
+                // Retain the actual result so the C fixture can accumulate and
+                // report every tuple even when the held live target is refused.
+                return Ok(injected);
+            }
+            if args.arg1 as i64 == libc::SYS_getpriority {
+                let which = args.arg2 as libc::c_long;
+                let who = args.arg3 as libc::c_long;
+                // Observe the same two raw arguments on the application
+                // callback thread, independently of native target admission.
+                let kernel = unsafe { libc::syscall(libc::SYS_getpriority, which, who) };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::getpriority,
+                        SyscallArgs::new(args.arg2, args.arg3, 0, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-priority-query sysnum={} which={which} who={who} kernel={kernel} injected={injected}",
+                    args.arg1,
+                ));
+                // The fixture accumulates failures across the complete matrix;
+                // the host test also checks each kernel/injected witness. Keep
+                // the actual result so one red target cannot hide later rows.
+                return Ok(injected);
+            }
+            if matches!(
+                args.arg1 as i64,
+                libc::SYS_getpgid | libc::SYS_getsid | libc::SYS_sched_getscheduler
+            ) {
+                let target = args.arg2 as libc::pid_t;
+                // This independent kernel observation runs on the application
+                // callback thread and bypasses the native membership screen.
+                let kernel = unsafe { libc::syscall(args.arg1 as libc::c_long, target) };
+                let kernel = if kernel == -1 {
+                    -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    kernel
+                };
+                let injected = guest
+                    .inject(Syscall::from_raw(
+                        Sysno::from(args.arg1 as i32),
+                        SyscallArgs::new(args.arg2, 0, 0, 0, 0, 0),
+                    ))
+                    .await
+                    .unwrap_or_else(|errno| -i64::from(errno.into_raw()));
+                emit_line(&format!(
+                    "reverie-dbt-test: kernel-group-query sysnum={} target={target} kernel={kernel} injected={injected}",
+                    args.arg1,
+                ));
+                if injected != kernel {
+                    return Err(reverie::syscalls::Errno::EIO.into());
+                }
+                return Ok(injected);
+            }
+            let (query, adapter) = match args.arg1 as i64 {
+                libc::SYS_getpid => (Sysno::getpid, Some(i64::from(guest.pid().as_raw()))),
+                // Guest::ppid is traced-tree membership: the root has None.
+                libc::SYS_getppid => (Sysno::getppid, None),
+                libc::SYS_gettid => (Sysno::gettid, Some(i64::from(guest.tid().as_raw()))),
+                _ => return Err(reverie::syscalls::Errno::EINVAL.into()),
+            };
+            // This Tool is running on the application callback thread. A raw
+            // client syscall bypasses invoke_syscall and the native ID mapper;
+            // it is not a query performed by the background runtime helper.
+            let kernel = unsafe { libc::syscall(args.arg1 as libc::c_long) };
+            let injected = guest
+                .inject(Syscall::from_raw(query, SyscallArgs::new(0, 0, 0, 0, 0, 0)))
+                .await?;
+            let adapter_field = adapter.map_or_else(|| "none".to_owned(), |id| id.to_string());
+            emit_line(&format!(
+                "reverie-dbt-test: kernel-identity sysnum={} kernel={kernel} injected={injected} adapter={adapter_field}",
+                args.arg1,
+            ));
+            if kernel <= 0 || injected != kernel || adapter.is_some_and(|id| id != kernel) {
+                return Err(reverie::syscalls::Errno::EIO.into());
+            }
+            return Ok(injected);
+        }
         match syscall.number() {
             Sysno::getpid => {
                 let mut regs = guest.regs().await;
                 regs.r15 = SET_REG_SENTINEL;
                 guest.set_regs(regs).await?;
-                // Suppress getpid with a fixed value; the guest observes the
-                // rewritten r15 after resuming, not this return value.
+                // The guest checks both the rewritten register and this result.
                 Ok(4321)
             }
+            Sysno::getppid => Ok(4322),
+            Sysno::gettid => Ok(4323),
             _ => guest.tail_inject(syscall).await,
         }
+    }
+}
+
+/// `prctl` option that asks [`CompareExchangeTool`] for one compare-and-exchange:
+/// `prctl(COMPARE_EXCHANGE_PRCTL, address, expected, desired)`.
+pub const COMPARE_EXCHANGE_PRCTL: u64 = 0x4341_5321;
+
+/// Regression tool for [`MemoryAccess::compare_exchange_u32`] on the guest's
+/// own pages: on `prctl(COMPARE_EXCHANGE_PRCTL, address, expected, desired)`
+/// it runs the exchange through `Guest::memory()`, and so through the native
+/// callback the runtime installed, and returns the value the word held, or
+/// `-errno`. Every other syscall runs unchanged.
+#[derive(Clone, Copy, Debug, Default)]
+struct CompareExchangeTool;
+
+#[reverie::tool]
+impl Tool for CompareExchangeTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let (number, args) = syscall.into_parts();
+        if number != Sysno::prctl || args.arg0 as u64 != COMPARE_EXCHANGE_PRCTL {
+            guest.tail_inject(syscall).await;
+        }
+        let Some(address) = reverie::syscalls::AddrMut::<u32>::from_raw(args.arg1) else {
+            return Ok(-(libc::EFAULT as i64));
+        };
+        Ok(
+            match guest
+                .memory()
+                .compare_exchange_u32(address, args.arg2 as u32, args.arg3 as u32)
+            {
+                Ok(observed) => observed as i64,
+                Err(errno) => -(errno.into_raw() as i64),
+            },
+        )
     }
 }
 
@@ -1352,6 +1877,7 @@ enum ActiveTool {
     Noop,
     RewriteExit,
     SetReg,
+    CompareExchange,
     Ppid,
     Backtrace,
     InjectInvalidClone,
@@ -1369,6 +1895,8 @@ fn active_tool() -> Option<ActiveTool> {
         Some(ActiveTool::InjectInvalidClone)
     } else if *TEST_SET_REG_ENABLED {
         Some(ActiveTool::SetReg)
+    } else if *TEST_COMPARE_EXCHANGE_ENABLED {
+        Some(ActiveTool::CompareExchange)
     } else if *TEST_PPID_ENABLED {
         Some(ActiveTool::Ppid)
     } else if *TEST_BACKTRACE_ENABLED {
@@ -1765,6 +2293,17 @@ pub(crate) fn run_active_tool(
             read_registers,
             write_registers,
         ),
+        ActiveTool::CompareExchange => dispatch(
+            &CompareExchangeTool,
+            context,
+            tid,
+            pid,
+            branches,
+            syscall,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ),
         ActiveTool::Ppid => dispatch(
             &PpidTool,
             context,
@@ -2101,10 +2640,11 @@ fn dispatch_counter2(
     )?;
     if let Some(report) = report {
         if crate::sync_rpc::is_active() {
-            crate::sync_rpc::send_rpc_from_guest::<_, ()>(
+            crate::sync_rpc::send_rpc_from_guest::<Counter2Global>(
                 context,
                 invoke_syscall,
                 Pid::from_raw(tid),
+                &(),
                 report,
             );
         } else {
@@ -2122,7 +2662,13 @@ fn dispatch_counter2(
 mod tests {
     use super::*;
 
-    unsafe extern "C" fn fake_invoke(_context: usize, _number: i64, _args: *const u64) -> i64 {
+    unsafe extern "C" fn fake_invoke(
+        _context: usize,
+        _number: i64,
+        _args: *const u64,
+        purpose: u32,
+    ) -> i64 {
+        assert_eq!(purpose, reverie::InjectionPurpose::Application as u32);
         0
     }
 

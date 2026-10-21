@@ -59,10 +59,13 @@ mod entry_construction_tests {
             .install_static_elf(&minimal_test_elf(&code), "/bin/entry-construction")
             .unwrap();
         let registers = parent.vcpu.get_regs().unwrap();
-        let data = registers.rsp - 8;
+        // The guest increments the byte at rsp - 8; the test reads it physically.
+        let data = parent
+            .memory
+            .user_range_to_guest(registers.rsp - 8, 1)
+            .unwrap();
         parent.memory.write_raw(data, &[0]).unwrap();
         let xsave = parent.vcpu.get_xsave().unwrap();
-        let cpuid = parent.cpuid_policy;
         let group = parent.thread_group.clone();
         let gate = parent.memory.entry_gate();
         let owners = Box::new(parent.memory.test_mapping_owners());
@@ -85,7 +88,7 @@ mod entry_construction_tests {
         let (send, receive) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let result = KvmBackend::from_thread_state(
-                memory, registers, xsave, None, cpuid, CHILD_TID, group,
+                memory, registers, xsave, None, CHILD_TID, group,
             );
             let _ = send.send(result);
         });
@@ -216,7 +219,7 @@ mod entry_construction_tests {
             let load = |counter: &std::sync::atomic::AtomicUsize| counter.load(Ordering::SeqCst);
             assert_eq!(load(&probe.untracked_runs), if tracked { 0 } else { 2 });
             assert_eq!(load(&probe.tracked_runs), if tracked { 2 } else { 0 });
-            assert_eq!(load(&probe.prepare.mask_installs), 2);
+            assert_eq!(load(&probe.prepare.activations), 2);
             assert_eq!(load(&probe.clock_begins), if tracked { 2 } else { 0 });
             assert_eq!(load(&probe.intervals_created), if tracked { 2 } else { 0 });
             let registers = child.vcpu.get_regs().unwrap();
@@ -255,7 +258,6 @@ mod entry_construction_tests {
                 parent.vcpu.get_regs().unwrap(),
                 parent.vcpu.get_xsave().unwrap(),
                 None,
-                parent.cpuid_policy,
                 CHILD_TID + 1,
                 parent.thread_group.clone(),
             )

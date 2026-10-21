@@ -11,7 +11,6 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::future::Future;
-use std::io;
 use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
@@ -37,10 +36,11 @@ use reverie::Signal;
 use reverie::Stack;
 use reverie::TimerSchedule;
 use reverie::Tool as ReverieTool;
+use reverie_inguest::tool_host::DrivenSyscall;
+use reverie_inguest::tool_host::TailResult;
+use reverie_inguest::tool_host::drive_tool_syscall;
+use reverie_memory::LocalMemory;
 use reverie_memory::MemoryAccess;
-use reverie_preload::tool_host::DrivenSyscall;
-use reverie_preload::tool_host::TailResult;
-use reverie_preload::tool_host::drive_tool_syscall;
 use reverie_rpc_transport::BlockingRpcClient;
 use reverie_rpc_transport::RpcError;
 use reverie_syscalls::Addr;
@@ -50,7 +50,6 @@ use reverie_syscalls::Syscall;
 use reverie_syscalls::SyscallInfo;
 use syscalls::SyscallArgs;
 use syscalls::Sysno;
-use syscalls::syscall;
 
 use crate::SyscallExt;
 use crate::protected_files::ProtectedFd;
@@ -492,7 +491,17 @@ where
         let tid = current_tid();
         let pid = current_pid();
         let state = self.thread_state(tid).map_err(remote_rpc_error)?;
-        let mut state = state.lock();
+        // Only this thread takes its own state, so a held lock means this RDTSC
+        // re-entered a tool call already in progress on this thread: client
+        // code that the plugin itself reached, for example a guest-exported
+        // function the coordinator RPC resolved to. Waiting would deadlock, and
+        // there is no virtual value to give without the state, so refuse.
+        let Some(mut state) = state.try_lock() else {
+            crate::eprintln!(
+                "reverie-sabre: an RDTSC re-entered a tool call already in progress on thread {tid}; it has no deterministic value"
+            );
+            return Err(Errno::EDEADLK);
+        };
         let RemoteThreadState {
             thread_state,
             rpc,
@@ -535,6 +544,35 @@ where
     /// because SaBRe's central handler has usually already committed to the guest
     /// action by the time this runs.
     pub fn handle_signal(&self, signal: Signal) -> Result<Option<Signal>, Errno> {
+        self.handle_signal_reporting(signal, &mut None)
+    }
+
+    /// [`Self::handle_signal`], with the siginfo the kernel delivered the
+    /// signal with, which the tool reads through [`Guest::signal_info`]. A
+    /// replacement the tool makes ([`Guest::set_signal_info`]) is written back
+    /// to `info` when the signal is delivered.
+    pub fn handle_signal_with_info(
+        &self,
+        signal: Signal,
+        info: &mut libc::siginfo_t,
+    ) -> Result<Option<Signal>, Errno> {
+        let mut bytes = Some(siginfo_bytes(info));
+        let delivered = self.handle_signal_reporting(signal, &mut bytes)?;
+        if let (Some(_), Some(bytes)) = (delivered, bytes) {
+            // SAFETY: `siginfo_t` is plain data of exactly this size
+            // (`siginfo_bytes`).
+            *info = unsafe { std::mem::transmute_copy(&bytes) };
+        }
+        Ok(delivered)
+    }
+
+    /// Runs the tool's signal callback. `info` is the siginfo it reads, and on
+    /// return the siginfo to deliver: the tool's replacement, if it made one.
+    fn handle_signal_reporting(
+        &self,
+        signal: Signal,
+        info: &mut Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
+    ) -> Result<Option<Signal>, Errno> {
         let tid = current_tid();
         let pid = current_pid();
         let state = self.thread_state(tid).map_err(remote_rpc_error)?;
@@ -553,8 +591,9 @@ where
             None,
             None,
         );
+        guest.signal_info = *info;
 
-        match poll_once(self.tool.handle_signal_event(&mut guest, signal)) {
+        let result = match poll_once(self.tool.handle_signal_event(&mut guest, signal)) {
             Poll::Ready(result) => result,
             Poll::Pending => {
                 // Same failure mode the RDTSC path guards: a tool that suspends
@@ -565,7 +604,9 @@ where
                 );
                 Err(Errno::EIO)
             }
-        }
+        };
+        *info = guest.signal_info();
+        result
     }
 
     /// Forwards a runtime-bookkept syscall through the shared tool and remote
@@ -901,157 +942,6 @@ fn current_tid() -> Pid {
     Pid::from_raw(tid as i32)
 }
 
-/// Kernel-validated access to memory in the SaBRe guest process.
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-153): Review SaBRe process memory access semantics.
-#[derive(Clone, Copy, Debug)]
-pub struct SabreMemory {
-    pid: Pid,
-}
-
-impl SabreMemory {
-    fn new(pid: Pid) -> Self {
-        Self { pid }
-    }
-
-    fn transfer_result(result: Result<usize, Errno>) -> Result<usize, Errno> {
-        result.or_else(|error| {
-            if error == Errno::EFAULT {
-                // MemoryAccess treats a fault like an EOF so read_exact and
-                // write_exact can consistently report EFAULT.
-                Ok(0)
-            } else {
-                Err(error)
-            }
-        })
-    }
-}
-
-impl MemoryAccess for SabreMemory {
-    fn read_vectored(
-        &self,
-        remote: &[io::IoSlice],
-        local: &mut [io::IoSliceMut],
-    ) -> Result<usize, Errno> {
-        let result = unsafe {
-            syscall!(
-                Sysno::process_vm_readv,
-                self.pid.as_raw() as usize,
-                local.as_ptr() as usize,
-                local.len(),
-                remote.as_ptr() as usize,
-                remote.len(),
-                0
-            )
-        };
-        Self::transfer_result(result)
-    }
-
-    fn write_vectored(
-        &mut self,
-        local: &[io::IoSlice],
-        remote: &mut [io::IoSliceMut],
-    ) -> Result<usize, Errno> {
-        let result = unsafe {
-            syscall!(
-                Sysno::process_vm_writev,
-                self.pid.as_raw() as usize,
-                local.as_ptr() as usize,
-                local.len(),
-                remote.as_ptr() as usize,
-                remote.len(),
-                0
-            )
-        };
-        Self::transfer_result(result)
-    }
-
-    fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
-    where
-        A: Into<Addr<'a, u8>>,
-    {
-        let remote = libc::iovec {
-            iov_base: unsafe { addr.into().as_ptr() as *mut libc::c_void },
-            iov_len: buf.len(),
-        };
-        let local = libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-        };
-        let result = unsafe {
-            syscall!(
-                Sysno::process_vm_readv,
-                self.pid.as_raw() as usize,
-                &local as *const libc::iovec as usize,
-                1,
-                &remote as *const libc::iovec as usize,
-                1,
-                0
-            )
-        };
-        Self::transfer_result(result)
-    }
-
-    fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
-        let local = libc::iovec {
-            iov_base: buf.as_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let remote = libc::iovec {
-            iov_base: unsafe { addr.as_mut_ptr().cast() },
-            iov_len: buf.len(),
-        };
-        let result = unsafe {
-            syscall!(
-                Sysno::process_vm_writev,
-                self.pid.as_raw() as usize,
-                &local as *const libc::iovec as usize,
-                1,
-                &remote as *const libc::iovec as usize,
-                1,
-                0
-            )
-        };
-        Self::transfer_result(result)
-    }
-
-    fn write_with_user_access(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        addr.as_raw().checked_add(buf.len()).ok_or(Errno::EFAULT)?;
-        let local = libc::iovec {
-            iov_base: buf.as_ptr().cast_mut().cast(),
-            iov_len: buf.len(),
-        };
-        let remote = libc::iovec {
-            iov_base: addr.as_raw() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        // SAFETY: the local descriptor borrows buf for this call; the remote
-        // descriptor is a numeric address checked by the kernel. Keep the raw
-        // syscall convention used by the other SaBRe memory operations.
-        let written = unsafe {
-            syscall!(
-                Sysno::process_vm_writev,
-                self.pid.as_raw() as usize,
-                &local as *const libc::iovec as usize,
-                1,
-                &remote as *const libc::iovec as usize,
-                1,
-                0
-            )
-        }?;
-        // Do not use transfer_result: this operation reports a first-byte
-        // fault as EFAULT and preserves every other syscall error unchanged.
-        if written == 0 {
-            Err(Errno::EFAULT)
-        } else {
-            Ok(written)
-        }
-    }
-}
-
 fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
     let mut context = Context::from_waker(Waker::noop());
     pin!(future).as_mut().poll(&mut context)
@@ -1098,6 +988,10 @@ where
     special_inject: Option<&'inject mut (dyn FnMut() -> usize + Send + Sync)>,
     child_threads: Option<ChildThreadRegistry<'state, T>>,
     tail: Option<&'state TailResult>,
+    /// The siginfo of the signal being reported, while
+    /// `Tool::handle_signal_event` runs (`Guest::signal_info`), with any
+    /// replacement the tool made (`Guest::set_signal_info`).
+    signal_info: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
 }
 
 impl<'state, 'inject, T> SabreGuest<'state, 'inject, T>
@@ -1133,6 +1027,7 @@ where
             special_inject,
             child_threads,
             tail: None,
+            signal_info: None,
         }
     }
 
@@ -1193,7 +1088,7 @@ impl<T> Guest<T> for SabreGuest<'_, '_, T>
 where
     T: ReverieTool,
 {
-    type Memory = SabreMemory;
+    type Memory = LocalMemory;
     type Stack = SabreStack;
 
     fn tid(&self) -> Pid {
@@ -1219,8 +1114,25 @@ where
         false
     }
 
+    fn signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
+        self.signal_info
+    }
+
+    fn set_signal_info(&mut self, info: [u8; reverie::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
+        let original = self.signal_info.ok_or(Errno::EINVAL)?;
+        if info[..4] != original[..4] {
+            return Err(Errno::EINVAL);
+        }
+        self.signal_info = Some(info);
+        Ok(())
+    }
+
+    // SaBRe's guest memory access is the shared LocalMemory; the review
+    // markers that annotated its former SabreMemory stay with it here.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-153): Review SaBRe process memory access semantics.
     fn memory(&self) -> Self::Memory {
-        SabreMemory::new(self.pid)
+        LocalMemory::new()
     }
 
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
@@ -1327,6 +1239,20 @@ where
 
     async fn daemonize(&mut self) {}
 
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: reverie::InjectionPurpose,
+    ) -> std::result::Result<i64, reverie::Error> {
+        // This route keeps its existing guarded injection behavior.
+        match purpose {
+            reverie::InjectionPurpose::Application
+            | reverie::InjectionPurpose::Pselect6WrapperValidation => {
+                self.inject(syscall).await.map_err(reverie::Error::from)
+            }
+        }
+    }
+
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         let (number, args) = syscall.into_parts();
         let terminal_original = self.original == Some((number, args))
@@ -1370,7 +1296,7 @@ where
                 // injection. Classify the final image here so a process clone
                 // rewritten to CLONE_THREAD cannot race parent-state handoff.
                 let final_thread_clone =
-                    self.child_threads.is_some() && is_thread_clone(self.pid, number, args);
+                    self.child_threads.is_some() && is_thread_clone(number, args);
                 let _pending_thread_clone = if final_thread_clone {
                     let pending = self
                         .child_threads
@@ -1383,7 +1309,7 @@ where
                     None
                 };
                 let _pending_process_fork =
-                    if self.child_threads.is_some() && is_process_fork(self.pid, number, args) {
+                    if self.child_threads.is_some() && is_process_fork(number, args) {
                         let Some(parent_state) = self.thread_state.as_ref() else {
                             return Err(Errno::EIO);
                         };
@@ -1504,25 +1430,25 @@ where
 }
 
 // TODO-HUMAN-REVIEW(PR-212): Review clone3 thread-state detection.
-fn clone_flags(pid: Pid, number: Sysno, args: SyscallArgs) -> Option<u64> {
+fn clone_flags(number: Sysno, args: SyscallArgs) -> Option<u64> {
     match number {
         Sysno::clone => Some(args.arg0 as u64),
         // AUTONOMOUS-BOT-IMPLEMENTED
         Sysno::clone3 if args.arg1 >= std::mem::size_of::<u64>() => {
             let address = Addr::<u64>::from_raw(args.arg0)?;
-            SabreMemory::new(pid).read_value(address).ok()
+            LocalMemory::new().read_value(address).ok()
         }
         _ => None,
     }
 }
 
-fn is_thread_clone(pid: Pid, number: Sysno, args: SyscallArgs) -> bool {
-    clone_flags(pid, number, args).is_some_and(|flags| flags & libc::CLONE_THREAD as u64 != 0)
+fn is_thread_clone(number: Sysno, args: SyscallArgs) -> bool {
+    clone_flags(number, args).is_some_and(|flags| flags & libc::CLONE_THREAD as u64 != 0)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-273): Review process-fork classification for state inheritance.
-fn is_process_fork(pid: Pid, number: Sysno, args: SyscallArgs) -> bool {
+fn is_process_fork(number: Sysno, args: SyscallArgs) -> bool {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-285): Review vfork state inheritance after private-fork rewriting.
     // The SaBRe callback rewrites direct vfork to a private fork so its child
@@ -1532,7 +1458,7 @@ fn is_process_fork(pid: Pid, number: Sysno, args: SyscallArgs) -> bool {
     if matches!(number, Sysno::fork | Sysno::vfork) {
         return true;
     }
-    let Some(flags) = clone_flags(pid, number, args) else {
+    let Some(flags) = clone_flags(number, args) else {
         return false;
     };
     if flags & libc::CLONE_VFORK as u64 != 0 && flags & libc::CLONE_THREAD as u64 == 0 {
@@ -1619,8 +1545,16 @@ fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
+/// The raw bytes of `info`, as `Guest::signal_info` reports them.
+fn siginfo_bytes(info: &libc::siginfo_t) -> [u8; reverie::SIGNAL_INFO_SIZE] {
+    const _: () = assert!(std::mem::size_of::<libc::siginfo_t>() == reverie::SIGNAL_INFO_SIZE);
+    // SAFETY: `siginfo_t` is plain data of exactly this size (checked above).
+    unsafe { std::mem::transmute_copy(info) }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
@@ -1655,13 +1589,13 @@ mod tests {
             0,
         );
 
-        assert!(is_thread_clone(current_pid(), Sysno::clone, thread_args));
-        assert!(!is_thread_clone(current_pid(), Sysno::clone3, clone3_args));
+        assert!(is_thread_clone(Sysno::clone, thread_args));
+        assert!(!is_thread_clone(Sysno::clone3, clone3_args));
         clone3_flags = libc::CLONE_THREAD as u64;
-        assert!(is_thread_clone(current_pid(), Sysno::clone3, clone3_args));
+        assert!(is_thread_clone(Sysno::clone3, clone3_args));
         assert_eq!(clone3_flags, libc::CLONE_THREAD as u64);
-        assert!(!is_thread_clone(current_pid(), Sysno::clone, process_args));
-        assert!(!is_thread_clone(current_pid(), Sysno::fork, thread_args));
+        assert!(!is_thread_clone(Sysno::clone, process_args));
+        assert!(!is_thread_clone(Sysno::fork, thread_args));
     }
 
     #[test]
@@ -1734,164 +1668,12 @@ mod tests {
             0,
         );
 
-        assert!(is_process_fork(current_pid(), Sysno::fork, process_args));
-        assert!(is_process_fork(current_pid(), Sysno::clone, process_args));
-        assert!(is_process_fork(current_pid(), Sysno::clone3, clone3_args));
-        assert!(!is_process_fork(current_pid(), Sysno::clone, thread_args));
-        assert!(is_process_fork(current_pid(), Sysno::clone, vfork_args));
-        assert!(is_process_fork(current_pid(), Sysno::vfork, process_args));
-    }
-
-    #[test]
-    fn sabre_memory_reads_and_writes_valid_memory() {
-        let mut memory = SabreMemory::new(current_pid());
-        let source = *b"sabre";
-        let source_addr = Addr::from_ptr(source.as_ptr()).unwrap();
-        let mut copy = [0; 5];
-        memory.read_exact(source_addr, &mut copy).unwrap();
-        assert_eq!(copy, source);
-
-        let mut destination = [0; 5];
-        let destination_addr = AddrMut::from_ptr(destination.as_mut_ptr()).unwrap();
-        memory.write_exact(destination_addr, b"guest").unwrap();
-        assert_eq!(&destination, b"guest");
-    }
-
-    #[test]
-    fn sabre_memory_reports_invalid_addresses_as_efault() {
-        let mut memory = SabreMemory::new(current_pid());
-        let invalid = Addr::from_raw(1).unwrap();
-        let invalid_mut = AddrMut::from_raw(1).unwrap();
-        let mut byte = [0];
-
-        assert_eq!(memory.read(invalid, &mut byte), Ok(0));
-        assert_eq!(memory.read_exact(invalid, &mut byte), Err(Errno::EFAULT));
-        assert_eq!(memory.write(invalid_mut, &byte), Ok(0));
-        assert_eq!(memory.write_exact(invalid_mut, &byte), Err(Errno::EFAULT));
-    }
-
-    struct UserCopyPages {
-        base: *mut u8,
-        length: usize,
-        page: usize,
-    }
-
-    impl UserCopyPages {
-        fn new() -> Self {
-            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            assert!(page > 0);
-            let page = page as usize;
-            let length = 3 * page;
-            let base = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    length,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(base, libc::MAP_FAILED);
-            Self {
-                base: base.cast(),
-                length,
-                page,
-            }
-        }
-
-        fn protect_middle(&self, protection: libc::c_int) {
-            assert_eq!(
-                unsafe { libc::mprotect(self.base.add(self.page).cast(), self.page, protection) },
-                0
-            );
-        }
-    }
-
-    impl Drop for UserCopyPages {
-        fn drop(&mut self) {
-            assert_eq!(unsafe { libc::munmap(self.base.cast(), self.length) }, 0);
-        }
-    }
-
-    #[test]
-    fn sabre_user_copy_checks_permissions_at_every_size_and_preserves_prefixes() {
-        let mut memory = SabreMemory::new(current_pid());
-        let pages = UserCopyPages::new();
-        for protection in [libc::PROT_READ, libc::PROT_NONE] {
-            for offset in [0, pages.page - 3, pages.page] {
-                for length in [0, 1, 7, 8, 9, pages.page + 8] {
-                    pages.protect_middle(libc::PROT_READ | libc::PROT_WRITE);
-                    unsafe { std::ptr::write_bytes(pages.base, 0xa5, pages.length) };
-                    pages.protect_middle(protection);
-                    let source: Vec<_> = (0..length + 1).map(|i| (19 + i * 37) as u8).collect();
-                    let source = &source[1..];
-                    let destination = AddrMut::from_raw(pages.base as usize + offset).unwrap();
-                    let expected = if offset < pages.page {
-                        (pages.page - offset).min(length)
-                    } else {
-                        0
-                    };
-                    assert_eq!(
-                        memory.write_with_user_access(destination, source),
-                        if expected != 0 || length == 0 {
-                            Ok(expected)
-                        } else {
-                            Err(Errno::EFAULT)
-                        },
-                        "protection={protection} offset={offset} length={length}"
-                    );
-                    // Restore read access only after the real API call, then
-                    // inspect the entire mapping, including protected canaries.
-                    pages.protect_middle(libc::PROT_READ | libc::PROT_WRITE);
-                    let actual = unsafe { std::slice::from_raw_parts(pages.base, pages.length) };
-                    for (index, &byte) in actual.iter().enumerate() {
-                        let expected_byte = if index >= offset && index - offset < expected {
-                            source[index - offset]
-                        } else {
-                            0xa5
-                        };
-                        assert_eq!(byte, expected_byte, "destination byte {index}");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn sabre_user_copy_empty_and_invalid_addresses_preserve_memory() {
-        let mut memory = SabreMemory::new(current_pid());
-        let pages = UserCopyPages::new();
-        unsafe { std::ptr::write_bytes(pages.base, 0xa5, pages.length) };
-        for invalid in [1, usize::MAX - 3, usize::MAX] {
-            let destination = AddrMut::from_raw(invalid).unwrap();
-            assert_eq!(memory.write_with_user_access(destination, &[]), Ok(0));
-            for source in [&b"x"[..], &b"rejected"[..]] {
-                assert_eq!(
-                    memory.write_with_user_access(destination, source),
-                    Err(Errno::EFAULT)
-                );
-                let actual = unsafe { std::slice::from_raw_parts(pages.base, pages.length) };
-                assert!(actual.iter().all(|&byte| byte == 0xa5));
-            }
-        }
-    }
-
-    #[test]
-    fn sabre_user_copy_preserves_non_fault_errno() {
-        // A negative PID is invalid, so this error case has no PID-reuse race.
-        let mut memory = SabreMemory::new(Pid::from_raw(-1));
-        let mut destination = [0xa5; 8];
-        let address = AddrMut::from_ptr(destination.as_mut_ptr()).unwrap();
-        assert_eq!(
-            memory.write_with_user_access(address, b"rejected"),
-            Err(Errno::ESRCH)
-        );
-        assert_eq!(destination, [0xa5; 8]);
-        assert_eq!(
-            memory.write_with_user_access(AddrMut::from_raw(usize::MAX).unwrap(), &[]),
-            Ok(0)
-        );
+        assert!(is_process_fork(Sysno::fork, process_args));
+        assert!(is_process_fork(Sysno::clone, process_args));
+        assert!(is_process_fork(Sysno::clone3, clone3_args));
+        assert!(!is_process_fork(Sysno::clone, thread_args));
+        assert!(is_process_fork(Sysno::clone, vfork_args));
+        assert!(is_process_fork(Sysno::vfork, process_args));
     }
 
     #[derive(Default)]
@@ -1954,7 +1736,7 @@ mod tests {
     /// `d7eb0a1d` made the shared driver restart EVERY private `ERESTARTSYS`, not
     /// only the wait family. An earlier version of this branch deleted the
     /// adapter's non-wait assertion on the grounds that asserting the new
-    /// behaviour here would merely duplicate `reverie-preload`'s unit test. That
+    /// behaviour here would merely duplicate `reverie-inguest`'s unit test. That
     /// reasoning was WRONG and `agent(hermit-123)` measured why: the preload test
     /// establishes the shared driver's POLICY, while an adapter test establishes
     /// that a given CALL SITE applies it. Returning `ERESTARTSYS` for `read` in
@@ -2046,7 +1828,7 @@ mod tests {
     // red, because a wedged run reads as a slow box.
     //
     // Removed rather than inverted: asserting the NEW behaviour here would only
-    // duplicate `classify_outcome_restarts_on_erestartsys` in reverie-preload, which
+    // duplicate `classify_outcome_restarts_on_erestartsys` in reverie-inguest, which
     // already owns that policy.
 
     #[test]
@@ -2190,6 +1972,116 @@ mod tests {
         );
         drop(adapter);
 
+        assert!(server_thread.join().unwrap().is_ok());
+    }
+
+    static SIGNAL_INFOS: Mutex<Vec<Option<(i32, i32, i32)>>> = Mutex::new(Vec::new());
+
+    /// Records the signal number, `si_code` and `si_pid` its signal callback
+    /// sees through `Guest::signal_info`, suppresses a child-exit SIGCHLD, and
+    /// gives an `SI_USER` one the siginfo of child 99's exit.
+    #[derive(Default)]
+    struct SignalInfoTool;
+
+    #[reverie::tool]
+    impl ReverieTool for SignalInfoTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        async fn handle_signal_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            signal: Signal,
+        ) -> Result<Option<Signal>, Errno> {
+            let fields = guest.signal_info().map(|bytes| {
+                let field = |at: usize| i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+                (field(0), field(8), field(16))
+            });
+            SIGNAL_INFOS.lock().push(fields);
+            if let (Some(mut bytes), Some((_, libc::SI_USER, _))) = (guest.signal_info(), fields) {
+                bytes[8..12].copy_from_slice(&libc::CLD_EXITED.to_ne_bytes());
+                bytes[16..20].copy_from_slice(&99i32.to_ne_bytes());
+                guest.set_signal_info(bytes).unwrap();
+                // Another signal's siginfo is refused.
+                bytes[0..4].copy_from_slice(&libc::SIGUSR1.to_ne_bytes());
+                assert_eq!(guest.set_signal_info(bytes), Err(Errno::EINVAL));
+            }
+            Ok(match fields {
+                Some((_, libc::CLD_EXITED, _)) => None,
+                _ => Some(signal),
+            })
+        }
+    }
+
+    /// A signal reported with its siginfo shows it to the tool through
+    /// `Guest::signal_info`; the tool's suppression is returned, and its
+    /// replacement siginfo is written back. One reported without it shows
+    /// none, and has none to replace.
+    #[test]
+    fn remote_adapter_reports_the_siginfo_and_the_tools_suppression() {
+        let path = std::path::Path::new("/tmp").join(format!(
+            "reverie-sabre-siginfo-{}-{}.sock",
+            std::process::id(),
+            RPC_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let server_path = path.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let server_thread = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let server =
+                        reverie_rpc_transport::RpcServer::bind(&server_path, Arc::new(()), ())
+                            .unwrap();
+                    ready_tx.send(()).unwrap();
+                    server.serve_one().await
+                })
+        });
+        ready_rx.recv().unwrap();
+        SIGNAL_INFOS.lock().clear();
+
+        let adapter = RemoteReverieAdapter::<SignalInfoTool>::connect(&path).unwrap();
+        // SAFETY: an all-zero siginfo_t is valid plain data.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        info.si_signo = libc::SIGCHLD;
+        info.si_code = libc::CLD_EXITED;
+        // `si_pid` is the first field after the three ints and their padding.
+        // SAFETY: the field is inside the zeroed siginfo_t.
+        unsafe {
+            *(std::ptr::addr_of_mut!(info) as *mut u8)
+                .add(16)
+                .cast::<i32>() = 4242;
+        }
+        assert_eq!(
+            adapter.handle_signal_with_info(Signal::SIGCHLD, &mut info),
+            Ok(None)
+        );
+        assert_eq!(info.si_code, libc::CLD_EXITED);
+        info.si_code = libc::SI_USER;
+        assert_eq!(
+            adapter.handle_signal_with_info(Signal::SIGCHLD, &mut info),
+            Ok(Some(Signal::SIGCHLD))
+        );
+        // SAFETY: `si_pid` is valid for a SIGCHLD siginfo.
+        assert_eq!(
+            (info.si_code, unsafe { info.si_pid() }),
+            (libc::CLD_EXITED, 99)
+        );
+        assert_eq!(
+            adapter.handle_signal(Signal::SIGCHLD),
+            Ok(Some(Signal::SIGCHLD))
+        );
+        assert_eq!(
+            *SIGNAL_INFOS.lock(),
+            vec![
+                Some((libc::SIGCHLD, libc::CLD_EXITED, 4242)),
+                Some((libc::SIGCHLD, libc::SI_USER, 4242)),
+                None,
+            ]
+        );
+        drop(adapter);
         assert!(server_thread.join().unwrap().is_ok());
     }
 

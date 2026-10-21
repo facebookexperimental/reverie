@@ -6,16 +6,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The e9patch in-guest dispatcher, built on the shared `reverie-preload`
+//! The e9patch in-guest dispatcher, built on the shared `reverie-inguest`
 //! runtime that LiteInst also uses.
 //!
 //! # Shared with LiteInst
 //!
 //! e9patch and LiteInst plug into the *same* seam:
-//! [`reverie_preload::dispatch::SyscallDispatcher`]. The `reverie-preload`
+//! [`reverie_inguest::dispatch::SyscallDispatcher`]. The `reverie-inguest`
 //! crate owns the seccomp filter, the `SIGSYS` handler, the trusted syscall
 //! gate, and the fail-closed guard policy
-//! ([`reverie_preload::dispatch::PassthroughDispatcher`]). Both backends reuse
+//! ([`reverie_inguest::dispatch::PassthroughDispatcher`]). Both backends reuse
 //! that policy rather than reimplementing it, so the correctness-critical
 //! boundaries (`execve` cannot cross an inherited filter, `SIGSYS` stays
 //! reserved, non-null `clone` stacks are refused, …) are written and reviewed
@@ -29,7 +29,7 @@
 //! * **LiteInst** patches at *runtime*: the first execution of a syscall site
 //!   traps to `SIGSYS`, and its dispatcher publishes a replacement trampoline
 //!   in a reachable arena and
-//!   [`defer_to`](reverie_preload::dispatch::SyscallEvent::defer_to)s it so the
+//!   [`defer_to`](reverie_inguest::dispatch::SyscallEvent::defer_to)s it so the
 //!   tool callback runs later in ordinary guest context. Every subsequent
 //!   execution of that site is a near-native trampoline call.
 //! * **e9patch built-ins** patch *ahead of time*: `e9tool` rewrites every
@@ -50,11 +50,11 @@
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 
-use reverie_preload::dispatch::PassthroughDispatcher;
-use reverie_preload::dispatch::SyscallDispatcher;
-use reverie_preload::dispatch::SyscallEvent;
-use reverie_preload::dispatch::SyscallEventSource;
-use reverie_preload::fork::ForkHook;
+use reverie_inguest::dispatch::PassthroughDispatcher;
+use reverie_inguest::dispatch::SyscallDispatcher;
+use reverie_inguest::dispatch::SyscallEvent;
+use reverie_inguest::dispatch::SyscallEventSource;
+use reverie_inguest::fork::ForkHook;
 
 /// Distinct syscall numbers broken out individually by the fallback counters.
 ///
@@ -291,7 +291,7 @@ pub(crate) fn fallback_syscall_count(number: i64) -> u64 {
 /// copy-on-write inherits the parent's accumulated values, so without a reset the
 /// child would report the parent's residual surface as its own. This is the
 /// per-process runtime state that the shared [`ForkHook`] seam
-/// ([`reverie_preload::fork`]) exists to re-establish in the child — the same
+/// ([`reverie_inguest::fork`]) exists to re-establish in the child — the same
 /// mechanism LiteInst uses (there, to open a fresh coordinator connection). Here
 /// the per-process state is observability, so the child's fallback attribution
 /// starts clean.

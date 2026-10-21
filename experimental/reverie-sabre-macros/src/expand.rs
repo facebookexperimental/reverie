@@ -126,6 +126,12 @@ impl ToTokens for Tool {
 
         // Implement the entry point for our plugin.
         tokens.extend(quote! {
+            // Tracing programs that use jemalloc hang if the plugin allocates
+            // while jemalloc calls readlinkat; a separate allocator avoids it.
+            #[global_allocator]
+            static REVERIE_SABRE_GLOBAL_ALLOCATOR: ::reverie_sabre::mimalloc::MiMalloc =
+                ::reverie_sabre::mimalloc::MiMalloc;
+
             #[no_mangle]
             pub unsafe extern "C" fn reverie_sabre_install_loader_bootstrap_v1(
                 callback: ::reverie_sabre::bootstrap::TakeStateFn,

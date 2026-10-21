@@ -139,7 +139,7 @@ fn ordinary_post_exec_owner_cell(force_legacy: bool, unrelated_signal: bool) {
     assert_eq!(unsafe { libc::waitpid(raw, &mut status, 0) }, raw);
     assert!(libc::WIFSTOPPED(status));
     assert_eq!(libc::WSTOPSIG(status), libc::SIGSTOP);
-    let options = libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_EXITKILL;
+    let options = libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_EXITKILL | libc::PTRACE_O_TRACESYSGOOD;
     assert_eq!(
         unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, raw, 0, options) },
         0
@@ -186,11 +186,16 @@ fn ordinary_post_exec_owner_cell(force_legacy: bool, unrelated_signal: bool) {
     let (orphanage, _orphans) = mpsc::channel(1);
     let (daemon_kill, _) = broadcast::channel(1);
     let exec_stops = Arc::new(AtomicUsize::new(0));
+    let exit_stops = Arc::new(AtomicUsize::new(0));
+    let drained_stops = Arc::new(AtomicUsize::new(0));
     let preinit_stops = Arc::new(AtomicUsize::new(0));
+    let mmap_returns = Arc::new(AtomicUsize::new(0));
     let sent_signal = Arc::new(AtomicBool::new(false));
-    let intercepted_trap = Arc::new(AtomicBool::new(false));
     let exec_check = exec_stops.clone();
+    let exit_check = exit_stops.clone();
+    let drained_check = drained_stops.clone();
     let preinit_check = preinit_stops.clone();
+    let mmap_check = mmap_returns.clone();
     let signal_check = sent_signal.clone();
     let original_terminal = terminal.clone();
     let hook: PreinitPointForTest = Arc::new(move |tid, retained, point| {
@@ -214,8 +219,17 @@ fn ordinary_post_exec_owner_cell(force_legacy: bool, unrelated_signal: bool) {
                 );
             }
         }
+        if point == PreinitPoint::PostExecDrained {
+            assert_eq!(exit_check.load(Ordering::SeqCst), 1);
+            assert_eq!(drained_check.fetch_add(1, Ordering::SeqCst), 0);
+        }
         if point == PreinitPoint::RegsSaved {
-            preinit_check.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(exit_check.load(Ordering::SeqCst), 1);
+            assert_eq!(drained_check.load(Ordering::SeqCst), 1);
+            assert_eq!(preinit_check.fetch_add(1, Ordering::SeqCst), 0);
+        }
+        if point == PreinitPoint::MmapReturned {
+            assert_eq!(mmap_check.fetch_add(1, Ordering::SeqCst), 0);
         }
     });
     let mut traced = TracedTask::<()>::new(
@@ -226,8 +240,6 @@ fn ordinary_post_exec_owner_cell(force_legacy: bool, unrelated_signal: bool) {
             command_bootstrap: false,
             events: &events,
             injected_syscall_trap: None,
-            liteinst_runtime: None,
-            liteinst_trap_only: None,
             backend_stats: None,
             final_resume_signal_for_test: None,
             pre_syscall_for_test: None,
@@ -252,43 +264,61 @@ fn ordinary_post_exec_owner_cell(force_legacy: bool, unrelated_signal: bool) {
             .assume_stopped();
         assert_eq!(event, Event::Exec(pid));
         assert_eq!(stopped.generation(), generation);
+        let exec_regs = stopped.getregs().unwrap();
+        let exec_info = stopped.getsyscallinfo().unwrap();
+        assert_eq!(exec_info.operation, safeptrace::SyscallInfoOp::None);
+        assert_eq!(exec_info.architecture, 0xc000_003e);
+        assert_eq!(exec_info.instruction_pointer, exec_regs.ip());
+        assert_eq!(exec_info.stack_pointer, exec_regs.stack_ptr());
         // Production arms each returned stop before dispatching its handler.
         traced.arm_liteinst_root_stop(&stopped, &event);
         assert!(traced.ordinary_held_stop.lock().unwrap().is_some());
-        if unrelated_signal {
-            let hook_generation = generation.clone();
-            let trap_check = intercepted_trap.clone();
-            POST_EXEC_STEP_FOR_TEST.with(|slot| {
-                assert!(slot.borrow().is_none());
-                *slot.borrow_mut() = Some(Box::new(move |running| {
-                    // Own the actual Running returned by the production step.
-                    // Its SDK wait returns the real first stopped capability;
-                    // no unchecked state or numeric recapture is constructed.
-                    assert_eq!(running.generation(), hook_generation);
-                    let mut first = running.wait_owned_on_ptracer_thread().into_driver();
-                    let waker = futures::task::noop_waker();
-                    let mut context = Context::from_waker(&waker);
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                    let first = loop {
-                        match first.poll_on_ptracer_thread(&mut context) {
-                            Poll::Ready(result) => break result.unwrap(),
-                            Poll::Pending => {
-                                assert!(std::time::Instant::now() < deadline);
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                            }
-                        }
-                    };
-                    let (stopped, event) = first.assume_stopped();
-                    assert_eq!(event, Event::Signal(Signal::SIGTRAP));
-                    assert_eq!(stopped.generation(), hook_generation);
-                    assert!(!trap_check.swap(true, Ordering::SeqCst));
-                    stopped.resume(None).unwrap()
-                }));
-            });
-        }
+        let hook_generation = generation.clone();
+        let exit_check = exit_stops.clone();
+        POST_EXEC_RETURN_FOR_TEST.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |stopped, info| {
+                // Observe the real, validated stopped capability without
+                // consuming it, waiting on another owner, or resuming it.
+                assert_eq!(stopped.pid(), pid);
+                assert_eq!(stopped.generation(), hook_generation);
+                assert_eq!(exit_check.fetch_add(1, Ordering::SeqCst), 0);
+                assert_eq!(
+                    info.operation,
+                    safeptrace::SyscallInfoOp::Exit {
+                        return_value: 0,
+                        is_error: false,
+                    }
+                );
+                assert_eq!(info.architecture, exec_info.architecture);
+                assert_eq!(info.instruction_pointer, exec_info.instruction_pointer);
+                assert_eq!(info.stack_pointer, exec_info.stack_pointer);
+                let exit_regs = stopped.getregs().unwrap();
+                assert_eq!(exit_regs.ip(), exec_regs.ip());
+                assert_eq!(exit_regs.stack_ptr(), exec_regs.stack_ptr());
+                assert_eq!(exit_regs.ret(), 0);
+                assert_eq!(*info, stopped.getsyscallinfo().unwrap());
+                // Linux reports syscall EXIT before processing pending
+                // signals. The queued instance must still belong to the
+                // kernel here, not to a test hold or a synthetic delivery.
+                let pending = pending_signal_mask(pid).unwrap();
+                assert_eq!(
+                    pending & signal_mask_bit(Signal::SIGUSR1) != 0,
+                    unrelated_signal
+                );
+                eprintln!(
+                    "actual exec-return forced={force_legacy} signal={unrelated_signal}: exec={exec_info:?}, exit={info:?}, generation={hook_generation:?}"
+                );
+            }));
+        });
         // This is the real ordinary production handler, including its post-exec
-        // single-step wait, preinitialization and normal post-exec continuation.
-        traced.handle_exec_event(stopped, pid).await
+        // syscall-exit wait, preinitialization and normal post-exec continuation.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            traced.handle_exec_event(stopped),
+        )
+        .await
+        .expect("the owned exec-return and preinit path exceeded its three-second bound")
     });
     match &result {
         Ok(Wait::Exited(tid, status)) => eprintln!(
@@ -307,21 +337,29 @@ fn ordinary_post_exec_owner_cell(force_legacy: bool, unrelated_signal: bool) {
     }
     let expected = if unrelated_signal {
         assert!(sent_signal.load(Ordering::SeqCst));
-        assert!(intercepted_trap.load(Ordering::SeqCst));
-        assert_eq!(preinit_stops.load(Ordering::SeqCst), 0);
+        // The checked EXIT arrives before SIGUSR1 delivery, so preinit
+        // saves the entry registers and patches its private mmap syscall.
+        // SIGUSR1 then kills the tracee before that mmap returns or any
+        // original image instruction can execute. The old test consumed a
+        // synthetic SIGTRAP and CONTed before preinit; it tested a different
+        // sequence and therefore expected no preinit visit.
+        assert_eq!(preinit_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(mmap_returns.load(Ordering::SeqCst), 0);
         ExitStatus::Signaled(Signal::SIGUSR1, false)
     } else {
         assert!(!sent_signal.load(Ordering::SeqCst));
-        assert!(!intercepted_trap.load(Ordering::SeqCst));
         assert_eq!(
             preinit_stops.load(Ordering::SeqCst),
             1,
-            "the actual accepted SIGTRAP reached real preinitialization"
+            "the actual checked exec EXIT reached real preinitialization"
         );
+        assert_eq!(mmap_returns.load(Ordering::SeqCst), 1);
         ExitStatus::Exited(0)
     };
     assert_eq!(exec_stops.load(Ordering::SeqCst), 1);
-    POST_EXEC_STEP_FOR_TEST.with(|slot| assert!(slot.borrow().is_none()));
+    assert_eq!(exit_stops.load(Ordering::SeqCst), 1);
+    assert_eq!(drained_stops.load(Ordering::SeqCst), 1);
+    POST_EXEC_RETURN_FOR_TEST.with(|slot| assert!(slot.borrow().is_none()));
     assert_eq!(result.unwrap().assume_exited(), (pid, expected));
     assert_eq!(terminal.observed_exit_status(), Ok(Some(expected)));
     assert!(traced.ordinary_held_stop.lock().unwrap().is_none());

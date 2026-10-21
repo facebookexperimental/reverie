@@ -1,7 +1,7 @@
 [package]
 name = "reverie-dbt"
 description = "Dynamic binary instrumentation (DBT) execution backend for the Reverie framework."
-version = "0.4.0"
+version = "0.5.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -18,9 +18,9 @@ prototype-runtime = []
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
 libc = "0.2.186"
-reverie = { version = "0.4.0", path = "../reverie", package = "reverie-core" }
-reverie-memory = { version = "0.4.0", path = "../reverie-memory" }
-reverie-rpc-transport = { version = "0.4.0", path = "../reverie-rpc-transport" }
+reverie = { version = "0.5.1", path = "../reverie", package = "reverie-core" }
+reverie-memory = { version = "0.5.1", path = "../reverie-memory" }
+reverie-rpc-transport = { version = "0.5.1", path = "../reverie-rpc-transport" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["alloc"] }
 tempfile = "3.27.0"

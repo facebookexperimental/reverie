@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Native early-main fatal-invocation controls, never a libtest bootstrap.
 //! These case bodies reuse the existing launcher startup and 30s/kill2s guard.
 //! Exit125 is established only by an external actual wait, not this marker.

@@ -16,6 +16,7 @@ use std::task::Context;
 use std::task::Waker;
 
 use super::*;
+use crate::error::ErrorExt;
 use crate::failure::owned_future::PanicPayload;
 
 struct ExpectedError {

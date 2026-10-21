@@ -1,0 +1,1 @@
+./libtest.so -M false -P 'nop()@init'

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
@@ -381,20 +373,244 @@ fn fallback_refusal_is_counted_separately_from_tool_errors() {
     }
 }
 
-fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().unwrap();
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
+/// Own direct-child cleanup through capture errors and caller unwinding.
+/// This deliberately retains the tests' existing process-group semantics.
+struct KillOnDropChild(Option<std::process::Child>);
+
+impl KillOnDropChild {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0.as_mut().expect("child has not been reaped")
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child().try_wait()?;
+        if status.is_some() {
+            // try_wait reaped the child: never direct later cleanup at its PID.
+            self.0 = None;
         }
+        Ok(status)
+    }
+
+    fn kill_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        // It may have exited between polling and killing. wait still owns and
+        // reaps that child; a kill error must not replace the timeout failure.
+        let _ = self.child().kill();
+        let status = self.child().wait()?;
+        self.0 = None;
+        Ok(status)
+    }
+}
+
+impl Drop for KillOnDropChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    fn nonblocking(fd: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: fd is one of this invocation's owned pipe read handles.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn read_chunk(pipe: &mut impl Read, bytes: &mut Vec<u8>) -> std::io::Result<bool> {
+        // One bounded chunk per stream keeps a continuously writable stream
+        // from starving the other stream or the absolute deadline check.
+        let mut buffer = [0; 8192];
+        match pipe.read(&mut buffer) {
+            Ok(0) => Ok(true),
+            Ok(count) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                Ok(false)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = KillOnDropChild::new(command.spawn().unwrap());
+    let deadline = Instant::now() + timeout;
+    let mut stdout = child.child().stdout.take().unwrap();
+    let mut stderr = child.child().stderr.take().unwrap();
+    nonblocking(stdout.as_raw_fd()).unwrap();
+    nonblocking(stderr.as_raw_fd()).unwrap();
+    let (mut stdout_bytes, mut stderr_bytes) = (Vec::new(), Vec::new());
+    let (mut stdout_eof, mut stderr_eof) = (false, false);
+    let mut status = None;
+    loop {
         if Instant::now() >= deadline {
-            child.kill().unwrap();
-            let output = child.wait_with_output().unwrap();
+            // Closing the readers before reaping never waits for a descendant
+            // that retained a pipe writer. Subtree cleanup belongs to the
+            // outer test box; kernel-uninterruptible reaping needs that bound.
+            drop(stdout);
+            drop(stderr);
+            let status = status.unwrap_or_else(|| child.kill_and_wait().unwrap());
+            let output = Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            };
             panic!("child exceeded {timeout:?}: {output:?}");
         }
-        thread::sleep(Duration::from_millis(10));
+        if status.is_none() {
+            status = child.try_wait().unwrap();
+        }
+        if !stdout_eof {
+            stdout_eof = read_chunk(&mut stdout, &mut stdout_bytes).unwrap_or_else(|error| {
+                panic!("stdout capture failed: {error}; stdout={stdout_bytes:?} stderr={stderr_bytes:?}")
+            });
+        }
+        if !stderr_eof && Instant::now() < deadline {
+            stderr_eof = read_chunk(&mut stderr, &mut stderr_bytes).unwrap_or_else(|error| {
+                panic!("stderr capture failed: {error}; stdout={stdout_bytes:?} stderr={stderr_bytes:?}")
+            });
+        }
+        if Instant::now() >= deadline {
+            continue;
+        }
+        if let Some(status) = status
+            && stdout_eof
+            && stderr_eof
+        {
+            return Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            };
+        }
+        let mut pipes = [
+            libc::pollfd {
+                fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+        ];
+        // Poll child status even when both pipes closed before child exit.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = remaining.as_millis().min(10) as libc::c_int;
+        // SAFETY: pipes contains two initialized, owned (or disabled) fds.
+        if unsafe { libc::poll(pipes.as_mut_ptr(), pipes.len() as libc::nfds_t, millis) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                panic!(
+                    "capture poll failed: {error}; stdout={stdout_bytes:?} stderr={stderr_bytes:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn timeout_capture_drains_both_8192_byte_pipes_while_child_runs() {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(
+        "i=0; while [ \"$i\" -lt 4096 ]; do \
+         printf 'out-0123456789abcdef\\n'; \
+         printf 'err-0123456789abcdef\\n' >&2; i=$((i+1)); done",
+    );
+    // Control only this regression's pipe capacity. The workload must exceed
+    // both pipes, rather than relying on the host's default capacity.
+    unsafe {
+        command.pre_exec(|| {
+            for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                if libc::fcntl(fd, libc::F_SETPIPE_SZ, 8192) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(fd, libc::F_GETPIPE_SZ) != 8192 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+            }
+            Ok(())
+        });
+    }
+    let output = output_with_timeout(command, Duration::from_secs(20));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"out-0123456789abcdef\n".repeat(4096));
+    assert_eq!(output.stderr, b"err-0123456789abcdef\n".repeat(4096));
+}
+
+#[test]
+fn timeout_capture_preserves_prefixes_and_reaps_child_and_coordinator_on_unwind() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("child.pid");
+    let mut coordinator = KillOnDropChild::new(
+        Command::new("/bin/sh")
+            .args(["-c", "while :; do :; done"])
+            .spawn()
+            .unwrap(),
+    );
+    let coordinator_pid = coordinator.child().id();
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "printf '%s\\n' \"$$\" > \"$1\"; printf 'stdout-prefix\\n'; \
+             printf 'stderr-prefix\\n' >&2; while :; do :; done",
+            "timeout-control",
+        ])
+        .arg(&pid_file);
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _coordinator = coordinator;
+        output_with_timeout(command, Duration::from_secs(1))
+    }))
+    .expect_err("a live child must remain a timeout failure");
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(message.contains("child exceeded 1s:"), "{message}");
+    assert!(
+        message.contains("stdout: \"stdout-prefix\\n\""),
+        "{message}"
+    );
+    assert!(
+        message.contains("stderr: \"stderr-prefix\\n\""),
+        "{message}"
+    );
+    let child_pid: u32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    for pid in [child_pid, coordinator_pid] {
+        let mut status = 0;
+        // SAFETY: these are the two direct children owned by this test. A
+        // successful cleanup has already reaped them, so neither is waitable.
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 }
 
@@ -455,6 +671,156 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
         Some(126),
         "{spoofed_sigsys:?}"
     );
+
+    let signal_runtime = Command::new(binary)
+        .arg("tool-signal-runtime")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert!(signal_runtime.status.success(), "{signal_runtime:?}");
+    assert_eq!(signal_runtime.stdout, b"tool-signal-runtime-ok\n");
+
+    for (mode, reached) in [
+        ("tool-sigreturn-trap", "sigreturn-site-fresh\n"),
+        ("tool-sigreturn-hook", "numbered-site-hooked\n"),
+        ("tool-sigreturn-trap-alias", "sigreturn-site-fresh\n"),
+        ("tool-sigreturn-hook-alias", "numbered-site-hooked\n"),
+    ] {
+        let output = Command::new(binary)
+            .arg(mode)
+            .arg(&socket)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(reverie_inguest::trap::GUEST_SIGNAL_RETURN_STATUS),
+            "{mode} {output:?}"
+        );
+        assert_eq!(output.stdout, reached.as_bytes(), "{mode} {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).ends_with(
+                "reverie-inguest: the guest made its own rt_sigreturn; only the runtime's \
+                 signal restorer may return from a signal, so the process ends\n"
+            ),
+            "{mode} {output:?}"
+        );
+    }
+
+    let admitted = |mode: &str, on: bool| {
+        let mut command = Command::new(binary);
+        command
+            .arg(mode)
+            .arg(&socket)
+            .env(reverie_liteinst::SITE_PATCHING_ENV, "0")
+            .env(
+                reverie_liteinst::SIGALRM_HANDLERS_ENV,
+                if on { "1" } else { "0" },
+            );
+        command.output().unwrap()
+    };
+    let virtual_state = admitted("sigalrm-virtual", true);
+    assert!(virtual_state.status.success(), "{virtual_state:?}");
+    assert_eq!(virtual_state.stdout, b"sigalrm-virtual-ok\n");
+    let unprepared = admitted("sigalrm-unprepared", true);
+    assert_eq!(
+        unprepared.status.code(),
+        Some(reverie_inguest::guest::sigalrm::UNPREPARED_SIGALRM_STATUS),
+        "{unprepared:?}"
+    );
+    assert_eq!(unprepared.stdout, b"sigalrm-handler-installed\n");
+    // The pending-at-installation refusal, admitted; and with handlers not
+    // admitted, the refusal of every handler (the same guest, same answer).
+    for on in [true, false] {
+        let refused = admitted("sigalrm-refused", on);
+        assert!(refused.status.success(), "{on} {refused:?}");
+        assert_eq!(refused.stdout, b"sigalrm-refused-ok\n");
+    }
+    let extra_filter = admitted("sigalrm-extra-filter", true);
+    assert!(extra_filter.status.success(), "{extra_filter:?}");
+    assert_eq!(extra_filter.stdout, b"sigalrm-extra-filter-ok\n");
+    let inherited_filter = admitted("sigalrm-inherited-filter", true);
+    assert!(inherited_filter.status.success(), "{inherited_filter:?}");
+    assert_eq!(inherited_filter.stdout, b"sigalrm-inherited-filter-ok\n");
+    let pkey_before = admitted("sigalrm-pkey-before-install", true);
+    assert!(pkey_before.status.success(), "{pkey_before:?}");
+    assert_eq!(pkey_before.stdout, b"sigalrm-pkey-before-install-ok\n");
+    // Delivery and its refusals, with the runtime's SIGSYS handler on its own
+    // alternate stack and on the guest's stack.
+    let admitted_on_stack = |mode: &str, on: bool, on_alt_stack: bool| {
+        let mut command = Command::new(binary);
+        command
+            .arg(mode)
+            .arg(&socket)
+            .env(reverie_liteinst::SITE_PATCHING_ENV, "0")
+            .env(
+                reverie_liteinst::SIGALRM_HANDLERS_ENV,
+                if on { "1" } else { "0" },
+            );
+        reverie_liteinst::set_guest_alt_stack(&mut command, on_alt_stack);
+        command.output().unwrap()
+    };
+    for on_alt_stack in [true, false] {
+        let delivery = admitted_on_stack("sigalrm-delivery", true, on_alt_stack);
+        assert!(delivery.status.success(), "{on_alt_stack} {delivery:?}");
+        assert_eq!(delivery.stdout, b"sigalrm-delivery-ok\n");
+        let entry_delivery = admitted_on_stack("sigalrm-entry-delivery", true, on_alt_stack);
+        assert!(
+            entry_delivery.status.success(),
+            "{on_alt_stack} {entry_delivery:?}"
+        );
+        assert_eq!(entry_delivery.stdout, b"sigalrm-entry-delivery-ok\n");
+        let stack_edit = admitted_on_stack("sigalrm-stack-edit", true, on_alt_stack);
+        assert_eq!(
+            stack_edit.status.code(),
+            Some(reverie_inguest::guest::sigalrm::DELIVERY_LOST_STATUS),
+            "{on_alt_stack} {stack_edit:?}"
+        );
+        assert_eq!(stack_edit.stdout, b"sigalrm-stack-edit-armed\n");
+        assert!(
+            String::from_utf8_lossy(&stack_edit.stderr).contains("changed uc_stack"),
+            "{on_alt_stack} {stack_edit:?}"
+        );
+        for mode in ["sigalrm-entry-mask", "sigalrm-entry-stack"] {
+            let entry = admitted_on_stack(mode, true, on_alt_stack);
+            assert_eq!(
+                entry.status.code(),
+                Some(reverie_inguest::guest::sigalrm::SIGNAL_STATE_LOST_STATUS),
+                "{on_alt_stack} {mode} {entry:?}"
+            );
+            assert_eq!(entry.stdout, b"sigalrm-entry-frame-armed\n", "{mode}");
+            assert!(
+                String::from_utf8_lossy(&entry.stderr).contains(
+                    "frame shows a signal mask or alternate stack the runtime did not set"
+                ),
+                "{on_alt_stack} {mode} {entry:?}"
+            );
+        }
+        let pkru = admitted_on_stack("sigalrm-handler-pkru", true, on_alt_stack);
+        assert!(pkru.status.success(), "{on_alt_stack} {pkru:?}");
+        if pkru.stdout == b"sigalrm-handler-pkru: OSPKE unavailable\n" {
+            eprintln!("SIGALRM handler PKRU return unmeasured: OSPKE unavailable");
+        } else {
+            assert_eq!(pkru.stdout, b"sigalrm-handler-pkru-ok\n");
+        }
+    }
+    let not_admitted = admitted("sigalrm-unprepared", false);
+    assert!(!not_admitted.status.success(), "{not_admitted:?}");
+    assert!(not_admitted.stdout.is_empty(), "{not_admitted:?}");
+
+    let sigtrap_default = Command::new(binary)
+        .arg("tool-sigtrap-default")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            sigtrap_default.status.signal(),
+            Some(libc::SIGTRAP),
+            "{sigtrap_default:?}"
+        );
+    }
+    assert_eq!(sigtrap_default.stdout, b"raising-sigtrap\n");
 
     let mut instruction_positives = 0;
     let mut instruction_refusals = 0;
@@ -833,13 +1199,15 @@ fn late_code_guest(
     let binary = env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest");
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("coordinator.sock");
-    let mut coordinator = Command::new(binary)
-        .arg("coordinator")
-        .arg(&socket)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let coordinator = KillOnDropChild::new(
+        Command::new(binary)
+            .arg("coordinator")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -850,8 +1218,7 @@ fn late_code_guest(
     reverie_liteinst::set_guest_alt_stack(&mut command, on_alt_stack);
     configure(&mut command);
     let output = ready.then(|| output_with_timeout(command, Duration::from_secs(20)));
-    let _ = coordinator.kill();
-    let _ = coordinator.wait();
+    drop(coordinator);
     output.expect("coordinator socket was not created")
 }
 
@@ -891,6 +1258,122 @@ fn late_code_instructions_reach_the_tool_through_the_continuation() {
         );
         assert!(
             output.stderr.is_empty(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+    }
+}
+
+// One Tool reached three ways must observe the same results (in-guest
+// layering step 2): LiteInst with site patching on, where the binary's
+// getpid site is patched and a site in an anonymous executable page (no
+// arena) is declined; LiteInst with site patching off, which declines every
+// site, as in-guest-trap runs it; and the shared runtime's installer with no
+// patcher at all. The first line is what the Tool and guest observe; the
+// second shows which route each site took.
+#[test]
+fn patched_declined_and_unpatched_sites_give_one_tool_the_same_results() {
+    const TOOL_OBSERVED: &str = "same-tool getpid=pid tool-getpid=16 rpc=16 clock=0 tool-clock=1 \
+                                 cpuid=tool tool-cpuid=1 rdtsc=tool tool-rdtsc=1";
+    let zero = "binary-site traps=0 hooks=0 anonymous-site traps=0 hooks=0";
+    let cases = [
+        (
+            "liteinst",
+            Some("1"),
+            "binary-site traps=1 hooks=8 anonymous-site traps=8 hooks=0",
+        ),
+        ("liteinst", Some("0"), zero),
+        ("no-patcher", None, zero),
+    ];
+    for on_alt_stack in [true, false] {
+        for (installer, site_patching, routes) in cases {
+            let label =
+                format!("{installer} site_patching={site_patching:?} alt_stack={on_alt_stack}");
+            let output = late_code_guest(
+                "same-tool",
+                &[std::ffi::OsStr::new(installer)],
+                on_alt_stack,
+                |command| {
+                    command.env(
+                        STRADDLER_STALENESS_TICKS_ENV,
+                        TEST_STRADDLER_STALENESS_TICKS,
+                    );
+                    if let Some(value) = site_patching {
+                        command.env(reverie_liteinst::SITE_PATCHING_ENV, value);
+                    }
+                },
+            );
+            // This control has no unmeasured outcome: every case must run,
+            // so a host that refuses CPUID/TSC faulting fails it.
+            assert!(
+                !instruction_control_refused(&output, &label),
+                "{label}: CPUID/TSC faulting is unavailable, so the same-Tool control cannot run"
+            );
+            assert!(output.status.success(), "{label}: {output:?}");
+            assert!(output.stderr.is_empty(), "{label}: {output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut lines = stdout.lines();
+            assert_eq!(lines.next(), Some(TOOL_OBSERVED), "{label}: {output:?}");
+            assert_eq!(lines.next(), Some(routes), "{label}: {output:?}");
+            assert_eq!(lines.next(), None, "{label}: {output:?}");
+        }
+    }
+}
+
+// With site patching off (the trap-only mode in-guest-trap needs), CPUID,
+// RDTSC and RDTSCP inside an arena are emulated through the continuation like
+// late code: no site is patched, and each reaches the Tool once with the same
+// result.
+#[test]
+fn site_patching_off_emulates_in_arena_instructions_through_the_continuation() {
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest(
+            "late-code-instruction-trap-only",
+            &[],
+            on_alt_stack,
+            |command| {
+                command.env(reverie_liteinst::SITE_PATCHING_ENV, "0");
+            },
+        );
+        if instruction_control_refused(&output, "late-code-instruction-trap-only") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "late-code trap-only cpuid=tool rdtsc=tool rdtscp=tool equals-in-arena=1 continuation=163+7 owned-stack=170 sites=0 registers=preserved\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+    }
+}
+
+// With site patching off, a fork runs entirely on the fallback continuation,
+// and the child first reads its RCB clock while still on that continuation.
+// Binding the child's fresh PMU counter reads CPUID; that is the runtime's own
+// code and must run natively, not be emulated through the busy continuation
+// (which used to kill the child with SIGSEGV and leave the parent waiting).
+#[test]
+fn site_patching_off_fork_child_binds_its_clock_and_exits() {
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest("nested-instruction-fork", &[], on_alt_stack, |command| {
+            command.env(reverie_liteinst::SITE_PATCHING_ENV, "0");
+        });
+        if instruction_control_refused(&output, "nested-instruction-fork trap-only") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "nested-cpuid=native nested-rdtsc=native nested-rdtscp=native guest-cpuid=tool guest-rdtsc=tool guest-rdtscp=tool child-getpid=complete child-exit=0\n",
             "alt_stack={on_alt_stack}: {output:?}"
         );
     }
@@ -1051,4 +1534,280 @@ fn undecodable_late_code_fault_ends_the_guest_by_sigsegv() {
             );
         }
     }
+}
+
+// A CPUID/RDTSC/RDTSCP inside an arena whose 8-byte word patch would cross a
+// cache line is refused before any byte changes while cross-line publication
+// is disabled. The guest must keep running: each execution traps and reaches
+// the Tool through the continuation, and the site is never patched. Nix's
+// coreutils runs this shape in `__cpu_indicator_init` before `main`.
+// A patchable neighbour whose patch would cover such a site, and so the
+// point where a thread in its continuation resumes, must stay unpatched too.
+#[test]
+fn cross_line_instruction_site_reaches_the_tool_through_the_continuation() {
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest("straddler-instruction", &[], on_alt_stack, |command| {
+            command
+                .env_remove(reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV)
+                .env(reverie_liteinst::IN_GUEST_STAGE_STREAM_ENV, "1");
+        });
+        if instruction_control_refused(&output, "straddler-instruction") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "straddler cpuid=tool rdtsc=tool rdtscp=tool calls=56 continuation=56 owned-stack=56 hooks=0 registers=preserved\n\
+             straddler-neighbour cpuid=tool callbacks=32 traps=8+24 hooks=0\n\
+             straddler-stale-jump cpuid=tool traps=8 hooks=0\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stage_count = |stage: &str| stderr.lines().filter(|line| line.ends_with(stage)).count();
+        for (stage, expected) in [
+            ("stage=instruction-fault-continuation-cpuid", 80),
+            ("stage=instruction-fault-continuation-rdtsc", 8),
+            ("stage=instruction-fault-continuation-rdtscp", 8),
+        ] {
+            assert_eq!(stage_count(stage), expected, "{stage}: {stderr}");
+        }
+        assert!(
+            !stderr.contains("instruction-sigsegv-"),
+            "no refusal stage may appear: {stderr}"
+        );
+    }
+}
+
+// A patched CPUID whose cross-line jump spans a page boundary, with only the
+// first page later replaced by its original bytes: executing the CPUID again
+// reclaims the site while the jump's displacement survives on the second
+// page. The runtime must end the guest (the earlier patch may survive)
+// rather than resume through the continuation into those bytes.
+#[test]
+fn reclaiming_a_site_whose_jump_partly_survives_fails_closed() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest("straddler-reclaim-partial", &[], on_alt_stack, |command| {
+            command
+                .env(reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV, "20000")
+                .env(reverie_liteinst::IN_GUEST_STAGE_STREAM_ENV, "1");
+        });
+        if instruction_control_refused(&output, "straddler-reclaim-partial") {
+            return;
+        }
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGSEGV),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "reclaim-partial ready\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stage_count = |stage: &str| stderr.lines().filter(|line| line.ends_with(stage)).count();
+        assert_eq!(
+            stage_count("stage=instruction-sigsegv-site-install-failed"),
+            1,
+            "alt_stack={on_alt_stack}: {stderr}"
+        );
+        // The site was patched, never emulated, and the reclaim must not
+        // resume through the continuation.
+        assert!(
+            !stderr.contains("stage=instruction-fault-continuation-cpuid"),
+            "alt_stack={on_alt_stack}: {stderr}"
+        );
+    }
+}
+
+// A syscall refused before any publication runs through the SIGSYS
+// continuation and leaves no footprint. After a no-op mremap makes it STALE,
+// a CPUID whose patch would cover it must still not be patched.
+#[test]
+fn a_stale_syscall_fallback_site_keeps_its_continuation_reservation() {
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest(
+            "straddler-syscall-reservation",
+            &[],
+            on_alt_stack,
+            |command| {
+                command.env_remove(reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV);
+            },
+        );
+        if instruction_control_refused(&output, "straddler-syscall-reservation") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "straddler-syscall-reservation cpuid=tool syscall=getpid traps=8 hooks=0+0\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+    }
+}
+
+// LiteInst publishes only into private mappings: a write through a shared
+// executable mapping would change the page cache that every alias and every
+// other process executes, behind their site tables. CPUIDs in a shared
+// mapping, even one whose word fits a cache line, must trap every time, reach
+// the Tool through the continuation, and leave the shared page unchanged.
+#[test]
+fn a_shared_executable_mapping_is_never_patched() {
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest("straddler-shared-mapping", &[], on_alt_stack, |command| {
+            command.env_remove(reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV);
+        });
+        if instruction_control_refused(&output, "straddler-shared-mapping") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "shared-mapping cpuid=tool traps=8+8 hooks=0+0 page=unchanged\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+    }
+}
+
+// A refused CPUID at a private page end resumes in an adjacent shared
+// mapping. LiteInst never publishes into shared mappings, so the resume
+// bytes are the original ones and the continuation must work.
+#[test]
+fn a_refused_site_resuming_into_a_shared_mapping_runs_through_the_continuation() {
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest("straddler-split-mapping", &[], on_alt_stack, |command| {
+            command.env_remove(reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV);
+        });
+        if instruction_control_refused(&output, "straddler-split-mapping") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "split-mapping cpuid=tool traps=8\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+    }
+}
+
+// A syscall refused before anything was written runs through the SIGSYS
+// continuation without leaving a footprint, so the patchable RDTSC starting
+// exactly at its resume point must still be patched.
+#[test]
+fn an_instruction_at_a_fallback_syscalls_resume_point_is_still_patched() {
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest(
+            "fallback-syscall-then-rdtsc",
+            &[],
+            on_alt_stack,
+            |command| {
+                command.env_remove(reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV);
+            },
+        );
+        if instruction_control_refused(&output, "fallback-syscall-then-rdtsc") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "fallback-syscall-then-rdtsc rdtsc=tool traps=1 patched=1\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+    }
+}
+
+// One file page mapped private and shared. The shared alias executes first
+// and must not be patched (the write would show through the clean private
+// alias); the private continuation site then runs on its original bytes.
+#[test]
+fn a_shared_alias_is_not_patched_under_a_private_continuation_site() {
+    for on_alt_stack in [true, false] {
+        let output = late_code_guest("straddler-private-alias", &[], on_alt_stack, |command| {
+            command.env_remove(reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV);
+        });
+        if instruction_control_refused(&output, "straddler-private-alias") {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "private-alias shared=unpatched private=original cpuid=tool traps=8+8\n",
+            "alt_stack={on_alt_stack}: {output:?}"
+        );
+    }
+}
+
+// This is Tool-selected full-event fidelity, not a Linux arbitrary-padding
+// comparison or a claim that the legacy mask/action owner has migrated.
+#[test]
+fn deferred_sigalrm_preserves_full_event_at_completion_and_before_syscall() {
+    let expected_info = |seed: u8| {
+        let mut bytes: [u8; 128] =
+            core::array::from_fn(|index| (index as u8).wrapping_mul(17).wrapping_add(seed));
+        bytes[..4].copy_from_slice(&libc::SIGALRM.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&73_i32.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&libc::SI_QUEUE.to_ne_bytes());
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let mut failures = Vec::new();
+    for mode in ["completion", "entry"] {
+        let mut expected = String::new();
+        for (round, seed) in [0x31, 0xa7].into_iter().enumerate() {
+            let count = round + 1;
+            expected.push_str(&format!(
+                "full-event {mode} round={round} siginfo={}\nfull-event {mode} round={round} registers=preserved runs={count} handlers={count} replacement=EINVAL\n",
+                expected_info(seed),
+            ));
+        }
+        expected.push_str(&format!("full-event {mode} complete\n"));
+        for on_alt_stack in [true, false] {
+            let output = late_code_guest(
+                &format!("sigalrm-full-event-{mode}"),
+                &[],
+                on_alt_stack,
+                |command| {
+                    command
+                        .env(reverie_liteinst::SITE_PATCHING_ENV, "0")
+                        .env(reverie_liteinst::SIGALRM_HANDLERS_ENV, "1");
+                },
+            );
+            // Keep all four actual outcomes on the red run. There is no
+            // unavailable/skip success path, timeout increase or byte filter.
+            eprintln!("full-event {mode} alt_stack={on_alt_stack}: {output:?}");
+            if !output.status.success()
+                || output.stdout != expected.as_bytes()
+                || !output.stderr.is_empty()
+            {
+                failures.push(format!("{mode} alt_stack={on_alt_stack}: {output:?}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "full-event fidelity failures:\n{}",
+        failures.join("\n")
+    );
 }

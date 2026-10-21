@@ -186,15 +186,6 @@ does not repeat a procfs open. An existing host anchor and established role
 also need no discarded constructor check: the first operation authenticates
 them normally. Constructor-only and unbound roles keep their original binding.
 
-The current attachment check can retain an optional status file opened from
-the original task directory. Each check reads it again at offset zero, which
-regenerates proc status even after a partial read; no attachment value is
-cached between polls. Any missing file, read failure or malformed result uses
-the existing fresh directory reader and its errors. Acquiring this optional
-file cannot refuse an otherwise valid capture. While the retained file works,
-its open permission is checked at capture rather than repeated on every poll;
-read permission and current kernel attachment still apply to every check.
-
 Ptrace requests still address numeric TIDs. The explicit interface checks the
 retained target before issuing a request and rejects an already retired target.
 A running nonleader can exec, release its TID, and be replaced by another tracee

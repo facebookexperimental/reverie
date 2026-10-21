@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* Every vDSO entry point must be routed to the plugin or stubbed. Under SaBRe
  * the vDSO's clock_getres, which the loader used to leave native, must reach
  * the plugin as a syscall, and the SGX enclave entry, which has no syscall

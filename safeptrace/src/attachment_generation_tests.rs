@@ -247,10 +247,6 @@ mod attachment_generation {
         replacement_pidfd: OwnedFd,
     }
 
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-    )]
     #[test]
     fn initial_seize_refuses_same_owner_exact_tid_reuse() {
         if env::var_os(INNER).is_none() {

@@ -1,9 +1,7 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
+ * Licensed under the BSD-style license in the repository root LICENSE.
  */
 
 use core::sync::atomic::AtomicU64;
@@ -18,7 +16,7 @@ use reverie::Tool;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
-use reverie_preload::trap::raw_syscall6;
+use reverie_inguest::trap::raw_syscall6;
 
 const STACK_BYTES: usize = 1024 * 1024;
 const XSTATE_OFFSET: usize = 512;

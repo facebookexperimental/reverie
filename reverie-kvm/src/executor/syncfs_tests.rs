@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // These controls qualify only ordinary syncfs and conservative ENOSYS refusal.
 // PR610's authenticated carrier/EBADMSG contract remains separate.
 
@@ -27,7 +19,7 @@ fn syncfs_dispatch_one_translated_host_call_preserves_each_errno() {
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
     let mut ordinary = syncfs_memfd("syncfs-ordinary");
-    ordinary.write_all(b"0.00 0.00\n").unwrap();
+    ordinary.write_all(SELF_MAPS_CONTENT).unwrap();
     let memfd = insert_file_with_flags(&mut state, ordinary, false, None);
     let [reader, _writer] = pipe_fionread_host_pipe();
     let pipe = insert_file_with_flags(&mut state, reader, false, None);
@@ -106,7 +98,7 @@ fn syncfs_closed_and_path_only_precede_private_refusal_without_host_call() {
             negative_errno(libc::EBADF)
         );
     }
-    for path in ["/proc/uptime", root.0.to_str().unwrap()] {
+    for path in ["/proc/self/maps", root.0.to_str().unwrap()] {
         let fd = open_with_flags(&mut memory, &mut state, path, libc::O_PATH);
         assert!(fd >= 0);
         assert_eq!(
@@ -203,7 +195,7 @@ fn syncfs_reserved_names_deny_without_authenticating_payload_or_seals() {
         "reverie-kvm-virtual-ordinary",
     ] {
         let mut file = syncfs_memfd(name);
-        file.write_all(b"0.00 0.00\n").unwrap();
+        file.write_all(SELF_MAPS_CONTENT).unwrap();
         let host = file.as_raw_fd();
         let fd = insert_file_with_flags(&mut state, file, false, None);
         let seen = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -300,9 +292,9 @@ fn syncfs_transfer_after_sender_close(
 fn syncfs_private_rights_remain_refused_after_sender_reuse_dup_fork_exec() {
     let root = TestDir::new();
     let replacement = root.0.join("replacement");
-    std::fs::write(&replacement, b"0.00 0.00\n").unwrap();
+    std::fs::write(&replacement, SELF_MAPS_CONTENT).unwrap();
     for path in [
-        "/proc/uptime",
+        "/proc/self/maps",
         "/proc/self/loginuid",
         "/proc/self/stat",
         "/proc/self/status",
@@ -317,7 +309,7 @@ fn syncfs_private_rights_remain_refused_after_sender_reuse_dup_fork_exec() {
             host_file_key(host_fd(&state, received).unwrap()).unwrap(),
             original_key
         );
-        if matches!(path, "/proc/uptime" | "/proc/self/loginuid") {
+        if matches!(path, "/proc/self/maps" | "/proc/self/loginuid") {
             assert!(
                 !state.proc_files.contains_key(&received),
                 "real transfer loses fixed/virtual metadata"
@@ -365,7 +357,7 @@ fn syncfs_known_private_descriptions_are_refused_without_host_call() {
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
     let mut fds = Vec::new();
     for path in [
-        "/proc/uptime",
+        "/proc/self/maps",
         "/proc/self/stat",
         "/proc/self/status",
         "/proc",

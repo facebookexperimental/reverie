@@ -8,6 +8,8 @@
 
 //! Typed SaBRe patch-shape and slow-path statistics.
 
+pub mod launch;
+
 use std::fmt;
 use std::io;
 use std::mem::size_of;
@@ -124,6 +126,19 @@ pub enum SabreDispatchRoute {
     Trampoline = 0,
     /// The SIGILL handler for a syscall marker.
     SigillMarker = 1,
+}
+
+impl SabreDispatchRoute {
+    /// The route the loader passes to a plugin's
+    /// `reverie_sabre_routed_syscall_v1` (its C `enum sbr_dispatch_route` as
+    /// a plain integer), or `None` for any value the loader does not define.
+    pub fn from_raw(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Trampoline),
+            1 => Some(Self::SigillMarker),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for SabreDispatchRoute {
@@ -536,6 +551,26 @@ mod tests {
     use std::mem::offset_of;
 
     use super::*;
+
+    #[test]
+    fn a_raw_route_converts_only_from_the_loaders_values() {
+        // The loader's enum sbr_dispatch_route (vendor/sabre/includes/loader/
+        // backend_stats.h): TRAMPOLINE = 0, SIGILL_MARKER = 1.
+        assert_eq!(
+            SabreDispatchRoute::from_raw(0),
+            Some(SabreDispatchRoute::Trampoline)
+        );
+        assert_eq!(
+            SabreDispatchRoute::from_raw(1),
+            Some(SabreDispatchRoute::SigillMarker)
+        );
+        for value in [2, -1, i64::MAX, i64::MIN] {
+            assert_eq!(SabreDispatchRoute::from_raw(value), None, "{value}");
+        }
+        for route in DISPATCH_ROUTES {
+            assert_eq!(SabreDispatchRoute::from_raw(route as i64), Some(route));
+        }
+    }
 
     #[test]
     fn disabled_request_allocates_no_stats_page() {

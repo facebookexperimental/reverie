@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
@@ -34,12 +26,9 @@ static int receive_case(int batch, int cloexec) {
   if (memcmp(payload, "hello", 5) || message.msg_hdr.msg_controllen != 0)
     return 5;
   if (message.msg_hdr.msg_flags != cloexec) {
-    fprintf(
-        stderr,
-        "%s requested=%#x returned=%#x\n",
-        batch ? "recvmmsg" : "recvmsg",
-        cloexec,
-        message.msg_hdr.msg_flags);
+    fprintf(stderr, "%s requested=%#x returned=%#x\n",
+            batch ? "recvmmsg" : "recvmsg", cloexec,
+            message.msg_hdr.msg_flags);
     return 6;
   }
   if (close(sockets[0]) || close(sockets[1]))

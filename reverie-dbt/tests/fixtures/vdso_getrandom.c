@@ -57,8 +57,8 @@ int main(void) {
   }
 
   /* Any state a caller held from before patching; the stub ignores it. */
-  void* state = mmap(
-      NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* state = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (state == MAP_FAILED)
     return 4;
   for (int draw = 0; draw < DRAWS; draw++) {

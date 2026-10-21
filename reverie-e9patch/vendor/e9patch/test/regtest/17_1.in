@@ -1,0 +1,1 @@
+./test -M 'jmp and imm[0] == &data_END' -P 'entry(addr,imm[0],target,bytes,size,asm)@inst'

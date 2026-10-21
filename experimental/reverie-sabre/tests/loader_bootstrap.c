@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* Native protocol control: link the actual loader bootstrap implementation.
  * This is not a PRNG or Hermit syscall oracle. The supervisor writes explicit
  * transport sentinels, and the child must observe them at the real boundary.

@@ -14,18 +14,22 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "kernel_task_identity.h"
+
 enum { ITERATIONS = 64 };
 
 typedef struct {
   pthread_barrier_t start;
   pid_t nested_pid;
   pid_t nested_tid;
+  kernel_task_identity_t nested_kernel;
 } race_state_t;
 
 static void* nested_main(void* argument) {
   race_state_t* state = argument;
   state->nested_pid = (pid_t)syscall(SYS_getpid);
   state->nested_tid = (pid_t)syscall(SYS_gettid);
+  state->nested_kernel = kernel_task_identity();
   return NULL;
 }
 
@@ -65,7 +69,10 @@ static int run_nested_race(pid_t expected_pid) {
     return 15;
   if (pthread_barrier_destroy(&state.start) != 0)
     return 16;
-  if (state.nested_pid != expected_pid || state.nested_tid == expected_pid ||
+  if (state.nested_kernel.pid <= 0 || state.nested_kernel.tid <= 0 ||
+      state.nested_pid != state.nested_kernel.pid ||
+      state.nested_tid != state.nested_kernel.tid ||
+      state.nested_pid != expected_pid || state.nested_tid == expected_pid ||
       state.nested_tid == child)
     return 17;
   return 0;
@@ -74,6 +81,11 @@ static int run_nested_race(pid_t expected_pid) {
 // TODO-HUMAN-REVIEW(PR-154): Review process-clone/pthread identity handoff
 // race.
 int main(void) {
+  kernel_task_identity_t root = kernel_task_identity();
+  if (root.pid <= 0 || root.tid != root.pid ||
+      (pid_t)syscall(SYS_getpid) != root.pid ||
+      (pid_t)syscall(SYS_gettid) != root.tid)
+    return 8;
   for (int iteration = 0; iteration < ITERATIONS; ++iteration) {
     race_state_t state = {.nested_pid = 0, .nested_tid = 0};
     pthread_t creator;
@@ -100,7 +112,10 @@ int main(void) {
       return 5;
     if (pthread_barrier_destroy(&state.start) != 0)
       return 6;
-    if (state.nested_pid != 3 || state.nested_tid <= 3 ||
+    if (state.nested_kernel.pid <= 0 || state.nested_kernel.tid <= 0 ||
+        state.nested_pid != state.nested_kernel.pid ||
+        state.nested_tid != state.nested_kernel.tid ||
+        state.nested_pid != root.pid || state.nested_tid == root.tid ||
         state.nested_tid == child)
       return 7;
   }

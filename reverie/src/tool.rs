@@ -132,9 +132,29 @@ pub trait GlobalTool: Send + Sync + Default {
         Default::default()
     }
 
+    /// Offer the actual launcher-created input before sharing this run's global
+    /// state or starting any guest hook. The default does not need the binding.
+    ///
+    /// The launcher prepares this temporary read-end lease before global-state
+    /// initialization, so installing it introduces no fallible startup work.
+    /// A Tool that uses it consumes the
+    /// binding only for the registered root's initial image, validating the
+    /// installed endpoint before marking its open-file description. It must not
+    /// grant the fact to inherited/unknown FIFOs or later reconnects, and must
+    /// release the lease at that handoff (or startup failure), not at run end.
+    fn install_inherited_input(&mut self, _input: crate::InheritedInputLease) {}
+
     /// Install one run-scoped backend capability before the first guest hook.
-    /// The default preserves backend-owned selection. A Tool that requires
-    /// controlled process signals must reject missing capabilities here.
+    /// The default preserves backend-owned selection. A Tool may reject a
+    /// missing capability here. A Tool whose
+    /// [`Tool::requires_signal_control`] holds need not: reverie-kvm refuses
+    /// that run with `EINVAL` when it offered a control and this did not
+    /// return `ToolControlled`, and with `ENOSYS`, before asking, when it has
+    /// no control to offer.
+    ///
+    /// `ToolControlled` is valid only when `control` is `Some`: a backend
+    /// refuses a run whose Tool claims control of a capability it did not
+    /// receive.
     fn install_backend_signal_control(
         &self,
         _control: Option<crate::BackendSignalControl>,
@@ -142,8 +162,42 @@ pub trait GlobalTool: Send + Sync + Default {
         Ok(crate::BackendSignalControlMode::Unchanged)
     }
 
+    /// Whether this run observes signal dequeues through
+    /// [`Tool::handle_signal_dequeue`], given the mode that
+    /// [`Self::install_backend_signal_control`] returned.
+    ///
+    /// The backend asks only when [`Tool::may_observe_signal_dequeues`]
+    /// admitted observation for the run's configuration, and enables
+    /// observation only when both answers are `true`. It asks after
+    /// installation, once for each process it starts, so the answer must
+    /// depend only on `mode` and on state fixed before installation returned.
+    /// The default observes whenever the configuration admitted it, whatever
+    /// the mode.
+    fn observe_signal_dequeues(&self, _mode: crate::BackendSignalControlMode) -> bool {
+        true
+    }
+
+    /// Whether the backend may skip a user-return boundary at which nothing
+    /// could be delivered, without calling
+    /// [`Self::authorize_backend_signal_boundary`]. Such a boundary is one
+    /// where the task holds no reserved permit and the backend's own state
+    /// shows no pending signal that the task's mask leaves unblocked, no
+    /// recorded dequeue or dequeue failure to report, no signalfd readiness to
+    /// refresh, and no parked ledger. A skipped boundary also has no
+    /// [`Self::on_backend_signal_boundary`] receipt.
+    ///
+    /// Return `true` only if authorization never publishes a signal or
+    /// otherwise changes what that boundary would select, and if the Tool
+    /// does not depend on being asked at every boundary; the answer must not
+    /// change during a run. The default `false` authorizes every boundary.
+    fn skip_empty_signal_boundaries(&self) -> bool {
+        false
+    }
+
     /// Authorize the current real user-return boundary. The backend calls
     /// this outside signal locks; host callback arrival is not authorization.
+    /// See [`Self::skip_empty_signal_boundaries`] for the boundaries a Tool
+    /// may let the backend skip.
     fn authorize_backend_signal_boundary(
         &self,
         _task: crate::SignalTaskIdentity,
@@ -185,6 +239,29 @@ pub trait GlobalTool: Send + Sync + Default {
         Ok(())
     }
 
+    /// Reports that guest process `pid` has physically left the host, for a
+    /// backend whose process exits complete asynchronously
+    /// ([`crate::BackendCapabilities::process_exits_complete_asynchronously`]),
+    /// or that the kernel has published `pid`'s exit to its guest parent, for a
+    /// backend that reports child-exit publication
+    /// ([`crate::BackendCapabilities::reports_child_exit_publication`]: under
+    /// ptrace, right after the tracer consumes the final wait status of an
+    /// ordinary, initialized process leader; see that capability for the
+    /// processes it does not cover). The backend calls it once per process,
+    /// after the kernel has published the exit to the parent, and possibly
+    /// before the tool has granted that process's exit. It must not wait for
+    /// guest progress.
+    fn on_backend_process_exited(&self, _pid: i32) {}
+
+    /// The guest processes whose exit the tool has granted and whose physical
+    /// exit has not been reported through
+    /// [`GlobalTool::on_backend_process_exited`] yet. A backend whose process
+    /// exits complete asynchronously reads it from a watchdog, to notice an
+    /// exit that never completes. It must not wait for guest progress.
+    fn backend_pending_process_exits(&self) -> Vec<i32> {
+        Vec::new()
+    }
+
     /// Receive a (potentially) inter-process upcall on the global state object.
     /// This intended to be IPC, inter-process communication, in some backends,
     /// and a local method call in others, but never truly a communication
@@ -210,6 +287,45 @@ pub trait GlobalTool: Send + Sync + Default {
     /// idempotent and preserve the first terminal cause. It must not wait for
     /// Tool callbacks or physical worker joins that depend on that transition.
     fn report_backend_failure(&self, _event: BackendFailure) {}
+
+    /// Called by a backend that holds guest thread `exit.tid` at its exit stop
+    /// while the thread's whole process is exiting because of a signal whose
+    /// default action dumps core, before the thread is released to finish
+    /// exiting. The kernel has already made the fatal decision and its own
+    /// core dump step is over, so the thread's exit status cannot change.
+    ///
+    /// The thread's memory is normally still mapped and may be read through
+    /// `/proc/<tid>/mem`, but holding the thread does not keep it there. The
+    /// kernel's OOM reaper, any process that calls `process_mrelease` on the
+    /// dying process, or anything that ends the exit stop early can unmap it
+    /// before or during the call, including after the backend's last
+    /// successful register read, and a process outside the thread group that
+    /// shares the address space can keep writing to it. A read can therefore fail, come back short, or
+    /// return pages that were reaped or are being changed. A consumer must
+    /// treat unavailable or partial memory as a normal outcome and keep
+    /// whatever it got rather than fail.
+    ///
+    /// The call is per thread: each thread of the dying process reaches its
+    /// own exit stop, in host order, so one process death can produce several
+    /// calls. At most one of them has `exit.dumping` set: the thread that
+    /// took the signal, when the kernel ran its core dump step. A thread that
+    /// ends with a core-dumping signal number but without a process-wide
+    /// fatal signal, such as one killed by `SECCOMP_RET_KILL_THREAD` while
+    /// its process lives on, is not offered.
+    ///
+    /// Delivery is best effort. A death is not offered when the backend never
+    /// holds the thread at a readable exit stop, for example when the stop has
+    /// already been advanced, the registers or `/proc/<tid>/stat` cannot be
+    /// read, the root dies during backend initialization, or the thread is
+    /// reaped as a zombie.
+    ///
+    /// The call runs synchronously on the backend's tracing thread, which
+    /// drives every guest task, so its host time stalls the whole guest tree.
+    /// It can come after `report_backend_failure`, when `exit.deadline` names
+    /// the instant by which cleanup must finish. The method must be bounded,
+    /// must not panic, must not wait for guest progress, and must not modify
+    /// the guest. The default does nothing. Only the ptrace backend calls it.
+    fn on_fatal_signal_exit(&self, _exit: &FatalSignalExit) {}
 
     /// Waits until this run cannot continue faithfully. Each call must subscribe
     /// independently: multiple Tool callbacks and the scheduler may be waiting.
@@ -283,6 +399,73 @@ pub struct BackendFailure {
     pub tid: Tid,
     /// Backend operation that failed.
     pub phase: &'static str,
+}
+
+/// A guest thread held at its exit stop while a core-dumping fatal signal
+/// ends its process. See [`GlobalTool::on_fatal_signal_exit`].
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct FatalSignalExit {
+    /// Host thread ID of the dying thread.
+    pub tid: Tid,
+    /// The signal that is ending the thread's process. It is the same for
+    /// every thread of the process and always equals the signal in `status`.
+    pub signal: Signal,
+    /// This thread's exit status at its exit stop. Its core-dumped flag is
+    /// per thread: the kernel sets it only on the thread that dumped core,
+    /// and only when a core was written, so it can differ between threads
+    /// and from the status the process finally reports to its waiter.
+    pub status: ExitStatus,
+    /// Whether this thread took the signal and ran the kernel's core dump
+    /// step, whether or not that step wrote a core. At most one thread of a
+    /// dying process has it, and none when the kernel skipped the step, for
+    /// example for a process that is not dumpable.
+    pub dumping: bool,
+    /// The instant by which the backend must finish cleaning up a run that
+    /// has already failed, or `None` while the run has not failed.
+    pub deadline: Option<std::time::Instant>,
+    /// The thread's general-purpose registers at its exit stop.
+    pub regs: libc::user_regs_struct,
+}
+
+impl FatalSignalExit {
+    /// Describes a thread held at its exit stop, for backends that offer it.
+    pub fn new(
+        tid: Tid,
+        status: ExitStatus,
+        dumping: bool,
+        deadline: Option<std::time::Instant>,
+        regs: libc::user_regs_struct,
+    ) -> Option<Self> {
+        let ExitStatus::Signaled(signal, _) = status else {
+            return None;
+        };
+        Some(Self {
+            tid,
+            signal,
+            status,
+            dumping,
+            deadline,
+            regs,
+        })
+    }
+}
+
+/// Whether the default action of `signal` dumps core (signal(7)).
+pub fn signal_dumps_core(signal: Signal) -> bool {
+    matches!(
+        signal,
+        Signal::SIGABRT
+            | Signal::SIGBUS
+            | Signal::SIGFPE
+            | Signal::SIGILL
+            | Signal::SIGQUIT
+            | Signal::SIGSEGV
+            | Signal::SIGSYS
+            | Signal::SIGTRAP
+            | Signal::SIGXCPU
+            | Signal::SIGXFSZ
+    )
 }
 
 /// A child state and waitability decision observed by an execution backend.
@@ -515,6 +698,24 @@ pub trait Tool: Send + Sync + Default {
         Default::default()
     }
 
+    /// Bind a fresh root state to an initial image whose launch exec has
+    /// already completed before this Tool's first registration.
+    ///
+    /// A backend may call this synchronous hook only under its existing
+    /// authenticated, one-use initial-image owner, after constructing this
+    /// exact state and before `handle_thread_start` or any registration/RPC.
+    /// A root TID, missing parent, image address or serialized flag alone is
+    /// not this fact. It is not used for a preserved or restored exec state.
+    /// The default changes nothing. An error is fatal initialization failure;
+    /// the backend must retain physical ownership and must not resume Guest.
+    fn on_initial_image_attached(
+        &self,
+        _tid: Tid,
+        _thread_state: &mut Self::ThreadState,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Similar to `handle_syscall_event`, except this traps the first
     /// instruction executed by a new thread. Typical uses of this method include
     /// delaying thread execution or running initialization actions (injections
@@ -635,12 +836,249 @@ pub trait Tool: Send + Sync + Default {
         Ok(Some(signal))
     }
 
-    /// Enables acknowledgment of real KVM pending removals before thread start.
+    /// Handles a guest's signal that [`Signal`] cannot name before it is
+    /// delivered to the guest: a realtime signal, numbered 32 to 64 (glibc
+    /// reserves 32 and 33, so `SIGRTMIN()` is 34). `signal` is the raw number.
+    /// A backend reports every other signal to [`Tool::handle_signal_event`]
+    /// (<https://github.com/rrnewton/reverie/issues/207>).
+    ///
+    /// # Return value
+    ///  - `Some(sig)`: the raw signal `sig` will be delivered to the guest.
+    ///  - `None`: the signal is suppressed and never delivered to the guest.
+    ///
+    /// The default delivers it unchanged, as a backend that could not report
+    /// it would.
+    async fn handle_raw_signal_event<T: Guest<Self>>(
+        &self,
+        _guest: &mut T,
+        signal: i32,
+    ) -> Result<Option<i32>, Errno> {
+        Ok(Some(signal))
+    }
+
+    /// The first half of a signal delivery reported in two phases, by a
+    /// backend that knows of a delivery before the kernel dequeues the signal:
+    /// an in-guest backend predicts the deliveries the kernel will make when
+    /// its runtime returns to guest code. `signal` is the raw number, 1 to 64;
+    /// any other is `EINVAL`.
+    ///
+    /// The protocol, at one return to guest code:
+    /// 1. Before its final read of the thread's pending signals, the backend
+    ///    announces each delivery it predicts. The Tool may wait for its turn
+    ///    in its schedule here. It must not assume that the kernel has
+    ///    dequeued `signal`, and must do nothing that only a delivery
+    ///    justifies.
+    /// 2. An announcement may return `Ok(None)`: the Tool suppresses that
+    ///    delivery. The backend removes that pending instance from the
+    ///    kernel's queue and predicts again; announcements already made stay
+    ///    outstanding. Suppression is decided here, before the final read,
+    ///    so that no commit ever rests on a read a suppression voids.
+    /// 3. After the final read, the backend calls
+    ///    [`Tool::commit_signal_event`] for each outstanding announcement the
+    ///    read confirms the kernel delivers at the return, in the order the
+    ///    kernel delivers them (the read's predicted order), and
+    ///    [`Tool::withdraw_signal_event`], in any order, for each other one.
+    ///    It settles every announcement, and makes no other Tool call between
+    ///    the final read and the return.
+    /// 4. Any `Err` from either half ends the run: the backend fails closed.
+    ///    The one exception is `EOPNOTSUPP` from the first announcement the
+    ///    backend makes to a Tool, which means that the Tool has not opted in
+    ///    (below): the backend then refuses the run by name, because it
+    ///    cannot report its deliveries to that Tool.
+    ///
+    /// Neither half may read or rewrite the delivery's siginfo: the kernel
+    /// has not dequeued it, and the backend answers [`Guest::signal_info`]
+    /// and [`Guest::set_signal_info`] as having none.
+    ///
+    /// A backend that reports each delivery once, after the kernel dequeued
+    /// it (the ptrace backend's signal-delivery stop), calls
+    /// [`Tool::handle_signal_event`] or [`Tool::handle_raw_signal_event`]
+    /// instead, and never these.
+    ///
+    /// A Tool opts in by implementing all three hooks. The default checks the
+    /// signal's range, then refuses with `EOPNOTSUPP`: a delivery reported
+    /// whole cannot be split without the Tool's knowledge of which of its
+    /// effects only a delivery justifies.
+    async fn announce_signal_event<T: Guest<Self>>(
+        &self,
+        _guest: &mut T,
+        signal: i32,
+    ) -> Result<Option<crate::SignalAnnouncement>, Errno> {
+        if !(1..=64).contains(&signal) {
+            return Err(Errno::EINVAL);
+        }
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// The second half of a two-phase delivery
+    /// ([`Tool::announce_signal_event`]): the backend's final read confirmed
+    /// that the kernel delivers the announced signal when the runtime returns
+    /// to guest code, and the Tool records the delivery. It must not wait for
+    /// a turn in its schedule, and cannot suppress or replace the signal; an
+    /// `Err` ends the run. The default refuses with `EOPNOTSUPP`.
+    async fn commit_signal_event<T: Guest<Self>>(
+        &self,
+        _guest: &mut T,
+        _announcement: crate::SignalAnnouncement,
+    ) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// Settles an announcement ([`Tool::announce_signal_event`]) whose
+    /// delivery does not happen at the runtime's return: another signal
+    /// pushed it out. The signal stays pending in the kernel, to be announced
+    /// again at a later return. It can only record: it gets the thread's
+    /// state and no access to the guest. The default records nothing.
+    fn withdraw_signal_event(
+        &self,
+        _thread_state: &mut Self::ThreadState,
+        _announcement: crate::SignalAnnouncement,
+    ) {
+    }
+
+    /// Decides whether a signal that the backend passes to the guest without
+    /// reporting it to [`Tool::handle_signal_event`] reaches the guest at all.
+    ///
+    /// A backend may pass a signal on unreported where reporting it could
+    /// change what the guest observes: the ptrace backend does so for many
+    /// signals it held while a Tool injection ran, and for signals that arrive
+    /// while it steps the guest through its own setup. Such a signal is
+    /// otherwise invisible to the Tool, so a Tool that must keep exactly one
+    /// copy of a signal (for example, its own copy of one the kernel also
+    /// sent) needs to see it here. Every such signal is shown, whatever its
+    /// number (realtime signals included), siginfo or sender, including the backend's own, which Linux
+    /// does not tell apart from a guest's signal of the same number (the
+    /// ptrace backend's: a SIGSTOP of a gdb freeze or of a group-stop request,
+    /// and its timer's signal, SIGSTKFLT). Dropping one of those breaks the
+    /// backend, so keep every signal you do not own. The hook can be called
+    /// before the guest's first exec, while the backend initializes it; a
+    /// failed GlobalTool ends a hook still waiting on its RPC then as at any
+    /// other time.
+    ///
+    /// The hook can only decide: it gets the signal's read-only description
+    /// and a handle that can send RPCs to the global tool, and no access to
+    /// the guest, so it cannot inject a syscall or change the guest's
+    /// registers or memory. Drop only a signal identified by its siginfo; a
+    /// signal shown without one is one the backend could not record.
+    ///
+    /// # Return value
+    ///  - `true`: the signal is passed on as before.
+    ///  - `false`: the signal is dropped and never delivered to the guest.
+    ///
+    /// The default keeps every signal. A backend that never passes a signal
+    /// on unreported never calls it.
+    async fn filter_unreported_signal<R: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _rpc: &R,
+        _signal: crate::UnreportedSignal,
+    ) -> bool {
+        true
+    }
+
+    /// Whether this Tool wants every guest `rt_sigreturn` reported to
+    /// [`Tool::handle_sigreturn`], known from configuration alone. A backend
+    /// whose capabilities say it reports sigreturns
+    /// ([`BackendCapabilities::reports_sigreturns`](crate::BackendCapabilities::reports_sigreturns))
+    /// then reports each one, except those the capability names; the ptrace
+    /// backend stops at each guest `rt_sigreturn` only for such a Tool, and
+    /// not while its gdbserver is attached. The default wants none, so a
+    /// backend adds no stop.
+    fn observes_sigreturns(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
+        false
+    }
+
+    /// Whether this Tool, known from configuration alone, enforces a
+    /// serialized-execution contract:
+    /// - at most one guest thread runs at any time, so no guest thread runs
+    ///   while the backend works on another, stopped one;
+    /// - the guest cannot install a seccomp filter: the Tool refuses
+    ///   `seccomp(SECCOMP_SET_MODE_FILTER)` and `prctl(PR_SET_SECCOMP)`; and
+    /// - no seccomp filter is installed on the tracer's own threads once the
+    ///   trace has started, by the Tool or the program that embeds it: the
+    ///   backend reads each tracer thread's filter state once, and a filter
+    ///   that comes later goes unseen.
+    ///
+    /// The backend trusts the declaration and does not check it. The ptrace
+    /// backend keeps the guest's SIGTRAP action and mask across its own
+    /// single-steps only for such a Tool, on x86-64: that repair injects
+    /// `rt_sigaction` into a stopped thread, which a guest thread running
+    /// meanwhile could defeat, for example by installing with
+    /// `SECCOMP_FILTER_FLAG_TSYNC` a filter that kills the injected call
+    /// (<https://github.com/rrnewton/hermit/issues/4409>). The default
+    /// declares nothing, and the backend then leaves SIGTRAP as Linux's step
+    /// traps leave it.
+    fn enforces_serialized_execution(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
+        false
+    }
+
+    /// Records one guest `rt_sigreturn` before it runs, for a Tool for which
+    /// [`Tool::observes_sigreturns`] holds, on a backend that reports
+    /// sigreturns. The backend then carries the call out exactly as it would
+    /// without the hook.
+    ///
+    /// The hook can only record: it gets the calling thread's state and the
+    /// report, and no access to the guest, so it cannot inject a syscall or
+    /// change the guest's registers or memory.
+    fn handle_sigreturn(
+        &self,
+        _thread_state: &mut Self::ThreadState,
+        _report: crate::SigreturnReport,
+    ) {
+    }
+
+    /// Records, in the taking thread's state, one signal the backend passes
+    /// on unreported, after [`Tool::filter_unreported_signal`] decided about
+    /// it: `kept` is that hook's answer. A kept signal is resumed into the
+    /// guest, and Linux then delivers it, puts it back in the queue when the
+    /// thread's mask blocks it (a later stop can take the same instance again
+    /// and pass it once more), queues a new instance with a kernel siginfo
+    /// (a syscall stop), or discards it (an ignored signal, or a ptrace event
+    /// stop or group stop); a dropped one is not resumed. So the hook sees
+    /// passes, not deliveries. The signal's
+    /// [`crate::UnreportedSignal::reason`] says why it was not reported, so
+    /// that a Tool can count what its signal callback never saw.
+    ///
+    /// The hook can only record: it gets the thread's state and the signal's
+    /// read-only description, and no access to the guest. The default
+    /// records nothing.
+    fn note_unreported_signal(
+        &self,
+        _thread_state: &mut Self::ThreadState,
+        _signal: &crate::UnreportedSignal,
+        _kept: bool,
+    ) {
+    }
+
+    /// Admits acknowledgment of real KVM pending removals before thread start.
     /// Other Tools retain their existing pending-state behavior by default.
-    /// The static-ELF runner requires effective [`ThreadOwnership::Tool`],
-    /// including caller overrides, and rejects an incompatible Host choice
-    /// before initializing GlobalState or consuming/executing the installed ELF.
-    fn observe_signal_dequeues(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
+    ///
+    /// This is an upper bound known from configuration alone: a run observes
+    /// dequeues only when this returns `true` and, after installation,
+    /// [`GlobalTool::observe_signal_dequeues`] also returns `true` for the
+    /// installed mode. The bound exists for refusals that must precede
+    /// installation and any guest code. The static-ELF runner requires
+    /// effective [`ThreadOwnership::Tool`], including caller overrides, and
+    /// rejects an incompatible Host choice before initializing GlobalState or
+    /// consuming/executing the installed ELF. Admitting observation does not
+    /// require process signal control: see [`Tool::requires_signal_control`].
+    fn may_observe_signal_dequeues(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
+        false
+    }
+
+    /// Whether this run cannot proceed without process signal control, known
+    /// from configuration alone.
+    ///
+    /// reverie-kvm's non-ELF loop, which has no process signal control to
+    /// offer, rejects a `true` answer with `ENOSYS` after initializing
+    /// GlobalState, so that state's startup records are kept, and before
+    /// asking it to install a control. reverie-kvm's runners that offer
+    /// control consult this after
+    /// [`GlobalTool::install_backend_signal_control`] returns: a `true` answer
+    /// with any mode other than `ToolControlled` is refused with `EINVAL`
+    /// before the first guest hook, through the same failure path as an
+    /// installation error. The default requires nothing, so a Tool that only
+    /// observes dequeues runs everywhere it ran before.
+    fn requires_signal_control(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
         false
     }
 
@@ -700,6 +1138,103 @@ pub trait Tool: Send + Sync + Default {
     /// errors or cancellation, including states whose `handle_thread_start`
     /// was never entered or completed. No further guest event is started to
     /// perform this cleanup. Panic unwinding may bypass the hook.
+    ///
+    /// # Exit status: exact, or predicted
+    ///
+    /// A backend that observes the death from outside the guest (ptrace)
+    /// passes the kernel's status. A backend that runs the Tool inside the
+    /// guest reports a death before it happens, because the Tool dies with
+    /// the guest; then only part of the status is known. For an exit, the
+    /// code is exact. For a death by a signal the guest sends itself (the
+    /// in-guest host's `deliver_staged_signals`), the signal is exact, and the
+    /// core-dump flag of [`ExitStatus::Signaled`] is a prediction from the
+    /// inputs Linux checks before it writes a core (the signal's default
+    /// action, the dumpable mode, `RLIMIT_CORE` and `core_pattern`); the
+    /// kernel's own flag differs when its write of the core fails. A Tool must
+    /// not rely on that flag from such a backend. The same holds for
+    /// [`Tool::on_exit_process`].
+    ///
+    /// # Signals a Tool sends its own guest, under an in-guest backend
+    ///
+    /// The in-guest host holds a signal a Tool's injection sends the guest
+    /// itself, when it would end the process, until the callback that sent
+    /// it returns, and then delivers it as a tracer delivers a held signal.
+    /// An injection that ends the guest (an exit, or a SIGKILL of the guest
+    /// itself) ends the callback that made it there, as under a tracer; the
+    /// callback does not resume. That ending is latched when the injection
+    /// is made, and the guest ends even if the callback then returns. A Tool
+    /// that abandons the injection's future and goes on gets no further
+    /// effect on the guest through its [`Guest`]:
+    ///
+    /// - `inject`, `tail_inject`, `set_regs`, the signal deliveries
+    ///   (`defer_signal_delivery`, `defer_signal_delivery_before_syscall`)
+    ///   and `send_rpc` never complete: the callback stays parked until the
+    ///   host ends the process, so a request that could block on the
+    ///   coordinator is never sent;
+    /// - every read and write through a `memory()` handle, one obtained
+    ///   before the injection included, fails with ESRCH and copies nothing,
+    ///   as a tracer's access to a tracee its injection killed fails;
+    /// - the backend's blocking coordinator request for synchronous Tool
+    ///   code (LiteInst's `blocking_global_rpc`) fails with ESRCH, unsent.
+    ///
+    /// The rest of the interface has no effect on the guest (`regs`, `pid`,
+    /// `thread_state` and the other reads; `stack`, whose storage is the
+    /// host's; `set_timer`, which the in-guest host refuses). The exit
+    /// callbacks run afterwards with their own coordinator connection and no
+    /// [`Guest`], and may use both the connection and the blocking request.
+    /// Effects a Tool makes outside these interfaces (its own system calls,
+    /// direct stores to guest memory, a `LocalMemory` it constructs itself)
+    /// are not seen by the host, and remain the Tool's responsibility, as
+    /// every such effect is.
+    ///
+    /// These cases are unsupported, and the host ends the process as a Tool
+    /// error that names the case (exit status 125) before anything is made
+    /// for it: a `tail_inject` of a call that does not end the guest outside
+    /// a syscall handler (in a start-up, instruction or signal callback); a
+    /// process creation (fork, vfork, clone or clone3, refused by syscall
+    /// number without reading guest memory) injected outside a syscall
+    /// handler; and a signal callback that has SIGALRM
+    /// delivered while the guest's SIGALRM handler is kept virtual (signal
+    /// phase 1), which only the backend's own delivery can reach: in place of
+    /// another signal, or as the guest's own SIGALRM, held while the Tool
+    /// installed the guest's handler; and installing a seccomp filter after a
+    /// self-signal has been staged, including during its signal callback or
+    /// while the delivery drain owns pending signals. The filter installation
+    /// is refused before it executes, through both `inject` and `tail_inject`.
+    ///
+    /// # Supported self-signal deaths
+    ///
+    /// Staging covers `kill`, `tkill`, and `tgkill` aimed at the calling
+    /// process or thread, for unblocked standard signals 1 through 31 with
+    /// a terminating default action and no admitted guest seccomp filter.
+    /// SIGTRAP uses the guest's action behind the runtime's routing handler.
+    /// Explicit self-kill with SIGPIPE is included; SIGPIPE raised by a failed
+    /// write is a different source and is excluded. Real-time signals cannot
+    /// be named by the Tool's `Signal` and are excluded. Process-group and
+    /// broadcast kill targets are excluded as well.
+    ///
+    /// # Self-signal deaths that remain a recorded loss
+    ///
+    /// The in-guest host stages a guest's self-directed fatal signal (and
+    /// runs the exit callbacks before it) only when the signal's action is
+    /// the guest's own default. Two cases keep the earlier behaviour, where
+    /// the process dies without its exit callbacks and the Tool records that
+    /// it exited without deregistering (an explicit determinism loss, never a
+    /// silent pass): a signal the runtime itself handles for the guest
+    /// (SIGSEGV while LiteInst routes instruction subscriptions through it,
+    /// and SIGSYS, the runtime's seccomp trap), and any self-directed signal
+    /// once a guest seccomp filter has been admitted, where the call runs as
+    /// the guest's own, so a filter's errno is honoured. Filter admission is
+    /// possible only without a creation hook and without virtual SIGALRM
+    /// handler admission; a Tool such as Hermit may refuse guest filters
+    /// independently. Installing the runtime before any seccomp filter is
+    /// active remains the backend's unsafe launch precondition.
+    ///
+    /// Hardware faults, signals from another process or the scheduler, and
+    /// syscall-generated SIGPIPE also retain their existing recorded loss.
+    /// A standalone Tool must arrange to detect missing exit callbacks;
+    /// Hermit's coordinator records the deregistration loss and strict
+    /// verification refuses it.
     async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
         &self,
         _tid: Tid,
@@ -720,6 +1255,9 @@ pub trait Tool: Send + Sync + Default {
     /// initial thread starts, after the thread states have been consumed. It
     /// must support cleanup after fatal failure without ordinary guest RPC
     /// progress. Panic unwinding may bypass the hook.
+    ///
+    /// The status is exact or predicted as described for
+    /// [`Tool::on_exit_thread`].
     async fn on_exit_process<G: GlobalRPC<Self::GlobalState>>(
         self,
         _pid: Pid,
@@ -747,6 +1285,19 @@ pub trait GlobalRPC<G: GlobalTool>: Sync {
     /// Send an RPC message to wherever the global state is stored, synchronously
     /// blocks the current thread until a response is received.
     async fn send_rpc(&self, message: G::Request) -> G::Response;
+
+    /// Optionally complete an RPC without constructing or polling a future.
+    ///
+    /// An unsupported implementation returns the original request without
+    /// sending any part of it or changing transport admission. An implementation
+    /// returning `Ok` uses its ordinary authenticated channel and wire contract.
+    /// This does not grant a scheduler turn, promise nonallocating arbitrary
+    /// serialization, or permit a request whose completion requires this caller
+    /// to yield. Transport failures retain that implementation's normal failure
+    /// behavior; they must not be relabeled as an unsupported request.
+    fn try_send_rpc_sync(&self, message: G::Request) -> Result<G::Response, G::Request> {
+        Err(message)
+    }
 
     /// Return the read-only tool configuration
     fn config(&self) -> &G::Config;

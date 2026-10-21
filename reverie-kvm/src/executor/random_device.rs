@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Private random descriptors retain an immutable, read-only carrier. Guest
 // permissions/status belong to the shared description, never to that carrier.
 impl RandomDeviceDescription {
@@ -129,7 +121,6 @@ fn random_device_early(
         libc::SYS_lseek
         | libc::SYS_fchmod
         | libc::SYS_fchown
-        | libc::SYS_flock
         | libc::SYS_ioctl
         | libc::SYS_flistxattr
             if path =>
@@ -193,7 +184,7 @@ fn random_device_lock(
     command: i32,
     address: u64,
 ) -> crate::Result<i64> {
-    let imported = read_guest_struct::<libc::flock>(memory, address);
+    let imported = read_guest_struct::<libc::flock>(&ProviderMemory(memory), address);
     check_random_copy_failure(memory)?;
     let lock = match imported {
         Ok(lock) => lock,
@@ -378,11 +369,23 @@ fn random_device_mmap(
     };
     let kind = flags & libc::MAP_TYPE;
     let fixed = flags & (libc::MAP_FIXED | libc::MAP_FIXED_NOREPLACE) != 0;
-    let address = if fixed {
-        args[0]
+    // `address` is the user address; `physical` names its memory, for the
+    // bookkeeping checks below.
+    let (address, physical) = if fixed {
+        (args[0], memory.user_range_to_guest(args[0], length))
     } else {
-        match find_mmap_address(memory, state, length) {
-            Some(address) => address,
+        match crate::executor::place_mapping(
+            memory,
+            state,
+            length,
+            args[0],
+            crate::executor::MappingKind::Other,
+            flags & libc::MAP_32BIT != 0,
+        ) {
+            Some(physical) => (
+                memory.physical_to_user(physical).unwrap_or(physical),
+                Some(physical),
+            ),
             None => return negative_errno(libc::ENOMEM),
         }
     };
@@ -398,11 +401,13 @@ fn random_device_mmap(
     if fixed && !address.is_multiple_of(PAGE_SIZE) {
         return negative_errno(libc::EINVAL);
     }
-    if address < BOOT_RESERVED_END || end > state.mmap_limit {
+    let Some(physical) = physical.filter(|physical| {
+        *physical >= BOOT_RESERVED_END && physical + length <= state.mmap_limit
+    }) else {
         return negative_errno(libc::ENOMEM);
-    }
+    };
     if flags & libc::MAP_FIXED_NOREPLACE != 0
-        && (address..address + length)
+        && (physical..physical + length)
             .step_by(PAGE_SIZE as usize)
             .any(|page| memory.user_range_is_mapped(page, PAGE_SIZE))
     {
@@ -468,7 +473,7 @@ fn random_path_xattr(
     if setting && args[4] as i32 & !(libc::XATTR_CREATE | libc::XATTR_REPLACE) != 0 {
         return Ok(negative_errno(libc::EINVAL));
     }
-    let imported = read_c_string(memory, args[1], 256);
+    let imported = read_c_string(&ProviderMemory(memory), args[1], 256);
     check_random_copy_failure(memory)?;
     match imported {
         Ok(name) if name.is_empty() => return Ok(negative_errno(libc::ERANGE)),

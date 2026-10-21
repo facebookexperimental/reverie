@@ -1,7 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -287,6 +286,26 @@ pub trait ProcessSignalControl: Debug + Send + Sync {
         process: SignalProcessId,
         event: SignalEvent,
     ) -> ProcessSignalPublicationResult;
+
+    /// Publish one expiration of a Tool-owned POSIX timer to an exact process
+    /// lifetime: a complete process-directed event for a standard signal
+    /// (1 to 31, never SIGKILL or SIGSTOP) whose siginfo has `si_code`
+    /// `SI_TIMER`, as Linux queues a `SIGEV_SIGNAL` timer's signal.
+    ///
+    /// The caller owns the timer, its deadline and the ordering of the
+    /// expiration; the backend only publishes the pending signal, with the
+    /// same shared pending ownership, standard-signal coalescing and
+    /// disposition handling as [`Self::publish_alarm`]. No Tool hook, guest
+    /// instruction, timer operation or wait completion is performed.
+    /// Backends without a controlled signal queue keep the default `ENOSYS`.
+    // TODO-HUMAN-REVIEW(PR-1019): Review the timer-expiry publication API.
+    fn publish_timer_expiry(
+        &self,
+        _process: SignalProcessId,
+        _event: SignalEvent,
+    ) -> ProcessSignalPublicationResult {
+        ProcessSignalPublicationResult::RejectedBeforeCommit(Errno::ENOSYS)
+    }
 
     /// Publish one scheduler-authorized terminal child transition.
     ///

@@ -16,6 +16,9 @@
 //! guests — including forked children that connect later — observe one unified
 //! global state, which is exactly the property the DBT backend currently lacks.
 
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +41,111 @@ use crate::codec::read_message;
 use crate::codec::write_message;
 use crate::envelope::RequestEnvelope;
 use crate::error::RpcError;
+use crate::initial_image::InitialImageAdmission;
+use crate::successor::SuccessorAdmission;
+
+/// `SO_PEERPIDFD` (Linux 6.5): a pidfd for the process that connected the
+/// socket. Defined here because the libc crate exports it only from its
+/// unstable `new` module. The value is asm-generic's, which x86_64 uses.
+const SO_PEERPIDFD: libc::c_int = 77;
+
+/// The process a guest connection's requests must come from, as decided by a
+/// [`ConnectionAdmission`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Admitted {
+    /// The id the connection's first request must name as its sender.
+    pub process_id: i32,
+}
+
+/// Decides whether an accepted guest connection may be served.
+///
+/// The server calls it once per connection, after `accept` and before the
+/// configuration handshake or any request, with a pidfd for the connecting
+/// process from `SO_PEERPIDFD`. The kernel recorded that process at
+/// `connect`, so the descriptor cannot name another process and does not
+/// follow a reused pid. An error refuses the connection: the server closes it
+/// unserved, and a retained issue monitor records the refusal.
+pub trait ConnectionAdmission: Send + Sync {
+    /// Admits the connecting process, returning the id its requests must
+    /// come from, or refuses it.
+    fn admit(&self, peer: OwnedFd) -> std::io::Result<Admitted>;
+
+    /// Receives, before any connection is admitted, the coordinator's
+    /// [`ExitReporter`]. An admission that observes exits through the pidfds
+    /// it admits keeps it; the default ignores it.
+    fn attach_exit_reporter(&self, _reporter: Arc<dyn ExitReporter>) {}
+
+    /// Told when an accepted connection cannot be offered to
+    /// [`ConnectionAdmission::admit`] at all, because the connecting
+    /// process's pidfd could not be obtained (for example, descriptor
+    /// exhaustion, or the process already reaped). The server then refuses
+    /// the connection, as for a refused admission. An admission that fails
+    /// the run on a refused connection should fail it here too; the default
+    /// ignores it.
+    fn admission_failed(&self, _error: &std::io::Error) {}
+}
+
+/// What an admission that observes guest exits may tell, and ask, the
+/// coordinator's global tool during the run; see
+/// [`ConnectionAdmission::attach_exit_reporter`]. Each method forwards to the
+/// global tool's hook of the same purpose. None waits for guest progress, and
+/// after the run each does nothing (or returns nothing).
+pub trait ExitReporter: Send + Sync {
+    /// Guest process `pid` has physically exited
+    /// (`GlobalTool::on_backend_process_exited`).
+    fn process_exited(&self, pid: i32);
+
+    /// The processes whose exit the tool granted and is waiting to see
+    /// complete (`GlobalTool::backend_pending_process_exits`), for a
+    /// watchdog.
+    fn pending_process_exits(&self) -> Vec<i32>;
+
+    /// The run cannot continue faithfully
+    /// (`GlobalTool::report_backend_failure`).
+    fn backend_failed(&self, failure: reverie::BackendFailure);
+}
+
+/// A pidfd for the process that connected `stream`.
+fn peer_pidfd(stream: &impl AsRawFd) -> std::io::Result<OwnedFd> {
+    let mut fd: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_PEERPIDFD,
+            &mut fd as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if fd < 0 || len as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(std::io::Error::other(format!(
+            "SO_PEERPIDFD returned descriptor {fd} (length {len})"
+        )));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Runs `admission`, if any, on an accepted connection.
+fn admit_connection(
+    admission: Option<&Arc<dyn ConnectionAdmission>>,
+    stream: &UnixStream,
+) -> Result<Option<Admitted>, RpcError> {
+    let Some(admission) = admission else {
+        return Ok(None);
+    };
+    let peer = match peer_pidfd(stream) {
+        Ok(peer) => peer,
+        Err(error) => {
+            admission.admission_failed(&error);
+            return Err(error.into());
+        }
+    };
+    Ok(Some(admission.admit(peer)?))
+}
 
 /// A coordinator that serves one shared [`GlobalTool`] instance to many guest
 /// processes over a Unix-domain socket.
@@ -46,10 +154,263 @@ pub struct RpcServer<G: GlobalTool> {
     config: G::Config,
     listener: UnixListener,
     path: PathBuf,
+    cleanup_path: bool,
     readiness: Option<Arc<AtomicBool>>,
     connection_readiness: Option<Arc<AtomicBool>>,
     connections: ConnectionMonitor,
     issues: Option<RpcIssueMonitor>,
+    admission: Option<Arc<dyn ConnectionAdmission>>,
+    initial_image: Option<InitialImageSetup>,
+    native_successor: Option<Arc<dyn SuccessorAdmission>>,
+}
+
+#[derive(Clone)]
+struct InitialImageSetup {
+    admission: Arc<dyn InitialImageAdmission>,
+    config_bytes: Arc<Vec<u8>>,
+}
+
+struct HandshakeFrames {
+    config: Arc<Vec<u8>>,
+    successor_state: Option<Vec<u8>>,
+    strict_sender: bool,
+    native_image: Option<crate::successor::NativeImageConnection>,
+}
+
+/// Per-connection state retained by the same serving future, not a new owner.
+#[derive(Default)]
+struct ConnectionSetup {
+    readiness: Option<Arc<AtomicBool>>,
+    connection_readiness: Option<Arc<AtomicBool>>,
+    admitted: Option<Admitted>,
+    handshake: Option<HandshakeFrames>,
+    native_close: Option<Arc<dyn SuccessorAdmission>>,
+    cancellation: Option<(usize, RequestCancellation)>,
+}
+
+/// Actual error outcome of cancelling a received, admitted request. Fields are
+/// constructed only by the connection loop, not from the host's numeric intent.
+/// This is observation data, never execution or process-retirement authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelledRequest {
+    connection: usize,
+    process_id: i32,
+    sender: i32,
+    request: usize,
+}
+impl CancelledRequest {
+    /// Actual server connection ordinal whose task was joined.
+    pub fn connection(&self) -> usize {
+        self.connection
+    }
+    /// Process authenticated by this connection's existing admission.
+    pub fn process_id(&self) -> i32 {
+        self.process_id
+    }
+    /// Sender of the actual received request, checked against admission.
+    pub fn sender(&self) -> i32 {
+        self.sender
+    }
+    /// One-based request ordinal within that actual connection.
+    pub fn request(&self) -> usize {
+        self.request
+    }
+}
+impl std::fmt::Display for CancelledRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "owned admitted RPC cancelled without response: connection={} process={} sender={} request={}",
+            self.connection, self.process_id, self.sender, self.request
+        )
+    }
+}
+impl std::error::Error for CancelledRequest {}
+
+#[derive(Default)]
+struct RequestCancellationState {
+    process: Option<i32>,
+    // Appended ONLY by the server after JoinSet::join_next yields the actual
+    // completed connection task. Completion inside a task is not a join receipt.
+    joined: Vec<CancelledRequest>,
+    overflow: bool,
+    idle_connections: Vec<usize>,
+    drained: bool,
+}
+
+/// A drain of this serving owner's original task set, after accepts stopped.
+/// Empty request outcomes are valid only as drain data, not as a canceled RPC.
+#[derive(Clone, Debug)]
+pub struct CancellationDrain {
+    process_id: i32,
+    cancelled_requests: Vec<CancelledRequest>,
+    idle_connections: Vec<usize>,
+}
+impl CancellationDrain {
+    /// Actual PID requested by this owner's explicit cancellation intent.
+    pub fn process_id(&self) -> i32 {
+        self.process_id
+    }
+    /// Actual pending-dispatch cancellation errors whose tasks were joined.
+    pub fn cancelled_requests(&self) -> &[CancelledRequest] {
+        &self.cancelled_requests
+    }
+    /// Actual admitted framing/handshake-idle connections canceled and joined.
+    pub fn idle_connections(&self) -> &[usize] {
+        &self.idle_connections
+    }
+}
+
+/// Explicit control of this server's existing owned request futures. Creating
+/// or requesting this handle proves neither process death nor execution safety.
+/// The embedding owner must establish its own cancellation authority. It must
+/// keep the sole server future running until actual joined outcomes are read.
+#[derive(Clone, Default)]
+pub struct RequestCancellation {
+    state: Arc<Mutex<RequestCancellationState>>,
+    changed: Arc<Notify>,
+}
+impl RequestCancellation {
+    /// Request cancellation once. A dead-peer error which occurred earlier is
+    /// never cleared or relabelled by this operation. No matching request means
+    /// no outcome; the caller's ordinary deadline must fail that case. Intent
+    /// also stops further accepts by this serving owner; this is a drain, not a
+    /// per-request retry or a replacement admission mechanism.
+    pub fn request(&self, process_id: i32) -> Result<(), RpcError> {
+        if process_id <= 0 {
+            return Err(
+                std::io::Error::other("RPC cancellation requires positive admitted PID").into(),
+            );
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.process.is_some() {
+            return Err(std::io::Error::other("RPC cancellation already requested").into());
+        }
+        state.process = Some(process_id);
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+    async fn requested_any(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.lock().unwrap().process.is_some() {
+                return;
+            }
+            notified.await;
+        }
+    }
+    async fn requested(&self, process_id: i32) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.lock().unwrap().process == Some(process_id) {
+                return;
+            }
+            notified.await;
+        }
+    }
+    fn joined(&self, connection: CancelledConnection) {
+        let mut state = self.state.lock().unwrap();
+        if state.joined.len() + state.idle_connections.len() == 64 {
+            state.overflow = true;
+        } else {
+            match connection {
+                CancelledConnection::Request(request) => state.joined.push(request),
+                CancelledConnection::Idle {
+                    connection,
+                    process_id,
+                } => {
+                    if state.process != Some(process_id) {
+                        state.overflow = true;
+                    } else {
+                        state.idle_connections.push(connection);
+                    }
+                }
+            }
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+    fn drained(&self) {
+        self.state.lock().unwrap().drained = true;
+        self.changed.notify_waiters();
+    }
+    /// Wait until accepts stopped and this owner's original JoinSet is empty
+    /// because every connection task was actually joined. No RPC is invented
+    /// when there were zero tasks, or only read-idle connections.
+    pub async fn wait_for_drain(&self) -> Result<CancellationDrain, RpcError> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.state.lock().unwrap();
+                if state.overflow {
+                    return Err(
+                        std::io::Error::other("RPC cancelled outcome capacity exhausted").into(),
+                    );
+                }
+                if state.drained {
+                    let process_id = state.process.ok_or_else(|| {
+                        std::io::Error::other("RPC drain lacks cancellation intent")
+                    })?;
+                    return Ok(CancellationDrain {
+                        process_id,
+                        cancelled_requests: state.joined.clone(),
+                        idle_connections: state.idle_connections.clone(),
+                    });
+                }
+            }
+            notified.await;
+        }
+    }
+    /// Wait for real connection-task join, not simply for intent publication or
+    /// dropping an initializer observer future. No timeout is hidden here.
+    pub async fn wait_for_joined(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.state.lock().unwrap().joined.is_empty() {
+                return;
+            }
+            notified.await;
+        }
+    }
+    /// Actual joined cancellation errors, or an explicit bounded-storage failure.
+    pub fn joined_outcomes(&self) -> Result<Vec<CancelledRequest>, RpcError> {
+        let state = self.state.lock().unwrap();
+        if state.overflow {
+            return Err(std::io::Error::other("RPC cancelled outcome capacity exhausted").into());
+        }
+        Ok(state.joined.clone())
+    }
+}
+
+// Private control-flow result, never recovered from a public/cloneable error
+// payload. An admission/handshake hook may return any RpcError (even one wrapping
+// an old CancelledRequest); that remains Rpc and cannot mint cancellation.
+enum ConnectionError {
+    Rpc(RpcError),
+    Cancelled(CancelledConnection),
+}
+enum CancelledConnection {
+    Request(CancelledRequest),
+    Idle { connection: usize, process_id: i32 },
+}
+impl From<RpcError> for ConnectionError {
+    fn from(error: RpcError) -> Self {
+        Self::Rpc(error)
+    }
+}
+impl From<std::io::Error> for ConnectionError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Rpc(error.into())
+    }
 }
 
 /// Actual connection failures, retained independently of the serving task.
@@ -136,6 +497,17 @@ struct IssueGuard {
 }
 
 impl IssueGuard {
+    fn cancelled(&mut self, outcome: CancelledConnection) -> CancelledConnection {
+        // Distinct error completion, not normal reply success. Its typed value
+        // is retained only when the sole serving owner actually joins this task.
+        // Other connection issues already recorded are never cleared here.
+        self.completed = true;
+        if let Some(monitor) = &self.monitor {
+            monitor.reserved.fetch_sub(1, Ordering::Release);
+        }
+        outcome
+    }
+
     fn panic(&mut self, payload: Box<dyn std::any::Any + Send>) {
         self.completed = true;
         if let Some(monitor) = &self.monitor {
@@ -251,6 +623,76 @@ where
         Self::bind_inner(path, global, config, None, None)
     }
 
+    /// Bind a new coordinator without removing any existing directory entry.
+    ///
+    /// An occupied path returns the kernel's bind error unchanged, even if
+    /// the entry appeared after a caller's absence check. Failed binds do not
+    /// construct a server or clean up the path. Successful servers use the
+    /// same owned-path cleanup as [`Self::bind`].
+    pub fn bind_exclusive(
+        path: impl AsRef<Path>,
+        global: Arc<G>,
+        config: G::Config,
+    ) -> Result<Self, RpcError> {
+        let path = path.as_ref().to_path_buf();
+        let listener = UnixListener::bind(&path)?;
+        Ok(Self {
+            global,
+            config,
+            listener,
+            path,
+            cleanup_path: true,
+            readiness: None,
+            connection_readiness: None,
+            connections: ConnectionMonitor::new(),
+            issues: None,
+            admission: None,
+            initial_image: None,
+            native_successor: None,
+        })
+    }
+
+    /// Consume an already-bound ordinary listener without unlinking/rebinding.
+    ///
+    /// This preserves the exact listener FD and filesystem socket inode for a
+    /// common container's retained mount source. Call only inside the actual
+    /// Tokio reactor, after its common namespace setup; the caller bound the
+    /// listener before workers existed and owns its path/directory through all
+    /// connection drains. This server closes the listener but deliberately
+    /// leaves path retirement to that original owner.
+    pub fn from_prebound(
+        listener: std::os::unix::net::UnixListener,
+        global: Arc<G>,
+        config: G::Config,
+    ) -> Result<Self, RpcError> {
+        let path = listener
+            .local_addr()?
+            .as_pathname()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "prebound RPC listener has no filesystem path",
+                )
+            })?
+            .to_path_buf();
+        listener.set_nonblocking(true)?;
+        let listener = UnixListener::from_std(listener)?;
+        Ok(Self {
+            global,
+            config,
+            listener,
+            path,
+            cleanup_path: false,
+            readiness: None,
+            connection_readiness: None,
+            connections: ConnectionMonitor::new(),
+            issues: None,
+            admission: None,
+            initial_image: None,
+            native_successor: None,
+        })
+    }
+
     // TODO-HUMAN-REVIEW(PR-128): Review the externally shared fallback-readiness boundary.
     /// Binds a coordinator and marks `readiness` after the first complete
     /// guest request arrives.
@@ -295,11 +737,65 @@ where
             config,
             listener,
             path,
+            cleanup_path: true,
             readiness,
             connection_readiness,
             connections: ConnectionMonitor::new(),
             issues: None,
+            admission: None,
+            initial_image: None,
+            native_successor: None,
         })
+    }
+
+    /// Admits every later connection through `admission` before serving it;
+    /// see [`ConnectionAdmission`].
+    pub fn set_connection_admission(&mut self, admission: Arc<dyn ConnectionAdmission>) {
+        self.admission = Some(admission);
+    }
+
+    /// Require InitialImage redemption on every connection to this server.
+    ///
+    /// The normal process admission/watcher and retained issue monitor must
+    /// already be configured. There is no protocol detection or ordinary
+    /// fallback. This initial slice does not admit successor exec, fork or
+    /// thread transactions; an ordinary fork reconnect to this server fails
+    /// closed. Unconfigured legacy servers retain their config-first protocol.
+    /// Config is canonically encoded once here and those immutable bytes are
+    /// used for every digest and config frame on this server. The hook
+    /// implements launcher policy; transport does not authenticate it.
+    pub fn set_initial_image_admission(
+        &mut self,
+        admission: Arc<dyn InitialImageAdmission>,
+    ) -> Result<(), RpcError> {
+        if self.admission.is_none() || self.issues.is_none() {
+            return Err(crate::initial_image::invalid(
+                "InitialImage requires process admission and retained connection issues",
+            ));
+        }
+        self.initial_image = Some(InitialImageSetup {
+            admission,
+            config_bytes: Arc::new(encode(&self.config)?),
+        });
+        self.native_successor = None;
+        Ok(())
+    }
+
+    /// Explicitly serve both InitialImage and successor-v1 requests.
+    ///
+    /// Both hooks are launcher-owned policies, with the same actual process
+    /// watcher and retained issue monitor required by InitialImage admission.
+    /// Only the two configured magics/versions are accepted; there is no
+    /// config-first fallback. Each RPC sender stays bound to its accepted
+    /// socket's admitted process for the lifetime of this single-thread route.
+    pub fn set_native_image_admission(
+        &mut self,
+        initial: Arc<dyn InitialImageAdmission>,
+        successor: Arc<dyn SuccessorAdmission>,
+    ) -> Result<(), RpcError> {
+        self.set_initial_image_admission(initial)?;
+        self.native_successor = Some(successor);
+        Ok(())
     }
 
     /// The filesystem path this coordinator is listening on. Guests connect
@@ -344,74 +840,232 @@ where
     /// Per-connection errors are not fatal to the server: a guest that
     /// disconnects (cleanly or otherwise) simply ends its own task.
     pub async fn serve(self) -> Result<(), RpcError> {
+        self.serve_until(std::future::pending()).await
+    }
+
+    /// Serve until explicit owner shutdown, then cancel and join every owned
+    /// connection before returning. Listener errors take the same joined path.
+    /// Cancelling this future itself still uses JoinSet's abort-on-drop; callers
+    /// needing completion must retain and await this cooperative owner.
+    pub async fn serve_until<F>(self, shutdown: F) -> Result<(), RpcError>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        self.serve_owned(shutdown, None).await
+    }
+
+    /// Same serving owner, admission, framing and JoinSet as serve_until. The
+    /// opt-in handle can cancel an admitted request while receive_rpc is pending;
+    /// every other failure and normal response retains its original behavior.
+    pub async fn serve_until_with_request_cancellation<F>(
+        self,
+        shutdown: F,
+        cancellation: RequestCancellation,
+    ) -> Result<(), RpcError>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        self.serve_owned(shutdown, Some(cancellation)).await
+    }
+
+    async fn serve_owned<F>(
+        self,
+        shutdown: F,
+        cancellation: Option<RequestCancellation>,
+    ) -> Result<(), RpcError>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        tokio::pin!(shutdown);
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-170): Review connection cancellation on server shutdown.
-        let mut connections = tokio::task::JoinSet::new();
+        let mut connections = tokio::task::JoinSet::<Option<CancelledConnection>>::new();
         let mut connection = 0usize;
-        loop {
-            let (stream, _addr) = tokio::select! {
-                result = self.listener.accept() => result?,
-                _ = connections.join_next(), if !connections.is_empty() => continue,
-            };
-            connection = connection
-                .checked_add(1)
-                .ok_or_else(|| std::io::Error::other("RPC connection identity exhausted"))?;
-            let global = self.global.clone();
-            let config = self.config.clone();
-            let readiness = self.readiness.clone();
-            let connection_readiness = self.connection_readiness.clone();
-            let connection_guard = self.connections.connected();
-            if let Some(issues) = &self.issues {
-                issues.reserve()?;
-            }
-            let mut issue_guard = IssueGuard {
-                monitor: self.issues.clone(),
-                connection,
-                completed: false,
-            };
-            let retain_issues = self.issues.is_some();
-            connections.spawn(async move {
-                let _connection_guard = connection_guard;
-                let future =
-                    serve_connection_inner(global, config, stream, readiness, connection_readiness);
-                if retain_issues {
-                    let mut future = std::pin::pin!(future);
-                    let result = std::future::poll_fn(|context| {
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            std::future::Future::poll(future.as_mut(), context)
-                        })) {
-                            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
-                            Ok(std::task::Poll::Ready(result)) => {
-                                std::task::Poll::Ready(Ok(result))
-                            }
-                            Err(payload) => std::task::Poll::Ready(Err(payload)),
-                        }
-                    })
-                    .await;
-                    match result {
-                        Ok(result) => issue_guard.complete(result),
-                        Err(payload) => issue_guard.panic(payload),
-                    }
-                } else {
-                    issue_guard.complete(future.await);
+        let mut accepting = true;
+        let result = async {
+            loop {
+                if !accepting && connections.is_empty() {
+                    if let Some(cancellation) = &cancellation { cancellation.drained(); }
                 }
-            });
+                let (stream, _addr) = tokio::select! {
+                    biased;
+                    () = &mut shutdown => return Ok(()),
+                    () = async {
+                        if let Some(cancellation) = &cancellation { cancellation.requested_any().await; }
+                    }, if accepting && cancellation.is_some() => {
+                        // Same owner stops new admission before processing any
+                        // completed cancellation or accepting another connection.
+                        accepting = false;
+                        continue;
+                    },
+                    result = self.listener.accept(), if accepting => result?,
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Ok(Some(outcome))) = joined {
+                            if let Some(cancellation) = &cancellation { cancellation.joined(outcome); }
+                        }
+                        continue;
+                    },
+                };
+                connection = connection
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("RPC connection identity exhausted"))?;
+                let global = self.global.clone();
+                let config = self.config.clone();
+                let readiness = self.readiness.clone();
+                let connection_readiness = self.connection_readiness.clone();
+                let connection_guard = self.connections.connected();
+                if let Some(issues) = &self.issues {
+                    issues.reserve()?;
+                }
+                let mut issue_guard = IssueGuard {
+                    monitor: self.issues.clone(),
+                    connection,
+                    completed: false,
+                };
+                let retain_issues = self.issues.is_some();
+                let admission = self.admission.clone();
+                let initial_image = self.initial_image.clone();
+                let native_successor = self.native_successor.clone();
+                let request_cancellation = cancellation.clone();
+                connections.spawn(async move {
+                    let _connection_guard = connection_guard;
+                    let future = async move {
+                        let mut stream = stream;
+                        let admitted = admit_connection(admission.as_ref(), &stream)?;
+                        let cancellation = request_cancellation.map(|cancel| (connection, cancel));
+                        let config_bytes = match initial_image {
+                            Some(hook) => Some(connection_io(
+                                image_handshake(&mut stream, admitted, &hook,
+                                    native_successor.as_deref()),
+                                admitted, cancellation.as_ref()).await?),
+                            None => None,
+                        };
+                        serve_connection_owned(
+                            global,
+                            config,
+                            stream,
+                            ConnectionSetup {
+                                readiness,
+                                connection_readiness,
+                                admitted,
+                                handshake: config_bytes,
+                                native_close: native_successor,
+                                cancellation,
+                            },
+                        )
+                        .await
+                    };
+                    if retain_issues {
+                        let mut future = std::pin::pin!(future);
+                        let result =
+                            std::future::poll_fn(|context| {
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    std::future::Future::poll(future.as_mut(), context)
+                                })) {
+                                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                                    Ok(std::task::Poll::Ready(result)) => {
+                                        std::task::Poll::Ready(Ok(result))
+                                    }
+                                    Err(payload) => std::task::Poll::Ready(Err(payload)),
+                                }
+                            })
+                            .await;
+                        match result {
+                            Ok(Err(ConnectionError::Cancelled(outcome))) => {
+                                return Some(issue_guard.cancelled(outcome));
+                            }
+                            Ok(Err(ConnectionError::Rpc(error))) => issue_guard.complete(Err(error)),
+                            Ok(Ok(())) => issue_guard.complete(Ok(())),
+                            Err(payload) => issue_guard.panic(payload),
+                        }
+                    } else {
+                        match future.await {
+                            Err(ConnectionError::Cancelled(outcome)) => {
+                                return Some(issue_guard.cancelled(outcome));
+                            }
+                            Err(ConnectionError::Rpc(error)) => issue_guard.complete(Err(error)),
+                            Ok(()) => issue_guard.complete(Ok(())),
+                        }
+                    }
+                    None
+                });
+            }
         }
+        .await;
+        connections.abort_all();
+        while let Some(joined) = connections.join_next().await {
+            if let Ok(Some(outcome)) = joined {
+                if let Some(cancellation) = &cancellation {
+                    cancellation.joined(outcome);
+                }
+            }
+        }
+        result
     }
 
     /// Accept and fully serve exactly one connection on the current task. This
     /// is primarily useful for tests and for single-guest scenarios.
     pub async fn serve_one(&self) -> Result<(), RpcError> {
-        let (stream, _addr) = self.listener.accept().await?;
+        let (mut stream, _addr) = self.listener.accept().await?;
         let _connection_guard = self.connections.connected();
-        serve_connection_inner(
-            self.global.clone(),
-            self.config.clone(),
-            stream,
-            self.readiness.clone(),
-            self.connection_readiness.clone(),
-        )
-        .await
+        // Legacy serve_one retains its original error-return behavior. The
+        // explicit InitialImage path also retains every admission/redemption
+        // failure independently of this task, including missing redemption EOF.
+        let monitor = self.initial_image.as_ref().and(self.issues.clone());
+        if let Some(monitor) = &monitor {
+            monitor.reserve()?;
+        }
+        let mut guard = IssueGuard {
+            monitor,
+            connection: 1,
+            completed: false,
+        };
+        let result = async {
+            let admitted = admit_connection(self.admission.as_ref(), &stream)?;
+            let config = self.config.clone();
+            let config_bytes = match &self.initial_image {
+                Some(hook) => Some(
+                    image_handshake(
+                        &mut stream,
+                        admitted,
+                        hook,
+                        self.native_successor.as_deref(),
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
+            serve_connection_inner(
+                self.global.clone(),
+                config,
+                stream,
+                ConnectionSetup {
+                    readiness: self.readiness.clone(),
+                    connection_readiness: self.connection_readiness.clone(),
+                    admitted,
+                    handshake: config_bytes,
+                    native_close: self.native_successor.clone(),
+                    cancellation: None,
+                },
+            )
+            .await
+        }
+        .await;
+        match result {
+            Err(error) if guard.monitor.is_some() => {
+                let error = Arc::new(error);
+                guard.completed = true;
+                guard.monitor.as_ref().unwrap().record(
+                    guard.connection,
+                    ConnectionFailure::Transport(error.clone()),
+                );
+                Err(RpcError::Io(std::io::Error::other(error)))
+            }
+            other => {
+                guard.complete(Ok(()));
+                other
+            }
+        }
     }
 }
 
@@ -429,7 +1083,9 @@ impl Drop for ConnectionGuard {
 
 impl<G: GlobalTool> Drop for RpcServer<G> {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.cleanup_path {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -444,7 +1100,7 @@ pub async fn serve_connection<G>(
 where
     G: GlobalTool,
 {
-    serve_connection_inner(global, config, stream, None, None).await
+    serve_connection_inner(global, config, stream, ConnectionSetup::default()).await
 }
 
 /// Serve an independently owned asynchronous byte stream using the same
@@ -462,20 +1118,164 @@ where
     G: GlobalTool,
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    serve_connection_inner(global, config, stream, None, None).await
+    serve_connection_inner(global, config, stream, ConnectionSetup::default()).await
+}
+
+/// Admission has already installed the normal process watch. A second pidfd
+/// comes from this exact socket; the watcher continues owning its first one.
+async fn image_handshake(
+    stream: &mut UnixStream,
+    admitted: Option<Admitted>,
+    initial: &InitialImageSetup,
+    successor: Option<&dyn SuccessorAdmission>,
+) -> Result<HandshakeFrames, RpcError> {
+    let Some(successor) = successor else {
+        return Ok(HandshakeFrames {
+            config: initial_image_handshake(
+                stream,
+                admitted,
+                initial.admission.as_ref(),
+                initial.config_bytes.clone(),
+            )
+            .await?,
+            successor_state: None,
+            strict_sender: false,
+            native_image: None,
+        });
+    };
+    let admitted = admitted.ok_or_else(|| {
+        crate::successor::invalid("native image connection has no watched process admission")
+    })?;
+    let peer = peer_pidfd(stream)?;
+    let request = read_message(stream, crate::successor::MAX_CONTROL_LEN)
+        .await
+        .map_err(|error| match error {
+            RpcError::Closed => crate::successor::invalid("native image redemption is missing"),
+            other => other,
+        })?;
+    let digest = crate::initial_image::config_digest(&initial.config_bytes);
+    let (successor_state, native_image) =
+        if request.starts_with(&crate::initial_image::REQUEST_MAGIC) {
+            let redemption = crate::initial_image::decode_redemption(&request)?;
+            initial
+                .admission
+                .redeem(peer, admitted, redemption, digest)?;
+            write_message(stream, &crate::initial_image::encode_ack(digest)).await?;
+            (None, crate::successor::NativeImageConnection::Initial)
+        } else {
+            // The exact successor decoder refuses every unknown magic/version,
+            // malformed length, empty ticket and trailing byte. Never fall back.
+            let redemption = crate::successor::decode_redemption(&request)?;
+            if redemption.expected.config != digest {
+                return Err(crate::successor::invalid(
+                    "successor expected Config differs from run",
+                ));
+            }
+            let state = successor.redeem(peer, admitted, redemption)?;
+            crate::successor::check_state(&state, redemption.expected.state)?;
+            write_message(stream, &crate::successor::encode_ack(redemption)).await?;
+            (
+                Some(state),
+                crate::successor::NativeImageConnection::Successor {
+                    ticket: redemption.ticket.to_vec(),
+                },
+            )
+        };
+    Ok(HandshakeFrames {
+        config: initial.config_bytes.clone(),
+        successor_state,
+        strict_sender: true,
+        native_image: Some(native_image),
+    })
+}
+
+async fn initial_image_handshake(
+    stream: &mut UnixStream,
+    admitted: Option<Admitted>,
+    hook: &dyn InitialImageAdmission,
+    config_bytes: Arc<Vec<u8>>,
+) -> Result<Arc<Vec<u8>>, RpcError> {
+    let admitted = admitted.ok_or_else(|| {
+        crate::initial_image::invalid("InitialImage connection has no watched process admission")
+    })?;
+    let peer = peer_pidfd(stream)?;
+    let request = read_message(stream, crate::initial_image::MAX_FRAME_LEN)
+        .await
+        .map_err(|error| match error {
+            RpcError::Closed => crate::initial_image::invalid("InitialImage redemption is missing"),
+            other => other,
+        })?;
+    let redemption = crate::initial_image::decode_redemption(&request)?;
+    let digest = crate::initial_image::config_digest(&config_bytes);
+    hook.redeem(peer, admitted, redemption, digest)?;
+    let ack = crate::initial_image::encode_ack(digest);
+    write_message(stream, &ack).await?;
+    Ok(config_bytes)
+}
+
+// Cancel an admitted connection which is waiting for framing/handshake IO, without
+// pretending that it had dispatched a GlobalTool request. Once explicit intent
+// is published, no further handshake/frame IO is polled. Earlier returned IO
+// errors retain the ordinary Rpc result and issue path; none is reclassified.
+async fn connection_io<T>(
+    io: impl std::future::Future<Output = Result<T, RpcError>>,
+    admitted: Option<Admitted>,
+    cancellation: Option<&(usize, RequestCancellation)>,
+) -> Result<T, ConnectionError> {
+    if let (Some(owner), Some((connection, cancel))) = (admitted, cancellation) {
+        tokio::select! {
+            biased;
+            () = cancel.requested(owner.process_id) => Err(ConnectionError::Cancelled(
+                CancelledConnection::Idle { connection: *connection, process_id: owner.process_id })),
+            result = io => result.map_err(ConnectionError::Rpc),
+        }
+    } else {
+        io.await.map_err(ConnectionError::Rpc)
+    }
 }
 
 async fn serve_connection_inner<G, S>(
     global: Arc<G>,
     config: G::Config,
-    mut stream: S,
-    readiness: Option<Arc<AtomicBool>>,
-    connection_readiness: Option<Arc<AtomicBool>>,
+    stream: S,
+    setup: ConnectionSetup,
 ) -> Result<(), RpcError>
 where
     G: GlobalTool,
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // All ordinary callers pass cancellation=None; preserve their public result
+    // type without granting any interpretation to arbitrary RpcError payloads.
+    match serve_connection_owned(global, config, stream, setup).await {
+        Ok(()) => Ok(()),
+        Err(ConnectionError::Rpc(error)) => Err(error),
+        Err(ConnectionError::Cancelled(_)) => Err(std::io::Error::other(
+            "unexpected request cancellation in ordinary connection",
+        )
+        .into()),
+    }
+}
+
+async fn serve_connection_owned<G, S>(
+    global: Arc<G>,
+    config: G::Config,
+    mut stream: S,
+    setup: ConnectionSetup,
+) -> Result<(), ConnectionError>
+where
+    G: GlobalTool,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let ConnectionSetup {
+        readiness,
+        connection_readiness,
+        mut admitted,
+        handshake,
+        native_close,
+        cancellation,
+    } = setup;
+    let cancellation_admitted = admitted;
+    let mut request_number = 0usize;
     // space (it is a separate process), so the coordinator sends it first.
     //
     // NOTE: `G::Request`/`G::Response` are `Send` but not `Sync`, so we always
@@ -483,26 +1283,123 @@ where
     // passing a `&Request`/`&Response` into an async fn. Holding such a borrow
     // across an await would make this future non-`Send` and break
     // `tokio::spawn`.
-    let config_bytes = encode(&config)?;
-    write_message(&mut stream, &config_bytes).await?;
+    let config_bytes = match &handshake {
+        Some(frames) => std::borrow::Cow::Borrowed(frames.config.as_slice()),
+        None => std::borrow::Cow::Owned(encode(&config)?),
+    };
+    connection_io(
+        write_message(&mut stream, &config_bytes),
+        cancellation_admitted,
+        cancellation.as_ref(),
+    )
+    .await?;
+    if let Some(state) = handshake
+        .as_ref()
+        .and_then(|frames| frames.successor_state.as_ref())
+    {
+        connection_io(
+            write_message(&mut stream, state),
+            cancellation_admitted,
+            cancellation.as_ref(),
+        )
+        .await?;
+    }
+    let strict_sender = handshake
+        .as_ref()
+        .is_some_and(|frames| frames.strict_sender);
     if let Some(readiness) = &connection_readiness {
         readiness.store(true, Ordering::Release);
     }
 
     loop {
-        let request_bytes = match read_message(&mut stream, DEFAULT_MAX_FRAME_LEN).await {
+        let request_bytes = match connection_io(
+            read_message(&mut stream, DEFAULT_MAX_FRAME_LEN),
+            cancellation_admitted,
+            cancellation.as_ref(),
+        )
+        .await
+        {
             Ok(bytes) => bytes,
-            Err(RpcError::Closed) => return Ok(()),
+            Err(ConnectionError::Rpc(RpcError::Closed)) => {
+                if strict_sender {
+                    let hook = native_close.as_ref().ok_or_else(|| {
+                        crate::successor::invalid("native stream lost its lifecycle owner")
+                    })?;
+                    let image = handshake
+                        .as_ref()
+                        .and_then(|frames| frames.native_image.as_ref())
+                        .ok_or_else(|| {
+                            crate::successor::invalid("native stream lost its image incarnation")
+                        })?;
+                    hook.connection_closed(
+                        admitted.ok_or_else(|| {
+                            crate::successor::invalid("native stream lost its watched sender")
+                        })?,
+                        image,
+                    )?;
+                }
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
         let RequestEnvelope { from, request } =
             decode::<RequestEnvelope<G::Request>>(&request_bytes)?;
+        // Combined native-image admission binds every RPC sender to this
+        // accepted process. Legacy/InitialImage-only admission retains its
+        // first-request check; a forked child reconnects before sending.
+        let request_owner = if strict_sender {
+            admitted
+        } else {
+            admitted.take()
+        };
+        if let Some(Admitted { process_id }) = request_owner {
+            if from.as_raw() != process_id {
+                let which = if strict_sender { "a" } else { "its first" };
+                return Err(RpcError::Io(std::io::Error::other(format!(
+                    "connection admitted for process {process_id} sent {which} request as {}",
+                    from.as_raw()
+                )))
+                .into());
+            }
+        }
         if let Some(readiness) = &readiness {
             readiness.store(true, Ordering::Release);
         }
-        let response = global.receive_rpc(from, request).await;
+        let response = if let (Some((connection, cancel)), Some(owner)) =
+            (&cancellation, cancellation_admitted)
+        {
+            request_number = request_number
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("RPC request identity exhausted"))?;
+            if owner.process_id != from.as_raw() {
+                return Err(std::io::Error::other(
+                    "RPC cancellation sender differs from admitted process",
+                )
+                .into());
+            }
+            // This select owns the actual receive_rpc future. Returning the
+            // typed error drops it before the task can encode/write a response.
+            // A host Pause remains held until this task has actually joined.
+            tokio::select! {
+                biased;
+                () = cancel.requested(owner.process_id) => {
+                    return Err(ConnectionError::Cancelled(CancelledConnection::Request(CancelledRequest {
+                        connection: *connection, process_id: owner.process_id,
+                        sender: from.as_raw(), request: request_number,
+                    })));
+                }
+                response = global.receive_rpc(from, request) => response,
+            }
+        } else {
+            global.receive_rpc(from, request).await
+        };
         let response_bytes = encode(&response)?;
-        write_message(&mut stream, &response_bytes).await?;
+        connection_io(
+            write_message(&mut stream, &response_bytes),
+            cancellation_admitted,
+            cancellation.as_ref(),
+        )
+        .await?;
     }
 }
 
@@ -511,4 +1408,639 @@ where
 // connection error so a coordinator operator can see it.
 fn tracing_disconnect(e: &RpcError) {
     eprintln!("reverie-rpc-transport: guest connection ended with error: {e}");
+}
+
+#[cfg(test)]
+mod exclusive_bind_tests {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::AtomicU64;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct EmptyGlobal;
+
+    #[reverie::global_tool]
+    impl GlobalTool for EmptyGlobal {
+        type Request = ();
+        type Response = ();
+        type Config = ();
+
+        async fn receive_rpc(&self, _from: reverie::Tid, _request: ()) {}
+    }
+
+    struct Directory(PathBuf);
+
+    impl Directory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = PathBuf::from(format!(
+                "/tmp/reverie-rpc-new-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn socket(&self) -> PathBuf {
+            self.0.join("rpc.sock")
+        }
+    }
+
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn identity(path: &Path) -> (u64, u64, u32) {
+        let entry = std::fs::symlink_metadata(path).unwrap();
+        (entry.dev(), entry.ino(), entry.mode())
+    }
+
+    fn expect_occupied(path: &Path) {
+        match RpcServer::bind_exclusive(path, Arc::new(EmptyGlobal), ()) {
+            Err(RpcError::Io(error)) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+            }
+            Err(error) => panic!("unexpected exclusive bind error: {error}"),
+            Ok(_) => panic!("exclusive bind replaced an occupied entry"),
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_preserves_regular_file() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        let bytes = b"existing file\0with exact bytes\xff";
+        std::fs::write(&path, bytes).unwrap();
+        let before = identity(&path);
+        expect_occupied(&path);
+        assert_eq!(identity(&path), before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_preserves_symlink_and_target() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        let target = directory.0.join("target");
+        let bytes = b"untouched symlink target\0\xfe";
+        std::fs::write(&target, bytes).unwrap();
+        std::os::unix::fs::symlink("target", &path).unwrap();
+        let before = identity(&path);
+        let target_before = identity(&target);
+        let link_before = std::fs::read_link(&path).unwrap();
+        expect_occupied(&path);
+        assert_eq!(identity(&path), before);
+        assert_eq!(std::fs::read_link(&path).unwrap(), link_before);
+        assert_eq!(identity(&target), target_before);
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_preserves_existing_live_socket() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let before = identity(&path);
+        expect_occupied(&path);
+        assert_eq!(identity(&path), before);
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        assert_eq!(identity(&path), before);
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_preserves_entry_created_after_absence_check() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        // Deterministically occupy the named check/bind window.
+        let bytes = b"created after the absence check";
+        std::fs::write(&path, bytes).unwrap();
+        let before = identity(&path);
+        expect_occupied(&path);
+        assert_eq!(identity(&path), before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn initial_stats_exclusive_bind_cleanup_and_ordinary_replacement_are_preserved() {
+        let directory = Directory::new();
+        let path = directory.socket();
+        let server = RpcServer::bind_exclusive(&path, Arc::new(EmptyGlobal), ()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        drop(server);
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        std::fs::write(&path, b"ordinary bind still replaces this stale entry").unwrap();
+        let server = RpcServer::bind(&path, Arc::new(EmptyGlobal), ()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        drop(server);
+        assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use std::os::fd::FromRawFd;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// Records what the server told it.
+    #[derive(Default)]
+    struct Recording {
+        admitted: Mutex<bool>,
+        failed: Mutex<Option<std::io::ErrorKind>>,
+    }
+
+    impl ConnectionAdmission for Recording {
+        fn admit(&self, _peer: OwnedFd) -> std::io::Result<Admitted> {
+            *self.admitted.lock().unwrap() = true;
+            Ok(Admitted { process_id: 1 })
+        }
+
+        fn admission_failed(&self, error: &std::io::Error) {
+            *self.failed.lock().unwrap() = Some(error.kind());
+        }
+    }
+
+    /// A connection whose peer pidfd cannot be obtained is reported through
+    /// `admission_failed` and refused, and never reaches `admit`. A pipe
+    /// stands in for the socket so `SO_PEERPIDFD` fails deterministically.
+    #[tokio::test]
+    async fn a_connection_without_a_peer_pidfd_is_reported_and_refused() {
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let _write_end = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(pipe[0]) };
+        std_stream.set_nonblocking(true).unwrap();
+        let stream = UnixStream::from_std(std_stream).unwrap();
+        let recording = Arc::new(Recording::default());
+        let admission: Arc<dyn ConnectionAdmission> = recording.clone();
+        assert!(admit_connection(Some(&admission), &stream).is_err());
+        assert!(
+            recording.failed.lock().unwrap().is_some(),
+            "the server must report a connection it could not offer for admission"
+        );
+        assert!(!*recording.admitted.lock().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod owned_request_cancellation_tests {
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct WaitingGlobal {
+        entered: Notify,
+        release: Notify,
+        dropped: Arc<AtomicBool>,
+    }
+    struct Dropped(Arc<AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    #[reverie::global_tool]
+    impl GlobalTool for WaitingGlobal {
+        type Request = ();
+        type Response = ();
+        type Config = ();
+        async fn receive_rpc(&self, _from: reverie::Tid, _request: ()) {
+            let _drop = Dropped(self.dropped.clone());
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+    struct SelfPeer;
+    impl ConnectionAdmission for SelfPeer {
+        fn admit(&self, peer: OwnedFd) -> std::io::Result<Admitted> {
+            // Test uses an actual same-process Unix connection and its kernel
+            // SO_PEERPIDFD. This is transport coverage, NOT a reaped-child claim.
+            let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", peer.as_raw_fd()))?;
+            let pid = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+                .ok_or_else(|| std::io::Error::other("actual peer pidfd PID absent"))?;
+            if pid != std::process::id() as i32 {
+                return Err(std::io::Error::other("transport fixture peer differs"));
+            }
+            Ok(Admitted { process_id: pid })
+        }
+    }
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = PathBuf::from(format!(
+                "/tmp/rpc-cancel-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    const LIMIT: Duration = Duration::from_secs(2);
+
+    async fn opened_request(path: &Path, global: &WaitingGlobal) -> UnixStream {
+        let mut client = UnixStream::connect(path).await.unwrap();
+        let config = read_message(&mut client, DEFAULT_MAX_FRAME_LEN)
+            .await
+            .unwrap();
+        assert_eq!(decode::<()>(&config).unwrap(), ());
+        let request = encode(&RequestEnvelope {
+            from: reverie::Tid::from_raw(std::process::id() as i32),
+            request: (),
+        })
+        .unwrap();
+        write_message(&mut client, &request).await.unwrap();
+        tokio::time::timeout(LIMIT, global.entered.notified())
+            .await
+            .unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn actual_pending_request_is_dropped_joined_and_never_replied() {
+        let directory = Directory::new();
+        let path = directory.0.join("rpc.sock");
+        let global = Arc::new(WaitingGlobal::default());
+        let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
+        server.set_connection_admission(Arc::new(SelfPeer));
+        let issues = server.retain_connection_issues();
+        let connections = server.connection_monitor();
+        let cancellation = RequestCancellation::default();
+        let task_cancel = cancellation.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve_until_with_request_cancellation(
+            async move {
+                let _ = stopped.await;
+            },
+            task_cancel,
+        ));
+        let mut client = opened_request(&path, &global).await;
+        assert!(!global.dropped.load(Ordering::Acquire));
+        assert!(cancellation.joined_outcomes().unwrap().is_empty());
+        cancellation.request(std::process::id() as i32).unwrap();
+        tokio::time::timeout(LIMIT, cancellation.wait_for_joined())
+            .await
+            .unwrap();
+        assert!(global.dropped.load(Ordering::Acquire));
+        tokio::time::timeout(LIMIT, connections.wait_for_idle())
+            .await
+            .unwrap();
+        let outcomes = cancellation.joined_outcomes().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].connection(), 1);
+        assert_eq!(outcomes[0].process_id(), std::process::id() as i32);
+        assert_eq!(outcomes[0].sender(), std::process::id() as i32);
+        assert_eq!(outcomes[0].request(), 1);
+        assert!(matches!(
+            tokio::time::timeout(LIMIT, read_message(&mut client, DEFAULT_MAX_FRAME_LEN))
+                .await
+                .unwrap(),
+            Err(RpcError::Closed)
+        ));
+        assert!(issues.snapshot().is_empty());
+        // A queued connection cannot be accepted/configured after cancellation.
+        let mut late = UnixStream::connect(&path).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                read_message(&mut late, DEFAULT_MAX_FRAME_LEN)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(connections.active_connections(), 0);
+        drop(late);
+        stop.send(()).unwrap();
+        tokio::time::timeout(LIMIT, task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(issues.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn different_process_cannot_cancel_the_owned_request() {
+        let directory = Directory::new();
+        let path = directory.0.join("rpc.sock");
+        let global = Arc::new(WaitingGlobal::default());
+        let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
+        server.set_connection_admission(Arc::new(SelfPeer));
+        let issues = server.retain_connection_issues();
+        let cancellation = RequestCancellation::default();
+        let task_cancel = cancellation.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve_until_with_request_cancellation(
+            async move {
+                let _ = stopped.await;
+            },
+            task_cancel,
+        ));
+        let _client = opened_request(&path, &global).await;
+        let actual = std::process::id() as i32;
+        let other = if actual == 1 { 2 } else { 1 };
+        cancellation.request(other).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), cancellation.wait_for_joined())
+                .await
+                .is_err()
+        );
+        assert!(!global.dropped.load(Ordering::Acquire));
+        assert!(cancellation.joined_outcomes().unwrap().is_empty());
+        assert!(issues.snapshot().is_empty());
+        stop.send(()).unwrap();
+        tokio::time::timeout(LIMIT, task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(global.dropped.load(Ordering::Acquire));
+        assert!(matches!(
+            issues.snapshot().as_slice(),
+            [ConnectionIssue {
+                failure: ConnectionFailure::Interrupted,
+                ..
+            }]
+        ));
+        assert!(cancellation.joined_outcomes().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn actual_broken_pipe_remains_a_transport_failure() {
+        let directory = Directory::new();
+        let path = directory.0.join("rpc.sock");
+        let global = Arc::new(WaitingGlobal::default());
+        let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
+        server.set_connection_admission(Arc::new(SelfPeer));
+        let issues = server.retain_connection_issues();
+        let connections = server.connection_monitor();
+        let cancellation = RequestCancellation::default();
+        let task_cancel = cancellation.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve_until_with_request_cancellation(
+            async move {
+                let _ = stopped.await;
+            },
+            task_cancel,
+        ));
+        let client = opened_request(&path, &global).await;
+        drop(client);
+        global.release.notify_one();
+        tokio::time::timeout(LIMIT, connections.wait_for_idle())
+            .await
+            .unwrap();
+        let before = issues.snapshot();
+        assert!(matches!(before.as_slice(), [ConnectionIssue {
+            failure: ConnectionFailure::Transport(error), .. }]
+            if matches!(error.as_ref(), RpcError::Io(error)
+                if error.raw_os_error() == Some(libc::EPIPE))));
+        cancellation.request(std::process::id() as i32).unwrap();
+        assert!(cancellation.joined_outcomes().unwrap().is_empty());
+        assert_eq!(issues.snapshot().len(), before.len());
+        stop.send(()).unwrap();
+        tokio::time::timeout(LIMIT, task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn cancellation_error_identity_is_not_diagnostic_text() {
+        let spoof = RpcError::Io(std::io::Error::other(
+            "owned admitted RPC cancelled without response: connection=1 process=2 sender=2 request=1",
+        ));
+        assert!(matches!(
+            ConnectionError::from(spoof),
+            ConnectionError::Rpc(_)
+        ));
+        // Even an actual previous public observation replayed by a hook stays a
+        // transport error. Only the private dispatch branch can cancel a task.
+        let replay = CancelledRequest {
+            connection: 1,
+            process_id: 2,
+            sender: 2,
+            request: 1,
+        };
+        let hook_error = RpcError::Io(std::io::Error::other(replay));
+        assert!(matches!(
+            ConnectionError::from(hook_error),
+            ConnectionError::Rpc(_)
+        ));
+        let cancellation = RequestCancellation::default();
+        assert!(cancellation.request(0).is_err());
+        assert!(cancellation.joined_outcomes().unwrap().is_empty());
+        cancellation.request(2).unwrap();
+        assert!(cancellation.request(2).is_err());
+        assert!(cancellation.joined_outcomes().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replayed_public_outcome_from_admission_is_still_transport_failure() {
+        struct Replay;
+        impl ConnectionAdmission for Replay {
+            fn admit(&self, _peer: OwnedFd) -> std::io::Result<Admitted> {
+                Err(std::io::Error::other(CancelledRequest {
+                    connection: 1,
+                    process_id: std::process::id() as i32,
+                    sender: std::process::id() as i32,
+                    request: 1,
+                }))
+            }
+        }
+        let directory = Directory::new();
+        let path = directory.0.join("rpc.sock");
+        let mut server =
+            RpcServer::bind_exclusive(&path, Arc::new(WaitingGlobal::default()), ()).unwrap();
+        server.set_connection_admission(Arc::new(Replay));
+        let issues = server.retain_connection_issues();
+        let connections = server.connection_monitor();
+        let cancellation = RequestCancellation::default();
+        let task_cancel = cancellation.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve_until_with_request_cancellation(
+            async move {
+                let _ = stopped.await;
+            },
+            task_cancel,
+        ));
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(LIMIT, read_message(&mut client, DEFAULT_MAX_FRAME_LEN))
+                .await
+                .unwrap(),
+            Err(RpcError::Closed)
+        ));
+        tokio::time::timeout(LIMIT, connections.wait_for_idle())
+            .await
+            .unwrap();
+        assert!(matches!(issues.snapshot().as_slice(), [ConnectionIssue {
+            failure: ConnectionFailure::Transport(error), .. }]
+            if matches!(error.as_ref(), RpcError::Io(error)
+                if error.get_ref().is_some_and(|payload| payload.is::<CancelledRequest>()))));
+        assert!(cancellation.joined_outcomes().unwrap().is_empty());
+        stop.send(()).unwrap();
+        tokio::time::timeout(LIMIT, task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(issues.snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_precedes_ready_dispatch_without_pause() {
+        let directory = Directory::new();
+        let path = directory.0.join("rpc.sock");
+        let global = Arc::new(WaitingGlobal::default());
+        let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
+        server.set_connection_admission(Arc::new(SelfPeer));
+        let issues = server.retain_connection_issues();
+        let cancellation = RequestCancellation::default();
+        let task_cancel = cancellation.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve_until_with_request_cancellation(
+            async move {
+                let _ = stopped.await;
+            },
+            task_cancel,
+        ));
+        let mut client = opened_request(&path, &global).await;
+        // No Pause or physical-test probe. Simulate the existing watcher wake
+        // making the normal dispatch continuation ready at the first await.
+        // Intent must already be visible when that actual future is repolled.
+        cancellation.request(std::process::id() as i32).unwrap();
+        global.release.notify_one();
+        let drained = tokio::time::timeout(LIMIT, cancellation.wait_for_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(drained.cancelled_requests().len(), 1);
+        assert!(drained.idle_connections().is_empty());
+        assert!(global.dropped.load(Ordering::Acquire));
+        assert!(matches!(
+            tokio::time::timeout(LIMIT, read_message(&mut client, DEFAULT_MAX_FRAME_LEN))
+                .await
+                .unwrap(),
+            Err(RpcError::Closed)
+        ));
+        assert!(issues.snapshot().is_empty());
+        stop.send(()).unwrap();
+        tokio::time::timeout(LIMIT, task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_closed_and_read_idle_drains_never_invent_a_cancelled_rpc() {
+        for mode in ["empty", "closed", "read_idle"] {
+            let directory = Directory::new();
+            let path = directory.0.join("rpc.sock");
+            let global = Arc::new(WaitingGlobal::default());
+            let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
+            server.set_connection_admission(Arc::new(SelfPeer));
+            let issues = server.retain_connection_issues();
+            let connections = server.connection_monitor();
+            let cancellation = RequestCancellation::default();
+            let task_cancel = cancellation.clone();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(server.serve_until_with_request_cancellation(
+                async move {
+                    let _ = stopped.await;
+                },
+                task_cancel,
+            ));
+            let mut idle = None;
+            if mode != "empty" {
+                let mut client = UnixStream::connect(&path).await.unwrap();
+                let config =
+                    tokio::time::timeout(LIMIT, read_message(&mut client, DEFAULT_MAX_FRAME_LEN))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(decode::<()>(&config).unwrap(), ());
+                if mode == "closed" {
+                    drop(client);
+                    tokio::time::timeout(LIMIT, connections.wait_for_idle())
+                        .await
+                        .unwrap();
+                } else {
+                    idle = Some(client);
+                }
+            }
+            cancellation.request(std::process::id() as i32).unwrap();
+            let drained = tokio::time::timeout(LIMIT, cancellation.wait_for_drain())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(drained.process_id(), std::process::id() as i32);
+            assert!(drained.cancelled_requests().is_empty());
+            assert_eq!(
+                drained.idle_connections(),
+                if mode == "read_idle" {
+                    &[1][..]
+                } else {
+                    &[][..]
+                }
+            );
+            assert_eq!(connections.active_connections(), 0);
+            assert!(!global.dropped.load(Ordering::Acquire)); // receive_rpc never ran
+            assert!(issues.snapshot().is_empty());
+            if let Some(mut client) = idle {
+                assert!(matches!(
+                    tokio::time::timeout(LIMIT, read_message(&mut client, DEFAULT_MAX_FRAME_LEN))
+                        .await
+                        .unwrap(),
+                    Err(RpcError::Closed)
+                ));
+            }
+            stop.send(()).unwrap();
+            tokio::time::timeout(LIMIT, task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
 }

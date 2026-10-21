@@ -45,7 +45,11 @@ use crate::bootstrap::BOOT_RESERVED_END;
 use crate::bootstrap::PROGRAM_HEADERS_ADDRESS;
 use crate::bootstrap::VDSO_ADDRESS;
 use crate::memory::AllocationCursors;
+use crate::memory::MMAP_BASE;
 use crate::memory::RegionKind;
+use crate::memory::USER_ADDRESS_END;
+use crate::memory::USER_STACK_TOP;
+use crate::memory::UserWindow;
 use crate::signal::ProcessSignalState;
 use crate::signal::SharedThreadSignalState;
 
@@ -54,21 +58,31 @@ pub(crate) mod parent_death;
 
 const PAGE_SIZE: u64 = 4096;
 pub(crate) const TASK_COMM_LEN: usize = 16;
+/// The fixed ELF64 layout also used by the ptrace tracee initializer.
+pub(crate) const LINUX_FIXED_PERSONALITY: u32 = 0x0004_0000;
 pub(crate) const STACK_LIMIT: u64 = 8 * 1024 * 1024;
-const STACK_STRING_HEADROOM: u64 = 4096;
-const MMAP_GAP: u64 = 1024 * 1024;
 const MAX_PROGRAM_HEADERS_SIZE: usize = PAGE_SIZE as usize;
 const MAX_INTERPRETER_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SCRIPT_INTERPRETERS: usize = 4;
 const MAIN_LOAD_BIAS: u64 = 2 * 1024 * 1024;
 const _: () = assert!(BOOT_RESERVED_END <= MAIN_LOAD_BIAS);
-const INTERPRETER_LOAD_BIAS: u64 = 16 * 1024 * 1024;
-const IOPRIO_CLASS_SHIFT: u32 = 13;
+/// The host kernel's own vDSO pages that Linux 7.x maps top-down below the
+/// interpreter at exec ([vvar] 0x4000, [vvar_vclock] 0x2000, [vdso] 0x2000).
+/// Hermit's ptrace backend maps its canonical vDSO elsewhere but leaves these
+/// in place, as do the other backends that run on the host kernel, so they
+/// occupy the address space. KVM reserves the same range, inaccessible, so its
+/// mappings land at the same addresses.
+const VDSO_GAP: u64 = 0x8000;
+const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
+/// The least program-break growth the layout leaves above a main image: 1 MiB
+/// for a static program and 4 MiB for one with an interpreter, as before the
+/// mmap window existed.
+const STATIC_BRK_HEADROOM: u64 = 1024 * 1024;
+/// Where Linux loads an interpreted PIE main image with address randomization
+/// off (x86-64 ELF_ET_DYN_BASE), before rounding to the image's alignment.
+const PIE_BASE: u64 = 0x5555_5555_4000;
+const INTERPRETED_BRK_HEADROOM: u64 = 4 * 1024 * 1024;
 pub(crate) const GUEST_CAPABILITY_MASK: u64 = (1_u64 << 41) - 1;
-/// Page-aligned program-break gap reserved between a large main image and a
-/// relocated interpreter base. Only applies when the main image would overrun
-/// the historical fixed [`INTERPRETER_LOAD_BIAS`]; small PIEs are unaffected.
-const INTERPRETER_MIN_BRK_HEADROOM: u64 = 4 * 1024 * 1024;
 const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
 const POLICY_OPEN_EINTR_ATTEMPTS: usize = 16;
 
@@ -297,8 +311,8 @@ pub(crate) enum IdentityTimestamps {
     /// the carrier rather than of any guest-visible file.
     VirtualFile,
     /// A synthetic `/proc` snapshot carrier, such as the one for
-    /// `/proc/uptime`. It reports timestamp 0, like every synthetic `/proc`
-    /// file.
+    /// `/proc/self/maps`. It reports timestamp 0, like every synthetic
+    /// `/proc` file.
     ProcSnapshot,
 }
 
@@ -333,6 +347,8 @@ pub(crate) struct GuestFileIdentityTable {
     /// keyed by their pinned backing memfd.
     pub proc_transfers:
         std::collections::BTreeMap<(libc::dev_t, libc::ino_t), crate::executor::ProcTransfer>,
+    /// Run-wide virtual inotify rename cookies; see executor/inotify.rs.
+    pub inotify_cookies: crate::executor::InotifyCookieTable,
 }
 
 /// Process-tree-wide state whose lifetime follows a guest task rather than an
@@ -359,6 +375,8 @@ pub(crate) struct TaskLifecycleTable {
     >,
     process_exits: std::collections::BTreeMap<(i32, u64), ProcessExitState>,
     pub(crate) parent_death: parent_death::ParentDeathState,
+    /// Thread-group id of the root guest the table was created for.
+    root_tgid: Option<i32>,
 }
 
 #[derive(Debug, Default)]
@@ -370,9 +388,19 @@ struct ProcessExitState {
 
 impl TaskLifecycleTable {
     pub(crate) fn with_root(tid: i32, tgid: i32, pgid: i32, dumpable: bool) -> Self {
-        let mut table = Self::default();
+        let mut table = Self {
+            root_tgid: Some(tgid),
+            ..Self::default()
+        };
         table.register(tid, tgid, pgid, dumpable);
         table
+    }
+
+    /// True when the root guest is not PID 1, so the namespace init it is
+    /// parented to (`getppid() == 1`) is synthesized rather than a guest task.
+    pub(crate) fn synthesizes_namespace_init(&self) -> bool {
+        self.root_tgid
+            .is_some_and(|root| root != crate::vm::CONTAINER_INIT_PID)
     }
 
     pub(crate) fn register(&mut self, tid: i32, tgid: i32, pgid: i32, dumpable: bool) -> u64 {
@@ -832,6 +860,64 @@ impl Drop for StagedFile {
     }
 }
 
+/// A guest descriptor entry: its identity in the file table (replaced by
+/// every insertion, see [`LoadedStaticElf::insert_file`]), and what probing
+/// its open file description has shown. Each fact is a property Linux fixes
+/// when the description is opened, so it holds for as long as this entry
+/// stands: the access mode and `O_PATH` (`F_GETFL`), the file type
+/// (`fstat`), and whether the description can be read at all
+/// (`FMODE_CAN_READ`, which a zero-iovec `readv` tests). Each is recorded
+/// only from a successful probe; a failing probe is repeated, so its error
+/// is reported as before.
+#[derive(Debug, Default)]
+pub(crate) struct FdEntry {
+    access: std::sync::OnceLock<libc::c_int>,
+    file_type: std::sync::OnceLock<libc::mode_t>,
+    read_capable: std::sync::OnceLock<()>,
+}
+
+impl FdEntry {
+    /// The access mode and `O_PATH` bits of `F_GETFL` (`probe`) for this
+    /// entry's host descriptor.
+    pub(crate) fn access(
+        &self,
+        probe: impl FnOnce() -> std::result::Result<libc::c_int, i64>,
+    ) -> std::result::Result<libc::c_int, i64> {
+        if let Some(access) = self.access.get() {
+            return Ok(*access);
+        }
+        let access = probe()? & (libc::O_ACCMODE | libc::O_PATH);
+        Ok(*self.access.get_or_init(|| access))
+    }
+
+    /// The file type bits (`S_IFMT`) of `fstat` (`probe`) for this entry's
+    /// host descriptor.
+    pub(crate) fn file_type(
+        &self,
+        probe: impl FnOnce() -> std::result::Result<libc::mode_t, i64>,
+    ) -> std::result::Result<libc::mode_t, i64> {
+        if let Some(file_type) = self.file_type.get() {
+            return Ok(*file_type);
+        }
+        let file_type = probe()? & libc::S_IFMT;
+        Ok(*self.file_type.get_or_init(|| file_type))
+    }
+
+    /// Runs the read-capability `probe` unless it has already succeeded for
+    /// this entry.
+    pub(crate) fn read_capable(
+        &self,
+        probe: impl FnOnce() -> std::result::Result<(), i64>,
+    ) -> std::result::Result<(), i64> {
+        if self.read_capable.get().is_some() {
+            return Ok(());
+        }
+        probe()?;
+        self.read_capable.get_or_init(|| ());
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LoadedStaticElf {
     pub entry_point: u64,
@@ -839,6 +925,11 @@ pub(crate) struct LoadedStaticElf {
     /// Initial program break set at load time (`align_up(main_end)`); the base
     /// of the brk-managed heap. The live heap spans `[heap_base, program_break)`.
     pub heap_base: u64,
+    /// The lowest break brk accepts: Linux's `mm->end_data` (the end of the
+    /// main image's file-backed segment contents), its minimum under
+    /// CONFIG_COMPAT_BRK without brk randomization. Shrinking below it
+    /// would unmap the image's data.
+    pub min_break: u64,
     pub program_break: u64,
     pub brk_limit: u64,
     pub mmap_base: u64,
@@ -892,19 +983,18 @@ pub(crate) struct LoadedStaticElf {
     /// the traced process tree", and `Guest::is_root_process` is derived from it,
     /// so conflating the two makes the root guest invisible to the tool.
     pub is_traced_tree_root: bool,
-    // Direct KVM workers do not participate in Detcore's virtual clock. Keep a
-    // private logical clock so repeated observations advance deterministically
-    // without making host thread scheduling observable.
-    // TODO-HUMAN-REVIEW(PR-221): Review direct-worker logical clock semantics.
-    pub logical_clock_ns: u64,
     pub umask: libc::mode_t,
+    /// Per-task ELF64 Linux personality. Only UNAME26 can change within the
+    /// fixed ADDR_NO_RANDOMIZE layout. Fork and clone copy it by value; ordinary
+    /// supported exec preserves the calling task's value.
+    pub(crate) linux_personality: u32,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-228): Review caller-provided deterministic random seed state.
     pub random_seed: u64,
-    /// Position in this task's deterministic getrandom byte stream. A new
-    /// fork/thread starts at zero under its own virtual TID; exec preserves
-    /// the caller's position. Only successful copyout advances the stream.
-    pub getrandom_offset: u64,
+    /// Task IDs each new task spends (`reverie::task_ids`): Linux's 1 unless
+    /// the caller asks for another numbering (Hermit asks for its ptrace
+    /// reference's). Shared by the whole run: forks and exec keep it.
+    pub ids_per_task: i32,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
     // Review host metadata timestamps for Tool runs.
@@ -939,13 +1029,6 @@ pub(crate) struct LoadedStaticElf {
     pub capability_ambient: u64,
     // TODO-HUMAN-REVIEW(PR-235): Review virtual dumpability lifecycle semantics.
     pub dumpable: bool,
-    // TODO-HUMAN-REVIEW(PR-92): Review virtual nice process state.
-    pub nice: libc::c_int,
-    // TODO-HUMAN-REVIEW(PR-119): Review virtual scheduler/ioprio process state.
-    pub sched_policy: libc::c_int,
-    pub sched_priority: libc::c_int,
-    pub sched_reset_on_fork: bool,
-    pub ioprio: libc::c_int,
     /// Dispositions and process-pending signals shared by a thread group.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-235): Review process-local virtual signalfd state.
@@ -976,7 +1059,7 @@ pub(crate) struct LoadedStaticElf {
     /// Identity of each descriptor entry, independent of its filesystem object.
     /// Insertion, including a dup destination, creates a new identity. Table
     /// snapshots and fork copies retain it so unchanged host handles stay stable.
-    pub fd_entry_ids: std::collections::BTreeMap<i32, std::sync::Arc<()>>,
+    pub fd_entry_ids: std::collections::BTreeMap<i32, std::sync::Arc<FdEntry>>,
     pub(crate) epoll_domain: std::sync::Arc<std::sync::Mutex<crate::executor::EpollDomain>>,
     pub(crate) poll_table_id: std::sync::Arc<crate::executor::NativePollTable>,
     pub(crate) native_poll_fds:
@@ -1013,7 +1096,6 @@ pub(crate) struct LoadedStaticElf {
     /// Host-kernel ordering for O_CREAT|O_DIRECTORY on an existing regular
     /// procfs entry, established before this image can execute.
     pub regular_create_directory_policy: RegularCreateDirectoryPolicy,
-    pub proc_mounts: std::sync::Arc<crate::proc_mounts::ProcMountSnapshot>,
     pub fdinfo_files:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::FdinfoDescription>>,
     pub fdinfo_table: std::sync::Weak<std::sync::Mutex<crate::executor::FileTableState>>,
@@ -1023,6 +1105,11 @@ pub(crate) struct LoadedStaticElf {
     // registry contains only weak references keyed by unexposed host identity.
     pub fd_object_inodes: std::collections::BTreeMap<i32, std::sync::Arc<GuestFileIdentity>>,
     pub file_identity_table: std::sync::Arc<std::sync::Mutex<GuestFileIdentityTable>>,
+    /// Why the signal syscall just executed was refused with ENOSYS, if it
+    /// was. Set by the signal-sending path and taken by the executor at the
+    /// same syscall boundary, which turns it into the typed refusal
+    /// `UnsupportedOperation::Signal`. Never carried across fork or exec.
+    pub(crate) signal_refusal: Option<&'static str>,
 }
 
 impl LoadedStaticElf {
@@ -1051,7 +1138,8 @@ impl LoadedStaticElf {
         if fd == libc::STDIN_FILENO {
             retired.extend(self.take_stdin());
         }
-        self.fd_entry_ids.insert(fd, std::sync::Arc::new(()));
+        self.fd_entry_ids
+            .insert(fd, std::sync::Arc::new(FdEntry::default()));
         retired
     }
 
@@ -1088,9 +1176,6 @@ impl LoadedStaticElf {
 
     pub(crate) fn try_clone_for_fork_locked(&self, child_pid: i32) -> Result<Self> {
         // TODO-HUMAN-REVIEW(PR-136): Review shared file identity inheritance across fork.
-        // TODO-HUMAN-REVIEW(PR-119): Review scheduler reset and ioprio fork inheritance.
-        let reset_realtime = self.sched_reset_on_fork
-            && matches!(self.sched_policy, libc::SCHED_FIFO | libc::SCHED_RR);
         let files = self
             .files
             .iter()
@@ -1111,6 +1196,7 @@ impl LoadedStaticElf {
             entry_point: self.entry_point,
             stack_pointer: self.stack_pointer,
             heap_base: self.heap_base,
+            min_break: self.min_break,
             program_break: self.program_break,
             brk_limit: self.brk_limit,
             mmap_base: self.mmap_base,
@@ -1135,10 +1221,10 @@ impl LoadedStaticElf {
             orphan_reaper_pid: std::sync::Arc::new(AtomicI32::new(0)),
             // A guest-created child always has a traced parent: this process.
             is_traced_tree_root: false,
-            logical_clock_ns: self.logical_clock_ns,
             umask: self.umask,
+            linux_personality: self.linux_personality,
             random_seed: self.random_seed,
-            getrandom_offset: 0,
+            ids_per_task: self.ids_per_task,
             host_metadata_timestamps: self.host_metadata_timestamps,
             thread_name: self.thread_name,
             thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(self.thread_name)),
@@ -1152,23 +1238,6 @@ impl LoadedStaticElf {
             capability_bounding: self.capability_bounding,
             capability_ambient: self.capability_ambient,
             dumpable: self.dumpable,
-            nice: self.nice,
-            sched_policy: if reset_realtime {
-                libc::SCHED_OTHER
-            } else {
-                self.sched_policy
-            },
-            sched_priority: if reset_realtime {
-                0
-            } else {
-                self.sched_priority
-            },
-            sched_reset_on_fork: false,
-            ioprio: if self.ioprio >> IOPRIO_CLASS_SHIFT == 0 {
-                0
-            } else {
-                self.ioprio
-            },
             process_signals: std::sync::Arc::new(std::sync::Mutex::new(process_signals)),
             signal_transaction: Default::default(),
             thread_signals: self.thread_signals.for_fork(),
@@ -1179,6 +1248,7 @@ impl LoadedStaticElf {
                 .map(|(fd, file)| (fd, file.into_file()))
                 .collect(),
             file_retirement: FileRetirement::default(),
+            signal_refusal: None,
             pipe_owners: self.pipe_owners.clone(),
             fd_entry_ids: self.fd_entry_ids.clone(),
             epoll_domain: self.epoll_domain.clone(),
@@ -1199,7 +1269,6 @@ impl LoadedStaticElf {
             proc_files: self.proc_files.clone(),
             synthetic_proc_nofollow_fds: self.synthetic_proc_nofollow_fds.clone(),
             regular_create_directory_policy: self.regular_create_directory_policy,
-            proc_mounts: self.proc_mounts.clone(),
             fdinfo_files: self.fdinfo_files.clone(),
             fdinfo_table: self.fdinfo_table.clone(),
             fd_object_inodes: self.fd_object_inodes.clone(),
@@ -1385,11 +1454,11 @@ impl LoadedStaticElf {
         self.orphan_reaper_pid = previous.orphan_reaper_pid;
         // `execve` replaces the image, never the position in the process tree.
         self.is_traced_tree_root = previous.is_traced_tree_root;
-        self.logical_clock_ns = previous.logical_clock_ns;
         self.signal_dequeue_failure = previous.signal_dequeue_failure;
         self.umask = previous.umask;
+        self.linux_personality = previous.linux_personality;
         self.random_seed = previous.random_seed;
-        self.getrandom_offset = previous.getrandom_offset;
+        self.ids_per_task = previous.ids_per_task;
         self.host_metadata_timestamps = previous.host_metadata_timestamps;
         // `thread_name` intentionally remains the replacement image's name.
         self.thp_disabled = thp_disabled;
@@ -1401,12 +1470,6 @@ impl LoadedStaticElf {
         self.capability_ambient =
             previous.capability_ambient & self.capability_permitted & self.capability_inheritable;
         self.dumpable = true;
-        self.nice = previous.nice;
-        // TODO-HUMAN-REVIEW(PR-119): Review scheduler and ioprio exec inheritance.
-        self.sched_policy = previous.sched_policy;
-        self.sched_priority = previous.sched_priority;
-        self.sched_reset_on_fork = previous.sched_reset_on_fork;
-        self.ioprio = previous.ioprio;
         self.process_signals = std::sync::Arc::new(std::sync::Mutex::new(process_signals));
         self.signal_transaction = previous.signal_transaction;
         self.thread_signals = thread_signals;
@@ -1429,7 +1492,6 @@ impl LoadedStaticElf {
         self.proc_files = proc_files;
         self.synthetic_proc_nofollow_fds = synthetic_proc_nofollow_fds;
         self.regular_create_directory_policy = regular_create_directory_policy;
-        self.proc_mounts = previous.proc_mounts;
         self.fdinfo_files = fdinfo_files;
         self.fdinfo_table = previous.fdinfo_table;
         self.fd_object_inodes = fd_object_inodes;
@@ -1440,9 +1502,28 @@ impl LoadedStaticElf {
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review script loading and executable resolution.
+/// Loads `image` as exec'd by the filename `argv[0]`; see
+/// [`load_static_elf_with_execfn`].
 pub(crate) fn load_static_elf(
     memory: &mut GuestMemory,
     image: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    cwd: &Path,
+) -> Result<LoadedStaticElf> {
+    load_static_elf_with_execfn(memory, image, None, argv, envp, cwd)
+}
+
+/// Loads `image` as `execve(execfn, argv, envp)` would. `execfn` is the
+/// filename given to execve, byte for byte, which Linux copies to the top of
+/// the new stack and names in `AT_EXECFN`; `None` means `argv[0]`. A `#!`
+/// script keeps it: for a script Linux still records the script's filename
+/// there, not the interpreter's. Given explicitly, it is also the script's
+/// own argument after the interpreter (bprm->interp), whatever `argv[0]` is.
+pub(crate) fn load_static_elf_with_execfn(
+    memory: &mut GuestMemory,
+    image: &[u8],
+    execfn: Option<&[u8]>,
     argv: &[&str],
     envp: &[&str],
     cwd: &Path,
@@ -1452,7 +1533,18 @@ pub(crate) fn load_static_elf(
     let owner = memory.clone();
     let _transaction = owner.allocation_guard();
     begin_image(memory)?;
-    let result = load_executable(memory, image, argv, envp, cwd, 0, None);
+    let script_name = execfn.map(|execfn| String::from_utf8_lossy(execfn).into_owned());
+    let result = load_executable(
+        memory,
+        image,
+        execfn,
+        script_name.as_deref(),
+        argv,
+        envp,
+        cwd,
+        0,
+        None,
+    );
     if result.is_err() {
         memory.clear_user_access();
     }
@@ -1472,7 +1564,17 @@ pub(crate) fn load_static_elf_file(
     let owner = memory.clone();
     let _transaction = owner.allocation_guard();
     begin_image(memory)?;
-    let result = load_executable(memory, &image, argv, envp, cwd, 0, Some(Arc::new(file)));
+    let result = load_executable(
+        memory,
+        &image,
+        None,
+        None,
+        argv,
+        envp,
+        cwd,
+        0,
+        Some(Arc::new(file)),
+    );
     let mut loaded = match result {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -1494,6 +1596,9 @@ pub(crate) fn load_static_elf_file(
 // this only after its existing fatal point of no return.
 fn begin_image(memory: &GuestMemory) -> Result<()> {
     memory.clear_user_access();
+    // The new image's layout replaces the old one whole: its identity end and
+    // windows may differ (a larger image raises the identity end).
+    memory.clear_user_layout();
     let end = memory.guest_end().min(BOOT_RESERVED_END);
     if end > memory.guest_base() {
         memory
@@ -1543,9 +1648,16 @@ fn read_file_image(file: &File) -> std::io::Result<Vec<u8>> {
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review recursive script interpreter loading.
+#[allow(clippy::too_many_arguments)]
+/// `script_name` is the name of the file `image` came from, as the kernel
+/// passes it to a `#!` interpreter (bprm->interp): the exec filename, then
+/// each interpreter's name as its script's `#!` line gives it. `None` keeps
+/// the older rule: the retained file's path, else `argv[0]` resolved.
 fn load_executable(
     memory: &mut GuestMemory,
     image: &[u8],
+    execfn: Option<&[u8]>,
+    script_name: Option<&str>,
     argv: &[&str],
     envp: &[&str],
     cwd: &Path,
@@ -1555,13 +1667,16 @@ fn load_executable(
     let argv0 = *argv
         .first()
         .ok_or_else(|| Error::UnsupportedElf("argv must contain at least argv[0]".to_string()))?;
+    let execfn = execfn.unwrap_or(argv0.as_bytes());
     if let Some((interpreter, optional_argument)) = parse_shebang(image)? {
         if script_depth >= MAX_SCRIPT_INTERPRETERS {
             return Err(Error::UnsupportedElf(
                 "script interpreter recursion limit exceeded".to_string(),
             ));
         }
-        let script_path = if let Some(file) = executable_file.as_ref() {
+        let script_path = if let Some(name) = script_name {
+            PathBuf::from(name)
+        } else if let Some(file) = executable_file.as_ref() {
             std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?
         } else {
             resolve_executable_path(argv0, envp, cwd)?
@@ -1599,6 +1714,8 @@ fn load_executable(
         return load_executable(
             memory,
             &interpreter_image,
+            Some(execfn),
+            script_name.map(|_| interpreter.as_str()),
             &interpreter_argv,
             envp,
             cwd,
@@ -1610,66 +1727,165 @@ fn load_executable(
     let elf = Elf::parse(image)?;
     validate_elf(&elf, true)?;
 
-    for entry in argv.iter().chain(envp.iter()) {
-        if entry.as_bytes().contains(&0) {
+    for entry in argv
+        .iter()
+        .chain(envp.iter())
+        .map(|entry| entry.as_bytes())
+        .chain([execfn])
+    {
+        if entry.contains(&0) {
             return Err(Error::UnsupportedElf(
-                "an argv/envp entry contains an embedded NUL byte".to_string(),
+                "an execfn/argv/envp entry contains an embedded NUL byte".to_string(),
             ));
         }
     }
 
-    let main_bias = if elf.header.e_type == ET_DYN {
-        MAIN_LOAD_BIAS
+    let interpreter_image = interpreter_path(image, &elf)?
+        .map(|path| read_interpreter_image(&path))
+        .transpose()?;
+    let interpreter = interpreter_image
+        .as_deref()
+        .map(|interpreter_image| -> Result<_> {
+            let interpreter = Elf::parse(interpreter_image)?;
+            validate_elf(&interpreter, false)?;
+            if interpreter.header.e_type != ET_DYN {
+                return Err(Error::UnsupportedElf(
+                    "program interpreter must be ET_DYN".to_string(),
+                ));
+            }
+            let (first, end) = load_span(&interpreter)?;
+            Ok((interpreter, first, end - first))
+        })
+        .transpose()?;
+    let brk_headroom = if interpreter.is_some() {
+        INTERPRETED_BRK_HEADROOM
     } else {
-        0
+        STATIC_BRK_HEADROOM
     };
-    let main_end = load_segments(memory, image, &elf, main_bias)?;
-    let main_entry = main_bias
-        .checked_add(elf.entry)
-        .ok_or_else(|| Error::UnsupportedElf("main entry point overflow".to_string()))?;
+    let interpreter_span = interpreter.as_ref().map(|(_, _, span)| *span);
 
-    let (entry_point, at_base, image_end) = if let Some(path) = interpreter_path(image, &elf)? {
-        // TODO-HUMAN-REVIEW(reverie-kvm): relocate the interpreter above large
-        // main images instead of failing to load.
-        //
-        // Place the dynamic interpreter (ld.so) above the main image. Small
-        // PIEs keep the historical fixed 16 MiB base, so their memory layout is
-        // byte-identical to before. Large PIEs (e.g. rustc, cargo) whose image
-        // would overrun that base get the interpreter relocated just above the
-        // main image, with a page-aligned program-break gap, instead of the
-        // previous hard "overlaps interpreter base" load failure.
-        let interpreter_load_bias = interpreter_load_bias(main_end)?;
-        let interpreter_image = read_interpreter_image(&path)?;
-        let interpreter = Elf::parse(&interpreter_image)?;
-        validate_elf(&interpreter, false)?;
-        if interpreter.header.e_type != ET_DYN {
-            return Err(Error::UnsupportedElf(
-                "program interpreter must be ET_DYN".to_string(),
-            ));
-        }
-        let interpreter_end = load_segments(
+    // An interpreted PIE main image loads where Linux loads it (ELF_ET_DYN_BASE
+    // rounded to its alignment) in its own window carved out of identity
+    // memory, with its program break; identity memory then holds no image, so
+    // the layout is chosen before the image loads. A non-PIE image, an
+    // ET_DYN image without an interpreter (a static PIE, which Linux places
+    // through mmap instead; not modelled), or a PIE in memory too small for its
+    // window loads in identity memory (an ET_DYN at MAIN_LOAD_BIAS), and the
+    // layout follows it.
+    let mut pie_window = None;
+    let mut layout = None;
+    let mut pie_start = 0;
+    if elf.header.e_type == ET_DYN
+        && interpreter.is_some()
+        && let Some(mut pie_layout) =
+            establish_linux_layout(memory, BOOT_RESERVED_END, 0, interpreter_span)?
+    {
+        let (first, end) = load_span(&elf)?;
+        pie_start = interpreted_pie_start(&elf)?;
+        pie_window = establish_pie_window(
             memory,
-            &interpreter_image,
-            &interpreter,
-            interpreter_load_bias,
+            &mut pie_layout,
+            pie_start,
+            end - first,
+            brk_headroom,
         )?;
-        let interpreter_entry = interpreter_load_bias
-            .checked_add(interpreter.entry)
-            .ok_or_else(|| Error::UnsupportedElf("interpreter entry point overflow".to_string()))?;
-        (
-            interpreter_entry,
-            interpreter_load_bias,
-            main_end.max(interpreter_end),
-        )
-    } else {
-        (main_entry, 0, main_end)
+        if pie_window.is_some() {
+            layout = Some(pie_layout);
+        } else {
+            memory.clear_user_layout();
+        }
+    }
+    // A PIE's image is relocated relative to its first loaded page, which
+    // lands at user `pie_start`; an image linked above that moves down, so
+    // its user bias may wrap (it is only ever added to linked addresses).
+    let (main_first, _) = load_span(&elf)?;
+    let (main_bias, main_end) = match &pie_window {
+        Some(window) => {
+            let physical_start = window.physical_start + (pie_start - window.user_start);
+            let physical_end = load_segments_relocated(memory, image, &elf, &|address| {
+                address.checked_sub(main_first)?.checked_add(physical_start)
+            })?;
+            (
+                pie_start.wrapping_sub(main_first),
+                pie_start + (physical_end - physical_start),
+            )
+        }
+        None => {
+            let bias = if elf.header.e_type == ET_DYN {
+                MAIN_LOAD_BIAS
+            } else {
+                0
+            };
+            (bias, load_segments(memory, image, &elf, bias)?)
+        }
+    };
+    // The user address of a linked address in the main image.
+    let user_address = |address: u64| {
+        if pie_window.is_some() {
+            Some(main_bias.wrapping_add(address))
+        } else {
+            main_bias.checked_add(address)
+        }
+    };
+    // Linux's end_data: the highest end of a PT_LOAD segment's file contents.
+    let min_break = elf
+        .program_headers
+        .iter()
+        .filter(|header| header.p_type == PT_LOAD)
+        .map(|header| {
+            user_address(header.p_vaddr)
+                .and_then(|start| start.checked_add(header.p_filesz))
+                .ok_or_else(|| Error::UnsupportedElf("PT_LOAD address overflow".to_string()))
+        })
+        .try_fold(BOOT_RESERVED_END, |end, segment| {
+            Ok::<_, Error>(end.max(segment?))
+        })?;
+    let main_entry = user_address(elf.entry)
+        .ok_or_else(|| Error::UnsupportedElf("main entry point overflow".to_string()))?;
+    let layout = match layout {
+        Some(layout) => Some(layout),
+        None => establish_linux_layout(memory, main_end, brk_headroom, interpreter_span)?,
+    };
+
+    let (entry_point, at_base) = match (&interpreter, &layout) {
+        (Some((interpreter, first, span)), Some(layout)) => {
+            // Linux maps the interpreter (ld.so) first, top-down below
+            // mmap_base, so it sits at the top of the mmap window whatever the
+            // main image's size. Its first segment may lie at any address the
+            // window can be biased down to.
+            let bias_error = || {
+                Error::UnsupportedElf("interpreter segments lie above the mmap window".to_string())
+            };
+            let user_bias = (layout.mmap_user_end - span)
+                .checked_sub(*first)
+                .ok_or_else(bias_error)?;
+            let physical_start = layout.mmap_end - span;
+            let physical_bias = physical_start.checked_sub(*first).ok_or_else(bias_error)?;
+            load_segments(
+                memory,
+                interpreter_image.as_deref().unwrap_or_default(),
+                interpreter,
+                physical_bias,
+            )?;
+            reserve_vdso_gap(memory, physical_start)?;
+            let interpreter_entry = user_bias.checked_add(interpreter.entry).ok_or_else(|| {
+                Error::UnsupportedElf("interpreter entry point overflow".to_string())
+            })?;
+            (interpreter_entry, user_bias)
+        }
+        (None, Some(layout)) => {
+            reserve_vdso_gap(memory, layout.mmap_end)?;
+            (main_entry, 0)
+        }
+        (None, None) => (main_entry, 0),
+        (Some(_), None) => unreachable!("a dynamic program always gets a window"),
     };
 
     let program_headers_address = elf
         .program_headers
         .iter()
         .find(|header| header.p_type == goblin::elf::program_header::PT_PHDR)
-        .and_then(|header| main_bias.checked_add(header.p_vaddr))
+        .and_then(|header| user_address(header.p_vaddr))
         .unwrap_or(PROGRAM_HEADERS_ADDRESS);
     memory
         .reserve_region(
@@ -1689,9 +1905,11 @@ fn load_executable(
     memory
         .reserve_region(stack_start, STACK_LIMIT, RegionKind::Stack)?
         .commit();
+    crate::bootstrap::map_user_stack_window(memory, STACK_LIMIT)?;
     let (stack_pointer, auxv) = build_initial_stack(
         memory,
         &elf,
+        execfn,
         argv,
         envp,
         program_headers_address,
@@ -1700,27 +1918,29 @@ fn load_executable(
     )?;
     memory.map_user_range(memory.guest_end() - STACK_LIMIT, STACK_LIMIT, false)?;
     let program_break = align_up(main_end, PAGE_SIZE)?;
-    let mmap_next = align_up(
-        image_end
-            .checked_add(MMAP_GAP)
-            .ok_or_else(|| Error::UnsupportedElf("initial mmap base overflow".to_string()))?,
-        PAGE_SIZE,
-    )?;
-    let mmap_limit = memory
-        .guest_end()
-        .checked_sub(STACK_LIMIT)
-        .ok_or(Error::LongModeMemoryTooSmall)?;
-    if mmap_next >= mmap_limit {
-        return Err(Error::LongModeMemoryTooSmall);
-    }
-    let brk_limit = if at_base == 0 {
-        mmap_next
-    } else {
-        // The interpreter is loaded at `at_base`; the program break grows in the
-        // gap between the main image and the interpreter, so cap it there. For a
-        // relocated (large-PIE) interpreter this equals the dynamic base rather
-        // than the fixed `INTERPRETER_LOAD_BIAS`.
-        at_base
+    // Mappings are placed top-down in the mmap window, [mmap_base, mmap_limit)
+    // physically; the program break grows up to the end of the identity
+    // addresses, below the window. Without a window (a static program in
+    // memory too small for one) mappings are placed bottom-up above the
+    // program break's headroom, below the stack, as before the window existed.
+    let (mmap_next, mmap_limit) = match &layout {
+        Some(layout) => (layout.mmap_start, layout.mmap_end),
+        None => (
+            align_up(
+                main_end.checked_add(STATIC_BRK_HEADROOM).ok_or_else(|| {
+                    Error::UnsupportedElf("program break headroom overflow".to_string())
+                })?,
+                PAGE_SIZE,
+            )?,
+            stack_start,
+        ),
+    };
+    // The program break grows to the end of the identity addresses, or of the
+    // PIE window.
+    let brk_limit = match (&pie_window, &layout) {
+        (Some(window), _) => window.user_end(),
+        (None, Some(layout)) => layout.identity_end,
+        (None, None) => mmap_next,
     };
 
     let cwd_fd = OpenOptions::new()
@@ -1746,6 +1966,7 @@ fn load_executable(
         entry_point,
         stack_pointer,
         heap_base: program_break,
+        min_break,
         program_break,
         brk_limit,
         mmap_base: mmap_next,
@@ -1772,10 +1993,10 @@ fn load_executable(
         // `KvmBackend::set_root_pid` may later renumber `pid`/`tid`/`ppid`; it
         // must not change this.
         is_traced_tree_root: true,
-        logical_clock_ns: 0,
         umask: 0o022,
+        linux_personality: LINUX_FIXED_PERSONALITY,
         random_seed: 0,
-        getrandom_offset: 0,
+        ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
         host_metadata_timestamps: false,
         thread_name,
         thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(thread_name)),
@@ -1787,12 +2008,6 @@ fn load_executable(
         capability_bounding: GUEST_CAPABILITY_MASK,
         capability_ambient: 0,
         dumpable: true,
-        nice: 0,
-        // TODO-HUMAN-REVIEW(PR-119): Review default virtual scheduler and ioprio state.
-        sched_policy: libc::SCHED_OTHER,
-        sched_priority: 0,
-        sched_reset_on_fork: false,
-        ioprio: 0,
         process_signals: std::sync::Arc::new(std::sync::Mutex::new(ProcessSignalState::default())),
         signal_transaction: Default::default(),
         thread_signals: SharedThreadSignalState::default(),
@@ -1802,6 +2017,7 @@ fn load_executable(
         ))),
         files: std::collections::BTreeMap::new(),
         file_retirement: FileRetirement::default(),
+        signal_refusal: None,
         pipe_owners: Default::default(),
         fd_entry_ids: std::collections::BTreeMap::new(),
         epoll_domain: Default::default(),
@@ -1818,11 +2034,11 @@ fn load_executable(
         proc_files: std::collections::BTreeMap::new(),
         synthetic_proc_nofollow_fds: std::collections::BTreeSet::new(),
         regular_create_directory_policy: initialize_regular_create_directory_policy()?,
-        proc_mounts: std::sync::Arc::new(crate::proc_mounts::ProcMountSnapshot::capture()?),
         fdinfo_files: std::collections::BTreeMap::new(),
         fdinfo_table: std::sync::Weak::new(),
         fd_object_inodes: std::collections::BTreeMap::new(),
         file_identity_table: std::sync::Arc::new(std::sync::Mutex::new(GuestFileIdentityTable {
+            inotify_cookies: crate::executor::InotifyCookieTable::default(),
             next_inode: 0x2100_0000,
             objects: std::collections::BTreeMap::new(),
             proc_transfers: std::collections::BTreeMap::new(),
@@ -2002,14 +2218,31 @@ fn read_interpreter_image(path: &str) -> Result<Vec<u8>> {
     Ok(image)
 }
 
+/// Loads `elf`'s PT_LOAD segments at physical `physical_bias + p_vaddr` and
+/// returns the physical end of the image. The caller decides the user address
+/// those pages have (the same for a non-PIE image; a window's for ld.so).
 fn load_segments(
     memory: &mut GuestMemory,
     image: &[u8],
     elf: &Elf<'_>,
-    load_bias: u64,
+    physical_bias: u64,
 ) -> Result<u64> {
-    let entry = load_bias
-        .checked_add(elf.entry)
+    load_segments_relocated(memory, image, elf, &|address| {
+        physical_bias.checked_add(address)
+    })
+}
+
+/// [`load_segments`], placing each linked address where `relocate` puts it
+/// (`None` refuses it). A PIE window's image relocates relative to its first
+/// segment, so an image linked above where it lands moves down without
+/// wrapping arithmetic.
+fn load_segments_relocated(
+    memory: &mut GuestMemory,
+    image: &[u8],
+    elf: &Elf<'_>,
+    relocate: &dyn Fn(u64) -> Option<u64>,
+) -> Result<u64> {
+    let entry = relocate(elf.entry)
         .ok_or_else(|| Error::UnsupportedElf("ELF entry point overflow".to_string()))?;
     let mut image_end = 0;
     let mut entry_is_executable = false;
@@ -2025,8 +2258,7 @@ fn load_segments(
             )));
         }
 
-        let segment_start = load_bias
-            .checked_add(header.p_vaddr)
+        let segment_start = relocate(header.p_vaddr)
             .ok_or_else(|| Error::UnsupportedElf("PT_LOAD address overflow".to_string()))?;
         let segment_end = segment_start
             .checked_add(header.p_memsz)
@@ -2072,6 +2304,13 @@ fn load_segments(
                 true,
                 header.p_flags & PF_W != 0,
             )?;
+            // The file-backed pages map the image file from the segment's
+            // page-aligned offset, as Linux maps them.
+            memory.record_file_pages(
+                mapped_start,
+                file_end - mapped_start,
+                Some(header.p_offset & !(PAGE_SIZE - 1)),
+            );
         }
         if header.p_memsz > header.p_filesz {
             let anonymous_start = if header.p_filesz == 0 {
@@ -2115,35 +2354,45 @@ fn copy_program_headers(memory: &mut GuestMemory, image: &[u8], elf: &Elf<'_>) -
     memory.write_raw(PROGRAM_HEADERS_ADDRESS, headers)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_initial_stack(
     memory: &mut GuestMemory,
     elf: &Elf<'_>,
+    execfn: &[u8],
     argv: &[&str],
     envp: &[&str],
     program_headers_address: u64,
     at_base: u64,
     at_entry: u64,
 ) -> Result<(u64, Vec<(libc::c_ulong, libc::c_ulong)>)> {
-    // Strings (argv[], envp[], the AT_RANDOM bytes) live in a high region that
-    // grows downward from the top of guest memory; the pointer arrays and auxv
-    // that reference them are written lower, at the final `rsp`.
-    let mut cursor = memory.guest_end().saturating_sub(STACK_STRING_HEADROOM);
+    // Linux's layout (fs/exec.c, then create_elf_tables in fs/binfmt_elf.c)
+    // with address randomization off, at its addresses, so pointers the guest
+    // sees match a traced guest's: from the top of the user address space down,
+    // an 8-byte NULL, the exec filename, the envp strings and the argv strings
+    // (so argv[0] is lowest and the strings ascend argv, envp, execfn), then,
+    // below argv[0] rounded down to 16 bytes, the platform string, the
+    // AT_RANDOM bytes, and the 16-byte-aligned pointer arrays and auxv.
+    // Addresses here are user addresses in the stack window.
+    let bottom = USER_ADDRESS_END - STACK_LIMIT;
+    let mut cursor = USER_STACK_TOP - std::mem::size_of::<u64>() as u64;
+    write_user_stack(memory, cursor, &[0; 8])?;
 
-    // Push argv/envp strings, recording each guest address. argv[0] is first.
-    let mut arg_addresses = Vec::with_capacity(argv.len());
-    for arg in argv {
-        cursor = push_c_string(memory, cursor, arg.as_bytes())?;
-        arg_addresses.push(cursor);
-    }
-    let mut env_addresses = Vec::with_capacity(envp.len());
-    for entry in envp {
+    // AT_EXECFN names the filename given to execve (bprm->filename), which
+    // for a `#!` script is the script's, not the interpreter's.
+    cursor = push_c_string(memory, cursor, execfn)?;
+    let execfn_address = cursor;
+    let mut env_addresses = vec![0; envp.len()];
+    for (index, entry) in envp.iter().enumerate().rev() {
         cursor = push_c_string(memory, cursor, entry.as_bytes())?;
-        env_addresses.push(cursor);
+        env_addresses[index] = cursor;
     }
-    let argv0_address = arg_addresses[0];
+    let mut arg_addresses = vec![0; argv.len()];
+    for (index, arg) in argv.iter().enumerate().rev() {
+        cursor = push_c_string(memory, cursor, arg.as_bytes())?;
+        arg_addresses[index] = cursor;
+    }
 
-    // Linux writes the platform string below the argument and environment
-    // strings, and the AT_RANDOM bytes below it.
+    cursor &= !0xf;
     cursor = push_c_string(memory, cursor, GUEST_PLATFORM)?;
     let platform_address = cursor;
 
@@ -2154,7 +2403,7 @@ fn build_initial_stack(
     cursor = cursor
         .checked_sub(random.len() as u64)
         .ok_or(Error::LongModeMemoryTooSmall)?;
-    memory.write_raw(cursor, &random)?;
+    write_user_stack(memory, cursor, &random)?;
     let random_address = cursor;
 
     // Build the SysV initial stack image, low to high:
@@ -2170,7 +2419,7 @@ fn build_initial_stack(
         base: at_base,
         entry: at_entry,
         random: random_address,
-        execfn: argv0_address,
+        execfn: execfn_address,
         platform: platform_address,
     });
 
@@ -2191,7 +2440,7 @@ fn build_initial_stack(
         .checked_sub(stack_size)
         .ok_or(Error::LongModeMemoryTooSmall)?
         & !0xf;
-    if cursor < memory.guest_end().saturating_sub(STACK_LIMIT) {
+    if cursor < bottom {
         return Err(Error::LongModeMemoryTooSmall);
     }
 
@@ -2199,8 +2448,16 @@ fn build_initial_stack(
     for word in words {
         stack.extend_from_slice(&word.to_le_bytes());
     }
-    memory.write_raw(cursor, &stack)?;
+    write_user_stack(memory, cursor, &stack)?;
     Ok((cursor, auxv))
+}
+
+/// Writes `bytes` at user address `address` in the stack window.
+fn write_user_stack(memory: &mut GuestMemory, address: u64, bytes: &[u8]) -> Result<()> {
+    let physical = memory
+        .user_range_to_guest(address, bytes.len() as u64)
+        .ok_or(Error::LongModeMemoryTooSmall)?;
+    memory.write_raw(physical, bytes)
 }
 
 /// Writes a NUL-terminated copy of `bytes` ending just below `cursor` and
@@ -2209,8 +2466,8 @@ fn push_c_string(memory: &mut GuestMemory, cursor: u64, bytes: &[u8]) -> Result<
     let start = cursor
         .checked_sub((bytes.len() + 1) as u64)
         .ok_or(Error::LongModeMemoryTooSmall)?;
-    memory.write_raw(start, bytes)?;
-    memory.write_raw(start + bytes.len() as u64, &[0])?;
+    write_user_stack(memory, start, bytes)?;
+    write_user_stack(memory, start + bytes.len() as u64, &[0])?;
     Ok(start)
 }
 
@@ -2221,26 +2478,224 @@ fn align_up(value: u64, alignment: u64) -> Result<u64> {
         .ok_or_else(|| Error::UnsupportedElf("address alignment overflow".to_string()))
 }
 
-/// Choose the load base for the dynamic interpreter (`ld.so`) given the end of
-/// the already-loaded main image.
+/// The physical layout of a loaded guest (see the K2 design note).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LinuxLayout {
+    /// The end of the identity user addresses (boot area, a non-PIE image, the
+    /// program break).
+    pub(crate) identity_end: u64,
+    /// The physical start of the mmap window: `identity_end`, or the PIE
+    /// window's end when there is one.
+    pub(crate) mmap_start: u64,
+    /// The physical end of the mmap window.
+    pub(crate) mmap_end: u64,
+    /// The window's user end: `MMAP_BASE`, unless memory is too tight for that
+    /// (see `establish_linux_layout`).
+    pub(crate) mmap_user_end: u64,
+}
+
+/// Places the mmap window between the identity addresses and the stack window
+/// and ends the identity user addresses at its start. The window's user end is
+/// `MMAP_BASE`, and its physical end agrees with `MMAP_BASE` modulo a large
+/// page, so alignment decisions are the same in both and the window maps with
+/// large pages. The window takes a quarter of guest memory, or more if it must
+/// hold an interpreter of `interpreter_span` bytes and the vDSO gap; less when
+/// the main image and `brk_headroom` of program-break growth above it need
+/// more. The identity addresses keep the rest, so MAP_FIXED and the program
+/// break reach as much memory as the window leaves.
 ///
-/// Small position-independent executables keep the historical fixed
-/// [`INTERPRETER_LOAD_BIAS`], so their layout is unchanged. When the main image
-/// would reach into or past that base (large PIEs such as `rustc` or `cargo`),
-/// the interpreter is instead placed just above the main image, page-aligned
-/// and past a reserved [`INTERPRETER_MIN_BRK_HEADROOM`] program-break gap. This
-/// replaces the previous hard "overlaps interpreter base" load failure.
-fn interpreter_load_bias(main_end: u64) -> Result<u64> {
-    if main_end <= INTERPRETER_LOAD_BIAS {
-        Ok(INTERPRETER_LOAD_BIAS)
+/// When memory is too tight for a window ending at the highest such physical
+/// address, the window ends at the stack window's start instead, with its user
+/// end moved down below `MMAP_BASE` (by less than a large page) to keep the
+/// agreement. When even that cannot hold the interpreter and the vDSO gap, a
+/// static program (no `interpreter_span`) keeps the identity layout memory had
+/// before the mmap window (`None`); a dynamic one is refused.
+pub(crate) fn establish_linux_layout(
+    memory: &mut GuestMemory,
+    main_end: u64,
+    brk_headroom: u64,
+    interpreter_span: Option<u64>,
+) -> Result<Option<LinuxLayout>> {
+    let stack_start = memory
+        .guest_end()
+        .checked_sub(STACK_LIMIT)
+        .ok_or(Error::LongModeMemoryTooSmall)?;
+    let heap_end = align_up(
+        main_end
+            .checked_add(brk_headroom)
+            .ok_or_else(|| Error::UnsupportedElf("program break headroom overflow".to_string()))?,
+        PAGE_SIZE,
+    )?;
+    let needed = interpreter_span
+        .unwrap_or(0)
+        .checked_add(VDSO_GAP + PAGE_SIZE)
+        .ok_or_else(|| Error::UnsupportedElf("interpreter span overflow".to_string()))?;
+    // The page tables keep the first large page (the boot area) identity mapped.
+    let floor = heap_end.max(LARGE_PAGE_SIZE);
+    let fits = |end: u64| floor.checked_add(needed).is_some_and(|need| need <= end);
+    let candidate = stack_start / LARGE_PAGE_SIZE * LARGE_PAGE_SIZE + MMAP_BASE % LARGE_PAGE_SIZE;
+    let preferred = if candidate <= stack_start {
+        Some(candidate)
     } else {
-        align_up(
-            main_end
-                .checked_add(INTERPRETER_MIN_BRK_HEADROOM)
-                .ok_or_else(|| Error::UnsupportedElf("interpreter base overflow".to_string()))?,
-            PAGE_SIZE,
-        )
+        candidate.checked_sub(LARGE_PAGE_SIZE)
+    };
+    let mmap_end = match preferred {
+        Some(end) if fits(end) => end,
+        _ if fits(stack_start) => stack_start,
+        _ if interpreter_span.is_none() && heap_end < stack_start => return Ok(None),
+        _ => return Err(Error::LongModeMemoryTooSmall),
+    };
+    let mmap_user_end = MMAP_BASE - (MMAP_BASE - mmap_end) % LARGE_PAGE_SIZE;
+    let window = (memory.guest_end() / 4).max(needed);
+    let identity_end =
+        (mmap_end.saturating_sub(window) / LARGE_PAGE_SIZE * LARGE_PAGE_SIZE).max(floor);
+    memory.establish_user_window(UserWindow {
+        physical_start: identity_end,
+        physical_end: mmap_end,
+        user_start: mmap_user_end - (mmap_end - identity_end),
+        user_end: mmap_user_end,
+    })?;
+    memory.set_user_identity_end(identity_end);
+    Ok(Some(LinuxLayout {
+        identity_end,
+        mmap_start: identity_end,
+        mmap_end,
+        mmap_user_end,
+    }))
+}
+
+/// A PIE main image's window: physical memory just below the mmap window,
+/// mapped at `user_start` (the large page holding the image's start), holding
+/// the image and its program break.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PieWindow {
+    pub(crate) physical_start: u64,
+    pub(crate) physical_end: u64,
+    pub(crate) user_start: u64,
+}
+
+impl PieWindow {
+    pub(crate) fn user_end(&self) -> u64 {
+        self.user_start + (self.physical_end - self.physical_start)
     }
+}
+
+/// The user address of an interpreted PIE's first loaded page, as Linux's
+/// load_elf_binary picks it with randomization off: ELF_ET_DYN_BASE rounded
+/// down to the largest power-of-two PT_LOAD alignment (maximum_alignment, at
+/// least a page), less the first PT_LOAD's address, page-aligned down; plus
+/// that segment's page.
+fn interpreted_pie_start(elf: &Elf<'_>) -> Result<u64> {
+    let loads = || {
+        elf.program_headers
+            .iter()
+            .filter(|header| header.p_type == PT_LOAD)
+    };
+    let alignment = loads()
+        .map(|header| header.p_align)
+        .filter(|align| align.is_power_of_two())
+        .max()
+        .unwrap_or(0)
+        .max(PAGE_SIZE);
+    let base = PIE_BASE & !(alignment - 1);
+    let first = loads()
+        .next()
+        .ok_or_else(|| Error::UnsupportedElf("ELF has no PT_LOAD segment".to_string()))?
+        .p_vaddr;
+    // The bias wraps for an image linked above the base; adding the first
+    // page back undoes the wrap. establish_pie_window bounds the result.
+    let bias = base.wrapping_sub(first) & !(PAGE_SIZE - 1);
+    let (first_page, _) = load_span(elf)?;
+    Ok(bias.wrapping_add(first_page))
+}
+
+/// Carves the PIE window for an image of `span` bytes starting at user
+/// `image_start` out of the top of the identity memory `layout` left below
+/// the mmap window, and ends the identity addresses at its start. The window
+/// starts at the large page holding `image_start` and holds the image and
+/// room for the program break: a quarter of guest memory, or as little as
+/// `brk_headroom` when memory is tight. Both ends are large-page aligned, so
+/// the window maps with large pages. `None` when even that does not fit above
+/// the first large page; the image then loads in identity memory, as before
+/// the window existed.
+pub(crate) fn establish_pie_window(
+    memory: &mut GuestMemory,
+    layout: &mut LinuxLayout,
+    image_start: u64,
+    span: u64,
+    brk_headroom: u64,
+) -> Result<Option<PieWindow>> {
+    let user_start = image_start & !(LARGE_PAGE_SIZE - 1);
+    let image = (image_start - user_start)
+        .checked_add(span)
+        .ok_or_else(|| Error::UnsupportedElf("PIE span overflow".to_string()))?;
+    let size = |headroom: u64| {
+        image
+            .checked_add(headroom)
+            .ok_or_else(|| Error::UnsupportedElf("PIE span overflow".to_string()))
+            .and_then(|size| align_up(size, LARGE_PAGE_SIZE))
+    };
+    let end = layout.mmap_start / LARGE_PAGE_SIZE * LARGE_PAGE_SIZE;
+    let preferred = size((memory.guest_end() / 4).max(brk_headroom))?;
+    let least = size(brk_headroom)?;
+    let start = end.saturating_sub(preferred).max(LARGE_PAGE_SIZE);
+    if end < start
+        || end - start < least
+        || user_start
+            .checked_add(end - start)
+            .is_none_or(|end| end > MMAP_BASE)
+    {
+        return Ok(None);
+    }
+    memory.establish_user_window(UserWindow {
+        physical_start: start,
+        physical_end: end,
+        user_start,
+        user_end: user_start + (end - start),
+    })?;
+    memory.set_user_identity_end(start);
+    layout.identity_end = start;
+    Ok(Some(PieWindow {
+        physical_start: start,
+        physical_end: end,
+        user_start,
+    }))
+}
+
+/// The page-aligned span `[first, end)` of `elf`'s PT_LOAD segments.
+fn load_span(elf: &Elf<'_>) -> Result<(u64, u64)> {
+    let loads = elf
+        .program_headers
+        .iter()
+        .filter(|header| header.p_type == PT_LOAD);
+    let first = loads
+        .clone()
+        .map(|header| header.p_vaddr & !(PAGE_SIZE - 1))
+        .min()
+        .ok_or_else(|| Error::UnsupportedElf("ELF has no PT_LOAD segment".to_string()))?;
+    let mut end = 0;
+    for header in loads {
+        end = end.max(align_up(
+            header
+                .p_vaddr
+                .checked_add(header.p_memsz)
+                .ok_or_else(|| Error::UnsupportedElf("PT_LOAD address overflow".to_string()))?,
+            PAGE_SIZE,
+        )?);
+    }
+    Ok((first, end))
+}
+
+/// Reserves the host vDSO pages' range ([`VDSO_GAP`]) just below physical
+/// `below`, inaccessible, so mappings are placed around it as on the host.
+pub(crate) fn reserve_vdso_gap(memory: &mut GuestMemory, below: u64) -> Result<()> {
+    let start = below
+        .checked_sub(VDSO_GAP)
+        .ok_or(Error::LongModeMemoryTooSmall)?;
+    memory
+        .reserve_region(start, VDSO_GAP, RegionKind::Mmap)?
+        .commit();
+    memory.map_user_permissions(start, VDSO_GAP, false, false)
 }
 
 #[cfg(test)]
@@ -2328,7 +2783,7 @@ mod tests {
         );
         assert_eq!(
             memory.reserved_pages() as u64,
-            BOOT_RESERVED_END / PAGE_SIZE + 2 + STACK_LIMIT / PAGE_SIZE
+            BOOT_RESERVED_END / PAGE_SIZE + 2 + STACK_LIMIT / PAGE_SIZE + VDSO_GAP / PAGE_SIZE
         );
         assert_eq!(
             memory.allocation_cursors().unwrap().mmap_next,
@@ -2338,7 +2793,8 @@ mod tests {
         memory.read_raw(TEST_LOAD_ADDRESS, &mut code).unwrap();
         assert_eq!(code, [0x90, 0xc3]);
         let mut argc = [0; 8];
-        memory.read_raw(loaded.stack_pointer, &mut argc).unwrap();
+        let stack = memory.user_range_to_guest(loaded.stack_pointer, 8).unwrap();
+        memory.read_raw(stack, &mut argc).unwrap();
         assert_eq!(u64::from_le_bytes(argc), 2);
         memory.enable_user_access();
         // Later overlapping headers replace policy; they do not union it.
@@ -2464,6 +2920,188 @@ mod tests {
         assert_eq!(value(11), 0);
     }
 
+    /// The initial stack follows Linux's exec layout at Linux's addresses, so
+    /// the pointers a guest sees match a traced guest's: an 8-byte NULL below
+    /// TASK_SIZE, the exec filename, the envp strings and the argv strings
+    /// (ascending argv, envp, execfn), then, below argv[0] rounded down to 16
+    /// bytes, the platform string, the AT_RANDOM bytes, and the 16-byte-aligned
+    /// argc, argv, envp and auxv words.
+    #[test]
+    fn initial_stack_follows_linux_exec_layout() {
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let image = test_static_elf(&[0x0f, 0x0b]);
+        let loaded = load_static_elf(
+            &mut memory,
+            &image,
+            &["/prog", "a"],
+            &["X=1", "Y=22"],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let execfn = USER_STACK_TOP - 8 - 6;
+        let env_y = execfn - 5;
+        let env_x = env_y - 4;
+        let arg1 = env_x - 2;
+        let arg0 = arg1 - 6;
+        let platform = (arg0 & !0xf) - 7;
+        let random = platform - 16;
+        let auxv = |key: libc::c_ulong| {
+            loaded
+                .auxv
+                .iter()
+                .find(|(entry, _)| *entry == key)
+                .unwrap()
+                .1
+        };
+        assert_eq!(auxv(libc::AT_EXECFN), execfn);
+        assert_eq!(auxv(AT_PLATFORM), platform);
+        assert_eq!(auxv(libc::AT_RANDOM), random);
+        let read = |address: u64, length: usize| {
+            let mut bytes = vec![0; length];
+            let physical = memory.user_range_to_guest(address, length as u64).unwrap();
+            memory.read_raw(physical, &mut bytes).unwrap();
+            bytes
+        };
+        assert_eq!(read(USER_STACK_TOP - 8, 8), [0; 8]);
+        assert_eq!(
+            read(arg0, (USER_STACK_TOP - 8 - arg0) as usize),
+            b"/prog\0a\0X=1\0Y=22\0/prog\0"
+        );
+        assert_eq!(read(platform, 7), b"x86_64\0");
+
+        assert_eq!(read(random, 16), b"Reverie-KVM-ELF!");
+
+        let words = 1 + 3 + 3 + 2 * loaded.auxv.len() as u64 + 2;
+        assert_eq!(loaded.stack_pointer, (random - words * 8) & !0xf);
+        let stack: Vec<u64> = read(loaded.stack_pointer, words as usize * 8)
+            .chunks(8)
+            .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+            .collect();
+        assert_eq!(stack[..7], [2, arg0, arg1, 0, env_x, env_y, 0]);
+        // The auxv pairs as the guest reads them, then AT_NULL.
+        let pairs: Vec<(u64, u64)> = stack[7..]
+            .chunks(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect();
+        let (last, entries) = pairs.split_last().unwrap();
+        assert_eq!(*last, (AT_NULL, 0));
+        assert_eq!(entries, loaded.auxv.as_slice());
+    }
+
+    /// AT_EXECFN names the filename execve was given, which Linux copies to
+    /// the top of the stack above the envp and argv strings. For a `#!`
+    /// script that filename is the script's even though argv[0] is now the
+    /// interpreter's, both when a launcher rewrote argv itself and when this
+    /// loader resolves the script. Naming the interpreter instead shortens the
+    /// strings and moves every stack address the guest logs.
+    #[test]
+    fn initial_stack_names_the_execve_filename_not_argv0() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let read_c_string = |memory: &GuestMemory, address: u64| {
+            let mut bytes = Vec::new();
+            loop {
+                let mut byte = [0];
+                let physical = memory
+                    .user_range_to_guest(address + bytes.len() as u64, 1)
+                    .unwrap();
+                memory.read_raw(physical, &mut byte).unwrap();
+                if byte[0] == 0 {
+                    return String::from_utf8(bytes).unwrap();
+                }
+                bytes.push(byte[0]);
+            }
+        };
+        let execfn_of = |loaded: &LoadedStaticElf| {
+            loaded
+                .auxv
+                .iter()
+                .find(|(entry, _)| *entry == libc::AT_EXECFN)
+                .unwrap()
+                .1
+        };
+
+        // A launcher that already rewrote a script's argv to its interpreter.
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let loaded = load_static_elf_with_execfn(
+            &mut memory,
+            &test_static_elf(&[0x0f, 0x0b]),
+            Some(b"/s/run.sh"),
+            &["/bin/i", "/s/run.sh"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let execfn = USER_STACK_TOP - 8 - 10;
+        assert_eq!(execfn_of(&loaded), execfn);
+        assert_eq!(read_c_string(&memory, execfn), "/s/run.sh");
+        let words = 1 + 3 + 1 + 2 * loaded.auxv.len() as u64 + 2;
+        let argv0 = execfn - 10 - 7;
+        let random = ((argv0 & !0xf) - 7) - 16;
+        assert_eq!(loaded.stack_pointer, (random - words * 8) & !0xf);
+
+        // A script this loader resolves itself keeps the script's filename.
+        let dir = std::env::temp_dir().join(format!("reverie-kvm-execfn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let interpreter = dir.join("interpreter");
+        std::fs::write(&interpreter, test_static_elf(&[0x0f, 0x0b])).unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = dir.join("script.sh");
+        let script_body = format!("#!{}\n", interpreter.display());
+        std::fs::write(&script, &script_body).unwrap();
+        let script_name = script.to_str().unwrap();
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let loaded = load_static_elf(
+            &mut memory,
+            script_body.as_bytes(),
+            &[script_name, "a"],
+            &[],
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(read_c_string(&memory, execfn_of(&loaded)), script_name);
+
+        // Given explicitly, the filename is also the script's argument, even
+        // under a display-only argv[0] and through a script interpreter that
+        // is itself a script, whose name its `#!` line gives.
+        let inner = dir.join("inner.sh");
+        std::fs::write(&inner, &script_body).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let inner_name = inner.to_str().unwrap();
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let loaded = load_static_elf_with_execfn(
+            &mut memory,
+            format!("#!{inner_name}\n").as_bytes(),
+            Some(b"./outer"),
+            &["display", "a"],
+            &[],
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(read_c_string(&memory, execfn_of(&loaded)), "./outer");
+        let word = |address: u64| {
+            let mut bytes = [0; 8];
+            let physical = memory.user_range_to_guest(address, 8).unwrap();
+            memory.read_raw(physical, &mut bytes).unwrap();
+            u64::from_le_bytes(bytes)
+        };
+        let argc = word(loaded.stack_pointer);
+        let argv = (1..=argc)
+            .map(|index| read_c_string(&memory, word(loaded.stack_pointer + 8 * index)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            argv,
+            [
+                interpreter.canonicalize().unwrap().to_str().unwrap(),
+                inner_name,
+                "./outer",
+                "a"
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// `AT_PLATFORM` points at the platform string on the guest stack.
     #[test]
     fn loaded_auxiliary_vector_names_the_platform() {
@@ -2484,6 +3122,7 @@ mod tests {
             .unwrap()
             .1;
         let mut bytes = [0; 7];
+        let platform = memory.user_range_to_guest(platform, 7).unwrap();
         memory.read_raw(platform, &mut bytes).unwrap();
         assert_eq!(&bytes, b"x86_64\0");
     }
@@ -2499,59 +3138,609 @@ mod tests {
         );
     }
 
+    /// The mmap window ends at Linux's mmap_base, its physical end agrees with
+    /// mmap_base modulo a large page, and the identity user addresses end where
+    /// it begins. The window takes a quarter of memory (rounded to a large
+    /// page); a large image moves the identity end above the image and its
+    /// program-break headroom, shrinking the window from below, so ld.so's
+    /// place at the window's top does not move.
     #[test]
-    fn small_pie_keeps_fixed_interpreter_base() {
-        // A typical small PIE loads well under 16 MiB; layout must be unchanged.
+    fn linux_layout_places_the_mmap_window_below_mmap_base() {
+        const MIB: u64 = 1024 * 1024;
+        let mut memory = GuestMemory::new(0, (1024 * MIB) as usize).unwrap();
+        let layout = establish_linux_layout(&mut memory, 0x40_5000, STATIC_BRK_HEADROOM, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(layout.identity_end, 758 * MIB);
+        assert_eq!(layout.mmap_end, 1024 * MIB - STACK_LIMIT - PAGE_SIZE);
         assert_eq!(
-            interpreter_load_bias(MAIN_LOAD_BIAS).unwrap(),
-            INTERPRETER_LOAD_BIAS
+            layout.mmap_end % LARGE_PAGE_SIZE,
+            MMAP_BASE % LARGE_PAGE_SIZE
         );
         assert_eq!(
-            interpreter_load_bias(3 * 1024 * 1024).unwrap(),
-            INTERPRETER_LOAD_BIAS
+            memory.physical_to_user(layout.mmap_end - PAGE_SIZE),
+            Some(MMAP_BASE - PAGE_SIZE)
         );
-        // Exactly at the fixed base still uses it (boundary is inclusive).
         assert_eq!(
-            interpreter_load_bias(INTERPRETER_LOAD_BIAS).unwrap(),
-            INTERPRETER_LOAD_BIAS
+            memory.user_range_to_guest(MMAP_BASE - PAGE_SIZE, PAGE_SIZE),
+            Some(layout.mmap_end - PAGE_SIZE)
+        );
+        assert_eq!(memory.user_range_to_guest(MMAP_BASE, 1), None);
+        assert_eq!(memory.user_range_to_guest(layout.identity_end, 1), None);
+        assert_eq!(
+            memory.user_range_to_guest(layout.identity_end - 1, 1),
+            Some(layout.identity_end - 1)
+        );
+
+        // A 256 MiB guest keeps identity addresses past 128 MiB, where guest
+        // programs map MAP_FIXED.
+        let mut quarter = GuestMemory::new(0, (256 * MIB) as usize).unwrap();
+        let layout = establish_linux_layout(&mut quarter, 0x40_5000, STATIC_BRK_HEADROOM, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(layout.identity_end, 182 * MIB);
+        assert_eq!(
+            quarter.user_range_to_guest(0x0800_3000, PAGE_SIZE),
+            Some(0x0800_3000)
+        );
+
+        let mut large = GuestMemory::new(0, (1024 * MIB) as usize).unwrap();
+        let layout = establish_linux_layout(
+            &mut large,
+            800 * MIB + 1,
+            INTERPRETED_BRK_HEADROOM,
+            Some(0x3b000),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(layout.identity_end, 804 * MIB + PAGE_SIZE);
+        assert_eq!(layout.mmap_end, 1024 * MIB - STACK_LIMIT - PAGE_SIZE);
+        let mut small = GuestMemory::new(0, (8 * MIB) as usize).unwrap();
+        assert!(establish_linux_layout(&mut small, 0x40_5000, STATIC_BRK_HEADROOM, None).is_err());
+        let mut overflow = GuestMemory::new(0, (16 * MIB) as usize).unwrap();
+        assert!(
+            establish_linux_layout(&mut overflow, u64::MAX - 1024, STATIC_BRK_HEADROOM, None)
+                .is_err()
         );
     }
 
+    /// The smallest memory the loader accepted before the mmap window existed
+    /// still loads: a 12 MiB guest holds the boot area, a two-page static image
+    /// at 2 MiB with its 1 MiB of program-break headroom, the window with the
+    /// vDSO gap, and the 8 MiB stack.
     #[test]
-    fn large_pie_relocates_interpreter_above_main_image() {
-        // rustc/cargo observed main image end that overran the fixed base.
-        let main_end = 0x015b_bb30;
-        let base = interpreter_load_bias(main_end).unwrap();
-        // Interpreter is placed above the main image (no overlap)...
-        assert!(
-            base > main_end,
-            "interpreter base {base:#x} must clear main end {main_end:#x}"
-        );
-        // ...page-aligned...
+    fn loader_fits_a_static_image_in_a_twelve_mib_guest() {
+        const MIB: u64 = 1024 * 1024;
+        let mut memory = GuestMemory::new(0, (12 * MIB) as usize).unwrap();
+        let image = test_static_elf(&[0x0f, 0x0b]);
+        let loaded = load_static_elf(
+            &mut memory,
+            &image,
+            &["initial"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.brk_limit, TEST_LOAD_ADDRESS + 0x2000 + MIB);
+        assert_eq!(loaded.mmap_limit, 4 * MIB - PAGE_SIZE);
         assert_eq!(
-            base % PAGE_SIZE,
+            memory.physical_to_user(loaded.mmap_limit - PAGE_SIZE),
+            Some(MMAP_BASE - PAGE_SIZE)
+        );
+    }
+
+    /// A minimal ELF64 x86-64 image of type `e_type`: one PT_LOAD of `memsz`
+    /// bytes at `vaddr` holding `code` (entered at `vaddr`), and a PT_INTERP
+    /// naming `interpreter` when given.
+    fn test_elf(
+        e_type: u16,
+        vaddr: u64,
+        memsz: u64,
+        interpreter: Option<&std::path::Path>,
+        code: &[u8],
+    ) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut image = vec![0; TEST_CODE_OFFSET + code.len()];
+        image[..4].copy_from_slice(b"\x7fELF");
+        image[4] = ELFCLASS64;
+        image[5] = ELFDATA2LSB;
+        image[6] = 1;
+        image[16..18].copy_from_slice(&e_type.to_le_bytes());
+        image[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        image[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        image[24..32].copy_from_slice(&vaddr.to_le_bytes());
+        image[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        image[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        image[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        let header = |image: &mut Vec<u8>, at: usize, fields: [u64; 6], kind: u32, flags: u32| {
+            image[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            image[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+            for (index, field) in fields.iter().enumerate() {
+                let start = at + 8 + index * 8;
+                image[start..start + 8].copy_from_slice(&field.to_le_bytes());
+            }
+        };
+        let mut next = 64;
+        if let Some(path) = interpreter {
+            let path = path.as_os_str().as_bytes();
+            let path_offset = 64 + 2 * 56;
+            image[path_offset..path_offset + path.len()].copy_from_slice(path);
+            let size = path.len() as u64 + 1;
+            header(
+                &mut image,
+                next,
+                [path_offset as u64, 0, 0, size, size, 1],
+                PT_INTERP,
+                4,
+            );
+            next += 56;
+        }
+        header(
+            &mut image,
+            next,
+            [
+                TEST_CODE_OFFSET as u64,
+                vaddr,
+                vaddr,
+                code.len() as u64,
+                memsz,
+                PAGE_SIZE,
+            ],
+            PT_LOAD,
+            PF_X | 4,
+        );
+        let headers = (next - 64) / 56 + 1;
+        image[56..58].copy_from_slice(&(headers as u16).to_le_bytes());
+        image[TEST_CODE_OFFSET..].copy_from_slice(code);
+        image
+    }
+
+    /// Writes a small ET_DYN interpreter whose one segment spans `memsz` bytes
+    /// from `vaddr`, and returns a static-address main image that names it.
+    fn dynamic_program(name: &str, vaddr: u64, memsz: u64) -> (std::path::PathBuf, Vec<u8>) {
+        let dir =
+            std::env::temp_dir().join(format!("reverie-kvm-interp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ld.so");
+        std::fs::write(&path, test_elf(ET_DYN, vaddr, memsz, None, &[0x0f, 0x0b])).unwrap();
+        let main = test_elf(
+            ET_EXEC,
+            TEST_LOAD_ADDRESS,
+            0x2000,
+            Some(&path),
+            &[0x0f, 0x0b],
+        );
+        (dir, main)
+    }
+
+    /// The window grows to hold a large interpreter: a 70 MiB interpreter
+    /// span in a 256 MiB guest loads at the window's top, as before the window
+    /// existed it loaded at 16 MiB.
+    #[test]
+    fn loader_sizes_the_window_for_a_large_interpreter() {
+        const MIB: u64 = 1024 * 1024;
+        let (dir, main) = dynamic_program("large", 0, 70 * MIB);
+        let mut memory = GuestMemory::new(0, (256 * MIB) as usize).unwrap();
+        let loaded = load_static_elf(
+            &mut memory,
+            &main,
+            &["initial"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.entry_point, MMAP_BASE - 70 * MIB);
+        let physical = memory
+            .user_range_to_guest(loaded.entry_point, 70 * MIB)
+            .unwrap();
+        assert!(physical >= loaded.brk_limit);
+        assert!(loaded.brk_limit >= TEST_LOAD_ADDRESS + 0x2000 + INTERPRETED_BRK_HEADROOM);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An interpreter whose first segment lies above where the window could
+    /// bias it is refused, not loaded at a wrapped address.
+    #[test]
+    fn loader_refuses_an_interpreter_above_the_window() {
+        const MIB: u64 = 1024 * 1024;
+        let (dir, main) = dynamic_program("high", 0x4000_0000, 0x2000);
+        let mut memory = GuestMemory::new(0, (64 * MIB) as usize).unwrap();
+        let error = load_static_elf(
+            &mut memory,
+            &main,
+            &["initial"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::UnsupportedElf(reason) if reason.contains("above the mmap window")),
+            "{error:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A static program in memory too small for the mmap window keeps the
+    /// layout memory had before it: an 11 MiB + 12 KiB guest leaves one page
+    /// between the image's program-break headroom and the stack, and mappings
+    /// go there bottom-up.
+    #[test]
+    fn static_program_without_room_for_a_window_keeps_the_identity_layout() {
+        const MIB: u64 = 1024 * 1024;
+        let mut memory = GuestMemory::new(0, (11 * MIB + 0x3000) as usize).unwrap();
+        let image = test_static_elf(&[0x0f, 0x0b]);
+        let loaded = load_static_elf(
+            &mut memory,
+            &image,
+            &["initial"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.brk_limit, 0x30_2000);
+        assert_eq!(loaded.mmap_base, 0x30_2000);
+        assert_eq!(loaded.mmap_limit, 0x30_3000);
+        assert!(!memory.has_mmap_window());
+        assert_eq!(memory.user_layout().0.len(), 1, "the stack window only");
+    }
+
+    /// When memory is too tight for the window to end at the highest address
+    /// congruent with mmap_base, it ends at the stack window instead, with its
+    /// user end moved down (by less than a large page) to keep user and
+    /// physical addresses congruent; the vDSO gap stays below it.
+    #[test]
+    fn tight_memory_moves_the_window_user_end_down() {
+        const MIB: u64 = 1024 * 1024;
+        let mut memory = GuestMemory::new(0, (11 * MIB + 0x10000) as usize).unwrap();
+        let image = test_static_elf(&[0x0f, 0x0b]);
+        let loaded = load_static_elf(
+            &mut memory,
+            &image,
+            &["initial"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.mmap_limit, 0x31_0000);
+        let user_end = memory
+            .physical_to_user(loaded.mmap_limit - PAGE_SIZE)
+            .unwrap()
+            + PAGE_SIZE;
+        assert_eq!(user_end, MMAP_BASE - 0xef000);
+        assert_eq!(
+            user_end % LARGE_PAGE_SIZE,
+            loaded.mmap_limit % LARGE_PAGE_SIZE
+        );
+        assert_eq!(
+            memory.reservation_kind(loaded.mmap_limit - VDSO_GAP),
+            Some(RegionKind::Mmap)
+        );
+        // An interpreter that needs the whole stretch up to the stack fits too.
+        let mut tight = GuestMemory::new(0, (11 * MIB + 0x10000) as usize).unwrap();
+        let layout = establish_linux_layout(
+            &mut tight,
+            0x20_2000,
+            STATIC_BRK_HEADROOM,
+            Some(0x31_0000 - 0x30_2000 - VDSO_GAP - PAGE_SIZE),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(layout.mmap_end, 0x31_0000);
+        assert_eq!(layout.mmap_user_end, MMAP_BASE - 0xef000);
+    }
+
+    /// An interpreted PIE main image (ET_DYN with a small interpreter) whose one
+    /// segment is linked at `vaddr` with `align`, `memsz` bytes long; the
+    /// interpreter file lives in the returned directory.
+    fn interpreted_pie(
+        name: &str,
+        vaddr: u64,
+        memsz: u64,
+        align: u64,
+    ) -> (std::path::PathBuf, Vec<u8>) {
+        let dir =
+            std::env::temp_dir().join(format!("reverie-kvm-pie-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ld.so");
+        std::fs::write(&path, test_elf(ET_DYN, 0, 0x2000, None, &[0x0f, 0x0b])).unwrap();
+        let mut main = test_elf(ET_DYN, vaddr, memsz, Some(&path), &[0x0f, 0x0b]);
+        // The PT_LOAD header follows the PT_INTERP one; p_align is its last word.
+        let align_at = 64 + 56 + 48;
+        main[align_at..align_at + 8].copy_from_slice(&align.to_le_bytes());
+        (dir, main)
+    }
+
+    fn load(memory: &mut GuestMemory, image: &[u8]) -> Result<LoadedStaticElf> {
+        load_static_elf(
+            memory,
+            image,
+            &["initial"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+    }
+
+    /// An interpreted PIE main image loads where Linux loads it, ELF_ET_DYN_BASE,
+    /// in its own window below the mmap window, and its program break follows
+    /// the image there: brk grows and shrinks in the window, the window's
+    /// physical pages are not identity addresses, and identity fallbacks stay
+    /// below it.
+    #[test]
+    fn interpreted_pie_loads_at_linux_pie_base() {
+        const MIB: u64 = 1024 * 1024;
+        let (dir, image) = interpreted_pie("base", 0, 0x3000, PAGE_SIZE);
+        let mut memory = GuestMemory::new(0, (64 * MIB) as usize).unwrap();
+        let mut loaded = load(&mut memory, &image).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The entry is ld.so's; the image's entry and headers are its auxv.
+        let auxv = &loaded.auxv;
+        let aux = |key: u64| auxv.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+        assert_eq!(aux(libc::AT_ENTRY), Some(PIE_BASE));
+        assert_eq!(loaded.program_break, PIE_BASE + 0x3000);
+        assert_eq!(loaded.heap_base, PIE_BASE + 0x3000);
+        let physical = memory.user_range_to_guest(PIE_BASE, 0x3000).unwrap();
+        let (windows, identity_end) = memory.user_layout();
+        assert_eq!(windows.len(), 3, "PIE, mmap and stack windows");
+        assert!(physical >= identity_end && physical < loaded.mmap_base);
+        assert_eq!(physical % LARGE_PAGE_SIZE, PIE_BASE % LARGE_PAGE_SIZE);
+        assert_eq!(memory.user_range_to_guest(physical, 1), None);
+        assert!(loaded.brk_limit > loaded.program_break);
+        assert_eq!(
+            memory.user_range_to_guest(loaded.brk_limit - PAGE_SIZE, PAGE_SIZE),
+            Some(loaded.mmap_base - PAGE_SIZE)
+        );
+        memory.enable_user_access();
+        let low = crate::executor::place_mapping(
+            &memory,
+            &loaded,
+            PAGE_SIZE,
             0,
-            "interpreter base {base:#x} must be page aligned"
-        );
-        // ...past the reserved program-break headroom...
-        assert!(
-            base >= main_end + INTERPRETER_MIN_BRK_HEADROOM,
-            "interpreter base {base:#x} must reserve brk headroom above {main_end:#x}"
-        );
-        // ...and above the historical fixed base since the image overran it.
-        assert!(base > INTERPRETER_LOAD_BIAS);
-        // Exact expected value: align_up(main_end + headroom, PAGE_SIZE).
+            crate::executor::MappingKind::Anonymous,
+            true,
+        )
+        .unwrap();
+        assert_eq!(low, identity_end - PAGE_SIZE);
+        let grown = PIE_BASE + 0x3000 + 16 * PAGE_SIZE;
         assert_eq!(
-            base,
-            align_up(main_end + INTERPRETER_MIN_BRK_HEADROOM, PAGE_SIZE).unwrap()
+            crate::executor::test_brk(&mut memory, &mut loaded, grown),
+            grown as i64
+        );
+        memory.user().write(grown - 1, &[7]).unwrap();
+        let shrunk = PIE_BASE + 0x3000 + PAGE_SIZE;
+        assert_eq!(
+            crate::executor::test_brk(&mut memory, &mut loaded, shrunk),
+            shrunk as i64
+        );
+        assert!(memory.user().read(grown - 1, &mut [0]).is_err());
+        let limit = loaded.brk_limit;
+        assert_eq!(
+            crate::executor::test_brk(&mut memory, &mut loaded, limit),
+            shrunk as i64
         );
     }
 
+    /// Linux rounds ELF_ET_DYN_BASE down to the image's largest PT_LOAD
+    /// alignment, and biases an image linked anywhere so its first segment
+    /// lands there: a 2 MiB-aligned PIE starts at 0x555555400000, and ones
+    /// linked at 0x08000000 and at 0x600000000000 (above the base) are moved
+    /// down to ELF_ET_DYN_BASE.
     #[test]
-    fn interpreter_base_overflow_is_reported() {
-        // A main image ending near u64::MAX cannot reserve headroom; report it
-        // rather than wrapping.
-        assert!(interpreter_load_bias(u64::MAX - 1024).is_err());
+    fn interpreted_pie_placement_follows_alignment_and_relocates_down() {
+        const MIB: u64 = 1024 * 1024;
+        // The segment's file offset is TEST_CODE_OFFSET, so a 2 MiB-aligned
+        // segment is linked at that offset to stay congruent.
+        for (name, vaddr, align, start) in [
+            (
+                "aligned",
+                TEST_CODE_OFFSET as u64,
+                LARGE_PAGE_SIZE,
+                0x5555_5540_0000_u64,
+            ),
+            ("linked-high", 0x0800_0000, PAGE_SIZE, PIE_BASE),
+            ("linked-above-base", 0x6000_0000_0000, PAGE_SIZE, PIE_BASE),
+        ] {
+            let (dir, image) = interpreted_pie(name, vaddr, 0x3000, align);
+            let mut memory = GuestMemory::new(0, (256 * MIB) as usize).unwrap();
+            let loaded = load(&mut memory, &image).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            let entry = loaded
+                .auxv
+                .iter()
+                .find(|(key, _)| *key == libc::AT_ENTRY)
+                .map(|(_, value)| *value);
+            assert_eq!(entry, Some(start), "{name}");
+            assert_eq!(loaded.program_break, start + 0x3000, "{name}");
+            assert!(
+                memory.user_range_to_guest(start, 0x3000).is_some(),
+                "{name}"
+            );
+        }
+    }
+
+    /// An ET_DYN image without an interpreter (a static PIE) is not placed at
+    /// ELF_ET_DYN_BASE: Linux maps it through mmap placement, which is not
+    /// modelled, so it keeps the identity placement at 2 MiB.
+    #[test]
+    fn static_pie_keeps_identity_placement() {
+        const MIB: u64 = 1024 * 1024;
+        let image = test_elf(ET_DYN, 0, 0x3000, None, &[0x0f, 0x0b]);
+        let mut memory = GuestMemory::new(0, (64 * MIB) as usize).unwrap();
+        let loaded = load(&mut memory, &image).unwrap();
+        assert_eq!(loaded.entry_point, MAIN_LOAD_BIAS);
+        assert_eq!(memory.user_layout().0.len(), 2, "mmap and stack windows");
+    }
+
+    /// An interpreted PIE in memory too small for its window loads in identity
+    /// memory, at 2 MiB, as before the window existed.
+    #[test]
+    fn interpreted_pie_without_room_for_its_window_loads_in_identity_memory() {
+        const MIB: u64 = 1024 * 1024;
+        let (dir, image) = interpreted_pie("small", 0, 0x3000, PAGE_SIZE);
+        let mut memory = GuestMemory::new(0, (16 * MIB) as usize).unwrap();
+        let loaded = load(&mut memory, &image).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let entry = loaded
+            .auxv
+            .iter()
+            .find(|(key, _)| *key == libc::AT_ENTRY)
+            .map(|(_, value)| *value);
+        assert_eq!(entry, Some(MAIN_LOAD_BIAS));
+        assert_eq!(
+            memory.user_range_to_guest(MAIN_LOAD_BIAS, PAGE_SIZE),
+            Some(MAIN_LOAD_BIAS)
+        );
+        assert_eq!(memory.user_range_to_guest(PIE_BASE, 1), None);
+    }
+
+    /// brk does not go below the image's data (Linux's end_data under
+    /// CONFIG_COMPAT_BRK): with a fully file-backed segment the data page
+    /// survives a request below it; with bss, the break may go down to the end
+    /// of the file contents, as on Linux, and no lower.
+    #[test]
+    fn brk_stays_at_or_above_the_image_data() {
+        let mut contents = vec![0; 0x2000];
+        contents[..2].copy_from_slice(&[0x0f, 0x0b]);
+        contents[0x1800] = 0x5a;
+        let full = test_static_elf(&contents);
+        let bss = test_static_elf(&[0x0f, 0x0b]);
+        for (image, min_break) in [(full, 0x20_2000_u64), (bss, 0x20_0002)] {
+            let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+            let mut loaded = load_static_elf(
+                &mut memory,
+                &image,
+                &["initial"],
+                &[],
+                &std::env::current_dir().unwrap(),
+            )
+            .unwrap();
+            memory.enable_user_access();
+            assert_eq!(loaded.min_break, min_break);
+            assert_eq!(loaded.program_break, 0x20_2000);
+            let below = min_break - 1;
+            assert_eq!(
+                crate::executor::test_brk(&mut memory, &mut loaded, below),
+                0x20_2000
+            );
+            let mut byte = [0];
+            memory.user().read(0x20_1800, &mut byte).unwrap();
+            assert_eq!(byte, [image_byte(min_break)]);
+            assert_eq!(
+                crate::executor::test_brk(&mut memory, &mut loaded, min_break),
+                min_break as i64
+            );
+        }
+        fn image_byte(min_break: u64) -> u8 {
+            if min_break == 0x20_2000 { 0x5a } else { 0 }
+        }
+    }
+
+    /// An image whose end is a large-page boundary past the window's usual
+    /// start still gets program-break headroom: the identity end moves above
+    /// it, and the break grows.
+    #[test]
+    fn large_image_keeps_program_break_headroom() {
+        const MIB: u64 = 1024 * 1024;
+        let mut memory = GuestMemory::new(0, (64 * MIB) as usize).unwrap();
+        let mut image = test_static_elf(&[0x0f, 0x0b]);
+        image[104..112].copy_from_slice(&(48 * MIB - TEST_LOAD_ADDRESS).to_le_bytes());
+        let loaded = load_static_elf(
+            &mut memory,
+            &image,
+            &["initial"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.program_break, 48 * MIB);
+        assert_eq!(loaded.brk_limit, 49 * MIB);
+        assert_eq!(
+            memory.user_range_to_guest(49 * MIB - 1, 1),
+            Some(49 * MIB - 1)
+        );
+        assert_eq!(memory.user_range_to_guest(49 * MIB, 1), None);
+        memory.enable_user_access();
+        let mut state = loaded;
+        let grown = 48 * MIB + 16 * PAGE_SIZE;
+        assert_eq!(
+            crate::executor::test_brk(&mut memory, &mut state, grown),
+            grown as i64
+        );
+        assert!(memory.user().write(grown - 1, &[1]).is_ok());
+    }
+
+    /// Exec replaces the whole layout. A program whose image needs a higher
+    /// identity end than the one before it, and the reverse, both load into
+    /// the memory the other left, with the same windows and identity addresses
+    /// as in fresh memory.
+    #[test]
+    fn exec_replaces_a_layout_with_a_different_identity_end() {
+        const MIB: u64 = 1024 * 1024;
+        let small = test_static_elf(&[0x0f, 0x0b]);
+        let mut large = test_static_elf(&[0x0f, 0x0b]);
+        large[104..112].copy_from_slice(&(48 * MIB - TEST_LOAD_ADDRESS).to_le_bytes());
+        let load = |memory: &mut GuestMemory, image: &[u8]| {
+            load_static_elf(
+                memory,
+                image,
+                &["initial"],
+                &[],
+                &std::env::current_dir().unwrap(),
+            )
+            .unwrap()
+        };
+        let fresh = |image: &[u8]| {
+            let mut memory = GuestMemory::new(0, (64 * MIB) as usize).unwrap();
+            let loaded = load(&mut memory, image);
+            (memory.user_layout(), loaded.brk_limit, loaded.mmap_limit)
+        };
+        let small_layout = fresh(&small);
+        let large_layout = fresh(&large);
+        assert_ne!(small_layout.0.1, large_layout.0.1);
+
+        let mut memory = GuestMemory::new(0, (64 * MIB) as usize).unwrap();
+        for (image, expected) in [
+            (&small, &small_layout),
+            (&large, &large_layout),
+            (&small, &small_layout),
+        ] {
+            let loaded = load(&mut memory, image);
+            assert_eq!(
+                (memory.user_layout(), loaded.brk_limit, loaded.mmap_limit),
+                *expected
+            );
+        }
+    }
+
+    /// A loaded program's mappings are bounded by the layout: the program break
+    /// grows to the identity end, mappings fill the window below mmap_base, and
+    /// the host vDSO pages' range just below mmap_base (no interpreter here) is
+    /// reserved and inaccessible.
+    #[test]
+    fn loader_reserves_the_vdso_gap_and_bounds_mappings_by_the_layout() {
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let image = test_static_elf(&[0x0f, 0x0b]);
+        let loaded = load_static_elf(
+            &mut memory,
+            &image,
+            &["initial"],
+            &[],
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let gap = memory
+            .user_range_to_guest(MMAP_BASE - VDSO_GAP, VDSO_GAP)
+            .unwrap();
+        assert_eq!(gap + VDSO_GAP, loaded.mmap_limit);
+        assert_eq!(memory.reservation_kind(gap), Some(RegionKind::Mmap));
+        memory.enable_user_access();
+        assert!(memory.user().read(MMAP_BASE - VDSO_GAP, &mut [0]).is_err());
+        assert_eq!(loaded.brk_limit, loaded.mmap_base);
+        assert_eq!(
+            memory.physical_to_user(loaded.mmap_base),
+            Some(MMAP_BASE - (loaded.mmap_limit - loaded.mmap_base))
+        );
     }
 
     #[test]

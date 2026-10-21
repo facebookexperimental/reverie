@@ -1,0 +1,20 @@
+[package]
+name = "reverie-liteinst-artifact"
+version = "0.5.1"
+authors = ["Meta Platforms"]
+# The shared source is also included by Hermit's Rust 2021 script consumers.
+edition = "2021"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+publish = false
+description = "Host-only qualification of Reverie LiteInst artifacts"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+goblin = "=0.10.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "=0.10.9"
+libc = "0.2"

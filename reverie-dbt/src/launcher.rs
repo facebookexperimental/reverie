@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::File;
 use std::future::Future;
 use std::io;
@@ -28,14 +29,15 @@ use std::process::Output;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
 use reverie::BackendStatsRequest;
 use reverie::GlobalTool;
 use reverie_rpc_transport::RpcServer;
 
-use crate::backend_stats::DbtBackendStatsAggregator;
 use crate::backend_stats::DbtBackendStatsSource;
+use crate::backend_stats::DbtStatsCapture;
 use crate::evidence::DbtEvidenceLogLevel;
 use crate::evidence::EvidenceSession;
 
@@ -44,6 +46,19 @@ const DYNAMORIO_ENV: &str = "DYNAMORIO_HOME";
 const DYNAMORIO_DIR_ENV: &str = "DynamoRIO_DIR";
 const SUMMARY_ENV: &str = "REVERIE_DBT_SUMMARY";
 const PATH_ENV: &str = "PATH";
+/// Names, for the bundled DynamoRIO, the variable prefixes it removes from the
+/// guest's initial environment (with its own `DYNAMORIO_*` variables) and passes
+/// on to the children it follows.
+const HIDE_ENV_PREFIXES_ENV: &str = "DYNAMORIO_HIDE_ENV_PREFIXES";
+/// Tells the bundled DynamoRIO that the tool answers the guest's `brk(2)`
+/// itself ([`DbtRunner::tool_answers_brk`]). A `DYNAMORIO_*` variable, so the
+/// guest never sees it.
+const TOOL_ANSWERS_BRK_ENV: &str = "DYNAMORIO_TOOL_ANSWERS_BRK";
+/// The prefix of the runtime's private environment variables, such as
+/// [`crate::sync_rpc::RPC_SOCKET_ENV`] and Hermit's Detcore configuration. The
+/// launcher has DynamoRIO hide every variable with this prefix from the guest,
+/// so a guest sees only the environment it was given.
+pub const PRIVATE_ENV_PREFIX: &str = "HERMIT_DBT_";
 const BINPRM_BUF_SIZE: usize = 256;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm the reserved descriptor across followed execs.
@@ -76,9 +91,37 @@ pub struct DbtRunner {
     summary: bool,
     isolated_process_group: bool,
     terminate_process_group_on_exit: bool,
+    defer_evidence_finish: bool,
+    tool_answers_brk: bool,
+}
+
+// A blocking socket-to-pipe splice can hold the child's stdin pipe mutex
+// while waiting for the next input byte. Read first, then write, so a child
+// can consume each chunk while its producer remains open.
+fn copy_streaming_input<R: Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
+    let mut buffer = [0u8; 8192];
+    let mut copied = 0;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Ok(copied);
+        }
+        writer.write_all(&buffer[..count])?;
+        copied += count as u64;
+    }
 }
 
 impl DbtRunner {
+    /// The static facts about how this backend runs a guest that a tool may
+    /// need, in the same form [`reverie::Backend::capabilities`] reports them
+    /// for backends that implement that trait.
+    pub const fn capabilities() -> reverie::BackendCapabilities {
+        reverie::BackendCapabilities::DBT
+    }
+
     /// Resolves DynamoRIO and the Reverie DBT client from the environment.
     pub fn from_env() -> io::Result<Self> {
         let dynamorio_home = env::var_os(DYNAMORIO_ENV)
@@ -114,12 +157,27 @@ impl DbtRunner {
             summary: false,
             isolated_process_group: false,
             terminate_process_group_on_exit: false,
+            defer_evidence_finish: false,
+            tool_answers_brk: false,
         })
     }
 
     /// Enables or disables the instrumentation summary written at process exit.
     pub fn summary(mut self, enabled: bool) -> Self {
         self.summary = enabled;
+        self
+    }
+
+    /// Declares that the tool answers the guest's `brk(2)` itself, without
+    /// the kernel's program break. DynamoRIO then reserves nothing for the
+    /// break: no region of its own to emulate it in, no nudge of the kernel's
+    /// break, and no inaccessible page after the images it maps for the app
+    /// (the guest's own, where the break starts, and its interpreter's).
+    /// Without this, DynamoRIO answers `brk` from its own emulation, and the
+    /// runner removes the variable that tells DynamoRIO otherwise from every
+    /// environment the launch would pass on.
+    pub fn tool_answers_brk(mut self, enabled: bool) -> Self {
+        self.tool_answers_brk = enabled;
         self
     }
 
@@ -179,6 +237,39 @@ impl DbtRunner {
         self
     }
 
+    /// The appender for records the coordinator emits into this run's
+    /// protected evidence, when an evidence file is configured.
+    pub fn coordinator_evidence(&self) -> Option<crate::CoordinatorEvidence> {
+        self.evidence
+            .as_ref()
+            .map(|evidence| evidence.coordinator_evidence())
+    }
+
+    /// Keeps the protected evidence open after the guest tree is reaped, until
+    /// [`Self::finish_deferred_evidence`].
+    ///
+    /// A coordinator that appends records through [`Self::coordinator_evidence`]
+    /// keeps emitting after the guest exits (Detcore's scheduler logs that its
+    /// run queue emptied), so finishing when the tree is reaped would make
+    /// whether those records are in the stream depend on timing. The caller
+    /// finishes its own shutdown first, then finishes the evidence. Failure
+    /// paths still finish immediately and refuse publication.
+    pub fn defer_evidence_finish(mut self) -> Self {
+        self.defer_evidence_finish = true;
+        self
+    }
+
+    /// Finishes evidence whose finish [`Self::defer_evidence_finish`] deferred,
+    /// combining the guest's `status` with the evidence result as an undeferred
+    /// run does.
+    pub fn finish_deferred_evidence(&self, status: ExitStatus) -> io::Result<ExitStatus> {
+        let evidence = match &self.evidence {
+            Some(evidence) => evidence.finish_deferred(),
+            None => Ok(()),
+        };
+        combine_status_and_evidence(Ok(status), evidence)
+    }
+
     /// Runs the DynamoRIO launcher in a new process group when enabled.
     ///
     /// This lets a Tool terminate the complete instrumented process tree without signaling
@@ -203,7 +294,7 @@ impl DbtRunner {
     /// Runs `guest` with inherited standard streams and waits for it to exit.
     pub fn status(&self, guest: &Command) -> io::Result<ExitStatus> {
         let child = self.spawn_command(&mut self.command(guest, None))?;
-        self.wait_for_status(child)
+        self.wait_for_status(child, None)
     }
 
     /// Runs `guest` with an exact environment instead of inheriting the launcher environment.
@@ -213,7 +304,7 @@ impl DbtRunner {
         environment: &BTreeMap<OsString, OsString>,
     ) -> io::Result<ExitStatus> {
         let child = self.spawn_command(&mut self.command(guest, Some(environment)))?;
-        self.wait_for_status(child)
+        self.wait_for_status(child, None)
     }
 
     /// Runs `guest` and captures its standard output and standard error.
@@ -224,7 +315,7 @@ impl DbtRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
         )?;
-        self.wait_with_output(child)
+        self.wait_with_output(child, None)
     }
 
     /// Captures guest output while preserving an inherited terminal stdin.
@@ -235,7 +326,7 @@ impl DbtRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
         )?;
-        self.wait_with_output(child)
+        self.wait_with_output(child, None)
     }
 
     /// Runs `guest` with captured output and supplies `input` on standard input.
@@ -259,8 +350,16 @@ impl DbtRunner {
         })?;
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(move || io::copy(&mut input, &mut stdin));
-            let output = self.wait_with_output(child);
+            let writer = match std::thread::Builder::new()
+                .spawn_scoped(scope, move || copy_streaming_input(&mut input, &mut stdin))
+            {
+                Ok(writer) => writer,
+                Err(error) => {
+                    self.terminate_and_reap(&mut child);
+                    return Err(error);
+                }
+            };
+            let output = self.wait_with_output(child, None);
             let write_result = writer
                 .join()
                 .map_err(|_| io::Error::other("DBT guest stdin writer thread panicked"))?;
@@ -303,7 +402,7 @@ impl DbtRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
         )?;
-        self.wait_with_output(child)
+        self.wait_with_output(child, None)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -564,13 +663,25 @@ impl DbtRunner {
             .prefix("reverie-dbt-")
             .tempdir_in("/tmp")?;
         let socket = directory.path().join("coordinator.sock");
-        let mut global = Arc::new(G::init_global_state(&config).await);
-        let connected = Arc::new(AtomicBool::new(false));
-        let server = RpcServer::bind_with_connection_readiness(
+        let inherited_input = match &input {
+            CoordinatedInput::Reader(_) => Some(reverie::InheritedInput::pipe(libc::STDIN_FILENO)?),
+            CoordinatedInput::Null | CoordinatedInput::Inherit => None,
+        };
+        let input_lease = inherited_input
+            .as_ref()
+            .map(reverie::InheritedInput::lease)
+            .transpose()?;
+        let mut global = G::init_global_state(&config).await;
+        if let Some(input) = input_lease {
+            global.install_inherited_input(input);
+        }
+        let mut global = Arc::new(global);
+        let requested = Arc::new(AtomicBool::new(false));
+        let server = RpcServer::bind_with_readiness(
             &socket,
             Arc::clone(&global),
             config,
-            Arc::clone(&connected),
+            Arc::clone(&requested),
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
 
@@ -581,16 +692,15 @@ impl DbtRunner {
         // process environment after fork.
         let mut runner = self.clone().client_argument("-external-global");
         let stats_sink = if stats.is_enabled() {
-            let sink = StatsSink::new()?;
-            for argument in sink.client_arguments() {
-                runner = runner.client_argument(argument);
-            }
+            let sink = DbtStatsSink::new()?;
+            runner = sink.configure(runner);
             Some(sink)
         } else {
             None
         };
         let mut command = runner.command(guest, environment);
         command.env(crate::sync_rpc::RPC_SOCKET_ENV, &socket);
+        let mut input_writer = None;
         match &input {
             CoordinatedInput::Null => {
                 command.stdin(Stdio::null());
@@ -599,33 +709,57 @@ impl DbtRunner {
                 command.stdin(Stdio::inherit());
             }
             CoordinatedInput::Reader(_) => {
-                command.stdin(Stdio::piped());
+                let (reader, writer) = inherited_input
+                    .expect("Reader input was prepared")
+                    .into_reader_and_writer();
+                command.stdin(Stdio::from(reader));
+                input_writer = Some(writer);
             }
         }
         if capture_output {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
         let child = runner.spawn_command(&mut command)?;
+        // A reusable Command retains a caller-supplied Stdio owner after spawn.
+        // Keep no parent reader beyond the Tool's temporary initial-image lease.
+        drop(command);
+        // Do not serve the existing config handshake until all parent I/O
+        // threads exist. The guest's native helper cannot publish READY before
+        // receiving that config, including runs without protected evidence.
+        let (setup_sender, setup) = tokio::sync::oneshot::channel();
         let wait = tokio::task::spawn_blocking(move || match input {
             CoordinatedInput::Reader(input) => runner
-                .wait_with_output_and_detached_reader(child, input)
+                .wait_with_output_and_input_writer(
+                    child,
+                    input,
+                    input_writer.expect("Reader writer was retained"),
+                    Some(setup_sender),
+                )
                 .map(ChildWait::Output),
-            CoordinatedInput::Null | CoordinatedInput::Inherit if capture_output => {
-                runner.wait_with_output(child).map(ChildWait::Output)
-            }
-            CoordinatedInput::Null | CoordinatedInput::Inherit => {
-                runner.wait_for_status(child).map(ChildWait::Status)
-            }
+            CoordinatedInput::Null | CoordinatedInput::Inherit if capture_output => runner
+                .wait_with_output(child, Some(setup_sender))
+                .map(ChildWait::Output),
+            CoordinatedInput::Null | CoordinatedInput::Inherit => runner
+                .wait_for_status(child, Some(setup_sender))
+                .map(ChildWait::Status),
         });
-        let wait = serve_rpc_until(server, async move {
+        let completion = async move {
             wait.await
                 .map_err(|error| io::Error::other(error.to_string()))?
-        })
-        .await?;
-        if missing_coordinator_connection_is_error(connected.load(Ordering::Acquire), &wait) {
+        };
+        if setup.await.is_err() {
+            // Setup owns cleanup before dropping its sender. Await its real
+            // error rather than starting the server or losing the child wait.
+            return match completion.await {
+                Err(error) => Err(error),
+                Ok(_) => Err(io::Error::other("DBT launch setup ended without readiness")),
+            };
+        }
+        let wait = serve_rpc_until(server, completion).await?;
+        if missing_coordinator_request_is_error(requested.load(Ordering::Acquire), &wait) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                "DBT guest exited successfully without connecting to the global-state coordinator",
+                "DBT guest exited successfully without sending a request to the global-state coordinator",
             ));
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -677,8 +811,9 @@ impl DbtRunner {
             && let Err(error) = evidence.publish_root(child.id())
         {
             if self.manages_process_group() {
-                let _ = terminate_process_group(child.id() as i32);
-                let _ = wait_for_process_group_no_live_members(child.id() as i32);
+                let _ = child.kill();
+                let _ = wait_for_exit_without_reaping(child.id());
+                let _ = terminate_run(child.id() as i32);
             } else {
                 let _ = child.kill();
             }
@@ -689,32 +824,72 @@ impl DbtRunner {
         Ok(child)
     }
 
-    fn wait_for_status(&self, mut child: Child) -> io::Result<ExitStatus> {
-        let status = if !self.manages_process_group() {
+    fn finish_launch_setup(
+        &self,
+        setup: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> io::Result<()> {
+        if let Some(evidence) = &self.evidence {
+            evidence.start()?;
+        }
+        if let Some(setup) = setup {
+            setup
+                .send(())
+                .map_err(|_| io::Error::other("DBT launch owner was cancelled"))?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_status(
+        &self,
+        mut child: Child,
+        setup: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> io::Result<ExitStatus> {
+        if let Err(error) = self.finish_launch_setup(setup) {
+            self.terminate_and_reap(&mut child);
+            return Err(error);
+        }
+        let status = self.reap_tree(child);
+        self.finish_status(status)
+    }
+
+    /// Waits for the guest's root and, when this runner manages the process
+    /// group, empties the group, then reaps the root. An error here means the
+    /// tree may still hold the guest's output pipes open.
+    fn reap_tree(&self, mut child: Child) -> io::Result<ExitStatus> {
+        if !self.manages_process_group() {
             child.wait()
         } else {
-            let process_group = child.id() as i32;
             let observed = wait_for_exit_without_reaping(child.id());
-            let terminated = if observed.is_ok() {
-                terminate_process_group(process_group)
-            } else {
-                Ok(())
-            };
-            let emptied = match (&observed, &terminated) {
-                (Ok(()), Ok(())) => wait_for_process_group_no_live_members(process_group),
-                _ => Ok(()),
+            let terminated = match &observed {
+                Ok(()) => terminate_run(child.id() as i32),
+                Err(_) => Ok(()),
             };
             let status = child.wait();
-            match (observed.and(terminated).and(emptied), status) {
+            match (observed.and(terminated), status) {
                 (Ok(()), status) => status,
                 (Err(error), _) => Err(error),
             }
-        };
+        }
+    }
+
+    /// Finishes protected evidence for a reaped tree and folds its result into
+    /// the tree's status.
+    fn finish_status(&self, status: io::Result<ExitStatus>) -> io::Result<ExitStatus> {
+        if self.defer_evidence_finish
+            && let Some(evidence) = &self.evidence
+        {
+            evidence.defer_finish(status.is_ok());
+            return status;
+        }
         let evidence = self.finish_evidence(status.is_ok());
         combine_status_and_evidence(status, evidence)
     }
 
-    fn wait_with_output(&self, mut child: Child) -> io::Result<Output> {
+    fn wait_with_output(
+        &self,
+        mut child: Child,
+        setup: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> io::Result<Output> {
         let mut stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -742,16 +917,57 @@ impl DbtRunner {
         }
 
         std::thread::scope(|scope| {
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let stdout_cancelled = Arc::clone(&cancelled);
-            let stderr_cancelled = Arc::clone(&cancelled);
-            let stdout_reader =
-                scope.spawn(move || read_cancellable(&mut stdout, &stdout_cancelled));
-            let stderr_reader =
-                scope.spawn(move || read_cancellable(&mut stderr, &stderr_cancelled));
-            let status = self.wait_for_status(child);
-            if status.is_err() {
-                cancelled.store(true, Ordering::Release);
+            let stop = Arc::new(AtomicU8::new(READ_ON));
+            let stdout_stop = Arc::clone(&stop);
+            let stderr_stop = Arc::clone(&stop);
+            let stdout_reader = match std::thread::Builder::new()
+                .spawn_scoped(scope, move || read_cancellable(&mut stdout, &stdout_stop))
+            {
+                Ok(reader) => reader,
+                Err(error) => {
+                    self.terminate_and_reap(&mut child);
+                    return Err(error);
+                }
+            };
+            let stderr_reader = match std::thread::Builder::new()
+                .spawn_scoped(scope, move || read_cancellable(&mut stderr, &stderr_stop))
+            {
+                Ok(reader) => reader,
+                Err(error) => {
+                    stop.store(READ_DISCARD, Ordering::Release);
+                    self.terminate_and_reap(&mut child);
+                    let _ = stdout_reader.join();
+                    return Err(error);
+                }
+            };
+            // Input and blocking-waiter tasks, when needed, already exist.
+            // Only now release START and the coordinator config handshake.
+            let reaped = match self.finish_launch_setup(setup) {
+                Ok(()) => self.reap_tree(child),
+                Err(error) => {
+                    self.terminate_and_reap(&mut child);
+                    Err(error)
+                }
+            };
+            let reap_failed = reaped.is_err();
+            if reap_failed {
+                // A tree member may still hold the pipes; what was read so far
+                // is not the run's output.
+                stop.store(READ_DISCARD, Ordering::Release);
+            }
+            let status = self.finish_status(reaped);
+            if status.is_err() && !reap_failed {
+                // The tree was reaped, so its members have closed the pipes,
+                // and the readers normally reach end of file at once. A guest
+                // may still have handed a pipe to a process outside the tree;
+                // do not let that hold the error back. Keep what was read.
+                let deadline = std::time::Instant::now() + FAILED_RUN_OUTPUT_DRAIN;
+                while !(stdout_reader.is_finished() && stderr_reader.is_finished())
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                stop.store(READ_KEEP, Ordering::Release);
             }
             let stdout = stdout_reader
                 .join()
@@ -760,33 +976,57 @@ impl DbtRunner {
                 .join()
                 .map_err(|_| io::Error::other("DBT stderr reader thread panicked"));
 
-            Ok(Output {
-                status: status?,
-                stdout: stdout??,
-                stderr: stderr??,
-            })
+            match status {
+                Ok(status) => Ok(Output {
+                    status,
+                    stdout: stdout??,
+                    stderr: stderr??,
+                }),
+                Err(error) => Err(match (stdout, stderr) {
+                    (Ok(Ok(stdout)), Ok(Ok(stderr))) => {
+                        DbtFailedRunOutput::attach(error, stdout, stderr)
+                    }
+                    _ => error,
+                }),
+            }
         })
     }
 
     fn wait_with_output_and_detached_reader<R>(
         &self,
         mut child: Child,
-        mut input: R,
+        input: R,
     ) -> io::Result<Output>
     where
         R: Read + Send + 'static,
     {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
+        let stdin = child.stdin.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "failed to open DBT guest stdin")
         })?;
+        self.wait_with_output_and_input_writer(child, input, stdin, None)
+    }
 
+    fn wait_with_output_and_input_writer<R, W>(
+        &self,
+        mut child: Child,
+        mut input: R,
+        mut stdin: W,
+        setup: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> io::Result<Output>
+    where
+        R: Read + Send + 'static,
+        W: io::Write + Send + 'static,
+    {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-84): Review detaching a source-blocked input pump at child exit.
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _ = sender.send(io::copy(&mut input, &mut stdin));
-        });
-        let output = self.wait_with_output(child)?;
+        if let Err(error) = std::thread::Builder::new().spawn(move || {
+            let _ = sender.send(copy_streaming_input(&mut input, &mut stdin));
+        }) {
+            self.terminate_and_reap(&mut child);
+            return Err(error);
+        }
+        let output = self.wait_with_output(child, setup)?;
         match receiver.try_recv() {
             Ok(Err(error)) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -798,8 +1038,11 @@ impl DbtRunner {
 
     fn terminate_and_reap(&self, child: &mut Child) {
         if self.manages_process_group() {
-            let _ = terminate_process_group(child.id() as i32);
-            let _ = wait_for_process_group_no_live_members(child.id() as i32);
+            let _ = child.kill();
+            let _ = wait_for_exit_without_reaping(child.id());
+            let _ = terminate_run(child.id() as i32);
+        } else {
+            let _ = child.kill();
         }
         let _ = child.wait();
         let _ = self.finish_evidence(false);
@@ -827,6 +1070,11 @@ impl DbtRunner {
         command
             .arg("-quiet")
             .arg("-disable_rseq")
+            // DynamoRIO reserves its code region at -vm_base plus a random
+            // offset (seeded from /dev/urandom), which a guest sees in
+            // /proc/self/maps and smaps: no offset, so the layout repeats.
+            // The value must be hex: DynamoRIO parses address options so.
+            .args(["-vm_max_offset", "0x0"])
             .args(["-stack_size", "2M"])
             .arg("-c")
             .arg(&self.client)
@@ -840,7 +1088,18 @@ impl DbtRunner {
         }
         command.args(&self.client_arguments);
         if self.evidence.is_some() || self.isolated_process_group {
-            command.arg("-isolated-process-group");
+            // The client finds the run's root from this pid (the process whose
+            // parent is this one), whatever process groups or sessions the
+            // guest makes.
+            command
+                .arg("-launcher-pid")
+                .arg(std::process::id().to_string());
+            // Outside a PID namespace of its own the run is contained by its
+            // process group (`terminate_run`), which the client then keeps
+            // the guest from leaving.
+            if !is_namespace_init() {
+                command.arg("-contain-by-process-group");
+            }
         }
         if self.summary {
             command.arg("-summary");
@@ -878,7 +1137,18 @@ impl DbtRunner {
                 }
             }
         }
-        if self.manages_process_group() {
+        command.env(HIDE_ENV_PREFIXES_ENV, PRIVATE_ENV_PREFIX);
+        // DynamoRIO acts on the variable's presence, whatever its value, so
+        // without the option it is removed from whichever environment the
+        // launch would otherwise pass on: inherited, the guest's, or explicit.
+        if self.tool_answers_brk {
+            command.env(TOOL_ANSWERS_BRK_ENV, "1");
+        } else {
+            command.env_remove(TOOL_ANSWERS_BRK_ENV);
+        }
+        // A PID namespace's init contains the run by the namespace
+        // (`terminate_run`); elsewhere the run gets its own process group.
+        if self.manages_process_group() && !is_namespace_init() {
             command.process_group(0);
         }
 
@@ -939,6 +1209,56 @@ impl DbtRunner {
 /// not an `io::ErrorKind` any caller should branch on. The underlying error is
 /// preserved verbatim in the message, which is where the cause has always been
 /// read.
+/// The output a DBT run captured before its status or its protected evidence
+/// failed.
+///
+/// The output methods of [`DbtRunner`] return an [`io::Error`] that carries
+/// this value, with the original error's kind and message, when the guest tree
+/// was reaped. A run that ends on a backend or Tool failure usually wrote the
+/// reason to its stderr just before, so a caller can still show it. Read it
+/// with [`failed_run_output`]. The streams hold everything the tree wrote,
+/// unless a guest handed a pipe to a process outside the tree: the readers
+/// then stop after a bounded drain, and the streams end there.
+#[derive(Debug)]
+pub struct DbtFailedRunOutput {
+    /// Everything the guest tree wrote to stdout.
+    pub stdout: Vec<u8>,
+    /// Everything the guest tree wrote to stderr.
+    pub stderr: Vec<u8>,
+    error: io::Error,
+}
+
+impl DbtFailedRunOutput {
+    fn attach(error: io::Error, stdout: Vec<u8>, stderr: Vec<u8>) -> io::Error {
+        io::Error::new(
+            error.kind(),
+            Self {
+                stdout,
+                stderr,
+                error,
+            },
+        )
+    }
+}
+
+impl fmt::Display for DbtFailedRunOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for DbtFailedRunOutput {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// The output that a failed DBT run captured, when `error` came from one of
+/// [`DbtRunner`]'s output methods and the output was read in full.
+pub fn failed_run_output(error: &io::Error) -> Option<&DbtFailedRunOutput> {
+    error.get_ref()?.downcast_ref()
+}
+
 fn combine_status_and_evidence(
     status: io::Result<ExitStatus>,
     evidence: io::Result<()>,
@@ -962,20 +1282,27 @@ fn combine_status_and_evidence(
 /// file (see `native/client.c`). A shared path with append-mode opens (O_APPEND)
 /// keeps concurrent appends atomic and side-steps the drrun -> guest exec fd
 /// inheritance problem the diagnostic fd works around. After the whole tree is
-/// reaped, [`StatsSink::drain`] decodes and commutatively aggregates every
-/// record into one snapshot.
-struct StatsSink {
+/// reaped, [`Self::capture`] retains the exact artifact; [`DbtStatsCapture::snapshot`]
+/// decodes and commutatively aggregates its records.
+pub struct DbtStatsSink {
     // Owns the temporary directory; dropping it removes the backing file. Held
     // until after `drain` reads the records.
     _directory: tempfile::TempDir,
     path: PathBuf,
 }
 
-impl StatsSink {
-    fn new() -> io::Result<Self> {
-        let directory = tempfile::Builder::new()
-            .prefix("reverie-dbt-stats-")
-            .tempdir()?;
+impl DbtStatsSink {
+    /// Allocate using this launcher's existing prefix and the caller's TMPDIR.
+    pub fn new() -> io::Result<Self> {
+        Self::with_prefix("reverie-dbt-stats-")
+    }
+
+    /// Allocate with a caller's existing visible name prefix and TMPDIR.
+    ///
+    /// A caller entering a private filesystem can declare a bind of
+    /// [`Self::directory`] before launch, keeping this owner until completion.
+    pub fn with_prefix(prefix: &str) -> io::Result<Self> {
+        let directory = tempfile::Builder::new().prefix(prefix).tempdir()?;
         let path = directory.path().join("records.bin");
         Ok(Self {
             _directory: directory,
@@ -983,11 +1310,45 @@ impl StatsSink {
         })
     }
 
+    /// Borrow the backing directory for an existing container mount declaration.
+    pub fn directory(&self) -> &Path {
+        self._directory.path()
+    }
+
+    /// Configure the native client to append its records to this owned sink.
+    pub fn configure(&self, runner: DbtRunner) -> DbtRunner {
+        self.configure_at(runner, self.directory())
+    }
+
+    /// Configure the client using this sink's directory as seen by the guest.
+    ///
+    /// The caller must make `guest_directory` refer to [`Self::directory`] in
+    /// the guest's filesystem. This only changes the client argument: the sink
+    /// still owns and reads its unique host path until [`Self::capture`].
+    pub fn configure_at(&self, mut runner: DbtRunner, guest_directory: &Path) -> DbtRunner {
+        for argument in self.client_arguments(guest_directory) {
+            runner = runner.client_argument(argument);
+        }
+        runner
+    }
+
+    /// Read exact records after the caller has reaped the followed process tree.
+    ///
+    /// This consumes and removes the sink. Read failures remain completion data
+    /// so the caller can preserve its guest-result and evidence-error precedence.
+    pub fn capture(self) -> DbtStatsCapture {
+        DbtStatsCapture::read(&self.path)
+    }
+
     /// The `-stats_path <path>` client arguments passed to the native client.
-    fn client_arguments(&self) -> [OsString; 2] {
+    fn client_arguments(&self, directory: &Path) -> [OsString; 2] {
+        let filename = self
+            .path
+            .file_name()
+            .expect("the owned stats path has a filename");
         [
             OsString::from("-stats_path"),
-            self.path.clone().into_os_string(),
+            directory.join(filename).into_os_string(),
         ]
     }
 
@@ -996,18 +1357,9 @@ impl StatsSink {
     /// A missing file means no instrumented image reported (for example the
     /// guest died before `event_exit`); that yields an empty snapshot rather
     /// than an error. A present but malformed or truncated stream is a hard
-    /// error, matching [`DbtBackendStatsAggregator::absorb_wire_stream`].
+    /// error, matching [`crate::backend_stats::DbtBackendStatsAggregator::absorb_wire_stream`].
     fn drain(self) -> io::Result<DbtBackendStatsSource> {
-        let bytes = match std::fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error),
-        };
-        let mut aggregator = DbtBackendStatsAggregator::new();
-        aggregator
-            .absorb_wire_stream(&bytes)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        Ok(aggregator.into_source())
+        self.capture().legacy_source()
     }
 }
 
@@ -1025,8 +1377,8 @@ impl ChildWait {
     }
 }
 
-fn missing_coordinator_connection_is_error(connected: bool, wait: &ChildWait) -> bool {
-    !connected && wait.status().success()
+fn missing_coordinator_request_is_error(requested: bool, wait: &ChildWait) -> bool {
+    !requested && wait.status().success()
 }
 
 enum CoordinatedInput {
@@ -1138,28 +1490,63 @@ fn set_nonblocking(stream: &impl AsRawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn read_cancellable(reader: &mut impl Read, cancelled: &AtomicBool) -> io::Result<Vec<u8>> {
+/// The output readers keep reading.
+const READ_ON: u8 = 0;
+/// Process-group cleanup failed: the readers stop and return an error.
+const READ_DISCARD: u8 = 1;
+/// The run failed after its tree was reaped: the readers read what is already
+/// in their pipes, then stop and return everything they have read.
+const READ_KEEP: u8 = 2;
+
+/// At most this many more bytes are read after [`READ_KEEP`] is seen, so a
+/// writer outside the reaped tree that never pauses cannot hold a reader.
+const KEPT_OUTPUT_DRAIN_BYTES: usize = 1 << 20;
+
+/// How long the output readers may keep draining after a run that was reaped
+/// has failed. A reaped tree has closed its pipes, so this bounds only a pipe
+/// that a guest handed to a process outside the tree.
+const FAILED_RUN_OUTPUT_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn read_cancellable(reader: &mut impl Read, stop: &AtomicU8) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 8192];
+    // Bytes still allowed after READ_KEEP was seen; None until then.
+    let mut kept_budget: Option<usize> = None;
     loop {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "DBT output capture cancelled after process-group cleanup failed",
-            ));
+        match stop.load(Ordering::Acquire) {
+            READ_DISCARD => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "DBT output capture cancelled after process-group cleanup failed",
+                ));
+            }
+            READ_KEEP if kept_budget.is_none() => kept_budget = Some(KEPT_OUTPUT_DRAIN_BYTES),
+            _ => {}
         }
-        match reader.read(&mut buffer) {
+        let limit = match kept_budget {
+            Some(0) => return Ok(bytes),
+            Some(budget) => budget.min(buffer.len()),
+            None => buffer.len(),
+        };
+        match reader.read(&mut buffer[..limit]) {
             Ok(0) => return Ok(bytes),
-            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Ok(read) => {
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(budget) = &mut kept_budget {
+                    *budget = budget.saturating_sub(read);
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "DBT output capture cancelled after process-group cleanup failed",
-                    ));
+                // The pipe is empty for now. After READ_KEEP that is the end of
+                // the output; otherwise wait for more, or for a stop, which the
+                // top of the loop handles before the next read.
+                if kept_budget.is_some() {
+                    return Ok(bytes);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                if stop.load(Ordering::Acquire) == READ_ON {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
             Err(error) => return Err(error),
         }
@@ -1189,6 +1576,91 @@ fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
             return Err(error);
         }
     }
+}
+
+/// Whether this process is the init of its PID namespace (pid 1), as Hermit's
+/// container init is: then the namespace holds only the run.
+fn is_namespace_init() -> bool {
+    std::process::id() == 1
+}
+
+/// Kill every process of the run but its root, which has exited and is not
+/// yet reaped, and wait until none is left.
+///
+/// As a PID namespace's init, by the namespace: `kill(-1)` kills every
+/// process in it but this one, and each becomes this process's child to reap,
+/// whatever process group or session the guest put it in (`setsid`,
+/// `setpgid`), so none escapes. Elsewhere, by the run's own process group.
+fn terminate_run(root: i32) -> io::Result<()> {
+    if !is_namespace_init() {
+        terminate_process_group(root)?;
+        return wait_for_process_group_no_live_members(root);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // Its result is not the test of an empty namespace: the root, a
+        // zombie kept for the caller to reap, still counts as signalled.
+        // SAFETY: from a namespace init, -1 names every other process of the
+        // namespace.
+        unsafe { libc::kill(-1, libc::SIGKILL) };
+        let mut left = false;
+        for (pid, state) in own_children()? {
+            if pid == root {
+                continue;
+            }
+            left = true;
+            if matches!(state, 'Z' | 'X') {
+                // SAFETY: reaps exactly this exited child.
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            }
+        }
+        // Every process of the namespace descends from its init, and one
+        // whose parent dies becomes the init's child, so no child but the
+        // root means no process of the run is left.
+        if !left {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "DBT containment: the run's processes did not die within 5 s",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// This process's children, each with its state, from `/proc/<pid>/stat`.
+fn own_children() -> io::Result<Vec<(i32, char)>> {
+    let me = std::process::id() as i32;
+    let mut children = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(after_name) = stat.rsplit_once(')').map(|(_, tail)| tail.trim_start()) else {
+            continue;
+        };
+        let mut fields = after_name.split_ascii_whitespace();
+        let (Some(state), Some(parent)) = (
+            fields.next().and_then(|field| field.chars().next()),
+            fields.next().and_then(|field| field.parse::<i32>().ok()),
+        ) else {
+            continue;
+        };
+        if parent == me {
+            children.push((pid, state));
+        }
+    }
+    Ok(children)
 }
 
 fn terminate_process_group(process_group: i32) -> io::Result<()> {
@@ -1397,6 +1869,8 @@ fn duplicate_to_diagnostic_fd(source: libc::c_int) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    mod inherited_input;
+    mod stats_capture;
     use std::io::Seek as _;
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -1406,21 +1880,69 @@ mod tests {
     const TEST_DRRUN_DIAGNOSTIC: &str = "REVERIE_DBT_TEST_DRRUN_DIAGNOSTIC";
 
     #[test]
-    fn failed_guest_status_is_preserved_before_coordinator_connection() {
+    fn failed_guest_status_is_preserved_before_coordinator_request() {
         let bootstrap_failure = ChildWait::Status(ExitStatus::from_raw(125 << 8));
         let other_failure = ChildWait::Status(ExitStatus::from_raw(1 << 8));
         let success = ChildWait::Status(ExitStatus::from_raw(0));
 
-        assert!(!missing_coordinator_connection_is_error(
+        assert!(!missing_coordinator_request_is_error(
             false,
             &bootstrap_failure
         ));
-        assert!(!missing_coordinator_connection_is_error(
+        assert!(!missing_coordinator_request_is_error(false, &other_failure));
+        assert!(missing_coordinator_request_is_error(false, &success));
+        assert!(!missing_coordinator_request_is_error(true, &success));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_only_bootstrap_cannot_satisfy_the_application_request_guard() {
+        use reverie::GlobalRPC as _;
+        use reverie::Tid;
+        use reverie_rpc_transport::BlockingRpcClient;
+
+        use crate::Counter2Global;
+        use crate::counter2_global::Counter2Request;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordinator.sock");
+        let global = Arc::new(Counter2Global::default());
+        let requested = Arc::new(AtomicBool::new(false));
+        let server =
+            RpcServer::bind_with_readiness(&path, Arc::clone(&global), (), Arc::clone(&requested))
+                .unwrap();
+        let serving = tokio::spawn(server.serve());
+        let bootstrap_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::sync_rpc::read_initial_config::<()>(&bootstrap_path).unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(!requested.load(Ordering::Acquire));
+        assert_eq!(global.snapshot(), (0, 0, 0));
+        assert!(missing_coordinator_request_is_error(
             false,
-            &other_failure
+            &ChildWait::Status(ExitStatus::from_raw(0)),
         ));
-        assert!(missing_coordinator_connection_is_error(false, &success));
-        assert!(!missing_coordinator_connection_is_error(true, &success));
+
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let client =
+                BlockingRpcClient::<Counter2Global>::connect(&path, Tid::from_raw(17)).unwrap();
+            runtime.block_on(client.send_rpc(Counter2Request {
+                syscalls: 5,
+                threads: 2,
+            }));
+        })
+        .await
+        .unwrap();
+        assert!(requested.load(Ordering::Acquire));
+        assert_eq!(global.snapshot(), (5, 1, 2));
+        assert!(!missing_coordinator_request_is_error(
+            true,
+            &ChildWait::Status(ExitStatus::from_raw(0)),
+        ));
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
     }
 
     fn runner() -> DbtRunner {
@@ -1434,7 +1956,114 @@ mod tests {
             summary: false,
             isolated_process_group: false,
             terminate_process_group_on_exit: false,
+            defer_evidence_finish: false,
+            tool_answers_brk: false,
         }
+    }
+
+    #[test]
+    fn cancelled_launch_setup_reaps_the_owned_child() {
+        for (capture, process_group) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let runner = runner().terminate_process_group_on_exit(process_group);
+            let mut command = Command::new("/bin/sleep");
+            command.arg("60").process_group(0);
+            if capture {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+            let child = command.spawn().unwrap();
+            let pid = child.id();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            drop(receiver);
+            let error = if capture {
+                runner.wait_with_output(child, Some(sender)).unwrap_err()
+            } else {
+                runner.wait_for_status(child, Some(sender)).unwrap_err()
+            };
+            assert!(error.to_string().contains("DBT launch owner was cancelled"));
+            // Cleanup, including reap, completes before setup failure returns.
+            let waited = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+            assert_eq!(waited, -1);
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    async fn queued_launch_readiness_survives_coordinator_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("coordinator.sock");
+        let requested = Arc::new(AtomicBool::new(false));
+        let server = RpcServer::bind_with_readiness(
+            &socket,
+            Arc::new(crate::Counter2Global::default()),
+            (),
+            Arc::clone(&requested),
+        )
+        .unwrap();
+        let evidence = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::from_env()
+            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+            .evidence_file(&evidence)
+            .unwrap()
+            .defer_evidence_finish()
+            .terminate_process_group_on_exit(true)
+            .client_argument("-external-global");
+        let mut guest = Command::new("/bin/echo");
+        guest
+            .arg("application-started")
+            .env("HERMIT_DBT_COUNTER2", "1");
+        let mut command = runner.command(&guest, None);
+        command
+            .env(crate::sync_rpc::RPC_SOCKET_ENV, &socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = runner.spawn_command(&mut command).unwrap();
+        let pid = child.id() as i32;
+        drop(command);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (done, completed) = std::sync::mpsc::channel();
+        let waiting_runner = runner.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = done.send(waiting_runner.wait_with_output(child, Some(sender)));
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while receiver.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Observe successful send without consuming readiness. This is the
+        // window after setup succeeds but before run_with_global serves RPC.
+        let readiness_queued = !receiver.is_empty();
+        drop(receiver);
+        drop(server);
+        let result = completed.recv_timeout(std::time::Duration::from_secs(10));
+        if result.is_err() {
+            // Bound a regression without allowing cleanup to make it pass.
+            terminate_process_group(pid).unwrap();
+        }
+        waiter.join().unwrap();
+        assert!(readiness_queued, "launch readiness was not queued");
+        let output = result
+            .expect("cancelled coordinator left its guest running")
+            .unwrap();
+        assert_eq!(output.status.signal(), Some(libc::SIGKILL), "{output:?}");
+        assert!(output.stdout.is_empty(), "application ran: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("reverie-dbt: startup refused:"),
+            "the real initial-config request did not refuse startup: {output:?}"
+        );
+        assert!(!requested.load(Ordering::Acquire));
+        assert!(runner.finish_deferred_evidence(output.status).is_err());
+        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     fn write_executable_script(path: &Path, contents: &[u8]) {
@@ -1514,7 +2143,7 @@ mod tests {
         assert!(
             !cleanup_only
                 .get_args()
-                .any(|argument| argument == OsStr::new("-isolated-process-group"))
+                .any(|argument| argument == OsStr::new("-launcher-pid"))
         );
     }
 
@@ -1538,6 +2167,8 @@ mod tests {
             [
                 "-quiet",
                 "-disable_rseq",
+                "-vm_max_offset",
+                "0x0",
                 "-stack_size",
                 "2M",
                 "-c",
@@ -1545,7 +2176,9 @@ mod tests {
                 "-diagnostic_fd",
                 "198",
                 "-panic-on-unsupported-syscalls",
-                "-isolated-process-group",
+                "-launcher-pid",
+                &std::process::id().to_string(),
+                "-contain-by-process-group",
                 "--",
                 "/bin/true",
             ]
@@ -1571,6 +2204,8 @@ mod tests {
             [
                 "-quiet",
                 "-disable_rseq",
+                "-vm_max_offset",
+                "0x0",
                 "-stack_size",
                 "2M",
                 "-c",
@@ -1609,6 +2244,8 @@ mod tests {
             [
                 OsStr::new("-quiet"),
                 OsStr::new("-disable_rseq"),
+                OsStr::new("-vm_max_offset"),
+                OsStr::new("0x0"),
                 OsStr::new("-stack_size"),
                 OsStr::new("2M"),
                 OsStr::new("-c"),
@@ -1641,6 +2278,8 @@ mod tests {
             [
                 OsStr::new("-quiet"),
                 OsStr::new("-disable_rseq"),
+                OsStr::new("-vm_max_offset"),
+                OsStr::new("0x0"),
                 OsStr::new("-stack_size"),
                 OsStr::new("2M"),
                 OsStr::new("-c"),
@@ -1673,6 +2312,8 @@ mod tests {
             [
                 OsStr::new("-quiet"),
                 OsStr::new("-disable_rseq"),
+                OsStr::new("-vm_max_offset"),
+                OsStr::new("0x0"),
                 OsStr::new("-stack_size"),
                 OsStr::new("2M"),
                 OsStr::new("-c"),
@@ -1701,8 +2342,8 @@ mod tests {
 
         let wrapped = runner().command(&guest, None);
         let args = wrapped.get_args().collect::<Vec<_>>();
-        assert_eq!(args[9], OsStr::new("/bin/sh"));
-        assert_eq!(args[10], script.as_os_str());
+        assert_eq!(args[11], OsStr::new("/bin/sh"));
+        assert_eq!(args[12], script.as_os_str());
         assert_eq!(wrapped.get_current_dir(), Some(root.path()));
     }
 
@@ -1721,8 +2362,8 @@ mod tests {
 
         let wrapped = runner().command(&guest, None);
         let args = wrapped.get_args().collect::<Vec<_>>();
-        assert_eq!(args[9], OsStr::new("/bin/sh"));
-        assert_eq!(args[10], wrapper.as_os_str());
+        assert_eq!(args[11], OsStr::new("/bin/sh"));
+        assert_eq!(args[12], wrapper.as_os_str());
     }
 
     #[test]
@@ -1738,8 +2379,8 @@ mod tests {
 
         let wrapped = runner().command(&guest, None);
         let args = wrapped.get_args().collect::<Vec<_>>();
-        assert_eq!(args[9], OsStr::new("guest-elf"));
-        assert_eq!(args[10], OsStr::new("argument"));
+        assert_eq!(args[11], OsStr::new("guest-elf"));
+        assert_eq!(args[12], OsStr::new("argument"));
     }
 
     #[test]
@@ -1748,10 +2389,219 @@ mod tests {
         let environment = BTreeMap::from([(OsString::from("ONLY"), OsString::from("guest"))]);
 
         let wrapped = runner().command(&guest, Some(&environment));
+        // drrun also receives the bundled DynamoRIO's prefix list, a
+        // `DYNAMORIO_*` variable DynamoRIO removes from the guest's environment
+        // with the prefixed ones (tests/guest_environment_live.rs).
         assert_eq!(
             wrapped.get_envs().collect::<Vec<_>>(),
-            [(OsStr::new("ONLY"), Some(OsStr::new("guest")))]
+            [
+                (
+                    OsStr::new(HIDE_ENV_PREFIXES_ENV),
+                    Some(OsStr::new(PRIVATE_ENV_PREFIX))
+                ),
+                (OsStr::new("ONLY"), Some(OsStr::new("guest")))
+            ]
         );
+    }
+
+    /// The environment a launch through `runner` gives drrun, as a stand-in
+    /// drrun that prints its environment reports it.
+    fn drrun_environment(
+        runner: DbtRunner,
+        guest: &Command,
+        environment: Option<&BTreeMap<OsString, OsString>>,
+    ) -> String {
+        let directory = tempfile::tempdir().expect("stand-in drrun directory");
+        let drrun = directory.path().join("drrun");
+        std::fs::write(&drrun, "#!/bin/sh\nexec /usr/bin/env\n").expect("write stand-in drrun");
+        std::fs::set_permissions(&drrun, std::fs::Permissions::from_mode(0o755))
+            .expect("make stand-in drrun executable");
+        let runner = DbtRunner { drrun, ..runner };
+        // Another test's fork can still hold the script's write descriptor
+        // for a moment after it is written (ETXTBSY).
+        let mut attempts = 0;
+        let output = loop {
+            match runner.command(guest, environment).output() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 50 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => break result.expect("run the stand-in drrun"),
+            }
+        };
+        assert!(output.status.success(), "stand-in drrun: {output:?}");
+        String::from_utf8(output.stdout).expect("environment should be UTF-8")
+    }
+
+    /// The variable's line in an environment listing, if any.
+    fn answers_brk_line(environment: &str) -> Option<String> {
+        environment
+            .lines()
+            .find(|line| line.starts_with(&format!("{TOOL_ANSWERS_BRK_ENV}=")))
+            .map(str::to_owned)
+    }
+
+    const ANSWERS_BRK: &str = "DYNAMORIO_TOOL_ANSWERS_BRK=1";
+
+    #[test]
+    fn only_a_tool_that_answers_brk_tells_dynamorio_so_whatever_the_guests_environment() {
+        let off = || runner().tool_answers_brk(true).tool_answers_brk(false);
+        // DynamoRIO acts on presence, so empty and "0" count as set.
+        for value in ["", "0", "1"] {
+            let environment =
+                BTreeMap::from([(OsString::from(TOOL_ANSWERS_BRK_ENV), OsString::from(value))]);
+            let plain = Command::new("/usr/bin/true");
+            let mut guest = Command::new("/usr/bin/true");
+            guest.env(TOOL_ANSWERS_BRK_ENV, value);
+            for (label, guest, environment) in [
+                ("an explicit environment", &plain, Some(&environment)),
+                ("the guest's environment", &guest, None),
+            ] {
+                for (mode, runner) in [("default", runner()), ("turned off", off())] {
+                    assert_eq!(
+                        answers_brk_line(&drrun_environment(runner, guest, environment)),
+                        None,
+                        "{mode}, {label} carrying {value:?}"
+                    );
+                }
+                assert_eq!(
+                    answers_brk_line(&drrun_environment(
+                        runner().tool_answers_brk(true),
+                        guest,
+                        environment
+                    ))
+                    .as_deref(),
+                    Some(ANSWERS_BRK),
+                    "on, {label} carrying {value:?}"
+                );
+            }
+        }
+    }
+
+    /// Set (to any value) only in the copy of this test binary that
+    /// [`a_tool_that_does_not_answer_brk_drops_an_inherited_variable`] runs,
+    /// where it asks [`inherited_tool_answers_brk_probe`] to report.
+    const INHERITED_PROBE_ENV: &str = "REVERIE_DBT_TEST_INHERITED_ANSWERS_BRK_PROBE";
+
+    /// Reports, from a process that inherited the variable, what drrun gets
+    /// with the option off and on. Run only by
+    /// [`a_tool_that_does_not_answer_brk_drops_an_inherited_variable`].
+    #[test]
+    #[ignore = "a probe that a_tool_that_does_not_answer_brk_drops_an_inherited_variable runs in a child"]
+    fn inherited_tool_answers_brk_probe() {
+        if std::env::var_os(INHERITED_PROBE_ENV).is_none() {
+            return;
+        }
+        let guest = Command::new("/usr/bin/true");
+        for (mode, runner) in [("off", runner()), ("on", runner().tool_answers_brk(true))] {
+            let line = answers_brk_line(&drrun_environment(runner, &guest, None));
+            println!("probe {mode}: {}", line.as_deref().unwrap_or("absent"));
+        }
+    }
+
+    #[test]
+    fn a_tool_that_does_not_answer_brk_drops_an_inherited_variable() {
+        // The variable is set in a child copy of this test binary, never in
+        // this process, whose environment the parallel tests share.
+        for value in ["", "0", "1"] {
+            let output = Command::new(std::env::current_exe().expect("this test binary"))
+                .args([
+                    "--exact",
+                    "launcher::tests::inherited_tool_answers_brk_probe",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(TOOL_ANSWERS_BRK_ENV, value)
+                .env(INHERITED_PROBE_ENV, "1")
+                .output()
+                .expect("run the probe");
+            assert!(output.status.success(), "probe: {output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // libtest's own "test ... " may share the first probe line.
+            let reported = |mode: &str| {
+                let marker = format!("probe {mode}: ");
+                stdout
+                    .lines()
+                    .find_map(|line| line.split_once(&marker).map(|(_, rest)| rest.to_owned()))
+            };
+            assert_eq!(
+                reported("off").as_deref(),
+                Some("absent"),
+                "{value:?}: {stdout}"
+            );
+            assert_eq!(
+                reported("on").as_deref(),
+                Some(ANSWERS_BRK),
+                "{value:?}: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_input_reaches_child_before_source_closes() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        let (mut source, mut producer) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let pump = std::thread::spawn(move || copy_streaming_input(&mut source, &mut input));
+        let (send, receive) = mpsc::channel();
+        let echoes = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let mut byte = [0];
+                let result = output.read_exact(&mut byte).map(|()| byte[0]);
+                if send.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        let bound = Duration::from_secs(3);
+        let mut progress = Vec::new();
+        for byte in *b"AB" {
+            let sent = producer.write_all(&[byte]);
+            let echoed = receive.recv_timeout(bound);
+            let complete = sent.is_ok() && matches!(echoed, Ok(Ok(value)) if value == byte);
+            progress.push((byte, sent, echoed));
+            if !complete {
+                break;
+            }
+        }
+        // Snapshot the oracle while the producer is still open. EOF below is
+        // cleanup only and cannot turn a failed progress assertion into a pass.
+        let before_eof = progress.len() == 2
+            && progress.iter().all(|(byte, sent, echoed)| {
+                sent.is_ok() && matches!(echoed, Ok(Ok(value)) if value == byte)
+            });
+        drop(producer);
+        let deadline = Instant::now() + bound;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let copied = pump.join().unwrap();
+        echoes.join().unwrap();
+        assert!(
+            before_eof,
+            "input did not reach child before EOF: {progress:?}"
+        );
+        assert_eq!(copied.unwrap(), 2);
+        assert!(status.success(), "{status}");
     }
 
     #[test]
@@ -1784,15 +2634,80 @@ mod tests {
 
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
         set_nonblocking(&reader).unwrap();
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicU8::new(READ_ON));
         std::thread::scope(|scope| {
             let writer = scope.spawn(move || while writer.write_all(&[b'x'; 4096]).is_ok() {});
-            let reader_cancelled = Arc::clone(&cancelled);
-            let handle = scope.spawn(move || read_cancellable(&mut reader, &reader_cancelled));
+            let reader_stop = Arc::clone(&stop);
+            let handle = scope.spawn(move || read_cancellable(&mut reader, &reader_stop));
             std::thread::sleep(std::time::Duration::from_millis(5));
-            cancelled.store(true, Ordering::Release);
+            stop.store(READ_DISCARD, Ordering::Release);
             let error = handle.join().unwrap().unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            writer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn a_kept_output_reader_returns_what_it_read_while_a_writer_still_holds_the_pipe() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        set_nonblocking(&reader).unwrap();
+        writer.write_all(b"the reason the run failed\n").unwrap();
+        // The stop comes before the reader has read anything, the worst case
+        // for a slow reader. `writer` stays open, as a pipe held outside the
+        // reaped tree would, so the reader never sees end of file; what is
+        // already in the pipe must still be returned.
+        let stop = AtomicU8::new(READ_KEEP);
+        assert_eq!(
+            read_cancellable(&mut reader, &stop).unwrap(),
+            b"the reason the run failed\n"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn a_kept_output_reader_reads_exactly_its_cap_from_a_source_that_never_ends() {
+        // Never reports end of file or EAGAIN, like a writer that never pauses
+        // and always wins the race with the reader. Its reads are one byte
+        // short of the reader's buffer, so a cap that did not limit each read
+        // to the remaining budget would overshoot.
+        struct ShortReads;
+        impl Read for ShortReads {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let length = buffer.len().min(8191);
+                buffer[..length].fill(b'x');
+                Ok(length)
+            }
+        }
+        let mut endless = ShortReads;
+        let stop = AtomicU8::new(READ_KEEP);
+        let kept = read_cancellable(&mut endless, &stop).unwrap();
+        assert_eq!(kept.len(), KEPT_OUTPUT_DRAIN_BYTES);
+    }
+
+    #[test]
+    fn a_kept_output_reader_stops_although_a_writer_never_pauses() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        set_nonblocking(&reader).unwrap();
+        let stop = AtomicU8::new(READ_KEEP);
+        std::thread::scope(|scope| {
+            // Writes until the reader is dropped.
+            let writer = scope.spawn(move || while writer.write_all(&[b'x'; 4096]).is_ok() {});
+            // The reader may find the socket empty before the writer runs and
+            // return at once; this test checks only that it returns and that
+            // the writer is released. The cap itself is pinned above.
+            let kept = read_cancellable(&mut reader, &stop).unwrap();
+            assert!(
+                kept.len() <= KEPT_OUTPUT_DRAIN_BYTES,
+                "read {} bytes after the stop",
+                kept.len()
+            );
+            drop(reader);
             writer.join().unwrap();
         });
     }
@@ -2078,6 +2993,262 @@ mod tests {
 
     #[test]
     #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn a_backend_failure_under_protected_evidence_keeps_the_captured_stderr() {
+        let file = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::from_env()
+            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+            .evidence_file(&file)
+            .unwrap()
+            .client_argument("-test-backend-failure");
+
+        let error = runner.output(&Command::new("/bin/true")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DBT backend or Tool reported an internal failure"),
+            "backend failure was reported as the wrong error: {error}"
+        );
+        // Without a diagnostic file the client writes its diagnostics to the
+        // guest's stderr, which the runner captured before evidence failed.
+        let output = failed_run_output(&error)
+            .unwrap_or_else(|| panic!("the error dropped the captured output: {error:?}"));
+        assert!(
+            output
+                .stderr
+                .windows(b"requested backend failure for testing".len())
+                .any(|window| window == b"requested backend failure for testing"),
+            "captured stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn a_terminal_exit_marks_its_stats_record_as_a_backend_failure() {
+        for (test_failure, expected_code, expected_failures) in
+            [(false, Some(0), 0), (true, Some(101), 1)]
+        {
+            let sink = DbtStatsSink::new().unwrap();
+            let [flag, path] = sink.client_arguments(sink.directory());
+            let mut runner = DbtRunner::from_env()
+                .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+                .client_argument(flag)
+                .client_argument(path);
+            if test_failure {
+                runner = runner.client_argument("-test-backend-failure");
+            }
+
+            let output = runner.output(&Command::new("/bin/true")).unwrap();
+            assert_eq!(output.status.code(), expected_code, "{output:?}");
+            let snapshot = sink.drain().unwrap().snapshot().clone();
+            assert_eq!(snapshot.process_images(), 1, "{snapshot}");
+            assert_eq!(snapshot.backend_failures(), expected_failures, "{snapshot}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a built DynamoRIO and native client; run explicitly with --ignored"]
+    fn private_memory_loss_injection_failure_is_a_backend_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("private_memory_exec");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/private_memory_exec.c");
+        let compile = Command::new("cc")
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(source)
+            .arg("-o")
+            .arg(&program)
+            .output()
+            .unwrap();
+        assert!(compile.status.success(), "{compile:?}");
+
+        // This is the explicit control-backing fault injector, not guest close
+        // admission. A real close(-1) fails without destroying the live backing.
+        let mut snapshots = Vec::new();
+        for protected in [false, true] {
+            let evidence = tempfile::tempfile().unwrap();
+            let sink = DbtStatsSink::new().unwrap();
+            let [flag, path] = sink.client_arguments(sink.directory());
+            let mut runner = DbtRunner::from_env()
+                .expect("built DynamoRIO and native client")
+                .client_argument(flag)
+                .client_argument(path)
+                .client_argument("-test-private-memory")
+                .client_argument("lost-exec-close-failure");
+            if protected {
+                runner = runner.evidence_file(&evidence).unwrap();
+            }
+            let mut command = Command::new(&program);
+            command.arg("exec");
+            let result = runner.output(&command);
+            eprintln!("private memory close failure protected={protected}: {result:?}");
+            let (stdout, stderr) = if protected {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("DBT backend or Tool reported an internal failure"),
+                    "{error}"
+                );
+                assert_eq!(evidence.metadata().unwrap().len(), 0);
+                let output = failed_run_output(&error).expect("retained failure output");
+                (output.stdout.clone(), output.stderr.clone())
+            } else {
+                let output = result.unwrap();
+                assert_eq!(output.status.code(), Some(101), "{output:?}");
+                (output.stdout, output.stderr)
+            };
+            assert!(stdout.is_empty(), "{stdout:?}");
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert_eq!(
+                stderr
+                    .matches("PRIVATE_MEMORY_TEST loss-injection-failed\n")
+                    .count(),
+                1
+            );
+            assert!(!stderr.contains("followed_exec=1"), "{stderr}");
+            let snapshot = sink.drain().unwrap().snapshot().clone();
+            eprintln!(
+                "private memory close failure protected={protected}: failures={} {snapshot}",
+                snapshot.backend_failures()
+            );
+            assert_eq!(snapshot.process_images(), 1, "{snapshot}");
+            snapshots.push(snapshot);
+        }
+        for snapshot in snapshots {
+            assert_eq!(snapshot.backend_failures(), 1, "{snapshot}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
+    fn a_copied_failure_publishes_its_record_before_root_termination() {
+        use crate::backend_stats::DbtProcessRecord;
+        use crate::backend_stats::WIRE_RECORD_LEN;
+        use crate::backend_stats::decode_process_record;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/evidence_vfork_open_exec.c");
+        let fixture = directory.path().join("copied-terminal-failure");
+        let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+        assert!(
+            Command::new(compiler)
+                .args(["-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                .arg(source)
+                .arg("-o")
+                .arg(&fixture)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // First force cleanup omission, then check ordinary termination does
+        // not append a second record. Neither run can rely on event_exit.
+        for skip_cleanup in [true, false] {
+            let sink = DbtStatsSink::new().unwrap();
+            let [flag, path] = sink.client_arguments(sink.directory());
+            let mut runner = DbtRunner::from_env()
+                .unwrap()
+                .isolated_process_group(true)
+                .client_argument(flag)
+                .client_argument(path)
+                .client_argument("-test-copied-backend-failure");
+            if skip_cleanup {
+                runner = runner.client_argument("-test-skip-terminal-cleanup");
+            }
+            let mut guest = Command::new(&fixture);
+            guest.arg("terminal-failure").env_remove(crate::TOOL_ENV);
+            for selector in [
+                "HERMIT_DBT_TEST_REWRITE_EXIT",
+                "HERMIT_DBT_TEST_INJECT_INVALID_CLONE",
+                "HERMIT_DBT_TEST_SET_REG",
+                "HERMIT_DBT_TEST_COMPARE_EXCHANGE",
+                "HERMIT_DBT_TEST_PPID",
+                "HERMIT_DBT_TEST_BACKTRACE",
+                "HERMIT_DBT_STRACE",
+                "HERMIT_DBT_SYSCALL_HISTOGRAM",
+                "HERMIT_DBT_COUNTER1",
+                "HERMIT_DBT_COUNTER2",
+                "HERMIT_DBT_CHUNKY_PRINT",
+                "HERMIT_DBT_CHROME_TRACE",
+                "HERMIT_DBT_CHAOS",
+                "HERMIT_DBT_NOOP",
+                "HERMIT_DBT_COUNTER1_EXACT",
+                "HERMIT_DBT_COUNTER2_EXACT",
+            ] {
+                guest.env_remove(selector);
+            }
+            let output = runner.output(&guest).unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("unsupported syscall 145 in copied child"),
+                "{output:?}"
+            );
+            eprintln!("forced copied failure: skip_cleanup={skip_cleanup} {output:?}");
+            assert_eq!(output.status.signal(), Some(libc::SIGKILL), "{output:?}");
+            assert_eq!(
+                output.stdout.len(),
+                12,
+                "identity only, no after-call marker: {output:?}"
+            );
+            let identities: Vec<_> = output
+                .stdout
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| i32::from_ne_bytes(*bytes))
+                .collect();
+            assert!(identities[0] > 0);
+            assert_ne!(identities[0], identities[1]);
+            assert_eq!(identities[1], identities[2]);
+            let capture = sink.capture();
+            let bytes = capture
+                .records()
+                .expect("failure must be published before root termination");
+            assert_eq!(
+                bytes.len(),
+                WIRE_RECORD_LEN,
+                "exactly one failing child record"
+            );
+            let (record, consumed) = decode_process_record(bytes).unwrap();
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(
+                record,
+                DbtProcessRecord {
+                    backend_failure: true,
+                    image_generation: record.image_generation,
+                    process_identity: identities[0] as u64,
+                    parent_identity: identities[1] as u64,
+                    ..Default::default()
+                }
+            );
+            let snapshot = capture.snapshot().unwrap();
+            assert_eq!(snapshot.process_images(), 1);
+            assert_eq!(snapshot.backend_failures(), 1);
+            eprintln!(
+                "copied terminal record: skip_cleanup={skip_cleanup} pid={} ppid={} bytes={}",
+                identities[0],
+                identities[1],
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_run_keeps_its_error_and_carries_its_output() {
+        let original = io::Error::new(io::ErrorKind::InvalidData, "evidence failed");
+        let error = DbtFailedRunOutput::attach(original, b"out".to_vec(), b"why\n".to_vec());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "evidence failed");
+        let output = failed_run_output(&error).expect("captured output");
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"why\n");
+        assert!(failed_run_output(&io::Error::other("plain")).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
     fn protected_evidence_keeps_a_backend_failure_after_sender_lookup_misses() {
         let file = tempfile::tempfile().unwrap();
         let mut diagnostics = tempfile::tempfile().unwrap();
@@ -2174,8 +3345,8 @@ mod tests {
 
     #[test]
     fn stats_sink_passes_the_records_path_to_the_client() {
-        let sink = StatsSink::new().unwrap();
-        let arguments = sink.client_arguments();
+        let sink = DbtStatsSink::new().unwrap();
+        let arguments = sink.client_arguments(sink.directory());
         assert_eq!(arguments[0], OsStr::new("-stats_path"));
         assert_eq!(arguments[1], sink.path.clone().into_os_string());
         assert_eq!(arguments[1], sink.path.as_os_str());
@@ -2183,7 +3354,7 @@ mod tests {
 
     #[test]
     fn stats_sink_drain_of_missing_file_yields_an_empty_snapshot() {
-        let sink = StatsSink::new().unwrap();
+        let sink = DbtStatsSink::new().unwrap();
         // No image ever wrote the file (e.g. the guest died before event_exit).
         assert!(!sink.path.exists());
         let source = sink.drain().unwrap();
@@ -2198,7 +3369,7 @@ mod tests {
         use crate::backend_stats::DbtProcessRecord;
         use crate::backend_stats::DbtRuntimeKind;
 
-        let sink = StatsSink::new().unwrap();
+        let sink = DbtStatsSink::new().unwrap();
 
         // One image with DynamoRIO translation stats present.
         append_record(
@@ -2262,7 +3433,7 @@ mod tests {
     fn stats_sink_drain_of_a_truncated_stream_is_an_error() {
         use std::io::Write as _;
 
-        let sink = StatsSink::new().unwrap();
+        let sink = DbtStatsSink::new().unwrap();
         let encoded =
             crate::backend_stats::encode_process_record(&crate::backend_stats::DbtProcessRecord {
                 branches: 42,
@@ -2369,6 +3540,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
         let output = child.wait_with_output().unwrap();
         wait_for_process_group_no_live_members(process_group).unwrap();
@@ -2420,6 +3592,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
 
         let mut outside = Command::new(fixture);
@@ -2471,6 +3644,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
         let output = child.wait_with_output().unwrap();
         wait_for_process_group_no_live_members(process_group).unwrap();
@@ -2516,6 +3690,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
         let output = child.wait_with_output().unwrap();
         wait_for_process_group_no_live_members(process_group).unwrap();
@@ -2557,6 +3732,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = runner.spawn_command(&mut command).unwrap();
+        runner.finish_launch_setup(None).unwrap();
         let process_group = child.id() as i32;
         let output = child.wait_with_output().unwrap();
         wait_for_process_group_no_live_members(process_group).unwrap();
@@ -2580,36 +3756,39 @@ mod tests {
     #[test]
     #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
     fn native_runtime_abi_mismatch_fails_before_guest_execution() {
-        let mut file = tempfile::tempfile().unwrap();
-        let runner = DbtRunner::from_env()
-            .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
-            .evidence_file(&file)
-            .unwrap()
-            .client_argument("-test-runtime-abi-mismatch");
-        let guest = Command::new("/bin/true");
-        let mut command = runner.command(&guest, None);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = runner.spawn_command(&mut command).unwrap();
-        let process_group = child.id() as i32;
-        let output = child.wait_with_output().unwrap();
-        wait_for_process_group_no_live_members(process_group).unwrap();
-        assert!(runner.finish_evidence(true).is_err());
-        file.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        assert_eq!(output.status.code(), Some(101));
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("native/runtime ABI version or callback size mismatch"),
-            "runtime ABI mismatch failed for the wrong reason: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            bytes.is_empty(),
-            "runtime ABI mismatch published an evidence artifact"
-        );
+        for argument in ["-test-runtime-abi-mismatch", "-test-runtime-abi12-mismatch"] {
+            let mut file = tempfile::tempfile().unwrap();
+            let runner = DbtRunner::from_env()
+                .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")
+                .evidence_file(&file)
+                .unwrap()
+                .client_argument(argument);
+            let guest = Command::new("/bin/true");
+            let mut command = runner.command(&guest, None);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let child = runner.spawn_command(&mut command).unwrap();
+            runner.finish_launch_setup(None).unwrap();
+            let process_group = child.id() as i32;
+            let output = child.wait_with_output().unwrap();
+            wait_for_process_group_no_live_members(process_group).unwrap();
+            assert!(runner.finish_evidence(true).is_err());
+            file.seek(std::io::SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(output.status.code(), Some(101));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("native/runtime ABI version or callback size mismatch"),
+                "runtime ABI mismatch failed for the wrong reason: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                bytes.is_empty(),
+                "runtime ABI mismatch published an evidence artifact"
+            );
+        }
     }
 }

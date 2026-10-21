@@ -28,12 +28,8 @@ fn child_driver_rebinds_inherited_callback_view_and_preserves_generation() {
     let parent_callback = parent.begin_entry_callback().unwrap().unwrap();
     let parent_view = parent.memory.clone();
     let parent_origin = parent_view.entry_origin().operation.unwrap();
-    let mut child = KvmBackend::new_with_memory_and_cpuid_policy(
-        parent.memory.clone(),
-        CpuidPolicy::default(),
-        None,
-    )
-    .expect("child binding control requires /dev/kvm");
+    let mut child = KvmBackend::new_with_memory(parent.memory.clone(), None)
+        .expect("child binding control requires /dev/kvm");
     assert!(child.entry_driver_owner().is_none());
     assert!(
         child
