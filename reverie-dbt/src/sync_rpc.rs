@@ -334,6 +334,11 @@ pub fn send_rpc_from_guest<G: GlobalTool>(
     let response = match GUEST_CLIENT.connection.try_lock() {
         Ok(mut slot) => {
             let pid = std::process::id();
+            assert!(
+                !matches!(slot.as_ref(), Some(connection)
+                if connection.pid == pid && !connection.usable),
+                "reverie-dbt: primary stream retired after mapping capture failure"
+            );
             let must_connect = !matches!(
                 slot.as_ref(),
                 Some(connection) if connection.pid == pid && connection.path == path
@@ -404,6 +409,62 @@ struct GuestConnection {
     pid: u32,
     path: PathBuf,
     fd: i32,
+    // A capture framing failure leaves the reserved numeric slot occupied,
+    // but this image may never reconnect or reuse that stream for another RPC.
+    usable: bool,
+}
+
+pub(crate) struct MappingCapturePrimary {
+    guard: Option<std::sync::MutexGuard<'static, Option<GuestConnection>>>,
+    fd: i32,
+}
+
+impl MappingCapturePrimary {
+    pub(crate) fn fd(&self) -> i32 {
+        self.fd
+    }
+    pub(crate) fn is_released(&self) -> bool {
+        self.guard.is_none()
+    }
+}
+
+pub(crate) fn borrow_mapping_capture_primary()
+-> Result<MappingCapturePrimary, reverie::MappingCaptureError> {
+    // No pathname, environment, connect, dup, poisoned recovery or fork fallback.
+    let guard = GUEST_CLIENT
+        .connection
+        .try_lock()
+        .map_err(|_| reverie::MappingCaptureError::Connection)?;
+    let connection = guard
+        .as_ref()
+        .ok_or(reverie::MappingCaptureError::Connection)?;
+    let pid = std::process::id();
+    if connection.pid != pid
+        || !connection.usable
+        || GUEST_CLIENT.descriptor(pid) != Some(connection.fd)
+    {
+        return Err(reverie::MappingCaptureError::Connection);
+    }
+    let fd = connection.fd;
+    Ok(MappingCapturePrimary {
+        guard: Some(guard),
+        fd,
+    })
+}
+
+pub(crate) unsafe extern "C" fn release_mapping_capture_primary(lease: usize, usable: i32) {
+    // SAFETY: only the fixed native operation receives this pointer, borrowed
+    // from execute's live stack. It calls once after helper restoration and
+    // before caller unmasking. No Tool code, close, allocation or decode here.
+    let lease = unsafe { &mut *(lease as *mut MappingCapturePrimary) };
+    if let Some(mut guard) = lease.guard.take() {
+        if usable != 1
+            && let Some(connection) = guard.as_mut()
+        {
+            connection.usable = false;
+        }
+        drop(guard);
+    }
 }
 
 // This owner retains a raw descriptor because closing it requires the current
@@ -600,6 +661,7 @@ fn connect_guest(
             pid,
             path: path.to_path_buf(),
             fd,
+            usable: true,
         })
     })();
     if result.is_err() {
@@ -734,6 +796,9 @@ fn invoke(
 
 #[cfg(test)]
 mod shared_client_tests;
+
+#[cfg(test)]
+mod mapping_capture_tests;
 
 #[cfg(test)]
 mod initial_config_tests {

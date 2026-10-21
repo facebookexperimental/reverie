@@ -66,6 +66,7 @@
 mod blocking_client;
 pub mod codec;
 pub mod initial_image;
+pub mod mapping_capture;
 pub mod successor;
 
 mod client;

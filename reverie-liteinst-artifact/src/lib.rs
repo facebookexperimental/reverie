@@ -977,18 +977,18 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 53] = [
     ),
     (
         "reverie/src/lib.rs",
-        6661,
-        "c7da5c4977c37d143b82b0b53eebd52a44b807cdeb0bec8869329eb76dc4e002",
+        6710,
+        "45637a90668db7504d716052e10dd43e632d6e30adbd79ead6a65da9ad3ec0d2",
     ),
     (
         "reverie/src/perf.rs",
-        76845,
-        "6c43e97e6a0224c8b4786b40e437f0884a5dee90954a833ab5ba556b2e0a7b1c",
+        76893,
+        "ffb2b8a902a27abc8a347eb0d608fe3e4c418702299bcfbd96578eb25bf934ef",
     ),
     (
         "reverie/src/pmu_config.rs",
-        31505,
-        "88cfa9208b89eced277fd7ea964665f6a3c95cb60b9edeb2bc77c240d8a954d4",
+        31507,
+        "172c10e84154d3cfb7e4b5dd869a0a60eaf49ad64797e1a33787ff6fd8e2b4ff",
     ),
     (
         "reverie/src/in_guest_rcb.rs",

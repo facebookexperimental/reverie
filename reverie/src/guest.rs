@@ -359,6 +359,19 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         false
     }
 
+    /// Execute one prepared controller observation without yielding the guest's
+    /// existing turn. A capable backend excludes every certified MM executor,
+    /// validates private ownership before and after the complete exchange, and
+    /// restores helpers, transport leases and physical signal masks before
+    /// returning or decoding Tool data. No runtime authority is inferred from
+    /// ownership tokens alone. The default advertises no such capability.
+    fn try_mapping_capture(
+        &self,
+        _prepared: crate::PreparedMappingCapture<<T::GlobalState as GlobalTool>::Request>,
+    ) -> Result<<T::GlobalState as GlobalTool>::Response, crate::MappingCaptureError> {
+        Err(crate::MappingCaptureError::Unavailable)
+    }
+
     /// The guest's stack pointer at the current image's first instruction:
     /// the address of `argc`, above which the kernel (or a loader standing
     /// in for it) laid out `argv`, `envp` and the auxiliary vector. `Some`
@@ -1209,6 +1222,13 @@ where
 
     fn runtime_private_memory_is_current(&self, snapshot: &RuntimePrivateMemorySnapshot) -> bool {
         self.inner.runtime_private_memory_is_current(snapshot)
+    }
+
+    fn try_mapping_capture(
+        &self,
+        prepared: crate::PreparedMappingCapture<<L::GlobalState as GlobalTool>::Request>,
+    ) -> Result<<L::GlobalState as GlobalTool>::Response, crate::MappingCaptureError> {
+        self.inner.try_mapping_capture(prepared)
     }
 
     fn is_main_thread(&self) -> bool {

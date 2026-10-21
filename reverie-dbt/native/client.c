@@ -117,6 +117,35 @@ _Static_assert(sizeof(private_memory_snapshot_t) == 176,
 typedef int32_t (*runtime_private_memory_t)(
     uintptr_t, const private_memory_snapshot_t*, private_memory_snapshot_t*);
 
+// ABI 15: prepared control I/O has a fixed native implementation, not a Tool
+// callback executed under the masks. The release hook only unlocks the borrowed
+// primary connection; it cannot decode, allocate, log, or close its descriptor.
+typedef struct {
+  private_memory_snapshot_t expected;
+  uint64_t nonce;
+  int32_t root_pid;
+  int32_t fd;
+  unsigned char* request;
+  size_t request_capacity;
+  size_t request_length;
+  unsigned char* response;
+  size_t response_capacity;
+  size_t response_length;
+  uintptr_t lease;
+  void (*release_lease)(uintptr_t, int32_t);
+} mapping_capture_arguments_t;
+typedef int32_t (*mapping_capture_t)(uintptr_t, uint32_t, mapping_capture_arguments_t*);
+_Static_assert(sizeof(mapping_capture_arguments_t) == 256, "mapping capture arguments ABI size");
+_Static_assert(offsetof(mapping_capture_arguments_t, request) == 192,
+    "mapping capture request ABI offset");
+_Static_assert(offsetof(mapping_capture_arguments_t, release_lease) == 248,
+    "mapping capture release ABI offset");
+static int32_t runtime_mapping_capture(uintptr_t, uint32_t, mapping_capture_arguments_t*);
+static bool mapping_capture_active(void);
+static void mapping_capture_terminal(void) __attribute__((noreturn));
+static void mapping_capture_withdraw_for_syscall(int sysnum);
+static void runtime_background_init(void* argument);
+
 /* ABI-12: equality-only scope within the existing live task-state authority.
  * Status is separate: a zeroed record never substitutes for unavailable work. */
 typedef struct {
@@ -299,7 +328,7 @@ typedef struct {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 14u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 15u
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -328,14 +357,17 @@ typedef struct {
   // Fixed-size current-owner query or foreign owner/version validation.
   runtime_private_memory_t runtime_private_memory;
   branch_fact_query_t branch_fact;
+  mapping_capture_t mapping_capture;
 } runtime_callbacks_t;
-_Static_assert(sizeof(runtime_callbacks_t) == 80, "runtime callbacks ABI size");
+_Static_assert(sizeof(runtime_callbacks_t) == 88, "runtime callbacks ABI size");
 _Static_assert(offsetof(runtime_callbacks_t, controller_capture_control) == 56,
     "controller capture callback ABI offset");
 _Static_assert(offsetof(runtime_callbacks_t, runtime_private_memory) == 64,
     "private memory callback ABI offset");
 _Static_assert(offsetof(runtime_callbacks_t, branch_fact) == 72,
     "branch fact callback ABI offset");
+_Static_assert(offsetof(runtime_callbacks_t, mapping_capture) == 80,
+    "mapping capture callback ABI offset");
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
 // Inherited from the launcher so guest stderr redirections cannot capture it.
@@ -510,6 +542,24 @@ static bool test_skip_terminal_cleanup;
 static bool test_backend_failure_sender_lookup_miss;
 static bool test_compare_exchange;
 static bool test_controller_capture;
+enum {
+  MAPPING_TEST_NONE, MAPPING_TEST_OBSERVE, MAPPING_TEST_CANCEL_REQUESTED,
+  MAPPING_TEST_CANCEL_ENTERING, MAPPING_TEST_FAIL_PARKED,
+  MAPPING_TEST_FAIL_RELEASE, MAPPING_TEST_EXTRA_HELPER, MAPPING_TEST_FORGED_TOKEN,
+  MAPPING_TEST_OWNER_FINAL_CHANGED, MAPPING_TEST_CALLER_MASK_FAILURE,
+  MAPPING_TEST_HELPER_MASK_FAILURE, MAPPING_TEST_MASK_PENDING,
+  MAPPING_TEST_PRIVATE_SPLIT, MAPPING_TEST_STALE_NONCE,
+  MAPPING_TEST_GENERATION_EXHAUSTED, MAPPING_TEST_OWNER_BUSY,
+  MAPPING_TEST_PARTIAL_FRAMES, MAPPING_TEST_TRANSPORT_EPIPE,
+  MAPPING_TEST_TRANSPORT_EOF, MAPPING_TEST_CLOSED_OBSERVER,
+  MAPPING_TEST_CLOSED_ALLOCATION, MAPPING_TEST_STALE_GENERATION,
+  MAPPING_TEST_BIRTH_DOMAIN, MAPPING_TEST_APP_ROLE, MAPPING_TEST_HELPER_EXIT,
+  MAPPING_TEST_OWNER_FINAL_BUSY, MAPPING_TEST_REGISTRY_BUSY, MAPPING_TEST_IMAGE_CHANGED,
+  MAPPING_TEST_RAW_FLAG_CLEAR, MAPPING_TEST_RAW_FLAG_HELD,
+  MAPPING_TEST_TRANSPORT_STALL, MAPPING_TEST_TRANSPORT_OVERSIZE,
+  MAPPING_TEST_TRANSPORT_MALFORMED
+};
+static int test_mapping_capture;
 static atomic_flag controller_capture_self_tested = ATOMIC_FLAG_INIT;
 static void run_controller_capture_self_test(void);
 enum {
@@ -648,6 +698,8 @@ static process_id_t launch_root_below(process_id_t launcher) {
   return 0;
 }
 static void terminate_runtime_tree(int exit_code) {
+  if (mapping_capture_active())
+    mapping_capture_terminal();
   // A copied child cannot kill its own process group and then run DynamoRIO
   // cleanup. Kill the run's root instead; the launcher reaps it and
   // terminates the rest of the run after preserving its exit status.
@@ -662,6 +714,8 @@ static void terminate_runtime_tree(int exit_code) {
 }
 
 static void exit_runtime_tree(int exit_code) {
+  if (mapping_capture_active())
+    mapping_capture_terminal();
   mark_backend_failure();
   terminate_runtime_tree(exit_code);
 }
@@ -3961,6 +4015,7 @@ static bool capture_lifecycle_is_uncertain(int sysnum, const uint64_t* args) {
 }
 
 static void capture_observe_lifecycle(int sysnum, const uint64_t* args) {
+  mapping_capture_withdraw_for_syscall(sysnum);
   if (capture_lifecycle_is_uncertain(sysnum, args))
     capture_mark_uncertain();
 }
@@ -7011,6 +7066,8 @@ static void event_exit(void) {
   if (dr_get_process_id() == runtime_memory_owner_pid) {
     retire_private_memory();
     dr_set_private_reservation_retirement_callback(NULL);
+    dr_set_mapping_capture_birth_observer(NULL);
+    dr_set_mapping_capture_memory_observer(NULL);
   }
   if (test_branch_owner_admission)
     dr_fprintf(diagnostic_file,
@@ -7157,6 +7214,8 @@ static void signal_admission_return(void) {
   }
 }
 
+#include "mapping_capture.h"
+
 static void runtime_idle(void) {
   if (!runtime_retirement_requested &&
       atomic_load_explicit(
@@ -7165,11 +7224,13 @@ static void runtime_idle(void) {
     runtime_retirement_requested = true;
     reverie_dbt_runtime_process_exit();
   }
+  mapping_capture_helper_idle();
   dr_sleep(1);
 }
 
 static void runtime_background_init(void* argument) {
   (void)argument;
+  mapping_capture_helper_enter();
   runtime_process_control->helper_pid = (int32_t)getpid();
   publish_helper_membership(runtime_process_control->helper_pid);
   if (!evidence_process_start_time(
@@ -7238,8 +7299,11 @@ static void ensure_runtime_background(void) {
     return;
 
   // TODO-HUMAN-REVIEW(PR-134): Review fail-fast native runtime bootstrap.
+  if (mapping_capture_slot != NULL)
+    atomic_store_explicit(&mapping_capture_slot->helper_permit, true, memory_order_release);
   if (!dr_create_client_thread(
           runtime_background_init, (void*)reverie_dbt_emit)) {
+    mapping_capture_withdraw();
     atomic_store_explicit(&runtime_background_state, 0, memory_order_release);
     dr_fprintf(
         diagnostic_file,
@@ -7336,6 +7400,29 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
         test_private_memory = PRIVATE_MEMORY_TEST_ROUTES;
       else {
         dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST invalid-mode\n");
+        dr_exit_process(101);
+        return;
+      }
+    } else if (strcmp(argv[i], "-test-mapping-capture") == 0) {
+      if (++i >= argc) {
+        dr_fprintf(diagnostic_file, "MAPPING_CAPTURE_TEST missing-mode\n");
+        dr_exit_process(101);
+        return;
+      }
+      const char* modes[] = { "observe", "cancel-requested", "cancel-entering",
+          "fail-parked", "fail-release", "extra-helper", "forged-token",
+          "owner-final-changed", "caller-mask-failure", "helper-mask-failure",
+          "mask-pending", "private-split", "stale-nonce", "generation-exhausted",
+          "owner-busy", "partial-frames", "transport-epipe", "transport-eof",
+          "closed-observer", "closed-allocation", "stale-generation",
+          "birth-domain", "app-role", "helper-exit", "owner-final-busy",
+          "registry-busy", "image-changed", "raw-flag-clear", "raw-flag-held",
+          "transport-stall", "transport-oversize", "transport-malformed" };
+      for (size_t mode = 0; mode < sizeof(modes) / sizeof(modes[0]); ++mode)
+        if (strcmp(argv[i], modes[mode]) == 0)
+          test_mapping_capture = (int)mode + 1;
+      if (test_mapping_capture == MAPPING_TEST_NONE) {
+        dr_fprintf(diagnostic_file, "MAPPING_CAPTURE_TEST invalid-mode\n");
         dr_exit_process(101);
         return;
       }
@@ -7471,7 +7558,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
                strcmp(argv[i], "-test-runtime-abi12-mismatch") == 0 ||
                strcmp(argv[i], "-test-runtime-abi13-mismatch") == 0) {
       /* Handled before application initialization. */
-    } else if (strcmp(argv[i], "-test-private-memory") == 0) {
+    } else if (strcmp(argv[i], "-test-private-memory") == 0 ||
+               strcmp(argv[i], "-test-mapping-capture") == 0) {
       ++i; /* Mode was checked before application initialization. */
     } else if (
         strcmp(argv[i], "-test-wait-for-background") == 0 ||
@@ -7535,6 +7623,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
   initialize_private_memory(preempt_stub, signal_stub, dr_page_size());
   runtime_callbacks_page.value.runtime_private_memory = runtime_private_memory;
   runtime_callbacks_page.value.branch_fact = query_branch_fact;
+  mapping_capture_initialize();
+  runtime_callbacks_page.value.mapping_capture = runtime_mapping_capture;
   if (!run_private_memory_self_test())
     return;
 

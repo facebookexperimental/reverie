@@ -3574,6 +3574,20 @@ dr_set_private_reservation_retirement_callback(void (*callback)(void))
     heap_set_private_reservation_retirement_callback(callback);
 }
 
+#ifdef LINUX
+DR_API bool
+dr_mapping_capture_stack(void *context, byte **start, size_t *size)
+{
+    dcontext_t *dcontext = (dcontext_t *)context;
+    if (dcontext == NULL || dcontext != get_thread_private_dcontext() ||
+        !is_currently_on_dstack(dcontext) || start == NULL || size == NULL)
+        return false;
+    *start = dcontext->dstack - DYNAMORIO_STACK_SIZE;
+    *size = DYNAMORIO_STACK_SIZE;
+    return true;
+}
+#endif
+
 void
 instrument_client_lib_loaded(byte *start, byte *end)
 {

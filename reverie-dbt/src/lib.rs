@@ -22,6 +22,7 @@ pub mod counter;
 mod counter2_global;
 mod evidence;
 mod launcher;
+mod mapping_capture;
 pub mod sync_rpc;
 #[cfg(feature = "prototype-runtime")]
 mod tools;
@@ -69,6 +70,9 @@ pub use launcher::DbtRunner;
 pub use launcher::DbtStatsSink;
 pub use launcher::PRIVATE_ENV_PREFIX;
 pub use launcher::failed_run_output;
+pub use mapping_capture::MappingCapture;
+pub use mapping_capture::NativeMappingCapture;
+pub use mapping_capture::install_mapping_capture;
 use reverie::Backtrace;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -361,7 +365,9 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// Version 14 grows the private-memory snapshot from 96 to 176 bytes to carry
 /// eight ownership intervals. The callback table stays 80 bytes; an ABI-13
 /// producer cannot write or validate the new pointee layout.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 14;
+/// Version 15 appends the prepared mapping-capture primitive at offset 80;
+/// the callback table is 88 bytes. Ownership snapshot and task layout stay fixed.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 15;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -450,6 +456,8 @@ pub struct DbtRuntimeCallbacks {
     pub runtime_private_memory: RuntimePrivateMemoryQuery,
     /// Optional original-conditional facts, separate from the mixed statistic.
     pub branch_fact: BranchFactQuery,
+    /// Prepared cooperative mapping capture, with native restoration ownership.
+    pub mapping_capture: MappingCapture,
 }
 
 /// Reports the exact native-client/external-runtime ABI version.
@@ -862,6 +870,13 @@ where
             Some(snapshot) => reverie::RuntimePrivateMemory::Ready(snapshot),
             None => reverie::RuntimePrivateMemory::Unavailable,
         })
+    }
+
+    fn try_mapping_capture(
+        &self,
+        prepared: reverie::PreparedMappingCapture<<T::GlobalState as GlobalTool>::Request>,
+    ) -> Result<<T::GlobalState as GlobalTool>::Response, reverie::MappingCaptureError> {
+        mapping_capture::execute::<T>(self.context, self.tid, self.config, prepared)
     }
 
     fn runtime_private_memory_is_current(
@@ -2518,6 +2533,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
     install_controller_capture_control(callbacks.controller_capture_control);
     install_runtime_private_memory(callbacks.runtime_private_memory);
     install_branch_fact_query(callbacks.branch_fact);
+    install_mapping_capture(callbacks.mapping_capture);
     PROCESS_CLONE_RESULT_PROBE.store(
         std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
         Ordering::Release,
@@ -3245,11 +3261,11 @@ mod tests {
 
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 14);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 15);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
-        assert_eq!(reverie_dbt_runtime_callbacks_size(), 80);
-        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 80);
+        assert_eq!(reverie_dbt_runtime_callbacks_size(), 88);
+        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 88);
         assert_eq!(std::mem::offset_of!(DbtRuntimeCallbacks, branch_fact), 72);
         assert_eq!(std::mem::size_of::<NativeBranchFact>(), 48);
         assert_eq!(

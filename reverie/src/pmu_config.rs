@@ -164,7 +164,7 @@ pub const SKID_MARGIN_OVERRIDE_ENV: &str = "REVERIE_SKID_MARGIN_OVERRIDE";
 /// staged precise timer event leaves room for by default (see
 /// [`PmuConfig::stages`]). Measured on AMD family 1Ah, the latency was 43 ns
 /// at the median and 185 ns at the 99th percentile, and reached about 590 ns
-/// in a noisy hour (https://github.com/rrnewton/hermit/issues/3810). The
+/// in a noisy hour (<https://github.com/rrnewton/hermit/issues/3810>). The
 /// tail grows with contention for the guest's core. For a loop retiring
 /// about 2.9 RCBs per ns, the largest second-stage skid in 64 to 96
 /// notifications was 134 RCBs (about 45 ns) unloaded, 823 (about 280 ns)

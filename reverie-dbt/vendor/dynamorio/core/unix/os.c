@@ -3574,6 +3574,7 @@ dr_raw_brk(void *new_address)
 void
 os_heap_free(void *p, size_t size, heap_error_code_t *error_code)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_MAP));
     long rc;
     ASSERT(error_code != NULL);
     if (!dynamo_exited)
@@ -3596,6 +3597,7 @@ void *
 os_heap_reserve(void *preferred, size_t size, heap_error_code_t *error_code,
                 bool executable)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_MAP));
     void *p;
     uint prot = PROT_NONE;
 #ifdef VMX86_SERVER
@@ -3773,6 +3775,7 @@ os_heap_reserve_in_region(void *start, void *end, size_t size,
 bool
 os_heap_commit(void *p, size_t size, uint prot, heap_error_code_t *error_code)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_PROTECT));
     uint os_prot = memprot_to_osprot(prot);
     long res;
     /* should only be used on aligned pieces */
@@ -3798,6 +3801,7 @@ os_heap_commit(void *p, size_t size, uint prot, heap_error_code_t *error_code)
 void
 os_heap_decommit(void *p, size_t size, heap_error_code_t *error_code)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_PROTECT));
     ASSERT(error_code != NULL);
 
     if (!dynamo_exited)
@@ -4296,6 +4300,85 @@ dynamorio_clone_macos(uint flags, byte *newsp, void *ptid, void *tls, void *ctid
  *   the thread is auto-terminated and stack cleaned up on return from run
  *   function
  */
+#ifdef LINUX
+DECLARE_NEVERPROT_VAR(static void (*mapping_capture_birth_observer)(
+                         void *, void (*)(void *), void *), NULL);
+DECLARE_NEVERPROT_VAR(static void (*mapping_capture_memory_observer)(
+                         dr_mapping_capture_memory_kind_t), NULL);
+
+DR_API void
+dr_set_mapping_capture_memory_observer(
+    void (*callback)(dr_mapping_capture_memory_kind_t))
+{
+    mapping_capture_memory_observer = callback;
+}
+
+void
+mapping_capture_observe_memory(dr_mapping_capture_memory_kind_t kind)
+{
+    if (mapping_capture_memory_observer != NULL)
+        mapping_capture_memory_observer(kind);
+}
+
+DR_API void
+dr_set_mapping_capture_birth_observer(void (*callback)(void *, void (*)(void *), void *))
+{
+    mapping_capture_birth_observer = callback;
+}
+
+void
+mapping_capture_observe_birth(void *parent_context, void (*entry)(void *), void *arg)
+{
+    if (mapping_capture_birth_observer != NULL)
+        mapping_capture_birth_observer(parent_context, entry, arg);
+}
+
+DR_API ptr_int_t
+dr_mapping_capture_control(dr_mapping_capture_operation_t operation, ptr_uint_t a,
+                            ptr_uint_t b, ptr_uint_t c)
+{
+#    ifdef X64
+    switch (operation) {
+    case DR_MAPPING_CAPTURE_SEND:
+        return dynamorio_syscall(SYS_sendto, 6, a, b, c, 0x40 | 0x4000, 0, 0);
+    case DR_MAPPING_CAPTURE_RECEIVE:
+        return dynamorio_syscall(SYS_recvfrom, 6, a, b, c, 0x40, 0, 0);
+    case DR_MAPPING_CAPTURE_POLL:
+        return dynamorio_syscall(SYS_poll, 3, a, 1, b);
+    case DR_MAPPING_CAPTURE_CLOCK:
+        return dynamorio_syscall(SYS_clock_gettime, 2, 1 /* CLOCK_MONOTONIC */, a);
+    case DR_MAPPING_CAPTURE_BLOCK_SIGNALS: {
+        uint64 mask = ~(uint64)0;
+        return dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, &mask, a, 8);
+    }
+    case DR_MAPPING_CAPTURE_RESTORE_SIGNALS:
+        return dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, a, 0, 8);
+    case DR_MAPPING_CAPTURE_WAIT:
+        return dynamorio_syscall(SYS_futex, 6, a, 0 /* FUTEX_WAIT */, b, c, 0, 0);
+    case DR_MAPPING_CAPTURE_WAKE:
+        return dynamorio_syscall(SYS_futex, 6, a, 1 /* FUTEX_WAKE */, 1, 0, 0, 0);
+    case DR_MAPPING_CAPTURE_EXIT:
+        return dynamorio_syscall(SYS_exit_group, 1, a);
+    case DR_MAPPING_CAPTURE_QUERY_MASK:
+        return dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, 0, a, 8);
+    case DR_MAPPING_CAPTURE_PENDING:
+        return dynamorio_syscall(SYS_rt_sigpending, 2, a, 8);
+    case DR_MAPPING_CAPTURE_TEST_SIGNAL:
+        return dynamorio_syscall(SYS_tgkill, 3, a, b, c);
+    case DR_MAPPING_CAPTURE_TEST_TAKE_PENDING: {
+        const struct timespec timeout = { 0, 0 };
+        return dynamorio_syscall(SYS_rt_sigtimedwait, 4, a, b, &timeout, 8);
+    }
+    case DR_MAPPING_CAPTURE_TEST_WRITE:
+        return dynamorio_syscall(SYS_write, 3, a, b, c);
+    case DR_MAPPING_CAPTURE_TEST_SHUTDOWN:
+        return dynamorio_syscall(SYS_shutdown, 2, a, b);
+    }
+#    endif
+    return -ENOSYS;
+}
+#endif
+
 DR_API bool
 dr_create_client_thread(void (*func)(void *param), void *arg)
 {
@@ -4312,6 +4395,7 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
         CLONE_SIGHAND
             /* CLONE_THREAD required.  Signals and itimers are private anyway. */
             IF_VMX86(| (os_in_vmkernel_userworld() ? CLONE_THREAD : 0));
+    IF_LINUX(mapping_capture_observe_birth(dcontext, func, arg));
     pre_second_thread();
     /* need to share signal handler table, prior to creating clone record */
     handle_clone(dcontext, flags);
@@ -4775,6 +4859,7 @@ byte *
 os_map_file(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc addr, uint prot,
             map_flags_t map_flags)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_MAP));
     int flags;
     byte *map = NULL;
 #ifdef LINUX
@@ -4920,6 +5005,7 @@ os_map_file(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc addr, uin
 bool
 os_unmap_file(byte *map, size_t size)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_MAP));
     if (DYNAMO_OPTION(vm_reserve) && is_vmm_reserved_address(map, size, NULL, NULL)) {
         /* XXX i#3570: We'd prefer to have the VMM perform this to ensure it matches
          * how it originally reserved the memory.  To do that would we expose a way
@@ -5298,6 +5384,7 @@ os_set_protection(byte *pc, size_t length, uint prot /*MEMPROT_*/)
 bool
 set_protection(byte *pc, size_t length, uint prot /*MEMPROT_*/)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_PROTECT));
     if (os_set_protection(pc, length, prot) == false)
         return false;
 #ifndef HAVE_MEMINFO_QUERY

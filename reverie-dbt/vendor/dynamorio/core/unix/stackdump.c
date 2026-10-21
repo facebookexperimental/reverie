@@ -101,6 +101,7 @@ execve_syscall(const char *exe, const char **argv, char **envp)
 int
 fork_syscall(void)
 {
+    IF_LINUX(mapping_capture_observe_birth(NULL, NULL, NULL));
 #if FORK_BROKEN_CASE_4967
     /* XXX: SYS_fork on dereksha is creating a child whose pid is
      * same as parent but has a different tid, and the abort() to dump

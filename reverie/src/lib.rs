@@ -81,6 +81,7 @@ pub mod pmu;
 pub mod pmu_config;
 pub use in_guest_rcb::InGuestRcbCounter;
 pub use perf::is_perf_supported;
+mod mapping_capture;
 mod process_signal_control;
 pub mod provider;
 #[cfg(target_arch = "x86_64")]
@@ -107,6 +108,7 @@ pub use dispatch_stats::*;
 pub use error::*;
 pub use guest::*;
 pub use inherited_input::*;
+pub use mapping_capture::*;
 pub use process::ExitStatus;
 pub use process::Pid;
 #[cfg(target_arch = "x86_64")]

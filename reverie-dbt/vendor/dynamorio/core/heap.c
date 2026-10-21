@@ -4335,6 +4335,7 @@ heap_unit_extend_commitment(heap_unit_t *u, size_t size_need, uint prot)
 static void *
 common_heap_alloc(thread_units_t *tu, size_t size HEAPACCT(which_heap_t which))
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_ALLOC));
     heap_unit_t *u = tu->cur_unit;
     heap_pc p = NULL;
     int bucket = 0;
@@ -4660,6 +4661,7 @@ static bool
 common_heap_free(thread_units_t *tu, void *p_void,
                  size_t size HEAPACCT(which_heap_t which))
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_FREE));
     int bucket = 0;
     heap_pc p = (heap_pc)p_void;
 #if defined(DEBUG) && (defined(DEBUG_MEMORY) || defined(HEAP_ACCOUNTING))

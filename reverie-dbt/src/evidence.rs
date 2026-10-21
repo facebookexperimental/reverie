@@ -3166,6 +3166,40 @@ mod tests {
             .split_once("static void exit_runtime_tree(int exit_code) {")
             .unwrap()
             .0;
+        // Active capture cannot enter DR cleanup or evidence logging while
+        // either executor may still have its physical mask installed.
+        for entry in [exit_runtime_tree, terminate_runtime_tree] {
+            assert!(
+                entry
+                    .trim_start()
+                    .starts_with("if (mapping_capture_active())\n    mapping_capture_terminal();")
+            );
+        }
+        assert!(source.contains("#include \"mapping_capture.h\""));
+        let capture = include_str!("../native/mapping_capture.h");
+        let terminal = capture
+            .split_once("static void mapping_capture_terminal(void) {")
+            .unwrap()
+            .1
+            .split_once("static void mapping_capture_withdraw(void) {")
+            .unwrap()
+            .0;
+        assert!(
+            terminal.contains("dr_mapping_capture_control(DR_MAPPING_CAPTURE_EXIT, 125, 0, 0);")
+        );
+        for forbidden in [
+            "dr_exit_process(",
+            "exit_runtime_tree(",
+            "terminate_runtime_tree(",
+            "mark_backend_failure(",
+            "evidence_flush(",
+            "dr_fprintf(",
+        ] {
+            assert!(
+                !terminal.contains(forbidden),
+                "capture terminal calls {forbidden}"
+            );
+        }
         assert!(
             terminate_runtime_tree
                 .find("kill((pid_t)runtime_process_group, SIGKILL);")
@@ -3208,19 +3242,28 @@ mod tests {
             "static bool private_memory_test_check(bool condition, const char* check) {",
             "static bool private_memory_test_unavailable(",
         );
-        let options = region(
+        let private_options = region(
             "else if (strcmp(argv[i], \"-test-private-memory\") == 0) {",
+            "} else if (strcmp(argv[i], \"-test-mapping-capture\") == 0) {",
+        );
+        let mapping_options = region(
+            "} else if (strcmp(argv[i], \"-test-mapping-capture\") == 0) {",
             "} else if (strcmp(argv[i], \"-test-compare-exchange\") == 0)",
         );
-        for diagnostic in ["missing-mode", "invalid-mode"] {
-            let refusal = options
-                .split_once(&format!("PRIVATE_MEMORY_TEST {diagnostic}\\n"))
-                .unwrap()
-                .1
-                .split_once("return;")
-                .unwrap()
-                .0;
-            assert_eq!(refusal.matches("dr_exit_process(101);").count(), 1);
+        for (options, prefix) in [
+            (private_options, "PRIVATE_MEMORY_TEST"),
+            (mapping_options, "MAPPING_CAPTURE_TEST"),
+        ] {
+            for diagnostic in ["missing-mode", "invalid-mode"] {
+                let refusal = options
+                    .split_once(&format!("{prefix} {diagnostic}\\n"))
+                    .unwrap()
+                    .1
+                    .split_once("return;")
+                    .unwrap()
+                    .0;
+                assert_eq!(refusal.matches("dr_exit_process(101);").count(), 1);
+            }
         }
         let main = source
             .split_once("DR_EXPORT void dr_client_main")
@@ -3233,22 +3276,28 @@ mod tests {
         for (block, call, count) in [
             (terminate_runtime_tree, "dr_exit_process(exit_code);", 1),
             (startup_check, "dr_exit_process(101);", 1),
-            (options, "dr_exit_process(101);", 2),
+            (private_options, "dr_exit_process(101);", 2),
+            (mapping_options, "dr_exit_process(101);", 2),
             (abi_block, "dr_exit_process(101);", 1),
         ] {
             assert_eq!(block.matches(call).count(), count);
             assert_eq!(block.matches("dr_exit_process(").count(), count);
         }
-        assert_eq!(source.matches("dr_exit_process(").count(), 5);
+        assert_eq!(source.matches("dr_exit_process(").count(), 7);
 
         // Missing/invalid options and ABI refusal precede evidence setup.
         // The startup self-test runs before the exit callback is registered.
         // None can claim a completed terminal evidence stream.
         let evidence_initialization = main.find("initialize_evidence_transport();").unwrap();
         let exit_registration = main.find("drmgr_register_exit_event(event_exit);").unwrap();
-        let option_refusal = main.find("PRIVATE_MEMORY_TEST invalid-mode").unwrap();
         let startup_test = main.find("run_private_memory_self_test()").unwrap();
-        assert!(option_refusal < evidence_initialization);
+        for prefix in ["PRIVATE_MEMORY_TEST", "MAPPING_CAPTURE_TEST"] {
+            for diagnostic in ["missing-mode", "invalid-mode"] {
+                let option_refusal = main.find(&format!("{prefix} {diagnostic}")).unwrap();
+                assert!(option_refusal < evidence_initialization);
+                assert!(option_refusal < exit_registration);
+            }
+        }
         assert!(abi_refusal < evidence_initialization);
         assert!(abi_refusal < exit_registration);
         assert!(startup_test < exit_registration);
@@ -3287,9 +3336,9 @@ mod tests {
             &format!("initialize_evidence_transport();\n  {block}"),
             1,
         );
-        // This mutation preserves all five exits and both earlier option
+        // This mutation preserves all seven exits and all four earlier option
         // refusals. A first-match ABI check would incorrectly accept it.
-        assert_eq!(source.matches("dr_exit_process(").count(), 5);
+        assert_eq!(source.matches("dr_exit_process(").count(), 7);
         assert!(std::panic::catch_unwind(|| check_native_internal_exits(&source)).is_err());
     }
 

@@ -2076,6 +2076,58 @@ get_list_of_threads_common(thread_record_t ***list,
     d_r_mutex_unlock(&all_threads_lock);
 }
 
+#ifdef LINUX
+DR_API bool
+dr_mapping_capture_test_registry_lock(bool acquire)
+{
+    dcontext_t *context = get_thread_private_dcontext();
+    if (context == NULL || !IS_CLIENT_THREAD(context))
+        return false;
+    if (acquire)
+        return d_r_mutex_trylock(&all_threads_lock);
+    d_r_mutex_unlock(&all_threads_lock);
+    return true;
+}
+
+DR_API bool
+dr_mapping_capture_registry(void *caller_context, void *helper_context,
+                             thread_id_t helper_tid)
+{
+    dcontext_t *caller = (dcontext_t *)caller_context;
+    dcontext_t *helper = (dcontext_t *)helper_context;
+    if (caller == NULL || helper == NULL || caller == helper ||
+        caller != get_thread_private_dcontext() || is_self_couldbelinking() ||
+        all_threads == NULL || !d_r_mutex_trylock(&thread_initexit_lock))
+        return false;
+    if (!d_r_mutex_trylock(&all_threads_lock)) {
+        d_r_mutex_unlock(&thread_initexit_lock);
+        return false;
+    }
+    bool valid = uninit_thread_count == 0 && exiting_thread_count == 0 &&
+        num_known_threads == 2 && num_execve_threads == 0;
+    uint seen_caller = 0, seen_helper = 0;
+    for (uint i = 0; valid && i < HASHTABLE_SIZE(ALL_THREADS_HASH_BITS); ++i) {
+        for (thread_record_t *tr = all_threads[i]; tr != NULL; tr = tr->next) {
+            if (tr->execve || tr->dcontext == NULL) {
+                valid = false;
+                break;
+            }
+            if (tr->dcontext == caller && !IS_CLIENT_THREAD(caller))
+                ++seen_caller;
+            else if (tr->dcontext == helper && tr->id == helper_tid &&
+                     IS_CLIENT_THREAD(helper))
+                ++seen_helper;
+            else
+                valid = false;
+        }
+    }
+    valid = valid && seen_caller == 1 && seen_helper == 1;
+    d_r_mutex_unlock(&all_threads_lock);
+    d_r_mutex_unlock(&thread_initexit_lock);
+    return valid;
+}
+#endif
+
 void
 get_list_of_threads(thread_record_t ***list, int *num)
 {

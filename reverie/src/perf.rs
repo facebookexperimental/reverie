@@ -19,8 +19,8 @@
 //! those of `perf_event_open(2)`. No attempts are made to paper over the
 //! non-determinism/weirndess of `perf`. For example, counter increments are
 //! dropped whenever an event fires on a running thread.
-//! [`PerfCounter::DISABLE_SAMPLE_PERIOD`] can be used to avoid this for sampling.
-//! events.
+//! [`PerfCounter::DISABLE_SAMPLE_PERIOD`](crate::perf::PerfCounter::DISABLE_SAMPLE_PERIOD)
+//! can be used to avoid this for sampling events.
 
 use core::ptr::NonNull;
 #[allow(unused_imports)] // only used if we have an error

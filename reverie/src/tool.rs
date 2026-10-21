@@ -31,6 +31,30 @@ use crate::rdtsc::Rdtsc;
 #[cfg(target_arch = "x86_64")]
 use crate::rdtsc::RdtscResult;
 
+/// Whether code running in the observed address space creates execution only
+/// through the backend's managed runtime.
+///
+/// This is a maintained contract, not a census of the threads currently alive.
+/// It covers the Tool and its inner Tools, constructors, callbacks, codecs,
+/// destructors, installed hooks, FFI, and dependencies. Controller workers in a
+/// separate address space are outside this contract. A backend must separately
+/// establish its own runtime's executor membership and lifecycle authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NativeMmOwnership {
+    /// No guarantee is available. This is the default for arbitrary Tools.
+    #[default]
+    Unavailable,
+    /// Code in the observed address space creates no unreported native executor
+    /// or kernel worker sharing that address space. Any executor creation must
+    /// use a managed path that withdraws capture eligibility before attempting
+    /// the birth, including an attempt that subsequently fails.
+    ///
+    /// An implementation must reconsider this declaration when its dependency,
+    /// feature, hook, or FFI construction changes. It does not authorize capture
+    /// by itself, nor promise that ordinary guest programs are single-threaded.
+    ManagedRuntimeOnly,
+}
+
 /// Who owns a guest thread: the single axis that governs *both* how the thread
 /// executes *and* who owns its thread-synchronization primitives (`futex`,
 /// `CLONE_CHILD_CLEARTID`).
@@ -143,6 +167,18 @@ pub trait GlobalTool: Send + Sync + Default {
     /// grant the fact to inherited/unknown FIFOs or later reconnects, and must
     /// release the lease at that handoff (or startup failure), not at run end.
     fn install_inherited_input(&mut self, _input: crate::InheritedInputLease) {}
+
+    /// Install launcher-owned capture accounting before the first guest hook.
+    /// Only an external controller may retain this handle. Capture authority is
+    /// enabled only when existing containment performs whole-run cleanup;
+    /// disabled accounting retains refusals without authorizing capture.
+    /// Default Tools do not use it. See [`crate::MappingCaptureRun`].
+    /// This capability does not certify the controller's filesystem context.
+    /// A Tool reading path-rendered procfs views must independently authenticate
+    /// an equal target/reader root and mount namespace and ensure that no
+    /// controller callback or shared-FS executor changes that context during
+    /// the synchronous read. Endpoint equality alone does not exclude ABA.
+    fn install_mapping_capture_run(&mut self, _run: crate::MappingCaptureRun) {}
 
     /// Install one run-scoped backend capability before the first guest hook.
     /// The default preserves backend-owned selection. A Tool may reject a
@@ -644,6 +680,15 @@ pub trait Tool: Send + Sync + Default {
     /// are not).
     fn subscriptions(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
         Subscription::all_syscalls()
+    }
+
+    /// Declare native executor ownership for Tool code running in the observed
+    /// address space. See [`NativeMmOwnership`] for the complete obligation.
+    ///
+    /// Wrapping Tools must compose an explicit declaration from every inner
+    /// Tool; a trait bound or a known type name is not such a declaration.
+    fn native_mm_ownership(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> NativeMmOwnership {
+        NativeMmOwnership::Unavailable
     }
 
     /// How this tool's guest threads (children created via `CLONE_THREAD`) are

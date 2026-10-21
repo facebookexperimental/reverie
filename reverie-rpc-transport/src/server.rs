@@ -147,6 +147,20 @@ fn admit_connection(
     Ok(Some(admission.admit(peer)?))
 }
 
+fn mapping_capture_peer(
+    run: Option<reverie::MappingCaptureRun>,
+    stream: &UnixStream,
+) -> Result<Option<(reverie::MappingCaptureRun, i32)>, RpcError> {
+    let Some(run) = run else {
+        return Ok(None);
+    };
+    let peer = stream
+        .peer_cred()?
+        .pid()
+        .ok_or_else(|| std::io::Error::other("mapping capture connection has no physical peer"))?;
+    Ok(Some((run, peer)))
+}
+
 /// A coordinator that serves one shared [`GlobalTool`] instance to many guest
 /// processes over a Unix-domain socket.
 pub struct RpcServer<G: GlobalTool> {
@@ -162,6 +176,7 @@ pub struct RpcServer<G: GlobalTool> {
     admission: Option<Arc<dyn ConnectionAdmission>>,
     initial_image: Option<InitialImageSetup>,
     native_successor: Option<Arc<dyn SuccessorAdmission>>,
+    mapping_capture: Option<reverie::MappingCaptureRun>,
 }
 
 #[derive(Clone)]
@@ -186,6 +201,7 @@ struct ConnectionSetup {
     handshake: Option<HandshakeFrames>,
     native_close: Option<Arc<dyn SuccessorAdmission>>,
     cancellation: Option<(usize, RequestCancellation)>,
+    mapping_capture: Option<(reverie::MappingCaptureRun, i32)>,
 }
 
 /// Actual error outcome of cancelling a received, admitted request. Fields are
@@ -649,6 +665,7 @@ where
             admission: None,
             initial_image: None,
             native_successor: None,
+            mapping_capture: None,
         })
     }
 
@@ -690,6 +707,7 @@ where
             admission: None,
             initial_image: None,
             native_successor: None,
+            mapping_capture: None,
         })
     }
 
@@ -745,7 +763,16 @@ where
             admission: None,
             initial_image: None,
             native_successor: None,
+            mapping_capture: None,
         })
+    }
+
+    /// Install only a launcher's existing enabled mapping-capture containment
+    /// owner. Authorization uses the accepted socket's physical peer, never a
+    /// Tool-supplied numeric sender. No connection or cleanup policy is enabled.
+    pub fn mapping_capture(mut self, run: reverie::MappingCaptureRun) -> Self {
+        self.mapping_capture = Some(run);
+        self
     }
 
     /// Admits every later connection through `admission` before serving it;
@@ -927,10 +954,12 @@ where
                 let initial_image = self.initial_image.clone();
                 let native_successor = self.native_successor.clone();
                 let request_cancellation = cancellation.clone();
+                let mapping_capture = self.mapping_capture.clone();
                 connections.spawn(async move {
                     let _connection_guard = connection_guard;
                     let future = async move {
                         let mut stream = stream;
+                        let mapping_capture = mapping_capture_peer(mapping_capture, &stream)?;
                         let admitted = admit_connection(admission.as_ref(), &stream)?;
                         let cancellation = request_cancellation.map(|cancel| (connection, cancel));
                         let config_bytes = match initial_image {
@@ -951,6 +980,7 @@ where
                                 handshake: config_bytes,
                                 native_close: native_successor,
                                 cancellation,
+                                mapping_capture,
                             },
                         )
                         .await
@@ -1021,6 +1051,7 @@ where
             completed: false,
         };
         let result = async {
+            let mapping_capture = mapping_capture_peer(self.mapping_capture.clone(), &stream)?;
             let admitted = admit_connection(self.admission.as_ref(), &stream)?;
             let config = self.config.clone();
             let config_bytes = match &self.initial_image {
@@ -1046,6 +1077,7 @@ where
                     handshake: config_bytes,
                     native_close: self.native_successor.clone(),
                     cancellation: None,
+                    mapping_capture,
                 },
             )
             .await
@@ -1273,6 +1305,7 @@ where
         handshake,
         native_close,
         cancellation,
+        mapping_capture,
     } = setup;
     let cancellation_admitted = admitted;
     let mut request_number = 0usize;
@@ -1342,6 +1375,19 @@ where
             }
             Err(e) => return Err(e),
         };
+        if let Some(token) = crate::mapping_capture::decode_request(&request_bytes)? {
+            let authorized = mapping_capture
+                .as_ref()
+                .is_some_and(|(run, peer)| run.authorize(token, *peer));
+            let response = crate::mapping_capture::reply(&request_bytes, authorized);
+            connection_io(
+                write_message(&mut stream, &response),
+                cancellation_admitted,
+                cancellation.as_ref(),
+            )
+            .await?;
+            continue;
+        }
         let RequestEnvelope { from, request } =
             decode::<RequestEnvelope<G::Request>>(&request_bytes)?;
         // Combined native-image admission binds every RPC sender to this

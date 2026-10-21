@@ -672,18 +672,33 @@ impl DbtRunner {
             .map(reverie::InheritedInput::lease)
             .transpose()?;
         let mut global = G::init_global_state(&config).await;
+        // The broader terminate-on-exit option does not prevent group escape.
+        // Only these existing modes install the native containment guard (or
+        // run under namespace-init cleanup); no runner default is changed.
+        let containment_enabled = self.evidence.is_some() || self.isolated_process_group;
+        let (mapping_capture_owner, mapping_capture_control) = if containment_enabled {
+            reverie::MappingCaptureRunOwner::new()
+        } else {
+            reverie::MappingCaptureRunOwner::disabled()
+        };
+        // Failure accounting is present even when capture authority is absent:
+        // a pre-Prepare refusal must not become an ordinary guest exit101.
+        global.install_mapping_capture_run(mapping_capture_control.clone());
         if let Some(input) = input_lease {
             global.install_inherited_input(input);
         }
         let mut global = Arc::new(global);
         let requested = Arc::new(AtomicBool::new(false));
-        let server = RpcServer::bind_with_readiness(
+        let mut server = RpcServer::bind_with_readiness(
             &socket,
             Arc::clone(&global),
             config,
             Arc::clone(&requested),
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
+        if containment_enabled {
+            server = server.mapping_capture(mapping_capture_control);
+        }
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-247): Review native external-global capability propagation.
@@ -719,7 +734,11 @@ impl DbtRunner {
         if capture_output {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        let child = runner.spawn_command(&mut command)?;
+        let mut child = runner.spawn_command(&mut command)?;
+        if let Err(error) = mapping_capture_owner.bind_root(&child) {
+            runner.terminate_and_reap(&mut child);
+            return Err(error);
+        }
         // A reusable Command retains a caller-supplied Stdio owner after spawn.
         // Keep no parent reader beyond the Tool's temporary initial-image lease.
         drop(command);
@@ -756,6 +775,9 @@ impl DbtRunner {
             };
         }
         let wait = serve_rpc_until(server, completion).await?;
+        // The wait owns real child/tree cleanup. Only then may a complete
+        // capture become an ordinary guest status, including verify-allow.
+        mapping_capture_owner.finish()?;
         if missing_coordinator_request_is_error(requested.load(Ordering::Acquire), &wait) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
