@@ -21,6 +21,7 @@ mod branch_facts;
 pub mod counter;
 mod counter2_global;
 mod evidence;
+mod host_linux;
 mod launcher;
 mod mapping_capture;
 pub mod sync_rpc;
@@ -694,14 +695,14 @@ where
         // identity bookkeeping still completes synchronously, while the
         // original-syscall post-event latch remains disarmed because the raw
         // result is returned directly to this Tool call.
-        let result = unsafe {
-            (self.invoke_syscall)(
-                self.context,
-                number.id() as i64,
-                args.as_ptr(),
-                purpose as u32,
-            )
-        };
+        let result = host_linux::forward(
+            self.tid,
+            self.pid,
+            self.context,
+            self.invoke_syscall,
+            purpose,
+            &reverie::provider::SyscallRequest::new(number.id() as u64, args),
+        );
         Errno::from_ret(result as usize).map(|value| value as i64)
     }
 
@@ -3367,6 +3368,7 @@ mod tests {
         sysnum: i64,
         args: [u64; 6],
         result: i64,
+        calls: std::cell::Cell<usize>,
     }
 
     unsafe extern "C" fn invoke_expected(
@@ -3380,7 +3382,258 @@ mod tests {
         let actual_args = unsafe { std::slice::from_raw_parts(args, 6) };
         assert_eq!(sysnum, expected.sysnum);
         assert_eq!(actual_args, expected.args);
+        expected.calls.set(expected.calls.get() + 1);
         expected.result
+    }
+
+    fn expected_provider_call<S: SyscallInfo>(
+        guest: &DbtGuest<'_, PrototypeTool>,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> host_linux::Observed {
+        host_linux::Observed {
+            tid: guest.tid,
+            pid: guest.pid,
+            context: guest.context,
+            callback: guest.invoke_syscall as usize,
+            request: reverie::provider::SyscallRequest::from_syscall(syscall),
+            purpose,
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordedCallback {
+        calls: Vec<(i64, [u64; 6], u32)>,
+        result: i64,
+    }
+
+    unsafe extern "C" fn record_callback(
+        context: usize,
+        number: i64,
+        args: *const u64,
+        purpose: u32,
+    ) -> i64 {
+        let record = unsafe { &mut *(context as *mut RecordedCallback) };
+        record
+            .calls
+            .push((number, unsafe { args.cast::<[u64; 6]>().read() }, purpose));
+        record.result
+    }
+
+    #[test]
+    fn provider_routing_preserves_raw_return_boundaries() {
+        host_linux::take_observed();
+        let mut counters = PrototypeCounters::default();
+        let args = [u64::MAX, 1_u64 << 63, 0, 17, 31, 0x1234_5678_9abc_def0];
+        let call = Syscall::from_raw(
+            Sysno::getpid,
+            SyscallArgs::new(
+                args[0] as usize,
+                args[1] as usize,
+                args[2] as usize,
+                args[3] as usize,
+                args[4] as usize,
+                args[5] as usize,
+            ),
+        );
+        // Raw Linux errno range is -4095..=-1; other negative bit patterns
+        // remain successful values. In particular neither EINTR nor the
+        // not-run errno value alone establishes a ProviderOutcome::Interrupted.
+        for (raw, expected) in [
+            (0, Ok(0)),
+            (73, Ok(73)),
+            (-22, Err(22)),
+            (-4, Err(4)),
+            (-512, Err(512)),
+            (-4095, Err(4095)),
+            (-4096, Ok(-4096)),
+            (i64::MIN, Ok(i64::MIN)),
+        ] {
+            let mut record = RecordedCallback {
+                result: raw,
+                ..Default::default()
+            };
+            let mut guest = DbtGuest::<PrototypeTool>::new(
+                &mut record as *mut _ as usize,
+                Pid::from_raw(10),
+                Pid::from_raw(9),
+                None,
+                0,
+                &mut counters,
+                &GLOBAL_STATE,
+                &CONFIG,
+                record_callback,
+                read_regs,
+                write_regs_noop,
+            );
+            let tail = Arc::clone(&guest.tail_inject_result);
+            assert_eq!(
+                run_ready(guest.inject(call), &tail)
+                    .unwrap()
+                    .map_err(Errno::into_raw),
+                expected
+            );
+            assert_eq!(
+                host_linux::take_observed(),
+                [expected_provider_call(
+                    &guest,
+                    call,
+                    InjectionPurpose::Application
+                )]
+            );
+            assert_eq!(
+                record.calls,
+                [(libc::SYS_getpid, args, InjectionPurpose::Application as u32)]
+            );
+        }
+    }
+
+    // Called only inside the real shared-client CHILD fixture, while its
+    // original connection owner and application descriptor are still live.
+    pub(super) fn assert_provider_admission(reserved: i32, application: i32) {
+        host_linux::take_observed();
+        let mut counters = PrototypeCounters::default();
+        let mut record = RecordedCallback::default();
+        let mut guest = DbtGuest::<PrototypeTool>::new(
+            &mut record as *mut _ as usize,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            record_callback,
+            read_regs,
+            write_regs_noop,
+        );
+        let tail = Arc::clone(&guest.tail_inject_result);
+        for number in [Sysno::close, Sysno::connect] {
+            let call =
+                Syscall::from_raw(number, SyscallArgs::new(reserved as usize, 0, 0, 0, 0, 0));
+            assert_eq!(
+                run_ready(guest.inject(call), &tail),
+                Some(Err(Errno::EBADF))
+            );
+            assert!(host_linux::take_observed().is_empty());
+            assert!(record.calls.is_empty());
+        }
+        let close_range = Syscall::from_raw(
+            Sysno::close_range,
+            SyscallArgs::new(reserved as usize - 1, reserved as usize + 1, 0, 0, 0, 0),
+        );
+        assert_eq!(run_ready(guest.inject(close_range), &tail), Some(Ok(0)));
+        assert!(host_linux::take_observed().is_empty());
+        assert_eq!(
+            record.calls,
+            [reserved - 1, reserved + 1].map(|fd| (
+                libc::SYS_close_range,
+                [fd as u64, fd as u64, 0, 0, 0, 0],
+                InjectionPurpose::Application as u32
+            ))
+        );
+        record.calls.clear();
+        let ordinary = Syscall::from_raw(
+            Sysno::read,
+            SyscallArgs::new(application as usize, 0, 0, 0, 0, 0),
+        );
+        assert_eq!(run_ready(guest.inject(ordinary), &tail), Some(Ok(0)));
+        assert_eq!(
+            host_linux::take_observed(),
+            [expected_provider_call(
+                &guest,
+                ordinary,
+                InjectionPurpose::Application
+            )]
+        );
+        assert_eq!(
+            record.calls,
+            [(
+                libc::SYS_read,
+                [application as u64, 0, 0, 0, 0, 0],
+                InjectionPurpose::Application as u32
+            )]
+        );
+    }
+
+    #[test]
+    fn provider_invariant_failures_never_become_guest_results() {
+        use std::convert::Infallible;
+        use std::os::unix::process::ExitStatusExt;
+
+        use reverie::provider::LinuxProvider;
+        use reverie::provider::ProviderOutcome;
+        use reverie::provider::SyscallRequest;
+
+        const MODE: &str = "REVERIE_DBT_PROVIDER_INVARIANT_TEST";
+        struct Broken(String);
+        #[reverie::provider]
+        impl LinuxProvider for Broken {
+            type Context = host_linux::Invocation;
+            type Plan = Infallible;
+            type Error = host_linux::WrongTask;
+
+            async fn execute(
+                &mut self,
+                task: Pid,
+                request: &SyscallRequest,
+                cx: &mut Self::Context,
+            ) -> Result<ProviderOutcome<Infallible>, Self::Error> {
+                match self.0.as_str() {
+                    "wrong-task" => {
+                        host_linux::HostLinux
+                            .execute(Pid::from_raw(task.as_raw() + 1), request, cx)
+                            .await
+                    }
+                    "pending" => std::future::pending().await,
+                    "cancelled" => Ok(ProviderOutcome::Cancelled),
+                    "interrupted" => Ok(ProviderOutcome::Interrupted),
+                    _ => panic!("unknown test mode"),
+                }
+            }
+        }
+        unsafe extern "C" fn forbidden_callback(_: usize, _: i64, _: *const u64, _: u32) -> i64 {
+            // This must be distinguishable from the invariant's SIGABRT.
+            std::process::exit(92)
+        }
+        if let Ok(mode) = std::env::var(MODE) {
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) }, 0);
+            let tid = Pid::from_raw(10);
+            let mut cx = host_linux::Invocation {
+                tid,
+                pid: tid,
+                context: 0,
+                invoke: forbidden_callback,
+                purpose: InjectionPurpose::Application,
+            };
+            host_linux::forward_with(
+                &mut Broken(mode),
+                tid,
+                &SyscallRequest::new(libc::SYS_getpid as u64, [0; 6]),
+                &mut cx,
+            );
+            std::process::exit(93);
+        }
+        for mode in ["wrong-task", "pending", "cancelled", "interrupted"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::provider_invariant_failures_never_become_guest_results",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.signal(),
+                Some(libc::SIGABRT),
+                "{mode}: {output:?}"
+            );
+        }
     }
 
     unsafe extern "C" fn read_regs(_context: usize, regs: *mut libc::user_regs_struct) -> i32 {
@@ -3497,14 +3750,15 @@ mod tests {
         unsafe extern "C" fn observe(
             context: usize,
             number: i64,
-            _args: *const u64,
+            args: *const u64,
             purpose: u32,
         ) -> i64 {
-            let calls = unsafe { &mut *(context as *mut Vec<(i64, u32)>) };
-            calls.push((number, purpose));
+            let calls = unsafe { &mut *(context as *mut Vec<(i64, [u64; 6], u32)>) };
+            calls.push((number, unsafe { args.cast::<[u64; 6]>().read() }, purpose));
             -i64::from(libc::EINVAL)
         }
-        let mut calls = Vec::<(i64, u32)>::new();
+        let mut calls = Vec::<(i64, [u64; 6], u32)>::new();
+        host_linux::take_observed();
         let mut counters = PrototypeCounters::default();
         let mut guest = DbtGuest::<PrototypeTool>::new(
             &mut calls as *mut _ as usize,
@@ -3536,6 +3790,18 @@ mod tests {
             )
             .unwrap();
         let call = reverie::syscalls::Pselect6::new().with_timeout(Some(timeout));
+        assert_eq!(
+            run_ready(guest.inject(call), &tail),
+            Some(Err(Errno::EINVAL))
+        );
+        assert_eq!(
+            host_linux::take_observed(),
+            [expected_provider_call(
+                &guest,
+                call,
+                InjectionPurpose::Application
+            )]
+        );
         {
             let mut adapted = guest.into_guest();
             let result = run_ready(
@@ -3550,17 +3816,44 @@ mod tests {
             assert!(matches!(result, Err(Error::Errno(Errno::EINVAL))));
         }
         assert_eq!(
+            host_linux::take_observed(),
+            [expected_provider_call(
+                &guest,
+                call,
+                InjectionPurpose::Pselect6WrapperValidation
+            )]
+        );
+        assert_eq!(
             run_ready(guest.inject(call), &tail),
             Some(Err(Errno::EINVAL))
         );
+        assert_eq!(
+            host_linux::take_observed(),
+            [expected_provider_call(
+                &guest,
+                call,
+                InjectionPurpose::Application
+            )]
+        );
+        let args = *reverie::provider::SyscallRequest::from_syscall(call).args();
         assert_eq!(
             calls,
             [
                 (
                     libc::SYS_pselect6,
+                    args,
+                    InjectionPurpose::Application as u32
+                ),
+                (
+                    libc::SYS_pselect6,
+                    args,
                     InjectionPurpose::Pselect6WrapperValidation as u32
                 ),
-                (libc::SYS_pselect6, InjectionPurpose::Application as u32),
+                (
+                    libc::SYS_pselect6,
+                    args,
+                    InjectionPurpose::Application as u32
+                ),
             ]
         );
     }
@@ -3601,6 +3894,7 @@ mod tests {
 
     #[test]
     fn core_file_io_syscalls_dispatch_through_guest() {
+        host_linux::take_observed();
         let cases = [
             (libc::SYS_open, [0, 11, 12, 13, 14, 15]),
             (libc::SYS_openat, [20, 0, 22, 23, 24, 25]),
@@ -3631,6 +3925,7 @@ mod tests {
                 sysnum,
                 args: raw_args.map(|arg| arg as u64),
                 result,
+                calls: std::cell::Cell::new(0),
             };
             let syscall = Syscall::from_raw(
                 Sysno::from(sysnum as i32),
@@ -3662,6 +3957,15 @@ mod tests {
                 &tail_result,
             )
             .unwrap();
+            assert_eq!(expected.calls.get(), 1);
+            assert_eq!(
+                host_linux::take_observed(),
+                [expected_provider_call(
+                    &guest,
+                    syscall,
+                    InjectionPurpose::Application
+                )]
+            );
             if result < 0 {
                 assert!(matches!(outcome, Err(Error::Errno(Errno::EACCES))));
             } else {
@@ -3730,10 +4034,12 @@ mod tests {
 
     #[test]
     fn tail_inject_defers_exact_syscall_and_suspends() {
+        host_linux::take_observed();
+        let mut native = RecordedCallback::default();
         let mut counters = PrototypeCounters::default();
         let syscall = Syscall::from_raw(Sysno::write, SyscallArgs::new(1, 0x1000, 7, 0, 0, 0));
         let mut guest: DbtGuest<'_, PrototypeTool> = DbtGuest::new(
-            0,
+            &mut native as *mut _ as usize,
             Pid::from_raw(10),
             Pid::from_raw(10),
             None,
@@ -3741,7 +4047,7 @@ mod tests {
             &mut counters,
             &GLOBAL_STATE,
             &CONFIG,
-            invoke,
+            record_callback,
             read_regs,
             write_regs_noop,
         );
@@ -3756,6 +4062,8 @@ mod tests {
             tail_result.take(),
             Some(TailInjectAction::ExecuteOriginal(syscall))
         );
+        assert!(host_linux::take_observed().is_empty());
+        assert!(native.calls.is_empty());
 
         let exit = Syscall::from_raw(Sysno::exit_group, SyscallArgs::new(42, 0, 0, 0, 0, 0));
         tail_result.clear();
@@ -3771,6 +4079,8 @@ mod tests {
         unsafe { write_deferred_syscall(exit, &mut deferred_number, deferred_args.as_mut_ptr()) };
         assert_eq!(deferred_number, Sysno::exit_group.id() as i64);
         assert_eq!(deferred_args, [42, 0, 0, 0, 0, 0]);
+        assert!(host_linux::take_observed().is_empty());
+        assert!(native.calls.is_empty());
 
         for number in [
             Sysno::fork,
@@ -3789,6 +4099,8 @@ mod tests {
                 Some(TailInjectAction::ExecuteOriginal(lifecycle)),
                 "{number:?} must use DynamoRIO's original lifecycle path"
             );
+            assert!(host_linux::take_observed().is_empty());
+            assert!(native.calls.is_empty());
         }
     }
 

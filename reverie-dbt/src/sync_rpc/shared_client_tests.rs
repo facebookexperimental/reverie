@@ -272,6 +272,7 @@ fn exercise_both_paths() {
             Some(-i64::from(libc::EBADF))
         );
         assert_eq!(GUEST_CLIENT.descriptor(pid.wrapping_add(1)), None);
+        crate::tests::assert_provider_admission(primary, high.as_raw_fd());
     }
     assert_eq!(second.send(32, 9), Response(32, 9));
 

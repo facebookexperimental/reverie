@@ -18,11 +18,11 @@
 //! reverie-linux-provider, which now only re-exports this module. It names no
 //! backend: reverie-kvm implements the memory traits for its guest arena and
 //! fixes the associated types; reverie-kvm's syscall executor and the
-//! crate-private `HostLinux` providers of reverie-ptrace and reverie-inguest
-//! implement [`LinuxProvider`].
+//! crate-private `HostLinux` providers of reverie-ptrace, reverie-inguest and
+//! reverie-dbt implement [`LinuxProvider`].
 //!
-//! Being in core does not yet make it part of every backend's contract. Three
-//! backends implement and call it. In reverie-kvm the syscall executor is the
+//! Being in core does not yet make it part of every backend's contract. Four
+//! backend implementations call it. In reverie-kvm the syscall executor is the
 //! provider. In reverie-ptrace the provider is the host kernel: a
 //! crate-private `HostLinux` runs each injected call in the stopped tracee.
 //! In reverie-inguest, the runtime LiteInst and in-guest-trap share, the
@@ -34,9 +34,15 @@
 //! and the syscalls of the runtime's virtual signal calls still reach Linux
 //! directly from the backend. Its `SuccessorImageGuest`, the feature-gated
 //! `Guest` of a native exec's successor image, does not route through the
-//! provider yet. The other backends (DBT and SaBRe) do not route
-//! `Guest::inject` through it yet, and [`Backend`](crate::Backend) does not
-//! carry a provider. Those are later steps, tracked in
+//! provider yet. In reverie-dbt, returning calls that pass backend admission
+//! reach a private `HostLinux` through the existing full native invoker on the
+//! issuing task. The invocation keeps its exact purpose, native ownership,
+//! descriptor/lifecycle bookkeeping and interruption receipt. Tool-requested
+//! `close_range` fragments in admission, deferred tail execution, native
+//! copied-child/lifecycle paths and coordinator transport calls remain outside
+//! that provider route. SaBRe does not route `Guest::inject` through it yet,
+//! and [`Backend`](crate::Backend) does not carry a provider. The remaining
+//! routes are later steps, tracked in
 //! <https://github.com/rrnewton/hermit/issues/4485>.
 //!
 //! # Rules every provider is held to
