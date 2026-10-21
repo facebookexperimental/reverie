@@ -1341,3 +1341,41 @@ fn descriptor_pwrite64_admission_runs_no_write_callback() {
         negative_errno(libc::EFAULT)
     );
 }
+
+/// Under host-owned threads, read and readv are backend-owned unless the read
+/// is Tool-visible. A random device's reads stay Tool-visible through every
+/// alias (the Tool answers them), as regular files' do; another character
+/// device's do not.
+#[test]
+fn random_device_reads_are_tool_visible_after_duplication() {
+    let root = TestDir::new();
+    let mut state = test_state(&root.0);
+    let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    for path in ["/dev/urandom", "/dev/random", "/dev//urandom"] {
+        let fd = open_readonly(&mut memory, &mut state, path);
+        assert!(fd >= 0, "{path}: {fd}");
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_dup3,
+                [fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(close(&mut state, fd as u64), 0);
+    }
+    let null = open_readonly(&mut memory, &mut state, "/dev/null");
+    assert!(null >= 0);
+    let executor = ElfExecutor::new(state, false);
+    for number in [libc::SYS_read, libc::SYS_readv] {
+        assert!(executor.is_tool_visible_read(&SyscallRequest::new(
+            number as u64,
+            [0, 0x200, 1, 0, 0, 0],
+        )));
+        assert!(!executor.is_tool_visible_read(&SyscallRequest::new(
+            number as u64,
+            [null as u64, 0x200, 1, 0, 0, 0],
+        )));
+    }
+}

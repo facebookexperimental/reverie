@@ -57,25 +57,21 @@ expect_error(enum open_call call, const char* path, long flags, int expected) {
   return 0;
 }
 
-static int check_reopens(long fd, int native) {
+static int check_reopens(long fd) {
   const char* directories[] = {"/proc/self/fd", "/dev/fd"};
   for (size_t index = 0; index < sizeof(directories) / sizeof(directories[0]);
        ++index) {
     char path[80];
     int length = snprintf(path, sizeof(path), "%s/%ld", directories[index], fd);
     CHECK(length > 0 && (size_t)length < sizeof(path));
-    if (native) {
-      /* Native Linux supports these read-only random-device reopens. */
-      long reopened = open_path(
-          USE_OPENAT, (long)AT_FDCWD, path, (long)(O_RDONLY | O_CLOEXEC));
-      CHECK(reopened >= 0);
-      CHECK(syscall(SYS_close, reopened) == 0);
-    } else {
-      /* A guest reopen must not lose the private stream's identity. */
-      CHECK(
-          expect_error(
-              USE_OPENAT, path, (long)(O_RDONLY | O_CLOEXEC), ENOSYS) == 0);
-    }
+    /* Linux reopens a random device through its descriptor's link as a new
+     * open file description, natively and under the backend. */
+    long reopened = open_path(
+        USE_OPENAT, (long)AT_FDCWD, path, (long)(O_RDONLY | O_CLOEXEC));
+    CHECK(reopened >= 0);
+    unsigned char byte;
+    CHECK(syscall(SYS_read, reopened, (long)&byte, 1L) == 1);
+    CHECK(syscall(SYS_close, reopened) == 0);
   }
   return 0;
 }
@@ -85,8 +81,7 @@ static int run_case(
     const char* variant,
     enum open_call call,
     long dirfd,
-    const char* path,
-    int native) {
+    const char* path) {
   unsigned char bytes[106];
   long fd = open_path(call, dirfd, path, (long)(O_RDONLY | O_CLOEXEC));
   CHECK(fd >= 0);
@@ -97,7 +92,7 @@ static int run_case(
   CHECK(syscall(SYS_readv, alias, (long)parts, 3L) == 59);
   CHECK(syscall(SYS_read, fd, (long)(bytes + 82), 11L) == 11);
   CHECK(syscall(SYS_close, fd) == 0);
-  CHECK(check_reopens(alias, native) == 0);
+  CHECK(check_reopens(alias) == 0);
   CHECK(syscall(SYS_read, alias, (long)(bytes + 93), 13L) == 13);
   CHECK(syscall(SYS_close, alias) == 0);
 
@@ -110,14 +105,11 @@ static int run_case(
       variant,
       call_name(call));
   CHECK(length > 0 && (size_t)length < sizeof(header));
+  /* The bytes are the host's entropy without a Tool that answers them, so
+   * only the count is reported. */
   CHECK(
       syscall(SYS_write, (long)STDOUT_FILENO, (long)header, (long)length) ==
       length);
-  CHECK(
-      syscall(
-          SYS_write, (long)STDOUT_FILENO, (long)bytes, (long)sizeof(bytes)) ==
-      (long)sizeof(bytes));
-  CHECK(syscall(SYS_write, (long)STDOUT_FILENO, (long)"\n", 1L) == 1);
   return 0;
 }
 
@@ -238,8 +230,7 @@ int main(int argc, char** argv) {
                 variants[variant].name,
                 call,
                 (long)AT_FDCWD,
-                path,
-                native) != 0) {
+                path) != 0) {
           fprintf(
               stderr,
               "device=%s variant=%s call=%s\n",
@@ -256,8 +247,7 @@ int main(int argc, char** argv) {
             "dirfd",
             USE_OPENAT,
             devfd,
-            devices[device],
-            native) == 0);
+            devices[device]) == 0);
   }
   CHECK(syscall(SYS_close, devfd) == 0);
   return check_controls(native);

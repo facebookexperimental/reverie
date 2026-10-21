@@ -707,15 +707,20 @@ mod shared_file_dispatch_tests {
         }
     }
 
-    // The backend no longer creates a memfd named reverie-kvm-virtual-file, so
-    // in every run a guest memfd with that name is an ordinary shared file
-    // backing.
+    // The backend no longer creates a memfd named reverie-kvm-virtual-file or
+    // reverie-kvm-virtual, so in every run a guest memfd with either name is an
+    // ordinary shared file backing.
     #[test]
-    fn removed_virtual_file_carrier_name_is_an_ordinary_backing() {
-        for host_metadata_timestamps in [false, true] {
+    fn removed_virtual_carrier_names_are_ordinary_backings() {
+        for (name, host_metadata_timestamps) in [
+            ("reverie-kvm-virtual-file", false),
+            ("reverie-kvm-virtual-file", true),
+            ("reverie-kvm-virtual", false),
+            ("reverie-kvm-virtual", true),
+        ] {
             let mut f = Fixture::new();
             f.state.host_metadata_timestamps = host_metadata_timestamps;
-            let mut file = syncfs_memfd("reverie-kvm-virtual-file");
+            let mut file = syncfs_memfd(name);
             file.write_all(&f.expected).unwrap();
             let fd = insert_file_with_flags(&mut f.state, file, false, None);
             assert!(fd >= 3);

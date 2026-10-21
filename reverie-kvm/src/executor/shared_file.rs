@@ -30,7 +30,6 @@ fn classify_shared_mmap_file(
 ) -> crate::Result<()> {
     if state.proc_files.contains_key(&fd)
         || state.fdinfo_files.contains_key(&fd)
-        || state.random_device_fds.contains(&fd)
         || (capture_output && output_alias(state, fd).is_some())
     {
         return Err(unsupported_mmap("synthetic or captured backing"));
@@ -74,14 +73,6 @@ pub(super) fn mmap_with_shared_files(
     // for an anonymous mapping too.
     if !args[5].is_multiple_of(PAGE_SIZE) {
         return Ok(negative_errno(libc::EINVAL));
-    }
-    // Preserve the random device's earlier ABI checks. Its existing mmap path
-    // always refuses before reservation/zeroing, including MAP_FIXED; calling
-    // it cannot overwrite a currently shared ordinary file.
-    if args[3] & libc::MAP_ANONYMOUS as u64 == 0
-        && let Some(random) = state.random_device_descriptions.get(&(args[4] as i32))
-    {
-        return Ok(random_device_mmap(memory, state, args, random));
     }
     if let Some(error) = super::non_regular_mmap_early_refusal(state, args) {
         return Ok(error);
@@ -598,7 +589,7 @@ mod tests {
     #[test]
     fn shared_mmap_capability_refusals_preserve_target_and_descriptor_precedence() {
         let (mut memory, mut state) = setup();
-        state.files.insert(3, backing(c"reverie-kvm-virtual"));
+        state.files.insert(3, backing(c"reverie-kvm-proc"));
         state.files.insert(4, backing(c"shared-map-ordinary"));
         let address = state.mmap_base;
         memory.write(address, &[0x5a; 32]).unwrap();

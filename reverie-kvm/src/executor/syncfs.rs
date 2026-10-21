@@ -23,7 +23,6 @@ fn sync_filesystem(state: &LoadedStaticElf, raw_fd: u64, capture_output: bool) -
     }
     if state.proc_files.contains_key(&fd)
         || state.fdinfo_files.contains_key(&fd)
-        || state.random_device_fds.contains(&fd)
         || signalfd_mask(state, fd).is_some()
         || (capture_output && output_alias(state, fd).is_some())
     {
@@ -85,14 +84,12 @@ fn syncfs_private_memfd_name(path: &[u8]) -> bool {
         return false;
     };
     // Current creation sites: open_synthetic_proc (also process stat/status and
-    // fdinfo), open_random_device, and create_memory_backing.
+    // fdinfo), and create_memory_backing.
     // Guest RAM is not exported, but must not become ordinary if imported.
     // The last two are reserved carrier shapes from the preserved PR610
     // implementation. Refusing them does not implement its EBADMSG/auth rules.
-    matches!(
-        name,
-        b"reverie-kvm-proc" | b"reverie-kvm-virtual" | b"reverie-kvm-guest-memory"
-    ) || name.starts_with(b"reverie-kvm.proc-carrier.v1")
+    matches!(name, b"reverie-kvm-proc" | b"reverie-kvm-guest-memory")
+        || name.starts_with(b"reverie-kvm.proc-carrier.v1")
         || name.starts_with(b"reverie-kvm.capture-transfer.v1")
 }
 

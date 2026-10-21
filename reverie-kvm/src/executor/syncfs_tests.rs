@@ -121,17 +121,22 @@ fn syncfs_closed_and_path_only_precede_private_refusal_without_host_call() {
     }
 }
 
-// The backend no longer creates a memfd named reverie-kvm-virtual-file, so in
-// every run the name belongs to the guest, and the guest's memfd is an ordinary
-// file that Linux syncfs serves.
+// The backend no longer creates a memfd named reverie-kvm-virtual-file or
+// reverie-kvm-virtual, so in every run those names belong to the guest, and the
+// guest's memfd is an ordinary file that Linux syncfs serves.
 #[test]
-fn syncfs_serves_a_guest_memfd_named_like_the_removed_virtual_file_carrier() {
+fn syncfs_serves_a_guest_memfd_named_like_the_removed_virtual_carriers() {
     let root = TestDir::new();
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-    for host_metadata_timestamps in [false, true] {
+    for (name, host_metadata_timestamps) in [
+        ("reverie-kvm-virtual-file", false),
+        ("reverie-kvm-virtual-file", true),
+        ("reverie-kvm-virtual", false),
+        ("reverie-kvm-virtual", true),
+    ] {
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = host_metadata_timestamps;
-        let mut file = syncfs_memfd("reverie-kvm-virtual-file");
+        let mut file = syncfs_memfd(name);
         file.write_all(b"guest bytes\n").unwrap();
         let host = file.as_raw_fd();
         let fd = insert_file_with_flags(&mut state, file, false, None);
@@ -145,28 +150,28 @@ fn syncfs_serves_a_guest_memfd_named_like_the_removed_virtual_file_carrier() {
         assert_eq!(
             syncfs_call(&mut memory, &mut state, fd as u64),
             0,
-            "host_metadata_timestamps={host_metadata_timestamps}"
+            "{name} host_metadata_timestamps={host_metadata_timestamps}"
         );
         assert_eq!(
             seen.get(),
             1,
-            "host_metadata_timestamps={host_metadata_timestamps}"
+            "{name} host_metadata_timestamps={host_metadata_timestamps}"
         );
         drop(hook);
         assert_eq!(close(&mut state, fd as u64), 0);
     }
 }
 
-// truncate through a /proc/self/fd link refuses only the random device's
-// carrier, by its exact name; a guest memfd named like the removed
-// virtual-file carrier, or another reverie-kvm-virtual name, is truncated.
+// truncate through a /proc/self/fd link truncates a guest memfd named like a
+// removed carrier (the random device's reverie-kvm-virtual or the virtual
+// file's reverie-kvm-virtual-file) as Linux truncates any other memfd.
 #[test]
-fn truncate_refuses_only_the_random_device_carrier_name() {
+fn truncate_serves_guest_memfds_named_like_removed_carriers() {
     let root = TestDir::new();
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
     for (name, expected) in [
-        ("reverie-kvm-virtual", negative_errno(libc::EINVAL)),
+        ("reverie-kvm-virtual", 0),
         ("reverie-kvm-virtual-file", 0),
         ("reverie-kvm-virtual-ordinary", 0),
     ] {
@@ -196,7 +201,6 @@ fn syncfs_reserved_names_deny_without_authenticating_payload_or_seals() {
     let _hook = install_syncfs_test_hook(|_| panic!("reserved private name reached host syncfs"));
     for name in [
         "reverie-kvm-proc",
-        "reverie-kvm-virtual",
         "reverie-kvm-guest-memory",
         "reverie-kvm.proc-carrier.v1",
         "reverie-kvm.proc-carrier.v1.forged",
@@ -218,6 +222,7 @@ fn syncfs_reserved_names_deny_without_authenticating_payload_or_seals() {
     for name in [
         "syncfs-ordinary",
         "reverie-kvm-proc-ordinary",
+        "reverie-kvm-virtual",
         "reverie-kvm-virtual-ordinary",
     ] {
         let mut file = syncfs_memfd(name);
@@ -382,7 +387,6 @@ fn syncfs_known_private_descriptions_are_refused_without_host_call() {
         "/proc/self/stat",
         "/proc/self/status",
         "/proc",
-        "/dev/urandom",
     ] {
         let fd = open_readonly(&mut memory, &mut state, path);
         assert!(fd >= 0, "{path}: {fd}");

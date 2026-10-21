@@ -718,9 +718,9 @@ fn provider_disposition(error: Error) -> Result<ProviderOutcome> {
 ///   commands and `prctl` options, among others) answer a bare `-ENOSYS`
 ///   without a refusal, as do the admission checks above. An absent refusal
 ///   therefore does not establish that a request was supported.
-/// - The clock reads and `uname` go to the host. The executor still makes up
-///   some values a guest sees: the `/dev/random` and `/dev/urandom` bytes,
-///   the synthetic `/proc` files, and its signal model's decisions, which
+/// - The clock reads, `uname` and the random devices go to the host. The
+///   executor still makes up some values a guest sees: the synthetic `/proc`
+///   files, and its signal model's decisions, which
 ///   Detcore owns too and which are scheduled for deletion; and a fixed
 ///   identity persona that Detcore passes through: getgroups' fixed group
 ///   list, the capability sets of `capget`/`capset`, and `prctl`
@@ -6285,7 +6285,6 @@ impl KvmBackend {
                 // the worker on the Tool loop, which issues the matching
                 // `handle_thread_start` the parent's clone handler waits for.
                 let backend_owned = is_backend_owned_syscall(request.number(), thread_ownership)
-                    && !executor.is_random_device_read(&request)
                     && !executor.is_tool_visible_read(&request);
                 let subscribed = !backend_owned && subscribed_syscalls.contains(syscall.number());
                 let (

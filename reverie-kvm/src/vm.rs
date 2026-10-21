@@ -2217,19 +2217,6 @@ impl KvmBackend {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-228): Review the KVM random-seed configuration API.
-    /// Configure the deterministic seed used by the virtual random devices.
-    pub fn set_random_seed(&mut self, seed: u64) -> Result<()> {
-        AbandonedRuns::admit(&self.abandoned_runs)?;
-        let loaded = self
-            .static_elf
-            .as_mut()
-            .ok_or(Error::StaticElfNotInstalled)?;
-        loaded.random_seed = seed;
-        Ok(())
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
     // Review host metadata timestamps for Tool runs.
     /// Declare that the Tool rewrites every timestamp that `stat`, `fstat`,
@@ -2243,8 +2230,8 @@ impl KvmBackend {
     /// Real host files and descriptors report the kernel's timestamps whether
     /// or not this is enabled, as the kernel reports them to a ptrace guest;
     /// what the guest sees is the Tool's decision. Captured output, synthetic
-    /// `/proc` files, guest descriptor links and virtual random devices keep
-    /// their fixed timestamps either way. A run without a Tool, or with
+    /// `/proc` files and guest descriptor links keep their fixed timestamps
+    /// either way. A run without a Tool, or with
     /// host-owned threads (see [`Self::unmonitored_threads`]), refuses to
     /// start while this is enabled, because nothing would rewrite them.
     ///

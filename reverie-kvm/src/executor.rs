@@ -852,50 +852,6 @@ fn execute_basic_syscall_inner(
         return continue_with(error);
     }
 
-    if let Some(result) = random_device_early(memory, state, number as libc::c_long, args) {
-        return match result {
-            Ok(result) => continue_with(result),
-            Err(error) => SyscallAction::Failure(error),
-        };
-    }
-
-    // Only these supported operations use a random carrier's current OFD
-    // position. Writes cannot advance it: its sole exposed host description
-    // is O_RDONLY, and proc-fd/SCM_RIGHTS metadata-losing exports are refused.
-    let random_position_fd = if number == libc::SYS_read as u64
-        || number == libc::SYS_readv as u64
-        || number == libc::SYS_lseek as u64
-        || (number == libc::SYS_preadv2 as u64 && args[3] as i64 == -1)
-    {
-        Some(args[0] as libc::c_int)
-    } else if number == libc::SYS_sendfile as u64 && args[2] == 0 {
-        Some(args[1] as libc::c_int)
-    } else {
-        None
-    };
-    let random_description = random_position_fd
-        .and_then(|fd| state.random_device_descriptions.get(&fd))
-        .cloned();
-    let mut random_position = match random_description.as_ref() {
-        Some(description) => match description.position.lock() {
-            Ok(guard) => Some(guard),
-            Err(_) => {
-                return SyscallAction::Failure(crate::Error::HostIo(std::io::Error::other(
-                    "KVM random-device position lock poisoned",
-                )));
-            }
-        },
-        None => None,
-    };
-    if (number == libc::SYS_read as u64 || number == libc::SYS_readv as u64)
-        && let Some(description) = random_description.as_ref()
-    {
-        return match random_device_read(memory, state, args, number, description) {
-            Ok(result) => continue_with(result),
-            Err(error) => SyscallAction::Failure(error),
-        };
-    }
-
     let result = if number == libc::SYS_write as u64 {
         write(memory, state, args, output)
     } else if number == libc::SYS_read as u64 {
@@ -927,7 +883,7 @@ fn execute_basic_syscall_inner(
         pwrite64(memory, state, args)
     } else if number == libc::SYS_sendfile as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        sendfile(memory, state, args, output, random_position.take())
+        sendfile(memory, state, args, output)
     } else if number == libc::SYS_lseek as u64 {
         lseek(state, args, capture_output)
     } else if number == libc::SYS_ftruncate as u64 {
@@ -2303,51 +2259,6 @@ impl ChildCompletionSlot {
     }
 }
 
-/// Seed and operation serialization shared by aliases of one random-device
-/// open description. Its private host OFD remains the only position authority.
-/// This preserves atomic consumption, not ordering between unsynchronized
-/// direct workers. The Tool retains responsibility for deterministic scheduling.
-#[derive(Debug)]
-pub(crate) struct RandomDeviceDescription {
-    seed: u64,
-    access: i32,
-    minor: u32,
-    nofollow: bool,
-    async_opened: bool,
-    async_set: Mutex<bool>,
-    position: Mutex<()>,
-    #[cfg(test)]
-    fail_cursor_commit: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    poison_after_copy: Mutex<Option<Arc<crate::Error>>>,
-    #[cfg(test)]
-    consumed_input: std::sync::atomic::AtomicUsize,
-}
-
-impl RandomDeviceDescription {
-    fn new(seed: u64, flags: i32, minor: u32) -> Self {
-        Self {
-            seed,
-            access: if flags & libc::O_PATH != 0 {
-                libc::O_PATH
-            } else {
-                flags & libc::O_ACCMODE
-            },
-            minor,
-            nofollow: flags & libc::O_NOFOLLOW != 0,
-            async_opened: flags & libc::O_PATH == 0 && flags & libc::O_ASYNC != 0,
-            async_set: Mutex::new(false),
-            position: Mutex::new(()),
-            #[cfg(test)]
-            fail_cursor_commit: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            poison_after_copy: Mutex::new(None),
-            #[cfg(test)]
-            consumed_input: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-}
-
 /// Positive provenance is minted only by the corresponding native creator.
 /// In particular, a virtual signalfd's eventfd carrier is not NativeEventFd.
 #[derive(Clone, Debug)]
@@ -2483,8 +2394,6 @@ pub(crate) struct FileTableState {
     poll_table_id: Arc<NativePollTable>,
     native_poll_fds: std::collections::BTreeMap<i32, Arc<NativePollBinding>>,
     pipe_owners: std::collections::BTreeMap<i32, Arc<pipe_owner::PipeOwner>>,
-    random_device_fds: std::collections::BTreeSet<i32>,
-    random_device_descriptions: std::collections::BTreeMap<i32, Arc<RandomDeviceDescription>>,
     stdout_alias_fds: std::collections::BTreeSet<i32>,
     stderr_alias_fds: std::collections::BTreeSet<i32>,
     cloexec_fds: std::collections::BTreeSet<i32>,
@@ -2838,7 +2747,6 @@ impl FdinfoTarget {
                 return Err(negative_errno(libc::ENOENT));
             }
             if table.proc_files.contains_key(&self.target_fd)
-                || table.random_device_fds.contains(&self.target_fd)
                 || table.signalfd_fds.contains(&self.target_fd)
                 || (self.capture_output
                     && (table.stdout_alias_fds.contains(&self.target_fd)
@@ -3119,7 +3027,6 @@ fn ensure_fdinfo_content_supported(
     // lifecycle order, while refused opens allocate no description/seq state.
     let host = host_fd(state, fd).ok_or_else(|| negative_errno(libc::ENOENT))?;
     if state.proc_files.contains_key(&fd)
-        || state.random_device_fds.contains(&fd)
         || signalfd_mask(state, fd).is_some()
         || (capture_output && output_alias(state, fd).is_some())
     {
@@ -3337,8 +3244,6 @@ impl FileTableState {
             poll_table_id: state.poll_table_id.clone(),
             native_poll_fds: state.native_poll_fds.clone(),
             pipe_owners: state.pipe_owners.clone(),
-            random_device_fds: state.random_device_fds.clone(),
-            random_device_descriptions: state.random_device_descriptions.clone(),
             stdout_alias_fds: state.stdout_alias_fds.clone(),
             stderr_alias_fds: state.stderr_alias_fds.clone(),
             cloexec_fds: state.cloexec_fds.clone(),
@@ -3383,8 +3288,6 @@ impl FileTableState {
             poll_table_id,
             native_poll_fds,
             pipe_owners,
-            random_device_fds,
-            random_device_descriptions,
             stdout_alias_fds,
             stderr_alias_fds,
             cloexec_fds,
@@ -3407,8 +3310,6 @@ impl FileTableState {
             && Arc::ptr_eq(poll_table_id, &state.poll_table_id)
             && same_arcs(native_poll_fds, &state.native_poll_fds)
             && same_arcs(pipe_owners, &state.pipe_owners)
-            && *random_device_fds == state.random_device_fds
-            && same_arcs(random_device_descriptions, &state.random_device_descriptions)
             && *stdout_alias_fds == state.stdout_alias_fds
             && *stderr_alias_fds == state.stderr_alias_fds
             && *cloexec_fds == state.cloexec_fds
@@ -3486,10 +3387,6 @@ impl FileTableState {
         state.poll_table_id.clone_from(&self.poll_table_id);
         state.native_poll_fds.clone_from(&self.native_poll_fds);
         state.pipe_owners.clone_from(&self.pipe_owners);
-        state.random_device_fds.clone_from(&self.random_device_fds);
-        state
-            .random_device_descriptions
-            .clone_from(&self.random_device_descriptions);
         state.stdout_alias_fds.clone_from(&self.stdout_alias_fds);
         state.stderr_alias_fds.clone_from(&self.stderr_alias_fds);
         state.cloexec_fds.clone_from(&self.cloexec_fds);
@@ -5292,17 +5189,6 @@ impl ElfExecutor {
         (self.state.fs_base, self.state.gs_base)
     }
 
-    // TODO-HUMAN-REVIEW(PR-235): Review deterministic random-read Tool routing.
-    pub(crate) fn is_random_device_read(&self, request: &SyscallRequest) -> bool {
-        matches!(
-            request.number(),
-            number if number == libc::SYS_read as u64 || number == libc::SYS_readv as u64
-        ) && self
-            .state
-            .random_device_fds
-            .contains(&(request.args()[0] as libc::c_int))
-    }
-
     // AUTONOMOUS-BOT-IMPLEMENTED: Route ordinary reads to the Tool for accounting parity.
     // TODO-HUMAN-REVIEW(PR-266): Review tool-visible vs backend-owned read classification.
     //
@@ -5317,6 +5203,9 @@ impl ElfExecutor {
     // reads on regular files and on the standard streams are ordinary guest I/O
     // and must reach `Tool::handle_syscall_event`; only non-regular,
     // non-standard descriptors (eventfd/pipe/socket) stay backend-owned.
+    // Reads of a random device reach the Tool as well: the Tool (Detcore)
+    // answers them itself, and executing them here would hand the guest host
+    // entropy behind its back.
     pub(crate) fn is_tool_visible_read(&self, request: &SyscallRequest) -> bool {
         let number = request.number();
         if number != libc::SYS_read as u64 && number != libc::SYS_readv as u64 {
@@ -5330,7 +5219,9 @@ impl ElfExecutor {
             .files
             .get(&fd)
             .and_then(|file| file.metadata().ok())
-            .is_some_and(|metadata| metadata.file_type().is_file())
+            .is_some_and(|metadata| {
+                metadata.file_type().is_file() || is_random_character_device(&metadata)
+            })
     }
 
     // TODO-HUMAN-REVIEW(PR-235): Review virtual parent identity for KVM Tool callbacks.
@@ -8375,6 +8266,17 @@ fn file_mode(file: &std::fs::File) -> Result<libc::mode_t, i64> {
     fd_mode(file.as_raw_fd())
 }
 
+/// Linux's random character devices, /dev/random (1:8) and /dev/urandom
+/// (1:9), recognized by device number, as Linux binds their operations. Used
+/// only to route their reads to the Tool (see `is_tool_visible_read`).
+fn is_random_character_device(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    metadata.file_type().is_char_device()
+        && libc::major(metadata.rdev()) == 1
+        && matches!(libc::minor(metadata.rdev()), 8 | 9)
+}
+
 /// Whether a description's status flags grant read access. Linux's open gives
 /// FMODE_READ only to O_RDONLY and O_RDWR: access mode 3 (O_ACCMODE) grants
 /// neither read nor write, and an O_PATH descriptor grants no I/O at all.
@@ -9215,143 +9117,6 @@ fn finish_host_read(memory: &mut GuestMemory, address: u64, bytes: &[u8], count:
     }
 }
 
-fn prepare_random_device_read(
-    memory: &GuestMemory,
-    state: &LoadedStaticElf,
-    args: &[u64; 6],
-    number: u64,
-) -> Result<(RawFd, Vec<GuestIoVec>, usize), i64> {
-    let fd = args[0] as libc::c_int;
-    let file = state
-        .files
-        .get(&fd)
-        .ok_or_else(|| negative_errno(libc::EBADF))?;
-    if number == libc::SYS_read as u64 {
-        let requested = usize::try_from(args[2]).map_err(|_| negative_errno(libc::EINVAL))?;
-        ensure_read_capable(file)?;
-        ensure_readable(file)?;
-        if !range_is_valid(&ProviderMemory(memory), args[1], args[2]) {
-            return Err(negative_errno(libc::EFAULT));
-        }
-        let length = requested.min(MAX_HOST_IO);
-        Ok((
-            file.as_raw_fd(),
-            vec![GuestIoVec {
-                base: args[1],
-                length,
-            }],
-            length,
-        ))
-    } else {
-        ensure_readable(file)?;
-        let (vectors, total, kernel_total) =
-            decode_guest_iovecs(memory, args[1], u64::from(args[2] as u32))?;
-        // Retain the ordinary vector path's staging-bound refusal even though
-        // tmpfs itself does not impose O_DIRECT alignment on this carrier.
-        if kernel_total > total && file_status_flags(file)? & libc::O_DIRECT != 0 {
-            return Err(negative_errno(libc::EOPNOTSUPP));
-        }
-        Ok((file.as_raw_fd(), vectors, total))
-    }
-}
-
-fn check_random_copy_failure(memory: &GuestMemory) -> crate::Result<()> {
-    match memory.entry_gate().pending_failure() {
-        Some(failure) => Err(failure.error()),
-        None => Ok(()),
-    }
-}
-
-/// The caller holds the shared description's position guard. Generate only a
-/// bounded chunk and commit exactly the writable prefix to the actual OFD.
-/// Keeping this operation checked prevents an impossible private seek failure
-/// after copyout from becoming a fabricated guest errno or successful count.
-fn random_device_read(
-    memory: &GuestMemory,
-    state: &LoadedStaticElf,
-    args: &[u64; 6],
-    number: u64,
-    description: &RandomDeviceDescription,
-) -> crate::Result<i64> {
-    let prepared = prepare_random_device_read(memory, state, args, number);
-    // Iovec import maps ordinary memory errors to EFAULT. Admission poison
-    // must win over every preparation errno and zero-work return.
-    check_random_copy_failure(memory)?;
-    let (host_fd, vectors, total) = match prepared {
-        Ok(prepared) => prepared,
-        Err(errno) => return Ok(errno),
-    };
-    if total == 0 {
-        return Ok(0);
-    }
-    // SAFETY: the installed descriptor snapshot owns this read-only memfd.
-    let position = unsafe { libc::lseek(host_fd, 0, libc::SEEK_CUR) };
-    if position < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // Preserve the regular carrier's rw_verify_area overflow check before any
-    // copyout, including requests whose destination would fault later.
-    if position.checked_add(total as libc::off_t).is_none() {
-        return Ok(negative_errno(libc::EINVAL));
-    }
-    let mut chunk = [0_u8; 4096];
-    let mut copied = 0usize;
-    'vectors: for vector in vectors {
-        let mut vector_copied = 0usize;
-        while vector_copied < vector.length {
-            let length = (vector.length - vector_copied).min(chunk.len());
-            for (index, byte) in chunk[..length].iter_mut().enumerate() {
-                *byte = deterministic_random_device_byte(
-                    description.seed,
-                    position as u64 + copied as u64 + index as u64,
-                );
-            }
-            let written = match memory
-                .user()
-                .copy_to_user_prefix(vector.base + vector_copied as u64, &chunk[..length])
-            {
-                Ok(written) => written,
-                Err(_) => {
-                    check_random_copy_failure(memory)?;
-                    break 'vectors;
-                }
-            };
-            copied += written;
-            vector_copied += written;
-            #[cfg(test)]
-            if let Some(cause) = description.poison_after_copy.lock().unwrap().take() {
-                memory
-                    .entry_gate()
-                    .poison(None, crate::Error::SharedFailure(cause));
-            }
-            if written != length {
-                break 'vectors;
-            }
-        }
-    }
-    check_random_copy_failure(memory)?;
-    if copied == 0 {
-        return Ok(negative_errno(libc::EFAULT));
-    }
-    #[cfg(test)]
-    if description.fail_cursor_commit.swap(false, Ordering::SeqCst) {
-        return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
-    }
-    let committed_position = position + copied as libc::off_t;
-    // SAFETY: the live owned memfd is seekable; the nonnegative target was
-    // bounded before copyout. Every supported current-position user holds
-    // this description's guard, and unmodeled exports are refused.
-    let result = unsafe { libc::lseek(host_fd, committed_position, libc::SEEK_SET) };
-    if result < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    if result != committed_position {
-        return Err(std::io::Error::other("KVM random-device cursor commit mismatch").into());
-    }
-    check_random_copy_failure(memory)?;
-    Ok(copied as i64)
-}
-
 /// Lend the existing private-snapshot descriptor to the terminal reader. Its
 /// inner owner returns the File only after physical retirement. Restore that
 /// exact File on success, error, or unwind without changing entry metadata or
@@ -9448,7 +9213,6 @@ fn read(
     };
     if requested_length == 0
         && !state.proc_files.contains_key(&fd)
-        && !state.random_device_fds.contains(&fd)
         && signalfd_mask(state, fd).is_none()
     {
         // Only actual host endpoints decide zero-count error ordering here.
@@ -10568,7 +10332,6 @@ fn sendfile(
     state: &LoadedStaticElf,
     args: &[u64; 6],
     output: Option<&mut CapturedOutput>,
-    position_guard: Option<std::sync::MutexGuard<'_, ()>>,
 ) -> i64 {
     // Linux syscall `int` arguments consume only the low descriptor word.
     let out_fd = args[0] as libc::c_int;
@@ -10578,18 +10341,7 @@ fn sendfile(
         (None, Some(negative_errno(libc::EBADF)))
     } else {
         match state.files.get(&out_fd) {
-            Some(file) => (
-                Some(file),
-                if let Some(random) = state.random_device_descriptions.get(&out_fd) {
-                    Some(negative_errno(if random.writable() {
-                        libc::ENOSYS
-                    } else {
-                        libc::EBADF
-                    }))
-                } else {
-                    ensure_writable(file).err()
-                },
-            ),
+            Some(file) => (Some(file), ensure_writable(file).err()),
             None if is_open_standard(state, out_fd) => {
                 let error = if out_fd == libc::STDIN_FILENO {
                     let stdin = state
@@ -10606,16 +10358,6 @@ fn sendfile(
         }
     };
     let in_fd = args[1] as libc::c_int;
-    if let Some(random) = state.random_device_descriptions.get(&in_fd)
-        && !random.readable()
-    {
-        if args[2] != 0
-            && let Err(error) = read_sendfile_offset(memory, args[2])
-        {
-            return error;
-        }
-        return negative_errno(libc::EBADF);
-    }
     let in_file = match resolve_sendfile_input(state, in_fd) {
         Ok(file) => file,
         Err(error) => {
@@ -10745,9 +10487,6 @@ fn sendfile(
             )
         }
     };
-    // The input position has committed. Do not make another random read wait
-    // for an unrelated potentially blocking standard-stream output operation.
-    drop(position_guard);
     if read < 0 {
         return io_error(std::io::Error::last_os_error());
     }
@@ -10913,13 +10652,6 @@ fn truncate(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i
         let Some(host_fd) = host_fd(state, guest_fd) else {
             return negative_errno(libc::ENOENT);
         };
-        // The random device's carrier, by its exact name, as syncfs and
-        // shared mmap refuse it; a guest memfd of another name is ordinary.
-        if canonical_fd_path(host_fd).is_ok_and(|target| {
-            target.as_os_str().as_bytes() == b"/memfd:reverie-kvm-virtual (deleted)"
-        }) {
-            return negative_errno(libc::EINVAL);
-        }
         host_fd
     } else {
         held_file = match open_metadata_path(state, libc::AT_FDCWD, &path, false) {
@@ -11245,14 +10977,6 @@ fn open_file(
     if let Some(guest_fd) = guest_fd_path(state, path) {
         return open_guest_fd_path(state, guest_fd, flags, guest_cloexec);
     }
-    if path == b"/dev/random" || path == b"/dev/urandom" {
-        return open_random_device(
-            state,
-            flags,
-            guest_cloexec,
-            if path == b"/dev/random" { 8 } else { 9 },
-        );
-    }
     let Ok((host_dirfd, path)) = host_dirfd_and_path(state, guest_dirfd, path) else {
         return negative_errno(libc::EBADF);
     };
@@ -11324,17 +11048,6 @@ fn open_file(
     if let Err(error) = ensure_not_procfs(&file) {
         return error;
     }
-    match host_random_device_minor(&file) {
-        Ok(Some(minor)) => {
-            // Resolve the original name/flags first, then classify this held
-            // object. Re-resolving a pathname would race rename/symlink changes.
-            // Drop the real device before creating or publishing its carrier.
-            drop(file);
-            return open_random_device(state, flags, guest_cloexec, minor);
-        }
-        Ok(None) => {}
-        Err(error) => return error,
-    }
     if uses_mode && created {
         // Override the supervisor umask only for a file created by this call.
         // SAFETY: file is a live owned descriptor and mode is bounded above.
@@ -11344,101 +11057,6 @@ fn open_file(
     }
     insert_file_with_flags(state, file, guest_cloexec, None)
 }
-
-/// Recognize Linux's random devices by the opened object, including relative
-/// names, ordinary symlinks and alternate device nodes. O_PATH|O_NOFOLLOW on a
-/// symlink observes S_IFLNK here and must retain that symlink object unchanged.
-fn host_random_device_minor(file: &std::fs::File) -> Result<Option<u32>, i64> {
-    #[cfg(test)]
-    tests::random_path_before_classification(file)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-    // SAFETY: file owns a live fd and stat is writable for the complete result.
-    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(io_error(std::io::Error::last_os_error()));
-    }
-    // SAFETY: fstat initialized stat on success.
-    let stat = unsafe { stat.assume_init() };
-    Ok((stat.st_mode & libc::S_IFMT == libc::S_IFCHR
-        && libc::major(stat.st_rdev) == 1
-        && matches!(libc::minor(stat.st_rdev), 8 | 9))
-    .then_some(libc::minor(stat.st_rdev)))
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-228): Review cross-backend random-device stream parity.
-fn open_random_device(
-    state: &mut LoadedStaticElf,
-    flags: u64,
-    close_on_exec: bool,
-    minor: u32,
-) -> i64 {
-    #[cfg(test)]
-    if let Err(error) = tests::random_path_before_carrier() {
-        return error;
-    }
-    let flags = flags as i32;
-    let path_only = flags & libc::O_PATH != 0;
-    if !path_only && flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL {
-        return negative_errno(libc::EEXIST);
-    }
-    if flags & libc::O_DIRECTORY != 0 {
-        return negative_errno(libc::ENOTDIR);
-    }
-    if !path_only && flags & libc::O_DIRECT != 0 {
-        return negative_errno(libc::EINVAL);
-    }
-    let bytes = deterministic_random_device_bytes(state.random_seed, 64 * 1024);
-    let host = unsafe { libc::memfd_create(c"reverie-kvm-virtual".as_ptr(), libc::MFD_CLOEXEC) };
-    if host < 0 {
-        return io_error(std::io::Error::last_os_error());
-    }
-    // The setup writer never enters any guest table or shared description.
-    let mut setup = unsafe { std::fs::File::from_raw_fd(host) };
-    if let Err(error) = setup.write_all(&bytes) {
-        return io_error(error);
-    }
-    // Present ordinary random-device DAC bits, while open access remains an
-    // immutable property of the shared description even after chmod.
-    if unsafe { libc::fchmod(host, 0o666) } != 0 {
-        return io_error(std::io::Error::last_os_error());
-    }
-    let physical = if path_only {
-        libc::O_PATH
-    } else {
-        libc::O_RDONLY
-            | (flags
-                & (libc::O_APPEND
-                    | libc::O_NONBLOCK
-                    | libc::O_NOATIME
-                    | libc::O_DSYNC
-                    | libc::O_SYNC))
-    };
-    let target =
-        CString::new(format!("/proc/self/fd/{host}")).expect("numeric descriptor has no NUL");
-    // Follow our private setup descriptor even for guest NOFOLLOW: the guest's
-    // named-object resolution already happened, and NOFOLLOW is presented by
-    // the description. Never return an O_PATH handle to a supervisor symlink.
-    let carrier = unsafe { libc::open(target.as_ptr(), physical | libc::O_CLOEXEC) };
-    if carrier < 0 {
-        return io_error(std::io::Error::last_os_error());
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(carrier) };
-    drop(setup);
-    let description = Arc::new(RandomDeviceDescription::new(
-        state.random_seed,
-        flags,
-        minor,
-    ));
-    let result = insert_file_with_flags(state, file, close_on_exec, None);
-    if result >= 0 {
-        let fd = result as i32;
-        state.random_device_fds.insert(fd);
-        state.random_device_descriptions.insert(fd, description);
-    }
-    result
-}
-
-include!("executor/random_device.rs");
 
 // TODO-HUMAN-REVIEW(PR-92): Review this KVM compatibility implementation.
 // TODO-HUMAN-REVIEW(PR-114): Review /proc/thread-self/fd guest descriptor resolution.
@@ -11602,11 +11220,9 @@ fn open_guest_fd_path(
         // backing file.
         return negative_errno(libc::ENOSYS);
     }
-    if state.fdinfo_files.contains_key(&guest_fd) || state.random_device_fds.contains(&guest_fd) {
-        // Random-only prerequisite from https://github.com/rrnewton/reverie/pull/610
-        // at acffb228964041190ff9aa071454a5f0017e34a1. Native random-device
-        // aliases are valid, but this private carrier would lose its stream
-        // metadata and permit writable reopening. Refuse that unsupported route.
+    if state.fdinfo_files.contains_key(&guest_fd) {
+        // A private fdinfo carrier would lose its stream metadata and permit
+        // writable reopening. Refuse that unsupported route.
         return negative_errno(libc::ENOSYS);
     }
     if flags & libc::O_TMPFILE as u64 == libc::O_TMPFILE as u64 {
@@ -11657,16 +11273,6 @@ fn open_guest_fd_path(
         Ok(file) => file,
         Err(error) => return error,
     };
-    match host_random_device_minor(&file) {
-        Ok(Some(minor)) => {
-            drop(file);
-            // A freshly virtualized endpoint must not inherit the source's
-            // host-device inode or captured-output alias identity.
-            return open_random_device(state, flags, close_on_exec, minor);
-        }
-        Ok(None) => {}
-        Err(error) => return error,
-    }
     let new_fd = insert_file_with_flags(state, file, close_on_exec, source_alias);
     if new_fd >= 0 {
         state
@@ -12054,8 +11660,6 @@ struct DuplicateFdSource {
     synthetic_proc_nofollow: bool,
     fdinfo: Option<Arc<FdinfoDescription>>,
     object_inode: Arc<GuestFileIdentity>,
-    is_random: bool,
-    random_description: Option<Arc<RandomDeviceDescription>>,
     signalfd_mask: Option<Arc<KernelSigset>>,
     native_poll: Option<NativePollDescription>,
     pipe_owner: Option<Arc<pipe_owner::PipeOwner>>,
@@ -12185,12 +11789,6 @@ fn duplicate_fd_at_or_above(
         install_native_poll_description(state, fd, description);
     }
     state.fd_object_inodes.insert(fd, source.object_inode);
-    if source.is_random {
-        state.random_device_fds.insert(fd);
-    }
-    if let Some(description) = source.random_description {
-        state.random_device_descriptions.insert(fd, description);
-    }
     replace_signalfd_mask(state, fd, source.signalfd_mask);
     if close_on_exec {
         state.cloexec_fds.insert(fd);
@@ -12242,8 +11840,6 @@ fn duplicate_fd(
     let source_proc_inode = state.proc_files.get(&old_fd).copied();
     let source_synthetic_proc_nofollow = state.synthetic_proc_nofollow_fds.contains(&old_fd);
     let source_fdinfo = state.fdinfo_files.get(&old_fd).cloned();
-    let source_is_random = state.random_device_fds.contains(&old_fd);
-    let source_random_description = state.random_device_descriptions.get(&old_fd).cloned();
     let source_native_poll = native_poll_description(state, old_fd);
     let source_signalfd_mask = signalfd_mask(state, old_fd);
     let source_pipe_owner = state.pipe_owners.get(&old_fd).cloned();
@@ -12287,15 +11883,7 @@ fn duplicate_fd(
         if let Some(description) = source_native_poll {
             install_native_poll_description(state, new_fd, description);
         }
-        if let Some(description) = source_random_description {
-            state.random_device_descriptions.insert(new_fd, description);
-        }
         state.fd_object_inodes.insert(new_fd, source_object_inode);
-        if source_is_random {
-            state.random_device_fds.insert(new_fd);
-        } else {
-            state.random_device_fds.remove(&new_fd);
-        }
         replace_signalfd_mask(state, new_fd, source_signalfd_mask);
         cleanup_fd_object_inodes(state);
         if close_on_exec {
@@ -12336,17 +11924,9 @@ fn duplicate_fd(
             if let Some(description) = source_native_poll {
                 install_native_poll_description(state, new_fd as i32, description);
             }
-            if let Some(description) = source_random_description {
-                state
-                    .random_device_descriptions
-                    .insert(new_fd as libc::c_int, description);
-            }
             state
                 .fd_object_inodes
                 .insert(new_fd as libc::c_int, source_object_inode);
-            if source_is_random {
-                state.random_device_fds.insert(new_fd as libc::c_int);
-            }
             replace_signalfd_mask(state, new_fd as libc::c_int, source_signalfd_mask);
             if let Some(description) = source_fdinfo {
                 state.fdinfo_files.insert(new_fd as i32, description);
@@ -15295,12 +14875,10 @@ fn translate_outgoing_rights(
                 transfers.push(register_proc_transfer(state, guest_fd, host_fd)?);
             } else if state.fdinfo_files.contains_key(&guest_fd)
                 || signalfd_mask(state, guest_fd).is_some()
-                || state.random_device_fds.contains(&guest_fd)
             {
-                // Random-only prerequisite from https://github.com/rrnewton/reverie/pull/610
-                // at acffb228964041190ff9aa071454a5f0017e34a1. The receiver
-                // cannot reconstruct private stream/signalfd metadata. Refuse
-                // before host sendmsg delivers any payload or descriptors.
+                // The receiver cannot reconstruct private stream/signalfd
+                // metadata. Refuse before host sendmsg delivers any payload or
+                // descriptors.
                 return Err(negative_errno(libc::ENOSYS));
             }
             write_control_fd(control, offset, host_fd)?;
@@ -16448,7 +16026,7 @@ fn getgroups<M: GuestMemoryAccess<Error = crate::Error>>(memory: &mut M, args: &
 ///   so a lock Linux keeps through the mapping would be released early;
 /// - descriptors passed through SCM_RIGHTS are held in flight by the host
 ///   kernel, invisible to the guest descriptor tables;
-/// - captured stdio and synthetic carriers (random devices, procfs snapshots)
+/// - captured stdio and synthetic carriers (procfs snapshots)
 ///   are not the guest's descriptions at all;
 /// - on network and FUSE filesystems even LOCK_NB can wait on a server.
 ///
@@ -16997,10 +16575,6 @@ fn statx(
 // TODO-HUMAN-REVIEW(PR-183): Review fixed host-backed metadata timestamps.
 fn sanitize_stat_timestamps(stat: &mut libc::stat) {
     set_stat_timestamps(stat, DETERMINISTIC_METADATA_SECONDS);
-}
-
-fn sanitize_statx_timestamps(stat: &mut libc::statx) {
-    set_statx_timestamps(stat, DETERMINISTIC_METADATA_SECONDS);
 }
 
 /// Sets every timestamp of a `stat` result to `seconds`.
@@ -18447,21 +18021,6 @@ fn sanitize_guest_fd_stat(state: &LoadedStaticElf, guest_fd: libc::c_int, stat: 
         sanitize_proc_stat(stat, inode);
         return;
     }
-    if let Some(random) = state.random_device_descriptions.get(&guest_fd) {
-        stat.st_mode = libc::S_IFCHR | (stat.st_mode & 0o7777);
-        stat.st_rdev = libc::makedev(1, random.minor);
-        stat.st_size = 0;
-        stat.st_blocks = 0;
-        stat.st_nlink = 1;
-        stat.st_uid = 0;
-        stat.st_gid = 0;
-        let identity = guest_fd_object_identity(state, guest_fd);
-        stat.st_dev = synthetic_dev(SYNTHETIC_GUEST_FD_DEV_MINOR);
-        stat.st_ino = identity.inode;
-        // A virtual random device is synthetic, so its timestamps stay fixed.
-        sanitize_stat_timestamps(stat);
-        return;
-    }
     if let Some(seconds) = synthetic_descriptor_seconds(state, guest_fd) {
         set_stat_timestamps(stat, seconds);
     }
@@ -18470,23 +18029,6 @@ fn sanitize_guest_fd_stat(state: &LoadedStaticElf, guest_fd: libc::c_int, stat: 
 fn sanitize_guest_fd_statx(state: &LoadedStaticElf, guest_fd: libc::c_int, stat: &mut libc::statx) {
     if let Some(&inode) = state.proc_files.get(&guest_fd) {
         *stat = synthetic_proc_statx(inode, stat.stx_size);
-        return;
-    }
-    if let Some(random) = state.random_device_descriptions.get(&guest_fd) {
-        stat.stx_mode = libc::S_IFCHR as u16 | (stat.stx_mode & 0o7777);
-        stat.stx_rdev_major = 1;
-        stat.stx_rdev_minor = random.minor;
-        stat.stx_size = 0;
-        stat.stx_blocks = 0;
-        stat.stx_nlink = 1;
-        stat.stx_uid = 0;
-        stat.stx_gid = 0;
-        let identity = guest_fd_object_identity(state, guest_fd);
-        stat.stx_dev_major = libc::major(synthetic_dev(SYNTHETIC_GUEST_FD_DEV_MINOR));
-        stat.stx_dev_minor = libc::minor(synthetic_dev(SYNTHETIC_GUEST_FD_DEV_MINOR));
-        stat.stx_ino = identity.inode;
-        // A virtual random device is synthetic, so its timestamps stay fixed.
-        sanitize_statx_timestamps(stat);
         return;
     }
     if let Some(seconds) = synthetic_descriptor_seconds(state, guest_fd) {
@@ -18887,8 +18429,6 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
     let source_proc_inode = state.proc_files.get(&guest_fd).copied();
     let source_synthetic_proc_nofollow = state.synthetic_proc_nofollow_fds.contains(&guest_fd);
     let source_fdinfo = state.fdinfo_files.get(&guest_fd).cloned();
-    let source_is_random = state.random_device_fds.contains(&guest_fd);
-    let source_random_description = state.random_device_descriptions.get(&guest_fd).cloned();
     let source_native_poll = native_poll_description(state, guest_fd);
     let source_signalfd_mask = signalfd_mask(state, guest_fd);
     let source_pipe_owner = state.pipe_owners.get(&guest_fd).cloned();
@@ -18916,8 +18456,6 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
                 synthetic_proc_nofollow: source_synthetic_proc_nofollow,
                 fdinfo: source_fdinfo,
                 object_inode: source_object_inode,
-                is_random: source_is_random,
-                random_description: source_random_description,
                 signalfd_mask: source_signalfd_mask,
                 native_poll: source_native_poll,
                 pipe_owner: source_pipe_owner,
@@ -18934,8 +18472,6 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
                 synthetic_proc_nofollow: source_synthetic_proc_nofollow,
                 fdinfo: source_fdinfo,
                 object_inode: source_object_inode,
-                is_random: source_is_random,
-                random_description: source_random_description,
                 signalfd_mask: source_signalfd_mask,
                 native_poll: source_native_poll,
                 pipe_owner: source_pipe_owner,
@@ -19166,7 +18702,6 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
             state.closed_standard_fds.insert(fd);
         }
         state.cloexec_fds.remove(&fd);
-        state.random_device_fds.remove(&fd);
         replace_signalfd_mask(state, fd, None);
         state.proc_files.remove(&fd);
         state.synthetic_proc_nofollow_fds.remove(&fd);
@@ -19186,7 +18721,6 @@ fn close(state: &mut LoadedStaticElf, raw_fd: u64) -> i64 {
         };
         state.closed_standard_fds.insert(fd);
         state.cloexec_fds.remove(&fd);
-        state.random_device_fds.remove(&fd);
         replace_signalfd_mask(state, fd, None);
         state.fd_object_inodes.remove(&fd);
         cleanup_fd_object_inodes(state);
@@ -20234,11 +19768,6 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     if !args[5].is_multiple_of(PAGE_SIZE) {
         return negative_errno(libc::EINVAL);
     }
-    if args[3] & libc::MAP_ANONYMOUS as u64 == 0
-        && let Some(random) = state.random_device_descriptions.get(&(args[4] as i32))
-    {
-        return random_device_mmap(memory, state, args, random);
-    }
     if let Some(error) = non_regular_mmap_early_refusal(state, args) {
         return error;
     }
@@ -20993,24 +20522,6 @@ fn sched_priority_bound(number: libc::c_long, policy: u64) -> i64 {
     } else {
         result
     }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-228): Review cross-backend random-device stream parity.
-fn deterministic_random_device_bytes(seed: u64, length: usize) -> Vec<u8> {
-    (0..length)
-        .map(|index| deterministic_random_device_byte(seed, index as u64))
-        .collect()
-}
-
-fn deterministic_random_device_byte(seed: u64, index: u64) -> u8 {
-    const BYTE_STRIDE: u8 = 73;
-    const FIRST_BYTE: u8 = 41;
-    let seed_byte = seed.rotate_right(((index % 8) * 8) as u32) as u8;
-    (index as u8)
-        .wrapping_mul(BYTE_STRIDE)
-        .wrapping_add(FIRST_BYTE)
-        ^ seed_byte
 }
 
 // The time family goes to the host clock and host sleeps, as Linux answers the
@@ -22942,7 +22453,6 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         is_traced_tree_root: true,
         umask: 0o022,
         linux_personality: crate::elf::LINUX_FIXED_PERSONALITY,
-        random_seed: 0,
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
         host_metadata_timestamps: false,
         thread_name: *b"test\0\0\0\0\0\0\0\0\0\0\0\0",
@@ -22970,8 +22480,6 @@ pub(crate) fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         epoll_domain: Default::default(),
         poll_table_id: Default::default(),
         native_poll_fds: Default::default(),
-        random_device_fds: std::collections::BTreeSet::new(),
-        random_device_descriptions: std::collections::BTreeMap::new(),
         stdout_alias_fds: std::collections::BTreeSet::new(),
         stderr_alias_fds: std::collections::BTreeSet::new(),
         cloexec_fds: std::collections::BTreeSet::new(),
@@ -23011,8 +22519,6 @@ mod tests {
     include!("executor/shared_file_tests.rs");
     include!("executor/read_zero_cancel_tests.rs");
     include!("executor/descriptor_generic_tests.rs");
-    include!("executor/random_device_stream_tests.rs");
-    include!("executor/random_device_carrier_tests.rs");
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::io::Seek;
@@ -23145,273 +22651,6 @@ mod tests {
     use super::*;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
-
-    type RandomPathClassifyHook = Box<dyn FnOnce(&std::fs::File) -> Result<(), i64>>;
-    type RandomPathCarrierHook = Box<dyn FnOnce() -> Result<(), i64>>;
-
-    thread_local! {
-        static RANDOM_PATH_CLASSIFY_HOOK: std::cell::RefCell<Option<RandomPathClassifyHook>> =
-            const { std::cell::RefCell::new(None) };
-        static RANDOM_PATH_CARRIER_HOOK: std::cell::RefCell<Option<RandomPathCarrierHook>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn random_path_before_classification(file: &std::fs::File) -> Result<(), i64> {
-        let hook = RANDOM_PATH_CLASSIFY_HOOK.with(|slot| slot.borrow_mut().take());
-        hook.map_or(Ok(()), |hook| hook(file))
-    }
-
-    pub(super) fn random_path_before_carrier() -> Result<(), i64> {
-        let hook = RANDOM_PATH_CARRIER_HOOK.with(|slot| slot.borrow_mut().take());
-        hook.map_or(Ok(()), |hook| hook())
-    }
-
-    fn with_random_path_hooks<T>(
-        classify: Option<RandomPathClassifyHook>,
-        carrier: Option<RandomPathCarrierHook>,
-        operation: impl FnOnce() -> T,
-    ) -> T {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                RANDOM_PATH_CLASSIFY_HOOK.with(|slot| slot.borrow_mut().take());
-                RANDOM_PATH_CARRIER_HOOK.with(|slot| slot.borrow_mut().take());
-            }
-        }
-        RANDOM_PATH_CLASSIFY_HOOK.with(|slot| {
-            assert!(std::mem::replace(&mut *slot.borrow_mut(), classify).is_none());
-        });
-        RANDOM_PATH_CARRIER_HOOK.with(|slot| {
-            assert!(std::mem::replace(&mut *slot.borrow_mut(), carrier).is_none());
-        });
-        let _reset = Reset;
-        operation()
-    }
-
-    #[test]
-    fn random_paths_classify_the_held_object_after_path_replacement() {
-        for (original, replacement, random) in [
-            ("/dev/random", "/dev/null", true),
-            ("/dev/urandom", "/dev/null", true),
-            ("/dev/null", "/dev/urandom", false),
-        ] {
-            let root = TestDir::new();
-            let path = root.0.join("device");
-            std::os::unix::fs::symlink(original, &path).unwrap();
-            let mut state = test_state(&root.0);
-            let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-            let changed_path = path.clone();
-            let fd = with_random_path_hooks(
-                Some(Box::new(move |_| {
-                    std::fs::remove_file(&changed_path).unwrap();
-                    std::os::unix::fs::symlink(replacement, &changed_path).unwrap();
-                    Ok(())
-                })),
-                None,
-                || open_readonly(&mut memory, &mut state, path.to_str().unwrap()),
-            );
-            assert!(fd >= 0);
-            assert_eq!(state.random_device_fds.contains(&(fd as i32)), random);
-            assert_eq!(
-                state.random_device_descriptions.contains_key(&(fd as i32)),
-                random
-            );
-            let result = random_stream_read(&mut memory, &mut state, fd, 0x300, 23);
-            if random {
-                assert_eq!(result, 23);
-                let expected: Vec<u8> = (0..23).map(|i| ((i * 73 + 41) & 255) as u8).collect();
-                assert_eq!(random_stream_bytes(&memory, 0x300, 23), expected);
-                let carrier = file_identity_stat(&state.files[&(fd as i32)]).unwrap();
-                assert_eq!(carrier.st_mode & libc::S_IFMT, libc::S_IFREG);
-                assert_eq!(carrier.st_size, 65536);
-            } else {
-                assert_eq!(result, 0, "the held /dev/null must remain /dev/null");
-            }
-            assert_eq!(std::fs::read_link(&path).unwrap(), Path::new(replacement));
-        }
-    }
-
-    #[test]
-    fn random_paths_reopen_unmarked_devices_without_source_identity_or_output_alias() {
-        for device in ["/dev/random", "/dev/urandom"] {
-            let root = TestDir::new();
-            let mut state = test_state(&root.0);
-            let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-            // Model an inherited, unmarked endpoint. R1 contains its named
-            // reopen; it does not claim to virtualize all inherited descriptors.
-            let source = insert_file_with_flags(
-                &mut state,
-                std::fs::File::open(device).unwrap(),
-                false,
-                Some(OutputAlias::Stdout),
-            ) as i32;
-            assert!(!state.random_device_fds.contains(&source));
-            let source_inode = state.fd_object_inodes[&source].clone();
-            let path = format!("/proc/self/fd/{source}");
-            let fd = open_with_flags(&mut memory, &mut state, &path, libc::O_CLOEXEC);
-            assert!(fd >= 0);
-            let fd = fd as i32;
-            assert!(state.random_device_fds.contains(&fd));
-            assert!(state.random_device_descriptions.contains_key(&fd));
-            assert!(state.cloexec_fds.contains(&fd));
-            assert!(output_alias(&state, fd).is_none());
-            assert!(!Arc::ptr_eq(&source_inode, &state.fd_object_inodes[&fd]));
-            assert!(!state.proc_files.contains_key(&fd));
-            assert!(matches!(
-                output_alias(&state, source),
-                Some(OutputAlias::Stdout)
-            ));
-            state.random_seed = 37;
-            assert_eq!(
-                random_stream_read(&mut memory, &mut state, i64::from(fd), 0x300, 23),
-                23
-            );
-            let expected: Vec<u8> = (0..23).map(|i| ((i * 73 + 41) & 255) as u8).collect();
-            assert_eq!(random_stream_bytes(&memory, 0x300, 23), expected);
-            assert_eq!(
-                open_readonly(&mut memory, &mut state, &format!("/proc/self/fd/{fd}")),
-                negative_errno(libc::ENOSYS)
-            );
-        }
-    }
-
-    #[test]
-    fn random_paths_classification_and_carrier_failures_publish_nothing() {
-        for reopen in [false, true] {
-            for fail_classify in [false, true] {
-                let root = TestDir::new();
-                let mut state = test_state(&root.0);
-                let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-                let source = insert_file_with_flags(
-                    &mut state,
-                    std::fs::File::open("/dev/urandom").unwrap(),
-                    true,
-                    Some(OutputAlias::Stdout),
-                ) as i32;
-                let inode = state.fd_object_inodes[&source].clone();
-                let files: Vec<_> = state
-                    .files
-                    .iter()
-                    .map(|(&fd, file)| (fd, file.as_raw_fd()))
-                    .collect();
-                let next_inode = state.file_identity_table.lock().unwrap().next_inode;
-                let held_fd = std::rc::Rc::new(std::cell::Cell::new(-1));
-                let classify_fd = held_fd.clone();
-                let carrier_called = std::rc::Rc::new(std::cell::Cell::new(false));
-                let called = carrier_called.clone();
-                let result = with_random_path_hooks(
-                    Some(Box::new(move |file| {
-                        classify_fd.set(file.as_raw_fd());
-                        if fail_classify {
-                            Err(negative_errno(libc::EIO))
-                        } else {
-                            Ok(())
-                        }
-                    })),
-                    Some(Box::new(move || {
-                        called.set(true);
-                        Err(negative_errno(libc::EMFILE))
-                    })),
-                    || {
-                        let path = if reopen {
-                            format!("/proc/self/fd/{source}")
-                        } else {
-                            "/dev//urandom".to_owned()
-                        };
-                        open_with_flags(&mut memory, &mut state, &path, libc::O_CLOEXEC)
-                    },
-                );
-                assert_eq!(
-                    result,
-                    negative_errno(if fail_classify {
-                        libc::EIO
-                    } else {
-                        libc::EMFILE
-                    })
-                );
-                assert!(held_fd.get() >= 0);
-                assert_eq!(carrier_called.get(), !fail_classify);
-                // The production drop(file) precedes carrier construction.
-                // A retired numeric fd can already belong to another parallel
-                // test, so its later lookup cannot establish this ownership.
-                assert_eq!(
-                    state
-                        .files
-                        .iter()
-                        .map(|(&fd, file)| (fd, file.as_raw_fd()))
-                        .collect::<Vec<_>>(),
-                    files
-                );
-                assert_eq!(state.fd_object_inodes.len(), 1);
-                assert!(Arc::ptr_eq(&inode, &state.fd_object_inodes[&source]));
-                assert_eq!(
-                    state.file_identity_table.lock().unwrap().next_inode,
-                    next_inode
-                );
-                assert_eq!(
-                    state.cloexec_fds.iter().copied().collect::<Vec<_>>(),
-                    vec![source]
-                );
-                assert_eq!(
-                    state.stdout_alias_fds.iter().copied().collect::<Vec<_>>(),
-                    vec![source]
-                );
-                assert!(state.stderr_alias_fds.is_empty());
-                assert!(state.random_device_fds.is_empty());
-                assert!(state.random_device_descriptions.is_empty());
-                assert!(state.proc_files.is_empty());
-                assert!(state.fdinfo_files.is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn random_paths_preserve_modes_and_marks_for_named_aliases() {
-        let root = TestDir::new();
-        let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        for path in [
-            "/dev/random",
-            "/dev//random",
-            "/dev/urandom",
-            "/dev/./urandom",
-        ] {
-            for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_PATH] {
-                let fd = open_with_flags(&mut memory, &mut state, path, flags);
-                assert!(fd >= 0, "open {path} flags {flags}: {fd}");
-                assert!(state.random_device_fds.contains(&(fd as i32)));
-                assert!(state.random_device_descriptions.contains_key(&(fd as i32)));
-                let status = syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_fcntl,
-                    [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
-                );
-                assert_eq!(status as i32 & (libc::O_ACCMODE | libc::O_PATH), flags);
-                assert_eq!(close(&mut state, fd as u64), 0);
-                assert!(state.files.is_empty());
-                assert!(state.fd_object_inodes.is_empty());
-                assert!(state.random_device_fds.is_empty());
-                assert!(state.random_device_descriptions.is_empty());
-            }
-        }
-        // Linux creat on an existing random character device neither truncates
-        // it nor performs a data write. The private result retains its mark.
-        write_c_string(&mut memory, 0x100, "/dev//urandom");
-        let fd = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_creat,
-            [0x100, 0o600, 0, 0, 0, 0],
-        );
-        assert!(fd >= 0);
-        assert!(state.random_device_fds.contains(&(fd as i32)));
-        assert_eq!(state.files[&(fd as i32)].metadata().unwrap().len(), 65536);
-        assert_eq!(close(&mut state, fd as u64), 0);
-        assert!(state.files.is_empty());
-        assert!(state.random_device_fds.is_empty());
-        assert!(state.random_device_descriptions.is_empty());
-    }
 
     include!("capture_identity_tests.rs");
     include!("pipe_fionread_tests.rs");
@@ -28121,79 +27360,52 @@ mod tests {
     }
 
     #[test]
-    fn virtual_identity_stays_read_only_and_random_access_is_separate() {
+    fn virtual_identity_stays_read_only() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
 
-        let maps_first_byte = proc_self_maps_content(&state)[0];
-        for (path, first_byte) in [("/dev/urandom", 41), ("/proc/self/maps", maps_first_byte)] {
-            write_c_string(&mut memory, 0x100, path);
-            let writable = syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_openat,
-                [libc::AT_FDCWD as u64, 0x100, libc::O_RDWR as u64, 0, 0, 0],
-            );
-            if path == "/dev/urandom" {
-                assert!(writable >= 0);
-                assert_eq!(close(&mut state, writable as u64), 0);
-            } else {
-                assert_eq!(writable, negative_errno(libc::EACCES));
-            }
+        let path = "/proc/self/maps";
+        let first_byte = proc_self_maps_content(&state)[0];
+        write_c_string(&mut memory, 0x100, path);
+        let writable = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_openat,
+            [libc::AT_FDCWD as u64, 0x100, libc::O_RDWR as u64, 0, 0, 0],
+        );
+        assert_eq!(writable, negative_errno(libc::EACCES));
 
-            let fd = open_readonly(&mut memory, &mut state, path);
-            assert!(fd >= 0, "open {path} failed: {fd}");
-            let flags = syscall_result(
+        let fd = open_readonly(&mut memory, &mut state, path);
+        assert!(fd >= 0, "open {path} failed: {fd}");
+        let flags = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_fcntl,
+            [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
+        );
+        assert_eq!(flags as libc::c_int & libc::O_ACCMODE, libc::O_RDONLY);
+        assert_eq!(
+            syscall_result(
                 &mut memory,
                 &mut state,
-                libc::SYS_fcntl,
-                [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
-            );
-            assert_eq!(flags as libc::c_int & libc::O_ACCMODE, libc::O_RDONLY);
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_read,
-                    [fd as u64, 0x200, 1, 0, 0, 0]
-                ),
-                1
-            );
-            let mut byte = [0];
-            memory.read(0x200, &mut byte).unwrap();
-            assert_eq!(byte[0], first_byte);
-            if path == "/dev/urandom" {
-                write_c_string(&mut memory, 0x100, &format!("/proc/self/fd/{fd}"));
-                assert_eq!(
-                    syscall_result(
-                        &mut memory,
-                        &mut state,
-                        libc::SYS_truncate,
-                        [0x100, 0, 0, 0, 0, 0],
-                    ),
-                    negative_errno(libc::EINVAL)
-                );
-                assert_eq!(
-                    syscall_result(
-                        &mut memory,
-                        &mut state,
-                        libc::SYS_read,
-                        [fd as u64, 0x200, 1, 0, 0, 0],
-                    ),
-                    1
-                );
-            }
-            assert_eq!(
-                syscall_result(
-                    &mut memory,
-                    &mut state,
-                    libc::SYS_write,
-                    [fd as u64, 0x200, 1, 0, 0, 0]
-                ),
-                negative_errno(libc::EBADF)
-            );
-        }
+                libc::SYS_read,
+                [fd as u64, 0x200, 1, 0, 0, 0]
+            ),
+            1
+        );
+        let mut byte = [0];
+        memory.read(0x200, &mut byte).unwrap();
+        assert_eq!(byte[0], first_byte);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_write,
+                [fd as u64, 0x200, 1, 0, 0, 0]
+            ),
+            negative_errno(libc::EBADF)
+        );
     }
 
     #[test]
@@ -29822,7 +29034,6 @@ mod tests {
                             &state,
                             &[raw_stdin, 3, offset, count, 0, 0],
                             capture.then_some(&mut output),
-                            None,
                         ),
                         count as i64,
                         "writable stdin {raw_stdin:#x}, capture={capture}, offset={offset:#x}"
@@ -43136,7 +42347,6 @@ mod tests {
 
     fn fdinfo_content_unsupported_targets(fixture: &mut FdinfoFixture) -> Vec<(&'static str, i64)> {
         let synthetic_proc = fixture.open("/proc/self/maps", libc::O_RDONLY);
-        let random = fixture.open("/dev/urandom", libc::O_RDONLY);
         fixture.memory.write(0x300, &0_u64.to_ne_bytes()).unwrap();
         let signalfd = fixture.call(
             libc::SYS_signalfd4,
@@ -43155,7 +42365,6 @@ mod tests {
         );
         for (label, fd) in [
             ("synthetic-proc", synthetic_proc),
-            ("random", random),
             ("signalfd", signalfd),
             ("anonymous-inode", anonymous_inode),
         ] {
@@ -43163,7 +42372,6 @@ mod tests {
         }
         vec![
             ("synthetic-proc", synthetic_proc),
-            ("random", random),
             ("signalfd", signalfd),
             ("captured-output", libc::STDOUT_FILENO as i64),
             ("anonymous-inode", anonymous_inode),
@@ -44854,7 +44062,6 @@ mod tests {
         let old_objects = f.executor.state.fd_object_inodes.clone();
         let metadata = |state: &LoadedStaticElf| {
             (
-                state.random_device_fds.clone(),
                 state.stdout_alias_fds.clone(),
                 state.stderr_alias_fds.clone(),
                 state.cloexec_fds.clone(),
@@ -45704,14 +44911,12 @@ mod tests {
         );
         let target = f.open("a", libc::O_RDWR);
         let info = f.info(target);
-        for path in ["/proc/self/maps", "/dev/urandom"] {
-            let private = f.open(path, libc::O_RDONLY);
-            assert!(private >= 0);
-            assert_eq!(
-                f.open(&format!("/proc/self/fdinfo/{private}"), libc::O_RDONLY),
-                negative_errno(libc::ENOSYS)
-            );
-        }
+        let private = f.open("/proc/self/maps", libc::O_RDONLY);
+        assert!(private >= 0);
+        assert_eq!(
+            f.open(&format!("/proc/self/fdinfo/{private}"), libc::O_RDONLY),
+            negative_errno(libc::ENOSYS)
+        );
         f.memory.write(0x300, &0_u64.to_ne_bytes()).unwrap();
         let signal = f.call(
             libc::SYS_signalfd4,
@@ -46687,7 +45892,6 @@ mod tests {
     #[test]
     fn host_files_report_stored_times_with_or_without_the_setting() {
         const PATH_ADDRESS: u64 = 0x100;
-        const RANDOM_ADDRESS: u64 = 0x180;
         const EMPTY_ADDRESS: u64 = 0x1c0;
         const TIMES_ADDRESS: u64 = 0x200;
         const STAT_ADDRESS: u64 = 0x1000;
@@ -46705,7 +45909,6 @@ mod tests {
         state.host_metadata_timestamps = true;
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
         write_c_string(&mut memory, PATH_ADDRESS, "stamped");
-        write_c_string(&mut memory, RANDOM_ADDRESS, "/dev/urandom");
         write_c_string(&mut memory, EMPTY_ADDRESS, "");
         assert_eq!(
             write_struct(
@@ -46888,73 +46091,6 @@ mod tests {
                     );
                 }
             }
-        }
-        state.host_metadata_timestamps = true;
-
-        // A virtual random device is synthetic and keeps the fixed timestamps.
-        let random = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_openat,
-            [
-                libc::AT_FDCWD as u64,
-                RANDOM_ADDRESS,
-                libc::O_RDONLY as u64,
-                0,
-                0,
-                0,
-            ],
-        );
-        assert!(random >= 0, "open /dev/urandom failed: {random}");
-        assert!(
-            state
-                .random_device_descriptions
-                .contains_key(&(random as libc::c_int))
-        );
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fstat,
-                [random as u64, STAT_ADDRESS, 0, 0, 0, 0],
-            ),
-            0
-        );
-        let random_stat: libc::stat = read_struct(&memory, STAT_ADDRESS);
-        for timestamp in [
-            random_stat.st_atime,
-            random_stat.st_mtime,
-            random_stat.st_ctime,
-        ] {
-            assert_eq!(timestamp, DETERMINISTIC_METADATA_SECONDS);
-        }
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_statx,
-                [
-                    random as u64,
-                    EMPTY_ADDRESS,
-                    libc::AT_EMPTY_PATH as u64,
-                    statx_mask,
-                    STATX_ADDRESS,
-                    0,
-                ],
-            ),
-            0
-        );
-        let random_statx: libc::statx = read_struct(&memory, STATX_ADDRESS);
-        for timestamp in [
-            random_statx.stx_atime,
-            random_statx.stx_btime,
-            random_statx.stx_ctime,
-            random_statx.stx_mtime,
-        ] {
-            assert_eq!(
-                (timestamp.tv_sec, timestamp.tv_nsec),
-                (DETERMINISTIC_METADATA_SECONDS, 0)
-            );
         }
     }
 
@@ -51291,77 +50427,65 @@ mod tests {
     }
 
     #[test]
-    fn read_zero_count_random_and_proc_keep_synthetic_routing_and_position() {
-        for path in ["/dev/urandom", "/proc/self/status"] {
-            let mut state = test_state(&std::env::current_dir().unwrap());
-            let mut memory = read_zero_memory();
-            let fd = open_readonly(&mut memory, &mut state, path);
-            assert!(fd >= 0, "open {path}: {fd}");
-            assert!(
-                state.random_device_fds.contains(&(fd as i32))
-                    || state.proc_files.contains_key(&(fd as i32))
-            );
-            let process_status = path == "/proc/self/status";
-            let expected = if process_status {
-                // Process status is a live seq description with an empty
-                // metadata carrier. Its independent literal prefix must come
-                // from the description, never from that private host file.
-                assert!(state.fdinfo_files.contains_key(&(fd as i32)));
-                assert_eq!(state.files[&(fd as i32)].metadata().unwrap().len(), 0);
-                b"Name:\ttest\nUmask".to_vec()
+    fn read_zero_count_proc_keeps_synthetic_routing_and_position() {
+        let path = "/proc/self/status";
+        let mut state = test_state(&std::env::current_dir().unwrap());
+        let mut memory = read_zero_memory();
+        let fd = open_readonly(&mut memory, &mut state, path);
+        assert!(fd >= 0, "open {path}: {fd}");
+        assert!(state.proc_files.contains_key(&(fd as i32)));
+        // Process status is a live seq description with an empty metadata
+        // carrier. Its independent literal prefix must come from the
+        // description, never from that private host file.
+        assert!(state.fdinfo_files.contains_key(&(fd as i32)));
+        assert_eq!(state.files[&(fd as i32)].metadata().unwrap().len(), 0);
+        let expected = b"Name:\ttest\nUmask".to_vec();
+        memory.write(READ_ZERO_BUFFER, &[0x5a; 16]).unwrap();
+        for address in READ_ZERO_ADDRESSES {
+            // Live process seq reads admit a zero-length userspace interval
+            // without touching a page, like the fdinfo control. The route
+            // must preserve position and all canaries.
+            let expected_result = if address >= 0x8000_0000_0000_0000 {
+                negative_errno(libc::EFAULT)
             } else {
-                random_stream_carrier_bytes(&state, fd, 0, 16)
+                0
             };
-            memory.write(READ_ZERO_BUFFER, &[0x5a; 16]).unwrap();
-            for address in READ_ZERO_ADDRESSES {
-                // Random dispatch retains its guest-arena admission: the
-                // canonical address beyond this arena returns EFAULT. Live
-                // process seq reads instead admit a zero-length userspace
-                // interval without touching a page, like the fdinfo control.
-                // Both routes must preserve position and all canaries.
-                let expected_result = if process_status {
-                    if address >= 0x8000_0000_0000_0000 {
-                        negative_errno(libc::EFAULT)
-                    } else {
-                        0
-                    }
-                } else if address <= memory.guest_end() {
-                    0
-                } else {
-                    negative_errno(libc::EFAULT)
-                };
-                assert_eq!(
-                    syscall_result(
-                        &mut memory,
-                        &mut state,
-                        libc::SYS_read,
-                        [READ_ZERO_HIGH_FD | fd as u64, address, 0, 0, 0, 0],
-                    ),
-                    expected_result,
-                    "synthetic {path} address={address:#x}"
-                );
-                assert_read_zero_canaries(&memory);
-                assert_eq!(
-                    syscall_result(
-                        &mut memory,
-                        &mut state,
-                        libc::SYS_lseek,
-                        [fd as u64, 0, libc::SEEK_CUR as u64, 0, 0, 0],
-                    ),
-                    0
-                );
-            }
             assert_eq!(
-                random_stream_read(&mut memory, &mut state, fd, READ_ZERO_BUFFER, 16),
-                16
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_read,
+                    [READ_ZERO_HIGH_FD | fd as u64, address, 0, 0, 0, 0],
+                ),
+                expected_result,
+                "synthetic {path} address={address:#x}"
             );
+            assert_read_zero_canaries(&memory);
             assert_eq!(
-                read_guest_bytes::<16>(&ProviderMemory(&memory), READ_ZERO_BUFFER)
-                    .unwrap()
-                    .as_slice(),
-                expected
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_lseek,
+                    [fd as u64, 0, libc::SEEK_CUR as u64, 0, 0, 0],
+                ),
+                0
             );
         }
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_read,
+                [fd as u64, READ_ZERO_BUFFER, 16, 0, 0, 0],
+            ),
+            16
+        );
+        assert_eq!(
+            read_guest_bytes::<16>(&ProviderMemory(&memory), READ_ZERO_BUFFER)
+                .unwrap()
+                .as_slice(),
+            expected
+        );
     }
 
     #[test]
@@ -62618,64 +61742,6 @@ mod tests {
         );
 
         drop(child);
-    }
-
-    #[test]
-    fn deterministic_random_device_repeats_and_changes_with_seed() {
-        let root = deterministic_random_device_bytes(0, 32);
-        assert_eq!(root, deterministic_random_device_bytes(0, 32));
-        assert_eq!(root[0], 41);
-        assert_ne!(root, deterministic_random_device_bytes(17, 32));
-    }
-
-    #[test]
-    fn random_device_reads_remain_tool_routed_after_duplication() {
-        let root = TestDir::new();
-        let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        write_c_string(&mut memory, 0x100, "/dev/urandom");
-
-        let random_fd = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_openat,
-            [libc::AT_FDCWD as u64, 0x100, 0, 0, 0, 0],
-        );
-        assert!(random_fd >= 0);
-        assert!(state.random_device_fds.contains(&(random_fd as i32)));
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_dup3,
-                [random_fd as u64, 0, 0, 0, 0, 0],
-            ),
-            0
-        );
-        assert!(state.random_device_fds.contains(&0));
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_close,
-                [random_fd as u64, 0, 0, 0, 0, 0],
-            ),
-            0
-        );
-
-        let executor = ElfExecutor::new(state, false);
-        assert!(executor.is_random_device_read(&SyscallRequest::new(
-            libc::SYS_read as u64,
-            [0, 0x200, 8, 0, 0, 0],
-        )));
-        assert!(executor.is_random_device_read(&SyscallRequest::new(
-            libc::SYS_readv as u64,
-            [0, 0x200, 1, 0, 0, 0],
-        )));
-        assert!(!executor.is_random_device_read(&SyscallRequest::new(
-            libc::SYS_read as u64,
-            [1, 0x200, 8, 0, 0, 0],
-        )));
     }
 
     #[test]

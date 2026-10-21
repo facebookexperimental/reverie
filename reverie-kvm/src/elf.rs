@@ -983,9 +983,6 @@ pub(crate) struct LoadedStaticElf {
     /// fixed ADDR_NO_RANDOMIZE layout. Fork and clone copy it by value; ordinary
     /// supported exec preserves the calling task's value.
     pub(crate) linux_personality: u32,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-228): Review caller-provided deterministic random seed state.
-    pub random_seed: u64,
     /// Task IDs each new task spends (`reverie::task_ids`): Linux's 1 unless
     /// the caller asks for another numbering (Hermit asks for its ptrace
     /// reference's). Shared by the whole run: forks and exec keep it.
@@ -998,8 +995,8 @@ pub(crate) struct LoadedStaticElf {
     /// for its own data are classified and keep fixed timestamps (see
     /// [`IdentityTimestamps`]). False by default. Real host files and
     /// descriptors report the kernel's timestamps either way, and captured
-    /// output, synthetic `/proc` files and virtual random devices keep fixed
-    /// timestamps either way. Set through
+    /// output and synthetic `/proc` files keep fixed timestamps either way.
+    /// Set through
     /// [`crate::KvmBackend::set_host_metadata_timestamps`]; fork, clone and
     /// exec carry it unchanged.
     pub host_metadata_timestamps: bool,
@@ -1061,11 +1058,6 @@ pub(crate) struct LoadedStaticElf {
     pub(crate) poll_table_id: std::sync::Arc<crate::executor::NativePollTable>,
     pub(crate) native_poll_fds:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::NativePollBinding>>,
-    // AUTONOMOUS-BOT-IMPLEMENTED: Keep deterministic random descriptors on the Tool path.
-    // TODO-HUMAN-REVIEW(PR-235): Review random-device descriptor lifecycle parity.
-    pub random_device_fds: std::collections::BTreeSet<i32>,
-    pub random_device_descriptions:
-        std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::RandomDeviceDescription>>,
     pub stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub stderr_alias_fds: std::collections::BTreeSet<i32>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Model guest close-on-exec state independently.
@@ -1129,7 +1121,6 @@ impl LoadedStaticElf {
                 binding.retire();
             }
         }
-        self.random_device_descriptions.remove(&fd);
         self.pipe_owners.remove(&fd);
         let mut retired: Vec<_> = self.files.insert(fd, file).into_iter().collect();
         if fd == libc::STDIN_FILENO {
@@ -1156,7 +1147,6 @@ impl LoadedStaticElf {
                 binding.retire();
             }
         }
-        self.random_device_descriptions.remove(&fd);
         self.pipe_owners.remove(&fd);
         let file = self.files.remove(&fd);
         self.fd_entry_ids.remove(&fd);
@@ -1220,7 +1210,6 @@ impl LoadedStaticElf {
             is_traced_tree_root: false,
             umask: self.umask,
             linux_personality: self.linux_personality,
-            random_seed: self.random_seed,
             ids_per_task: self.ids_per_task,
             host_metadata_timestamps: self.host_metadata_timestamps,
             thread_name: self.thread_name,
@@ -1255,8 +1244,6 @@ impl LoadedStaticElf {
                 .iter()
                 .map(|(&fd, binding)| (fd, binding.fork_binding()))
                 .collect(),
-            random_device_fds: self.random_device_fds.clone(),
-            random_device_descriptions: self.random_device_descriptions.clone(),
             stdout_alias_fds: self.stdout_alias_fds.clone(),
             stderr_alias_fds: self.stderr_alias_fds.clone(),
             cloexec_fds: self.cloexec_fds.clone(),
@@ -1338,16 +1325,6 @@ impl LoadedStaticElf {
             .collect();
         let fd_entry_ids = previous
             .fd_entry_ids
-            .into_iter()
-            .filter(|(fd, _)| files.contains_key(fd))
-            .collect();
-        let random_device_fds = previous
-            .random_device_fds
-            .into_iter()
-            .filter(|fd| files.contains_key(fd))
-            .collect();
-        let random_device_descriptions = previous
-            .random_device_descriptions
             .into_iter()
             .filter(|(fd, _)| files.contains_key(fd))
             .collect();
@@ -1454,7 +1431,6 @@ impl LoadedStaticElf {
         self.signal_dequeue_failure = previous.signal_dequeue_failure;
         self.umask = previous.umask;
         self.linux_personality = previous.linux_personality;
-        self.random_seed = previous.random_seed;
         self.ids_per_task = previous.ids_per_task;
         self.host_metadata_timestamps = previous.host_metadata_timestamps;
         // `thread_name` intentionally remains the replacement image's name.
@@ -1479,8 +1455,6 @@ impl LoadedStaticElf {
         self.epoll_domain = previous.epoll_domain;
         self.poll_table_id = previous.poll_table_id;
         self.native_poll_fds = native_poll_fds;
-        self.random_device_fds = random_device_fds;
-        self.random_device_descriptions = random_device_descriptions;
         self.stdout_alias_fds = stdout_alias_fds;
         self.stderr_alias_fds = stderr_alias_fds;
         self.cloexec_fds = std::collections::BTreeSet::new();
@@ -1992,7 +1966,6 @@ fn load_executable(
         is_traced_tree_root: true,
         umask: 0o022,
         linux_personality: LINUX_FIXED_PERSONALITY,
-        random_seed: 0,
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
         host_metadata_timestamps: false,
         thread_name,
@@ -2020,8 +1993,6 @@ fn load_executable(
         epoll_domain: Default::default(),
         poll_table_id: Default::default(),
         native_poll_fds: Default::default(),
-        random_device_fds: std::collections::BTreeSet::new(),
-        random_device_descriptions: std::collections::BTreeMap::new(),
         stdout_alias_fds: std::collections::BTreeSet::new(),
         stderr_alias_fds: std::collections::BTreeSet::new(),
         cloexec_fds: std::collections::BTreeSet::new(),

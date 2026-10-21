@@ -88,8 +88,7 @@ impl GuestMemoryAccess for ProviderMemory<'_> {
         self.0.user().read(address, destination)
     }
 
-    /// No executor handler calls this yet: its only candidate caller, the
-    /// random-device write, still needs the arena's copy-failure check.
+    /// No executor handler calls this yet.
     fn copy_from_user_prefix(&self, address: u64, destination: &mut [u8]) -> Result<usize> {
         self.0.user().copy_from_user_prefix(address, destination)
     }
