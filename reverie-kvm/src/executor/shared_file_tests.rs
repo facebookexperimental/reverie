@@ -1805,4 +1805,101 @@ mod shared_file_dispatch_tests {
         // SAFETY: both halves are this test's own mappings.
         unsafe { libc::munmap(host, 2 * CHUNK) };
     }
+
+    /// pwritev2 refuses an unknown flag (EOPNOTSUPP) before it reads any
+    /// payload byte, as natively: a one-byte source on a shared file page
+    /// whose file has been truncated to zero cannot be read, yet the write is
+    /// refused for its flags and the run goes on.
+    #[test]
+    fn pwritev2_flags_are_refused_before_a_truncated_shared_source_is_read() {
+        // Native control.
+        let native_root = TestDir::new();
+        let source_path = native_root.0.join("source");
+        std::fs::write(&source_path, [7_u8; PAGE_SIZE as usize]).unwrap();
+        let source = std::fs::File::open(&source_path).unwrap();
+        let destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(native_root.0.join("destination"))
+            .unwrap();
+        // SAFETY: a kernel-placed shared mapping of a live file, unmapped below.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE_SIZE as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                source.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let vector = libc::iovec {
+            iov_base: mapping,
+            iov_len: 1,
+        };
+        // SAFETY: the vector names one byte of the mapping above; the kernel
+        // refuses the flag before reading it.
+        let native = unsafe {
+            libc::syscall(
+                libc::SYS_pwritev2,
+                destination.as_raw_fd(),
+                &vector,
+                1_usize,
+                0_i64,
+                0_i64,
+                0x8000_i64,
+            )
+        };
+        let native = if native < 0 {
+            io_error(std::io::Error::last_os_error())
+        } else {
+            native
+        };
+        // SAFETY: the mapping above is one page and is not used again.
+        unsafe { libc::munmap(mapping, PAGE_SIZE as usize) };
+        assert_eq!(native, negative_errno(libc::EOPNOTSUPP));
+
+        let mut f = Fixture::new();
+        let fd = f.open(false);
+        let address = f.shared(fd, 0, 0, false);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&f.path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(f.root.0.join("destination"))
+            .unwrap();
+        let destination = insert_file_with_flags(&mut f.state, destination, false, None);
+        write_struct(
+            &mut ProviderMemory(&f.memory),
+            0x100,
+            &libc::iovec {
+                iov_base: address as *mut libc::c_void,
+                iov_len: 1,
+            },
+        );
+        assert_eq!(
+            syscall_result(
+                &mut f.memory,
+                &mut f.state,
+                libc::SYS_pwritev2,
+                [destination as u64, 0x100, 1, 0, 0, 0x8000],
+            ),
+            native
+        );
+        assert!(f.memory.entry_gate().pending_failure().is_none());
+    }
 }

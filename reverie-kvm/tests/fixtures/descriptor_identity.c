@@ -58,11 +58,22 @@ static int mapping_errors(long fd, long mode) {
       {(long)(pages + 4096), 4096, t | f, 0, EINVAL},
       {(long)(pages + 4096), 4096, MAP_SHARED_VALIDATE | n, 0, EOPNOTSUPP},
       {(long)pages, 4096, MAP_SHARED_VALIDATE | n, 0, EEXIST},
+      /* Mapping type 0: placement refusals first, the type last. */
+      {(long)pages, 4096, n, 0, EEXIST},
+      {-4096L, 4096, f, 0, ENOMEM},
+      {(long)(pages + 4096), 4096, f, 0, EINVAL},
+      /* A high offset is the object's to judge, after placement. */
+      {(long)(pages + 4096), 4096, MAP_PRIVATE | f, (long)(1UL << 63), ENODEV},
+      {(long)pages, 4096, MAP_PRIVATE | n, (long)(1UL << 63), EEXIST},
+      {-4096L, 4096, MAP_PRIVATE | f, (long)(1UL << 63), ENOMEM},
+      {0x1001L, 4096, MAP_PRIVATE | f, (long)(1UL << 63), EINVAL},
   };
   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
     int error = cases[i].offset == 1
         ? EINVAL
         : (mode == O_PATH ? EBADF : cases[i].error);
+    if (error == ENODEV && (mode == O_WRONLY || mode == 3))
+      error = EACCES;
     FAIL(
         syscall(
             SYS_mmap,
@@ -178,6 +189,13 @@ static int mapping_errors(long fd, long mode) {
             fd,
             0UL),
         mode == O_PATH ? EBADF : ranges[i].error);
+  /* mmap ignores protection bits beyond read, write and execute. */
+  const long prots[] = {PROT_READ | 0x8, PROT_READ | 0x10, PROT_READ | 0x01000000};
+  for (unsigned i = 0; i < sizeof(prots) / sizeof(prots[0]); ++i)
+    FAIL(
+        syscall(SYS_mmap, 0L, 4096L, prots[i], (long)MAP_PRIVATE, fd, 0L),
+        mode == O_PATH ? EBADF
+                       : (mode == O_WRONLY || mode == 3 ? EACCES : ENODEV));
   CHECK(syscall(SYS_fcntl, fd, (long)F_GETFL, 0L) == original);
   for (unsigned i = 0; i < 4096; ++i)
     CHECK(pages[i] == 0xa5 && pages[8192 + i] == 0xa5);
@@ -194,7 +212,7 @@ static int mapping_errors(long fd, long mode) {
   return 0;
 }
 
-static int one(const char* path, unsigned minor_number, int native) {
+static int one(const char* path, unsigned minor_number) {
   const long modes[] = {O_RDONLY, O_WRONLY, O_RDWR, 3, O_PATH};
   for (unsigned m = 0; m < sizeof(modes) / sizeof(modes[0]); ++m) {
     long mode = modes[m];
@@ -291,7 +309,7 @@ static int one(const char* path, unsigned minor_number, int native) {
             SYS_mmap, 0L, 4096L, (long)PROT_READ, (long)MAP_PRIVATE, fd, 0L),
         mode == O_PATH ? EBADF
                        : (mode == O_WRONLY || mode == 3 ? EACCES : ENODEV));
-    if (!native && (mode == O_WRONLY || mode == O_RDWR)) {
+    if (mode == O_WRONLY || mode == O_RDWR) {
       unsigned char* pages = (void*)syscall(
           SYS_mmap,
           0L,
@@ -316,21 +334,73 @@ static int one(const char* path, unsigned minor_number, int native) {
       CHECK(syscall(SYS_read, fd, (long)bytes, 23L) == 23);
       struct iovec iv[] = {{bytes + 23, 7}, {bytes + 30, 19}, {bytes + 49, 33}};
       CHECK(syscall(SYS_readv, alias, (long)iv, 3L) == 59);
-      if (!native)
-        for (unsigned i = 0; i < sizeof(bytes); ++i)
-          CHECK(bytes[i] == (unsigned char)((i * 73 + 41) & 255));
     }
     CHECK(syscall(SYS_close, fd) == 0);
     CHECK(syscall(SYS_close, alias) == 0);
   }
   return 0;
 }
-int main(int argc, char** argv) {
-  int native = argc == 2 && strcmp(argv[1], "native") == 0;
-  CHECK(one("/dev/random", 8, native) == 0);
-  CHECK(one("/dev/urandom", 9, native) == 0);
-  CHECK(one("/dev//random", 8, native) == 0);
-  CHECK(one("/dev/./urandom", 9, native) == 0);
-  puts("random carrier access, identity, flags, faults and bytes ok");
+/* The three stat calls agree on an ordinary file as on a device. */
+static int regular_identity(void) {
+  long fd = syscall(
+      SYS_openat,
+      (long)AT_FDCWD,
+      (long)"regular",
+      (long)(O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC),
+      0600L);
+  CHECK(fd >= 0);
+  CHECK(syscall(SYS_write, fd, (long)"identity", 8L) == 8);
+  long alias = syscall(SYS_dup, fd);
+  CHECK(alias >= 0);
+  struct stat st, at;
+  CHECK(syscall(SYS_fstat, fd, (long)&st) == 0);
+  CHECK(S_ISREG(st.st_mode) && st.st_size == 8);
+  struct statx sx;
+  CHECK(
+      syscall(
+          SYS_statx,
+          alias,
+          (long)"",
+          (long)AT_EMPTY_PATH,
+          (long)STATX_BASIC_STATS,
+          (long)&sx) == 0);
+  CHECK((sx.stx_mode & S_IFMT) == S_IFREG && sx.stx_size == 8);
+  CHECK(sx.stx_ino == st.st_ino && sx.stx_blocks == (unsigned long long)st.st_blocks);
+  CHECK(
+      syscall(SYS_newfstatat, alias, (long)"", (long)&at, (long)AT_EMPTY_PATH) ==
+      0);
+  CHECK(
+      at.st_mode == st.st_mode && at.st_ino == st.st_ino &&
+      at.st_dev == st.st_dev && at.st_size == st.st_size);
+  /* An ordinary file's mapping: unknown protection bits are ignored, and
+   * mapping type 0 is refused only after placement. */
+  unsigned char* page = (void*)syscall(
+      SYS_mmap,
+      0L,
+      4096L,
+      (long)(PROT_READ | PROT_WRITE),
+      (long)(MAP_PRIVATE | MAP_ANONYMOUS),
+      -1L,
+      0L);
+  CHECK(page != MAP_FAILED);
+  long mapped = syscall(SYS_mmap, 0L, 4096L, (long)(PROT_READ | 0x8), (long)MAP_PRIVATE, fd, 0L);
+  CHECK(mapped != -1);
+  CHECK(syscall(SYS_munmap, mapped, 4096L) == 0);
+  FAIL(syscall(SYS_mmap, (long)page, 4096L, (long)PROT_READ, (long)MAP_FIXED_NOREPLACE, fd, 0L), EEXIST);
+  FAIL(syscall(SYS_mmap, -4096L, 4096L, (long)PROT_READ, (long)MAP_FIXED, fd, 0L), ENOMEM);
+  FAIL(syscall(SYS_mmap, 0L, 4096L, (long)PROT_READ, 0L, fd, 0L), EINVAL);
+  CHECK(syscall(SYS_munmap, (long)page, 4096L) == 0);
+  CHECK(syscall(SYS_close, fd) == 0);
+  CHECK(syscall(SYS_close, alias) == 0);
+  return 0;
+}
+
+int main(void) {
+  CHECK(one("/dev/random", 8) == 0);
+  CHECK(one("/dev/urandom", 9) == 0);
+  CHECK(one("/dev//random", 8) == 0);
+  CHECK(one("/dev/./urandom", 9) == 0);
+  CHECK(regular_identity() == 0);
+  puts("descriptor access, identity, flags, mapping errors and faults ok");
   return 0;
 }

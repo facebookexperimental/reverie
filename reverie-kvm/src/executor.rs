@@ -8375,9 +8375,22 @@ fn file_mode(file: &std::fs::File) -> Result<libc::mode_t, i64> {
     fd_mode(file.as_raw_fd())
 }
 
+/// Whether a description's status flags grant read access. Linux's open gives
+/// FMODE_READ only to O_RDONLY and O_RDWR: access mode 3 (O_ACCMODE) grants
+/// neither read nor write, and an O_PATH descriptor grants no I/O at all.
+fn status_grants_read(flags: libc::c_int) -> bool {
+    flags & libc::O_PATH == 0 && matches!(flags & libc::O_ACCMODE, libc::O_RDONLY | libc::O_RDWR)
+}
+
+/// Whether a description's status flags grant write access (FMODE_WRITE):
+/// only O_WRONLY and O_RDWR, as for [`status_grants_read`].
+fn status_grants_write(flags: libc::c_int) -> bool {
+    flags & libc::O_PATH == 0 && matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
+}
+
 fn ensure_read_access_fd(fd: RawFd) -> Result<(), i64> {
     let flags = fd_status_flags(fd)?;
-    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE == libc::O_WRONLY {
+    if !status_grants_read(flags) {
         return Err(negative_errno(libc::EBADF));
     }
     Ok(())
@@ -8409,7 +8422,7 @@ fn ensure_writable_entry(
         return ensure_writable(file);
     };
     let flags = entry.access(|| file_status_flags(file))?;
-    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE == libc::O_RDONLY {
+    if !status_grants_write(flags) {
         Err(negative_errno(libc::EBADF))
     } else {
         Ok(())
@@ -8426,7 +8439,7 @@ fn ensure_read_capable_entry(
         return ensure_read_capable(file);
     };
     let flags = entry.access(|| file_status_flags(file))?;
-    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE == libc::O_WRONLY {
+    if !status_grants_read(flags) {
         return Err(negative_errno(libc::EBADF));
     }
     entry.read_capable(|| read_capability_probe(file))
@@ -8438,7 +8451,7 @@ fn ensure_writable(file: &std::fs::File) -> Result<(), i64> {
 
 fn ensure_writable_fd(fd: RawFd) -> Result<(), i64> {
     let flags = fd_status_flags(fd)?;
-    if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE == libc::O_RDONLY {
+    if !status_grants_write(flags) {
         Err(negative_errno(libc::EBADF))
     } else {
         Ok(())
@@ -8653,8 +8666,39 @@ fn write(
     {
         return error;
     }
+    // vfs_write checks the buffer's address range (access_ok) for the whole
+    // count after the access mode and before anything is written, even when
+    // the count is zero.
+    if let Err(error) = validate_guest_iovec_address(args[1], requested_length) {
+        return error;
+    }
     if length == 0 {
         return 0;
+    }
+
+    // An owned descriptor writes through the host unless captured output
+    // takes its bytes.
+    if !standard && (output_destination.is_none() || output.is_none()) {
+        let host_fd = state
+            .files
+            .get(&fd)
+            .expect("owned descriptor disappeared")
+            .as_raw_fd();
+        let mut staged = match stage_guest_write(memory, host_fd, args[1], length) {
+            Ok(staged) => staged,
+            Err(error) => return error,
+        };
+        let (buffer, buffer_length) = staged.host_buffer();
+        let private_pipe = private_pipe_owner(state, fd);
+        let still_private = || private_pipe.is_some_and(|owner| owner.pair_never_exported());
+        let pipe_requested = private_pipe.map(|_| (length, &still_private as &dyn Fn() -> bool));
+        let (written, sigpipe) = suppress_host_sigpipe_reporting(pipe_requested, || {
+            // SAFETY: the staged buffer is `length` live host bytes (a partly
+            // readable one has its unreadable suffix PROT_NONE), and host_fd
+            // is a live backing descriptor.
+            unsafe { libc::write(host_fd, buffer, buffer_length) as i64 }
+        });
+        return with_guest_sigpipe(state, written, sigpipe);
     }
 
     let mut bytes = vec![0; length];
@@ -8673,28 +8717,77 @@ fn write(
             return host_write(fd, &bytes);
         }
     }
-    if standard {
-        return state
-            .stdin
-            .as_mut()
-            .expect("open standard input disappeared")
-            .write(&bytes)
-            .map_or_else(io_error, |count| count as i64);
-    }
+    debug_assert!(
+        standard,
+        "an owned descriptor writes through the staged path"
+    );
+    state
+        .stdin
+        .as_mut()
+        .expect("open standard input disappeared")
+        .write(&bytes)
+        .map_or_else(io_error, |count| count as i64)
+}
 
-    let host_fd = state
-        .files
-        .get(&fd)
-        .expect("owned descriptor disappeared")
-        .as_raw_fd();
-    let private_pipe = private_pipe_owner(state, fd);
-    let still_private = || private_pipe.is_some_and(|owner| owner.pair_never_exported());
-    let pipe_requested = private_pipe.map(|_| (bytes.len(), &still_private as &dyn Fn() -> bool));
-    let (written, sigpipe) = suppress_host_sigpipe_reporting(pipe_requested, || {
-        // SAFETY: bytes is a live host buffer and host_fd is a live backing descriptor.
-        unsafe { libc::write(host_fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) as i64 }
-    });
-    with_guest_sigpipe(state, written, sigpipe)
+/// A guest write buffer staged for one host write.
+enum StagedWrite {
+    /// The whole buffer was readable.
+    Whole(Vec<u8>),
+    /// Only a prefix was: see [`stage_guest_write`].
+    Partial(StagedIoVector),
+}
+
+impl StagedWrite {
+    /// The host buffer and its length, which is always the guest's length.
+    fn host_buffer(&mut self) -> (*const libc::c_void, usize) {
+        match self {
+            Self::Whole(bytes) => (bytes.as_ptr().cast(), bytes.len()),
+            Self::Partial(staged) => {
+                let iovec = staged.host_iovec();
+                (iovec.iov_base.cast_const(), iovec.iov_len)
+            }
+        }
+    }
+}
+
+/// Stages a guest write buffer for one host write of `length` bytes, from one
+/// snapshot of guest memory: the readable prefix is copied under a single
+/// admission and permission transaction (`copy_from_user_prefix`), so the
+/// bytes and the point where the buffer stops being readable come from the
+/// same state. A buffer readable throughout is written as it is. One that
+/// stops being readable part way is staged as that prefix in a private arena
+/// whose remaining pages are PROT_NONE, so it reaches the host kernel with the
+/// shape it had in the guest, and the kernel decides the result for its
+/// object (a short count for a random device, EFAULT for some filesystems and
+/// for a pipe, for example), as for vectored writes.
+fn stage_guest_write(
+    memory: &GuestMemory,
+    host_fd: RawFd,
+    address: u64,
+    length: usize,
+) -> Result<StagedWrite, i64> {
+    let mut bytes = vec![0; length];
+    let prefix = match memory.user().copy_from_user_prefix(address, &mut bytes) {
+        Ok(prefix) => prefix,
+        Err(
+            crate::Error::InvalidGuestAddress { .. } | crate::Error::GuestMemoryAccessDenied { .. },
+        ) => 0,
+        Err(_) => return Err(negative_errno(libc::EFAULT)),
+    };
+    if prefix == length {
+        return Ok(StagedWrite::Whole(bytes));
+    }
+    let vector = GuestIoVec {
+        base: address,
+        length,
+    };
+    let mut staged = StagedIoVector::new(vector, prefix, direct_io_memory_alignment(host_fd))?;
+    if prefix != 0 {
+        staged
+            .accessible_slice_mut(prefix)
+            .copy_from_slice(&bytes[..prefix]);
+    }
+    Ok(StagedWrite::Partial(staged))
 }
 
 /// The pipe-owner record of `fd` if it is a guest pipe end (pipe/pipe2 or a
@@ -8975,6 +9068,14 @@ std::thread_local! {
 /// outside this supported surface. Known local regular files retain the
 /// backend's existing filesystem-I/O contract; arbitrary pseudo/FUSE files and
 /// unknown drivers are not assumed to have regular-file zero-read semantics.
+/// Whether the host's random pool is initialized, so that reading
+/// /dev/random cannot wait: getrandom of zero bytes with GRND_NONBLOCK fails
+/// with EAGAIN until then.
+fn host_random_pool_ready() -> bool {
+    // SAFETY: a zero-length request writes nothing.
+    unsafe { libc::getrandom(std::ptr::null_mut(), 0, libc::GRND_NONBLOCK) == 0 }
+}
+
 fn admit_host_read_zero(file: &std::fs::File, guest_fd: i32, address: u64) -> crate::Result<()> {
     let host_fd = file.as_raw_fd();
     #[cfg(test)]
@@ -8998,6 +9099,14 @@ fn admit_host_read_zero(file: &std::fs::File, guest_fd: i32, address: u64) -> cr
         return Err(std::io::Error::last_os_error().into());
     }
     let stat = unsafe { stat.assume_init() };
+    // fdget_pos takes a position lock only for regular files and directories.
+    // For any other object a descriptor without read access fails vfs_read's
+    // FMODE_READ check (EBADF) before anything can wait.
+    if !matches!(stat.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+        && !status_grants_read(flags)
+    {
+        return Ok(());
+    }
     match stat.st_mode & libc::S_IFMT {
         // pipe_read returns before taking its mutex for a zero-sized iterator.
         libc::S_IFIFO => return Ok(()),
@@ -9011,6 +9120,16 @@ fn admit_host_read_zero(file: &std::fs::File, guest_fd: i32, address: u64) -> cr
             if libc::major(stat.st_rdev) == 1 && matches!(libc::minor(stat.st_rdev), 3 | 5) =>
         {
             // Linux's /dev/null and /dev/zero implementations need no data.
+            return Ok(());
+        }
+        // urandom_read_iter never waits. random_read_iter waits only until
+        // the host's random pool is initialized, which getrandom with
+        // GRND_NONBLOCK reports without waiting.
+        libc::S_IFCHR
+            if libc::major(stat.st_rdev) == 1
+                && (libc::minor(stat.st_rdev) == 9
+                    || (libc::minor(stat.st_rdev) == 8 && host_random_pool_ready())) =>
+        {
             return Ok(());
         }
         _ => {}
@@ -9475,18 +9594,58 @@ fn pwrite64(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i
             Err(error) => error,
         };
     }
+    // ksys_pwrite64 refuses an object without positioned writes (a pipe,
+    // socket or FIFO: ESPIPE) before vfs_write checks the access mode and the
+    // buffer. A zero-vector host pwritev at the same offset applies that
+    // order: do_pwritev checks FMODE_PWRITE, and vfs_writev the access mode,
+    // before it returns for a zero total, so no write callback of the object
+    // runs (a zero-length pwrite64 would call it: /dev/full answers ENOSPC,
+    // and /dev/kmsg emits an empty record).
+    // SAFETY: a zero vector count reads nothing from the null vector array.
+    let preflight = unsafe {
+        libc::syscall(
+            libc::SYS_pwritev,
+            file.as_raw_fd() as libc::c_long,
+            std::ptr::null::<libc::iovec>(),
+            0_usize,
+            args[3] as libc::c_ulong,
+            0_usize,
+        )
+    };
+    if preflight < 0 {
+        return io_error(std::io::Error::last_os_error());
+    }
     if let Err(error) = ensure_writable(file) {
+        return error;
+    }
+    // As write: vfs_write's access_ok covers the whole count, even zero.
+    if let Err(error) = validate_guest_iovec_address(args[1], requested_length) {
         return error;
     }
     if length == 0 {
         return 0;
     }
-    let mut bytes = vec![0; length];
-    if memory.user().read(args[1], &mut bytes).is_err() {
-        return negative_errno(libc::EFAULT);
+    let mut staged = match stage_guest_write(memory, file.as_raw_fd(), args[1], length) {
+        Ok(staged) => staged,
+        Err(error) => return error,
+    };
+    let (buffer, buffer_length) = staged.host_buffer();
+    // SAFETY: the staged buffer is `length` live host bytes (a partly
+    // readable one has its unreadable suffix PROT_NONE), and file owns a live
+    // backing descriptor.
+    let written = unsafe {
+        libc::pwrite(
+            file.as_raw_fd(),
+            buffer,
+            buffer_length,
+            args[3] as libc::off_t,
+        )
+    };
+    if written < 0 {
+        io_error(std::io::Error::last_os_error())
+    } else {
+        written as i64
     }
-    file.write_at(&bytes, args[3])
-        .map_or_else(io_error, |count| count as i64)
 }
 
 struct AlignedIoArena {
@@ -10076,17 +10235,32 @@ fn vectored_io(
         return error;
     }
 
-    let count = if state.random_device_descriptions.contains_key(&guest_fd) {
-        u64::from(args[2] as u32)
-    } else {
-        args[2]
-    };
+    // Linux's import_iovec takes the vector count as an unsigned int, so the
+    // raw register's upper 32 bits are ignored for every vectored read and
+    // write.
+    let count = u64::from(args[2] as u32);
     let (guest_iovecs, total, kernel_total) = match decode_guest_iovecs(memory, args[1], count) {
         Ok(decoded) => decoded,
         Err(error) => return error,
     };
-    if positioned && let Err(error) = validate_positioned_vectored_flags(number, args, total) {
-        return error;
+    // Linux validates preadv2 and pwritev2 flags (kiocb_set_rw_flags) after
+    // importing the vectors and verifying the extent (rw_verify_area), and
+    // before any byte is copied. The host call below comes only after the
+    // executor has staged the payload, which reads guest memory, so the
+    // refusal of unknown or conflicting flags is given here, after the same
+    // extent check: a write whose source the guest cannot read (a truncated
+    // shared file page, for example) is still refused for its flags.
+    if positioned && total != 0 && matches!(number, libc::SYS_preadv2 | libc::SYS_pwritev2) {
+        if !current_position
+            && !virtual_signalfd
+            && !captured_output
+            && (args[3] as i64).checked_add(total as i64).is_none()
+        {
+            return negative_errno(libc::EINVAL);
+        }
+        if let Err(error) = validate_positioned_vectored_flags(number, args, total) {
+            return error;
+        }
     }
     if virtual_signalfd {
         debug_assert!(reading && current_position);
@@ -10775,6 +10949,9 @@ fn fallocate(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Some(host_fd) = host_fd(state, fd) else {
         return negative_errno(libc::EBADF);
     };
+    if let Err(error) = refuse_o_path_descriptor(host_fd) {
+        return error;
+    }
     let mode = args[1] as libc::c_int;
     let offset = args[2] as libc::off_t;
     let length = args[3] as libc::off_t;
@@ -10828,6 +11005,9 @@ fn readahead(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Some(host_fd) = host_fd(state, fd) else {
         return negative_errno(libc::EBADF);
     };
+    if let Err(error) = refuse_o_path_descriptor(host_fd) {
+        return error;
+    }
     let offset = args[1] as libc::off64_t;
     let Ok(count) = usize::try_from(args[2]) else {
         return negative_errno(libc::EINVAL);
@@ -10853,6 +11033,9 @@ fn sync_file_range(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Some(host_fd) = host_fd(state, fd) else {
         return negative_errno(libc::EBADF);
     };
+    if let Err(error) = refuse_o_path_descriptor(host_fd) {
+        return error;
+    }
     let offset = args[1] as libc::off64_t;
     let length = args[2] as libc::off64_t;
     let flags = args[3] as libc::c_uint;
@@ -16079,6 +16262,14 @@ fn ioctl(
     let Some(host_fd) = host_fd(state, guest_fd) else {
         return negative_errno(libc::EBADF);
     };
+    // ioctl looks its descriptor up with fdget, which refuses an O_PATH
+    // descriptor, so every command (FIOCLEX and FIONCLEX included) fails with
+    // EBADF there before any descriptor flag changes.
+    match fd_status_flags(host_fd) {
+        Ok(flags) if flags & libc::O_PATH != 0 => return negative_errno(libc::EBADF),
+        Ok(_) => {}
+        Err(error) => return error,
+    }
     // Linux ioctl takes an unsigned-int command even on the 64-bit syscall ABI.
     // Keep this limited support independent of the other ioctl dispatch arms.
     if args[1] as u32 == libc::FIONREAD as u32 {
@@ -18676,6 +18867,20 @@ fn host_fd(state: &LoadedStaticElf, guest_fd: libc::c_int) -> Option<RawFd> {
 }
 
 // TODO-HUMAN-REVIEW(PR-52): Review KVM guest fcntl compatibility boundaries.
+/// EBADF for an O_PATH descriptor, refused where Linux's filtered descriptor
+/// lookup refuses it, before any operand is checked or copied: fcntl lets an
+/// O_PATH descriptor run only its descriptor-flag, status-flag and
+/// duplication commands (every lock command fails before its flock structure
+/// is copied), and fallocate, readahead and sync_file_range look their
+/// descriptor up with fdget before checking their ranges.
+fn refuse_o_path_descriptor(host_fd: RawFd) -> Result<(), i64> {
+    if fd_status_flags(host_fd)? & libc::O_PATH != 0 {
+        Err(negative_errno(libc::EBADF))
+    } else {
+        Ok(())
+    }
+}
+
 fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let guest_fd = args[0] as libc::c_int;
     let source_alias = output_alias(state, guest_fd);
@@ -18827,6 +19032,9 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-211): Review KVM advisory-lock forwarding.
         command @ (libc::F_SETLK | libc::F_SETLKW | libc::F_OFD_SETLK | libc::F_OFD_SETLKW) => {
+            if let Err(error) = refuse_o_path_descriptor(host_fd) {
+                return error;
+            }
             let mut lock = match read_guest_struct::<libc::flock>(&ProviderMemory(memory), args[2])
             {
                 Ok(lock) => lock,
@@ -18858,6 +19066,9 @@ fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> 
         // fcntl(2) does. A conflicting holder is an OFD lock, which Linux
         // reports with l_pid -1, so a guest F_GETLK never sees a host pid.
         command @ (libc::F_GETLK | libc::F_OFD_GETLK) => {
+            if let Err(error) = refuse_o_path_descriptor(host_fd) {
+                return error;
+            }
             let mut lock = match read_guest_struct::<libc::flock>(&ProviderMemory(memory), args[2])
             {
                 Ok(lock) => lock,
@@ -19432,17 +19643,24 @@ fn validate_xattr_target_and_name(
     number: u64,
     args: &[u64; 6],
 ) -> Result<XattrTarget, i64> {
-    let target = if number == libc::SYS_fgetxattr as u64
+    let descriptor_call = number == libc::SYS_fgetxattr as u64
         || number == libc::SYS_fsetxattr as u64
-        || number == libc::SYS_fremovexattr as u64
-    {
+        || number == libc::SYS_fremovexattr as u64;
+    let target = if descriptor_call {
+        // The descriptor calls import the name before their filtered
+        // descriptor lookup, which refuses an unknown or O_PATH descriptor;
+        // the namespace is resolved after both.
+        let name = read_xattr_name(memory, args[1])?;
         let Ok(guest_fd) = libc::c_int::try_from(args[0]) else {
             return Err(negative_errno(libc::EBADF));
         };
         let Some(fd) = host_fd(state, guest_fd) else {
             return Err(negative_errno(libc::EBADF));
         };
-        XattrTarget::Fd(fd)
+        if fd_status_flags(fd)? & libc::O_PATH != 0 {
+            return Err(negative_errno(libc::EBADF));
+        }
+        return resolve_xattr_name(XattrTarget::Fd(fd), name);
     } else {
         let path = match read_c_string(&ProviderMemory(memory), args[0], 4096) {
             Ok(path) => path,
@@ -19461,33 +19679,43 @@ fn validate_xattr_target_and_name(
         }
     };
 
-    match read_c_string(&ProviderMemory(memory), args[1], 256) {
+    let name = read_xattr_name(memory, args[1])?;
+    resolve_xattr_name(target, name)
+}
+
+/// Imports an attribute name as Linux's import_xattr_name does: a fault is
+/// EFAULT, and an empty or over-long name is ERANGE.
+fn read_xattr_name(memory: &GuestMemory, address: u64) -> Result<Vec<u8>, i64> {
+    match read_c_string(&ProviderMemory(memory), address, 256) {
         Ok(name) if name.is_empty() => Err(negative_errno(libc::ERANGE)),
-        Ok(name) => {
-            let empty_namespace =
-                [b"user.".as_slice(), b"trusted.", b"security."].contains(&name.as_slice());
-            if empty_namespace {
-                return Err(negative_errno(libc::EINVAL));
-            }
-            let supported_namespace = [b"user.".as_slice(), b"trusted.", b"security."]
-                .iter()
-                .any(|prefix| name.starts_with(prefix));
-            let supported_system_name = matches!(
-                name.as_slice(),
-                b"system.posix_acl_access" | b"system.posix_acl_default"
-            );
-            if !(supported_namespace || supported_system_name) {
-                Err(negative_errno(libc::EOPNOTSUPP))
-            } else if name.starts_with(b"user.") && !matches!(target, XattrTarget::Synthetic) {
-                // A name read from guest memory has no interior NUL.
-                let name = CString::new(name).map_err(|_| negative_errno(libc::EINVAL))?;
-                Ok(XattrTarget::Host(Box::new(target), name))
-            } else {
-                Ok(XattrTarget::Modeled)
-            }
-        }
+        Ok(name) => Ok(name),
         Err(ReadCStringError::Fault) => Err(negative_errno(libc::EFAULT)),
         Err(ReadCStringError::NameTooLong) => Err(negative_errno(libc::ERANGE)),
+    }
+}
+
+/// Resolves an imported name's namespace for `target`.
+fn resolve_xattr_name(target: XattrTarget, name: Vec<u8>) -> Result<XattrTarget, i64> {
+    let empty_namespace =
+        [b"user.".as_slice(), b"trusted.", b"security."].contains(&name.as_slice());
+    if empty_namespace {
+        return Err(negative_errno(libc::EINVAL));
+    }
+    let supported_namespace = [b"user.".as_slice(), b"trusted.", b"security."]
+        .iter()
+        .any(|prefix| name.starts_with(prefix));
+    let supported_system_name = matches!(
+        name.as_slice(),
+        b"system.posix_acl_access" | b"system.posix_acl_default"
+    );
+    if !(supported_namespace || supported_system_name) {
+        Err(negative_errno(libc::EOPNOTSUPP))
+    } else if name.starts_with(b"user.") && !matches!(target, XattrTarget::Synthetic) {
+        // A name read from guest memory has no interior NUL.
+        let name = CString::new(name).map_err(|_| negative_errno(libc::EINVAL))?;
+        Ok(XattrTarget::Host(Box::new(target), name))
+    } else {
+        Ok(XattrTarget::Modeled)
     }
 }
 
@@ -19567,6 +19795,27 @@ fn getxattr(
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1017): Review user-namespace xattr pass-through.
 fn setxattr(memory: &GuestMemory, state: &LoadedStaticElf, number: u64, args: &[u64; 6]) -> i64 {
+    // fsetxattr validates its flags and imports its name and value
+    // (setxattr_copy) before its filtered descriptor lookup.
+    if number == libc::SYS_fsetxattr as u64 {
+        let flags = args[4] as libc::c_int;
+        if flags & !(libc::XATTR_CREATE | libc::XATTR_REPLACE) != 0 {
+            return negative_errno(libc::EINVAL);
+        }
+        if let Err(error) = read_xattr_name(memory, args[1]) {
+            return error;
+        }
+        let Ok(value_length) = usize::try_from(args[3]) else {
+            return negative_errno(libc::E2BIG);
+        };
+        if value_length > XATTR_SIZE_MAX {
+            return negative_errno(libc::E2BIG);
+        }
+        let mut value = vec![0; value_length];
+        if value_length != 0 && memory.user().read(args[2], &mut value).is_err() {
+            return negative_errno(libc::EFAULT);
+        }
+    }
     let target = match validate_xattr_target_and_name(memory, state, number, args) {
         Ok(target) => target,
         Err(error) => return error,
@@ -19980,10 +20229,18 @@ pub(crate) fn noreplace_error(
 }
 
 fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    // x86-64's sys_mmap refuses an unaligned offset before anything else,
+    // for an anonymous mapping too.
+    if !args[5].is_multiple_of(PAGE_SIZE) {
+        return negative_errno(libc::EINVAL);
+    }
     if args[3] & libc::MAP_ANONYMOUS as u64 == 0
         && let Some(random) = state.random_device_descriptions.get(&(args[4] as i32))
     {
         return random_device_mmap(memory, state, args, random);
+    }
+    if let Some(error) = non_regular_mmap_early_refusal(state, args) {
+        return error;
     }
     if args[1] == 0 {
         return negative_errno(libc::EINVAL);
@@ -19992,13 +20249,9 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     let is_anonymous = flags & libc::MAP_ANONYMOUS as u64 != 0;
     let is_private = flags & libc::MAP_PRIVATE as u64 != 0;
     let is_shared = flags & libc::MAP_SHARED as u64 != 0;
-    let allowed_protection = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-    if args[2] & !allowed_protection != 0 {
-        return negative_errno(libc::EINVAL);
-    }
-    if !is_private && !is_shared {
-        return negative_errno(libc::EINVAL);
-    }
+    // mmap ignores protection bits other than these (calc_vm_prot_bits drops
+    // PROT_SEM and unknown bits; only mprotect validates them).
+    let prot = args[2] & MMAP_PROT_BITS;
 
     let Some(length) = align_up(args[1], PAGE_SIZE) else {
         return negative_errno(libc::ENOMEM);
@@ -20007,10 +20260,6 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     // but fails with EEXIST rather than replace anything there (do_mmap).
     let noreplace = flags & libc::MAP_FIXED_NOREPLACE as u64 != 0;
     let fixed = flags & libc::MAP_FIXED as u64 != 0 || noreplace;
-    // x86-64's sys_mmap refuses an unaligned offset before anything else.
-    if !is_anonymous && !args[5].is_multiple_of(PAGE_SIZE) {
-        return negative_errno(libc::EINVAL);
-    }
     if let Some(errno) = fixed_mapping_address_error(fixed, args[0], length) {
         return negative_errno(errno);
     }
@@ -20053,6 +20302,12 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
     if address < BOOT_RESERVED_END || end > state.mmap_limit {
         return negative_errno(libc::ENOMEM);
     }
+    // do_mmap refuses an unknown mapping type only after placement. For an
+    // object that is not a regular file, the object probe below answers it,
+    // after the object's extent check, as do_mmap orders them.
+    if !matches!(kind, MappingKind::Other) && !is_private && !is_shared {
+        return negative_errno(libc::EINVAL);
+    }
     let Ok(length) = usize::try_from(length) else {
         return negative_errno(libc::ENOMEM);
     };
@@ -20062,7 +20317,7 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
         let Some(file) = state.files.get(&fd) else {
             return negative_errno(libc::EBADF);
         };
-        if is_shared && args[2] & libc::PROT_WRITE as u64 != 0 {
+        if is_shared && prot & libc::PROT_WRITE as u64 != 0 {
             let status = match file_status_flags(file) {
                 Ok(status) => status,
                 Err(error) => return error,
@@ -20087,6 +20342,11 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
                     return io_error(error);
                 }
             }
+        }
+        if !matches!(kind, MappingKind::RegularFile(_))
+            && let Some(error) = host_mmap_probe(file.as_raw_fd(), args)
+        {
+            return error;
         }
         // Only the first chunk is read before the reservation. The rest is
         // streamed below, so the host never holds a copy of the whole range
@@ -20171,8 +20431,8 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
         .map_user_permissions(
             address,
             length as u64,
-            args[2] != libc::PROT_NONE as u64,
-            args[2] & libc::PROT_WRITE as u64 != 0,
+            prot != libc::PROT_NONE as u64,
+            prot & libc::PROT_WRITE as u64 != 0,
         )
         .is_err()
     {
@@ -20196,6 +20456,138 @@ fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) 
         state.mmap_next = state.mmap_next.max(end);
     }
     memory.physical_to_user(address).unwrap_or(address) as i64
+}
+
+/// The protection bits mmap honours; it ignores every other bit (Linux's
+/// calc_vm_prot_bits drops PROT_SEM and unknown bits, and only mprotect
+/// validates them).
+pub(crate) const MMAP_PROT_BITS: u64 =
+    (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+
+/// Flags a host mmap probe clears from the guest's request: they choose where
+/// a mapping goes, or ask for work beyond creating it (population, locking).
+/// The probe maps at an address of the host's choosing and keeps nothing.
+const HOST_MMAP_PROBE_CLEARED_FLAGS: u64 = (libc::MAP_FIXED
+    | libc::MAP_FIXED_NOREPLACE
+    | libc::MAP_32BIT
+    | libc::MAP_POPULATE
+    | libc::MAP_LOCKED
+    | libc::MAP_NONBLOCK) as u64;
+
+/// The object's own answer to the guest's mmap of `fd`, for an object that is
+/// not a regular file, asked of the host kernel after the guest's placement
+/// has succeeded: the host maps `fd` with the guest's raw length, protection,
+/// flags (less [`HOST_MMAP_PROBE_CLEARED_FLAGS`]) and offset at an address of
+/// its choosing and removes the mapping at once. Returns the kernel's negative
+/// errno when it refuses (the object's extent check, the mapping type and
+/// MAP_SHARED_VALIDATE flag validation, the access mode, a missing mmap
+/// operation), and `None` when it maps.
+///
+/// Every error, ENOMEM included, is the guest's answer for its original
+/// request: the copy below never runs without a successful probe of that
+/// exact extent. Absurd lengths do not reach the probe: the checks before
+/// placement (zero, overflowing when page-aligned, overflowing the page
+/// offset) and the guest's own placement refuse them first.
+pub(crate) fn host_mmap_probe(fd: RawFd, args: &[u64; 6]) -> Option<i64> {
+    #[cfg(test)]
+    if let Some(error) = HOST_MMAP_PROBE_TEST_ANSWER.with(std::cell::Cell::get) {
+        return Some(error);
+    }
+    host_mmap_probe_with(fd, args[1], args[2], args[3], args[5])
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// A test's injected answer for every host mmap probe on this thread.
+    static HOST_MMAP_PROBE_TEST_ANSWER: std::cell::Cell<Option<i64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes every host mmap probe on this thread answer `answer` until the
+/// returned guard is dropped.
+#[cfg(test)]
+fn inject_host_mmap_probe_answer(answer: i64) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HOST_MMAP_PROBE_TEST_ANSWER.with(|slot| slot.set(None));
+        }
+    }
+    HOST_MMAP_PROBE_TEST_ANSWER.with(|slot| slot.set(Some(answer)));
+    Reset
+}
+
+fn host_mmap_probe_with(fd: RawFd, length: u64, prot: u64, flags: u64, offset: u64) -> Option<i64> {
+    // SAFETY: without MAP_FIXED or MAP_FIXED_NOREPLACE the kernel places the
+    // mapping where nothing is mapped, so no existing mapping is replaced;
+    // nothing reads it, and it is unmapped below. The raw operands keep the
+    // guest's bits, as its own mmap passes them.
+    let mapped = unsafe {
+        libc::syscall(
+            libc::SYS_mmap,
+            0_u64,
+            length,
+            prot,
+            flags & !HOST_MMAP_PROBE_CLEARED_FLAGS,
+            fd as libc::c_long,
+            offset,
+        )
+    };
+    if mapped == -1 {
+        return Some(io_error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: the host returned this mapping of `length` bytes just above.
+    let unmapped = unsafe { libc::munmap(mapped as *mut libc::c_void, length as usize) };
+    debug_assert_eq!(unmapped, 0, "the probe mapping could not be removed");
+    None
+}
+
+/// The refusals Linux gives before it places a file mapping, for a mapping of
+/// an object that is not a regular file; `None` for anything else. They do not
+/// depend on the object, and come in the kernel's order: x86-64's sys_mmap
+/// refuses an unaligned offset (EINVAL); ksys_mmap_pgoff's descriptor lookup
+/// refuses O_PATH (EBADF), then MAP_HUGETLB for a file outside hugetlbfs
+/// (EINVAL; such a file is always regular); do_mmap refuses a zero length
+/// (EINVAL), a length that overflows when page-aligned (ENOMEM) and a file
+/// offset whose page index overflows with the length (EOVERFLOW). The
+/// caller's placement checks follow, and the object's answer comes last from
+/// [`host_mmap_probe`], as in do_mmap. These checks choose their errno here,
+/// inside the executor that provides emulated Linux to injected calls.
+pub(crate) fn non_regular_mmap_early_refusal(
+    state: &LoadedStaticElf,
+    args: &[u64; 6],
+) -> Option<i64> {
+    if args[3] & libc::MAP_ANONYMOUS as u64 != 0 {
+        return None;
+    }
+    let file = state.files.get(&(args[4] as libc::c_int))?;
+    match file_mode(file) {
+        Ok(mode) if mode & libc::S_IFMT == libc::S_IFREG => return None,
+        Ok(_) => {}
+        Err(error) => return Some(error),
+    }
+    if !args[5].is_multiple_of(PAGE_SIZE) {
+        return Some(negative_errno(libc::EINVAL));
+    }
+    match file_status_flags(file) {
+        Ok(status) if status & libc::O_PATH != 0 => return Some(negative_errno(libc::EBADF)),
+        Ok(_) => {}
+        Err(error) => return Some(error),
+    }
+    if args[3] & libc::MAP_HUGETLB as u64 != 0 {
+        return Some(negative_errno(libc::EINVAL));
+    }
+    if args[1] == 0 {
+        return Some(negative_errno(libc::EINVAL));
+    }
+    let Some(length) = align_up(args[1], PAGE_SIZE) else {
+        return Some(negative_errno(libc::ENOMEM));
+    };
+    let page_index = args[5] / PAGE_SIZE;
+    if page_index.checked_add(length / PAGE_SIZE).is_none() {
+        return Some(negative_errno(libc::EOVERFLOW));
+    }
+    None
 }
 
 /// Fails an mmap after its reservation, returning `result`.
@@ -22618,6 +23010,7 @@ mod tests {
     include!("executor/inotify_tests.rs");
     include!("executor/shared_file_tests.rs");
     include!("executor/read_zero_cancel_tests.rs");
+    include!("executor/descriptor_generic_tests.rs");
     include!("executor/random_device_stream_tests.rs");
     include!("executor/random_device_carrier_tests.rs");
     use std::collections::BTreeMap;

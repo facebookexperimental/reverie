@@ -15,23 +15,23 @@ use kvm_ioctls::Kvm;
 use reverie_kvm::KvmBackend;
 use reverie_kvm::StraceTool;
 static NEXT: AtomicU64 = AtomicU64::new(0);
-const EXPECTED: &[u8] = b"random carrier access, identity, flags, faults and bytes ok\n";
+const EXPECTED: &[u8] = b"descriptor access, identity, flags, mapping errors and faults ok\n";
 
-fn run_carrier(tool: bool) {
-    Kvm::new().expect("random carrier access regression requires usable /dev/kvm");
-    let artifact_root = std::env::var_os("REVERIE_KVM_RANDOM_CARRIER_ARTIFACT_DIR");
+fn run_identity(tool: bool) {
+    Kvm::new().expect("descriptor identity regression requires usable /dev/kvm");
+    let artifact_root = std::env::var_os("REVERIE_KVM_DESCRIPTOR_IDENTITY_ARTIFACT_DIR");
     let retain = artifact_root.is_some();
     let root = artifact_root.map_or_else(std::env::temp_dir, PathBuf::from);
     std::fs::create_dir_all(&root).unwrap();
     let directory = std::fs::canonicalize(root).unwrap().join(format!(
-        "random-carrier-{}-{}",
+        "descriptor-identity-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&directory).unwrap();
-    let source = directory.join("random_device_carrier.c");
-    let binary = directory.join("random_device_carrier");
-    std::fs::write(&source, include_str!("fixtures/random_device_carrier.c")).unwrap();
+    let source = directory.join("descriptor_identity.c");
+    let binary = directory.join("descriptor_identity");
+    std::fs::write(&source, include_str!("fixtures/descriptor_identity.c")).unwrap();
     let compiled = std::process::Command::new("/usr/bin/gcc")
         .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
         .arg(&source)
@@ -44,11 +44,13 @@ fn run_carrier(tool: bool) {
         "gcc: {}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    // Native comparison checks open/access/status/type/error semantics, never
-    // compares host entropy to canonical bytes and never writes host entropy.
+    // The native run checks the same open, access, status, type, mapping-error
+    // and write-fault answers on the random devices and an ordinary file; the
+    // backend must give each of them. No byte of host entropy is compared.
     let native_started = std::time::Instant::now();
     let native = std::process::Command::new(&binary)
         .arg("native")
+        .current_dir(&directory)
         .output()
         .unwrap();
     if retain {
@@ -142,10 +144,10 @@ fn run_carrier(tool: bool) {
     }
 }
 #[test]
-fn random_carrier_direct() {
-    run_carrier(false);
+fn descriptor_identity_direct() {
+    run_identity(false);
 }
 #[test]
-fn random_carrier_subscribed_tool() {
-    run_carrier(true);
+fn descriptor_identity_subscribed_tool() {
+    run_identity(true);
 }

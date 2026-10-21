@@ -7,10 +7,12 @@
 #include <unistd.h>
 
 int main(int argc, char** argv) {
-  if (argc != 2)
+  if (argc != 2 && argc != 3)
     return 90;
   int vector = strcmp(argv[1], "vector") == 0;
-  int fd = open("/dev/urandom", O_RDONLY);
+  /* The partitioned reads take any readable object; the default is the
+   * device. */
+  int fd = open(argc == 3 ? argv[2] : "/dev/urandom", O_RDONLY);
   if (fd < 0)
     return 91;
   if (strcmp(argv[1], "partitioned") == 0) {
