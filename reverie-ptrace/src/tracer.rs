@@ -9970,7 +9970,7 @@ mod tests {
     ) -> Result<(), String> {
         use crate::task::PreinitPoint::*;
         let nth = match point {
-            ExecStopped | PostExecDrained => 1,
+            ExecStopped | ExecReturned | PostExecDrained => 1,
             RegsSaved
             | CodeRead
             | MmapStepped
@@ -10090,6 +10090,10 @@ mod tests {
         exec_preinit_kill_vdso_writable_exited: exec_preinit_killed_at::<AllSyscallsTool>(VdsoWritable, Exited);
         exec_stopped_kill_exit_stop_vdso: exec_preinit_killed_at::<AllSyscallsTool>(ExecStopped, ExitStop);
         exec_stopped_kill_exit_stop_no_vdso: exec_preinit_killed_at::<InitFailureTool>(ExecStopped, ExitStop);
+        exec_returned_kill_exit_stop_vdso: exec_preinit_killed_at::<AllSyscallsTool>(ExecReturned, ExitStop);
+        exec_returned_kill_exit_stop_no_vdso: exec_preinit_killed_at::<InitFailureTool>(ExecReturned, ExitStop);
+        exec_returned_kill_exited_vdso: exec_preinit_killed_at::<AllSyscallsTool>(ExecReturned, Exited);
+        exec_returned_kill_exited_no_vdso: exec_preinit_killed_at::<InitFailureTool>(ExecReturned, Exited);
         post_exec_drained_kill_exited_vdso: exec_preinit_killed_at::<AllSyscallsTool>(PostExecDrained, Exited);
         post_exec_drained_kill_exited_no_vdso: exec_preinit_killed_at::<InitFailureTool>(PostExecDrained, Exited);
         postspawn_preinit_kill_regs_saved_exit_stop: postspawn_preinit_killed_at::<AllSyscallsTool>(RegsSaved, ExitStop);

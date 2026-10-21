@@ -3522,6 +3522,9 @@ pub(crate) enum PreinitPoint {
     TrampolineUnprotected,
     /// At the exec stop, before resuming only toward its syscall-exit stop.
     ExecStopped,
+    /// At the stop the exec drain waited for, before checking that it is
+    /// the exec's syscall-exit stop.
+    ExecReturned,
     /// At the validated exec syscall-exit stop, before any guest instruction.
     PostExecDrained,
 }
@@ -7054,6 +7057,13 @@ impl<L: Tool + 'static> TracedTask<L> {
             Wait::Stopped(task, event) => (task, event),
             Wait::Exited(pid, exit_status) => return Ok(Wait::Exited(pid, exit_status)),
         };
+        #[cfg(test)]
+        at_preinit_point(
+            &preinit_point,
+            task.pid(),
+            || task.terminal_cleanup(),
+            PreinitPoint::ExecReturned,
+        );
         let info = match task.getsyscallinfo() {
             Ok(info) => info,
             Err(safeptrace::SyscallInfoError::Trace(died @ TraceError::Died(_))) => {
@@ -7079,6 +7089,18 @@ impl<L: Tool + 'static> TracedTask<L> {
             || returned_regs.stack_ptr() != entry_regs.stack_ptr()
             || returned_regs.ret() != 0
         {
+            // A fatal signal (another process's SIGKILL, say) can take the
+            // tracee out of the syscall-exit stop the wait above reported and
+            // into its PTRACE_EVENT_EXIT stop before the requests above run.
+            // They then succeed against the exit stop: PTRACE_GET_SYSCALL_INFO
+            // reports no syscall operation, while the registers still hold
+            // the entry and execve's 0. This tracer has not resumed the
+            // tracee since that wait, so finding it in its exit stop proves
+            // the kill; report the death, as for an ESRCH in transit
+            // (`dead_or`), rather than a refused exec return.
+            if let Some(died) = task.died_into_exit_stop() {
+                return Err(died);
+            }
             // This stop does not authorize guest execution or another resume
             // toward an assumed exit. Retain its owned stop for fatal cleanup;
             // do not consume or reinject a signal while guessing the phase.
