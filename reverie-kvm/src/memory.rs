@@ -1881,6 +1881,93 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Make the Tool's scratch range `[guest_address, guest_address + length)`
+    /// user-accessible and writable for one callback. The result, success or
+    /// error, is exactly that of reserving the range as
+    /// [`RegionKind::ToolScratch`], mapping it with `map_user_range(..,
+    /// false)` and committing the reservation (a failed mapping rolls the
+    /// reservation back), but under one lock acquisition and without the
+    /// rollback record, which this runs for every Tool callback.
+    pub(crate) fn expose_tool_scratch(&self, guest_address: u64, length: u64) -> Result<()> {
+        let Some((first_page, last_page)) = self.checked_page_range(guest_address, length)? else {
+            return Ok(());
+        };
+        let mut access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        // ToolScratch is a permanent kind, so reserving it is never refused.
+        // The mapping's only refusal is a writable mapping of a read-only
+        // file page; the separate reservation was rolled back then, leaving
+        // nothing changed, which is what returning here first leaves.
+        if access
+            .backing_pages
+            .range(first_page..=last_page)
+            .any(|(_, page)| {
+                matches!(
+                    page._slice.backing.kind,
+                    BackingKind::OrdinaryFile {
+                        max_writable: false
+                    }
+                )
+            })
+        {
+            return Err(Error::GuestMemoryAccessDenied {
+                address: guest_address,
+                length: length as usize,
+            });
+        }
+        for page in first_page..=last_page {
+            access.reservations.insert(page, RegionKind::ToolScratch);
+            access
+                .pages
+                .insert(page, UserPageState::Accessible { writable: true });
+        }
+        Ok(())
+    }
+
+    /// Hide the Tool's scratch range again after its callback: exactly
+    /// [`GuestMemory::unmap_user_range`], with its retained-shared check made
+    /// under the same lock acquisition as the unmapping.
+    pub(crate) fn hide_tool_scratch(&self, guest_address: u64, length: u64) -> Result<()> {
+        let range = self.checked_page_range(guest_address, length);
+        let mut access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        if length != 0 {
+            let last = guest_address.saturating_add(length - 1) / PAGE_SIZE as u64;
+            if access
+                .backing_pages
+                .range(guest_address / PAGE_SIZE as u64..=last)
+                .any(|(_, page)| page._slice.backing.kind.retained_shared())
+            {
+                return Err(Error::SharedFileCapability {
+                    operation: "metadata-only unmap",
+                    reason: "ordinary-file and shared anonymous backing require physical private replacement",
+                });
+            }
+        }
+        let Some((first_page, last_page)) = range? else {
+            return Ok(());
+        };
+        for page in first_page..=last_page {
+            access.pages.remove(&page);
+            access.file_pages.remove(&page);
+            access.shared_anonymous_pages.remove(&page);
+            if !access
+                .reservations
+                .get(&page)
+                .is_some_and(|kind| kind.permanent())
+            {
+                access.reservations.remove(&page);
+            }
+        }
+        Ok(())
+    }
+
     // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
     pub(crate) fn unmap_user_range(&self, guest_address: u64, length: u64) -> Result<()> {
         if self.range_contains_retained_shared(guest_address, length as usize) {

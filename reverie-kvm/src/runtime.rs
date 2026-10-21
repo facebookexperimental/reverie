@@ -68,7 +68,6 @@ use crate::failure::FailureCheck;
 use crate::failure::FailureContext;
 use crate::failure::RunFailure;
 use crate::failure::wait_for_failure;
-use crate::memory::RegionKind;
 
 /// Bounded test observations around the existing wait registration boundary.
 /// Registration is current-host scoped and invokes no closure under its borrow.
@@ -152,6 +151,68 @@ enum HandlerSignal {
 
 type SharedHandlerSignal = Arc<Mutex<Option<HandlerSignal>>>;
 pub(crate) type SharedChildStarts = Arc<Mutex<Vec<PendingChildStart>>>;
+
+/// The two per-callback slots one guest thread's syscall callbacks use,
+/// kept from one callback to the next instead of allocated for each.
+///
+/// The context holds a slot only while it is the slot's sole owner (no other
+/// `Arc` or `Weak`), the slot's mutex is not poisoned, and the slot is empty:
+/// [`CallbackContext::keep_handler_signal`] and
+/// [`CallbackContext::keep_child_starts`] are the only ways in, and they
+/// check all three. [`CallbackContext::begin`] is the only way out and removes
+/// the slots. So a kept slot is indistinguishable from
+/// `Arc::new(Mutex::new(empty))`: no handler outcome, child start or
+/// reference that a callback, an exec, a clone, fork or vfork, a thread exit,
+/// a signal delivery or a descriptor-table change produced can survive into
+/// the next callback through it. Each slot is returned where the callback
+/// used to drop its last reference (the handler slot as soon as the driver
+/// and the guest handle are gone, the child-start slot once its starts were
+/// released), so a slot that is not kept, and anything left in it, is
+/// dropped at the same point as before. The context carries no other
+/// state.
+#[derive(Default)]
+struct CallbackContext {
+    handler_signal: Option<SharedHandlerSignal>,
+    pending_child_starts: Option<SharedChildStarts>,
+}
+
+impl CallbackContext {
+    /// Empty slots for the next callback: the kept ones, or new ones.
+    fn begin(&mut self) -> (SharedHandlerSignal, SharedChildStarts) {
+        (
+            self.handler_signal
+                .take()
+                .unwrap_or_else(|| Arc::new(Mutex::new(None))),
+            self.pending_child_starts
+                .take()
+                .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new()))),
+        )
+    }
+
+    /// Return a callback's handler slot once its driver and guest handle are
+    /// gone. It is kept only if it is empty and this is its last reference;
+    /// otherwise it is dropped here.
+    fn keep_handler_signal(&mut self, handler_signal: SharedHandlerSignal) {
+        self.handler_signal = keep_if_empty_and_unique(handler_signal, Option::is_none);
+    }
+
+    /// Return a callback's child-start slot once its starts were released.
+    /// It is kept only if it is empty and this is its last reference;
+    /// otherwise it is dropped here.
+    fn keep_child_starts(&mut self, pending_child_starts: SharedChildStarts) {
+        self.pending_child_starts = keep_if_empty_and_unique(pending_child_starts, Vec::is_empty);
+    }
+}
+
+fn keep_if_empty_and_unique<T>(
+    mut slot: Arc<Mutex<T>>,
+    is_empty: impl FnOnce(&T) -> bool,
+) -> Option<Arc<Mutex<T>>> {
+    let kept = Arc::get_mut(&mut slot)
+        .and_then(|mutex| mutex.get_mut().ok())
+        .is_some_and(|value| is_empty(value));
+    kept.then_some(slot)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PendingChildKind {
@@ -2689,7 +2750,7 @@ async fn drive_handler_completion_inner<T>(
     use std::panic::catch_unwind;
 
     use crate::failure::owned_future::CaughtFuture;
-    use crate::failure::owned_future::catch_owned_future;
+    use crate::failure::owned_future::catch_pinned_future;
 
     // The callback may already have moved irreversible effects into this
     // terminal error. Failure still wins over ordinary values/child starts,
@@ -2702,11 +2763,15 @@ async fn drive_handler_completion_inner<T>(
         Some(HandlerSignal::RuntimeError(error)) => HandlerOutcome::RuntimeError(error),
         _ => HandlerOutcome::RunFailed,
     };
-    // Own the pinned allocation: dropping a Pin<&mut F> would only end a
-    // borrow. Any caller's callback receipt must follow destruction of this
-    // future, including an inline RPC that was pending when failure arrived.
-    let mut future = Box::pin(future);
-    let mut failure = Box::pin(failure);
+    // Own the pinned values: dropping a Pin<&mut F> would only end a borrow,
+    // so each is destroyed in place, by setting its slot to None, at the
+    // point the callback protocol requires. Any caller's callback receipt
+    // must follow destruction of this future, including an inline RPC that
+    // was pending when failure arrived. They are pinned in this driver's own
+    // (already pinned) state rather than in two heap allocations per
+    // callback.
+    let mut future = std::pin::pin!(Some(future));
+    let mut failure = std::pin::pin!(Some(failure));
     // The driver watch's wake is registered only once the callback suspends.
     // Most callbacks complete on their first poll, and registering subscribes
     // to the gate's failure and the owner's change channel, which costs a
@@ -2735,7 +2800,7 @@ async fn drive_handler_completion_inner<T>(
     };
     // This driver only borrows the callback. Its caught poll cannot destroy the
     // callback allocation or an outcome already moved out of the signal slot.
-    let caught = catch_owned_future(poll_fn(|context| {
+    let caught = catch_pinned_future(std::pin::pin!(Some(poll_fn(|context| {
         // Once registered, renew the private wake before rechecking the
         // sticky obligation: this poll may carry a new waker.
         if private_failure.is_some() {
@@ -2756,11 +2821,20 @@ async fn drive_handler_completion_inner<T>(
             });
         }
         if matches!(failure_order, HandlerFailureOrder::BeforeCallback)
-            && failure.as_mut().poll(context).is_ready()
+            && failure
+                .as_mut()
+                .as_pin_mut()
+                .expect("callback failure polled after destruction")
+                .poll(context)
+                .is_ready()
         {
             return select(terminal());
         }
-        let result = future.as_mut().poll(context);
+        let result = future
+            .as_mut()
+            .as_pin_mut()
+            .expect("callback polled after destruction")
+            .poll(context);
         if let Some(error) = watch.as_ref().and_then(|watch| watch.check().err()) {
             // Keep a selected typed callback value/nonlocal result intact.
             // The outer finalizer maps its error before combining this sticky
@@ -2778,7 +2852,12 @@ async fn drive_handler_completion_inner<T>(
             });
         }
         if matches!(failure_order, HandlerFailureOrder::BeforeCallback)
-            && failure.as_mut().poll(context).is_ready()
+            && failure
+                .as_mut()
+                .as_pin_mut()
+                .expect("callback failure polled after destruction")
+                .poll(context)
+                .is_ready()
         {
             return select(terminal());
         }
@@ -2801,7 +2880,12 @@ async fn drive_handler_completion_inner<T>(
                     register_private_wake(&mut private_failure, context);
                 }
                 if matches!(failure_order, HandlerFailureOrder::AfterReadyCleanup)
-                    && failure.as_mut().poll(context).is_ready()
+                    && failure
+                        .as_mut()
+                        .as_pin_mut()
+                        .expect("callback failure polled after destruction")
+                        .poll(context)
+                        .is_ready()
                 {
                     return select(terminal());
                 }
@@ -2820,7 +2904,7 @@ async fn drive_handler_completion_inner<T>(
                 Poll::Pending
             }
         }
-    }))
+    }))))
     .await;
     // Selection precedes unwinding any discarded callback value as well as
     // destruction of the callback future itself. Neither owns this outcome.
@@ -2840,10 +2924,10 @@ async fn drive_handler_completion_inner<T>(
     }
     // Keep the selected outcome outside both destruction catches. Neither a
     // callback panic nor destruction of the failure future may discard it.
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| future.set(None))) {
         completion.panics.push(payload);
     }
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(failure))) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| failure.set(None))) {
         completion.panics.push(payload);
     }
     // Destructors may themselves capture a cause. Do not discard a selected
@@ -2897,18 +2981,11 @@ fn tool_stack_bottom(tool_stack_top: u64) -> u64 {
 }
 
 fn expose_tool_scratch(memory: &GuestMemory, tool_stack_top: u64) -> Result<()> {
-    let reservation = memory.reserve_region(
-        tool_stack_bottom(tool_stack_top),
-        TOOL_STACK_SIZE,
-        RegionKind::ToolScratch,
-    )?;
-    memory.map_user_range(tool_stack_bottom(tool_stack_top), TOOL_STACK_SIZE, false)?;
-    reservation.commit();
-    Ok(())
+    memory.expose_tool_scratch(tool_stack_bottom(tool_stack_top), TOOL_STACK_SIZE)
 }
 
 fn hide_tool_scratch(memory: &GuestMemory, tool_stack_top: u64) -> Result<()> {
-    memory.unmap_user_range(tool_stack_bottom(tool_stack_top), TOOL_STACK_SIZE)
+    memory.hide_tool_scratch(tool_stack_bottom(tool_stack_top), TOOL_STACK_SIZE)
 }
 
 // TODO-HUMAN-REVIEW(PR-156): Review repeated post-exec lifecycle delivery.
@@ -5544,11 +5621,13 @@ impl KvmBackend {
         let failure_subscription = self.failure_subscription(executor.is_traced_tree_root());
         // One failure wait for every Tool callback this thread runs. Building
         // one takes the GlobalTool's failure waiter (Detcore locks its
-        // scheduler for it) and two subscriptions, once per guest syscall;
-        // polling a kept one only renews its waker. It stays Ready once it
-        // has fired, so every later callback still sees the failure first.
-        // It is destroyed under a catch after the execution completes.
-        let mut callback_failure = crate::failure::StickyFailure::new(Box::pin(wait_for_failure(
+        // scheduler for it) and two subscriptions, once per guest syscall.
+        // A kept one is polled again only after it woke (GatedFailure), so
+        // the several polls of each syscall cost a waker registration each.
+        // It stays Ready once it has fired, so every later callback still
+        // sees the failure first. It is destroyed under a catch after the
+        // execution completes.
+        let mut callback_failure = crate::failure::GatedFailure::new(Box::pin(wait_for_failure(
             global_state.as_ref(),
             failure_subscription.clone(),
         )));
@@ -5568,6 +5647,9 @@ impl KvmBackend {
         // loop write syscall results back into the guest's frame.
         let mut memory = self.memory.clone();
         let stack_checked_out = Arc::new(AtomicBool::new(false));
+        // The slots of this thread's ordinary syscall callbacks, kept between
+        // callbacks (see CallbackContext for why nothing can leak through).
+        let mut callback_context = CallbackContext::default();
 
         let handler_signal = Arc::new(Mutex::new(None));
         let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
@@ -6300,8 +6382,7 @@ impl KvmBackend {
                     // the saved context reports EINTR or rewinds the syscall under
                     // SA_RESTART. The private errno itself never reaches userspace.
                     loop {
-                        let handler_signal = Arc::new(Mutex::new(None));
-                        let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
+                        let (handler_signal, pending_child_starts) = callback_context.begin();
                         self.check_entry_owner()?;
                         expose_tool_scratch(&memory, tool_stack_top)?;
                         let boundary = {
@@ -6358,13 +6439,16 @@ impl KvmBackend {
                             .with_rpc_failure(&rpc_failure);
                             drive_entry_handler_completion_from(
                                 || tool.handle_syscall_event(&mut guest, syscall),
-                                handler_signal,
+                                handler_signal.clone(),
                                 pending_child_starts.clone(),
                                 Pin::new(&mut callback_failure),
                                 callback_watch.clone(),
                             )
                             .await
                         };
+                        // The driver and the guest handle, the slot's other
+                        // holders, are gone: this was its last reference.
+                        callback_context.keep_handler_signal(handler_signal);
                         drop(callback_scope);
                         self.restore_entry_origin();
                         executor.bind_address_space(&self.memory);
@@ -6410,6 +6494,7 @@ impl KvmBackend {
                                             executor,
                                             &pending_child_starts,
                                         )?;
+                                        callback_context.keep_child_starts(pending_child_starts);
                                         continue;
                                     }
                                     None => (
@@ -6503,6 +6588,7 @@ impl KvmBackend {
                             }
                         };
                         self.start_pending_tool_children(executor, &pending_child_starts)?;
+                        callback_context.keep_child_starts(pending_child_starts);
                         break classified;
                     }
                 } else {
@@ -6912,6 +6998,7 @@ mod tests {
     use crate::bootstrap::BOOT_RESERVED_END;
     use crate::bootstrap::TOOL_STACK_TOP;
     use crate::bootstrap::thread_tool_stack_top;
+    use crate::memory::RegionKind;
 
     fn synthetic_initial_exec() -> SyscallRequest {
         SyscallRequest::new(libc::SYS_execve as u64, [0x100, 0x200, 0x300, 0, 0, 0])
@@ -8391,6 +8478,9 @@ mod worker_execution_panic_tests;
 
 #[cfg(test)]
 mod entry_owner_tests;
+
+#[cfg(test)]
+mod callback_context_tests;
 
 #[cfg(test)]
 mod entry_operation_tests;

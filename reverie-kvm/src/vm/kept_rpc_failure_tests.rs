@@ -29,17 +29,27 @@ mod kept_rpc_failure_tests {
         fourth: AtomicU64,
         /// The backend failure the GlobalTool's waits report once set.
         failed: AtomicBool,
-        /// Wakers the GlobalTool's waits registered while Pending, and how
-        /// many registrations happened after a PENDING_RPC_WAKES RPC began.
+        /// Wakers the GlobalTool's waits registered while Pending.
         wakers: Mutex<Vec<Waker>>,
-        registered_after_third: AtomicU64,
+        /// PENDING_RPC_WAKES: the RPC's response has been polled Pending.
+        third_pending: AtomicBool,
+        /// How many registered wakers the publication woke, and how many
+        /// polls of a failure wait found the published failure. A wait is
+        /// polled after the publication only if something polls the task
+        /// again; while the RPC's response stays Pending, only those wakes
+        /// can.
+        woken_by_publication: AtomicU64,
+        ready_after_publication: AtomicU64,
     }
 
     impl Counts {
         /// Publish the backend failure and wake every registered wait.
         fn fail(&self) {
             self.failed.store(true, Ordering::SeqCst);
-            for waker in self.wakers.lock().unwrap().drain(..) {
+            let wakers: Vec<Waker> = self.wakers.lock().unwrap().drain(..).collect();
+            self.woken_by_publication
+                .fetch_add(wakers.len() as u64, Ordering::SeqCst);
+            for waker in wakers {
                 waker.wake();
             }
         }
@@ -90,17 +100,28 @@ mod kept_rpc_failure_tests {
                 }
                 3 => {
                     counts.third.fetch_add(1, Ordering::SeqCst);
-                    // Publish from another thread only after the RPC's failure
-                    // wait has registered a waker while this response was
-                    // Pending, so only that wake can end the RPC.
+                    // Publish from another thread only after this response
+                    // was polled Pending, when nothing polls the callback
+                    // again unless a registered failure waker wakes it, so
+                    // only that wake can end the RPC. A failure wait that is
+                    // polled again only after it woke (GatedFailure,
+                    // KeptRpcFailure) registered its waker at its first poll,
+                    // before this RPC, and keeps it; no wait registers again
+                    // after this suspension, so the test counts the wakes
+                    // and the polls that follow them instead.
                     let publisher = counts.clone();
                     std::thread::spawn(move || {
-                        while publisher.registered_after_third.load(Ordering::SeqCst) == 0 {
+                        while !publisher.third_pending.load(Ordering::SeqCst) {
                             std::thread::yield_now();
                         }
                         publisher.fail();
                     });
-                    std::future::pending::<()>().await;
+                    let pending = counts.clone();
+                    std::future::poll_fn(move |_| {
+                        pending.third_pending.store(true, Ordering::SeqCst);
+                        Poll::<()>::Pending
+                    })
+                    .await;
                 }
                 4 => {
                     counts.fourth.fetch_add(1, Ordering::SeqCst);
@@ -114,18 +135,16 @@ mod kept_rpc_failure_tests {
             let counts = self.counts.as_ref().unwrap().clone();
             counts.waits.fetch_add(1, Ordering::SeqCst);
             std::future::poll_fn(move |context| {
-                if counts.failed.load(Ordering::SeqCst) {
-                    return Poll::Ready(());
+                if !counts.failed.load(Ordering::SeqCst) {
+                    counts.wakers.lock().unwrap().push(context.waker().clone());
+                    if !counts.failed.load(Ordering::SeqCst) {
+                        return Poll::Pending;
+                    }
                 }
-                counts.wakers.lock().unwrap().push(context.waker().clone());
-                if counts.third.load(Ordering::SeqCst) != 0 {
-                    counts.registered_after_third.fetch_add(1, Ordering::SeqCst);
-                }
-                if counts.failed.load(Ordering::SeqCst) {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
+                counts
+                    .ready_after_publication
+                    .fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(())
             })
             .await
         }
@@ -304,17 +323,31 @@ mod kept_rpc_failure_tests {
     }
 
     /// An RPC whose response stays Pending ends when another thread
-    /// publishes a failure after the RPC's failure wait has registered a
-    /// waker. In this root process the callback's own failure wait would
-    /// also end the callback, so this checks only that the run ends; the
-    /// per-RPC wake is pinned by
-    /// failure::tests::a_kept_rpc_failure_wakes_every_pending_listener.
+    /// publishes a failure after the response was polled Pending, through a
+    /// waker a failure wait registered before the publication: the
+    /// publication wakes registered wakers, and a failure wait is then
+    /// polled again and finds the failure. Nothing else polls the task once
+    /// the response is Pending. In this root process the callback's own
+    /// failure wait would also end the callback, so this does not say which
+    /// wait ended it; the per-RPC wake is pinned by
+    /// failure::tests::a_kept_rpc_failure_wakes_every_pending_listener, and
+    /// the callback wait's by failure::tests::a_gated_failure_*.
     #[test]
     fn a_pending_rpc_wakes_on_a_failure_published_later() {
         let (counts, result) = run(PENDING_RPC_WAKES);
         assert!(result.is_err(), "the run must end in the published failure");
         assert_eq!(counts.third.load(Ordering::SeqCst), 1);
-        assert_ne!(counts.registered_after_third.load(Ordering::SeqCst), 0);
+        assert!(counts.third_pending.load(Ordering::SeqCst));
+        assert_ne!(
+            counts.woken_by_publication.load(Ordering::SeqCst),
+            0,
+            "the publication woke no registered failure waker"
+        );
+        assert_ne!(
+            counts.ready_after_publication.load(Ordering::SeqCst),
+            0,
+            "no failure wait was polled again after the publication"
+        );
     }
 
     /// A forked child, which is not the traced tree's root, has an RPC that

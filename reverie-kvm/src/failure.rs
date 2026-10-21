@@ -501,6 +501,89 @@ impl<F: Future<Output = ()> + Unpin> Future for StickyFailure<F> {
     }
 }
 
+/// A [`StickyFailure`] that is polled again only after its own waker fired.
+///
+/// One thread keeps its Tool callbacks' failure wait for every callback, and
+/// each guest syscall polls it several times (while capturing the syscall
+/// boundary, and before and after each poll of the callback), nearly always
+/// to learn that nothing has failed. Polling the wait polls its
+/// subscriptions: a shared receiver that re-registers its waker under a lock,
+/// and the GlobalTool's failure future. Here the wait is only ever polled with
+/// this wrapper's own waker, which records the wake and then wakes the task
+/// that polled last. Until that waker is woken, polling the wait again would
+/// return Pending (the Future contract: a Pending wait wakes the waker it was
+/// last polled with before it can complete), so the poll is skipped; it costs
+/// one waker registration and one atomic swap instead. The task's waker is
+/// registered before the swap, so a wake after the swap still reaches it.
+/// Once the wait is Ready, every later poll is Ready, as with
+/// [`StickyFailure`]. The same reasoning lets [`KeptRpcFailure`] skip polls.
+pub(crate) struct GatedFailure<F> {
+    wait: StickyFailure<F>,
+    gate: Arc<FailureGate>,
+    gate_waker: Waker,
+}
+
+struct FailureGate {
+    /// Set when the wait wakes `gate_waker`, and initially, so the first poll
+    /// polls the wait and registers `gate_waker` with its sources; cleared
+    /// before each poll of the wait.
+    woken: AtomicBool,
+    /// The task that polled last.
+    task: futures::task::AtomicWaker,
+}
+
+impl Wake for FailureGate {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        // Set before waking, so the poll this wake causes polls the wait.
+        self.woken.store(true, Ordering::SeqCst);
+        self.task.wake();
+    }
+}
+
+impl<F: Future<Output = ()> + Unpin> GatedFailure<F> {
+    pub(crate) fn new(wait: F) -> Self {
+        let gate = Arc::new(FailureGate {
+            woken: AtomicBool::new(true),
+            task: futures::task::AtomicWaker::new(),
+        });
+        Self {
+            wait: StickyFailure::new(wait),
+            gate_waker: Waker::from(gate.clone()),
+            gate,
+        }
+    }
+}
+
+impl<F: Future<Output = ()> + Unpin> Future for GatedFailure<F> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        if this.wait.wait.is_none() {
+            return Poll::Ready(());
+        }
+        this.gate.task.register(context.waker());
+        if !this.gate.woken.swap(false, Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        let (wait, gate_waker) = (&mut this.wait, &this.gate_waker);
+        match catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(wait).poll(&mut Context::from_waker(gate_waker))
+        })) {
+            Ok(poll) => poll,
+            Err(panic) => {
+                // A panicking wait is polled again next time, as before.
+                this.gate.woken.store(true, Ordering::SeqCst);
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 /// A failure wait one thread keeps for every RPC its Tool callbacks send,
 /// instead of building one per RPC. Building one takes the GlobalTool's
 /// failure waiter (Detcore locks its scheduler for it, and boxes the future)
@@ -1008,6 +1091,141 @@ mod tests {
             assert!(
                 Pin::new(&mut kept)
                     .poll(&mut Context::from_waker(&noop))
+                    .is_ready()
+            );
+        }
+    }
+
+    /// Counts its polls and is Ready once `ready` is set; it wakes the waker
+    /// of its last poll when `fire` is called, as a subscription does.
+    #[derive(Default)]
+    struct CountedWait {
+        polls: std::sync::atomic::AtomicUsize,
+        ready: AtomicBool,
+        panic_next: AtomicBool,
+        waker: Mutex<Option<Waker>>,
+    }
+
+    impl CountedWait {
+        fn fire(&self) {
+            self.ready.store(true, Ordering::SeqCst);
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+
+        fn polls(&self) -> usize {
+            self.polls.load(Ordering::SeqCst)
+        }
+    }
+
+    fn counted_wait(
+        wait: &Arc<CountedWait>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + Unpin + 'static>> {
+        let wait = wait.clone();
+        Box::pin(std::future::poll_fn(move |context| {
+            wait.polls.fetch_add(1, Ordering::SeqCst);
+            if wait.panic_next.swap(false, Ordering::SeqCst) {
+                panic!("controlled failure-wait poll panic");
+            }
+            if wait.ready.load(Ordering::SeqCst) {
+                return Poll::Ready(());
+            }
+            *wait.waker.lock().unwrap() = Some(context.waker().clone());
+            Poll::Pending
+        }))
+    }
+
+    #[derive(Default)]
+    struct TaskWakes(std::sync::atomic::AtomicUsize);
+    impl futures::task::ArcWake for TaskWakes {
+        fn wake_by_ref(arc: &Arc<Self>) {
+            arc.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_gated_failure_polls_its_wait_only_after_the_wait_woke_it() {
+        let wait = Arc::new(CountedWait::default());
+        let mut gated = GatedFailure::new(counted_wait(&wait));
+        let noop = noop_waker();
+        // The first poll polls the wait, registering the gate's waker.
+        assert!(
+            Pin::new(&mut gated)
+                .poll(&mut Context::from_waker(&noop))
+                .is_pending()
+        );
+        assert_eq!(wait.polls(), 1);
+        // Later polls, by any task, skip it until it wakes the gate.
+        let wakes = Arc::new(TaskWakes::default());
+        let waker = futures::task::waker(wakes.clone());
+        for _ in 0..5 {
+            assert!(
+                Pin::new(&mut gated)
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+        }
+        assert_eq!(wait.polls(), 1);
+        // A wake that does not complete the wait: one more poll of it, which
+        // finds it Pending again.
+        wait.waker.lock().unwrap().take().unwrap().wake();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "last task not woken");
+        assert!(
+            Pin::new(&mut gated)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(wait.polls(), 2);
+        // The failure: the task that polled last is woken, the next poll
+        // polls the wait and is Ready, and every later poll is Ready without
+        // polling it.
+        wait.fire();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 2, "last task not woken");
+        for _ in 0..3 {
+            assert!(
+                Pin::new(&mut gated)
+                    .poll(&mut Context::from_waker(&noop))
+                    .is_ready()
+            );
+        }
+        assert_eq!(wait.polls(), 3);
+    }
+
+    #[test]
+    fn a_gated_failure_repolls_a_wait_whose_poll_panicked() {
+        let wait = Arc::new(CountedWait::default());
+        let mut gated = GatedFailure::new(counted_wait(&wait));
+        let noop = noop_waker();
+        wait.panic_next.store(true, Ordering::SeqCst);
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = Pin::new(&mut gated).poll(&mut Context::from_waker(&noop));
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            Pin::new(&mut gated)
+                .poll(&mut Context::from_waker(&noop))
+                .is_pending()
+        );
+        assert_eq!(wait.polls(), 2);
+    }
+
+    #[test]
+    fn a_gated_failure_published_from_another_thread_is_seen() {
+        // Each round races publication on another thread against polls on
+        // this one; the task must always end Ready.
+        for _ in 0..200 {
+            let (sender, receiver) = oneshot::channel::<()>();
+            let subscription: FailureSubscription = receiver.shared();
+            let mut gated = GatedFailure::new(Box::pin(async move {
+                let _ = subscription.await;
+            }));
+            let publisher = std::thread::spawn(move || sender.send(()).unwrap());
+            futures::executor::block_on(&mut gated);
+            publisher.join().unwrap();
+            assert!(
+                Pin::new(&mut gated)
+                    .poll(&mut Context::from_waker(&noop_waker()))
                     .is_ready()
             );
         }

@@ -1483,6 +1483,107 @@ mod tests {
         bytes
     }
 
+    type AccessMaps = (
+        std::collections::BTreeMap<u64, UserPageState>,
+        std::collections::BTreeMap<u64, RegionKind>,
+        std::collections::BTreeMap<u64, u64>,
+        std::collections::BTreeSet<u64>,
+    );
+
+    fn access_maps(memory: &GuestMemory) -> AccessMaps {
+        let access = memory.mapping.address_space.lock().unwrap();
+        (
+            access.pages.clone(),
+            access.reservations.clone(),
+            access.file_pages.clone(),
+            access.shared_anonymous_pages.clone(),
+        )
+    }
+
+    /// The composition the Tool-scratch fast paths replace.
+    fn composed_expose(memory: &GuestMemory, address: u64, length: u64) -> Result<()> {
+        let reservation = memory.reserve_region(address, length, RegionKind::ToolScratch)?;
+        memory.map_user_range(address, length, false)?;
+        reservation.commit();
+        Ok(())
+    }
+
+    fn outcome(result: Result<()>) -> String {
+        match result {
+            Ok(()) => "ok".to_owned(),
+            Err(error) => format!("{error:?}"),
+        }
+    }
+
+    fn readonly_file_page(memory: &GuestMemory, file: &File) {
+        let path = std::ffi::CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(raw >= 0);
+        memory
+            .publish_shared_file_range(
+                memory.allocation_guard(),
+                SharedFileRangePlan {
+                    address: BASE + P,
+                    length: PAGE_SIZE,
+                    file: unsafe { OwnedFd::from_raw_fd(raw) },
+                    offset: 0,
+                    readable: true,
+                    writable: false,
+                    max_writable: false,
+                    cursors: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn tool_scratch_fast_paths_match_the_composed_mapping_calls() {
+        let file = file(1);
+        // (setup, address, length)
+        let cases: Vec<(&str, u64, u64)> = vec![
+            ("plain", BASE, P),
+            ("plain", BASE + 2 * P, 2 * P),
+            ("plain", BASE, 0),
+            ("plain", BASE + 4 * P, P),
+            ("plain", BASE + 3 * P + 1, P),
+            ("readonly-file", BASE + P, P),
+            ("readonly-file", BASE, 2 * P),
+            ("shared-file", BASE + P, P),
+            ("shared-file", BASE, 3 * P),
+        ];
+        for (setup, address, length) in cases {
+            let prepare = || {
+                let memory = fixture(4);
+                memory.unmap_user_range(BASE, 4 * P).unwrap();
+                match setup {
+                    "plain" => {}
+                    "readonly-file" => readonly_file_page(&memory, &file),
+                    "shared-file" => install(&memory, &file, BASE + P, 1, 0),
+                    _ => unreachable!(),
+                }
+                memory
+            };
+            let fast = prepare();
+            let composed = prepare();
+            assert_eq!(access_maps(&fast), access_maps(&composed));
+            for round in 0..2 {
+                let label = format!("{setup} {address:#x}+{length:#x} round {round}");
+                assert_eq!(
+                    outcome(fast.expose_tool_scratch(address, length)),
+                    outcome(composed_expose(&composed, address, length)),
+                    "expose {label}"
+                );
+                assert_eq!(access_maps(&fast), access_maps(&composed), "expose {label}");
+                assert_eq!(
+                    outcome(fast.hide_tool_scratch(address, length)),
+                    outcome(composed.unmap_user_range(address, length)),
+                    "hide {label}"
+                );
+                assert_eq!(access_maps(&fast), access_maps(&composed), "hide {label}");
+            }
+        }
+    }
+
     #[test]
     fn unrelated_shared_failure_keeps_its_wrapper_without_poisoning_memory() {
         for deferred in [false, true] {
