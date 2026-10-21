@@ -347,6 +347,36 @@ mod tests {
         }
     }
 
+    /// True if this host can trap CPUID, so that the instruction becomes a
+    /// stop the tool observes, which is what cancels a timer event. AMD hosts
+    /// report the state but reject the trap before Linux 6.17.
+    #[cfg(target_arch = "x86_64")]
+    fn cpuid_faulting_supported() -> bool {
+        const ARCH_GET_CPUID: libc::c_int = 0x1011;
+        const ARCH_SET_CPUID: libc::c_int = 0x1012;
+
+        // SAFETY: `arch_prctl(ARCH_GET_CPUID)` takes no pointer arguments and
+        // only reads the calling thread's CPUID-faulting state.
+        let previous = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0) };
+        if previous < 0 {
+            return false;
+        }
+        // SAFETY: `arch_prctl(ARCH_SET_CPUID)` takes no pointer arguments and
+        // only writes the calling thread's CPUID-faulting state. CPUID faults
+        // in this thread until the state is restored below, and neither this
+        // function nor the restore executes the instruction.
+        if unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0) } != 0 {
+            return false;
+        }
+        // SAFETY: as above, writing back the state read before the probe.
+        unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, previous) == 0 }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn cpuid_faulting_supported() -> bool {
+        false
+    }
+
     fn rdtsc() {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -487,6 +517,10 @@ mod tests {
         additional_evts: u64,
     ) {
         ret_without_perf!();
+        if fun == cpuid && !cpuid_faulting_supported() {
+            eprintln!("skipping: this host does not support CPUID faulting");
+            return;
+        }
         let rcbx2 = rcbs * 2;
         for e in early_stop_rcbs(rcbs) {
             // Precompute to avoid underflow checks in the guest
