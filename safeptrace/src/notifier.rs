@@ -6043,6 +6043,42 @@ impl StoppedObservation {
     }
 }
 
+impl EventHandle {
+    /// The bound thread's stat flags (field 9), read through its retained
+    /// proc directory, so they describe this exact generation; `None` without
+    /// a captured identity, or when the identity is bound to another PID.
+    pub(super) fn bound_stat_flags(&self, pid: Pid) -> Option<Result<u32, ProcStatError>> {
+        #[cfg(test)]
+        if let Some(error) = BOUND_STAT_FLAGS_ERROR_FOR_TEST.with(|slot| slot.borrow().clone()) {
+            return Some(Err(error));
+        }
+        self.identity()
+            .filter(|identity| identity.pid == pid)
+            .map(|identity| read_bound_stat_flags(identity))
+    }
+
+    /// Whether the bound thread's retained pidfd still names a live task;
+    /// `None` without a captured identity bound to `pid`.
+    pub(super) fn bound_pidfd_live(&self, pid: Pid) -> Option<Result<bool, Errno>> {
+        #[cfg(test)]
+        if let Some(live) = BOUND_PIDFD_LIVE_FOR_TEST.with(std::cell::Cell::get) {
+            return Some(live);
+        }
+        self.identity()
+            .filter(|identity| identity.pid == pid)
+            .map(|identity| identity.pidfd_is_live())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes `EventHandle::bound_stat_flags` fail with this error, on this
+    /// thread only.
+    pub(super) static BOUND_STAT_FLAGS_ERROR_FOR_TEST: std::cell::RefCell<Option<ProcStatError>> = const { std::cell::RefCell::new(None) };
+    /// Makes `EventHandle::bound_pidfd_live` answer this, on this thread only.
+    pub(super) static BOUND_PIDFD_LIVE_FOR_TEST: std::cell::Cell<Option<Result<bool, Errno>>> = const { std::cell::Cell::new(None) };
+}
+
 fn read_bound_stat_flags(identity: &WorkerIdentity) -> Result<u32, ProcStatError> {
     let _open = launch_window::TransientOpen::begin();
     let raw = unsafe {
@@ -7691,6 +7727,7 @@ impl TerminalCleanup {
 mod test {
     include!("adaptive_api_tests.rs");
     include!("managed_native_tests.rs");
+    include!("exit_probe_tests.rs");
     include!("stop_auth_cache_tests.rs");
     include!("retired_tid_tests.rs");
     include!("legacy_thread_tests.rs");

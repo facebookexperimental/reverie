@@ -2242,6 +2242,9 @@ impl HeldRootStop {
 pub(crate) struct RootStopLease {
     task: Option<Stopped>,
     held_root_stop: Option<Arc<StdMutex<Option<HeldRootStop>>>>,
+    /// Make each transition with `Stopped::transition_unless_left_for_exit_with`
+    /// and this probe (https://github.com/rrnewton/reverie/issues/1091).
+    exit_guard: Option<safeptrace::ExitProbe>,
 }
 
 impl RootStopLease {
@@ -2252,6 +2255,30 @@ impl RootStopLease {
         Self {
             task: Some(task),
             held_root_stop,
+            exit_guard: None,
+        }
+    }
+
+    /// Refuses each transition, as a request meeting `ESRCH` would, when the
+    /// tracee has left the held stop for its exit stop, probing with `probe`
+    /// (none: no guard). A resume addressed by PID would consume that exit
+    /// stop. For a stop other than the exit stop.
+    pub(crate) fn guard_exit_stop(mut self, probe: Option<safeptrace::ExitProbe>) -> Self {
+        self.exit_guard = probe;
+        self
+    }
+
+    /// Makes `transition` on `task`, through the exit guard when it is set.
+    fn transition(
+        &self,
+        task: Stopped,
+        transition: safeptrace::Transition,
+        unguarded: impl FnOnce(Stopped) -> Result<Running, TraceError>,
+    ) -> Result<Running, TraceError> {
+        if let Some(probe) = self.exit_guard {
+            task.transition_unless_left_for_exit_with(transition, probe)
+        } else {
+            unguarded(task)
         }
     }
 
@@ -2276,7 +2303,13 @@ impl RootStopLease {
         mut self,
         signal: T,
     ) -> Result<Running, TraceError> {
-        self.take_for_transition()?.resume(signal)
+        let signal = signal.into();
+        let task = self.take_for_transition()?;
+        self.transition(
+            task,
+            safeptrace::Transition::Cont(signal.map_or(0, |signal| signal as i32)),
+            |task| task.resume(signal),
+        )
     }
 
     pub(crate) fn step<T: Into<Option<Signal>>>(
@@ -2293,7 +2326,12 @@ impl RootStopLease {
                 task.terminal_cleanup().observed_exit_status()
             )
         });
-        let result = task.step(signal);
+        let signal = signal.into();
+        let result = self.transition(
+            task,
+            safeptrace::Transition::Step(signal.map_or(0, |signal| signal as i32)),
+            |task| task.step(signal),
+        );
         #[cfg(test)]
         record_fatal_phase_for_test(|| format!("RootStopLease step result: {result:?}"));
         result
@@ -2303,14 +2341,21 @@ impl RootStopLease {
         mut self,
         signal: T,
     ) -> Result<Running, TraceError> {
-        self.take_for_transition()?.syscall(signal)
+        let signal = signal.into();
+        let task = self.take_for_transition()?;
+        self.transition(
+            task,
+            safeptrace::Transition::Syscall(signal.map_or(0, |signal| signal as i32)),
+            |task| task.syscall(signal),
+        )
     }
 
     /// Runs the stopped root until it next takes a branch
     /// (`Stopped::block_step`), delivering no signal.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn block_step(mut self) -> Result<Running, TraceError> {
-        self.take_for_transition()?.block_step()
+        let task = self.take_for_transition()?;
+        self.transition(task, safeptrace::Transition::BlockStep, Stopped::block_step)
     }
 
     /// `resume` for a signal that may be one nix cannot name.
@@ -2327,17 +2372,26 @@ impl RootStopLease {
     /// `resume`, delivering a raw signal number nix cannot name
     /// (`Stopped::resume_raw`).
     pub(crate) fn resume_raw(mut self, signal: i32) -> Result<Running, TraceError> {
-        self.take_for_transition()?.resume_raw(signal)
+        let task = self.take_for_transition()?;
+        self.transition(task, safeptrace::Transition::Cont(signal), |task| {
+            task.resume_raw(signal)
+        })
     }
 
     /// `step`, delivering a raw signal number (`Stopped::step_raw`).
     pub(crate) fn step_raw(mut self, signal: i32) -> Result<Running, TraceError> {
-        self.take_for_transition()?.step_raw(signal)
+        let task = self.take_for_transition()?;
+        self.transition(task, safeptrace::Transition::Step(signal), |task| {
+            task.step_raw(signal)
+        })
     }
 
     /// `syscall`, delivering a raw signal number (`Stopped::syscall_raw`).
     pub(crate) fn syscall_raw(mut self, signal: i32) -> Result<Running, TraceError> {
-        self.take_for_transition()?.syscall_raw(signal)
+        let task = self.take_for_transition()?;
+        self.transition(task, safeptrace::Transition::Syscall(signal), |task| {
+            task.syscall_raw(signal)
+        })
     }
 }
 
@@ -6351,6 +6405,401 @@ mod tests {
             ["wait during injected syscall"],
             "the run loop did not stay pending on the injected wait's ECHILD"
         );
+    }
+
+    /// Records whether the leader's held stop was overtaken by its exit stop
+    /// before it was resumed.
+    #[derive(Default)]
+    struct ExitWhileHeldLog(Arc<StdMutex<Vec<(u8, Pid)>>>);
+    #[reverie::global_tool]
+    impl GlobalTool for ExitWhileHeldLog {
+        type Config = u8;
+        type Request = (u8, Pid);
+        type Response = ();
+        async fn receive_rpc(&self, _from: Pid, event: Self::Request) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// How [`ExitWhileHeldTool`] holds and resumes the leader's stop.
+    const HELD_SUPPRESS: u8 = 0;
+    /// Replace the held signal's siginfo, then return it for delivery: the
+    /// resume first writes that siginfo, which on the exit stop erases its
+    /// exit signature.
+    const HELD_REPLACE_AND_DELIVER: u8 = 1;
+    /// Hold the stop in the timer's single-step loop instead of a signal
+    /// callback: a precise timer armed at the leader's getpgid.
+    const HELD_TIMER_STEP: u8 = 2;
+
+    /// The file by which the tracer tells the guest's sibling that the
+    /// leader's stop is held.
+    fn exit_while_held_marker(pid: Pid) -> String {
+        format!("/tmp/reverie-1091-held-{pid}")
+    }
+
+    /// Blocks (no await: the exit future must not claim the exit stop first)
+    /// until the thread is in its exit stop: in a tracing stop with
+    /// PF_SIGNALED (0x400) in its stat flags, set by the fatal signal before
+    /// do_exit reports that stop. False after five seconds.
+    fn block_until_exit_stop(pid: Pid, tid: Pid) -> bool {
+        let stat = format!("/proc/{pid}/task/{tid}/stat");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let in_exit_stop = std::fs::read_to_string(&stat).ok().is_some_and(|stat| {
+                let fields: Vec<&str> = stat
+                    .rsplit_once(')')
+                    .map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
+                fields.first() == Some(&"t")
+                    && fields
+                        .get(6)
+                        .and_then(|flags| flags.parse::<u64>().ok())
+                        .is_some_and(|flags| flags & 0x400 != 0)
+            });
+            if in_exit_stop {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Holds the leader's stop while its sibling execs, then resumes the
+    /// stale stop. The exec's de_thread SIGKILLs the leader, which leaves the
+    /// held stop for its PTRACE_EVENT_EXIT stop.
+    #[derive(Default)]
+    struct ExitWhileHeldTool {
+        mode: u8,
+        armed: AtomicBool,
+    }
+    #[reverie::tool]
+    impl Tool for ExitWhileHeldTool {
+        type GlobalState = ExitWhileHeldLog;
+        type ThreadState = ();
+        fn new(_pid: Pid, mode: &u8) -> Self {
+            Self {
+                mode: *mode,
+                armed: AtomicBool::new(false),
+            }
+        }
+        // No syscall stop but the timer mode's getpgid: the sibling must run
+        // to its exec while a blocking hold occupies the tracer thread.
+        fn subscriptions(mode: &u8) -> Subscription {
+            if *mode == HELD_TIMER_STEP {
+                [Sysno::getpgid].into_iter().collect()
+            } else {
+                Subscription::none()
+            }
+        }
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            let result = guest.inject(syscall).await?;
+            if self.mode == HELD_TIMER_STEP
+                && guest.tid() == guest.pid()
+                && !self.armed.swap(true, Ordering::SeqCst)
+            {
+                // The sibling is running: the leader called getpgid only then.
+                let (pid, tid) = (guest.pid(), guest.tid());
+                crate::task::TIMER_STEP_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |task: &Stopped| {
+                        assert_eq!(task.pid(), tid, "the timer stepped another thread");
+                        std::fs::write(exit_while_held_marker(pid), b"held").unwrap();
+                        assert!(
+                            block_until_exit_stop(pid, tid),
+                            "no exit stop under the timer step"
+                        );
+                        let _ = std::fs::remove_file(exit_while_held_marker(pid));
+                    }));
+                });
+                guest.set_timer_precise(reverie::TimerSchedule::Rcbs(1000))?;
+            }
+            Ok(result)
+        }
+        async fn handle_signal_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            signal: Signal,
+        ) -> Result<Option<Signal>, Errno> {
+            if self.mode == HELD_TIMER_STEP
+                || signal != Signal::SIGUSR1
+                || guest.tid() != guest.pid()
+            {
+                return Ok(Some(signal));
+            }
+            // Tell the sibling the stop is held: it execs only after this.
+            let held = exit_while_held_marker(guest.pid());
+            std::fs::write(&held, b"held").unwrap();
+            let overtaken = block_until_exit_stop(guest.pid(), guest.tid());
+            let _ = std::fs::remove_file(&held);
+            guest.send_rpc((u8::from(overtaken), guest.tid())).await;
+            if self.mode == HELD_REPLACE_AND_DELIVER {
+                let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+                info.si_signo = libc::SIGUSR1;
+                info.si_code = libc::SI_USER;
+                let bytes: [u8; reverie::SIGNAL_INFO_SIZE] = unsafe { std::mem::transmute(info) };
+                // On the exit stop this already overwrites the siginfo.
+                guest.set_signal_info(bytes)?;
+                return Ok(Some(Signal::SIGUSR1));
+            }
+            // Suppress the signal: the run loop now resumes the stop it
+            // holds, which the leader has already left.
+            Ok(None)
+        }
+        async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+            guest.send_rpc((2, guest.tid())).await;
+            Ok(())
+        }
+    }
+
+    /// https://github.com/rrnewton/reverie/issues/1091: a fatal signal takes
+    /// a tracee out of the stop its run loop holds and into its exit stop. A
+    /// resume through the held capability must not consume that exit stop,
+    /// whose GETEVENTMSG is the only record of a displaced leader's exit.
+    /// Before the fix, the PTRACE_CONT (or step) resumed the exit stop, the
+    /// exit status was lost, and the run stayed pending on "no retained
+    /// preceding EXIT event status".
+    async fn held_stop_overtaken_by_the_exit_stop(mode: u8) {
+        let refusals_before = crate::task::EXIT_STOP_RESUME_REFUSALS.with(std::cell::Cell::get);
+        let tracer = spawn_fn_with_config::<ExitWhileHeldTool, _>(
+            move || {
+                let leader = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+                let running = Arc::new(AtomicBool::new(false));
+                let started = running.clone();
+                std::thread::spawn(move || {
+                    // The tracer has resumed this thread's initial stop. Only
+                    // then may the leader's stop be held: holding it blocks
+                    // the tracer thread.
+                    started.store(true, Ordering::Release);
+                    // Exec only once the tracer holds the leader's stop.
+                    let held = exit_while_held_marker(Pid::from_raw(unsafe { libc::getpid() }));
+                    while !std::path::Path::new(&held).exists() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let args = [c"/bin/true".as_ptr(), std::ptr::null()];
+                    unsafe {
+                        libc::execv(args[0], args.as_ptr());
+                        libc::_exit(127);
+                    }
+                });
+                while !running.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if mode == HELD_TIMER_STEP {
+                    // Arms the precise timer, then retires branches until
+                    // it fires.
+                    unsafe { libc::syscall(libc::SYS_getpgid, 0) };
+                    let mut index = 0u64;
+                    loop {
+                        index = std::hint::black_box(index.wrapping_add(1));
+                    }
+                }
+                unsafe {
+                    libc::syscall(libc::SYS_tgkill, libc::getpid(), leader, libc::SIGUSR1);
+                }
+                loop {
+                    unsafe {
+                        libc::pause();
+                    }
+                }
+            },
+            mode,
+            true,
+        )
+        .await
+        .unwrap();
+        let root = tracer.guest_pid();
+        let log = tracer.gref.0.clone();
+        let identity = untraced_process_identity(root);
+        let termination = tracer.termination_handle().unwrap();
+        let mut completion = Box::pin(tracer.wait_with_output_completion());
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut completion).await;
+        let events = log.lock().unwrap().clone();
+        let description = match &result {
+            Ok(ToolRunOutcome::Complete(completed)) => format!("Complete({:?})", completed.result),
+            Ok(ToolRunOutcome::CleanupPending(pending)) => {
+                format!("Pending({:?})", pending.failure())
+            }
+            Ok(ToolRunOutcome::UnsupportedBackend(_)) => "UnsupportedBackend".to_owned(),
+            Err(error) => format!("Timeout({error})"),
+        };
+        let completed = match result {
+            Ok(ToolRunOutcome::Complete(completed)) => completed,
+            other => {
+                // Rescue only, so a failure leaks no tracee.
+                termination.terminate(Error::Tool(anyhow::Error::new(TestDeadline)));
+                let _ = identity.send_signal(Signal::SIGKILL);
+                if let Ok(ToolRunOutcome::CleanupPending(pending)) = other {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), pending.resume_cleanup())
+                        .await;
+                } else if other.is_err() {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut completion).await;
+                }
+                panic!(
+                    "the overtaken held stop did not complete: {description}, events={events:?}"
+                );
+            }
+        };
+        if mode != HELD_TIMER_STEP {
+            assert!(
+                events.contains(&(1, root)),
+                "the leader's held stop was never overtaken by its exit stop: events={events:?}"
+            );
+        }
+        assert!(
+            events.iter().any(|event| event.0 == 2),
+            "the sibling's exec never reached post-exec: events={events:?}"
+        );
+        let output = completed.result.expect("the run failed");
+        assert_eq!(output.status, ExitStatus::Exited(0), "events={events:?}");
+        assert!(
+            crate::task::EXIT_STOP_RESUME_REFUSALS.with(std::cell::Cell::get) > refusals_before,
+            "the run completed without the guard refusing the overtaken stop's resume"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_stop_overtaken_by_the_exit_stop_does_not_consume_it() {
+        held_stop_overtaken_by_the_exit_stop(HELD_SUPPRESS).await;
+    }
+
+    /// The replayed siginfo erases the exit stop's signature (PTRACE_SETSIGINFO
+    /// succeeds on an exit stop; GETEVENTMSG keeps the status), so the guard
+    /// must not read siginfo.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replaced_siginfo_does_not_hide_the_exit_stop_from_the_guard() {
+        held_stop_overtaken_by_the_exit_stop(HELD_REPLACE_AND_DELIVER).await;
+    }
+
+    /// The timer's single-step loop resumes the held stop once per step.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_timer_step_does_not_consume_an_overtaking_exit_stop() {
+        held_stop_overtaken_by_the_exit_stop(HELD_TIMER_STEP).await;
+    }
+
+    #[derive(Default)]
+    struct ForgedExitLog(Arc<StdMutex<Vec<Pid>>>);
+    #[reverie::global_tool]
+    impl GlobalTool for ForgedExitLog {
+        type Config = ();
+        type Request = Pid;
+        type Response = ();
+        async fn receive_rpc(&self, _from: Pid, tid: Self::Request) {
+            self.0.lock().unwrap().push(tid);
+        }
+    }
+    #[derive(Default)]
+    struct ForgedExitTool;
+    #[reverie::tool]
+    impl Tool for ForgedExitTool {
+        type GlobalState = ForgedExitLog;
+        type ThreadState = ();
+        fn subscriptions(_config: &()) -> Subscription {
+            Subscription::none()
+        }
+        async fn handle_signal_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            signal: Signal,
+        ) -> Result<Option<Signal>, Errno> {
+            if signal != Signal::SIGTRAP {
+                return Ok(Some(signal));
+            }
+            guest.send_rpc(guest.tid()).await;
+            Ok(None)
+        }
+    }
+
+    /// The guard of https://github.com/rrnewton/reverie/issues/1091 must not
+    /// take a guest's own SIGTRAP for the exit stop. A thread may queue
+    /// itself a SIGTRAP whose si_code is the exit signature (0x605); only
+    /// PF_SIGNALED tells the real exit stop apart. Refusing this resume would
+    /// leave a live, stopped leader that nothing resumes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forged_exit_siginfo_does_not_refuse_the_resume() {
+        let refusals_before = crate::task::EXIT_STOP_RESUME_REFUSALS.with(std::cell::Cell::get);
+        let forged_before = crate::task::FORGED_EXIT_SIGNATURES_RESUMED.with(std::cell::Cell::get);
+        let tracer = spawn_fn_with_config::<ForgedExitTool, _>(
+            || {
+                // A sibling makes the leader one the guard applies to.
+                let running = Arc::new(AtomicBool::new(false));
+                let started = running.clone();
+                std::thread::spawn(move || {
+                    started.store(true, Ordering::Release);
+                    loop {
+                        unsafe {
+                            libc::pause();
+                        }
+                    }
+                });
+                while !running.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+                info.si_signo = libc::SIGTRAP;
+                info.si_code = libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8);
+                let queued = unsafe {
+                    libc::syscall(
+                        libc::SYS_rt_tgsigqueueinfo,
+                        libc::getpid(),
+                        libc::syscall(libc::SYS_gettid),
+                        libc::SIGTRAP,
+                        &info as *const libc::siginfo_t,
+                    )
+                };
+                unsafe { libc::_exit(if queued == 0 { 0 } else { 3 }) };
+            },
+            (),
+            true,
+        )
+        .await
+        .unwrap();
+        let root = tracer.guest_pid();
+        let log = tracer.gref.0.clone();
+        let identity = untraced_process_identity(root);
+        let termination = tracer.termination_handle().unwrap();
+        let mut completion = Box::pin(tracer.wait_with_output_completion());
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut completion).await;
+        let trapped = log.lock().unwrap().clone();
+        let completed = match result {
+            Ok(ToolRunOutcome::Complete(completed)) => completed,
+            other => {
+                let description = match &other {
+                    Ok(ToolRunOutcome::CleanupPending(pending)) => {
+                        format!("Pending({:?})", pending.failure())
+                    }
+                    Ok(_) => "UnsupportedBackend".to_owned(),
+                    Err(error) => format!("Timeout({error})"),
+                };
+                termination.terminate(Error::Tool(anyhow::Error::new(TestDeadline)));
+                let _ = identity.send_signal(Signal::SIGKILL);
+                if let Ok(ToolRunOutcome::CleanupPending(pending)) = other {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), pending.resume_cleanup())
+                        .await;
+                } else if other.is_err() {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut completion).await;
+                }
+                panic!(
+                    "the forged-siginfo run did not complete: {description}, trapped={trapped:?}"
+                );
+            }
+        };
+        // Reverie handles a SIGTRAP stop itself, so the Tool may not see it;
+        // the guard's own record shows it probed the forged stop.
+        assert!(
+            crate::task::FORGED_EXIT_SIGNATURES_RESUMED.with(std::cell::Cell::get) > forged_before,
+            "the guard never probed the forged SIGTRAP stop: trapped={trapped:?}"
+        );
+        assert_eq!(
+            crate::task::EXIT_STOP_RESUME_REFUSALS.with(std::cell::Cell::get),
+            refusals_before,
+            "the guard refused a resume of a live SIGTRAP stop"
+        );
+        let output = completed.result.expect("the run failed");
+        assert_eq!(output.status, ExitStatus::Exited(0));
     }
 
     #[tokio::test(flavor = "current_thread")]
