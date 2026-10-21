@@ -7,7 +7,7 @@ of a Reverie tool or backend.
 
 ```toml
 [dependencies]
-reverie-process = "0.4"
+reverie-process = "0.5"
 ```
 
 The default features build on stable Rust. Namespace operations require the

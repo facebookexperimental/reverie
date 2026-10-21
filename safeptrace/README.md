@@ -10,7 +10,7 @@ lifetime and tracing policy.
 
 ```toml
 [dependencies]
-safeptrace = "0.4"
+safeptrace = "0.5"
 ```
 
 ## Optional features
@@ -23,7 +23,7 @@ Both features are off by default. For asynchronous tracing with memory access:
 
 ```toml
 [dependencies]
-safeptrace = { version = "0.4", features = ["memory", "notifier"] }
+safeptrace = { version = "0.5", features = ["memory", "notifier"] }
 ```
 
 See the [API documentation](https://docs.rs/safeptrace) for state transitions

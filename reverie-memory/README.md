@@ -16,7 +16,7 @@ grant access to unreadable pages or enforce a remote protection key.
 
 ```toml
 [dependencies]
-reverie-memory = "0.4"
+reverie-memory = "0.5"
 ```
 
 See the [API documentation](https://docs.rs/reverie-memory) for the contracts

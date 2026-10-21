@@ -18,7 +18,7 @@ sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev
 
 ```toml
 [dependencies]
-reverie-ptrace = "0.4"
+reverie-ptrace = "0.5"
 ```
 
 The build uses the system `libunwind-ptrace` and discovers its private link

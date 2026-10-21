@@ -10,7 +10,7 @@ The package is named `reverie-core`; its Rust library is named `reverie`:
 
 ```toml
 [dependencies]
-reverie = { package = "reverie-core", version = "0.4" }
+reverie = { package = "reverie-core", version = "0.5" }
 ```
 
 See the [API documentation](https://docs.rs/reverie-core), and
