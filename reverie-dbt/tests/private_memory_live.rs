@@ -34,8 +34,50 @@ fn observe(mode: &str, exec: bool) -> Vec<String> {
     eprintln!("private memory {mode}, exec={exec}: {output:?}");
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"private memory guest completed\n");
-    String::from_utf8(output.stderr)
-        .unwrap()
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let bootstrap: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.starts_with("PRIVATE_MEMORY_BOOTSTRAP "))
+        .collect();
+    let coverage = "PRIVATE_MEMORY_BOOTSTRAP loads=4 bss=1 covered=1";
+    let mut expected = vec![coverage.to_owned()];
+    if mode == "ready" && exec {
+        expected.push(coverage.to_owned());
+    }
+    if mode == "old-size-exec" || mode == "old-magic-exec" {
+        let layout = if mode == "old-size-exec" { 1 } else { 2 };
+        expected.push(format!(
+            "PRIVATE_MEMORY_BOOTSTRAP old_layout={layout} injected=1"
+        ));
+    }
+    if mode == "routes" {
+        expected.push("PRIVATE_MEMORY_BOOTSTRAP derivation_controls=1".to_owned());
+        for (name, notifications) in [
+            ("bootstrap-left-edge", 1),
+            ("bootstrap-right-edge", 1),
+            ("bootstrap-interior", 1),
+            ("bootstrap-left-crossing", 1),
+            ("bootstrap-right-crossing", 1),
+            ("bootstrap-left-adjacent", 0),
+            ("bootstrap-right-adjacent", 0),
+            ("bootstrap-fixed-overlap", 1),
+            ("bootstrap-noreplace-overlap", 0),
+            ("bootstrap-mremap-source", 1),
+            ("bootstrap-mremap-destination", 1),
+            ("bootstrap-gap-unmap", 0),
+            ("bootstrap-gap-fixed", 0),
+        ] {
+            expected.push(format!(
+                "PRIVATE_MEMORY_BOOTSTRAP route={name} notifications={notifications}"
+            ));
+        }
+        expected.push("PRIVATE_MEMORY_BOOTSTRAP routes=13 physical_gap=1".to_owned());
+    }
+    assert_eq!(
+        bootstrap, expected,
+        "required bootstrap controls did not run"
+    );
+    stderr
         .lines()
         .filter(|line| line.starts_with("PRIVATE_MEMORY_TEST "))
         .map(str::to_owned)
@@ -75,6 +117,15 @@ fn private_memory_followed_exec_with_lost_backing_is_unavailable() {
             "PRIVATE_MEMORY_TEST followed-exec-unavailable=1",
         ]
     );
+    for legacy in ["old-size-exec", "old-magic-exec"] {
+        assert_eq!(
+            observe(legacy, true),
+            [
+                FIRST_READY,
+                "PRIVATE_MEMORY_TEST followed-exec-unavailable=1"
+            ]
+        );
+    }
 }
 
 #[test]

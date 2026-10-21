@@ -3756,7 +3756,11 @@ mod tests {
     #[test]
     #[ignore = "requires built DynamoRIO and native client; run explicitly with --ignored"]
     fn native_runtime_abi_mismatch_fails_before_guest_execution() {
-        for argument in ["-test-runtime-abi-mismatch", "-test-runtime-abi12-mismatch"] {
+        for argument in [
+            "-test-runtime-abi-mismatch",
+            "-test-runtime-abi12-mismatch",
+            "-test-runtime-abi13-mismatch",
+        ] {
             let mut file = tempfile::tempfile().unwrap();
             let runner = DbtRunner::from_env()
                 .expect("DYNAMORIO_HOME and REVERIE_DBT_CLIENT must select the live native client")

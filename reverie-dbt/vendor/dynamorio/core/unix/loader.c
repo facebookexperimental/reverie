@@ -47,6 +47,7 @@
 #ifdef LINUX
 #    include "include/syscall.h"
 #    include "memquery.h"
+#    include "bootstrap_private_segments.h"
 #    define _GNU_SOURCE 1
 #    define __USE_GNU 1
 #    include <link.h> /* struct dl_phdr_info, must be prior to dlfcn.h */
@@ -236,6 +237,69 @@ privload_add_gdb_cmd(elf_loader_t *loader, const char *filename, bool reachable)
 }
 #endif
 
+#if defined(LINUX) && !defined(STATIC_LIBRARY)
+_Static_assert(PRIVATE_RESERVATION_CAPACITY == DR_PRIVATE_RESERVATION_MAX &&
+                   PRIVATE_RESERVATION_CAPACITY == BOOTSTRAP_PRIVATE_MAX_RANGES,
+               "private ownership interval capacities must agree");
+/* Bind pure LOAD derivation to the authenticated loader owner and safe reads.
+ * The test compiles the same calculations, but obtains its live expected image
+ * independently from OS mappings and the resolved imported DR code address. */
+static size_t
+bootstrap_private_load_segments(privmod_t *mod, byte **starts, size_t *sizes)
+{
+    ELF_HEADER_TYPE header;
+    ELF_PROGRAM_HEADER_TYPE headers[BOOTSTRAP_PRIVATE_MAX_PHDRS];
+    bootstrap_private_load_t loads[BOOTSTRAP_PRIVATE_MAX_PHDRS];
+    bootstrap_private_segment_t recorded[BOOTSTRAP_PRIVATE_MAX_PHDRS + 1];
+    bootstrap_private_segment_t result[BOOTSTRAP_PRIVATE_MAX_RANGES];
+    ptr_uint_t base = (ptr_uint_t)mod->base;
+    if (!mod->bootstrap_dr_owner || !mod->externally_loaded ||
+        mod->base != get_dynamorio_dll_start() ||
+        mod->size != (size_t)(get_dynamorio_dll_end() - mod->base) ||
+        base > POINTER_MAX - mod->size ||
+        !d_r_safe_read(mod->base, sizeof(header), &header) ||
+        !is_elf_so_header((byte *)&header, sizeof(header)) ||
+        header.e_ident[EI_CLASS] != IF_X64_ELSE(ELFCLASS64, ELFCLASS32) ||
+        header.e_ident[EI_DATA] != ELFDATA2LSB ||
+        header.e_ident[EI_VERSION] != EV_CURRENT)
+        return 0;
+    size_t table_size;
+    if (!bootstrap_private_table_size(mod->size, header.e_phoff, header.e_phnum,
+                                      header.e_phentsize, sizeof(header),
+                                      sizeof(headers[0]), &table_size) ||
+        !d_r_safe_read(mod->base + header.e_phoff, table_size, headers))
+        return 0;
+    size_t load_count = 0;
+    for (uint i = 0; i < header.e_phnum; ++i) {
+        ELF_PROGRAM_HEADER_TYPE *ph = &headers[i];
+        if (ph->p_type == PT_LOAD) {
+            loads[load_count++] = (bootstrap_private_load_t){
+                ph->p_vaddr, ph->p_memsz, ph->p_filesz, ph->p_offset,
+                TEST(PF_R, ph->p_flags)
+            };
+        }
+    }
+    os_module_data_t *data = &libdr_opd->os_data;
+    if (data->segments == NULL || data->num_segments > BOOTSTRAP_PRIVATE_MAX_PHDRS + 1)
+        return 0;
+    for (uint i = 0; i < data->num_segments; ++i) {
+        recorded[i] = (bootstrap_private_segment_t){
+            (ptr_uint_t)data->segments[i].start, (ptr_uint_t)data->segments[i].end
+        };
+    }
+    bootstrap_private_image_t image = {
+        base, mod->size, PAGE_SIZE, header.e_phoff + table_size,
+        loads, load_count, recorded, data->num_segments
+    };
+    size_t count = bootstrap_private_segments(&image, result);
+    for (size_t i = 0; i < count; ++i) {
+        starts[i] = (byte *)result[i].start;
+        sizes[i] = result[i].end - result[i].start;
+    }
+    return count;
+}
+#endif
+
 /* os specific loader initialization prologue before finalizing the load. */
 void
 os_loader_init_prologue(void)
@@ -285,6 +349,10 @@ os_loader_init_prologue(void)
     /* This exact bootstrap image has an established owner before client loading.
      * No other externally_loaded module acquires this exception. */
     mod->bootstrap_dr_owner = true;
+    byte *starts[PRIVATE_RESERVATION_CAPACITY] = { 0 };
+    size_t sizes[PRIVATE_RESERVATION_CAPACITY] = { 0 };
+    size_t count = bootstrap_private_load_segments(mod, starts, sizes);
+    heap_set_bootstrap_private_segments(starts, sizes, count);
 #    endif
 #    ifdef LINUX /*i#1285*/
     if (DYNAMO_OPTION(early_inject)) {
@@ -330,6 +398,8 @@ os_loader_init_epilogue(void)
 void
 os_loader_exit(void)
 {
+    /* Withdraw before the loader frees the metadata which authenticated it. */
+    heap_set_bootstrap_private_segments(NULL, NULL, 0);
     if (libdr_opd != NULL) {
         HEAP_ARRAY_FREE(GLOBAL_DCONTEXT, libdr_opd->os_data.segments, module_segment_t,
                         libdr_opd->os_data.alloc_segments, ACCT_OTHER, PROTECTED);

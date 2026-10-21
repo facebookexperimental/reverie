@@ -3551,12 +3551,15 @@ DR_API
 size_t
 dr_get_private_reservations(dr_private_reservation_t *regions, size_t capacity)
 {
-    if (regions == NULL || capacity < 3)
+    if (regions == NULL)
         return 0;
-    byte *starts[3];
-    size_t sizes[3];
-    size_t count = heap_private_reservations(starts, sizes, 3);
-    memset(regions, 0, 3 * sizeof(*regions));
+    byte *starts[PRIVATE_RESERVATION_CAPACITY];
+    size_t sizes[PRIVATE_RESERVATION_CAPACITY];
+    size_t count =
+        heap_private_reservations(starts, sizes, PRIVATE_RESERVATION_CAPACITY);
+    memset(regions, 0, MIN(capacity, DR_PRIVATE_RESERVATION_MAX) * sizeof(*regions));
+    if (count > capacity)
+        return 0;
     for (size_t i = 0; i < count; ++i) {
         regions[i].start = starts[i];
         regions[i].size = sizes[i];

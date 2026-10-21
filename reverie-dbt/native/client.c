@@ -110,9 +110,9 @@ typedef struct {
   uint64_t version;
   uint32_t state; // 0: unavailable, 1: ready
   uint32_t count;
-  private_memory_range_t ranges[3];
+  private_memory_range_t ranges[DR_PRIVATE_RESERVATION_MAX];
 } private_memory_snapshot_t;
-_Static_assert(sizeof(private_memory_snapshot_t) == 96,
+_Static_assert(sizeof(private_memory_snapshot_t) == 176,
     "private memory snapshot ABI");
 typedef int32_t (*runtime_private_memory_t)(
     uintptr_t, const private_memory_snapshot_t*, private_memory_snapshot_t*);
@@ -232,8 +232,8 @@ typedef struct {
 #define TASK_STATE_FD 197
 #define CLIENT_THREAD_START_FAILURE_EXIT_CODE 125
 #define DBT_DIAGNOSTIC_FD 198
-// Layout 7 combines controller admission and private-memory image ownership.
-#define TASK_STATE_MAGIC UINT64_C(0x5245565049443037)
+// Layout 8 carries eight authenticated private-memory intervals per image.
+#define TASK_STATE_MAGIC UINT64_C(0x5245565049443038)
 #define MAX_TASK_MEMBERSHIPS 8192
 #define TEST_REUSED_TID_STALE 0
 #define EXEC_HELPER_RETIREMENT_TIMEOUT_MS UINT64_C(60000)
@@ -260,7 +260,7 @@ struct process_control {
   uint32_t memory_published;
   uint32_t memory_retired;
 };
-_Static_assert(sizeof(process_control_t) == 160, "shared process control layout");
+_Static_assert(sizeof(process_control_t) == 240, "shared process control layout");
 
 typedef struct {
   uint64_t magic;
@@ -299,7 +299,7 @@ typedef struct {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 13u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 14u
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -522,6 +522,8 @@ enum {
 static int test_private_memory;
 static bool test_private_memory_loss_injected;
 static bool test_private_memory_close_failure;
+static int test_private_memory_old_layout;
+static bool private_memory_test_check(bool condition, const char* check);
 static atomic_flag compare_exchange_self_tested = ATOMIC_FLAG_INIT;
 static void run_compare_exchange_self_test(void);
 static uint32_t compare_exchange_word(
@@ -1929,6 +1931,27 @@ static void retire_private_memory_for_exec(void) {
   if (test_private_memory == PRIVATE_MEMORY_TEST_LOST_EXEC &&
       !dr_is_post_execve() && !test_private_memory_loss_injected) {
     test_private_memory_loss_injected = true;
+    if (test_private_memory_old_layout != 0) {
+      // Supply a real incompatible inherited backing while leaving this
+      // image's live mapping intact. Neither rejection may mint Ready again.
+      uint64_t old_magic = UINT64_C(0x5245565049443037);
+      size_t old_size = sizeof(*task_state) -
+          MAX_TASK_MEMBERSHIPS * (sizeof(process_control_t) - 160);
+      size_t backing_size = test_private_memory_old_layout == 1
+          ? old_size : sizeof(*task_state);
+      int fd = (int)syscall(SYS_memfd_create, "reverie-dbt-old-layout", 0);
+      bool ok = fd >= 0 && ftruncate(fd, backing_size) == 0 &&
+          pwrite(fd, &old_magic, sizeof(old_magic), 0) == sizeof(old_magic) &&
+          dup2(fd, TASK_STATE_FD) == TASK_STATE_FD;
+      if (fd >= 0 && fd != TASK_STATE_FD)
+        close(fd);
+      if (!private_memory_test_check(ok, "old-layout-injection"))
+        return;
+      dr_fprintf(diagnostic_file,
+          "PRIVATE_MEMORY_BOOTSTRAP old_layout=%d injected=1\n",
+          test_private_memory_old_layout);
+      return;
+    }
     // Explicit control-backing fault injection, not guest close semantics.
     int backing_fd = test_private_memory_close_failure ? -1 : TASK_STATE_FD;
     if (syscall(SYS_close, backing_fd) != 0) {
@@ -1965,7 +1988,7 @@ static int32_t runtime_private_memory(
     const private_memory_snapshot_t* value = &entry->private_memory;
     ready = entry->memory_published != 0 && entry->memory_retired == 0 &&
         atomic_load_explicit(&entry->image_epoch, memory_order_relaxed) == epoch &&
-        value->state == 1 && value->count > 0 && value->count <= 3 &&
+        value->state == 1 && value->count > 0 && value->count <= DR_PRIVATE_RESERVATION_MAX &&
         value->owner[0] == task_state_device && value->owner[1] == task_state_inode &&
         value->owner[2] == slot && value->owner[3] == epoch &&
         (expected == NULL || value->version == wanted.version);
@@ -1984,6 +2007,8 @@ static bool private_memory_test_check(bool condition, const char* check) {
   return false;
 }
 
+#include "private_memory_bootstrap_test.h"
+
 static bool private_memory_test_unavailable(
     const private_memory_snapshot_t* expected) {
   private_memory_snapshot_t output;
@@ -1997,6 +2022,149 @@ static uint32_t private_memory_test_notifications;
 
 static void count_private_memory_test_notification(void) {
   ++private_memory_test_notifications;
+}
+
+static bool bootstrap_test_free_page(uint64_t address, uint64_t* page_start) {
+  dr_mem_info_t info;
+  uint64_t page = dr_page_size();
+  if (!dr_query_memory_ex((const byte*)(uintptr_t)address, &info) ||
+      info.type != DR_MEMTYPE_FREE)
+    return false;
+  uint64_t start = (uint64_t)(uintptr_t)info.base_pc;
+  if (start > UINT64_MAX - info.size || start > UINT64_MAX - (page - 1))
+    return false;
+  uint64_t aligned = (start + page - 1) & ~(page - 1);
+  if (aligned > start + info.size || page > start + info.size - aligned)
+    return false;
+  *page_start = aligned;
+  return true;
+}
+
+static bool bootstrap_test_adjacent(const private_memory_snapshot_t* current,
+    uint64_t start, uint64_t page) {
+  dr_mem_info_t info;
+  // This UNIX query reads the OS mapping table, not the exported snapshot or
+  // DR's broad module-envelope membership list.
+  if (!private_memory_test_check(
+          dr_query_memory_ex((const byte*)(uintptr_t)start, &info),
+          "bootstrap-adjacent-os-query"))
+    return false;
+  uint64_t base = (uint64_t)(uintptr_t)info.base_pc;
+  if (!private_memory_test_check(base <= start && base <= UINT64_MAX - info.size &&
+          start <= UINT64_MAX - page && start + page <= base + info.size,
+          "bootstrap-adjacent-os-extent"))
+    return false;
+  if (info.type != DR_MEMTYPE_FREE) {
+    // The task-state memfd can immediately precede the bootstrap image. Its
+    // actual returned mapping and retained backing identity are independent of
+    // this export, which deliberately does not yet include task-state memory.
+    // Authenticate that precise residual; never infer ownership from a name,
+    // broad DR membership, or the snapshot whose bounds are being tested.
+    struct stat backing;
+    uint64_t task_start = (uint64_t)(uintptr_t)task_state;
+    if (!private_memory_test_check(page != 0 && (page & (page - 1)) == 0 &&
+            sizeof(*task_state) <= SIZE_MAX - (page - 1),
+            "bootstrap-adjacent-task-size-overflow"))
+      return false;
+    size_t task_size = (sizeof(*task_state) + page - 1) & ~(page - 1);
+    uint64_t magic = 0;
+    bool authority = false;
+    if (!private_memory_test_check(task_state != NULL &&
+            task_state_identity_valid && !task_state_identity_lost &&
+            bootstrap_test_read((uint64_t)(uintptr_t)&task_state->magic,
+                &magic, sizeof(magic)) && magic == TASK_STATE_MAGIC &&
+            bootstrap_test_read(
+                (uint64_t)(uintptr_t)&task_state->private_memory_authority,
+                &authority, sizeof(authority)) && authority &&
+            fstat(TASK_STATE_FD, &backing) == 0 &&
+            backing.st_size == (off_t)sizeof(*task_state) &&
+            (uint64_t)backing.st_dev == task_state_device &&
+            (uint64_t)backing.st_ino == task_state_inode &&
+            base == task_start && info.size == task_size &&
+            info.type == DR_MEMTYPE_DATA &&
+            info.prot == (DR_MEMPROT_READ | DR_MEMPROT_WRITE),
+            "bootstrap-adjacent-occupied-owner-unavailable"))
+      return false;
+    dr_fprintf(diagnostic_file,
+        "PRIVATE_MEMORY_ADJACENCY known_unexported_task_state=1 base=%p size=%zu device=%llu inode=%llu\n",
+        info.base_pc, info.size, (unsigned long long)task_state_device,
+        (unsigned long long)task_state_inode);
+  }
+  for (uint32_t i = 0; i < current->count; ++i)
+    if (!private_memory_test_check(start + page <= current->ranges[i].start ||
+            current->ranges[i].end <= start,
+            "bootstrap-adjacent-page-overclaimed"))
+      return false;
+  return true;
+}
+
+static bool run_bootstrap_private_memory_route_test(
+    const private_memory_snapshot_t* current) {
+  bootstrap_test_image_t image;
+  if (!bootstrap_test_owned_image(current, &image))
+    return false;
+  reg_t left = image.loads[0].start;
+  reg_t right = 0;
+  reg_t page = dr_page_size();
+  for (size_t i = 0; i < image.count; ++i)
+    if (right < image.loads[i].end)
+      right = image.loads[i].end;
+  reg_t gap;
+  if (!private_memory_test_check(left >= page && right <= UINT64_MAX - page,
+          "bootstrap-route-address-bounds") ||
+      !private_memory_test_check(
+          bootstrap_test_free_page(right, &gap) ||
+              bootstrap_test_free_page(left - 1, &gap),
+          "bootstrap-physical-gap-unavailable"))
+    return false;
+  for (uint32_t i = 0; i < current->count; ++i)
+    if (!private_memory_test_check(
+            gap + page <= current->ranges[i].start ||
+                current->ranges[i].end <= gap,
+            "bootstrap-physical-gap-unowned"))
+      return false;
+  if (!bootstrap_test_adjacent(current, left - page, page) ||
+      !bootstrap_test_adjacent(current, right, page))
+    return false;
+  const struct {
+    const char* name;
+    int sysnum;
+    reg_t args[6];
+    uint32_t notifications;
+  } cases[] = {
+      {"bootstrap-left-edge", SYS_munmap, {left, 1}, 1},
+      {"bootstrap-right-edge", SYS_munmap, {right - 1, 1}, 1},
+      {"bootstrap-interior", SYS_munmap, {image.symbol, 1}, 1},
+      {"bootstrap-left-crossing", SYS_munmap, {left - 1, 2}, 1},
+      {"bootstrap-right-crossing", SYS_munmap, {right - 1, 2}, 1},
+      {"bootstrap-left-adjacent", SYS_munmap, {left - page, page}, 0},
+      {"bootstrap-right-adjacent", SYS_munmap, {right, page}, 0},
+      {"bootstrap-fixed-overlap", SYS_mmap, {left, page, 0, MAP_FIXED}, 1},
+      {"bootstrap-noreplace-overlap", SYS_mmap,
+          {left, page, 0, MAP_FIXED_NOREPLACE}, 0},
+      {"bootstrap-mremap-source", SYS_mremap, {left, page, page}, 1},
+      {"bootstrap-mremap-destination", SYS_mremap,
+          {gap, page, page, MREMAP_FIXED, left}, 1},
+      {"bootstrap-gap-unmap", SYS_munmap, {gap, page}, 0},
+      {"bootstrap-gap-fixed", SYS_mmap, {gap, page, 0, MAP_FIXED}, 0},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    private_memory_test_notifications = 0;
+    dr_set_private_reservation_retirement_callback(
+        count_private_memory_test_notification);
+    dr_test_private_reservation_syscall(cases[i].sysnum, cases[i].args);
+    dr_set_private_reservation_retirement_callback(retire_private_memory);
+    if (!private_memory_test_check(
+            private_memory_test_notifications == cases[i].notifications,
+            cases[i].name))
+      return false;
+    dr_fprintf(diagnostic_file,
+        "PRIVATE_MEMORY_BOOTSTRAP route=%s notifications=%u\n",
+        cases[i].name, private_memory_test_notifications);
+  }
+  dr_fprintf(diagnostic_file,
+      "PRIVATE_MEMORY_BOOTSTRAP routes=13 physical_gap=1\n");
+  return true;
 }
 
 static bool run_private_memory_route_test(
@@ -2066,6 +2234,10 @@ static bool run_private_memory_route_test(
         "PRIVATE_MEMORY_TEST route=%s notifications=%u\n",
         cases[i].name, private_memory_test_notifications);
   }
+  if (!run_private_memory_derivation_controls())
+    return false;
+  if (!run_bootstrap_private_memory_route_test(current))
+    return false;
   private_memory_snapshot_t output;
   memset(&output, 0xa5, sizeof(output));
   if (!private_memory_test_check(
@@ -2094,7 +2266,7 @@ static bool run_private_memory_self_test(void) {
   memset(&current, 0xa5, sizeof(current));
   if (!private_memory_test_check(
           runtime_private_memory(0, NULL, &current) == 1 &&
-              current.state == 1 && current.count > 0 && current.count <= 3 &&
+              current.state == 1 && current.count > 0 && current.count <= DR_PRIVATE_RESERVATION_MAX &&
               current.version > 0,
           "current-ready"))
     return false;
@@ -2104,6 +2276,45 @@ static bool run_private_memory_self_test(void) {
                 (i == 0 || current.ranges[i - 1].end <= current.ranges[i].start),
             "canonical-ranges"))
       return false;
+  // An imported DR code address belongs to the actual bootstrap image.
+  uint64_t bootstrap_pc = (uint64_t)(uintptr_t)dr_get_private_reservations;
+  bool bootstrap_covered = false;
+  for (uint32_t i = 0; i < current.count; ++i)
+    if (current.ranges[i].start <= bootstrap_pc &&
+        bootstrap_pc < current.ranges[i].end)
+      bootstrap_covered = true;
+  if (!private_memory_test_check(bootstrap_covered, "bootstrap-code-covered"))
+    return false;
+  dr_private_reservation_t exported[DR_PRIVATE_RESERVATION_MAX];
+  memset(exported, 0xa5, sizeof(exported));
+  size_t exported_count = dr_get_private_reservations(exported, DR_PRIVATE_RESERVATION_MAX);
+  if (!private_memory_test_check(exported_count == current.count,
+          "bootstrap-complete-export-count"))
+    return false;
+  for (size_t i = 0; i < DR_PRIVATE_RESERVATION_MAX; ++i) {
+    uint64_t start = (uint64_t)(uintptr_t)exported[i].start;
+    bool equal = i < exported_count
+        ? start == current.ranges[i].start &&
+            exported[i].size == current.ranges[i].end - current.ranges[i].start
+        : start == 0 && exported[i].size == 0;
+    if (!private_memory_test_check(equal, "bootstrap-complete-export-ranges"))
+      return false;
+  }
+  memset(exported, 0xa5, sizeof(exported));
+  if (!private_memory_test_check(
+          dr_get_private_reservations(exported, current.count - 1) == 0,
+          "bootstrap-small-capacity-refuses-whole"))
+    return false;
+  for (size_t i = 0; i + 1 < current.count; ++i)
+    if (!private_memory_test_check(exported[i].start == NULL && exported[i].size == 0,
+            "bootstrap-small-capacity-zero-output"))
+      return false;
+  bootstrap_test_image_t bootstrap;
+  if (!bootstrap_test_owned_image(&current, &bootstrap))
+    return false;
+  dr_fprintf(diagnostic_file,
+      "PRIVATE_MEMORY_BOOTSTRAP loads=%zu bss=%zu covered=1\n",
+      bootstrap.count, bootstrap.bss_count);
   private_memory_snapshot_t output;
   memset(&output, 0xa5, sizeof(output));
   if (!private_memory_test_check(
@@ -2151,10 +2362,10 @@ static bool private_ranges_contain(
 
 static void initialize_private_memory(
     const byte* preempt, const byte* signal, size_t page_size) {
-  dr_private_reservation_t regions[3] = {0};
+  dr_private_reservation_t regions[DR_PRIVATE_RESERVATION_MAX] = {0};
   private_memory_snapshot_t value = {0};
-  size_t count = dr_get_private_reservations(regions, 3);
-  bool ready = task_state_identity_valid && count > 0 && count <= 3;
+  size_t count = dr_get_private_reservations(regions, DR_PRIVATE_RESERVATION_MAX);
+  bool ready = task_state_identity_valid && count > 0 && count <= DR_PRIVATE_RESERVATION_MAX;
   for (size_t i = 0; ready && i < count; ++i) {
     uint64_t start = (uint64_t)(uintptr_t)regions[i].start;
     if (regions[i].size == 0 || start > UINT64_MAX - regions[i].size) {
@@ -7064,6 +7275,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
   bool test_direct_evidence_entry = false;
   bool test_runtime_abi_mismatch = false;
   bool test_runtime_abi12_mismatch = false;
+  bool test_runtime_abi13_mismatch = false;
   bool evidence_socket_seen = false;
   bool evidence_token_seen = false;
   unsigned char evidence_address[EVIDENCE_ADDRESS_LEN] = {0};
@@ -7080,6 +7292,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       test_runtime_abi_mismatch = true;
     else if (strcmp(argv[i], "-test-runtime-abi12-mismatch") == 0)
       test_runtime_abi12_mismatch = true;
+    else if (strcmp(argv[i], "-test-runtime-abi13-mismatch") == 0)
+      test_runtime_abi13_mismatch = true;
     else if (strcmp(argv[i], "-test-wait-for-background") == 0)
       test_wait_for_background = true;
     else if (strcmp(argv[i], "-test-delay-exec-helper-exit") == 0)
@@ -7110,6 +7324,11 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
         test_private_memory = PRIVATE_MEMORY_TEST_RETIRE;
       else if (strcmp(argv[i], "lost-exec") == 0)
         test_private_memory = PRIVATE_MEMORY_TEST_LOST_EXEC;
+      else if (strcmp(argv[i], "old-size-exec") == 0 ||
+               strcmp(argv[i], "old-magic-exec") == 0) {
+        test_private_memory = PRIVATE_MEMORY_TEST_LOST_EXEC;
+        test_private_memory_old_layout = strcmp(argv[i], "old-size-exec") == 0 ? 1 : 2;
+      }
       else if (strcmp(argv[i], "lost-exec-close-failure") == 0) {
         test_private_memory = PRIVATE_MEMORY_TEST_LOST_EXEC;
         test_private_memory_close_failure = true;
@@ -7166,6 +7385,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
     runtime_abi_version = 10;
   if (test_runtime_abi12_mismatch)
     runtime_abi_version = 12; // Same-size callback table, incompatible invoker signature.
+  if (test_runtime_abi13_mismatch)
+    runtime_abi_version = 13; // Same-size callback table, incompatible snapshot pointee.
   if (runtime_abi_version != REVERIE_DBT_RUNTIME_ABI_VERSION ||
       reverie_dbt_runtime_callbacks_size() != sizeof(runtime_callbacks_t)) {
     dr_fprintf(
@@ -7247,7 +7468,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
     else if (strcmp(argv[i], "-test-direct-evidence-entry") == 0) {
       /* Handled before application initialization. */
     } else if (strcmp(argv[i], "-test-runtime-abi-mismatch") == 0 ||
-               strcmp(argv[i], "-test-runtime-abi12-mismatch") == 0) {
+               strcmp(argv[i], "-test-runtime-abi12-mismatch") == 0 ||
+               strcmp(argv[i], "-test-runtime-abi13-mismatch") == 0) {
       /* Handled before application initialization. */
     } else if (strcmp(argv[i], "-test-private-memory") == 0) {
       ++i; /* Mode was checked before application initialization. */

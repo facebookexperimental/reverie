@@ -802,19 +802,25 @@ DR_API
 bool
 dr_memory_is_in_client(const byte *pc);
 
-/** One complete OS reservation owned by DynamoRIO's private heap manager. */
+/** One interval of authenticated DynamoRIO-owned pages. */
 typedef struct _dr_private_reservation_t {
     byte *start;
     size_t size;
 } dr_private_reservation_t;
 
+/** Maximum number of canonical private ownership intervals. */
+#define DR_PRIVATE_RESERVATION_MAX 8
+
 DR_API
 /**
- * Copies the fixed vmheap/vmcode reservations, including alignment padding and
- * any writable alias.  This is a bounded ownership subset, not an inventory of
- * client images or allocations outside those reservations.  Call during client
- * initialization, before application execution.  Returns zero if the output
- * cannot represent the complete subset.  Does not allocate or retain a lock.
+ * Copies the canonical union of vmheap/vmcode reservations (including alignment
+ * padding and any writable alias) and the authenticated bootstrap image's actual
+ * page-rounded PT_LOAD memory extents, including BSS. Gaps are not inferred to
+ * be owned. Other allocations outside those owners are not included. Call during
+ * client initialization, before application execution. Returns zero if bootstrap
+ * metadata is unavailable/invalid or the complete union cannot fit; never returns
+ * an arena-only prefix. The bounded output is zeroed even on failure. Does not
+ * allocate or retain a lock. Bootstrap header storage accepts at most 128 PHDRs.
  */
 size_t
 dr_get_private_reservations(dr_private_reservation_t *regions, size_t capacity);

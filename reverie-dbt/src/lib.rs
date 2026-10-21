@@ -159,7 +159,7 @@ fn acknowledge_tool_admission(context: usize) {
     }
 }
 
-/// Fixed native ownership-fact record used by ABI version 11.
+/// Fixed native ownership-fact record used by ABI version 14.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativePrivateMemorySnapshot {
@@ -169,10 +169,10 @@ pub struct NativePrivateMemorySnapshot {
     pub version: u64,
     /// One means ready; zero means explicitly unavailable.
     pub state: u32,
-    /// Number of initialized intervals, at most three.
+    /// Number of initialized intervals, at most eight.
     pub count: u32,
-    /// Whole reservation bounds, including OS alignment padding.
-    pub ranges: [[u64; 2]; 3],
+    /// Canonical arena reservations and authenticated bootstrap LOAD/BSS pages.
+    pub ranges: [[u64; 2]; 8],
 }
 
 /// Copies current facts when `expected` is null, otherwise validates that exact
@@ -195,7 +195,13 @@ pub fn install_runtime_private_memory(query: RuntimePrivateMemoryQuery) {
 fn decode_private_memory(
     native: NativePrivateMemorySnapshot,
 ) -> Option<reverie::RuntimePrivateMemorySnapshot> {
-    if native.state != 1 || native.count > 3 || native.version == 0 {
+    if native.state != 1 || native.count == 0 || native.count > 8 || native.version == 0 {
+        return None;
+    }
+    if native.ranges[native.count as usize..]
+        .iter()
+        .any(|range| *range != [0, 0])
+    {
         return None;
     }
     let mut regions = Vec::with_capacity(native.count as usize);
@@ -352,7 +358,10 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// at offset 72. It does not change the shared clock or timer contract.
 /// Version 13 adds the injection purpose as the syscall invoker's fourth
 /// argument. The callback table remains 80 bytes; version 12 is incompatible.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 13;
+/// Version 14 grows the private-memory snapshot from 96 to 176 bytes to carry
+/// eight ownership intervals. The callback table stays 80 bytes; an ABI-13
+/// producer cannot write or validate the new pointee layout.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 14;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -862,7 +871,7 @@ where
         let Some(query) = self.runtime_private_memory else {
             return false;
         };
-        if snapshot.regions.len() > 3 {
+        if snapshot.regions.is_empty() || snapshot.regions.len() > 8 {
             return false;
         }
         let mut expected = NativePrivateMemorySnapshot {
@@ -2898,7 +2907,16 @@ mod tests {
             version: 7,
             state: 1,
             count: 1,
-            ranges: [[0x1000, 0x3000], [0, 0], [0, 0]],
+            ranges: [
+                [0x1000, 0x3000],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+            ],
         };
         // SAFETY: this test obeys the fixed callback storage contract.
         unsafe {
@@ -2961,22 +2979,59 @@ mod tests {
             version: 1,
             state: 1,
             count: 2,
-            ranges: [[0x1000, 0x2000], [0x3000, 0x4000], [0, 0]],
+            ranges: [
+                [0x1000, 0x2000],
+                [0x3000, 0x4000],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+            ],
         };
         assert!(decode_private_memory(ready).is_some());
+        let mut full = ready;
+        full.count = 8;
+        for (i, range) in full.ranges.iter_mut().enumerate() {
+            *range = [0x1000 + i as u64 * 0x2000, 0x2000 + i as u64 * 0x2000];
+        }
+        assert_eq!(decode_private_memory(full).unwrap().regions.len(), 8);
+        let mut unused = ready;
+        unused.ranges[7] = [0x9000, 0xa000];
         for bad in [
+            unused,
             NativePrivateMemorySnapshot { state: 0, ..ready },
-            NativePrivateMemorySnapshot { count: 4, ..ready },
+            NativePrivateMemorySnapshot { count: 0, ..ready },
+            NativePrivateMemorySnapshot { count: 9, ..ready },
             NativePrivateMemorySnapshot {
                 version: 0,
                 ..ready
             },
             NativePrivateMemorySnapshot {
-                ranges: [[2, 1], [3, 4], [0, 0]],
+                ranges: [
+                    [2, 1],
+                    [3, 4],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
                 ..ready
             },
             NativePrivateMemorySnapshot {
-                ranges: [[1, 3], [2, 4], [0, 0]],
+                ranges: [
+                    [1, 3],
+                    [2, 4],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
                 ..ready
             },
         ] {
@@ -3190,7 +3245,7 @@ mod tests {
 
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 13);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 14);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
         assert_eq!(reverie_dbt_runtime_callbacks_size(), 80);
@@ -3206,7 +3261,7 @@ mod tests {
             64
         );
         assert_eq!(std::mem::size_of::<NativeControllerCaptureFact>(), 24);
-        assert_eq!(std::mem::size_of::<NativePrivateMemorySnapshot>(), 96);
+        assert_eq!(std::mem::size_of::<NativePrivateMemorySnapshot>(), 176);
         assert_eq!(
             DbtStartupMode::try_from(1).unwrap(),
             DbtStartupMode::Standalone

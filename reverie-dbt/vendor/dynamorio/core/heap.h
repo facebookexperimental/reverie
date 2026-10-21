@@ -154,6 +154,10 @@ vmcode_get_end(void);
 void
 iterate_vmm_regions(void (*cb)(byte *region_start, byte *region_end, void *user_data),
                     void *user_data);
+#define PRIVATE_RESERVATION_CAPACITY 8
+/* Initialization/teardown only. NULL withdraws the bootstrap owner's facts. */
+void
+heap_set_bootstrap_private_segments(byte **starts, size_t *sizes, size_t count);
 size_t
 heap_private_reservations(byte **starts, size_t *sizes, size_t capacity);
 void
