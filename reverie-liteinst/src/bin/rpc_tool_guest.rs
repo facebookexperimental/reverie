@@ -1486,6 +1486,50 @@ fn tool_sigtrap_default_guest(path: &Path) -> ! {
     panic!("a non-guard SIGTRAP did not take the default action");
 }
 
+/// LiteInst's SIGTRAP guard router is installed only where the image may
+/// publish sites, which is site patching on (A5 step 3c slice 0c): the guest
+/// leaves SIGTRAP at `prior` (`default` or `ignore`), installs the Tool, and
+/// prints the kernel's SIGTRAP action after installation, `router` for a
+/// handler returning through the runtime's private restorer or the guest's
+/// own `default` or `ignore`, with whether SIGTRAP is blocked and the
+/// site-patching setting the runtime captured.
+fn tool_sigtrap_action_guest(path: &Path, prior: &str) {
+    use reverie_inguest::signal::KernelSigaction;
+    use reverie_inguest::signal::SA_RESTORER;
+    use reverie_inguest::signal::raw_sigaction;
+    use reverie_inguest::signal::raw_sigprocmask;
+    use reverie_inguest::signal::signal_restorer;
+
+    let prior_handler = match prior {
+        "default" => libc::SIG_DFL,
+        "ignore" => libc::SIG_IGN,
+        other => panic!("unknown prior SIGTRAP action {other:?}"),
+    };
+    assert_ne!(
+        unsafe { libc::signal(libc::SIGTRAP, prior_handler) },
+        libc::SIG_ERR
+    );
+    unsafe { reverie_liteinst::install_tool::<CounterTool>(path) }.unwrap();
+    let mut action = KernelSigaction::default();
+    unsafe { raw_sigaction(libc::SIGTRAP, None, Some(&mut action)) }.unwrap();
+    let kernel = if action.handler == libc::SIG_DFL as u64 {
+        "default"
+    } else if action.handler == libc::SIG_IGN as u64 {
+        "ignore"
+    } else if action.flags & SA_RESTORER as u64 != 0 && action.restorer == signal_restorer() {
+        "router"
+    } else {
+        "other"
+    };
+    let mut mask = 0_u64;
+    unsafe { raw_sigprocmask(libc::SIG_BLOCK, None, Some(&mut mask)) }.unwrap();
+    let blocked = mask & (1_u64 << (libc::SIGTRAP - 1)) != 0;
+    println!(
+        "sigtrap-action prior={prior} kernel={kernel} blocked={blocked} site-patching={}",
+        reverie_liteinst::site_patching_enabled()
+    );
+}
+
 unsafe extern "C" fn guest_sigalrm_handler(_signal: libc::c_int) {}
 
 unsafe extern "C" fn other_guest_sigalrm_handler(_signal: libc::c_int) {}
@@ -3445,6 +3489,13 @@ fn main() {
             tool_guest_sigreturn_guest(Path::new(&path), true, true)
         }
         Some("tool-sigtrap-default") => tool_sigtrap_default_guest(Path::new(&path)),
+        Some("tool-sigtrap-action") => tool_sigtrap_action_guest(
+            Path::new(&path),
+            args.next()
+                .expect("prior SIGTRAP action")
+                .to_str()
+                .expect("UTF-8 prior SIGTRAP action"),
+        ),
         Some("instruction-guest") => {
             instruction_guest(Path::new(&path), InstructionPublication::Concurrent)
         }

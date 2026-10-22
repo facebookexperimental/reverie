@@ -107,6 +107,11 @@ static PAGE_SIZE: AtomicU64 = AtomicU64::new(0);
 static INSTALL_HELD: AtomicBool = AtomicBool::new(false);
 static PATCH_PUBLICATION: AtomicU8 = AtomicU8::new(PatchPublication::Concurrent as u8);
 static SITE_PATCHING_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Set when this image's Tool installation left LiteInst's SIGTRAP guard
+/// router out ([`GuardRouter::Omit`]): from then on no site may be published,
+/// since a publication plants guard breakpoints only the router takes
+/// (`install_site_hook` refuses).
+static GUARD_ROUTER_OMITTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) use reverie_inguest::guest::clock::enter_rcb_handler;
 #[cfg(feature = "exec-private-init")]
@@ -678,8 +683,9 @@ pub(crate) struct LiteinstPatchHost {
 
 // SAFETY: LiteinstPatcher keeps the Patcher contract (see its SAFETY
 // comment). The steps below are the code LiteInst's own installer runs at the
-// same points; the only handler they install, the SIGTRAP guard router, uses
-// the runtime's raw signal operations and private restorer.
+// same points; the only handler they install, the SIGTRAP guard router (with
+// site patching on only), uses the runtime's raw signal operations and private
+// restorer.
 unsafe impl PatchHost for LiteinstPatchHost {
     type Runtime = crate::tool_host::LiteinstRuntime;
 
@@ -729,7 +735,18 @@ unsafe impl PatchHost for LiteinstPatchHost {
 
     fn prepare_patcher(&self, vdso_sites: &[reverie::vdso::VdsoSyscallSite]) -> io::Result<()> {
         PATCH_PUBLICATION.store(self.publication as u8, Ordering::Release);
-        prepare_instrumentation(InstrumentationPreparation::Patcher)?;
+        // `select` has stored the captured site-patching setting. With it
+        // off, nothing in this image publishes a site (the vDSO gets trapping
+        // stubs and no hooks, `vdso_sites` is empty, and every syscall and
+        // instruction site stays unpatched), so no guard breakpoint is ever
+        // planted and the router has nothing to route: SIGTRAP stays the
+        // guest's (A5 step 3c slice 0c).
+        let router = if SITE_PATCHING_ENABLED.load(Ordering::Acquire) {
+            GuardRouter::Install
+        } else {
+            GuardRouter::Omit
+        };
+        prepare_instrumentation(InstrumentationPreparation::Patcher, router)?;
         install_vdso_sites(vdso_sites)
     }
 
@@ -801,7 +818,10 @@ fn install_runtime(
             "native trap preparation requires patching off and no vDSO hooks",
         ));
     }
-    prepare_instrumentation(preparation)?;
+    // The private-image (loader) installs and the strace and compat runtimes
+    // keep the router whatever the setting; only the shared Tool host's
+    // preparation omits it (`LiteinstPatchHost::prepare_patcher`).
+    prepare_instrumentation(preparation, GuardRouter::Install)?;
     install_vdso_sites(vdso_sites)?;
     #[cfg(feature = "exec-native-injection")]
     let (initial, before_frontend) = match initial {
@@ -1111,16 +1131,44 @@ fn discover_arena_aliases(
     }
 }
 
-fn prepare_instrumentation(preparation: InstrumentationPreparation) -> io::Result<()> {
+/// Whether [`prepare_instrumentation`] installs LiteInst2's SIGTRAP guard
+/// router.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GuardRouter {
+    /// Install it: the image may publish sites, whose guard breakpoints it
+    /// takes.
+    Install,
+    /// Leave SIGTRAP's action as the guest left it: the image publishes no
+    /// site (site patching off on the shared Tool host), and
+    /// `install_site_hook` refuses any publication.
+    Omit,
+}
+
+fn prepare_instrumentation(
+    preparation: InstrumentationPreparation,
+    router: GuardRouter,
+) -> io::Result<()> {
     crate::straddler::initialize_from_environment()?;
-    // Initialization retains the guard router for modes that may publish
-    // concurrently. Its SIGTRAP handler is installed through the runtime's
-    // raw signal operations so that it, like the SIGSYS and SIGSEGV handlers,
-    // returns through the runtime's private restorer.
-    // SAFETY: preparation runs single-threaded, before the syscall filter is
-    // installed, and the callbacks below meet `GuardSignalRuntime`'s contract.
-    unsafe { prepare_live_patching_with_signal_runtime(GUARD_SIGNAL_RUNTIME) }
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    match router {
+        GuardRouter::Install => {
+            // Initialization retains the guard router for modes that may
+            // publish concurrently. Its SIGTRAP handler is installed through
+            // the runtime's raw signal operations so that it, like the SIGSYS
+            // and SIGSEGV handlers, returns through the runtime's private
+            // restorer.
+            // SAFETY: preparation runs single-threaded, before the syscall
+            // filter is installed, and the callbacks below meet
+            // `GuardSignalRuntime`'s contract.
+            unsafe { prepare_live_patching_with_signal_runtime(GUARD_SIGNAL_RUNTIME) }
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        GuardRouter::Omit => {
+            // LiteInst2 would install the router lazily, in its standalone
+            // mode, at the first trap site; `install_site_hook`, the one path
+            // to a trap site, refuses from here on.
+            GUARD_ROUTER_OMITTED.store(true, Ordering::Release);
+        }
+    }
     prepare_instrumentation_state(preparation)
 }
 
@@ -2325,6 +2373,14 @@ unsafe fn install_site_hook(
     expected_instruction: &[u8],
     manage_protection: bool,
 ) -> Result<(), InstallFailure> {
+    // Every caller is gated on site patching, which is on wherever the router
+    // is installed; this keeps the invariant local. Nothing has been read or
+    // written yet.
+    if GUARD_ROUTER_OMITTED.load(Ordering::Acquire) {
+        return Err(InstallFailure::untouched(io::Error::other(
+            "LiteInst site publication without the SIGTRAP guard router",
+        )));
+    }
     // No guest code may run from the first check below to the completed
     // publication, whatever signal arrives; see AsyncSignalsBlocked.
     let _signals_blocked = AsyncSignalsBlocked::new().map_err(InstallFailure::touched)?;
@@ -3657,6 +3713,62 @@ mod tests {
     use super::SITE_PATCHING_ENABLED;
     use super::site_patching_enabled;
     use super::syscall_install_failure_ends_guest;
+
+    unsafe extern "C" fn unreachable_hook(_context: *mut liteinst2::trampoline::HookContext) {
+        unreachable!("a refused publication installs no hook");
+    }
+
+    // A5 step 3c slice 0c: once installation has left the SIGTRAP guard router
+    // out (site patching off), install_site_hook refuses before it reads or
+    // writes anything, so no guard breakpoint can be planted with no router to
+    // take it, and liteinst2 never installs one lazily. The refusal is
+    // untouched (the code is the original) and the slot keeps no trace.
+    #[test]
+    fn site_publication_without_the_guard_router_is_refused_untouched() {
+        use super::EntryProof;
+        use super::GUARD_ROUTER_OMITTED;
+        use super::PatchPublication;
+        use super::SiteHookPolicy;
+        use super::SiteSlot;
+        use super::install_site_hook;
+
+        // A syscall instruction in this test's own memory; no arena covers
+        // it, which would be a touched refusal if the guard did not come
+        // first.
+        let code: &'static [u8; 2] = Box::leak(Box::new([0x0f, 0x05]));
+        let slot: &'static SiteSlot = Box::leak(Box::new(SiteSlot::new()));
+        let previous = GUARD_ROUTER_OMITTED.swap(true, Ordering::AcqRel);
+        // SAFETY: the refusal returns before the address is read.
+        let result = unsafe {
+            install_site_hook(
+                code.as_ptr() as u64,
+                slot,
+                unreachable_hook,
+                SiteHookPolicy {
+                    publication: PatchPublication::Quiescent,
+                    entry_proof: EntryProof::NotListed,
+                    unpublished_read_write: false,
+                },
+                &[0x0f, 0x05],
+                false,
+            )
+        };
+        GUARD_ROUTER_OMITTED.store(previous, Ordering::Release);
+        let failure = result.expect_err("publication without the router must be refused");
+        assert!(failure.code_untouched, "{}", failure.error);
+        assert!(!failure.possibly_written, "{}", failure.error);
+        assert_eq!(
+            failure.error.to_string(),
+            "LiteInst site publication without the SIGTRAP guard router"
+        );
+        assert_eq!(*code, [0x0f, 0x05]);
+        assert_eq!(slot.state.load(Ordering::Acquire), 0);
+        assert_eq!(slot.instruction_len.load(Ordering::Acquire), 0);
+        assert_eq!(slot.mapping_end.load(Ordering::Acquire), 0);
+        assert!(!slot.publication_attempted.load(Ordering::Acquire));
+        assert!(slot.hook.load(Ordering::Acquire).is_null());
+        assert!(slot.adapter.load(Ordering::Acquire).is_null());
+    }
 
     // A syscall site's failed installation declines (the trap runs through
     // the fallback continuation) unless the jump may already be published:

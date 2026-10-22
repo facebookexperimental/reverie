@@ -807,20 +807,73 @@ fn installed_hook_reentry_bypasses_tool_with_shared_coordinator_rpc() {
     assert!(!not_admitted.status.success(), "{not_admitted:?}");
     assert!(not_admitted.stdout.is_empty(), "{not_admitted:?}");
 
-    let sigtrap_default = Command::new(binary)
-        .arg("tool-sigtrap-default")
-        .arg(&socket)
-        .output()
-        .unwrap();
-    {
-        use std::os::unix::process::ExitStatusExt;
+    // With site patching on (the default) the guard router takes this
+    // SIGTRAP and passes it to the default action; with it off no router is
+    // installed and the kernel's own default action ends the process.
+    for patching in ["1", "0"] {
+        let sigtrap_default = Command::new(binary)
+            .arg("tool-sigtrap-default")
+            .arg(&socket)
+            .env(reverie_liteinst::SITE_PATCHING_ENV, patching)
+            .output()
+            .unwrap();
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                sigtrap_default.status.signal(),
+                Some(libc::SIGTRAP),
+                "patching={patching} {sigtrap_default:?}"
+            );
+        }
         assert_eq!(
-            sigtrap_default.status.signal(),
-            Some(libc::SIGTRAP),
-            "{sigtrap_default:?}"
+            sigtrap_default.stdout, b"raising-sigtrap\n",
+            "patching={patching}"
         );
     }
-    assert_eq!(sigtrap_default.stdout, b"raising-sigtrap\n");
+
+    // A5 step 3c slice 0c: the runtime installs LiteInst's SIGTRAP guard
+    // router only with site patching on. With it off, SIGTRAP's action after
+    // installation is the one the guest left, default or ignored, and
+    // SIGTRAP is not left blocked.
+    for (patching, prior, expected) in [
+        (
+            None,
+            "default",
+            "sigtrap-action prior=default kernel=router blocked=false site-patching=true\n",
+        ),
+        (
+            Some("1"),
+            "ignore",
+            "sigtrap-action prior=ignore kernel=router blocked=false site-patching=true\n",
+        ),
+        (
+            Some("0"),
+            "default",
+            "sigtrap-action prior=default kernel=default blocked=false site-patching=false\n",
+        ),
+        (
+            Some("0"),
+            "ignore",
+            "sigtrap-action prior=ignore kernel=ignore blocked=false site-patching=false\n",
+        ),
+    ] {
+        let mut command = Command::new(binary);
+        command.arg("tool-sigtrap-action").arg(&socket).arg(prior);
+        match patching {
+            Some(value) => command.env(reverie_liteinst::SITE_PATCHING_ENV, value),
+            None => command.env_remove(reverie_liteinst::SITE_PATCHING_ENV),
+        };
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "patching={patching:?} prior={prior} {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "patching={patching:?} prior={prior} {output:?}"
+        );
+    }
 
     let mut instruction_positives = 0;
     let mut instruction_refusals = 0;
