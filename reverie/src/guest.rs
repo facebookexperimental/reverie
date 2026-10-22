@@ -922,6 +922,23 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         Err(MaskChangeRefused::Unsupported)
     }
 
+    /// The signal mask the guest thread runs under when this callback
+    /// returns to its code, bit `n - 1` for signal `n`, from a backend whose
+    /// runtime runs with a mask of its own while it handles the guest's
+    /// event: the kernel's current mask is then the runtime's, and the
+    /// guest's is the one the runtime saved and puts back at its return.
+    /// Inside a mask-swapping syscall (`rt_sigsuspend`, `ppoll`, `pselect6`,
+    /// `epoll_pwait`) whose temporary mask governs the wait, it is that
+    /// temporary mask. It reads only the backend's own record, never the
+    /// kernel, and changes nothing.
+    ///
+    /// `None` from a backend whose kernel mask at the event is the guest's
+    /// own, and from one that does not keep the guest's mask apart (the
+    /// default).
+    fn resume_signal_mask(&self) -> Option<u64> {
+        None
+    }
+
     /// Like [`Guest::inject`], but will retry the syscall if `EINTR` or
     /// `ERESTARTSYS` are returned.
     ///
@@ -1393,6 +1410,10 @@ where
 
     async fn set_blocked_signals(&mut self, mask: u64) -> Result<u64, MaskChangeRefused> {
         self.inner.set_blocked_signals(mask).await
+    }
+
+    fn resume_signal_mask(&self) -> Option<u64> {
+        self.inner.resume_signal_mask()
     }
 
     fn set_timer(&mut self, sched: TimerSchedule) -> Result<(), Error> {

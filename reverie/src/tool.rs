@@ -926,7 +926,16 @@ pub trait Tool: Send + Sync + Default {
     ///    kernel delivers them (the read's predicted order), and
     ///    [`Tool::withdraw_signal_event`], in any order, for each other one.
     ///    It settles every announcement, and makes no other Tool call between
-    ///    the final read and the return.
+    ///    the final read and the return, with one exception: when the read
+    ///    predicts that a delivery at this return ends the thread group (a
+    ///    default-fatal signal; [`crate::predict_deliveries`]), the backend
+    ///    first withdraws every announcement behind that delivery, which the
+    ///    kernel will never make, then commits the ones before it and the
+    ///    fatal one itself in order, then calls
+    ///    [`Tool::exit_for_predicted_death`] once with the death's status,
+    ///    and then runs the thread's exit lifecycle (the exit callbacks with
+    ///    that status). Nothing else is called before the return, at which
+    ///    the kernel ends the group.
     /// 4. Any `Err` from either half ends the run: the backend fails closed.
     ///    Two errors from an announcement tell the backend why, so that it
     ///    can name the refusal:
@@ -948,10 +957,20 @@ pub trait Tool: Send + Sync + Default {
     /// [`Tool::handle_signal_event`] or [`Tool::handle_raw_signal_event`]
     /// instead, and never these.
     ///
-    /// A Tool opts in by implementing all three hooks. The default checks the
-    /// signal's range, then refuses with `EOPNOTSUPP`: a delivery reported
-    /// whole cannot be split without the Tool's knowledge of which of its
-    /// effects only a delivery justifies.
+    /// A Tool opts in by implementing every method the protocol uses:
+    /// - this hook, [`Tool::commit_signal_event`] and
+    ///   [`Tool::withdraw_signal_event`], for every two-phase delivery;
+    /// - [`Tool::exit_for_predicted_death`], for a final read that predicts
+    ///   the thread group's death (step 3), whose default refuses with
+    ///   `EOPNOTSUPP` and so ends such a run;
+    /// - [`Tool::in_guest_signal_delivery`], answering `true` for the
+    ///   configuration, for an in-guest backend to deliver signals from its
+    ///   runtime at all; its default answers `false`, and the backend then
+    ///   keeps its existing delivery.
+    ///
+    /// The default of this hook checks the signal's range, then refuses with
+    /// `EOPNOTSUPP`: a delivery reported whole cannot be split without the
+    /// Tool's knowledge of which of its effects only a delivery justifies.
     async fn announce_signal_event<T: Guest<Self>>(
         &self,
         _guest: &mut T,
@@ -984,6 +1003,39 @@ pub trait Tool: Send + Sync + Default {
         _thread_state: &mut Self::ThreadState,
         _announcement: crate::SignalAnnouncement,
     ) {
+    }
+
+    /// Called once, after the commits of a final read that predicts the
+    /// thread group's death at the runtime's return
+    /// ([`Tool::announce_signal_event`], step 3): the last committed delivery
+    /// is default-fatal, and `status` names the signal it dies of
+    /// ([`crate::PredictionEnd::Death`]). `status` is not a wait status and
+    /// must not be forwarded as one: its core flag is always false, because
+    /// whether a core is written is known only when the kernel has tried
+    /// (whether the default action asks for one is
+    /// [`crate::PredictedAction::Fatal`]'s `core_dump`); the wait status a
+    /// parent sees comes from the kernel at the reap. The backend has already
+    /// withdrawn every announcement behind that delivery.
+    ///
+    /// The Tool makes the death a scheduled one: it may keep the turn it
+    /// holds and file the requests that end the group, so that no other
+    /// guest thread runs between the decision and the end. The hook may wait
+    /// for the Tool's schedule. After it returns, the backend runs the
+    /// thread's exit lifecycle (the exit callbacks with `status`, then the
+    /// thread's end) and returns to guest code, where the kernel ends the
+    /// group; it calls no other Tool hook in between.
+    ///
+    /// Any `Err` ends the run: the backend fails closed. `EOPNOTSUPP` means
+    /// the Tool has not opted in, as for the announcement, so the backend can
+    /// name that refusal; a Tool that implements the hook never returns it.
+    /// The default refuses with `EOPNOTSUPP`. Only a backend that reports
+    /// deliveries in two phases calls it.
+    async fn exit_for_predicted_death<T: Guest<Self>>(
+        &self,
+        _guest: &mut T,
+        _status: ExitStatus,
+    ) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
     }
 
     /// Decides whether a signal that the backend passes to the guest without
@@ -1034,6 +1086,24 @@ pub trait Tool: Send + Sync + Default {
     /// not while its gdbserver is attached. The default wants none, so a
     /// backend adds no stop.
     fn observes_sigreturns(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
+        false
+    }
+
+    /// Whether this Tool, known from configuration alone, takes an in-guest
+    /// backend's own signal delivery: while its runtime runs, the runtime
+    /// blocks every signal it does not reserve, and at each return to guest
+    /// code it predicts the kernel's deliveries
+    /// ([`crate::predict_deliveries`]), reports them in two phases
+    /// ([`Tool::announce_signal_event`]), and makes a predicted death a
+    /// scheduled one ([`Tool::exit_for_predicted_death`]). Such a backend
+    /// reads it once, when its runtime starts in a process, and keeps its
+    /// existing delivery when it does not hold.
+    ///
+    /// A Tool answers `true` only for a configuration in which it can keep
+    /// that whole protocol, for every thread of the run. The default answers
+    /// `false`, so a backend keeps its existing delivery. The ptrace backend,
+    /// whose kernel delivers at its own stops, never reads it.
+    fn in_guest_signal_delivery(_config: &<Self::GlobalState as GlobalTool>::Config) -> bool {
         false
     }
 
@@ -1200,9 +1270,13 @@ pub trait Tool: Send + Sync + Default {
     /// core-dump flag of [`ExitStatus::Signaled`] is a prediction from the
     /// inputs Linux checks before it writes a core (the signal's default
     /// action, the dumpable mode, `RLIMIT_CORE` and `core_pattern`); the
-    /// kernel's own flag differs when its write of the core fails. A Tool must
-    /// not rely on that flag from such a backend. The same holds for
-    /// [`Tool::on_exit_process`].
+    /// kernel's own flag differs when its write of the core fails. For a
+    /// death a backend's final read predicts
+    /// ([`Tool::exit_for_predicted_death`]: a default-fatal delivery at its
+    /// runtime's return), the signal is exact and the core-dump flag is
+    /// always false, whatever the default action asks for
+    /// ([`crate::PredictionEnd::Death`]). A Tool must not rely on that flag
+    /// from such a backend. The same holds for [`Tool::on_exit_process`].
     ///
     /// # Signals a Tool sends its own guest, under an in-guest backend
     ///

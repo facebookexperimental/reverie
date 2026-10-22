@@ -275,6 +275,32 @@ fn two_phase_defaults_refuse_as_not_opted_in() {
     assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
 }
 
+/// A Tool that has not opted in to in-guest delivery refuses a predicted
+/// death through the trait's default with `EOPNOTSUPP`, for a signal nix can
+/// name and a realtime one, and its configuration predicate answers no; a
+/// backend that keeps no separate guest mask answers none.
+#[test]
+fn in_guest_delivery_defaults_refuse_and_answer_no() {
+    let mut guest = TestGuest::default();
+    let tool = LegacyTool::default();
+    for status in [
+        reverie::ExitStatus::signaled(libc::SIGTERM, false),
+        reverie::ExitStatus::signaled(libc::SIGQUIT, false),
+        reverie::ExitStatus::signaled(40, false),
+    ] {
+        assert_eq!(
+            ready(tool.exit_for_predicted_death(&mut guest, status)),
+            Err(Errno::EOPNOTSUPP),
+        );
+    }
+    assert!(!<LegacyTool as Tool>::in_guest_signal_delivery(&()));
+    assert_eq!(
+        <TestGuest as Guest<LegacyTool>>::resume_signal_mask(&guest),
+        None
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn legacy_bridge_preserves_unchanged_event_bytes_and_suppression() {
     let input = event(libc::SIGUSR1);
