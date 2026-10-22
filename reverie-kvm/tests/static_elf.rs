@@ -3200,11 +3200,6 @@ int main(int argc, char **argv) {
 
     EXPECT_ERROR(write(descriptor, "x", 1), EBADF);
     EXPECT_ERROR(syscall(SYS_pwrite64, descriptor, "x", 1, 0), ESPIPE);
-    int cmdline = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
-    CHECK(cmdline >= 0);
-    EXPECT_ERROR(syscall(SYS_pwrite64, cmdline, "x", 1, 0), EBADF);
-    EXPECT_ERROR(syscall(SYS_pwrite64, cmdline, "x", 0, (off_t)-1), EINVAL);
-    CHECK(close(cmdline) == 0);
     EXPECT_ERROR(ftruncate(descriptor, 0), EINVAL);
     EXPECT_ERROR(syscall(SYS_fallocate, descriptor, 0, 0, 1), EBADF);
     /* KVM leaves the identity calls to the Tool (Detcore answers root); a
@@ -3702,7 +3697,7 @@ static int enumeration(int descriptor, int guest) {
 }
 
 static int contents(int descriptor, int baseline, int guest) {
-    const char *paths[] = {"self/maps", "self/cmdline"};
+    const char *paths[] = {"self/maps"};
     for (unsigned index = 0; index < sizeof(paths) / sizeof(paths[0]); ++index) {
         int actual = openat(descriptor, paths[index], O_RDONLY);
         int expected = openat(baseline, paths[index], O_RDONLY);

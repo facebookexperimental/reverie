@@ -9344,17 +9344,17 @@ fn pwrite64(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i
     let Some(file) = state.files.get(&fd) else {
         return negative_errno(libc::EBADF);
     };
-    if let Some(&inode) = state
+    if state
         .proc_files
         .get(&fd)
-        .filter(|inode| !is_synthetic_proc_directory_inode(**inode))
+        .is_some_and(|inode| !is_synthetic_proc_directory_inode(*inode))
     {
-        // Regular procfs files do not support positioned writes. After the
-        // global signed-offset check, O_PATH access precedes the path-specific
-        // procfs refusal.
+        // The remaining regular procfs files are seq_files, which Linux opens
+        // without FMODE_PWRITE (ESPIPE). After the global signed-offset
+        // check, O_PATH access precedes that refusal.
         return match file_status_flags(file) {
             Ok(status) if status & libc::O_PATH != 0 => negative_errno(libc::EBADF),
-            Ok(_) => negative_errno(synthetic_proc_pwrite_errno(inode)),
+            Ok(_) => negative_errno(libc::ESPIPE),
             Err(error) => error,
         };
     }
@@ -17495,11 +17495,16 @@ const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 // regression test carried AUTONOMOUS-BOT-IMPLEMENTED and
 // TODO-HUMAN-REVIEW(PR-225) (the mountinfo surface added for df), a review
 // that now applies to Detcore's rendering.
+// /proc/self/cmdline followed, once Detcore rendered every process's own
+// command line from its memory by Linux's get_mm_cmdline rule, at the
+// argument area it reads from each image's initial stack (package K slice
+// D4b). Its KVM copy (this table's entry, argv[0] and a NUL from the loader's
+// argv0, and the positioned-write EBADF that a read-only open of a plain
+// procfs file gives) carried no marker.
 const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] = &[
     b"/proc/locks",
     b"/proc/self/stat",
     b"/proc/self/status",
-    b"/proc/self/cmdline",
     b"/proc/self/maps",
 ];
 
@@ -17528,17 +17533,6 @@ fn synthetic_proc_path_for_inode(inode: u64) -> Option<&'static [u8]> {
 
 fn is_synthetic_proc_directory_inode(inode: u64) -> bool {
     inode == synthetic_proc_inode(b"/proc")
-}
-
-fn synthetic_proc_pwrite_errno(inode: u64) -> libc::c_int {
-    if [b"/proc/self/cmdline".as_slice()]
-        .iter()
-        .any(|path| synthetic_proc_inode(path) == inode)
-    {
-        libc::EBADF
-    } else {
-        libc::ESPIPE
-    }
 }
 
 fn is_synthetic_proc_directory(state: &LoadedStaticElf, path: &[u8]) -> bool {
@@ -17638,7 +17632,6 @@ fn synthetic_proc_content(state: &LoadedStaticElf, path: &[u8]) -> Option<Vec<u8
         b"/proc/locks" => proc_locks_content(state),
         b"/proc/self/stat" => proc_self_stat_content(state),
         b"/proc/self/status" => proc_self_status_content(state),
-        b"/proc/self/cmdline" => proc_self_cmdline_content(state),
         b"/proc/self/maps" => proc_self_maps_content(state),
         _ => return None,
     };
@@ -17681,16 +17674,6 @@ fn proc_locks_content(state: &LoadedStaticElf) -> Vec<u8> {
 #[cfg(test)]
 fn proc_comm(state: &LoadedStaticElf) -> Vec<u8> {
     ProcessProcView::of(state).comm()
-}
-
-fn proc_self_cmdline_content(state: &LoadedStaticElf) -> Vec<u8> {
-    // Minimal: argv[0] followed by a NUL. reverie-kvm does not retain the full
-    // guest argv here, so consumers needing the complete command line get only
-    // argv[0]; the common "who am I" use is satisfied and the file is
-    // NUL-terminated like the kernel's.
-    let mut content = state.argv0.clone();
-    content.push(0);
-    content
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED: Expose only the deterministic guest stack map.
@@ -24608,7 +24591,8 @@ mod tests {
         memory.write(BUFFER, b"x").unwrap();
         for &path in SYNTHETIC_REGULAR_PROC_PATHS {
             let path = std::str::from_utf8(path).unwrap();
-            let expected = synthetic_proc_pwrite_errno(synthetic_proc_inode(path.as_bytes()));
+            // Every remaining surface is a seq_file: no positioned writes.
+            let expected = libc::ESPIPE;
             let native = std::fs::File::open(path).unwrap();
             for (count, offset, expected_errno) in
                 [(1, 0, expected), (0, 0, expected), (0, -1, libc::EINVAL)]
@@ -27042,9 +27026,6 @@ mod tests {
             String::from_utf8_lossy(&stat)
         );
 
-        let fd = open_readonly(&mut memory, &mut state, "/proc/self/cmdline");
-        assert_eq!(read_fd_to_end(&mut memory, &mut state, fd), b"test\0");
-
         let fd = open_readonly(&mut memory, &mut state, "/proc/self/status");
         let status = String::from_utf8(read_fd_to_end(&mut memory, &mut state, fd)).unwrap();
         assert!(status.contains("Name:\ttest\n"), "{status}");
@@ -27067,12 +27048,11 @@ mod tests {
         let fd = open_readonly(&mut memory, &mut state, "/proc/self/status");
         let status = String::from_utf8(read_fd_to_end(&mut memory, &mut state, fd)).unwrap();
         assert!(status.contains("Name:\tworker-name\n"), "{status}");
-        let fd = open_readonly(&mut memory, &mut state, "/proc/self/cmdline");
-        assert_eq!(read_fd_to_end(&mut memory, &mut state, fd), b"test\0");
 
         // /proc/<pid> aliases /proc/self for this guest's own pid.
-        let fd = open_readonly(&mut memory, &mut state, "/proc/1/cmdline");
-        assert_eq!(read_fd_to_end(&mut memory, &mut state, fd), b"test\0");
+        let fd = open_readonly(&mut memory, &mut state, "/proc/1/stat");
+        let stat = String::from_utf8(read_fd_to_end(&mut memory, &mut state, fd)).unwrap();
+        assert!(stat.starts_with("1 (worker-name) R 0 "), "{stat}");
     }
 
     #[test]
@@ -64587,10 +64567,6 @@ mod tests {
         assert_eq!(
             crate::elf::initial_thread_name(Path::new("somewhere/alias-name")),
             *b"alias-name\0\0\0\0\0\0"
-        );
-        assert_eq!(
-            proc_self_cmdline_content(&state),
-            b"chosen/argv-zero\0".to_vec()
         );
     }
 
