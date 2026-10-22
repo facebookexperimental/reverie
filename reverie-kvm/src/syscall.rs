@@ -122,15 +122,21 @@ impl SyscallRequest {
     pub(crate) fn read_from(memory: &GuestMemory, guest_address: u64) -> Result<Self> {
         let mut frame = [0; FRAME_SIZE];
         memory.read_raw(guest_address, &mut frame)?;
+        Ok(Self::from_frame(&frame))
+    }
+
+    /// Decodes the request words of a transport frame already copied out of
+    /// guest memory, exactly as [`Self::read_from`] decodes the copy it makes.
+    pub(crate) fn from_frame(frame: &[u8; FRAME_SIZE]) -> Self {
         let mut words = [0; REQUEST_WORDS];
         for (index, value) in words.iter_mut().enumerate() {
             let start = index * WORD_SIZE;
             *value = u64::from_le_bytes(frame[start..start + WORD_SIZE].try_into().unwrap());
         }
-        Ok(Self::new(
+        Self::new(
             words[0],
             [words[1], words[2], words[3], words[4], words[5], words[6]],
-        ))
+        )
     }
 
     pub(crate) fn write_result(

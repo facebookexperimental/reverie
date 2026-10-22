@@ -187,7 +187,28 @@ impl EntryDriverWatch {
 /// An EntryDriverWatch's sticky check, on borrowed parts: a driver's owner
 /// and its gate. KvmBackend::check_entry_owner runs it several times per
 /// guest syscall without building and dropping a watch each time.
+///
+/// Nearly always there is nothing to report, so this first reads the three
+/// flags the full check reads first, in the same order: whether the owner
+/// has pending failures, whether the gate has recorded a failure, and the
+/// owner's lifecycle. When all three are clear the full check can only return
+/// Ok, so return it here, inlined, without the full check's frame and the
+/// large Result values its fold moves. Otherwise run the full check, which
+/// observes all three again.
+#[inline]
 pub(crate) fn check_entry(owner: Option<&DriverOwner>, gate: &EntryGate) -> Result<()> {
+    if owner.is_none_or(|owner| !owner.has_pending())
+        && !gate.failure_recorded()
+        && owner.is_none_or(|owner| owner.lifecycle() == DriverLifecycle::Active)
+    {
+        return Ok(());
+    }
+    check_entry_observed(owner, gate)
+}
+
+#[cold]
+#[inline(never)]
+fn check_entry_observed(owner: Option<&DriverOwner>, gate: &EntryGate) -> Result<()> {
     let owned = owner.map(DriverOwner::pending).unwrap_or_default();
     let result = fold_causes(Ok(()), owned.iter().flat_map(|failure| failure.causes()));
     let result = match gate.pending_failure() {

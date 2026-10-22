@@ -46,6 +46,7 @@ struct RetirementWitness {
 }
 
 impl RetirementWitness {
+    #[inline]
     fn lifecycle(&self) -> DriverLifecycle {
         match self.lifecycle.load(Ordering::Acquire) {
             value if value == DriverLifecycle::Active as u8 => DriverLifecycle::Active,
@@ -248,8 +249,16 @@ impl Drop for DriverScope {
 }
 
 impl DriverOwner {
+    #[inline]
     pub(crate) fn lifecycle(&self) -> DriverLifecycle {
         self.state.witness.lifecycle()
+    }
+
+    /// Whether [`Self::pending`] may be nonempty: the flag it reads first.
+    /// False means `pending` would return an empty list.
+    #[inline]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.state.has_pending.load(Ordering::Acquire)
     }
 
     /// Subscribe before rechecking pending causes or lifecycle. Readiness,

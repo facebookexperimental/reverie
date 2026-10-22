@@ -314,6 +314,20 @@ pub(crate) fn configure_user_segments(vcpu: &VcpuFd) -> Result<()> {
     Ok(())
 }
 
+/// The frame words a syscall return reads: 1 through SAVED_RBX_WORD.
+const RETURN_FIRST_WORD: usize = 1;
+const RETURN_LAST_WORD: usize = SAVED_RBX_WORD;
+const _: () = assert!(
+    RETURN_FIRST_WORD <= RETURN_RIP_WORD
+        && RETURN_RIP_WORD <= RETURN_LAST_WORD
+        && RETURN_FIRST_WORD <= RETURN_FLAGS_WORD
+        && RETURN_FLAGS_WORD <= RETURN_LAST_WORD
+        && 6 <= RETURN_LAST_WORD
+);
+const RETURN_WORDS_BYTES: usize =
+    (RETURN_LAST_WORD - RETURN_FIRST_WORD + 1) * std::mem::size_of::<u64>();
+type ReturnWords = [u8; RETURN_WORDS_BYTES];
+
 /// Reconstructs the userspace register file stopped at a syscall boundary.
 ///
 /// The live vCPU is executing the ring-zero VMCALL trampoline, which has
@@ -321,7 +335,7 @@ pub(crate) fn configure_user_segments(vcpu: &VcpuFd) -> Result<()> {
 /// those registers and for the userspace return RIP and RFLAGS.
 pub(crate) fn process_syscall_return_registers(
     memory: &GuestMemory,
-    mut registers: kvm_bindings::kvm_regs,
+    registers: kvm_bindings::kvm_regs,
     syscall_frame_address: u64,
     result: i64,
     stack_pointer: Option<u64>,
@@ -329,22 +343,55 @@ pub(crate) fn process_syscall_return_registers(
     // One guest-memory copy for the whole span, words 1 through
     // SAVED_RBX_WORD: each copy is admitted against the entry gate, and nine
     // separate word reads cost a quarter of a KVM guest syscall.
-    const FIRST: usize = 1;
-    const LAST: usize = SAVED_RBX_WORD;
-    const _: () = assert!(
-        FIRST <= RETURN_RIP_WORD
-            && RETURN_RIP_WORD <= LAST
-            && FIRST <= RETURN_FLAGS_WORD
-            && RETURN_FLAGS_WORD <= LAST
-            && 6 <= LAST
-    );
-    let mut frame = [0u8; (LAST - FIRST + 1) * std::mem::size_of::<u64>()];
+    let mut frame: ReturnWords = [0; RETURN_WORDS_BYTES];
     memory.read_raw(
-        frame_word_address_u64(syscall_frame_address, FIRST),
+        frame_word_address_u64(syscall_frame_address, RETURN_FIRST_WORD),
         &mut frame,
     )?;
+    Ok(return_registers_from_words(
+        &frame,
+        registers,
+        result,
+        stack_pointer,
+    ))
+}
+
+/// [`process_syscall_return_registers`] followed by
+/// [`crate::SyscallRequest::write_result`]'s store of `result` into the
+/// frame's result word, under one entry-gate admission instead of two. The
+/// read precedes the store, a read error or a failure recorded or deferred
+/// after the read returns before the store, and the store writes the same
+/// eight bytes at the same address; see [`GuestMemory::read_then_write_raw`].
+pub(crate) fn process_syscall_return_registers_storing_result(
+    memory: &GuestMemory,
+    registers: kvm_bindings::kvm_regs,
+    syscall_frame_address: u64,
+    result: i64,
+    stack_pointer: Option<u64>,
+) -> Result<kvm_bindings::kvm_regs> {
+    let mut frame: ReturnWords = [0; RETURN_WORDS_BYTES];
+    memory.read_then_write_raw(
+        frame_word_address_u64(syscall_frame_address, RETURN_FIRST_WORD),
+        &mut frame,
+        frame_word_address_u64(syscall_frame_address, RESULT_WORD),
+        &result.to_le_bytes(),
+    )?;
+    Ok(return_registers_from_words(
+        &frame,
+        registers,
+        result,
+        stack_pointer,
+    ))
+}
+
+fn return_registers_from_words(
+    frame: &ReturnWords,
+    mut registers: kvm_bindings::kvm_regs,
+    result: i64,
+    stack_pointer: Option<u64>,
+) -> kvm_bindings::kvm_regs {
     let word = |index: usize| {
-        let start = (index - FIRST) * std::mem::size_of::<u64>();
+        let start = (index - RETURN_FIRST_WORD) * std::mem::size_of::<u64>();
         u64::from_le_bytes(frame[start..start + 8].try_into().unwrap())
     };
     let return_rip = word(RETURN_RIP_WORD);
@@ -364,7 +411,7 @@ pub(crate) fn process_syscall_return_registers(
     if let Some(stack_pointer) = stack_pointer {
         registers.rsp = stack_pointer;
     }
-    Ok(registers)
+    registers
 }
 
 // TODO-HUMAN-REVIEW(PR-172): Review syscall-frame selection for concurrent vCPUs.

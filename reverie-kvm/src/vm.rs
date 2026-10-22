@@ -1303,6 +1303,57 @@ fn normalize_completed_syscall_boundary_registers_with_read(
     Ok(registers)
 }
 
+/// What a syscall exit's first guest-memory copy read: the whole transport
+/// frame, and, in the same entry-gate admission, the syscall trampoline's
+/// hypercall instruction, which the exit's completed boundary checks when the
+/// syscall goes to a Tool callback. Both used to be copied twice per exit, by
+/// separate admissions: the frame when the request was decoded and again,
+/// with the instruction, when the boundary was captured.
+///
+/// The bytes stand in for the boundary's second copy only through
+/// [`CompletedSyscallBoundary::capture_admitted_reusing`], and only when the
+/// gate shows that no mapping publication has happened since they were read
+/// (see [`crate::entry::EntryGate::admit_operation_unchanged`]). No host code
+/// writes them in between: the frame and the trampoline's hypercall bytes
+/// are written only by this thread's own backend, which writes neither
+/// between the two reads. Guest code on another vCPU could store to them
+/// (the boot area is mapped writable for the guest), but the gate never
+/// orders guest stores against host copies (it admits copies while vCPUs
+/// run), so such a store races the second copy as much as the first, and
+/// reusing the first read is the outcome in which the store landed after
+/// the second.
+pub(crate) struct SyscallExitRead {
+    frame_address: u64,
+    frame: [u8; FRAME_SIZE],
+    hypercall_address: u64,
+    /// None when the attempted read failed; the boundary then copies again.
+    hypercall: Option<[u8; 3]>,
+    generation: crate::entry::MappingGeneration,
+}
+
+impl SyscallExitRead {
+    /// Serves the boundary capture's two reads from these bytes. Any other
+    /// read, which the capture never makes, is refused rather than guessed.
+    fn read(&self, address: u64, destination: &mut [u8]) -> Result<()> {
+        if address == self.frame_address && destination.len() == FRAME_SIZE {
+            destination.copy_from_slice(&self.frame);
+            return Ok(());
+        }
+        match self.hypercall {
+            Some(hypercall)
+                if address == self.hypercall_address && destination.len() == hypercall.len() =>
+            {
+                destination.copy_from_slice(&hypercall);
+                Ok(())
+            }
+            _ => Err(Error::UnexpectedVcpuExit(format!(
+                "syscall exit read cannot serve {} bytes at {address:#x}",
+                destination.len()
+            ))),
+        }
+    }
+}
+
 /// Exact reusable state for a syscall transport whose KVM hypercall has
 /// already been acknowledged but whose ring-zero return path has not run.
 ///
@@ -1368,6 +1419,52 @@ impl CompletedSyscallBoundary {
     ) -> Result<Option<Self>> {
         backend
             .prepare_action_read(stop, |backend, access| {
+                Self::capture_with_read(
+                    backend,
+                    frame_address,
+                    action_return_registers,
+                    |address, bytes| access.read_raw(address, bytes),
+                )
+            })
+            .await
+    }
+
+    /// [`Self::capture_admitted`], using the bytes the exit's first copy
+    /// already read instead of copying them again, when the gate permits it.
+    /// `exit` is reused only if it was read through this backend's own
+    /// mapping (the same entry gate), covers exactly the frame and hypercall
+    /// this capture reads, and the gate still admits at the generation the
+    /// read saw; otherwise this is `capture_admitted`, unchanged.
+    pub(crate) async fn capture_admitted_reusing(
+        backend: &mut KvmBackend,
+        frame_address: u64,
+        action_return_registers: Option<kvm_regs>,
+        stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
+        exit: Option<(&SyscallExitRead, &GuestMemory)>,
+    ) -> Result<Option<Self>> {
+        let hypercall_address = syscall_hypercall_address(
+            backend.hypercall_instruction,
+            backend.syscall_trampoline_address,
+            backend.syscall_frame_address,
+        );
+        let reuse = exit.filter(|(exit, memory)| {
+            exit.frame_address == frame_address
+                && exit.hypercall_address == hypercall_address
+                && exit.hypercall.is_some()
+                && Arc::ptr_eq(memory.entry_gate_ref(), backend.memory.entry_gate_ref())
+        });
+        let reused = reuse.map(|(exit, _)| {
+            (exit.generation, move |backend: &KvmBackend| {
+                Self::capture_with_read(
+                    backend,
+                    frame_address,
+                    action_return_registers,
+                    |address, bytes| exit.read(address, bytes),
+                )
+            })
+        });
+        backend
+            .prepare_action_read_or_reuse(stop, reused, |backend, access| {
                 Self::capture_with_read(
                     backend,
                     frame_address,
@@ -2479,14 +2576,77 @@ impl KvmBackend {
         self.pending_segment = None;
     }
 
+    /// Reads a syscall exit's transport frame and decodes its request, as
+    /// [`SyscallRequest::read_from`] does, and in the same admission also
+    /// reads the trampoline's hypercall instruction, which the exit's
+    /// completed boundary checks if a Tool callback follows (see
+    /// [`SyscallExitRead`]). The frame read and its errors are exactly
+    /// `read_from`'s; the extra read is only an attempt, and its failure
+    /// changes nothing but leaves the boundary to copy again.
+    pub(crate) fn read_syscall_exit(
+        &self,
+        memory: &GuestMemory,
+        frame_address: u64,
+    ) -> Result<(SyscallRequest, SyscallExitRead)> {
+        let hypercall_address = syscall_hypercall_address(
+            self.hypercall_instruction,
+            self.syscall_trampoline_address,
+            self.syscall_frame_address,
+        );
+        let mut frame = [0; FRAME_SIZE];
+        let mut hypercall = [0; 3];
+        let (generation, read) = memory.read_raw_and_try_read(
+            frame_address,
+            &mut frame,
+            hypercall_address,
+            &mut hypercall,
+        )?;
+        Ok((
+            SyscallRequest::from_frame(&frame),
+            SyscallExitRead {
+                frame_address,
+                frame,
+                hypercall_address,
+                hypercall: read.then_some(hypercall),
+                generation,
+            },
+        ))
+    }
+
     /// Capture one complete parent read state only after admission. The owned
     /// action stays with the caller across waits; no copy token or partial
     /// capture survives this synchronous closure. None is terminal cancellation.
     async fn prepare_action_read<T>(
         &mut self,
-        mut stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
+        stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
         capture: impl Fn(&Self, &crate::memory::RawMemoryRead<'_>) -> Result<T>,
     ) -> Result<Option<T>> {
+        self.prepare_action_read_or_reuse(
+            stop,
+            None::<(crate::entry::MappingGeneration, fn(&Self) -> Result<T>)>,
+            capture,
+        )
+        .await
+    }
+
+    /// [`Self::prepare_action_read`], except that on its first attempt
+    /// `reused` may stand in for `capture`'s admitted copy. `reused` builds
+    /// the same value from bytes an earlier admission at the given generation
+    /// already read. It runs only if, under the gate lock the first attempt
+    /// takes anyway, the gate has no failure, admits, and is still at that
+    /// generation; every other check of the attempt (stop, group exit,
+    /// cancellation, the copy failures checked around an admitted copy) runs
+    /// in the same order as for a fresh copy. Otherwise the attempt copies,
+    /// exactly as `prepare_action_read`.
+    async fn prepare_action_read_or_reuse<T, R>(
+        &mut self,
+        mut stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
+        mut reused: Option<(crate::entry::MappingGeneration, R)>,
+        capture: impl Fn(&Self, &crate::memory::RawMemoryRead<'_>) -> Result<T>,
+    ) -> Result<Option<T>>
+    where
+        R: FnOnce(&Self) -> Result<T>,
+    {
         let gate = self.memory.entry_gate();
         // The first attempt subscribes to nothing: it nearly always reads at
         // once, and subscribing to the gate's change marks it taken, so its
@@ -2496,12 +2656,29 @@ impl KvmBackend {
         let mut subscribe = false;
         loop {
             let subscriptions = subscribe.then(|| (gate.subscribe(), self.entry_cancellation()));
-            gate.admit_operation().map_err(|failure| failure.error())?;
+            let reuse = match reused.take() {
+                Some((generation, reused)) => gate
+                    .admit_operation_unchanged(generation)
+                    .map_err(|failure| failure.error())?
+                    .then_some(reused),
+                None => {
+                    gate.admit_operation().map_err(|failure| failure.error())?;
+                    None
+                }
+            };
             if stop.as_mut().now_or_never().is_some() {
                 return Err(Error::RunAborted);
             }
             if self.guest_thread_group_exit_status().is_some() || self.guest_thread_is_cancelled() {
                 return Ok(None);
+            }
+            if let Some(reused) = reuse {
+                // The failures an admitted copy checks before and after it
+                // runs; the bytes themselves were copied under admission.
+                self.memory.check_copy_failures()?;
+                let value = reused(self);
+                self.memory.check_copy_failures()?;
+                return value.map(Some);
             }
             if let Some(value) = self.memory.try_read_with(|access| capture(self, access))? {
                 return Ok(Some(value));
@@ -6158,6 +6335,7 @@ mod tests {
     include!("vm/entry_eintr_tests.rs");
     include!("vm/inline_interrupt_tests.rs");
     include!("vm/memory_publication_tests.rs");
+    include!("vm/exit_read_reuse_tests.rs");
     include!("vm/read_zero_guest_tests.rs");
 
     #[derive(Default)]

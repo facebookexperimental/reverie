@@ -78,6 +78,10 @@ pub struct GuestMemory {
     test_user_copy_failure: Option<Arc<TestUserCopyFailure>>,
     #[cfg(test)]
     test_user_copy_backing_wait: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Runs in `read_then_write_raw` after its read and before its
+    /// failure checkpoint, while the copy is still admitted.
+    #[cfg(test)]
+    test_between_read_and_write: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     test_shared_map: Option<SharedMapHook>,
     #[cfg(test)]
@@ -1167,6 +1171,8 @@ impl GuestMemory {
             test_user_copy_failure: None,
             #[cfg(test)]
             test_user_copy_backing_wait: None,
+            #[cfg(test)]
+            test_between_read_and_write: None,
             #[cfg(test)]
             test_shared_map: None,
             #[cfg(test)]
@@ -2449,6 +2455,92 @@ impl GuestMemory {
     // TODO-HUMAN-REVIEW(PR-132): Review internal copies that bypass the user map.
     pub(crate) fn write_raw(&self, guest_address: u64, source: &[u8]) -> Result<()> {
         self.with_copy(|copy| self.write_raw_admitted(guest_address, source, copy))
+    }
+
+    /// `read_raw` then `write_raw`, under one admission instead of two.
+    ///
+    /// Between the read and the write this keeps the refusal checkpoint the
+    /// two separate calls had: after a successful read it checks for a
+    /// recorded or deferred failure (as `read_raw`'s completion did) and
+    /// then for a gate failure under the gate lock (as `write_raw`'s
+    /// admission did, serialized with failure publication), and on a
+    /// failure it returns that failure without writing. A read error
+    /// returns exactly as `read_raw`'s, before anything is written. What one
+    /// admission removes is the gate's other refusal at the write: a close
+    /// begun after the read can no longer park the write until the gate
+    /// reopens, because a close cannot complete while this copy is
+    /// admitted; the write then sees the image the read saw.
+    pub(crate) fn read_then_write_raw(
+        &self,
+        read_address: u64,
+        destination: &mut [u8],
+        write_address: u64,
+        source: &[u8],
+    ) -> Result<()> {
+        let copy = self.copy_access()?;
+        let read = self.read_raw_admitted(read_address, destination, &copy);
+        let result = match read {
+            Err(error) => Err(error),
+            Ok(()) => {
+                #[cfg(test)]
+                if let Some(between) = &self.test_between_read_and_write {
+                    between();
+                }
+                let checkpoint = self.check_copy_failure().and_then(|()| {
+                    self.mapping
+                        .entry_gate
+                        .admit_operation()
+                        .map_err(|failure| failure.error())
+                });
+                if let Err(failure) = checkpoint {
+                    // As `read_raw` returning its failure after its copy
+                    // retired, or `write_raw` refused at admission.
+                    drop(copy);
+                    return Err(failure);
+                }
+                self.write_raw_admitted(write_address, source, &copy)
+            }
+        };
+        // The completion checks of `with_copy`, for whichever operation ran last.
+        let prior = self.check_copy_failure();
+        drop(copy);
+        let result = result.map_err(|error| self.capture_shared_file_error(error));
+        prior?;
+        self.check_copy_failure()?;
+        result
+    }
+
+    /// `read_raw` of `destination`, then, under the same admission, an
+    /// attempt to read `speculative` too. The first read is exactly
+    /// `read_raw`, errors included. The second is only an attempt: if it
+    /// fails, its error is dropped (it never reaches
+    /// `capture_shared_file_error`) and it reports false, so a caller that
+    /// later needs those bytes must read them again through an ordinary
+    /// admission. Returns the mapping generation the admission saw; no
+    /// publication can change the mapping while an admission is held, so
+    /// both reads observe that generation.
+    pub(crate) fn read_raw_and_try_read(
+        &self,
+        guest_address: u64,
+        destination: &mut [u8],
+        speculative_address: u64,
+        speculative: &mut [u8],
+    ) -> Result<(crate::entry::MappingGeneration, bool)> {
+        self.with_copy(|copy| {
+            self.read_raw_admitted(guest_address, destination, copy)?;
+            let read = self
+                .read_raw_admitted(speculative_address, speculative, copy)
+                .is_ok();
+            Ok((copy.generation(), read))
+        })
+    }
+
+    /// The checks an admitted copy makes before and after it runs (a
+    /// recorded gate failure, or a shared-file failure deferred behind a
+    /// notification scope), without admitting a copy. For a caller that
+    /// reuses bytes an earlier admission already read.
+    pub(crate) fn check_copy_failures(&self) -> Result<()> {
+        self.check_copy_failure()
     }
 
     /// Attempts one short copy without parking the calling executor. A closed
@@ -7820,5 +7912,262 @@ mod tests {
             memory.find_unmapped_user_range(0x1001, 0x9000, 0x1000),
             None
         );
+    }
+}
+
+/// The two one-admission copies a KVM syscall exit uses: the same bytes,
+/// order and errors as the separate copies they replace, one admission each,
+/// and the same refusals by the entry gate.
+#[cfg(test)]
+mod one_admission_copy_tests {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::*;
+
+    const PAGE: usize = 4096;
+    const LIMIT: u64 = (4 * PAGE) as u64;
+
+    fn until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition not reached");
+            std::thread::yield_now();
+        }
+    }
+
+    fn fixture() -> GuestMemory {
+        let memory = GuestMemory::new(0, 4 * PAGE).unwrap();
+        let pattern: Vec<u8> = (0..LIMIT).map(|byte| byte as u8).collect();
+        memory.write_raw(0, &pattern).unwrap();
+        memory
+    }
+
+    fn bytes(memory: &GuestMemory, address: u64, length: usize) -> Vec<u8> {
+        let mut bytes = vec![0; length];
+        memory.read_raw(address, &mut bytes).unwrap();
+        bytes
+    }
+
+    fn admissions(memory: &GuestMemory) -> usize {
+        memory.entry_gate().test_state().copy_admissions
+    }
+
+    #[test]
+    fn read_then_write_raw_is_the_two_copies_under_one_admission() {
+        let combined = fixture();
+        let separate = fixture();
+        // Overlapping ranges: the read must see the bytes from before the
+        // store, as read_raw then write_raw would.
+        let (read_at, write_at) = (0x1008, 0x1038);
+        let source = 0x55aa_33cc_i64.to_le_bytes();
+
+        let before = admissions(&combined);
+        let mut read = [0; 80];
+        combined
+            .read_then_write_raw(read_at, &mut read, write_at, &source)
+            .unwrap();
+        assert_eq!(admissions(&combined), before + 1);
+
+        let before = admissions(&separate);
+        let mut expected = [0; 80];
+        separate.read_raw(read_at, &mut expected).unwrap();
+        separate.write_raw(write_at, &source).unwrap();
+        assert_eq!(admissions(&separate), before + 2, "control: two copies");
+
+        assert_eq!(read, expected);
+        assert_eq!(bytes(&combined, 0, 4 * PAGE), bytes(&separate, 0, 4 * PAGE));
+        assert_eq!(combined.entry_gate().test_state().copies, 0);
+    }
+
+    #[test]
+    fn read_then_write_raw_stores_nothing_after_a_read_error() {
+        let memory = fixture();
+        let unchanged = bytes(&memory, 0x2000, 8);
+        let mut read = [0xee; 16];
+        // The read runs past the end of guest memory.
+        assert!(
+            memory
+                .read_then_write_raw(LIMIT - 8, &mut read, 0x2000, &[0x77; 8])
+                .is_err()
+        );
+        assert_eq!(bytes(&memory, 0x2000, 8), unchanged);
+        // A store error after a good read is an error too, as write_raw's.
+        let mut read = [0; 8];
+        assert!(
+            memory
+                .read_then_write_raw(0x2000, &mut read, LIMIT - 4, &[0x77; 8])
+                .is_err()
+        );
+        assert_eq!(read.as_slice(), unchanged.as_slice());
+        assert_eq!(memory.entry_gate().test_state().copies, 0);
+    }
+
+    /// A failure that arrives after the read, while the combined copy is
+    /// still admitted, refuses the store, as the separate `write_raw` was
+    /// refused: a gate failure recorded then (a peer's entry cleanup can
+    /// record one while a copy is held), and a shared-file failure deferred
+    /// behind an open notification scope. The read has happened; the result
+    /// word keeps its old bytes; the error is the failure itself.
+    #[test]
+    fn read_then_write_raw_refuses_the_store_after_a_failure_between_them() {
+        for deferred in [false, true] {
+            let mut memory = fixture();
+            let observer = memory.clone();
+            let unchanged = bytes(&memory, 0x2000, 8);
+            let gate = memory.entry_gate();
+            let recorded = Arc::new(std::sync::Mutex::new(None));
+            let slot = recorded.clone();
+            memory.test_between_read_and_write = Some(Arc::new(move || {
+                let error = if deferred {
+                    observer.capture_shared_file_error(Error::SharedFileCopy {
+                        operation: "controlled deferred failure",
+                        address: 0x2000,
+                        requested: 8,
+                        transferred: 0,
+                        prior_transferred: 0,
+                        source: std::io::Error::from_raw_os_error(libc::EIO),
+                    })
+                } else {
+                    gate.poison(
+                        None,
+                        Error::UnexpectedVcpuExit("controlled failure between".to_owned()),
+                    )
+                    .error()
+                };
+                *slot.lock().unwrap() = Some(format!("{error:?}"));
+            }));
+            let scope = deferred.then(|| memory.defer_notifications());
+            if deferred {
+                assert!(memory.entry_gate().pending_failure().is_none());
+            }
+            let mut read = [0; 8];
+            let error = memory
+                .read_then_write_raw(0x1000, &mut read, 0x2000, &[0x77; 8])
+                .unwrap_err();
+            assert_eq!(read, [0, 1, 2, 3, 4, 5, 6, 7], "the read ran");
+            assert_eq!(
+                Some(format!("{error:?}")),
+                *recorded.lock().unwrap(),
+                "deferred={deferred}"
+            );
+            assert_eq!(memory.entry_gate().test_state().copies, 0);
+            drop(scope);
+            // The failure is terminal now; inspect the word through the
+            // backing directly rather than through a refused copy.
+            let offset = memory.checked_offset(0x2000, 8).unwrap();
+            let chunks = memory.mapping.host_chunks(offset, 8);
+            let mut word = [0; 8];
+            let mut copied = 0;
+            for chunk in chunks.iter() {
+                // SAFETY: the chunks cover exactly the 8 validated bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.mapping.as_ptr(),
+                        word[copied..].as_mut_ptr(),
+                        chunk.length,
+                    );
+                }
+                copied += chunk.length;
+            }
+            assert_eq!(word.as_slice(), unchanged.as_slice(), "the store ran");
+        }
+    }
+
+    #[test]
+    fn one_admission_copies_are_refused_by_a_failed_gate() {
+        for speculative in [false, true] {
+            let memory = fixture();
+            let failure = memory.entry_gate().poison(
+                None,
+                Error::UnexpectedVcpuExit("controlled poison".to_owned()),
+            );
+            let before = admissions(&memory);
+            let mut read = [0xee; 8];
+            let error = if speculative {
+                memory
+                    .read_raw_and_try_read(0x1000, &mut read, 0x2000, &mut [0; 3])
+                    .map(drop)
+                    .unwrap_err()
+            } else {
+                memory
+                    .read_then_write_raw(0x1000, &mut read, 0x2000, &[0x77; 8])
+                    .unwrap_err()
+            };
+            assert!(error.retains_primary(&failure.causes()[0]), "{error:?}");
+            // Refused before admission: nothing read, nothing admitted.
+            assert_eq!(read, [0xee; 8]);
+            assert_eq!(admissions(&memory), before);
+            assert_eq!(memory.entry_gate().test_state().copies, 0);
+        }
+    }
+
+    #[test]
+    fn one_admission_copies_wait_for_a_closed_gate_and_see_the_reopened_image() {
+        for speculative in [false, true] {
+            let memory = fixture();
+            let gate = memory.entry_gate();
+            let closed =
+                futures::executor::block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
+            let before = admissions(&memory);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let mut read = [0; 8];
+                    if speculative {
+                        let mut extra = [0; 3];
+                        let (generation, read_extra) = memory
+                            .read_raw_and_try_read(0x1000, &mut read, 0x1100, &mut extra)
+                            .unwrap();
+                        assert!(read_extra);
+                        assert_eq!(extra, [0x00, 0x01, 0x02]);
+                        Some(generation)
+                    } else {
+                        memory
+                            .read_then_write_raw(0x1000, &mut read, 0x2000, &[0x77; 8])
+                            .unwrap();
+                        assert_eq!(read, [0, 1, 2, 3, 4, 5, 6, 7]);
+                        None
+                    }
+                });
+                until(|| !gate.test_state().copy_waiters.is_empty());
+                // Parked before admission: nothing admitted or written yet.
+                assert_eq!(admissions(&memory), before);
+                assert_eq!(gate.test_state().copies, 0);
+                drop(closed);
+                if let Some(generation) = worker.join().unwrap() {
+                    assert_eq!(generation, gate.generation().unwrap());
+                }
+            });
+            assert_eq!(admissions(&memory), before + 1);
+            if !speculative {
+                assert_eq!(bytes(&memory, 0x2000, 8), [0x77; 8]);
+            }
+        }
+    }
+
+    #[test]
+    fn read_raw_and_try_read_keeps_the_first_read_and_drops_a_failed_attempt() {
+        let memory = fixture();
+        let before = admissions(&memory);
+        let mut read = [0; 8];
+        let mut extra = [0xee; 3];
+        let (generation, read_extra) = memory
+            .read_raw_and_try_read(0x1000, &mut read, LIMIT - 1, &mut extra)
+            .unwrap();
+        assert_eq!(admissions(&memory), before + 1);
+        assert!(!read_extra, "an attempt past the end reported success");
+        assert_eq!(read.as_slice(), bytes(&memory, 0x1000, 8).as_slice());
+        assert_eq!(generation, memory.entry_gate().generation().unwrap());
+        // The first read's error is read_raw's, attempted read or not.
+        let mut past = [0; 8];
+        let first = memory
+            .read_raw_and_try_read(LIMIT - 4, &mut past, 0x1000, &mut [0; 3])
+            .map(drop)
+            .unwrap_err();
+        let control = memory.read_raw(LIMIT - 4, &mut past).unwrap_err();
+        assert_eq!(format!("{first:?}"), format!("{control:?}"));
+        // A failed attempt leaves no failure behind for later copies.
+        assert!(memory.entry_gate().pending_failure().is_none());
+        memory.check_copy_failures().unwrap();
     }
 }

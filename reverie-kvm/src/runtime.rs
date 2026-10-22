@@ -49,6 +49,7 @@ use crate::VMCALL_SYSCALL_TRANSPORT;
 use crate::bootstrap::SegmentBase;
 use crate::bootstrap::TOOL_STACK_SIZE;
 use crate::bootstrap::process_syscall_return_registers;
+use crate::bootstrap::process_syscall_return_registers_storing_result;
 use crate::bootstrap::set_user_segment_base;
 use crate::bootstrap::stage_process_signal_return;
 use crate::bootstrap::stage_process_syscall_return;
@@ -6258,7 +6259,11 @@ impl KvmBackend {
                     )));
                 }
                 let registers = self.vcpu.get_regs()?;
-                let request = SyscallRequest::read_from(&memory, frame_address)?;
+                // The same copy also reads what a Tool callback's completed
+                // boundary would copy again; the first callback below reuses
+                // it when the gate allows (see `SyscallExitRead`).
+                let (request, exit_read) = self.read_syscall_exit(&memory, frame_address)?;
+                let mut exit_read = Some(exit_read);
                 // The KVM_RUN hypercall return slot is one-shot storage. Publish
                 // its unused value exactly once while this decoded exit is live;
                 // process actions may re-enter the vCPU before the Tool callback
@@ -6388,11 +6393,16 @@ impl KvmBackend {
                         let boundary = {
                             let stop = Pin::new(&mut callback_failure);
                             let stop: Pin<&mut (dyn Future<Output = ()> + Send)> = stop;
-                            CompletedSyscallBoundary::capture_admitted(
+                            // Only the first attempt may reuse the exit's copy:
+                            // a restarted callback follows a Tool callback,
+                            // which may have written guest memory.
+                            let exit_read = exit_read.take();
+                            CompletedSyscallBoundary::capture_admitted_reusing(
                                 self,
                                 frame_address,
                                 None,
                                 stop,
+                                exit_read.as_ref().map(|exit_read| (exit_read, &memory)),
                             )
                             .await?
                         };
@@ -6627,19 +6637,34 @@ impl KvmBackend {
                     .await?;
                     (raw, false, false, false)
                 };
-                let mut returned_registers = process_syscall_return_registers(
-                    &memory,
-                    registers,
-                    frame_address,
-                    result,
-                    None,
-                )?;
-                let mut restarted_registers = restart_requested
-                    .then(|| restart_syscall_registers(returned_registers, request.number()))
-                    .transpose()?;
                 // The ring0 trampoline reads the result from the frame and then
                 // SYSRETs, so the hypercall return slot is unused here.
-                SyscallRequest::write_result(&mut memory, frame_address, result)?;
+                let (mut returned_registers, mut restarted_registers) = if restart_requested {
+                    // A rewind can fail between the read and the store, and
+                    // then nothing may be stored: keep the two copies.
+                    let returned_registers = process_syscall_return_registers(
+                        &memory,
+                        registers,
+                        frame_address,
+                        result,
+                        None,
+                    )?;
+                    let restarted_registers =
+                        restart_syscall_registers(returned_registers, request.number())?;
+                    SyscallRequest::write_result(&mut memory, frame_address, result)?;
+                    (returned_registers, Some(restarted_registers))
+                } else {
+                    // Nothing runs between reading the return words and
+                    // storing the result, so one admission covers both.
+                    let returned_registers = process_syscall_return_registers_storing_result(
+                        &memory,
+                        registers,
+                        frame_address,
+                        result,
+                        None,
+                    )?;
+                    (returned_registers, None)
+                };
                 let pending_segment = self.take_pending_segment();
                 let mut pending_exit = executor.take_exit();
                 let pending_process = executor.take_process_action();
