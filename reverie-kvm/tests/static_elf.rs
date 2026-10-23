@@ -6035,13 +6035,13 @@ static volatile sig_atomic_t nested_seen;
 static uintptr_t alt_lower;
 static int mode;
 
-__attribute__((naked)) static void nested_handler(void) {
+__attribute__((naked)) static void nested_handler(int signo) {
   __asm__ volatile(
       "movl $1, nested_seen(%rip)\n\t"
       "ret\n\t");
 }
 
-__attribute__((naked)) static void fresh_handler(void) {
+__attribute__((naked)) static void fresh_handler(int signo) {
   __asm__ volatile(
       "xorl %edi, %edi\n\t"
       "movl $60, %eax\n\t"
