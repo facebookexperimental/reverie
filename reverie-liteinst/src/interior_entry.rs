@@ -1,30 +1,20 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The entry proof for a LiteInst jump patch
 //! (<https://github.com/rrnewton/reverie/issues/812>).
 //!
-//! [`reverie_ptrace::liteinst_census`] lists, for each `syscall` site of a
-//! loaded object, the lowest known control-transfer entry after it. This
-//! module checks a live scan of the bytes a patch would displace against that
-//! entry. Under ptrace the tracer builds the census from the tracee's memory
-//! and passes the entry to the installation helper; without a tracer the
-//! runtime builds the census itself from an [`ObjectImage`].
+//! [`crate::liteinst_census`] lists, for each `syscall` site of a loaded
+//! object, the lowest known control-transfer entry after it. This module
+//! checks a live scan of the bytes a patch would displace against that entry.
+//! The runtime builds the census itself from an [`ObjectImage`].
 
 use iced_x86::Mnemonic;
 use liteinst2::patcher::NEAR_JUMP_BYTES;
 use liteinst2::scanner::ScannedInstruction;
-pub(crate) use reverie_ptrace::liteinst_census::Census;
-pub(crate) use reverie_ptrace::liteinst_census::CensusError;
-pub(crate) use reverie_ptrace::liteinst_census::REFUSED_ENTRY_LIMIT;
-pub(crate) use reverie_ptrace::liteinst_census::Refusal;
-use reverie_ptrace::liteinst_census::Segment;
-pub(crate) use reverie_ptrace::liteinst_census::SiteEntries;
+
+pub(crate) use crate::liteinst_census::Census;
+pub(crate) use crate::liteinst_census::CensusError;
+pub(crate) use crate::liteinst_census::Refusal;
+use crate::liteinst_census::Segment;
+pub(crate) use crate::liteinst_census::SiteEntries;
 
 /// Where a loaded object was mapped when LiteInst initialized.
 #[derive(Debug, Eq, PartialEq)]
@@ -37,6 +27,16 @@ pub(crate) struct ObjectImage {
 impl ObjectImage {
     pub(crate) fn new(header: u64, ranges: Box<[(u64, u64, bool)]>) -> Self {
         Self { header, ranges }
+    }
+
+    /// Whether a mapping change overlaps any retained census input, including
+    /// non-executable ELF metadata. This inspects addresses, never stale bytes.
+    pub(crate) fn overlaps(&self, start: u64, end: u64) -> bool {
+        start < end
+            && self
+                .ranges
+                .iter()
+                .any(|&(first, last, _)| start < last && first < end)
     }
 
     /// Builds the census of the executable mapping `text` from the object's
@@ -318,6 +318,20 @@ mod tests {
             prove(&object, &census(&object), 0x40 + MADVISE_SITE),
             madvise_refusal()
         );
+    }
+
+    #[test]
+    fn object_overlap_includes_metadata_but_not_gaps_or_empty_ranges() {
+        let image = ObjectImage::new(
+            0x1000,
+            vec![(0x1000, 0x2000, false), (0x3000, 0x4000, true)].into_boxed_slice(),
+        );
+        assert!(image.overlaps(0x1100, 0x1200));
+        assert!(image.overlaps(0x3100, 0x3200));
+        assert!(image.overlaps(0x1fff, 0x3001));
+        assert!(!image.overlaps(0x2000, 0x3000));
+        assert!(!image.overlaps(0x3100, 0x3100));
+        assert!(!image.overlaps(0x4000, 0x5000));
     }
 
     #[test]

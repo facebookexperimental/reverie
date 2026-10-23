@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Included in executor::tests. These are pending-state controls, not VM delivery.
 fn process_alarm_event(pid: i32) -> reverie::SignalEvent {
     let mut info = [0; reverie::SIGNAL_INFO_SIZE];
@@ -23,7 +15,6 @@ fn process_alarm_event(pid: i32) -> reverie::SignalEvent {
 
 #[derive(Debug, Eq, PartialEq)]
 struct ProcessAlarmSnapshot {
-    logical_clock_ns: u64,
     process: crate::signal::ProcessSignalState,
     thread: crate::signal::ThreadSignalState,
     readiness: Vec<(i32, Option<i16>)>,
@@ -51,7 +42,6 @@ fn process_alarm_snapshot(executor: &ElfExecutor) -> ProcessAlarmSnapshot {
         })
         .collect();
     ProcessAlarmSnapshot {
-        logical_clock_ns: executor.state.logical_clock_ns,
         process,
         thread,
         readiness,
@@ -401,6 +391,7 @@ fn process_alarm_signal_receiver_lifetime_and_process_actions_refuse_before_muta
                 executor.process_action = Some(ProcessAction::Exec {
                     executable_path: root.0.join("pending-exec"),
                     executable_file: None,
+                    execfn: None,
                     image: Vec::new(),
                     argv: Vec::new(),
                     envp: Vec::new(),
@@ -575,7 +566,7 @@ fn process_alarm_signal_tool_sigchld_replacement_preserves_thread_fault_and_proc
             let alarm = process_alarm_event(executor.state.pid);
             let selected = match origin {
                 "fault" => {
-                    crate::vm::PageZeroFault::for_test(executor.page_zero_fault_event(0)).pending()
+                    crate::vm::UserTrap::for_test(executor.page_zero_fault_event(0)).pending()
                 }
                 "thread" | "process" => {
                     if origin == "thread" {

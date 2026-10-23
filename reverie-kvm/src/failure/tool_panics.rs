@@ -16,6 +16,7 @@ use super::owned_future::CaughtFuture;
 use super::owned_future::PanicPayload;
 use crate::Error;
 use crate::Result;
+use crate::error::ErrorExt;
 
 #[derive(Default)]
 pub(crate) struct ToolPanics {

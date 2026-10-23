@@ -7,15 +7,166 @@ backend and [`hermit-run`](https://crates.io/crates/hermit-run) for the CLI.
 Hermit's `liteinst` feature is optional and off by default.
 
 `reverie-liteinst` is an experimental Linux x86-64 Reverie backend built on the
-standalone `liteinst2` patching library, the shared `reverie-preload` runtime,
+standalone `liteinst2` patching library, the shared `reverie-inguest` runtime,
 and `reverie-rpc-transport`.
 
+## Preload and allocator ownership
+
+The `reverie-liteinst` core is an allocator-neutral rlib. The standalone runtime
+is the separate cdylib-only `reverie-liteinst-preload` package:
+
+```sh
+cargo build -p reverie-liteinst-preload
+```
+
+Cargo produces `libreverie_liteinst_preload.so`; Hermit installs that artifact
+under its existing resource name `libreverie_liteinst.so`. The leaf owns its
+constructor, glibc compatibility code, static unwinder and unconditional
+`FixedPrivatePatchAllocator`. The old core `preload-constructor` feature is a deprecated
+no-op, including in workspace feature unions. Linking the core into a host
+program does not replace that program's allocator or add a LiteInst constructor.
+The independent legacy `reverie-inguest/preload-constructor` feature still owns
+its own constructor if another dependency enables it; the core disables that
+dependency's default features.
+
+The standalone leaf's native constructor scans the current `environ` vector
+for the first exact `REVERIE_LITEINST_TOOL=` entry. If present, it enters a
+fixed guarded constructor stack before running the named Tool initialization.
+It copies the selected value before calling other providers. Empty or invalid
+values refuse initialization there. With no selector, the leaf remains inert
+and runs only its existing compatibility resolver. The environment must remain
+valid and stable from the native scan through copying the selected value.
+
+This leaf deliberately ignores an interposed `getenv` for its Tool selector,
+and its constructor root cannot be replaced by interposing the public generic
+initializer. The separately exported `reverie_liteinst_initialize` retains its
+`std::env`/`getenv` selection semantics for embeddings, now on its own fresh
+fixed guarded startup stack before the first Rust instruction. An explicit
+call selecting no Tool still retains that reservation without activating a
+runtime. A repeated call or existing region refuses before a second selector
+or body call. See [the stack storage contract](STACK_MEMORY.md) for its scalar
+startup requirements and separate ownership diagnostics. On the active leaf,
+runtime initialization and its dispatch scope finish before the compatibility
+resolver runs. Earlier loader/CRT initialization and the inert resolver are
+outside the constructor-stack placement guarantee.
+
+A Tool-specific preload uses `reverie_liteinst::declare_fixed_tool_allocator!()`
+once at its crate root. This declares both the compiler allocator and a strong,
+hidden, immutable backing descriptor. Authenticated startup reserves two fixed
+32 MiB arenas before publishing the region: reusable storage at
+`0x600010000000..0x600012000000` and process-lifetime installation storage at
+`0x600014000000..0x600016000000`, each between inaccessible guard pages. Their
+mutable cursor/free-list/lock state lives in the fixed control area. Allocation
+before publication and exhaustion return null through `GlobalAlloc`; neither
+can bootstrap lazily or fall back to guest allocation. Reallocation and
+deallocation preserve the original arena's ownership across scope changes.
+A foreign or unready address refuses through the trusted syscall gate before
+reading an allocation header.
+
+Legacy embedded Tools use `declare_legacy_scoped_tool_allocator!()` to retain the
+prior dispatch/installation-scoped policy, or
+`declare_legacy_private_tool_allocator!()` for the always-private BSS policy.
+These are explicit source declarations, not automatic defaults. Missing or
+duplicate backing declarations are link errors. A custom/default allocator
+control can use `declare_legacy_tool_backing!()` without replacing its allocator;
+that declaration cannot bypass the allocation ownership check.
+The RPC and lifecycle fixtures and
+example preload do so; this also preserves the examples rlib's existing allocator
+propagation into its host binaries. These legacy roots are not isolated preloads.
+Every `install_tool` variant checks a fallible compiler-selected allocation in a
+dispatch scope before creating a Tool, opening RPC or installing a filter. A
+System-only root is refused with `EOPNOTSUPP`; exhaustion returns `ENOMEM`.
+Fixed ownership must already be published, or preflight returns `EAGAIN` before
+allocating. Preflight accepts only the selected backing, never both fixed and
+legacy storage together.
+
+This boundary covers compiler-selected Rust allocation. It does not isolate
+allocations inside libc or the loader, guest TLS, or all entry-frame storage.
+The installation-depth counter still lives in ELF TLS and is reached through
+the loader's `__tls_get_addr`; this slice does not isolate that resolver's work.
+The interiors remain on protection key zero; boundary guards do not prevent
+guest writes into them. This is not a claim of complete Tool memory isolation.
+
+Once a runtime publishes a ToolRegion owner, its physical syscall forwarding
+protects the entire four-GiB reservation, including unused lease capacity.
+This also applies to a Legacy allocator runtime that owns fixed Tool stacks;
+a backing declaration alone does not activate protection. The existing FullTool
+unsubscribed, injected and tail-injected paths check final arguments. Nested Tool
+syscalls and native Strace/Compat forwarding activate the same guard when an
+owner is published. A Tool may still emulate or rewrite a guest operation.
+
+Overlapping `munmap`, `mprotect`, `pkey_mprotect`, `madvise`, `remap_file_pages`,
+fixed `mmap`, `mremap` and raw `mseal` are refused with `EPERM`. Mapping ranges
+include effective huge-page extents. `SHM_REMAP` and `process_madvise` retain a
+conservative refusal because their effective targets cannot be established by
+this guard. A refused `brk` instead returns the genuine unchanged break, as its
+raw Linux ABI requires. If that current break cannot be established, the runtime
+refuses the configuration. Trusted Tool allocation and lease operations retain
+their raw gates, and mappings outside the reservation remain usable.
+
+This finite guard does not prevent CPU stores, kernel writes through guest
+buffers, aliases, external writers or jumps into trusted code. It adds no
+protection-key assignment or TLS isolation, and does not admit new syscalls.
+
+The alternate signal stack and the typed Tool continuation use explicit fixed
+region backing. See [the stack storage contract](STACK_MEMORY.md) for the exact
+range, guards, lifetime and remaining isolation work.
+
+## Artifact qualification boundary
+
+The loader-byte proof deliberately supports a restricted ELF layout: retained
+section tables, little-endian x86-64 shared objects, nonempty page-disjoint LOAD
+segments, and a complete read-only ELF/program-header mapping at file and virtual
+offset zero. The unique dynamic table and all relocation, symbol, string, hash
+and version tables must have matching complete section, file and loaded views.
+They must remain protected after relocation, and no declared relocation may
+write into those inputs. Relative fast-count prefixes must contain exactly
+symbol-zero relative relocations.
+
+Qualification requires eager binding with the supported NOW flags. Empty or
+aliased LOAD mappings, ambiguous metadata, packed relocations, COPY relocations,
+local IFUNC/resolver callbacks and unsupported loader extensions are refused.
+These are explicit format exclusions; an unproved input never earns a partial
+qualification. Both producer collection and consumer requalification apply the
+same boundary. This does not establish protection against arbitrary later guest
+stores or mapping changes, and does not expand the memory-isolation contract above.
+
+For Hermit Cargo Git builds, full Fixed qualification resolves locked, offline
+Cargo metadata independently of the artifact receipt. The caller supplies the
+full Reverie revision and build root; the checker joins the exact package,
+target, clean Git checkout and source blobs before accepting compiler filename
+operands. Consumers repeat that resolution. A receipt cannot authorize a source
+path, a short revision, a remapped filename or a different checkout namespace.
+This path currently requires Git metadata in the Hermit source tree; Gitless
+source imports are explicitly unsupported for full Fixed staging, even when
+the caller supplies a valid revision. Ordinary ELF constructor discovery is a
+separate, narrower check and does not establish full allocator qualification.
+
 ## Event path
+
+The experimental `fixed-syscall-gates` Cargo feature is a native-exec
+prerequisite, disabled by default. It supports only explicit FullTool
+installation, with no inherited seccomp filter. Compatibility, strace and
+built-in selectors are refused before handler publication. Existing ordinary
+builds retain their current gates and signal-return policy.
+
+This feature reserves the page at `0x500000000000` without replacing an
+existing mapping, copies its scalar, guest-permission and signal-return gates
+while writable, then seals the page read-execute before publishing it.
+Physical guest mapping changes cannot remove or replace the published page.
+An installation error after publication terminates the process with status
+127; it cannot resume with a partial runtime. This is mapping integrity, not
+protection against arbitrary guest entry into trusted code.
+
+Exec remains refused. Successor bootstrap, private Tool TLS and genuine Tool
+state continuity are still required before enabling it. The optional artifact
+also needs its own compiler/source qualification before a Hermit consumer can
+use it; ordinary artifact qualification does not qualify fixed gates.
 
 1. A tool-specific DSO calls `install_tool::<T>` from its preload constructor.
    It connects to the coordinator and receives `T::GlobalState::Config` before
    seccomp is active.
-2. `reverie-preload` installs the SIGSYS handler, alternate stack, trusted
+2. `reverie-inguest` installs the SIGSYS handler, alternate stack, trusted
    syscall gate, and seccomp filter.
 3. The first syscall at an instruction reaches SIGSYS. The LiteInst dispatcher
    installs a replace-first hook and changes the saved signal-context RIP to the
@@ -24,7 +175,8 @@ and `reverie-rpc-transport`.
 4. After `sigreturn`, the trampoline invokes `T::handle_syscall_event` in normal
    guest context. The first invocation and later patched invocations therefore
    use the same tool path; the first site trap is not also a tool execution.
-5. `LiteinstGuest<T>` supplies in-process memory/register access and syscall
+5. reverie-inguest's Tool host (`reverie_inguest::guest::host`, whose `Guest`
+   is `InGuest`) supplies in-process memory/register access and syscall
    injection through the trusted gate. `CoordinatorRpc<G>` serializes
    `GlobalRPC` messages over the same UDS/bincode framing as
    `reverie-rpc-transport::RpcServer<G>`. The launcher accepts concurrent local
@@ -42,52 +194,40 @@ same Tool driver as installed syscall hooks, including six arguments, error
 results, tail injection, retries, and coordinator RPC. It retains no pointer
 into the expired kernel signal frame and does not rewrite guest text.
 
-The entry saves registers below the guest's 128-byte red-zone, aligns its
-extended-state area to 64 bytes, and sizes that area from CPUID leaf 0xD. XSAVE
-and XRSTOR use every user-state component enabled in XCR0; there is no fixed
-component mask. Machines without OS-enabled XSAVE use FXSAVE64/FXRSTOR64.
-The XSAVE header is zeroed before saving. On OS-enabled PKU systems the entry
-saves the original PKRU in a register, opens runtime memory access before any
-global or TLS read, and puts the original PKRU back in the saved image with its
-correct initial-state bit. Nested Tool syscall traps reopen runtime access;
-their real signal return restores the interrupted permissions. The callback
-receives an empty x87 stack, default FP controls and a cleared direction flag;
-the guest's FP state, permissions, flags and libc errno are restored afterward.
-After the final XRSTOR, only registers and the guest-accessible frame are read.
-Future runtime or clock boundaries must finish before that restore. The syscall outputs remain RAX
-(result), RCX (continuation PC), and R11 (saved flags).
+The SIGSYS handler captures the guest registers and extended state from the
+real kernel signal frame into a preallocated owner. The first genuine
+`sigreturn` resumes the callback on its separate 8 MiB stack with runtime memory
+access open. The callback receives an empty x87 stack, default FP controls and
+a cleared direction flag. Its completion syscall produces a second genuine
+signal frame; the runtime verifies the pending phase, thread, cookie and
+generation before restoring the saved guest image with the Tool's results.
+With the alternate stack disabled, the kernel's signal frames still
+use the interrupted stack; that option has no alternate-stack isolation claim.
 
-The installing thread initializes and touches its continuation TLS before
-seccomp installation. A supported COW fork inherits that initialized state.
-Each such thread owns one pending continuation; a second preparation while it
-is occupied refuses without replacing it. Future thread support must initialize
-these TLS keys in ordinary child-thread startup before its first trap, rather
-than first touching dynamic TLS in a signal handler. After dispatch, the saved
-RCX owns the return address and return reads no mutable TLS continuation.
-Nested Tool-internal syscalls use the existing trusted gate and do not acquire
-another continuation. Callable guest signal handlers remain unsupported;
-this guard does not add asynchronous callback support. Callbacks must obey the
-ordinary no-unwind ABI and preserve TLS bases. HookContext IP/SP fields retain
-the existing register API's metadata semantics.
+The saved image preserves the kernel-reported extended-state layout. Setup
+checks the actual enabled XCR0 mask, CPUID state size and PKRU component bounds;
+it does not substitute a smaller fixed component list. Signal-frame validation
+and genuine completion own restoration, including the guest's permissions and
+flags. The syscall outputs retain the existing RAX, RCX and R11 semantics.
+AMX/XFD execution has not been measured on the current test machine; preserving
+the CPU-provided layout is not measured AMX coverage.
 
-The guest stack must accommodate the callback stack plus at most
-`335 + round_up(CPUID.0D.0:EBX, 64)` bytes below the original RSP. This includes
-the 128-byte red-zone, 144-byte register frame, at most 63 alignment bytes and
-the full state area. The FXSAVE case needs at most 847 bytes plus the callback
-stack. Initialization checks size arithmetic and rejects an area smaller than
-the XSAVE header or larger than the signed stack-adjustment bound. The actual
-CPUID size describes the complete standard layout for the actual XCR0 mask;
-there is no smaller fixed allocation that could omit a high component.
+The installing thread initializes its continuation TLS and saved-state owner
+before seccomp installation. A supported COW fork inherits the live image and
+stack and rebinds the child owner. Each thread has one pending activation; a
+second preparation refuses without overwriting it. Future thread creation must
+initialize this state before its first trap. Nested Tool-internal syscalls use
+the existing trusted gate and do not acquire another continuation. Callbacks
+must obey the ordinary no-unwind ABI and preserve TLS bases. HookContext IP/SP
+fields retain their existing register API semantics.
 
-This may require more stack than the installed-hook path on an AMX host:
-a 11008-byte enabled state area needs at most 11343 bytes before the callback
-stack. The full mask preserves state that an AMX-permitted guest can use.
-XFD gates use of permission-controlled state; XSAVE records the initial-state
-status of disabled components, and XRSTOR initializes components whose saved
-XSTATE_BV bits are clear. The entry preserves those CPU-provided bits for all
-components other than the explicitly restored PKRU. AMX/XFD execution has not
-been tested on the current AMD host; preserving the full mask is not a claim
-of measured AMX coverage.
+FullTool's ordinary installed callbacks now enter distinct guarded stacks
+before their existing Rust bodies, with the pool prepared before the guest
+branch clock starts. An entry on the actual registered Tool alternate stack
+retains its current position. Native Strace/Compat keep their existing entry
+addresses. The earlier LiteInst register-capture trampoline, saved-state owner,
+TLS and remaining cold entries still need isolation. See the
+[storage contract](STACK_MEMORY.md) for capacity, lifetime and protection limits.
 
 `tests/rpc_tool.rs` covers an RX page ending in `syscall; ret`, with six traps,
 zero installed hooks, exact original bytes, Tool results distinct from native,
@@ -140,32 +280,32 @@ Built-in `strace` and compatibility modes remain available through
 `configure_command`. They use the same shared preload and LiteInst hook path
 without a coordinator.
 
-### Shared `reverie-preload` built-in tools
+### Shared `reverie-inguest` built-in tools
 
 The single `REVERIE_LITEINST_TOOL` selector is a superset of the
 LiteInst-native `strace`/`compat` modes: it also accepts the shared
-`reverie-preload` built-ins `passthrough` and `spoof-getpid`, selected through
+`reverie-inguest` built-ins `passthrough` and `spoof-getpid`, selected through
 `configure_command_builtin(&mut Command, BuiltinTool)`. When one of these values
 is set, the runtime installs the built-in verbatim through
-`reverie_preload::install_builtin` — it does **not** run the LiteInst patching
+`reverie_inguest::install_builtin` — it does **not** run the LiteInst patching
 dispatcher or prepare instrumentation. This is the LiteInst analog of the
 e9patch built-in selector, so the same `BuiltinTool` value installs the same
 shared dispatcher in both backends.
 
 `spoof-getpid` proves the fallback/trap path can service **and mutate** a
-syscall result: a raw `getpid` returns `reverie_preload::SPOOF_PID` instead of
+syscall result: a raw `getpid` returns `reverie_inguest::SPOOF_PID` instead of
 the real PID, while `passthrough` leaves the result unchanged. The
 `reverie-liteinst-spoof-guest` fixture and the
 `spoof_getpid_builtin_mutates_getpid_result` /
 `passthrough_builtin_preserves_getpid_result` tests in `tests/strace.rs` cover
 both.
 
-### Shared `reverie-preload` runtime configuration
+### Shared `reverie-inguest` runtime configuration
 
 The in-guest runtime's `SIGSYS` handler is installed through the shared
-`reverie-preload` `RuntimeConfig`, whose `use_alt_stack` knob decides whether the
+`reverie-inguest` `RuntimeConfig`, whose `use_alt_stack` knob decides whether the
 handler runs on an alternate signal stack. The `RuntimeConfig` and the
-controller that honors it live in `reverie-preload` and are reviewed once; both
+controller that honors it live in `reverie-inguest` and are reviewed once; both
 ld-preload backends install through that same seam. The launcher selects the
 knob per guest with `set_guest_alt_stack(&mut Command, bool)`, which sets the
 `REVERIE_LITEINST_ALT_STACK` environment variable (`1`/`0`, `true`/`false`,
@@ -173,7 +313,7 @@ knob per guest with `set_guest_alt_stack(&mut Command, bool)`, which sets the
 the env-var spelling is LiteInst's — this is the LiteInst analog of e9patch's
 `REVERIE_E9PATCH_ALT_STACK`, so the same `RuntimeConfig` drives both backends.
 It applies to the LiteInst-dispatcher install path (the `strace`/`compat`/Detcore
-modes); a shared `BuiltinTool` installs through `reverie_preload::install_builtin`
+modes); a shared `BuiltinTool` installs through `reverie_inguest::install_builtin`
 with the shared default. The `alt_stack_from_env_value` parser and the
 `set_guest_alt_stack` round-trip are unit-tested in `src/runtime.rs` and
 `src/lib.rs`.
@@ -198,6 +338,24 @@ its return stack. Runtime-private syscalls keep their original gate. Nested Tool
 signals carry the nested interrupted rights, so RPC buffers are not treated as
 buffers belonging to an earlier outer guest call.
 
+The shared typed Tool host retains `pkey_alloc` permission effects when the
+current event owns a saved guest PKRU value. Its original unsubscribed forwarding,
+`Guest::inject` and `tail_inject` use that same authority, including callbacks
+sharing the owned syscall event. Allocation runs under those guest rights;
+Linux's actual returned PKRU is retained even on errno, and callback rights are
+restored before private runtime storage is accessed. Other private injections
+keep their existing gate. On OSPKE systems, this host refuses `pkey_alloc` with
+EOPNOTSUPP before allocation when no saved guest PKRU is available, including
+installed hooks and instruction callbacks without an owned rights image. This
+reduces support for both valid and invalid allocation arguments at those
+locations; refusal does not establish native allocation semantics there. Without
+OSPKE, Linux supplies the allocation result without PKRU instructions. The
+existing SIGALRM-handler admission restriction still returns ENOSPC first.
+This applies only to the shared typed Tool host: LiteInst's direct strace/compat
+forwarding and nested Tool forwarding bypass it and retain their existing gaps.
+It does not repair installed-hook XSAVE ownership or establish permission-effect
+parity for `pkey_free`, `mprotect`, `pkey_mprotect` or execute-only `mmap`.
+
 The shared preload protection-key test compares native execution with both
 signal-stack modes: 12 read/write cases, four actual partial transfers, and 24
 clock/time/signal-action buffer cases. It checks raw errno, unchanged refused
@@ -208,23 +366,52 @@ still need their own permission provenance and are outside this measurement.
 These cases do not establish complete backend PKRU parity.
 Deferred typed callbacks already run with runtime PKRU zero: their `LocalMemory`
 C-string reads and writes can access a key-denied guest buffer that a native
-syscall rejects. The protection-key behavior of Tool injection, indirect policy
-reads and the separate CPUID/RDTSC SIGSEGV entry also remains unqualified.
+syscall rejects. Beyond the bounded `pkey_alloc` support above, protection-key
+effects of Tool injection, indirect policy reads and the separate CPUID/RDTSC
+SIGSEGV entry remain unqualified.
 
 ## Patch publication modes
 
-The stopped ptrace install helper uses LiteInst2's quiescent entrypoint. The
-backend must have every other tracee thread stopped for the complete helper
-call; the current single-process, single-thread hybrid satisfies that contract.
-Planning and relocation remain unchanged, so this route can patch a cache-line
-straddler without registering WordPatch++ traps.
+`install_tool_quiescent` uses LiteInst2's quiescent entrypoint. Its caller
+asserts that no other application thread can execute while a site is
+installed; Hermit, which runs one guest thread at a time, satisfies that
+contract. Planning and relocation remain unchanged, so this route can patch a
+cache-line straddler without registering WordPatch++ traps.
 
-The in-process SIGSYS dispatcher always uses concurrent publication because
-other application threads may fetch the site. Single-line patches publish
+By default the in-process SIGSYS dispatcher uses concurrent publication,
+because other application threads may fetch the site; `install_tool` and
+`install_tool_from_bootstrap` select it. Single-line patches publish
 atomically. Split patches retain the full guarded WordPatch++ protocol and
 require `REVERIE_LITEINST_STRADDLER_STALENESS_TICKS` to be set above the
 machine's measured `Tmax`; without that calibration they fail closed to the
-trap path. Quiescent publication is never selected from this route.
+trap path. The dispatcher publishes quiescently only when the tool was
+installed with `install_tool_quiescent`, under the caller assertion above.
+vDSO sites are also published quiescently, during initialization and before
+any application thread starts.
+
+Native `strace` can run `read` and `write` at an otherwise admitted site whose
+split-word publication lacks calibration. It leaves the source bytes and page
+permissions unchanged and returns from the genuine SIGSYS frame to an ordinary
+callback. That callback runs the kernel operation with the guest's restored
+signal mask and live PKRU, then returns directly to the original syscall's next
+instruction. No following guest instruction is copied. These entries are
+unpatched signal entries, not direct installed hooks.
+
+This admission requires the guard router's successfully recorded prior
+`SIG_DFL` profile. Prior `SIG_IGN` and unknown profiles remain refused: routing
+an ignored SIGTRAP through a returning caught handler can interrupt timeout
+I/O. Every trap rechecks its syscall number and retained source admission.
+Interior entries, overlapping or possibly partial patches, missing arenas and
+other installation failures keep their refusals. Replacing a retained object
+mapping, revoking read access to its census inputs, or assigning them a
+protection key permanently invalidates the adapter's admission. Other native
+syscalls, compatibility mode and Tool
+dispatch retain their existing paths.
+
+The new adapter does not repair the older native installed-hook PKRU policy:
+an aligned native `pkey_alloc` hook can still undo the kernel's permission
+change when restoring its saved extended state. Native protection-key parity,
+owned Tool stacks and protected Tool memory are not established by this path.
 
 ## Current boundaries
 
@@ -269,6 +456,24 @@ trap path. Quiescent publication is never selected from this route.
   mappings disappear. It remains fail closed; completing exec requires a
   non-seccomp in-guest coverage mechanism or another bootstrap that does not
   reintroduce a ptracer.
+- Process exits complete asynchronously (`BackendCapabilities::
+  process_exits_complete_asynchronously`): a guest process leaves the host some
+  time after the tool grants its exit. A tool that holds scheduling until each
+  exit is physically complete (Hermit's Detcore does) needs the coordinator's
+  owner to report completions; `LiteinstBackend::with_connection_admission`
+  hands it each connecting process's pidfd for that. Under such a hold, these
+  topologies cannot make progress, because the exiting process waits on
+  another guest that needs a scheduler turn:
+  - a guest serving FUSE or CUSE (holding a `/dev/fuse` or `/dev/cuse` device
+    descriptor) or holding a seccomp user-notification listener: refused by
+    the tool with a named error;
+  - a guest serving a kernel network-filesystem client (NFS, CIFS, 9p) mounted
+    outside the guest set: unsupported. A tool can only detect the stall
+    (Hermit fails the run by name after a 1 s kernel wait or its 60 s
+    watchdog); a soft mount whose retry budget expires in under 1 s can
+    complete with semantics that differ from a ptrace run;
+  - a guest serving another guest's userfaultfd faults: supported, but a stall
+    is only detected, as for the network-filesystem case.
 - This is in-process instrumentation, not a security sandbox.
 
 Hermit CLI linkage and a published `liteinst2` revision are separate integration
@@ -309,7 +514,7 @@ signal, and no flags beyond `CLONE_CHILD_CLEARTID`, `CLONE_CHILD_SETTID` and
 `CLONE_PARENT_SETTID`, which covers glibc's `fork`; raw `vfork` and `clone3` are
 refused with `ENOTSUP` before forwarding), so `process_syscall`
 invokes the shared
-[`reverie_preload::fork::ForkHook`] seam in the child (guarded by the shared
+[`reverie_inguest::fork::ForkHook`] seam in the child (guarded by the shared
 `is_fork_like` classifier and a zero return value): immediately after the fork
 returns `0` in the child, `reset_fallback_observability` clears inherited
 counters so the child's attribution starts clean. Typed Tool mode then records
@@ -343,7 +548,7 @@ in-process runtime or a current L2 measurement:
   native by design. Canonical L2 assurance is not established by these results.
 - **Four boundary modes were reported in that historical sweep**,
   shared with e9patch because both ld-preload backends routed
-  clone/fork through the same `reverie-preload` dispatcher and share this
+  clone/fork through the same `reverie-inguest` dispatcher and share this
   crate's signal/timer policy: thread `clone` and `fork` are rejected, a
   callable guest signal handler is rejected (fail-closed, nonzero exit), and an
   armed timer never fires (the guest spins to timeout).

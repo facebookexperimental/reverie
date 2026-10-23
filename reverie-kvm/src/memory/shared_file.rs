@@ -64,6 +64,10 @@ impl Drop for AllocationGuard<'_> {
             if deferred.scopes != 0 {
                 return;
             }
+            self.memory
+                .mapping
+                .deferred_queued
+                .store(false, std::sync::atomic::Ordering::Release);
             (
                 std::mem::take(&mut deferred.causes),
                 std::mem::take(&mut deferred.notifications),
@@ -91,6 +95,10 @@ impl Drop for DeferredNotifications<'_> {
             if deferred.scopes != 0 || deferred.active.is_some() {
                 return;
             }
+            self.memory
+                .mapping
+                .deferred_queued
+                .store(false, std::sync::atomic::Ordering::Release);
             (
                 std::mem::take(&mut deferred.causes),
                 std::mem::take(&mut deferred.notifications),
@@ -123,10 +131,18 @@ impl std::ops::Deref for MemoryCopyAccess<'_> {
 
 impl Drop for MemoryCopyAccess<'_> {
     fn drop(&mut self) {
-        let notification = self.copy.take().unwrap().retire_deferred();
+        let memory = self.memory;
+        let mut notification = self
+            .copy
+            .take()
+            .unwrap()
+            .retire_deferred_with(|| memory.entry_origin());
         {
             let mut deferred = self.memory.mapping.deferred.lock().unwrap();
             if deferred.active.is_some() || deferred.scopes != 0 {
+                // Queued past this borrow: keep the issuing context alive
+                // until delivery, as a stored origin would.
+                notification.keep_issuer(|| memory.entry_origin());
                 deferred.notifications.push(notification);
                 return;
             }
@@ -144,6 +160,18 @@ pub(crate) struct SharedFileRangePlan {
     pub(crate) writable: bool,
     pub(crate) max_writable: bool,
     pub(crate) cursors: Option<AllocationCursors>,
+}
+
+/// Where a publication's new HVA view comes from.
+#[derive(Clone, Copy)]
+enum InstallSource {
+    /// A new shared view of the slice's backing.
+    Fresh,
+    /// A new shared view of the slice's backing, after first copying the
+    /// target range's current bytes into that backing.
+    CurrentContents,
+    /// A duplicate of this exact installed source VMA (fork only).
+    Inherited(NonNull<u8>),
 }
 
 pub(crate) struct PrivateRangePlan<'a> {
@@ -232,6 +260,9 @@ impl GuestMemory {
                     .any(|(_, old)| Arc::ptr_eq(old, &cause))
                 {
                     deferred.causes.push((origin, cause.clone()));
+                    self.mapping
+                        .deferred_queued
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
                 return self.entry_gate().pending_failure().map_or_else(
                     || Error::SharedFailure(deferred.causes[0].1.clone()),
@@ -252,6 +283,33 @@ impl GuestMemory {
             .backing_pages
             .values()
             .any(|page| matches!(page._slice.backing.kind, BackingKind::OrdinaryFile { .. }))
+    }
+
+    /// Whether any page is a retained shared view: an ordinary file, or
+    /// shared anonymous memory that a fork has made reachable from another
+    /// address space. Such a page can only be replaced by a publication.
+    pub(crate) fn contains_retained_shared(&self) -> bool {
+        self.mapping
+            .address_space
+            .lock()
+            .unwrap()
+            .backing_pages
+            .values()
+            .any(|page| page._slice.backing.kind.retained_shared())
+    }
+
+    pub(crate) fn range_contains_retained_shared(&self, address: u64, length: usize) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let last = address.saturating_add(length as u64 - 1) / PAGE_SIZE as u64;
+        self.mapping
+            .address_space
+            .lock()
+            .unwrap()
+            .backing_pages
+            .range(address / PAGE_SIZE as u64..=last)
+            .any(|(_, page)| page._slice.backing.kind.retained_shared())
     }
 
     pub(crate) fn range_contains_shared_file(&self, address: u64, length: usize) -> bool {
@@ -401,7 +459,14 @@ impl GuestMemory {
         permissions: Option<(bool, bool)>,
         cursors: Option<AllocationCursors>,
     ) -> Result<()> {
-        self.publish_range_from(allocation, address, slice, permissions, cursors, None)
+        self.publish_range_from(
+            allocation,
+            address,
+            slice,
+            permissions,
+            cursors,
+            InstallSource::Fresh,
+        )
     }
 
     // Only snapshot_with_shared_files may supply a source VMA. Its parent
@@ -414,7 +479,7 @@ impl GuestMemory {
         slice: BackingSlice,
         permissions: Option<(bool, bool)>,
         cursors: Option<AllocationCursors>,
-        inherited: Option<NonNull<u8>>,
+        source: InstallSource,
     ) -> Result<()> {
         self.check_copy_failure()?;
         if self.mapping.sync_mmu.lock().unwrap().as_ref() == Some(&false) {
@@ -474,6 +539,8 @@ impl GuestMemory {
                 }
                 None => {
                     prepared.pages.remove(&page);
+                    prepared.file_pages.remove(&page);
+                    prepared.shared_anonymous_pages.remove(&page);
                     if !prepared
                         .reservations
                         .get(&page)
@@ -535,6 +602,14 @@ impl GuestMemory {
             drop(closed);
             return Err(failure.error());
         }
+        if matches!(source, InstallSource::CurrentContents)
+            && let Err(error) = self.copy_current_contents(&closed, address, &slice)
+        {
+            drop(reservation);
+            drop(allocation);
+            drop(closed);
+            return Err(error);
+        }
         let mapping = &self.mapping;
         let result = closed
             .publish(self.entry_origin(), expected, move |generation| {
@@ -545,7 +620,9 @@ impl GuestMemory {
                     *ownership = Some(ledger);
                     let target = mapping.base_address + offset;
                     let protection = match slice.backing.kind {
-                        BackingKind::Fixed | BackingKind::OrdinaryFile { max_writable: true } => {
+                        BackingKind::Fixed
+                        | BackingKind::SharedAnonymous
+                        | BackingKind::OrdinaryFile { max_writable: true } => {
                             libc::PROT_READ | libc::PROT_WRITE
                         }
                         BackingKind::OrdinaryFile {
@@ -556,9 +633,13 @@ impl GuestMemory {
                         .as_mut()
                         .unwrap()
                         .lose_fixed_target(offset, slice.length, None);
-                    let installed = match inherited {
-                        Some(source) => self.duplicate_shared_image(source, target, slice.length),
-                        None => self.map_shared_image(target, &slice, protection),
+                    let installed = match source {
+                        InstallSource::Inherited(source) => {
+                            self.duplicate_shared_image(source, target, slice.length)
+                        }
+                        InstallSource::Fresh | InstallSource::CurrentContents => {
+                            self.map_shared_image(target, &slice, protection)
+                        }
                     };
                     let installed = match installed {
                         Ok(installed) => installed,
@@ -611,10 +692,127 @@ impl GuestMemory {
         result.map(|_| ())
     }
 
+    /// Fill a new backing with the bytes the target range holds now. The exact
+    /// Closed token excludes guest entry and every ordinary host copy, so no
+    /// store can land in the old page after it is read.
+    fn copy_current_contents(
+        &self,
+        closed: &Closed,
+        address: u64,
+        slice: &BackingSlice,
+    ) -> Result<()> {
+        if !closed.belongs_to(&self.entry_gate()) {
+            return Err(Error::MappingPublicationGateMismatch);
+        }
+        let mut buffer = vec![0; (1024 * 1024).min(slice.length)];
+        let mut copied = 0;
+        while copied < slice.length {
+            let length = buffer.len().min(slice.length - copied);
+            let current = address + copied as u64;
+            let offset = self.checked_offset(current, length)?;
+            let chunks = self.mapping.host_chunks(offset, length);
+            if chunks
+                .iter()
+                .any(|chunk| chunk.backing.kind.retained_shared())
+            {
+                return Err(Error::SharedFileCapability {
+                    operation: "shared anonymous fork sharing",
+                    reason: "the source page is already a retained shared view",
+                });
+            }
+            self.read_host_chunks(&chunks, current, &mut buffer[..length])?;
+            write_backing_at(&slice.backing, slice.offset + copied, &buffer[..length])
+                .map_err(Error::MemoryMapping)?;
+            copied += length;
+        }
+        Ok(())
+    }
+
+    /// Before a fork, move every `MAP_SHARED | MAP_ANONYMOUS` page that still
+    /// lives in private backing into its own shmem object, keeping its bytes
+    /// and permissions, so the child inherits the object instead of a copy.
+    /// Linux creates that object at mmap time; doing it at the first fork is
+    /// unobservable to the guest and leaves single-process use, including
+    /// threads, on the unchanged private path. Returns the allocation guard
+    /// once no such page remains.
+    pub(super) fn share_anonymous_memory_for_fork(&self) -> Result<AllocationGuard<'_>> {
+        loop {
+            let allocation = self.allocation_guard();
+            let run = {
+                let state = self.mapping.address_space.lock().unwrap();
+                let pending = |page: u64| {
+                    let shared = state.backing_pages.get(&page).is_some_and(|installed| {
+                        installed._slice.backing.kind == BackingKind::SharedAnonymous
+                    });
+                    (!shared).then(|| state.pages.get(&page).copied()).flatten()
+                };
+                let mut run: Option<(u64, u64, UserPageState)> = None;
+                for &page in &state.shared_anonymous_pages {
+                    let Some(permission) = pending(page) else {
+                        if run.is_some() {
+                            break;
+                        }
+                        continue;
+                    };
+                    match &mut run {
+                        None => run = Some((page, 1, permission)),
+                        Some((first, count, current))
+                            if *first + *count == page && *current == permission =>
+                        {
+                            *count += 1;
+                        }
+                        Some(_) => break,
+                    }
+                }
+                run
+            };
+            let Some((first, count, permission)) = run else {
+                return Ok(allocation);
+            };
+            let length = usize::try_from(count)
+                .ok()
+                .and_then(|count| count.checked_mul(PAGE_SIZE))
+                .ok_or(Error::InvalidMemoryLayout {
+                    guest_base: first * PAGE_SIZE as u64,
+                    size: usize::MAX,
+                })?;
+            let backing =
+                Arc::new(Backing::new_shared_anonymous(length).map_err(Error::MemoryMapping)?);
+            let slice = BackingSlice::new(backing, 0, length).map_err(Error::MemoryMapping)?;
+            let permissions = match permission {
+                UserPageState::Accessible { writable } => (true, writable),
+                UserPageState::NoAccess => (false, false),
+            };
+            match self.publish_range_from(
+                allocation,
+                first * PAGE_SIZE as u64,
+                slice,
+                Some(permissions),
+                None,
+                InstallSource::CurrentContents,
+            ) {
+                Ok(()) => {}
+                Err(Error::SharedFileCapability {
+                    operation: "mapping publication",
+                    ..
+                }) => {
+                    // Copying the object instead would silently give the child
+                    // private memory where Linux shares it.
+                    return Err(Error::SharedFileCapability {
+                        operation: "fork with shared anonymous memory",
+                        reason: "sharing MAP_SHARED|MAP_ANONYMOUS memory with a child requires one stopped vCPU (no other live thread), no host copies and no retained operands",
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Fork into a distinct address space, preserving retained shared VMAs.
     /// This is not CLONE_VM: private bytes, permissions, gate and HVA ownership
-    /// all belong to the new child. Anonymous MAP_SHARED has no such metadata
-    /// yet and retains its pre-existing behavior outside this bounded repair.
+    /// all belong to the new child. Ordinary-file views and fork-shared
+    /// anonymous memory (see `share_anonymous_memory_for_fork`) are inherited
+    /// as the same object; everything else is copied.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-919): Review shared-file fork ownership and copies.
     pub(super) fn snapshot_with_shared_files(
@@ -651,10 +849,7 @@ impl GuestMemory {
         let mut cursor = self.guest_base();
         let mut inherited = Vec::new();
         for (&page, installed) in &parent_state.backing_pages {
-            if !matches!(
-                installed._slice.backing.kind,
-                BackingKind::OrdinaryFile { .. }
-            ) {
+            if !installed._slice.backing.kind.retained_shared() {
                 continue;
             }
             let address = page * PAGE_SIZE as u64;
@@ -680,21 +875,48 @@ impl GuestMemory {
         // installed pointers are recreated only from actual child syscall results.
         child_state.backing_pages.clear();
         *child.mapping.address_space.lock().unwrap() = child_state;
-        for (page, installed) in inherited {
-            let permissions = match parent_state.pages.get(&page) {
-                Some(UserPageState::Accessible { writable }) => Some((true, *writable)),
-                Some(UserPageState::NoAccess) => Some((false, false)),
-                None => None,
-            };
+        let permissions = |page: u64| match parent_state.pages.get(&page) {
+            Some(UserPageState::Accessible { writable }) => Some((true, *writable)),
+            Some(UserPageState::NoAccess) => Some((false, false)),
+            None => None,
+        };
+        let mut inherited = inherited.into_iter().peekable();
+        while let Some((page, installed)) = inherited.next() {
+            if installed._slice.backing.kind == BackingKind::SharedAnonymous {
+                // The backend owns this memfd and never seals it, so a fresh
+                // shared view of the same pages is the same object. Map a run
+                // of consecutive pages of one object with one publication.
+                let mut slice = installed._slice;
+                let mut pages = 1;
+                while let Some((next, following)) = inherited.peek()
+                    && *next == page + pages
+                    && Arc::ptr_eq(&following._slice.backing, &slice.backing)
+                    && following._slice.offset == slice.offset + slice.length
+                    && permissions(*next) == permissions(page)
+                {
+                    slice.length += following._slice.length;
+                    pages += 1;
+                    inherited.next();
+                }
+                child.publish_range_from(
+                    child.allocation_guard(),
+                    page * PAGE_SIZE as u64,
+                    slice,
+                    permissions(page),
+                    None,
+                    InstallSource::Fresh,
+                )?;
+                continue;
+            }
             // A page is always contained in one existing host VMA. Do not
             // merge numerically adjacent publications into an unproved VMA.
             child.publish_range_from(
                 child.allocation_guard(),
                 page * PAGE_SIZE as u64,
                 installed._slice,
-                permissions,
+                permissions(page),
                 None,
-                Some(installed.mapping),
+                InstallSource::Inherited(installed.mapping),
             )?;
         }
         self.check_copy_failure()?;
@@ -749,9 +971,12 @@ impl GuestMemory {
             let allocation = self.allocation_guard();
             let range = {
                 let state = self.mapping.address_space.lock().unwrap();
-                let mut pages = state.backing_pages.iter().filter(|(_, page)| {
-                    matches!(page._slice.backing.kind, BackingKind::OrdinaryFile { .. })
-                });
+                // Shared anonymous views retire too: discarding the outgoing
+                // image would otherwise zero the object for its other holders.
+                let mut pages = state
+                    .backing_pages
+                    .iter()
+                    .filter(|(_, page)| page._slice.backing.kind.retained_shared());
                 pages.next().map(|(&first, _)| {
                     let mut end = first + 1;
                     for (&page, _) in pages {
@@ -812,7 +1037,7 @@ impl GuestMemory {
         let copy = self.copy_access()?;
         let retained = self
             .entry_gate()
-            .retain_operand(&copy)
+            .retain_operand_with(&copy, || self.entry_origin())
             .map_err(|failure| failure.error())?;
         let (spans, hole) = {
             let state = self.mapping.address_space.lock().unwrap();
@@ -969,7 +1194,7 @@ impl GuestMemory {
                 BackingKind::OrdinaryFile { .. } => {
                     self.copy_file_chunk(chunk, target, false, address, destination.len(), copied)?
                 }
-                BackingKind::Fixed => unsafe {
+                BackingKind::Fixed | BackingKind::SharedAnonymous => unsafe {
                     std::ptr::copy_nonoverlapping(chunk.mapping.as_ptr(), target, chunk.length);
                 },
             }
@@ -980,6 +1205,13 @@ impl GuestMemory {
     }
 
     pub(super) fn deferred_failure(&self) -> Option<Arc<Error>> {
+        if !self
+            .mapping
+            .deferred_queued
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
         self.mapping
             .deferred
             .lock()
@@ -997,7 +1229,7 @@ impl GuestMemory {
     pub(crate) fn record_kvm_sync_mmu(&self, supported: bool) -> Result<()> {
         let _allocation = self.allocation_guard();
         self.check_copy_failure()?;
-        if !supported && self.contains_shared_file() {
+        if !supported && self.contains_retained_shared() {
             return Err(Error::SynchronousMmuUnsupported);
         }
         let mut record = self.mapping.sync_mmu.lock().unwrap();
@@ -1012,11 +1244,12 @@ impl UserMemory {
     /// rollback of arbitrary intervening syscall effects.
     pub(crate) fn preflight_atomic_store(&self, address: u64, length: usize) -> Result<()> {
         self.memory.with_copy(|copy| {
-            self.translate_admitted(address, length, copy)?;
+            let physical = self.translate_admitted(address, length, copy)?;
             if self.user_writable_prefix_admitted(address, length, copy)? != length {
                 return Err(Error::GuestMemoryAccessDenied { address, length });
             }
-            if self.memory.range_contains_shared_file(address, length) {
+            // Shared-file metadata is by physical address.
+            if self.memory.range_contains_shared_file(physical, length) {
                 return Err(Error::SharedFileCapability { operation: "atomic scalar store", reason: "truncate-capable file backing has no proven fault-contained atomic store" });
             }
             Ok(())
@@ -1171,6 +1404,7 @@ mod tests {
     use reverie::syscalls::AddrSliceMut;
 
     use super::*;
+    use crate::error::ErrorExt;
 
     const BASE: u64 = 0x10000;
     const P: u64 = PAGE_SIZE as u64;
@@ -1247,6 +1481,107 @@ mod tests {
         let mut bytes = vec![0; length];
         memory.read_raw(address, &mut bytes).unwrap();
         bytes
+    }
+
+    type AccessMaps = (
+        std::collections::BTreeMap<u64, UserPageState>,
+        std::collections::BTreeMap<u64, RegionKind>,
+        std::collections::BTreeMap<u64, u64>,
+        std::collections::BTreeSet<u64>,
+    );
+
+    fn access_maps(memory: &GuestMemory) -> AccessMaps {
+        let access = memory.mapping.address_space.lock().unwrap();
+        (
+            access.pages.clone(),
+            access.reservations.clone(),
+            access.file_pages.clone(),
+            access.shared_anonymous_pages.clone(),
+        )
+    }
+
+    /// The composition the Tool-scratch fast paths replace.
+    fn composed_expose(memory: &GuestMemory, address: u64, length: u64) -> Result<()> {
+        let reservation = memory.reserve_region(address, length, RegionKind::ToolScratch)?;
+        memory.map_user_range(address, length, false)?;
+        reservation.commit();
+        Ok(())
+    }
+
+    fn outcome(result: Result<()>) -> String {
+        match result {
+            Ok(()) => "ok".to_owned(),
+            Err(error) => format!("{error:?}"),
+        }
+    }
+
+    fn readonly_file_page(memory: &GuestMemory, file: &File) {
+        let path = std::ffi::CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(raw >= 0);
+        memory
+            .publish_shared_file_range(
+                memory.allocation_guard(),
+                SharedFileRangePlan {
+                    address: BASE + P,
+                    length: PAGE_SIZE,
+                    file: unsafe { OwnedFd::from_raw_fd(raw) },
+                    offset: 0,
+                    readable: true,
+                    writable: false,
+                    max_writable: false,
+                    cursors: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn tool_scratch_fast_paths_match_the_composed_mapping_calls() {
+        let file = file(1);
+        // (setup, address, length)
+        let cases: Vec<(&str, u64, u64)> = vec![
+            ("plain", BASE, P),
+            ("plain", BASE + 2 * P, 2 * P),
+            ("plain", BASE, 0),
+            ("plain", BASE + 4 * P, P),
+            ("plain", BASE + 3 * P + 1, P),
+            ("readonly-file", BASE + P, P),
+            ("readonly-file", BASE, 2 * P),
+            ("shared-file", BASE + P, P),
+            ("shared-file", BASE, 3 * P),
+        ];
+        for (setup, address, length) in cases {
+            let prepare = || {
+                let memory = fixture(4);
+                memory.unmap_user_range(BASE, 4 * P).unwrap();
+                match setup {
+                    "plain" => {}
+                    "readonly-file" => readonly_file_page(&memory, &file),
+                    "shared-file" => install(&memory, &file, BASE + P, 1, 0),
+                    _ => unreachable!(),
+                }
+                memory
+            };
+            let fast = prepare();
+            let composed = prepare();
+            assert_eq!(access_maps(&fast), access_maps(&composed));
+            for round in 0..2 {
+                let label = format!("{setup} {address:#x}+{length:#x} round {round}");
+                assert_eq!(
+                    outcome(fast.expose_tool_scratch(address, length)),
+                    outcome(composed_expose(&composed, address, length)),
+                    "expose {label}"
+                );
+                assert_eq!(access_maps(&fast), access_maps(&composed), "expose {label}");
+                assert_eq!(
+                    outcome(fast.hide_tool_scratch(address, length)),
+                    outcome(composed.unmap_user_range(address, length)),
+                    "hide {label}"
+                );
+                assert_eq!(access_maps(&fast), access_maps(&composed), "hide {label}");
+            }
+        }
     }
 
     #[test]
@@ -1988,6 +2323,48 @@ mod tests {
             assert!(memory.user_range_is_mapped(BASE, P));
             assert_eq!(bytes(&file, 0, PAGE_SIZE), before);
         }
+    }
+
+    /// `zero_lazily` refuses a range that holds a retained shared view, in
+    /// every build, before the poisoning discard is reached: the file is
+    /// unchanged, the entry gate stays clear, and memory stays usable
+    /// (https://github.com/rrnewton/reverie/issues/1058).
+    #[test]
+    fn zero_lazily_refuses_a_retained_shared_view_before_discarding() {
+        let memory = fixture(2);
+        let file = file(1);
+        install(&memory, &file, BASE, 1, 0);
+        let before = bytes(&file, 0, PAGE_SIZE);
+        assert!(matches!(
+            memory.zero_lazily(BASE, 2 * PAGE_SIZE),
+            Err(Error::SharedFileCapability { .. })
+        ));
+        assert!(memory.entry_gate().pending_failure().is_none());
+        assert_eq!(bytes(&file, 0, PAGE_SIZE), before);
+        memory.zero_raw(BASE + P, PAGE_SIZE).unwrap();
+    }
+
+    /// The same refusal at 2 MiB, where zero_lazily would otherwise discard:
+    /// one ordinary-file page inside a 2 MiB range is refused, unchanged and
+    /// unpoisoned, in debug and release builds
+    /// (https://github.com/rrnewton/reverie/issues/1058).
+    #[test]
+    fn zero_lazily_refuses_a_retained_shared_view_at_lazy_size() {
+        let pages = crate::memory::LAZY_ZERO_MIN_BYTES / PAGE_SIZE + 4;
+        let memory = fixture(pages);
+        let file = file(1);
+        install(&memory, &file, BASE + 4 * P, 1, 0);
+        let before = bytes(&file, 0, PAGE_SIZE);
+        assert!(matches!(
+            memory.zero_lazily(BASE, crate::memory::LAZY_ZERO_MIN_BYTES),
+            Err(Error::SharedFileCapability {
+                operation: "zero lazily",
+                ..
+            })
+        ));
+        assert!(memory.entry_gate().pending_failure().is_none());
+        assert_eq!(bytes(&file, 0, PAGE_SIZE), before);
+        memory.zero_raw(BASE, PAGE_SIZE).unwrap();
     }
 
     #[test]

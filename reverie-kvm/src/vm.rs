@@ -6,11 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![allow(
-    unexpected_cfgs,
-    reason = "`fbcode_build` is supplied by the internal Buck build"
-)]
-
 use std::fs::File;
 use std::future::Future;
 use std::os::fd::AsRawFd;
@@ -37,6 +32,7 @@ use kvm_ioctls::Kvm;
 use kvm_ioctls::VcpuExit;
 use kvm_ioctls::VcpuFd;
 use kvm_ioctls::VmFd;
+use reverie::BackendCapabilities;
 use reverie::BackendStatsRequest;
 use reverie::BackendStatsSource;
 use reverie::ExitStatus;
@@ -46,7 +42,6 @@ use reverie::SignalProcessId;
 use reverie::ThreadOwnership;
 use reverie::Tool;
 
-use crate::CpuidPolicy;
 use crate::Error;
 use crate::GuestMemory;
 use crate::Result;
@@ -70,6 +65,7 @@ use crate::bootstrap::exception_from_halt;
 use crate::bootstrap::exception_pushes_error_code;
 use crate::bootstrap::process_syscall_return_registers;
 use crate::bootstrap::set_user_segment_base;
+use crate::bootstrap::stage_process_signal_return;
 use crate::bootstrap::stage_process_syscall_return;
 use crate::bootstrap::syscall_hypercall_address;
 use crate::bootstrap::thread_tool_stack_top;
@@ -79,6 +75,8 @@ use crate::elf::TaskLifecycleTable;
 use crate::elf::initial_thread_name;
 use crate::elf::load_static_elf;
 use crate::elf::load_static_elf_file;
+use crate::elf::load_static_elf_with_execfn;
+use crate::error::ErrorExt;
 use crate::executor::AbandonedRuns;
 use crate::executor::CapturedOutput;
 #[cfg(test)]
@@ -179,13 +177,61 @@ impl<I> InstructionBoundary<I> {
     }
 }
 
+/// The signal Linux raises for a CPU exception taken in user mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserTrapSignal {
+    pub(crate) signal: libc::c_int,
+    pub(crate) code: i32,
+    /// `si_addr`: the faulting instruction for SIGILL and SIGFPE, CR2 for
+    /// SIGSEGV.
+    pub(crate) address: u64,
+}
+
+/// Maps a user-mode CPU exception to the signal Linux's x86 trap handlers
+/// raise for it, or `None` when this backend keeps it as a backend error.
+///
+/// - #DE (0): `exc_divide_error` -> SIGFPE, FPE_INTDIV, si_addr = RIP. This
+///   covers both division by zero and quotient overflow, as on Linux.
+/// - #UD (6): `exc_invalid_op` -> SIGILL, ILL_ILLOPN, si_addr = RIP.
+/// - #PF (14): only a not-present user access to page zero, the one page this
+///   backend's page tables deliberately leave unmapped below the identity
+///   limit (error code 4 read, 6 write, 20 instruction fetch) ->
+///   SIGSEGV, SEGV_MAPERR, si_addr = CR2. Other page faults still name a
+///   backend layout gap rather than a guest fault, so they stay errors.
+pub(crate) fn user_trap_signal(
+    vector: u8,
+    error_code: u64,
+    instruction_pointer: u64,
+    fault_address: u64,
+) -> Option<UserTrapSignal> {
+    let (signal, code, address) = match vector {
+        0 => (libc::SIGFPE, crate::signal::FPE_INTDIV, instruction_pointer),
+        6 => (libc::SIGILL, crate::signal::ILL_ILLOPN, instruction_pointer),
+        14 if fault_address < PAGE_SIZE && [4, 6, 20].contains(&error_code) => {
+            (libc::SIGSEGV, crate::signal::SEGV_MAPERR, fault_address)
+        }
+        _ => return None,
+    };
+    Some(UserTrapSignal {
+        signal,
+        code,
+        address,
+    })
+}
+
+/// A synchronous CPU exception taken in guest user mode that Linux reports to
+/// the faulting thread as a signal (`force_sig_fault`). The faulting
+/// instruction has not retired: `registers.rip` names it, so a handler that
+/// returns re-executes it, exactly as on Linux.
 #[derive(Clone)]
-pub(crate) struct PageZeroFault {
+pub(crate) struct UserTrap {
     pub(crate) registers: kvm_regs,
     pub(crate) event: reverie::SignalEvent,
     code_segment: u16,
     stack_segment: u16,
+    vector: u8,
     error_code: u64,
+    /// The `sigcontext.cr2` value: CR2 for a page fault, otherwise zero.
     address: u64,
     halted_registers: kvm_regs,
     special_registers: kvm_bindings::kvm_sregs,
@@ -194,7 +240,7 @@ pub(crate) struct PageZeroFault {
     transport_address: u64,
 }
 
-impl PageZeroFault {
+impl UserTrap {
     #[cfg(test)]
     pub(crate) fn for_test(event: reverie::SignalEvent) -> Self {
         Self {
@@ -207,6 +253,7 @@ impl PageZeroFault {
             xsave: Arc::new(unsafe { std::mem::zeroed() }),
             code_segment: crate::signal::USER_CODE_SELECTOR,
             stack_segment: crate::signal::USER_DATA_SELECTOR,
+            vector: 14,
             error_code: 4,
             address: 0,
             transport: [0; FRAME_SIZE],
@@ -1194,7 +1241,7 @@ fn validate_root_pid(pid: i32) -> Result<i32> {
 /// PID 1, so the conventional root guest (PID 3, see detcore `ROOT_DETPID`) has
 /// `getppid() == 1`. KVM synthesizes the guest identity rather than using a real
 /// namespace, so it must reproduce the same parent value for parity.
-const CONTAINER_INIT_PID: i32 = 1;
+pub(crate) const CONTAINER_INIT_PID: i32 = 1;
 
 /// Deterministic parent PID for the container's root guest, matching the ptrace
 /// backend. A guest that is itself the namespace init (PID 1) has no parent and
@@ -1254,6 +1301,57 @@ fn normalize_completed_syscall_boundary_registers_with_read(
     // that same completed-hypercall state.
     registers.rax = 0;
     Ok(registers)
+}
+
+/// What a syscall exit's first guest-memory copy read: the whole transport
+/// frame, and, in the same entry-gate admission, the syscall trampoline's
+/// hypercall instruction, which the exit's completed boundary checks when the
+/// syscall goes to a Tool callback. Both used to be copied twice per exit, by
+/// separate admissions: the frame when the request was decoded and again,
+/// with the instruction, when the boundary was captured.
+///
+/// The bytes stand in for the boundary's second copy only through
+/// [`CompletedSyscallBoundary::capture_admitted_reusing`], and only when the
+/// gate shows that no mapping publication has happened since they were read
+/// (see [`crate::entry::EntryGate::admit_operation_unchanged`]). No host code
+/// writes them in between: the frame and the trampoline's hypercall bytes
+/// are written only by this thread's own backend, which writes neither
+/// between the two reads. Guest code on another vCPU could store to them
+/// (the boot area is mapped writable for the guest), but the gate never
+/// orders guest stores against host copies (it admits copies while vCPUs
+/// run), so such a store races the second copy as much as the first, and
+/// reusing the first read is the outcome in which the store landed after
+/// the second.
+pub(crate) struct SyscallExitRead {
+    frame_address: u64,
+    frame: [u8; FRAME_SIZE],
+    hypercall_address: u64,
+    /// None when the attempted read failed; the boundary then copies again.
+    hypercall: Option<[u8; 3]>,
+    generation: crate::entry::MappingGeneration,
+}
+
+impl SyscallExitRead {
+    /// Serves the boundary capture's two reads from these bytes. Any other
+    /// read, which the capture never makes, is refused rather than guessed.
+    fn read(&self, address: u64, destination: &mut [u8]) -> Result<()> {
+        if address == self.frame_address && destination.len() == FRAME_SIZE {
+            destination.copy_from_slice(&self.frame);
+            return Ok(());
+        }
+        match self.hypercall {
+            Some(hypercall)
+                if address == self.hypercall_address && destination.len() == hypercall.len() =>
+            {
+                destination.copy_from_slice(&hypercall);
+                Ok(())
+            }
+            _ => Err(Error::UnexpectedVcpuExit(format!(
+                "syscall exit read cannot serve {} bytes at {address:#x}",
+                destination.len()
+            ))),
+        }
+    }
 }
 
 /// Exact reusable state for a syscall transport whose KVM hypercall has
@@ -1321,6 +1419,52 @@ impl CompletedSyscallBoundary {
     ) -> Result<Option<Self>> {
         backend
             .prepare_action_read(stop, |backend, access| {
+                Self::capture_with_read(
+                    backend,
+                    frame_address,
+                    action_return_registers,
+                    |address, bytes| access.read_raw(address, bytes),
+                )
+            })
+            .await
+    }
+
+    /// [`Self::capture_admitted`], using the bytes the exit's first copy
+    /// already read instead of copying them again, when the gate permits it.
+    /// `exit` is reused only if it was read through this backend's own
+    /// mapping (the same entry gate), covers exactly the frame and hypercall
+    /// this capture reads, and the gate still admits at the generation the
+    /// read saw; otherwise this is `capture_admitted`, unchanged.
+    pub(crate) async fn capture_admitted_reusing(
+        backend: &mut KvmBackend,
+        frame_address: u64,
+        action_return_registers: Option<kvm_regs>,
+        stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
+        exit: Option<(&SyscallExitRead, &GuestMemory)>,
+    ) -> Result<Option<Self>> {
+        let hypercall_address = syscall_hypercall_address(
+            backend.hypercall_instruction,
+            backend.syscall_trampoline_address,
+            backend.syscall_frame_address,
+        );
+        let reuse = exit.filter(|(exit, memory)| {
+            exit.frame_address == frame_address
+                && exit.hypercall_address == hypercall_address
+                && exit.hypercall.is_some()
+                && Arc::ptr_eq(memory.entry_gate_ref(), backend.memory.entry_gate_ref())
+        });
+        let reused = reuse.map(|(exit, _)| {
+            (exit.generation, move |backend: &KvmBackend| {
+                Self::capture_with_read(
+                    backend,
+                    frame_address,
+                    action_return_registers,
+                    |address, bytes| exit.read(address, bytes),
+                )
+            })
+        });
+        backend
+            .prepare_action_read_or_reuse(stop, reused, |backend, access| {
                 Self::capture_with_read(
                     backend,
                     frame_address,
@@ -1458,7 +1602,6 @@ pub struct KvmBackend {
     vm: VmFd,
     pub(crate) memory: GuestMemory,
     _kvm: Kvm,
-    cpuid_policy: CpuidPolicy,
     hypercall_instruction: [u8; 3],
     syscall_trampoline_address: u64,
     pub(crate) syscall_frame_address: u64,
@@ -1498,12 +1641,30 @@ pub struct KvmBackend {
     pub(crate) stdin: Arc<Mutex<Option<File>>>,
     pub(crate) native_exit_broker: Option<crate::native_exit_broker::BrokerClient>,
     pub(crate) root_pid: i32,
+    /// Task IDs each new guest task spends (`set_ids_per_task`).
+    pub(crate) ids_per_task: i32,
     // One optional collector is shared by every fork and thread backend in the
     // guest tree. `None` is the allocation-free, update-free default.
     pub(crate) exit_collector: Option<Arc<KvmExitCollector>>,
     // Public runs that never returned, with every child host thread their
     // roots still own. Once one exists, no run or image is admitted.
     pub(crate) abandoned_runs: Arc<Mutex<AbandonedRuns>>,
+    /// The FS or GS base staged during the current guest callback and applied
+    /// to the vCPU at the next return to the guest. A later staged base
+    /// replaces an earlier one, an exec discards it, and a new task lifetime
+    /// on this backend (an installed image, or a run's new root executor)
+    /// starts with it empty, as each new executor's slot did. It was the
+    /// executor's `pending_segment` until provider step E2e; the rule is
+    /// unchanged.
+    ///
+    /// Known deviation, kept on purpose so that E2e changes no behaviour: the
+    /// slot is shared by both registers. So a callback that sets FS and then
+    /// GS applies only the GS base to the vCPU, although the provider records
+    /// both. The provider contract (`ProviderOutcome::SegmentBase`) is per
+    /// register; KVM's fix is a separate, behaviour-changing commit, drafted
+    /// as an issue in the dev-hermit parent repository, at
+    /// ai_docs/evidence/kvm-kernel-trait-design-20261016/pending-issue-reverie-kvm-segment-slot.md.
+    pending_segment: Option<(SegmentBase, u64)>,
 }
 
 struct CompletedToolPanic {
@@ -1530,7 +1691,6 @@ struct KvmProcessSnapshot {
     registers: kvm_regs,
     xsave: kvm_xsave,
     stdin: Option<File>,
-    cpuid_policy: CpuidPolicy,
 }
 
 struct ForkedProcess {
@@ -1562,8 +1722,19 @@ fn hide_tool_scratch_pages(memory: &GuestMemory) -> Result<()> {
     Ok(())
 }
 
+impl KvmBackend {
+    /// The static facts about how this backend runs a guest that a tool may
+    /// need, in the same form [`reverie::Backend::capabilities`] reports them
+    /// for backends that implement that trait.
+    pub const fn capabilities() -> BackendCapabilities {
+        BackendCapabilities::KVM
+    }
+}
+
 struct InitializedKvmResources {
     vcpu: VcpuFd,
+    /// KVM can copy general and special registers into `kvm_run` on exit.
+    sync_regs: bool,
     vm: VmFd,
     kvm: Kvm,
     hypercall_instruction: [u8; 3],
@@ -1585,6 +1756,10 @@ impl KvmBackend {
 
     pub(crate) fn entry_driver_owner(&self) -> Option<crate::entry::owner::DriverOwner> {
         self.entry_driver.clone()
+    }
+
+    pub(crate) fn entry_driver_ref(&self) -> Option<&crate::entry::owner::DriverOwner> {
+        self.entry_driver.as_ref()
     }
 
     pub(crate) fn set_operation_origin(
@@ -1680,7 +1855,8 @@ impl KvmBackend {
 
     /// Creates a VM with one vCPU and a memory slot starting at GPA zero.
     pub fn new(memory_size: usize) -> Result<Self> {
-        Self::new_with_cpuid_policy(memory_size, CpuidPolicy::default())
+        let stdin = duplicate_stdin()?;
+        Self::new_with_stdin(memory_size, stdin)
     }
 
     /// Creates a VM with an explicitly reserved supervisor standard input.
@@ -1688,32 +1864,20 @@ impl KvmBackend {
     /// Callers that initialize async runtimes before KVM should reserve stdin
     /// first so an originally closed descriptor cannot be reused internally.
     pub fn new_with_stdin(memory_size: usize, stdin: Option<File>) -> Result<Self> {
-        Self::new_with_cpuid_policy_and_stdin(memory_size, CpuidPolicy::default(), stdin)
-    }
-
-    /// Creates a VM with a caller-selected CPUID feature policy.
-    pub fn new_with_cpuid_policy(memory_size: usize, cpuid_policy: CpuidPolicy) -> Result<Self> {
-        let stdin = duplicate_stdin()?;
-        Self::new_with_cpuid_policy_and_stdin(memory_size, cpuid_policy, stdin)
-    }
-
-    fn new_with_cpuid_policy_and_stdin(
-        memory_size: usize,
-        cpuid_policy: CpuidPolicy,
-        stdin: Option<File>,
-    ) -> Result<Self> {
         let memory = GuestMemory::new(0, memory_size)?;
-        Self::new_with_memory_and_cpuid_policy(memory, cpuid_policy, stdin)
+        Self::new_with_memory(memory, stdin)
     }
 
-    fn initialize_resources(
-        memory: &GuestMemory,
-        cpuid_policy: CpuidPolicy,
-    ) -> Result<InitializedKvmResources> {
+    fn initialize_resources(memory: &GuestMemory) -> Result<InitializedKvmResources> {
         let kvm = Kvm::new()?;
         let vm = kvm.create_vm()?;
         if !vm.check_extension(Cap::ExitHypercall) {
             return Err(Error::HypercallExitUnsupported);
+        }
+        // A closer relies on kvm_run.immediate_exit to stop a vCPU whose
+        // thread took the reserved signal just before KVM_RUN.
+        if !vm.check_extension(Cap::ImmediateExit) {
+            return Err(Error::ImmediateExitUnsupported);
         }
         // Serialize the capability record with physical publication. A file
         // image created before attachment requires synchronous invalidation;
@@ -1723,10 +1887,16 @@ impl KvmBackend {
         // this HVA: slot registration below is its first attachment to the VM.
         memory.record_kvm_sync_mmu(kvm.check_extension(Cap::SyncMmu))?;
 
-        let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+        // The vCPU gets KVM's host-supported CPUID table, with its extended
+        // state limited to the x87, SSE and YMM components the backend's
+        // signal frames carry (`signal::FIXED_XFEATURES`); with more, KVM would
+        // save state (AVX-512, PKRU) that no frame can hold. A guest never
+        // reads this table: every guest CPUID faults to the Tool, whose answer
+        // is the guest's (Detcore's machine description under Hermit, the
+        // host's by Reverie's default).
+        let cpuid = vcpu_cpuid(kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?)?;
         // TODO-HUMAN-REVIEW(PR-129): Review host-selected private hypercall transport.
         let hypercall_instruction = supported_hypercall_instruction(&cpuid)?;
-        cpuid_policy.apply(&mut cpuid)?;
         let cap = kvm_enable_cap {
             cap: Cap::ExitHypercall as u32,
             args: [1_u64 << VMCALL_SYSCALL_TRANSPORT, 0, 0, 0],
@@ -1749,30 +1919,32 @@ impl KvmBackend {
 
         let vcpu = vm.create_vcpu(0)?;
         vcpu.set_cpuid2(&cpuid)?;
+        let wanted = kvm_bindings::KVM_SYNC_X86_REGS | kvm_bindings::KVM_SYNC_X86_SREGS;
+        // A negative result is a failed probe, not a mask.
+        let offered = vm.check_extension_int(Cap::SyncRegs);
+        let sync_regs = offered > 0 && (offered as u32) & wanted == wanted;
         Ok(InitializedKvmResources {
             vcpu,
+            sync_regs,
             vm,
             kvm,
             hypercall_instruction,
         })
     }
 
-    fn new_with_memory_and_cpuid_policy(
-        memory: GuestMemory,
-        cpuid_policy: CpuidPolicy,
-        stdin: Option<File>,
-    ) -> Result<Self> {
+    fn new_with_memory(memory: GuestMemory, stdin: Option<File>) -> Result<Self> {
         install_worker_interrupt_handler()?;
         const INITIALIZATION_ATTEMPTS: usize = 3;
         let mut attempts = 0;
         let InitializedKvmResources {
             vcpu,
+            sync_regs,
             vm,
             kvm,
             hypercall_instruction,
         } = loop {
             attempts += 1;
-            match Self::initialize_resources(&memory, cpuid_policy) {
+            match Self::initialize_resources(&memory) {
                 Ok(resources) => break resources,
                 Err(Error::Kvm(error))
                     if error.errno() == libc::EINTR && attempts < INITIALIZATION_ATTEMPTS => {}
@@ -1780,11 +1952,10 @@ impl KvmBackend {
             }
         };
         Ok(Self {
-            vcpu: crate::clock::CountedVcpu::new(vcpu, memory.clone())?,
+            vcpu: crate::clock::CountedVcpu::new(vcpu, memory.clone(), sync_regs)?,
             vm,
             memory,
             _kvm: kvm,
-            cpuid_policy,
             hypercall_instruction,
             syscall_trampoline_address: SYSCALL_TRAMPOLINE_ADDRESS,
             syscall_frame_address: SYSCALL_FRAME_ADDRESS,
@@ -1811,8 +1982,10 @@ impl KvmBackend {
             stdin: Arc::new(Mutex::new(stdin)),
             native_exit_broker: None,
             root_pid: 1,
+            ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
             exit_collector: None,
             abandoned_runs: Arc::default(),
+            pending_segment: None,
         })
     }
 
@@ -1914,6 +2087,23 @@ impl KvmBackend {
              unrepresentable now that one ThreadOwnership drives both decisions",
             self.thread_ownership,
         );
+    }
+
+    /// Number new guest tasks spending `ids_per_task` task IDs each, from the
+    /// root's ID up (see `reverie::task_ids`): Linux's 1 by default; Hermit
+    /// passes `reverie::task_ids::HERMIT_PTRACE_IDS_PER_TASK` so its guests see
+    /// the IDs its ptrace reference gives them. Applies to the installed image
+    /// and any later one; fails for a step below 1.
+    pub fn set_ids_per_task(&mut self, ids_per_task: i32) -> Result<()> {
+        AbandonedRuns::admit(&self.abandoned_runs)?;
+        if ids_per_task < 1 {
+            return Err(Error::InvalidTaskIdStep(ids_per_task));
+        }
+        self.ids_per_task = ids_per_task;
+        if let Some(loaded) = self.static_elf.as_mut() {
+            loaded.ids_per_task = ids_per_task;
+        }
+        Ok(())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2044,7 +2234,35 @@ impl KvmBackend {
         self.install_loaded_static_elf(loaded)
     }
 
+    /// As [`Self::install_static_elf_with_context`], for an image exec'd by
+    /// the filename `execfn`: Linux copies that filename to the top of the
+    /// initial stack and names it in `AT_EXECFN`. When a launcher has
+    /// already rewritten a `#!` script's `argv` to its interpreter, `execfn`
+    /// is still the script's filename, as `execve` gave it to the kernel, so
+    /// the guest's stack matches a traced guest's.
+    pub fn install_static_elf_with_exec_context(
+        &mut self,
+        image: &[u8],
+        execfn: &std::ffi::OsStr,
+        argv: &[&str],
+        envp: &[&str],
+        cwd: &Path,
+    ) -> Result<()> {
+        AbandonedRuns::admit(&self.abandoned_runs)?;
+        self.vcpu.check_initial_elf_install()?;
+        let loaded = load_static_elf_with_execfn(
+            &mut self.memory,
+            image,
+            Some(std::os::unix::ffi::OsStrExt::as_bytes(execfn)),
+            argv,
+            envp,
+            cwd,
+        )?;
+        self.install_loaded_static_elf(loaded)
+    }
+
     fn install_loaded_static_elf(&mut self, mut loaded: LoadedStaticElf) -> Result<()> {
+        loaded.ids_per_task = self.ids_per_task;
         loaded.pid = self.root_pid;
         loaded.pgid = self.root_pid;
         loaded.tid = self.root_pid;
@@ -2065,6 +2283,9 @@ impl KvmBackend {
         )?;
         self.memory.enable_user_access();
         self.static_elf = Some(loaded);
+        // A new image starts a new task lifetime: nothing staged for an
+        // earlier one survives (on the base it died with that executor).
+        self.clear_pending_segment();
         self.vcpu.new_elf_guest();
         Ok(())
     }
@@ -2093,36 +2314,23 @@ impl KvmBackend {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-228): Review the KVM random-seed configuration API.
-    /// Configure the deterministic seed used by getrandom and virtual random devices.
-    /// Configuring an installed image starts its getrandom stream at byte zero.
-    pub fn set_random_seed(&mut self, seed: u64) -> Result<()> {
-        AbandonedRuns::admit(&self.abandoned_runs)?;
-        let loaded = self
-            .static_elf
-            .as_mut()
-            .ok_or(Error::StaticElfNotInstalled)?;
-        loaded.random_seed = seed;
-        loaded.getrandom_offset = 0;
-        Ok(())
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/reverie/issues/924):
     // Review host metadata timestamps for Tool runs.
-    /// Report the kernel's timestamps from `stat`, `fstat`, `newfstatat` and
-    /// `statx` on real host files and descriptors, instead of the fixed
-    /// timestamp the backend uses by default. Captured output, synthetic
-    /// `/proc` files, guest descriptor links and virtual random devices keep
-    /// their fixed timestamps.
+    /// Declare that the Tool rewrites every timestamp that `stat`, `fstat`,
+    /// `newfstatat` and `statx` return, as Detcore does with virtual
+    /// metadata. The backend then classifies the carriers it makes for its
+    /// own data (`/proc` snapshots, the virtual signalfd's eventfd and the
+    /// self-pidfd proxy), including one received over a socket, so that they
+    /// report fixed timestamps through every alias. Without it, those
+    /// carriers report the kernel's timestamps.
     ///
-    /// Host timestamps are host wall-clock values, so enable this only for a
-    /// Tool that rewrites every timestamp it returns to the guest, such as
-    /// Detcore with virtual metadata. The Tool can then read the values the
-    /// kernel stored, for example to confirm that `utimensat` stored the
-    /// requested time. A run without a Tool, or with host-owned threads
-    /// (see [`Self::unmonitored_threads`]), refuses to start while this is
-    /// enabled, because those syscalls would reach the guest unrewritten.
+    /// Real host files and descriptors report the kernel's timestamps whether
+    /// or not this is enabled, as the kernel reports them to a ptrace guest;
+    /// what the guest sees is the Tool's decision. Captured output, synthetic
+    /// `/proc` files and guest descriptor links keep their fixed timestamps
+    /// either way. A run without a Tool, or with
+    /// host-owned threads (see [`Self::unmonitored_threads`]), refuses to
+    /// start while this is enabled, because nothing would rewrite them.
     ///
     /// A successful call writes the stored values into the guest's buffer
     /// before the Tool rewrites them. The backend cannot see whether another
@@ -2132,16 +2340,11 @@ impl KvmBackend {
     /// rewritten, so the backend leaves only fixed timestamps in the part of
     /// a buffer that a faulting copy reached.
     ///
-    /// While enabled, a guest cannot change the mode of a file the backend
-    /// serves from its own data: `fchmod` and empty-path `fchmodat` and
-    /// `fchmodat2` fail with `EPERM` on a synthetic `/proc` file and on a
-    /// virtual file such as `/proc/self/loginuid` or a CPU-frequency file
-    /// under `/sys/devices/system/cpu`. Linux refuses a mode change on a
-    /// process `/proc` file with `EPERM` too, but lets the owner change the
-    /// mode of a writable sysfs file, so for those files this is a
-    /// compatibility restriction. The backend recognizes such a file received
-    /// over a socket by reopening it, which a mode without read permission
-    /// would prevent.
+    /// While enabled, a guest cannot change the mode of a synthetic `/proc`
+    /// file: `fchmod` and empty-path `fchmodat` and `fchmodat2` fail with
+    /// `EPERM`, as Linux refuses a mode change on a process `/proc` file. The
+    /// backend recognizes such a file received over a socket by reopening it,
+    /// which a mode without read permission would prevent.
     pub fn set_host_metadata_timestamps(&mut self, enabled: bool) -> Result<()> {
         AbandonedRuns::admit(&self.abandoned_runs)?;
         let loaded = self
@@ -2224,18 +2427,13 @@ impl KvmBackend {
             registers: self.vcpu.get_regs()?,
             xsave: self.vcpu.get_xsave()?,
             stdin: self.clone_reserved_stdin()?,
-            cpuid_policy: self.cpuid_policy,
         })
     }
 
     fn from_process_snapshot(snapshot: KvmProcessSnapshot) -> Result<Self> {
         #[cfg(test)]
         tests::entry_action_tests::observe("fork_backend");
-        let mut child = Self::new_with_memory_and_cpuid_policy(
-            snapshot.memory,
-            snapshot.cpuid_policy,
-            snapshot.stdin,
-        )?;
+        let mut child = Self::new_with_memory(snapshot.memory, snapshot.stdin)?;
         configure_long_mode(
             &mut child.memory,
             &child.vcpu,
@@ -2255,13 +2453,12 @@ impl KvmBackend {
         registers: kvm_regs,
         xsave: kvm_xsave,
         stdin: Option<File>,
-        cpuid_policy: CpuidPolicy,
         child_tid: i32,
         thread_group: Arc<GuestThreadGroup>,
     ) -> Result<Self> {
         #[cfg(test)]
         tests::entry_action_tests::observe("thread_backend");
-        let mut child = Self::new_with_memory_and_cpuid_policy(memory, cpuid_policy, stdin)?;
+        let mut child = Self::new_with_memory(memory, stdin)?;
         child.thread_group = thread_group;
         child.is_guest_thread = true;
         let slot = child.thread_group.reserve_transport_slot(child_tid)?;
@@ -2292,6 +2489,7 @@ impl KvmBackend {
         &mut self,
         executor: &mut ElfExecutor,
         executable: (&Path, Option<Arc<File>>),
+        execfn: Option<&[u8]>,
         image: &[u8],
         argv: &[String],
         envp: &[String],
@@ -2314,7 +2512,14 @@ impl KvmBackend {
 
         let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
         let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut loaded = load_static_elf(&mut self.memory, image, &argv, &envp, executor.cwd())?;
+        let mut loaded = load_static_elf_with_execfn(
+            &mut self.memory,
+            image,
+            execfn,
+            &argv,
+            &envp,
+            executor.cwd(),
+        )?;
         let (executable_path, executable_file) = executable;
         loaded.executable_path = executable_file
             .as_ref()
@@ -2337,7 +2542,75 @@ impl KvmBackend {
         )?;
         self.memory.enable_user_access();
         executor.replace_after_exec(loaded);
+        // An exec discards a base staged for the old image, as
+        // replace_after_exec discards the executor's.
+        self.clear_pending_segment();
         Ok(())
+    }
+
+    /// Stages an FS or GS base for the next return to the guest. A later base
+    /// replaces an earlier one; `None` leaves the slot as it is.
+    pub(crate) fn stage_segment(&mut self, segment: Option<(SegmentBase, u64)>) {
+        if segment.is_some() {
+            self.pending_segment = segment;
+        }
+    }
+
+    /// Moves a base the executor staged during a direct call (one that did
+    /// not go through the provider trait) into the backend's slot. Called
+    /// after every such call, before any reader.
+    pub(crate) fn harvest_segment(&mut self, executor: &mut ElfExecutor) {
+        self.stage_segment(executor.take_segment());
+    }
+
+    /// Takes the staged base, to apply it to the vCPU.
+    pub(crate) fn take_pending_segment(&mut self) -> Option<(SegmentBase, u64)> {
+        self.pending_segment.take()
+    }
+
+    /// Discards any staged base. Every clear goes through here: an installed
+    /// image and a run's new root executor (a new task lifetime on this
+    /// backend, as a new executor's slot started empty), and an exec (as
+    /// `replace_after_exec` discards the executor's).
+    pub(crate) fn clear_pending_segment(&mut self) {
+        self.pending_segment = None;
+    }
+
+    /// Reads a syscall exit's transport frame and decodes its request, as
+    /// [`SyscallRequest::read_from`] does, and in the same admission also
+    /// reads the trampoline's hypercall instruction, which the exit's
+    /// completed boundary checks if a Tool callback follows (see
+    /// [`SyscallExitRead`]). The frame read and its errors are exactly
+    /// `read_from`'s; the extra read is only an attempt, and its failure
+    /// changes nothing but leaves the boundary to copy again.
+    pub(crate) fn read_syscall_exit(
+        &self,
+        memory: &GuestMemory,
+        frame_address: u64,
+    ) -> Result<(SyscallRequest, SyscallExitRead)> {
+        let hypercall_address = syscall_hypercall_address(
+            self.hypercall_instruction,
+            self.syscall_trampoline_address,
+            self.syscall_frame_address,
+        );
+        let mut frame = [0; FRAME_SIZE];
+        let mut hypercall = [0; 3];
+        let (generation, read) = memory.read_raw_and_try_read(
+            frame_address,
+            &mut frame,
+            hypercall_address,
+            &mut hypercall,
+        )?;
+        Ok((
+            SyscallRequest::from_frame(&frame),
+            SyscallExitRead {
+                frame_address,
+                frame,
+                hypercall_address,
+                hypercall: read.then_some(hypercall),
+                generation,
+            },
+        ))
     }
 
     /// Capture one complete parent read state only after admission. The owned
@@ -2345,23 +2618,75 @@ impl KvmBackend {
     /// capture survives this synchronous closure. None is terminal cancellation.
     async fn prepare_action_read<T>(
         &mut self,
-        mut stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
+        stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
         capture: impl Fn(&Self, &crate::memory::RawMemoryRead<'_>) -> Result<T>,
     ) -> Result<Option<T>> {
+        self.prepare_action_read_or_reuse(
+            stop,
+            None::<(crate::entry::MappingGeneration, fn(&Self) -> Result<T>)>,
+            capture,
+        )
+        .await
+    }
+
+    /// [`Self::prepare_action_read`], except that on its first attempt
+    /// `reused` may stand in for `capture`'s admitted copy. `reused` builds
+    /// the same value from bytes an earlier admission at the given generation
+    /// already read. It runs only if, under the gate lock the first attempt
+    /// takes anyway, the gate has no failure, admits, and is still at that
+    /// generation; every other check of the attempt (stop, group exit,
+    /// cancellation, the copy failures checked around an admitted copy) runs
+    /// in the same order as for a fresh copy. Otherwise the attempt copies,
+    /// exactly as `prepare_action_read`.
+    async fn prepare_action_read_or_reuse<T, R>(
+        &mut self,
+        mut stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
+        mut reused: Option<(crate::entry::MappingGeneration, R)>,
+        capture: impl Fn(&Self, &crate::memory::RawMemoryRead<'_>) -> Result<T>,
+    ) -> Result<Option<T>>
+    where
+        R: FnOnce(&Self) -> Result<T>,
+    {
         let gate = self.memory.entry_gate();
+        // The first attempt subscribes to nothing: it nearly always reads at
+        // once, and subscribing to the gate's change marks it taken, so its
+        // next change would allocate a fresh channel. If it cannot read, the
+        // loop goes around once more with both subscriptions taken before
+        // the same checks, so a change after those checks still wakes it.
+        let mut subscribe = false;
         loop {
-            let changed = gate.subscribe();
-            let cancelled = self.entry_cancellation();
-            gate.admit_operation().map_err(|failure| failure.error())?;
+            let subscriptions = subscribe.then(|| (gate.subscribe(), self.entry_cancellation()));
+            let reuse = match reused.take() {
+                Some((generation, reused)) => gate
+                    .admit_operation_unchanged(generation)
+                    .map_err(|failure| failure.error())?
+                    .then_some(reused),
+                None => {
+                    gate.admit_operation().map_err(|failure| failure.error())?;
+                    None
+                }
+            };
             if stop.as_mut().now_or_never().is_some() {
                 return Err(Error::RunAborted);
             }
             if self.guest_thread_group_exit_status().is_some() || self.guest_thread_is_cancelled() {
                 return Ok(None);
             }
+            if let Some(reused) = reuse {
+                // The failures an admitted copy checks before and after it
+                // runs; the bytes themselves were copied under admission.
+                self.memory.check_copy_failures()?;
+                let value = reused(self);
+                self.memory.check_copy_failures()?;
+                return value.map(Some);
+            }
             if let Some(value) = self.memory.try_read_with(|access| capture(self, access))? {
                 return Ok(Some(value));
             }
+            let Some((changed, cancelled)) = subscriptions else {
+                subscribe = true;
+                continue;
+            };
             match futures::future::select(
                 futures::future::select(changed, cancelled),
                 stop.as_mut(),
@@ -2514,7 +2839,7 @@ impl KvmBackend {
         clear_sighand: bool,
         share_address_space: bool,
         park_syscall_return: bool,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
     ) -> Result<ForkedProcess> {
         let mut stop = std::pin::pin!(std::future::pending());
         futures::executor::block_on(self.prepare_forked_process_admitted(
@@ -2545,7 +2870,7 @@ impl KvmBackend {
         clear_sighand: bool,
         share_address_space: bool,
         park_syscall_return: bool,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
         stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
     ) -> Result<Option<ForkedProcess>> {
         let shared_file_snapshot = self.memory.contains_shared_file();
@@ -2765,7 +3090,7 @@ impl KvmBackend {
         executor: &mut ElfExecutor,
         action: ProcessAction,
         park_syscall_return: bool,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
         mut stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
         direct_registration: Option<&GuestThreadRegistration>,
     ) -> Result<ProcessActionOutcome> {
@@ -2933,7 +3258,6 @@ impl KvmBackend {
                     child_registers,
                     parent_xsave,
                     child_stdin,
-                    self.cpuid_policy,
                     child_tid,
                     self.thread_group.clone(),
                 )?;
@@ -3081,6 +3405,7 @@ impl KvmBackend {
             ProcessAction::Exec {
                 executable_path,
                 executable_file,
+                execfn,
                 image,
                 argv,
                 envp,
@@ -3109,6 +3434,7 @@ impl KvmBackend {
                 let result = self.exec_process(
                     executor,
                     (&executable_path, executable_file),
+                    execfn.as_deref(),
                     &image,
                     &argv,
                     &envp,
@@ -3353,7 +3679,7 @@ impl KvmBackend {
         action: ProcessAction,
         park_syscall_return: bool,
         context: ToolContext<'_, T>,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
     ) -> Result<ProcessActionOutcome>
     where
         T: Tool + 'static,
@@ -3430,10 +3756,10 @@ impl KvmBackend {
                         "forked KVM Tool process requires shared global state".to_owned(),
                     )
                 })?;
-                let child_tool = Arc::new(T::new(child_pid, &context.config));
+                let child_tool = Arc::new(T::new(child_pid, context.config));
                 let child_thread_state = child_tool
                     .init_thread_state(child_pid, Some((context.tid, context.thread_state)));
-                let config = context.config;
+                let config = context.config.clone();
                 let subscriptions = context.subscriptions;
                 let pending_child_starts = context.pending_child_starts;
                 let raw_child_pid = child.pid;
@@ -3707,7 +4033,6 @@ impl KvmBackend {
                     child_registers,
                     parent_xsave,
                     child_stdin,
-                    self.cpuid_policy,
                     child_tid,
                     self.thread_group.clone(),
                 )?;
@@ -3749,7 +4074,7 @@ impl KvmBackend {
                         "KVM CLONE_THREAD worker requires shared global state".to_owned(),
                     )
                 })?;
-                let config = context.config;
+                let config = context.config.clone();
                 let subscriptions = context.subscriptions;
 
                 self.vcpu.set_regs(&parent_registers)?;
@@ -4034,7 +4359,7 @@ impl KvmBackend {
         executor: &mut ElfExecutor,
         action: ProcessAction,
         context: ToolContext<'_, T>,
-        fault: &PageZeroFault,
+        fault: &UserTrap,
     ) -> Result<ProcessActionOutcome>
     where
         T: Tool + 'static,
@@ -4310,21 +4635,26 @@ impl KvmBackend {
         Ok(())
     }
 
-    pub(crate) fn capture_page_zero_fault(
-        &self,
-        executor: &ElfExecutor,
-    ) -> Result<Option<PageZeroFault>> {
+    pub(crate) fn capture_user_trap(&self, executor: &ElfExecutor) -> Result<Option<UserTrap>> {
         let halted_registers = self.vcpu.get_regs()?;
-        if exception_from_halt(halted_registers.rip) != Some(14) {
+        let Some(vector) = exception_from_halt(halted_registers.rip) else {
             return Ok(None);
-        }
+        };
         let special_registers = self.vcpu.get_sregs()?;
-        let address = special_registers.cr2;
-        if address >= PAGE_SIZE {
+        // The exception stub halts with the hardware frame on its stack: an
+        // optional error code, then RIP, CS, RFLAGS, RSP, SS.
+        let first = usize::from(exception_pushes_error_code(vector));
+        let mut frame = [0; 6 * 8];
+        let words = first + 5;
+        if self
+            .memory
+            .read_raw(halted_registers.rsp, &mut frame[..words * 8])
+            .is_err()
+        {
+            // An unreadable frame cannot be a user trap; keep the exception's
+            // own diagnostic.
             return Ok(None);
         }
-        let mut frame = [0; 6 * 8];
-        self.memory.read_raw(halted_registers.rsp, &mut frame)?;
         let word = |index: usize| {
             u64::from_le_bytes(
                 frame[index * 8..index * 8 + 8]
@@ -4332,11 +4662,13 @@ impl KvmBackend {
                     .expect("exception frame word"),
             )
         };
-        let error_code = word(0);
-        let code_segment = word(2);
-        let stack_segment = word(5);
-        if ![4, 6, 20].contains(&error_code)
-            || code_segment != u64::from(crate::signal::USER_CODE_SELECTOR)
+        let error_code = if first == 1 { word(0) } else { 0 };
+        let instruction_pointer = word(first);
+        let code_segment = word(first + 1);
+        let stack_segment = word(first + 4);
+        // Only a trap taken in guest user mode is the guest's own fault. A
+        // fault in backend-owned supervisor code stays a backend error.
+        if code_segment != u64::from(crate::signal::USER_CODE_SELECTOR)
             || ![
                 u64::from(crate::signal::USER_DATA_SELECTOR),
                 u64::from(crate::signal::USER_DATA_SELECTOR & !3),
@@ -4345,20 +4677,33 @@ impl KvmBackend {
         {
             return Ok(None);
         }
+        let Some(signal) = user_trap_signal(
+            vector,
+            error_code,
+            instruction_pointer,
+            special_registers.cr2,
+        ) else {
+            return Ok(None);
+        };
         let mut registers = halted_registers;
-        registers.rip = word(1);
-        registers.rflags = word(3);
-        registers.rsp = word(4);
+        registers.rip = instruction_pointer;
+        registers.rflags = word(first + 2);
+        registers.rsp = word(first + 3);
         let mut transport = [0; FRAME_SIZE];
         self.memory
             .read_raw(self.syscall_frame_address, &mut transport)?;
-        Ok(Some(PageZeroFault {
+        Ok(Some(UserTrap {
             registers,
-            event: executor.page_zero_fault_event(address),
+            event: executor.trap_signal_event(signal.signal, signal.code, signal.address),
             code_segment: code_segment as u16,
             stack_segment: stack_segment as u16,
+            vector,
             error_code,
-            address,
+            address: if vector == 14 {
+                special_registers.cr2
+            } else {
+                0
+            },
             halted_registers,
             special_registers,
             xsave: Arc::new(self.vcpu.get_xsave()?),
@@ -4378,9 +4723,17 @@ impl KvmBackend {
 
         let registers = self.vcpu.get_regs()?;
         let mut instruction = [0];
+        // The faulting instruction is named by its user address, which the
+        // stack window places away from its physical address.
+        let Some(instruction_address) = self
+            .memory
+            .user_range_to_guest(exception.instruction_pointer, 1)
+        else {
+            return Ok(false);
+        };
         if self
             .memory
-            .read_raw(exception.instruction_pointer, &mut instruction)
+            .read_raw(instruction_address, &mut instruction)
             .is_err()
             || instruction != [0xed]
             || registers.rbx & u64::from(u32::MAX) != VMWARE_BACKDOOR_MAGIC
@@ -4435,24 +4788,28 @@ impl KvmBackend {
         syscall_frame_address: u64,
         interrupted: kvm_bindings::kvm_regs,
     ) -> Result<bool> {
-        loop {
+        let delivered = loop {
             let Some(pending) = executor
                 .take_pending_signal_for_delivery()
                 .map_err(|errno| Error::Reverie(errno.into()))?
             else {
-                return Ok(false);
+                break false;
             };
 
             if executor.signal_disposition(pending.event.signal()) == SignalDisposition::Ignore {
                 continue;
             }
-            return self.deliver_selected_signal_from_registers(
+            break self.deliver_selected_signal_from_registers(
                 executor,
                 syscall_frame_address,
                 interrupted,
                 pending,
-            );
+            )?;
+        };
+        if !delivered {
+            executor.restore_saved_signal_mask();
         }
+        Ok(delivered)
     }
 
     pub(crate) fn deliver_selected_signal_from_registers(
@@ -4472,10 +4829,10 @@ impl KvmBackend {
         )
     }
 
-    pub(crate) fn deliver_page_zero_fault(
+    pub(crate) fn deliver_user_trap(
         &mut self,
         executor: &mut ElfExecutor,
-        fault: &PageZeroFault,
+        fault: &UserTrap,
         pending: crate::executor::PendingSignal,
     ) -> Result<bool> {
         self.deliver_selected_signal_at_boundary(
@@ -4518,7 +4875,7 @@ impl KvmBackend {
         syscall_frame_address: u64,
         interrupted: kvm_regs,
         pending: crate::executor::PendingSignal,
-        fault: Option<&PageZeroFault>,
+        fault: Option<&UserTrap>,
         thread_entry: bool,
     ) -> Result<bool> {
         let signal = pending.event.signal();
@@ -4567,13 +4924,14 @@ impl KvmBackend {
         } else {
             XsaveImage::from_kvm(&self.vcpu.get_xsave()?)
         };
-        let mut mcontext =
-            Sigcontext::from_kvm(interrupted, layout.xsave_address, executor.signal_mask());
+        // A temporary-mask call's saved mask, else the current one.
+        let saved_mask = executor.frame_signal_mask();
+        let mut mcontext = Sigcontext::from_kvm(interrupted, layout.xsave_address, saved_mask);
         if let Some(fault) = fault {
             mcontext.cs = fault.code_segment;
             mcontext.ss = fault.stack_segment;
             mcontext.err = fault.error_code;
-            mcontext.trapno = 14;
+            mcontext.trapno = fault.vector.into();
             mcontext.cr2 = fault.address;
         }
         let frame = RtSigframe {
@@ -4583,7 +4941,7 @@ impl KvmBackend {
                 link: 0,
                 stack: altstack,
                 mcontext,
-                sigmask: executor.signal_mask(),
+                sigmask: saved_mask,
             },
             siginfo: pending.event.siginfo(),
         };
@@ -4721,6 +5079,15 @@ impl KvmBackend {
         };
         #[cfg(test)]
         clear_tid_diagnostic::woke(operand.address(), _wake_result, wake_errno);
+        // A test can widen the window in which a woken joiner runs before
+        // this dying task finishes exiting.
+        #[cfg(test)]
+        {
+            let delay = DELAY_AFTER_CLEAR_TID_WAKE_MS.load(Ordering::Relaxed);
+            if delay != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+        }
     }
 
     pub(crate) fn restore_rt_sigreturn(
@@ -4828,6 +5195,8 @@ impl KvmBackend {
     fn run_admitted_static_elf(&mut self) -> Result<i32> {
         self.admit_host_metadata_timestamps(false)?;
         let loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
+        // A new root executor starts with an empty segment slot.
+        self.clear_pending_segment();
         let mut executor = ElfExecutor::with_output(loaded, None);
         let result = self.run_static_elf_process(&mut executor);
         let (status, _, _) = result.map_err(|error| self.finish_direct_process_error(error))?;
@@ -4848,6 +5217,8 @@ impl KvmBackend {
         // executor/child cleanup, including early-return and unwind paths.
         let capture_owner = self.prepare_captured_output(true)?;
         let loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
+        // A new root executor starts with an empty segment slot.
+        self.clear_pending_segment();
         let mut executor = ElfExecutor::with_output(loaded, capture_owner.clone());
         let result = self.run_static_elf_process(&mut executor);
         let (status, stdout, stderr) =
@@ -5001,7 +5372,7 @@ impl KvmBackend {
                                 restored,
                             )?;
                             if !delivered {
-                                stage_process_syscall_return(
+                                stage_process_signal_return(
                                     &mut self.memory,
                                     &self.vcpu,
                                     frame_address,
@@ -5010,6 +5381,7 @@ impl KvmBackend {
                             }
                         }
                         if executor.has_pending_exit() {
+                            self.publish_pending_group_exit(executor);
                             self.discard_process_clear_tid_at_signal_return(executor);
                             self.clear_registered_worker_tid_before_exit(executor);
                         }
@@ -5043,8 +5415,9 @@ impl KvmBackend {
                                 Err(error) => return Err(error),
                             };
                         SyscallRequest::write_result(&mut self.memory, frame_address, result)?;
+                        self.harvest_segment(executor);
                         (
-                            executor.take_segment(),
+                            self.take_pending_segment(),
                             executor.take_process_action(),
                             Some((frame_address, result)),
                         )
@@ -5054,12 +5427,13 @@ impl KvmBackend {
                     if self.try_resume_vmware_backdoor_probe()? {
                         continue;
                     }
-                    let Some(fault) = self.capture_page_zero_fault(executor)? else {
+                    let Some(fault) = self.capture_user_trap(executor)? else {
                         return Err(self.static_elf_halt_error()?);
                     };
-                    executor.prepare_captured_page_zero_fault();
-                    self.deliver_page_zero_fault(executor, &fault, fault.pending())?;
+                    executor.prepare_captured_trap(fault.event.signal());
+                    self.deliver_user_trap(executor, &fault, fault.pending())?;
                     if executor.has_pending_exit() {
+                        self.publish_pending_group_exit(executor);
                         self.discard_process_clear_tid_at_signal_return(executor);
                         self.clear_registered_worker_tid_before_exit(executor);
                     }
@@ -5142,12 +5516,14 @@ impl KvmBackend {
     ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
         executor.retire_current_thread(exit.status, exit.group);
         executor.check_parent_death_failure()?;
-        self.clear_registered_worker_tid_before_exit(executor);
-        executor.finish_terminal_cleanup().await?;
-        self.release_stdin_on_exit();
+        // Publish a group exit before the clear_child_tid wake below; see
+        // publish_pending_group_exit.
         if exit.group {
             self.request_guest_thread_group_exit(exit.status);
         }
+        self.clear_registered_worker_tid_before_exit(executor);
+        executor.finish_terminal_cleanup().await?;
+        self.release_stdin_on_exit();
         // Best-effort writes and Errno adapters can conceal a captured cause.
         // An inline child must hand that cause back to its enclosing callback
         // before cancellation or a physical join can depend on destruction.
@@ -5304,6 +5680,17 @@ impl KvmBackend {
 
     pub(crate) fn request_guest_thread_group_exit(&self, status: ExitStatus) {
         self.thread_group.request_exit_group(status);
+    }
+
+    /// Linux makes a fatal signal's group exit visible to every sibling
+    /// (SIGNAL_GROUP_EXIT, then zap_other_threads) before the dying task's
+    /// mm_release stores and wakes its clear_child_tid word. A joiner woken
+    /// by that wake must therefore find the group exit at its next syscall
+    /// boundary instead of running one more syscall. Publish it first.
+    fn publish_pending_group_exit(&self, executor: &ElfExecutor) {
+        if let Some(status) = executor.pending_group_exit_status() {
+            self.request_guest_thread_group_exit(status);
+        }
     }
 
     // TODO-HUMAN-REVIEW(PR-172): Review signal-driven KVM worker cancellation.
@@ -5799,6 +6186,54 @@ pub(crate) fn clear_tid_and_wake(memory: &mut GuestMemory, address: Option<u64>)
     };
     #[cfg(test)]
     clear_tid_diagnostic::woke(operand.address(), _wake_result, wake_errno);
+    #[cfg(test)]
+    {
+        let delay = DELAY_AFTER_CLEAR_TID_WAKE_MS.load(Ordering::Relaxed);
+        if delay != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
+}
+
+/// The vCPU's CPUID table. A guest reads it only when its Tool does not
+/// subscribe to CPUID (a subscribing Tool answers every guest CPUID), and then
+/// it must read what the same program reads natively under a non-subscribing
+/// ptrace Tool: the host's rows. So every leaf KVM lists takes the host's
+/// registers, except:
+/// - KVM's own hypervisor leaves (0x4000_0000 to 0x4fff_ffff), which the host
+///   does not answer;
+/// - leaf 0xd, whose extended state is limited to `signal::FIXED_XFEATURES`,
+///   the x87, SSE and YMM components the backend's signal frames carry; KVM
+///   sizes the guest's XSAVE state from this leaf, so with more it would save
+///   state (AVX-512, PKRU) that no frame can hold.
+///
+/// KVM still computes the fields that describe the vCPU itself (OSXSAVE from
+/// the guest's CR4, the XSAVE sizes from its XCR0) when the guest reads them.
+pub(crate) fn vcpu_cpuid(supported: CpuId) -> Result<CpuId> {
+    let fixed = crate::signal::FIXED_XFEATURES;
+    let entries = supported
+        .as_slice()
+        .iter()
+        .filter(|entry| {
+            !(entry.function == 0xd && entry.index >= 2 && fixed & (1 << entry.index) == 0)
+        })
+        .map(|entry| {
+            let mut entry = *entry;
+            if !(0x4000_0000..0x5000_0000).contains(&entry.function) {
+                let host = core::arch::x86_64::__cpuid_count(entry.function, entry.index);
+                (entry.eax, entry.ebx, entry.ecx, entry.edx) =
+                    (host.eax, host.ebx, host.ecx, host.edx);
+            }
+            if entry.function == 0xd && entry.index == 0 {
+                entry.eax &= fixed as u32;
+                entry.edx &= (fixed >> 32) as u32;
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    CpuId::from_entries(&entries).map_err(|error| {
+        Error::UnsupportedCpuidProfile(format!("KVM's CPUID table did not fit: {error:?}"))
+    })
 }
 
 fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
@@ -5830,7 +6265,61 @@ mod worker_panic_tests;
 pub(crate) use tests::minimal_test_elf;
 
 #[cfg(test)]
+mod user_trap_signal_tests {
+    use super::*;
+
+    #[test]
+    fn user_mode_exceptions_raise_the_linux_trap_signal() {
+        let rip = 0x40_1234;
+        assert_eq!(
+            user_trap_signal(0, 0, rip, 0xdead_0000),
+            Some(UserTrapSignal {
+                signal: libc::SIGFPE,
+                code: crate::signal::FPE_INTDIV,
+                address: rip,
+            })
+        );
+        assert_eq!(
+            user_trap_signal(6, 0, rip, 0xdead_0000),
+            Some(UserTrapSignal {
+                signal: libc::SIGILL,
+                code: crate::signal::ILL_ILLOPN,
+                address: rip,
+            })
+        );
+        for (error_code, address) in [(4, 0), (6, 0x18), (20, 0xfff)] {
+            assert_eq!(
+                user_trap_signal(14, error_code, rip, address),
+                Some(UserTrapSignal {
+                    signal: libc::SIGSEGV,
+                    code: crate::signal::SEGV_MAPERR,
+                    address,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn other_exceptions_stay_backend_errors() {
+        let rip = 0x40_1234;
+        // A page fault outside page zero, or with a present/reserved/kernel
+        // error code, names a backend layout gap rather than a guest fault.
+        assert_eq!(user_trap_signal(14, 6, rip, PAGE_SIZE), None);
+        assert_eq!(user_trap_signal(14, 7, rip, 0), None);
+        assert_eq!(user_trap_signal(14, 2, rip, 0), None);
+        // #DB, #BP, #GP and the rest are not translated here.
+        for vector in [1, 3, 4, 5, 7, 8, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 31] {
+            assert_eq!(user_trap_signal(vector, 0, rip, 0), None, "vector {vector}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    /// The stack window's first page in a 16 MiB test memory: the user address
+    /// of physical 0x80_0000, which these tests use as scratch memory.
+    const STACK_SCRATCH: u64 = crate::memory::USER_ADDRESS_END - crate::elf::STACK_LIMIT;
+
     use super::*;
 
     include!("cpuid_runtime_tests.rs");
@@ -5846,6 +6335,7 @@ mod tests {
     include!("vm/entry_eintr_tests.rs");
     include!("vm/inline_interrupt_tests.rs");
     include!("vm/memory_publication_tests.rs");
+    include!("vm/exit_read_reuse_tests.rs");
     include!("vm/read_zero_guest_tests.rs");
 
     #[derive(Default)]
@@ -5916,7 +6406,7 @@ mod tests {
         )
         .unwrap();
         let (status, stdout, stderr) = completion.result.unwrap();
-        assert_eq!(status, 0);
+        assert_eq!(status, ExitStatus::Exited(0));
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }
@@ -6407,7 +6897,6 @@ mod tests {
             input.seek(SeekFrom::Start(7)).unwrap();
             let input_observer = input.try_clone().unwrap();
             let metadata = input.metadata().unwrap();
-            let policy = CpuidPolicy::default();
             let request = Arc::new(AtomicU64::new(0));
             let acknowledgement = Arc::new(AtomicU64::new(0));
             let peer_request = request.clone();
@@ -6442,8 +6931,7 @@ mod tests {
                 Arc::as_ptr(&request) as u64,
                 Arc::as_ptr(&acknowledgement) as u64,
             );
-            let mut result =
-                KvmBackend::new_with_memory_and_cpuid_policy(memory, policy, Some(input));
+            let mut result = KvmBackend::new_with_memory(memory, Some(input));
             marker(1, 0, 0, 0);
             if acknowledgement.load(Ordering::Acquire) == 1 {
                 expected[0x10_000..0x11_000].fill(0xe7);
@@ -6471,7 +6959,6 @@ mod tests {
                         "unexpected success"
                     );
                     assert_eq!(backend.memory.host_address(), address);
-                    assert_eq!(backend.cpuid_policy, policy);
                     assert_eq!(
                         backend
                             .stdin
@@ -6503,7 +6990,6 @@ mod tests {
                     assert_eq!(error.raw_os_error(), Some(errno))
                 }
                 Err(Error::HypercallExitUnsupported) if stage == "capability" => (),
-                Err(Error::UnsupportedCpuidProfile(_)) if stage == "policy" => (),
                 Err(Error::Kvm(error)) => {
                     assert!(
                         failures >= 3 || errno != libc::EINTR,
@@ -6556,22 +7042,13 @@ mod tests {
                 drop(parent);
                 marker(5, memory.host_address(), 0, 0);
                 result = if stage == "thread-registers" {
-                    KvmBackend::from_thread_state(
-                        memory,
-                        registers,
-                        xsave,
-                        None,
-                        policy,
-                        2,
-                        group.clone(),
-                    )
+                    KvmBackend::from_thread_state(memory, registers, xsave, None, 2, group.clone())
                 } else {
                     KvmBackend::from_process_snapshot(KvmProcessSnapshot {
                         memory,
                         registers,
                         xsave,
                         stdin: None,
-                        cpuid_policy: policy,
                     })
                 };
                 marker(1, 0, 0, 0);
@@ -6737,7 +7214,6 @@ mod tests {
             let mut completed = false;
             let mut post_initialization = false;
             let mut handler_calls = 0;
-            let mut cpuid_buffer = 0;
             let mut backing = Vec::new();
             let mut registration_address = 0;
             let mut wrapper_phase = false;
@@ -6774,22 +7250,6 @@ mod tests {
                             0
                         );
                         pending = false;
-                    } else if cpuid_buffer != 0 {
-                        assert_eq!(registers.rax, 0);
-                        let entries = traced_read(tid, cpuid_buffer) as u32;
-                        assert!(entries > 0 && entries <= KVM_MAX_CPUID_ENTRIES as u32);
-                        let mut changed = false;
-                        for index in 0..entries {
-                            let entry_address = cpuid_buffer + 8 + u64::from(index) * 40;
-                            if traced_read(tid, entry_address) as u32 == 1 {
-                                let edx = traced_read(tid, entry_address + 24);
-                                traced_write(tid, entry_address + 24, edx & !(1 << 26));
-                                changed = true;
-                            }
-                        }
-                        assert!(changed);
-                        injected += 1;
-                        cpuid_buffer = 0;
                     }
                     continue;
                 }
@@ -6945,9 +7405,6 @@ mod tests {
                             "fresh CPUID scratch"
                         );
                     }
-                    if stage == "policy" {
-                        cpuid_buffer = registers.rdx;
-                    }
                 }
                 if operation == "memory" {
                     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
@@ -7007,7 +7464,7 @@ mod tests {
             } else if wrapper_phase {
                 2
             } else if errno != libc::EINTR
-                || ["capability", "policy", "post-registers", "guest"].contains(&stage)
+                || ["capability", "post-registers", "guest"].contains(&stage)
             {
                 1
             } else {
@@ -7082,12 +7539,11 @@ mod tests {
         }
 
         #[test]
-        fn initialization_policy_and_post_commit_boundaries() {
+        fn initialization_post_commit_boundaries() {
             if !available() {
                 return;
             }
             let cases = [
-                ("policy", 1),
                 ("post-registers", 1),
                 ("guest", 0),
                 ("thread-registers", 1),
@@ -7287,6 +7743,7 @@ mod tests {
         let exec = ProcessAction::Exec {
             executable_path: std::path::PathBuf::new(),
             executable_file: None,
+            execfn: None,
             image: Vec::new(),
             argv: Vec::new(),
             envp: Vec::new(),
@@ -7384,6 +7841,7 @@ mod tests {
         ProcessAction::Exec {
             executable_path: std::path::PathBuf::new(),
             executable_file: None,
+            execfn: None,
             image: Vec::new(),
             argv: Vec::new(),
             envp: Vec::new(),
@@ -7644,7 +8102,7 @@ mod tests {
                         tid: Pid::from_raw(1),
                         thread_state: &(),
                         global_state: Some(Arc::new(crate::StraceLog::default())),
-                        config: (),
+                        config: &(),
                         subscriptions: reverie::Subscription::none(),
                         pending_child_starts: starts.clone(),
                     };
@@ -7911,7 +8369,6 @@ mod tests {
                     initial,
                     parent.vcpu.get_xsave().unwrap(),
                     None,
-                    parent.cpuid_policy,
                     2,
                     parent.thread_group.clone(),
                 )
@@ -8038,7 +8495,6 @@ mod tests {
             parent.vcpu.get_regs().unwrap(),
             parent.vcpu.get_xsave().unwrap(),
             None,
-            parent.cpuid_policy,
             2,
             parent.thread_group.clone(),
         )
@@ -8424,7 +8880,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .read(0x80_0000, &mut bytes)
+                .read(STACK_SCRATCH, &mut bytes)
                 .unwrap();
             self.observations.lock().unwrap().push((status, bytes));
         }
@@ -8485,7 +8941,7 @@ mod tests {
             .memory
             .map_user_permissions(0x80_0000, 4096, true, writable)
             .unwrap();
-        parent.memory.write(0x80_0000, &[0x5a; 4096]).unwrap();
+        parent.memory.write(STACK_SCRATCH, &[0x5a; 4096]).unwrap();
         let mut child = parent
             .prepare_forked_process(
                 &executor, 2, None, None, None, None, false, false, true, None,
@@ -8493,7 +8949,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             child.executor.execute(
-                &SyscallRequest::new(libc::SYS_set_tid_address as u64, [0x80_0000, 0, 0, 0, 0, 0]),
+                &SyscallRequest::new(
+                    libc::SYS_set_tid_address as u64,
+                    [STACK_SCRATCH, 0, 0, 0, 0, 0]
+                ),
                 &child.backend.memory
             ),
             2
@@ -8522,12 +8981,12 @@ mod tests {
                 .unwrap()
         };
         let mut before_wrapper = [0; 4096];
-        memory.read(0x80_0000, &mut before_wrapper).unwrap();
+        memory.read(STACK_SCRATCH, &mut before_wrapper).unwrap();
         parent
             .finish_forked_process(&mut executor, child, status, stdout.clone(), stderr.clone())
             .unwrap();
         let mut after_wrapper = [0; 4096];
-        memory.read(0x80_0000, &mut after_wrapper).unwrap();
+        memory.read(STACK_SCRATCH, &mut after_wrapper).unwrap();
         assert_eq!(status.into_raw(), libc::SIGSEGV | 0x80);
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
@@ -8547,11 +9006,11 @@ mod tests {
             .unwrap();
         let request = SyscallRequest::new(
             libc::SYS_wait4 as u64,
-            [2, 0x80_0000, libc::WNOHANG as u64, 0, 0, 0],
+            [2, STACK_SCRATCH, libc::WNOHANG as u64, 0, 0, 0],
         );
         assert_eq!(executor.execute(&request, &parent.memory), 2);
         let mut wait_status = [0; 4];
-        parent.memory.read(0x80_0000, &mut wait_status).unwrap();
+        parent.memory.read(STACK_SCRATCH, &mut wait_status).unwrap();
         assert_eq!(i32::from_ne_bytes(wait_status), libc::SIGSEGV | 0x80);
     }
 
@@ -8575,10 +9034,6 @@ mod tests {
         check_fatal_page_zero_registration(true, true);
     }
 
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
-    )]
     #[test]
     fn page_fault_action_restores_complete_stopped_context() {
         for thread in [false, true] {
@@ -8614,7 +9069,7 @@ mod tests {
                         .expect("test entry admission was unexpectedly closed"),
                     VcpuExit::Hlt
                 ));
-                let fault = backend.capture_page_zero_fault(&executor).unwrap().unwrap();
+                let fault = backend.capture_user_trap(&executor).unwrap().unwrap();
                 let mut frame_before = [0; PAGE_SIZE as usize];
                 let mut exception_before = [0; PAGE_SIZE as usize];
                 backend
@@ -8653,7 +9108,7 @@ mod tests {
                     tid: Pid::from_raw(1),
                     thread_state: &(),
                     global_state: (!missing_global).then(|| Arc::new(crate::StraceLog::default())),
-                    config: (),
+                    config: &(),
                     subscriptions: reverie::Subscription::none(),
                     pending_child_starts: starts.clone(),
                 };
@@ -8740,7 +9195,7 @@ mod tests {
             .memory
             .map_user_permissions(0x80_0000, 4096, true, writable)
             .unwrap();
-        parent.memory.write(0x80_0000, &[0x5a; 4096]).unwrap();
+        parent.memory.write(STACK_SCRATCH, &[0x5a; 4096]).unwrap();
         let mut child = parent
             .prepare_forked_process(
                 &executor, 2, None, None, None, None, false, false, true, None,
@@ -8748,7 +9203,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             child.executor.execute(
-                &SyscallRequest::new(libc::SYS_set_tid_address as u64, [0x80_0000, 0, 0, 0, 0, 0]),
+                &SyscallRequest::new(
+                    libc::SYS_set_tid_address as u64,
+                    [STACK_SCRATCH, 0, 0, 0, 0, 0]
+                ),
                 &child.backend.memory
             ),
             2
@@ -8777,12 +9235,12 @@ mod tests {
                 .unwrap()
         };
         let mut before_wrapper = [0; 4096];
-        memory.read(0x80_0000, &mut before_wrapper).unwrap();
+        memory.read(STACK_SCRATCH, &mut before_wrapper).unwrap();
         parent
             .finish_forked_process(&mut executor, child, status, stdout.clone(), stderr.clone())
             .unwrap();
         let mut after_wrapper = [0; 4096];
-        memory.read(0x80_0000, &mut after_wrapper).unwrap();
+        memory.read(STACK_SCRATCH, &mut after_wrapper).unwrap();
         assert_eq!(status.into_raw(), libc::SIGSEGV | 0x80);
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
@@ -8802,11 +9260,11 @@ mod tests {
             .unwrap();
         let request = SyscallRequest::new(
             libc::SYS_wait4 as u64,
-            [2, 0x80_0000, libc::WNOHANG as u64, 0, 0, 0],
+            [2, STACK_SCRATCH, libc::WNOHANG as u64, 0, 0, 0],
         );
         assert_eq!(executor.execute(&request, &parent.memory), 2);
         let mut wait_status = [0; 4];
-        parent.memory.read(0x80_0000, &mut wait_status).unwrap();
+        parent.memory.read(STACK_SCRATCH, &mut wait_status).unwrap();
         assert_eq!(i32::from_ne_bytes(wait_status), libc::SIGSEGV | 0x80);
     }
 
@@ -8880,11 +9338,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((status, slot, bytes));
+            let address = *self.address.lock().unwrap();
+            let physical = memory.user_range_to_guest(address, 4).unwrap();
             memory
-                .write_raw(
-                    *self.address.lock().unwrap(),
-                    &0x6b6b_6b6b_i32.to_ne_bytes(),
-                )
+                .write_raw(physical, &0x6b6b_6b6b_i32.to_ne_bytes())
                 .unwrap();
         }
     }
@@ -9020,9 +9477,9 @@ mod tests {
             .memory
             .map_user_permissions(0x80_0000, 8192, true, true)
             .unwrap();
-        parent.memory.write(0x80_0000, &[0x5a; 8192]).unwrap();
+        parent.memory.write(STACK_SCRATCH, &[0x5a; 8192]).unwrap();
         let offset = if mode == 3 { 4094 } else { 64 };
-        let address = 0x80_0000 + offset;
+        let address = STACK_SCRATCH + offset;
         match mode {
             0 => {}
             1 => parent
@@ -9057,7 +9514,7 @@ mod tests {
             tid: Pid::from_raw(1),
             thread_state: &(),
             global_state: Some(log.clone()),
-            config: fail_callback,
+            config: &fail_callback,
             subscriptions: reverie::Subscription::none(),
             pending_child_starts: starts.clone(),
         };
@@ -9085,7 +9542,8 @@ mod tests {
             let (result_sender, result_receiver) = std::sync::mpsc::channel();
             *log.wake_observed.lock().unwrap() = Some(wake_receiver);
             let waiter = std::thread::spawn(move || {
-                let host = memory.host_address() + address - memory.guest_base();
+                let physical = memory.user_range_to_guest(address, 4).unwrap();
+                let host = memory.host_address() + physical - memory.guest_base();
                 let bound = libc::timespec {
                     tv_sec: 1,
                     tv_nsec: 0,
@@ -9125,7 +9583,9 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .unwrap();
             qualify_waiter_enrollment(
-                parent.memory.host_address() + address - parent.memory.guest_base(),
+                parent.memory.host_address()
+                    + parent.memory.user_range_to_guest(address, 4).unwrap()
+                    - parent.memory.guest_base(),
                 &result_receiver,
             );
             Some(waiter)
@@ -9620,7 +10080,7 @@ mod tests {
                     tid: Pid::from_raw(1),
                     thread_state: &1,
                     global_state: Some(global.clone()),
-                    config: (),
+                    config: &(),
                     subscriptions: reverie::Subscription::none(),
                     pending_child_starts: starts.clone(),
                 };
@@ -9943,11 +10403,47 @@ mod tests {
         let Some((backend, _executor, _boundary)) = backend_at_completed_tool_boundary() else {
             return;
         };
-        for address in (PAGE_SIZE..backend.memory.guest_end()).step_by(PAGE_SIZE as usize) {
+        // Identity addresses map one-to-one up to the identity end. Every
+        // window's user addresses map onto its physical pages, and those pages'
+        // identity addresses (everything from the identity end up) are unmapped.
+        let (windows, identity_end) = backend.memory.user_layout();
+        assert_eq!(windows.len(), 2, "the mmap and stack windows");
+        for address in (PAGE_SIZE..identity_end).step_by(PAGE_SIZE as usize) {
             let translated = backend.vcpu.translate_gva(address).unwrap();
             assert_eq!(translated.valid, 1, "address {address:#x}");
             assert_eq!(translated.physical_address, address);
         }
+        for physical in (identity_end..backend.memory.guest_end()).step_by(PAGE_SIZE as usize) {
+            assert_eq!(
+                backend.vcpu.translate_gva(physical).unwrap().valid,
+                0,
+                "identity address {physical:#x}"
+            );
+        }
+        for window in &windows {
+            for user in (window.user_start..window.user_end).step_by(PAGE_SIZE as usize) {
+                let translated = backend.vcpu.translate_gva(user).unwrap();
+                assert_eq!(translated.valid, 1, "user address {user:#x}");
+                assert_eq!(translated.physical_address, window.physical(user));
+            }
+        }
+        // Linux's TASK_SIZE page is not a user address: it faults.
+        assert_eq!(
+            backend
+                .vcpu
+                .translate_gva(crate::memory::USER_STACK_TOP)
+                .unwrap()
+                .valid,
+            0
+        );
+        assert_eq!(
+            backend
+                .vcpu
+                .translate_gva(crate::memory::MMAP_BASE)
+                .unwrap()
+                .valid,
+            0
+        );
         for address in [0, 1, PAGE_SIZE - 1] {
             assert_eq!(
                 backend.vcpu.translate_gva(address).unwrap().valid,
@@ -9987,7 +10483,6 @@ mod tests {
                     parent.vcpu.get_regs().unwrap(),
                     parent.vcpu.get_xsave().unwrap(),
                     None,
-                    parent.cpuid_policy,
                     2001,
                     parent.thread_group.clone(),
                 )
@@ -10010,6 +10505,7 @@ mod tests {
                     .exec_process(
                         &mut executor,
                         (Path::new("/page-zero-exec"), None),
+                        None,
                         &minimal_test_elf(&[HLT]),
                         &["/page-zero-exec".to_owned()],
                         &[],
@@ -10142,7 +10638,7 @@ mod tests {
             tid: Pid::from_raw(1),
             thread_state: &thread_state,
             global_state: Some(global_state),
-            config: (),
+            config: &(),
             subscriptions: reverie::Subscription::none(),
             pending_child_starts: starts.clone(),
         };
@@ -10736,7 +11232,6 @@ mod tests {
             parent.vcpu.get_regs().unwrap(),
             parent.vcpu.get_xsave().unwrap(),
             None,
-            parent.cpuid_policy,
             7,
             group.clone(),
         )
@@ -10762,6 +11257,7 @@ mod tests {
             ProcessAction::Exec {
                 executable_path: Path::new("/worker-exec-guard").to_owned(),
                 executable_file: None,
+                execfn: None,
                 image,
                 argv: vec!["/worker-exec-guard".to_owned()],
                 envp: Vec::new(),
@@ -10923,7 +11419,7 @@ mod tests {
         executable_file.write_all(&image).unwrap();
         drop(executable_file);
 
-        let stack_bottom = backend.memory.guest_end() - crate::elf::STACK_LIMIT;
+        let stack_bottom = crate::memory::USER_ADDRESS_END - crate::elf::STACK_LIMIT;
         let path_address = stack_bottom;
         let path = executable.as_os_str().as_bytes();
         backend.memory.write(path_address, path).unwrap();
@@ -10965,6 +11461,10 @@ mod tests {
         let sentinel_address = stack_bottom + PAGE_SIZE;
         const SENTINEL: [u8; 16] = *b"old-image-state!";
         backend.memory.write(sentinel_address, &SENTINEL).unwrap();
+        let sentinel_physical = backend
+            .memory
+            .user_range_to_guest(sentinel_address, SENTINEL.len() as u64)
+            .unwrap();
         let retained = backend.memory.clone();
         let error = backend
             .run_process_action(&mut executor, action, false)
@@ -10980,9 +11480,9 @@ mod tests {
         assert!(
             !backend
                 .memory
-                .user_range_is_mapped(sentinel_address, SENTINEL.len() as u64)
+                .user_range_is_mapped(sentinel_physical, SENTINEL.len() as u64)
         );
-        retained.read_raw(sentinel_address, &mut observed).unwrap();
+        retained.read_raw(sentinel_physical, &mut observed).unwrap();
         assert_eq!(observed, [0; SENTINEL.len()]);
     }
 
@@ -11727,6 +12227,9 @@ mod tests {
     }
 
     include!("vm/public_tool_panic_tests.rs");
+    include!("vm/kept_failure_wait_tests.rs");
+    include!("vm/kept_rpc_failure_tests.rs");
+    include!("vm/empty_signal_boundary_tests.rs");
     include!("vm/instruction_callback_panic_tests.rs");
 }
 
@@ -11848,3 +12351,12 @@ mod entry_owner_tests;
 #[cfg(test)]
 #[path = "vm/exec_wait_tests.rs"]
 mod exec_wait_tests;
+
+/// Milliseconds a dying task sleeps after its clear_child_tid wake (tests).
+#[cfg(test)]
+static DELAY_AFTER_CLEAR_TID_WAKE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+#[path = "vm/group_exit_order_tests.rs"]
+mod group_exit_order_tests;

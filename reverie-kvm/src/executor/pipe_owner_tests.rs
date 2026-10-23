@@ -714,7 +714,7 @@ fn fcntl_owner_failed_export_poison_is_shared_but_managed_export_delivers_nothin
         iov_base: 0x400_usize as *mut libc::c_void,
         iov_len: 1,
     };
-    assert_eq!(write_struct(&mut memory, 0x200, &iov), 0);
+    assert_eq!(write_struct(&mut ProviderMemory(&memory), 0x200, &iov), 0);
     // SAFETY: all-zero is a valid empty Linux msghdr. Guest pointers below are
     // translated by sendmsg; Rust never dereferences them as host addresses.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -722,7 +722,7 @@ fn fcntl_owner_failed_export_poison_is_shared_but_managed_export_delivers_nothin
     message.msg_iovlen = 1;
     message.msg_control = 0x300_usize as *mut libc::c_void;
     message.msg_controllen = control.len();
-    assert_eq!(write_struct(&mut memory, 0x100, &message), 0);
+    assert_eq!(write_struct(&mut ProviderMemory(&memory), 0x100, &message), 0);
     assert_eq!(
         syscall_result(
             &mut memory,

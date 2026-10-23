@@ -6,78 +6,28 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::cell::Cell;
+
 use kvm_bindings::Msrs;
 use kvm_bindings::kvm_fpu;
 use kvm_bindings::kvm_msr_entry;
 use kvm_bindings::kvm_segment;
 use kvm_ioctls::VcpuFd;
+pub(crate) use reverie_kvm_core::layout::*;
 
 use crate::Error;
 use crate::GuestMemory;
 use crate::Result;
 use crate::VMCALL_SYSCALL_TRANSPORT;
 use crate::syscall::FRAME_SIZE;
+use crate::syscall::FULL_RETURN_WORD;
+use crate::syscall::IRET_FRAME_WORD;
 use crate::syscall::RESULT_WORD;
 use crate::syscall::RETURN_FLAGS_WORD;
+use crate::syscall::RETURN_R11_WORD;
+use crate::syscall::RETURN_RCX_WORD;
 use crate::syscall::RETURN_RIP_WORD;
 use crate::syscall::SAVED_RBX_WORD;
-
-const PAGE_SIZE: u64 = 4096;
-const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
-const PAGE_DIRECTORY_SPAN: u64 = 1024 * 1024 * 1024;
-const PAGE_DIRECTORY_ADDRESSES: [u64; 3] = [0x4000, 0x9000, 0xe000];
-const FIRST_PAGE_TABLE_ADDRESS: u64 = 0;
-const MAX_IDENTITY_MAP: u64 = PAGE_DIRECTORY_SPAN * PAGE_DIRECTORY_ADDRESSES.len() as u64;
-
-const GDT_ADDRESS: u64 = 0x1000;
-const PML4_ADDRESS: u64 = 0x2000;
-const PDPT_ADDRESS: u64 = 0x3000;
-pub(crate) const SYSCALL_TRAMPOLINE_ADDRESS: u64 = 0x5000;
-pub(crate) const SYSCALL_FRAME_ADDRESS: u64 = 0x6000;
-pub(crate) const PROGRAM_HEADERS_ADDRESS: u64 = 0x7000;
-const TSS_ADDRESS: u64 = 0x8000;
-const IDT_ADDRESS: u64 = 0xa000;
-const EXCEPTION_STUB_ADDRESS: u64 = 0xb000;
-const EXCEPTION_STACK_BOTTOM: u64 = 0xc000;
-const EXCEPTION_STACK_TOP: u64 = 0xd000;
-pub(crate) const TOOL_STACK_TOP: u64 = 0xe000;
-pub(crate) const TOOL_STACK_SIZE: u64 = PAGE_SIZE;
-// Includes the 0xe000..0xf000 third page directory and 160 private
-// trampoline/frame pairs used by concurrent KVM guest threads.
-// AUTONOMOUS-BOT-IMPLEMENTED: Reserve transport slots for savevm worker pools.
-// TODO-HUMAN-REVIEW(PR-173): Review the bounded per-thread transport layout.
-pub(crate) const THREAD_SYSCALL_AREA_START: u64 = 0xf000;
-pub(crate) const THREAD_SYSCALL_AREA_STRIDE: u64 = 2 * PAGE_SIZE;
-pub(crate) const MAX_GUEST_THREADS: u64 = 160;
-// AUTONOMOUS-BOT-IMPLEMENTED: Provide a kernel-note vDSO for glibc os-version discovery.
-// TODO-HUMAN-REVIEW(PR-266): Review the guest vDSO placement and note contents.
-// A single read-only page holding the canonical vDSO
-// (`reverie::vdso::canonical_vdso_image`), the image every backend maps in
-// place of the host kernel's. glibc's loader reaches it through
-// `AT_SYSINFO_EHDR`, reads its kernel-version note (`_dl_discover_osversion`)
-// instead of calling `uname(2)`, and looks up its functions, each a stub that
-// issues the syscall. The page sits inside the boot-reserved region (below
-// `BOOT_RESERVED_END`), so guest brk/mmap never allocate over it and the
-// user-memory zeroing leaves it intact. It is covered by the identity map
-// (present + user, executable), so the guest reads and runs it directly
-// without an executor round-trip.
-pub(crate) const VDSO_ADDRESS: u64 =
-    THREAD_SYSCALL_AREA_START + THREAD_SYSCALL_AREA_STRIDE * MAX_GUEST_THREADS;
-// Keep the established syscall-transport and vDSO addresses unchanged. Each
-// worker gets one Tool scratch page after the vDSO, indexed by the same slot
-// that owns its private syscall transport.
-pub(crate) const THREAD_TOOL_STACK_AREA_START: u64 = VDSO_ADDRESS + PAGE_SIZE;
-pub(crate) const BOOT_RESERVED_END: u64 =
-    THREAD_TOOL_STACK_AREA_START + TOOL_STACK_SIZE * MAX_GUEST_THREADS;
-const _: () = {
-    assert!(TOOL_STACK_TOP <= THREAD_SYSCALL_AREA_START);
-    assert!(
-        THREAD_SYSCALL_AREA_START + THREAD_SYSCALL_AREA_STRIDE * MAX_GUEST_THREADS <= VDSO_ADDRESS
-    );
-    assert!(VDSO_ADDRESS + PAGE_SIZE <= THREAD_TOOL_STACK_AREA_START);
-    assert!(VDSO_ADDRESS == reverie::vdso::CANONICAL_VDSO_ADDRESS);
-    assert!(reverie::vdso::CANONICAL_VDSO_SIZE <= PAGE_SIZE);
-};
 
 /// Returns the exclusive upper address of the Tool scratch page assigned to a
 /// guest thread's transport slot.
@@ -138,6 +88,24 @@ const STAR: u64 =
 pub(crate) enum SegmentBase {
     Fs,
     Gs,
+}
+
+impl From<SegmentBase> for reverie::provider::SegmentRegister {
+    fn from(segment: SegmentBase) -> Self {
+        match segment {
+            SegmentBase::Fs => Self::Fs,
+            SegmentBase::Gs => Self::Gs,
+        }
+    }
+}
+
+impl From<reverie::provider::SegmentRegister> for SegmentBase {
+    fn from(register: reverie::provider::SegmentRegister) -> Self {
+        match register {
+            reverie::provider::SegmentRegister::Fs => Self::Fs,
+            reverie::provider::SegmentRegister::Gs => Self::Gs,
+        }
+    }
 }
 
 pub(crate) fn configure_long_mode(
@@ -218,6 +186,16 @@ pub(crate) fn configure_long_mode_with_syscall_area(
     sregs.cr3 = PML4_ADDRESS;
     sregs.cr4 |= CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE;
     sregs.efer |= EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE;
+    if initialize_shared_tables {
+        // The page tables were just rewritten, and an exec's new layout can
+        // unmap identity pages the old image used. Passing through a different
+        // CR3 makes KVM reset its MMU, which flushes the guest's cached
+        // translations before the vCPU next runs; setting an unchanged CR3
+        // alone does not.
+        let mut through = sregs;
+        through.cr3 = PDPT_ADDRESS;
+        vcpu.set_sregs(&through)?;
+    }
     vcpu.set_sregs(&sregs)?;
 
     let mut xcrs = vcpu.get_xcrs()?;
@@ -336,6 +314,20 @@ pub(crate) fn configure_user_segments(vcpu: &VcpuFd) -> Result<()> {
     Ok(())
 }
 
+/// The frame words a syscall return reads: 1 through SAVED_RBX_WORD.
+const RETURN_FIRST_WORD: usize = 1;
+const RETURN_LAST_WORD: usize = SAVED_RBX_WORD;
+const _: () = assert!(
+    RETURN_FIRST_WORD <= RETURN_RIP_WORD
+        && RETURN_RIP_WORD <= RETURN_LAST_WORD
+        && RETURN_FIRST_WORD <= RETURN_FLAGS_WORD
+        && RETURN_FLAGS_WORD <= RETURN_LAST_WORD
+        && 6 <= RETURN_LAST_WORD
+);
+const RETURN_WORDS_BYTES: usize =
+    (RETURN_LAST_WORD - RETURN_FIRST_WORD + 1) * std::mem::size_of::<u64>();
+type ReturnWords = [u8; RETURN_WORDS_BYTES];
+
 /// Reconstructs the userspace register file stopped at a syscall boundary.
 ///
 /// The live vCPU is executing the ring-zero VMCALL trampoline, which has
@@ -343,30 +335,75 @@ pub(crate) fn configure_user_segments(vcpu: &VcpuFd) -> Result<()> {
 /// those registers and for the userspace return RIP and RFLAGS.
 pub(crate) fn process_syscall_return_registers(
     memory: &GuestMemory,
-    mut registers: kvm_bindings::kvm_regs,
+    registers: kvm_bindings::kvm_regs,
     syscall_frame_address: u64,
     result: i64,
     stack_pointer: Option<u64>,
 ) -> Result<kvm_bindings::kvm_regs> {
-    let return_rip = read_u64(
-        memory,
-        frame_word_address_u64(syscall_frame_address, RETURN_RIP_WORD),
+    // One guest-memory copy for the whole span, words 1 through
+    // SAVED_RBX_WORD: each copy is admitted against the entry gate, and nine
+    // separate word reads cost a quarter of a KVM guest syscall.
+    let mut frame: ReturnWords = [0; RETURN_WORDS_BYTES];
+    memory.read_raw(
+        frame_word_address_u64(syscall_frame_address, RETURN_FIRST_WORD),
+        &mut frame,
     )?;
-    let return_flags = read_u64(
-        memory,
-        frame_word_address_u64(syscall_frame_address, RETURN_FLAGS_WORD),
+    Ok(return_registers_from_words(
+        &frame,
+        registers,
+        result,
+        stack_pointer,
+    ))
+}
+
+/// [`process_syscall_return_registers`] followed by
+/// [`crate::SyscallRequest::write_result`]'s store of `result` into the
+/// frame's result word, under one entry-gate admission instead of two. The
+/// read precedes the store, a read error or a failure recorded or deferred
+/// after the read returns before the store, and the store writes the same
+/// eight bytes at the same address; see [`GuestMemory::read_then_write_raw`].
+pub(crate) fn process_syscall_return_registers_storing_result(
+    memory: &GuestMemory,
+    registers: kvm_bindings::kvm_regs,
+    syscall_frame_address: u64,
+    result: i64,
+    stack_pointer: Option<u64>,
+) -> Result<kvm_bindings::kvm_regs> {
+    let mut frame: ReturnWords = [0; RETURN_WORDS_BYTES];
+    memory.read_then_write_raw(
+        frame_word_address_u64(syscall_frame_address, RETURN_FIRST_WORD),
+        &mut frame,
+        frame_word_address_u64(syscall_frame_address, RESULT_WORD),
+        &result.to_le_bytes(),
     )?;
+    Ok(return_registers_from_words(
+        &frame,
+        registers,
+        result,
+        stack_pointer,
+    ))
+}
+
+fn return_registers_from_words(
+    frame: &ReturnWords,
+    mut registers: kvm_bindings::kvm_regs,
+    result: i64,
+    stack_pointer: Option<u64>,
+) -> kvm_bindings::kvm_regs {
+    let word = |index: usize| {
+        let start = (index - RETURN_FIRST_WORD) * std::mem::size_of::<u64>();
+        u64::from_le_bytes(frame[start..start + 8].try_into().unwrap())
+    };
+    let return_rip = word(RETURN_RIP_WORD);
+    let return_flags = word(RETURN_FLAGS_WORD);
     registers.rax = result as u64;
-    registers.rdi = read_u64(memory, frame_word_address_u64(syscall_frame_address, 1))?;
-    registers.rsi = read_u64(memory, frame_word_address_u64(syscall_frame_address, 2))?;
-    registers.rdx = read_u64(memory, frame_word_address_u64(syscall_frame_address, 3))?;
-    registers.r10 = read_u64(memory, frame_word_address_u64(syscall_frame_address, 4))?;
-    registers.r8 = read_u64(memory, frame_word_address_u64(syscall_frame_address, 5))?;
-    registers.r9 = read_u64(memory, frame_word_address_u64(syscall_frame_address, 6))?;
-    registers.rbx = read_u64(
-        memory,
-        frame_word_address_u64(syscall_frame_address, SAVED_RBX_WORD),
-    )?;
+    registers.rdi = word(1);
+    registers.rsi = word(2);
+    registers.rdx = word(3);
+    registers.r10 = word(4);
+    registers.r8 = word(5);
+    registers.r9 = word(6);
+    registers.rbx = word(SAVED_RBX_WORD);
     registers.rcx = return_rip;
     registers.r11 = return_flags;
     registers.rip = return_rip;
@@ -374,7 +411,7 @@ pub(crate) fn process_syscall_return_registers(
     if let Some(stack_pointer) = stack_pointer {
         registers.rsp = stack_pointer;
     }
-    Ok(registers)
+    registers
 }
 
 // TODO-HUMAN-REVIEW(PR-172): Review syscall-frame selection for concurrent vCPUs.
@@ -419,6 +456,8 @@ pub(crate) fn stage_process_syscall_return(
         (RETURN_RIP_WORD, registers.rip),
         (RETURN_FLAGS_WORD, registers.rflags),
         (SAVED_RBX_WORD, registers.rbx),
+        // A syscall return is SYSRETQ-shaped; never reuse an older request.
+        (FULL_RETURN_WORD, 0),
     ] {
         write_u64(
             memory,
@@ -437,19 +476,84 @@ pub(crate) fn stage_process_syscall_return(
     Ok(())
 }
 
+/// Stages the context `rt_sigreturn` restored. Linux restores every register
+/// from the signal frame, and returns with IRET whenever SYSRET could not
+/// reproduce it (RCX != RIP or R11 != RFLAGS). That is the normal case for a
+/// handler returning to an interrupted CPU exception, where RCX and R11 are
+/// live program values; a SYSRET return would silently replace them.
+pub(crate) fn stage_process_signal_return(
+    memory: &mut GuestMemory,
+    vcpu: &VcpuFd,
+    syscall_frame_address: u64,
+    registers: kvm_bindings::kvm_regs,
+) -> Result<()> {
+    stage_process_syscall_return(memory, vcpu, syscall_frame_address, registers)?;
+    if registers.rcx == registers.rip && registers.r11 == registers.rflags {
+        return Ok(());
+    }
+    for (word, value) in [
+        (RETURN_RCX_WORD, registers.rcx),
+        (RETURN_R11_WORD, registers.r11),
+        (IRET_FRAME_WORD, registers.rip),
+        (IRET_FRAME_WORD + 1, u64::from(USER_CODE_SELECTOR)),
+        (IRET_FRAME_WORD + 2, registers.rflags),
+        (IRET_FRAME_WORD + 3, registers.rsp),
+        (IRET_FRAME_WORD + 4, u64::from(USER_DATA_SELECTOR)),
+        (FULL_RETURN_WORD, 1),
+    ] {
+        write_u64(
+            memory,
+            frame_word_address_u64(syscall_frame_address, word),
+            value,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn syscall_hypercall_address(
     hypercall_instruction: [u8; 3],
     syscall_trampoline_address: u64,
     syscall_frame_address: u64,
 ) -> u64 {
+    let (offset, _) = trampoline_hypercall(hypercall_instruction, syscall_frame_address);
+    syscall_trampoline_address
+        .checked_add(offset as u64)
+        .expect("syscall hypercall address must not overflow")
+}
+
+/// [`trampoline_hypercall`]'s inputs: the hypercall instruction and the
+/// syscall frame address.
+type TrampolineKey = ([u8; 3], u64);
+/// [`trampoline_hypercall`]'s result: the hypercall's offset and the byte
+/// after it.
+type TrampolineHypercall = (usize, u8);
+
+thread_local! {
+    /// The last [`trampoline_hypercall`] on this thread. Every guest syscall
+    /// asks for it (its completed boundary, and parking), always with the
+    /// same thread's inputs, and computing it builds the whole trampoline.
+    static LAST_TRAMPOLINE_HYPERCALL: Cell<Option<(TrampolineKey, TrampolineHypercall)>> =
+        const { Cell::new(None) };
+}
+
+/// The offset of the hypercall in the syscall trampoline for these inputs,
+/// and the trampoline byte just after it (the return a parked thread's halt
+/// replaces). Memoized per thread: a pure function of its inputs.
+fn trampoline_hypercall(hypercall_instruction: [u8; 3], syscall_frame_address: u64) -> (usize, u8) {
+    let key = (hypercall_instruction, syscall_frame_address);
+    if let Some((last, result)) = LAST_TRAMPOLINE_HYPERCALL.get()
+        && last == key
+    {
+        return result;
+    }
     let trampoline = syscall_trampoline(hypercall_instruction, syscall_frame_address);
     let offset = trampoline
         .windows(hypercall_instruction.len())
         .position(|window| window == hypercall_instruction)
         .expect("syscall trampoline must contain its hypercall");
-    syscall_trampoline_address
-        .checked_add(offset as u64)
-        .expect("syscall hypercall address must not overflow")
+    let result = (offset, trampoline[offset + hypercall_instruction.len()]);
+    LAST_TRAMPOLINE_HYPERCALL.set(Some((key, result)));
+    result
 }
 
 /// The async owner retains its parking stage when admission is closed. This
@@ -477,18 +581,12 @@ fn syscall_return_park_byte(
     syscall_frame_address: u64,
     park: bool,
 ) -> (u64, u8) {
-    let trampoline = syscall_trampoline(hypercall_instruction, syscall_frame_address);
-    let return_offset = (syscall_hypercall_address(
-        hypercall_instruction,
-        syscall_trampoline_address,
-        syscall_frame_address,
-    ) - syscall_trampoline_address) as usize
-        + hypercall_instruction.len();
-    let byte = if park {
-        0xf4
-    } else {
-        trampoline[return_offset]
-    };
+    let (offset, return_byte) = trampoline_hypercall(hypercall_instruction, syscall_frame_address);
+    syscall_trampoline_address
+        .checked_add(offset as u64)
+        .expect("syscall hypercall address must not overflow");
+    let return_offset = offset + hypercall_instruction.len();
+    let byte = if park { 0xf4 } else { return_byte };
     (syscall_trampoline_address + return_offset as u64, byte)
 }
 
@@ -628,6 +726,138 @@ fn write_page_tables(memory: &mut GuestMemory) -> Result<()> {
             )?;
         }
     }
+    // The loader may already have placed windows; keep them.
+    install_user_windows(memory)
+}
+
+/// Places the top `length` bytes of guest memory at the top of the user address
+/// space, where Linux puts the initial stack, and maps every window in the
+/// page tables (`install_user_windows`). Returns the window's first user
+/// address. `length` must be whole pages and leave the first large page alone.
+pub(crate) fn map_user_stack_window(memory: &mut GuestMemory, length: u64) -> Result<u64> {
+    if memory
+        .guest_end()
+        .checked_sub(length)
+        .is_none_or(|start| start < LARGE_PAGE_SIZE)
+    {
+        return Err(Error::LongModeMemoryTooSmall);
+    }
+    let user_start = memory.establish_user_stack_window(length)?;
+    install_user_windows(memory)?;
+    Ok(user_start)
+}
+
+/// Page-table pages handed out from the window table pool.
+struct TablePool {
+    next: u64,
+}
+
+impl TablePool {
+    const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+
+    fn allocate(&mut self, memory: &mut GuestMemory) -> Result<u64> {
+        if self.next == WINDOW_TABLE_POOL_PAGES {
+            return Err(Error::LongModeMemoryTooSmall);
+        }
+        let table = WINDOW_TABLE_POOL_ADDRESS + self.next * PAGE_SIZE;
+        self.next += 1;
+        memory.zero_raw(table, PAGE_SIZE as usize)?;
+        Ok(table)
+    }
+
+    /// The table that entry `index` of `table` points to, allocating it when the
+    /// entry is empty.
+    fn child(&mut self, memory: &mut GuestMemory, table: u64, index: u64) -> Result<u64> {
+        let entry_address = table + index * std::mem::size_of::<u64>() as u64;
+        let entry = read_u64(memory, entry_address)?;
+        if entry != 0 {
+            return Ok(entry & Self::ADDRESS_MASK);
+        }
+        let child = self.allocate(memory)?;
+        write_u64(memory, entry_address, child | 0x7)?;
+        Ok(child)
+    }
+}
+
+/// Maps every user window (see `crate::memory::UserWindow`) in the guest page
+/// tables, maps the identity addresses below the identity limit and unmaps
+/// those at and above it, so no physical page is reachable at two user addresses. A window uses a
+/// 2 MiB page wherever a whole aligned block of it maps to an aligned physical
+/// block, and 4 KiB pages elsewhere; addresses past a window's user end (the
+/// stack window's TASK_SIZE page) stay unmapped, so a guest access faults as on
+/// Linux. The tables come from a fixed pool in the boot area and are rebuilt
+/// whole each time, so repeating it changes nothing.
+pub(crate) fn install_user_windows(memory: &mut GuestMemory) -> Result<()> {
+    let (windows, identity_limit) = memory.user_layout();
+    let entry = std::mem::size_of::<u64>() as u64;
+    let entries = PAGE_SIZE / entry;
+    let index = |address: u64, shift: u32| (address >> shift) & (entries - 1);
+    // Only the first top-level entry maps identity addresses.
+    for slot in 1..entries {
+        write_u64(memory, PML4_ADDRESS + slot * entry, 0)?;
+    }
+    let mut pool = TablePool { next: 0 };
+    for window in &windows {
+        let mut user = window.user_start;
+        while user < window.user_end {
+            let physical = window.physical(user);
+            let pdpt = pool.child(memory, PML4_ADDRESS, index(user, 39))?;
+            let directory = pool.child(memory, pdpt, index(user, 30))?;
+            if user.is_multiple_of(LARGE_PAGE_SIZE)
+                && physical.is_multiple_of(LARGE_PAGE_SIZE)
+                && user + LARGE_PAGE_SIZE <= window.user_end
+            {
+                write_u64(memory, directory + index(user, 21) * entry, physical | 0x87)?;
+                user += LARGE_PAGE_SIZE;
+                continue;
+            }
+            let table = pool.child(memory, directory, index(user, 21))?;
+            write_u64(memory, table + index(user, 12) * entry, physical | 0x7)?;
+            user += PAGE_SIZE;
+        }
+    }
+    let mapped_large_pages = memory.guest_end().div_ceil(LARGE_PAGE_SIZE);
+    // Identity addresses that cover all of memory are mapped as
+    // `write_page_tables` maps them, in whole large pages.
+    let identity_limit = if identity_limit >= memory.guest_end() {
+        mapped_large_pages * LARGE_PAGE_SIZE
+    } else {
+        identity_limit
+    };
+    if identity_limit < LARGE_PAGE_SIZE {
+        return Err(Error::LongModeMemoryTooSmall);
+    }
+    // Map the identity addresses below the limit and unmap those at and above
+    // it, rewriting every large page after the first (which keeps its page
+    // table) so that a limit an earlier layout lowered is raised again. A large
+    // page wholly below the limit is mapped, one wholly above it unmapped, and
+    // one that straddles it split so that only its pages below the limit stay
+    // mapped.
+    for large_page in 1..mapped_large_pages {
+        let Some(directory_address) = PAGE_DIRECTORY_ADDRESSES.get((large_page / entries) as usize)
+        else {
+            continue;
+        };
+        let directory_entry = directory_address + (large_page % entries) * entry;
+        let base = large_page * LARGE_PAGE_SIZE;
+        if base + LARGE_PAGE_SIZE <= identity_limit {
+            write_u64(memory, directory_entry, base | 0x87)?;
+            continue;
+        }
+        if base >= identity_limit {
+            write_u64(memory, directory_entry, 0)?;
+            continue;
+        }
+        let table = pool.allocate(memory)?;
+        for page in 0..(identity_limit - base) / PAGE_SIZE {
+            write_u64(
+                memory,
+                table + page * entry,
+                (base + page * PAGE_SIZE) | 0x7,
+            )?;
+        }
+        write_u64(memory, directory_entry, table | 0x7)?;
+    }
     Ok(())
 }
 
@@ -636,9 +866,9 @@ fn write_page_tables(memory: &mut GuestMemory) -> Result<()> {
 //
 // Deterministic kernel version advertised by the vDSO note. Encoded as
 // `(major << 16) | (minor << 8) | patch`, this is `LINUX_VERSION_CODE` for the
-// "6.0.0" release the KVM backend reports through `uname(2)`, `/proc/version`,
-// and `/proc/sys/kernel/osrelease` (see reverie-kvm/src/executor.rs). Keeping
-// the value fixed preserves determinism regardless of the real host kernel.
+// "6.0.0" release the KVM backend reports through `uname(2)` (see
+// reverie-kvm/src/executor.rs). Keeping the value fixed preserves determinism
+// regardless of the real host kernel.
 const GUEST_LINUX_VERSION_MAJOR: u32 = 6;
 const GUEST_LINUX_VERSION_MINOR: u32 = 0;
 const GUEST_LINUX_VERSION_PATCH: u32 = 0;
@@ -782,7 +1012,42 @@ fn syscall_trampoline(hypercall_instruction: [u8; 3], syscall_frame_address: u64
         RETURN_FLAGS_WORD,
     );
     load_absolute(&mut code, syscall_frame_address, 0x48, 0x1c, SAVED_RBX_WORD);
+    // cmp qword ptr [FULL_RETURN_WORD], 0; jne full_return
+    code.extend_from_slice(&[0x48, 0x83, 0x3c, 0x25]);
+    code.extend_from_slice(
+        &frame_word_address(syscall_frame_address, FULL_RETURN_WORD).to_le_bytes(),
+    );
+    code.extend_from_slice(&[0x00, 0x75, 0x03]);
+    // sysretq: RCX becomes RIP and R11 becomes RFLAGS.
     code.extend_from_slice(&[0x48, 0x0f, 0x07]);
+    // full_return: consume the request, restore RCX/R11, and IRETQ through
+    // the staged frame, as Linux returns to a context SYSRET cannot express.
+    // mov qword ptr [FULL_RETURN_WORD], 0
+    code.extend_from_slice(&[0x48, 0xc7, 0x04, 0x25]);
+    code.extend_from_slice(
+        &frame_word_address(syscall_frame_address, FULL_RETURN_WORD).to_le_bytes(),
+    );
+    code.extend_from_slice(&0_u32.to_le_bytes());
+    load_absolute(
+        &mut code,
+        syscall_frame_address,
+        0x48,
+        0x0c,
+        RETURN_RCX_WORD,
+    );
+    load_absolute(
+        &mut code,
+        syscall_frame_address,
+        0x4c,
+        0x1c,
+        RETURN_R11_WORD,
+    );
+    // mov rsp, IRET frame (sign-extended imm32), then iretq
+    code.extend_from_slice(&[0x48, 0xc7, 0xc4]);
+    code.extend_from_slice(
+        &frame_word_address(syscall_frame_address, IRET_FRAME_WORD).to_le_bytes(),
+    );
+    code.extend_from_slice(&[0x48, 0xcf]);
     code
 }
 
@@ -822,13 +1087,138 @@ mod tests {
     use super::*;
     use crate::SyscallRequest;
 
+    /// The memoized hypercall offset and return byte equal a fresh build of
+    /// the trampoline for every input, including after the inputs change
+    /// back and forth on one thread.
+    #[test]
+    fn memoized_trampoline_hypercall_matches_a_fresh_build() {
+        let fresh = |instruction: [u8; 3], frame: u64, trampoline_address: u64, park: bool| {
+            let code = syscall_trampoline(instruction, frame);
+            let offset = code
+                .windows(instruction.len())
+                .position(|window| window == instruction)
+                .unwrap();
+            let return_offset = offset + instruction.len();
+            let byte = if park { 0xf4 } else { code[return_offset] };
+            (
+                trampoline_address + offset as u64,
+                (trampoline_address + return_offset as u64, byte),
+            )
+        };
+        let vmcall = [0x0f, 0x01, 0xc1];
+        let vmmcall = [0x0f, 0x01, 0xd9];
+        let inputs = [
+            (vmcall, 0x7000, 0x5000),
+            (vmmcall, 0x7000, 0x5000),
+            (vmcall, 0x9_1000, 0x8_2000),
+            (vmcall, 0x7000, 0x5000),
+            (vmmcall, 0x9_1000, 0x6000),
+            (vmmcall, 0x9_1000, 0x6000),
+            // This frame address's bytes contain VMCALL, so the first window
+            // equal to it lies inside an earlier immediate: a memo that
+            // ignored the frame address would return the usual offset.
+            (vmcall, 0x00c1_010f, 0x5000),
+            (vmcall, 0x7000, 0x5000),
+        ];
+        // The trampoline address is not part of the memo: the same key at two
+        // trampoline addresses, back to back, gives two addresses.
+        assert_eq!(
+            syscall_hypercall_address(vmcall, 0x5000, 0x7000) + 0x1000,
+            syscall_hypercall_address(vmcall, 0x6000, 0x7000)
+        );
+        for (instruction, frame, trampoline_address) in inputs {
+            for park in [false, true] {
+                let (hypercall, park_byte) = fresh(instruction, frame, trampoline_address, park);
+                assert_eq!(
+                    syscall_hypercall_address(instruction, trampoline_address, frame),
+                    hypercall
+                );
+                assert_eq!(
+                    syscall_return_park_byte(instruction, trampoline_address, frame, park),
+                    park_byte
+                );
+            }
+        }
+    }
+
     #[test]
     fn trampoline_preserves_syscall_return_state() {
         let code = syscall_trampoline([0x0f, 0x01, 0xc1], SYSCALL_FRAME_ADDRESS);
 
         assert!(code.windows(3).any(|window| window == [0x0f, 0x01, 0xc1]));
-        assert_eq!(&code[code.len() - 3..], &[0x48, 0x0f, 0x07]);
+        // The SYSRETQ return is taken unless a full return was staged; the
+        // full return consumes its request, restores RCX/R11, and IRETQs.
+        let full = frame_word_address(SYSCALL_FRAME_ADDRESS, FULL_RETURN_WORD).to_le_bytes();
+        let mut tail = vec![0x48, 0x83, 0x3c, 0x25];
+        tail.extend_from_slice(&full);
+        tail.extend_from_slice(&[0x00, 0x75, 0x03, 0x48, 0x0f, 0x07]);
+        tail.extend_from_slice(&[0x48, 0xc7, 0x04, 0x25]);
+        tail.extend_from_slice(&full);
+        tail.extend_from_slice(&[0, 0, 0, 0, 0x48, 0x8b, 0x0c, 0x25]);
+        tail.extend_from_slice(
+            &frame_word_address(SYSCALL_FRAME_ADDRESS, RETURN_RCX_WORD).to_le_bytes(),
+        );
+        tail.extend_from_slice(&[0x4c, 0x8b, 0x1c, 0x25]);
+        tail.extend_from_slice(
+            &frame_word_address(SYSCALL_FRAME_ADDRESS, RETURN_R11_WORD).to_le_bytes(),
+        );
+        tail.extend_from_slice(&[0x48, 0xc7, 0xc4]);
+        tail.extend_from_slice(
+            &frame_word_address(SYSCALL_FRAME_ADDRESS, IRET_FRAME_WORD).to_le_bytes(),
+        );
+        tail.extend_from_slice(&[0x48, 0xcf]);
+        assert!(code.ends_with(&tail));
         assert!(code.len() < THREAD_TSS_OFFSET as usize);
+    }
+
+    #[test]
+    fn signal_return_requests_iret_only_when_sysret_would_change_registers() {
+        const FRAME: u64 = 0x1000;
+        let kvm = kvm_ioctls::Kvm::new();
+        let Ok(kvm) = kvm else {
+            eprintln!("skipping: cannot open /dev/kvm");
+            return;
+        };
+        let vm = kvm.create_vm().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+        let word = |memory: &GuestMemory, word: usize| {
+            read_u64(memory, frame_word_address_u64(FRAME, word)).unwrap()
+        };
+        let mut registers = kvm_bindings::kvm_regs {
+            rip: 0x40_1000,
+            rcx: 0x40_1000,
+            rflags: 0x246,
+            r11: 0x246,
+            rsp: 0x7fff_0000,
+            ..Default::default()
+        };
+        // A SYSRET-shaped context keeps the SYSRET return.
+        stage_process_signal_return(&mut memory, &vcpu, FRAME, registers).unwrap();
+        assert_eq!(word(&memory, FULL_RETURN_WORD), 0);
+
+        registers.rcx = 0x1122_3344_5566_7788;
+        registers.r11 = 0x0123_4567_89ab_cdef;
+        stage_process_signal_return(&mut memory, &vcpu, FRAME, registers).unwrap();
+        assert_eq!(word(&memory, FULL_RETURN_WORD), 1);
+        assert_eq!(word(&memory, RETURN_RCX_WORD), registers.rcx);
+        assert_eq!(word(&memory, RETURN_R11_WORD), registers.r11);
+        assert_eq!(
+            (0..5)
+                .map(|index| word(&memory, IRET_FRAME_WORD + index))
+                .collect::<Vec<_>>(),
+            vec![
+                registers.rip,
+                u64::from(USER_CODE_SELECTOR),
+                registers.rflags,
+                registers.rsp,
+                u64::from(USER_DATA_SELECTOR),
+            ]
+        );
+
+        // An ordinary syscall return never reuses that request.
+        stage_process_syscall_return(&mut memory, &vcpu, FRAME, registers).unwrap();
+        assert_eq!(word(&memory, FULL_RETURN_WORD), 0);
     }
 
     #[test]
@@ -961,7 +1351,11 @@ mod tests {
 
         assert_eq!(first_top - TOOL_STACK_SIZE, THREAD_TOOL_STACK_AREA_START);
         assert_eq!(second_top - first_top, TOOL_STACK_SIZE);
-        assert_eq!(last_top, BOOT_RESERVED_END);
+        assert_eq!(last_top, WINDOW_TABLE_POOL_ADDRESS);
+        assert_eq!(
+            BOOT_RESERVED_END,
+            WINDOW_TABLE_POOL_ADDRESS + WINDOW_TABLE_POOL_PAGES * PAGE_SIZE
+        );
     }
 
     #[test]
@@ -987,6 +1381,62 @@ mod tests {
             read_u64(&memory, 0xe000 + 511 * 8).unwrap(),
             0xbfe0_0000 | 0x87
         );
+    }
+
+    /// The guest-physical address the page tables map `address` to, walking
+    /// them as the CPU does.
+    fn walk(memory: &GuestMemory, address: u64) -> Option<u64> {
+        const MASK: u64 = 0x000f_ffff_ffff_f000;
+        let index = |shift: u32| ((address >> shift) & 511) * 8;
+        let pml4 = read_u64(memory, PML4_ADDRESS + index(39)).unwrap();
+        if pml4 & 1 == 0 {
+            return None;
+        }
+        let pdpt = read_u64(memory, (pml4 & MASK) + index(30)).unwrap();
+        if pdpt & 1 == 0 {
+            return None;
+        }
+        let directory = read_u64(memory, (pdpt & MASK) + index(21)).unwrap();
+        if directory & 1 == 0 {
+            return None;
+        }
+        if directory & 0x80 != 0 {
+            return Some(
+                (directory & MASK & !(LARGE_PAGE_SIZE - 1)) | (address & (LARGE_PAGE_SIZE - 1)),
+            );
+        }
+        let table = read_u64(memory, (directory & MASK) + index(12)).unwrap();
+        (table & 1 != 0).then_some((table & MASK) | (address & (PAGE_SIZE - 1)))
+    }
+
+    /// A new layout's page tables replace the old one's whole: an identity end
+    /// raised by a larger image maps the identity pages the old window held,
+    /// and lowering it again unmaps them.
+    #[test]
+    fn page_tables_follow_an_identity_end_that_moves_both_ways() {
+        const MIB: u64 = 1024 * 1024;
+        let mut memory = GuestMemory::new(0, (64 * MIB) as usize).unwrap();
+        write_page_tables(&mut memory).unwrap();
+        for main_end in [3 * MIB, 48 * MIB, 3 * MIB] {
+            memory.clear_user_layout();
+            crate::elf::establish_linux_layout(&mut memory, main_end, MIB, None)
+                .unwrap()
+                .unwrap();
+            map_user_stack_window(&mut memory, 8 * MIB).unwrap();
+            let (windows, identity_end) = memory.user_layout();
+            assert_eq!(windows.len(), 2);
+            for address in (PAGE_SIZE..identity_end).step_by(PAGE_SIZE as usize) {
+                assert_eq!(walk(&memory, address), Some(address), "{address:#x}");
+            }
+            for address in (identity_end..memory.guest_end()).step_by(PAGE_SIZE as usize) {
+                assert_eq!(walk(&memory, address), None, "{address:#x}");
+            }
+            for window in &windows {
+                for user in (window.user_start..window.user_end).step_by(PAGE_SIZE as usize) {
+                    assert_eq!(walk(&memory, user), Some(window.physical(user)));
+                }
+            }
+        }
     }
 
     #[test]

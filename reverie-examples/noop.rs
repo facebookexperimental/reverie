@@ -9,8 +9,8 @@
 //! This instrumentation tool intercepts events but does nothing with them. It is
 //! useful for observing the overhead of interception, and as a starting point.
 
-#[path = "src/kvm_runner.rs"]
-mod kvm_runner;
+#[path = "backend.rs"]
+mod backend;
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -20,7 +20,6 @@ use std::sync::atomic::Ordering;
 use clap::Parser;
 #[cfg(test)]
 use reverie::Error;
-use reverie::ExitStatus;
 #[cfg(test)]
 use reverie::Guest;
 use reverie::Subscription;
@@ -73,40 +72,33 @@ impl Tool for NoopTool {
 #[derive(Debug, Parser)]
 struct Opts {
     // TODO-HUMAN-REVIEW(PR-151): Review noop runner selection.
-    /// Execution runner; KVM selects the prototype KvmGuest host.
-    #[clap(long, value_enum, default_value = "ptrace")]
-    runner: kvm_runner::Runner,
+    /// The Reverie backend to run the program on (`--runner` is accepted).
+    #[clap(long, value_enum, default_value = "ptrace", alias = "runner")]
+    backend: backend::BackendKind,
+
+    /// The example preload the in-guest backends host the tool in; by
+    /// default `libreverie_examples.so` beside this binary.
+    #[clap(long)]
+    preload: Option<std::path::PathBuf>,
 
     #[clap(flatten)]
     common: CommonToolArguments,
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = Opts::parse();
-    let stdin = match args.runner {
-        kvm_runner::Runner::Ptrace => None,
-        kvm_runner::Runner::Kvm => kvm_runner::reserve_stdin()?,
-    };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(run_main(args, stdin))
+    run_main(Opts::parse())
 }
 
-async fn run_main(args: Opts, stdin: Option<std::fs::File>) -> anyhow::Result<()> {
+fn run_main(args: Opts) -> anyhow::Result<()> {
     let log_guard = args.common.init_tracing();
-    let (status, _global_state) = match args.runner {
-        kvm_runner::Runner::Ptrace => {
-            let tracer = reverie_ptrace::TracerBuilder::<NoopTool>::new(args.common.clone().into())
-                .spawn()
-                .await?;
-            tracer.wait().await?
-        }
-        kvm_runner::Runner::Kvm => {
-            let result = kvm_runner::run::<NoopTool>(&args.common, (), stdin).await?;
-            (ExitStatus::Exited(result.exit_code), result.global_state)
-        }
-    };
+    let run = backend::run_blocking::<NoopTool>(
+        args.backend,
+        &args.common,
+        (),
+        "noop",
+        args.preload.clone(),
+    )?;
+    let (status, _global_state) = (run.status, run.global_state);
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }

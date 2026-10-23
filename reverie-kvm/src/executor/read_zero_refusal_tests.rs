@@ -21,7 +21,8 @@ mod read_zero_refusal_tests {
             for with_context in [false, true] {
                 let raw = unsafe {
                     libc::inotify_init1(
-                        libc::IN_CLOEXEC | if nonblocking { libc::IN_NONBLOCK } else { 0 },
+                        libc::IN_CLOEXEC
+                            | if nonblocking { libc::IN_NONBLOCK } else { 0 },
                     )
                 };
                 assert!(raw >= 0);
@@ -78,7 +79,7 @@ mod read_zero_refusal_tests {
                         };
                         assert_eq!(retained.as_raw_fd(), raw);
                         assert_eq!(file_status_flags(retained).unwrap(), flags);
-                        assert_eq!(state.fd_entry_ids, entries);
+                        assert!(same_entries(&state.fd_entry_ids, &entries));
                         assert_read_zero_canaries(&memory);
                     }
                 }
@@ -106,7 +107,8 @@ mod read_zero_refusal_tests {
                 for inherited in [false, true] {
                     for with_context in [false, true] {
                         let (file, mut peer) = if datagram {
-                            let (socket, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+                            let (socket, peer) =
+                                std::os::unix::net::UnixDatagram::pair().unwrap();
                             socket.set_nonblocking(nonblocking).unwrap();
                             let socket: std::os::fd::OwnedFd = socket.into();
                             let peer: std::os::fd::OwnedFd = peer.into();
@@ -125,14 +127,14 @@ mod read_zero_refusal_tests {
                         assert_eq!(flags & libc::O_NONBLOCK != 0, nonblocking);
                         assert_eq!(file_mode(&file).unwrap() & libc::S_IFMT, libc::S_IFSOCK);
                         let mut state = test_state(&std::env::current_dir().unwrap());
-                        let entry_id = Arc::new(());
                         let fd = if inherited {
                             state.stdin = Some(file);
-                            state.stdin_entry_id = entry_id.clone();
+                            state.stdin_entry_id = Arc::new(());
                             0
                         } else {
                             state.files.insert(3, file);
-                            state.fd_entry_ids.insert(3, entry_id.clone());
+                            state.fd_entry_ids
+                                .insert(3, Arc::new(crate::elf::FdEntry::default()));
                             3
                         };
                         let entries = state.fd_entry_ids.clone();
@@ -217,10 +219,7 @@ mod read_zero_refusal_tests {
                                     );
                                     assert_eq!(state.fd_entry_ids.len(), entries.len());
                                     for (entry_fd, original) in &entries {
-                                        assert!(Arc::ptr_eq(
-                                            &state.fd_entry_ids[entry_fd],
-                                            original
-                                        ));
+                                        assert!(Arc::ptr_eq(&state.fd_entry_ids[entry_fd], original));
                                     }
                                     assert!(Arc::ptr_eq(&state.stdin_entry_id, &stdin_entry));
                                     assert_read_zero_canaries(&memory);
@@ -243,10 +242,7 @@ mod read_zero_refusal_tests {
                                     };
                                     if queued {
                                         assert_eq!(count, PAYLOAD.len() as isize);
-                                        assert_eq!(
-                                            &observed, PAYLOAD,
-                                            "zero read consumed payload"
-                                        );
+                                        assert_eq!(&observed, PAYLOAD, "zero read consumed payload");
                                     } else {
                                         assert_eq!(count, -1);
                                         assert_eq!(
@@ -311,10 +307,7 @@ mod read_zero_refusal_tests {
                 // The host's architecture may allow addresses above the guest
                 // ceiling. UINTPTR_MAX is rejected on both; the guest boundary
                 // expectation remains the existing four-level address policy.
-                assert_eq!(
-                    native_read_zero(raw as u64, u64::MAX),
-                    negative_errno(libc::EFAULT)
-                );
+                assert_eq!(native_read_zero(raw as u64, u64::MAX), negative_errno(libc::EFAULT));
                 assert_eq!(
                     syscall_result(
                         &mut memory,
@@ -331,18 +324,13 @@ mod read_zero_refusal_tests {
 
     #[test]
     fn read_zero_intrinsic_nonwaiting_endpoints_keep_native_results_with_blocking_flags() {
-        for kind in [
-            "pipe", "eventfd", "timerfd", "signalfd", "epoll", "null", "zero",
-        ] {
+        for kind in ["pipe", "eventfd", "timerfd", "signalfd", "epoll", "null", "zero"] {
             let (file, _writer) = match kind {
                 "pipe" => {
                     let mut fds = [-1; 2];
                     assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
                     unsafe {
-                        (
-                            std::fs::File::from_raw_fd(fds[0]),
-                            Some(std::fs::File::from_raw_fd(fds[1])),
-                        )
+                        (std::fs::File::from_raw_fd(fds[0]), Some(std::fs::File::from_raw_fd(fds[1])))
                     }
                 }
                 "null" | "zero" => (std::fs::File::open(format!("/dev/{kind}")).unwrap(), None),
@@ -350,9 +338,7 @@ mod read_zero_refusal_tests {
                     let raw = match kind {
                         "eventfd" => unsafe { libc::eventfd(9, libc::EFD_CLOEXEC) },
                         "epoll" => unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) },
-                        "timerfd" => unsafe {
-                            libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC)
-                        },
+                        "timerfd" => unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) },
                         "signalfd" => {
                             let mut mask = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
                             assert_eq!(unsafe { libc::sigemptyset(mask.as_mut_ptr()) }, 0);
@@ -383,12 +369,7 @@ mod read_zero_refusal_tests {
                 };
                 assert_eq!(native, expected, "native {kind} address={address:#x}");
                 assert_eq!(
-                    syscall_result(
-                        &mut memory,
-                        &mut state,
-                        libc::SYS_read,
-                        [3, address, 0, 0, 0, 0]
-                    ),
+                    syscall_result(&mut memory, &mut state, libc::SYS_read, [3, address, 0, 0, 0, 0]),
                     native,
                     "guest {kind} address={address:#x}"
                 );
@@ -397,10 +378,7 @@ mod read_zero_refusal_tests {
             assert_eq!(fd_status_flags(raw).unwrap() & libc::O_NONBLOCK, 0);
             if kind == "eventfd" {
                 let mut value = 0_u64;
-                assert_eq!(
-                    unsafe { libc::read(raw, (&mut value as *mut u64).cast(), 8) },
-                    8
-                );
+                assert_eq!(unsafe { libc::read(raw, (&mut value as *mut u64).cast(), 8) }, 8);
                 assert_eq!(value, 9, "zero-count calls consumed the counter");
             }
         }

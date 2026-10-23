@@ -27,8 +27,9 @@ typedef int (*sgx_enter_enclave)(
 
 int main(void) {
   void* vdso = dlopen("linux-vdso.so.1", RTLD_NOW | RTLD_NOLOAD);
-  sgx_enter_enclave sgx =
-      vdso ? (sgx_enter_enclave)dlsym(vdso, "__vdso_sgx_enter_enclave") : NULL;
+  sgx_enter_enclave sgx = vdso
+      ? (sgx_enter_enclave)dlsym(vdso, "__vdso_sgx_enter_enclave")
+      : NULL;
   if (sgx == NULL) {
     puts("vdso-sgx=absent");
     return 0;

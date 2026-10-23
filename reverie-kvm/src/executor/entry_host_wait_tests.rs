@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The unchanged-mapping fence must not wait for a retained kernel operand or
 //! for allocation-only mmap file preparation. These controls execute the real
 //! Host adapters; they do not change a mapping while the fence is held.
@@ -119,7 +111,7 @@ fn queued_host_futex_retains_operands_while_unchanged_mapping_fence_completes() 
             let wait_started_at = started.elapsed();
             // Exactly one adapter invocation, with no EINTR or timeout retry.
             let result = futex(
-                &waiting_memory,
+                &ProviderMemory(&waiting_memory),
                 &[WORD, libc::FUTEX_WAIT as u64, 0, TIMEOUT, 0, 0],
             );
             // Capture thread-local errno before any timestamp, channel or log
@@ -148,7 +140,7 @@ fn queued_host_futex_retains_operands_while_unchanged_mapping_fence_completes() 
         // membership at that instant, not persistent sleep at SECOND: Linux
         // may internally retry or restart this same WAIT at its original WORD.
         let moved = futex(
-            &memory,
+            &ProviderMemory(&memory),
             &[WORD, libc::FUTEX_CMP_REQUEUE as u64, 0, 1, SECOND, 0],
         );
         // SAFETY: errno_location points to this live thread's errno cell.
@@ -236,7 +228,10 @@ fn queued_host_futex_retains_operands_while_unchanged_mapping_fence_completes() 
         let mut by_key = [0; 2];
         let mut errnos = [0; 2];
         for (index, address) in [SECOND, WORD].into_iter().enumerate() {
-            by_key[index] = futex(&memory, &[address, libc::FUTEX_WAKE as u64, 1, 0, 0, 0]);
+            by_key[index] = futex(
+                &ProviderMemory(&memory),
+                &[address, libc::FUTEX_WAKE as u64, 1, 0, 0, 0],
+            );
             // SAFETY: errno_location points to this live thread's errno cell.
             errnos[index] = unsafe { *libc::__errno_location() };
             assert!(
@@ -281,11 +276,17 @@ fn queued_host_futex_retains_operands_while_unchanged_mapping_fence_completes() 
     assert_eq!(owners(), 1);
     assert!(gate.pending_failure().is_none());
     assert_eq!(
-        futex(&memory, &[SECOND, libc::FUTEX_WAKE as u64, 1, 0, 0, 0]),
+        futex(
+            &ProviderMemory(&memory),
+            &[SECOND, libc::FUTEX_WAKE as u64, 1, 0, 0, 0]
+        ),
         0
     );
     assert_eq!(
-        futex(&memory, &[WORD, libc::FUTEX_WAKE as u64, 1, 0, 0, 0]),
+        futex(
+            &ProviderMemory(&memory),
+            &[WORD, libc::FUTEX_WAKE as u64, 1, 0, 0, 0]
+        ),
         0
     );
     drop(memory);
@@ -331,7 +332,10 @@ fn futex_allow_lists_every_supported_command_and_clock_combination() {
     // oracle: EFAULT proves the adapter did not reject the operation as ENOSYS.
     for (name, operation) in allowed {
         assert_eq!(
-            futex(&memory, &[WORD, operation as u64, 0, 0, 0, 0]),
+            futex(
+                &ProviderMemory(&memory),
+                &[WORD, operation as u64, 0, 0, 0, 0]
+            ),
             negative_errno(libc::EFAULT),
             "{name} did not pass the futex allow lists"
         );
@@ -367,7 +371,7 @@ fn matching_futex_wait_observes_copied_finite_timeout() {
     let mut waiter = FutexWaiter {
         handle: Some(std::thread::spawn(move || {
             let result = futex(
-                &waiting_memory,
+                &ProviderMemory(&waiting_memory),
                 &[WORD, libc::FUTEX_WAIT as u64, 0, TIMEOUT, 0, 0],
             );
             let _ = finished.send(result);
@@ -427,7 +431,7 @@ fn futex_timeout_import_and_non_pi_word_alignment_follow_linux_fault_order() {
     // before get_futex_key reaches a misaligned, inaccessible word.
     assert_eq!(
         futex(
-            &memory,
+            &ProviderMemory(&memory),
             &[
                 WORD + 1,
                 (libc::FUTEX_WAIT | libc::FUTEX_CLOCK_REALTIME) as u64,
@@ -440,7 +444,7 @@ fn futex_timeout_import_and_non_pi_word_alignment_follow_linux_fault_order() {
         negative_errno(libc::ENOSYS)
     );
     assert_eq!(
-        futex(&memory, &[WORD + 1, 99, 0, 0, 0, 0]),
+        futex(&ProviderMemory(&memory), &[WORD + 1, 99, 0, 0, 0, 0]),
         negative_errno(libc::ENOSYS)
     );
 
@@ -448,7 +452,7 @@ fn futex_timeout_import_and_non_pi_word_alignment_follow_linux_fault_order() {
     // misaligned address faults instead of reaching the alignment check.
     assert_eq!(
         futex(
-            &memory,
+            &ProviderMemory(&memory),
             &[WORD + 1, libc::FUTEX_UNLOCK_PI as u64, 0, 0, 0, 0]
         ),
         negative_errno(libc::EFAULT)
@@ -457,7 +461,7 @@ fn futex_timeout_import_and_non_pi_word_alignment_follow_linux_fault_order() {
     // The outer sys_futex timeout import still precedes do_futex validation.
     assert_eq!(
         futex(
-            &memory,
+            &ProviderMemory(&memory),
             &[
                 WORD + 1,
                 (libc::FUTEX_WAIT | libc::FUTEX_CLOCK_REALTIME) as u64,
@@ -501,7 +505,10 @@ fn futex_timeout_import_and_non_pi_word_alignment_follow_linux_fault_order() {
             libc::FUTEX_LOCK_PI2,
         ] {
             assert_eq!(
-                futex(&memory, &[WORD, operation as u64, 0, TIMEOUT, 0, 0]),
+                futex(
+                    &ProviderMemory(&memory),
+                    &[WORD, operation as u64, 0, TIMEOUT, 0, 0]
+                ),
                 negative_errno(libc::EINVAL),
                 "operation {operation} must validate its timeout first"
             );
@@ -525,7 +532,7 @@ fn futex_timeout_import_and_non_pi_word_alignment_follow_linux_fault_order() {
     // translation behavior. PI lookup-order fidelity remains unverified.
     assert_eq!(
         futex(
-            &memory,
+            &ProviderMemory(&memory),
             &[
                 MAPPED_WORD + 1,
                 libc::FUTEX_WAIT_REQUEUE_PI as u64,
@@ -542,14 +549,14 @@ fn futex_timeout_import_and_non_pi_word_alignment_follow_linux_fault_order() {
     // words of the covered non-PI operations.
     assert_eq!(
         futex(
-            &memory,
+            &ProviderMemory(&memory),
             &[WORD + 1, libc::FUTEX_WAIT as u64, 0, TIMEOUT, 0, 0]
         ),
         negative_errno(libc::EINVAL)
     );
     assert_eq!(
         futex(
-            &memory,
+            &ProviderMemory(&memory),
             &[
                 MAPPED_WORD,
                 libc::FUTEX_CMP_REQUEUE as u64,
@@ -594,7 +601,10 @@ fn futex_timeout_copy_accepts_unaligned_readonly_cross_page_input() {
     // Linux copies a timespec bytewise: it need not be naturally aligned or
     // writable. The mismatched word makes the actual host wait return EAGAIN.
     assert_eq!(
-        futex(&memory, &[WORD, libc::FUTEX_WAIT as u64, 0, TIMEOUT, 0, 0]),
+        futex(
+            &ProviderMemory(&memory),
+            &[WORD, libc::FUTEX_WAIT as u64, 0, TIMEOUT, 0, 0]
+        ),
         negative_errno(libc::EAGAIN)
     );
 
@@ -602,7 +612,10 @@ fn futex_timeout_copy_accepts_unaligned_readonly_cross_page_input() {
         .map_user_permissions(TIMEOUT_PAGE + PAGE_SIZE, PAGE_SIZE, false, false)
         .unwrap();
     assert_eq!(
-        futex(&memory, &[WORD, libc::FUTEX_WAIT as u64, 0, TIMEOUT, 0, 0]),
+        futex(
+            &ProviderMemory(&memory),
+            &[WORD, libc::FUTEX_WAIT as u64, 0, TIMEOUT, 0, 0]
+        ),
         negative_errno(libc::EFAULT)
     );
 }
@@ -731,4 +744,101 @@ fn allocation_held_mmap_file_read_does_not_hold_unchanged_mapping_fence() {
     assert!(gate.pending_failure().is_none());
     drop(memory);
     assert_eq!(owners(), 0);
+}
+
+/// The streamed twin of the test above: every file read after the reservation
+/// also runs outside admission, so the unchanged-mapping fence closes at once
+/// while any of them blocks.
+#[test]
+fn streamed_mmap_file_reads_do_not_hold_unchanged_mapping_fence() {
+    const CHUNK: usize = 64 * 1024;
+    let mut state = native_loaded_state(std::path::Path::new("/"));
+    state.mmap_limit = state.mmap_base + 4 * CHUNK as u64;
+    let expected_address = state.mmap_base;
+    let memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+    memory.enable_user_access();
+    let len = 3 * CHUNK + 100;
+    let expected: Vec<u8> = (0..len).map(|i| (i * 17 + 3) as u8).collect();
+    // SAFETY: the fixed name is nul-terminated. A successful returned fd is
+    // immediately owned by File.
+    let raw = unsafe { libc::memfd_create(c"entry-mmap-stream".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(
+        raw >= 0,
+        "memfd_create: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+    file.write_all(&expected).unwrap();
+    let fd = insert_file_with_flags(&mut state, file, false, None);
+    let gate = memory.entry_gate();
+    let mut reading_memory = memory.clone();
+    let (prepared, preparation) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let length = (4 * CHUNK) as u64;
+    let handle = std::thread::spawn(move || {
+        let reads = AtomicUsize::new(0);
+        let _observer = MmapObserverGuard::install(Rc::new(move || {
+            // The first read precedes the reservation; block every later one.
+            if reads.fetch_add(1, Ordering::SeqCst) >= 1 {
+                prepared.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }));
+        match execute_basic_syscall(
+            &mut reading_memory,
+            &mut state,
+            &SyscallRequest::new(
+                libc::SYS_mmap as u64,
+                [
+                    0,
+                    length,
+                    libc::PROT_READ as u64,
+                    libc::MAP_PRIVATE as u64,
+                    fd as u64,
+                    0,
+                ],
+            ),
+        ) {
+            SyscallAction::Continue {
+                result,
+                segment: None,
+            } => result,
+            _ => panic!("mmap did not retain its ordinary syscall disposition"),
+        }
+    });
+    let mut blocked = 0;
+    loop {
+        match preparation.recv_timeout(Duration::from_millis(500)) {
+            Ok(()) => {
+                blocked += 1;
+                assert_eq!(
+                    gate.test_state().copies,
+                    0,
+                    "streamed read {blocked} ran under admission"
+                );
+                let closed = gate
+                    .try_close()
+                    .unwrap()
+                    .unwrap()
+                    .finish()
+                    .now_or_never()
+                    .expect("fence waited for a streamed file read")
+                    .unwrap();
+                assert!(gate.test_state().closed);
+                drop(closed);
+                release.send(()).unwrap();
+            }
+            Err(_) if handle.is_finished() => break,
+            Err(_) => {}
+        }
+    }
+    let result = handle.join().unwrap();
+    // The 2 * 64 KiB + 100 bytes after the first chunk take at least three reads.
+    assert!(blocked >= 3, "only {blocked} streamed reads blocked");
+    assert_eq!(result, expected_address as i64);
+    let mut actual = vec![0xff; length as usize];
+    memory.user().read(expected_address, &mut actual).unwrap();
+    assert_eq!(&actual[..len], &expected[..]);
+    assert!(actual[len..].iter().all(|byte| *byte == 0));
+    assert!(gate.pending_failure().is_none());
 }

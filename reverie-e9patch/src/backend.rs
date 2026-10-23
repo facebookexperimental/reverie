@@ -33,6 +33,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use reverie::Backend;
+use reverie::BackendCapabilities;
 use reverie::BackendStatsRequest;
 use reverie::BackendStatsSource;
 use reverie::Error;
@@ -1207,6 +1208,10 @@ async fn unwrap_global_after_connections<G>(mut global: Arc<G>) -> io::Result<G>
 #[reverie::backend(?Send)]
 impl Backend for E9patchBackend {
     type Stats = E9patchBackendStatsSnapshot;
+
+    fn capabilities() -> BackendCapabilities {
+        BackendCapabilities::E9PATCH
+    }
 
     async fn run<T>(
         command: Command,

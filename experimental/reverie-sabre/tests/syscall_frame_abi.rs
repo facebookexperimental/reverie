@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Execute the production x86 wrappers and Rust child-return helpers against a
 //! scratch continuation, displaced instruction, and full red-zone sentinel.
 

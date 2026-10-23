@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Real bootstrap syscall-boundary controls for the ordinary-main launcher.
 //! No filesystem class is fabricated. The filter affects this isolated process
 //! and its children only; the existing outer 30s/kill2s bound is unchanged.

@@ -3,7 +3,7 @@
 [package]
 name = "reverie-sabre"
 description = "Experimental SaBRe selective binary-rewriting backend for Reverie."
-version = "0.4.0"
+version = "0.5.1"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -15,16 +15,16 @@ heapless = "0.8.0"
 lazy_static = "1.4"
 libc = "0.2.139"
 mimalloc = { version = "0.1", default-features = false }
-nostd-print = { version = "0.4.0", path = "../nostd-print" }
+nostd-print = { version = "0.5.1", path = "../nostd-print" }
 parking_lot = { version = "0.12.1", features = ["send_guard"] }
-reverie = { version = "0.4.0", path = "../../reverie", package = "reverie-core" }
-reverie-memory = { version = "0.4.0", path = "../../reverie-memory" }
-reverie-preload = { version = "0.4.0", path = "../../reverie-preload", default-features = false, features = ["coordinator-rpc"] }
-reverie-rpc = { version = "0.4.0", path = "../reverie-rpc" }
-reverie-rpc-transport = { version = "0.4.0", path = "../../reverie-rpc-transport" }
-reverie-sabre-stats = { version = "0.4.0", path = "../reverie-sabre-stats" }
-reverie-sabre-macros = { version = "0.4.0", path = "../reverie-sabre-macros" }
-reverie-syscalls = { version = "0.4.0", path = "../../reverie-syscalls" }
+reverie = { version = "0.5.1", path = "../../reverie", package = "reverie-core" }
+reverie-memory = { version = "0.5.1", path = "../../reverie-memory" }
+reverie-inguest = { version = "0.5.1", path = "../../reverie-inguest", default-features = false, features = ["coordinator-rpc"] }
+reverie-rpc = { version = "0.5.1", path = "../reverie-rpc" }
+reverie-rpc-transport = { version = "0.5.1", path = "../../reverie-rpc-transport" }
+reverie-sabre-stats = { version = "0.5.1", path = "../reverie-sabre-stats" }
+reverie-sabre-macros = { version = "0.5.1", path = "../reverie-sabre-macros" }
+reverie-syscalls = { version = "0.5.1", path = "../../reverie-syscalls" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 syscalls = { version = "0.6.7", features = ["serde"] }
 
@@ -35,3 +35,22 @@ cc = "1.0"
 cc = "1.0"
 tempfile = "3.27.0"
 tokio = { version = "1.52.4", features = ["net", "rt"] }
+
+[features]
+# SaBRe's entry into the shared in-guest runtime's saved-register entry
+# (shared_entry::dispatch_rewritten_syscall). Off by default: the plugin
+# links the shared runtime's RCB clock only from the SaBRe switch on.
+shared-entry = ["reverie-inguest/rcb-clock"]
+# SaBRe's plugin ABI for the shared in-guest runtime
+# (shared_runtime::shared_runtime_plugin!). Off by default: only a runtime
+# library that is loaded as the SaBRe plugin enables it.
+shared-runtime = ["shared-entry"]
+
+[[example]]
+name = "shared_runtime_plugin"
+crate-type = ["cdylib"]
+required-features = ["shared-runtime"]
+
+[[test]]
+name = "shared_runtime_plugin"
+required-features = ["shared-runtime"]

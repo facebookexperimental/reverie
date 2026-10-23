@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* A shared library whose constructor runs CPUID and RDTSC while dlopen maps
  * it, after the LiteInst runtime recorded its trampoline arenas. This is the
  * shape of libcrypto's OPENSSL_cpuid_setup, which runs from its initializer
@@ -19,13 +11,8 @@ static unsigned int constructor_words[4];
 static uint64_t constructor_tsc;
 
 __attribute__((constructor)) static void late_code_constructor(void) {
-  __cpuid_count(
-      0,
-      0,
-      constructor_words[0],
-      constructor_words[1],
-      constructor_words[2],
-      constructor_words[3]);
+  __cpuid_count(0, 0, constructor_words[0], constructor_words[1],
+                constructor_words[2], constructor_words[3]);
   constructor_tsc = __rdtsc();
 }
 
@@ -35,6 +22,4 @@ void late_code_constructor_cpuid(unsigned int out[4]) {
   }
 }
 
-uint64_t late_code_constructor_tsc(void) {
-  return constructor_tsc;
-}
+uint64_t late_code_constructor_tsc(void) { return constructor_tsc; }

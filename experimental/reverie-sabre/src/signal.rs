@@ -232,10 +232,17 @@ macro_rules! generate_signal_handlers {
 
             $(
                 #[allow(non_snake_case)]
-                pub fn $signal_name<T: ToolGlobal>(handler_input: HandlerInput) {
+                pub fn $signal_name<T: ToolGlobal>(mut handler_input: HandlerInput) {
                     signal::guard::mark_signal_dispatched(signal_values::$signal_name);
 
-                    T::global().handle_signal_event(signal_values::$signal_name);
+                    // The tool can suppress this instance, so the guest's
+                    // action is not applied to it, or rewrite its siginfo.
+                    if !T::global().handle_signal_event_with_info(
+                        signal_values::$signal_name,
+                        &mut handler_input,
+                    ) {
+                        return;
+                    }
 
                     if let Some(pair) = handler_keys::$signal_name
                         .load(Relaxed)

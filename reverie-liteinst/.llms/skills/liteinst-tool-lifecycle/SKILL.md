@@ -1,9 +1,6 @@
 ---
 name: liteinst-tool-lifecycle
 description: "Use when changing LiteInst backend launch, preload bootstrap, tool installation, coordinator RPC, syscall dispatch, injection, signals, or lifecycle callbacks."
-metadata:
-  oncalls:
-    - hermit
 ---
 
 # LiteInst Tool Lifecycle

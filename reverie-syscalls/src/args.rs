@@ -345,18 +345,18 @@ impl<'a> Displayable for Option<StatPtr<'a>> {
 
 /// A pointer to a `statx` buffer.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct StatxPtr<'a>(pub AddrMut<'a, libc::statx>);
+pub struct StatxPtr<'a>(pub AddrMut<'a, crate::linux_abi::Statx>);
 
 impl<'a> StatxPtr<'a> {
     /// Creates the `StatxPtr` from a raw pointer. Returns `None` if the given
     /// pointer is NULL.
-    pub fn from_ptr(r: *const libc::statx) -> Option<Self> {
+    pub fn from_ptr(r: *const crate::linux_abi::Statx) -> Option<Self> {
         AddrMut::from_ptr(r).map(StatxPtr)
     }
 }
 
 impl<'a> ReadAddr for StatxPtr<'a> {
-    type Target = libc::statx;
+    type Target = crate::linux_abi::Statx;
     type Error = Errno;
 
     fn read<M: MemoryAccess>(&self, memory: &M) -> Result<Self::Target, Self::Error> {
@@ -366,7 +366,7 @@ impl<'a> ReadAddr for StatxPtr<'a> {
 
 impl<'a> FromToRaw for Option<StatxPtr<'a>> {
     fn from_raw(raw: usize) -> Self {
-        Option::<AddrMut<'a, libc::statx>>::from_raw(raw).map(StatxPtr)
+        Option::<AddrMut<'a, crate::linux_abi::Statx>>::from_raw(raw).map(StatxPtr)
     }
 
     fn into_raw(self) -> usize {

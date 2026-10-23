@@ -42,6 +42,13 @@
 //!    backend; the [`Backend`] trait spells out exactly what any alternative
 //!    backend must provide.
 //!
+//! The [`provider`](mod@provider) module defines the interface of the Linux
+//! syscall provider beneath a backend's `Guest::inject`: the
+//! [`provider::LinuxProvider`] trait and the memory interfaces it uses. Today
+//! the KVM backend, whose syscall executor is the provider, and the ptrace and
+//! in-guest backends, whose provider is the host kernel, implement and call
+//! it; see the module documentation.
+//!
 //! For examples of usage, please see the [`reverie-examples`][] folder.
 //!
 //! See also [`README.md`][] for a high-level overview of Reverie.
@@ -57,30 +64,51 @@ mod auxv;
 mod backend;
 pub mod backend_stats;
 mod backtrace;
+mod capabilities;
 mod dispatch_stats;
 mod error;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub mod glibc_symbol;
 mod guest;
+/// Shared in-process retired-branch counter mechanics.
+pub mod in_guest_rcb;
+mod inherited_input;
+/// Shared Linux perf event mechanics; no tracer or timer policy.
+pub mod perf;
 #[cfg(target_arch = "x86_64")]
 pub mod pmu;
+/// Process-wide PMU configuration shared by counters and precise timers.
+pub mod pmu_config;
+pub use in_guest_rcb::InGuestRcbCounter;
+pub use perf::is_perf_supported;
+mod mapping_capture;
 mod process_signal_control;
+pub mod provider;
 #[cfg(target_arch = "x86_64")]
 mod rdtsc;
 mod regs;
 mod signal;
+mod signal_delivery;
 mod signal_observation;
 mod stack;
 mod subscription;
+pub mod task_ids;
 mod timer;
 mod tool;
+mod unsupported;
+mod user_address;
 pub mod vdso;
 
 pub use auxv::*;
 pub use backend::*;
 pub use backend_stats::*;
 pub use backtrace::*;
+pub use capabilities::*;
 pub use dispatch_stats::*;
 pub use error::*;
 pub use guest::*;
+pub use inherited_input::*;
+pub use mapping_capture::*;
 pub use process::ExitStatus;
 pub use process::Pid;
 #[cfg(target_arch = "x86_64")]
@@ -89,11 +117,15 @@ pub use regs::RegDisplay;
 pub use regs::RegDisplayOptions;
 pub use reverie_process as process;
 pub use signal::*;
+pub use signal_delivery::*;
 pub use signal_observation::*;
 pub use stack::*;
 pub use subscription::*;
 pub use timer::*;
 pub use tool::*;
+pub use unsupported::*;
+pub use user_address::UserAddressLimit;
+pub use user_address::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT;
 
 /// The identifier for a specific thread, corresponding to the output of gettid.
 /// In many cases, Linux blurs the Pid/Tid distinction, but Reverie should
@@ -120,6 +152,13 @@ pub use async_trait::async_trait as global_tool;
 /// NOTE: This is just an alias for `async_trait` for now, but may be extended in
 /// the future.
 pub use async_trait::async_trait as backend;
+/// Required for `impl LinuxProvider for MyProvider` blocks, because
+/// [`provider::LinuxProvider::execute`] is an `async` trait method.
+///
+/// NOTE: This is just an alias for `async_trait` for now, as `tool` and
+/// `backend` are. The module of the same name, [`provider`](mod@provider),
+/// defines the trait.
+pub use async_trait::async_trait as provider;
 // Reexport nix Signal type.
 pub use nix::sys::signal::Signal;
 /// CPUID result.

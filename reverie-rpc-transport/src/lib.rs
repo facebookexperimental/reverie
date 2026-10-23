@@ -65,6 +65,9 @@
 
 mod blocking_client;
 pub mod codec;
+pub mod initial_image;
+pub mod mapping_capture;
+pub mod successor;
 
 mod client;
 mod envelope;
@@ -78,13 +81,25 @@ mod server;
 pub mod mapped;
 
 pub use blocking_client::BlockingRpcClient;
+pub use blocking_client::BorrowedBlockingRpcClient;
+pub use blocking_client::InitialImageClient;
+pub use blocking_client::RpcRequest;
+pub use blocking_client::RpcResponse;
+pub use blocking_client::SuccessorClient;
+pub use blocking_client::read_config_frame;
 pub use client::RpcClient;
 pub use envelope::RequestEnvelope;
 pub use error::RpcError;
+pub use server::Admitted;
+pub use server::CancellationDrain;
+pub use server::CancelledRequest;
+pub use server::ConnectionAdmission;
 pub use server::ConnectionFailure;
 pub use server::ConnectionIssue;
 pub use server::ConnectionMonitor;
+pub use server::ExitReporter;
 pub use server::PanicPayload;
+pub use server::RequestCancellation;
 pub use server::RpcIssueMonitor;
 pub use server::RpcServer;
 pub use server::serve_connection;

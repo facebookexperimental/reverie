@@ -1,6 +1,5 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
@@ -241,10 +240,7 @@ fn wait_after_sigkill_waits_for_retirement_after_terminal_status() {
         observed,
         Ok(Some(crate::ExitStatus::Signaled(Signal::SIGKILL, _)))
     ));
-    assert!(
-        pending_empty,
-        "a nonterminal status was queued after SIGKILL"
-    );
+    assert!(pending_empty, "a nonterminal status was queued after SIGKILL");
     assert!(!early_ack, "DONE was published while the worker was paused");
     assert!(
         result.is_ok(),

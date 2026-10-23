@@ -29,6 +29,7 @@ mod mount;
 mod namespace;
 mod net;
 mod pid;
+mod pinned_mount;
 mod pty;
 pub mod seccomp;
 mod spawn;
@@ -41,9 +42,11 @@ use std::io;
 pub use child::Child;
 pub use child::Output;
 pub use container::ChildCleanupObservation;
+pub use container::ChildParentResourceStartContext;
 pub use container::ChildStartContext;
 pub use container::Container;
 pub use container::DeferredContainerRun;
+pub use container::LinuxMonotonicDeadline;
 pub use container::MAX_STARTUP_FDS;
 pub use container::OwnedContainerCleanup;
 pub use container::OwnedDecodeFailure;
@@ -52,6 +55,11 @@ pub use container::OwnedFinalization;
 pub use container::OwnedFinalize;
 pub use container::OwnedReapedResult;
 pub use container::OwnedRunFailure;
+pub use container::ParentResourcePublication;
+pub use container::ParentResourceStartContext;
+pub use container::ParentResourceStartupFailure;
+pub use container::ParentResourceStartupPhase;
+pub use container::ParentResourceStartupResult;
 pub use container::ParentStartContext;
 pub use container::RunError;
 pub use container::StartupError;
@@ -68,6 +76,7 @@ pub use namespace::Namespace;
 // Re-export Signal since it is used by `Child::signal`.
 pub use nix::sys::signal::Signal;
 pub use pid::Pid;
+pub use pinned_mount::PinnedMountSource;
 pub use pty::Pty;
 pub use pty::PtyChild;
 pub use stdio::ChildStderr;
@@ -76,12 +85,24 @@ pub use stdio::ChildStdout;
 pub use stdio::Stdio;
 use syscalls::Errno;
 
+/// Trusted terminal execution entry using the command's exact prepared vectors.
+///
+/// Successful kernel exec never returns. An entry must also terminate through
+/// its own admitted gate on failure; it cannot return into the ordinary spawn
+/// error path after publishing an inherited filter.
+pub type TerminalExecve = unsafe extern "C" fn(
+    *const libc::c_char,
+    *const *const libc::c_char,
+    *const *const libc::c_char,
+) -> !;
+
 /// A builder for spawning a process.
 // See the builder.rs for documentation of each field.
 pub struct Command {
     program: CString,
     args: util::CStringArray,
     pre_exec: Vec<Box<dyn FnMut() -> Result<(), Errno> + Send + Sync>>,
+    terminal_execve: Option<TerminalExecve>,
     container: Container,
 }
 
@@ -130,6 +151,12 @@ impl Command {
     /// seccomp filters, pseudoterminals, and CPU affinity.
     pub fn try_into_std(self) -> io::Result<std::process::Command> {
         let blockers = self.container.std_conversion_blockers();
+        if self.terminal_execve.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot convert a command with a terminal execution entry",
+            ));
+        }
         if !blockers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -166,9 +193,14 @@ impl Command {
             program,
             args,
             pre_exec,
+            terminal_execve,
             container,
         } = self;
 
+        assert!(
+            terminal_execve.is_none(),
+            "terminal entry requires the native command owner"
+        );
         let mut result = std::process::Command::new(OsStr::from_bytes(program.to_bytes()));
         result.args(
             args.iter()

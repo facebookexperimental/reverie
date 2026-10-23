@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Actual timestamp terminal transitions. These controls exercise the real
 // Tool/Guest/driver and consuming hooks; they do not model Detcore's clock RPC.
 use futures::channel::oneshot;
@@ -275,7 +267,7 @@ fn terminal_exit_preserves_status_and_consuming_cleanup() {
             );
         } else {
             let (status, stdout, stderr) = completion.result.unwrap();
-            assert_eq!(status, expected_status);
+            assert_eq!(status, expected);
             assert!(stdout.is_empty());
             assert!(stderr.is_empty());
         }
@@ -379,7 +371,7 @@ fn worker_terminal_rpc_precedes_real_sibling_exit_group() {
     let code = sibling_terminal_program(false);
     let (completion, _) = run_terminal(7, &code);
     let (status, stdout, stderr) = completion.result.unwrap();
-    assert_eq!(status, 17);
+    assert_eq!(status, ExitStatus::Exited(17));
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
     let events = completion.global_state.events.lock().unwrap();
@@ -417,7 +409,7 @@ fn worker_timestamp_exit_group_terminates_leader_and_runs_hooks_once() {
     }
     let (completion, _) = run_terminal(10, &sibling_terminal_program(true));
     let (status, stdout, stderr) = completion.result.unwrap();
-    assert_eq!(status, 29);
+    assert_eq!(status, reverie::ExitStatus::Exited(29));
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
     let events = completion.global_state.events.lock().unwrap();

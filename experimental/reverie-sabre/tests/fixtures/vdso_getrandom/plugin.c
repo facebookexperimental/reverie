@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 #define _GNU_SOURCE
 #include <string.h>
 #include <sys/syscall.h>
@@ -16,8 +8,8 @@
 #define DRAW_LEN 37
 #define PATTERN 0xa5
 
-static long
-handler(long nr, long a, long b, long c, long d, long e, long f, void* sp) {
+static long handler(long nr, long a, long b, long c, long d, long e, long f,
+                    void* sp) {
   (void)sp;
   if (nr == SYS_getrandom && b == DRAW_LEN) {
     memset((void*)a, PATTERN, DRAW_LEN);

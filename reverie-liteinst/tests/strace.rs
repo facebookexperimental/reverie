@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::File;
@@ -31,6 +23,10 @@ use reverie_liteinst::SPOOF_PID;
 use reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV;
 use reverie_liteinst::configure_command;
 use reverie_liteinst::configure_command_builtin;
+
+#[allow(dead_code)]
+#[path = "support/liteinst_runtime.rs"]
+mod liteinst_runtime;
 
 const TEST_EVENT_COOKIE: u64 = 7_915_913_731_959_187_131;
 const TEST_EVENT_FD_ENV: &str = "REVERIE_LITEINST_TEST_EVENT_FD";
@@ -229,15 +225,9 @@ fn run_compat_guest_with_event_pipe_within(
 }
 
 fn preload_path() -> PathBuf {
-    let launcher = PathBuf::from(env!("CARGO_BIN_EXE_reverie-liteinst-strace"));
-    let target = launcher.parent().unwrap();
-    [
-        target.join("libreverie_liteinst.so"),
-        target.join("deps/libreverie_liteinst.so"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .expect("cargo did not build the preload cdylib")
+    liteinst_runtime::required_preload_path().unwrap_or_else(|error| {
+        panic!("strace integration requires the qualified standalone producer inputs: {error}")
+    })
 }
 
 #[test]
@@ -286,9 +276,8 @@ fn run_pc_relative_guest(hooked: bool) -> Output {
     };
     command
         .env_remove("LD_PRELOAD")
-        .env_remove("REVERIE_LITEINST_HOST_RUNTIME")
         .env_remove("REVERIE_LITEINST_TOOL")
-        .env_remove("REVERIE_PRELOAD_TOOL")
+        .env_remove("REVERIE_INGUEST_TOOL")
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(File::create(directory.path().join("stdout")).unwrap())
@@ -633,17 +622,6 @@ fn other_runtimes_refuse_site_patching_selector() {
         let mut command = Command::new("/bin/true");
         configure_command_builtin(&mut command, BuiltinTool::Passthrough).unwrap();
         check(command, "built-in Tool", value);
-        // Past the guard, the ptrace-hosted runtime stops at its tracer
-        // handshake trap, which needs the LiteInst tracer, so only the refused
-        // values run here. The accepted `1` takes the same guard as the three
-        // runtimes above.
-        if value != "1" {
-            let mut command = Command::new("/bin/true");
-            command
-                .env("LD_PRELOAD", preload_path())
-                .env("REVERIE_LITEINST_HOST_RUNTIME", "1");
-            check(command, "ptrace-hosted", value);
-        }
     }
 }
 
@@ -876,7 +854,7 @@ fn spoof_getpid_builtin_mutates_getpid_result() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // The shared built-in installs via reverie_preload::install_builtin and
+    // The shared built-in installs via reverie_inguest::install_builtin and
     // rewrites the trapped getpid result: the LiteInst trap path MUTATED a
     // syscall return value, not merely observed it.
     assert_eq!(output.stdout, format!("getpid={SPOOF_PID}\n").as_bytes());

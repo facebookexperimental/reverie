@@ -39,6 +39,90 @@ fn compile_fixture(source_name: &str, output: &Path, extra_arguments: &[&str]) {
     assert!(compile_status.success(), "fixture compilation failed");
 }
 
+#[test]
+#[ignore = "requires a built DynamoRIO and the reverie-dbt native client; run with --ignored"]
+fn protected_evidence_follows_first_syscall_exec() {
+    let directory = tempfile::tempdir().expect("fixture tempdir");
+    let fixture = directory.path().join("exec-first-syscall");
+    compile_fixture(
+        "exec_first_syscall.S",
+        &fixture,
+        &["-nostdlib", "-static", "-Wl,--build-id=none"],
+    );
+
+    // The prototype runtime returns from background initialization immediately.
+    // Also force that completion before exec to bracket an already-finished
+    // predecessor. Neither case may wait for a nonexistent copied helper.
+    for wait_for_background in [false, true] {
+        let mut evidence_file = tempfile::tempfile().expect("evidence tempfile");
+        let mut runner = DbtRunner::from_env()
+            .expect("DynamoRIO and the native client must be configured")
+            .evidence_file(&evidence_file)
+            .expect("configure protected evidence");
+        if wait_for_background {
+            runner = runner.client_argument("-test-wait-for-background");
+        }
+        // Keep process-group cleanup disabled: normal completion must close
+        // the old helper's copy of stdout and publish its own FINAL.
+        let output = runner
+            .output(&Command::new(&fixture))
+            .expect("first-syscall exec evidence run should complete");
+        assert!(output.status.success(), "exec guest failed: {output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "unexpected guest output: {output:?}"
+        );
+        evidence_file
+            .rewind()
+            .expect("rewind exec evidence artifact");
+        let mut bytes = Vec::new();
+        evidence_file
+            .read_to_end(&mut bytes)
+            .expect("read exec evidence artifact");
+        let evidence = reverie_dbt::decode_evidence(&bytes)
+            .expect("both exec images and their helpers must finalize evidence");
+        assert!(
+            evidence.initialization_records() >= 4,
+            "both application images and their helpers must contribute evidence"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a built DynamoRIO and the reverie-dbt native client; run with --ignored"]
+fn protected_evidence_waits_for_exec_helper_kernel_exit() {
+    let directory = tempfile::tempdir().expect("fixture tempdir");
+    let fixture = directory.path().join("exec-pipe-eof");
+    compile_fixture("exec_pipe_eof.c", &fixture, &[]);
+    let mut evidence_file = tempfile::tempfile().expect("evidence tempfile");
+    let runner = DbtRunner::from_env()
+        .expect("DynamoRIO and the native client must be configured")
+        .evidence_file(&evidence_file)
+        .expect("configure protected evidence")
+        .client_argument("-test-delay-exec-helper-exit");
+    // The first helper keeps its shared descriptor table for one second after
+    // the successor claims its image, despite already acknowledging FINAL.
+    // Zero-time POLLHUP must still see EOF on the guest's CLOEXEC writer.
+    let output = runner
+        .output(&Command::new(fixture))
+        .expect("exec must await the old helper's kernel exit");
+    assert!(
+        output.status.success(),
+        "exec pipe guest failed: {output:?}"
+    );
+    assert_eq!(output.stdout, b"exec-pipe-eof-ok\n");
+    evidence_file
+        .rewind()
+        .expect("rewind exec evidence artifact");
+    let mut bytes = Vec::new();
+    evidence_file
+        .read_to_end(&mut bytes)
+        .expect("read exec evidence");
+    let evidence = reverie_dbt::decode_evidence(&bytes)
+        .expect("both exec images and helpers must finalize evidence");
+    assert!(evidence.initialization_records() >= 4);
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a built DynamoRIO and the reverie-dbt native client; run with --ignored"]
 async fn protected_evidence_survives_fork_pthread_lifecycle() {

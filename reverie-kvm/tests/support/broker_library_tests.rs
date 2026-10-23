@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Authenticated library-test adapter. Bootstrap occurs only in the separately
 // built ordinary-main launcher, never in a libtest worker or constructor.
 use std::os::unix::ffi::OsStringExt;
@@ -98,8 +90,7 @@ pub(crate) fn selected_child(test: &str) -> Option<BrokerClient> {
 fn launcher_path(executable: &std::path::Path) -> PathBuf {
     let path = if let Some(value) = std::env::var_os(LAUNCHER_ENV) {
         let path = PathBuf::from(value);
-        // Buck passes the helper's location relative to the test's working
-        // directory.
+        // Test runners may provide the helper relative to their working directory.
         let path = if path.is_relative() {
             std::env::current_dir()
                 .expect("test working directory")

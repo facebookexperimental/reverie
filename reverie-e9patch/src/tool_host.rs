@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Generic in-guest host for Reverie tools on e9patch's direct AOT path.
 
 use core::sync::atomic::AtomicBool;
@@ -33,16 +25,17 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
-use reverie_preload::dispatch::PassthroughDispatcher;
-use reverie_preload::dispatch::SyscallDispatcher;
-use reverie_preload::dispatch::SyscallEvent;
-use reverie_preload::dispatch::SyscallEventSource;
-use reverie_preload::lifecycle::InProcessSeccomp;
-use reverie_preload::tool_host::DrivenSyscall;
-use reverie_preload::tool_host::TailResult;
-use reverie_preload::tool_host::drive_ready;
-use reverie_preload::tool_host::drive_tool_syscall;
-use reverie_preload::trap::raw_syscall6;
+use reverie_inguest::dispatch::PassthroughDispatcher;
+use reverie_inguest::dispatch::SyscallDispatcher;
+use reverie_inguest::dispatch::SyscallEvent;
+use reverie_inguest::dispatch::SyscallEventSource;
+use reverie_inguest::lifecycle::InProcessSeccomp;
+use reverie_inguest::reserved_fds;
+use reverie_inguest::tool_host::DrivenSyscall;
+use reverie_inguest::tool_host::TailResult;
+use reverie_inguest::tool_host::drive_ready;
+use reverie_inguest::tool_host::drive_tool_syscall;
+use reverie_inguest::trap::raw_syscall6;
 
 use crate::aot;
 use crate::dispatch::record_fallback_dispatch;
@@ -151,7 +144,7 @@ where
     // SAFETY: the caller provides the once-before-threads contract. The
     // dispatcher is registered before the controller installs its filter.
     let result =
-        unsafe { reverie_preload::install(Box::new(dispatcher), &InProcessSeccomp, &config) };
+        unsafe { reverie_inguest::install(Box::new(dispatcher), &InProcessSeccomp, &config) };
     if result.is_ok() {
         dispatch_page.commit();
     }
@@ -243,7 +236,7 @@ where
             return;
         }
 
-        if protect_coordinator_channel(event, self.rpc.raw_fd()) {
+        if protect_coordinator_channel(event, self.rpc.raw_fd(), true) {
             return;
         }
 
@@ -471,7 +464,7 @@ impl<T: Tool> Guest<T> for E9patchGuest<'_, T> {
 
     // This in-process host has no begin/ready runtime window: the Tool
     // receives syscalls only through the seccomp filter that
-    // reverie_preload::install arms as the last step of runtime installation,
+    // reverie_inguest::install arms as the last step of runtime installation,
     // so the runtime's own setup is never delivered to it.
     fn is_backend_runtime_bootstrap(&self) -> bool {
         false
@@ -515,6 +508,20 @@ impl<T: Tool> Guest<T> for E9patchGuest<'_, T> {
     }
 
     async fn daemonize(&mut self) {}
+
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: reverie::InjectionPurpose,
+    ) -> std::result::Result<i64, reverie::Error> {
+        // This route keeps its existing guarded injection behavior.
+        match purpose {
+            reverie::InjectionPurpose::Application
+            | reverie::InjectionPurpose::Pselect6WrapperValidation => {
+                self.inject(syscall).await.map_err(reverie::Error::from)
+            }
+        }
+    }
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         let (number, args) = syscall.into_parts();
@@ -636,22 +643,36 @@ fn forward_nested_tool_syscall(event: &mut SyscallEvent, coordinator_fd: libc::c
         event.fail(libc::ENOTSUP);
     } else if unsupported_signal_state {
         event.fail(libc::EPERM);
-    } else if !protect_coordinator_channel(event, coordinator_fd) {
+    } else if !protect_coordinator_channel(event, coordinator_fd, false) {
         event.forward();
     }
 }
 
 // TODO-HUMAN-REVIEW(PR-269): Review coordinator-channel
 // descriptor virtualization.
-fn protect_coordinator_channel(event: &mut SyscallEvent, coordinator_fd: libc::c_int) -> bool {
+/// Keeps `event` away from the coordinator connection by the rule every
+/// in-process backend shares ([`reserved_fds`]): a `close_range` over it
+/// closes the rest of its range, and a `close` or any other call naming it
+/// fails with `EBADF`, as on a descriptor the guest does not have. The socket calls (send, recv, shutdown and the like)
+/// are refused for guest syscalls only (`guest_syscall`): the Tool's own client
+/// uses the connection through them. Returns whether `event` was handled here.
+fn protect_coordinator_channel(
+    event: &mut SyscallEvent,
+    coordinator_fd: libc::c_int,
+    guest_syscall: bool,
+) -> bool {
     let fd = coordinator_fd as u64;
     let number = event.number();
     let args = event.args();
-    if number == libc::SYS_close && args[0] == fd {
-        event.set_result(0);
-    } else if number == libc::SYS_close_range && args[0] <= fd && fd <= args[1] {
+    if number == libc::SYS_close && reserved_fds::descriptor_arg(&args, 0) == fd {
+        event.fail(libc::EBADF);
+    } else if number == libc::SYS_close_range && reserved_fds::close_range_covers(&args, &[fd]) {
         event.set_result(close_range_preserving_fd(args, fd));
-    } else if syscall_targets_fd(number, args, fd) {
+    } else if let Some(result) = reserved_fds::epoll_wait_result(number, &args, fd) {
+        event.set_result(result);
+    } else if syscall_targets_fd(number, args, fd)
+        || (guest_syscall && reserved_fds::socket_call_names_descriptor(number, &args, fd))
+    {
         event.fail(libc::EBADF);
     } else {
         return false;
@@ -662,69 +683,16 @@ fn protect_coordinator_channel(event: &mut SyscallEvent, coordinator_fd: libc::c
 // TODO-HUMAN-REVIEW(PR-269): Review close_range splitting
 // around the reserved coordinator descriptor.
 fn close_range_preserving_fd(args: [u64; 6], fd: u64) -> i64 {
-    const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
-    const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
-    let first = args[0];
-    let last = args[1];
-    let mut flags = args[2];
-    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
-        return -i64::from(libc::EINVAL);
+    // SAFETY: `args` is the guest's `close_range`, run in its own descriptor
+    // table; the coordinator connection is spared.
+    unsafe {
+        reserved_fds::close_range_sparing(&args, &[fd], |number, args| raw_syscall6(number, args))
     }
-    if flags & CLOSE_RANGE_UNSHARE != 0 {
-        let result =
-            unsafe { raw_syscall6(libc::SYS_unshare, [libc::CLONE_FILES as u64, 0, 0, 0, 0, 0]) };
-        if result < 0 {
-            return result;
-        }
-        flags &= !CLOSE_RANGE_UNSHARE;
-    }
-    if first < fd {
-        let result =
-            unsafe { raw_syscall6(libc::SYS_close_range, [first, fd - 1, flags, 0, 0, 0]) };
-        if result < 0 {
-            return result;
-        }
-    }
-    if fd < last {
-        let result = unsafe { raw_syscall6(libc::SYS_close_range, [fd + 1, last, flags, 0, 0, 0]) };
-        if result < 0 {
-            return result;
-        }
-    }
-    0
 }
 
-// TODO-HUMAN-REVIEW(PR-269): Review syscalls classified
-// as targeting the reserved coordinator descriptor.
+/// Whether a call names descriptor `fd`, by the shared rule.
 fn syscall_targets_fd(number: i64, args: [u64; 6], fd: u64) -> bool {
-    match number {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        libc::SYS_read
-        | libc::SYS_readv
-        | libc::SYS_pread64
-        | libc::SYS_preadv
-        | libc::SYS_preadv2
-        | libc::SYS_write
-        | libc::SYS_writev
-        | libc::SYS_pwrite64
-        | libc::SYS_pwritev
-        | libc::SYS_pwritev2
-        | libc::SYS_vmsplice
-        | libc::SYS_fcntl
-        | libc::SYS_ioctl
-        | libc::SYS_dup => args[0] == fd,
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // sendfile(out_fd, in_fd, ...) names a descriptor in both args[0]
-        // (out_fd) and args[1] (in_fd). Guarding out_fd alone would let a guest
-        // read the reserved coordinator channel by naming it as the in_fd
-        // source, so both endpoints must fail closed, matching `tee`.
-        libc::SYS_dup2 | libc::SYS_dup3 | libc::SYS_sendfile | libc::SYS_tee => {
-            args[0] == fd || args[1] == fd
-        }
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        libc::SYS_splice | libc::SYS_copy_file_range => args[0] == fd || args[2] == fd,
-        _ => false,
-    }
+    reserved_fds::names_descriptor(number, &args, fd)
 }
 
 #[repr(C)]
@@ -1131,6 +1099,38 @@ mod tests {
         assert!(!syscall_targets_fd(
             libc::SYS_close_range,
             [FD, FD, 0, 0, 0, 0],
+            FD
+        ));
+    }
+
+    #[test]
+    fn coordinator_channel_follows_the_shared_rule() {
+        const FD: u64 = 7;
+        // The kernel reads a descriptor from the low 32 bits of its register.
+        // This classifier compared the whole register, so a guest passing
+        // `fd | 1 << 32` reached the coordinator connection.
+        assert!(syscall_targets_fd(
+            libc::SYS_read,
+            [FD | 1 << 32, 0, 0, 0, 0, 0],
+            FD
+        ));
+        // Calls this classifier's own list missed, which the shared rule
+        // covers as the in-guest runtime always has.
+        for number in [
+            libc::SYS_fstat,
+            libc::SYS_lseek,
+            libc::SYS_getdents64,
+            libc::SYS_flock,
+            libc::SYS_fchdir,
+        ] {
+            assert!(
+                syscall_targets_fd(number, [FD, 0, 0, 0, 0, 0], FD),
+                "syscall {number} on the coordinator fd must be classified"
+            );
+        }
+        assert!(syscall_targets_fd(
+            libc::SYS_mmap,
+            [0, 4096, 1, libc::MAP_SHARED as u64, FD, 0],
             FD
         ));
     }

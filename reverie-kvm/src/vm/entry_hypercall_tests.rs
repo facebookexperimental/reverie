@@ -46,7 +46,7 @@ mod entry_hypercall_tests {
         let load = |value: &AtomicUsize| value.load(Ordering::SeqCst);
         Counts {
             fd: load(&probe.shared_fd_accesses),
-            masks: load(&probe.prepare.mask_installs),
+            masks: load(&probe.prepare.activations),
             untracked: load(&probe.untracked_runs),
             tracked: load(&probe.tracked_runs),
             begins: load(&probe.clock_begins),

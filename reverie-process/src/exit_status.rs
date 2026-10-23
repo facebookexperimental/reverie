@@ -25,6 +25,13 @@ pub enum ExitStatus {
     Exited(i32),
     /// Program killed by signal, with or without a coredump.
     Signaled(Signal, bool),
+    /// Program killed by a signal that nix's [`Signal`] cannot name, a
+    /// realtime signal (32 to 64), with or without a coredump. The number is
+    /// the raw signal number (<https://github.com/rrnewton/reverie/issues/997>).
+    /// It is only for numbers nix cannot name: build a status from a raw
+    /// number with [`ExitStatus::signaled`], which picks this or
+    /// [`ExitStatus::Signaled`].
+    SignaledRaw(i32, bool),
 }
 
 impl ExitStatus {
@@ -36,10 +43,17 @@ impl ExitStatus {
         if libc::WIFEXITED(code) {
             ExitStatus::Exited(libc::WEXITSTATUS(code))
         } else {
-            ExitStatus::Signaled(
-                Signal::try_from(libc::WTERMSIG(code)).unwrap(),
-                libc::WCOREDUMP(code),
-            )
+            Self::signaled(libc::WTERMSIG(code), libc::WCOREDUMP(code))
+        }
+    }
+
+    /// The status of a process killed by the raw signal `signal`:
+    /// [`ExitStatus::Signaled`] when nix names it, else
+    /// [`ExitStatus::SignaledRaw`].
+    pub fn signaled(signal: i32, coredump: bool) -> Self {
+        match Signal::try_from(signal) {
+            Ok(signal) => ExitStatus::Signaled(signal, coredump),
+            Err(_) => ExitStatus::SignaledRaw(signal, coredump),
         }
     }
 
@@ -54,6 +68,13 @@ impl ExitStatus {
                     sig as i32 & 0x7f
                 }
             }
+            ExitStatus::SignaledRaw(sig, coredump) => {
+                if coredump {
+                    (sig | 0x80) & 0xff
+                } else {
+                    sig & 0x7f
+                }
+            }
         }
     }
 
@@ -62,6 +83,7 @@ impl ExitStatus {
         match self {
             ExitStatus::Exited(_) => None,
             ExitStatus::Signaled(sig, _) => Some(*sig as i32 & 0x7f),
+            ExitStatus::SignaledRaw(sig, _) => Some(*sig & 0x7f),
         }
     }
 
@@ -108,6 +130,49 @@ impl ExitStatus {
                 // Incase the signal is not fatal:
                 std::process::exit(signal as i32 + 128);
             }
+            ExitStatus::SignaledRaw(signal, core_dump) => {
+                if core_dump {
+                    let limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+                }
+                // As above, with the raw number nix cannot name, through raw
+                // syscalls: glibc's signal(), raise() and sigprocmask() refuse
+                // 32 and 33, which it reserves for itself. The kernel's
+                // sigaction is handler, flags, restorer and a 64-bit mask.
+                let default: [u64; 4] = [libc::SIG_DFL as u64, 0, 0, 0];
+                // A number outside 1 to 64 names no signal: none is raised,
+                // and the process exits below.
+                let unblock: u64 = u32::try_from(signal - 1)
+                    .ok()
+                    .and_then(|bit| 1u64.checked_shl(bit))
+                    .unwrap_or(0);
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_rt_sigaction,
+                        signal,
+                        default.as_ptr(),
+                        std::ptr::null_mut::<u64>(),
+                        8,
+                    );
+                    libc::syscall(
+                        libc::SYS_tgkill,
+                        libc::getpid(),
+                        libc::syscall(libc::SYS_gettid),
+                        signal,
+                    );
+                    libc::syscall(
+                        libc::SYS_rt_sigprocmask,
+                        libc::SIG_UNBLOCK,
+                        &unblock as *const u64,
+                        std::ptr::null_mut::<u64>(),
+                        8,
+                    );
+                }
+                std::process::exit(signal + 128);
+            }
             ExitStatus::Exited(code) => std::process::exit(code),
         }
     }
@@ -122,7 +187,7 @@ impl From<ExitStatus> for std::process::ExitStatus {
 impl From<std::process::ExitStatus> for ExitStatus {
     fn from(status: std::process::ExitStatus) -> Self {
         if let Some(sig) = status.signal() {
-            ExitStatus::Signaled(Signal::try_from(sig).unwrap(), true)
+            ExitStatus::signaled(sig, status.core_dumped())
         } else {
             ExitStatus::Exited(status.code().unwrap_or(255))
         }
@@ -267,6 +332,140 @@ mod tests_non_sanitized {
             }),
             Ok(ExitStatus::Signaled(Signal::SIGILL, true))
         );
+    }
+
+    // Like `run_forked`, decoding the raw wait status with
+    // `ExitStatus::from_raw`, which keeps a realtime signal nix's
+    // `WaitStatus` cannot hold.
+    fn run_forked_raw<F>(f: F) -> ExitStatus
+    where
+        F: FnOnce(),
+    {
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Parent { child, .. } => {
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(child.as_raw(), &mut status, 0) },
+                    child.as_raw()
+                );
+                ExitStatus::from_raw(status)
+            }
+            ForkResult::Child => {
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+                f();
+                unsafe { ::libc::_exit(0) };
+            }
+        }
+    }
+
+    /// A raw signal status round-trips through `into_raw` and `from_raw`,
+    /// and `signaled` picks `SignaledRaw` only for a number nix cannot name.
+    /// Converting to std's `ExitStatus` and back keeps every status,
+    /// including whether a core was dumped, for named signals and for
+    /// realtime ones, 32 and 33 among them.
+    #[test]
+    fn statuses_round_trip_through_std() {
+        let statuses = [
+            ExitStatus::Exited(0),
+            ExitStatus::Exited(42),
+            ExitStatus::Signaled(Signal::SIGKILL, false),
+            ExitStatus::Signaled(Signal::SIGILL, true),
+            ExitStatus::SignaledRaw(32, false),
+            ExitStatus::SignaledRaw(33, false),
+            ExitStatus::SignaledRaw(33, true),
+            ExitStatus::SignaledRaw(64, false),
+            ExitStatus::SignaledRaw(64, true),
+        ];
+        for status in statuses {
+            let std_status = std::process::ExitStatus::from(status);
+            assert_eq!(ExitStatus::from(std_status), status, "{status:?}");
+            assert_eq!(
+                std_status.core_dumped(),
+                status.into_raw() & 0x80 != 0 && status.code().is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn raw_signal_statuses_round_trip() {
+        for (signal, coredump) in [(34, false), (64, false), (40, true)] {
+            let status = ExitStatus::SignaledRaw(signal, coredump);
+            assert_eq!(ExitStatus::from_raw(status.into_raw()), status);
+            assert_eq!(ExitStatus::signaled(signal, coredump), status);
+        }
+        assert_eq!(
+            ExitStatus::signaled(libc::SIGKILL, false),
+            ExitStatus::Signaled(Signal::SIGKILL, false)
+        );
+    }
+
+    /// A process killed by a realtime signal, which nix's `Signal` cannot
+    /// name, is `SignaledRaw` with its number, and `raise_or_exit`
+    /// propagates it (<https://github.com/rrnewton/reverie/issues/997>),
+    /// including 32 and 33, which glibc reserves and its `raise()` refuses.
+    #[test]
+    fn exit_by_a_realtime_signal() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        for signal in [32, 33, libc::SIGRTMIN() + 1] {
+            // glibc handles 32 and 33 itself; the child sets the default
+            // action and unblocks the signal with raw syscalls first.
+            let killed = run_forked_raw(|| unsafe {
+                let default: [u64; 4] = [libc::SIG_DFL as u64, 0, 0, 0];
+                let unblock: u64 = 1 << (signal - 1);
+                libc::syscall(
+                    libc::SYS_rt_sigaction,
+                    signal,
+                    default.as_ptr(),
+                    std::ptr::null_mut::<u64>(),
+                    8,
+                );
+                libc::syscall(
+                    libc::SYS_rt_sigprocmask,
+                    libc::SIG_UNBLOCK,
+                    &unblock as *const u64,
+                    std::ptr::null_mut::<u64>(),
+                    8,
+                );
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::syscall(libc::SYS_gettid),
+                    signal,
+                );
+            });
+            assert_eq!(killed, ExitStatus::SignaledRaw(signal, false));
+            assert_eq!(killed.signal(), Some(signal));
+            assert_eq!(killed.code(), None);
+            assert_eq!(
+                run_forked_raw(|| ExitStatus::SignaledRaw(signal, false).raise_or_exit()),
+                ExitStatus::SignaledRaw(signal, false),
+                "raise_or_exit of signal {signal}"
+            );
+            // With the signal blocked first, raise_or_exit must unblock it.
+            assert_eq!(
+                run_forked_raw(|| {
+                    let block: u64 = 1 << (signal - 1);
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_rt_sigprocmask,
+                            libc::SIG_BLOCK,
+                            &block as *const u64,
+                            std::ptr::null_mut::<u64>(),
+                            8,
+                        )
+                    };
+                    ExitStatus::SignaledRaw(signal, false).raise_or_exit()
+                }),
+                ExitStatus::SignaledRaw(signal, false),
+                "raise_or_exit of blocked signal {signal}"
+            );
+        }
     }
 
     #[test]

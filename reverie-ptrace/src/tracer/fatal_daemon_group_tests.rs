@@ -231,7 +231,8 @@ mod fatal_daemon_group_tests {
         let _identities = IdentitiesScope;
         let words = FatalWords::new();
         let address = words.0 as usize;
-        let sentinel = fork_paused_child(Instant::now() + left(deadline));
+        let sentinel_child = fork_paused_child(Instant::now() + left(deadline));
+        let sentinel = sentinel_child.pid();
         let sentinel_identity = untraced_process_identity(sentinel);
         let tracer = tokio::time::timeout(
             left(deadline),

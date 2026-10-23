@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Native F1 SEND and F3 UPDATE-prefix controls, after mapped setup fd closure.
 //! These are ordinary owned kernel operations, without instrumentation or guards.
 use std::os::fd::AsRawFd;

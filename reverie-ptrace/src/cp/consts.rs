@@ -16,6 +16,14 @@ pub const TRAMPOLINE_SIZE: usize = 0x1000;
 /// total private page size
 pub const PRIVATE_PAGE_SIZE: usize = TRAMPOLINE_SIZE;
 
+/// The page after the trampoline, where pre-init maps, at every exec, the
+/// SIGTRAP repairs' page, read-write and sealed (`mseal`), unless the new
+/// image already has something there
+/// (<https://github.com/rrnewton/hermit/issues/4409>). Once sealed, no task
+/// can unmap, replace or reprotect it.
+pub const SCRATCH_BASE: usize = TRAMPOLINE_BASE + TRAMPOLINE_SIZE;
+pub const SCRATCH_SIZE: usize = 0x1000;
+
 /// The size of the `ud2` instruction on x86_64.
 #[cfg(target_arch = "x86_64")]
 pub const UD_INSTR_SIZE: usize = 1;

@@ -16,6 +16,7 @@ use syscalls::Sysno;
 use syscalls::syscall;
 
 use super::protected_files;
+use super::tool_output;
 use super::utils;
 use super::vdso;
 use crate::ffi::fn_icept;
@@ -181,6 +182,21 @@ pub trait Tool {
     /// Called when a signal of the given value is received before any handlers
     /// for that signal are evaluated
     fn handle_signal_event(&self, _signal: i32) {}
+
+    /// Called, in place of [`Tool::handle_signal_event`], when `signal`
+    /// arrives with the siginfo `info` the kernel delivered, before any
+    /// handler for it is evaluated. Returns whether the guest's action for
+    /// the signal runs: false suppresses this instance, so the guest's
+    /// handler, default action or `SIG_IGN` is not applied to it. The tool may
+    /// rewrite `info`; a guest handler then gets the rewritten siginfo.
+    ///
+    /// The default calls `handle_signal_event` and runs the guest's action,
+    /// as before this method existed.
+    fn handle_signal_event_with_info(&self, signal: i32, info: &mut libc::siginfo_t) -> bool {
+        let _ = info;
+        self.handle_signal_event(signal);
+        true
+    }
     /// This is called early on from sbr_init to get a list of functions we want
     /// to be detoured. Because this is called very early on, this function
     /// should not be doing *any* allocations or library calls.
@@ -214,13 +230,7 @@ impl SyscallExt for Syscall {
         let (sysno, args) = self.into_parts();
 
         // Some syscalls need to be handled in a special way.
-        if sysno == Sysno::readlink {
-            utils::sys_readlink(
-                args.arg0 as *const libc::c_char,
-                args.arg1 as *mut libc::c_char,
-                args.arg2,
-            )
-        } else if sysno == Sysno::execve {
+        if sysno == Sysno::execve {
             utils::sys_execve(
                 args.arg0 as *const libc::c_char,
                 args.arg1 as *const *const libc::c_char,
@@ -253,22 +263,43 @@ impl SyscallExt for Syscall {
         // TODO-HUMAN-REVIEW(PR-175): Review atomic rt_sigsuspend wake preservation.
         } else if sysno == Sysno::rt_sigsuspend {
             utils::sys_rt_sigsuspend(args.arg0 as *const _, args.arg1)
-        } else if sysno == Sysno::close && args.arg0 == libc::STDERR_FILENO as usize {
-            // Prevent stderr from getting closed. We need this for logging
-            // purposes.
-            // FIXME: All logging should go through the global state instead.
-            Ok(0)
         } else if sysno == Sysno::close_range {
             protected_files::sys_close_range(args.arg0, args.arg1, args.arg2)
-        } else if protected_files::uses_protected_fd(sysno, args.arg0, args.arg1) {
-            // If this syscall operates on a protected file descriptor, we
-            // should return EBADF to indicate that the file descriptor isn't
-            // opened (even if it really is).
-            Err(Errno::EBADF)
+        } else if let Some(result) = protected_fd_result(
+            sysno,
+            [
+                args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+            ]
+            .map(|arg| arg as u64),
+        ) {
+            // To the guest a protected descriptor is not open, even if it
+            // really is.
+            Err(Errno::new(-result as i32))
         } else {
             syscall!(
                 sysno, args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5
             )
         }
     }
+}
+
+/// The result of a guest syscall that reaches a protected descriptor
+/// ([`protected_files::protected_fd_result`]), or `None` to run it. A
+/// `dup2`/`dup3` onto the tool-output socket's number first moves the socket,
+/// so the guest's call runs as it would on a free number; one the kernel fails
+/// anyway runs natively, without touching the socket.
+fn protected_fd_result(sysno: Sysno, args: [u64; 6]) -> Option<i64> {
+    if sysno == Sysno::dup2 || sysno == Sysno::dup3 {
+        let flags = if sysno == Sysno::dup3 {
+            args[2] as usize
+        } else {
+            0
+        };
+        if tool_output::before_guest_dup_onto(args[0] as i32, args[1] as i32, flags)
+            == tool_output::GuestDup::Native
+        {
+            return None;
+        }
+    }
+    protected_files::protected_fd_result(sysno, &args)
 }

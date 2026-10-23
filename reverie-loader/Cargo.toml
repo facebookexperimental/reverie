@@ -1,0 +1,9 @@
+[package]
+name = "reverie-loader"
+description = "Hermit's in-guest loader: validation of the fixed-address loader and runtime images, and the loader's initialization stages."
+version = "0.5.1"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+publish = false

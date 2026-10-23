@@ -46,6 +46,7 @@ struct RetirementWitness {
 }
 
 impl RetirementWitness {
+    #[inline]
     fn lifecycle(&self) -> DriverLifecycle {
         match self.lifecycle.load(Ordering::Acquire) {
             value if value == DriverLifecycle::Active as u8 => DriverLifecycle::Active,
@@ -117,20 +118,46 @@ struct OwnerData {
     callbacks: BTreeSet<u64>,
     pending: Vec<Arc<PendingFailure>>,
     change: Change,
+    /// Whether anyone took the current `change` receiver since it was armed.
+    /// Only then does a change complete it and arm the next one: nearly every
+    /// change (a callback scope's end, on every guest syscall) has no watcher,
+    /// and arming allocates a channel and a shared future.
+    change_subscribed: bool,
+    /// The generation of the last destroyed callback scope, kept so the next
+    /// callback can reuse its allocation. It is reused only when this is the
+    /// last reference to it (`Arc::get_mut`), so no origin, waiter or nested
+    /// callback can observe the reuse; a reused generation gets a fresh
+    /// identity and is reset to the state `Arc::new` would give it.
+    spare_generation: Option<Arc<CallbackGeneration>>,
 }
 
 impl OwnerData {
     fn changed(&mut self) -> OwnerNotification {
+        let previous = std::mem::take(&mut self.change_subscribed)
+            .then(|| std::mem::replace(&mut self.change, Change::new()));
         OwnerNotification {
-            previous: Some(std::mem::replace(&mut self.change, Change::new())),
+            previous,
             keepalive: None,
         }
+    }
+
+    /// Every subscriber goes through here, so the next change completes it.
+    fn subscribe(&mut self) -> OwnerSubscription {
+        self.change_subscribed = true;
+        self.change.receiver.clone()
     }
 }
 
 struct DriverState {
     witness: Arc<RetirementWitness>,
     data: Mutex<OwnerData>,
+    /// Whether `data.pending` is nonempty. Written under the `data` mutex
+    /// with every change to `pending`, so [`DriverOwner::pending`], which
+    /// every entry and callback checks and which is nearly always empty,
+    /// can skip the mutex. A check that reads false is ordered before any
+    /// capture still in progress, as it would be had it taken the mutex
+    /// first.
+    has_pending: AtomicBool,
 }
 
 /// One lexical guard per actual invocation/worker. Clone DriverOwner, not this.
@@ -166,7 +193,10 @@ impl DriverScope {
                     callbacks: BTreeSet::new(),
                     pending: Vec::new(),
                     change: Change::new(),
+                    change_subscribed: false,
+                    spare_generation: None,
                 }),
+                has_pending: AtomicBool::new(false),
             })),
         }
     }
@@ -190,6 +220,7 @@ impl DriverScope {
         };
         state.witness.close(lifecycle);
         let pending = std::mem::take(&mut data.pending);
+        state.has_pending.store(false, Ordering::Release);
         let notification = data.changed();
         drop(data);
         DriverRetirement {
@@ -218,24 +249,37 @@ impl Drop for DriverScope {
 }
 
 impl DriverOwner {
+    #[inline]
     pub(crate) fn lifecycle(&self) -> DriverLifecycle {
         self.state.witness.lifecycle()
+    }
+
+    /// Whether [`Self::pending`] may be nonempty: the flag it reads first.
+    /// False means `pending` would return an empty list.
+    #[inline]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.state.has_pending.load(Ordering::Acquire)
     }
 
     /// Subscribe before rechecking pending causes or lifecycle. Readiness,
     /// including a disconnected sender, authorizes only that recheck.
     pub(crate) fn subscribe(&self) -> OwnerSubscription {
-        self.state.data.lock().unwrap().change.receiver.clone()
+        self.state.data.lock().unwrap().subscribe()
     }
 
     pub(crate) fn pending(&self) -> Vec<Arc<PendingFailure>> {
+        if !self.state.has_pending.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         self.state.data.lock().unwrap().pending.clone()
     }
 
     /// Transfer obligations to this driver's outer error path, not a peer.
     #[cfg(test)]
     pub(crate) fn take_pending(&self) -> Vec<Arc<PendingFailure>> {
-        std::mem::take(&mut self.state.data.lock().unwrap().pending)
+        let mut data = self.state.data.lock().unwrap();
+        self.state.has_pending.store(false, Ordering::Release);
+        std::mem::take(&mut data.pending)
     }
 
     pub(crate) fn origin(&self) -> OperationOrigin {
@@ -278,21 +322,29 @@ impl DriverOwner {
             .next_callback
             .checked_add(1)
             .ok_or_else(|| protocol("callback identity exhausted"))?;
-        let (sender, receiver) = oneshot::channel();
-        let callback = Arc::new(CallbackGeneration {
-            id,
-            destroyed: AtomicBool::new(false),
-            destroyed_notification: receiver.shared(),
-            parent,
-        });
+        // Reuse the last destroyed generation's allocation only while nothing
+        // else refers to it: then no one can tell it from a new one. Its old
+        // parent is moved out here and dropped after the owner lock.
+        let mut released = None;
+        let mut spare = data.spare_generation.take();
+        let callback = match spare.as_mut().and_then(Arc::get_mut) {
+            Some(reused) => {
+                released = reused.reset(id, parent);
+                spare.take().expect("reused spare generation")
+            }
+            // A shared spare stays with its other holders.
+            None => Arc::new(CallbackGeneration::new(id, parent)),
+        };
         data.next_callback = id;
         data.callbacks.insert(id);
+        drop(data);
+        drop(released);
+        drop(spare);
         Ok(CallbackScope {
             origin: OperationOrigin {
                 callback: Some(callback),
                 ..self.origin()
             },
-            sender: Some(sender),
         })
     }
 }
@@ -300,8 +352,75 @@ impl DriverOwner {
 struct CallbackGeneration {
     id: u64,
     destroyed: AtomicBool,
-    destroyed_notification: OwnerSubscription,
+    /// Created by the first waiter only. Almost no callback is ever awaited,
+    /// and creating the channel and its shared receiver for every callback
+    /// cost three allocations per guest syscall. The scope's destructor
+    /// stores `destroyed` before it takes this lock, and a waiter rechecks
+    /// `destroyed` after it releases this lock, so either the waiter sees the
+    /// destruction or the destructor finds and completes its channel.
+    destroyed_notification: Mutex<Option<DestroyedNotification>>,
     parent: Option<Arc<CallbackGeneration>>,
+}
+
+struct DestroyedNotification {
+    sender: Option<oneshot::Sender<()>>,
+    receiver: OwnerSubscription,
+}
+
+impl CallbackGeneration {
+    fn new(id: u64, parent: Option<Arc<CallbackGeneration>>) -> Self {
+        Self {
+            id,
+            destroyed: AtomicBool::new(false),
+            destroyed_notification: Mutex::new(None),
+            parent,
+        }
+    }
+
+    /// Give a uniquely owned generation the state [`CallbackGeneration::new`]
+    /// would, returning its previous parent for the caller to drop outside
+    /// its locks.
+    fn reset(
+        &mut self,
+        id: u64,
+        parent: Option<Arc<CallbackGeneration>>,
+    ) -> Option<Arc<CallbackGeneration>> {
+        self.id = id;
+        *self.destroyed.get_mut() = false;
+        *self
+            .destroyed_notification
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        std::mem::replace(&mut self.parent, parent)
+    }
+
+    /// Subscribe before rechecking `destroyed`.
+    fn subscribe_destroyed(&self) -> OwnerSubscription {
+        let mut notification = self
+            .destroyed_notification
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        notification
+            .get_or_insert_with(|| {
+                let (sender, receiver) = oneshot::channel();
+                DestroyedNotification {
+                    sender: Some(sender),
+                    receiver: receiver.shared(),
+                }
+            })
+            .receiver
+            .clone()
+    }
+
+    /// Called after `destroyed` was stored. Returns the sender to complete
+    /// once the caller holds no lock.
+    fn take_destroyed_sender(&self) -> Option<oneshot::Sender<()>> {
+        self.destroyed_notification
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+            .and_then(|notification| notification.sender.take())
+    }
 }
 
 /// Drop this guard only after dropping the owned callback future and its
@@ -310,7 +429,6 @@ struct CallbackGeneration {
 #[must_use = "keep the scope outside and alive through its owned callback future"]
 pub(crate) struct CallbackScope {
     origin: OperationOrigin,
-    sender: Option<oneshot::Sender<()>>,
 }
 
 impl CallbackScope {
@@ -329,20 +447,26 @@ impl std::fmt::Debug for CallbackScope {
 
 impl Drop for CallbackScope {
     fn drop(&mut self) {
-        let generation = self.origin.callback.as_ref().unwrap();
+        let generation = self.origin.callback.take().unwrap();
+        let mut released = None;
         let notification = self.origin.owner.upgrade().map(|owner| {
             let mut data = owner.data.lock().unwrap();
             let removed = data.callbacks.remove(&generation.id);
             debug_assert!(removed, "unique callback scope was already removed");
             generation.destroyed.store(true, Ordering::Release);
+            // Keep this generation for the next callback's allocation. The
+            // one it replaces is dropped below, outside the owner lock.
+            released = data.spare_generation.replace(generation.clone());
             data.changed()
         });
         // The lexical driver may already have been abandoned and destroyed.
         // The retained generation still records actual callback destruction.
         generation.destroyed.store(true, Ordering::Release);
-        if let Some(sender) = self.sender.take() {
+        if let Some(sender) = generation.take_destroyed_sender() {
             let _ = sender.send(());
         }
+        drop(generation);
+        drop(released);
         if let Some(notification) = notification {
             notification.notify();
         }
@@ -394,7 +518,7 @@ impl OperationOrigin {
     pub(crate) fn subscribe(&self) -> Option<OwnerSubscription> {
         self.owner
             .upgrade()
-            .map(|owner| owner.data.lock().unwrap().change.receiver.clone())
+            .map(|owner| owner.data.lock().unwrap().subscribe())
     }
 
     pub(crate) fn lifecycle(&self) -> DriverLifecycle {
@@ -439,9 +563,12 @@ impl OperationOrigin {
         let mut callback = self.callback.clone();
         while let Some(generation) = callback {
             if !generation.destroyed.load(Ordering::Acquire) {
-                let _ = generation.destroyed_notification.clone().await;
+                let destroyed = generation.subscribe_destroyed();
                 if !generation.destroyed.load(Ordering::Acquire) {
-                    return Err(protocol("callback notification lost before destruction"));
+                    let _ = destroyed.await;
+                    if !generation.destroyed.load(Ordering::Acquire) {
+                        return Err(protocol("callback notification lost before destruction"));
+                    }
                 }
             }
             callback = generation.parent.clone();
@@ -513,6 +640,7 @@ impl OperationOrigin {
             }
         } else {
             data.pending.push(failure);
+            owner.has_pending.store(true, Ordering::Release);
             data.changed()
         };
         drop(data);
@@ -549,6 +677,47 @@ mod tests {
 
     fn poll<F: Future>(future: Pin<&mut F>, waker: &Waker) -> Poll<F::Output> {
         future.poll(&mut Context::from_waker(waker))
+    }
+
+    #[test]
+    fn an_unwatched_owner_change_arms_and_completes_nothing() {
+        let scope = DriverScope::new();
+        let owner = scope.owner();
+        let origin = owner.origin();
+        // Read the armed receiver directly, which does not subscribe.
+        let armed = owner.state.data.lock().unwrap().change.receiver.clone();
+        let notification = origin.capture(cause()).unwrap();
+        assert!(
+            notification.previous.is_none(),
+            "an unwatched change was armed"
+        );
+        notification.notify();
+        let data = owner.state.data.lock().unwrap();
+        assert!(futures::future::Shared::ptr_eq(
+            &armed,
+            &data.change.receiver
+        ));
+        assert!(!data.change_subscribed);
+        drop(data);
+        assert!(armed.peek().is_none(), "an unwatched change completed");
+        drop(scope.retire());
+    }
+
+    #[test]
+    fn an_owner_subscriber_taken_between_changes_sees_the_next_one() {
+        let scope = DriverScope::new();
+        let owner = scope.owner();
+        let origin = owner.origin();
+        origin.capture(cause()).unwrap().notify();
+        let mut subscription = Box::pin(owner.subscribe());
+        let waker = futures::task::noop_waker();
+        assert!(poll(subscription.as_mut(), &waker).is_pending());
+        let notification = origin.capture(cause()).unwrap();
+        assert!(notification.previous.is_some());
+        notification.notify();
+        assert!(poll(subscription.as_mut(), &waker).is_ready());
+        assert!(!owner.state.data.lock().unwrap().change_subscribed);
+        drop(scope.retire());
     }
 
     #[test]
@@ -766,6 +935,191 @@ mod tests {
         let retirement = scope.retire();
         retirement.result.unwrap();
         retirement.notification.notify();
+    }
+
+    fn spare(owner: &DriverOwner) -> Option<Arc<CallbackGeneration>> {
+        owner.state.data.lock().unwrap().spare_generation.clone()
+    }
+
+    fn has_destroyed_channel(origin: &OperationOrigin) -> bool {
+        origin
+            .callback
+            .as_ref()
+            .unwrap()
+            .destroyed_notification
+            .lock()
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn a_destroyed_generation_is_reused_only_when_nothing_else_holds_it() {
+        let scope = DriverScope::new();
+        let owner = scope.owner();
+        let first = owner.begin_callback(None).unwrap();
+        let first_id = first.origin().callback_id().unwrap();
+        let first_ptr = Arc::as_ptr(first.origin.callback.as_ref().unwrap());
+        drop(first);
+        // Kept, not freed, and still recording its destruction.
+        let kept = spare(&owner).unwrap();
+        assert_eq!(Arc::as_ptr(&kept), first_ptr);
+        assert!(kept.destroyed.load(Ordering::Acquire));
+        drop(kept);
+
+        // Sole holder: the next callback takes the allocation, with a new
+        // identity and the state of a new generation.
+        let second = owner.begin_callback(None).unwrap();
+        let second_origin = second.origin();
+        assert_eq!(
+            Arc::as_ptr(second_origin.callback.as_ref().unwrap()),
+            first_ptr
+        );
+        assert!(second_origin.callback_id().unwrap() > first_id);
+        assert!(!second_origin.callback_dropped());
+        assert!(!has_destroyed_channel(&second_origin));
+        assert!(spare(&owner).is_none());
+
+        // A retained origin (a memory view, a pending failure) holds the
+        // generation, so the next callback must not reuse it: that origin
+        // still names the destroyed callback.
+        drop(second);
+        let third = owner.begin_callback(None).unwrap();
+        let third_origin = third.origin();
+        assert!(!third_origin.same_callback(&second_origin));
+        assert_ne!(
+            Arc::as_ptr(third_origin.callback.as_ref().unwrap()),
+            first_ptr
+        );
+        assert!(second_origin.callback_dropped());
+        assert!(!third_origin.callback_dropped());
+        drop(third);
+        drop(third_origin);
+        drop(second_origin);
+        let retirement = scope.retire();
+        retirement.result.unwrap();
+        retirement.notification.notify();
+    }
+
+    #[test]
+    fn a_reused_generation_drops_its_old_parent_and_takes_the_new_one() {
+        let scope = DriverScope::new();
+        let owner = scope.owner();
+        let parent = owner.begin_callback(None).unwrap();
+        let parent_origin = parent.origin();
+        let nested = owner.begin_callback(Some(&parent_origin)).unwrap();
+        drop(nested);
+        assert!(spare(&owner).unwrap().parent.is_some());
+        drop(parent);
+        // The parent's scope replaced the nested spare, releasing its parent
+        // reference; only the origin above and the new spare hold the parent.
+        assert_eq!(
+            Arc::strong_count(parent_origin.callback.as_ref().unwrap()),
+            2
+        );
+        drop(parent_origin);
+        let next = owner.begin_callback(None).unwrap();
+        assert!(next.origin.callback.as_ref().unwrap().parent.is_none());
+        let next_origin = next.origin();
+        let nested = owner.begin_callback(Some(&next_origin)).unwrap();
+        assert!(Arc::ptr_eq(
+            nested
+                .origin
+                .callback
+                .as_ref()
+                .unwrap()
+                .parent
+                .as_ref()
+                .unwrap(),
+            next_origin.callback.as_ref().unwrap()
+        ));
+        drop(nested);
+        drop(next);
+        drop(next_origin);
+        let retirement = scope.retire();
+        retirement.result.unwrap();
+        retirement.notification.notify();
+    }
+
+    #[test]
+    fn an_unawaited_callback_creates_no_destruction_channel() {
+        let scope = DriverScope::new();
+        let owner = scope.owner();
+        let callback = owner.begin_callback(None).unwrap();
+        let origin = callback.origin();
+        assert!(!has_destroyed_channel(&origin));
+        drop(callback);
+        assert!(!has_destroyed_channel(&origin));
+        assert!(origin.callback_dropped());
+        // A wait that starts after destruction completes without a channel.
+        let mut done = Box::pin(origin.wait_callback_drop());
+        assert!(matches!(
+            poll(done.as_mut(), Waker::noop()),
+            Poll::Ready(Ok(()))
+        ));
+        drop(done);
+        assert!(!has_destroyed_channel(&origin));
+        drop(origin);
+        let retirement = scope.retire();
+        retirement.result.unwrap();
+        retirement.notification.notify();
+    }
+
+    #[test]
+    fn a_waiter_subscribed_before_destruction_is_woken_by_it() {
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let scope = DriverScope::new();
+        let owner = scope.owner();
+        let callback = owner.begin_callback(None).unwrap();
+        let origin = callback.origin();
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut done = Box::pin(origin.wait_callback_drop());
+        assert!(poll(done.as_mut(), &waker).is_pending());
+        assert!(has_destroyed_channel(&origin));
+        drop(callback);
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(poll(done.as_mut(), &waker), Poll::Ready(Ok(()))));
+        drop(done);
+        drop(origin);
+        // The generation that had a channel is reused without it.
+        let next = owner.begin_callback(None).unwrap();
+        assert!(!has_destroyed_channel(&next.origin()));
+        drop(next);
+        let retirement = scope.retire();
+        retirement.result.unwrap();
+        retirement.notification.notify();
+    }
+
+    #[test]
+    fn a_wait_racing_destruction_always_completes() {
+        // Either the waiter subscribes first and the destructor completes its
+        // channel, or the destructor stores `destroyed` first and the
+        // waiter's recheck sees it. No interleaving may leave it pending.
+        for _ in 0..200 {
+            let scope = DriverScope::new();
+            let owner = scope.owner();
+            let callback = owner.begin_callback(None).unwrap();
+            let origin = callback.origin();
+            let barrier = Arc::new(Barrier::new(2));
+            let destroyer_barrier = barrier.clone();
+            let destroyer = std::thread::spawn(move || {
+                destroyer_barrier.wait();
+                drop(callback);
+            });
+            barrier.wait();
+            futures::executor::block_on(origin.wait_callback_drop()).unwrap();
+            destroyer.join().unwrap();
+            assert!(origin.callback_dropped());
+            drop(origin);
+            let retirement = scope.retire();
+            retirement.result.unwrap();
+            retirement.notification.notify();
+        }
     }
 
     #[test]

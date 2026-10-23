@@ -462,7 +462,7 @@ mod entry_public_tests {
             )
             .unwrap();
             completion.result.map(|(status, stdout, stderr)| {
-                assert_eq!(status, 0);
+                assert_eq!(status, reverie::ExitStatus::Exited(0));
                 assert!(stdout.is_empty());
                 assert!(stderr.is_empty());
             })

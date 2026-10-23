@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Included in executor::tests; these use the real descriptor and executor paths.
 fn capture_native_stat(fd: RawFd) -> libc::stat {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();

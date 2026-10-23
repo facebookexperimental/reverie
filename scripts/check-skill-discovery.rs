@@ -6,7 +6,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
 //! Verify that Claude and stock Codex discover the same Reverie product skills.
 //!
 //! There is deliberately NO roster in this file. The checker DISCOVERS every

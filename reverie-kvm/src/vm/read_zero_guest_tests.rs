@@ -13,9 +13,9 @@
 mod read_zero_guest_tests {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
+    use std::sync::mpsc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use std::sync::mpsc;
     use std::time::Duration;
 
     use reverie::GlobalTool;
@@ -289,7 +289,7 @@ mod read_zero_guest_tests {
                 .map(|completion| {
                     let result = completion.result.map(|(status, stdout, stderr)| {
                         assert!(stdout.is_empty() && stderr.is_empty());
-                        status
+                        conventional_exit_code(status)
                     });
                     (
                         result,

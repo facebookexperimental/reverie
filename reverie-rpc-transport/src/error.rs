@@ -42,4 +42,11 @@ pub enum RpcError {
     /// bincode failed to deserialize a value.
     #[error("rpc decode error: {0}")]
     Decode(#[from] bincode::error::DecodeError),
+
+    /// Strict decoding found bytes after the complete value in the frame.
+    #[error("rpc payload has {remaining} trailing bytes")]
+    TrailingBytes {
+        /// Bytes not consumed by the decoded value.
+        remaining: usize,
+    },
 }

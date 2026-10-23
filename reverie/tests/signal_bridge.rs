@@ -145,6 +145,32 @@ impl<T: Tool<GlobalState = (), ThreadState = ()>> Guest<T> for TestGuest {
     }
 }
 
+/// Reuse this file's existing Guest fake without overriding the new mechanism,
+/// so the native default remains covered when a backend adds its own override.
+#[test]
+fn tool_syscall_default_preserves_native_success_and_errno() {
+    let guest = TestGuest::default();
+    // SAFETY: getpid has no pointer effects, and -1 is an invalid physical fd.
+    unsafe {
+        assert_eq!(
+            <TestGuest as Guest<()>>::tool_syscall(
+                &guest,
+                reverie::syscalls::Sysno::getpid,
+                [0; 6]
+            ),
+            Ok(libc::getpid() as usize),
+        );
+        assert_eq!(
+            <TestGuest as Guest<()>>::tool_syscall(
+                &guest,
+                reverie::syscalls::Sysno::close,
+                [usize::MAX, 0, 0, 0, 0, 0],
+            ),
+            Err(Errno::EBADF),
+        );
+    }
+}
+
 struct LegacyTool {
     response: Option<Signal>,
     calls: AtomicUsize,
@@ -217,6 +243,62 @@ fn ready<F: Future>(future: F) -> F::Output {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("test callback unexpectedly yielded"),
     }
+}
+
+/// A Tool that does not implement the two-phase hooks refuses through the
+/// trait's defaults: an announcement with `EINVAL` for a number that is not a
+/// signal, checked first, and otherwise with `EOPNOTSUPP` (not opted in), as
+/// does a commit.
+#[test]
+fn two_phase_defaults_refuse_as_not_opted_in() {
+    let mut guest = TestGuest::default();
+    let tool = LegacyTool::default();
+    for signal in [1, libc::SIGUSR1, 34, 64] {
+        assert_eq!(
+            ready(tool.announce_signal_event(&mut guest, signal)),
+            Err(Errno::EOPNOTSUPP),
+        );
+    }
+    for signal in [0, 65, -1, i32::MIN, i32::MAX] {
+        assert_eq!(
+            ready(tool.announce_signal_event(&mut guest, signal)),
+            Err(Errno::EINVAL),
+        );
+    }
+    assert_eq!(
+        ready(tool.commit_signal_event(
+            &mut guest,
+            reverie::SignalAnnouncement::new(libc::SIGUSR1, 0)
+        )),
+        Err(Errno::EOPNOTSUPP),
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+}
+
+/// A Tool that has not opted in to in-guest delivery refuses a predicted
+/// death through the trait's default with `EOPNOTSUPP`, for a signal nix can
+/// name and a realtime one, and its configuration predicate answers no; a
+/// backend that keeps no separate guest mask answers none.
+#[test]
+fn in_guest_delivery_defaults_refuse_and_answer_no() {
+    let mut guest = TestGuest::default();
+    let tool = LegacyTool::default();
+    for status in [
+        reverie::ExitStatus::signaled(libc::SIGTERM, false),
+        reverie::ExitStatus::signaled(libc::SIGQUIT, false),
+        reverie::ExitStatus::signaled(40, false),
+    ] {
+        assert_eq!(
+            ready(tool.exit_for_predicted_death(&mut guest, status)),
+            Err(Errno::EOPNOTSUPP),
+        );
+    }
+    assert!(!<LegacyTool as Tool>::in_guest_signal_delivery(&()));
+    assert_eq!(
+        <TestGuest as Guest<LegacyTool>>::resume_signal_mask(&guest),
+        None
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -301,4 +383,29 @@ fn child_exit_signal_default_refuses_before_publication() {
             errno: Errno::ENOSYS,
         }
     );
+}
+
+#[test]
+fn validation_injection_default_refuses_without_an_errno_fallback() {
+    let mut guest = TestGuest::default();
+    let unsupported = ready(<TestGuest as Guest<()>>::inject_with_purpose(
+        &mut guest,
+        reverie::syscalls::Pselect6::new(),
+        reverie::InjectionPurpose::Pselect6WrapperValidation,
+    ))
+    .unwrap_err();
+    assert!(matches!(unsupported, Error::Tool(_)));
+    assert!(
+        unsupported
+            .to_string()
+            .starts_with("pselect6-wrapper-validation-unsupported: ")
+    );
+    assert!(matches!(
+        ready(<TestGuest as Guest<()>>::inject_with_purpose(
+            &mut guest,
+            reverie::syscalls::Getpid::new(),
+            reverie::InjectionPurpose::Application,
+        )),
+        Err(Error::Errno(Errno::ENOSYS))
+    ));
 }

@@ -68,6 +68,40 @@ where
 
 /// Trait that all syscalls and their arguments need to implement in order to be
 /// printed out.
+///
+/// This is deliberately not [`std::fmt::Display`]. Pointer arguments such as
+/// [`PathPtr`](crate::PathPtr) are addresses in the *guest's* address space, so
+/// printing what they point to needs a way to read that memory, which
+/// `std::fmt::Display::fmt` has no room for. Implementors provide only
+/// [`Displayable::fmt`], which takes the memory explicitly; the provided
+/// [`display`](Displayable::display) and
+/// [`display_with_outputs`](Displayable::display_with_outputs) methods pair a
+/// value with a memory and return something that does implement
+/// `std::fmt::Display`. To get the value itself rather than text, use
+/// [`ReadAddr::read`](crate::ReadAddr::read).
+///
+/// ```
+/// use reverie_syscalls::Displayable;
+/// use reverie_syscalls::LocalMemory;
+/// use reverie_syscalls::PathPtr;
+/// use reverie_syscalls::ReadAddr;
+///
+/// // A path in "guest" memory; here the guest is this process.
+/// let raw = c"/etc/hostname";
+/// let path: Option<PathPtr> = PathPtr::from_ptr(raw.as_ptr());
+/// let memory = LocalMemory::new();
+///
+/// // `format!("{}", path)` does not compile: pair the pointer with the memory.
+/// let shown = format!("{}", path.display(&memory));
+/// assert!(shown.ends_with(r#" -> "/etc/hostname""#), "{shown}");
+///
+/// // Read the pointed-to value itself.
+/// assert_eq!(
+///     path.unwrap().read(&memory).unwrap(),
+///     std::path::PathBuf::from("/etc/hostname")
+/// );
+/// assert_eq!(format!("{}", None::<PathPtr>.display(&memory)), "NULL");
+/// ```
 pub trait Displayable {
     /// Displays a syscall with all of its arguments.
     fn fmt<M: MemoryAccess>(

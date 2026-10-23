@@ -16,6 +16,7 @@ use std::sync::MutexGuard;
 use std::thread::ThreadId;
 
 use super::*;
+use crate::error::ErrorExt;
 
 type JoinedWorker = std::thread::Result<GuestWorkerResult>;
 

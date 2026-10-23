@@ -22,6 +22,7 @@ use super::owner::DriverOwner;
 use super::owner::DriverScope;
 use crate::Error;
 use crate::Result;
+use crate::error::ErrorExt;
 use crate::failure::references_shared_error;
 use crate::vm::KvmBackend;
 
@@ -153,36 +154,20 @@ impl EntryDriverWatch {
     }
 
     pub(crate) fn check(&self) -> Result<()> {
-        let owned = self
-            .owner
-            .as_ref()
-            .map(DriverOwner::pending)
-            .unwrap_or_default();
-        let result = fold_causes(Ok(()), owned.iter().flat_map(|failure| failure.causes()));
-        let result = match self.gate.pending_failure() {
-            Some(failure) => fold_causes(result, failure.causes()),
-            None => result,
-        };
-        if self
-            .owner
-            .as_ref()
-            .is_some_and(|owner| owner.lifecycle() != DriverLifecycle::Active)
-        {
-            combine_pending(
-                result,
-                Err(protocol("operation after driver registration closed")),
-            )
-        } else {
-            result
-        }
+        check_entry(self.owner.as_ref(), &self.gate)
     }
 
     pub(crate) async fn wait(&self) {
         loop {
-            // Both subscriptions precede the state checks. A callback drop or
-            // unrelated gate reopening only rotates this loop; it is not a
-            // fatal event and is never a publication receipt.
-            let gate = self.gate.subscribe();
+            // Both subscriptions precede the state checks. The gate's part of
+            // `check` is only its failure, so subscribe to that alone: the
+            // gate's ordinary change channel completes on every copy, entry
+            // and exit of every vCPU sharing it, and waking each parked
+            // sibling for each of those made every guest syscall cost
+            // O(threads) host wakeups. An owner change only rotates this
+            // loop; it is not a fatal event and is never a publication
+            // receipt.
+            let gate = self.gate.subscribe_failure();
             let owner = self.owner.as_ref().map(DriverOwner::subscribe);
             if self.check().is_err() {
                 return;
@@ -196,6 +181,47 @@ impl EntryDriverWatch {
                 }
             }
         }
+    }
+}
+
+/// An EntryDriverWatch's sticky check, on borrowed parts: a driver's owner
+/// and its gate. KvmBackend::check_entry_owner runs it several times per
+/// guest syscall without building and dropping a watch each time.
+///
+/// Nearly always there is nothing to report, so this first reads the three
+/// flags the full check reads first, in the same order: whether the owner
+/// has pending failures, whether the gate has recorded a failure, and the
+/// owner's lifecycle. When all three are clear the full check can only return
+/// Ok, so return it here, inlined, without the full check's frame and the
+/// large Result values its fold moves. Otherwise run the full check, which
+/// observes all three again.
+#[inline]
+pub(crate) fn check_entry(owner: Option<&DriverOwner>, gate: &EntryGate) -> Result<()> {
+    if owner.is_none_or(|owner| !owner.has_pending())
+        && !gate.failure_recorded()
+        && owner.is_none_or(|owner| owner.lifecycle() == DriverLifecycle::Active)
+    {
+        return Ok(());
+    }
+    check_entry_observed(owner, gate)
+}
+
+#[cold]
+#[inline(never)]
+fn check_entry_observed(owner: Option<&DriverOwner>, gate: &EntryGate) -> Result<()> {
+    let owned = owner.map(DriverOwner::pending).unwrap_or_default();
+    let result = fold_causes(Ok(()), owned.iter().flat_map(|failure| failure.causes()));
+    let result = match gate.pending_failure() {
+        Some(failure) => fold_causes(result, failure.causes()),
+        None => result,
+    };
+    if owner.is_some_and(|owner| owner.lifecycle() != DriverLifecycle::Active) {
+        combine_pending(
+            result,
+            Err(protocol("operation after driver registration closed")),
+        )
+    } else {
+        result
     }
 }
 
@@ -469,7 +495,7 @@ impl KvmBackend {
     }
 
     pub(crate) fn check_entry_owner(&self) -> Result<()> {
-        self.entry_driver_watch().check()
+        check_entry(self.entry_driver_ref(), self.memory.entry_gate_ref())
     }
 
     /// Call only after this driver's ordinary callback borrow scope ended.

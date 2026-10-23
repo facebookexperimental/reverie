@@ -30,6 +30,8 @@
 //! the [`fmt::Display`] output, so the rendered snapshot is reproducible.
 
 use std::fmt;
+use std::io;
+use std::path::Path;
 
 use reverie::BackendStatsSnapshot;
 use reverie::BackendStatsSource;
@@ -43,6 +45,17 @@ pub const WIRE_VERSION: u16 = 1;
 
 /// Flag bit set when the process reported DynamoRIO `dr_get_stats` translation data.
 pub const WIRE_FLAG_DR_STATS_PRESENT: u32 = 1 << 0;
+
+/// Flag bit set when the process image ended through the client's terminal
+/// path (`exit_runtime_tree`), that is, on a backend or Tool failure.
+///
+/// Without an isolated process group, that path ends only the failing process.
+/// A parent that ignores the child's exit status can then finish the tree
+/// normally, so the launcher's caller learns of the failure only from this
+/// record. Decoders that predate the bit ignore it, so it needs no new wire
+/// version. A copied (pre-exec) child writes a record only when it failed,
+/// with every counter zero, because its counters were copied from its parent.
+pub const WIRE_FLAG_BACKEND_FAILURE: u32 = 1 << 1;
 
 /// Exact byte length of one wire-v1 process record.
 ///
@@ -113,6 +126,8 @@ pub struct DbtProcessRecord {
     pub runtime_kind: DbtRuntimeKind,
     /// Whether DynamoRIO translation stats are populated in this record.
     pub dr_stats_present: bool,
+    /// Whether this image ended through the client's terminal path.
+    pub backend_failure: bool,
     /// DynamoRIO application-image generation (incremented per followed exec).
     pub image_generation: u64,
     /// Virtual (deterministic) process id. Identity only; never aggregated or shown.
@@ -150,6 +165,7 @@ impl Default for DbtProcessRecord {
         Self {
             runtime_kind: DbtRuntimeKind::PrototypeTool,
             dr_stats_present: false,
+            backend_failure: false,
             image_generation: 0,
             process_identity: 0,
             parent_identity: 0,
@@ -232,11 +248,13 @@ pub fn encode_process_record(record: &DbtProcessRecord) -> [u8; WIRE_RECORD_LEN]
     cursor += 2;
     out[cursor..cursor + 2].copy_from_slice(&(WIRE_RECORD_LEN as u16).to_le_bytes());
     cursor += 2;
-    let flags = if record.dr_stats_present {
-        WIRE_FLAG_DR_STATS_PRESENT
-    } else {
-        0
-    };
+    let mut flags = 0;
+    if record.dr_stats_present {
+        flags |= WIRE_FLAG_DR_STATS_PRESENT;
+    }
+    if record.backend_failure {
+        flags |= WIRE_FLAG_BACKEND_FAILURE;
+    }
     out[cursor..cursor + 4].copy_from_slice(&flags.to_le_bytes());
     cursor += 4;
     out[cursor] = record.runtime_kind.to_wire();
@@ -306,6 +324,7 @@ pub fn decode_process_record(bytes: &[u8]) -> Result<(DbtProcessRecord, usize), 
     let record = DbtProcessRecord {
         runtime_kind,
         dr_stats_present: flags & WIRE_FLAG_DR_STATS_PRESENT != 0,
+        backend_failure: flags & WIRE_FLAG_BACKEND_FAILURE != 0,
         image_generation: next_u64(),
         process_identity: next_u64(),
         parent_identity: next_u64(),
@@ -390,10 +409,91 @@ impl DbtTranslationStats {
     }
 }
 
+/// The exact statistics artifact observed after a physical DBT run.
+///
+/// This is completion data, not a verdict: a caller may need to process the
+/// guest status, clean up its GlobalTool, or reject incomplete execution
+/// evidence before interpreting statistics. Missing, unreadable, present-empty
+/// and malformed records remain distinct. Raw records retain their byte order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DbtStatsCapture {
+    /// No instrumented image created the statistics file.
+    Missing,
+    /// The file could not be read. This does not replace the physical result.
+    Unreadable {
+        /// The original filesystem error's display text.
+        message: String,
+        /// The original OS error number, when available.
+        raw_os_error: Option<i32>,
+    },
+    /// Exact file contents, including an empty or malformed stream.
+    Records(Vec<u8>),
+}
+
+impl DbtStatsCapture {
+    /// Read a completed artifact, including a caller-retained saved run.
+    ///
+    /// The physical launcher calls this only after reaping the followed tree.
+    /// No missing file is manufactured into a present, measured zero record.
+    pub fn read(path: &Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => Self::Records(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::Missing,
+            Err(error) => Self::Unreadable {
+                message: error.to_string(),
+                raw_os_error: error.raw_os_error(),
+            },
+        }
+    }
+
+    /// Borrow the exact captured bytes without decoding or copying them.
+    pub fn records(&self) -> io::Result<&[u8]> {
+        match self {
+            Self::Records(bytes) => Ok(bytes),
+            Self::Missing => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "DBT statistics were missing",
+            )),
+            Self::Unreadable {
+                message,
+                raw_os_error,
+            } => Err(match raw_os_error {
+                Some(code) => io::Error::from_raw_os_error(*code),
+                None => io::Error::other(message.clone()),
+            }),
+        }
+    }
+
+    /// Decode the captured records using the shared wire-format owner.
+    ///
+    /// Present-empty records yield an empty snapshot; callers that require
+    /// execution evidence must reject that explicitly. Missing and malformed
+    /// records are errors, and the original bytes remain available afterward.
+    pub fn snapshot(&self) -> io::Result<DbtBackendStatsSnapshot> {
+        let mut aggregator = DbtBackendStatsAggregator::new();
+        aggregator
+            .absorb_wire_stream(self.records()?)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(aggregator.snapshot())
+    }
+
+    // Preserve the original optional instrumentation API's missing-file policy.
+    // Strict consumers use the presence-aware capture instead of this projection.
+    pub(crate) fn legacy_source(self) -> io::Result<DbtBackendStatsSource> {
+        let snapshot = if matches!(self, Self::Missing) {
+            DbtBackendStatsAggregator::new().snapshot()
+        } else {
+            self.snapshot()?
+        };
+        Ok(DbtBackendStatsSource::from_snapshot(snapshot))
+    }
+}
+
 /// Stable DBT statistics captured after one backend run over a whole process tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DbtBackendStatsSnapshot {
     process_images: u64,
+    backend_failures: u64,
     counted_branches: u64,
     intercepted_syscalls: u64,
     rewritten_syscalls: u64,
@@ -407,6 +507,13 @@ impl DbtBackendStatsSnapshot {
     /// Number of instrumented process images aggregated into this snapshot.
     pub const fn process_images(&self) -> u64 {
         self.process_images
+    }
+
+    /// Number of process images that ended through the client's terminal path
+    /// (see [`WIRE_FLAG_BACKEND_FAILURE`]). A run with any is a failed run,
+    /// whatever exit status the tree's root returned.
+    pub const fn backend_failures(&self) -> u64 {
+        self.backend_failures
     }
 
     /// Total counted control-flow branches (the DBT branch clock) across the tree.
@@ -501,6 +608,7 @@ impl BackendStatsSnapshot for DbtBackendStatsSnapshot {
 #[derive(Clone, Debug, Default)]
 pub struct DbtBackendStatsAggregator {
     process_images: u64,
+    backend_failures: u64,
     counted_branches: u64,
     intercepted_syscalls: u64,
     rewritten_syscalls: u64,
@@ -527,6 +635,7 @@ impl DbtBackendStatsAggregator {
     /// Folds one decoded process record into the running totals.
     pub fn record(&mut self, record: &DbtProcessRecord) {
         self.process_images += 1;
+        self.backend_failures += u64::from(record.backend_failure);
         self.counted_branches = self.counted_branches.saturating_add(record.branches);
         self.intercepted_syscalls = self.intercepted_syscalls.saturating_add(record.syscalls);
         self.rewritten_syscalls = self.rewritten_syscalls.saturating_add(record.rewritten);
@@ -575,6 +684,7 @@ impl DbtBackendStatsAggregator {
     pub fn snapshot(&self) -> DbtBackendStatsSnapshot {
         DbtBackendStatsSnapshot {
             process_images: self.process_images,
+            backend_failures: self.backend_failures,
             counted_branches: self.counted_branches,
             intercepted_syscalls: self.intercepted_syscalls,
             rewritten_syscalls: self.rewritten_syscalls,
@@ -646,6 +756,7 @@ mod tests {
         DbtProcessRecord {
             runtime_kind: DbtRuntimeKind::Counter1,
             dr_stats_present: dr_stats,
+            backend_failure: seed % 2 == 1,
             image_generation: seed,
             process_identity: 1000 + seed,
             parent_identity: 1,
@@ -673,6 +784,48 @@ mod tests {
             let (decoded, consumed) = decode_process_record(&encoded).unwrap();
             assert_eq!(consumed, WIRE_RECORD_LEN);
             assert_eq!(decoded, record);
+        }
+    }
+
+    #[test]
+    fn a_terminal_image_is_counted_as_a_backend_failure() {
+        for backend_failure in [false, true] {
+            let record = DbtProcessRecord {
+                backend_failure,
+                ..sample_record(4, true)
+            };
+            let encoded = encode_process_record(&record);
+            let flags = u32::from_le_bytes(encoded[12..16].try_into().unwrap());
+            assert_eq!(flags & WIRE_FLAG_BACKEND_FAILURE != 0, backend_failure);
+            assert_eq!(decode_process_record(&encoded).unwrap().0, record);
+        }
+        let mut aggregator = DbtBackendStatsAggregator::new();
+        for backend_failure in [false, true, false] {
+            aggregator.record(&DbtProcessRecord {
+                backend_failure,
+                ..sample_record(2, true)
+            });
+        }
+        let snapshot = aggregator.snapshot();
+        assert_eq!(snapshot.process_images(), 3);
+        assert_eq!(snapshot.backend_failures(), 1);
+    }
+
+    #[test]
+    fn the_native_client_writes_the_flag_bits_this_decoder_reads() {
+        let client = include_str!("../native/client.c");
+        for (name, bit) in [
+            (
+                "STATS_WIRE_FLAG_DR_STATS_PRESENT",
+                WIRE_FLAG_DR_STATS_PRESENT,
+            ),
+            ("STATS_WIRE_FLAG_BACKEND_FAILURE", WIRE_FLAG_BACKEND_FAILURE),
+        ] {
+            let definition = format!("#define {name} {bit}u\n");
+            assert!(
+                client.contains(&definition),
+                "client.c must contain {definition:?}"
+            );
         }
     }
 

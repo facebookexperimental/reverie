@@ -7,29 +7,19 @@
  */
 
 /*
- * Regression fixture for native virtual-clock and virtual-resource
- * virtualization in copied (forked) DBT children.
+ * Clock and resource-limit reads across fork and exec under the DBT client.
  *
- * The DynamoRIO backend runs the Reverie Tool runtime only in the root of the
- * traced tree; copied/forked children are served entirely by the native-only
- * path. Before this fixture's fix, that path applied only identity
- * virtualization, so a forked child read real host time and real host rlimits
- * while the root process saw the deterministic native virtual clock and virtual
- * limits. This fixture reads clock_gettime through libc's vDSO path repeatedly
- * before and after two ordered children. The first child continues from fork;
- * the second execs this fixture so a new DynamoRIO client image remaps the
- * shared state and patches its newly loaded vDSO. It then starts two execed
- * children behind a pipe barrier, waits until both client images are ready, and
- * releases them to read the clock without waiting for either child first. The
- * harness checks the ordered lifecycle observations and the sorted union of the
- * concurrent observations as strictly increasing, fine-grained sequences. A
- * private COW counter, an exec-time reset, a frozen clock, duplicate values, or
- * a first-read-only match therefore cannot pass.
+ * This reads clock_gettime through libc's vDSO path repeatedly before and after
+ * two ordered children. The first child continues from fork; the second execs
+ * this fixture so a new DynamoRIO client image patches its newly loaded vDSO.
+ * It then starts two execed children behind a pipe barrier, waits until both
+ * client images are ready, and releases them to read the clock. Each process
+ * also prints its RLIMIT_NOFILE soft limit.
  *
- *   - Virtual CLOCK_MONOTONIC advances one microsecond per read across the
- *     complete process tree; no process restarts or owns a private clock.
- *   - Virtual RLIMIT_NOFILE is 1048576, distinct from a typical host soft
- * limit.
+ * The client keeps no clock or limit table of its own, so under the prototype
+ * runtime every read reaches the host: test-example-tools.sh requires each
+ * ordered clock sequence to increase and every process's limit to equal the
+ * value this fixture reads natively.
  */
 
 #define _GNU_SOURCE

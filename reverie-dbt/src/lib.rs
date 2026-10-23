@@ -17,40 +17,63 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod backend_stats;
+mod branch_facts;
 pub mod counter;
 mod counter2_global;
 mod evidence;
+mod host_linux;
 mod launcher;
+mod mapping_capture;
 pub mod sync_rpc;
 #[cfg(feature = "prototype-runtime")]
 mod tools;
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+/// Names the shared example tool (reverie-examples) the prototype runtime
+/// hosts, as the example preload names it: `counter1` or `recorder`. The
+/// launcher holds the tool's GlobalState and serves it over the coordinator
+/// socket ([`DbtRunner::output_with_global`]). Any other name ends the run by
+/// name. `HERMIT_DBT_COUNTER1_EXACT` and `HERMIT_DBT_COUNTER2_EXACT` select
+/// `counter1` and `counter2` as before, with the runtime's own in-process
+/// GlobalState.
+pub const TOOL_ENV: &str = "REVERIE_DBT_TOOL";
+
+#[cfg(any(feature = "prototype-runtime", test))]
 use std::ffi::c_void;
 use std::future::Future;
 use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::Mutex;
 #[cfg(feature = "prototype-runtime")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
-use std::sync::atomic::AtomicU16;
+#[cfg(feature = "prototype-runtime")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 
+pub use branch_facts::BranchFact;
+pub use branch_facts::BranchFactQuery;
+pub use branch_facts::BranchFactUnavailable;
+pub use branch_facts::NativeBranchFact;
+pub use branch_facts::install_branch_fact_query;
 pub use counter2_global::Counter2Global;
+pub use evidence::CoordinatorEvidence;
 pub use evidence::DbtEvidence;
 pub use evidence::DbtEvidenceLogLevel;
 pub use evidence::decode_evidence;
 // TODO-HUMAN-REVIEW(PR-134): Review the native bootstrap failure ABI export.
 pub use launcher::CLIENT_THREAD_START_FAILURE_EXIT_CODE;
+pub use launcher::DbtFailedRunOutput;
 pub use launcher::DbtRunner;
+pub use launcher::DbtStatsSink;
+pub use launcher::PRIVATE_ENV_PREFIX;
+pub use launcher::failed_run_output;
+pub use mapping_capture::MappingCapture;
+pub use mapping_capture::NativeMappingCapture;
+pub use mapping_capture::install_mapping_capture;
 use reverie::Backtrace;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -58,17 +81,16 @@ use reverie::Frame;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
+use reverie::InjectionPurpose;
 use reverie::Never;
 use reverie::Pid;
+use reverie::Signal;
 use reverie::Stack;
 use reverie::TimerSchedule;
 use reverie::Tool;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
-use reverie::syscalls::FcntlCmd;
-use reverie::syscalls::PathPtr;
-use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 #[cfg(any(feature = "prototype-runtime", test))]
 use reverie::syscalls::SyscallArgs;
@@ -81,7 +103,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// Native callback used to issue a syscall with DynamoRIO bookkeeping.
-pub type SyscallInvoker = unsafe extern "C" fn(usize, i64, *const u64) -> i64;
+/// The final ABI13 argument is the fixed-width [InjectionPurpose] discriminant.
+pub type SyscallInvoker = unsafe extern "C" fn(usize, i64, *const u64, u32) -> i64;
 
 /// Native callback used to translate DynamoRIO's machine context.
 pub type RegisterReader = unsafe extern "C" fn(usize, *mut libc::user_regs_struct) -> i32;
@@ -98,6 +121,212 @@ pub type MemoryReader = unsafe extern "C" fn(usize, *mut u8, usize) -> i32;
 /// Returns the number of bytes written before the first guest-memory fault.
 pub type MemoryWriter = unsafe extern "C" fn(usize, *const u8, usize) -> usize;
 
+/// Native callback that atomically replaces the aligned 32-bit guest word at
+/// an address with a desired value if it holds an expected one, and stores the
+/// value the word held through the last argument: the native client's
+/// `runtime_compare_exchange_u32` (ABI version 8). Returns 0, `-EINVAL` for a
+/// misaligned address, or `-EFAULT` where the word cannot be read and written.
+pub type MemoryCompareExchange = unsafe extern "C" fn(usize, u32, u32, *mut u32) -> i32;
+
+/// Fixed native representation of a controller-capture fact (ABI version 10).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeControllerCaptureFact {
+    physical_pid: i32,
+    physical_tid: i32,
+    procfs_device: u64,
+    procfs_inode: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<NativeControllerCaptureFact>() == 24);
+
+/// Native capture control: operation 0 queries the current fact; operation 1
+/// acknowledges successful Tool thread-start admission for this exact context.
+/// Returns 1 on success and 0 on unavailable. The native callback initializes
+/// every output byte, including on failure, and never retains the context.
+pub type ControllerCaptureControl =
+    unsafe extern "C" fn(usize, u32, *mut NativeControllerCaptureFact) -> i32;
+
+static CONTROLLER_CAPTURE_CONTROL: std::sync::OnceLock<ControllerCaptureControl> =
+    std::sync::OnceLock::new();
+
+/// Installs the native capture callback during external runtime initialization.
+pub fn install_controller_capture_control(control: ControllerCaptureControl) {
+    let _ = CONTROLLER_CAPTURE_CONTROL.set(control);
+}
+
+fn acknowledge_tool_admission(context: usize) {
+    if let Some(control) = CONTROLLER_CAPTURE_CONTROL.get() {
+        let mut output = NativeControllerCaptureFact::default();
+        // A failed acknowledgment keeps capture unavailable; it does not change
+        // the Tool hook's result or allow guest execution to bypass that hook.
+        unsafe { control(context, 1, &mut output) };
+    }
+}
+
+/// Fixed native ownership-fact record used by ABI version 14.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativePrivateMemorySnapshot {
+    /// Authenticated table, append-only slot and image identity.
+    pub owner: [u64; 4],
+    /// Checked non-reused authority version.
+    pub version: u64,
+    /// One means ready; zero means explicitly unavailable.
+    pub state: u32,
+    /// Number of initialized intervals, at most eight.
+    pub count: u32,
+    /// Canonical arena reservations and authenticated bootstrap LOAD/BSS pages.
+    pub ranges: [[u64; 2]; 8],
+}
+
+/// Copies current facts when `expected` is null, otherwise validates that exact
+/// target token/version. Returns one only for ready facts. Neither call retains
+/// a lock or borrowed native memory after return.
+pub type RuntimePrivateMemoryQuery = unsafe extern "C" fn(
+    usize,
+    *const NativePrivateMemorySnapshot,
+    *mut NativePrivateMemorySnapshot,
+) -> i32;
+
+static RUNTIME_PRIVATE_MEMORY: std::sync::OnceLock<RuntimePrivateMemoryQuery> =
+    std::sync::OnceLock::new();
+
+/// Installs the ABI-11 native ownership callback before any guest callback.
+pub fn install_runtime_private_memory(query: RuntimePrivateMemoryQuery) {
+    let _ = RUNTIME_PRIVATE_MEMORY.set(query);
+}
+
+fn decode_private_memory(
+    native: NativePrivateMemorySnapshot,
+) -> Option<reverie::RuntimePrivateMemorySnapshot> {
+    if native.state != 1 || native.count == 0 || native.count > 8 || native.version == 0 {
+        return None;
+    }
+    if native.ranges[native.count as usize..]
+        .iter()
+        .any(|range| *range != [0, 0])
+    {
+        return None;
+    }
+    let mut regions = Vec::with_capacity(native.count as usize);
+    let mut previous_end = 0;
+    for [start, end] in native.ranges[..native.count as usize].iter().copied() {
+        if start >= end || start < previous_end {
+            return None;
+        }
+        previous_end = end;
+        regions.push(reverie::RuntimePrivateMemoryRegion { start, end });
+    }
+    Some(reverie::RuntimePrivateMemorySnapshot {
+        owner: native.owner,
+        version: native.version,
+        regions,
+    })
+}
+
+/// The native client's compare-and-exchange, once the runtime's background
+/// initialization has installed it with [`install_guest_compare_exchange`].
+static GUEST_COMPARE_EXCHANGE: std::sync::OnceLock<MemoryCompareExchange> =
+    std::sync::OnceLock::new();
+
+/// Installs the native client's compare-and-exchange
+/// ([`DbtRuntimeCallbacks::compare_exchange_u32`]) for [`DbtMemory`]. A
+/// runtime calls this from its background initialization; later calls keep
+/// the first value, which is the same callback in every image.
+pub fn install_guest_compare_exchange(compare_exchange: MemoryCompareExchange) {
+    let _ = GUEST_COMPARE_EXCHANGE.set(compare_exchange);
+}
+
+/// Guest memory for the DBT backend. The tool runs in the guest's address
+/// space, so reads and writes are [`LocalMemory`]'s. In addition,
+/// [`MemoryAccess::compare_exchange_u32`] runs the native client's atomic
+/// compare-and-exchange once a runtime has installed it; before that it is
+/// `ENOSYS`. The native side checks the word's page first and gives `EFAULT`
+/// for one that is unmapped or not writable, so it never faults on a word it
+/// refuses; a page DynamoRIO protects for its code cache is written only
+/// inside a system-call event, and gives `EFAULT` outside one. It does not
+/// catch faults: a mapping that changes between the check and the exchange
+/// aborts the run, which a tool rules out by running the exchange while no
+/// other guest thread runs.
+#[derive(Debug)]
+pub struct DbtMemory {
+    local: LocalMemory,
+    compare_exchange: Option<MemoryCompareExchange>,
+}
+
+impl Default for DbtMemory {
+    /// The same as [`DbtMemory::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DbtMemory {
+    /// Guest memory with the compare-and-exchange the runtime installed, if any.
+    pub fn new() -> Self {
+        Self {
+            local: LocalMemory::new(),
+            compare_exchange: GUEST_COMPARE_EXCHANGE.get().copied(),
+        }
+    }
+}
+
+impl MemoryAccess for DbtMemory {
+    fn read_vectored(
+        &self,
+        read_from: &[std::io::IoSlice],
+        write_to: &mut [std::io::IoSliceMut],
+    ) -> Result<usize, Errno> {
+        self.local.read_vectored(read_from, write_to)
+    }
+
+    fn write_vectored(
+        &mut self,
+        read_from: &[std::io::IoSlice],
+        write_to: &mut [std::io::IoSliceMut],
+    ) -> Result<usize, Errno> {
+        self.local.write_vectored(read_from, write_to)
+    }
+
+    fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
+    where
+        A: Into<reverie::syscalls::Addr<'a, u8>>,
+    {
+        self.local.read(addr, buf)
+    }
+
+    fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+        self.local.write(addr, buf)
+    }
+
+    fn write_with_user_access(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+        self.local.write_with_user_access(addr, buf)
+    }
+
+    fn compare_exchange_u32(
+        &mut self,
+        addr: AddrMut<u32>,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, Errno> {
+        let Some(compare_exchange) = self.compare_exchange else {
+            return Err(Errno::ENOSYS);
+        };
+        let mut observed = 0u32;
+        // SAFETY: the callback writes only through `observed`, which outlives
+        // the call, and touches the guest word only after checking that its
+        // page is mapped and writable (see `DbtMemory`).
+        let status = unsafe { compare_exchange(addr.as_raw(), expected, desired, &mut observed) };
+        match status {
+            0 => Ok(observed),
+            negative if negative < 0 => Err(Errno::new(-negative)),
+            // The native contract has no positive result.
+            _ => Err(Errno::EPROTO),
+        }
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-66): Confirm the external runtime callback ABI.
 /// Native callback used to emit runtime diagnostics without re-entering guest I/O.
 pub type RuntimeEmitter = unsafe extern "C" fn(*const u8, usize);
@@ -111,11 +340,72 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// An external runtime used with this native client must export
 /// `reverie_dbt_runtime_abi_version`, `reverie_dbt_runtime_callbacks_size`,
 /// `reverie_dbt_runtime_thread_created_v2`,
-/// `reverie_dbt_runtime_process_clone_result`, and
-/// `reverie_dbt_runtime_background_init_v2`. Advancing a consumer's Reverie
-/// revision without those matching exports is an incomplete cross-repository
-/// update and fails at link or at the pre-callback ABI check.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 4;
+/// `reverie_dbt_runtime_process_clone_result`,
+/// `reverie_dbt_runtime_background_init_v3`, and (from version 5)
+/// `reverie_dbt_runtime_rdtsc`. Advancing a consumer's Reverie revision without
+/// those matching exports is an incomplete cross-repository update and fails at
+/// link or at the pre-callback ABI check.
+/// Version 6 retains the 48-byte callback layout and requires the initialized
+/// native mode and a returned startup status; the no-mode V1/V2 entries are not
+/// admitted initialization routes.
+/// Version 7 also requires `reverie_dbt_runtime_signal_event`, entered only from
+/// the native owned signal continuation.
+/// Version 8 appends [`DbtRuntimeCallbacks::compare_exchange_u32`], growing the
+/// callback layout from 48 to 56 bytes.
+/// Version 9 also requires `reverie_dbt_runtime_cpuid`: the native client no
+/// longer answers CPUID from a table of its own, it asks the runtime's tool.
+/// Version 10 appends the controller-capture control, growing the callback
+/// layout from 56 to 64 bytes.
+/// Version 11 appends the private-memory fact query after the controller
+/// control, growing callbacks from 64 to 72 bytes. The independent historical
+/// private-memory ABI-10 layout is incompatible and is not accepted.
+/// Version 12 appends the optional image/task-scoped instruction-fact query
+/// at offset 72. It does not change the shared clock or timer contract.
+/// Version 13 adds the injection purpose as the syscall invoker's fourth
+/// argument. The callback table remains 80 bytes; version 12 is incompatible.
+/// Version 14 grows the private-memory snapshot from 96 to 176 bytes to carry
+/// eight ownership intervals. The callback table stays 80 bytes; an ABI-13
+/// producer cannot write or validate the new pointee layout.
+/// Version 15 appends the prepared mapping-capture primitive at offset 80;
+/// the callback table is 88 bytes. Ownership snapshot and task layout stay fixed.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 15;
+
+/// Initialized native execution mode supplied by the version-6 startup bridge.
+///
+/// This describes the retained per-image native state, not the presence of an
+/// environment variable. Unknown (wire value 0) is never standalone authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum DbtStartupMode {
+    /// Native state was initialized without the external-global capability.
+    Standalone = 1,
+    /// Native state retains the external-global capability.
+    Coordinated = 2,
+}
+
+/// A startup bridge supplied unknown or unsupported native mode authority.
+#[derive(Debug)]
+pub struct InvalidDbtStartupMode;
+
+impl std::fmt::Display for InvalidDbtStartupMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("unknown or unsupported native startup mode")
+    }
+}
+
+impl std::error::Error for InvalidDbtStartupMode {}
+
+impl TryFrom<u32> for DbtStartupMode {
+    type Error = InvalidDbtStartupMode;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Standalone),
+            2 => Ok(Self::Coordinated),
+            _ => Err(InvalidDbtStartupMode),
+        }
+    }
+}
 
 #[cfg(feature = "prototype-runtime")]
 #[repr(C)]
@@ -156,6 +446,19 @@ pub struct DbtRuntimeCallbacks {
     pub emit_evidence: RuntimeEmitter,
     /// Protected [`DbtEvidenceLogLevel`] discriminant selected by the launcher.
     pub evidence_log_level: i32,
+    /// The native client's atomic compare-and-exchange of an aligned guest
+    /// word (ABI version 8). A runtime installs it with
+    /// [`install_guest_compare_exchange`] so that [`DbtMemory`] offers
+    /// [`MemoryAccess::compare_exchange_u32`].
+    pub compare_exchange_u32: MemoryCompareExchange,
+    /// Native process-admission and proc-view facts for controller capture.
+    pub controller_capture_control: ControllerCaptureControl,
+    /// Copies or validates fixed native private-memory facts (ABI version 11).
+    pub runtime_private_memory: RuntimePrivateMemoryQuery,
+    /// Optional original-conditional facts, separate from the mixed statistic.
+    pub branch_fact: BranchFactQuery,
+    /// Prepared cooperative mapping capture, with native restoration ownership.
+    pub mapping_capture: MappingCapture,
 }
 
 /// Reports the exact native-client/external-runtime ABI version.
@@ -163,6 +466,72 @@ pub struct DbtRuntimeCallbacks {
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbt_runtime_abi_version() -> u32 {
     DBT_RUNTIME_ABI_VERSION
+}
+
+/// Answers a guest `rdtsc` or `rdtscp` (ABI version 5): 1 with `tsc` and `aux`
+/// written when the runtime's tool answers it, 0 to leave it to the native
+/// client's fixed-stride counter, negative on failure.
+///
+/// The prototype tools observe syscalls and do not virtualize time, so this
+/// runtime leaves every read to the client, as before version 5. A runtime
+/// whose tool owns the guest's clock (Detcore, in hermit) answers here instead.
+///
+/// # Safety
+///
+/// Never dereferences its arguments.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_rdtsc(
+    _context: *mut c_void,
+    _counters: *mut PrototypeCounters,
+    _tid: i32,
+    _pid: i32,
+    _branches: u64,
+    _with_aux: i32,
+    _invoke_syscall: SyscallInvoker,
+    _read_registers: RegisterReader,
+    _write_registers: RegisterWriter,
+    _emit: tools::Emitter,
+    _tsc: *mut u64,
+    _aux: *mut u32,
+) -> i32 {
+    0
+}
+
+/// Answers a guest `cpuid` for `leaf` and `subleaf` (ABI version 9): 1 with
+/// `registers` written as EAX, EBX, ECX and EDX, negative on failure, which
+/// ends the run.
+///
+/// The prototype tools observe syscalls and do not describe a machine, so this
+/// runtime answers what Reverie's default `Tool::handle_cpuid_event` answers:
+/// the host's CPUID. A runtime whose tool owns the machine description
+/// (Detcore, in hermit) answers from that description instead.
+///
+/// # Safety
+///
+/// `registers` must be valid for writing four `u32`s; the other arguments are
+/// never dereferenced.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_cpuid(
+    _context: *mut c_void,
+    _counters: *mut PrototypeCounters,
+    _tid: i32,
+    _pid: i32,
+    _branches: u64,
+    leaf: u32,
+    subleaf: u32,
+    _invoke_syscall: SyscallInvoker,
+    _read_registers: RegisterReader,
+    _write_registers: RegisterWriter,
+    _emit: tools::Emitter,
+    registers: *mut [u32; 4],
+) -> i32 {
+    let result = core::arch::x86_64::__cpuid_count(leaf, subleaf);
+    unsafe { registers.write([result.eax, result.ebx, result.ecx, result.edx]) };
+    1
 }
 
 /// Reports the exact callback-structure size for the current ABI version.
@@ -182,6 +551,61 @@ pub enum DbtSyscallOutcome {
     ExecuteOriginal(Syscall),
 }
 
+/// Owned signal payload exchanged with the native admission continuation.
+///
+/// No pointer into DynamoRIO's pending queue crosses the runtime boundary.
+/// Version 7 adds this 200-byte, 8-byte-aligned wire object without changing
+/// [`DbtRuntimeCallbacks`]. The caller initializes all fields before entry.
+#[repr(C)]
+pub struct DbtSignalEvent {
+    /// Signal reported by the kernel.
+    pub signal: i32,
+    /// Signal selected for delivery on a successful returning callback.
+    pub delivered_signal: i32,
+    /// Authentic Linux siginfo, or an explicitly selected replacement.
+    pub signal_info: [u8; reverie::SIGNAL_INFO_SIZE],
+    /// Nonzero only for an explicit replacement for the reported signal.
+    pub signal_info_changed: i32,
+    /// Reserved; must be zero.
+    pub reserved: u32,
+    /// Deferred native syscall number when the callback terminates its task.
+    pub deferred_sysnum: i64,
+    /// Deferred native syscall arguments.
+    pub deferred_args: [u64; 6],
+}
+
+/// Result of the real Tool signal hook after its future and Guest borrow end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DbtSignalOutcome {
+    /// Commit delivery through DynamoRIO's existing signal machinery.
+    Deliver(Signal),
+    /// Resume the ordinary interrupted context without installing a frame.
+    Suppress,
+    /// Execute the Tool's terminal syscall after leaving Rust ownership.
+    ExecuteOriginal(Syscall),
+}
+
+/// The owned transport cannot synthesize Linux provenance for a different signal.
+#[derive(Debug)]
+pub struct UnsupportedSignalTransformation {
+    /// Authentic reported signal.
+    pub reported: Signal,
+    /// Different signal requested by the Tool.
+    pub requested: Signal,
+}
+
+impl std::fmt::Display for UnsupportedSignalTransformation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "DBT signal transport cannot transform {:?} into {:?} without authentic replacement provenance",
+            self.reported, self.requested
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedSignalTransformation {}
+
 /// In-process guest state passed to a Reverie tool handler.
 pub struct DbtGuest<'a, T>
 where
@@ -199,7 +623,10 @@ where
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
     read_memory: Option<MemoryReader>,
+    runtime_private_memory: Option<RuntimePrivateMemoryQuery>,
     tail_inject_result: Arc<TailInjectResult>,
+    signal_info: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
+    signal_info_replacement: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
 }
 
 impl<'a, T> DbtGuest<'a, T>
@@ -234,8 +661,55 @@ where
             read_registers,
             write_registers,
             read_memory: None,
+            runtime_private_memory: RUNTIME_PRIVATE_MEMORY.get().copied(),
             tail_inject_result: Arc::new(TailInjectResult::default()),
+            signal_info: None,
+            signal_info_replacement: None,
         }
+    }
+
+    fn inject_for_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Errno> {
+        let (number, args) = syscall.into_parts();
+        let args = [
+            args.arg0 as u64,
+            args.arg1 as u64,
+            args.arg2 as u64,
+            args.arg3 as u64,
+            args.arg4 as u64,
+            args.arg5 as u64,
+        ];
+        if let Some(result) = sync_rpc::protect_guest_operation(
+            self.context,
+            self.invoke_syscall,
+            number.id() as i64,
+            &args,
+            false,
+        ) {
+            return Errno::from_ret(result as usize).map(|value| value as i64);
+        }
+        // The native bridge classifies this as an injected syscall: clone
+        // identity bookkeeping still completes synchronously, while the
+        // original-syscall post-event latch remains disarmed because the raw
+        // result is returned directly to this Tool call.
+        let result = host_linux::forward(
+            self.tid,
+            self.pid,
+            self.context,
+            self.invoke_syscall,
+            purpose,
+            &reverie::provider::SyscallRequest::new(number.id() as u64, args),
+        );
+        Errno::from_ret(result as usize).map(|value| value as i64)
+    }
+
+    /// Reads optional image/task-scoped original-conditional facts. This is
+    /// DBT-internal observation transport, not a shared clock capability.
+    pub fn branch_fact(&self) -> Result<BranchFact, BranchFactUnavailable> {
+        branch_facts::query(self.context)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -274,9 +748,15 @@ where
         if crate::sync_rpc::is_active() {
             match self.guest_rpc {
                 Some((context, invoke_syscall)) => {
-                    crate::sync_rpc::send_rpc_from_guest(context, invoke_syscall, self.tid, message)
+                    crate::sync_rpc::send_rpc_from_guest::<T::GlobalState>(
+                        context,
+                        invoke_syscall,
+                        self.tid,
+                        self.config,
+                        message,
+                    )
                 }
-                None => crate::sync_rpc::send_rpc(self.tid, message),
+                None => crate::sync_rpc::send_rpc::<T::GlobalState>(self.tid, self.config, message),
             }
         } else {
             self.global_state.receive_rpc(self.tid, message).await
@@ -302,15 +782,33 @@ where
         // See `DbtGlobal::send_rpc`: prefer the cross-process coordinator when
         // one is configured, so fork/exec children share one GlobalState.
         if crate::sync_rpc::is_active() {
-            crate::sync_rpc::send_rpc_from_guest(
+            crate::sync_rpc::send_rpc_from_guest::<T::GlobalState>(
                 self.context,
                 self.invoke_syscall,
                 self.tid,
+                self.config,
                 message,
             )
         } else {
             self.global_state.receive_rpc(self.tid, message).await
         }
+    }
+
+    fn try_send_rpc_sync(
+        &self,
+        message: <T::GlobalState as GlobalTool>::Request,
+    ) -> Result<<T::GlobalState as GlobalTool>::Response, <T::GlobalState as GlobalTool>::Request>
+    {
+        if !crate::sync_rpc::is_active() {
+            return Err(message);
+        }
+        Ok(crate::sync_rpc::send_rpc_from_guest::<T::GlobalState>(
+            self.context,
+            self.invoke_syscall,
+            self.tid,
+            self.config,
+            message,
+        ))
     }
 
     fn config(&self) -> &<T::GlobalState as GlobalTool>::Config {
@@ -323,7 +821,7 @@ impl<T> Guest<T> for DbtGuest<'_, T>
 where
     T: Tool,
 {
-    type Memory = LocalMemory;
+    type Memory = DbtMemory;
     type Stack = DbtStack;
 
     fn tid(&self) -> Pid {
@@ -332,6 +830,79 @@ where
 
     fn pid(&self) -> Pid {
         self.pid
+    }
+
+    fn controller_capture_fact(&self) -> Option<reverie::ControllerCaptureFact> {
+        if !sync_rpc::is_active() {
+            return None;
+        }
+        let control = CONTROLLER_CAPTURE_CONTROL.get()?;
+        let mut fact = NativeControllerCaptureFact::default();
+        if unsafe { control(self.context, 0, &mut fact) } != 1
+            || fact.physical_pid <= 0
+            || fact.physical_tid <= 0
+            || fact.procfs_inode == 0
+        {
+            return None;
+        }
+        Some(reverie::ControllerCaptureFact {
+            physical_pid: Pid::from_raw(fact.physical_pid),
+            physical_tid: Pid::from_raw(fact.physical_tid),
+            procfs_device: fact.procfs_device,
+            procfs_inode: fact.procfs_inode,
+        })
+    }
+
+    fn is_runtime_owned_fd(&self, fd: i32) -> bool {
+        // Guest PID can be a Tool identity. The connection owner is keyed by
+        // the physical process, as in send_rpc_from_guest.
+        sync_rpc::is_runtime_owned_fd(fd)
+    }
+
+    fn runtime_private_memory_regions(&self) -> Option<reverie::RuntimePrivateMemory> {
+        let snapshot = self.runtime_private_memory.and_then(|query| {
+            let mut native = NativePrivateMemorySnapshot::default();
+            // SAFETY: both fixed records are local; null requests current facts.
+            (unsafe { query(self.context, std::ptr::null(), &mut native) } == 1)
+                .then(|| decode_private_memory(native))
+                .flatten()
+        });
+        Some(match snapshot {
+            Some(snapshot) => reverie::RuntimePrivateMemory::Ready(snapshot),
+            None => reverie::RuntimePrivateMemory::Unavailable,
+        })
+    }
+
+    fn try_mapping_capture(
+        &self,
+        prepared: reverie::PreparedMappingCapture<<T::GlobalState as GlobalTool>::Request>,
+    ) -> Result<<T::GlobalState as GlobalTool>::Response, reverie::MappingCaptureError> {
+        mapping_capture::execute::<T>(self.context, self.tid, self.config, prepared)
+    }
+
+    fn runtime_private_memory_is_current(
+        &self,
+        snapshot: &reverie::RuntimePrivateMemorySnapshot,
+    ) -> bool {
+        let Some(query) = self.runtime_private_memory else {
+            return false;
+        };
+        if snapshot.regions.is_empty() || snapshot.regions.len() > 8 {
+            return false;
+        }
+        let mut expected = NativePrivateMemorySnapshot {
+            owner: snapshot.owner,
+            version: snapshot.version,
+            state: 1,
+            count: snapshot.regions.len() as u32,
+            ..Default::default()
+        };
+        for (out, region) in expected.ranges.iter_mut().zip(&snapshot.regions) {
+            *out = [region.start, region.end];
+        }
+        let mut actual = NativePrivateMemorySnapshot::default();
+        // SAFETY: native copies fixed records only and retains neither pointer.
+        unsafe { query(self.context, &expected, &mut actual) == 1 && actual == expected }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -354,8 +925,29 @@ where
         false
     }
 
+    // The native client rewrites every application CPUID into a call to
+    // `reverie_dbt_runtime_cpuid` (ABI version 9), which the runtime answers
+    // through its Tool's `handle_cpuid_event`.
+    fn has_cpuid_interception(&self) -> bool {
+        true
+    }
+
     fn memory(&self) -> Self::Memory {
-        LocalMemory::new()
+        DbtMemory::new()
+    }
+
+    // The application's own auxiliary vector, the one on its initial stack,
+    // rather than the kernel's saved copy in `/proc/<pid>/auxv` that the
+    // default reads. The kernel exec'd DynamoRIO's library, and DynamoRIO
+    // rewrites only the application's vector: the kernel's copy keeps the
+    // library's AT_ENTRY, AT_PHDR and AT_BASE, and where the application's
+    // path does not fit in the space the library's took, its AT_EXECFN points
+    // at storage DynamoRIO has cleared. Falls back to the kernel's copy where
+    // the application's cannot be read, as the default would.
+    fn auxv(&self) -> reverie::Auxv {
+        application_auxv(self.read_memory)
+            .or_else(kernel_auxv)
+            .expect("failed to read auxv table")
     }
 
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
@@ -364,6 +956,19 @@ where
 
     fn thread_state(&self) -> &T::ThreadState {
         self.thread_state
+    }
+
+    fn signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
+        self.signal_info_replacement.or(self.signal_info)
+    }
+
+    fn set_signal_info(&mut self, info: [u8; reverie::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
+        let original = self.signal_info.ok_or(Errno::EINVAL)?;
+        if info[..4] != original[..4] {
+            return Err(Errno::EINVAL);
+        }
+        self.signal_info_replacement = Some(info);
+        Ok(())
     }
 
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -396,22 +1001,16 @@ where
     async fn daemonize(&mut self) {}
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
-        let (number, args) = syscall.into_parts();
-        let args = [
-            args.arg0 as u64,
-            args.arg1 as u64,
-            args.arg2 as u64,
-            args.arg3 as u64,
-            args.arg4 as u64,
-            args.arg5 as u64,
-        ];
-        // The native bridge classifies this as an injected syscall: clone
-        // identity bookkeeping still completes synchronously, while the
-        // original-syscall post-event latch remains disarmed because the raw
-        // result is returned directly to this Tool call.
-        let result =
-            unsafe { (self.invoke_syscall)(self.context, number.id() as i64, args.as_ptr()) };
-        Errno::from_ret(result as usize).map(|value| value as i64)
+        self.inject_for_purpose(syscall, InjectionPurpose::Application)
+    }
+
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Error> {
+        self.inject_for_purpose(syscall, purpose)
+            .map_err(Error::from)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -554,6 +1153,91 @@ fn read_guest_word_from_process(addr: u64) -> Option<u64> {
         Some(value)
     } else {
         None
+    }
+}
+
+/// The auxiliary vector on this process's initial stack, from the start of
+/// that stack (`startstack`, field 28 of `/proc/self/stat`, where the kernel
+/// put argc). `None` where the stat record or any word cannot be read.
+fn application_auxv(read_memory: Option<MemoryReader>) -> Option<reverie::Auxv> {
+    let stat = std::fs::read("/proc/self/stat").ok()?;
+    let fields = &stat[stat.iter().rposition(|&byte| byte == b')')? + 2..];
+    let start = std::str::from_utf8(fields.split(|&byte| byte == b' ').nth(28 - 3)?)
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    auxv_after_initial_stack(start, |address| read_guest_word(read_memory, address))
+}
+
+/// The kernel's saved copy of this process's auxiliary vector.
+fn kernel_auxv() -> Option<reverie::Auxv> {
+    auxv_from_kernel_bytes(&std::fs::read("/proc/self/auxv").ok()?)
+}
+
+/// The auxiliary vector in `bytes`, as `/proc/<pid>/auxv` lays it out:
+/// whole key/value pairs up to a (0, 0) pair. `None` where the bytes end
+/// before that pair, whether after whole pairs or inside one, as
+/// `Auxv::new` refuses them.
+fn auxv_from_kernel_bytes(bytes: &[u8]) -> Option<reverie::Auxv> {
+    let mut entries = Vec::new();
+    for pair in bytes.chunks(16) {
+        let pair: &[u8; 16] = pair.try_into().ok()?;
+        let (key, value) = pair.split_at(8);
+        let key = u64::from_ne_bytes(key.try_into().unwrap());
+        let value = u64::from_ne_bytes(value.try_into().unwrap());
+        if key == 0 && value == 0 {
+            return Some(reverie::Auxv::from_entries(entries));
+        }
+        entries.push((key, value));
+    }
+    None
+}
+
+/// The auxiliary vector of the initial stack at `start`: argc, argc argument
+/// pointers and a null, environment pointers up to a null, then the vector's
+/// pairs up to AT_NULL (the System V x86-64 ABI's process-initialization
+/// layout). `None` where a word cannot be read or a bound is passed.
+fn auxv_after_initial_stack(
+    start: u64,
+    read_word: impl Fn(u64) -> Option<u64>,
+) -> Option<reverie::Auxv> {
+    // Linux bounds the argument and environment strings by a quarter of the
+    // stack limit; this bound only stops a walk of a corrupted stack.
+    const MOST_POINTERS: u64 = 1 << 22;
+    const MOST_ENTRIES: u64 = 256;
+    const WORD: u64 = std::mem::size_of::<u64>() as u64;
+    if start == 0 {
+        return None;
+    }
+    let argc = read_word(start)?;
+    if argc >= MOST_POINTERS {
+        return None;
+    }
+    let argv_end = start.checked_add((1 + argc) * WORD)?;
+    if read_word(argv_end)? != 0 {
+        return None;
+    }
+    let mut cursor = argv_end + WORD;
+    let mut pointers = 0;
+    while read_word(cursor)? != 0 {
+        pointers += 1;
+        if pointers == MOST_POINTERS {
+            return None;
+        }
+        cursor = cursor.checked_add(WORD)?;
+    }
+    cursor = cursor.checked_add(WORD)?;
+    let mut entries = Vec::new();
+    loop {
+        let key = read_word(cursor)?;
+        if key == libc::AT_NULL {
+            return Some(reverie::Auxv::from_entries(entries));
+        }
+        entries.push((key, read_word(cursor.checked_add(WORD)?)?));
+        if entries.len() as u64 == MOST_ENTRIES {
+            return None;
+        }
+        cursor = cursor.checked_add(2 * WORD)?;
     }
 }
 
@@ -701,7 +1385,12 @@ pub struct PrototypeCounters {
     pub rewritten_syscalls: u64,
 }
 
-/// Tool used by the standalone prototype client.
+/// Tool used by the standalone prototype client. It forwards every syscall
+/// it is given and only counts them: Linux semantics and determinism belong to
+/// the kernel and to Detcore, not to a backend's own tool. It once carried its
+/// own deterministic `uname`, ports, random bytes, `/proc` snapshots,
+/// `getrusage` and `sysinfo`, a second determinism layer that nothing in
+/// Hermit used (step A10 of <https://github.com/rrnewton/hermit/issues/4485>).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PrototypeTool;
 
@@ -716,345 +1405,8 @@ impl Tool for PrototypeTool {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         guest.thread_state_mut().rewritten_syscalls += 1;
-        match syscall {
-            Syscall::Uname(call) => {
-                let result = guest.inject(call).await?;
-                if result == 0
-                    && let Some(buffer) = call.buf()
-                {
-                    // Overwrite every host-derived field, not just `release`, so
-                    // `nodename` (hostname) and `version` (kernel build string)
-                    // cannot leak host- or run-specific values.
-                    let mut value = guest.memory().read_value(buffer)?;
-                    set_c_string(&mut value.sysname, b"Linux");
-                    set_c_string(&mut value.nodename, b"hermit");
-                    set_c_string(&mut value.release, b"5.2.0");
-                    set_c_string(&mut value.version, b"#1 SMP hermit-deterministic");
-                    set_c_string(&mut value.machine, b"x86_64");
-                    set_c_string(&mut value.domainname, b"(none)");
-                    guest.memory().write_value(buffer, &value)?;
-                }
-                Ok(result)
-            }
-            Syscall::Bind(call) => handle_bind(guest, call).await,
-            Syscall::Connect(call) => handle_connect(guest, call).await,
-            Syscall::Getsockname(call) => handle_getsockname(guest, call).await,
-            Syscall::Getpeername(call) => handle_getpeername(guest, call).await,
-            Syscall::Open(call) => handle_open(guest, call.path(), call).await,
-            Syscall::Openat(call) => handle_open(guest, call.path(), call).await,
-            Syscall::Read(call) if is_random_fd(call.fd()) => {
-                write_deterministic_random(guest, call.buf(), call.len())
-            }
-            Syscall::Pread64(call) if is_random_fd(call.fd()) => {
-                write_deterministic_random(guest, call.buf(), call.len())
-            }
-            Syscall::Readv(call) if is_random_fd(call.fd()) => {
-                deterministic_random_readv(guest, call.iov(), call.len())
-            }
-            Syscall::Preadv(call) if is_random_fd(call.fd()) => {
-                deterministic_random_readv(guest, call.iov(), call.iov_len())
-            }
-            Syscall::Preadv2(call) if is_random_fd(call.fd()) => {
-                deterministic_random_readv(guest, call.iov(), call.iov_len() as usize)
-            }
-            Syscall::Dup(call) => {
-                let result = guest.inject(call).await?;
-                track_duplicated_fd(call.oldfd(), result);
-                Ok(result)
-            }
-            Syscall::Dup2(call) => {
-                let (oldfd, newfd) = (call.oldfd(), call.newfd());
-                let result = guest.inject(call).await?;
-                track_replacing_fd(oldfd, newfd, result);
-                Ok(result)
-            }
-            Syscall::Dup3(call) => {
-                let (oldfd, newfd) = (call.oldfd(), call.newfd());
-                let result = guest.inject(call).await?;
-                track_replacing_fd(oldfd, newfd, result);
-                Ok(result)
-            }
-            Syscall::Fcntl(call) => {
-                let oldfd = call.fd();
-                let duplicating = matches!(
-                    call.cmd(),
-                    FcntlCmd::F_DUPFD(_) | FcntlCmd::F_DUPFD_CLOEXEC(_)
-                );
-                let result = guest.inject(call).await?;
-                if duplicating {
-                    track_duplicated_fd(oldfd, result);
-                }
-                Ok(result)
-            }
-            Syscall::Close(call) => {
-                let result = guest.inject(call).await?;
-                if result == 0 {
-                    random_fds().remove(&call.fd());
-                    bound_ports().remove(&call.fd());
-                }
-                Ok(result)
-            }
-            Syscall::Getrandom(call) => deterministic_getrandom(guest, call),
-            Syscall::Getrusage(call) => {
-                let result = guest.inject(call).await?;
-                if result == 0
-                    && let Some(usage) = call.usage()
-                {
-                    guest
-                        .memory()
-                        .write_value(usage, &unsafe { std::mem::zeroed::<libc::rusage>() })?;
-                }
-                Ok(result)
-            }
-            Syscall::Sysinfo(call) => deterministic_sysinfo(guest, call),
-            syscall => Ok(guest.inject(syscall).await?),
-        }
+        Ok(guest.inject(syscall).await?)
     }
-}
-
-const RNG_SEED_ENV: &str = "HERMIT_DBT_RNG_SEED";
-
-static RANDOM_FDS: LazyLock<Mutex<HashSet<i32>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BoundPort {
-    address: std::net::IpAddr,
-    guest_port: u16,
-    host_port: u16,
-}
-
-static BOUND_PORTS: LazyLock<Mutex<HashMap<i32, BoundPort>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Global count of 64-bit random words dispensed so far. The deterministic RNG
-/// stream is a pure function of `(seed, word position)`, so it does not depend
-/// on guest memory layout and is reproducible across hosts.
-static RANDOM_WORDS: AtomicU64 = AtomicU64::new(0);
-
-fn random_fds() -> std::sync::MutexGuard<'static, HashSet<i32>> {
-    RANDOM_FDS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn bound_ports() -> std::sync::MutexGuard<'static, HashMap<i32, BoundPort>> {
-    BOUND_PORTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn is_random_fd(fd: i32) -> bool {
-    random_fds().contains(&fd)
-}
-
-/// Records that `new_fd` (the return value of `dup`/`fcntl(F_DUPFD*)`) aliases
-/// `old_fd`, so reads through the duplicate stay deterministic.
-fn track_duplicated_fd(old_fd: i32, new_fd: i64) {
-    if new_fd < 0 {
-        return;
-    }
-    let new_fd = new_fd as i32;
-    if is_random_fd(old_fd) {
-        random_fds().insert(new_fd);
-    }
-    let mut ports = bound_ports();
-    if let Some(binding) = ports.get(&old_fd).copied() {
-        ports.insert(new_fd, binding);
-    }
-}
-
-/// Records the effect of `dup2`/`dup3`, where `new_fd` becomes a copy of
-/// `old_fd`, dropping any previous random association on the target descriptor.
-fn track_replacing_fd(old_fd: i32, new_fd: i32, result: i64) {
-    if result < 0 {
-        return;
-    }
-    let mut fds = random_fds();
-    if fds.contains(&old_fd) {
-        fds.insert(result as i32);
-    } else {
-        fds.remove(&new_fd);
-    }
-    drop(fds);
-
-    let mut ports = bound_ports();
-    if let Some(binding) = ports.get(&old_fd).copied() {
-        ports.insert(result as i32, binding);
-    } else {
-        ports.remove(&new_fd);
-    }
-}
-
-fn deterministic_proc_content(path: &Path) -> Option<Vec<u8>> {
-    match path.to_str()? {
-        "/proc/cpuinfo" => Some(b"processor\t: 0\ncpu MHz\t\t: 0.000\n".to_vec()),
-        "/proc/self/maps" => {
-            Some(b"00400000-00401000 r--p 00000000 00:00 0 [reverie-dbt]\n".to_vec())
-        }
-        "/proc/self/stat" => {
-            let mut contents = String::from("1 (hermit-dbt) R");
-            for _ in 0..49 {
-                contents.push_str(" 0");
-            }
-            contents.push('\n');
-            Some(contents.into_bytes())
-        }
-        "/proc/self/status" => Some(
-            b"Name:\thermit-dbt\nPid:\t1\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
-                .to_vec(),
-        ),
-        _ => None,
-    }
-}
-
-fn create_memfd(contents: &[u8]) -> Result<i64, Error> {
-    let name = b"reverie-dbt-proc\0";
-    let fd = Errno::result(unsafe {
-        libc::syscall(
-            libc::SYS_memfd_create,
-            name.as_ptr() as *const libc::c_char,
-            libc::MFD_CLOEXEC,
-        )
-    })? as i32;
-    let written = Errno::result(unsafe {
-        libc::write(fd, contents.as_ptr() as *const c_void, contents.len())
-    });
-    if written != Ok(contents.len() as isize)
-        || Errno::result(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }).is_err()
-    {
-        unsafe { libc::close(fd) };
-        return Err(Errno::EIO.into());
-    }
-    Ok(fd as i64)
-}
-
-async fn handle_open<'a, G, S>(
-    guest: &mut G,
-    path: Option<PathPtr<'a>>,
-    call: S,
-) -> Result<i64, Error>
-where
-    G: Guest<PrototypeTool>,
-    S: SyscallInfo,
-{
-    let Some(path) = path else {
-        return Ok(guest.inject(call).await?);
-    };
-    let path = path.read(&guest.memory())?;
-    if let Some(contents) = deterministic_proc_content(&path) {
-        return create_memfd(&contents);
-    }
-
-    let result = guest.inject(call).await?;
-    if result >= 0 && matches!(path.to_str(), Some("/dev/random" | "/dev/urandom")) {
-        random_fds().insert(result as i32);
-    }
-    Ok(result)
-}
-
-fn configured_rng_seed() -> u64 {
-    std::env::var(RNG_SEED_ENV)
-        .ok()
-        .and_then(|seed| seed.parse().ok())
-        .unwrap_or(0)
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-/// Fills `bytes` from a reproducible stream indexed by `position` (the absolute
-/// 64-bit word offset of the first chunk). The stream depends only on the seed
-/// and the word position, never on the destination address, so it is stable
-/// across memory layouts and hosts. Bytes are emitted little-endian for
-/// host-independence.
-fn deterministic_random_bytes(seed: u64, position: u64, bytes: &mut [u8]) {
-    for (index, chunk) in bytes.chunks_mut(8).enumerate() {
-        let word = position.wrapping_add(index as u64);
-        let value = splitmix64(seed ^ splitmix64(word));
-        chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
-    }
-}
-
-/// Reserves `count` consecutive 64-bit words from the global stream and returns
-/// the first word's absolute position.
-fn reserve_random_words(count: u64) -> u64 {
-    RANDOM_WORDS.fetch_add(count, Ordering::SeqCst)
-}
-
-fn write_deterministic_random<G: Guest<PrototypeTool>>(
-    guest: &mut G,
-    buffer: Option<AddrMut<'_, u8>>,
-    length: usize,
-) -> Result<i64, Error> {
-    if length == 0 {
-        return Ok(0);
-    }
-    let buffer = buffer.ok_or(Errno::EFAULT)?;
-    let words = length.div_ceil(8) as u64;
-    let position = reserve_random_words(words);
-    let mut bytes = vec![0; length];
-    deterministic_random_bytes(configured_rng_seed(), position, &mut bytes);
-    guest.memory().write_exact(buffer, &bytes)?;
-    Ok(length as i64)
-}
-
-/// Fills each `iovec` of a `readv`/`preadv` from a random descriptor with the
-/// deterministic stream, returning the total number of bytes written.
-fn deterministic_random_readv<G: Guest<PrototypeTool>>(
-    guest: &mut G,
-    iov: Option<Addr<'_, libc::iovec>>,
-    iov_count: usize,
-) -> Result<i64, Error> {
-    let iov = iov.ok_or(Errno::EFAULT)?;
-    // Match the kernel's IOV_MAX cap rather than trusting an arbitrary count.
-    const IOV_MAX: usize = 1024;
-    if iov_count > IOV_MAX {
-        return Err(Errno::EINVAL.into());
-    }
-    let mut vectors = vec![unsafe { std::mem::zeroed::<libc::iovec>() }; iov_count];
-    guest.memory().read_values(iov, &mut vectors)?;
-    let mut total: usize = 0;
-    for vector in &vectors {
-        if vector.iov_len == 0 {
-            continue;
-        }
-        let base = AddrMut::<u8>::from_raw(vector.iov_base as usize).ok_or(Errno::EFAULT)?;
-        let written = write_deterministic_random(guest, Some(base), vector.iov_len)?;
-        total = total.saturating_add(written as usize);
-    }
-    Ok(total as i64)
-}
-
-fn deterministic_getrandom<G: Guest<PrototypeTool>>(
-    guest: &mut G,
-    call: reverie::syscalls::Getrandom,
-) -> Result<i64, Error> {
-    // GRND_INSECURE is a valid kernel flag; accept it alongside the others.
-    let allowed = (libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE) as usize;
-    if call.flags() & !allowed != 0 {
-        return Err(Errno::EINVAL.into());
-    }
-    write_deterministic_random(guest, call.buf(), call.buflen())
-}
-
-fn deterministic_sysinfo<G: Guest<PrototypeTool>>(
-    guest: &mut G,
-    call: reverie::syscalls::Sysinfo,
-) -> Result<i64, Error> {
-    let destination = call.info().ok_or(Errno::EFAULT)?;
-    let mut info = unsafe { std::mem::zeroed::<libc::sysinfo>() };
-    info.uptime = 1;
-    info.loads = [0; 3];
-    info.totalram = 1024 * 1024 * 1024;
-    info.freeram = 512 * 1024 * 1024;
-    info.procs = 1;
-    info.mem_unit = 1;
-    guest.memory().write_value(destination, &info)?;
-    Ok(0)
 }
 
 #[cfg(any(feature = "prototype-runtime", test))]
@@ -1095,223 +1447,6 @@ fn should_rewrite_syscall(sysnum: i64) -> bool {
         libc::SYS_sysinfo,
     ]
     .contains(&sysnum)
-}
-
-fn set_c_string(destination: &mut [libc::c_char], value: &[u8]) {
-    destination.fill(0);
-    for (destination, source) in destination.iter_mut().zip(value) {
-        *destination = *source as libc::c_char;
-    }
-}
-
-static NEXT_PORT: AtomicU16 = AtomicU16::new(32768);
-
-fn deterministic_port(next: &AtomicU16, requested: u16) -> u16 {
-    if requested == 0 {
-        next.fetch_add(1, Ordering::SeqCst)
-    } else {
-        next.fetch_max(requested.saturating_add(1), Ordering::SeqCst);
-        requested
-    }
-}
-
-fn sockaddr_address<G: Guest<PrototypeTool>>(
-    guest: &G,
-    address: AddrMut<'_, libc::sockaddr>,
-    length: usize,
-) -> Result<Option<(std::net::IpAddr, u16)>, Error> {
-    let memory = guest.memory();
-    if length < std::mem::size_of::<libc::sa_family_t>() {
-        return Ok(None);
-    }
-    let family = memory.read_value(address.cast::<u16>())?;
-    match family as i32 {
-        libc::AF_INET if length >= std::mem::size_of::<libc::sockaddr_in>() => {
-            let address = memory.read_value(address.cast::<libc::sockaddr_in>())?;
-            Ok(Some((
-                std::net::Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()).into(),
-                u16::from_be(address.sin_port),
-            )))
-        }
-        libc::AF_INET6 if length >= std::mem::size_of::<libc::sockaddr_in6>() => {
-            let address = memory.read_value(address.cast::<libc::sockaddr_in6>())?;
-            Ok(Some((
-                std::net::Ipv6Addr::from(address.sin6_addr.s6_addr).into(),
-                u16::from_be(address.sin6_port),
-            )))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn write_sockaddr_port<G: Guest<PrototypeTool>>(
-    guest: &G,
-    address: AddrMut<'_, libc::sockaddr>,
-    length: usize,
-    port: u16,
-) -> Result<(), Error> {
-    if length < 4 {
-        return Ok(());
-    }
-    let port_address = unsafe { address.cast::<u8>().offset(2) }.cast::<u16>();
-    guest.memory().write_value(port_address, &port.to_be())?;
-    Ok(())
-}
-
-async fn socket_address<G: Guest<PrototypeTool>>(
-    guest: &mut G,
-    fd: i32,
-) -> Result<(std::net::IpAddr, u16), Error> {
-    let mut stack = guest.stack().await;
-    let address: AddrMut<'_, libc::sockaddr_storage> = stack.reserve();
-    let length: AddrMut<'_, libc::socklen_t> = stack.reserve();
-    let _guard = stack.commit()?;
-    guest.memory().write_value(
-        length,
-        &(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t),
-    )?;
-    let call = reverie::syscalls::Getsockname::new()
-        .with_fd(fd)
-        .with_usockaddr(Some(address.cast()))
-        .with_usockaddr_len(Some(length));
-    guest.inject(call).await?;
-    sockaddr_address(
-        guest,
-        address.cast(),
-        guest.memory().read_value(length)? as usize,
-    )?
-    .ok_or_else(|| Errno::EINVAL.into())
-}
-
-async fn handle_bind<G: Guest<PrototypeTool>>(
-    guest: &mut G,
-    call: reverie::syscalls::Bind,
-) -> Result<i64, Error> {
-    let Some(address) = call.umyaddr() else {
-        return Ok(guest.inject(call).await?);
-    };
-    let Ok(address_length) = usize::try_from(call.addrlen()) else {
-        return Ok(guest.inject(call).await?);
-    };
-    let family = guest.memory().read_value(address.cast::<u16>())?;
-    if family != libc::AF_INET as u16 && family != libc::AF_INET6 as u16 {
-        return Ok(guest.inject(call).await?);
-    };
-    let Some((_requested_address, requested)) = sockaddr_address(guest, address, address_length)?
-    else {
-        return Ok(guest.inject(call).await?);
-    };
-
-    let guest_port = deterministic_port(&NEXT_PORT, requested);
-    let result = guest.inject(call).await?;
-    if result == 0 && requested == 0 {
-        let (host_address, host_port) = socket_address(guest, call.fd()).await?;
-        bound_ports().insert(
-            call.fd(),
-            BoundPort {
-                address: host_address,
-                guest_port,
-                host_port,
-            },
-        );
-    }
-    Ok(result)
-}
-
-async fn handle_connect<G: Guest<PrototypeTool>>(
-    guest: &mut G,
-    call: reverie::syscalls::Connect,
-) -> Result<i64, Error> {
-    let Some(address) = call.uservaddr() else {
-        return Ok(guest.inject(call).await?);
-    };
-    let Ok(address_length) = usize::try_from(call.addrlen()) else {
-        return Ok(guest.inject(call).await?);
-    };
-    if address_length > std::mem::size_of::<libc::sockaddr_storage>() {
-        return Ok(guest.inject(call).await?);
-    }
-    let Some((destination, guest_port)) = sockaddr_address(guest, address, address_length)? else {
-        return Ok(guest.inject(call).await?);
-    };
-    let host_port = bound_ports()
-        .values()
-        .find(|binding| {
-            binding.guest_port == guest_port
-                && (binding.address == destination
-                    || (binding.address.is_unspecified()
-                        && (destination.is_loopback() || destination.is_unspecified())))
-        })
-        .map(|binding| binding.host_port);
-    let Some(host_port) = host_port else {
-        return Ok(guest.inject(call).await?);
-    };
-
-    let mut stack = guest.stack().await;
-    let translated: AddrMut<'_, libc::sockaddr_storage> = stack.reserve();
-    let _guard = stack.commit()?;
-    let mut bytes = vec![0; address_length];
-    guest
-        .memory()
-        .read_exact(address.cast::<u8>(), &mut bytes)?;
-    guest
-        .memory()
-        .write_exact(translated.cast::<u8>(), &bytes)?;
-    write_sockaddr_port(guest, translated.cast(), address_length, host_port)?;
-    Ok(guest
-        .inject(call.with_uservaddr(Some(translated.cast())))
-        .await?)
-}
-
-async fn handle_getsockname<G: Guest<PrototypeTool>>(
-    guest: &mut G,
-    call: reverie::syscalls::Getsockname,
-) -> Result<i64, Error> {
-    let requested_length = call
-        .usockaddr_len()
-        .map(|length| guest.memory().read_value(length))
-        .transpose()?;
-    let result = guest.inject(call).await?;
-    if result == 0
-        && let (Some(address), Some(length), Some(binding)) = (
-            call.usockaddr(),
-            requested_length,
-            bound_ports().get(&call.fd()).copied(),
-        )
-        && let Some((host_address, host_port)) = sockaddr_address(guest, address, length as usize)?
-        && host_address == binding.address
-        && host_port == binding.host_port
-    {
-        write_sockaddr_port(guest, address, length as usize, binding.guest_port)?;
-    }
-    Ok(result)
-}
-
-async fn handle_getpeername<G: Guest<PrototypeTool>>(
-    guest: &mut G,
-    call: reverie::syscalls::Getpeername,
-) -> Result<i64, Error> {
-    let requested_length = call
-        .usockaddr_len()
-        .map(|length| guest.memory().read_value(length))
-        .transpose()?;
-    let result = guest.inject(call).await?;
-    if result == 0
-        && let (Some(address), Some(length)) = (call.usockaddr(), requested_length)
-        && let Some((host_address, host_port)) = sockaddr_address(guest, address, length as usize)?
-        && let Some(guest_port) = bound_ports()
-            .values()
-            .find(|binding| {
-                binding.host_port == host_port
-                    && (binding.address == host_address
-                        || (binding.address.is_unspecified()
-                            && (host_address.is_loopback() || host_address.is_unspecified())))
-            })
-            .map(|binding| binding.guest_port)
-    {
-        write_sockaddr_port(guest, address, length as usize, guest_port)?;
-    }
-    Ok(result)
 }
 
 /// Drives an async tool handler on the calling guest thread, returning `Some`
@@ -1383,6 +1518,7 @@ pub fn run_tool_thread_start<T: Tool>(
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
 ) -> Result<(), Error> {
+    sync_rpc::prepare_guest(context, invoke_syscall)?;
     let mut guest = DbtGuest::new(
         context,
         tid,
@@ -1396,9 +1532,15 @@ pub fn run_tool_thread_start<T: Tool>(
         read_registers,
         write_registers,
     );
+    #[cfg(feature = "prototype-runtime")]
+    branch_facts::observe_test_bridge(&guest, "tool-thread-start", -1);
     let tail_result = Arc::clone(&guest.tail_inject_result);
-    run_ready(tool.handle_thread_start(&mut guest), &tail_result)
-        .expect("thread-start handler unexpectedly tail-injected")
+    let result = run_ready(tool.handle_thread_start(&mut guest), &tail_result)
+        .expect("thread-start handler unexpectedly tail-injected");
+    if result.is_ok() {
+        acknowledge_tool_admission(context);
+    }
+    result
 }
 
 /// Drives an external tool's post-exec lifecycle hook on a DBT guest.
@@ -1596,6 +1738,10 @@ fn run_tool_syscall_inner<T: Tool>(
     write_registers: RegisterWriter,
     read_memory: Option<MemoryReader>,
 ) -> Result<DbtSyscallOutcome, Error> {
+    sync_rpc::prepare_guest(context, invoke_syscall)?;
+    if let Some(result) = protect_tool_syscall(context, invoke_syscall, syscall, true) {
+        return Ok(DbtSyscallOutcome::Suppress(result));
+    }
     let mut guest = DbtGuest::new(
         context,
         tid,
@@ -1612,6 +1758,8 @@ fn run_tool_syscall_inner<T: Tool>(
     if let Some(read_memory) = read_memory {
         guest = guest.with_memory_reader(read_memory);
     }
+    #[cfg(feature = "prototype-runtime")]
+    branch_facts::observe_test_bridge(&guest, "tool-syscall", syscall.number().id() as i64);
     let tail_result = Arc::clone(&guest.tail_inject_result);
     tail_result.clear();
     match run_ready(tool.handle_syscall_event(&mut guest, syscall), &tail_result) {
@@ -1620,8 +1768,111 @@ fn run_tool_syscall_inner<T: Tool>(
             .take()
             .expect("tool handler suspended without a tail-inject result")
         {
+            TailInjectAction::ExecuteOriginal(syscall) => Ok(
+                match protect_tool_syscall(context, invoke_syscall, syscall, false) {
+                    Some(result) => DbtSyscallOutcome::Suppress(result),
+                    None => DbtSyscallOutcome::ExecuteOriginal(syscall),
+                },
+            ),
+        },
+    }
+}
+
+fn protect_tool_syscall(
+    context: usize,
+    invoke_syscall: SyscallInvoker,
+    syscall: Syscall,
+    before_tool: bool,
+) -> Option<i64> {
+    let (number, args) = syscall.into_parts();
+    sync_rpc::protect_guest_operation(
+        context,
+        invoke_syscall,
+        number.id() as i64,
+        &[
+            args.arg0 as u64,
+            args.arg1 as u64,
+            args.arg2 as u64,
+            args.arg3 as u64,
+            args.arg4 as u64,
+            args.arg5 as u64,
+        ],
+        before_tool,
+    )
+}
+
+/// Drives the shared Tool signal hook from an exclusively owned native continuation.
+///
+/// The native caller must retain the authentic delivery frame and both interrupted
+/// contexts until this returns. Register callbacks operate on that saved application
+/// state, never on the private continuation's registers. No frame or mask is
+/// committed here. In particular, suppression does not restart an interrupted syscall.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_signal_with_memory_reader<T: Tool>(
+    tool: &T,
+    context: usize,
+    tid: Pid,
+    pid: Pid,
+    branch_count: u64,
+    thread_state: &mut T::ThreadState,
+    global_state: &T::GlobalState,
+    config: &<T::GlobalState as GlobalTool>::Config,
+    event: &mut DbtSignalEvent,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    read_memory: MemoryReader,
+) -> Result<DbtSignalOutcome, Error> {
+    sync_rpc::prepare_guest(context, invoke_syscall)?;
+    let signal = Signal::try_from(event.signal).map_err(|_| Errno::EINVAL)?;
+    if event.reserved != 0
+        || i32::from_ne_bytes(event.signal_info[..4].try_into().unwrap()) != event.signal
+    {
+        return Err(Errno::EINVAL.into());
+    }
+    event.signal_info_changed = 0;
+    event.delivered_signal = event.signal;
+    let mut guest = DbtGuest::new(
+        context,
+        tid,
+        pid,
+        current_ppid(),
+        branch_count,
+        thread_state,
+        global_state,
+        config,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    )
+    .with_memory_reader(read_memory);
+    guest.signal_info = Some(event.signal_info);
+    let tail_result = Arc::clone(&guest.tail_inject_result);
+    let result = run_ready(tool.handle_signal_event(&mut guest, signal), &tail_result);
+    match result {
+        Some(Ok(Some(delivered))) => {
+            if delivered != signal {
+                return Err(std::io::Error::other(UnsupportedSignalTransformation {
+                    reported: signal,
+                    requested: delivered,
+                })
+                .into());
+            }
+            event.delivered_signal = delivered as i32;
+            if let Some(replacement) = guest.signal_info_replacement {
+                event.signal_info = replacement;
+                event.signal_info_changed = 1;
+            }
+            Ok(DbtSignalOutcome::Deliver(delivered))
+        }
+        Some(Ok(None)) => Ok(DbtSignalOutcome::Suppress),
+        Some(Err(errno)) => Err(errno.into()),
+        None => match tail_result
+            .take()
+            .expect("signal hook suspended without a tail-inject result")
+        {
             TailInjectAction::ExecuteOriginal(syscall) => {
-                Ok(DbtSyscallOutcome::ExecuteOriginal(syscall))
+                Ok(DbtSignalOutcome::ExecuteOriginal(syscall))
             }
         },
     }
@@ -1690,12 +1941,15 @@ static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "prototype-runtime")]
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "prototype-runtime")]
+static READY_IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "prototype-runtime")]
 static PROCESS_CLONE_RESULT_PROBE: AtomicBool = AtomicBool::new(false);
 
 /// Begins a new DynamoRIO application image and returns its generation.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
+    READY_IMAGE_GENERATION.store(0, Ordering::Release);
     IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
@@ -1912,6 +2166,69 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
     unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
 }
 
+/// Drives the prototype Tool's signal hook from the owned native continuation.
+///
+/// # Safety
+/// All pointers/callbacks must remain valid for this call and `counters` must be
+/// exclusively owned by this thread. No Rust borrow may survive the return.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
+    context: *mut c_void,
+    counters: *mut c_void,
+    tid: i32,
+    pid: i32,
+    _image_generation: u64,
+    branches: u64,
+    event: *mut DbtSignalEvent,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    read_memory: MemoryReader,
+    _write_memory: MemoryWriter,
+    emit: RuntimeEmitter,
+) -> i32 {
+    if context.is_null() || counters.is_null() || event.is_null() {
+        return -1;
+    }
+    let event = unsafe { &mut *event };
+    tools::set_emitter(emit);
+    let result = run_tool_signal_with_memory_reader(
+        &PROTOTYPE_TOOL,
+        context as usize,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
+        branches,
+        unsafe { &mut *counters.cast::<PrototypeCounters>() },
+        &GLOBAL_STATE,
+        &CONFIG,
+        event,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+        read_memory,
+    );
+    match result {
+        Ok(DbtSignalOutcome::Deliver(_)) => 0,
+        Ok(DbtSignalOutcome::Suppress) => 1,
+        Ok(DbtSignalOutcome::ExecuteOriginal(syscall)) => {
+            unsafe {
+                write_deferred_syscall(
+                    syscall,
+                    &mut event.deferred_sysnum,
+                    event.deferred_args.as_mut_ptr(),
+                )
+            };
+            2
+        }
+        Err(error) => {
+            tools::emit_line(&format!("reverie-dbt: signal admission failed: {error}"));
+            -1
+        }
+    }
+}
+
 /// Handles a DynamoRIO pre-syscall event.
 ///
 /// Returning one asks the native client to suppress the original syscall and
@@ -1962,55 +2279,65 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         TOTAL_SYSCALLS.fetch_add(1, Ordering::Relaxed);
         tools::set_emitter(emit);
 
-        let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+        // Preparation is a runtime prerequisite, not a guest syscall error.
+        // Do this before any Tool mapping that converts its own error to EIO.
+        if let Err(error) = sync_rpc::prepare_guest(context as usize, invoke_syscall) {
+            tools::emit_line(&format!(
+                "reverie-dbt: application RPC preparation refused: {error}"
+            ));
+            return -1;
+        }
 
+        let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+        if let Some(value) = sync_rpc::protect_guest_operation(
+            context as usize,
+            invoke_syscall,
+            sysnum,
+            unsafe { &*args.cast::<[u64; 6]>() },
+            true,
+        ) {
+            unsafe { result.write(value) };
+            return 1;
+        }
+
+        if tools::recorder_enabled() {
+            return unsafe {
+                pre_syscall_with_unit_tool(
+                    tools::recorder_tool(),
+                    tools::recorder_global(),
+                    context,
+                    tid,
+                    pid,
+                    sysnum,
+                    raw_args,
+                    branches,
+                    result,
+                    deferred_sysnum,
+                    deferred_args,
+                    invoke_syscall,
+                    read_registers,
+                    write_registers,
+                )
+            };
+        }
         if tools::counter1_exact_enabled() {
-            let syscall = Syscall::from_raw(
-                Sysno::from(sysnum as i32),
-                SyscallArgs::new(
-                    raw_args[0] as usize,
-                    raw_args[1] as usize,
-                    raw_args[2] as usize,
-                    raw_args[3] as usize,
-                    raw_args[4] as usize,
-                    raw_args[5] as usize,
-                ),
-            );
-            let mut thread_state = ();
-            let outcome = run_tool_syscall(
-                tools::counter1_exact_tool(),
-                context as usize,
-                Pid::from_raw(tid),
-                Pid::from_raw(pid),
-                branches,
-                &mut thread_state,
-                tools::counter1_exact_global(),
-                &(),
-                syscall,
-                invoke_syscall,
-                read_registers,
-                write_registers,
-            );
-            return match outcome {
-                Ok(DbtSyscallOutcome::ExecuteOriginal(syscall)) => {
-                    unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
-                    2
-                }
-                Ok(DbtSyscallOutcome::Suppress(value)) => {
-                    unsafe { result.write(value) };
-                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-                    1
-                }
-                Err(Error::Errno(errno)) => {
-                    unsafe { result.write(-(errno.into_raw() as i64)) };
-                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-                    1
-                }
-                Err(_) => {
-                    unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
-                    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-                    1
-                }
+            return unsafe {
+                pre_syscall_with_unit_tool(
+                    tools::counter1_exact_tool(),
+                    tools::counter1_exact_global(),
+                    context,
+                    tid,
+                    pid,
+                    sysnum,
+                    raw_args,
+                    branches,
+                    result,
+                    deferred_sysnum,
+                    deferred_args,
+                    invoke_syscall,
+                    read_registers,
+                    write_registers,
+                )
             };
         }
 
@@ -2145,10 +2472,32 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 
     // `catch_unwind` cannot actually catch under DR; a genuine panic aborts
     // before reaching here. An error means "leave the syscall unchanged".
-    handled.unwrap_or_default()
+    let action = handled.unwrap_or_default();
+    // Cover the prototype's unhandled/original route too. Tool paths leave
+    // close/close_range accounting to their handler and protect forwarding.
+    if matches!(action, 0 | 2) {
+        let (number, arguments) = if action == 0 {
+            (sysnum, unsafe { &*args.cast::<[u64; 6]>() })
+        } else {
+            (unsafe { deferred_sysnum.read() }, unsafe {
+                &*deferred_args.cast::<[u64; 6]>()
+            })
+        };
+        if let Some(value) = sync_rpc::protect_guest_operation(
+            context as usize,
+            invoke_syscall,
+            number,
+            arguments,
+            false,
+        ) {
+            unsafe { result.write(value) };
+            return 1;
+        }
+    }
+    action
 }
 
-/// Initializes the built-in prototype runtime on a native client thread.
+/// Initializes the built-in prototype runtime through the admitted startup bridge.
 ///
 /// The `argument` is a `*const DbtRuntimeCallbacks` (the native
 /// `runtime_callbacks_t`). It records the re-entrancy-safe stdout emitter. The
@@ -2158,26 +2507,88 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 ///
 /// # Safety
 ///
-/// `argument` must point to a valid `DbtRuntimeCallbacks` for the call.
+/// `argument` must be null or point to a valid `DbtRuntimeCallbacks` for the call.
+/// `native_mode` must be the initialized native state admitted by ABI version 6.
+/// A nonzero result requires the native owner's existing tree-failure path.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-162): Review the stdout-emitter init delivery.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
-    if !argument.is_null() {
-        let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
-        tools::set_stdout_emitter(callbacks.emit_stdout);
-        PROCESS_CLONE_RESULT_PROBE.store(
-            std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
-            Ordering::Release,
-        );
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
+    argument: *mut c_void,
+    native_mode: u32,
+) -> i32 {
+    if argument.is_null() {
+        return 1;
     }
+    let generation = IMAGE_GENERATION.load(Ordering::Acquire);
+    let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
+    let control = std::env::var_os(sync_rpc::RPC_SOCKET_ENV);
+    if let Err(error) = prototype_initial_config(native_mode, control.as_deref()) {
+        let message = format!("reverie-dbt: startup refused: {error}\n");
+        unsafe { (callbacks.emit)(message.as_ptr(), message.len()) };
+        return 1;
+    }
+    tools::set_stdout_emitter(callbacks.emit_stdout);
+    install_guest_compare_exchange(callbacks.compare_exchange_u32);
+    install_controller_capture_control(callbacks.controller_capture_control);
+    install_runtime_private_memory(callbacks.runtime_private_memory);
+    install_branch_fact_query(callbacks.branch_fact);
+    install_mapping_capture(callbacks.mapping_capture);
+    PROCESS_CLONE_RESULT_PROBE.store(
+        std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
+        Ordering::Release,
+    );
+    // The helper's DynamoRIO bootstrap (including temporary maps FDs) has
+    // finished before this callback. Config receipt retired its own socket.
+    // Only this prototype publishes here; Detcore owns its distinct READY
+    // boundary while its background scheduler remains active.
+    READY_IMAGE_GENERATION.store(generation, Ordering::Release);
+    0
+}
+
+#[cfg(feature = "prototype-runtime")]
+fn prototype_initial_config(
+    native_mode: u32,
+    control: Option<&std::ffi::OsStr>,
+) -> Result<(), String> {
+    let mode = DbtStartupMode::try_from(native_mode).map_err(|error| error.to_string())?;
+    match control {
+        Some(path) => {
+            sync_rpc::read_initial_config::<()>(Path::new(path)).map_err(|error| error.to_string())
+        }
+        None if mode == DbtStartupMode::Coordinated => {
+            Err("coordinated startup requires a coordinator socket".into())
+        }
+        None => Ok(()),
+    }
+}
+
+/// Retained version-2 symbol, unadmitted without native mode and startup status.
+///
+/// Direct no-mode calls fatally refuse before prototype state initialization.
+/// This process-local refusal does not certify cleanup of a DynamoRIO tree.
+///
+/// # Safety
+///
+/// `argument` must be null or point to a valid `DbtRuntimeCallbacks` for the call.
+#[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
+    let emitter = if argument.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(argument as *const DbtRuntimeCallbacks) }.emit)
+    };
+    refuse_legacy_background_init(emitter);
 }
 
 /// Compatibility entry point for native clients using ABI version 1.
 ///
 /// The version-1 callback structure ends after `emit_stdout`; this function
 /// must not read the protected-evidence fields added by ABI version 2.
+/// It retains that layout but fatally refuses initialization without mode and
+/// status. This is a process-local refusal, not proof of native tree cleanup.
 ///
 /// # Safety
 ///
@@ -2185,13 +2596,103 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
-    if !argument.is_null() {
-        let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacksV1) };
-        tools::set_stdout_emitter(callbacks.emit_stdout);
+    let emitter = if argument.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(argument as *const DbtRuntimeCallbacksV1) }.emit)
+    };
+    refuse_legacy_background_init(emitter);
+}
+
+#[cfg(feature = "prototype-runtime")]
+fn refuse_legacy_background_init(emitter: Option<RuntimeEmitter>) -> ! {
+    if let Some(emit) = emitter {
+        let message = b"reverie-dbt: initialization requires the ABI-6 native mode/status bridge\n";
+        unsafe { emit(message.as_ptr(), message.len()) };
     }
+    std::process::abort()
 }
 
 // TODO-HUMAN-REVIEW(PR-66): Confirm process-exit callback ownership semantics.
+/// One syscall through a hosted tool whose thread state is `()` (counter1,
+/// the recorder): the dispatch `reverie_dbt_runtime_pre_syscall` returns, as
+/// that function documents its result.
+///
+/// # Safety
+///
+/// The pointers are `reverie_dbt_runtime_pre_syscall`'s, valid for this call.
+#[cfg(feature = "prototype-runtime")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pre_syscall_with_unit_tool<T>(
+    tool: &T,
+    global: &T::GlobalState,
+    context: *mut c_void,
+    tid: i32,
+    pid: i32,
+    sysnum: i64,
+    raw_args: &[u64],
+    branches: u64,
+    result: *mut i64,
+    deferred_sysnum: *mut i64,
+    deferred_args: *mut u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) -> i32
+where
+    T: Tool<ThreadState = ()>,
+    <T::GlobalState as GlobalTool>::Config: Default,
+{
+    let syscall = Syscall::from_raw(
+        Sysno::from(sysnum as i32),
+        SyscallArgs::new(
+            raw_args[0] as usize,
+            raw_args[1] as usize,
+            raw_args[2] as usize,
+            raw_args[3] as usize,
+            raw_args[4] as usize,
+            raw_args[5] as usize,
+        ),
+    );
+    let mut thread_state = ();
+    let config = Default::default();
+    let outcome = run_tool_syscall(
+        tool,
+        context as usize,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
+        branches,
+        &mut thread_state,
+        global,
+        &config,
+        syscall,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    match outcome {
+        Ok(DbtSyscallOutcome::ExecuteOriginal(syscall)) => {
+            unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
+            2
+        }
+        Ok(DbtSyscallOutcome::Suppress(value)) => {
+            unsafe { result.write(value) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            1
+        }
+        Err(Error::Errno(errno)) => {
+            unsafe { result.write(-(errno.into_raw() as i64)) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            1
+        }
+        Err(_) => {
+            unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            1
+        }
+    }
+}
+
 /// Handles process exit for the built-in synchronous prototype runtime.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
@@ -2215,15 +2716,19 @@ pub extern "C" fn reverie_dbt_runtime_process_exit() {
 /// Reports whether the built-in prototype runtime is ready for callbacks.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbt_runtime_ready(_image_generation: u64) -> i32 {
-    1
+pub extern "C" fn reverie_dbt_runtime_ready(image_generation: u64) -> i32 {
+    i32::from(
+        image_generation != 0 && READY_IMAGE_GENERATION.load(Ordering::Acquire) == image_generation,
+    )
 }
 
 /// Returns the name of the built-in DBT runtime for native summary evidence.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbt_runtime_name() -> *const libc::c_char {
-    if tools::counter1_exact_enabled() {
+    if tools::recorder_enabled() {
+        c"Recorder".as_ptr()
+    } else if tools::counter1_exact_enabled() {
         c"Counter1".as_ptr()
     } else if tools::counter2_exact_enabled() {
         c"CounterLocal".as_ptr()
@@ -2282,13 +2787,552 @@ pub unsafe extern "C" fn reverie_dbt_runtime_totals(
 mod tests {
     use super::*;
 
-    const PORT_TEST_CHILD: &str = "REVERIE_DBT_PORT_TEST_CHILD";
-    const PORT_TEST_ADDRESS: &str = "REVERIE_DBT_PORT_TEST_ADDRESS";
-    const PORT_TEST_READY: &str = "REVERIE_DBT_PORT_TEST_READY";
-    const PORT_TEST_RELEASE: &str = "REVERIE_DBT_PORT_TEST_RELEASE";
+    /// A word of `stack`, as if it started at address 0x1000.
+    fn word_of(stack: &[u64]) -> impl Fn(u64) -> Option<u64> + '_ {
+        |address| {
+            let offset = address.checked_sub(0x1000)?;
+            (offset % 8 == 0)
+                .then(|| stack.get((offset / 8) as usize).copied())
+                .flatten()
+        }
+    }
 
-    /// Serializes tests that mutate the process-global `RANDOM_FDS` set.
-    static RANDOM_FD_TEST_LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn the_auxv_follows_the_arguments_and_the_environment() {
+        let stack = [
+            2,
+            0xa0,
+            0xa8,
+            0, // argc, argv, null
+            0xb0,
+            0xb8,
+            0xc0,
+            0, // envp, null
+            libc::AT_PAGESZ,
+            4096,
+            libc::AT_EXECFN,
+            0xd0,
+            libc::AT_NULL,
+            0,
+        ];
+        let auxv = auxv_after_initial_stack(0x1000, word_of(&stack)).expect("a vector");
+        assert_eq!(auxv.len(), 2);
+        assert_eq!(auxv.at_execfn().map(|address| address.as_raw()), Some(0xd0));
+
+        let empty_environment = [0, 0, 0, libc::AT_EXECFN, 0xd0, libc::AT_NULL, 0];
+        let auxv = auxv_after_initial_stack(0x1000, word_of(&empty_environment)).expect("a vector");
+        assert_eq!(auxv.at_execfn().map(|address| address.as_raw()), Some(0xd0));
+    }
+
+    #[test]
+    fn a_stack_that_cannot_be_walked_whole_gives_no_auxv() {
+        // argv's terminator is not null.
+        let unterminated = [1, 0xa0, 0xa8, 0, 0, libc::AT_NULL, 0];
+        assert!(auxv_after_initial_stack(0x1000, word_of(&unterminated)).is_none());
+        // The stack ends before AT_NULL.
+        let cut = [0, 0, 0, libc::AT_EXECFN, 0xd0];
+        assert!(auxv_after_initial_stack(0x1000, word_of(&cut)).is_none());
+        assert!(auxv_after_initial_stack(0, word_of(&cut)).is_none());
+    }
+
+    /// `pairs` as `/proc/<pid>/auxv` bytes.
+    fn auxv_bytes(pairs: &[(u64, u64)]) -> Vec<u8> {
+        pairs
+            .iter()
+            .flat_map(|(key, value)| [key.to_ne_bytes(), value.to_ne_bytes()])
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn the_kernels_auxv_is_read_up_to_its_terminating_pair() {
+        let auxv = auxv_from_kernel_bytes(&auxv_bytes(&[
+            (libc::AT_PAGESZ, 4096),
+            (libc::AT_EXECFN, 0xd0),
+            (0, 0),
+        ]))
+        .expect("a whole, terminated vector");
+        assert_eq!(auxv.len(), 2);
+        assert_eq!(auxv.at_execfn().map(|address| address.as_raw()), Some(0xd0));
+    }
+
+    #[test]
+    fn an_incomplete_kernel_auxv_is_refused() {
+        assert!(auxv_from_kernel_bytes(b"").is_none(), "empty");
+        let whole = auxv_bytes(&[(libc::AT_PAGESZ, 4096), (libc::AT_EXECFN, 0xd0)]);
+        assert!(
+            auxv_from_kernel_bytes(&whole).is_none(),
+            "whole pairs without the terminating pair"
+        );
+        let mut partial = whole.clone();
+        partial.extend_from_slice(&0_u64.to_ne_bytes());
+        assert!(
+            auxv_from_kernel_bytes(&partial).is_none(),
+            "a partial pair where the terminating pair should be"
+        );
+        let cut_entry = &whole[..whole.len() - 3];
+        assert!(
+            auxv_from_kernel_bytes(cut_entry).is_none(),
+            "an entry cut inside its value"
+        );
+    }
+
+    #[test]
+    fn this_processs_initial_stack_holds_the_kernels_auxv() {
+        // Natively, the vector on the initial stack is the one the kernel
+        // saved; nothing has rewritten either.
+        let auxv = application_auxv(None).expect("this process's vector");
+        let kernel = kernel_auxv().expect("the kernel's vector");
+        assert_eq!(auxv.len(), kernel.len());
+        assert_eq!(
+            auxv.at_execfn().map(|address| address.as_raw()),
+            kernel.at_execfn().map(|address| address.as_raw())
+        );
+        assert_eq!(
+            auxv.at_random().map(|address| address.as_raw()),
+            kernel.at_random().map(|address| address.as_raw())
+        );
+        assert_eq!(
+            auxv.at_execfn().map(|address| address.as_raw()),
+            Some(unsafe { libc::getauxval(libc::AT_EXECFN) } as usize)
+        );
+    }
+
+    impl AsMut<PrototypeTool> for PrototypeTool {
+        fn as_mut(&mut self) -> &mut PrototypeTool {
+            self
+        }
+    }
+    impl AsRef<PrototypeCounters> for PrototypeCounters {
+        fn as_ref(&self) -> &PrototypeCounters {
+            self
+        }
+    }
+    impl AsMut<PrototypeCounters> for PrototypeCounters {
+        fn as_mut(&mut self) -> &mut PrototypeCounters {
+            self
+        }
+    }
+
+    unsafe extern "C" fn private_memory_probe(
+        _context: usize,
+        expected: *const NativePrivateMemorySnapshot,
+        out: *mut NativePrivateMemorySnapshot,
+    ) -> i32 {
+        let ready = NativePrivateMemorySnapshot {
+            owner: [10, 20, 3, 1],
+            version: 7,
+            state: 1,
+            count: 1,
+            ranges: [
+                [0x1000, 0x3000],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+            ],
+        };
+        // SAFETY: this test obeys the fixed callback storage contract.
+        unsafe {
+            out.write(Default::default());
+            if !expected.is_null()
+                && ((*expected).owner != ready.owner || (*expected).version != ready.version)
+            {
+                return 0;
+            }
+            out.write(ready);
+        }
+        1
+    }
+
+    #[test]
+    fn private_memory_adapter_forwards_and_rejects_stale_target_facts() {
+        let mut counters = PrototypeCounters::default();
+        let mut guest: DbtGuest<'_, PrototypeTool> = DbtGuest::new(
+            0,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            read_regs,
+            write_regs_noop,
+        );
+        guest.runtime_private_memory = None;
+        assert_eq!(
+            guest.runtime_private_memory_regions(),
+            Some(reverie::RuntimePrivateMemory::Unavailable)
+        );
+        guest.runtime_private_memory = Some(private_memory_probe);
+        let Some(reverie::RuntimePrivateMemory::Ready(facts)) =
+            guest.runtime_private_memory_regions()
+        else {
+            panic!("ready provider")
+        };
+        let wrapped = guest.into_guest();
+        assert_eq!(
+            <_ as Guest<PrototypeTool>>::runtime_private_memory_regions(&wrapped),
+            Some(reverie::RuntimePrivateMemory::Ready(facts.clone())),
+        );
+        assert!(<_ as Guest<PrototypeTool>>::runtime_private_memory_is_current(&wrapped, &facts));
+        let mut stale = facts.clone();
+        stale.version += 1;
+        assert!(!<_ as Guest<PrototypeTool>>::runtime_private_memory_is_current(&wrapped, &stale));
+        stale = facts;
+        stale.owner[2] += 1;
+        assert!(!<_ as Guest<PrototypeTool>>::runtime_private_memory_is_current(&wrapped, &stale));
+    }
+
+    #[test]
+    fn private_memory_native_records_reject_invalid_intervals() {
+        let ready = NativePrivateMemorySnapshot {
+            owner: [1, 2, 3, 4],
+            version: 1,
+            state: 1,
+            count: 2,
+            ranges: [
+                [0x1000, 0x2000],
+                [0x3000, 0x4000],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+            ],
+        };
+        assert!(decode_private_memory(ready).is_some());
+        let mut full = ready;
+        full.count = 8;
+        for (i, range) in full.ranges.iter_mut().enumerate() {
+            *range = [0x1000 + i as u64 * 0x2000, 0x2000 + i as u64 * 0x2000];
+        }
+        assert_eq!(decode_private_memory(full).unwrap().regions.len(), 8);
+        let mut unused = ready;
+        unused.ranges[7] = [0x9000, 0xa000];
+        for bad in [
+            unused,
+            NativePrivateMemorySnapshot { state: 0, ..ready },
+            NativePrivateMemorySnapshot { count: 0, ..ready },
+            NativePrivateMemorySnapshot { count: 9, ..ready },
+            NativePrivateMemorySnapshot {
+                version: 0,
+                ..ready
+            },
+            NativePrivateMemorySnapshot {
+                ranges: [
+                    [2, 1],
+                    [3, 4],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+                ..ready
+            },
+            NativePrivateMemorySnapshot {
+                ranges: [
+                    [1, 3],
+                    [2, 4],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+                ..ready
+            },
+        ] {
+            assert!(decode_private_memory(bad).is_none());
+        }
+    }
+
+    #[derive(Default)]
+    struct SignalProbe(u8);
+
+    #[reverie::tool]
+    impl Tool for SignalProbe {
+        type GlobalState = ();
+        type ThreadState = u32;
+
+        async fn handle_signal_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            signal: Signal,
+        ) -> Result<Option<Signal>, Errno> {
+            assert_eq!(signal, Signal::SIGCHLD);
+            let original = guest.signal_info().expect("owned authentic payload");
+            assert_eq!(original[24], 0x91);
+            // Exercise the actual async Tool driver, including a suspended poll.
+            let mut first = true;
+            std::future::poll_fn(|cx| {
+                if first {
+                    first = false;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
+            *guest.thread_state_mut() += 1;
+            let mut replacement = original;
+            replacement[24] = 0x72;
+            guest.set_signal_info(replacement)?;
+            replacement[..4].copy_from_slice(&(Signal::SIGUSR1 as i32).to_ne_bytes());
+            assert_eq!(guest.set_signal_info(replacement), Err(Errno::EINVAL));
+            assert_eq!(guest.signal_info().unwrap()[24], 0x72);
+            match self.0 {
+                0 => Ok(Some(signal)),
+                1 => Ok(None),
+                2 => Ok(Some(Signal::SIGUSR1)),
+                3 => Err(Errno::EIO),
+                4 => {
+                    guest
+                        .tail_inject(reverie::syscalls::Exit::new().with_status(31))
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn signal_event() -> DbtSignalEvent {
+        let mut info = [0u8; reverie::SIGNAL_INFO_SIZE];
+        info[..4].copy_from_slice(&(Signal::SIGCHLD as i32).to_ne_bytes());
+        info[24] = 0x91;
+        DbtSignalEvent {
+            signal: Signal::SIGCHLD as i32,
+            delivered_signal: 0,
+            signal_info: info,
+            signal_info_changed: 0,
+            reserved: 0,
+            deferred_sysnum: 0,
+            deferred_args: [0; 6],
+        }
+    }
+
+    fn probe_signal(mode: u8, event: &mut DbtSignalEvent) -> Result<DbtSignalOutcome, Error> {
+        unsafe extern "C" fn no_read(_: usize, _: *mut u8, _: usize) -> i32 {
+            panic!("signal probe must not inspect unrelated memory")
+        }
+        let mut entries = 0;
+        let result = run_tool_signal_with_memory_reader(
+            &SignalProbe(mode),
+            0,
+            Pid::from_raw(3),
+            Pid::from_raw(3),
+            41,
+            &mut entries,
+            &(),
+            &(),
+            event,
+            invoke,
+            read_regs,
+            write_regs_noop,
+            no_read,
+        );
+        assert_eq!(entries, 1);
+        result
+    }
+
+    #[test]
+    fn signal_admission_drives_real_tool_and_preserves_selected_siginfo() {
+        let mut event = signal_event();
+        assert_eq!(
+            probe_signal(0, &mut event).unwrap(),
+            DbtSignalOutcome::Deliver(Signal::SIGCHLD)
+        );
+        assert_eq!(event.signal_info_changed, 1);
+        assert_eq!(event.signal_info[24], 0x72);
+        assert_eq!(event.delivered_signal, Signal::SIGCHLD as i32);
+    }
+
+    #[test]
+    fn signal_admission_suppression_does_not_commit_a_replacement() {
+        let mut event = signal_event();
+        assert_eq!(
+            probe_signal(1, &mut event).unwrap(),
+            DbtSignalOutcome::Suppress
+        );
+        assert_eq!(event.signal_info_changed, 0);
+        assert_eq!(event.signal_info[24], 0x91);
+    }
+
+    #[test]
+    fn signal_admission_refuses_transformation_without_fabricating_siginfo() {
+        let mut event = signal_event();
+        let error = probe_signal(2, &mut event).unwrap_err();
+        let Error::Io(error) = error else {
+            panic!("expected typed transformation refusal")
+        };
+        let refusal = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<UnsupportedSignalTransformation>()
+            .unwrap();
+        assert_eq!(refusal.reported, Signal::SIGCHLD);
+        assert_eq!(refusal.requested, Signal::SIGUSR1);
+        assert_eq!(event.signal_info_changed, 0);
+    }
+
+    #[test]
+    fn signal_admission_preserves_error_and_terminal_tail_injection() {
+        assert!(matches!(
+            probe_signal(3, &mut signal_event()),
+            Err(Error::Errno(Errno::EIO))
+        ));
+        assert_eq!(
+            probe_signal(4, &mut signal_event()).unwrap(),
+            DbtSignalOutcome::ExecuteOriginal(
+                reverie::syscalls::Exit::new().with_status(31).into()
+            )
+        );
+    }
+
+    /// Stands in for the native client's `runtime_compare_exchange_u32`.
+    unsafe extern "C" fn fake_compare_exchange(
+        address: usize,
+        expected: u32,
+        desired: u32,
+        observed: *mut u32,
+    ) -> i32 {
+        if !address.is_multiple_of(4) {
+            return -libc::EINVAL;
+        }
+        if address == 4 {
+            return -libc::EFAULT;
+        }
+        let word = unsafe { &*(address as *const std::sync::atomic::AtomicU32) };
+        let value =
+            match word.compare_exchange(expected, desired, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(value) | Err(value) => value,
+            };
+        unsafe { *observed = value };
+        0
+    }
+
+    #[test]
+    fn dbt_memory_compare_exchange_reports_the_native_result() {
+        let word = std::sync::atomic::AtomicU32::new(7);
+        let address = AddrMut::from_ptr(word.as_ptr()).unwrap();
+        let mut memory = DbtMemory {
+            local: LocalMemory::new(),
+            compare_exchange: Some(fake_compare_exchange),
+        };
+        assert_eq!(memory.compare_exchange_u32(address, 7, 9), Ok(7));
+        assert_eq!(word.load(Ordering::SeqCst), 9);
+        assert_eq!(memory.compare_exchange_u32(address, 7, 11), Ok(9));
+        assert_eq!(word.load(Ordering::SeqCst), 9);
+        let misaligned = AddrMut::from_raw(word.as_ptr() as usize + 1).unwrap();
+        assert_eq!(
+            memory.compare_exchange_u32(misaligned, 9, 1),
+            Err(Errno::EINVAL)
+        );
+        let faulting = AddrMut::from_raw(4).unwrap();
+        assert_eq!(
+            memory.compare_exchange_u32(faulting, 9, 1),
+            Err(Errno::EFAULT)
+        );
+    }
+
+    #[test]
+    fn dbt_memory_without_a_native_compare_exchange_is_unsupported() {
+        let word = std::sync::atomic::AtomicU32::new(7);
+        let address = AddrMut::from_ptr(word.as_ptr()).unwrap();
+        let mut memory = DbtMemory {
+            local: LocalMemory::new(),
+            compare_exchange: None,
+        };
+        assert_eq!(
+            memory.compare_exchange_u32(address, 7, 9),
+            Err(Errno::ENOSYS)
+        );
+        assert_eq!(word.load(Ordering::SeqCst), 7);
+    }
+
+    #[test]
+    fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
+        assert_eq!(reverie_dbt_runtime_abi_version(), 15);
+        assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
+        assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
+        assert_eq!(reverie_dbt_runtime_callbacks_size(), 88);
+        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 88);
+        assert_eq!(std::mem::offset_of!(DbtRuntimeCallbacks, branch_fact), 72);
+        assert_eq!(std::mem::size_of::<NativeBranchFact>(), 48);
+        assert_eq!(
+            std::mem::offset_of!(DbtRuntimeCallbacks, controller_capture_control),
+            56
+        );
+        assert_eq!(
+            std::mem::offset_of!(DbtRuntimeCallbacks, runtime_private_memory),
+            64
+        );
+        assert_eq!(std::mem::size_of::<NativeControllerCaptureFact>(), 24);
+        assert_eq!(std::mem::size_of::<NativePrivateMemorySnapshot>(), 176);
+        assert_eq!(
+            DbtStartupMode::try_from(1).unwrap(),
+            DbtStartupMode::Standalone
+        );
+        assert_eq!(
+            DbtStartupMode::try_from(2).unwrap(),
+            DbtStartupMode::Coordinated
+        );
+        for unknown in [0, 3, u32::MAX] {
+            assert!(DbtStartupMode::try_from(unknown).is_err());
+        }
+        #[cfg(feature = "prototype-runtime")]
+        assert_ne!(
+            unsafe { reverie_dbt_runtime_background_init_v3(std::ptr::null_mut(), 1) },
+            0
+        );
+    }
+
+    #[cfg(feature = "prototype-runtime")]
+    #[test]
+    fn prototype_startup_preserves_positive_control_and_refuses_missing_authority() {
+        use std::io::Read as _;
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+
+        assert!(prototype_initial_config(1, None).is_ok());
+        assert!(prototype_initial_config(2, None).is_err());
+        assert!(prototype_initial_config(1, Some(std::ffi::OsStr::new(""))).is_err());
+        assert!(prototype_initial_config(2, Some(std::ffi::OsStr::new(""))).is_err());
+        for mode in [0, 3, u32::MAX] {
+            assert_eq!(
+                prototype_initial_config(mode, Some(std::ffi::OsStr::new("missing.sock")))
+                    .unwrap_err(),
+                "unknown or unsupported native startup mode",
+            );
+        }
+        for mode in [1, 2] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                // All current prototype GlobalTools have Config = (). Its
+                // existing legacy-bincode frame has an empty payload.
+                stream.write_all(&0_u32.to_be_bytes()).unwrap();
+                assert_eq!(stream.read(&mut [0_u8; 1]).unwrap(), 0);
+            });
+            assert!(prototype_initial_config(mode, Some(path.as_os_str())).is_ok());
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn copied_vfork_is_classified_before_the_shared_memory_return() {
@@ -2309,82 +3353,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signal_wait_translation_requires_a_tail_injected_wait_record() {
-        let source = include_str!("../native/client.c");
-        let prepare = source
-            .split_once("static bool prepare_original_identity_syscall(")
-            .expect("identity preparation")
-            .1
-            .split_once("static void post_syscall")
-            .expect("end of identity preparation")
-            .0;
-        assert!(
-            prepare.contains("tail_injected\n      ? blocking_positive_child_wait_target_argument")
-        );
-        assert!(prepare.contains("translated[wait_target_argument] != args[wait_target_argument]"));
-        let target = source
-            .split_once("static int blocking_positive_child_wait_target_argument")
-            .expect("blocking positive child-wait target selection")
-            .1
-            .split_once("static bool prepare_original_identity_syscall")
-            .expect("end of child-wait target selection")
-            .0;
-        assert!(target.contains("sysnum == SYS_wait4"));
-        assert!(target.contains("sysnum == SYS_waitid"));
-        assert!(target.contains("args[0] == P_PID"));
-        assert_eq!(target.matches("WNOHANG").count(), 2);
-        for excluded in ["WUNTRACED", "WSTOPPED", "WCONTINUED", "WEXITED"] {
-            assert!(
-                !target.contains(excluded),
-                "blocking legacy child wait was excluded by {excluded}"
-            );
-        }
-
-        let pre_syscall = source
-            .split_once("static bool pre_syscall(void* drcontext, int sysnum)")
-            .expect("native pre_syscall definition")
-            .1
-            .split_once("static void thread_init")
-            .expect("end of native pre_syscall definition")
-            .0;
-        assert_eq!(
-            pre_syscall
-                .matches("prepare_original_identity_syscall(\n        drcontext, counters,")
-                .count()
-                + pre_syscall
-                    .matches("prepare_original_identity_syscall(\n      drcontext, counters,")
-                    .count(),
-            3
-        );
-        assert_eq!(pre_syscall.matches("sysnum, args, true").count(), 1);
-        let copied = pre_syscall.find("sysnum, args, false").unwrap();
-        let deferred = pre_syscall.find("sysnum, args, true").unwrap();
-        assert!(copied < deferred);
-        assert!(pre_syscall[deferred..].contains("args, false);"));
-
-        let signal = source
-            .split_once("static void virtualize_translated_child_wait_target")
-            .expect("signal-time wait translation")
-            .1
-            .split_once("static dr_signal_action_t event_signal")
-            .expect("end of signal-time wait translation")
-            .0;
-        assert!(signal.contains("translated_child_wait.pending"));
-        assert!(signal.contains("consume_translated_child_wait"));
-        assert!(!signal.contains("lookup_virtual_identity"));
-
-        let post = source
-            .split_once("static void post_syscall(void* drcontext, int sysnum) {")
-            .expect("native post_syscall definition")
-            .1
-            .split_once("static bool pre_syscall")
-            .expect("end of native post_syscall definition")
-            .0;
-        assert!(post.contains("clear_translated_child_wait"));
-    }
-
-    unsafe extern "C" fn invoke(_context: usize, sysnum: i64, args: *const u64) -> i64 {
+    unsafe extern "C" fn invoke(
+        _context: usize,
+        sysnum: i64,
+        args: *const u64,
+        purpose: u32,
+    ) -> i64 {
+        assert_eq!(purpose, InjectionPurpose::Application as u32);
         assert_eq!(sysnum, libc::SYS_write);
         unsafe { *args.add(2) as i64 }
     }
@@ -2393,306 +3368,272 @@ mod tests {
         sysnum: i64,
         args: [u64; 6],
         result: i64,
+        calls: std::cell::Cell<usize>,
     }
 
-    unsafe extern "C" fn invoke_expected(context: usize, sysnum: i64, args: *const u64) -> i64 {
+    unsafe extern "C" fn invoke_expected(
+        context: usize,
+        sysnum: i64,
+        args: *const u64,
+        purpose: u32,
+    ) -> i64 {
+        assert_eq!(purpose, InjectionPurpose::Application as u32);
         let expected = unsafe { &*(context as *const ExpectedInvocation) };
         let actual_args = unsafe { std::slice::from_raw_parts(args, 6) };
         assert_eq!(sysnum, expected.sysnum);
         assert_eq!(actual_args, expected.args);
+        expected.calls.set(expected.calls.get() + 1);
         expected.result
     }
 
-    unsafe extern "C" fn invoke_uname(_context: usize, sysnum: i64, args: *const u64) -> i64 {
-        assert_eq!(sysnum, libc::SYS_uname);
-        unsafe { libc::uname(*args as *mut libc::utsname) as i64 }
-    }
-
-    unsafe extern "C" fn invoke_real_syscall(
-        _context: usize,
-        sysnum: i64,
-        args: *const u64,
-    ) -> i64 {
-        let args = unsafe { std::slice::from_raw_parts(args, 6) };
-        let result =
-            unsafe { libc::syscall(sysnum, args[0], args[1], args[2], args[3], args[4], args[5]) };
-        if result == -1 {
-            -(std::io::Error::last_os_error().raw_os_error().unwrap() as i64)
-        } else {
-            result
+    fn expected_provider_call<S: SyscallInfo>(
+        guest: &DbtGuest<'_, PrototypeTool>,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> host_linux::Observed {
+        host_linux::Observed {
+            tid: guest.tid,
+            pid: guest.pid,
+            context: guest.context,
+            callback: guest.invoke_syscall as usize,
+            request: reverie::provider::SyscallRequest::from_syscall(syscall),
+            purpose,
         }
     }
 
-    fn run_prototype_syscall(syscall: Syscall) -> Result<i64, Error> {
-        let pid = Pid::from_raw(unsafe { libc::getpid() });
+    #[derive(Default)]
+    struct RecordedCallback {
+        calls: Vec<(i64, [u64; 6], u32)>,
+        result: i64,
+    }
+
+    unsafe extern "C" fn record_callback(
+        context: usize,
+        number: i64,
+        args: *const u64,
+        purpose: u32,
+    ) -> i64 {
+        let record = unsafe { &mut *(context as *mut RecordedCallback) };
+        record
+            .calls
+            .push((number, unsafe { args.cast::<[u64; 6]>().read() }, purpose));
+        record.result
+    }
+
+    #[test]
+    fn provider_routing_preserves_raw_return_boundaries() {
+        host_linux::take_observed();
         let mut counters = PrototypeCounters::default();
-        match run_tool_syscall(
-            &PrototypeTool,
-            0,
-            pid,
-            pid,
+        let args = [u64::MAX, 1_u64 << 63, 0, 17, 31, 0x1234_5678_9abc_def0];
+        let call = Syscall::from_raw(
+            Sysno::getpid,
+            SyscallArgs::new(
+                args[0] as usize,
+                args[1] as usize,
+                args[2] as usize,
+                args[3] as usize,
+                args[4] as usize,
+                args[5] as usize,
+            ),
+        );
+        // Raw Linux errno range is -4095..=-1; other negative bit patterns
+        // remain successful values. In particular neither EINTR nor the
+        // not-run errno value alone establishes a ProviderOutcome::Interrupted.
+        for (raw, expected) in [
+            (0, Ok(0)),
+            (73, Ok(73)),
+            (-22, Err(22)),
+            (-4, Err(4)),
+            (-512, Err(512)),
+            (-4095, Err(4095)),
+            (-4096, Ok(-4096)),
+            (i64::MIN, Ok(i64::MIN)),
+        ] {
+            let mut record = RecordedCallback {
+                result: raw,
+                ..Default::default()
+            };
+            let mut guest = DbtGuest::<PrototypeTool>::new(
+                &mut record as *mut _ as usize,
+                Pid::from_raw(10),
+                Pid::from_raw(9),
+                None,
+                0,
+                &mut counters,
+                &GLOBAL_STATE,
+                &CONFIG,
+                record_callback,
+                read_regs,
+                write_regs_noop,
+            );
+            let tail = Arc::clone(&guest.tail_inject_result);
+            assert_eq!(
+                run_ready(guest.inject(call), &tail)
+                    .unwrap()
+                    .map_err(Errno::into_raw),
+                expected
+            );
+            assert_eq!(
+                host_linux::take_observed(),
+                [expected_provider_call(
+                    &guest,
+                    call,
+                    InjectionPurpose::Application
+                )]
+            );
+            assert_eq!(
+                record.calls,
+                [(libc::SYS_getpid, args, InjectionPurpose::Application as u32)]
+            );
+        }
+    }
+
+    // Called only inside the real shared-client CHILD fixture, while its
+    // original connection owner and application descriptor are still live.
+    pub(super) fn assert_provider_admission(reserved: i32, application: i32) {
+        host_linux::take_observed();
+        let mut counters = PrototypeCounters::default();
+        let mut record = RecordedCallback::default();
+        let mut guest = DbtGuest::<PrototypeTool>::new(
+            &mut record as *mut _ as usize,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
             0,
             &mut counters,
             &GLOBAL_STATE,
             &CONFIG,
-            syscall,
-            invoke_real_syscall,
+            record_callback,
             read_regs,
             write_regs_noop,
-        )? {
-            DbtSyscallOutcome::Suppress(result) => Ok(result),
-            DbtSyscallOutcome::ExecuteOriginal(syscall) => {
-                panic!("prototype unexpectedly deferred {syscall:?}")
-            }
+        );
+        let tail = Arc::clone(&guest.tail_inject_result);
+        for number in [Sysno::close, Sysno::connect] {
+            let call =
+                Syscall::from_raw(number, SyscallArgs::new(reserved as usize, 0, 0, 0, 0, 0));
+            assert_eq!(
+                run_ready(guest.inject(call), &tail),
+                Some(Err(Errno::EBADF))
+            );
+            assert!(host_linux::take_observed().is_empty());
+            assert!(record.calls.is_empty());
         }
-    }
-
-    fn direct_socket_port(fd: i32) -> u16 {
-        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-        let mut length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let close_range = Syscall::from_raw(
+            Sysno::close_range,
+            SyscallArgs::new(reserved as usize - 1, reserved as usize + 1, 0, 0, 0, 0),
+        );
+        assert_eq!(run_ready(guest.inject(close_range), &tail), Some(Ok(0)));
+        assert!(host_linux::take_observed().is_empty());
         assert_eq!(
-            unsafe {
-                libc::getsockname(
-                    fd,
-                    (&mut address as *mut libc::sockaddr_in).cast(),
-                    &mut length,
-                )
-            },
-            0
-        );
-        u16::from_be(address.sin_port)
-    }
-
-    fn prototype_socket_port(fd: i32, peer: bool) -> u16 {
-        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-        let length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        let syscall = if peer {
-            Syscall::Getpeername(
-                reverie::syscalls::Getpeername::new()
-                    .with_fd(fd)
-                    .with_usockaddr(AddrMut::from_ptr(
-                        (&mut address as *mut libc::sockaddr_in).cast(),
-                    ))
-                    .with_usockaddr_len(AddrMut::from_ptr(&length)),
-            )
-        } else {
-            Syscall::Getsockname(
-                reverie::syscalls::Getsockname::new()
-                    .with_fd(fd)
-                    .with_usockaddr(AddrMut::from_ptr(
-                        (&mut address as *mut libc::sockaddr_in).cast(),
-                    ))
-                    .with_usockaddr_len(AddrMut::from_ptr(&length)),
-            )
-        };
-        assert_eq!(run_prototype_syscall(syscall).unwrap(), 0);
-        u16::from_be(address.sin_port)
-    }
-
-    #[test]
-    fn port_zero_runtime_child() {
-        if std::env::var_os(PORT_TEST_CHILD).is_none() {
-            return;
-        }
-
-        NEXT_PORT.store(32768, Ordering::SeqCst);
-        bound_ports().clear();
-        let listener = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(
-            listener >= 0,
-            "listener socket failed: {}",
-            std::io::Error::last_os_error()
-        );
-        let loopback = std::env::var(PORT_TEST_ADDRESS)
-            .unwrap()
-            .parse::<std::net::Ipv4Addr>()
-            .unwrap();
-        let mut address = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: 0,
-            sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes(loopback.octets()),
-            },
-            sin_zero: [0; 8],
-        };
-        let bind = reverie::syscalls::Bind::new()
-            .with_fd(listener)
-            .with_umyaddr(AddrMut::from_ptr(
-                (&mut address as *mut libc::sockaddr_in).cast(),
+            record.calls,
+            [reserved - 1, reserved + 1].map(|fd| (
+                libc::SYS_close_range,
+                [fd as u64, fd as u64, 0, 0, 0, 0],
+                InjectionPurpose::Application as u32
             ))
-            .with_addrlen(std::mem::size_of::<libc::sockaddr_in>() as i32);
-        assert_eq!(run_prototype_syscall(Syscall::Bind(bind)).unwrap(), 0);
-        assert_eq!(unsafe { libc::listen(listener, 1) }, 0);
-
-        let guest_port = prototype_socket_port(listener, false);
-        let host_port = direct_socket_port(listener);
-        assert_eq!(guest_port, 32768);
-        assert_ne!(host_port, 0);
-
-        let client = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(client >= 0);
-        address.sin_port = guest_port.to_be();
-        let connect = reverie::syscalls::Connect::new()
-            .with_fd(client)
-            .with_uservaddr(AddrMut::from_ptr(
-                (&mut address as *mut libc::sockaddr_in).cast(),
-            ))
-            .with_addrlen(std::mem::size_of::<libc::sockaddr_in>() as i32);
-        assert_eq!(run_prototype_syscall(Syscall::Connect(connect)).unwrap(), 0);
-        assert_eq!(u16::from_be(address.sin_port), guest_port);
-        assert_eq!(prototype_socket_port(client, true), guest_port);
-        let accepted =
-            unsafe { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
-        assert!(accepted >= 0);
-
-        let ready = std::env::var_os(PORT_TEST_READY).unwrap();
-        std::fs::write(ready, format!("{guest_port} {host_port}\n")).unwrap();
-        let release = std::path::PathBuf::from(std::env::var_os(PORT_TEST_RELEASE).unwrap());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !release.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(release.exists(), "parent did not release port test child");
-
-        assert_eq!(unsafe { libc::close(accepted) }, 0);
-        assert_eq!(unsafe { libc::close(client) }, 0);
-        assert_eq!(unsafe { libc::close(listener) }, 0);
-    }
-
-    fn spawn_port_test_child(
-        ready: &Path,
-        release: &Path,
-        loopback: std::net::Ipv4Addr,
-    ) -> std::process::Child {
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("tests::port_zero_runtime_child")
-            .arg("--nocapture")
-            .env(PORT_TEST_CHILD, "1")
-            .env(PORT_TEST_ADDRESS, loopback.to_string())
-            .env(PORT_TEST_READY, ready)
-            .env(PORT_TEST_RELEASE, release)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap()
-    }
-
-    fn wait_for_port_test_child(
-        child: &mut std::process::Child,
-        ready: &Path,
-    ) -> Result<(u16, u16), String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if let Ok(value) = std::fs::read_to_string(ready) {
-                let mut values = value.split_whitespace().map(str::parse::<u16>);
-                let guest = values.next().unwrap().unwrap();
-                let host = values.next().unwrap().unwrap();
-                assert!(values.next().is_none());
-                return Ok((guest, host));
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                return Err(format!("child exited before binding: {status}"));
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err("child did not bind within 5 seconds".into());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn independent_runtimes_keep_deterministic_ports_without_host_collision() {
-        let directory = tempfile::tempdir().unwrap();
-        let release = directory.path().join("release");
-        let first_ready = directory.path().join("first-ready");
-        let second_ready = directory.path().join("second-ready");
-        let pid = std::process::id();
-        assert!(pid < 1 << 22);
-        let loopback = std::net::Ipv4Addr::new(
-            127,
-            0x80 | ((pid >> 16) as u8),
-            ((pid >> 8) & 0xff) as u8,
-            (pid & 0xff) as u8,
         );
-        let mut first = spawn_port_test_child(&first_ready, &release, loopback);
-        let first_ports = match wait_for_port_test_child(&mut first, &first_ready) {
-            Ok(ports) => ports,
-            Err(error) => {
-                std::fs::write(&release, b"release\n").unwrap();
-                let first_output = first.wait_with_output().unwrap();
-                panic!("{error}; first={first_output:?}");
-            }
-        };
-        let mut second = spawn_port_test_child(&second_ready, &release, loopback);
-        let second_ports = match wait_for_port_test_child(&mut second, &second_ready) {
-            Ok(ports) => ports,
-            Err(error) => {
-                std::fs::write(&release, b"release\n").unwrap();
-                let first_output = first.wait_with_output().unwrap();
-                let second_output = second.wait_with_output().unwrap();
-                panic!("{error}; first={first_output:?}; second={second_output:?}");
-            }
-        };
-
-        assert_eq!(first_ports.0, 32768);
-        assert_eq!(second_ports.0, 32768);
-        assert_ne!(
-            first_ports.1, second_ports.1,
-            "simultaneous runtimes must hold distinct host ports"
+        record.calls.clear();
+        let ordinary = Syscall::from_raw(
+            Sysno::read,
+            SyscallArgs::new(application as usize, 0, 0, 0, 0, 0),
         );
-        eprintln!(
-            "simultaneous DBT port-zero binds: first guest={} host={}, second guest={} host={}",
-            first_ports.0, first_ports.1, second_ports.0, second_ports.1
-        );
-
-        std::fs::write(&release, b"release\n").unwrap();
-        let first_output = first.wait_with_output().unwrap();
-        let second_output = second.wait_with_output().unwrap();
-        assert!(first_output.status.success(), "first={first_output:?}");
-        assert!(second_output.status.success(), "second={second_output:?}");
-    }
-
-    #[test]
-    fn explicit_port_collision_is_still_refused() {
-        let first = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(first >= 0);
-        let mut address = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: 0,
-            sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-            },
-            sin_zero: [0; 8],
-        };
+        assert_eq!(run_ready(guest.inject(ordinary), &tail), Some(Ok(0)));
         assert_eq!(
-            unsafe {
-                libc::bind(
-                    first,
-                    (&address as *const libc::sockaddr_in).cast(),
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
-            },
-            0
+            host_linux::take_observed(),
+            [expected_provider_call(
+                &guest,
+                ordinary,
+                InjectionPurpose::Application
+            )]
         );
-        address.sin_port = direct_socket_port(first).to_be();
+        assert_eq!(
+            record.calls,
+            [(
+                libc::SYS_read,
+                [application as u64, 0, 0, 0, 0, 0],
+                InjectionPurpose::Application as u32
+            )]
+        );
+    }
 
-        let second = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(second >= 0);
-        let bind = reverie::syscalls::Bind::new()
-            .with_fd(second)
-            .with_umyaddr(AddrMut::from_ptr(
-                (&mut address as *mut libc::sockaddr_in).cast(),
-            ))
-            .with_addrlen(std::mem::size_of::<libc::sockaddr_in>() as i32);
-        assert!(matches!(
-            run_prototype_syscall(Syscall::Bind(bind)),
-            Err(Error::Errno(Errno::EADDRINUSE))
-        ));
+    #[test]
+    fn provider_invariant_failures_never_become_guest_results() {
+        use std::convert::Infallible;
+        use std::os::unix::process::ExitStatusExt;
 
-        assert_eq!(unsafe { libc::close(second) }, 0);
-        assert_eq!(unsafe { libc::close(first) }, 0);
+        use reverie::provider::LinuxProvider;
+        use reverie::provider::ProviderOutcome;
+        use reverie::provider::SyscallRequest;
+
+        const MODE: &str = "REVERIE_DBT_PROVIDER_INVARIANT_TEST";
+        struct Broken(String);
+        #[reverie::provider]
+        impl LinuxProvider for Broken {
+            type Context = host_linux::Invocation;
+            type Plan = Infallible;
+            type Error = host_linux::WrongTask;
+
+            async fn execute(
+                &mut self,
+                task: Pid,
+                request: &SyscallRequest,
+                cx: &mut Self::Context,
+            ) -> Result<ProviderOutcome<Infallible>, Self::Error> {
+                match self.0.as_str() {
+                    "wrong-task" => {
+                        host_linux::HostLinux
+                            .execute(Pid::from_raw(task.as_raw() + 1), request, cx)
+                            .await
+                    }
+                    "pending" => std::future::pending().await,
+                    "cancelled" => Ok(ProviderOutcome::Cancelled),
+                    "interrupted" => Ok(ProviderOutcome::Interrupted),
+                    _ => panic!("unknown test mode"),
+                }
+            }
+        }
+        unsafe extern "C" fn forbidden_callback(_: usize, _: i64, _: *const u64, _: u32) -> i64 {
+            // This must be distinguishable from the invariant's SIGABRT.
+            std::process::exit(92)
+        }
+        if let Ok(mode) = std::env::var(MODE) {
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) }, 0);
+            let tid = Pid::from_raw(10);
+            let mut cx = host_linux::Invocation {
+                tid,
+                pid: tid,
+                context: 0,
+                invoke: forbidden_callback,
+                purpose: InjectionPurpose::Application,
+            };
+            host_linux::forward_with(
+                &mut Broken(mode),
+                tid,
+                &SyscallRequest::new(libc::SYS_getpid as u64, [0; 6]),
+                &mut cx,
+            );
+            std::process::exit(93);
+        }
+        for mode in ["wrong-task", "pending", "cancelled", "interrupted"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::provider_invariant_failures_never_become_guest_results",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.signal(),
+                Some(libc::SIGABRT),
+                "{mode}: {output:?}"
+            );
+        }
     }
 
     unsafe extern "C" fn read_regs(_context: usize, regs: *mut libc::user_regs_struct) -> i32 {
@@ -2805,6 +3746,119 @@ mod tests {
     }
 
     #[test]
+    fn into_guest_forwards_validation_purpose_and_restores_ordinary_injection() {
+        unsafe extern "C" fn observe(
+            context: usize,
+            number: i64,
+            args: *const u64,
+            purpose: u32,
+        ) -> i64 {
+            let calls = unsafe { &mut *(context as *mut Vec<(i64, [u64; 6], u32)>) };
+            calls.push((number, unsafe { args.cast::<[u64; 6]>().read() }, purpose));
+            -i64::from(libc::EINVAL)
+        }
+        let mut calls = Vec::<(i64, [u64; 6], u32)>::new();
+        host_linux::take_observed();
+        let mut counters = PrototypeCounters::default();
+        let mut guest = DbtGuest::<PrototypeTool>::new(
+            &mut calls as *mut _ as usize,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            observe,
+            read_regs,
+            write_regs_noop,
+        );
+        let tail = Arc::clone(&guest.tail_inject_result);
+        // The native mock observes routing only; this is not Linux semantics.
+        // Use a valid closed-purpose operation with live scratch nevertheless.
+        let mut stack = run_ready(guest.stack(), &tail).unwrap();
+        let timeout = stack.reserve::<reverie::syscalls::Timespec>();
+        let _guard = stack.commit().unwrap();
+        guest
+            .memory()
+            .write_value(
+                timeout,
+                &reverie::syscalls::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000_000,
+                },
+            )
+            .unwrap();
+        let call = reverie::syscalls::Pselect6::new().with_timeout(Some(timeout));
+        assert_eq!(
+            run_ready(guest.inject(call), &tail),
+            Some(Err(Errno::EINVAL))
+        );
+        assert_eq!(
+            host_linux::take_observed(),
+            [expected_provider_call(
+                &guest,
+                call,
+                InjectionPurpose::Application
+            )]
+        );
+        {
+            let mut adapted = guest.into_guest();
+            let result = run_ready(
+                <_ as Guest<PrototypeTool>>::inject_with_purpose(
+                    &mut adapted,
+                    call,
+                    InjectionPurpose::Pselect6WrapperValidation,
+                ),
+                &tail,
+            )
+            .unwrap();
+            assert!(matches!(result, Err(Error::Errno(Errno::EINVAL))));
+        }
+        assert_eq!(
+            host_linux::take_observed(),
+            [expected_provider_call(
+                &guest,
+                call,
+                InjectionPurpose::Pselect6WrapperValidation
+            )]
+        );
+        assert_eq!(
+            run_ready(guest.inject(call), &tail),
+            Some(Err(Errno::EINVAL))
+        );
+        assert_eq!(
+            host_linux::take_observed(),
+            [expected_provider_call(
+                &guest,
+                call,
+                InjectionPurpose::Application
+            )]
+        );
+        let args = *reverie::provider::SyscallRequest::from_syscall(call).args();
+        assert_eq!(
+            calls,
+            [
+                (
+                    libc::SYS_pselect6,
+                    args,
+                    InjectionPurpose::Application as u32
+                ),
+                (
+                    libc::SYS_pselect6,
+                    args,
+                    InjectionPurpose::Pselect6WrapperValidation as u32
+                ),
+                (
+                    libc::SYS_pselect6,
+                    args,
+                    InjectionPurpose::Application as u32
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn prototype_tool_uses_shared_guest_contract() {
         let mut counters = PrototypeCounters::default();
         let syscall = Syscall::from_raw(Sysno::write, SyscallArgs::new(1, 0x1000, 7, 0, 0, 0));
@@ -2840,6 +3894,7 @@ mod tests {
 
     #[test]
     fn core_file_io_syscalls_dispatch_through_guest() {
+        host_linux::take_observed();
         let cases = [
             (libc::SYS_open, [0, 11, 12, 13, 14, 15]),
             (libc::SYS_openat, [20, 0, 22, 23, 24, 25]),
@@ -2870,6 +3925,7 @@ mod tests {
                 sysnum,
                 args: raw_args.map(|arg| arg as u64),
                 result,
+                calls: std::cell::Cell::new(0),
             };
             let syscall = Syscall::from_raw(
                 Sysno::from(sysnum as i32),
@@ -2901,6 +3957,15 @@ mod tests {
                 &tail_result,
             )
             .unwrap();
+            assert_eq!(expected.calls.get(), 1);
+            assert_eq!(
+                host_linux::take_observed(),
+                [expected_provider_call(
+                    &guest,
+                    syscall,
+                    InjectionPurpose::Application
+                )]
+            );
             if result < 0 {
                 assert!(matches!(outcome, Err(Error::Errno(Errno::EACCES))));
             } else {
@@ -2909,125 +3974,6 @@ mod tests {
         }
 
         assert_eq!(counters.rewritten_syscalls, cases.len() as u64);
-    }
-
-    #[test]
-    fn prototype_tool_virtualizes_uname_release() {
-        let mut counters = PrototypeCounters::default();
-        let mut utsname = unsafe { std::mem::zeroed::<libc::utsname>() };
-        let syscall = Syscall::from_raw(
-            Sysno::uname,
-            SyscallArgs::new((&mut utsname as *mut libc::utsname) as usize, 0, 0, 0, 0, 0),
-        );
-        let mut guest = DbtGuest::new(
-            0,
-            Pid::from_raw(10),
-            Pid::from_raw(10),
-            None,
-            99,
-            &mut counters,
-            &GLOBAL_STATE,
-            &CONFIG,
-            invoke_uname,
-            read_regs,
-            write_regs_noop,
-        );
-
-        let tail_result = Arc::clone(&guest.tail_inject_result);
-        assert_eq!(
-            run_ready(
-                PROTOTYPE_TOOL.handle_syscall_event(&mut guest, syscall),
-                &tail_result,
-            )
-            .unwrap()
-            .unwrap(),
-            0
-        );
-        let field = |bytes: &[libc::c_char]| {
-            unsafe { std::ffi::CStr::from_ptr(bytes.as_ptr()) }
-                .to_bytes()
-                .to_vec()
-        };
-        assert_eq!(field(&utsname.release), b"5.2.0");
-        // Host-derived fields must be pinned too, not left as the real values.
-        assert_eq!(field(&utsname.sysname), b"Linux");
-        assert_eq!(field(&utsname.nodename), b"hermit");
-        assert_eq!(field(&utsname.machine), b"x86_64");
-        assert_eq!(field(&utsname.version), b"#1 SMP hermit-deterministic");
-    }
-
-    #[test]
-    fn procfs_snapshots_cover_volatile_files() {
-        for path in [
-            "/proc/cpuinfo",
-            "/proc/self/maps",
-            "/proc/self/stat",
-            "/proc/self/status",
-        ] {
-            assert!(
-                !deterministic_proc_content(Path::new(path))
-                    .unwrap()
-                    .is_empty()
-            );
-        }
-        assert!(deterministic_proc_content(Path::new("/proc/self/cmdline")).is_none());
-    }
-
-    #[test]
-    fn deterministic_random_streams_are_reproducible_and_distinct() {
-        let mut expected = [0; 24];
-        deterministic_random_bytes(17, 0, &mut expected);
-
-        let mut repeated = [0; 24];
-        deterministic_random_bytes(17, 0, &mut repeated);
-        assert_eq!(repeated, expected);
-
-        // Different seed or stream position must change the output; the
-        // destination address is no longer an input at all.
-        for (seed, position) in [(18, 0), (17, 1), (17, 3)] {
-            let mut changed = [0; 24];
-            deterministic_random_bytes(seed, position, &mut changed);
-            assert_ne!(changed, expected);
-        }
-    }
-
-    #[test]
-    fn deterministic_random_stream_positions_do_not_collide() {
-        // Chunk `index` at position `p` must equal a single fresh chunk at
-        // absolute position `p + index`: the stream is a flat, unique sequence.
-        let mut two_words = [0u8; 16];
-        deterministic_random_bytes(5, 10, &mut two_words);
-
-        let mut first = [0u8; 8];
-        deterministic_random_bytes(5, 10, &mut first);
-        let mut second = [0u8; 8];
-        deterministic_random_bytes(5, 11, &mut second);
-
-        assert_eq!(&two_words[..8], &first);
-        assert_eq!(&two_words[8..], &second);
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn duplicated_descriptors_inherit_random_tracking() {
-        let _guard = RANDOM_FD_TEST_LOCK.lock().unwrap();
-        random_fds().clear();
-        random_fds().insert(7);
-
-        // dup(7) -> 9 keeps determinism; fcntl(F_DUPFD) path uses the same hook.
-        track_duplicated_fd(7, 9);
-        assert!(is_random_fd(9));
-        // A failed dup must not register anything.
-        track_duplicated_fd(7, -1);
-        assert!(!is_random_fd(-1));
-        // dup2 of a non-random fd over a tracked target clears it.
-        track_replacing_fd(3, 9, 9);
-        assert!(!is_random_fd(9));
-        // dup2 of a random fd registers the target.
-        track_replacing_fd(7, 4, 4);
-        assert!(is_random_fd(4));
-
-        random_fds().clear();
     }
 
     #[test]
@@ -3088,10 +4034,12 @@ mod tests {
 
     #[test]
     fn tail_inject_defers_exact_syscall_and_suspends() {
+        host_linux::take_observed();
+        let mut native = RecordedCallback::default();
         let mut counters = PrototypeCounters::default();
         let syscall = Syscall::from_raw(Sysno::write, SyscallArgs::new(1, 0x1000, 7, 0, 0, 0));
         let mut guest: DbtGuest<'_, PrototypeTool> = DbtGuest::new(
-            0,
+            &mut native as *mut _ as usize,
             Pid::from_raw(10),
             Pid::from_raw(10),
             None,
@@ -3099,7 +4047,7 @@ mod tests {
             &mut counters,
             &GLOBAL_STATE,
             &CONFIG,
-            invoke,
+            record_callback,
             read_regs,
             write_regs_noop,
         );
@@ -3114,6 +4062,8 @@ mod tests {
             tail_result.take(),
             Some(TailInjectAction::ExecuteOriginal(syscall))
         );
+        assert!(host_linux::take_observed().is_empty());
+        assert!(native.calls.is_empty());
 
         let exit = Syscall::from_raw(Sysno::exit_group, SyscallArgs::new(42, 0, 0, 0, 0, 0));
         tail_result.clear();
@@ -3129,6 +4079,8 @@ mod tests {
         unsafe { write_deferred_syscall(exit, &mut deferred_number, deferred_args.as_mut_ptr()) };
         assert_eq!(deferred_number, Sysno::exit_group.id() as i64);
         assert_eq!(deferred_args, [42, 0, 0, 0, 0, 0]);
+        assert!(host_linux::take_observed().is_empty());
+        assert!(native.calls.is_empty());
 
         for number in [
             Sysno::fork,
@@ -3147,6 +4099,8 @@ mod tests {
                 Some(TailInjectAction::ExecuteOriginal(lifecycle)),
                 "{number:?} must use DynamoRIO's original lifecycle path"
             );
+            assert!(host_linux::take_observed().is_empty());
+            assert!(native.calls.is_empty());
         }
     }
 
@@ -3401,16 +4355,5 @@ mod tests {
         assert_eq!(align_up(8, 8), 8);
         assert_eq!(align_up(9, 8), 16);
         assert_eq!(align_up(13, 1), 13);
-    }
-
-    #[test]
-    fn deterministic_ports_advance_past_explicit_bindings() {
-        let next = AtomicU16::new(32768);
-
-        assert_eq!(deterministic_port(&next, 0), 32768);
-        assert_eq!(deterministic_port(&next, 32769), 32769);
-        assert_eq!(deterministic_port(&next, 0), 32770);
-        assert_eq!(deterministic_port(&next, 1200), 1200);
-        assert_eq!(deterministic_port(&next, 0), 32771);
     }
 }

@@ -12,14 +12,13 @@ pub(crate) mod filter;
 pub(crate) mod global_state;
 pub(crate) mod tool;
 
-#[path = "../src/kvm_runner.rs"]
-mod kvm_runner;
+#[path = "../backend.rs"]
+mod backend;
 
 use clap::Parser;
 // TODO-HUMAN-REVIEW(PR-139): Review type visibility for the shared LiteInst host.
 pub(crate) use config::Config;
 pub(crate) use filter::Filter;
-use reverie::ExitStatus;
 use reverie_util::CommonToolArguments;
 pub(crate) use tool::Strace;
 
@@ -27,9 +26,14 @@ pub(crate) use tool::Strace;
 #[derive(Parser, Debug)]
 struct Opts {
     // TODO-HUMAN-REVIEW(PR-151): Review strace runner selection.
-    /// Execution runner; KVM selects the prototype KvmGuest host.
-    #[clap(long, value_enum, default_value = "ptrace")]
-    runner: kvm_runner::Runner,
+    /// The Reverie backend to run the program on (`--runner` is accepted).
+    #[clap(long, value_enum, default_value = "ptrace", alias = "runner")]
+    backend: backend::BackendKind,
+
+    /// The example preload the in-guest backends host the tool in; by
+    /// default `libreverie_examples.so` beside this binary.
+    #[clap(long)]
+    preload: Option<std::path::PathBuf>,
 
     #[clap(flatten)]
     common: CommonToolArguments,
@@ -42,35 +46,22 @@ struct Opts {
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = Opts::parse();
-    let stdin = match args.runner {
-        kvm_runner::Runner::Ptrace => None,
-        kvm_runner::Runner::Kvm => kvm_runner::reserve_stdin()?,
-    };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(run_main(args, stdin))
+    run_main(Opts::parse())
 }
 
-async fn run_main(args: Opts, stdin: Option<std::fs::File>) -> anyhow::Result<()> {
+fn run_main(args: Opts) -> anyhow::Result<()> {
     let config = Config {
         filters: args.trace,
     };
     let log_guard = args.common.init_tracing();
-    let (status, _) = match args.runner {
-        kvm_runner::Runner::Ptrace => {
-            let tracer = reverie_ptrace::TracerBuilder::<Strace>::new(args.common.clone().into())
-                .config(config)
-                .spawn()
-                .await?;
-            tracer.wait().await?
-        }
-        kvm_runner::Runner::Kvm => {
-            let result = kvm_runner::run::<Strace>(&args.common, config, stdin).await?;
-            (ExitStatus::Exited(result.exit_code), result.global_state)
-        }
-    };
+    let run = backend::run_blocking::<Strace>(
+        args.backend,
+        &args.common,
+        config,
+        "strace",
+        args.preload.clone(),
+    )?;
+    let (status, _) = (run.status, run.global_state);
     drop(log_guard); // Flush logs before exiting.
     status.raise_or_exit()
 }

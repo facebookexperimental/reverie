@@ -49,7 +49,7 @@ impl Pty {
 
     /// Opens a pseudo-TTY slave that is connected to this master.
     pub fn child(&self) -> Result<PtyChild, Errno> {
-        const TIOCGPTPEER: libc::c_ulong = 0x5441;
+        const TIOCGPTPEER: libc::Ioctl = 0x5441;
 
         let parent = self.fd.as_raw_fd();
 

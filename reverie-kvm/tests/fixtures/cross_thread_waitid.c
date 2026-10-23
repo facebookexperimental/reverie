@@ -1,11 +1,5 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+/* Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Licensed under the BSD-style license in the LICENSE file. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
@@ -20,6 +14,17 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool (Detcore) and refuses it in a run without one, and its signals
+   then carry uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
 
 /* Raw x86-64 backend coverage. __WNOTHREAD remains unsupported here. */
 _Static_assert(sizeof(siginfo_t) == 128, "x86-64 siginfo ABI");
@@ -260,7 +265,7 @@ int main(int argc, char** argv) {
   c.process = getpid();
   c.leader = (pid_t)syscall(SYS_gettid);
   c.uid =
-      getuid(); /* Validate each backend's real/virtual UID; no filtering. */
+      sender_uid(); /* Validate each backend's real/virtual UID; no filtering. */
   require(c.leader == c.process, "main is process leader");
   require(
       pipe(c.ready) == 0 && pipe(c.release) == 0, "two synchronization pipes");

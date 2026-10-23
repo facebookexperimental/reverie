@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use kvm_bindings::kvm_regs;
 use kvm_bindings::kvm_xsave;
@@ -45,6 +47,10 @@ pub(crate) const SS_AUTODISARM: i32 = i32::MIN;
 pub(crate) const USER_CODE_SELECTOR: u16 = 0x23;
 pub(crate) const USER_DATA_SELECTOR: u16 = 0x1b;
 pub(crate) const SEGV_MAPERR: i32 = 1;
+/// `si_code` Linux reports for a #UD (`do_error_trap(..., SIGILL, ILL_ILLOPN, ...)`).
+pub(crate) const ILL_ILLOPN: i32 = 2;
+/// `si_code` Linux reports for a #DE (`do_error_trap(..., SIGFPE, FPE_INTDIV, ...)`).
+pub(crate) const FPE_INTDIV: i32 = 1;
 
 const UC_FP_XSTATE: u64 = 0x1;
 const UC_SIGCONTEXT_SS: u64 = 0x2;
@@ -68,7 +74,7 @@ const FIX_EFLAGS: u64 = (1 << 18)
     | (1 << 4)
     | (1 << 2)
     | (1 << 0);
-const FIXED_XFEATURES: u64 = XFEATURE_X87 | XFEATURE_SSE | XFEATURE_YMM;
+pub(crate) const FIXED_XFEATURES: u64 = XFEATURE_X87 | XFEATURE_SSE | XFEATURE_YMM;
 const MXCSR_FEATURE_MASK: u32 = 0x0000_ffbf;
 
 const FP_SW_RESERVED_OFFSET: usize = 464;
@@ -391,9 +397,22 @@ pub(crate) struct OwnedSignalDequeue {
 /// One keeper is shared by all descriptor aliases of one signalfd. Creation
 /// pins it before publishing the guest descriptor; close/exec can drop this
 /// bounded eventfd owner under the signal transaction without a blocking close.
+///
+/// The keeper also holds the description's guest-visible blocking mode
+/// (`O_NONBLOCK` clear). Linux keeps that flag on the open file description,
+/// so dup aliases and a forked child share it, as they share this keeper. The
+/// host eventfd itself stays nonblocking whatever the guest asks: no host
+/// read of it can ever wait outside the scheduler.
 #[derive(Clone, Debug)]
-pub(crate) struct SignalFdCarrier(Arc<std::fs::File>);
+pub(crate) struct SignalFdCarrier(Arc<std::fs::File>, Arc<AtomicBool>);
 impl SignalFdCarrier {
+    /// Whether the guest's description is in blocking mode.
+    pub(crate) fn guest_blocking(&self) -> bool {
+        self.1.load(Ordering::SeqCst)
+    }
+    pub(crate) fn set_guest_blocking(&self, blocking: bool) {
+        self.1.store(blocking, Ordering::SeqCst);
+    }
     pub(crate) fn pin_eventfd(file: &std::fs::File) -> std::io::Result<Self> {
         // The only production caller owns a freshly created EFD_NONBLOCK fd.
         // Existing signalfd F_SETFL/SCM_RIGHTS/proc-reopen guards preserve it.
@@ -405,7 +424,10 @@ impl SignalFdCarrier {
             return Err(std::io::Error::last_os_error());
         }
         // SAFETY: successful F_DUPFD_CLOEXEC returns a newly owned descriptor.
-        Ok(Self(Arc::new(unsafe { std::fs::File::from_raw_fd(fd) })))
+        Ok(Self(
+            Arc::new(unsafe { std::fs::File::from_raw_fd(fd) }),
+            Arc::new(AtomicBool::new(false)),
+        ))
     }
     pub(crate) fn file(&self) -> &std::fs::File {
         &self.0
@@ -524,6 +546,12 @@ pub(crate) struct ThreadSignalState {
     /// just as a ptrace signal-delivery stop does. Plain execution discards an
     /// unblocked ignored signal when it is generated.
     pub(crate) observe_ignored: bool,
+    /// Linux's `saved_sigmask` with `TIF_RESTORE_SIGMASK`: the thread's own
+    /// mask while a call that installed a temporary one (`rt_sigsuspend`, a
+    /// masked `pselect6`) returns to deliver a signal under it. The signal
+    /// frame saves this mask, so `rt_sigreturn` restores it; a boundary that
+    /// delivers no handler restores it directly.
+    pub(crate) saved_sigmask: Option<KernelSigset>,
     /// Admission identity, never reconstructed from a possibly reused numeric TID.
     pub(crate) dequeue_identity: Option<reverie::SignalTaskIdentity>,
     pub(crate) dequeue_wake: SignalDequeueWake,
@@ -536,6 +564,7 @@ impl ThreadSignalState {
             altstack: self.altstack,
             pending: StandardPendingSignals::default(),
             observe_ignored: self.observe_ignored,
+            saved_sigmask: None,
             dequeue_identity: None,
             dequeue_wake: SignalDequeueWake::default(),
         }
@@ -547,6 +576,7 @@ impl ThreadSignalState {
             altstack: None,
             pending: StandardPendingSignals::default(),
             observe_ignored: self.observe_ignored,
+            saved_sigmask: None,
             dequeue_identity: None,
             dequeue_wake: SignalDequeueWake::default(),
         }
@@ -558,6 +588,7 @@ impl ThreadSignalState {
             altstack: None,
             pending: self.pending.clone(),
             observe_ignored: self.observe_ignored,
+            saved_sigmask: None,
             dequeue_identity: self.dequeue_identity,
             dequeue_wake: self.dequeue_wake.clone(),
         }

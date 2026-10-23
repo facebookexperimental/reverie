@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Actual initialized KvmGuest/Tool/frame controls. This component has no Hermit
 // scheduler or timer: repeated publications are explicit fixture stimuli.
 use reverie::CallbackSignalSite;
@@ -89,7 +81,7 @@ impl Tool for ParkedTool {
             ..Default::default()
         }
     }
-    fn observe_signal_dequeues(_: &u8) -> bool {
+    fn may_observe_signal_dequeues(_: &u8) -> bool {
         true
     }
     fn subscriptions(mode: &u8) -> Subscription {
@@ -113,6 +105,12 @@ impl Tool for ParkedTool {
         assert_eq!(identity.process.tgid, guest.pid());
         assert!(identity.task_generation > 0 && identity.process.generation > 0);
         assert!(guest.parked_signal_site().is_none());
+        // This GlobalState keeps the default installation: observing dequeues
+        // does not make the run controlled.
+        assert_eq!(
+            guest.signal_control_mode(),
+            reverie::BackendSignalControlMode::Unchanged
+        );
         seen(Seen::Start(identity));
         Ok(())
     }
@@ -817,7 +815,7 @@ impl Tool for SiblingTool {
             ..Default::default()
         }
     }
-    fn observe_signal_dequeues(_: &u8) -> bool {
+    fn may_observe_signal_dequeues(_: &u8) -> bool {
         true
     }
     fn subscriptions(_: &u8) -> Subscription {
@@ -1155,12 +1153,7 @@ struct AdmissionTool;
 impl Tool for AdmissionTool {
     type GlobalState = AdmissionGlobal;
     type ThreadState = ();
-    fn subscriptions(_: &u8) -> Subscription {
-        let mut subscription = Subscription::all_syscalls();
-        subscription.cpuid();
-        subscription
-    }
-    fn observe_signal_dequeues(mode: &u8) -> bool {
+    fn may_observe_signal_dequeues(mode: &u8) -> bool {
         *mode != 2
     }
     fn thread_ownership(mode: &u8) -> reverie::ThreadOwnership {

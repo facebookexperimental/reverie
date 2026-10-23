@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Explicit early-launch bootstrap. This is not a lazy embedding constructor.
 //!
 //! Primary no-flush classes are bound in BOOTSTRAP-PRIMARY-ADDENDUM.md. The

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Backend lifecycle controls. These observe real callback ordering, not native
 //! selected-file or capability evidence. Native tests require the maintained owner.
 use std::sync::Arc;

@@ -36,7 +36,7 @@ reverie_e9patch_syscall:
  * trap above, preserving the existing correctness fallback.
  */
 /* TODO-HUMAN-REVIEW(PR-264): Review AOT trampoline routing through the shared
- * reverie-preload dispatcher. */
+ * reverie-inguest dispatcher. */
 /* AUTONOMOUS-BOT-IMPLEMENTED */
 .section .text.100_dispatch,"ax",@progbits
 .global reverie_e9patch_dispatch

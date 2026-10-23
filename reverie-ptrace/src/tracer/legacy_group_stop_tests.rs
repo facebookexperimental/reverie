@@ -31,8 +31,6 @@ async fn ptracer_task_recovers_same_driver_after_pending_adapter_cancellation() 
             command_bootstrap: false,
             events: &events,
             injected_syscall_trap: None,
-            liteinst_runtime: None,
-            liteinst_trap_only: None,
             backend_stats: None,
             final_resume_signal_for_test: None,
             pre_syscall_for_test: None,
@@ -311,13 +309,7 @@ async fn legacy_group_cleanup_holds_real_classic_and_seized_stops() {
         let exit = stopped.exit_event_on_ptracer_thread();
         let running = stopped.resume(None).unwrap();
         let terminal = running.terminal_cleanup();
-        let mut emergency = LiteinstTraceeCleanup::new(
-            root,
-            Arc::new(StdMutex::new(HashMap::new())),
-            Arc::new(StdMutex::new(None)),
-        )
-        .unwrap();
-        emergency.register_notifier(&running);
+        let emergency = running.terminal_cleanup();
         let waits = Arc::new(PtracerWaitOwner::default());
         waits.bind_running(&running);
         let stop = FatalTaskStop {
@@ -371,7 +363,10 @@ async fn legacy_group_cleanup_holds_real_classic_and_seized_stops() {
                 .any(|(tid, class)| *tid == root && *class == expected)
         );
         finish_group_fixture_root(running, exit, deadline).await;
-        emergency.terminate_and_confirm().unwrap();
+        match emergency.request_sigkill() {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(error) => panic!("emergency test cleanup: {error}"),
+        }
     }
 }
 
@@ -387,10 +382,7 @@ async fn legacy_group_cleanup_captures_newchild_before_parent_commit() {
     let exit = stopped.exit_event_on_ptracer_thread();
     let running = stopped.resume(None).unwrap();
     let terminal = running.terminal_cleanup();
-    let newborns = Arc::new(StdMutex::new(HashMap::new()));
-    let mut emergency =
-        LiteinstTraceeCleanup::new(root, newborns.clone(), Arc::new(StdMutex::new(None))).unwrap();
-    emergency.register_notifier(&running);
+    let emergency = running.terminal_cleanup();
     while !terminal
         .queued_raw_statuses()
         .iter()
@@ -419,7 +411,6 @@ async fn legacy_group_cleanup_captures_newchild_before_parent_commit() {
             assert_eq!(parent, root);
             assert_eq!(op, ChildOp::Fork);
             session.capture_for_group_stop_test(parent, op, child);
-            NewbornTracee::register(&newborns, parent, op, child);
             assert!(
                 captured
                     .lock()
@@ -472,6 +463,10 @@ async fn legacy_group_cleanup_captures_newchild_before_parent_commit() {
         Pid::from_raw(unsafe { libc::getpid() }),
         "actual fork-event parent differs from the real wait parent"
     );
+    // Retain the selected wait owner before consuming newborn: a Native
+    // notifier can retire the child after CONT, before a fresh explicit
+    // wait could authenticate through its retained proc directory.
+    let child_waits = newborn.waits.clone();
     newborn.signal().unwrap();
     let child_exit = tokio::time::timeout_at(deadline.into(), newborn.into_exit())
         .await
@@ -480,10 +475,7 @@ async fn legacy_group_cleanup_captures_newchild_before_parent_commit() {
     assert_eq!(
         tokio::time::timeout_at(
             deadline.into(),
-            child_exit
-                .resume(None)
-                .unwrap()
-                .wait_owned_on_ptracer_thread()
+            child_waits.wait_running(child_exit.resume(None).unwrap())
         )
         .await
         .unwrap()
@@ -496,20 +488,12 @@ async fn legacy_group_cleanup_captures_newchild_before_parent_commit() {
         Ok(Some(ExitStatus::Signaled(Signal::SIGKILL, false)))
     );
     assert!(child.wait(deadline.saturating_duration_since(Instant::now())));
-    // This fixture consumed the original newborn exit receiver itself. Hand
-    // its exact completed record out of the emergency owner's table, as the
-    // task handoff does, before that guard validates its remaining tree.
-    let completed = newborns
-        .lock()
-        .unwrap()
-        .remove(&child_tid)
-        .expect("original newborn emergency record remains until final wait");
-    assert!(completed.terminal.same_generation(&child));
-    assert!(completed.history.is_empty());
-    assert!(newborns.lock().unwrap().is_empty());
     finish_group_fixture_root(running, exit, deadline).await;
     assert_reaped("captured group-stop newborn", child_tid);
-    emergency.terminate_and_confirm().unwrap();
+    match emergency.request_sigkill() {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(error) => panic!("emergency test cleanup: {error}"),
+    }
 }
 
 async fn legacy_group_backend_control(
@@ -571,13 +555,9 @@ async fn legacy_group_backend_control(
     if inject_native_error {
         NATIVE_SIGSTOP_ERROR.with(|slot| slot.set(Some(Errno::EOPNOTSUPP)));
     }
-    let mut emergency = LiteinstTraceeCleanup::new(
-        root,
-        Arc::new(StdMutex::new(HashMap::new())),
-        Arc::new(StdMutex::new(None)),
-    )
-    .unwrap();
-    emergency.register_notifier(&Running::new_on_ptracer_thread(root).unwrap());
+    let emergency = Running::new_on_ptracer_thread(root)
+        .unwrap()
+        .terminal_cleanup();
     let outcome = tokio::time::timeout_at(deadline.into(), tracer.wait_completion())
         .await
         .unwrap();
@@ -668,7 +648,10 @@ async fn legacy_group_backend_control(
         control.relay_attempts.load(Ordering::SeqCst),
         control.held.lock().unwrap()
     );
-    emergency.terminate_and_confirm().unwrap();
+    match emergency.request_sigkill() {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(error) => panic!("emergency test cleanup: {error}"),
+    }
     assert!(root_absent);
     assert!(owner_complete);
     assert_eq!(words.read(0), 0);
@@ -936,13 +919,7 @@ async fn legacy_group_cleanup_preserves_existing_seized_job_control_stops() {
         let group = TraceeIdentity::open_root(root).unwrap();
         let exit = stopped.exit_event_on_ptracer_thread();
         let running = stopped.resume(None).unwrap();
-        let mut emergency = LiteinstTraceeCleanup::new(
-            root,
-            Arc::new(StdMutex::new(HashMap::new())),
-            Arc::new(StdMutex::new(None)),
-        )
-        .unwrap();
-        emergency.register_notifier(&running);
+        let emergency = running.terminal_cleanup();
         group.send_signal(signal).unwrap();
         let (delivery, event) =
             tokio::time::timeout_at(deadline.into(), running.wait_owned_on_ptracer_thread())
@@ -1013,6 +990,9 @@ async fn legacy_group_cleanup_preserves_existing_seized_job_control_stops() {
                 .any(|(tid, class)| *tid == root && *class == "seized-other")
         );
         finish_group_fixture_root(running, exit, deadline).await;
-        emergency.terminate_and_confirm().unwrap();
+        match emergency.request_sigkill() {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(error) => panic!("emergency test cleanup: {error}"),
+        }
     }
 }

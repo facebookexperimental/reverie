@@ -221,9 +221,10 @@ The comparison above should be read with these current limits:
   lifecycle parity.
 - Signal state is partly modeled, but asynchronous Linux signal delivery is
   not complete.
-- The deterministic CPUID profile and explicit time/random/identity handlers
-  reduce host leakage, but a generic Reverie tool run is not automatically
-  deterministic.
+- The explicit time/random/identity handlers reduce host leakage, but a
+  generic Reverie tool run is not automatically deterministic: CPUID, for
+  example, is the Tool's answer, or the host's for a Tool that does not
+  subscribe.
 - Unsupported operations fail explicitly rather than silently escaping to an
   untyped host syscall path.
 

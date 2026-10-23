@@ -1,6 +1,6 @@
 [package]
 name = "reverie-liteinst"
-version = "0.4.1"
+version = "0.5.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -13,11 +13,35 @@ categories = ["development-tools::debugging", "os::linux-apis"]
 description = "Experimental in-process syscall instrumentation for Reverie"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [features]
-default = ["preload-constructor"]
+default = []
+# Deprecated no-op: the constructor and linker policy belong to the preload leaf.
 preload-constructor = []
+# Exposes a fixed test ABI in the actual runtime without changing its allocator.
+allocator-fixture = ["reverie-inguest/allocator-fixture"]
+# Installed RPC mechanism regressions, absent from ordinary binary builds.
+rpc-io-fixture = ["reverie-inguest/rpc-io-fixture"]
+# Native-exec prerequisite. Only the FullTool installation route is admitted;
+# successor exec itself remains refused until its bootstrap is implemented.
+fixed-syscall-gates = ["reverie-inguest/fixed-syscall-gates"]
+# Private GNU loader InitialImage experiment; no successor exec admission.
+exec-private-init = ["fixed-syscall-gates", "reverie-inguest/exec-private-init"]
+# Forward the explicit private-loader layout; GNU keeps the legacy gate ABI.
+loader-private-runtime = ["exec-private-init", "reverie-inguest/loader-private-runtime"]
+# Inactive bounded native statistics transfer; no existing caller enables it.
+native-exec-state = ["exec-private-init", "reverie-inguest/native-exec-state"]
+# Inactive explicit successor installer; ordinary entry points stay unchanged.
+exec-private-successor = ["exec-private-init", "native-exec-state", "reverie-inguest/exec-private-successor"]
+# Explicit authenticated driver installation; no constructor or environment activation.
+exec-native-injection = ["exec-private-successor", "reverie-inguest/exec-native-injection"]
+
+
+[[bin]]
+name = "reverie-liteinst-allocator-host-control"
+path = "src/bin/allocator_host_control.rs"
+required-features = ["allocator-fixture"]
 
 [[bin]]
 name = "reverie-liteinst-strace"
@@ -35,19 +59,22 @@ path = "src/bin/lifecycle_guest.rs"
 bincode = { version = "2", features = ["serde"] }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 libc = "0.2.186"
-liteinst2 = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "2032b49d983f74ec8472761d7704c64c00085a55" }
-reverie = { version = "0.4.1", path = "../reverie", package = "reverie-core" }
-reverie-preload = { version = "0.4.1", path = "../reverie-preload", default-features = false, features = ["coordinator-rpc"] }
-reverie-ptrace = { version = "0.4.1", path = "../reverie-ptrace" }
-reverie-rpc-transport = { version = "0.4.1", path = "../reverie-rpc-transport" }
+liteinst2 = { version = "0.1.0", git = "https://github.com/rrnewton/liteinst2", rev = "d64dc833418a4c265803645653b8f597d0f25060" }
+reverie = { version = "0.5.1", path = "../reverie", package = "reverie-core" }
+reverie-inguest = { version = "0.5.1", path = "../reverie-inguest", default-features = false, features = ["coordinator-rpc", "rcb-clock", "launcher"] }
+reverie-rpc-transport = { version = "0.5.1", path = "../reverie-rpc-transport" }
 serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.52.4", features = ["macros", "net", "rt", "time"] }
 tempfile = "3.27.0"
 tracing = "0.1.41"
 
 [dev-dependencies]
-safeptrace = { version = "0.4.1", path = "../safeptrace" }
+# Cross-crate tests inspect the actual shared collector without exposing fields.
+reverie-inguest = { version = "0.5.1", path = "../reverie-inguest", default-features = false, features = ["native-exec-state-fixture"] }
+goblin = "=0.10.7"
+safeptrace = { version = "0.5.1", path = "../safeptrace" }
 sha2 = "0.10.9"
+serde_json = "1"
 tokio = { version = "1.52.4", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
 
@@ -58,6 +85,40 @@ path = "src/bin/trap_count_guest.rs"
 [[test]]
 name = "strace"
 path = "tests/strace.rs"
+
+[[test]]
+name = "native_unpublished"
+path = "tests/native_unpublished.rs"
+
+[[test]]
+name = "allocator_contract"
+path = "tests/allocator_contract.rs"
+required-features = ["allocator-fixture"]
+
+[[test]]
+name = "region_stacks"
+path = "tests/region_stacks.rs"
+required-features = ["allocator-fixture"]
+
+[[test]]
+name = "standalone_constructor"
+path = "tests/standalone_constructor.rs"
+required-features = ["allocator-fixture"]
+
+[[test]]
+name = "generic_bootstrap"
+path = "tests/generic_bootstrap.rs"
+required-features = ["allocator-fixture"]
+
+[[test]]
+name = "fixed_arena"
+path = "tests/fixed_arena.rs"
+required-features = ["allocator-fixture"]
+
+[[test]]
+name = "tool_tls"
+path = "tests/tool_tls.rs"
+required-features = ["allocator-fixture"]
 
 [[bin]]
 name = "reverie-liteinst-exec-guest"
@@ -78,3 +139,23 @@ path = "tests/rpc_tool.rs"
 [[test]]
 name = "lifecycle"
 path = "tests/lifecycle.rs"
+
+[[bin]]
+name = "reverie-liteinst-allocator-install-control"
+path = "src/bin/allocator_install_control.rs"
+required-features = ["allocator-fixture"]
+
+[[bin]]
+name = "reverie-liteinst-allocator-private-control"
+path = "src/bin/allocator_private_control.rs"
+required-features = ["allocator-fixture"]
+
+[[test]]
+name = "mapping_integrity"
+path = "tests/mapping_integrity.rs"
+required-features = ["allocator-fixture"]
+
+[[test]]
+name = "fixed_gates"
+path = "tests/fixed_gates.rs"
+required-features = ["fixed-syscall-gates"]

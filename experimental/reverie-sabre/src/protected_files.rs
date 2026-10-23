@@ -11,13 +11,13 @@
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::ptr;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 
 use parking_lot::Mutex;
 use syscalls::Sysno;
-use syscalls::SysnoSet;
 
 struct ProtectedFiles {
     // We have to use Vec here to ensure `new` can be a const fn, which is
@@ -78,9 +78,18 @@ impl ProcessRegistry {
                 return unsafe { &(*current).files };
             }
 
+            // A forked child inherits the descriptors marked inherited, and their
+            // protection with them (`protect_inherited_raw_fd`).
+            let mut files = ProtectedFiles::new();
+            for slot in &INHERITED {
+                let fd = slot.load(Acquire);
+                if fd >= 0 {
+                    files.insert(&fd);
+                }
+            }
             let candidate = Box::into_raw(Box::new(RegistryValue {
                 pid,
-                files: Mutex::new(ProtectedFiles::new()),
+                files: Mutex::new(files),
             }));
             match self
                 .current
@@ -99,6 +108,11 @@ impl ProcessRegistry {
 }
 
 static PROTECTED_FILES: ProcessRegistry = ProcessRegistry::new();
+
+/// Descriptors that every process of the guest keeps protected: a forked child's
+/// registry starts with them. Atomics, not a lock, so a child forked while another
+/// thread held a lock can still read them.
+static INHERITED: [AtomicI32; 4] = [const { AtomicI32::new(-1) }; 4];
 
 fn protected_files() -> &'static Mutex<ProtectedFiles> {
     PROTECTED_FILES.get()
@@ -151,6 +165,16 @@ pub(crate) fn protect_raw_fd(fd: RawFd) {
     protected_files().lock().insert(&fd);
 }
 
+/// Protects `fd` in this process and in every process forked from it later.
+/// Returns false, protecting it in this process only, if every inherited slot
+/// is taken.
+pub(crate) fn protect_inherited_raw_fd(fd: RawFd) -> bool {
+    protect_raw_fd(fd);
+    INHERITED.iter().any(|slot| {
+        slot.load(Acquire) == fd || slot.compare_exchange(-1, fd, AcqRel, Acquire).is_ok()
+    })
+}
+
 pub(crate) fn protect_raw_pair_with<F, E>(create: F) -> Result<(RawFd, RawFd), E>
 where
     F: FnOnce() -> Result<(RawFd, RawFd), E>,
@@ -166,177 +190,85 @@ pub(crate) fn unprotect_raw_fd(fd: RawFd) {
     protected_files().lock().remove(&fd);
 }
 
-fn close_ranges_around_protected(first: u32, last: u32, protected: &[RawFd]) -> Vec<(u32, u32)> {
-    if first > last {
-        return vec![(first, last)];
+/// Undoes [`protect_inherited_raw_fd`]: `fd` is no longer protected here, nor
+/// in a process forked from this one later.
+pub(crate) fn unprotect_inherited_raw_fd(fd: RawFd) {
+    for slot in &INHERITED {
+        let _ = slot.compare_exchange(fd, -1, AcqRel, Acquire);
     }
-    let mut protected: Vec<u32> = protected
-        .iter()
-        .filter_map(|fd| u32::try_from(*fd).ok())
-        .filter(|fd| (first..=last).contains(fd))
-        .collect();
-    protected.sort_unstable();
-    protected.dedup();
-
-    let mut ranges = Vec::new();
-    let mut next = first;
-    for fd in protected {
-        if next < fd {
-            ranges.push((next, fd - 1));
-        }
-        let Some(after) = fd.checked_add(1) else {
-            return ranges;
-        };
-        next = after;
-    }
-    if next <= last {
-        ranges.push((next, last));
-    }
-    ranges
+    unprotect_raw_fd(fd);
 }
 
+/// Runs a guest `close_range` without closing any protected descriptor, by
+/// the rule every in-process backend shares
+/// ([`reverie_inguest::reserved_fds::close_range_sparing`]). The registry stays
+/// locked throughout, so a descriptor pair being created and protected
+/// ([`protect_raw_pair_with`]) is either closed whole before it is protected or
+/// spared whole.
 pub(crate) fn sys_close_range(
     first: usize,
     last: usize,
     flags: usize,
 ) -> Result<usize, syscalls::Errno> {
-    const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
-    const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
-    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
-        return Err(syscalls::Errno::EINVAL);
-    }
-
-    let first = first as u32;
-    let last = last as u32;
-    if first > last {
-        return Err(syscalls::Errno::EINVAL);
-    }
-    let mut flags = flags;
-    if flags & CLOSE_RANGE_UNSHARE != 0 {
-        unsafe { syscalls::syscall1(Sysno::unshare, libc::CLONE_FILES as usize)? };
-        flags &= !CLOSE_RANGE_UNSHARE;
-    }
     let protected = protected_files().lock();
-    for (range_first, range_last) in close_ranges_around_protected(first, last, &protected.files) {
-        unsafe {
-            syscalls::syscall3(
-                Sysno::close_range,
-                range_first as usize,
-                range_last as usize,
-                flags,
-            )?;
-        }
+    let mut reserved: Vec<u64> = protected
+        .files
+        .iter()
+        .filter_map(|fd| u32::try_from(*fd).ok().map(u64::from))
+        .collect();
+    reserved.sort_unstable();
+    let args = [first as u64, last as u64, flags as u64, 0, 0, 0];
+    // SAFETY: `args` is the guest's `close_range`, run in its own descriptor
+    // table; every protected descriptor is spared.
+    let result = unsafe {
+        reverie_inguest::reserved_fds::close_range_sparing(&args, &reserved, |number, a| {
+            syscalls::raw::syscall6(
+                Sysno::from(number as i32),
+                a[0] as usize,
+                a[1] as usize,
+                a[2] as usize,
+                a[3] as usize,
+                a[4] as usize,
+                a[5] as usize,
+            ) as i64
+        })
+    };
+    drop(protected);
+    if result < 0 {
+        Err(syscalls::Errno::new(-result as i32))
+    } else {
+        Ok(0)
     }
-    Ok(0)
 }
 
-/// All of these syscalls take the input file descriptor as the first argument.
-/// Some syscalls, like mmap, don't conform to this pattern and need to be
-/// handled in a special way.
-static FD_ARG0_SYSCALLS: SysnoSet = SysnoSet::new(&[
-    Sysno::close,
-    Sysno::dup,
-    Sysno::dup2,
-    Sysno::openat,
-    Sysno::fstat,
-    Sysno::read,
-    Sysno::write,
-    Sysno::lseek,
-    Sysno::ioctl,
-    Sysno::pread64,
-    Sysno::pwrite64,
-    Sysno::readv,
-    Sysno::writev,
-    Sysno::connect,
-    Sysno::accept,
-    Sysno::sendto,
-    Sysno::recvfrom,
-    Sysno::sendmsg,
-    Sysno::recvmsg,
-    Sysno::shutdown,
-    Sysno::bind,
-    Sysno::listen,
-    Sysno::getsockname,
-    Sysno::getpeername,
-    Sysno::getsockopt,
-    Sysno::fcntl,
-    Sysno::flock,
-    Sysno::fsync,
-    Sysno::fdatasync,
-    Sysno::ftruncate,
-    Sysno::getdents,
-    Sysno::getdents64,
-    Sysno::fchdir,
-    Sysno::fchmod,
-    Sysno::fchown,
-    Sysno::fstatfs,
-    Sysno::readahead,
-    Sysno::fsetxattr,
-    Sysno::fgetxattr,
-    Sysno::flistxattr,
-    Sysno::fremovexattr,
-    Sysno::fadvise64,
-    Sysno::epoll_wait,
-    Sysno::epoll_ctl,
-    Sysno::inotify_add_watch,
-    Sysno::inotify_rm_watch,
-    Sysno::mkdirat,
-    Sysno::mknodat,
-    Sysno::fchownat,
-    Sysno::futimesat,
-    Sysno::newfstatat,
-    Sysno::unlinkat,
-    Sysno::renameat,
-    Sysno::linkat,
-    Sysno::readlinkat,
-    Sysno::fchmodat,
-    Sysno::faccessat,
-    Sysno::sync_file_range,
-    Sysno::vmsplice,
-    Sysno::utimensat,
-    Sysno::epoll_pwait,
-    Sysno::signalfd,
-    Sysno::fallocate,
-    Sysno::timerfd_settime,
-    Sysno::timerfd_gettime,
-    Sysno::accept4,
-    Sysno::signalfd4,
-    Sysno::dup3,
-    Sysno::preadv,
-    Sysno::pwritev,
-    Sysno::recvmmsg,
-    Sysno::fanotify_mark,
-    Sysno::name_to_handle_at,
-    Sysno::open_by_handle_at,
-    Sysno::syncfs,
-    Sysno::sendmmsg,
-    Sysno::setns,
-    Sysno::finit_module,
-    Sysno::renameat2,
-    Sysno::kexec_file_load,
-    Sysno::execveat,
-    Sysno::preadv2,
-    Sysno::pwritev2,
-    Sysno::statx,
-    Sysno::pidfd_send_signal,
-    Sysno::io_uring_enter,
-    Sysno::io_uring_register,
-    Sysno::open_tree,
-    Sysno::move_mount,
-    Sysno::fsconfig,
-    Sysno::fsmount,
-    Sysno::fspick,
-    Sysno::openat2,
-    Sysno::pidfd_getfd,
-]);
-
-static FD_ARG1_SYSCALLS: SysnoSet = SysnoSet::new(&[Sysno::dup2, Sysno::dup3]);
-
-/// Returns true if the given syscall operates on a protected file descriptor.
-pub fn uses_protected_fd(sysno: Sysno, arg0: usize, arg1: usize) -> bool {
-    (FD_ARG0_SYSCALLS.contains(sysno) && is_protected(&(arg0 as i32)))
-        || (FD_ARG1_SYSCALLS.contains(sysno) && is_protected(&(arg1 as i32)))
+/// The result a guest syscall gets when it names a protected descriptor, by
+/// the rule every in-process backend shares ([`reverie_inguest::reserved_fds`]):
+/// to the guest a protected descriptor is not open, so a `close` of it or any
+/// call that names it fails with `EBADF`, after Linux's own `EINVAL` check of
+/// `epoll_wait`'s event count. `None` when the call names none. A `*at` call
+/// whose path is absolute does not use its directory descriptor, so it is not
+/// refused. `close_range` and a `dup2`/`dup3` onto the Tool output socket's
+/// number are handled before this is asked.
+pub fn protected_fd_result(sysno: Sysno, args: &[u64; 6]) -> Option<i64> {
+    use reverie_inguest::reserved_fds;
+    let number = i64::from(sysno.id());
+    protected_files()
+        .lock()
+        .files
+        .iter()
+        .filter_map(|fd| u32::try_from(*fd).ok().map(u64::from))
+        .find_map(|fd| {
+            if let Some(result) = reserved_fds::epoll_wait_result(number, args, fd) {
+                return Some(result);
+            }
+            let closes = number == libc::SYS_close && reserved_fds::descriptor_arg(args, 0) == fd;
+            (closes
+                || reserved_fds::names_descriptor(number, args, fd)
+                || reserved_fds::socket_call_names_descriptor(number, args, fd))
+            .then_some(-i64::from(libc::EBADF))
+        })
 }
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -345,6 +277,89 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// A copy of a protected descriptor through a pidfd (`pidfd_getfd`'s second
+    /// argument) is refused like any other use of it.
+    #[test]
+    fn pidfd_getfd_of_a_protected_descriptor_is_refused() {
+        // A fresh process: this test opens, protects and closes descriptors,
+        // and the global protection registry is shared with every other test
+        // in this process (the adapter tests route their syscalls through it).
+        if std::env::var_os("REVERIE_SABRE_PROTECTED_FILES_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "protected_files::tests::pidfd_getfd_of_a_protected_descriptor_is_refused",
+                ])
+                .env("REVERIE_SABRE_PROTECTED_FILES_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "child test failed with {status}");
+            return;
+        }
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        protect_raw_fd(fds[0]);
+        let ebadf = Some(-i64::from(libc::EBADF));
+        assert_eq!(
+            protected_fd_result(Sysno::pidfd_getfd, &[u64::MAX, fds[0] as u64, 0, 0, 0, 0]),
+            ebadf
+        );
+        assert_eq!(
+            protected_fd_result(Sysno::pidfd_getfd, &[u64::MAX, fds[1] as u64, 0, 0, 0, 0]),
+            None
+        );
+        unprotect_raw_fd(fds[0]);
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// A descriptor marked inherited stays protected in a forked child, whose
+    /// registry starts empty otherwise; a plainly protected one does not.
+    #[test]
+    fn inherited_protection_survives_fork() {
+        // A fresh process: this test opens, protects and closes descriptors,
+        // and the global protection registry is shared with every other test
+        // in this process (the adapter tests route their syscalls through it).
+        if std::env::var_os("REVERIE_SABRE_PROTECTED_FILES_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "protected_files::tests::inherited_protection_survives_fork",
+                ])
+                .env("REVERIE_SABRE_PROTECTED_FILES_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "child test failed with {status}");
+            return;
+        }
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (inherited, plain) = (fds[0], fds[1]);
+        assert!(protect_inherited_raw_fd(inherited));
+        protect_raw_fd(plain);
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::alarm(5) };
+            let ok = is_protected(&inherited) && !is_protected(&plain);
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        for slot in &INHERITED {
+            let _ = slot.compare_exchange(inherited, -1, AcqRel, Acquire);
+        }
+        unprotect_raw_fd(inherited);
+        unprotect_raw_fd(plain);
+        unsafe {
+            libc::close(inherited);
+            libc::close(plain);
+        }
+    }
 
     #[test]
     fn fork_child_does_not_reuse_locked_registry() {
@@ -408,7 +423,10 @@ mod tests {
         let protected = protect_with(|| Ok::<RawFd, std::convert::Infallible>(fd)).unwrap();
 
         assert!(is_protected(&fd));
-        assert!(uses_protected_fd(Sysno::close, fd as usize, 0));
+        assert_eq!(
+            protected_fd_result(Sysno::close, &[fd as u64, 0, 0, 0, 0, 0]),
+            Some(-i64::from(libc::EBADF))
+        );
 
         drop(protected);
         assert!(
@@ -417,21 +435,6 @@ mod tests {
              `file` still owns it, so nothing else can have taken it"
         );
         drop(file);
-    }
-
-    #[test]
-    fn close_ranges_skip_every_protected_descriptor() {
-        assert_eq!(
-            close_ranges_around_protected(10, 20, &[12, 15, 20]),
-            vec![(10, 11), (13, 14), (16, 19)]
-        );
-        assert_eq!(
-            close_ranges_around_protected(10, 12, &[9, 13]),
-            vec![(10, 12)]
-        );
-        assert!(
-            close_ranges_around_protected(i32::MAX as u32, i32::MAX as u32, &[i32::MAX]).is_empty()
-        );
     }
 
     #[test]

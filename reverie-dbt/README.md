@@ -5,22 +5,19 @@ native DynamoRIO client:
 
 - inserts an atomic 64-bit counter update before every application branch via
   DynamoRIO's `drx` instruction-rewriting helper;
-- replaces application `CPUID` instructions with Hermit's deterministic CPU
-  identity, masking RDRAND, RDSEED, TSX, and AVX-512 features;
+- replaces application `CPUID` instructions with a call into the runtime,
+  which answers through its Tool's `handle_cpuid_event`. The client keeps no
+  CPU table: under Hermit the answer is Detcore's machine description, the
+  same one `/proc/cpuinfo` is rendered from, and the standalone prototype
+  runtime forwards the host's answer;
 - receives all application syscall entry events without ptrace;
-- rewrites every host-derived `uname` field (including `nodename` and `version`)
-  and zero-port `bind` calls with Hermit's deterministic values;
 - disables guest ASLR so non-fixed mappings remain stable;
-- substitutes minimal stable snapshots for volatile `/proc` views;
-- derives `getrandom` and random-device bytes from Hermit's configured RNG seed
-  using a layout-independent stream (indexed by seed and position, not by the
-  destination address), and follows random descriptors across the `read`/`pread`/
-  `readv`/`preadv` family and `dup`/`fcntl(F_DUPFD)` duplication;
-- virtualizes `getrusage` and `sysinfo` process metadata;
 - routes `open`/`openat`/`creat`, `read`/`write`/`close`, the legacy and modern
-  stat variants, `lseek`, and `access`/`faccessat`/`faccessat2` through the Rust
-  `PrototypeTool` and `Guest::inject`, returning the injected result while
-  suppressing the original syscall;
+  stat variants, `lseek`, `access`/`faccessat`/`faccessat2` and a few others
+  through a forwarding Rust tool (`PrototypeTool`) and `Guest::inject`,
+  returning the injected result while suppressing the original syscall. The
+  tool counts these calls and changes none of them: determinism is Detcore's
+  job, reached through Hermit's runtime, not this standalone one's;
 - launches shebang programs through their interpreter while preserving the exact
   guest environment; and
 - optionally reports process totals when the application exits.
@@ -83,6 +80,44 @@ run before their package's Rust library exists. Per-thread tool state is
 allocated by DynamoRIO and stored in `drmgr` TLS. The Rust runtime receives
 that state through an explicit C ABI pointer, avoiding dynamic Rust TLS inside
 DynamoRIO's private loader.
+
+Private client images and their dependencies require an owned VMM reservation
+before their segments are mapped. If a fixed mapping or owned-range restoration
+fails, the loader emits a named fatal diagnostic and exits with status 255,
+retaining the claim instead of retrying unsafe cleanup. A failure during exit-time
+unloading therefore overrides the application's ordinary exit status. Optional
+auxiliary-load refusals that retain known ownership can still return NULL after
+safe cleanup; mandatory startup ownership refusals terminate without running the
+guest uninstrumented. The bootstrap DynamoRIO core keeps its existing owner;
+this does not establish independence from changes to that core image's size.
+
+The native `-branch-facts` option enables a separate per-task count of completed
+original application conditional instructions from the first application
+instruction, including the interpreter and loaded modules. It is disabled by
+default because it adds instrumentation to every original conditional. The
+internal `DbtGuest::branch_fact` observation is distinct from mixed branch
+statistics and `Guest::read_clock`: it does not enable timers or change Detcore
+time, costs, or scheduling. Its equality-only owner identifies one live task
+and image; samples from different owners cannot be subtracted. A new task starts
+at zero, and a newly loaded image has a new scope. Unavailable observations are
+explicit errors rather than zero work. This interface is a mechanism prerequisite,
+not a continuous clock or a claim of PMU equivalence on every processor.
+
+With branch facts enabled, a returning syscall injection classified by DR's
+prehandler as CLONE_VM fails with a named backend error before kernel entry.
+This includes requests that Linux might later reject. Errors already established
+by DR's prehandler remain Linux errors. The returning bridge lacks the
+original/tail path's child-entry machinery; the refusal supplies no fabricated
+guest errno and does not silently convert a returning operation into a tail
+operation. Original and tail execution use their existing child-entry path.
+
+Collection is off by default. The accompanying cache-context retirement changes
+add local release-build checks for failed context reads, translations, and
+replacements. Failures return from a helper or suppress its abandonment
+notification; the void helpers do not return failure to outer reset/detach
+callers, which continue processing. These changes also apply when collection is
+disabled; component setter controls do not establish general failed-reset/detach
+recovery.
 
 ## Prototype Boundaries
 

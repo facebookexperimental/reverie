@@ -1,23 +1,14 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 #define _GNU_SOURCE
 #include <sys/syscall.h>
 #include <time.h>
 #include "real_syscall.h"
 #include "sbr_api_defs.h"
 
-/* A resolution no kernel reports, so the client can tell the plugin answered.
- */
+/* A resolution no kernel reports, so the client can tell the plugin answered. */
 #define MARKER_NSEC 12345
 
-static long
-handler(long nr, long a, long b, long c, long d, long e, long f, void* sp) {
+static long handler(long nr, long a, long b, long c, long d, long e, long f,
+                    void* sp) {
   (void)sp;
   if (nr == SYS_clock_getres && a == CLOCK_MONOTONIC && b != 0) {
     struct timespec* res = (struct timespec*)b;

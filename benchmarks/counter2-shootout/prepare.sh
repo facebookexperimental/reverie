@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 set -euo pipefail
 
 root=$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -16,10 +10,10 @@ has_backend() {
 }
 
 example_bins=()
-has_backend ptrace && example_bins+=(--bin counter2)
-has_backend kvm && example_bins+=(--bin reverie-kvm-counter2)
+# counter2 runs on ptrace, KVM and e9patch with --backend.
+{ has_backend ptrace || has_backend kvm || has_backend e9patch; } &&
+  example_bins+=(--bin counter2)
 has_backend liteinst && example_bins+=(--bin reverie-liteinst-examples)
-has_backend e9patch && example_bins+=(--bin reverie-e9patch-counter2)
 
 if ((${#example_bins[@]} > 0)); then
   cargo build --manifest-path "$root/Cargo.toml" --release \

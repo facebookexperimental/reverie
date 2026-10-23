@@ -40,6 +40,10 @@ struct Configuration {
 pub(crate) struct PipeOwner {
     creator: Arc<()>,
     configuration: Mutex<Configuration>,
+    /// Shared by both ends of one pipe: set once either end is exported.
+    /// An exported end can be given a host fasync owner, so a successful
+    /// write can then raise a configured signal (SIGPIPE included).
+    pair_exported: Arc<AtomicBool>,
 }
 
 impl PipeOwner {
@@ -48,9 +52,10 @@ impl PipeOwner {
         self.configuration.try_lock().is_ok()
     }
 
-    pub(super) fn new(creator: Arc<()>) -> Self {
+    pub(super) fn new(creator: Arc<()>, pair_exported: Arc<AtomicBool>) -> Self {
         Self {
             creator,
+            pair_exported,
             configuration: Mutex::new(Configuration {
                 phase: Phase::Fresh,
                 owner_type: 0, // F_OWNER_TID
@@ -71,7 +76,32 @@ impl PipeOwner {
         // The record is shared by every known alias; imported aliases never
         // acquire a new positive witness by inode or host-fd resemblance.
         configuration.phase = Phase::Escaped;
+        self.pair_exported.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Marks the pipe as no longer private to the guest without an export
+    /// record: a reopened /proc/self/fd description of it carries no owner
+    /// record, so its own export could not be seen.
+    pub(super) fn forfeit_privacy(&self) {
+        self.pair_exported.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether neither end of this pipe has been exported. Until one is, no
+    /// host fasync owner can exist for it (F_SETOWN stays in this record), so
+    /// a write that completes raises no signal.
+    pub(super) fn pair_never_exported(&self) -> bool {
+        !self.pair_exported.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn set_nonblocking(&self, host_fd: RawFd, value: libc::c_int) -> i64 {
+        let Ok(_configuration) = self.configuration.lock() else {
+            return negative_errno(libc::ENOSYS);
+        };
+        // Serialize with owner admission, F_SETFL and export across all aliases.
+        // Guest input was copied before this leaf lock. FIONBIO cannot enable
+        // fasync or overwrite unrelated flags with a stale F_GETFL snapshot.
+        set_fd_nonblocking(host_fd, value)
     }
 
     pub(super) fn set_flags(&self, host_fd: RawFd, flags: i32) -> i64 {

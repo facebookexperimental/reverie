@@ -13,6 +13,7 @@ use std::time::Instant;
 use futures::channel::oneshot;
 
 use super::*;
+use crate::error::ErrorExt;
 use crate::vm::GuestThreadGroup;
 
 #[derive(Default)]
@@ -138,12 +139,29 @@ impl Tool for RpcTool {
 }
 
 struct NoGuestExecution;
+#[reverie::provider]
+impl LinuxProvider for NoGuestExecution {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        panic!("native RPC control continued guest execution")
+    }
+}
+
+impl LinuxEmuSignalControl for NoGuestExecution {}
+
+impl LinuxEmuMemoryMap for NoGuestExecution {}
+
 impl GuestSyscallExecutor<RpcTool> for NoGuestExecution {
     fn read_clock(&self) -> Result<u64> {
         panic!("native RPC control read a guest clock")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("native RPC control continued guest execution")
     }
 }
 
@@ -1521,6 +1539,11 @@ impl Tool for NativeSignalTool {
     type GlobalState = NativeSignalGlobal;
     type ThreadState = Box<i32>;
 
+    // Every other test here passes `false`, which keeps the default.
+    fn requires_signal_control(config: &bool) -> bool {
+        *config
+    }
+
     async fn on_exit_thread<G: GlobalRPC<NativeSignalGlobal>>(
         &self,
         tid: Pid,
@@ -1557,6 +1580,14 @@ impl native_test_support::NativeToolCallback<NativeSignalTool> for NativeSignalC
     ) -> futures::future::BoxFuture<'a, std::result::Result<i64, reverie::Error>> {
         Box::pin(async move {
             assert_eq!(self.global.installs.load(Ordering::Acquire), 1);
+            // The callback's Guest reports the mode the root owner installed,
+            // in the parent and in the fork child alike.
+            let installed = if self.global.unchanged.load(Ordering::Acquire) {
+                reverie::BackendSignalControlMode::Unchanged
+            } else {
+                reverie::BackendSignalControlMode::ToolControlled
+            };
+            assert_eq!(guest.signal_control_mode(), installed);
             let task = guest
                 .signal_task_identity()
                 .expect("real executor identity required");
@@ -1737,6 +1768,109 @@ fn native_signal_setup_refusal_retires_before_hooks_and_preserves_original_cause
                 control.process.alarm_recipients(identity.process),
                 Err(Errno::ESRCH),
                 "no executor registry remains after refusal"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_required_signal_control_refuses_a_declined_offer_before_hooks() {
+    use native_test_support::NativeToolOwner;
+
+    // The configuration (`true`) requires process signal control. Offered the
+    // control, a Tool that answers Unchanged is refused by the backend with
+    // EINVAL through the installation failure path: published once, before
+    // either consuming hook, with the actual executor already retired. A Tool
+    // that takes the offer runs as before. Both constructors are exercised.
+    for (observe_lifecycle, unchanged) in
+        [(false, true), (true, true), (false, false), (true, false)]
+    {
+        let global = Arc::new(NativeSignalGlobal::default());
+        global.unchanged.store(unchanged, Ordering::Release);
+        global
+            .rpc
+            .failure_required
+            .store(unchanged, Ordering::Release);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let tool = Arc::new(NativeSignalTool {
+            drops: drops.clone(),
+        });
+        let pid = Pid::from_raw(1);
+        let result = if observe_lifecycle {
+            let state = crate::executor::native_loaded_state(&std::env::current_dir().unwrap());
+            let lifecycle = state.task_lifecycle.clone();
+            let executor = ElfExecutor::with_output(state, None);
+            let identity = executor.signal_task_identity().unwrap();
+            *global.retirement.lock().unwrap() = Some((lifecycle, identity));
+            let failure = FailureContext::new(RunFailure::new(&global), pid, pid);
+            NativeToolOwner::from_executor(
+                executor,
+                pid,
+                tool,
+                Box::new(1),
+                global.clone(),
+                true,
+                failure,
+            )
+        } else {
+            NativeToolOwner::new(pid, tool, Box::new(1), global.clone(), true)
+        };
+        assert_eq!(global.installs.load(Ordering::Acquire), 1);
+        if !unchanged {
+            let owner = result.expect("a taken control satisfies the requirement");
+            assert!(owner.signal_state_for_test().1);
+            // The successful run keeps its executor until it finishes.
+            if let Some((lifecycle, identity)) = global.retirement.lock().unwrap().take() {
+                assert!(
+                    lifecycle
+                        .lock()
+                        .unwrap()
+                        .get(identity.tid.as_raw())
+                        .is_some()
+                );
+            }
+            assert_eq!(
+                futures::executor::block_on(owner.finish(Ok(ExitStatus::Exited(37))))
+                    .unwrap()
+                    .0,
+                ExitStatus::Exited(37)
+            );
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+            assert_eq!(
+                *global.rpc.events.lock().unwrap(),
+                vec![(1, 1, 37), (2, 1, 37)]
+            );
+            assert_eq!(global.rpc.failures.load(Ordering::Acquire), 0);
+            assert!(global.rpc.failure_events.lock().unwrap().is_empty());
+            continue;
+        }
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a declined required control returned a callback-capable owner"),
+        };
+        assert!(
+            matches!(error.primary(), Error::Reverie(reverie::Error::Errno(errno)) if *errno == Errno::EINVAL)
+        );
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *global.rpc.events.lock().unwrap(),
+            vec![(1, 1, 255), (2, 1, 255)]
+        );
+        assert_eq!(
+            *global.rpc.failure_events.lock().unwrap(),
+            vec![reverie::BackendFailure {
+                pid,
+                tid: pid,
+                phase: "process signal control installation",
+            }]
+        );
+        if let Some((lifecycle, identity)) = global.retirement.lock().unwrap().as_ref() {
+            assert!(
+                lifecycle
+                    .lock()
+                    .unwrap()
+                    .get(identity.tid.as_raw())
+                    .is_none()
             );
         }
     }

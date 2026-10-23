@@ -197,7 +197,9 @@ fn run(retry: bool, queued_rt: usize) {
         return;
     }
     let discarded_before = late_timer_signals_discarded();
-    let margin = reverie_ptrace::PmuConfig::new().skid_margin();
+    let margin = reverie_ptrace::PmuConfig::new()
+        .expect("this host has a PMU profile")
+        .skid_margin();
     // Keep the syscall well inside the margin, leaving room for the loop's own
     // branches, so the target is never reached. Supported margins range from
     // 100 to 10,000 RCBs.
@@ -1136,7 +1138,9 @@ fn late_overflow_discard_steps_again_with_completed_signal_handling() {
         return;
     }
     let discarded_before = late_timer_signals_discarded();
-    let margin = reverie_ptrace::PmuConfig::new().skid_margin();
+    let margin = reverie_ptrace::PmuConfig::new()
+        .expect("this host has a PMU profile")
+        .skid_margin();
     let overflow_leads = MAX_OVERFLOW_LEADS.min(margin / 4);
     assert!(overflow_leads > 0, "skid margin {margin} leaves no lead");
     let timeout_rcbs = ARM_RCBS + margin;

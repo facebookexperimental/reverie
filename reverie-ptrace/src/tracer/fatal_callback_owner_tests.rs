@@ -114,7 +114,8 @@ mod fatal_callback_owner_tests {
         let words = FatalWords::new();
         let address = words.0 as usize;
         word(address, 0).store(MAGIC, Ordering::SeqCst);
-        let sentinel = fork_paused_child(Instant::now() + fatal_remaining(deadline));
+        let sentinel_child = fork_paused_child(Instant::now() + fatal_remaining(deadline));
+        let sentinel = sentinel_child.pid();
         let sentinel_identity = untraced_process_identity(sentinel);
         let tracer = tokio::time::timeout(
             fatal_remaining(deadline),

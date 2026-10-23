@@ -3,7 +3,7 @@
 [package]
 name = "reverie-core"
 description = "Deterministic user-space syscall and signal interception runtime — the core Reverie process-instrumentation framework."
-version = "0.4.1"
+version = "0.5.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -23,6 +23,11 @@ categories = ["development-tools::debugging", "os::linux-apis"]
 [lib]
 name = "reverie"
 
+[features]
+default = []
+# Cargo dev-edge test helpers; internal Buck exposes inert fixture support.
+perf-fixture = []
+
 [dependencies]
 addr2line = "0.26.1"
 anyhow = "1.0.103"
@@ -36,14 +41,17 @@ memmap2 = "0.9.11"
 never-say-never = "6"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 object = { version = "0.40.0", features = ["read", "write"] }
+perf-event-open-sys = "5.0"
 procfs = "0.18.0"
 raw-cpuid = "10.7.0"
-reverie-process = { version = "0.4.1", path = "../reverie-process" }
-reverie-syscalls = { version = "0.4.1", path = "../reverie-syscalls" }
+reverie-process = { version = "0.5.1", path = "../reverie-process" }
+reverie-syscalls = { version = "0.5.1", path = "../reverie-syscalls" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 syscalls = { version = "0.6.18", features = ["serde"] }
 thiserror = "2.0.18"
+tracing = "0.1.41"
 typed-arena = "2"
 
 [dev-dependencies]
 serde_json = { version = "1.0.140", features = ["alloc"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

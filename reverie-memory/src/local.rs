@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fmt;
 use std::io;
 
 use super::Addr;
@@ -25,8 +26,28 @@ use super::MemoryAccess;
 /// Scalar methods return `EFAULT` when no byte can be copied; vectored methods
 /// represent that fault as `Ok(0)`, matching safeptrace. Other errors and partial
 /// byte counts are preserved in both interfaces.
-#[derive(Default, Debug)]
-pub struct LocalMemory {}
+pub struct LocalMemory {
+    syscall: unsafe fn(syscalls::Sysno, [usize; 6]) -> Result<usize, Errno>,
+}
+
+impl Default for LocalMemory {
+    fn default() -> Self {
+        Self {
+            syscall: native_syscall,
+        }
+    }
+}
+
+impl fmt::Debug for LocalMemory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The execution mechanism must not expose an ASLR-dependent address.
+        formatter.debug_struct("LocalMemory").finish()
+    }
+}
+
+unsafe fn native_syscall(number: syscalls::Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+    unsafe { syscalls::syscall6(number, args[0], args[1], args[2], args[3], args[4], args[5]) }
+}
 
 impl LocalMemory {
     /// Creates a new representation of memory in the current address space.
@@ -41,6 +62,26 @@ impl LocalMemory {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Uses a runtime's syscall instruction for the same kernel memory copies.
+    ///
+    /// This selects only the mechanism for issuing the syscalls. Every transfer
+    /// still obtains the current physical process ID, then makes one kernel
+    /// copy attempt; no PID or syscall result is cached.
+    ///
+    /// # Safety
+    ///
+    /// On every invoking thread, for this instance's entire lifetime, `syscall`
+    /// must synchronously issue exactly the supplied Linux syscall with all six
+    /// arguments unchanged and return its unmodified success count or errno.
+    /// It must be reentrant, retain no pointers after return, and add no
+    /// allocation, lock, await, guest callback, retry, or synthetic result.
+    /// The syscall itself may block according to its kernel semantics.
+    pub unsafe fn with_syscall_executor(
+        syscall: unsafe fn(syscalls::Sysno, [usize; 6]) -> Result<usize, Errno>,
+    ) -> Self {
+        Self { syscall }
+    }
 }
 
 #[repr(C)]
@@ -50,6 +91,7 @@ struct Iovec {
 }
 
 fn copy(
+    memory: &LocalMemory,
     syscall: syscalls::Sysno,
     local: *const Iovec,
     local_count: usize,
@@ -60,15 +102,24 @@ fn copy(
     // returns the actual transferred prefix. In particular, do not preflight
     // later remote addresses or retry a short copy: either would change its
     // side effects. No guest pointee becomes a Rust reference here.
+    //
+    // The process id comes from the raw syscall rather than
+    // `std::process::id`, which calls the C library's `getpid`: inside an
+    // in-guest runtime that is a dynamic symbol the guest program or a
+    // preloaded library may define, and such a definition runs guest code
+    // (and may allocate in the guest's heap) on every memory access.
     unsafe {
-        syscalls::syscall6(
+        let pid = (memory.syscall)(syscalls::Sysno::getpid, [0; 6])?;
+        (memory.syscall)(
             syscall,
-            std::process::id() as usize,
-            local as usize,
-            local_count,
-            remote as usize,
-            remote_count,
-            0,
+            [
+                pid,
+                local as usize,
+                local_count,
+                remote as usize,
+                remote_count,
+                0,
+            ],
         )
     }
 }
@@ -100,6 +151,7 @@ impl MemoryAccess for LocalMemory {
         // IoSlice and IoSliceMut are ABI-compatible with iovec on Unix.
         // Pass only their descriptor arrays; never dereference remote slices.
         vectored_result(copy(
+            self,
             syscalls::Sysno::process_vm_readv,
             write_to.as_ptr().cast(),
             write_to.len(),
@@ -114,6 +166,7 @@ impl MemoryAccess for LocalMemory {
         write_to: &mut [io::IoSliceMut],
     ) -> Result<usize, Errno> {
         vectored_result(copy(
+            self,
             syscalls::Sysno::process_vm_writev,
             read_from.as_ptr().cast(),
             read_from.len(),
@@ -140,7 +193,14 @@ impl MemoryAccess for LocalMemory {
             base: buf.as_mut_ptr().cast(),
             len: buf.len(),
         };
-        copy(syscalls::Sysno::process_vm_readv, &local, 1, &remote, 1)
+        copy(
+            self,
+            syscalls::Sysno::process_vm_readv,
+            &local,
+            1,
+            &remote,
+            1,
+        )
     }
 
     fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
@@ -156,7 +216,14 @@ impl MemoryAccess for LocalMemory {
             base: buf.as_ptr() as *mut core::ffi::c_void,
             len: buf.len(),
         };
-        copy(syscalls::Sysno::process_vm_writev, &local, 1, &remote, 1)
+        copy(
+            self,
+            syscalls::Sysno::process_vm_writev,
+            &local,
+            1,
+            &remote,
+            1,
+        )
     }
 }
 

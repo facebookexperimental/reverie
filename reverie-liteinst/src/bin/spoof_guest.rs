@@ -1,20 +1,12 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-252): Review shared built-in spoof guest fixture.
 //! Guest fixture proving the LiteInst trap path can service and MUTATE a
-//! syscall result through a shared `reverie-preload` built-in.
+//! syscall result through a shared `reverie-inguest` built-in.
 //!
 //! It issues a raw `getpid` syscall (bypassing glibc's cached PID so the value
 //! comes from the trapped syscall, not a userspace cache) and prints
 //! `getpid=<value>`. Under the `spoof-getpid` built-in the runtime rewrites the
-//! result to `reverie_preload::SPOOF_PID`; under `passthrough` (or no tool) the
+//! result to `reverie_inguest::SPOOF_PID`; under `passthrough` (or no tool) the
 //! real PID is preserved.
 
 fn main() {

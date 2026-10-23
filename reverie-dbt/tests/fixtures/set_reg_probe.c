@@ -12,25 +12,34 @@
  * HERMIT_DBT_TEST_SET_REG tool intercepts to overwrite r15 via set_regs), then
  * reads r15 back. Because r15 is preserved across the syscall boundary, the
  * value observed afterwards is exactly what the tool wrote, proving set_regs
- * reached the application register file.
+ * reached the application register file. The same Tool returns distinct own-ID
+ * results; collect all three before checking that native code preserved them.
  */
 
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/syscall.h>
+#include <unistd.h>
 
 // TODO-HUMAN-REVIEW(PR-167): Review the DBT set_regs probe fixture.
 int main(void) {
   uint64_t observed = 0;
+  long pid = 0;
   __asm__ volatile(
       "movq $0x1111111111111111, %%r15\n\t"
       "movq $39, %%rax\n\t" /* SYS_getpid */
       "syscall\n\t"
       "movq %%r15, %0\n\t"
-      : "=r"(observed)
+      : "=r"(observed), "=a"(pid)
       :
-      : "rax", "rcx", "r11", "r15", "memory");
+      : "rcx", "r11", "r15", "memory");
+  long ppid = syscall(SYS_getppid);
+  long tid = syscall(SYS_gettid);
   printf("r15=0x%016llx\n", (unsigned long long)observed);
-  return 0;
+  printf("tool identities pid=%ld ppid=%ld tid=%ld\n", pid, ppid, tid);
+  return observed == UINT64_C(0xdeadbeefcafef00d) &&
+          pid == 4321 && ppid == 4322 && tid == 4323
+      ? 0
+      : 1;
 }

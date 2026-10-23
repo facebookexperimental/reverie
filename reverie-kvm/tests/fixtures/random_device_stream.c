@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -15,10 +7,12 @@
 #include <unistd.h>
 
 int main(int argc, char** argv) {
-  if (argc != 2)
+  if (argc != 2 && argc != 3)
     return 90;
   int vector = strcmp(argv[1], "vector") == 0;
-  int fd = open("/dev/urandom", O_RDONLY);
+  /* The partitioned reads take any readable object; the default is the
+   * device. */
+  int fd = open(argc == 3 ? argv[2] : "/dev/urandom", O_RDONLY);
   if (fd < 0)
     return 91;
   if (strcmp(argv[1], "partitioned") == 0) {

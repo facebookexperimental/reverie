@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Real original callbacks and captured bytes; no Hermit timer/scheduler model.
 use reverie::CallbackSignalSite;
 use reverie::ParkedObservationLease;
@@ -55,7 +47,7 @@ impl Tool for CaptureTool {
     fn new(_: Pid, mode: &u8) -> Self {
         Self { mode: *mode }
     }
-    fn observe_signal_dequeues(_: &u8) -> bool {
+    fn may_observe_signal_dequeues(_: &u8) -> bool {
         true
     }
     fn subscriptions(_: &u8) -> Subscription {

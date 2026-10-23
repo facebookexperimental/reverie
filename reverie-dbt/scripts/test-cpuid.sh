@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -20,9 +14,16 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 "${CC:-cc}" -std=c11 -O2 -Wall -Wextra -Werror \
   "$crate_dir/tests/cpuid_probe.c" -o "$tmpdir/cpuid-probe"
-"$drrun" -quiet -disable_rseq -stack_size 2M -c "$client" -- "$tmpdir/cpuid-probe" \
+# Leaves 1, 4 and 0xb report the CPU the program runs on, so both runs use the
+# same one.
+cpu=$(awk '/^Cpus_allowed_list/ {split($2, first, /[-,]/); print first[1]}' \
+  /proc/self/status)
+taskset -c "$cpu" "$tmpdir/cpuid-probe" >"$tmpdir/native"
+taskset -c "$cpu" "$drrun" -quiet -disable_rseq -stack_size 2M -c "$client" -- "$tmpdir/cpuid-probe" \
   >"$tmpdir/stdout" 2>"$tmpdir/stderr"
 
-grep -Fx 'CPUID-SUCCESS vendor=GenuineIntel signature=00000663' \
-  "$tmpdir/stdout"
+# The client answers CPUID only through the runtime's tool (ABI version 9), and
+# the prototype runtime forwards the host's answer, so every row must be the
+# native one. A table left in the client would change rows here.
+cmp "$tmpdir/native" "$tmpdir/stdout"
 cat "$tmpdir/stderr"

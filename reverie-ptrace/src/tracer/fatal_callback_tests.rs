@@ -1,6 +1,5 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
@@ -22,33 +21,6 @@ mod fatal_callback_tests {
     const TSC_VALUE: u64 = 0x1122_3344_5566_7788;
     #[cfg(target_arch = "x86_64")]
     const TSC_AUX: u32 = 0x1234_5678;
-    #[cfg(target_arch = "x86_64")]
-    const ARCH_GET_CPUID: libc::c_int = 0x1011;
-    #[cfg(target_arch = "x86_64")]
-    const ARCH_SET_CPUID: libc::c_int = 0x1012;
-
-    /// True if this host can trap CPUID, which the ptrace backend needs before
-    /// a `Callback::Cpuid` fixture can reach the tool at all. AMD hosts report
-    /// the state but reject the trap before Linux 6.17, and the backend then
-    /// continues without CPUID interception.
-    #[cfg(target_arch = "x86_64")]
-    fn cpuid_faulting_supported() -> bool {
-        // SAFETY: `arch_prctl(ARCH_GET_CPUID)` takes no pointer arguments and
-        // only reads the calling thread's CPUID-faulting state.
-        let previous = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0) };
-        if previous < 0 {
-            return false;
-        }
-        // SAFETY: `arch_prctl(ARCH_SET_CPUID)` takes no pointer arguments and
-        // only writes the calling thread's CPUID-faulting state. CPUID faults
-        // in this thread until the state is restored below, and neither this
-        // function nor the restore executes the instruction.
-        if unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0) } != 0 {
-            return false;
-        }
-        // SAFETY: as above, writing back the state read before the probe.
-        unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, previous) == 0 }
-    }
 
     #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
     enum Callback {
@@ -682,19 +654,11 @@ mod fatal_callback_tests {
     #[cfg(target_arch = "x86_64")]
     #[tokio::test(flavor = "current_thread")]
     async fn cpuid_success_returns_registers_and_resumes_guest() {
-        if !cpuid_faulting_supported() {
-            eprintln!("skipping: this host does not support CPUID faulting");
-            return;
-        }
         check_callback(Callback::Cpuid, false).await;
     }
     #[cfg(target_arch = "x86_64")]
     #[tokio::test(flavor = "current_thread")]
     async fn cpuid_real_esrch_preserves_first_cause_and_retires() {
-        if !cpuid_faulting_supported() {
-            eprintln!("skipping: this host does not support CPUID faulting");
-            return;
-        }
         check_callback(Callback::Cpuid, true).await;
     }
     #[cfg(target_arch = "x86_64")]

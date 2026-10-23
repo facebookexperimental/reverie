@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check-format:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v2
+
+      - name: Run clang-format
+        uses: jidicula/clang-format-action@v4.6.1
+        with:
+          clang-format-version: '12'
+          check-path: '.'
+          exclude-regex: '(libsqlfs|^./patchelf/elf.h$)'
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v2
+
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Install libelf
+        run: sudo apt install -y libelf-dev
+
+      - name: Run CMake
+        uses: lukka/run-cmake@v10
+        with:
+          configurePreset: 'ninja'
+          buildPreset: 'ninja'

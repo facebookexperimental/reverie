@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // These controls qualify only ordinary syncfs and conservative ENOSYS refusal.
 // PR610's authenticated carrier/EBADMSG contract remains separate.
 
@@ -27,7 +19,7 @@ fn syncfs_dispatch_one_translated_host_call_preserves_each_errno() {
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
     let mut ordinary = syncfs_memfd("syncfs-ordinary");
-    ordinary.write_all(b"0.00 0.00\n").unwrap();
+    ordinary.write_all(SELF_MAPS_CONTENT).unwrap();
     let memfd = insert_file_with_flags(&mut state, ordinary, false, None);
     let [reader, _writer] = pipe_fionread_host_pipe();
     let pipe = insert_file_with_flags(&mut state, reader, false, None);
@@ -106,7 +98,7 @@ fn syncfs_closed_and_path_only_precede_private_refusal_without_host_call() {
             negative_errno(libc::EBADF)
         );
     }
-    for path in ["/proc/uptime", root.0.to_str().unwrap()] {
+    for path in ["/proc/self/maps", root.0.to_str().unwrap()] {
         let fd = open_with_flags(&mut memory, &mut state, path, libc::O_PATH);
         assert!(fd >= 0);
         assert_eq!(
@@ -129,17 +121,22 @@ fn syncfs_closed_and_path_only_precede_private_refusal_without_host_call() {
     }
 }
 
-// The backend creates a memfd named reverie-kvm-virtual-file only in a run that
-// reports host metadata timestamps. In any other run the name belongs to the
-// guest, and the guest's memfd is an ordinary file that Linux syncfs serves.
+// The backend no longer creates a memfd named reverie-kvm-virtual-file or
+// reverie-kvm-virtual, so in every run those names belong to the guest, and the
+// guest's memfd is an ordinary file that Linux syncfs serves.
 #[test]
-fn syncfs_reserves_the_virtual_file_carrier_name_only_when_the_backend_creates_it() {
+fn syncfs_serves_a_guest_memfd_named_like_the_removed_virtual_carriers() {
     let root = TestDir::new();
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-    for host_metadata_timestamps in [false, true] {
+    for (name, host_metadata_timestamps) in [
+        ("reverie-kvm-virtual-file", false),
+        ("reverie-kvm-virtual-file", true),
+        ("reverie-kvm-virtual", false),
+        ("reverie-kvm-virtual", true),
+    ] {
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = host_metadata_timestamps;
-        let mut file = syncfs_memfd("reverie-kvm-virtual-file");
+        let mut file = syncfs_memfd(name);
         file.write_all(b"guest bytes\n").unwrap();
         let host = file.as_raw_fd();
         let fd = insert_file_with_flags(&mut state, file, false, None);
@@ -150,22 +147,48 @@ fn syncfs_reserves_the_virtual_file_carrier_name_only_when_the_backend_creates_i
             observed.set(observed.get() + 1);
             0
         });
-        let (expected, calls) = if host_metadata_timestamps {
-            (negative_errno(libc::ENOSYS), 0)
-        } else {
-            (0, 1)
-        };
         assert_eq!(
             syncfs_call(&mut memory, &mut state, fd as u64),
-            expected,
-            "host_metadata_timestamps={host_metadata_timestamps}"
+            0,
+            "{name} host_metadata_timestamps={host_metadata_timestamps}"
         );
         assert_eq!(
             seen.get(),
-            calls,
-            "host_metadata_timestamps={host_metadata_timestamps}"
+            1,
+            "{name} host_metadata_timestamps={host_metadata_timestamps}"
         );
         drop(hook);
+        assert_eq!(close(&mut state, fd as u64), 0);
+    }
+}
+
+// truncate through a /proc/self/fd link truncates a guest memfd named like a
+// removed carrier (the random device's reverie-kvm-virtual or the virtual
+// file's reverie-kvm-virtual-file) as Linux truncates any other memfd.
+#[test]
+fn truncate_serves_guest_memfds_named_like_removed_carriers() {
+    let root = TestDir::new();
+    let mut state = test_state(&root.0);
+    let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    for (name, expected) in [
+        ("reverie-kvm-virtual", 0),
+        ("reverie-kvm-virtual-file", 0),
+        ("reverie-kvm-virtual-ordinary", 0),
+    ] {
+        let mut file = syncfs_memfd(name);
+        file.write_all(b"guest bytes\n").unwrap();
+        let fd = insert_file_with_flags(&mut state, file, false, None);
+        write_c_string(&mut memory, 0x100, &format!("/proc/self/fd/{fd}"));
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_truncate,
+                [0x100, 0, 0, 0, 0, 0]
+            ),
+            expected,
+            "{name}"
+        );
         assert_eq!(close(&mut state, fd as u64), 0);
     }
 }
@@ -178,7 +201,6 @@ fn syncfs_reserved_names_deny_without_authenticating_payload_or_seals() {
     let _hook = install_syncfs_test_hook(|_| panic!("reserved private name reached host syncfs"));
     for name in [
         "reverie-kvm-proc",
-        "reverie-kvm-virtual",
         "reverie-kvm-guest-memory",
         "reverie-kvm.proc-carrier.v1",
         "reverie-kvm.proc-carrier.v1.forged",
@@ -200,10 +222,11 @@ fn syncfs_reserved_names_deny_without_authenticating_payload_or_seals() {
     for name in [
         "syncfs-ordinary",
         "reverie-kvm-proc-ordinary",
+        "reverie-kvm-virtual",
         "reverie-kvm-virtual-ordinary",
     ] {
         let mut file = syncfs_memfd(name);
-        file.write_all(b"0.00 0.00\n").unwrap();
+        file.write_all(SELF_MAPS_CONTENT).unwrap();
         let host = file.as_raw_fd();
         let fd = insert_file_with_flags(&mut state, file, false, None);
         let seen = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -300,13 +323,8 @@ fn syncfs_transfer_after_sender_close(
 fn syncfs_private_rights_remain_refused_after_sender_reuse_dup_fork_exec() {
     let root = TestDir::new();
     let replacement = root.0.join("replacement");
-    std::fs::write(&replacement, b"0.00 0.00\n").unwrap();
-    for path in [
-        "/proc/uptime",
-        "/proc/self/loginuid",
-        "/proc/self/stat",
-        "/proc/self/status",
-    ] {
+    std::fs::write(&replacement, SELF_MAPS_CONTENT).unwrap();
+    for path in ["/proc/self/maps", "/proc/self/stat", "/proc/self/status"] {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
         let original = open_readonly(&mut memory, &mut state, path) as i32;
@@ -317,10 +335,10 @@ fn syncfs_private_rights_remain_refused_after_sender_reuse_dup_fork_exec() {
             host_file_key(host_fd(&state, received).unwrap()).unwrap(),
             original_key
         );
-        if matches!(path, "/proc/uptime" | "/proc/self/loginuid") {
+        if path == "/proc/self/maps" {
             assert!(
                 !state.proc_files.contains_key(&received),
-                "real transfer loses fixed/virtual metadata"
+                "real transfer loses fixed metadata"
             );
             assert!(!state.fdinfo_files.contains_key(&received));
         }
@@ -365,12 +383,10 @@ fn syncfs_known_private_descriptions_are_refused_without_host_call() {
     let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
     let mut fds = Vec::new();
     for path in [
-        "/proc/uptime",
+        "/proc/self/maps",
         "/proc/self/stat",
         "/proc/self/status",
         "/proc",
-        "/dev/urandom",
-        "/proc/self/loginuid",
     ] {
         let fd = open_readonly(&mut memory, &mut state, path);
         assert!(fd >= 0, "{path}: {fd}");

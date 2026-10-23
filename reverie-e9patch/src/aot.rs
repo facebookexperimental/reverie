@@ -188,7 +188,7 @@ unsafe extern "C" fn reverie_e9patch_dispatch_aot(
     };
     let _scope = CurrentFrameScope::enter(frame, trap_rflags);
     let result =
-        reverie_preload::trap::dispatch_direct(number.id() as i64, args, instruction_pointer);
+        reverie_inguest::trap::dispatch_direct(number.id() as i64, args, instruction_pointer);
     // SAFETY: dispatch has returned and no Tool borrow of the current frame is
     // live; the trampoline still owns the same unique frame.
     unsafe { (&mut *frame).set_result(result) };

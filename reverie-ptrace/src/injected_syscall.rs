@@ -116,29 +116,6 @@ impl InjectedSyscallFrame {
         self.rax = result as u64;
     }
 
-    /// Re-dispatches this frame as `restart_syscall`, leaving every argument
-    /// register untouched, exactly as Linux rewrites `RAX` before restarting a
-    /// syscall that returned `-ERESTART_RESTARTBLOCK`.
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn set_restart_syscall(&mut self) {
-        self.rax = Sysno::restart_syscall as u64;
-    }
-
-    /// The raw syscall number the frame will dispatch, before a result is
-    /// stored in its place.
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn raw_syscall_number(&self) -> u64 {
-        self.rax
-    }
-
-    /// Replaces the syscall number the frame will re-dispatch, as a signal
-    /// handler that edits `rax` before a kernel restart changes the syscall
-    /// the restarted `syscall` instruction makes.
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn set_raw_syscall_number(&mut self, number: u64) {
-        self.rax = number;
-    }
-
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn copy_to_user_regs(&self, regs: &mut libc::user_regs_struct) {
         regs.r15 = self.r15;
@@ -319,33 +296,15 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn restart_syscall_rewrite_keeps_every_argument_register() {
-        let original = frame();
-        let mut restarted = original;
-        restarted.set_restart_syscall();
-        assert_eq!(restarted.syscall_number(), Sysno::restart_syscall);
-        assert_eq!(restarted.raw_args(), original.raw_args());
-        assert_eq!(restarted.rip, original.rip);
-        assert_eq!(
-            InjectedSyscallFrame {
-                rax: original.rax,
-                ..restarted
-            },
-            original
-        );
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
     fn repeated_syscall_entry_emulation_is_idempotent() {
-        // A rewound LiteInst trap re-enters dispatch and emulates the entry
-        // clobbers a second time with the same trap flags.
+        // Emulating the entry clobbers a second time with the same trap flags,
+        // even after the syscall number changes, leaves them as they were.
         let mut once = frame();
         once.emulate_syscall_entry(0x202);
         let mut twice = once;
         twice.emulate_syscall_entry(0x202);
         assert_eq!(twice, once);
-        twice.set_restart_syscall();
+        twice.rax = Sysno::restart_syscall as u64;
         twice.emulate_syscall_entry(0x202);
         assert_eq!(twice.rcx, once.rcx);
         assert_eq!(twice.r11, once.r11);

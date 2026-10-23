@@ -429,24 +429,6 @@ run_test_check() {
         "$LIBTEST_COUNTS_TOOL" run "$counts_file" -- "$@"
 }
 
-build_workspace_with_loader_conformance() {
-    printf 'Required substep: Build workspace\nCommand: cargo build --workspace --all-features\n'
-    if cargo build --workspace --all-features; then
-        :
-    else
-        return "$?"
-    fi
-
-    # The real release artifact is intentionally ignored by the all-features
-    # test harness. Its runner binds the DSO and requires exactly one test.
-    printf 'Required substep: LiteInst real target-loader conformance\nCommand:'
-    printf ' %q' env "CARGO_TARGET_DIR=$ROOT_DIR/target/liteinst-conformance" \
-        "$ROOT_DIR/reverie-liteinst/tests/run_target_loader_conformance.sh"
-    printf '\n'
-    env CARGO_TARGET_DIR="$ROOT_DIR/target/liteinst-conformance" \
-        "$ROOT_DIR/reverie-liteinst/tests/run_target_loader_conformance.sh"
-}
-
 if ((SELF_TEST_GATE_COUNTS == 1)); then
     set -e
     reset_self_test_gates() {
@@ -766,13 +748,42 @@ readonly -a REGULAR_TEST_SKIP_ARGS=(
     --skip tests::uid_namespace
 )
 
+# These inputs belong to the required producer for this validation generation.
+# Empty values after a failed prebuild cannot reuse an inherited/stale fixture.
+REVERIE_LITEINST_PRELOAD=
+REVERIE_LITEINST_TEST_RUNTIME_MANIFEST=
+REVERIE_LITEINST_ALLOCATOR_GUEST=
+REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST=
+
+build_liteinst_allocator_fixtures() {
+    local parent generation
+    mkdir -p "$ROOT_DIR/target/m1-validation" || return
+    parent=$(mktemp -d "$ROOT_DIR/target/m1-validation/run.XXXXXXXX") || return
+    generation="$parent/fixtures"
+    "$ROOT_DIR/scripts/build-liteinst-test-runtime.rs" --for-ci "$generation" || return
+    # The producer writes these four quoted paths only after both receipts pass.
+    source "$generation/bundle/fixture.env"
+}
+
 run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
-run_check "Build workspace" build_workspace_with_loader_conformance
+run_check "Build workspace" cargo build --workspace --all-features
+run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
 run_check "DBT virtual identity and pidfd_open policy" \
     "$ROOT_DIR/reverie-dbt/scripts/test-identity-policy.sh"
+# The counted runner accepts only a command that starts with `cargo test`, so
+# the fixture paths reach the tests through the environment rather than an
+# `env NAME=VALUE` prefix. They are exported for this step alone.
+export REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
+    REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
 run_test_check "Test regular workspace cases" cargo test --workspace --all-features \
     -- --test-threads=1 "${REGULAR_TEST_SKIP_ARGS[@]}"
+export -n REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
+    REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
 run_test_check "Documentation tests" cargo test --workspace --doc
+# Every backend this host has, against the ledger for its environment; a
+# backend whose inputs are missing is refused by name, and a host with no
+# ledger gets its verdicts reported, not judged (reverie-examples/e2e/README.md).
+run_check "Reverie-layer cross-backend e2e" "$ROOT_DIR/reverie-examples/e2e/run.sh"
 run_check "Clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
 

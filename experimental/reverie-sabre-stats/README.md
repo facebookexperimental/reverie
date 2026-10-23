@@ -10,7 +10,7 @@ the ordinary [`hermit-run`](https://crates.io/crates/hermit-run) installation.
 
 ```toml
 [dependencies]
-reverie-sabre-stats = "0.4"
+reverie-sabre-stats = "0.5"
 ```
 
 See the [API documentation](https://docs.rs/reverie-sabre-stats) for the ABI

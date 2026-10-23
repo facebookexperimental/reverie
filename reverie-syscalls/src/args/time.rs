@@ -39,8 +39,8 @@ impl From<libc::timespec> for Timespec {
     }
 }
 
-impl From<libc::statx_timestamp> for Timespec {
-    fn from(tp: libc::statx_timestamp) -> Self {
+impl From<crate::linux_abi::StatxTimestamp> for Timespec {
+    fn from(tp: crate::linux_abi::StatxTimestamp) -> Self {
         Timespec {
             tv_sec: tp.tv_sec as _,
             tv_nsec: tp.tv_nsec as _,
@@ -48,11 +48,11 @@ impl From<libc::statx_timestamp> for Timespec {
     }
 }
 
-impl From<Timespec> for libc::statx_timestamp {
+impl From<Timespec> for crate::linux_abi::StatxTimestamp {
     fn from(tp: Timespec) -> Self {
         let ts = core::mem::MaybeUninit::zeroed();
         // SAFETY: All zeroes is a valid representation of statx_timestamp.
-        let mut ts: libc::statx_timestamp = unsafe { ts.assume_init() };
+        let mut ts: crate::linux_abi::StatxTimestamp = unsafe { ts.assume_init() };
         ts.tv_sec = tp.tv_sec as _;
         ts.tv_nsec = tp.tv_nsec as _;
         ts

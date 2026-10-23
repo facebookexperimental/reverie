@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use reverie::ProcessAlarmSignalDisposition;
 use reverie::ProcessAlarmSignalErrorKind;
 use reverie::ProcessAlarmSignalOutcome;
@@ -37,6 +29,36 @@ struct QueueExecutor {
     outcome: ProcessAlarmSignalOutcome,
     calls: usize,
 }
+#[reverie::provider]
+impl LinuxProvider for QueueExecutor {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        panic!("queue operation executed a guest syscall")
+    }
+}
+
+impl LinuxEmuSignalControl for QueueExecutor {
+    fn defer_signal_delivery(&mut self, _: SignalEvent) -> std::result::Result<(), Errno> {
+        panic!("queue operation used private signal deferral")
+    }
+
+    fn queue_process_alarm_signal(&mut self, event: SignalEvent) -> ProcessAlarmSignalOutcome {
+        assert_eq!(event, self.expected);
+        self.calls += 1;
+        self.outcome
+    }
+}
+
+impl LinuxEmuMemoryMap for QueueExecutor {}
+
 impl GuestSyscallExecutor<AdapterTool> for QueueExecutor {
     fn read_clock(&self) -> Result<u64> {
         Err(Error::GuestClock(
@@ -44,20 +66,10 @@ impl GuestSyscallExecutor<AdapterTool> for QueueExecutor {
         ))
     }
 
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("queue operation executed a guest syscall")
-    }
-    fn defer_signal_delivery(&mut self, _: SignalEvent) -> std::result::Result<(), Errno> {
-        panic!("queue operation used private signal deferral")
-    }
-    fn queue_process_alarm_signal(&mut self, event: SignalEvent) -> ProcessAlarmSignalOutcome {
-        assert_eq!(event, self.expected);
-        self.calls += 1;
-        self.outcome
-    }
     fn complete_injection<'a>(
         &'a mut self,
         _: ToolContext<'a, AdapterTool>,
+        _plan: Option<crate::executor::StagedProcessAction>,
     ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
     where
         AdapterTool: 'a,
@@ -174,12 +186,29 @@ fn process_alarm_signal_into_guest_forwards_complete_outcomes_without_guest_effe
 }
 
 struct UnsupportedExecutor;
+#[reverie::provider]
+impl LinuxProvider for UnsupportedExecutor {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        panic!("refusal executed a guest syscall")
+    }
+}
+
+impl LinuxEmuSignalControl for UnsupportedExecutor {}
+
+impl LinuxEmuMemoryMap for UnsupportedExecutor {}
+
 impl GuestSyscallExecutor<AdapterTool> for UnsupportedExecutor {
     fn read_clock(&self) -> Result<u64> {
         panic!("refusal read a guest counter")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("refusal executed a guest syscall")
     }
 }
 
@@ -236,7 +265,7 @@ fn process_alarm_signal_transport_contexts_match_resumable_boundaries() {
     let mut info = [0; reverie::SIGNAL_INFO_SIZE];
     info[0..4].copy_from_slice(&libc::SIGSEGV.to_ne_bytes());
     info[8..12].copy_from_slice(&crate::signal::SEGV_MAPERR.to_ne_bytes());
-    let fault = PageZeroFault::for_test(
+    let fault = UserTrap::for_test(
         SignalEvent::new(
             libc::SIGSEGV,
             info,

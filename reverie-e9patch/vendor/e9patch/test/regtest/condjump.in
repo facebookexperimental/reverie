@@ -1,0 +1,1 @@
+./test.pie -M jcc -P 'entry(flags,(static)target,(static)next,bytes,size,asm)@inst'
