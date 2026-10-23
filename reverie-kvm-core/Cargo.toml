@@ -3,7 +3,7 @@
 [package]
 name = "reverie-kvm-core"
 description = "Lowest layer of the Reverie KVM backend: its error type and guest address map."
-version = "0.5.1"
+version = "0.5.3"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -17,5 +17,5 @@ categories = ["development-tools::debugging", "os::linux-apis"]
 [dependencies]
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 kvm-ioctls = "0.25.0"
-reverie = { version = "0.5.1", path = "../reverie", package = "reverie-core" }
+reverie = { version = "0.5.3", path = "../reverie", package = "reverie-core" }
 thiserror = "2.0.18"

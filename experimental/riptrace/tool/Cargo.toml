@@ -3,7 +3,7 @@
 [package]
 name = "riptrace-tool"
 description = "Instrumentation tool implementation for the experimental Reverie riptrace frontend."
-version = "0.5.1"
+version = "0.5.3"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libc = "0.2.139"
-reverie-sabre = { version = "0.5.1", path = "../../reverie-sabre" }
-reverie-syscalls = { version = "0.5.1", path = "../../../reverie-syscalls" }
-riptrace-rpc = { version = "0.5.1", path = "../rpc" }
+reverie-sabre = { version = "0.5.3", path = "../../reverie-sabre" }
+reverie-syscalls = { version = "0.5.3", path = "../../../reverie-syscalls" }
+riptrace-rpc = { version = "0.5.3", path = "../rpc" }
 syscalls = { version = "0.6.7", features = ["serde"] }

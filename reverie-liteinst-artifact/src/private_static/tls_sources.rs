@@ -230,6 +230,60 @@ const SHARED_INPUTS_051: &[SourceRow] = &[
     ),
 ];
 
+// Complete 0.5.3 version-only cohort; all Rust source rows remain identical.
+const SHARED_INPUTS_053: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        5569,
+        "d95d1413c8853732664d795dadfa65fa9c666d356585384c9d29eea5b351dfe8",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        11734,
+        "0fbf94503eac27b65e52967c11c675e23e7a2f50338ca32150002ff4c64fabbf",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        4853,
+        "369e35bcafda51a271720507dcf7a7c9072fb5db7486e110e14f15e4df91f0dd",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        12171,
+        "f7de3cd3a0653785f8aacc01e0fabdeb89172b2660f07ea0df9d393078299aab",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        499,
+        "8fcceedb234c081b5125d95d73eaafa083fadc2d1be41698b724487ab7cfae36",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        343,
+        "11ddee33344d8e2917248497d34e52c987eeca15d029cab1f87995dd5ad7b682",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        1510,
+        "b3318334635e632a23283c1f51633b090eb809de9710ab0c98038b684abbb5b8",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        7478,
+        "84011bb8505fa3357908e7445b1305f54303bae32ddb9d393546da8e309ee1ea",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
 fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
     let same = |expected: &[SourceRow]| {
         observed.len() == expected.len()
@@ -242,11 +296,13 @@ fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
         same(SHARED),
         same(SHARED_INPUTS),
         same(SHARED_INPUTS_051),
+        same(SHARED_INPUTS_053),
     ) {
-        (true, false, false, false) => Ok(Variant::LegacyInguest),
-        (false, true, false, false) | (false, false, true, false) | (false, false, false, true) => {
-            Ok(Variant::SharedLoader)
-        }
+        (true, false, false, false, false) => Ok(Variant::LegacyInguest),
+        (false, true, false, false, false)
+        | (false, false, true, false, false)
+        | (false, false, false, true, false)
+        | (false, false, false, false, true) => Ok(Variant::SharedLoader),
         _ => Err("runtime TLS sources are not one complete reviewed tuple".into()),
     }
 }
@@ -305,38 +361,53 @@ mod tests {
         observed[6].2 = "781863e2fb39d08ba64776020dc859abe6b68024f4c4219dc6fb96f4b814b203".into();
         observed
     }
+    fn development_053_rows() -> Vec<(String, u64, String)> {
+        let mut observed = development_051_rows();
+        observed[0].2 = "d95d1413c8853732664d795dadfa65fa9c666d356585384c9d29eea5b351dfe8".into();
+        observed[6].2 = "11ddee33344d8e2917248497d34e52c987eeca15d029cab1f87995dd5ad7b682".into();
+        observed
+    }
     #[test]
     fn tls_source_declarations_select_complete_051_without_mixed_versions() {
-        assert_eq!(
-            classify(&development_051_rows()).unwrap(),
-            Variant::SharedLoader
-        );
-        for index in [0, 6] {
-            let mut partial = development_051_rows();
-            partial[index] = rows(SHARED_INPUTS)[index].clone();
-            assert!(classify(&partial).is_err(), "mixed manifest row {index}");
+        for expected in [development_051_rows(), development_053_rows()] {
+            assert_eq!(classify(&expected).unwrap(), Variant::SharedLoader);
+            for other in [
+                rows(SHARED_INPUTS),
+                development_051_rows(),
+                development_053_rows(),
+            ] {
+                if other == expected {
+                    continue;
+                }
+                for index in [0, 6] {
+                    let mut partial = expected.clone();
+                    partial[index] = other[index].clone();
+                    assert!(classify(&partial).is_err(), "mixed manifest row {index}");
+                }
+            }
         }
     }
     #[test]
     fn tls_source_declarations_refuse_each_missing_changed_or_duplicate_051_row() {
-        let expected = development_051_rows();
-        for index in 0..expected.len() {
-            let mut missing = expected.clone();
-            missing.remove(index);
-            assert!(classify(&missing).is_err(), "missing row {index}");
-            let mut changed = expected.clone();
-            changed[index].2.replace_range(..1, "x");
-            assert!(classify(&changed).is_err(), "changed digest row {index}");
-            let mut size = expected.clone();
-            size[index].1 += 1;
-            assert!(classify(&size).is_err(), "changed size row {index}");
-            let mut path = expected.clone();
-            path[index].0.push_str(".unreviewed");
-            assert!(classify(&path).is_err(), "changed path row {index}");
+        for expected in [development_051_rows(), development_053_rows()] {
+            for index in 0..expected.len() {
+                let mut missing = expected.clone();
+                missing.remove(index);
+                assert!(classify(&missing).is_err(), "missing row {index}");
+                let mut changed = expected.clone();
+                changed[index].2.replace_range(..1, "x");
+                assert!(classify(&changed).is_err(), "changed digest row {index}");
+                let mut size = expected.clone();
+                size[index].1 += 1;
+                assert!(classify(&size).is_err(), "changed size row {index}");
+                let mut path = expected.clone();
+                path[index].0.push_str(".unreviewed");
+                assert!(classify(&path).is_err(), "changed path row {index}");
+            }
+            let mut duplicate = expected;
+            duplicate.push(duplicate[0].clone());
+            assert!(classify(&duplicate).is_err());
         }
-        let mut duplicate = expected;
-        duplicate.push(duplicate[0].clone());
-        assert!(classify(&duplicate).is_err());
     }
     // Numeric declaration controls only, not authenticated-source positives.
     #[test]
