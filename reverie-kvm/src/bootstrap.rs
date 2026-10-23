@@ -1171,6 +1171,82 @@ mod tests {
         assert!(code.len() < THREAD_TSS_OFFSET as usize);
     }
 
+    /// An ordinary syscall return leaves the guest RCX == RIP and R11 ==
+    /// RFLAGS, as SYSRET does on Linux. The trampoline reloads RCX from the
+    /// frame's return-RIP word and R11 from its return-flags word and, with
+    /// only a load of RBX and the full-return test between, executes
+    /// SYSRETQ, which sets RIP from RCX and RFLAGS from R11. Staging a
+    /// return writes the RIP and RFLAGS it returns to into those two words,
+    /// whatever RCX and R11 the staged registers hold, and clears any full
+    /// return request.
+    #[test]
+    fn ordinary_syscall_return_reloads_rcx_and_r11_from_the_return_words() {
+        let code = syscall_trampoline([0x0f, 0x01, 0xc1], SYSCALL_FRAME_ADDRESS);
+        let mut sysret = Vec::new();
+        load_absolute(
+            &mut sysret,
+            SYSCALL_FRAME_ADDRESS,
+            0x48,
+            0x0c,
+            RETURN_RIP_WORD,
+        );
+        load_absolute(
+            &mut sysret,
+            SYSCALL_FRAME_ADDRESS,
+            0x4c,
+            0x1c,
+            RETURN_FLAGS_WORD,
+        );
+        load_absolute(
+            &mut sysret,
+            SYSCALL_FRAME_ADDRESS,
+            0x48,
+            0x1c,
+            SAVED_RBX_WORD,
+        );
+        sysret.extend_from_slice(&[0x48, 0x83, 0x3c, 0x25]);
+        sysret.extend_from_slice(
+            &frame_word_address(SYSCALL_FRAME_ADDRESS, FULL_RETURN_WORD).to_le_bytes(),
+        );
+        sysret.extend_from_slice(&[0x00, 0x75, 0x03, 0x48, 0x0f, 0x07]);
+        let hypercall = code
+            .windows(3)
+            .position(|window| window == [0x0f, 0x01, 0xc1])
+            .unwrap();
+        let at = code
+            .windows(sysret.len())
+            .position(|window| window == sysret.as_slice())
+            .expect("the SYSRETQ return reloads RCX and R11 from the return words");
+        assert!(hypercall < at);
+
+        const FRAME: u64 = 0x1000;
+        let Ok(kvm) = kvm_ioctls::Kvm::new() else {
+            eprintln!("skipping the staging half: cannot open /dev/kvm");
+            return;
+        };
+        let vm = kvm.create_vm().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let mut memory = GuestMemory::new(0, 0x4000).unwrap();
+        write_u64(
+            &mut memory,
+            frame_word_address_u64(FRAME, FULL_RETURN_WORD),
+            1,
+        )
+        .unwrap();
+        let registers = kvm_bindings::kvm_regs {
+            rip: 0x40_1236,
+            rflags: 0x246,
+            rcx: 0x1122_3344_5566_7788,
+            r11: 0x0123_4567_89ab_cdef,
+            ..Default::default()
+        };
+        stage_process_syscall_return(&mut memory, &vcpu, FRAME, registers).unwrap();
+        let word = |word: usize| read_u64(&memory, frame_word_address_u64(FRAME, word)).unwrap();
+        assert_eq!(word(RETURN_RIP_WORD), registers.rip);
+        assert_eq!(word(RETURN_FLAGS_WORD), registers.rflags);
+        assert_eq!(word(FULL_RETURN_WORD), 0);
+    }
+
     #[test]
     fn signal_return_requests_iret_only_when_sysret_would_change_registers() {
         const FRAME: u64 = 0x1000;
