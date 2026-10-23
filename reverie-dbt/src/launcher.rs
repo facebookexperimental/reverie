@@ -1609,36 +1609,59 @@ fn is_namespace_init() -> bool {
 /// Kill every process of the run but its root, which has exited and is not
 /// yet reaped, and wait until none is left.
 ///
-/// As a PID namespace's init, by the namespace: `kill(-1)` kills every
-/// process in it but this one, and each becomes this process's child to reap,
-/// whatever process group or session the guest put it in (`setsid`,
-/// `setpgid`), so none escapes. Elsewhere, by the run's own process group.
+/// As a PID namespace's init, kill and reap direct children repeatedly. Their
+/// descendants are adopted by init even if they changed process groups or
+/// sessions. Elsewhere, containment is by the run's own process group.
 fn terminate_run(root: i32) -> io::Result<()> {
+    if root <= 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DBT containment: invalid run root PID",
+        ));
+    }
     if !is_namespace_init() {
         terminate_process_group(root)?;
         return wait_for_process_group_no_live_members(root);
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        // Its result is not the test of an empty namespace: the root, a
-        // zombie kept for the caller to reap, still counts as signalled.
-        // SAFETY: from a namespace init, -1 names every other process of the
-        // namespace.
-        unsafe { libc::kill(-1, libc::SIGKILL) };
         let mut left = false;
-        for (pid, state) in own_children()? {
+        for (pid, state) in own_children(Path::new("/proc"))? {
             if pid == root {
                 continue;
             }
             left = true;
             if matches!(state, 'Z' | 'X') {
-                // SAFETY: reaps exactly this exited child.
-                unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+                // Reaping happens only here, after the complete scan. A dying
+                // direct child remains visible as a zombie until then, and its
+                // descendants have been adopted before it can be reaped. Thus
+                // a nonempty pass always precedes checking for those orphans.
+                let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+                if result == pid {
+                    continue;
+                }
+                if result == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                // A thread-group leader can be a zombie while other threads
+                // still run. waitpid returns zero in that case: kill the
+                // group through its positive PID before trying to reap again.
+            }
+            // Only positive, namespace-local child PIDs are signaled. Keep
+            // the root zombie for the caller's Child::wait(), which also
+            // prevents its PID/process-group identity being reused.
+            let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+            if result == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
             }
         }
-        // Every process of the namespace descends from its init, and one
-        // whose parent dies becomes the init's child, so no child but the
-        // root means no process of the run is left.
         if !left {
             return Ok(());
         }
@@ -1652,11 +1675,18 @@ fn terminate_run(root: i32) -> io::Result<()> {
     }
 }
 
-/// This process's children, each with its state, from `/proc/<pid>/stat`.
-fn own_children() -> io::Result<Vec<(i32, char)>> {
+fn own_children(proc: &Path) -> io::Result<Vec<(i32, char)>> {
     let me = std::process::id() as i32;
+    // A proc mount inherited from an ancestor PID namespace uses different
+    // numeric PIDs. Never use those numbers as local signal destinations.
+    if std::fs::read_link(proc.join("self"))? != Path::new(&me.to_string()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DBT containment: /proc is not mounted for the current PID namespace",
+        ));
+    }
     let mut children = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
+    for entry in std::fs::read_dir(proc)? {
         let entry = entry?;
         let Some(pid) = entry
             .file_name()
@@ -1665,24 +1695,54 @@ fn own_children() -> io::Result<Vec<(i32, char)>> {
         else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // Nonchildren may disappear during the scan. An owned child
+            // cannot disappear before we reap it; other read errors must not
+            // turn an incomplete scan into successful containment.
+            Err(error) if proc_entry_vanished(&error) => continue,
+            Err(error) => return Err(error),
         };
-        let Some(after_name) = stat.rsplit_once(')').map(|(_, tail)| tail.trim_start()) else {
-            continue;
-        };
-        let mut fields = after_name.split_ascii_whitespace();
-        let (Some(state), Some(parent)) = (
-            fields.next().and_then(|field| field.chars().next()),
-            fields.next().and_then(|field| field.parse::<i32>().ok()),
-        ) else {
-            continue;
-        };
+        let (state, parent) = child_stat(&stat)?;
         if parent == me {
+            if pid <= 1 || pid == me {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DBT containment: invalid child PID in /proc",
+                ));
+            }
             children.push((pid, state));
         }
     }
     Ok(children)
+}
+
+fn proc_entry_vanished(error: &io::Error) -> bool {
+    // proc_single_show can return ESRCH when the process disappears after
+    // open but before read. Rust does not classify that errno as NotFound.
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+fn child_stat(stat: &[u8]) -> io::Result<(char, i32)> {
+    // comm can contain spaces, ')' and non-UTF-8 bytes; only the fields after
+    // its final ')' are ASCII. Do not parse the name as whitespace fields.
+    let parsed = (|| {
+        let end = stat.iter().rposition(|byte| *byte == b')')?;
+        let tail = std::str::from_utf8(&stat[end + 1..]).ok()?;
+        let mut fields = tail.split_ascii_whitespace();
+        let state = fields.next()?;
+        if state.len() != 1 || !"RSDZTtXxKWPI".contains(state) {
+            return None;
+        }
+        let parent = fields.next()?.parse::<i32>().ok()?;
+        (parent >= 0).then_some((state.chars().next()?, parent))
+    })();
+    parsed.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DBT containment: malformed /proc stat",
+        )
+    })
 }
 
 fn terminate_process_group(process_group: i32) -> io::Result<()> {
@@ -1892,6 +1952,7 @@ fn duplicate_to_diagnostic_fd(source: libc::c_int) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     mod inherited_input;
+    mod namespace_cleanup;
     mod stats_capture;
     use std::io::Seek as _;
     use std::os::unix::process::ExitStatusExt as _;
