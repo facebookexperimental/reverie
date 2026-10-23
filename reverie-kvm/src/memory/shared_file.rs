@@ -539,14 +539,14 @@ impl GuestMemory {
                 }
                 None => {
                     prepared.pages.remove(&page);
-                    prepared.file_pages.remove(&page);
-                    prepared.shared_anonymous_pages.remove(&page);
+                    prepared.file_pages.edit().remove(&page);
+                    prepared.shared_anonymous_pages.edit().remove(&page);
                     if !prepared
                         .reservations
                         .get(&page)
                         .is_some_and(|kind| kind.permanent())
                     {
-                        prepared.reservations.remove(&page);
+                        prepared.reservations.edit().remove(&page);
                     }
                 }
             }
@@ -1493,10 +1493,10 @@ mod tests {
     fn access_maps(memory: &GuestMemory) -> AccessMaps {
         let access = memory.mapping.address_space.lock().unwrap();
         (
-            access.pages.clone(),
-            access.reservations.clone(),
-            access.file_pages.clone(),
-            access.shared_anonymous_pages.clone(),
+            access.pages.to_map(),
+            (*access.reservations).clone(),
+            (*access.file_pages).clone(),
+            (*access.shared_anonymous_pages).clone(),
         )
     }
 
@@ -1582,6 +1582,117 @@ mod tests {
                 assert_eq!(access_maps(&fast), access_maps(&composed), "hide {label}");
             }
         }
+    }
+
+    fn scratch_cache_holds(memory: &GuestMemory, address: u64) -> bool {
+        memory
+            .mapping
+            .address_space
+            .lock()
+            .unwrap()
+            .scratch_cache_holds(address / P)
+    }
+
+    /// Repeated expose/hide cycles over two scratch pages, with every kind of
+    /// page edit in between, leave the same maps and results as the composed
+    /// calls; the cache serves the steady state and never survives an edit.
+    #[test]
+    fn tool_scratch_cache_matches_the_composed_calls_and_drops_on_any_page_edit() {
+        let (a, b) = (BASE, BASE + 2 * P);
+        let prepare = || {
+            let memory = fixture(4);
+            memory.unmap_user_range(BASE, 4 * P).unwrap();
+            memory
+        };
+        let fast = prepare();
+        let composed = prepare();
+        type Edit = fn(&GuestMemory);
+        fn file_a(m: &GuestMemory) {
+            m.record_file_pages(BASE, P, Some(0));
+        }
+        fn shared_b(m: &GuestMemory) {
+            m.record_page_backing(BASE + 2 * P, P, None, true);
+        }
+        fn read_only_a(m: &GuestMemory) {
+            m.map_user_permissions(BASE, P, true, false).unwrap();
+        }
+        fn no_access_a(m: &GuestMemory) {
+            m.map_user_range(BASE, P, true).unwrap();
+        }
+        fn file_b(m: &GuestMemory) {
+            m.record_file_pages(BASE + 2 * P, P, Some(P));
+        }
+        fn unmap_a(m: &GuestMemory) {
+            m.unmap_user_range(BASE, P).unwrap();
+        }
+        // (label, edit applied to both memories, whether the edit lands
+        // while the pages are exposed rather than before the cycle)
+        let edits: [(&str, Option<Edit>, bool); 12] = [
+            ("warm", None, false),
+            ("steady", None, false),
+            ("file offset while hidden", Some(file_a), false),
+            ("steady after file", None, false),
+            ("shared anonymous while hidden", Some(shared_b), false),
+            ("steady after shared", None, false),
+            ("mapped read-only while hidden", Some(read_only_a), false),
+            ("steady after map", None, false),
+            ("mapped no-access while exposed", Some(no_access_a), true),
+            ("file offset while exposed", Some(file_b), true),
+            ("unmapped while exposed", Some(unmap_a), true),
+            ("steady at the end", None, false),
+        ];
+        for (label, edit, while_exposed) in edits {
+            if let (Some(edit), false) = (edit, while_exposed) {
+                edit(&fast);
+                edit(&composed);
+                assert!(
+                    !scratch_cache_holds(&fast, a),
+                    "{label}: edit kept the cache"
+                );
+            }
+            // An edit made before the cycle drops the cache; one made while
+            // exposed has not happened yet.
+            let steady = (edit.is_none() || while_exposed) && label != "warm";
+            assert_eq!(scratch_cache_holds(&fast, a), steady, "{label}: page a");
+            for page in [a, b] {
+                assert_eq!(
+                    outcome(fast.expose_tool_scratch(page, P)),
+                    outcome(composed_expose(&composed, page, P)),
+                    "expose {label} {page:#x}"
+                );
+                assert_eq!(access_maps(&fast), access_maps(&composed), "expose {label}");
+            }
+            if let (Some(edit), true) = (edit, while_exposed) {
+                edit(&fast);
+                edit(&composed);
+                assert!(
+                    !scratch_cache_holds(&fast, a),
+                    "{label}: edit kept the cache"
+                );
+                assert_eq!(access_maps(&fast), access_maps(&composed), "edit {label}");
+            }
+            // Hide in the other order, as two Tool threads may.
+            for page in [b, a] {
+                assert_eq!(
+                    outcome(fast.hide_tool_scratch(page, P)),
+                    outcome(composed.unmap_user_range(page, P)),
+                    "hide {label} {page:#x}"
+                );
+                assert_eq!(access_maps(&fast), access_maps(&composed), "hide {label}");
+            }
+            assert!(
+                scratch_cache_holds(&fast, a) && scratch_cache_holds(&fast, b),
+                "{label}"
+            );
+        }
+        // A cloned state (a fork snapshot) carries the same facts, and an
+        // edit to the clone does not leave the original's cache stale.
+        let snapshot = fast.mapping.address_space.lock().unwrap().clone();
+        assert!(snapshot.scratch_cache_holds(a / P));
+        let mut edited = snapshot.clone();
+        edited.reservations.edit().insert(a / P, RegionKind::Mmap);
+        assert!(!edited.scratch_cache_holds(a / P));
+        assert!(snapshot.scratch_cache_holds(a / P));
     }
 
     #[test]

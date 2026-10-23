@@ -37,7 +37,10 @@ use crate::failure::FailureContext;
 
 const PAGE_SIZE: usize = 4096;
 
+mod page_maps;
 mod shared_file;
+use page_maps::UserPages;
+use page_maps::Versioned;
 pub(crate) use shared_file::AllocationGuard;
 use shared_file::MemoryCopyAccess;
 pub(crate) use shared_file::PrivateRangePlan;
@@ -315,15 +318,18 @@ struct AddressSpaceState {
     /// before that, they end where the lowest window's physical range begins.
     identity_end: Option<u64>,
     cursors: Option<AllocationCursors>,
-    reservations: BTreeMap<u64, RegionKind>,
+    reservations: Versioned<BTreeMap<u64, RegionKind>>,
     enabled: bool,
-    pages: BTreeMap<u64, UserPageState>,
+    pages: UserPages,
     /// The file offset of each page a regular file was mapped into, by
     /// physical page: Linux places a moved file mapping by its offset.
-    file_pages: BTreeMap<u64, u64>,
+    file_pages: Versioned<BTreeMap<u64, u64>>,
     /// The physical pages of `MAP_SHARED | MAP_ANONYMOUS` mappings. Their
     /// contents survive `MADV_DONTNEED`, which drops private anonymous pages.
-    shared_anonymous_pages: BTreeSet<u64>,
+    shared_anonymous_pages: Versioned<BTreeSet<u64>>,
+    /// Facts about hidden Tool-scratch pages that let the next expose and
+    /// hide skip every tree; see [`ScratchCache`].
+    scratch_cache: ScratchCache,
     /// Pages whose stable slot-0 HVA now names a separately retained backing.
     /// The current source increment keeps guest placement identity-only.
     backing_pages: BTreeMap<u64, InstalledBackingPage>,
@@ -431,7 +437,85 @@ impl RegionKind {
     }
 }
 
+/// Probe points that count the Tool-scratch fast path. They are empty and
+/// inlined away unless the crate is built with
+/// `RUSTFLAGS=--cfg reverie_kvm_scratch_probe`, which makes each an unmangled,
+/// never-inlined function a uprobe can count (`reverie_kvm_scratch_expose_hit`
+/// and so on). They observe; nothing reads them.
+mod scratch_probe {
+    macro_rules! probe {
+        ($name:ident, $symbol:literal) => {
+            #[cfg_attr(reverie_kvm_scratch_probe, inline(never))]
+            #[cfg_attr(reverie_kvm_scratch_probe, unsafe(export_name = $symbol))]
+            #[cfg_attr(not(reverie_kvm_scratch_probe), inline(always))]
+            pub(super) fn $name() {
+                #[cfg(reverie_kvm_scratch_probe)]
+                std::hint::black_box($symbol);
+            }
+        };
+    }
+    probe!(expose_hit, "reverie_kvm_scratch_expose_hit");
+    probe!(expose_miss, "reverie_kvm_scratch_expose_miss");
+    probe!(hide_hit, "reverie_kvm_scratch_hide_hit");
+    probe!(hide_miss, "reverie_kvm_scratch_hide_miss");
+}
+
+/// Facts about hidden Tool-scratch pages, valid only while none of the four
+/// page maps has changed since they were recorded.
+///
+/// For each page in `pages`: its reservation is `ToolScratch`, it is not a key
+/// of the page tree (it may be in the exposed overlay), it has no file offset
+/// and it is not shared anonymous memory. Those are exactly the facts that
+/// make exposing it nothing but an overlay insertion and hiding it nothing
+/// but an overlay removal. A [`Versioned`] version changes on every edit and
+/// is shared only by clones, so equal versions mean unchanged maps; the
+/// cache is part of the state and is cloned and replaced with it.
+#[derive(Clone, Debug, Default)]
+struct ScratchCache {
+    /// Reservations, page tree, file offsets, shared anonymous pages.
+    versions: [u64; 4],
+    pages: Vec<u64>,
+}
+
+impl ScratchCache {
+    /// Tool threads are few; past this the slow path stays exact.
+    const CAPACITY: usize = 64;
+
+    fn note(&mut self, page: u64) {
+        if !self.pages.contains(&page) && self.pages.len() < Self::CAPACITY {
+            self.pages.push(page);
+        }
+    }
+}
+
 impl AddressSpaceState {
+    fn scratch_cache_versions(&self) -> [u64; 4] {
+        [
+            self.reservations.version(),
+            self.pages.map_version(),
+            self.file_pages.version(),
+            self.shared_anonymous_pages.version(),
+        ]
+    }
+
+    fn scratch_cache_valid(&self) -> bool {
+        self.scratch_cache.versions == self.scratch_cache_versions()
+    }
+
+    fn scratch_cache_holds(&self, page: u64) -> bool {
+        self.scratch_cache_valid() && self.scratch_cache.pages.contains(&page)
+    }
+
+    /// After edits that touched only a page the cache does not name (or whose
+    /// facts the caller re-establishes), carry a cache that was valid before
+    /// them forward; otherwise start an empty one at the current versions.
+    fn keep_scratch_cache(&mut self, was_valid: bool) {
+        if !was_valid {
+            self.scratch_cache.pages.clear();
+        }
+        self.scratch_cache.versions = self.scratch_cache_versions();
+    }
+
     fn new(start: u64, length: usize) -> Self {
         Self {
             coverage: IdentityCoverage {
@@ -441,11 +525,12 @@ impl AddressSpaceState {
             windows: Vec::new(),
             identity_end: None,
             cursors: None,
-            reservations: BTreeMap::new(),
+            reservations: Versioned::new(BTreeMap::new()),
             enabled: false,
-            pages: BTreeMap::new(),
-            file_pages: BTreeMap::new(),
-            shared_anonymous_pages: BTreeSet::new(),
+            pages: UserPages::new(),
+            file_pages: Versioned::new(BTreeMap::new()),
+            shared_anonymous_pages: Versioned::new(BTreeSet::new()),
+            scratch_cache: ScratchCache::default(),
             backing_pages: BTreeMap::new(),
         }
     }
@@ -1048,10 +1133,10 @@ impl Drop for PendingReservation {
         for (page, old) in &self.old {
             match old {
                 Some(kind) => {
-                    state.reservations.insert(*page, *kind);
+                    state.reservations.edit().insert(*page, *kind);
                 }
                 None => {
-                    state.reservations.remove(page);
+                    state.reservations.edit().remove(page);
                 }
             }
         }
@@ -1203,6 +1288,92 @@ impl GuestMemory {
     /// not change any other view of the Mapping.
     pub(crate) fn set_operation_origin(&mut self, origin: Option<OperationOrigin>) {
         self.operation_origin = origin;
+    }
+
+    /// Make this handle equal to `source.clone()`, cloning only the parts
+    /// that are not already the same allocation.
+    ///
+    /// A clone of a GuestMemory is its parts' clones, and every part is a
+    /// shared handle compared here by identity (or a plain value), so after
+    /// this returns each part is either the very allocation `source` names
+    /// or a fresh clone of it: exactly the state `*self = source.clone()`
+    /// leaves. It only skips the reference-count traffic of replacing a part
+    /// with itself, which a callback's two address-space bindings otherwise
+    /// pay for the unchanged mapping and failure context on every syscall.
+    /// The exhaustive pattern makes a new field a compile error here.
+    pub(crate) fn rebind_from(&mut self, source: &GuestMemory) {
+        let GuestMemory {
+            mapping,
+            failure_context,
+            operation_origin,
+            #[cfg(test)]
+            after_vector_copy,
+            #[cfg(test)]
+            test_vector_copy_observer,
+            #[cfg(test)]
+            test_syscall_dispatch_observer,
+            #[cfg(test)]
+            test_backing_contention,
+            #[cfg(test)]
+            test_user_copy_failure,
+            #[cfg(test)]
+            test_user_copy_backing_wait,
+            #[cfg(test)]
+            test_between_read_and_write,
+            #[cfg(test)]
+            test_shared_map,
+            #[cfg(test)]
+            test_shared_sync,
+        } = source;
+        if !Arc::ptr_eq(&self.mapping, mapping) {
+            self.mapping = mapping.clone();
+        }
+        let same_failure = match (&self.failure_context, failure_context) {
+            (Some(current), Some(source)) => current.same_as(source),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_failure {
+            self.failure_context = failure_context.clone();
+        }
+        let same_origin = match (&self.operation_origin, operation_origin) {
+            (Some(current), Some(source)) => current.same_as(source),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_origin {
+            self.operation_origin = operation_origin.clone();
+        }
+        // Test-only observers are cloned unconditionally.
+        #[cfg(test)]
+        {
+            self.after_vector_copy = after_vector_copy.clone();
+            self.test_vector_copy_observer = test_vector_copy_observer.clone();
+            self.test_syscall_dispatch_observer = test_syscall_dispatch_observer.clone();
+            self.test_backing_contention = test_backing_contention.clone();
+            self.test_user_copy_failure = test_user_copy_failure.clone();
+            self.test_user_copy_backing_wait = test_user_copy_backing_wait.clone();
+            self.test_between_read_and_write = test_between_read_and_write.clone();
+            self.test_shared_map = test_shared_map.clone();
+            self.test_shared_sync = test_shared_sync.clone();
+        }
+    }
+
+    /// Whether this handle and `other` are part-for-part the same: what a
+    /// clone of `other` would be. Test-only observers are not compared.
+    #[cfg(test)]
+    pub(crate) fn same_binding_as(&self, other: &GuestMemory) -> bool {
+        Arc::ptr_eq(&self.mapping, &other.mapping)
+            && match (&self.failure_context, &other.failure_context) {
+                (Some(left), Some(right)) => left.same_as(right),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.operation_origin, &other.operation_origin) {
+                (Some(left), Some(right)) => left.same_as(right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     /// The issuing operation alone, without cloning the whole origin.
@@ -1594,7 +1765,7 @@ impl GuestMemory {
                 {
                     continue;
                 }
-                old.push((page, state.reservations.insert(page, kind)));
+                old.push((page, state.reservations.edit().insert(page, kind)));
             }
         }
         Ok(PendingReservation {
@@ -1817,9 +1988,9 @@ impl GuestMemory {
             .expect("guest memory access map lock poisoned");
         access.enabled = false;
         access.pages.clear();
-        access.file_pages.clear();
-        access.shared_anonymous_pages.clear();
-        access.reservations.clear();
+        access.file_pages.edit().clear();
+        access.shared_anonymous_pages.edit().clear();
+        access.reservations.edit().clear();
         access.cursors = None;
     }
 
@@ -1882,7 +2053,11 @@ impl GuestMemory {
         }
         for page in first_page..=last_page {
             access.pages.insert(page, state);
-            access.reservations.entry(page).or_insert(RegionKind::User);
+            access
+                .reservations
+                .edit()
+                .entry(page)
+                .or_insert(RegionKind::User);
         }
         Ok(())
     }
@@ -1925,10 +2100,27 @@ impl GuestMemory {
             });
         }
         for page in first_page..=last_page {
-            access.reservations.insert(page, RegionKind::ToolScratch);
-            access
-                .pages
-                .insert(page, UserPageState::Accessible { writable: true });
+            // Reserving ToolScratch and mapping the page Accessible+writable,
+            // touching no tree when the cache already proves the reservation
+            // and the page's absence from the page tree.
+            let cached = access.scratch_cache_holds(page);
+            if !cached {
+                let valid = access.scratch_cache_valid();
+                if access.reservations.get(&page) != Some(&RegionKind::ToolScratch) {
+                    access
+                        .reservations
+                        .edit()
+                        .insert(page, RegionKind::ToolScratch);
+                }
+                // The edits above touch only this page, which the cache does
+                // not name, so the cache's facts about other pages still hold.
+                access.pages.expose_scratch(page, false);
+                access.keep_scratch_cache(valid);
+                scratch_probe::expose_miss();
+            } else {
+                access.pages.expose_scratch(page, true);
+                scratch_probe::expose_hit();
+            }
         }
         Ok(())
     }
@@ -1960,15 +2152,36 @@ impl GuestMemory {
             return Ok(());
         };
         for page in first_page..=last_page {
-            access.pages.remove(&page);
-            access.file_pages.remove(&page);
-            access.shared_anonymous_pages.remove(&page);
-            if !access
+            // Exactly unmap_user_range's removals. A page the cache names has
+            // no file offset, is not shared anonymous memory, keeps its
+            // permanent ToolScratch reservation, and is no page-tree key, so
+            // only its overlay entry (if exposed) goes.
+            if access.scratch_cache_holds(page) {
+                access.pages.hide_scratch(page, true);
+                scratch_probe::hide_hit();
+                continue;
+            }
+            scratch_probe::hide_miss();
+            let valid = access.scratch_cache_valid();
+            access.pages.hide_scratch(page, false);
+            if access.file_pages.contains_key(&page) {
+                access.file_pages.edit().remove(&page);
+            }
+            if access.shared_anonymous_pages.contains(&page) {
+                access.shared_anonymous_pages.edit().remove(&page);
+            }
+            if access
                 .reservations
                 .get(&page)
-                .is_some_and(|kind| kind.permanent())
+                .is_some_and(|kind| !kind.permanent())
             {
-                access.reservations.remove(&page);
+                access.reservations.edit().remove(&page);
+            }
+            // Every edit above touched only this page, whose facts are now
+            // the cache's: no file offset, not shared, not a tree key.
+            access.keep_scratch_cache(valid);
+            if access.reservations.get(&page) == Some(&RegionKind::ToolScratch) {
+                access.scratch_cache.note(page);
             }
         }
         Ok(())
@@ -1992,14 +2205,14 @@ impl GuestMemory {
             .expect("guest memory access map lock poisoned");
         for page in first_page..=last_page {
             access.pages.remove(&page);
-            access.file_pages.remove(&page);
-            access.shared_anonymous_pages.remove(&page);
+            access.file_pages.edit().remove(&page);
+            access.shared_anonymous_pages.edit().remove(&page);
             if !access
                 .reservations
                 .get(&page)
                 .is_some_and(|kind| kind.permanent())
             {
-                access.reservations.remove(&page);
+                access.reservations.edit().remove(&page);
             }
         }
         Ok(())
@@ -2035,13 +2248,13 @@ impl GuestMemory {
             match offset
                 .and_then(|offset| offset.checked_add((page - first_page) * PAGE_SIZE as u64))
             {
-                Some(offset) => access.file_pages.insert(page, offset),
-                None => access.file_pages.remove(&page),
+                Some(offset) => access.file_pages.edit().insert(page, offset),
+                None => access.file_pages.edit().remove(&page),
             };
             if shared_anonymous {
-                access.shared_anonymous_pages.insert(page);
+                access.shared_anonymous_pages.edit().insert(page);
             } else {
-                access.shared_anonymous_pages.remove(&page);
+                access.shared_anonymous_pages.edit().remove(&page);
             }
         }
     }
@@ -2301,14 +2514,14 @@ impl GuestMemory {
             .collect::<Vec<_>>();
         for page in old_first..=old_last {
             access.pages.remove(&page);
-            access.file_pages.remove(&page);
-            access.shared_anonymous_pages.remove(&page);
+            access.file_pages.edit().remove(&page);
+            access.shared_anonymous_pages.edit().remove(&page);
             if !access
                 .reservations
                 .get(&page)
                 .is_some_and(|kind| kind.permanent())
             {
-                access.reservations.remove(&page);
+                access.reservations.edit().remove(&page);
             }
         }
         for (index, page) in (new_first..=new_last).enumerate() {
@@ -2327,8 +2540,8 @@ impl GuestMemory {
             // The destination's old provenance goes: a page that is no longer
             // a file's keeps no offset.
             match offset {
-                Some(offset) => access.file_pages.insert(page, offset),
-                None => access.file_pages.remove(&page),
+                Some(offset) => access.file_pages.edit().insert(page, offset),
+                None => access.file_pages.edit().remove(&page),
             };
             let shared_anonymous = old_shared_anonymous
                 .get(index)
@@ -2336,9 +2549,9 @@ impl GuestMemory {
                 .copied()
                 .unwrap_or(false);
             if shared_anonymous {
-                access.shared_anonymous_pages.insert(page);
+                access.shared_anonymous_pages.edit().insert(page);
             } else {
-                access.shared_anonymous_pages.remove(&page);
+                access.shared_anonymous_pages.edit().remove(&page);
             }
             if !access
                 .reservations
@@ -2351,7 +2564,7 @@ impl GuestMemory {
                     .unwrap_or(*old_kinds.last().unwrap());
                 // A low exposed supervisor page may supply the original user
                 // policy; its physical reservation does not move with bytes.
-                access.reservations.insert(
+                access.reservations.edit().insert(
                     page,
                     if kind.permanent() {
                         RegionKind::Mmap
@@ -8169,5 +8382,110 @@ mod one_admission_copy_tests {
         // A failed attempt leaves no failure behind for later copies.
         assert!(memory.entry_gate().pending_failure().is_none());
         memory.check_copy_failures().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod rebind_tests {
+    use super::*;
+    use crate::entry::owner::DriverScope;
+    use crate::failure::FailureContext;
+    use crate::failure::RunFailure;
+
+    const BASE: u64 = 0x1000;
+
+    /// The strong and weak counts a binding holds on each part it names.
+    fn counts(memory: &GuestMemory) -> (usize, usize) {
+        (
+            Arc::strong_count(&memory.mapping),
+            Arc::weak_count(&memory.mapping),
+        )
+    }
+
+    #[test]
+    fn rebinding_equals_cloning_for_unchanged_and_changed_parts() {
+        let global = Arc::new(());
+        let run = RunFailure::new(&global);
+        let driver = DriverScope::new();
+        let owner = driver.owner();
+        let mut source = GuestMemory::new(BASE, PAGE_SIZE).unwrap();
+        source.set_failure_context(Some(FailureContext::new(
+            run.clone(),
+            reverie::Pid::from_raw(5),
+            reverie::Pid::from_raw(6),
+        )));
+        source.set_operation_origin(Some(owner.origin()));
+
+        // Bound once by clone, then rebound to the unchanged source: every
+        // part is still the source's own allocation, and no count moved.
+        let mut bound = source.clone();
+        let before = counts(&source);
+        let run_before = Arc::strong_count(&run);
+        bound.rebind_from(&source);
+        assert!(bound.same_binding_as(&source));
+        assert_eq!(counts(&source), before);
+        assert_eq!(Arc::strong_count(&run), run_before);
+
+        // A callback origin replaces only the origin, and leaves the same
+        // counts a fresh clone would.
+        let callback = owner.begin_callback(None).unwrap();
+        let mut callback_memory = source.clone();
+        callback_memory.set_operation_origin(Some(callback.origin()));
+        bound.rebind_from(&callback_memory);
+        assert!(bound.same_binding_as(&callback_memory));
+        assert!(!bound.same_binding_as(&source));
+        let rebound = (counts(&source), Arc::strong_count(&run));
+        let mut cloned = source.clone();
+        drop(std::mem::replace(&mut cloned, callback_memory.clone()));
+        assert_eq!(
+            (counts(&source), Arc::strong_count(&run)),
+            ((rebound.0.0 + 1, rebound.0.1), rebound.1 + 1),
+            "the comparison clone holds exactly one more of each"
+        );
+        drop(cloned);
+        assert_eq!((counts(&source), Arc::strong_count(&run)), rebound);
+
+        // Back to the ordinary origin, as after every callback.
+        bound.rebind_from(&source);
+        assert!(bound.same_binding_as(&source));
+        drop(callback_memory);
+        drop(callback);
+
+        // Negative controls: a different task's context, no context, and a
+        // different mapping are each replaced, never kept.
+        let mut other_task = source.clone();
+        other_task.set_failure_context(Some(FailureContext::new(
+            run.clone(),
+            reverie::Pid::from_raw(5),
+            reverie::Pid::from_raw(7),
+        )));
+        bound.rebind_from(&other_task);
+        assert!(bound.same_binding_as(&other_task));
+        assert!(!bound.same_binding_as(&source));
+        let mut no_context = source.clone();
+        no_context.set_failure_context(None);
+        no_context.set_operation_origin(None);
+        bound.rebind_from(&no_context);
+        assert!(bound.same_binding_as(&no_context));
+        assert!(bound.failure_context.is_none() && bound.operation_origin.is_none());
+        let other_mapping = GuestMemory::new(BASE, PAGE_SIZE).unwrap();
+        bound.rebind_from(&other_mapping);
+        assert!(Arc::ptr_eq(&bound.mapping, &other_mapping.mapping));
+        assert!(!Arc::ptr_eq(&bound.mapping, &source.mapping));
+        drop((other_task, no_context));
+        assert_eq!(counts(&source), (1, 0), "the old mapping was released");
+    }
+
+    #[test]
+    fn origins_from_one_driver_are_the_same_only_with_the_same_callback() {
+        let driver = DriverScope::new();
+        let owner = driver.owner();
+        let first = owner.origin();
+        assert!(first.same_as(&owner.origin()), "a re-made driver origin");
+        let callback = owner.begin_callback(None).unwrap();
+        assert!(!first.same_as(&callback.origin()));
+        assert!(callback.origin().same_as(&callback.origin()));
+        let other = DriverScope::new();
+        assert!(!first.same_as(&other.owner().origin()));
     }
 }

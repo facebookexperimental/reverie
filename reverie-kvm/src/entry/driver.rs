@@ -127,9 +127,13 @@ impl EntryDriverWatch {
     /// A callback may retain a view of a different mapping owned by this same
     /// driver. Observe that owner's obligations as well as this mapping's gate.
     pub(crate) fn for_memory(memory: &crate::GuestMemory) -> Self {
-        let operation = memory.entry_origin().operation;
+        // Borrow the operation origin. Cloning the whole entry origin, failure
+        // context included, only to read its driver owner took and released
+        // up to five reference counts per callback; the owner is the same.
         Self {
-            owner: operation.as_ref().and_then(|origin| origin.driver_owner()),
+            owner: memory
+                .operation_origin()
+                .and_then(|origin| origin.driver_owner()),
             gate: memory.entry_gate(),
         }
     }

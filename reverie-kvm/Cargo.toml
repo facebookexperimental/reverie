@@ -13,6 +13,15 @@ keywords = ["linux", "instrumentation", "hermit"]
 categories = ["development-tools::debugging", "os::linux-apis"]
 build = "build.rs"
 
+# `reverie_kvm_scratch_probe` is an opt-in measurement cfg
+# (RUSTFLAGS=--cfg reverie_kvm_scratch_probe) that exports uprobe points for
+# the Tool-scratch fast path (src/memory.rs); declare it as a known cfg name so
+# the build does not warn under `unexpected_cfgs`. The same block is in the
+# reverie-kvm target's autocargo cargo_toml_config in ../BUCK, as for the
+# `sanitized` cfg of reverie-process; this file carries no @generated header.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(reverie_kvm_scratch_probe)'] }
+
 [features]
 default = []
 native-test-support = []

@@ -3504,8 +3504,13 @@ impl ElfExecutor {
         )
     }
 
+    /// Leaves `address_space` equal to `Some(memory.clone())`; see
+    /// [`GuestMemory::rebind_from`] for why reusing unchanged parts is that.
     pub(crate) fn bind_address_space(&mut self, memory: &GuestMemory) {
-        self.address_space = Some(memory.clone());
+        match &mut self.address_space {
+            Some(bound) => bound.rebind_from(memory),
+            None => self.address_space = Some(memory.clone()),
+        }
     }
 
     /// The brk-managed heap region `[heap_base, program_break)` of the loaded

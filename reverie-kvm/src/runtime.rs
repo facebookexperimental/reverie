@@ -6428,11 +6428,14 @@ impl KvmBackend {
                                 polled_read_attempt: None,
                                 process_completed: &mut handler_process_completed,
                             };
+                            // The guest handle takes the callback view itself:
+                            // nothing else in this block reads it, and it is
+                            // released with the handle, still inside the block.
                             let mut guest = KvmGuest::<T>::new(
                                 pid,
                                 tid,
                                 tool.clone(),
-                                memory.clone(),
+                                memory,
                                 &auxv,
                                 kvm_registers(registers, request.number()),
                                 &mut thread_state,

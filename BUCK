@@ -467,6 +467,14 @@ rust_library(
                 "default": [],
                 "native-test-support": [],
             },
+            "lints": {
+                "rust": {
+                    "unexpected_cfgs": {
+                        "check-cfg": ["cfg(reverie_kvm_scratch_probe)"],
+                        "level": "warn",
+                    },
+                },
+            },
         },
         "cargo_toml_dir": "reverie-kvm",
     },

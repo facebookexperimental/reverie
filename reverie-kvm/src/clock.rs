@@ -465,9 +465,142 @@ impl Default for CounterPlacement {
     }
 }
 
+/// The raw RCB encoding of the core PMU, reused across counted entries only
+/// on CPUs where it has been shown to be the same.
+///
+/// The encoding is a pure function of a CPU's CPUID vendor, family and model,
+/// and those never change for a CPU while the host runs. Selecting FollowTask
+/// placement only looks at the current CPU's vendor and the PMU device names,
+/// so it does not by itself show that every CPU the task can run on answers
+/// alike. The cache therefore needs a [`CpuDomain`]: every CPU the kernel lists
+/// as online, each mapped to its own encoding, all equal (and equal to what
+/// this CPU's CPUID answers when the value is first cached). A host where any
+/// online CPU differs, or is unsupported, or whose `/proc/cpuinfo` cannot be
+/// parsed, has no domain and keeps the per-entry lookup.
+///
+/// Each cached entry still checks that the CPU it starts on is in the domain
+/// (`sched_getcpu`, no CPUID). A CPU onlined after the domain was taken is not
+/// in it, so an entry that starts there runs the full lookup, with its refusal,
+/// exactly as before. A cpuset or affinity change can only move the task among
+/// online CPUs, all of which were validated. As before, the event follows its
+/// task within one KVM_RUN, so a CPU is judged where an entry begins.
+///
+/// Nothing guest-controlled is an input: exec, clone, fork, vfork, signal
+/// frames, thread exit and TID reuse change only the task, which
+/// `CounterIdentity` names separately. Under `PinEachEntry` (hybrid or
+/// unmeasured hosts) every entry asks the CPU it is pinned to. A failed lookup
+/// is never cached; it poisons the clock as before.
+#[derive(Debug, Default)]
+struct RawEventCache {
+    follow_task: Option<u64>,
+}
+
+impl RawEventCache {
+    fn raw_event(
+        &mut self,
+        placement: CounterPlacement,
+        domain: Option<&CpuDomain>,
+        current_cpu: impl FnOnce() -> Option<usize>,
+        lookup: impl FnOnce() -> Result<u64>,
+    ) -> Result<u64> {
+        match placement {
+            CounterPlacement::FollowTask => {
+                let domain =
+                    domain.filter(|domain| current_cpu().is_some_and(|cpu| domain.contains(cpu)));
+                if domain.is_some()
+                    && let Some(raw_event) = self.follow_task
+                {
+                    return Ok(raw_event);
+                }
+                let raw_event = lookup()?;
+                if domain.is_some_and(|domain| domain.raw_event == raw_event) {
+                    self.follow_task = Some(raw_event);
+                }
+                Ok(raw_event)
+            }
+            CounterPlacement::PinEachEntry => lookup(),
+        }
+    }
+}
+
+/// Online CPUs whose raw RCB encodings were each derived and found equal.
+#[derive(Debug, Eq, PartialEq)]
+struct CpuDomain {
+    raw_event: u64,
+    /// Bitmap of CPU numbers.
+    cpus: Vec<u64>,
+}
+
+impl CpuDomain {
+    /// A domain from `/proc/cpuinfo` text, or None unless every listed CPU
+    /// names its number, vendor, family and model, every one maps to a
+    /// supported encoding, and all the encodings are equal.
+    fn from_cpuinfo(text: &str) -> Option<Self> {
+        let mut raw_event = None;
+        let mut cpus = Vec::new();
+        for block in text.split("\n\n").filter(|block| !block.trim().is_empty()) {
+            let field = |name: &str| {
+                block.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    (key.trim() == name).then(|| value.trim())
+                })
+            };
+            let cpu: usize = field("processor")?.parse().ok()?;
+            let vendor: [u8; 12] = field("vendor_id")?.as_bytes().try_into().ok()?;
+            let family: u32 = field("cpu family")?.parse().ok()?;
+            let model: u32 = field("model")?.parse().ok()?;
+            let event = raw_event_for(&vendor, family, model).ok()?;
+            if *raw_event.get_or_insert(event) != event {
+                return None;
+            }
+            let word = cpu / 64;
+            if cpus.len() <= word {
+                cpus.resize(word + 1, 0);
+            }
+            cpus[word] |= 1 << (cpu % 64);
+        }
+        Some(Self {
+            raw_event: raw_event?,
+            cpus,
+        })
+    }
+
+    fn contains(&self, cpu: usize) -> bool {
+        self.cpus
+            .get(cpu / 64)
+            .is_some_and(|word| word & (1 << (cpu % 64)) != 0)
+    }
+}
+
+/// This host's domain, taken once per process (a fork child inherits it: the
+/// same host). None keeps every entry on the full lookup.
+///
+/// Unlike the task-ID epoch below, this `OnceLock` may make a caller wait.
+/// That is safe: it is first initialised in the root's first counted entry
+/// (`track_clock`, which runs `begin` before any guest instruction), so
+/// before any guest clone; every child is created after it holds its value
+/// and inherits it, so no child can copy it mid-initialisation.
+fn host_cpu_domain() -> Option<&'static CpuDomain> {
+    static DOMAIN: std::sync::OnceLock<Option<CpuDomain>> = std::sync::OnceLock::new();
+    DOMAIN
+        .get_or_init(|| {
+            std::fs::read_to_string("/proc/cpuinfo")
+                .ok()
+                .and_then(|text| CpuDomain::from_cpuinfo(&text))
+        })
+        .as_ref()
+}
+
+fn current_cpu() -> Option<usize> {
+    // SAFETY: sched_getcpu has no arguments; -1 reports failure.
+    let cpu = unsafe { libc::sched_getcpu() };
+    usize::try_from(cpu).ok()
+}
+
 #[derive(Default)]
 struct GuestClock {
     placement: CounterPlacement,
+    raw_event_cache: RawEventCache,
     tracking: bool,
     ran_untracked: bool,
     total: u64,
@@ -524,7 +657,15 @@ impl GuestClock {
                 cpu: affinity
                     .as_ref()
                     .map_or(FOLLOWS_TASK, |affinity| affinity.cpu),
-                raw_event: raw_event()?,
+                raw_event: self.raw_event_cache.raw_event(
+                    self.placement,
+                    match self.placement {
+                        CounterPlacement::FollowTask => host_cpu_domain(),
+                        CounterPlacement::PinEachEntry => None,
+                    },
+                    current_cpu,
+                    raw_event,
+                )?,
             };
             if self.binding.as_ref().map(|b| b.identity) != Some(identity) {
                 self.binding.take();
@@ -676,7 +817,7 @@ fn host_tid() -> libc::pid_t {
 fn current_raw_event() -> Result<u64> {
     // CPUID is supported on x86-64. Under PinEachEntry the calling thread is
     // restricted to one permitted CPU for this entire counted interval; under
-    // FollowTask every CPU has the same core PMU, so any CPU answers for all.
+    // FollowTask this answers for the CPU the entry starts on.
     let vendor = std::arch::x86_64::__cpuid(0);
     let mut bytes = [0; 12];
     bytes[..4].copy_from_slice(&vendor.ebx.to_le_bytes());
@@ -699,17 +840,28 @@ fn current_raw_event() -> Result<u64> {
         } else {
             0
         };
-    let vendor_matches_family = if bytes == *b"GenuineIntel" {
+    raw_event_for(&bytes, family, model)
+}
+
+/// The raw RCB encoding for a CPU's vendor, display family and display model,
+/// with the same refusals for every source of those values.
+fn raw_event_for(vendor: &[u8; 12], family: u32, model: u32) -> Result<u64> {
+    if vendor != b"GenuineIntel" && vendor != b"AuthenticAMD" {
+        return Err(failure(format!("unsupported CPU vendor {vendor:?}")));
+    }
+    let vendor_matches_family = if vendor == b"GenuineIntel" {
         family == 6
     } else {
         matches!(family, 0x17 | 0x19 | 0x1a)
     };
     if !vendor_matches_family {
         return Err(failure(format!(
-            "unsupported CPU vendor/family combination {bytes:?}/{family:#x}"
+            "unsupported CPU vendor/family combination {vendor:?}/{family:#x}"
         )));
     }
-    PmuProfile::for_family_model(family as u8, model as u8)
+    u8::try_from(model)
+        .ok()
+        .and_then(|model| PmuProfile::for_family_model(family as u8, model))
         .map(|profile| profile.raw_rcb_event())
         .ok_or_else(|| {
             failure(format!(
@@ -2106,6 +2258,275 @@ mod tests {
             "raw clone child reused a cached tid"
         );
         assert_eq!(host_tid(), parent);
+    }
+
+    /// `/proc/cpuinfo` text for `(cpu, vendor, family, model)` entries.
+    fn cpuinfo(cpus: &[(usize, &str, u32, u32)]) -> String {
+        cpus.iter()
+            .map(|(cpu, vendor, family, model)| {
+                format!(
+                    "processor\t: {cpu}\nvendor_id\t: {vendor}\ncpu family\t: {family}\nmodel\t\t: {model}\nmodel name\t: test\n\n"
+                )
+            })
+            .collect()
+    }
+
+    /// Zen 5 (family 0x1a), as on devbig014; a supported AMD encoding.
+    fn zen5_domain(cpus: &[usize]) -> CpuDomain {
+        let entries: Vec<_> = cpus
+            .iter()
+            .map(|&cpu| (cpu, "AuthenticAMD", 26, 17))
+            .collect();
+        CpuDomain::from_cpuinfo(&cpuinfo(&entries)).expect("a homogeneous supported domain")
+    }
+
+    #[test]
+    fn cpuinfo_domains_require_every_cpu_to_agree() {
+        let domain = zen5_domain(&[0, 1, 2, 130]);
+        assert_eq!(
+            domain.raw_event,
+            raw_event_for(b"AuthenticAMD", 26, 17).unwrap()
+        );
+        assert!(domain.contains(0) && domain.contains(2) && domain.contains(130));
+        assert!(!domain.contains(3) && !domain.contains(129) && !domain.contains(4096));
+        // Negative controls: an Intel CPU among AMD ones, an unsupported AMD
+        // family, an unsupported Intel model, a CPU missing its model, and no
+        // CPUs at all each leave the host without a domain.
+        for (label, text) in [
+            (
+                "mixed vendors",
+                cpuinfo(&[(0, "AuthenticAMD", 26, 17), (1, "GenuineIntel", 6, 0x55)]),
+            ),
+            (
+                "unsupported family on one CPU",
+                cpuinfo(&[(0, "AuthenticAMD", 26, 17), (1, "AuthenticAMD", 0x15, 1)]),
+            ),
+            (
+                "unsupported Intel model",
+                cpuinfo(&[(0, "GenuineIntel", 6, 0xfe)]),
+            ),
+            ("unknown vendor", cpuinfo(&[(0, "HygonGenuine", 0x18, 0)])),
+            (
+                "missing model",
+                "processor\t: 0\nvendor_id\t: AuthenticAMD\ncpu family\t: 26\n\n".to_owned(),
+            ),
+            ("empty", String::new()),
+        ] {
+            assert_eq!(CpuDomain::from_cpuinfo(&text), None, "{label}");
+        }
+    }
+
+    #[test]
+    fn follow_task_reuses_its_answer_only_inside_a_validated_domain() {
+        let domain = zen5_domain(&[0, 1]);
+        let lookups = std::cell::Cell::new(0);
+        let lookup = || {
+            lookups.set(lookups.get() + 1);
+            Ok(domain.raw_event)
+        };
+        let mut cache = RawEventCache::default();
+        for cpu in [0, 1, 0] {
+            assert_eq!(
+                cache
+                    .raw_event(
+                        CounterPlacement::FollowTask,
+                        Some(&domain),
+                        || Some(cpu),
+                        lookup
+                    )
+                    .unwrap(),
+                domain.raw_event
+            );
+        }
+        assert_eq!(
+            lookups.get(),
+            1,
+            "FollowTask reuses its first answer in the domain"
+        );
+
+        // A CPU outside the domain (onlined later) gets the full lookup on
+        // every entry, and so does an entry whose CPU cannot be read.
+        for cpu in [Some(2), None, Some(2)] {
+            cache
+                .raw_event(CounterPlacement::FollowTask, Some(&domain), || cpu, lookup)
+                .unwrap();
+        }
+        assert_eq!(lookups.get(), 4);
+
+        // A lookup the outside CPU refuses is still refused after caching.
+        let error = cache
+            .raw_event(
+                CounterPlacement::FollowTask,
+                Some(&domain),
+                || Some(2),
+                || Err(failure("unsupported CPU family")),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported CPU family"));
+
+        // Pinned entries ask their own CPU every time and get its answer,
+        // even with a FollowTask answer cached: a lookup whose answers differ
+        // from the cached value tells "returned the lookup" from "returned
+        // the cache".
+        assert_eq!(cache.follow_task, Some(domain.raw_event));
+        let mut answers = [1_u64, 2, 3].into_iter();
+        let seen: Vec<u64> = (0..3)
+            .map(|_| {
+                cache
+                    .raw_event(
+                        CounterPlacement::PinEachEntry,
+                        Some(&domain),
+                        || Some(0),
+                        || Ok(answers.next().unwrap()),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(seen, [1, 2, 3], "PinEachEntry must never use the cache");
+        assert_eq!(cache.follow_task, Some(domain.raw_event), "nor change it");
+        // A cache only ever used by pinned entries stays empty.
+        let mut pinned = RawEventCache::default();
+        let mut answers = [4_u64, 5, 6].into_iter();
+        let seen: Vec<u64> = (0..3)
+            .map(|_| {
+                pinned
+                    .raw_event(
+                        CounterPlacement::PinEachEntry,
+                        Some(&domain),
+                        || Some(0),
+                        || Ok(answers.next().unwrap()),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(seen, [4, 5, 6]);
+        assert_eq!(pinned.follow_task, None);
+    }
+
+    #[test]
+    fn follow_task_never_caches_without_a_domain_or_against_one() {
+        let lookups = std::cell::Cell::new(0);
+        let lookup = || {
+            lookups.set(lookups.get() + 1);
+            Ok(0x5100c4)
+        };
+        // A heterogeneous host has no domain: every entry looks up.
+        let mixed = cpuinfo(&[(0, "AuthenticAMD", 26, 17), (1, "GenuineIntel", 6, 0x55)]);
+        let none = CpuDomain::from_cpuinfo(&mixed);
+        assert_eq!(none, None);
+        let mut cache = RawEventCache::default();
+        for _ in 0..3 {
+            cache
+                .raw_event(
+                    CounterPlacement::FollowTask,
+                    none.as_ref(),
+                    || Some(0),
+                    lookup,
+                )
+                .unwrap();
+        }
+        assert_eq!(lookups.get(), 3);
+        assert_eq!(cache.follow_task, None);
+        // A domain whose encoding differs from this CPU's CPUID answer is
+        // not trusted either.
+        let domain = zen5_domain(&[0]);
+        assert_ne!(domain.raw_event, 0x5100c4);
+        for _ in 0..2 {
+            cache
+                .raw_event(
+                    CounterPlacement::FollowTask,
+                    Some(&domain),
+                    || Some(0),
+                    lookup,
+                )
+                .unwrap();
+        }
+        assert_eq!(lookups.get(), 5);
+        assert_eq!(cache.follow_task, None);
+    }
+
+    #[test]
+    fn a_failed_raw_event_lookup_is_not_cached() {
+        let domain = zen5_domain(&[0]);
+        let mut cache = RawEventCache::default();
+        let error = cache
+            .raw_event(
+                CounterPlacement::FollowTask,
+                Some(&domain),
+                || Some(0),
+                || Err(failure("unsupported CPU family")),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported CPU family"));
+        assert_eq!(cache.follow_task, None);
+        let lookups = std::cell::Cell::new(0);
+        let lookup = || {
+            lookups.set(lookups.get() + 1);
+            Ok(domain.raw_event)
+        };
+        for _ in 0..2 {
+            cache
+                .raw_event(
+                    CounterPlacement::FollowTask,
+                    Some(&domain),
+                    || Some(0),
+                    lookup,
+                )
+                .unwrap();
+        }
+        assert_eq!(lookups.get(), 1);
+    }
+
+    #[test]
+    fn this_hosts_domain_agrees_with_cpuid_on_every_permitted_cpu() {
+        // Runs CPUID and reads /proc/cpuinfo only; no PMU or KVM is needed.
+        let domain = host_cpu_domain();
+        let Ok(here) = current_raw_event() else {
+            assert!(domain.is_none(), "an unsupported CPU must leave no domain");
+            println!("raw event cache: CPU unsupported, no domain");
+            return;
+        };
+        let Some(domain) = domain else {
+            // On an AMD host with one core PMU (FollowTask) and a supported
+            // CPU, a missing domain means the cpuinfo parser regressed and
+            // the cache is silently off: fail rather than pass.
+            assert_ne!(
+                CounterPlacement::default(),
+                CounterPlacement::FollowTask,
+                "a FollowTask host with a supported CPU ({here:#x}) must have a CPU domain"
+            );
+            println!(
+                "raw event cache: pinned-placement host without a domain; every entry looks up"
+            );
+            return;
+        };
+        assert_eq!(domain.raw_event, here);
+        let original = affinity().unwrap();
+        let mut checked = 0;
+        for cpu in 0..libc::CPU_SETSIZE as usize {
+            // SAFETY: `cpu` is below CPU_SETSIZE and `original` is a valid set.
+            if !unsafe { libc::CPU_ISSET(cpu, &original) } {
+                continue;
+            }
+            assert!(
+                domain.contains(cpu),
+                "permitted cpu {cpu} is online but not in the domain"
+            );
+            // SAFETY: an all-zero cpu_set_t is the empty set.
+            let mut one: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `cpu` is below CPU_SETSIZE.
+            unsafe { libc::CPU_SET(cpu, &mut one) };
+            set_affinity(&one).unwrap();
+            assert_eq!(current_cpu(), Some(cpu));
+            assert_eq!(current_raw_event().unwrap(), domain.raw_event, "cpu {cpu}");
+            checked += 1;
+        }
+        set_affinity(&original).unwrap();
+        assert!(same_affinity(&affinity().unwrap(), &original));
+        println!(
+            "raw event cache: {checked} permitted CPUs agree with the domain's {:#x}",
+            domain.raw_event
+        );
     }
 }
 
