@@ -8815,7 +8815,7 @@ mod tests {
         let emerald = PmuConfig::from_family_model(0x06, 0xCF);
         let sapphire = PmuConfig::from_family_model(0x06, 0x8F);
         assert_eq!(emerald, sapphire);
-        assert_eq!(emerald.raw_rcb_event(), 0x5101c4);
+        assert_eq!(emerald.raw_rcb_event(), 0x5111c4);
         assert_eq!(emerald.skid_margin(), 125);
     }
 
@@ -8826,8 +8826,41 @@ mod tests {
     fn ice_lake_models_have_a_profile() {
         for model in [0x6A, 0x6C, 0x7D, 0x7E] {
             let config = PmuConfig::from_family_model(0x06, model);
-            assert_eq!(config.raw_rcb_event(), 0x5101c4, "model {model:#x}");
+            assert_eq!(config.raw_rcb_event(), 0x5111c4, "model {model:#x}");
             assert_eq!(config.skid_margin(), 100, "model {model:#x}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn tiger_lake_counts_every_conditional_branch() {
+        let config = PmuConfig::from_family_model(0x06, 0x8D);
+        assert_eq!(config.raw_rcb_event(), 0x5111c4);
+        assert_eq!(config.skid_margin(), 100);
+    }
+
+    // Umask 01 already counts every conditional branch on these cores
+    // (perfmon skylake_core.json, skylakex_core.json, cascadelakex_core.json).
+    // Alder Lake (hybrid) and model 0x86 keep their entries; that is the scope
+    // of https://github.com/rrnewton/reverie/issues/965, not a claim that
+    // their counting is right.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn models_outside_the_umask_11_correction_keep_their_event() {
+        for (model, margin) in [
+            (0x4E, 100),
+            (0x55, 100),
+            (0x5E, 100),
+            (0x8E, 100),
+            (0x9E, 100),
+            (0xA5, 100),
+            (0xA6, 100),
+            (0x9A, 125),
+            (0x86, 100),
+        ] {
+            let config = PmuConfig::from_family_model(0x06, model);
+            assert_eq!(config.raw_rcb_event(), 0x5101c4, "model {model:#x}");
+            assert_eq!(config.skid_margin(), margin, "model {model:#x}");
         }
     }
 

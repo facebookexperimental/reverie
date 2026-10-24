@@ -43,9 +43,9 @@ impl PmuProfile {
                 0x4E | 0x55 | 0x5E => (0x5101c4, 100),        // Intel Skylake
                 0x8E | 0x9E => (0x5101c4, 100),               // Intel Kabylake
                 0xA5 | 0xA6 => (0x5101c4, 100),               // Intel Cometlake
-                0x8D => (0x5101c4, 100),                      // Intel Tiger Lake
+                0x8D => (0x5111c4, 100),                      // Intel Tiger Lake
                 0x9A => (0x5101c4, 125),                      // Intel Alder Lake
-                0x8F => (0x5101c4, 125),                      // Intel Sapphire Rapids
+                0x8F => (0x5111c4, 125),                      // Intel Sapphire Rapids
                 0x86 => (0x5101c4, 100),                      // Intel Icelake
                 // Intel Emerald Rapids (Raptor Cove; Linux INTEL_EMERALDRAPIDS_X).
                 // Intel's perfmon tables encode BR_INST_RETIRED as Sapphire
@@ -53,16 +53,19 @@ impl PmuProfile {
                 // sapphirerapids_core.json v1.40: event C4, umask 01 COND_TAKEN,
                 // 10 COND_NTAKEN, 11 COND), and rr gives both the same profile,
                 // so this repeats Sapphire Rapids' entry.
-                0xCF => (0x5101c4, 125),
+                0xCF => (0x5111c4, 125),
                 // Intel Ice Lake, Sunny Cove: server (Linux INTEL_ICELAKE_X 0x6A,
                 // INTEL_ICELAKE_D 0x6C) and client (INTEL_ICELAKE 0x7D,
                 // INTEL_ICELAKE_L 0x7E). Intel's perfmon icelakex_core.json v1.31
                 // and icelake_core.json v1.25 encode BR_INST_RETIRED as Sapphire
                 // Rapids does (event C4, umask 01 COND_TAKEN, 10 COND_NTAKEN,
                 // 11 COND), and rr's Ice Lake profile (models 0x6A and 0x7E) has
-                // a margin of 100. The umask (01 here, 11 in rr) is
-                // https://github.com/rrnewton/reverie/issues/965.
-                0x6A | 0x6C | 0x7D | 0x7E => (0x5101c4, 100),
+                // a margin of 100. On these cores, as on Tiger Lake
+                // (tigerlake_core.json v1.20), Sapphire Rapids and Emerald
+                // Rapids, umask 01 counts only taken conditional branches; the
+                // RCB clock counts all of them, umask 11, as rr does
+                // (https://github.com/rrnewton/reverie/issues/965).
+                0x6A | 0x6C | 0x7D | 0x7E => (0x5111c4, 100),
                 _ => return None,
             },
             // Turin EPYC family 1Ah model 11h (measured on an EPYC 9D85).
