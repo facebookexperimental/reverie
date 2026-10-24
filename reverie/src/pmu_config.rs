@@ -1250,9 +1250,7 @@ impl PmuState {
     /// a configuration is installed already or its key is not the pinned key.
     pub fn set(&self, config: PmuConfig) -> Result<(), PmuConfig> {
         let pinned = self.lock();
-        if self.installed.get().is_some()
-            || pinned.is_some_and(|key| key != config.clock_key())
-        {
+        if self.installed.get().is_some() || pinned.is_some_and(|key| key != config.clock_key()) {
             return Err(config);
         }
         let result = self.installed.set(config);
@@ -1336,7 +1334,10 @@ mod clock_state_tests {
         ] {
             let clock = qualify_host(vendor, family, model).unwrap();
             assert_eq!(clock.metric, metric, "{vendor} {family:#x} {model:#x}");
-            assert_eq!(clock.raw_event, raw_event, "{vendor} {family:#x} {model:#x}");
+            assert_eq!(
+                clock.raw_event, raw_event,
+                "{vendor} {family:#x} {model:#x}"
+            );
         }
         assert_eq!(metric.id(), "rcb:cond-retired:user:v1");
         assert_eq!(RcbMetric::from_id(metric.id()), Some(metric));
@@ -1347,26 +1348,59 @@ mod clock_state_tests {
     fn unqualified_hosts_are_named() {
         use UnqualifiedReason::*;
         for (vendor, family, model, reason) in [
-            ("GenuineIntel", 0x06, 0x9A, MetricNotEstablished { family: 0x06, model: 0x9A }),
-            ("GenuineIntel", 0x06, 0x86, MetricNotEstablished { family: 0x06, model: 0x86 }),
-            ("GenuineIntel", 0x06, 0x01, ModelNotInTable { family: 0x06, model: 0x01 }),
+            (
+                "GenuineIntel",
+                0x06,
+                0x9A,
+                MetricNotEstablished {
+                    family: 0x06,
+                    model: 0x9A,
+                },
+            ),
+            (
+                "GenuineIntel",
+                0x06,
+                0x86,
+                MetricNotEstablished {
+                    family: 0x06,
+                    model: 0x86,
+                },
+            ),
+            (
+                "GenuineIntel",
+                0x06,
+                0x01,
+                ModelNotInTable {
+                    family: 0x06,
+                    model: 0x01,
+                },
+            ),
             (
                 "AuthenticAMD",
                 0x06,
                 0x55,
-                VendorFamilyNotInTable { vendor: "AuthenticAMD".into(), family: 0x06 },
+                VendorFamilyNotInTable {
+                    vendor: "AuthenticAMD".into(),
+                    family: 0x06,
+                },
             ),
             (
                 "GenuineIntel",
                 0x19,
                 0x11,
-                VendorFamilyNotInTable { vendor: "GenuineIntel".into(), family: 0x19 },
+                VendorFamilyNotInTable {
+                    vendor: "GenuineIntel".into(),
+                    family: 0x19,
+                },
             ),
             (
                 "HygonGenuine",
                 0x18,
                 0x00,
-                VendorFamilyNotInTable { vendor: "HygonGenuine".into(), family: 0x18 },
+                VendorFamilyNotInTable {
+                    vendor: "HygonGenuine".into(),
+                    family: 0x18,
+                },
             ),
         ] {
             assert_eq!(qualify_host(vendor, family, model), Err(reason));
@@ -1541,14 +1575,102 @@ mod clock_state_tests {
             barrier.wait();
             let committed = state.commit_pin(ticket).is_ok();
             let installed = setter.join().unwrap();
-            assert!(committed != installed, "committed {committed}, installed {installed}");
+            assert!(
+                committed != installed,
+                "committed {committed}, installed {installed}"
+            );
             if committed {
                 assert!(state.installed().is_none());
                 assert_eq!(state.pinned(), Some(amd().key()));
             } else {
-                assert_eq!(state.installed().map(PmuConfig::clock_key), Some(profile(0x06, 0x55).clock_key()));
+                assert_eq!(
+                    state.installed().map(PmuConfig::clock_key),
+                    Some(profile(0x06, 0x55).clock_key())
+                );
                 assert_eq!(state.pinned(), None);
             }
+        }
+    }
+
+    // F2 and F3: while another thread holds the process's PMU state lock, a
+    // child of `fork` (which runs atfork handlers) and of a raw `clone`
+    // without CLONE_VM (which runs none) still builds a configuration and
+    // reads the recorded margin and installed configuration: none of them
+    // takes the lock, so neither child can wait on one it inherited held.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn constructors_complete_in_a_child_forked_while_the_lock_is_held() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        let (held, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let holder = {
+            let (held, release) = (held.clone(), release.clone());
+            std::thread::spawn(move || {
+                let _guard = PMU_STATE.lock();
+                held.wait();
+                release.wait();
+            })
+        };
+        held.wait();
+        let mut statuses = Vec::new();
+        for raw_clone in [false, true] {
+            // SAFETY: the child calls only the lock-free constructors and
+            // reads, then `_exit`s.
+            let pid = unsafe {
+                if raw_clone {
+                    libc::syscall(
+                        libc::SYS_clone,
+                        libc::SIGCHLD as libc::c_ulong,
+                        0usize,
+                        0usize,
+                        0usize,
+                        0usize,
+                    ) as libc::pid_t
+                } else {
+                    libc::fork()
+                }
+            };
+            assert!(pid >= 0, "{}", std::io::Error::last_os_error());
+            if pid == 0 {
+                let _ = PmuConfig::try_new();
+                let _ = PMU_STATE.with_recorded_margin(profile(0x06, 0x55));
+                let _ = PMU_STATE.installed();
+                // SAFETY: ends the child without running the parent's exit path.
+                unsafe { libc::_exit(0) };
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                let mut status = 0;
+                // SAFETY: waits only for the child created above.
+                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if waited == pid {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    // SAFETY: signals only the child created above, then reaps it.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, &mut status, 0);
+                    }
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            statuses.push((raw_clone, status));
+        }
+        release.wait();
+        holder.join().unwrap();
+        for (raw_clone, status) in statuses {
+            let status = status.unwrap_or_else(|| {
+                panic!("the child (raw clone: {raw_clone}) did not finish in 20 s: it waited on the lock")
+            });
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "raw clone {raw_clone}: status {status:#x}"
+            );
         }
     }
 }
