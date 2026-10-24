@@ -9,7 +9,7 @@ The public package is named `reverie-utils`; its Rust library is named
 
 ```toml
 [dependencies]
-reverie-util = { package = "reverie-utils", version = "0.4" }
+reverie-util = { package = "reverie-utils", version = "0.5" }
 ```
 
 See the [API documentation](https://docs.rs/reverie-utils) for available

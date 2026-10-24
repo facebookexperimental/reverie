@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::cell::UnsafeCell;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -22,6 +14,16 @@ use super::Options;
 pub mod ordered;
 
 pub const PAYLOAD: usize = 4096;
+// These are native libc ancillary-data fields, whose widths differ on musl.
+// Keep every inferred input cast within both libc ABIs, and every output
+// conversion to usize lossless on the supported Linux pointer widths.
+const _: () = {
+    assert!(std::mem::size_of::<usize>() >= std::mem::size_of::<libc::socklen_t>());
+    assert!(std::mem::size_of::<[usize; 32]>() <= libc::socklen_t::MAX as usize);
+    assert!(unsafe { libc::CMSG_SPACE(4) } as usize <= std::mem::size_of::<[usize; 8]>());
+    assert!(unsafe { libc::CMSG_LEN(4) } <= unsafe { libc::CMSG_SPACE(4) });
+};
+
 const PRODUCERS: usize = 64;
 const MAGIC: u64 = 0x33474f4c52455652;
 pub(super) const RESERVED: u32 = 1;
@@ -157,12 +159,12 @@ fn send_descriptor(socket: &UnixStream, fd: &OwnedFd, mut tag: [u8; 4]) -> io::R
     message.msg_iov = &mut vector;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as usize;
+    message.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
     unsafe {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(4) as usize;
+        (*header).cmsg_len = libc::CMSG_LEN(4) as _;
         libc::CMSG_DATA(header)
             .cast::<i32>()
             .write_unaligned(fd.as_raw_fd());
@@ -344,7 +346,11 @@ impl SharedBuffer {
         message.msg_iov = &mut vector;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = std::mem::size_of_val(&control);
+        #[cfg(target_env = "musl")]
+        let control_length = std::mem::size_of_val(&control) as _;
+        #[cfg(not(target_env = "musl"))]
+        let control_length = std::mem::size_of_val(&control);
+        message.msg_controllen = control_length;
         let result = unsafe {
             libc::recvmsg(
                 fd,
@@ -365,9 +371,11 @@ impl SharedBuffer {
                 if (*header).cmsg_level == libc::SOL_SOCKET
                     && (*header).cmsg_type == libc::SCM_RIGHTS
                 {
-                    let bytes = (*header)
-                        .cmsg_len
-                        .saturating_sub(libc::CMSG_LEN(0) as usize);
+                    #[cfg(target_env = "musl")]
+                    let length = (*header).cmsg_len as usize;
+                    #[cfg(not(target_env = "musl"))]
+                    let length = (*header).cmsg_len;
+                    let bytes = length.saturating_sub(libc::CMSG_LEN(0) as usize);
                     for offset in (0..bytes / 4).map(|index| index * 4) {
                         let received = OwnedFd::from_raw_fd(
                             libc::CMSG_DATA(header)

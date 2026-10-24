@@ -3,7 +3,7 @@
 [package]
 name = "reverie-ptrace"
 description = "ptrace-based execution backend for the Reverie instrumentation framework."
-version = "0.4.1"
+version = "0.5.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -17,6 +17,8 @@ categories = ["development-tools::debugging", "os::linux-apis"]
 
 [features]
 default = []
+# Diagnostic counter reads only; logging alone cannot activate this observer.
+rcb-observation = []
 # Clear libtest's thread-local stdout/stderr capture in forked function guests.
 # Normal subprocess execution and descriptor-based capture use stable Rust.
 nightly = []
@@ -40,8 +42,8 @@ paste = "1.0.14"
 perf-event-open-sys = "5.0"
 procfs = "0.18.0"
 raw-cpuid = "10.7.0"
-reverie = { version = "0.4.1", path = "../reverie", package = "reverie-core" }
-safeptrace = { version = "0.4.1", path = "../safeptrace", features = ["memory", "notifier"] }
+reverie = { version = "0.5.1", path = "../reverie", package = "reverie-core" }
+safeptrace = { version = "0.5.1", path = "../safeptrace", features = ["memory", "notifier"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
@@ -54,4 +56,9 @@ unwind = { version = "0.4.2", features = ["ptrace"] }
 pkg-config = "0.3"
 
 [dev-dependencies]
+reverie = { version = "0.5.1", path = "../reverie", package = "reverie-core", features = ["perf-fixture"] }
 test-case = "3.3.1"
+
+[[test]]
+name = "first_instruction_cpuid"
+path = "../tests/first_instruction_cpuid.rs"

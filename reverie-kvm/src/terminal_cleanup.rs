@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Terminal descriptor retirement through an owned native-exit service.
 //!
 //! One prestarted service belongs to one guest task. Its native worker is ready
@@ -24,6 +16,7 @@ use std::time::Duration;
 
 use futures::task::AtomicWaker;
 
+use crate::error::ErrorExt;
 use crate::executor::AbandonedRuns;
 use crate::executor::ChildThread;
 use crate::executor::DroppedRunReaper;

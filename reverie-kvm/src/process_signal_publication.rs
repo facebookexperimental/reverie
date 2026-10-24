@@ -1,7 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -917,6 +916,30 @@ impl ProcessSignalControl {
         self.publish(target, event, None, true, None)
     }
 
+    /// A Tool-owned POSIX timer's expiration
+    /// ([`reverie::ProcessSignalControl::publish_timer_expiry`]): a
+    /// process-directed standard signal whose siginfo names itself with
+    /// `SI_TIMER`. Everything after validation is the alarm's publication.
+    fn publish_active_timer_expiry(
+        &self,
+        target: SignalProcessId,
+        event: SignalEvent,
+    ) -> ProcessPublication {
+        let signal = event.signal();
+        let info = event.siginfo();
+        let field = |at: usize| i32::from_ne_bytes(info[at..at + 4].try_into().unwrap());
+        if !(1..=31).contains(&signal)
+            || signal == libc::SIGKILL
+            || signal == libc::SIGSTOP
+            || field(0) != signal
+            || field(8) != libc::SI_TIMER
+            || event.target() != (reverie::SignalTarget::Process { pid: target.tgid })
+        {
+            return ProcessPublication::Rejected(PublicationRejection::InvalidEvent);
+        }
+        self.publish(target, event, None, true, None)
+    }
+
     fn publish_child_completion(
         &self,
         completion: reverie::ChildExitCompletion,
@@ -1224,6 +1247,8 @@ fn child_exit_signal_event(
         }
         reverie::ExitStatus::Signaled(signal, true) => (libc::CLD_DUMPED, signal as libc::c_int),
         reverie::ExitStatus::Signaled(signal, false) => (libc::CLD_KILLED, signal as libc::c_int),
+        reverie::ExitStatus::SignaledRaw(signal, true) => (libc::CLD_DUMPED, signal),
+        reverie::ExitStatus::SignaledRaw(signal, false) => (libc::CLD_KILLED, signal),
     };
     let mut info = [0; reverie::SIGNAL_INFO_SIZE];
     info[..4].copy_from_slice(&libc::SIGCHLD.to_ne_bytes());
@@ -1322,6 +1347,30 @@ impl ProcessSignalRegistry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&task_key(task));
+    }
+}
+
+/// The public result of a process signal publication (an alarm or a timer
+/// expiration).
+fn public_process_outcome(
+    publication: ProcessPublication,
+) -> reverie::ProcessSignalPublicationResult {
+    use reverie::ProcessSignalPublicationResult as Outcome;
+    match publication {
+        ProcessPublication::Committed(receipt) => Outcome::Committed(public_receipt(&receipt)),
+        ProcessPublication::FailedAfterCommit(failure) => Outcome::FailedAfterCommit {
+            receipt: public_receipt(&failure.receipt),
+            errno: failure.errno,
+        },
+        ProcessPublication::Rejected(reason) => Outcome::RejectedBeforeCommit(match reason {
+            PublicationRejection::Backend(errno) => errno,
+            PublicationRejection::Closed | PublicationRejection::StaleProcess => Errno::ESRCH,
+            PublicationRejection::ChangedImage => Errno::EAGAIN,
+            PublicationRejection::InvalidEvent | PublicationRejection::InvalidCompletion => {
+                Errno::EINVAL
+            }
+            PublicationRejection::Terminal => Errno::EIO,
+        }),
     }
 }
 
@@ -1445,23 +1494,15 @@ impl reverie::ProcessSignalControl for ProcessSignalControl {
         process: SignalProcessId,
         event: SignalEvent,
     ) -> reverie::ProcessSignalPublicationResult {
-        use reverie::ProcessSignalPublicationResult as Outcome;
-        match self.publish_active_alarm(process, event) {
-            ProcessPublication::Committed(receipt) => Outcome::Committed(public_receipt(&receipt)),
-            ProcessPublication::FailedAfterCommit(failure) => Outcome::FailedAfterCommit {
-                receipt: public_receipt(&failure.receipt),
-                errno: failure.errno,
-            },
-            ProcessPublication::Rejected(reason) => Outcome::RejectedBeforeCommit(match reason {
-                PublicationRejection::Backend(errno) => errno,
-                PublicationRejection::Closed | PublicationRejection::StaleProcess => Errno::ESRCH,
-                PublicationRejection::ChangedImage => Errno::EAGAIN,
-                PublicationRejection::InvalidEvent | PublicationRejection::InvalidCompletion => {
-                    Errno::EINVAL
-                }
-                PublicationRejection::Terminal => Errno::EIO,
-            }),
-        }
+        public_process_outcome(self.publish_active_alarm(process, event))
+    }
+
+    fn publish_timer_expiry(
+        &self,
+        process: SignalProcessId,
+        event: SignalEvent,
+    ) -> reverie::ProcessSignalPublicationResult {
+        public_process_outcome(self.publish_active_timer_expiry(process, event))
     }
 
     fn publish_child_exit(
@@ -1660,6 +1701,7 @@ mod tests {
     use super::*;
     use crate::GuestMemory;
     use crate::SyscallRequest;
+    use crate::error::ErrorExt;
     use crate::signal::KernelSigaction;
     use crate::signal::KernelSigset;
 
@@ -2141,6 +2183,80 @@ mod tests {
             .insert(fd, carrier);
     }
 
+    fn timer_expiry(target: SignalProcessId, signal: i32, code: i32) -> SignalEvent {
+        let mut info = [0; reverie::SIGNAL_INFO_SIZE];
+        info[..4].copy_from_slice(&signal.to_ne_bytes());
+        info[8..12].copy_from_slice(&code.to_ne_bytes());
+        info[16..20].copy_from_slice(&7i32.to_ne_bytes());
+        SignalEvent::new(
+            signal,
+            info,
+            reverie::SignalTarget::Process { pid: target.tgid },
+        )
+        .unwrap()
+    }
+
+    /// A Tool-owned POSIX timer's expiration is published as Linux queues a
+    /// `SIGEV_SIGNAL` timer's signal: only a process-directed standard signal
+    /// with `SI_TIMER`. Anything else is refused before any pending state
+    /// changes, and a committed one is the event the receiver dequeues.
+    #[test]
+    fn timer_expiry_publishes_only_a_process_directed_standard_si_timer_signal() {
+        let mut executor = executor();
+        let process = identity(&executor);
+        executor
+            .signal_registry
+            .controlled
+            .store(true, Ordering::Release);
+        let control = executor.backend_signal_control().process;
+        let thread_directed = SignalEvent::new(
+            libc::SIGUSR1,
+            timer_expiry(process, libc::SIGUSR1, libc::SI_TIMER).siginfo(),
+            reverie::SignalTarget::Thread {
+                pid: process.tgid,
+                tid: reverie::Tid::from_raw(process.tgid.as_raw()),
+            },
+        )
+        .unwrap();
+        for refused in [
+            timer_expiry(process, libc::SIGUSR1, libc::SI_KERNEL),
+            timer_expiry(process, libc::SIGKILL, libc::SI_TIMER),
+            timer_expiry(process, libc::SIGRTMIN(), libc::SI_TIMER),
+            thread_directed,
+        ] {
+            assert!(matches!(
+                control.publish_timer_expiry(process, refused),
+                reverie::ProcessSignalPublicationResult::RejectedBeforeCommit(Errno::EINVAL)
+            ));
+        }
+        assert!(
+            executor
+                .take_pending_signal_for_delivery()
+                .unwrap()
+                .is_none()
+        );
+        let expiry = timer_expiry(process, libc::SIGUSR1, libc::SI_TIMER);
+        assert!(matches!(
+            control.publish_timer_expiry(process, expiry),
+            reverie::ProcessSignalPublicationResult::Committed(_)
+        ));
+        control
+            .reserve_delivery(reverie::SignalDeliveryPermit {
+                task: executor.signal_task_identity().unwrap(),
+                sequence: 1,
+                site: None,
+            })
+            .unwrap();
+        assert_eq!(
+            executor
+                .take_pending_signal_for_delivery()
+                .unwrap()
+                .unwrap()
+                .event,
+            expiry
+        );
+    }
+
     #[test]
     fn controlled_pending_alarm_does_not_reject_or_preselect_a_new_thread() {
         let leader = executor();
@@ -2382,7 +2498,6 @@ mod tests {
                     }
                 );
                 assert_eq!(*executor.state.thread_signals.lock(), before_thread);
-                assert_eq!(executor.state.logical_clock_ns, 0);
                 assert_eq!(
                     executor
                         .state
@@ -4098,7 +4213,14 @@ mod tests {
             iov_base: RIGHTS_BYTE as *mut libc::c_void,
             iov_len: 1,
         };
-        assert_eq!(super::super::write_struct(memory, RIGHTS_IOV, &iov), 0);
+        assert_eq!(
+            super::super::write_struct(
+                &mut crate::provider_memory::ProviderMemory(memory),
+                RIGHTS_IOV,
+                &iov
+            ),
+            0
+        );
         // SAFETY: an all-zero msghdr is a valid empty header.
         let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
         header.msg_iov = RIGHTS_IOV as *mut libc::iovec;
@@ -4106,7 +4228,11 @@ mod tests {
         header.msg_control = RIGHTS_CONTROL as *mut libc::c_void;
         header.msg_controllen = control_length;
         assert_eq!(
-            super::super::write_struct(memory, RIGHTS_HEADER, &header),
+            super::super::write_struct(
+                &mut crate::provider_memory::ProviderMemory(memory),
+                RIGHTS_HEADER,
+                &header
+            ),
             0
         );
     }

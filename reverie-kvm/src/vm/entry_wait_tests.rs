@@ -52,7 +52,7 @@ mod entry_wait_tests {
         let load = |counter: &AtomicUsize| counter.load(Ordering::SeqCst);
         Counts {
             fd: load(&probe.shared_fd_accesses),
-            masks: load(&probe.prepare.mask_installs),
+            masks: load(&probe.prepare.activations),
             untracked: load(&probe.untracked_runs),
             tracked: load(&probe.tracked_runs),
             begins: load(&probe.clock_begins),
@@ -641,7 +641,7 @@ mod entry_wait_tests {
             };
             assert_eq!(
                 completed.result.unwrap(),
-                (expected, Vec::new(), Vec::new())
+                (ExitStatus::Exited(expected), Vec::new(), Vec::new())
             );
             expected
         };

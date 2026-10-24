@@ -603,6 +603,10 @@ impl WriteResponse for StopReason {
                         writer.put_str("X");
                         writer.put_hex_encoded(&[(*sig as u8) | 0x80]);
                     }
+                    ExitStatus::SignaledRaw(sig, _) => {
+                        writer.put_str("X");
+                        writer.put_hex_encoded(&[(*sig as u8) | 0x80]);
+                    }
                 }
                 writer.put_str(";process:");
                 writer.put_num(pid.as_raw());
@@ -613,7 +617,7 @@ impl WriteResponse for StopReason {
                         writer.put_str("w");
                         writer.put_hex_encoded(&[*code as u8]);
                     }
-                    ExitStatus::Signaled(_, _) => unreachable!(),
+                    ExitStatus::Signaled(_, _) | ExitStatus::SignaledRaw(_, _) => unreachable!(),
                 }
                 writer.put_str(";");
                 let threadid = ThreadId::pid_tid(tgid.as_raw(), pid.as_raw());

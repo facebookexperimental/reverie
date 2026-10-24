@@ -27,13 +27,6 @@ pub fn late_timer_signals_discarded() -> u64 {
     crate::task::LATE_TIMER_SIGNALS_DISCARDED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The number of timer overflow signals this process has discarded while the
-/// LiteInst patch helper ran. Concurrent tests in one process share the
-/// count.
-pub fn liteinst_helper_timer_signals_discarded() -> u64 {
-    crate::task::LITEINST_HELPER_TIMER_SIGNALS_DISCARDED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// The number of timer overflow signals this process has taken at injected
 /// syscalls as the notification of a timer event that no stop had decided, to
 /// deliver the event. Concurrent tests in one process share the count.
@@ -89,17 +82,77 @@ pub fn cancelled_timer_signals_discarded() -> u64 {
     crate::timer::CANCELLED_TIMER_SIGNALS_DISCARDED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The number of staged precise timer events this process has re-armed at
+/// their second stage (see [`crate::PmuConfig::stages`]). Concurrent tests in
+/// one process share the count.
+pub fn precise_timer_second_stages_armed() -> u64 {
+    crate::timer::SECOND_STAGES_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The steps this process's timers have taken toward precise event targets,
+/// and the lookups in their block bound caches, so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreciseTimerSteps {
+    /// Single instruction steps (`PTRACE_SINGLESTEP`).
+    pub instruction: u64,
+    /// Block steps (`PTRACE_SINGLEBLOCK`).
+    pub block: u64,
+    /// Block bounds found in the cache, with their code unchanged.
+    pub bound_hits: u64,
+    /// Block bounds decoded afresh.
+    pub bound_misses: u64,
+}
+
+impl std::ops::Sub for PreciseTimerSteps {
+    type Output = Self;
+    fn sub(self, earlier: Self) -> Self {
+        Self {
+            instruction: self.instruction - earlier.instruction,
+            block: self.block - earlier.block,
+            bound_hits: self.bound_hits - earlier.bound_hits,
+            bound_misses: self.bound_misses - earlier.bound_misses,
+        }
+    }
+}
+
+/// See [`PreciseTimerSteps`].
+pub fn precise_timer_steps() -> PreciseTimerSteps {
+    use std::sync::atomic::Ordering::Relaxed;
+    PreciseTimerSteps {
+        instruction: crate::timer::INSTRUCTION_STEPS.load(Relaxed),
+        block: crate::timer::BLOCK_STEPS.load(Relaxed),
+        bound_hits: crate::timer::BLOCK_BOUND_HITS.load(Relaxed),
+        bound_misses: crate::timer::BLOCK_BOUND_MISSES.load(Relaxed),
+    }
+}
+
+/// Makes this process's timers take block steps toward precise targets where
+/// the decoded bound allows (`enabled`, the default), or only single
+/// instruction steps, as `REVERIE_BLOCK_STEP=0` does. For a test that compares
+/// the two in one process; it affects every timer in the process.
+pub fn set_block_steps(enabled: bool) {
+    crate::timer::BLOCK_STEPS_OFF_FOR_TESTS.store(!enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Makes every hit in this process's block bound caches re-read and decode
+/// the guest's code again, and panic if that differs from the cached bound,
+/// as `REVERIE_BLOCK_STEP_VERIFY_CACHE` does.
+pub fn verify_block_bound_cache() {
+    crate::timer::VERIFY_BLOCK_BOUNDS_FOR_TESTS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub use crate::timer::KeptProgramming;
 
 /// Makes the timers of this process check, from now on, at every disregarded
-/// stop (a stop without a Tool callback, such as a LiteInst hook trap) that
-/// keeps a scheduled timer event whose request programmed a PMU notification,
-/// that the stop left that programming as the request made it: that no call
-/// that changes the counter's programming (enable, disable, refresh, reset,
-/// period or signal delivery) was made on it since the request, and that the
-/// counter still overflows at the clock at which the request programmed it
-/// to, the target less the skid margin for a precise event. The check reads
-/// both counters once per such stop.
+/// stop (a stop without a Tool callback, such as an unsubscribed syscall's
+/// injected-syscall trap) that keeps a scheduled timer event whose request
+/// programmed a PMU notification, that the stop left that programming as the
+/// request made it: that no call that changes the counter's programming
+/// (enable, disable, refresh, reset, period or signal delivery) was made on it
+/// since the request, and that the counter still overflows at the clock at
+/// which the request programmed it to, the target less the margin the request
+/// programmed for a precise event (see [`crate::PmuConfig::stages`]). A staged
+/// event's second stage is checked as the programming its re-arm made. The check reads both counters once per such stop.
 ///
 /// A stop whose check passes and that hands nothing on is checked again at
 /// the thread's next stop, or at the event's next request, cancellation or
@@ -299,7 +352,9 @@ pub fn rerun_skid_margin() -> Option<u64> {
         .parse()
         .expect("a re-run's skid margin must be a u64");
     assert_eq!(
-        crate::PmuConfig::new().skid_margin(),
+        crate::PmuConfig::new()
+            .expect("this host has a PMU profile")
+            .skid_margin(),
         margin,
         "the re-run's skid margin override must be in effect"
     );
@@ -370,17 +425,9 @@ pub fn rerun_at_skid_margin(
     text
 }
 
-/// The number of LiteInst host-hybrid restart landings in this process that
-/// interrupted a precise timer's single steps, after which the run loop
-/// resolved the landing and the steps continued. Concurrent tests in one
-/// process share the count.
-pub fn liteinst_timer_step_landings_resolved() -> u64 {
-    crate::task::LITEINST_TIMER_STEP_LANDINGS_RESOLVED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// The number of SIGTRAP stops this process has resumed without delivering
-/// the signal because no breakpoint, LiteInst trap, injected-syscall trap or
-/// debugger step claimed them. A single-step trap flag left set in the guest
+/// the signal because no breakpoint, injected-syscall trap or debugger step
+/// claimed them. A single-step trap flag left set in the guest
 /// produces one per instruction. Concurrent tests in one process share the
 /// count.
 pub fn unclaimed_sigtraps_suppressed() -> u64 {

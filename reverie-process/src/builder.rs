@@ -63,6 +63,7 @@ impl Command {
             program,
             args,
             pre_exec: Vec::new(),
+            terminal_execve: None,
             container: Container::new(),
         }
     }
@@ -424,6 +425,23 @@ impl Command {
         F: FnMut() -> Result<(), Errno> + Send + Sync + 'static,
     {
         self.pre_exec.push(Box::new(f));
+        self
+    }
+
+    /// Select a trusted terminal entry for the final original `execve`.
+    ///
+    /// The supplied entry receives the same prepared program, argv and envp
+    /// used by ordinary spawn. No PATH search, script fallback or vector
+    /// rewrite is performed on this path. A relative program is refused.
+    ///
+    /// # Safety
+    /// The caller qualifies the actual entry, child setup, inherited filter
+    /// and gate mapping. The entry must allocate and free nothing, preserve
+    /// all supplied vector bytes, issue the actual original target exec and
+    /// terminate through the surviving gate on every returned kernel error.
+    /// No replacement helper image or success-return path is permitted.
+    pub unsafe fn terminal_execve(&mut self, entry: super::TerminalExecve) -> &mut Self {
+        self.terminal_execve = Some(entry);
         self
     }
 

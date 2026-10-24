@@ -83,23 +83,19 @@ jobs:
         key: dynamorio-${{ runner.os }}-${{ hashFiles('reverie-dbt/vendor/dynamorio/**', 'reverie-dbt/build.rs') }}
     - name: Build
       run: cargo build --workspace --all-features
-    - name: Cache constructor-disabled LiteInst conformance artifacts
-      uses: actions/cache@v4
-      with:
-        # Keep release/no-default artifacts separate from all-features builds.
-        # Cargo still verifies source, dependency and compiler fingerprints.
-        path: target/liteinst-conformance
-        key: liteinst-conformance-${{ github.job }}-release-no-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
-    - name: LiteInst real target-loader conformance
-      # Uses ptrace and native loader oracles; no PMU or self-hosted runner needed.
-      # The bounded runner builds the release DSO, binds its digest and requires
-      # exactly one executed, passing test.
-      run: reverie-liteinst/tests/run_target_loader_conformance.sh
+    - name: LiteInst allocator fixtures
+      timeout-minutes: 10
+      run: |
+        set -euo pipefail
+        cargo install --locked rust-script
+        generation="$RUNNER_TEMP/liteinst-allocator-$GITHUB_JOB-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        scripts/build-liteinst-test-runtime.rs --for-ci "$generation"
+        cat "$generation/bundle/github.env" >> "$GITHUB_ENV"
     - name: DBT virtual identity and pidfd_open policy
       run: reverie-dbt/scripts/test-identity-policy.sh
     - name: Test regular workspace cases
       run: >-
-        cargo test --workspace --exclude reverie-kvm --exclude reverie-preload --all-features --no-fail-fast --
+        cargo test --workspace --exclude reverie-kvm --exclude reverie-inguest --all-features --no-fail-fast --
         --test-threads=1
         --skip container::tests::bind_to_low_port
         --skip container::tests::mount_error_from_child_is_returned
@@ -127,6 +123,11 @@ jobs:
       run: cargo clippy --workspace --all-targets --all-features
     - name: Format
       run: cargo fmt --all -- --check
+    # The cross-backend check on every backend that needs no device. A hosted
+    # runner's environment has no ledger, so its verdicts are reported, not
+    # judged (reverie-examples/e2e/README.md).
+    - name: Reverie-layer cross-backend e2e (no device)
+      run: reverie-examples/e2e/run.sh --backends ptrace,liteinst,in-guest-trap,e9patch,dbt,sabre
     - name: Restore hosted-runner namespace restriction
       if: ${{ always() && steps.userns.outputs.restore_required == 'true' }}
       timeout-minutes: 1
@@ -233,6 +234,16 @@ jobs:
         fi
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
+    - name: Build
+      run: cargo build --workspace --all-features
+    - name: LiteInst allocator fixtures
+      timeout-minutes: 10
+      run: |
+        set -euo pipefail
+        cargo install --locked rust-script
+        generation="$RUNNER_TEMP/liteinst-allocator-$GITHUB_JOB-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        scripts/build-liteinst-test-runtime.rs --for-ci "$generation"
+        cat "$generation/bundle/github.env" >> "$GITHUB_ENV"
     - name: Host-dependent workspace tests
       env:
         REVERIE_REQUIRE_KVM: "1"
@@ -256,3 +267,8 @@ jobs:
         kill "$watchdog" 2>/dev/null || true
         wait "$watchdog" 2>/dev/null || true
         exit "$status"
+    # The cross-backend check on KVM, which needs /dev/kvm (refused by name
+    # without it). Without a ledger for the runner's environment its verdicts
+    # are reported, not judged (reverie-examples/e2e/README.md).
+    - name: Reverie-layer cross-backend e2e (KVM)
+      run: reverie-examples/e2e/run.sh --backends kvm

@@ -17,6 +17,7 @@ use futures::task::ArcWake;
 
 use super::*;
 use crate::entry::owner::OperationOrigin;
+use crate::error::ErrorExt;
 use crate::failure::owned_future::PanicPayload;
 
 #[derive(Default)]

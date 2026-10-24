@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Included inside terminal_cleanup::tests with the authenticated broker adapter.
 #[test]
 fn dropped_waiter_keeps_native_wait_and_owned_service_alive() {

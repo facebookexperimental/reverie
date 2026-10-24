@@ -247,12 +247,8 @@ fn explicit_ptracer_mode_cannot_recapture_an_unbound_generic_token() {
 #[tokio::test(flavor = "current_thread")]
 #[cfg(all(feature = "memory", not(sanitized)))]
 async fn explicit_native_user_write_enforces_original_ptracer_owner() {
+    use reverie_memory::{Addr, AddrMut, MemoryAccess, RemoteIoVec};
     use std::io::IoSlice;
-
-    use reverie_memory::Addr;
-    use reverie_memory::AddrMut;
-    use reverie_memory::MemoryAccess;
-    use reverie_memory::RemoteIoVec;
 
     if run_legacy_test_outer("explicit_native_user_write_enforces_original_ptracer_owner") {
         return;
@@ -1373,10 +1369,6 @@ async fn explicit_native_reattach_preserves_current_owner_and_original_driver() 
     emit_completion_marker(MARKER);
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-)]
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn explicit_copied_owner_namespace_refuses_before_consuming_any_report() {
@@ -1694,10 +1686,6 @@ async fn explicit_copied_owner_namespace_refuses_before_consuming_any_report() {
     emit_completion_marker(MARKER);
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-)]
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn explicit_original_owner_progresses_through_retained_proc_overmount() {
@@ -1832,10 +1820,6 @@ async fn explicit_original_owner_progresses_through_retained_proc_overmount() {
     emit_completion_marker(MARKER);
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-)]
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn explicit_copied_stopped_namespace_refuses_numeric_ptrace() {
@@ -2153,10 +2137,6 @@ async fn explicit_copied_stopped_namespace_refuses_numeric_ptrace() {
     emit_completion_marker(MARKER);
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-)]
 #[tokio::test(flavor = "current_thread")]
 #[cfg(not(sanitized))]
 async fn explicit_first_binding_uses_original_native_event_mount() {

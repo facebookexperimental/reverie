@@ -7,6 +7,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -31,6 +32,7 @@ use crate::entry::EntryOrigin;
 use crate::entry::MappingGeneration;
 use crate::entry::RetainedOperand;
 use crate::entry::owner::OperationOrigin;
+use crate::error::ErrorExt;
 use crate::failure::FailureContext;
 
 const PAGE_SIZE: usize = 4096;
@@ -76,6 +78,10 @@ pub struct GuestMemory {
     test_user_copy_failure: Option<Arc<TestUserCopyFailure>>,
     #[cfg(test)]
     test_user_copy_backing_wait: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Runs in `read_then_write_raw` after its read and before its
+    /// failure checkpoint, while the copy is still admitted.
+    #[cfg(test)]
+    test_between_read_and_write: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     test_shared_map: Option<SharedMapHook>,
     #[cfg(test)]
@@ -105,10 +111,59 @@ impl RawMemoryRead<'_> {
     }
 }
 
+/// What `MADV_DONTNEED` must do to a user range (see
+/// `GuestMemory::dontneed_plan`).
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct DontneedPlan {
+    /// Physical addresses of the private anonymous pages, which then read as
+    /// zeros.
+    pub(crate) private_anonymous: Vec<u64>,
+    /// Whether a page is a private copy of a regular file, which Linux would
+    /// read from the file again.
+    pub(crate) private_file: bool,
+    /// Whether part of the range is not mapped.
+    pub(crate) unmapped: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackingKind {
+    /// Memory private to one address space: the arena itself, or a separately
+    /// retained private page.
     Fixed,
-    OrdinaryFile { max_writable: bool },
+    /// The shmem object behind `MAP_SHARED | MAP_ANONYMOUS` once a fork has
+    /// made it reachable from more than one address space. Each holder maps
+    /// the same backend-owned memfd, so a store through one is visible to all,
+    /// as with Linux's shmem object. The guest cannot reach or truncate this
+    /// file, so it is accessed like fixed RAM.
+    SharedAnonymous,
+    OrdinaryFile {
+        max_writable: bool,
+    },
+}
+
+impl BackingKind {
+    /// Whether this backing outlives its mapping in this address space and may
+    /// be shared with another: such a page cannot be zeroed, discarded or
+    /// moved in place, only replaced by a physical publication.
+    fn retained_shared(self) -> bool {
+        !matches!(self, Self::Fixed)
+    }
+}
+
+/// How a user copyout treats a destination that is not wholly writable, and
+/// a truncate-capable shared-file backing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Copyout {
+    /// `copy_to_user`: stores the writable prefix, through the
+    /// fault-contained file copy where the backing is a shared file.
+    Prefix,
+    /// `put_user` of a scalar whose store must not tear: all bytes or none,
+    /// and a truncate-capable file backing is refused, because it has no
+    /// proven fault-contained atomic store.
+    AtomicScalar,
+    /// All bytes or none by page permission, through the same
+    /// fault-contained file copy as [`Copyout::Prefix`].
+    Whole,
 }
 
 #[derive(Debug)]
@@ -141,6 +196,14 @@ impl Backing {
             kind: BackingKind::Fixed,
         })
     }
+
+    /// A zero-filled shmem object for shared anonymous memory.
+    fn new_shared_anonymous(length: usize) -> io::Result<Self> {
+        Ok(Self {
+            kind: BackingKind::SharedAnonymous,
+            ..Self::new(length)?
+        })
+    }
 }
 
 /// An owned range of a fixed-size backing, independent of any mmap view.
@@ -165,7 +228,11 @@ impl BackingSlice {
         libc::off_t::try_from(offset).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "backing offset exceeds off_t")
         })?;
-        if backing.kind == BackingKind::Fixed && end > backing.length {
+        if matches!(
+            backing.kind,
+            BackingKind::Fixed | BackingKind::SharedAnonymous
+        ) && end > backing.length
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "backing slice exceeds its backing",
@@ -197,16 +264,66 @@ struct Mapping {
     entry_gate: Arc<EntryGate>,
     retirement: Mutex<Option<Box<WriteAliasMapping>>>,
     deferred: Mutex<shared_file::DeferredFailures>,
+    /// Whether `deferred.causes` is non-empty. Every change to that list
+    /// updates this under the `deferred` lock, so reading false is equivalent
+    /// to having locked while the list was empty; every guest-memory copy
+    /// checks it twice.
+    deferred_queued: std::sync::atomic::AtomicBool,
     sync_mmu: Mutex<Option<bool>>,
+}
+
+/// The end of the x86-64 user address space with 4-level paging.
+pub(crate) const USER_ADDRESS_END: u64 = 1 << 47;
+/// Linux's `TASK_SIZE` and initial stack top with address randomization off.
+pub(crate) const USER_STACK_TOP: u64 = USER_ADDRESS_END - PAGE_SIZE as u64;
+
+/// Linux's `mmap_base` with address randomization off: TASK_SIZE less the
+/// 128 MiB minimum stack gap. Mappings without an address are placed top-down
+/// below it.
+pub(crate) const MMAP_BASE: u64 = USER_STACK_TOP - 128 * 1024 * 1024;
+
+/// A range of guest-physical memory, `[physical_start, physical_end)`, placed at
+/// user addresses starting at `user_start` through the guest page tables, so
+/// the guest sees Linux's layout (the stack below TASK_SIZE, mappings below
+/// `mmap_base`). Only `[user_start, user_end)` are user addresses; `user_end`
+/// may stop short of the physical range, as the stack window's does at
+/// TASK_SIZE. A window's identity addresses are not user addresses, so one
+/// physical page is never reachable at two user addresses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserWindow {
+    pub(crate) physical_start: u64,
+    pub(crate) physical_end: u64,
+    pub(crate) user_start: u64,
+    pub(crate) user_end: u64,
+}
+
+impl UserWindow {
+    fn contains_user(self, address: u64) -> bool {
+        (self.user_start..self.user_end).contains(&address)
+    }
+
+    pub(crate) fn physical(self, user: u64) -> u64 {
+        user - self.user_start + self.physical_start
+    }
 }
 
 #[derive(Clone, Debug)]
 struct AddressSpaceState {
     coverage: IdentityCoverage,
+    windows: Vec<UserWindow>,
+    /// The end of the identity user addresses, once a loader fixes the layout;
+    /// before that, they end where the lowest window's physical range begins.
+    identity_end: Option<u64>,
     cursors: Option<AllocationCursors>,
     reservations: BTreeMap<u64, RegionKind>,
     enabled: bool,
     pages: BTreeMap<u64, UserPageState>,
+    /// The file offset of each page a regular file was mapped into, by
+    /// physical page: Linux places a moved file mapping by its offset.
+    file_pages: BTreeMap<u64, u64>,
+    /// The physical pages of `MAP_SHARED | MAP_ANONYMOUS` mappings. Their
+    /// contents survive `MADV_DONTNEED`, which drops private anonymous pages.
+    shared_anonymous_pages: BTreeSet<u64>,
     /// Pages whose stable slot-0 HVA now names a separately retained backing.
     /// The current source increment keeps guest placement identity-only.
     backing_pages: BTreeMap<u64, InstalledBackingPage>,
@@ -227,6 +344,52 @@ struct HostChunk {
     mapping: NonNull<u8>,
     length: usize,
     backing: Arc<Backing>,
+}
+
+/// The host chunks of one guest range. Nearly every copy (a syscall frame,
+/// a result word) falls within one page, so that case stays off the heap.
+enum HostChunks {
+    One([HostChunk; 1]),
+    Many(Vec<HostChunk>),
+}
+
+impl std::ops::Deref for HostChunks {
+    type Target = [HostChunk];
+
+    fn deref(&self) -> &[HostChunk] {
+        match self {
+            Self::One(chunk) => chunk,
+            Self::Many(chunks) => chunks,
+        }
+    }
+}
+
+impl IntoIterator for HostChunks {
+    type Item = HostChunk;
+    type IntoIter = HostChunksIter;
+
+    fn into_iter(self) -> HostChunksIter {
+        match self {
+            Self::One(chunk) => HostChunksIter::One(chunk.into_iter()),
+            Self::Many(chunks) => HostChunksIter::Many(chunks.into_iter()),
+        }
+    }
+}
+
+enum HostChunksIter {
+    One(std::array::IntoIter<HostChunk, 1>),
+    Many(std::vec::IntoIter<HostChunk>),
+}
+
+impl Iterator for HostChunksIter {
+    type Item = HostChunk;
+
+    fn next(&mut self) -> Option<HostChunk> {
+        match self {
+            Self::One(chunks) => chunks.next(),
+            Self::Many(chunks) => chunks.next(),
+        }
+    }
 }
 
 /// Compatibility placement for the current fixed physical arena. Coverage is
@@ -275,15 +438,139 @@ impl AddressSpaceState {
                 start,
                 end: start + length as u64,
             },
+            windows: Vec::new(),
+            identity_end: None,
             cursors: None,
             reservations: BTreeMap::new(),
             enabled: false,
             pages: BTreeMap::new(),
+            file_pages: BTreeMap::new(),
+            shared_anonymous_pages: BTreeSet::new(),
             backing_pages: BTreeMap::new(),
         }
     }
 
+    fn invalid_address(&self, address: u64, length: usize) -> Error {
+        Error::InvalidGuestAddress {
+            address,
+            length,
+            guest_base: self.coverage.start,
+            guest_end: self.coverage.end,
+        }
+    }
+
+    /// The exclusive end of the identity user addresses.
+    fn identity_limit(&self) -> u64 {
+        self.identity_end
+            .unwrap_or_else(|| {
+                self.windows
+                    .iter()
+                    .map(|window| window.physical_start)
+                    .min()
+                    .unwrap_or(self.coverage.end)
+            })
+            .min(self.coverage.end)
+    }
+
+    /// The physical address of user address `address`, and the exclusive
+    /// physical limit a copy starting there may run to: the physical address of
+    /// its window's user end, or the end of the identity user addresses.
+    fn user_extent(&self, address: u64, length: usize) -> Result<(u64, u64)> {
+        if let Some(window) = self
+            .windows
+            .iter()
+            .find(|window| window.contains_user(address))
+        {
+            return Ok((window.physical(address), window.physical(window.user_end)));
+        }
+        let limit = self.identity_limit();
+        if (self.coverage.start..limit).contains(&address) {
+            return Ok((address, limit));
+        }
+        Err(self.invalid_address(address, length))
+    }
+
+    /// The user address of physical address `physical`, if it has one.
+    fn physical_to_user(&self, physical: u64) -> Option<u64> {
+        if let Some(window) = self.windows.iter().find(|window| {
+            (window.physical_start..window.physical(window.user_end)).contains(&physical)
+        }) {
+            return Some(physical - window.physical_start + window.user_start);
+        }
+        (self.coverage.start..self.identity_limit())
+            .contains(&physical)
+            .then_some(physical)
+    }
+
+    /// The user address ranges a user store may write, in address order with
+    /// adjacent pages merged: every user address of every accessible page, or,
+    /// while page permissions are not enforced, every user address. A user
+    /// store outside them fails.
+    ///
+    /// Read-only accessible pages are included because `UserMemory::write`,
+    /// which still stores most syscall results, such as `clock_gettime(2)`'s,
+    /// admits every accessible page.
+    fn user_storable_ranges(&self) -> Vec<(u64, u64)> {
+        let page = PAGE_SIZE as u64;
+        let identity_limit = self.identity_limit();
+        let mut ranges: Vec<(u64, u64)> = if self.enabled {
+            self.pages
+                .iter()
+                .filter(|(_, state)| matches!(state, UserPageState::Accessible { .. }))
+                .filter_map(|(&number, _)| number.checked_mul(page))
+                .flat_map(|physical| {
+                    // Every user address that can reach this page: its identity
+                    // address, and its address in each window that maps it.
+                    // Listing an identity address that a window shadows only
+                    // widens the ranges.
+                    let identity = (self.coverage.start..identity_limit)
+                        .contains(&physical)
+                        .then_some(physical);
+                    let windows = self
+                        .windows
+                        .iter()
+                        .filter(move |window| {
+                            (window.physical_start..window.physical(window.user_end))
+                                .contains(&physical)
+                        })
+                        .map(move |window| physical - window.physical_start + window.user_start);
+                    identity.into_iter().chain(windows)
+                })
+                .filter_map(|user| Some((user, user.checked_add(page)?)))
+                .collect()
+        } else {
+            self.windows
+                .iter()
+                .map(|window| (window.user_start, window.user_end))
+                .chain(std::iter::once((self.coverage.start, identity_limit)))
+                .collect()
+        };
+        ranges.retain(|(start, end)| start < end);
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+
     fn translate(&self, address: u64, length: usize) -> Result<u64> {
+        if let Some(window) = self.windows.iter().find(|window| {
+            window.contains_user(address) || (length == 0 && address == window.user_end)
+        }) {
+            let end = address.checked_add(length as u64);
+            if end.is_none_or(|end| end > window.user_end) {
+                return Err(self.invalid_address(address, length));
+            }
+            return Ok(window.physical(address));
+        }
+        let end = address.checked_add(length as u64);
+        if end.is_none_or(|end| end > self.identity_limit()) {
+            return Err(self.invalid_address(address, length));
+        }
         let offset = address.checked_sub(self.coverage.start);
         let end = offset.and_then(|offset| offset.checked_add(length as u64));
         if end.is_none_or(|end| end > self.coverage.end - self.coverage.start) {
@@ -792,6 +1079,10 @@ unsafe impl Send for Mapping {}
 // backing's mutex before dereferencing fixed RAM or issuing a contained file copy.
 unsafe impl Sync for Mapping {}
 
+/// The shortest range [`GuestMemory::zero_lazily`] discards rather than
+/// writes: one large page.
+pub(crate) const LAZY_ZERO_MIN_BYTES: usize = 2 * 1024 * 1024;
+
 impl GuestMemory {
     /// Allocates a shared, memfd-backed mapping for a guest-physical address range.
     pub fn new(guest_base: u64, size: usize) -> Result<Self> {
@@ -863,6 +1154,7 @@ impl GuestMemory {
                 entry_gate: EntryGate::new(),
                 retirement: Mutex::new(None),
                 deferred: Mutex::new(shared_file::DeferredFailures::default()),
+                deferred_queued: std::sync::atomic::AtomicBool::new(false),
                 sync_mmu: Mutex::new(None),
             }),
             failure_context: None,
@@ -880,6 +1172,8 @@ impl GuestMemory {
             #[cfg(test)]
             test_user_copy_backing_wait: None,
             #[cfg(test)]
+            test_between_read_and_write: None,
+            #[cfg(test)]
             test_shared_map: None,
             #[cfg(test)]
             test_shared_sync: None,
@@ -888,6 +1182,10 @@ impl GuestMemory {
 
     pub(crate) fn entry_gate(&self) -> Arc<EntryGate> {
         self.mapping.entry_gate.clone()
+    }
+
+    pub(crate) fn entry_gate_ref(&self) -> &Arc<EntryGate> {
+        &self.mapping.entry_gate
     }
 
     #[cfg(test)]
@@ -907,6 +1205,11 @@ impl GuestMemory {
         self.operation_origin = origin;
     }
 
+    /// The issuing operation alone, without cloning the whole origin.
+    pub(crate) fn operation_origin(&self) -> Option<&OperationOrigin> {
+        self.operation_origin.as_ref()
+    }
+
     pub(crate) fn entry_origin(&self) -> EntryOrigin {
         EntryOrigin {
             failure: self.failure_context.clone(),
@@ -918,7 +1221,7 @@ impl GuestMemory {
         self.check_copy_failure()?;
         self.mapping
             .entry_gate
-            .copy_blocking(self.entry_origin())
+            .copy_blocking_lazy(|| self.entry_origin())
             .map(|copy| MemoryCopyAccess::new(self, copy))
             .map_err(|failure| failure.error())
     }
@@ -960,7 +1263,7 @@ impl GuestMemory {
         let Some(copy) = self
             .mapping
             .entry_gate
-            .try_copy(self.entry_origin())
+            .try_copy_lazy(|| self.entry_origin())
             .map_err(|failure| failure.error())?
         else {
             return Ok(None);
@@ -1039,8 +1342,10 @@ impl GuestMemory {
         const COPY_CHUNK: usize = 1024 * 1024;
 
         self.check_copy_failure()?;
-        let _allocation = self.allocation_guard();
-        if self.contains_shared_file() {
+        // Shared anonymous memory becomes a separately retained object before
+        // it is inherited, so the child shares it rather than copying it.
+        let _allocation = self.share_anonymous_memory_for_fork()?;
+        if self.contains_retained_shared() {
             return self.snapshot_with_shared_files(_allocation);
         }
         if self.entry_gate().single_member_domain_active() {
@@ -1319,12 +1624,189 @@ impl GuestMemory {
         self.mapping.slice.length == 0
     }
 
+    /// Places the top `length` bytes of this memory at the top of the user
+    /// address space (see [`UserWindow`]), below TASK_SIZE, and returns the
+    /// window's first user address. Repeating it changes nothing. The caller
+    /// maps the windows in the guest's page tables.
+    pub(crate) fn establish_user_stack_window(&self, length: u64) -> Result<u64> {
+        let physical_end = self.guest_end();
+        let physical_start = physical_end
+            .checked_sub(length)
+            .filter(|start| *start >= self.guest_base() && length.is_multiple_of(PAGE_SIZE as u64))
+            .ok_or(Error::LongModeMemoryTooSmall)?;
+        let user_start = USER_ADDRESS_END - length;
+        self.establish_user_window(UserWindow {
+            physical_start,
+            physical_end,
+            user_start,
+            user_end: USER_STACK_TOP.max(user_start),
+        })?;
+        Ok(user_start)
+    }
+
+    /// Adds `window`, replacing any window with the same user start. Its
+    /// physical range must lie in this memory, be whole pages, and overlap no
+    /// other window's.
+    pub(crate) fn establish_user_window(&self, window: UserWindow) -> Result<()> {
+        let page = PAGE_SIZE as u64;
+        if window.physical_start < self.guest_base()
+            || window.physical_end > self.guest_end()
+            || window.physical_start >= window.physical_end
+            || !window.physical_start.is_multiple_of(page)
+            || !window.physical_end.is_multiple_of(page)
+            || !window.user_start.is_multiple_of(page)
+            || window.user_end < window.user_start
+            || window.user_end - window.user_start > window.physical_end - window.physical_start
+        {
+            return Err(Error::LongModeMemoryTooSmall);
+        }
+        let mut state = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        state
+            .windows
+            .retain(|existing| existing.user_start != window.user_start);
+        if state.windows.iter().any(|existing| {
+            existing.physical_start < window.physical_end
+                && window.physical_start < existing.physical_end
+        }) {
+            return Err(Error::LongModeMemoryTooSmall);
+        }
+        state.windows.push(window);
+        state.windows.sort_by_key(|window| window.user_start);
+        Ok(())
+    }
+
+    /// Ends the identity user addresses at `end`; the memory above it is reached
+    /// only through windows.
+    pub(crate) fn set_user_identity_end(&self, end: u64) {
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .identity_end = Some(end);
+    }
+
+    /// Withdraws every window and the identity end, for a new image's loader to
+    /// lay out the address space again. Like `clear_user_access`, it leaves a
+    /// memory with ordinary-file views alone (that refusal is already
+    /// recorded), so their pages keep their user addresses.
+    pub(crate) fn clear_user_layout(&self) {
+        if self.contains_retained_shared() {
+            return;
+        }
+        let mut state = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        state.windows.clear();
+        state.identity_end = None;
+    }
+
+    /// The established windows, by user start, and the end of the identity
+    /// user addresses.
+    pub(crate) fn user_layout(&self) -> (Vec<UserWindow>, u64) {
+        let state = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        (state.windows.clone(), state.identity_limit())
+    }
+
+    /// The stack window's length, once established.
+    #[cfg(test)]
+    pub(crate) fn user_stack_window_length(&self) -> Option<u64> {
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .windows
+            .iter()
+            .find(|window| window.user_end == USER_STACK_TOP)
+            .map(|window| window.physical_end - window.physical_start)
+    }
+
+    /// The user address of physical address `physical`, if it has one.
+    pub(crate) fn physical_to_user(&self, physical: u64) -> Option<u64> {
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .physical_to_user(physical)
+    }
+
+    /// The user address ranges a user store may write, in address order with
+    /// adjacent pages merged: every accessible page, or, while page
+    /// permissions are not enforced, every user address. A user store outside
+    /// them fails; one inside them can still fail, for example on a read-only
+    /// page through a path that checks writability.
+    pub(crate) fn user_storable_ranges(&self) -> Vec<(u64, u64)> {
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .user_storable_ranges()
+    }
+
+    /// The physical address of the user range `[address, address + length)`,
+    /// or `None` when it is not one contiguous range of user addresses.
+    pub(crate) fn user_range_to_guest(&self, address: u64, length: u64) -> Option<u64> {
+        let length = usize::try_from(length).ok()?;
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .translate(address, length)
+            .ok()
+    }
+
+    /// Whether the user range `[address, address + length)` holds an ordinary
+    /// shared-file page.
+    pub(crate) fn user_range_contains_shared_file(&self, address: u64, length: u64) -> bool {
+        self.user_range_to_guest(address, length)
+            .is_some_and(|physical| {
+                self.range_contains_shared_file(physical, length.try_into().unwrap_or(usize::MAX))
+            })
+    }
+
+    /// Whether the user range `[address, address + length)` holds a retained
+    /// shared page: an ordinary file, or fork-shared anonymous memory.
+    pub(crate) fn user_range_contains_retained_shared(&self, address: u64, length: u64) -> bool {
+        self.user_range_to_guest(address, length)
+            .is_some_and(|physical| {
+                self.range_contains_retained_shared(
+                    physical,
+                    length.try_into().unwrap_or(usize::MAX),
+                )
+            })
+    }
+
+    /// Whether `[address, address + length)` is one contiguous range of user
+    /// addresses, mapped or not.
+    pub(crate) fn user_range_is_addressable(&self, address: u64, length: u64) -> bool {
+        self.user_range_to_guest(address, length).is_some()
+    }
+
+    /// The physical address of user address `address`, for a copy of `length`
+    /// bytes.
+    fn translate_user(&self, address: u64, length: usize) -> Result<u64> {
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .translate(address, length)
+    }
+
     // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
     pub(crate) fn clear_user_access(&self) {
-        if self.contains_shared_file() {
+        if self.contains_retained_shared() {
             self.capture_shared_file_error(Error::SharedFileCapability {
                 operation: "clear user access",
-                reason: "ordinary-file views must retire before reset",
+                reason: "ordinary-file and shared anonymous views must retire before reset",
             });
             return;
         }
@@ -1335,6 +1817,8 @@ impl GuestMemory {
             .expect("guest memory access map lock poisoned");
         access.enabled = false;
         access.pages.clear();
+        access.file_pages.clear();
+        access.shared_anonymous_pages.clear();
         access.reservations.clear();
         access.cursors = None;
     }
@@ -1403,14 +1887,14 @@ impl GuestMemory {
         Ok(())
     }
 
-    // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
-    pub(crate) fn unmap_user_range(&self, guest_address: u64, length: u64) -> Result<()> {
-        if self.range_contains_shared_file(guest_address, length as usize) {
-            return Err(Error::SharedFileCapability {
-                operation: "metadata-only unmap",
-                reason: "ordinary-file backing requires physical private replacement",
-            });
-        }
+    /// Make the Tool's scratch range `[guest_address, guest_address + length)`
+    /// user-accessible and writable for one callback. The result, success or
+    /// error, is exactly that of reserving the range as
+    /// [`RegionKind::ToolScratch`], mapping it with `map_user_range(..,
+    /// false)` and committing the reservation (a failed mapping rolls the
+    /// reservation back), but under one lock acquisition and without the
+    /// rollback record, which this runs for every Tool callback.
+    pub(crate) fn expose_tool_scratch(&self, guest_address: u64, length: u64) -> Result<()> {
         let Some((first_page, last_page)) = self.checked_page_range(guest_address, length)? else {
             return Ok(());
         };
@@ -1419,8 +1903,66 @@ impl GuestMemory {
             .address_space
             .lock()
             .expect("guest memory access map lock poisoned");
+        // ToolScratch is a permanent kind, so reserving it is never refused.
+        // The mapping's only refusal is a writable mapping of a read-only
+        // file page; the separate reservation was rolled back then, leaving
+        // nothing changed, which is what returning here first leaves.
+        if access
+            .backing_pages
+            .range(first_page..=last_page)
+            .any(|(_, page)| {
+                matches!(
+                    page._slice.backing.kind,
+                    BackingKind::OrdinaryFile {
+                        max_writable: false
+                    }
+                )
+            })
+        {
+            return Err(Error::GuestMemoryAccessDenied {
+                address: guest_address,
+                length: length as usize,
+            });
+        }
+        for page in first_page..=last_page {
+            access.reservations.insert(page, RegionKind::ToolScratch);
+            access
+                .pages
+                .insert(page, UserPageState::Accessible { writable: true });
+        }
+        Ok(())
+    }
+
+    /// Hide the Tool's scratch range again after its callback: exactly
+    /// [`GuestMemory::unmap_user_range`], with its retained-shared check made
+    /// under the same lock acquisition as the unmapping.
+    pub(crate) fn hide_tool_scratch(&self, guest_address: u64, length: u64) -> Result<()> {
+        let range = self.checked_page_range(guest_address, length);
+        let mut access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        if length != 0 {
+            let last = guest_address.saturating_add(length - 1) / PAGE_SIZE as u64;
+            if access
+                .backing_pages
+                .range(guest_address / PAGE_SIZE as u64..=last)
+                .any(|(_, page)| page._slice.backing.kind.retained_shared())
+            {
+                return Err(Error::SharedFileCapability {
+                    operation: "metadata-only unmap",
+                    reason: "ordinary-file and shared anonymous backing require physical private replacement",
+                });
+            }
+        }
+        let Some((first_page, last_page)) = range? else {
+            return Ok(());
+        };
         for page in first_page..=last_page {
             access.pages.remove(&page);
+            access.file_pages.remove(&page);
+            access.shared_anonymous_pages.remove(&page);
             if !access
                 .reservations
                 .get(&page)
@@ -1433,6 +1975,164 @@ impl GuestMemory {
     }
 
     // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
+    pub(crate) fn unmap_user_range(&self, guest_address: u64, length: u64) -> Result<()> {
+        if self.range_contains_retained_shared(guest_address, length as usize) {
+            return Err(Error::SharedFileCapability {
+                operation: "metadata-only unmap",
+                reason: "ordinary-file and shared anonymous backing require physical private replacement",
+            });
+        }
+        let Some((first_page, last_page)) = self.checked_page_range(guest_address, length)? else {
+            return Ok(());
+        };
+        let mut access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        for page in first_page..=last_page {
+            access.pages.remove(&page);
+            access.file_pages.remove(&page);
+            access.shared_anonymous_pages.remove(&page);
+            if !access
+                .reservations
+                .get(&page)
+                .is_some_and(|kind| kind.permanent())
+            {
+                access.reservations.remove(&page);
+            }
+        }
+        Ok(())
+    }
+
+    /// Records that physical `[guest_address, guest_address + length)` maps a
+    /// regular file from byte `offset`, or, with `None`, that it maps none.
+    /// The range is not shared anonymous memory.
+    pub(crate) fn record_file_pages(&self, guest_address: u64, length: u64, offset: Option<u64>) {
+        self.record_page_backing(guest_address, length, offset, false);
+    }
+
+    /// Records what a new mapping of physical `[guest_address, guest_address +
+    /// length)` maps: a regular file from byte `offset` (or none), and whether
+    /// it is `MAP_SHARED | MAP_ANONYMOUS`. Whatever the range held before goes.
+    pub(crate) fn record_page_backing(
+        &self,
+        guest_address: u64,
+        length: u64,
+        offset: Option<u64>,
+        shared_anonymous: bool,
+    ) {
+        let Ok(Some((first_page, last_page))) = self.checked_page_range(guest_address, length)
+        else {
+            return;
+        };
+        let mut access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        for page in first_page..=last_page {
+            match offset
+                .and_then(|offset| offset.checked_add((page - first_page) * PAGE_SIZE as u64))
+            {
+                Some(offset) => access.file_pages.insert(page, offset),
+                None => access.file_pages.remove(&page),
+            };
+            if shared_anonymous {
+                access.shared_anonymous_pages.insert(page);
+            } else {
+                access.shared_anonymous_pages.remove(&page);
+            }
+        }
+    }
+
+    /// What `MADV_DONTNEED` over user `[user_start, user_start + length)` must
+    /// do (both page-aligned, `length` nonzero). Computed under one lock, in
+    /// time bounded by the smaller of the range's page count and the number of
+    /// mapped pages.
+    pub(crate) fn dontneed_plan(&self, user_start: u64, length: u64) -> DontneedPlan {
+        let page_size = PAGE_SIZE as u64;
+        let range_pages = length / page_size;
+        let access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        let mut plan = DontneedPlan {
+            private_anonymous: Vec::new(),
+            private_file: false,
+            unmapped: false,
+        };
+        let mut mapped = 0_u64;
+        let mut classify = |physical_page: u64, plan: &mut DontneedPlan| {
+            if !access.pages.contains_key(&physical_page) {
+                return;
+            }
+            mapped += 1;
+            let shared_file = access
+                .backing_pages
+                .get(&physical_page)
+                .is_some_and(|page| {
+                    matches!(page._slice.backing.kind, BackingKind::OrdinaryFile { .. })
+                });
+            if shared_file || access.shared_anonymous_pages.contains(&physical_page) {
+                // Shared contents survive: nothing to do.
+            } else if access.file_pages.contains_key(&physical_page) {
+                plan.private_file = true;
+            } else {
+                plan.private_anonymous.push(physical_page * page_size);
+            }
+        };
+        if range_pages <= access.pages.len() as u64 {
+            for index in 0..range_pages {
+                if let Ok(physical) = access.translate(user_start + index * page_size, PAGE_SIZE) {
+                    classify(physical / page_size, &mut plan);
+                }
+            }
+        } else {
+            let user_end = user_start + length;
+            let pages: Vec<u64> = access.pages.keys().copied().collect();
+            for physical_page in pages {
+                if access
+                    .physical_to_user(physical_page * page_size)
+                    .is_some_and(|user| (user_start..user_end).contains(&user))
+                {
+                    classify(physical_page, &mut plan);
+                }
+            }
+            plan.private_anonymous.sort_unstable();
+        }
+        plan.unmapped = mapped < range_pages;
+        plan
+    }
+
+    /// The file offset of the regular-file page at physical `guest_address`.
+    pub(crate) fn file_offset(&self, guest_address: u64) -> Option<u64> {
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .file_pages
+            .get(&(guest_address / PAGE_SIZE as u64))
+            .map(|offset| offset + guest_address % PAGE_SIZE as u64)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-132): Review the host-side KVM user mapping API.
+    /// Whether any page of physical `[guest_address, guest_address + length)`
+    /// is mapped.
+    pub(crate) fn user_range_has_mapping(&self, guest_address: u64, length: u64) -> bool {
+        let Ok(Some((first_page, last_page))) = self.checked_page_range(guest_address, length)
+        else {
+            return false;
+        };
+        let access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        access.pages.range(first_page..=last_page).next().is_some()
+    }
+
     pub(crate) fn user_range_is_mapped(&self, guest_address: u64, length: u64) -> bool {
         let Ok(Some((first_page, last_page))) = self.checked_page_range(guest_address, length)
         else {
@@ -1444,6 +2144,55 @@ impl GuestMemory {
             .lock()
             .expect("guest memory access map lock poisoned");
         (first_page..=last_page).all(|page| access.pages.contains_key(&page))
+    }
+
+    /// The highest page-aligned `length`-byte range of unmapped physical pages in
+    /// `[start, end)`, as Linux's top-down allocator chooses the highest free gap
+    /// below mmap_base.
+    pub(crate) fn find_unmapped_user_range_topdown(
+        &self,
+        start: u64,
+        end: u64,
+        length: u64,
+    ) -> Option<u64> {
+        let page_size = PAGE_SIZE as u64;
+        if length == 0
+            || !start.is_multiple_of(page_size)
+            || !end.is_multiple_of(page_size)
+            || !length.is_multiple_of(page_size)
+            || start < self.guest_base()
+            || end > self.guest_end()
+            || start >= end
+        {
+            return None;
+        }
+        let pages_needed = length / page_size;
+        let start_page = start / page_size;
+        let access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        let mut top = end / page_size;
+        for (&occupied, _) in access.pages.range(start_page..top).rev() {
+            if top - (occupied + 1) >= pages_needed {
+                return (top - pages_needed).checked_mul(page_size);
+            }
+            top = occupied;
+        }
+        (top - start_page >= pages_needed).then(|| (top - pages_needed) * page_size)
+    }
+
+    /// Whether a loader has given this memory Linux's layout: an identity end
+    /// and an mmap window above it, whatever the window's user end (mmap_base,
+    /// or below it in memory too tight for that).
+    pub(crate) fn has_mmap_window(&self) -> bool {
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .identity_end
+            .is_some()
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED: Reuse deterministic holes in the KVM guest arena.
@@ -1498,12 +2247,12 @@ impl GuestMemory {
         new_address: u64,
         new_length: u64,
     ) -> Result<()> {
-        if self.range_contains_shared_file(old_address, old_length as usize)
-            || self.range_contains_shared_file(new_address, new_length as usize)
+        if self.range_contains_retained_shared(old_address, old_length as usize)
+            || self.range_contains_retained_shared(new_address, new_length as usize)
         {
             return Err(Error::SharedFileCapability {
                 operation: "memory remap",
-                reason: "ordinary-file source or destination is not supported by the private-copy remapper",
+                reason: "ordinary-file or fork-shared anonymous source or destination is not supported by the private-copy remapper",
             });
         }
         let Some((old_first, old_last)) = self.checked_page_range(old_address, old_length)? else {
@@ -1540,8 +2289,20 @@ impl GuestMemory {
             .copied()
             .flatten()
             .expect("nonempty mapped range has a last page");
+        // A file mapping's offsets move with it, and a grown one continues its
+        // file past the last page, as Linux grows the file mapping.
+        let old_offsets = (old_first..=old_last)
+            .map(|page| access.file_pages.get(&page).copied())
+            .collect::<Vec<_>>();
+        // Shared anonymous memory stays shared where it moves, and a grown
+        // mapping is shared like its last page.
+        let old_shared_anonymous = (old_first..=old_last)
+            .map(|page| access.shared_anonymous_pages.contains(&page))
+            .collect::<Vec<_>>();
         for page in old_first..=old_last {
             access.pages.remove(&page);
+            access.file_pages.remove(&page);
+            access.shared_anonymous_pages.remove(&page);
             if !access
                 .reservations
                 .get(&page)
@@ -1557,6 +2318,28 @@ impl GuestMemory {
                 .flatten()
                 .unwrap_or(extension_state);
             access.pages.insert(page, state);
+            let offset = match old_offsets.get(index) {
+                Some(offset) => *offset,
+                None => old_offsets.last().copied().flatten().and_then(|last| {
+                    last.checked_add((index + 1 - old_offsets.len()) as u64 * PAGE_SIZE as u64)
+                }),
+            };
+            // The destination's old provenance goes: a page that is no longer
+            // a file's keeps no offset.
+            match offset {
+                Some(offset) => access.file_pages.insert(page, offset),
+                None => access.file_pages.remove(&page),
+            };
+            let shared_anonymous = old_shared_anonymous
+                .get(index)
+                .or(old_shared_anonymous.last())
+                .copied()
+                .unwrap_or(false);
+            if shared_anonymous {
+                access.shared_anonymous_pages.insert(page);
+            } else {
+                access.shared_anonymous_pages.remove(&page);
+            }
             if !access
                 .reservations
                 .get(&page)
@@ -1585,7 +2368,8 @@ impl GuestMemory {
     // TODO-HUMAN-REVIEW(PR-132): Review user-map enforcement on this public API.
     pub fn read(&self, guest_address: u64, destination: &mut [u8]) -> Result<()> {
         self.with_copy(|copy| {
-            self.checked_offset(guest_address, destination.len())?;
+            let physical = self.translate_user(guest_address, destination.len())?;
+            self.checked_offset(physical, destination.len())?;
             if self.user().user_accessible_prefix_admitted(
                 guest_address,
                 destination.len(),
@@ -1597,7 +2381,7 @@ impl GuestMemory {
                     length: destination.len(),
                 });
             }
-            self.read_raw_admitted(guest_address, destination, copy)
+            self.read_raw_admitted(physical, destination, copy)
         })
     }
 
@@ -1634,7 +2418,8 @@ impl GuestMemory {
     // TODO-HUMAN-REVIEW(PR-132): Review user-map enforcement on this public API.
     pub fn write(&mut self, guest_address: u64, source: &[u8]) -> Result<()> {
         self.with_copy(|copy| {
-            self.checked_offset(guest_address, source.len())?;
+            let physical = self.translate_user(guest_address, source.len())?;
+            self.checked_offset(physical, source.len())?;
             if self
                 .user()
                 .user_accessible_prefix_admitted(guest_address, source.len(), copy)?
@@ -1645,7 +2430,7 @@ impl GuestMemory {
                     length: source.len(),
                 });
             }
-            self.write_raw_admitted(guest_address, source, copy)
+            self.write_raw_admitted(physical, source, copy)
         })
     }
 
@@ -1672,6 +2457,92 @@ impl GuestMemory {
         self.with_copy(|copy| self.write_raw_admitted(guest_address, source, copy))
     }
 
+    /// `read_raw` then `write_raw`, under one admission instead of two.
+    ///
+    /// Between the read and the write this keeps the refusal checkpoint the
+    /// two separate calls had: after a successful read it checks for a
+    /// recorded or deferred failure (as `read_raw`'s completion did) and
+    /// then for a gate failure under the gate lock (as `write_raw`'s
+    /// admission did, serialized with failure publication), and on a
+    /// failure it returns that failure without writing. A read error
+    /// returns exactly as `read_raw`'s, before anything is written. What one
+    /// admission removes is the gate's other refusal at the write: a close
+    /// begun after the read can no longer park the write until the gate
+    /// reopens, because a close cannot complete while this copy is
+    /// admitted; the write then sees the image the read saw.
+    pub(crate) fn read_then_write_raw(
+        &self,
+        read_address: u64,
+        destination: &mut [u8],
+        write_address: u64,
+        source: &[u8],
+    ) -> Result<()> {
+        let copy = self.copy_access()?;
+        let read = self.read_raw_admitted(read_address, destination, &copy);
+        let result = match read {
+            Err(error) => Err(error),
+            Ok(()) => {
+                #[cfg(test)]
+                if let Some(between) = &self.test_between_read_and_write {
+                    between();
+                }
+                let checkpoint = self.check_copy_failure().and_then(|()| {
+                    self.mapping
+                        .entry_gate
+                        .admit_operation()
+                        .map_err(|failure| failure.error())
+                });
+                if let Err(failure) = checkpoint {
+                    // As `read_raw` returning its failure after its copy
+                    // retired, or `write_raw` refused at admission.
+                    drop(copy);
+                    return Err(failure);
+                }
+                self.write_raw_admitted(write_address, source, &copy)
+            }
+        };
+        // The completion checks of `with_copy`, for whichever operation ran last.
+        let prior = self.check_copy_failure();
+        drop(copy);
+        let result = result.map_err(|error| self.capture_shared_file_error(error));
+        prior?;
+        self.check_copy_failure()?;
+        result
+    }
+
+    /// `read_raw` of `destination`, then, under the same admission, an
+    /// attempt to read `speculative` too. The first read is exactly
+    /// `read_raw`, errors included. The second is only an attempt: if it
+    /// fails, its error is dropped (it never reaches
+    /// `capture_shared_file_error`) and it reports false, so a caller that
+    /// later needs those bytes must read them again through an ordinary
+    /// admission. Returns the mapping generation the admission saw; no
+    /// publication can change the mapping while an admission is held, so
+    /// both reads observe that generation.
+    pub(crate) fn read_raw_and_try_read(
+        &self,
+        guest_address: u64,
+        destination: &mut [u8],
+        speculative_address: u64,
+        speculative: &mut [u8],
+    ) -> Result<(crate::entry::MappingGeneration, bool)> {
+        self.with_copy(|copy| {
+            self.read_raw_admitted(guest_address, destination, copy)?;
+            let read = self
+                .read_raw_admitted(speculative_address, speculative, copy)
+                .is_ok();
+            Ok((copy.generation(), read))
+        })
+    }
+
+    /// The checks an admitted copy makes before and after it runs (a
+    /// recorded gate failure, or a shared-file failure deferred behind a
+    /// notification scope), without admitting a copy. For a caller that
+    /// reuses bytes an earlier admission already read.
+    pub(crate) fn check_copy_failures(&self) -> Result<()> {
+        self.check_copy_failure()
+    }
+
     /// Attempts one short copy without parking the calling executor. A closed
     /// gate returns None before inspecting layout or taking a backing lock.
     /// The owner must subscribe, recheck its stop predicates and await before
@@ -1681,7 +2552,7 @@ impl GuestMemory {
         let Some(copy) = self
             .mapping
             .entry_gate
-            .try_copy(self.entry_origin())
+            .try_copy_lazy(|| self.entry_origin())
             .map_err(|failure| failure.error())?
         else {
             return Ok(None);
@@ -1737,7 +2608,7 @@ impl GuestMemory {
                 BackingKind::OrdinaryFile { .. } => {
                     self.copy_file_chunk(chunk, local, true, address, source.len(), copied)?
                 }
-                BackingKind::Fixed => unsafe {
+                BackingKind::Fixed | BackingKind::SharedAnonymous => unsafe {
                     std::ptr::copy_nonoverlapping(local, chunk.mapping.as_ptr(), chunk.length);
                 },
             }
@@ -1746,11 +2617,12 @@ impl GuestMemory {
         debug_assert_eq!(copied, source.len());
         Ok(())
     }
-    /// Zeros a guest-physical address range.
+    /// Zeros a range of user addresses, as [`GuestMemory::write`] writes one.
     // TODO-HUMAN-REVIEW(PR-132): Review user-map enforcement on this public API.
     pub fn zero(&mut self, guest_address: u64, length: usize) -> Result<()> {
         self.with_copy(|copy| {
-            self.checked_offset(guest_address, length)?;
+            let physical = self.translate_user(guest_address, length)?;
+            self.checked_offset(physical, length)?;
             if self
                 .user()
                 .user_accessible_prefix_admitted(guest_address, length, copy)?
@@ -1761,7 +2633,7 @@ impl GuestMemory {
                     length,
                 });
             }
-            self.zero_raw_admitted(guest_address, length, copy)
+            self.zero_raw_admitted(physical, length, copy)
         })
     }
 
@@ -1800,7 +2672,7 @@ impl GuestMemory {
                         zeroed,
                     )?;
                 }
-                BackingKind::Fixed => unsafe {
+                BackingKind::Fixed | BackingKind::SharedAnonymous => unsafe {
                     std::ptr::write_bytes(chunk.mapping.as_ptr(), 0, chunk.length);
                 },
             }
@@ -1808,6 +2680,46 @@ impl GuestMemory {
         }
         debug_assert_eq!(zeroed, length);
         Ok(())
+    }
+
+    /// Zeroes `[guest_address, guest_address + length)` as [`Self::zero_raw`]
+    /// does, but discards whole pages with [`Self::discard_pages`] instead of
+    /// writing them, so a range the guest never touches again costs the host
+    /// no memory. Linux only reserves address space for a new anonymous
+    /// mapping; writing zeros over it made every reserved byte resident, so a
+    /// runtime's large PROT_NONE reservations cost their full size.
+    ///
+    /// A range shorter than [`LAZY_ZERO_MIN_BYTES`], or not whole pages, is
+    /// written with zeros: a page discarded here is refaulted on its next
+    /// touch, and for a small mapping the guest maps, touches and unmaps over
+    /// and over (as malloc above glibc's mmap threshold does) that refault
+    /// costs more than rewriting the resident page. Measured under KVM, 5000
+    /// rounds of a 256 KiB mapping took 2.67 s of CPU written and 3.75 s
+    /// discarded (https://github.com/rrnewton/reverie/issues/1058).
+    ///
+    /// A range that holds a retained shared view (an ordinary-file or shared
+    /// anonymous mapping) is refused with [`Error::SharedFileCapability`] and
+    /// nothing is changed. Such views are retired by publication, and both
+    /// discarding and writing zeros would zero the shared object for every
+    /// other holder; [`Self::discard_pages`] refuses them too, but inside its
+    /// copy access, which poisons this memory's entry gate. mmap and munmap
+    /// send ranges that hold one to the shared-file paths before they get
+    /// here, so the refusal is a guard, not a path either takes.
+    pub(crate) fn zero_lazily(&self, guest_address: u64, length: usize) -> Result<()> {
+        if self.range_contains_retained_shared(guest_address, length) {
+            return Err(Error::SharedFileCapability {
+                operation: "zero lazily",
+                reason: "the range holds a retained shared view, which only publication retires",
+            });
+        }
+        if length >= LAZY_ZERO_MIN_BYTES
+            && guest_address.is_multiple_of(PAGE_SIZE as u64)
+            && length.is_multiple_of(PAGE_SIZE)
+        {
+            self.discard_pages(guest_address, length)
+        } else {
+            self.zero_raw(guest_address, length)
+        }
     }
 
     /// Discards complete host pages while preserving this mapping's identity.
@@ -1839,11 +2751,12 @@ impl GuestMemory {
         let chunks = self.mapping.host_chunks(offset, length);
         if chunks
             .iter()
-            .any(|chunk| matches!(chunk.backing.kind, BackingKind::OrdinaryFile { .. }))
+            .any(|chunk| chunk.backing.kind.retained_shared())
         {
+            // Discarding would zero the shared object for every other holder.
             return Err(Error::SharedFileCapability {
                 operation: "discard pages",
-                reason: "ordinary-file views must be physically retired before reset",
+                reason: "ordinary-file and shared anonymous views must be physically retired before reset",
             });
         }
         let _guard = self
@@ -1876,6 +2789,186 @@ impl GuestMemory {
             }
         }
         Ok(())
+    }
+
+    /// Mirror current writable guest pages into a bounded kernel-only alias.
+    /// Invalid and protected addresses remain PROT_NONE so the actual syscall
+    /// decides whether it needs to touch them, including at EOF or zero count.
+    pub(crate) fn writable_alias(&self, address: u64, length: usize) -> Result<UserWriteAlias<'_>> {
+        // Retire the short copy before taking either alias lock: retirement
+        // notifies subscribers synchronously and their wakers may read memory.
+        // The retained operand still prevents a mapping-generation change.
+        let retained = self.with_copy(|copy| {
+            self.mapping
+                .entry_gate
+                .retain_operand_with(copy, || self.entry_origin())
+                .map_err(|failure| failure.error())
+        })?;
+        let mut alias = UserWriteAlias {
+            mapping: None,
+            offset: address as usize % PAGE_SIZE,
+            memory: self,
+            host_access: None,
+            permissions: None,
+            retained: Some(retained),
+        };
+        let result = (|| {
+            // Match permission-aware copyout's lock order. Keeping both guards
+            // through the syscall prevents stale mprotect/munmap permissions
+            // and simultaneous Rust dereferences of kernel-written memory.
+            alias.permissions = Some(
+                self.mapping
+                    .address_space
+                    .lock()
+                    .expect("guest memory access map lock poisoned"),
+            );
+            alias.host_access = Some(
+                self.mapping
+                    .slice
+                    .backing
+                    .host_access
+                    .lock()
+                    .expect("guest memory lock poisoned"),
+            );
+            let permissions = alias.permissions.as_ref().unwrap();
+            let offset = alias.offset;
+            let mapping_length = if length == 0 {
+                0
+            } else {
+                offset
+                    .checked_add(length)
+                    .and_then(|size| size.checked_add(PAGE_SIZE - 1))
+                    .map(|size| size & !(PAGE_SIZE - 1))
+                    .ok_or(Error::GuestMemoryAccessDenied { address, length })?
+            };
+            let mut extents: Vec<WriteAliasExtent> = Vec::new();
+            let first_page = address - offset as u64;
+            for alias_offset in (0..mapping_length).step_by(PAGE_SIZE) {
+                let Some(page_address) = first_page.checked_add(alias_offset as u64) else {
+                    break;
+                };
+                let Ok((physical, _)) = permissions.user_extent(page_address, PAGE_SIZE) else {
+                    continue;
+                };
+                let page = physical / PAGE_SIZE as u64;
+                if permissions.enabled
+                    && !matches!(
+                        permissions.pages.get(&page),
+                        Some(UserPageState::Accessible { writable: true })
+                    )
+                {
+                    continue;
+                }
+                let slice = match permissions.backing_pages.get(&page) {
+                    Some(installed) => installed._slice.clone(),
+                    None => BackingSlice {
+                        backing: self.mapping.slice.backing.clone(),
+                        offset: self.mapping.slice.offset + (physical - self.guest_base()) as usize,
+                        length: PAGE_SIZE,
+                    },
+                };
+                if let Some(last) = extents.last_mut()
+                    && last.offset + last.slice.length == alias_offset
+                    && Arc::ptr_eq(&last.slice.backing, &slice.backing)
+                    && last.slice.offset + last.slice.length == slice.offset
+                {
+                    last.slice.length += slice.length;
+                } else {
+                    extents.push(WriteAliasExtent {
+                        offset: alias_offset,
+                        slice,
+                    });
+                }
+            }
+            if mapping_length == 0 {
+                // The unowned sentinel still retains admission and both locks.
+                return Ok(());
+            }
+            // Preallocate both the normal owner and its terminal ledger link
+            // before acquiring any address that might later refuse retirement.
+            alias.mapping = Some(Box::new(WriteAliasMapping {
+                address: 0,
+                length: mapping_length,
+                ambiguous: None,
+                mapping_errno: None,
+                unexpected: None,
+                unexpected_bounds_valid: false,
+                owned: [None; 3],
+                cleanup: [None; 3],
+                _extents: extents,
+                next: None,
+            }));
+            let mapping = alias.mapping.as_mut().unwrap();
+            // SAFETY: this anonymous inaccessible reservation owns no guest
+            // bytes; shared extents below replace only its own pages.
+            let reservation = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    mapping_length,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if reservation == libc::MAP_FAILED {
+                return Err(Error::MemoryMapping(io::Error::last_os_error()));
+            }
+            mapping.address = reservation.expose_provenance();
+            mapping.owned[0] = Some(WriteAliasRange {
+                address: mapping.address,
+                length: mapping_length,
+            });
+            for index in 0..mapping._extents.len() {
+                let extent = &mapping._extents[index];
+                let offset = extent.offset;
+                let length = extent.slice.length;
+                let target = mapping.address + offset;
+                // SAFETY: this range is still ours and the memfd slice remains
+                // retained. Atomic MAP_FIXED replacement does not expose a
+                // successful-path hole to another ordinary host allocator.
+                let installed = unsafe {
+                    libc::mmap(
+                        std::ptr::with_exposed_provenance_mut::<libc::c_void>(target),
+                        length,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_FIXED,
+                        extent.slice.backing.fd.as_raw_fd(),
+                        extent.slice.offset as libc::off_t,
+                    )
+                };
+                if installed == libc::MAP_FAILED {
+                    let error = io::Error::last_os_error();
+                    // Linux 5.15 mmap_region and Linux 7.1 __mmap_setup /
+                    // __mmap_new_vma / vms_abort_munmap_vmas can leave a gap
+                    // after a failed fixed replacement. It may already have a
+                    // foreign occupant. Earlier failures can retain the old
+                    // reservation. Never unmap or retry this ambiguous target.
+                    mapping.lose_fixed_target(offset, length, error.raw_os_error());
+                    return Err(Error::MemoryMapping(error));
+                }
+                if installed.expose_provenance() != target {
+                    // MAP_FIXED must return its exact target. Partition a
+                    // defensive positive result into disjoint owned ranges,
+                    // excluding the requested ambiguous interval throughout.
+                    mapping.lose_fixed_target(offset, length, None);
+                    mapping.note_unexpected_address(installed.expose_provenance(), length);
+                    return Err(Error::MemoryMapping(io::Error::other(
+                        UNEXPECTED_WRITE_ALIAS_ADDRESS,
+                    )));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(alias.fail(error));
+        }
+        // A preparation notification may have poisoned admission. Retire first
+        // so the returned failure includes any newly refused cleanup as well.
+        if let Err(primary) = self.check_copy_failure() {
+            return Err(alias.finish().err().unwrap_or(primary));
+        }
+        Ok(alias)
     }
 
     pub(crate) fn host_address(&self) -> u64 {
@@ -2031,13 +3124,6 @@ impl PendingBackingPage<'_> {
 }
 
 impl UserMemory {
-    fn guest_base(&self) -> u64 {
-        self.memory.guest_base()
-    }
-    fn guest_end(&self) -> u64 {
-        self.memory.guest_end()
-    }
-
     fn translate_admitted(&self, address: u64, length: usize, _copy: &CopyAccess) -> Result<u64> {
         self.memory
             .mapping
@@ -2080,187 +3166,10 @@ impl UserMemory {
     }
 
     /// Mirror current writable guest pages into a bounded kernel-only alias.
-    /// Invalid and protected addresses remain PROT_NONE so the actual syscall
-    /// decides whether it needs to touch them, including at EOF or zero count.
+    /// See [`GuestMemory::writable_alias`].
+    #[cfg(test)]
     pub(crate) fn writable_alias(&self, address: u64, length: usize) -> Result<UserWriteAlias<'_>> {
-        // Retire the short copy before taking either alias lock: retirement
-        // notifies subscribers synchronously and their wakers may read memory.
-        // The retained operand still prevents a mapping-generation change.
-        let retained = self.memory.with_copy(|copy| {
-            self.memory
-                .mapping
-                .entry_gate
-                .retain_operand(copy)
-                .map_err(|failure| failure.error())
-        })?;
-        let mut alias = UserWriteAlias {
-            mapping: None,
-            offset: address as usize % PAGE_SIZE,
-            memory: &self.memory,
-            host_access: None,
-            permissions: None,
-            retained: Some(retained),
-        };
-        let result = (|| {
-            // Match permission-aware copyout's lock order. Keeping both guards
-            // through the syscall prevents stale mprotect/munmap permissions
-            // and simultaneous Rust dereferences of kernel-written memory.
-            alias.permissions = Some(
-                self.memory
-                    .mapping
-                    .address_space
-                    .lock()
-                    .expect("guest memory access map lock poisoned"),
-            );
-            alias.host_access = Some(
-                self.memory
-                    .mapping
-                    .slice
-                    .backing
-                    .host_access
-                    .lock()
-                    .expect("guest memory lock poisoned"),
-            );
-            let permissions = alias.permissions.as_ref().unwrap();
-            let offset = alias.offset;
-            let mapping_length = if length == 0 {
-                0
-            } else {
-                offset
-                    .checked_add(length)
-                    .and_then(|size| size.checked_add(PAGE_SIZE - 1))
-                    .map(|size| size & !(PAGE_SIZE - 1))
-                    .ok_or(Error::GuestMemoryAccessDenied { address, length })?
-            };
-            let mut extents: Vec<WriteAliasExtent> = Vec::new();
-            let first_page = address - offset as u64;
-            for alias_offset in (0..mapping_length).step_by(PAGE_SIZE) {
-                let Some(page_address) = first_page.checked_add(alias_offset as u64) else {
-                    break;
-                };
-                if page_address < self.guest_base() || page_address >= self.guest_end() {
-                    continue;
-                }
-                let page = page_address / PAGE_SIZE as u64;
-                if permissions.enabled
-                    && !matches!(
-                        permissions.pages.get(&page),
-                        Some(UserPageState::Accessible { writable: true })
-                    )
-                {
-                    continue;
-                }
-                let slice = match permissions.backing_pages.get(&page) {
-                    Some(installed) => installed._slice.clone(),
-                    None => BackingSlice {
-                        backing: self.memory.mapping.slice.backing.clone(),
-                        offset: self.memory.mapping.slice.offset
-                            + (page_address - self.guest_base()) as usize,
-                        length: PAGE_SIZE,
-                    },
-                };
-                if let Some(last) = extents.last_mut()
-                    && last.offset + last.slice.length == alias_offset
-                    && Arc::ptr_eq(&last.slice.backing, &slice.backing)
-                    && last.slice.offset + last.slice.length == slice.offset
-                {
-                    last.slice.length += slice.length;
-                } else {
-                    extents.push(WriteAliasExtent {
-                        offset: alias_offset,
-                        slice,
-                    });
-                }
-            }
-            if mapping_length == 0 {
-                // The unowned sentinel still retains admission and both locks.
-                return Ok(());
-            }
-            // Preallocate both the normal owner and its terminal ledger link
-            // before acquiring any address that might later refuse retirement.
-            alias.mapping = Some(Box::new(WriteAliasMapping {
-                address: 0,
-                length: mapping_length,
-                ambiguous: None,
-                mapping_errno: None,
-                unexpected: None,
-                unexpected_bounds_valid: false,
-                owned: [None; 3],
-                cleanup: [None; 3],
-                _extents: extents,
-                next: None,
-            }));
-            let mapping = alias.mapping.as_mut().unwrap();
-            // SAFETY: this anonymous inaccessible reservation owns no guest
-            // bytes; shared extents below replace only its own pages.
-            let reservation = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    mapping_length,
-                    libc::PROT_NONE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            if reservation == libc::MAP_FAILED {
-                return Err(Error::MemoryMapping(io::Error::last_os_error()));
-            }
-            mapping.address = reservation.expose_provenance();
-            mapping.owned[0] = Some(WriteAliasRange {
-                address: mapping.address,
-                length: mapping_length,
-            });
-            for index in 0..mapping._extents.len() {
-                let extent = &mapping._extents[index];
-                let offset = extent.offset;
-                let length = extent.slice.length;
-                let target = mapping.address + offset;
-                // SAFETY: this range is still ours and the memfd slice remains
-                // retained. Atomic MAP_FIXED replacement does not expose a
-                // successful-path hole to another ordinary host allocator.
-                let installed = unsafe {
-                    libc::mmap(
-                        std::ptr::with_exposed_provenance_mut::<libc::c_void>(target),
-                        length,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_SHARED | libc::MAP_FIXED,
-                        extent.slice.backing.fd.as_raw_fd(),
-                        extent.slice.offset as libc::off_t,
-                    )
-                };
-                if installed == libc::MAP_FAILED {
-                    let error = io::Error::last_os_error();
-                    // Linux 5.15 mmap_region and Linux 7.1 __mmap_setup /
-                    // __mmap_new_vma / vms_abort_munmap_vmas can leave a gap
-                    // after a failed fixed replacement. It may already have a
-                    // foreign occupant. Earlier failures can retain the old
-                    // reservation. Never unmap or retry this ambiguous target.
-                    mapping.lose_fixed_target(offset, length, error.raw_os_error());
-                    return Err(Error::MemoryMapping(error));
-                }
-                if installed.expose_provenance() != target {
-                    // MAP_FIXED must return its exact target. Partition a
-                    // defensive positive result into disjoint owned ranges,
-                    // excluding the requested ambiguous interval throughout.
-                    mapping.lose_fixed_target(offset, length, None);
-                    mapping.note_unexpected_address(installed.expose_provenance(), length);
-                    return Err(Error::MemoryMapping(io::Error::other(
-                        UNEXPECTED_WRITE_ALIAS_ADDRESS,
-                    )));
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            return Err(alias.fail(error));
-        }
-        // A preparation notification may have poisoned admission. Retire first
-        // so the returned failure includes any newly refused cleanup as well.
-        if let Err(primary) = self.memory.check_copy_failure() {
-            return Err(alias.finish().err().unwrap_or(primary));
-        }
-        Ok(alias)
+        self.memory.writable_alias(address, length)
     }
 
     fn host_operand_admitted(
@@ -2299,7 +3208,7 @@ impl UserMemory {
             .memory
             .mapping
             .entry_gate
-            .retain_operand(copy)
+            .retain_operand_with(copy, || self.memory.entry_origin())
             .map_err(|failure| failure.error())?;
         Ok(HostMemoryOperand {
             _memory: self.memory.clone(),
@@ -2349,19 +3258,30 @@ impl UserMemory {
     }
 
     pub(crate) fn copy_to_user(&self, guest_address: u64, source: &[u8]) -> Result<()> {
-        self.write_user(guest_address, source, true)
+        self.write_user(guest_address, source, Copyout::Prefix)
     }
 
     pub(crate) fn put_user_i16(&self, guest_address: u64, value: i16) -> Result<()> {
-        self.write_user(guest_address, &value.to_ne_bytes(), false)
+        self.write_user(guest_address, &value.to_ne_bytes(), Copyout::AtomicScalar)
     }
 
     pub(crate) fn put_user_i32(&self, guest_address: u64, value: i32) -> Result<()> {
-        self.write_user(guest_address, &value.to_ne_bytes(), false)
+        self.write_user(guest_address, &value.to_ne_bytes(), Copyout::AtomicScalar)
+    }
+
+    /// Linux's eight-byte `put_user` as `gettimeofday(2)` and `time(2)` use
+    /// it: stores all of `value` only when every byte is on a writable user
+    /// page, and otherwise stores nothing. Unlike [`Self::put_user_i32`], a
+    /// writable shared-file destination is supported, through the same
+    /// fault-contained file copy that [`Self::copy_to_user`] and
+    /// [`Self::write`] use. A fault in that copy (a truncated file) is the
+    /// terminal `SharedFileCopy` failure those report, not EFAULT.
+    pub(crate) fn store_user_u64(&self, guest_address: u64, value: u64) -> Result<()> {
+        self.write_user(guest_address, &value.to_ne_bytes(), Copyout::Whole)
     }
 
     pub(crate) fn copy_to_user_prefix(&self, guest_address: u64, source: &[u8]) -> Result<usize> {
-        self.write_user_prefix(guest_address, source, true)
+        self.write_user_prefix(guest_address, source, Copyout::Prefix)
     }
 
     /// Copy the readable prefix under one admission and one permission/backing
@@ -2377,20 +3297,21 @@ impl UserMemory {
                 return Ok(0);
             }
             self.translate_admitted(guest_address, 1, copy)?;
-            let end = guest_address
-                .checked_add(destination.len() as u64)
-                .ok_or(Error::GuestMemoryAccessDenied {
+            guest_address.checked_add(destination.len() as u64).ok_or(
+                Error::GuestMemoryAccessDenied {
                     address: guest_address,
                     length: destination.len(),
-                })?
-                .min(self.guest_end());
+                },
+            )?;
             let access = self
                 .memory
                 .mapping
                 .address_space
                 .lock()
                 .expect("guest memory access map lock poisoned");
-            let mut cursor = guest_address;
+            let (start, limit) = access.user_extent(guest_address, destination.len())?;
+            let end = start.saturating_add(destination.len() as u64).min(limit);
+            let mut cursor = start;
             while cursor < end {
                 if access.enabled
                     && !matches!(
@@ -2402,7 +3323,7 @@ impl UserMemory {
                 }
                 cursor = ((cursor / PAGE_SIZE as u64 + 1) * PAGE_SIZE as u64).min(end);
             }
-            let length = (cursor - guest_address) as usize;
+            let length = (cursor - start) as usize;
             if length != 0 {
                 let physical = access.translate(guest_address, length)?;
                 let offset = self.memory.checked_offset(physical, length)?;
@@ -2418,8 +3339,92 @@ impl UserMemory {
         })
     }
 
-    fn write_user(&self, guest_address: u64, source: &[u8], partial: bool) -> Result<()> {
-        if self.write_user_prefix(guest_address, source, partial)? != source.len() {
+    /// Atomically compare-and-exchange the aligned 32-bit user word at
+    /// `guest_address`, returning the value it held. Admission, the
+    /// writability check and the exchange run under one copy admission and
+    /// one address-space lock, as a permission-aware copyout does. A word on
+    /// truncate-capable file backing is refused as an atomic scalar store is.
+    /// No executor handler performs a guest compare-exchange yet; futex words
+    /// still go to the host kernel.
+    pub(crate) fn compare_exchange_u32(
+        &self,
+        guest_address: u64,
+        current: u32,
+        new: u32,
+    ) -> Result<u32> {
+        const LENGTH: usize = std::mem::size_of::<u32>();
+        let denied = Error::GuestMemoryAccessDenied {
+            address: guest_address,
+            length: LENGTH,
+        };
+        if !guest_address.is_multiple_of(LENGTH as u64) {
+            return Err(denied);
+        }
+        self.memory.with_copy(|copy| {
+            self.translate_admitted(guest_address, LENGTH, copy)?;
+            let access = self
+                .memory
+                .mapping
+                .address_space
+                .lock()
+                .expect("guest memory access map lock poisoned");
+            let (start, _) = access.user_extent(guest_address, LENGTH)?;
+            if access.enabled
+                && !matches!(
+                    access.pages.get(&(start / PAGE_SIZE as u64)),
+                    Some(UserPageState::Accessible { writable: true })
+                )
+            {
+                return Err(denied);
+            }
+            let physical = access.translate(guest_address, LENGTH)?;
+            let offset = self.memory.checked_offset(physical, LENGTH)?;
+            let chunks = self
+                .memory
+                .mapping
+                .host_chunks_from_state(&access, offset, LENGTH);
+            // An aligned word never crosses a page, so it is one chunk.
+            let [chunk] = &chunks[..] else {
+                return Err(denied);
+            };
+            if matches!(chunk.backing.kind, BackingKind::OrdinaryFile { .. }) {
+                return Err(Error::SharedFileCapability {
+                    operation: "atomic compare-exchange",
+                    reason: "truncate-capable file backing has no proven fault-contained atomic store",
+                });
+            }
+            let host_access = self
+                .memory
+                .mapping
+                .slice
+                .backing
+                .host_access
+                .lock()
+                .expect("guest memory lock poisoned");
+            // SAFETY: host_chunks_from_state returned the live mmap pointer
+            // for exactly these four bytes, which are four-byte aligned
+            // because the guest address and every chunk start are; the
+            // address-space lock keeps the mapping installed until the
+            // exchange completes. Guest vCPUs access the same bytes only
+            // through hardware atomics or plain stores, which an atomic RMW
+            // tolerates.
+            let word = unsafe { std::sync::atomic::AtomicU32::from_ptr(chunk.mapping.as_ptr().cast()) };
+            let observed = match word.compare_exchange(
+                current,
+                new,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(value) | Err(value) => value,
+            };
+            drop(host_access);
+            drop(access);
+            Ok(observed)
+        })
+    }
+
+    fn write_user(&self, guest_address: u64, source: &[u8], mode: Copyout) -> Result<()> {
+        if self.write_user_prefix(guest_address, source, mode)? != source.len() {
             return Err(Error::GuestMemoryAccessDenied {
                 address: guest_address,
                 length: source.len(),
@@ -2428,36 +3433,37 @@ impl UserMemory {
         Ok(())
     }
 
-    fn write_user_prefix(&self, guest_address: u64, source: &[u8], partial: bool) -> Result<usize> {
+    fn write_user_prefix(&self, guest_address: u64, source: &[u8], mode: Copyout) -> Result<usize> {
         self.memory
-            .with_copy(|copy| self.write_user_prefix_admitted(guest_address, source, partial, copy))
+            .with_copy(|copy| self.write_user_prefix_admitted(guest_address, source, mode, copy))
     }
 
     fn write_user_prefix_admitted(
         &self,
         guest_address: u64,
         source: &[u8],
-        partial: bool,
+        mode: Copyout,
         copy: &CopyAccess,
     ) -> Result<usize> {
         if source.is_empty() {
             return Ok(0);
         }
         self.translate_admitted(guest_address, 1, copy)?;
-        let requested_end = guest_address.checked_add(source.len() as u64).ok_or(
-            Error::GuestMemoryAccessDenied {
+        guest_address
+            .checked_add(source.len() as u64)
+            .ok_or(Error::GuestMemoryAccessDenied {
                 address: guest_address,
                 length: source.len(),
-            },
-        )?;
-        let end = requested_end.min(self.guest_end());
+            })?;
         let access = self
             .memory
             .mapping
             .address_space
             .lock()
             .expect("guest memory access map lock poisoned");
-        let mut cursor = guest_address;
+        let (start, limit) = access.user_extent(guest_address, source.len())?;
+        let end = start.saturating_add(source.len() as u64).min(limit);
+        let mut cursor = start;
         while cursor < end {
             if access.enabled
                 && !matches!(
@@ -2469,8 +3475,8 @@ impl UserMemory {
             }
             cursor = ((cursor / PAGE_SIZE as u64 + 1) * PAGE_SIZE as u64).min(end);
         }
-        let length = usize::try_from(cursor - guest_address).expect("copyout prefix fits usize");
-        if length == source.len() || (partial && length != 0) {
+        let length = usize::try_from(cursor - start).expect("copyout prefix fits usize");
+        if length == source.len() || (mode == Copyout::Prefix && length != 0) {
             let physical = access.translate(guest_address, length)?;
             let offset = self.memory.checked_offset(physical, length)?;
             let chunks = self
@@ -2479,7 +3485,7 @@ impl UserMemory {
                 .host_chunks_from_state(&access, offset, length);
             // Permission failure takes precedence. A scalar must refuse the
             // entire destination before even a preceding private chunk changes.
-            if !partial
+            if mode == Copyout::AtomicScalar
                 && chunks
                     .iter()
                     .any(|chunk| matches!(chunk.backing.kind, BackingKind::OrdinaryFile { .. }))
@@ -2537,29 +3543,19 @@ impl UserMemory {
         if length == 0 {
             return Ok(0);
         }
-        if guest_address < self.guest_base() || guest_address >= self.guest_end() {
-            return Err(Error::InvalidGuestAddress {
-                address: guest_address,
-                length,
-                guest_base: self.guest_base(),
-                guest_end: self.guest_end(),
-            });
-        }
-        let requested_end = guest_address.saturating_add(length as u64);
-        let end = requested_end.min(self.guest_end());
         let access = self
             .memory
             .mapping
             .address_space
             .lock()
             .expect("guest memory access map lock poisoned");
+        let (start, limit) = access.user_extent(guest_address, length)?;
+        let end = start.saturating_add(length as u64).min(limit);
         if !access.enabled {
-            return Ok(
-                usize::try_from(end - guest_address).expect("guest memory prefix must fit usize")
-            );
+            return Ok(usize::try_from(end - start).expect("guest memory prefix must fit usize"));
         }
 
-        let mut cursor = guest_address;
+        let mut cursor = start;
         while cursor < end {
             if !matches!(
                 access.pages.get(&(cursor / PAGE_SIZE as u64)),
@@ -2570,7 +3566,7 @@ impl UserMemory {
             let next_page = (cursor / PAGE_SIZE as u64 + 1) * PAGE_SIZE as u64;
             cursor = next_page.min(end);
         }
-        Ok(usize::try_from(cursor - guest_address).expect("guest memory prefix must fit usize"))
+        Ok(usize::try_from(cursor - start).expect("guest memory prefix must fit usize"))
     }
 
     pub(crate) fn user_writable_prefix(&self, guest_address: u64, length: usize) -> Result<usize> {
@@ -2587,29 +3583,18 @@ impl UserMemory {
         if length == 0 {
             return Ok(0);
         }
-        if guest_address < self.guest_base() || guest_address >= self.guest_end() {
-            return Err(Error::InvalidGuestAddress {
-                address: guest_address,
-                length,
-                guest_base: self.guest_base(),
-                guest_end: self.guest_end(),
-            });
-        }
-        let end = guest_address
-            .saturating_add(length as u64)
-            .min(self.guest_end());
         let access = self
             .memory
             .mapping
             .address_space
             .lock()
             .expect("guest memory access map lock poisoned");
+        let (start, limit) = access.user_extent(guest_address, length)?;
+        let end = start.saturating_add(length as u64).min(limit);
         if !access.enabled {
-            return Ok(
-                usize::try_from(end - guest_address).expect("guest memory prefix must fit usize")
-            );
+            return Ok(usize::try_from(end - start).expect("guest memory prefix must fit usize"));
         }
-        let mut cursor = guest_address;
+        let mut cursor = start;
         while cursor < end {
             if !matches!(
                 access.pages.get(&(cursor / PAGE_SIZE as u64)),
@@ -2620,7 +3605,7 @@ impl UserMemory {
             let next_page = (cursor / PAGE_SIZE as u64 + 1) * PAGE_SIZE as u64;
             cursor = next_page.min(end);
         }
-        Ok(usize::try_from(cursor - guest_address).expect("guest memory prefix must fit usize"))
+        Ok(usize::try_from(cursor - start).expect("guest memory prefix must fit usize"))
     }
 }
 
@@ -2679,7 +3664,10 @@ impl MemoryAccess for GuestMemory {
             }
             let destination =
                 &mut write_to[destination_index][destination_offset..destination_offset + count];
-            if let Err(error) = self.read_raw_admitted(address, destination, &copy) {
+            let physical = self
+                .translate_user(address, count)
+                .map_err(|_| Errno::EFAULT)?;
+            if let Err(error) = self.read_raw_admitted(physical, destination, &copy) {
                 drop(copy);
                 if matches!(
                     error.primary(),
@@ -2752,7 +3740,10 @@ impl MemoryAccess for GuestMemory {
                 };
             }
             let source = &read_from[source_index][source_offset..source_offset + count];
-            if let Err(error) = self.write_raw_admitted(address, source, &copy) {
+            let physical = self
+                .translate_user(address, source.len())
+                .map_err(|_| Errno::EFAULT)?;
+            if let Err(error) = self.write_raw_admitted(physical, source, &copy) {
                 drop(copy);
                 if matches!(
                     error.primary(),
@@ -2783,10 +3774,18 @@ impl MemoryAccess for GuestMemory {
 }
 
 fn write_backing(backing: &Backing, bytes: &[u8]) -> io::Result<()> {
+    write_backing_at(backing, 0, bytes)
+}
+
+fn write_backing_at(backing: &Backing, start: usize, bytes: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < bytes.len() {
-        let offset = libc::off_t::try_from(written)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "backing offset overflow"))?;
+        let offset = start
+            .checked_add(written)
+            .and_then(|offset| libc::off_t::try_from(offset).ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "backing offset overflow")
+            })?;
         // SAFETY: backing owns a writable memfd for at least bytes.len()
         // bytes, and this live slice supplies the remaining initialized input.
         let result = unsafe {
@@ -2921,7 +3920,7 @@ impl Mapping {
     /// Resolve a validated relative range into exact live mmap pointers. Once a
     /// page has been replaced, no Rust operation may cross that mapping
     /// boundary with a pointer derived from the original whole-arena mmap.
-    fn host_chunks(&self, offset: usize, length: usize) -> Vec<HostChunk> {
+    fn host_chunks(&self, offset: usize, length: usize) -> HostChunks {
         let state = self
             .address_space
             .lock()
@@ -2936,29 +3935,27 @@ impl Mapping {
         state: &AddressSpaceState,
         offset: usize,
         length: usize,
-    ) -> Vec<HostChunk> {
+    ) -> HostChunks {
         let end = offset
             .checked_add(length)
             .expect("validated guest-memory range cannot overflow");
         debug_assert!(end <= self.slice.length);
         if length == 0 {
-            return Vec::new();
+            return HostChunks::Many(Vec::new());
         }
 
         if state.backing_pages.is_empty() {
             // SAFETY: no page of the original whole-range mmap has ever been
             // replaced, and the validated range remains within that mapping.
             let mapping = unsafe { NonNull::new_unchecked(self.mapping.as_ptr().add(offset)) };
-            return vec![HostChunk {
+            return HostChunks::One([HostChunk {
                 mapping,
                 length,
                 backing: self.slice.backing.clone(),
-            }];
+            }]);
         }
 
-        let mut chunks = Vec::with_capacity(length.div_ceil(PAGE_SIZE) + 1);
-        let mut cursor = offset;
-        while cursor < end {
+        let chunk_at = |cursor: usize| {
             let relative_page = cursor / PAGE_SIZE;
             let within_page = cursor % PAGE_SIZE;
             let chunk_length = (PAGE_SIZE - within_page).min(end - cursor);
@@ -2973,14 +3970,25 @@ impl Mapping {
             // SAFETY: page_start is the exact live pointer for this page and
             // chunk_length cannot cross the page boundary.
             let mapping = unsafe { NonNull::new_unchecked(page_start.as_ptr().add(within_page)) };
-            chunks.push(HostChunk {
+            HostChunk {
                 mapping,
                 length: chunk_length,
                 backing,
-            });
-            cursor += chunk_length;
+            }
+        };
+        let first = chunk_at(offset);
+        if first.length == length {
+            return HostChunks::One([first]);
         }
-        chunks
+        let mut chunks = Vec::with_capacity(length.div_ceil(PAGE_SIZE) + 1);
+        let mut cursor = offset + first.length;
+        chunks.push(first);
+        while cursor < end {
+            let chunk = chunk_at(cursor);
+            cursor += chunk.length;
+            chunks.push(chunk);
+        }
+        HostChunks::Many(chunks)
     }
 }
 
@@ -3622,7 +4630,7 @@ impl MemoryAccess for UserMemory {
                 gate.copy_blocking(origin.clone()).map_err(|_| Errno::EIO)?,
             );
             let local_result =
-                self.write_user_prefix_admitted(addr.as_raw() as u64, buf, true, &copy);
+                self.write_user_prefix_admitted(addr.as_raw() as u64, buf, Copyout::Prefix, &copy);
             #[cfg(test)]
             let local_result = match (local_result, &self.memory.test_user_copy_failure) {
                 (Ok(copied), Some(injection)) => {
@@ -3947,6 +4955,7 @@ mod tests {
             assert_cause(user.copy_to_user(BASE, b"lost"), &original);
             assert_cause(user.copy_to_user_prefix(BASE, b"lost"), &original);
             assert_cause(user.put_user_i32(BASE, 0), &original);
+            assert_cause(user.store_user_u64(BASE, 0), &original);
             assert_cause(user.user_accessible_prefix(BASE, 4), &original);
             assert_cause(user.user_writable_prefix(BASE, 4), &original);
             assert_cause(user.host_operand(BASE, 4), &original);
@@ -4153,7 +5162,7 @@ mod tests {
             user.read_admitted(BASE, &mut bytes, &copy).unwrap();
             assert_eq!(&bytes, b"data");
             assert_eq!(
-                user.write_user_prefix_admitted(BASE, b"next", true, &copy)
+                user.write_user_prefix_admitted(BASE, b"next", Copyout::Prefix, &copy)
                     .unwrap(),
                 4
             );
@@ -4214,6 +5223,35 @@ mod tests {
                 run.primary().is_none(),
                 "memory helpers must capture, never publish"
             );
+        }
+
+        #[test]
+        fn queued_lazy_copy_retirement_keeps_its_issuing_context_alive() {
+            // Alias A defers notifications while alias B, which alone owns a
+            // FailureContext, completes a copy. B's retirement is queued past
+            // its borrow. If B then drops its context, the queued retirement
+            // must still keep it alive, so it is destroyed only on delivery,
+            // after A's scope ends, never while A still holds its locks.
+            let deferring = GuestMemory::new(BASE, PAGE_SIZE).unwrap();
+            let mut issuer = deferring.clone();
+            let global = Arc::new(());
+            let run = crate::failure::RunFailure::new(&global);
+            issuer.set_failure_context(Some(FailureContext::new(
+                run.clone(),
+                reverie::Pid::from_raw(3),
+                reverie::Pid::from_raw(5),
+            )));
+            let alone = Arc::strong_count(&run);
+            let scope = deferring.defer_notifications();
+            issuer.read_raw(BASE, &mut [0; 8]).unwrap();
+            issuer.set_failure_context(None);
+            assert_eq!(
+                Arc::strong_count(&run),
+                alone,
+                "the queued retirement released its issuing context"
+            );
+            drop(scope);
+            assert_eq!(Arc::strong_count(&run), alone - 1);
         }
 
         #[test]
@@ -4471,6 +5509,130 @@ mod tests {
                 &original,
             );
         }
+    }
+
+    /// The storable ranges hold every user address of every page a user store
+    /// is admitted to: all user addresses before permissions are enforced,
+    /// then each accessible page (read-only ones too, which `UserMemory::write`
+    /// admits) under every user address that reaches it.
+    #[test]
+    fn user_storable_ranges_cover_every_user_address_of_each_accessible_page() {
+        const MIB: u64 = 1024 * 1024;
+        let page = PAGE_SIZE as u64;
+        let memory = GuestMemory::new(0, (16 * MIB) as usize).unwrap();
+        let window = memory.establish_user_stack_window(8 * MIB).unwrap();
+        assert_eq!(
+            memory.user_storable_ranges(),
+            vec![(0, 8 * MIB), (window, USER_STACK_TOP)]
+        );
+
+        // Two adjacent writable pages, a read-only page after a gap, an
+        // inaccessible page, the window's first page, and the window's last
+        // physical page, which has no user address.
+        memory
+            .map_user_permissions(page, 2 * page, true, true)
+            .unwrap();
+        memory
+            .map_user_permissions(4 * page, page, true, false)
+            .unwrap();
+        memory.map_user_range(5 * page, page, true).unwrap();
+        memory
+            .map_user_permissions(8 * MIB, page, true, true)
+            .unwrap();
+        memory
+            .map_user_permissions(16 * MIB - page, page, true, true)
+            .unwrap();
+        memory.enable_user_access();
+        assert_eq!(
+            memory.user_storable_ranges(),
+            vec![
+                (page, 3 * page),
+                (4 * page, 5 * page),
+                (window, window + page)
+            ]
+        );
+        memory.user().write(4 * page, &[1; 8]).unwrap();
+        assert!(memory.user().write(5 * page, &[1; 8]).is_err());
+        assert!(memory.user().write(3 * page, &[1; 8]).is_err());
+
+        // A page reached both through the identity addresses and through the
+        // window is listed under both.
+        memory.set_user_identity_end(9 * MIB);
+        assert_eq!(
+            memory.user_storable_ranges(),
+            vec![
+                (page, 3 * page),
+                (4 * page, 5 * page),
+                (8 * MIB, 8 * MIB + page),
+                (window, window + page),
+            ]
+        );
+        memory.user().write(8 * MIB, &[2; 8]).unwrap();
+        memory.user().write(window + 8, &[3; 8]).unwrap();
+        let mut bytes = [0; 16];
+        memory.read_raw(8 * MIB, &mut bytes).unwrap();
+        assert_eq!(bytes, [[2; 8], [3; 8]].concat()[..]);
+    }
+
+    /// The stack window places the top of guest memory at the top of the user
+    /// address space; its identity addresses stop being user addresses, and
+    /// only addresses below Linux's TASK_SIZE are.
+    #[test]
+    fn stack_window_translates_only_its_user_addresses() {
+        const MIB: u64 = 1024 * 1024;
+        let memory = GuestMemory::new(0, (16 * MIB) as usize).unwrap();
+        assert_eq!(memory.user_range_to_guest(8 * MIB, 1), Some(8 * MIB));
+        let window = memory.establish_user_stack_window(8 * MIB).unwrap();
+        assert_eq!(window, USER_ADDRESS_END - 8 * MIB);
+        assert_eq!(memory.user_stack_window_length(), Some(8 * MIB));
+
+        assert_eq!(memory.user_range_to_guest(window, 1), Some(8 * MIB));
+        assert_eq!(
+            memory.user_range_to_guest(USER_STACK_TOP - 8, 8),
+            Some(16 * MIB - PAGE_SIZE as u64 - 8)
+        );
+        assert_eq!(memory.user_range_to_guest(USER_STACK_TOP, 1), None);
+        assert_eq!(memory.user_range_to_guest(USER_STACK_TOP - 1, 2), None);
+        assert_eq!(memory.user_range_to_guest(window - 1, 1), None);
+        // The window's identity addresses are not user addresses.
+        assert_eq!(memory.user_range_to_guest(8 * MIB, 1), None);
+        assert_eq!(memory.user_range_to_guest(16 * MIB - 1, 1), None);
+        assert_eq!(memory.user_range_to_guest(8 * MIB - 1, 2), None);
+        assert_eq!(
+            memory.user_range_to_guest(8 * MIB - 1, 1),
+            Some(8 * MIB - 1)
+        );
+
+        // A copy below the window stops where the window's identity range
+        // begins, even when the physical pages beyond it are mapped.
+        memory
+            .map_user_range(8 * MIB - PAGE_SIZE as u64, 2 * PAGE_SIZE as u64, false)
+            .unwrap();
+        memory.enable_user_access();
+        let user = memory.user();
+        assert_eq!(
+            user.user_accessible_prefix(8 * MIB - PAGE_SIZE as u64, 2 * PAGE_SIZE)
+                .unwrap(),
+            PAGE_SIZE
+        );
+        assert!(user.user_accessible_prefix(8 * MIB, 1).is_err());
+        // The window's first page is physical 8 MiB, mapped above; its second
+        // is not.
+        assert_eq!(
+            user.user_accessible_prefix(window, 2 * PAGE_SIZE).unwrap(),
+            PAGE_SIZE
+        );
+
+        // The public copies name the window by its user addresses.
+        let mut memory = memory;
+        memory.write(window, &[0x5a; 8]).unwrap();
+        let mut bytes = [0; 8];
+        memory.read_raw(8 * MIB, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x5a; 8]);
+        memory.zero(window, 8).unwrap();
+        memory.read(window, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 8]);
+        assert!(memory.zero(8 * MIB, 8).is_err());
     }
 
     #[test]
@@ -5374,10 +6536,11 @@ mod tests {
                 let generation = memory.entry_gate().test_state().generation;
                 let probe = probe(&memory, None);
                 let waker = Waker::from(probe.clone());
-                // This is the same subscription used by the checked Tool
-                // driver's private-failure future before polling its callback.
-                let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
-                let mut changed = Box::pin(watch.wait());
+                // The gate's ordinary change channel, which this preparation's
+                // copy retirement completes. (The checked Tool driver's
+                // private-failure future now waits on the gate's failure
+                // channel, which an ordinary retirement does not complete.)
+                let mut changed = Box::pin(memory.entry_gate().subscribe());
                 assert!(
                     changed
                         .as_mut()
@@ -5398,7 +6561,6 @@ mod tests {
                 memory.read(0, &mut actual).unwrap();
                 assert_eq!(actual, [0xa5; PAGE_SIZE]);
                 drop(changed);
-                drop(watch);
                 drop(waker);
                 drop(probe);
                 drop(user);
@@ -5413,8 +6575,7 @@ mod tests {
                 let memory = fixture(!writable);
                 let probe = probe(&memory, Some(WakeAction::SetWritable(writable)));
                 let waker = Waker::from(probe.clone());
-                let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
-                let mut changed = Box::pin(watch.wait());
+                let mut changed = Box::pin(memory.entry_gate().subscribe());
                 assert!(
                     changed
                         .as_mut()
@@ -5456,8 +6617,7 @@ mod tests {
                 ));
                 let probe = probe(&memory, Some(WakeAction::Poison(cause.clone())));
                 let waker = Waker::from(probe.clone());
-                let watch = crate::entry::driver::EntryDriverWatch::for_memory(&memory);
-                let mut changed = Box::pin(watch.wait());
+                let mut changed = Box::pin(memory.entry_gate().subscribe());
                 assert!(
                     changed
                         .as_mut()
@@ -6752,5 +7912,262 @@ mod tests {
             memory.find_unmapped_user_range(0x1001, 0x9000, 0x1000),
             None
         );
+    }
+}
+
+/// The two one-admission copies a KVM syscall exit uses: the same bytes,
+/// order and errors as the separate copies they replace, one admission each,
+/// and the same refusals by the entry gate.
+#[cfg(test)]
+mod one_admission_copy_tests {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::*;
+
+    const PAGE: usize = 4096;
+    const LIMIT: u64 = (4 * PAGE) as u64;
+
+    fn until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition not reached");
+            std::thread::yield_now();
+        }
+    }
+
+    fn fixture() -> GuestMemory {
+        let memory = GuestMemory::new(0, 4 * PAGE).unwrap();
+        let pattern: Vec<u8> = (0..LIMIT).map(|byte| byte as u8).collect();
+        memory.write_raw(0, &pattern).unwrap();
+        memory
+    }
+
+    fn bytes(memory: &GuestMemory, address: u64, length: usize) -> Vec<u8> {
+        let mut bytes = vec![0; length];
+        memory.read_raw(address, &mut bytes).unwrap();
+        bytes
+    }
+
+    fn admissions(memory: &GuestMemory) -> usize {
+        memory.entry_gate().test_state().copy_admissions
+    }
+
+    #[test]
+    fn read_then_write_raw_is_the_two_copies_under_one_admission() {
+        let combined = fixture();
+        let separate = fixture();
+        // Overlapping ranges: the read must see the bytes from before the
+        // store, as read_raw then write_raw would.
+        let (read_at, write_at) = (0x1008, 0x1038);
+        let source = 0x55aa_33cc_i64.to_le_bytes();
+
+        let before = admissions(&combined);
+        let mut read = [0; 80];
+        combined
+            .read_then_write_raw(read_at, &mut read, write_at, &source)
+            .unwrap();
+        assert_eq!(admissions(&combined), before + 1);
+
+        let before = admissions(&separate);
+        let mut expected = [0; 80];
+        separate.read_raw(read_at, &mut expected).unwrap();
+        separate.write_raw(write_at, &source).unwrap();
+        assert_eq!(admissions(&separate), before + 2, "control: two copies");
+
+        assert_eq!(read, expected);
+        assert_eq!(bytes(&combined, 0, 4 * PAGE), bytes(&separate, 0, 4 * PAGE));
+        assert_eq!(combined.entry_gate().test_state().copies, 0);
+    }
+
+    #[test]
+    fn read_then_write_raw_stores_nothing_after_a_read_error() {
+        let memory = fixture();
+        let unchanged = bytes(&memory, 0x2000, 8);
+        let mut read = [0xee; 16];
+        // The read runs past the end of guest memory.
+        assert!(
+            memory
+                .read_then_write_raw(LIMIT - 8, &mut read, 0x2000, &[0x77; 8])
+                .is_err()
+        );
+        assert_eq!(bytes(&memory, 0x2000, 8), unchanged);
+        // A store error after a good read is an error too, as write_raw's.
+        let mut read = [0; 8];
+        assert!(
+            memory
+                .read_then_write_raw(0x2000, &mut read, LIMIT - 4, &[0x77; 8])
+                .is_err()
+        );
+        assert_eq!(read.as_slice(), unchanged.as_slice());
+        assert_eq!(memory.entry_gate().test_state().copies, 0);
+    }
+
+    /// A failure that arrives after the read, while the combined copy is
+    /// still admitted, refuses the store, as the separate `write_raw` was
+    /// refused: a gate failure recorded then (a peer's entry cleanup can
+    /// record one while a copy is held), and a shared-file failure deferred
+    /// behind an open notification scope. The read has happened; the result
+    /// word keeps its old bytes; the error is the failure itself.
+    #[test]
+    fn read_then_write_raw_refuses_the_store_after_a_failure_between_them() {
+        for deferred in [false, true] {
+            let mut memory = fixture();
+            let observer = memory.clone();
+            let unchanged = bytes(&memory, 0x2000, 8);
+            let gate = memory.entry_gate();
+            let recorded = Arc::new(std::sync::Mutex::new(None));
+            let slot = recorded.clone();
+            memory.test_between_read_and_write = Some(Arc::new(move || {
+                let error = if deferred {
+                    observer.capture_shared_file_error(Error::SharedFileCopy {
+                        operation: "controlled deferred failure",
+                        address: 0x2000,
+                        requested: 8,
+                        transferred: 0,
+                        prior_transferred: 0,
+                        source: std::io::Error::from_raw_os_error(libc::EIO),
+                    })
+                } else {
+                    gate.poison(
+                        None,
+                        Error::UnexpectedVcpuExit("controlled failure between".to_owned()),
+                    )
+                    .error()
+                };
+                *slot.lock().unwrap() = Some(format!("{error:?}"));
+            }));
+            let scope = deferred.then(|| memory.defer_notifications());
+            if deferred {
+                assert!(memory.entry_gate().pending_failure().is_none());
+            }
+            let mut read = [0; 8];
+            let error = memory
+                .read_then_write_raw(0x1000, &mut read, 0x2000, &[0x77; 8])
+                .unwrap_err();
+            assert_eq!(read, [0, 1, 2, 3, 4, 5, 6, 7], "the read ran");
+            assert_eq!(
+                Some(format!("{error:?}")),
+                *recorded.lock().unwrap(),
+                "deferred={deferred}"
+            );
+            assert_eq!(memory.entry_gate().test_state().copies, 0);
+            drop(scope);
+            // The failure is terminal now; inspect the word through the
+            // backing directly rather than through a refused copy.
+            let offset = memory.checked_offset(0x2000, 8).unwrap();
+            let chunks = memory.mapping.host_chunks(offset, 8);
+            let mut word = [0; 8];
+            let mut copied = 0;
+            for chunk in chunks.iter() {
+                // SAFETY: the chunks cover exactly the 8 validated bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.mapping.as_ptr(),
+                        word[copied..].as_mut_ptr(),
+                        chunk.length,
+                    );
+                }
+                copied += chunk.length;
+            }
+            assert_eq!(word.as_slice(), unchanged.as_slice(), "the store ran");
+        }
+    }
+
+    #[test]
+    fn one_admission_copies_are_refused_by_a_failed_gate() {
+        for speculative in [false, true] {
+            let memory = fixture();
+            let failure = memory.entry_gate().poison(
+                None,
+                Error::UnexpectedVcpuExit("controlled poison".to_owned()),
+            );
+            let before = admissions(&memory);
+            let mut read = [0xee; 8];
+            let error = if speculative {
+                memory
+                    .read_raw_and_try_read(0x1000, &mut read, 0x2000, &mut [0; 3])
+                    .map(drop)
+                    .unwrap_err()
+            } else {
+                memory
+                    .read_then_write_raw(0x1000, &mut read, 0x2000, &[0x77; 8])
+                    .unwrap_err()
+            };
+            assert!(error.retains_primary(&failure.causes()[0]), "{error:?}");
+            // Refused before admission: nothing read, nothing admitted.
+            assert_eq!(read, [0xee; 8]);
+            assert_eq!(admissions(&memory), before);
+            assert_eq!(memory.entry_gate().test_state().copies, 0);
+        }
+    }
+
+    #[test]
+    fn one_admission_copies_wait_for_a_closed_gate_and_see_the_reopened_image() {
+        for speculative in [false, true] {
+            let memory = fixture();
+            let gate = memory.entry_gate();
+            let closed =
+                futures::executor::block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
+            let before = admissions(&memory);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let mut read = [0; 8];
+                    if speculative {
+                        let mut extra = [0; 3];
+                        let (generation, read_extra) = memory
+                            .read_raw_and_try_read(0x1000, &mut read, 0x1100, &mut extra)
+                            .unwrap();
+                        assert!(read_extra);
+                        assert_eq!(extra, [0x00, 0x01, 0x02]);
+                        Some(generation)
+                    } else {
+                        memory
+                            .read_then_write_raw(0x1000, &mut read, 0x2000, &[0x77; 8])
+                            .unwrap();
+                        assert_eq!(read, [0, 1, 2, 3, 4, 5, 6, 7]);
+                        None
+                    }
+                });
+                until(|| !gate.test_state().copy_waiters.is_empty());
+                // Parked before admission: nothing admitted or written yet.
+                assert_eq!(admissions(&memory), before);
+                assert_eq!(gate.test_state().copies, 0);
+                drop(closed);
+                if let Some(generation) = worker.join().unwrap() {
+                    assert_eq!(generation, gate.generation().unwrap());
+                }
+            });
+            assert_eq!(admissions(&memory), before + 1);
+            if !speculative {
+                assert_eq!(bytes(&memory, 0x2000, 8), [0x77; 8]);
+            }
+        }
+    }
+
+    #[test]
+    fn read_raw_and_try_read_keeps_the_first_read_and_drops_a_failed_attempt() {
+        let memory = fixture();
+        let before = admissions(&memory);
+        let mut read = [0; 8];
+        let mut extra = [0xee; 3];
+        let (generation, read_extra) = memory
+            .read_raw_and_try_read(0x1000, &mut read, LIMIT - 1, &mut extra)
+            .unwrap();
+        assert_eq!(admissions(&memory), before + 1);
+        assert!(!read_extra, "an attempt past the end reported success");
+        assert_eq!(read.as_slice(), bytes(&memory, 0x1000, 8).as_slice());
+        assert_eq!(generation, memory.entry_gate().generation().unwrap());
+        // The first read's error is read_raw's, attempted read or not.
+        let mut past = [0; 8];
+        let first = memory
+            .read_raw_and_try_read(LIMIT - 4, &mut past, 0x1000, &mut [0; 3])
+            .map(drop)
+            .unwrap_err();
+        let control = memory.read_raw(LIMIT - 4, &mut past).unwrap_err();
+        assert_eq!(format!("{first:?}"), format!("{control:?}"));
+        // A failed attempt leaves no failure behind for later copies.
+        assert!(memory.entry_gate().pending_failure().is_none());
+        memory.check_copy_failures().unwrap();
     }
 }

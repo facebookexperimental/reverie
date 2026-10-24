@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Real KvmGuest -> StaticElfSyscallExecutor -> shared pending -> Tool/frame path.
 // This fixture has no scheduler timer, periodic rearm, or parked-wait bridge.
 use reverie::ProcessAlarmSignalDisposition;

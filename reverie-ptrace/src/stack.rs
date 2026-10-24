@@ -20,6 +20,7 @@ use safeptrace::Error as TraceError;
 use safeptrace::Stopped;
 
 use super::regs::RegAccess;
+use crate::tool_memory::ToolMemory;
 
 // NB: leaf function can use redzone without explicit stack allocation, as
 // a result it is not safe to just adjust stack pointer. 128B of stack
@@ -76,7 +77,10 @@ pub struct GuestStack {
     sp: usize,
     capacity: usize,
     buf: Vec<u64>,
-    task: Stopped,
+    // The commit is a Tool write into guest-chosen memory (the guest controls
+    // its stack pointer), so it respects page protection and the private page
+    // as every other Tool write does (https://github.com/rrnewton/reverie/issues/1064).
+    task: ToolMemory,
     token: StackToken,
 }
 
@@ -122,7 +126,7 @@ impl GuestStack {
             sp: top,
             capacity: STACK_CAPACITY,
             buf: Vec::new(),
-            task,
+            task: ToolMemory::new(task),
             token,
         })
     }

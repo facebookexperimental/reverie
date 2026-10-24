@@ -925,7 +925,7 @@ typed_syscall! {
 typed_syscall! {
     pub struct Sendmsg {
         fd: i32,
-        msg: Option<Addr<libc::msghdr>>,
+        msg: Option<Addr<crate::linux_abi::Msghdr>>,
         flags: i32,
     }
 }
@@ -933,7 +933,7 @@ typed_syscall! {
 typed_syscall! {
     pub struct Recvmsg {
         sockfd: i32,
-        msg: Option<AddrMut<libc::msghdr>>,
+        msg: Option<AddrMut<crate::linux_abi::Msghdr>>,
         flags: i32,
     }
 }
@@ -1400,7 +1400,7 @@ typed_syscall! {
 
 typed_syscall! {
     pub struct Sysinfo {
-        info: Option<AddrMut<libc::sysinfo>>,
+        info: Option<AddrMut<crate::linux_abi::Sysinfo>>,
     }
 }
 
@@ -1634,14 +1634,14 @@ typed_syscall! {
 typed_syscall! {
     pub struct SchedSetparam {
         pid: libc::pid_t,
-        param: Option<Addr<libc::sched_param>>,
+        param: Option<Addr<crate::linux_abi::SchedParam>>,
     }
 }
 
 typed_syscall! {
     pub struct SchedGetparam {
         pid: libc::pid_t,
-        param: Option<AddrMut<libc::sched_param>>,
+        param: Option<AddrMut<crate::linux_abi::SchedParam>>,
     }
 }
 
@@ -1649,7 +1649,7 @@ typed_syscall! {
     pub struct SchedSetscheduler {
         pid: libc::pid_t,
         policy: i32,
-        param: Option<Addr<libc::sched_param>>,
+        param: Option<Addr<crate::linux_abi::SchedParam>>,
     }
 }
 
@@ -3204,7 +3204,7 @@ typed_syscall! {
 typed_syscall! {
     pub struct Recvmmsg {
         fd: i32,
-        mmsg: Option<AddrMut<libc::mmsghdr>>,
+        mmsg: Option<AddrMut<crate::linux_abi::Mmsghdr>>,
         vlen: u32,
         flags: u32,
         timeout: Option<Addr<Timespec>>,
@@ -3273,7 +3273,7 @@ typed_syscall! {
 typed_syscall! {
     pub struct Sendmmsg {
         sockfd: i32,
-        msgvec: Option<Addr<libc::msghdr>>,
+        msgvec: Option<Addr<crate::linux_abi::Msghdr>>,
         vlen: u32,
         flags: i32,
     }

@@ -7,7 +7,7 @@ syscalls without manually decoding every register and pointer argument.
 
 ```toml
 [dependencies]
-reverie-syscalls = "0.4"
+reverie-syscalls = "0.5"
 ```
 
 See the [API documentation](https://docs.rs/reverie-syscalls) for supported

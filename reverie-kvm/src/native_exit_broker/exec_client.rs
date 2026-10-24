@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Trusted launcher export/adoption. The environment only locates a descriptor;
 //! the dedicated registered channel and single-use nonce establish the session.
 //! These blocking setup methods must run before guest admission, never in Tool

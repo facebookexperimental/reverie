@@ -6,11 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![allow(
-    unexpected_cfgs,
-    reason = "`fbcode_build` is supplied by the internal Buck build"
-)]
-
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -52,6 +47,15 @@ use super::seccomp;
 use super::stdio::Stdio;
 use super::util::reset_signal_handling;
 use super::util::to_cstring;
+
+mod resource_startup;
+pub use resource_startup::ChildParentResourceStartContext;
+pub use resource_startup::LinuxMonotonicDeadline;
+pub use resource_startup::ParentResourcePublication;
+pub use resource_startup::ParentResourceStartContext;
+pub use resource_startup::ParentResourceStartupFailure;
+pub use resource_startup::ParentResourceStartupPhase;
+pub use resource_startup::ParentResourceStartupResult;
 
 /// A `Container` is a configuration of how a process shall be spawned. It can,
 /// but doesn't have to, include Linux namespace configuration.
@@ -641,6 +645,14 @@ impl Container {
         self
     }
 
+    pub(super) fn validate_pinned_clone(&self) -> Result<(), Errno> {
+        let shared = libc::CLONE_VM | libc::CLONE_FILES | libc::CLONE_VFORK | libc::CLONE_THREAD;
+        if self.namespace.bits() & shared != 0 && self.mounts.iter().any(Mount::has_pinned_source) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
     /// Called by the child process after `clone` to get itself set up for either
     /// `execve` or running an arbitrary function.
     ///
@@ -834,6 +846,7 @@ impl Container {
         F: FnMut() -> T,
         T: Serialize + DeserializeOwned,
     {
+        self.validate_pinned_clone()?;
         let clone_flags = self.namespace.bits() | libc::SIGCHLD;
 
         let uid_map = &make_id_map(&self.uid_map);
@@ -979,6 +992,8 @@ impl Container {
         F: FnMut(S) -> (T, D),
         T: Serialize + DeserializeOwned,
     {
+        self.validate_pinned_clone()
+            .map_err(|error| StartupRunError::BeforeClone(error.into()))?;
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
             .filter(|_| !timeout.is_zero())
@@ -1232,6 +1247,8 @@ impl Container {
     {
         use std::os::fd::AsFd;
         let before = |cause| StartupOwnedFailure::BeforeClone { cause };
+        self.validate_pinned_clone()
+            .map_err(|error| before(error.into()))?;
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
             .filter(|_| !timeout.is_zero())
@@ -1354,6 +1371,8 @@ impl Container {
         T: Serialize,
     {
         let before = |cause| StartupOwnedFailure::BeforeClone { cause };
+        self.validate_pinned_clone()
+            .map_err(|error| before(error.into()))?;
         let mut disposition: libc::sigaction = unsafe { std::mem::zeroed() };
         Errno::result(unsafe {
             libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut disposition)
@@ -1454,6 +1473,7 @@ impl Container {
         F: FnMut() -> (T, D),
         T: Serialize + DeserializeOwned,
     {
+        self.validate_pinned_clone()?;
         let clone_flags = self.namespace.bits() | libc::SIGCHLD;
         let uid_map = &make_id_map(&self.uid_map);
         let gid_map = &make_id_map(&self.gid_map);
@@ -1693,6 +1713,36 @@ const STARTUP_READY: u8 = 2;
 const STARTUP_FAILURE: u8 = 4;
 const STARTUP_FRAME_SIZE: usize = 64;
 
+// GNU and musl use different integer types for ancillary lengths. Keep
+// conversions checked without assuming a particular libc field type.
+fn startup_abi_len<T, U: TryFrom<T>>(value: T) -> Result<U, StartupError> {
+    U::try_from(value).map_err(|_| StartupError::Protocol)
+}
+
+fn startup_rights_lengths(count: usize) -> Result<(u32, u32), StartupError> {
+    // All callers use sixteen aligned words. Reserve a word for worst-case
+    // CMSG alignment; this also proves the bounded CMSG arithmetic fits u32.
+    const {
+        assert!(std::mem::size_of::<usize>() >= std::mem::size_of::<u32>());
+        assert!(
+            MAX_STARTUP_FDS
+                <= (std::mem::size_of::<[usize; 16]>()
+                    - std::mem::size_of::<libc::cmsghdr>()
+                    - std::mem::size_of::<usize>())
+                    / std::mem::size_of::<i32>()
+        );
+    }
+    if count > MAX_STARTUP_FDS {
+        return Err(StartupError::Protocol);
+    }
+    let bytes = count
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(StartupError::Protocol)?;
+    let bytes = startup_abi_len(bytes)?;
+    // SAFETY: the checked count and compile-time capacity bound prevent overflow.
+    Ok(unsafe { (libc::CMSG_SPACE(bytes), libc::CMSG_LEN(bytes)) })
+}
+
 struct StartupSocket {
     fd: Fd,
     deadline: std::time::Instant,
@@ -1755,15 +1805,17 @@ impl StartupSocket {
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
         if fds.len != 0 {
             message.msg_control = ancillary.as_mut_ptr().cast();
-            message.msg_controllen =
-                unsafe { libc::CMSG_SPACE((fds.len * std::mem::size_of::<i32>()) as u32) as usize };
-            assert!(message.msg_controllen <= std::mem::size_of_val(&ancillary));
+            let (space, length) = startup_rights_lengths(fds.len)?;
+            message.msg_controllen = startup_abi_len(space)?;
+            assert!(
+                startup_abi_len::<_, usize>(message.msg_controllen)?
+                    <= std::mem::size_of_val(&ancillary)
+            );
             unsafe {
                 let header = libc::CMSG_FIRSTHDR(&message);
                 (*header).cmsg_level = libc::SOL_SOCKET;
                 (*header).cmsg_type = libc::SCM_RIGHTS;
-                (*header).cmsg_len =
-                    libc::CMSG_LEN((fds.len * std::mem::size_of::<i32>()) as u32) as usize;
+                (*header).cmsg_len = startup_abi_len(length)?;
                 let data = libc::CMSG_DATA(header).cast::<i32>();
                 for index in 0..fds.len {
                     data.add(index)
@@ -1846,10 +1898,12 @@ impl StartupSocket {
             message.msg_iov = &mut iov;
             message.msg_iovlen = 1;
             message.msg_control = ancillary.as_mut_ptr().cast();
-            message.msg_controllen = unsafe {
-                libc::CMSG_SPACE((MAX_STARTUP_FDS * std::mem::size_of::<i32>()) as u32) as usize
-            };
-            assert!(message.msg_controllen <= std::mem::size_of_val(&ancillary));
+            let (space, _) = startup_rights_lengths(MAX_STARTUP_FDS)?;
+            message.msg_controllen = startup_abi_len(space)?;
+            assert!(
+                startup_abi_len::<_, usize>(message.msg_controllen)?
+                    <= std::mem::size_of_val(&ancillary)
+            );
             let size = match Errno::result(unsafe {
                 libc::recvmsg(self.fd.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC)
             }) {
@@ -1864,11 +1918,12 @@ impl StartupSocket {
             unsafe {
                 let mut header = libc::CMSG_FIRSTHDR(&message);
                 while !header.is_null() {
+                    let length: usize = startup_abi_len((*header).cmsg_len)?;
                     if (*header).cmsg_level == libc::SOL_SOCKET
                         && (*header).cmsg_type == libc::SCM_RIGHTS
-                        && (*header).cmsg_len >= libc::CMSG_LEN(0) as usize
+                        && length >= libc::CMSG_LEN(0) as usize
                     {
-                        let bytes = (*header).cmsg_len - libc::CMSG_LEN(0) as usize;
+                        let bytes = length - libc::CMSG_LEN(0) as usize;
                         malformed |= !bytes.is_multiple_of(std::mem::size_of::<i32>());
                         let data = libc::CMSG_DATA(header).cast::<i32>();
                         for index in 0..bytes / std::mem::size_of::<i32>() {
@@ -2801,6 +2856,42 @@ mod tests {
     use nix::sys::signal::sigaction;
 
     use super::*;
+
+    #[test]
+    fn ancillary_abi_lengths_are_checked_and_bounded() {
+        assert_eq!(startup_abi_len::<_, u32>(u32::MAX as usize), Ok(u32::MAX));
+        if let Some(overflow) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(
+                startup_abi_len::<_, u32>(overflow),
+                Err(StartupError::Protocol)
+            );
+        }
+        assert_eq!(
+            startup_rights_lengths(MAX_STARTUP_FDS + 1),
+            Err(StartupError::Protocol)
+        );
+        assert_eq!(
+            startup_rights_lengths(usize::MAX),
+            Err(StartupError::Protocol)
+        );
+        for count in 0..=MAX_STARTUP_FDS {
+            let (space, length) = startup_rights_lengths(count).unwrap();
+            assert!(length <= space);
+            assert!(space as usize <= std::mem::size_of::<[usize; 16]>());
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_controllen = startup_abi_len(space).unwrap();
+            assert_eq!(
+                startup_abi_len::<_, usize>(message.msg_controllen).unwrap(),
+                space as usize
+            );
+            let mut header: libc::cmsghdr = unsafe { std::mem::zeroed() };
+            header.cmsg_len = startup_abi_len(length).unwrap();
+            assert_eq!(
+                startup_abi_len::<_, usize>(header.cmsg_len).unwrap(),
+                length as usize
+            );
+        }
+    }
 
     include!("owned_deferred_tests.rs");
 
@@ -5271,10 +5362,6 @@ mod tests {
         );
     }
 
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: sandcastle-env: needs mount(2) in a fresh user and PID namespace"
-    )]
     #[test]
     fn test_directory_is_available_after_mount() {
         if crate::test_runs_in_own_process() {
@@ -5285,6 +5372,171 @@ mod tests {
             .map_root()
             .mount(Mount::tmpfs("/test").touch_target())
             .run(|| Path::new("/test").is_dir());
+
+        assert_eq!(result, Ok(true));
+    }
+
+    #[test]
+    fn fresh_nested_tmpfs_creates_its_requested_target_and_keeps_flags() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+
+        let outer = tempfile::tempdir().unwrap();
+        let nested = outer.path().join("new-parent/nested");
+        let marker = outer.path().join("host-marker");
+        std::fs::write(&marker, b"must be covered").unwrap();
+        let parent_namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
+        let parent_namespace = (parent_namespace.dev(), parent_namespace.ino());
+        let observed = nested.clone();
+        let flags = super::super::mount::MountFlags::MS_NOSUID
+            | super::super::mount::MountFlags::MS_NODEV
+            | super::super::mount::MountFlags::MS_NOEXEC;
+
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .mount(Mount::tmpfs(outer.path()))
+            .mount(Mount::tmpfs(&nested).touch_target().flags(flags))
+            .run(move || {
+                let namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
+                let directory = std::fs::File::open(&observed).unwrap();
+                let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                assert_eq!(
+                    unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) },
+                    0
+                );
+                let filesystem = unsafe { filesystem.assume_init() };
+                let mounted = nix::sys::statvfs::statvfs(&observed).unwrap();
+                let required = nix::sys::statvfs::FsFlags::ST_NOSUID
+                    | nix::sys::statvfs::FsFlags::ST_NODEV
+                    | nix::sys::statvfs::FsFlags::ST_NOEXEC;
+                (
+                    (namespace.dev(), namespace.ino()) != parent_namespace,
+                    !marker.exists(),
+                    observed.is_dir(),
+                    filesystem.f_type == libc::TMPFS_MAGIC,
+                    mounted.flags().contains(required),
+                    !mounted
+                        .flags()
+                        .contains(nix::sys::statvfs::FsFlags::ST_RDONLY),
+                )
+            });
+
+        assert_eq!(result, Ok((true, true, true, true, true, true)));
+        assert!(
+            !nested.exists(),
+            "child creation must stay in its fresh tmpfs"
+        );
+    }
+
+    #[test]
+    fn fresh_nested_tmpfs_without_touch_refuses_a_missing_target() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let outer = tempfile::tempdir().unwrap();
+        let nested = outer.path().join("missing");
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .mount(Mount::tmpfs(outer.path()))
+            .mount(Mount::tmpfs(&nested))
+            .run(|| 42);
+
+        assert_eq!(
+            result,
+            Err(RunError::Spawn(Error::new(Errno::ENOENT, Context::Mount)))
+        );
+        assert!(!nested.exists());
+    }
+
+    #[test]
+    fn fresh_tmpfs_touch_refuses_a_regular_file_target() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let target = outer.path().join("file");
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .mount(Mount::tmpfs(outer.path()))
+            .mount(Mount::bind(source.path(), &target).touch_target())
+            .mount(Mount::tmpfs(&target).touch_target())
+            .run(|| 42);
+
+        assert_eq!(
+            result,
+            Err(RunError::Spawn(Error::new(Errno::ENOTDIR, Context::Mount)))
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn fresh_tmpfs_touch_refuses_symlink_parents_without_creating_through_them() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("destination");
+        let link = parent.path().join("link");
+        std::fs::create_dir(&destination).unwrap();
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+        let target = link.join("missing");
+        let observed = destination.join("missing");
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .run(move || {
+                let result = Mount::tmpfs(&target).touch_target().mount();
+                (result, observed.exists())
+            });
+
+        assert_eq!(result, Ok((Err(Errno::ELOOP), false)));
+        assert!(!destination.join("missing").exists());
+    }
+
+    #[test]
+    fn tmpfs_touch_does_not_create_targets_for_other_mount_operations() {
+        if crate::test_runs_in_own_process() {
+            return;
+        }
+        use super::super::mount::MountFlags;
+
+        let outer = tempfile::tempdir().unwrap();
+        let target = outer.path().join("missing");
+        let result = Container::new()
+            .unshare(Namespace::USER | Namespace::MOUNT)
+            .map_root()
+            .mount(Mount::new("/").rprivate())
+            .mount(Mount::tmpfs(outer.path()))
+            .run(move || {
+                for flag in [
+                    MountFlags::MS_BIND,
+                    MountFlags::MS_MOVE,
+                    MountFlags::MS_REMOUNT,
+                    MountFlags::MS_SHARED,
+                    MountFlags::MS_PRIVATE,
+                    MountFlags::MS_SLAVE,
+                    MountFlags::MS_UNBINDABLE,
+                    MountFlags::MS_REC,
+                ] {
+                    let result = Mount::tmpfs(&target).touch_target().flags(flag).mount();
+                    assert!(
+                        result.is_err(),
+                        "missing target unexpectedly mounted: {flag:?}"
+                    );
+                    assert!(!target.exists(), "operation created a target: {flag:?}");
+                }
+                true
+            });
 
         assert_eq!(result, Ok(true));
     }

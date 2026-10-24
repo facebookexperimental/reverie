@@ -40,7 +40,7 @@ mod entry_main_tests {
         let load = |counter: &AtomicUsize| counter.load(Ordering::SeqCst);
         Counts {
             shared_fd: load(&probe.shared_fd_accesses),
-            masks: load(&probe.prepare.mask_installs),
+            masks: load(&probe.prepare.activations),
             untracked: load(&probe.untracked_runs),
             tracked: load(&probe.tracked_runs),
             begins: load(&probe.clock_begins),
@@ -483,9 +483,9 @@ mod entry_main_tests {
                 .run_static_elf_with_tool_completion::<EntryTool>(config, false)
                 .await?;
             drop(completion.global_state);
-            completion.result.map(|(code, stdout, stderr)| {
+            completion.result.map(|(status, stdout, stderr)| {
                 assert!(stdout.is_empty() && stderr.is_empty());
-                code
+                conventional_exit_code(status)
             })
         } else {
             let global = backend

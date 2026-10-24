@@ -3063,6 +3063,13 @@ struct RetainedProcStatus {
 /// pathname. Successful signal0 is not required for parent-owned waits:
 /// signal permission and wait authority have different kernel checks. A
 /// denied signal, including a seccomp-synthesized EPERM, proves no lifetime.
+///
+/// Each call opens, reads and closes `status` afresh. Do not keep the file
+/// and reread it with `pread` or `lseek`: the tracer thread runs this, may be
+/// under a seccomp filter that kills its process at a syscall main does not
+/// make, and reverie-ptrace's injected_syscall_group_stop tests hold it to
+/// main's syscalls. Such a filter killed a `pread` reread
+/// (https://github.com/rrnewton/reverie/issues/970).
 fn retained_proc_status(directory: RawFd) -> Result<RetainedProcStatus, Errno> {
     let _open = launch_window::TransientOpen::begin();
     let raw = unsafe {
@@ -3083,15 +3090,11 @@ fn retained_proc_status(directory: RawFd) -> Result<RetainedProcStatus, Errno> {
     if count < 0 {
         return Err(Errno::last());
     }
-    parse_retained_proc_status(&bytes[..count as usize])
-}
-
-fn parse_retained_proc_status(bytes: &[u8]) -> Result<RetainedProcStatus, Errno> {
     // Name can contain arbitrary comm bytes. Decode only the kernel's ASCII
     // identity lines, so a later PR_SET_NAME cannot revoke an established
     // wait authority. proc_task_name escapes embedded newlines in Name.
     let field = |name: &str| {
-        let line = bytes
+        let line = bytes[..count as usize]
             .split(|byte| *byte == b'\n')
             .find(|line| line.starts_with(name.as_bytes()))
             .ok_or(Errno::EIO)?;
@@ -3103,31 +3106,6 @@ fn parse_retained_proc_status(bytes: &[u8]) -> Result<RetainedProcStatus, Errno>
         tgid: field("Tgid:")?,
         tracer_pid: field("TracerPid:")?,
     })
-}
-
-/// Every positional read starts at zero. proc status uses seq_read_iter,
-/// which resets its iterator and buffered count at that position and runs
-/// show again, including after a partial read. This retains an open file,
-/// never its prior contents; attachment must remain fresh on every poll.
-fn pread_retained_proc_status(status: RawFd) -> Result<RetainedProcStatus, Errno> {
-    let mut bytes = [0u8; 8192];
-    let count = unsafe { libc::pread(status, bytes.as_mut_ptr().cast(), bytes.len(), 0) };
-    if count < 0 {
-        return Err(Errno::last());
-    }
-    parse_retained_proc_status(&bytes[..count as usize])
-}
-
-fn open_optional_status(directory: RawFd) -> Option<OwnedFd> {
-    let _open = launch_window::TransientOpen::begin();
-    let raw = unsafe {
-        libc::openat(
-            directory,
-            c"status".as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    (raw >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 /// The real parent's TGID is needed only when a new explicit wait interface
@@ -3178,9 +3156,6 @@ struct WorkerIdentity {
     proc_key: ProcDirectoryKey,
     numeric_name: std::ffi::CString,
     proc_root: Option<Arc<AlignedProcfs>>,
-    /// Optional original status file. Every use regenerates current contents
-    /// with pread0; acquisition and read failures take the directory reader.
-    status_fd: Option<OwnedFd>,
 }
 
 impl WorkerIdentity {
@@ -3265,7 +3240,6 @@ impl WorkerIdentity {
             return Err(Errno::ESRCH);
         }
 
-        let status_fd = open_optional_status(proc_dir.as_raw_fd());
         Ok(Self {
             pid,
             snapshot: after,
@@ -3275,7 +3249,6 @@ impl WorkerIdentity {
             proc_key,
             numeric_name: std::ffi::CString::new(pid.as_raw().to_string()).expect("decimal pid"),
             proc_root,
-            status_fd,
         })
     }
 
@@ -3292,13 +3265,7 @@ impl WorkerIdentity {
     /// Reads current attachment state through the retained proc directory,
     /// rather than through a routing number or the capture-time snapshot.
     fn current_tracer_pid(&self) -> Result<Pid, Errno> {
-        let status = self
-            .status_fd
-            .as_ref()
-            .and_then(|fd| pread_retained_proc_status(fd.as_raw_fd()).ok())
-            .filter(|status| status.pid == self.pid && status.tgid == self.snapshot.tgid)
-            .map(Ok)
-            .unwrap_or_else(|| retained_proc_status(self.proc_dir.as_raw_fd()))?;
+        let status = retained_proc_status(self.proc_dir.as_raw_fd())?;
         if status.pid != self.pid || status.tgid != self.snapshot.tgid {
             return Err(Errno::ESRCH);
         }
@@ -4065,7 +4032,12 @@ fn try_consume_legacy_status(
     match result {
         Ok(Some(status)) => {
             if terminal {
-                debug_assert_eq!(status, observed, "reaped a different terminal status");
+                // Terminal, but not necessarily `observed`: see
+                // `reaped_status_follows_a_later_group_exit`.
+                debug_assert!(
+                    libc::WIFEXITED(status) || libc::WIFSIGNALED(status),
+                    "reaped a nonterminal status after a terminal observation"
+                );
             } else {
                 debug_assert!(libc::WIFSTOPPED(status), "stop-only wait reaped a task");
             }
@@ -4118,7 +4090,12 @@ fn wait_thread_consuming(pid: Pid, handle: &ThreadHandle, event: &Event) -> Resu
             loop {
                 return match handle.wait_status(reap) {
                     Ok(Some(reaped)) => {
-                        debug_assert_eq!(reaped, status, "reaped a different terminal status");
+                        // Terminal, but not necessarily `status`: see
+                        // `reaped_status_follows_a_later_group_exit`.
+                        debug_assert!(
+                            libc::WIFEXITED(reaped) || libc::WIFSIGNALED(reaped),
+                            "reaped a nonterminal status after a terminal observation"
+                        );
                         Ok(reaped)
                     }
                     Ok(None) => unreachable!("observed terminal status is not reapable"),
@@ -6066,6 +6043,42 @@ impl StoppedObservation {
     }
 }
 
+impl EventHandle {
+    /// The bound thread's stat flags (field 9), read through its retained
+    /// proc directory, so they describe this exact generation; `None` without
+    /// a captured identity, or when the identity is bound to another PID.
+    pub(super) fn bound_stat_flags(&self, pid: Pid) -> Option<Result<u32, ProcStatError>> {
+        #[cfg(test)]
+        if let Some(error) = BOUND_STAT_FLAGS_ERROR_FOR_TEST.with(|slot| slot.borrow().clone()) {
+            return Some(Err(error));
+        }
+        self.identity()
+            .filter(|identity| identity.pid == pid)
+            .map(|identity| read_bound_stat_flags(identity))
+    }
+
+    /// Whether the bound thread's retained pidfd still names a live task;
+    /// `None` without a captured identity bound to `pid`.
+    pub(super) fn bound_pidfd_live(&self, pid: Pid) -> Option<Result<bool, Errno>> {
+        #[cfg(test)]
+        if let Some(live) = BOUND_PIDFD_LIVE_FOR_TEST.with(std::cell::Cell::get) {
+            return Some(live);
+        }
+        self.identity()
+            .filter(|identity| identity.pid == pid)
+            .map(|identity| identity.pidfd_is_live())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes `EventHandle::bound_stat_flags` fail with this error, on this
+    /// thread only.
+    pub(super) static BOUND_STAT_FLAGS_ERROR_FOR_TEST: std::cell::RefCell<Option<ProcStatError>> = const { std::cell::RefCell::new(None) };
+    /// Makes `EventHandle::bound_pidfd_live` answer this, on this thread only.
+    pub(super) static BOUND_PIDFD_LIVE_FOR_TEST: std::cell::Cell<Option<Result<bool, Errno>>> = const { std::cell::Cell::new(None) };
+}
+
 fn read_bound_stat_flags(identity: &WorkerIdentity) -> Result<u32, ProcStatError> {
     let _open = launch_window::TransientOpen::begin();
     let raw = unsafe {
@@ -7714,6 +7727,7 @@ impl TerminalCleanup {
 mod test {
     include!("adaptive_api_tests.rs");
     include!("managed_native_tests.rs");
+    include!("exit_probe_tests.rs");
     include!("stop_auth_cache_tests.rs");
     include!("retired_tid_tests.rs");
     include!("legacy_thread_tests.rs");
@@ -7721,6 +7735,7 @@ mod test {
     include!("ptracer_thread_tests.rs");
     include!("attachment_generation_tests.rs");
     include!("stop_observation_tests.rs");
+    include!("group_exit_status_tests.rs");
     include!("retirement_ack_tests.rs");
     include!("completion_wakeup_tests.rs");
     include!("native_final_wait_tests.rs");

@@ -1,0 +1,47 @@
+# The ledger for environment centos-9-glibc2.34 (run.sh names this host's: os id, os version, glibc).
+# Measured with `reverie-examples/e2e/run.sh --write-ledger` on a CentOS Stream 9 devserver (glibc
+# 2.34), all seven backends; two runs gave identical rows. A row names a program's first difference
+# only. cell<TAB>backend<TAB>verdict<TAB>signature<TAB>issue (full URL); * for any cell or signature.
+# Until their own issues are filed, the rows link the audit's tracking issue.
+#
+# ptrace: the tool never sees the rt_sigreturn that ends a signal handler.
+sh-fork	ptrace	mismatch	rt_sigreturn=ok -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-pipe	ptrace	mismatch	rt_sigreturn=ok -> rt_sigprocmask=ok	https://github.com/rrnewton/hermit/issues/4485
+# ptrace: a read returns a different byte count; most likely /proc/self/maps, where reverie-ptrace's
+# private pages show (the cause Hermit's pinned-root ledger found for grep).
+grep-passwd	ptrace	mismatch	read=4067 -> read=4068	https://github.com/rrnewton/hermit/issues/4485
+awk	ptrace	mismatch	read=4057 -> read=4036	https://github.com/rrnewton/hermit/issues/4485
+# KVM: rseq answers ENOSYS (reverie-kvm refuses it), the first difference on every program.
+*	kvm	mismatch	rseq=ok -> rseq=ENOSYS	https://github.com/rrnewton/hermit/issues/4485
+# liteinst: the tool lives in the example preload and starts after the loader's calls (compare.rs,
+# LATE_START). Then: the preload's two descriptors move the program's (openat/creat=3 -> 5); the
+# shell's getrandom is not seen by the tool; awk's fcntl(F_GETFL) lacks O_LARGEFILE; dd's and perl's
+# first visible calls do not appear in the native record in order (no aligned start).
+*	liteinst	mismatch	openat=3 -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+sh-builtin	liteinst	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
+sh-fork	liteinst	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
+sh-pipe	liteinst	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
+awk	liteinst	mismatch	fcntl=32769 -> fcntl=1	https://github.com/rrnewton/hermit/issues/4485
+dd-zero	liteinst	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+perl	liteinst	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+# in-guest-trap: the tool lives in the example preload and starts after the loader's calls (compare.rs,
+# LATE_START). Then: the preload's two descriptors move the program's (openat/creat=3 -> 5); the
+# shell's getrandom is not seen by the tool; awk's fcntl(F_GETFL) lacks O_LARGEFILE; dd's and perl's
+# first visible calls do not appear in the native record in order (no aligned start).
+*	in-guest-trap	mismatch	openat=3 -> openat=5	https://github.com/rrnewton/hermit/issues/4485
+sh-builtin	in-guest-trap	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
+sh-fork	in-guest-trap	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
+sh-pipe	in-guest-trap	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/rrnewton/hermit/issues/4485
+awk	in-guest-trap	mismatch	fcntl=32769 -> fcntl=1	https://github.com/rrnewton/hermit/issues/4485
+dd-zero	in-guest-trap	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+perl	in-guest-trap	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+# e9patch's direct path hosts a tool only in a program whose own executable makes syscalls; the
+# corpus's programs make theirs through libc.
+*	e9patch	no_result	recorder exit status: 1: Error: direct e9patch Tool hosting requires at least one recovered syscall site	https://github.com/rrnewton/hermit/issues/4485
+# DBT: DynamoRIO runs with -disable_rseq, so rseq answers ENOSYS. (The runtime's GlobalState connection
+# no longer takes the program's first descriptor: reverie-dbt reserves it before the program runs.)
+*	dbt	mismatch	rseq=ok -> rseq=ENOSYS	https://github.com/rrnewton/hermit/issues/4485
+# SaBRe: before the program's first call the tool sees a getrandom the program never makes (on this glibc,
+# which makes the call where a newer one reads the vDSO), so no start aligns: most likely the plugin's
+# own call through libc's rewritten site.
+*	sabre	mismatch	(no aligned start) -> getrandom=ok	https://github.com/rrnewton/hermit/issues/4485

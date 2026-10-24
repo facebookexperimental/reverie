@@ -30,18 +30,16 @@ fn classify_shared_mmap_file(
 ) -> crate::Result<()> {
     if state.proc_files.contains_key(&fd)
         || state.fdinfo_files.contains_key(&fd)
-        || state.random_device_fds.contains(&fd)
         || (capture_output && output_alias(state, fd).is_some())
     {
         return Err(unsupported_mmap("synthetic or captured backing"));
     }
     let path = canonical_fd_path(file.as_raw_fd())
         .map_err(|_| unsupported_mmap("cannot classify retained file backing"))?;
-    // Same deny-only predicate as ordinary syncfs. This also catches virtual
-    // files and received private descriptions whose side-table identity was
-    // lost. It does not adopt the authentication protocol of PR610.
+    // Same deny-only predicate as ordinary syncfs. This also catches received
+    // private descriptions whose side-table identity was lost. It does not adopt the authentication protocol of PR610.
     // https://github.com/rrnewton/reverie/pull/610
-    if syncfs_private_memfd_name(path.as_os_str().as_bytes(), state.host_metadata_timestamps) {
+    if syncfs_private_memfd_name(path.as_os_str().as_bytes()) {
         return Err(unsupported_mmap("reserved private memfd backing"));
     }
     if capture_output {
@@ -71,13 +69,13 @@ pub(super) fn mmap_with_shared_files(
     capture_output: bool,
     allocation: AllocationGuard<'_>,
 ) -> crate::Result<i64> {
-    // Preserve the random device's earlier ABI checks. Its existing mmap path
-    // always refuses before reservation/zeroing, including MAP_FIXED; calling
-    // it cannot overwrite a currently shared ordinary file.
-    if args[3] & libc::MAP_ANONYMOUS as u64 == 0
-        && let Some(random) = state.random_device_descriptions.get(&(args[4] as i32))
-    {
-        return Ok(random_device_mmap(memory, state, args, random));
+    // x86-64's sys_mmap refuses an unaligned offset before anything else,
+    // for an anonymous mapping too.
+    if !args[5].is_multiple_of(PAGE_SIZE) {
+        return Ok(negative_errno(libc::EINVAL));
+    }
+    if let Some(error) = super::non_regular_mmap_early_refusal(state, args) {
+        return Ok(error);
     }
     if args[1] == 0 {
         return Ok(negative_errno(libc::EINVAL));
@@ -86,27 +84,44 @@ pub(super) fn mmap_with_shared_files(
     let is_anonymous = flags & libc::MAP_ANONYMOUS as u64 != 0;
     let is_private = flags & libc::MAP_PRIVATE as u64 != 0;
     let is_shared = flags & libc::MAP_SHARED as u64 != 0;
-    let allowed_protection = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-    if args[2] & !allowed_protection != 0 || (!is_private && !is_shared) {
-        return Ok(negative_errno(libc::EINVAL));
-    }
+    // mmap ignores protection bits other than read, write and execute.
+    let prot = args[2] & super::MMAP_PROT_BITS;
     let Some(length) = align_up(args[1], PAGE_SIZE) else {
         return Ok(negative_errno(libc::ENOMEM));
     };
-    let fixed = flags & libc::MAP_FIXED as u64 != 0;
-    if fixed && !args[0].is_multiple_of(PAGE_SIZE) {
-        return Ok(negative_errno(libc::EINVAL));
-    }
-    if !is_anonymous && !args[5].is_multiple_of(PAGE_SIZE) {
-        return Ok(negative_errno(libc::EINVAL));
+    // MAP_FIXED_NOREPLACE places as MAP_FIXED does and refuses an occupied
+    // range (EEXIST) rather than replace it.
+    let noreplace = flags & libc::MAP_FIXED_NOREPLACE as u64 != 0;
+    let fixed = flags & libc::MAP_FIXED as u64 != 0 || noreplace;
+    if let Some(errno) = super::fixed_mapping_address_error(fixed, args[0], length) {
+        return Ok(negative_errno(errno));
     }
     if !is_anonymous && signalfd_mask(state, args[4] as libc::c_int).is_some() {
         return Ok(negative_errno(libc::ENODEV));
     }
-    let address = if fixed {
-        args[0]
+    let kind = if is_anonymous {
+        super::MappingKind::Anonymous
     } else {
-        let Some(address) = find_mmap_address(memory, state, length) else {
+        match state
+            .files
+            .get(&(args[4] as libc::c_int))
+            .map(std::fs::File::metadata)
+        {
+            Some(Ok(metadata)) if metadata.is_file() => super::MappingKind::RegularFile(args[5]),
+            _ => super::MappingKind::Other,
+        }
+    };
+    // A MAP_FIXED address is a user address; the bookkeeping below is by
+    // physical address, and the result is the user address.
+    let address = if fixed {
+        let Some(address) = memory.user_range_to_guest(args[0], length) else {
+            return Ok(negative_errno(libc::ENOMEM));
+        };
+        address
+    } else {
+        let map_32bit = args[3] & libc::MAP_32BIT as u64 != 0;
+        let Some(address) = super::place_mapping(memory, state, length, args[0], kind, map_32bit)
+        else {
             return Ok(negative_errno(libc::ENOMEM));
         };
         address
@@ -114,22 +129,34 @@ pub(super) fn mmap_with_shared_files(
     let Some(end) = address.checked_add(length) else {
         return Ok(negative_errno(libc::ENOMEM));
     };
+    if noreplace && let Some(errno) = super::noreplace_error(memory, state, args, address, end) {
+        return Ok(negative_errno(errno));
+    }
     if address < BOOT_RESERVED_END || end > state.mmap_limit {
         return Ok(negative_errno(libc::ENOMEM));
+    }
+    // An unknown mapping type is refused only after placement, as in do_mmap;
+    // for an object that is not a regular file the object probe answers it.
+    if !matches!(kind, super::MappingKind::Other) && !is_private && !is_shared {
+        return Ok(negative_errno(libc::EINVAL));
     }
     let Ok(length) = usize::try_from(length) else {
         return Ok(negative_errno(libc::ENOMEM));
     };
     let ordinary_shared = !is_anonymous && is_shared;
-    let replaces_file = memory.range_contains_shared_file(address, length);
-    if is_anonymous && is_shared && replaces_file {
+    if is_anonymous && is_shared && memory.range_contains_shared_file(address, length) {
         // Retiring the last ordinary file releases its single-vCPU domain.
-        // A shared anonymous replacement would then need separate fork-sharing
-        // ownership; a private replacement must not silently stand in for it.
+        // This bounded path does not establish that replacing a file view by
+        // shared anonymous memory preserves every guarantee of that domain.
         return Err(unsupported_mmap(
             "shared anonymous replacement requires independent fork-sharing ownership",
         ));
     }
+    // Replacing a fork-shared anonymous view by shared anonymous memory gets
+    // fresh private backing marked shared; the next fork moves it into its own
+    // shmem object, as for a new shared anonymous mapping (see
+    // `GuestMemory::share_anonymous_memory_for_fork`).
+    let replaces_file = memory.range_contains_retained_shared(address, length);
     if !ordinary_shared && !replaces_file {
         // This branch cannot zero an outgoing file view. Keep the existing
         // private/anonymous personality, including its flag and errno rules.
@@ -139,16 +166,18 @@ pub(super) fn mmap_with_shared_files(
         return Ok(result);
     }
 
-    // These ignored compatibility flags require no extra VM semantics. Other
-    // flags (locking, population, huge pages, grows-down, NOREPLACE, and so on)
+    // These ignored compatibility flags require no extra VM semantics, and
+    // MAP_FIXED_NOREPLACE's range is vacant by now, so it maps as MAP_FIXED.
+    // Other flags (locking, population, huge pages, grows-down, and so on)
     // require their own faithful implementation before file-view replacement.
     let supported_flags = (libc::MAP_PRIVATE
         | libc::MAP_SHARED
         | libc::MAP_FIXED
+        | libc::MAP_FIXED_NOREPLACE
         | libc::MAP_ANONYMOUS
         | libc::MAP_DENYWRITE
         | libc::MAP_EXECUTABLE) as u64;
-    let writable = args[2] & libc::PROT_WRITE as u64 != 0;
+    let writable = prot & libc::PROT_WRITE as u64 != 0;
     let mut cursors = AllocationCursors::from_elf(state);
     if !fixed {
         cursors.mmap_next = cursors.mmap_next.max(end);
@@ -165,6 +194,23 @@ pub(super) fn mmap_with_shared_files(
         };
         if status & libc::O_PATH != 0 {
             return Ok(negative_errno(libc::EBADF));
+        }
+        let mode = match file_mode(file) {
+            Ok(mode) => mode,
+            Err(error) => return Ok(error),
+        };
+        if mode & libc::S_IFMT != libc::S_IFREG {
+            // The object's own refusal (mapping type and flag validation,
+            // access mode, a missing mmap operation) is the host kernel's, in
+            // its order. One the kernel maps is beyond this path, which shares
+            // only regular files: it ends the run with the capability refusal,
+            // and the probe's mapping is already gone.
+            if let Some(error) = super::host_mmap_probe(file.as_raw_fd(), args) {
+                return Ok(error);
+            }
+            return Err(unsupported_mmap(
+                "only ordinary regular files are supported",
+            ));
         }
         if !matches!(status & libc::O_ACCMODE, libc::O_RDONLY | libc::O_RDWR)
             || (writable && status & libc::O_ACCMODE != libc::O_RDWR)
@@ -186,22 +232,13 @@ pub(super) fn mmap_with_shared_files(
         if writable && sealed_write {
             return Ok(negative_errno(libc::EPERM));
         }
-        let mode = match file_mode(file) {
-            Ok(mode) => mode,
-            Err(error) => return Ok(error),
-        };
-        if mode & libc::S_IFMT != libc::S_IFREG {
-            return Err(unsupported_mmap(
-                "only ordinary regular files are supported",
-            ));
-        }
         classify_shared_mmap_file(state, fd, file, capture_output)?;
         if flags & !supported_flags != 0 {
             return Err(unsupported_mmap(
                 "mapping flags need unsupported file-view semantics",
             ));
         }
-        if args[2] & libc::PROT_EXEC as u64 != 0 {
+        if prot & libc::PROT_EXEC as u64 != 0 {
             return Err(unsupported_mmap(
                 "executable file views require host noexec validation",
             ));
@@ -225,7 +262,7 @@ pub(super) fn mmap_with_shared_files(
                 length,
                 file,
                 offset: args[5],
-                readable: args[2] != libc::PROT_NONE as u64,
+                readable: prot != libc::PROT_NONE as u64,
                 writable,
                 max_writable: status & libc::O_ACCMODE == libc::O_RDWR && !sealed_write,
                 cursors: Some(cursors),
@@ -238,6 +275,11 @@ pub(super) fn mmap_with_shared_files(
             let Some(file) = state.files.get(&(args[4] as libc::c_int)) else {
                 return Ok(negative_errno(libc::EBADF));
             };
+            if !matches!(kind, super::MappingKind::RegularFile(_))
+                && let Some(error) = super::host_mmap_probe(file.as_raw_fd(), args)
+            {
+                return Ok(error);
+            }
             let mut bytes = vec![0; length];
             let mut count = 0;
             while count < length {
@@ -266,13 +308,19 @@ pub(super) fn mmap_with_shared_files(
                 address,
                 length,
                 contents: file_bytes.as_deref(),
-                permissions: Some((args[2] != libc::PROT_NONE as u64, writable)),
+                permissions: Some((prot != libc::PROT_NONE as u64, writable)),
                 cursors: Some(cursors),
             },
         )?;
     }
+    memory.record_page_backing(
+        address,
+        length as u64,
+        kind.file_offset(),
+        is_anonymous && is_shared,
+    );
     state.mmap_next = cursors.mmap_next;
-    Ok(address as i64)
+    Ok(memory.physical_to_user(address).unwrap_or(address) as i64)
 }
 
 /// Preserve legacy invalid-argument precedence before a valid file history
@@ -281,6 +329,7 @@ pub(super) fn remap_requires_shared_capability(
     memory: &GuestMemory,
     state: &LoadedStaticElf,
     args: &[u64; 6],
+    contains: fn(&GuestMemory, u64, usize) -> bool,
 ) -> bool {
     let Some(old_length) = align_up(args[1], PAGE_SIZE) else {
         return false;
@@ -296,25 +345,37 @@ pub(super) fn remap_requires_shared_capability(
         || !args[0].is_multiple_of(PAGE_SIZE)
         || flags & !allowed != 0
         || (fixed && flags & libc::MREMAP_MAYMOVE as u64 == 0)
-        || !range_is_valid(memory, args[0], old_length)
-        || !memory.user_range_is_mapped(args[0], old_length)
+        || !range_is_valid(&ProviderMemory(memory), args[0], old_length)
     {
         return false;
     }
+    // The source and destination are user addresses (a window's, in Linux's
+    // layout); the mapping metadata below is by physical address.
+    let Some(source) = memory.user_range_to_guest(args[0], old_length) else {
+        return false;
+    };
+    if !memory.user_range_is_mapped(source, old_length) {
+        return false;
+    }
+    let mut destination = None;
     if fixed {
-        let Some(end) = args[4].checked_add(new_length) else {
+        if !args[4].is_multiple_of(PAGE_SIZE) {
+            return false;
+        }
+        let Some(start) = memory.user_range_to_guest(args[4], new_length) else {
             return false;
         };
-        if args[4] < BOOT_RESERVED_END
-            || !args[4].is_multiple_of(PAGE_SIZE)
+        let end = start + new_length;
+        if start < BOOT_RESERVED_END
             || end > state.mmap_limit
-            || (args[4] < args[0] + old_length && args[0] < end)
+            || (start < source + old_length && source < end)
         {
             return false;
         }
+        destination = Some(start);
     }
-    memory.range_contains_shared_file(args[0], old_length as usize)
-        || (fixed && memory.range_contains_shared_file(args[4], new_length as usize))
+    contains(memory, source, old_length as usize)
+        || destination.is_some_and(|start| contains(memory, start, new_length as usize))
 }
 
 #[cfg(test)]
@@ -528,7 +589,7 @@ mod tests {
     #[test]
     fn shared_mmap_capability_refusals_preserve_target_and_descriptor_precedence() {
         let (mut memory, mut state) = setup();
-        state.files.insert(3, backing(c"reverie-kvm-virtual"));
+        state.files.insert(3, backing(c"reverie-kvm-proc"));
         state.files.insert(4, backing(c"shared-map-ordinary"));
         let address = state.mmap_base;
         memory.write(address, &[0x5a; 32]).unwrap();
@@ -580,5 +641,142 @@ mod tests {
             Err(crate::Error::SharedFileCapability { .. })
         ));
         assert_eq!(bytes(&memory, address, 32), [0x5a; 32]);
+    }
+
+    /// What the host kernel answers when `path`, opened with `open_flags`, is
+    /// mapped natively: zero for a mapping, or the negative errno of its
+    /// refusal.
+    fn native_mmap_result(
+        path: &str,
+        open_flags: libc::c_int,
+        length: u64,
+        flags: libc::c_int,
+    ) -> i64 {
+        let name = CString::new(path).unwrap();
+        // SAFETY: name is NUL-terminated; the descriptor is closed below.
+        let fd = unsafe { libc::open(name.as_ptr(), open_flags | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "{path}");
+        // SAFETY: a kernel-placed mapping of a live descriptor, unmapped below.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length as usize,
+                libc::PROT_READ,
+                flags,
+                fd,
+                0,
+            )
+        };
+        let result = if mapped == libc::MAP_FAILED {
+            io_error(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: the mapping above is `length` bytes and is not used again.
+            assert_eq!(unsafe { libc::munmap(mapped, length as usize) }, 0);
+            0
+        };
+        // SAFETY: fd is owned here.
+        unsafe { libc::close(fd) };
+        result
+    }
+
+    /// The executor copies a mapped file's bytes into guest memory, which
+    /// would succeed for any object read(2) reads. For an object that is not a
+    /// regular file, every refusal is the host kernel's, in its order: the
+    /// O_PATH lookup (EBADF, even for a zero length), MAP_HUGETLB outside
+    /// hugetlbfs (EINVAL), MAP_SHARED_VALIDATE's unknown flags (EOPNOTSUPP),
+    /// the access mode (EACCES) and a missing mmap operation (ENODEV). A
+    /// refusal leaves guest memory and the mmap cursor unchanged, MAP_FIXED
+    /// included. An accepted private mapping keeps the copy (zeros, for
+    /// /dev/zero); an accepted shared one remains the named capability
+    /// refusal.
+    #[test]
+    fn non_regular_file_mmap_follows_the_host_kernel() {
+        // Linux's random devices have no mmap operation.
+        assert_eq!(
+            native_mmap_result("/dev/urandom", libc::O_RDONLY, PAGE_SIZE, libc::MAP_PRIVATE),
+            negative_errno(libc::ENODEV)
+        );
+        let cases = [
+            (libc::O_RDONLY, libc::MAP_PRIVATE, PAGE_SIZE),
+            (libc::O_RDONLY, libc::MAP_SHARED, PAGE_SIZE),
+            (
+                libc::O_RDONLY,
+                libc::MAP_PRIVATE | libc::MAP_HUGETLB,
+                PAGE_SIZE,
+            ),
+            (
+                libc::O_RDONLY,
+                libc::MAP_SHARED_VALIDATE | libc::MAP_SYNC,
+                PAGE_SIZE,
+            ),
+            (libc::O_WRONLY, libc::MAP_PRIVATE, PAGE_SIZE),
+            (libc::O_WRONLY, libc::MAP_SHARED, PAGE_SIZE),
+            (libc::O_PATH, libc::MAP_PRIVATE, PAGE_SIZE),
+            (libc::O_PATH, libc::MAP_PRIVATE, 0),
+        ];
+        for path in ["/dev/urandom", "/dev/random", "/dev/null", "/dev/zero", "/"] {
+            for (open_flags, flags, length) in cases {
+                if path == "/" && open_flags == libc::O_WRONLY {
+                    continue;
+                }
+                let (mut memory, mut state) = setup();
+                let name = CString::new(path).unwrap();
+                // SAFETY: name is NUL-terminated; the File owns the descriptor.
+                let fd = unsafe { libc::open(name.as_ptr(), open_flags | libc::O_CLOEXEC) };
+                assert!(fd >= 0, "{path}");
+                // SAFETY: open returned this newly owned descriptor.
+                state
+                    .files
+                    .insert(3, unsafe { std::fs::File::from_raw_fd(fd) });
+                let address = state.mmap_base;
+                memory.write(address, &[0x5a; 32]).unwrap();
+                let before = state.mmap_next;
+                let args = [0, length, libc::PROT_READ as u64, flags as u64, 3, 0];
+                let result = call(&mut memory, &mut state, args, false);
+                let native = native_mmap_result(path, open_flags, length, flags);
+                let label = format!("{path} open={open_flags:#x} flags={flags:#x} length={length}");
+                if native < 0 {
+                    assert_eq!(result.unwrap(), native, "{label}");
+                    assert_eq!(bytes(&memory, address, 32), [0x5a; 32], "{label}");
+                    assert_eq!(state.mmap_next, before, "{label}");
+                } else if flags & libc::MAP_TYPE == libc::MAP_PRIVATE {
+                    let mapped = result.unwrap();
+                    assert!(mapped > 0, "{label}: {mapped}");
+                    let mapped = memory
+                        .user_range_to_guest(mapped as u64, PAGE_SIZE)
+                        .unwrap();
+                    assert_eq!(bytes(&memory, mapped, 32), [0; 32], "{label}");
+                } else {
+                    assert!(
+                        matches!(result, Err(crate::Error::SharedFileCapability { .. })),
+                        "{label}"
+                    );
+                }
+                assert!(!memory.contains_shared_file(), "{label}");
+            }
+        }
+        // A refused MAP_FIXED mapping leaves the bytes it would have replaced.
+        for flags in [libc::MAP_PRIVATE, libc::MAP_SHARED] {
+            let (mut memory, mut state) = setup();
+            state
+                .files
+                .insert(3, std::fs::File::open("/dev/urandom").unwrap());
+            let address = state.mmap_base;
+            memory.write(address, &[0x5a; 32]).unwrap();
+            let args = [
+                address,
+                PAGE_SIZE,
+                libc::PROT_READ as u64,
+                (flags | libc::MAP_FIXED) as u64,
+                3,
+                0,
+            ];
+            assert_eq!(
+                call(&mut memory, &mut state, args, false).unwrap(),
+                negative_errno(libc::ENODEV),
+                "flags={flags:#x}"
+            );
+            assert_eq!(bytes(&memory, address, 32), [0x5a; 32], "flags={flags:#x}");
+        }
     }
 }

@@ -10,10 +10,16 @@
 # exact Tool path. Keep the internal target synchronized before the next export.
 # PR-491 adds the parallel_tasks standalone program to the OSS Cargo build and
 # validation. Keep the internal target synchronized before the next export.
+# The cross-backend end-to-end check (reverie-examples/e2e/) adds the OSS-only
+# recorder and reverie-e2e-compare binaries and the recorder's nix dependency.
+# The reverie-dbt dependency (DbtRunner, without its prototype runtime) runs the
+# tools on DBT. counter1 and counter2 take --backend, which replaces the OSS-only
+# reverie-kvm-counter1/2 and reverie-e9patch-counter2 launchers.
+# Keep the internal target synchronized before the next export.
 
 [package]
 name = "reverie-examples"
-version = "0.4.0"
+version = "0.5.1"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -26,15 +32,15 @@ crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "chaos"
-path = "chaos.rs"
+path = "chaos_launcher.rs"
 
 [[bin]]
 name = "chrome_trace"
-path = "chrome-trace/main.rs"
+path = "chrome-trace/launcher.rs"
 
 [[bin]]
 name = "chunky_print"
-path = "chunky_print.rs"
+path = "chunky_print_launcher.rs"
 
 [[bin]]
 name = "counter1"
@@ -45,20 +51,8 @@ name = "counter2"
 path = "counter2.rs"
 
 [[bin]]
-name = "reverie-kvm-counter1"
-path = "kvm_counter1.rs"
-
-[[bin]]
-name = "reverie-kvm-counter2"
-path = "kvm_counter2.rs"
-
-[[bin]]
-name = "reverie-e9patch-counter2"
-path = "e9patch_counter2.rs"
-
-[[bin]]
 name = "debug"
-path = "debug.rs"
+path = "debug_launcher.rs"
 
 [[bin]]
 name = "noop"
@@ -77,23 +71,34 @@ name = "reverie-liteinst-env-guest"
 path = "liteinst_env_guest.rs"
 
 [[bin]]
+name = "recorder"
+path = "recorder.rs"
+
+[[bin]]
+name = "reverie-e2e-compare"
+path = "e2e/compare.rs"
+
+[[bin]]
 name = "strace"
 path = "strace/main.rs"
 
 [[bin]]
 name = "strace_minimal"
-path = "strace_minimal.rs"
+path = "strace_minimal_launcher.rs"
 
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 libc = "0.2.186"
-reverie = { version = "0.4.0", path = "../reverie", package = "reverie-core" }
-reverie-e9patch = { version = "0.4.0", path = "../reverie-e9patch", default-features = false }
-reverie-kvm = { version = "0.4.0", path = "../reverie-kvm" }
-reverie-liteinst = { version = "0.4.0", path = "../reverie-liteinst", default-features = false }
-reverie-ptrace = { version = "0.4.0", path = "../reverie-ptrace" }
-reverie-util = { version = "0.4.0", path = "../reverie-util" }
+nix = { version = "0.30.1", features = ["ptrace", "signal"] }
+reverie = { version = "0.5.1", path = "../reverie", package = "reverie-core" }
+reverie-dbt = { version = "0.5.1", path = "../reverie-dbt", default-features = false }
+reverie-e9patch = { version = "0.5.1", path = "../reverie-e9patch", default-features = false }
+reverie-host = { version = "0.5.1", path = "../experimental/reverie-host" }
+reverie-kvm = { version = "0.5.1", path = "../reverie-kvm" }
+reverie-liteinst = { version = "0.5.1", path = "../reverie-liteinst", default-features = false }
+reverie-ptrace = { version = "0.5.1", path = "../reverie-ptrace" }
+reverie-util = { version = "0.5.1", path = "../reverie-util" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }

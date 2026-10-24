@@ -352,45 +352,42 @@ struct ProbeExecutor {
     pending_dequeue: bool,
     ledger: Vec<reverie::SignalDequeue>,
 }
-impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
-    fn read_clock(&self) -> Result<u64> {
-        Ok(1)
-    }
-    fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
-        Some(self.failure.run.subscribe())
-    }
-    fn invalidate_polled_read_attempt(&mut self) {
-        self.counts.invalidations.fetch_add(1, Ordering::SeqCst);
-    }
-    fn prepare_signal_effects(&mut self) -> std::result::Result<(), Errno> {
-        self.counts.preparations.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-    fn execute(&mut self, request: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
+#[reverie::provider]
+impl LinuxProvider for ProbeExecutor {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _task: reverie::Tid,
+        request: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        let request = SyscallRequest::from_provider(request);
         assert_eq!(request.number(), libc::SYS_close as u64);
         assert_eq!(request.args()[0], 9);
         self.counts.dispatches.fetch_add(1, Ordering::SeqCst);
         self.counts.effects.fetch_add(1, Ordering::SeqCst);
-        Ok(0)
+        Ok(ProviderOutcome::Return(0))
     }
-    fn complete_injection<'a>(
-        &'a mut self,
-        _: ToolContext<'a, ProbeTool>,
-    ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
-    where
-        ProbeTool: 'a,
-    {
-        self.counts.completions.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async {
-            Ok(InjectionCompletion::Returns {
-                syscall_result: None,
-            })
-        })
+}
+
+impl LinuxEmuSignalControl for ProbeExecutor {
+    fn invalidate_polled_read_attempt(&mut self) {
+        self.counts.invalidations.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn prepare_signal_effects(&mut self) -> std::result::Result<(), Errno> {
+        self.counts.preparations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn defer_signal_delivery(&mut self, _: SignalEvent) -> std::result::Result<(), Errno> {
         self.counts.effects.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
     fn queue_child_exit_signal(&mut self, _: SignalEvent) -> reverie::ChildExitSignalOutcome {
         self.counts.effects.fetch_add(1, Ordering::SeqCst);
         reverie::ChildExitSignalOutcome::RejectedBeforeCommit {
@@ -398,6 +395,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             errno: Errno::ENOSYS,
         }
     }
+
     fn queue_process_alarm_signal(&mut self, _: SignalEvent) -> reverie::ProcessAlarmSignalOutcome {
         self.counts.effects.fetch_add(1, Ordering::SeqCst);
         reverie::ProcessAlarmSignalOutcome::RejectedBeforeCommit {
@@ -405,9 +403,11 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             errno: Errno::ENOSYS,
         }
     }
+
     fn parked_signal_site(&self) -> Option<reverie::CallbackSignalSite> {
         Some(site())
     }
+
     fn admit_signal_observation(
         &mut self,
         actual: reverie::CallbackSignalSite,
@@ -416,6 +416,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
         assert_eq!(actual, site());
         Ok(())
     }
+
     fn take_signal_for_observation(&mut self) -> std::result::Result<Option<PendingSignal>, Errno> {
         self.counts.signal_removals.fetch_add(1, Ordering::SeqCst);
         self.pending_dequeue = true;
@@ -424,12 +425,15 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             domain: crate::executor::PendingSignalDomain::Process,
         }))
     }
+
     fn signal_dequeue_front(&self) -> Option<reverie::SignalDequeue> {
         self.pending_dequeue.then(dequeue)
     }
+
     fn retain_signal_dequeue(&mut self, effect: reverie::SignalDequeue) {
         self.ledger.push(effect);
     }
+
     fn acknowledge_signal_dequeue(
         &mut self,
         effect: reverie::SignalDequeue,
@@ -441,6 +445,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             .fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
     fn filter_signal_replacement(
         &mut self,
         event: SignalEvent,
@@ -449,6 +454,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
         self.counts.signal_filters.fetch_add(1, Ordering::SeqCst);
         Ok(Some(PendingSignal { event, domain }))
     }
+
     fn reserve_signal_delivery(
         &mut self,
         _: PendingSignal,
@@ -463,6 +469,7 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             selection_nonce: 23,
         })
     }
+
     fn with_signal_effects(&mut self, cause: Error, raw_result: Option<i64>) -> Error {
         Error::SignalEffects {
             cause: Arc::new(cause),
@@ -472,6 +479,34 @@ impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
             raw_result,
             context: None,
         }
+    }
+}
+
+impl LinuxEmuMemoryMap for ProbeExecutor {}
+
+impl GuestSyscallExecutor<ProbeTool> for ProbeExecutor {
+    fn read_clock(&self) -> Result<u64> {
+        Ok(1)
+    }
+
+    fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
+        Some(self.failure.run.subscribe())
+    }
+
+    fn complete_injection<'a>(
+        &'a mut self,
+        _: ToolContext<'a, ProbeTool>,
+        _plan: Option<crate::executor::StagedProcessAction>,
+    ) -> Pin<Box<dyn Future<Output = Result<InjectionCompletion>> + Send + 'a>>
+    where
+        ProbeTool: 'a,
+    {
+        self.counts.completions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(InjectionCompletion::Returns {
+                syscall_result: None,
+            })
+        })
     }
 }
 
@@ -945,4 +980,98 @@ fn private_admission_preserves_already_selected_nonlocal_disposition() {
     assert_eq!(retirement.pending.len(), 1);
     assert!(retirement.result.is_ok());
     retirement.notification.notify();
+}
+
+/// A kept RPC failure wait whose answers the test scripts.
+struct ScriptedRpcFailure(Mutex<std::collections::VecDeque<FailureCheck>>);
+impl ScriptedRpcFailure {
+    fn answer(&self, checks: &[FailureCheck]) {
+        let mut script = self.0.lock().unwrap();
+        assert!(script.is_empty(), "an earlier answer went unused");
+        script.extend(checks);
+    }
+}
+impl crate::failure::RpcFailure for ScriptedRpcFailure {
+    fn listen(&self) -> usize {
+        0
+    }
+    fn poll_failure(&self, _: usize, _: &mut Context<'_>) -> FailureCheck {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("an unscripted failure check")
+    }
+    fn unlisten(&self, _: usize) {}
+}
+
+/// An RPC whose failure check is Unknown (the kept wait was being polled
+/// elsewhere) does not poll its response, and a response that completed
+/// before an Unknown check is held, not returned, until a check is Clear.
+/// A Failed check after that drops it.
+fn rpc_unknown_failure_check(then: FailureCheck) {
+    let fixture = Fixture::new();
+    let signal = Arc::new(Mutex::new(None));
+    let tool = Arc::new(ProbeTool::default());
+    let mut executor = fixture.executor();
+    let mut state = ();
+    let subscriptions = Subscription::none();
+    let scripted = ScriptedRpcFailure(Mutex::default());
+    let guest = KvmGuest::new(
+        Pid::from_raw(17),
+        Pid::from_raw(17),
+        tool,
+        fixture.memory.clone(),
+        &[],
+        unsafe { std::mem::zeroed() },
+        &mut state,
+        &mut executor,
+        fixture.global.as_ref(),
+        Some(fixture.global.clone()),
+        &(),
+        &subscriptions,
+        signal.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+        BASE + TOOL_STACK_SIZE,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .with_rpc_failure(&scripted);
+    let mut rpc = Box::pin(guest.send_rpc(()));
+    let mut context = Context::from_waker(Waker::noop());
+    let polls = &fixture.global.counts.rpc_polls;
+    scripted.answer(&[FailureCheck::Unknown]);
+    assert!(rpc.as_mut().poll(&mut context).is_pending());
+    assert_eq!(polls.load(Ordering::SeqCst), 0, "polled after Unknown");
+    scripted.answer(&[FailureCheck::Clear, FailureCheck::Unknown]);
+    assert!(rpc.as_mut().poll(&mut context).is_pending());
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    scripted.answer(&[then]);
+    let result = rpc.as_mut().poll(&mut context);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        1,
+        "a completed response repolled"
+    );
+    match then {
+        FailureCheck::Clear => assert_eq!(result, Poll::Ready(41)),
+        FailureCheck::Failed => {
+            assert!(result.is_pending(), "a response returned after a failure");
+            assert!(signal.lock().unwrap().is_some());
+        }
+        FailureCheck::Unknown => unreachable!(),
+    }
+    drop(rpc);
+    drop(guest);
+    drop(fixture.callback);
+    fixture.scope.retire().notification.notify();
+}
+
+#[test]
+fn rpc_waits_out_an_unknown_failure_check_then_returns_its_response() {
+    rpc_unknown_failure_check(FailureCheck::Clear);
+}
+
+#[test]
+fn rpc_drops_a_held_response_when_the_next_check_finds_a_failure() {
+    rpc_unknown_failure_check(FailureCheck::Failed);
 }

@@ -45,7 +45,12 @@
 //! largest skid margin of any processor in the PMU table, plus the single
 //! steps of an artificial notification, so the same guest clock keeps or
 //! cancels the event on every supported processor; only a skid margin
-//! override above the table's largest moves it.
+//! override above the table's largest moves it. A reported `rt_sigreturn`
+//! (`Timer::disregard_sigreturn_stop()`) requests a precise event it would
+//! cancel, and that nothing has delivered, again, where the mask its frame
+//! installs leaves the timer's signal unblocked: at the same target if the
+//! guest is short of it, and one conditional branch after the return if a
+//! late notification let the guest pass it.
 //!
 //! Proper use of timers requires that all delivered signals of type
 //! `Timer::signal_type()` be passed through `Timer::handle_signal`, and that
@@ -73,6 +78,7 @@ use reverie::RegDisplay;
 use reverie::RegDisplayOptions;
 use reverie::Signal;
 use reverie::Tid;
+pub use reverie::pmu_config::*;
 #[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Addr;
 #[cfg(target_arch = "x86_64")]
@@ -97,46 +103,6 @@ use crate::tracer::WaitOnPtracer;
 
 // This signal is unused, in that the kernel will never send it to a process.
 const MARKER_SIGNAL: Signal = reverie::PERF_EVENT_SIGNAL;
-
-/// We refuse to schedule a "perf timeout" for this or fewer RCBs, instead
-/// choosing to directly single step. This is because I am somewhat paranoid
-/// about perf event throttling, which isn't well-documented.
-const SINGLESTEP_TIMEOUT_RCBS: u64 = 5;
-
-/// The largest default skid margin of any processor in the PMU table
-/// (`reverie::pmu::PmuProfile`, and 1000 on aarch64): that of the AMD Zen
-/// processors without a measured 1K entry. A unit test checks it against the
-/// whole table.
-pub const LARGEST_TABLE_SKID_MARGIN: u64 = 10_000;
-
-/// The single, greppable marker emitted to stderr whenever this backend detects
-/// the RCB fallback overshooting its target. Re-exported from the
-/// backend-agnostic `reverie` crate so that this precise single-step guard and
-/// hermit's detcore log-and-continue path emit the *same* token — one marker,
-/// one source. See [`reverie::SKID_OVERSHOOT_MARKER`] for the full contract and
-/// the retry-harness safety property.
-pub use reverie::SKID_OVERSHOOT_MARKER;
-
-/// Fault-injection knob: when set to a parseable `u64`, this env var overrides
-/// the processor-detected skid margin for the whole process. Setting it to `0`
-/// programs the precise timer's overflow interrupt *at* the target RCB instead
-/// of `skid_margin` RCBs early, so any natural positive skid pushes the fallback
-/// single-step past the target and deterministically triggers the
-/// [`SKID_OVERSHOOT_MARKER`] path. This exists to exercise the skid overshoot +
-/// retry harness on demand; it is not a tuning knob for normal runs. A value
-/// that does not parse as `u64` is ignored (processor default retained).
-pub const SKID_MARGIN_OVERRIDE_ENV: &str = "REVERIE_SKID_MARGIN_OVERRIDE";
-
-/// Supervisor-only witness nonce. When the consuming harness (the hermit
-/// *supervisor*) sets this env var, its exact value is stamped into every
-/// [`SKID_OVERSHOOT_MARKER`] line as a ` witness=<value>` field. A downstream
-/// retry gate uses it to distinguish a genuine supervisor-emitted overshoot from
-/// guest-printed marker text: hermit strips this var from the guest environment,
-/// so the guest can neither read nor forge the value. Unset or empty leaves the
-/// marker in its plain (unauthenticated) shape.
-pub const WITNESS_TOKEN_ENV: &str = "HERMIT_SKID_WITNESS_TOKEN";
-
-static PMU_CONFIG: OnceLock<PmuConfig> = OnceLock::new();
 
 /// Overflow records forgotten because their notification had left the
 /// thread's pending queue, for tests.
@@ -164,6 +130,66 @@ pub(crate) static OVERTAKEN_WITH_NOTIFICATION_QUEUED_EVENTS: std::sync::Mutex<Ve
 
 /// How many events [`OVERTAKEN_WITH_NOTIFICATION_QUEUED_EVENTS`] keeps.
 const OVERTAKEN_WITH_NOTIFICATION_QUEUED_KEPT: usize = 1024;
+
+/// Staged precise events re-armed at their second stage (see
+/// [`PmuConfig::stages`]), for tests.
+pub(crate) static SECOND_STAGES_ARMED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How far one step toward a precise event's target runs the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepUnit {
+    /// One instruction (`PTRACE_SINGLESTEP`).
+    Instruction,
+    /// Up to and including the next taken branch (`PTRACE_SINGLEBLOCK`).
+    /// Only taken when the decoded bound shows the block cannot reach the
+    /// target (see [`TimerImpl::step_unit`]).
+    #[cfg(target_arch = "x86_64")]
+    Block,
+}
+
+/// Steps of each unit taken toward precise event targets, and lookups in the
+/// block bound cache, for tests and measurement.
+pub(crate) static INSTRUCTION_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BLOCK_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BLOCK_BOUND_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BLOCK_BOUND_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// When set to `0`, every step toward a precise event's target is a single
+/// instruction step, as before block steps existed. Any other value, or none,
+/// leaves block steps on. For measurement and as an escape hatch.
+pub const BLOCK_STEP_ENV: &str = "REVERIE_BLOCK_STEP";
+
+/// When set (to anything), every hit in the block bound cache re-reads the
+/// guest's code and decodes it again, and panics if the result differs from
+/// the cached one. A debug mode: a wrong entry would be a determinism bug.
+pub const BLOCK_STEP_VERIFY_CACHE_ENV: &str = "REVERIE_BLOCK_STEP_VERIFY_CACHE";
+
+/// Timers single step every step toward a precise target while this is set,
+/// as with `REVERIE_BLOCK_STEP=0`, for tests that compare the two.
+pub(crate) static BLOCK_STEPS_OFF_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Every hit in the block bound cache is checked against a fresh decode while
+/// this is set, as with [`BLOCK_STEP_VERIFY_CACHE_ENV`], for tests.
+pub(crate) static VERIFY_BLOCK_BOUNDS_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn block_steps_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var(BLOCK_STEP_ENV).map_or(true, |v| v.trim() != "0"))
+        && !BLOCK_STEPS_OFF_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_block_bound_cache() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(BLOCK_STEP_VERIFY_CACHE_ENV).is_some())
+        || VERIFY_BLOCK_BOUNDS_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Timer signals whose signal-delivery stop found their event cancelled, and
 /// which were discarded there, for tests.
@@ -264,6 +290,30 @@ struct ArmedProgramming {
     programmings: u64,
 }
 
+/// The programming of a staged precise event's first stage (see
+/// [`PmuConfig::stages`]).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct FirstStage {
+    /// `CLOCK_MONOTONIC`, in nanoseconds, once the request programmed it,
+    /// with the thread still stopped.
+    programmed_ns: u64,
+    /// The clock of the request.
+    programmed_clock: u64,
+}
+
+/// `CLOCK_MONOTONIC` in nanoseconds, the clock of `timer`'s sample records,
+/// or `u64::MAX`, which no sample follows, if it cannot be read.
+fn monotonic_ns() -> u64 {
+    nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+        .ok()
+        .and_then(|ts| {
+            let secs = u64::try_from(ts.tv_sec()).ok()?;
+            let nanos = u64::try_from(ts.tv_nsec()).ok()?;
+            secs.checked_mul(1_000_000_000)?.checked_add(nanos)
+        })
+        .unwrap_or(u64::MAX)
+}
+
 /// Counts a check of a kept programming, and records it if it found the
 /// programming changed.
 fn count_kept_programming_check(check: KeptProgramming) {
@@ -321,300 +371,6 @@ fn kernel_is_preempt_rt() -> bool {
 fn version_is_preempt_rt(version: &str) -> bool {
     const UTS_VERSION_MAX: usize = 64;
     version.len() >= UTS_VERSION_MAX || version.split_whitespace().any(|word| word == "PREEMPT_RT")
-}
-
-pub(crate) fn get_pmu_config() -> &'static PmuConfig {
-    PMU_CONFIG.get_or_init(PmuConfig::new)
-}
-
-/// Processor-specific PMU event settings used by precise ptrace timers.
-// TODO-HUMAN-REVIEW(PR-186): Review the programmatic PMU skid-margin override API.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PmuConfig {
-    rcb_event: u64,
-    skid_margin: u64,
-    skid_margin_override: Option<u64>,
-}
-
-impl PmuConfig {
-    /// Attempts to configure the PMU without assuming that this CPU has a
-    /// measured deterministic-timer profile.
-    ///
-    /// In-guest clocks can treat an unknown CPU as an unavailable optional
-    /// capability. Precise ptrace timers retain [`Self::new`]'s fail-fast
-    /// contract because they also require a measured skid margin.
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn try_new() -> Option<Self> {
-        let features = raw_cpuid::CpuId::new().get_feature_info()?;
-        Self::try_from_family_model(features.family_id(), features.model_id())
-            .map(Self::with_env_overrides)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    pub(crate) fn try_new() -> Option<Self> {
-        Some(Self::new())
-    }
-
-    /// Creates / initializes the PMU config.
-    #[cfg(target_arch = "x86_64")]
-    pub fn new() -> Self {
-        let c = raw_cpuid::CpuId::new();
-        let fi = c
-            .get_feature_info()
-            .expect("CPUID feature information is required to configure the PMU");
-        Self::from_cpuid_features(fi).with_env_overrides()
-    }
-
-    /// Creates / initializes the PMU config.
-    #[cfg(target_arch = "aarch64")]
-    pub fn new() -> Self {
-        // TODO:
-        //  1. Compute the microarchitecture from
-        //     `/sys/devices/system/cpu/cpu*/regs/identification/midr_el1`
-        //  2. Look up the microarchitecture in a table to determine what features
-        //     we can enable.
-        // References:
-        //  - https://github.com/rr-debugger/rr/blob/master/src/PerfCounters.cc#L156
-        const BR_RETIRED: u64 = 0x21;
-
-        // For now, always assume that we can get retired branch events.
-        Self {
-            rcb_event: BR_RETIRED,
-            skid_margin: 1000,
-            skid_margin_override: None,
-        }
-        .with_env_overrides()
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn from_cpuid_features(fi: raw_cpuid::FeatureInfo) -> Self {
-        Self::from_family_model(fi.family_id(), fi.model_id())
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn from_family_model(family_id: u8, model_id: u8) -> Self {
-        Self::try_from_family_model(family_id, model_id).unwrap_or_else(|| match family_id {
-            0x06 => panic!("Unsupported Intel processor model: {:#x}", model_id),
-            family => panic!(
-                "Unsupported processor family, model: ({:#x},{:#x})",
-                family, model_id
-            ),
-        })
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn try_from_family_model(family_id: u8, model_id: u8) -> Option<Self> {
-        reverie::pmu::PmuProfile::for_family_model(family_id, model_id).map(|profile| Self {
-            rcb_event: profile.raw_rcb_event(),
-            skid_margin: profile.default_skid_margin(),
-            skid_margin_override: None,
-        })
-    }
-
-    /// Overrides the processor-specific skid margin while preserving the detected PMU event.
-    pub fn with_skid_margin_override(mut self, skid_margin: u64) -> Self {
-        self.skid_margin_override = Some(skid_margin);
-        self
-    }
-
-    /// Applies the [`SKID_MARGIN_OVERRIDE_ENV`] fault-injection override, if the
-    /// env var is present and parses as a `u64`. A missing var leaves the
-    /// processor default untouched; a present-but-unparseable value is ignored
-    /// with a warning rather than aborting startup. When the override is applied
-    /// it is announced loudly on stderr, because it deliberately degrades timer
-    /// precision to force the overshoot path.
-    fn with_env_overrides(self) -> Self {
-        match std::env::var(SKID_MARGIN_OVERRIDE_ENV) {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(v) => {
-                    eprintln!(
-                        "[reverie-ptrace] {}={} active: skid margin forced to {} RCBs \
-                         (fault injection; not for production runs)",
-                        SKID_MARGIN_OVERRIDE_ENV, raw, v
-                    );
-                    self.with_skid_margin_override(v)
-                }
-                Err(_) => {
-                    eprintln!(
-                        "[reverie-ptrace] ignoring {}={:?}: not a u64; using processor default",
-                        SKID_MARGIN_OVERRIDE_ENV, raw
-                    );
-                    self
-                }
-            },
-            Err(_) => self,
-        }
-    }
-
-    /// This is the experimentally determined maximum number of RCBs an overflow
-    /// interrupt is delivered after the originating RCB.
-    ///
-    /// If this number is too small, timer event delivery can pass its target and
-    /// will be reported at the observed counter. If this number is too big, we
-    /// degrade performance from excessive single stepping.
-    pub fn skid_margin(&self) -> u64 {
-        self.skid_margin_override.unwrap_or(self.skid_margin)
-    }
-
-    /// The maximum single step count we expect can occur when a precise timer
-    /// event is requested that leaves less than the minimum perf timeout
-    /// remaining.
-    pub fn max_single_step_count(&self) -> u64 {
-        self.skid_margin().saturating_add(SINGLESTEP_TIMEOUT_RCBS)
-    }
-
-    /// How many RCBs short of a precise event's target a stop that nothing
-    /// continues must come to keep the event: a stop without a Tool callback
-    /// across which the event cannot be continued (an rt_sigreturn LiteInst
-    /// hook trap, or any such stop without overflow records) keeps the event
-    /// only while the guest's clock is more than this short of the target,
-    /// and cancels it otherwise.
-    ///
-    /// Short of the target by more than the processor's skid margin plus the
-    /// single steps of an artificial notification
-    /// ([`Self::max_single_step_count`]), the programming has not passed its
-    /// period, and no notification can be pending, taken or lost. Closer, one
-    /// of those holds as host interrupt timing decides. Using the largest
-    /// margin of any processor in the PMU table,
-    /// `LARGEST_TABLE_SKID_MARGIN`, instead of this processor's own gives a
-    /// stop the same outcome on every supported processor, since each
-    /// processor's own point lies at or after it. A skid margin override
-    /// above the table's largest raises it, so that the point still comes
-    /// before the period.
-    pub fn keep_margin(&self) -> u64 {
-        self.skid_margin()
-            .max(LARGEST_TABLE_SKID_MARGIN)
-            .saturating_add(SINGLESTEP_TIMEOUT_RCBS)
-    }
-
-    /// Emits the single canonical [`SKID_OVERSHOOT_MARKER`] line to stderr.
-    ///
-    /// This is called at every site that detects the RCB-fallback preemption
-    /// landing past its programmed target, so the overshoot signal has exactly
-    /// one greppable shape regardless of which layer noticed it. It reports the
-    /// counter value actually observed, the intended target, the skid margin in
-    /// effect (the CPU-specific constant whose tuning determines how often this
-    /// fires), and the resulting overshoot.
-    pub fn emit_skid_overshoot_marker(&self, rcb_actual: u64, rcb_target: u64) {
-        eprintln!(
-            "{}",
-            self.format_skid_overshoot_marker(rcb_actual, rcb_target)
-        );
-    }
-
-    /// Single decision-and-record site for a skid overshoot: iff the interrupt
-    /// was delivered *past* the programmed target (`rcb_actual > rcb_target`),
-    /// emit the canonical [`SKID_OVERSHOOT_MARKER`] line **and** increment the
-    /// process-global witness counter via [`reverie::record_skid_overshoot`],
-    /// then return `true`. A non-overshoot (`rcb_actual <= rcb_target`) records
-    /// nothing and returns `false`.
-    ///
-    /// `TimerImpl::attempt_single_step`'s late-delivery guard is the sole runtime
-    /// caller, so a unit test that drives real `(actual, target)` pairs through
-    /// this method exercises exactly the behaviour the supervisor runs — a
-    /// genuine overshoot causes exactly one witness record — without needing a
-    /// live guest or PMU. The boolean return is what makes that behaviour
-    /// (not merely the marker arithmetic) observable in a test.
-    pub fn record_overshoot_if_past_target(&self, rcb_actual: u64, rcb_target: u64) -> bool {
-        if rcb_actual > rcb_target {
-            self.emit_skid_overshoot_marker(rcb_actual, rcb_target);
-            // Structural, in-process signal (a guest cannot forge it) so an
-            // in-process classifier can causally attribute a divergence to skid.
-            reverie::record_skid_overshoot();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Single decision-and-record site for a precise event that another
-    /// Tool-observable stop overtook: iff the guest had already reached the
-    /// event's delivery point, emit the canonical [`SKID_OVERSHOOT_MARKER`]
-    /// line, increment the process-global witness counter, and return `true`.
-    ///
-    /// Unlike a late delivery, the event itself is lost here, so reaching the
-    /// delivery point exactly already counts: the event was due before the
-    /// stop. With an instruction offset the delivery point lies `instr_offset`
-    /// instructions past the target branch, and those instructions may include
-    /// further branches (see `ClockCounter::single_step_with_clock`). The
-    /// counter alone cannot show instruction progress, but every branch past
-    /// the target is at least one instruction, so `rcb_actual - rcb_target >=
-    /// instr_offset` proves the guest got there. A stop with fewer branches
-    /// past the target is not recorded, even if the delivery point was in fact
-    /// reached. `TimerImpl::commit_missed`, for a stop that retires the event,
-    /// is the sole runtime caller.
-    pub fn record_missed_if_target_reached(
-        &self,
-        rcb_actual: u64,
-        rcb_target: u64,
-        instr_offset: u64,
-    ) -> bool {
-        let reached = target_reached(rcb_actual, rcb_target, instr_offset);
-        if reached {
-            self.emit_skid_overshoot_marker(rcb_actual, rcb_target);
-            reverie::record_skid_overshoot();
-        }
-        reached
-    }
-
-    /// Formats the canonical [`SKID_OVERSHOOT_MARKER`] line. Split out from
-    /// [`Self::emit_skid_overshoot_marker`] so the exact shape is unit-testable
-    /// without capturing process stderr.
-    pub fn format_skid_overshoot_marker(&self, rcb_actual: u64, rcb_target: u64) -> String {
-        let overshoot = rcb_actual.saturating_sub(rcb_target);
-        let mut line = format!(
-            "{} rcb_actual={} rcb_target={} skid_margin={} overshoot={}",
-            SKID_OVERSHOOT_MARKER,
-            rcb_actual,
-            rcb_target,
-            self.skid_margin(),
-            overshoot,
-        );
-        // Supervisor-only witness nonce (see [`WITNESS_TOKEN_ENV`]): stamps the
-        // marker so a downstream retry gate can authenticate it as genuinely
-        // supervisor-emitted rather than guest-printed. Read from the env at emit
-        // time; the emit path is rare, so the lookup cost is irrelevant.
-        if let Ok(token) = std::env::var(WITNESS_TOKEN_ENV)
-            && !token.is_empty()
-        {
-            line.push_str(" witness=");
-            line.push_str(&token);
-        }
-        line
-    }
-
-    /// The event needed to configure the PMU and observe RCBs.
-    pub fn rcb_event(&self) -> Event {
-        Event::Raw(self.rcb_event)
-    }
-
-    /// Returns the raw perf event selector for retired conditional branches.
-    pub fn raw_rcb_event(&self) -> u64 {
-        self.rcb_event
-    }
-}
-
-impl Default for PmuConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Installs the PMU configuration used by subsequently created ptrace timers.
-///
-/// Returns the supplied configuration if a timer has already initialized the process-wide
-/// configuration. Callers should install overrides before spawning a [`crate::Tracer`].
-pub fn set_pmu_config(config: PmuConfig) -> Result<(), PmuConfig> {
-    PMU_CONFIG.set(config)
-}
-
-/// Whether a stop at `rcb_actual` has reached the delivery point of a precise
-/// event `instr_offset` instructions past `rcb_target`, as far as the counter
-/// can show. See [`PmuConfig::record_missed_if_target_reached`].
-fn target_reached(rcb_actual: u64, rcb_target: u64, instr_offset: u64) -> bool {
-    rcb_actual
-        .checked_sub(rcb_target)
-        .is_some_and(|past| past >= instr_offset)
 }
 
 /// Returns true if the current CPU supports precise_ip.
@@ -680,9 +436,8 @@ pub enum HandleFailure {
     Event(Wait),
 
     /// A single step ended at a seccomp stop: the stepped instruction entered
-    /// a traced syscall. The caller classifies it (trap-only refuses a patched
-    /// site carrying an allowed number, P2 spec O4 rule 4) and otherwise
-    /// dispatches it like [`HandleFailure::Event`].
+    /// a traced syscall. The caller dispatches it like
+    /// [`HandleFailure::Event`].
     #[error("Single step ended at a seccomp stop")]
     SeccompStop(Stopped),
 
@@ -725,9 +480,11 @@ impl Timer {
     fn with_initial_command(guest_pid: Pid, guest_tid: Tid, initial_command: bool) -> Self {
         // No errors are exposed here, as the construction should be
         // bullet-proof, and if it wasn't, consumers wouldn't be able to
-        // meaningfully handle the error anyway.
+        // meaningfully handle the error anyway. A CPU with no PMU profile has
+        // no event to count, so its tasks get no timer, as on a host without
+        // perf: building one would fail for every task, timer or not.
         Self {
-            inner: if is_perf_supported() {
+            inner: if is_perf_supported() && try_get_pmu_config().is_some() {
                 Some(
                     TimerImpl::new(guest_pid, guest_tid, initial_command).unwrap_or_else(|err| {
                         panic!(
@@ -776,6 +533,15 @@ impl Timer {
     /// near thread creation time.
     pub fn read_clock(&self) -> u64 {
         self.inner().read_clock()
+    }
+
+    /// Observe the existing counting clock without changing a timer request.
+    /// The diagnostic refuses missing/descheduled counters rather than reporting zero.
+    #[cfg(feature = "rcb-observation")]
+    pub(crate) fn observe_rcb(&self) -> Result<(u64, u64), Errno> {
+        let timer = self.inner.as_ref().ok_or(Errno::ENODEV)?;
+        let event = try_get_pmu_config().ok_or(Errno::ENODEV)?.raw_rcb_event();
+        Ok((event, timer.clock.ctr_value_fast()?))
     }
 
     /// Approximately convert a duration to the internal notion of timer ticks.
@@ -1012,6 +778,64 @@ impl Timer {
         }
     }
 
+    /// Disregards the stop at a guest `rt_sigreturn` reported to the Tool
+    /// before it runs, as [`Timer::disregard_stop_before_period`] does, except
+    /// that where that would cancel a precise event nothing has delivered
+    /// yet, the event is cancelled (see [`Timer::retire`]) and then requested
+    /// again: at the same target, if the guest's clock is still short of it,
+    /// and one conditional branch after the return if it was Scheduled and
+    /// the guest has passed its delivery point (below). Only where the mask
+    /// the frame installs leaves the timer's signal unblocked (below).
+    ///
+    /// The stop makes no Tool callback, so the Tool cannot ask for the event
+    /// again itself. Cancelled and not requested again, an event within the
+    /// keep margin of a handler return would be lost until the thread's next
+    /// Tool-observable stop, and a thread that returns from its handler and
+    /// then runs without one would never receive it. Requested again, it is
+    /// delivered at its original target, however near: closer than this
+    /// processor's skid margin the request is driven by an artificial
+    /// notification and single steps, which start once the guest's
+    /// `rt_sigreturn`, which retires no conditional branch in user mode, has
+    /// restored the interrupted context. Whether the notification was
+    /// pending, taken or lost at the stop changes nothing: every one of
+    /// those undelivered events is requested again at the same target, so
+    /// the event's delivery point is decided by the guest's clock alone, as
+    /// [`Timer::disregard_stop_before_period`] decides by cancelling.
+    ///
+    /// A Scheduled event whose delivery point the guest has passed had a
+    /// late notification: the stop records the overshoot, as there, and
+    /// requests the event one conditional branch after the return, where
+    /// without the reports the late notification would have delivered it,
+    /// at a clock host timing decided. Not requested again: an imprecise
+    /// event, which is cancelled past its period as there (Detcore requests
+    /// them only under `--imprecise-timers`); and an event at its clock
+    /// target whose instruction offset is still ahead, which is cancelled
+    /// without a recorded overshoot, as before (a request needs at least one
+    /// conditional branch, and no in-tree Tool asks for instruction
+    /// offsets).
+    ///
+    /// The new request's notification, artificial or from the PMU, reaches
+    /// the guest only after its `rt_sigreturn` has installed the frame's
+    /// mask. The caller passes `notified_after_return` true only if that
+    /// mask is known and leaves the timer's signal unblocked. Otherwise
+    /// nothing is requested again, and the stop decides exactly as
+    /// [`Timer::disregard_stop_before_period`] does: a request whose
+    /// notification stays blocked would also leave an event whose single
+    /// steps the stop ended with nothing to drive it.
+    pub(crate) fn disregard_sigreturn_stop(
+        &mut self,
+        notified_after_return: bool,
+    ) -> Result<(), Errno> {
+        match self.inner_mut_noinit() {
+            Some(timer) => {
+                let result = timer.disregard_sigreturn_stop(notified_after_return);
+                timer.check_kept_programming(result.is_ok());
+                result
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Cancel pending timer notifications. This is idempotent.
     ///
     /// If there was a previous call to [`Timer::enable_interval'], this
@@ -1143,13 +967,13 @@ impl Timer {
     /// counter.
     /// Drives a timer signal using caller-owned stopped-state transitions.
     ///
-    /// LiteInst uses this hook to keep its exact-generation root-stop lease
-    /// synchronized across the precise timer's internal single steps. The
-    /// non-LiteInst caller supplies the historical raw transition.
+    /// The caller uses this hook to keep its exact-generation root-stop lease
+    /// synchronized across the precise timer's internal single steps, and to
+    /// observe each step's wait, for example to retain a decoded new child.
     pub(crate) async fn handle_signal(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -1169,7 +993,7 @@ impl Timer {
         &mut self,
         task: Stopped,
         unfinished: Unfinished,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -1295,6 +1119,19 @@ struct TimerImpl {
     /// programmed. Consuming notifications does not clear it.
     programming_overflowed: bool,
 
+    /// How many RCBs short of the active precise event's target its latest
+    /// programming put the notification: the first stage margin while a
+    /// staged event's first stage is programmed, and at most that (see
+    /// [`PmuConfig::stages`]).
+    event_margin: u64,
+
+    /// The programming of the active precise event's first stage, if it is
+    /// staged and that programming's notification has not been delivered.
+    first_stage: Option<FirstStage>,
+    /// Decoded block bounds by code address (see [`BlockBounds`]).
+    #[cfg(target_arch = "x86_64")]
+    block_bounds: BlockBounds,
+
     initial_command: InitialCommand,
 
     /// Requests made before the first post-exec callback have no physical
@@ -1386,6 +1223,16 @@ enum Interruption {
     Lost,
 }
 
+/// A precise event that a reported `rt_sigreturn` found undelivered (see
+/// [`Timer::disregard_sigreturn_stop`]).
+#[derive(Debug, Copy, Clone)]
+struct UndeliveredEvent {
+    clock_target: u64,
+    offset: u64,
+    /// It was Scheduled before the stop, not Armed with steps under way.
+    scheduled: bool,
+}
+
 /// The timer's state before it observed a stop.
 #[derive(Debug, Clone)]
 struct ObservedStop {
@@ -1465,16 +1312,19 @@ enum ActiveEvent {
 
 impl ActiveEvent {
     /// Given the current clock, determine if another event is required to get the
-    /// clock to its expected state
-    fn reschedule_if_spurious_wakeup(&self, curr_clock: u64) -> Option<TimerEventRequest> {
+    /// clock to its expected state. A precise event needs one if more than
+    /// `max_single_step_count` steps remain.
+    fn reschedule_if_spurious_wakeup(
+        &self,
+        curr_clock: u64,
+        max_single_step_count: u64,
+    ) -> Option<TimerEventRequest> {
         match self {
             ActiveEvent::Precise {
                 clock_target,
                 offset: _,
             } => {
-                if clock_target.saturating_sub(curr_clock)
-                    > get_pmu_config().max_single_step_count()
-                {
+                if clock_target.saturating_sub(curr_clock) > max_single_step_count {
                     Some(TimerEventRequest::Precise(*clock_target - curr_clock))
                 } else {
                     None
@@ -1580,7 +1430,9 @@ impl ClockCounter {
 
 impl TimerImpl {
     pub fn new(guest_pid: Pid, guest_tid: Tid, initial_command: bool) -> Result<Self, Errno> {
-        let evt = get_pmu_config().rcb_event();
+        // A CPU with no profile has no event to count; refuse it as the
+        // in-guest clock does, rather than panic in the tracer.
+        let evt = try_get_pmu_config().ok_or(Errno::ENODEV)?.rcb_event();
 
         // measure the target tid irrespective of CPU
         let mut builder = Builder::new(guest_tid.as_raw(), -1);
@@ -1593,7 +1445,25 @@ impl TimerImpl {
             builder.precise_ip(1);
         }
 
-        let mut timer = builder.check_for_pmu_bugs().create()?;
+        // The time of the first stage's overflow measures the guest's branch
+        // rate for a staged precise event (see `PmuConfig::stages`).
+        crate::perf::check_for_pmu_bugs();
+        builder.sample_time(true);
+        let mut timer = match builder.create() {
+            Ok(timer) => timer,
+            Err(errno) => {
+                // A failure of the counter itself fails again here.
+                let timer = builder.sample_time(false).create()?;
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    warn!(
+                        %errno,
+                        "Could not record timer overflow times; the second stage of a staged precise timer event takes the skid margin"
+                    )
+                });
+                timer
+            }
+        };
         timer.set_signal_delivery(guest_tid, MARKER_SIGNAL)?;
         timer.reset()?;
         // measure the target tid irrespective of CPU
@@ -1638,7 +1508,7 @@ impl TimerImpl {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
                 warn!(
-                    "PREEMPT_RT kernel; timer signals at injected syscalls, late or not, will be delivered to the guest, a timer signal in the LiteInst patch helper fails the run, and a stop without a Tool callback within the keep margin of a precise timer event's target cancels the event (https://github.com/rrnewton/reverie/issues/747)"
+                    "PREEMPT_RT kernel; timer signals at injected syscalls, late or not, will be delivered to the guest, and a stop without a Tool callback within the keep margin of a precise timer event's target cancels the event (https://github.com/rrnewton/reverie/issues/747)"
                 )
             });
         } else if let Err(errno) = timer.map_sample_records() {
@@ -1646,7 +1516,7 @@ impl TimerImpl {
             WARNED.call_once(|| {
                 warn!(
                     %errno,
-                    "Could not map timer overflow records; timer signals at injected syscalls, late or not, will be delivered to the guest, a timer signal in the LiteInst patch helper fails the run, and a stop without a Tool callback within the keep margin of a precise timer event's target cancels the event (https://github.com/rrnewton/reverie/issues/747)"
+                    "Could not map timer overflow records; timer signals at injected syscalls, late or not, will be delivered to the guest, and a stop without a Tool callback within the keep margin of a precise timer event's target cancels the event (https://github.com/rrnewton/reverie/issues/747)"
                 )
             });
         }
@@ -1668,6 +1538,10 @@ impl TimerImpl {
             overflow_period: None,
             overflow_recorded: false,
             programming_overflowed: false,
+            event_margin: get_pmu_config().skid_margin(),
+            first_stage: None,
+            #[cfg(target_arch = "x86_64")]
+            block_bounds: BlockBounds::default(),
             initial_command: if initial_command {
                 InitialCommand::WaitingForExec
             } else {
@@ -1693,12 +1567,23 @@ impl TimerImpl {
     }
 
     pub fn request_event(&mut self, evt: TimerEventRequest) -> Result<(), Errno> {
-        let (delivery, notification) = match evt {
+        let config = get_pmu_config();
+        let (delivery, margin) = match evt {
             TimerEventRequest::Precise(ticks) | TimerEventRequest::PreciseInstruction(ticks, _) => {
-                (ticks, ticks.saturating_sub(get_pmu_config().skid_margin()))
+                let staged =
+                    self.initial_command == InitialCommand::Ordinary && config.stages(ticks);
+                (
+                    ticks,
+                    if staged {
+                        config.first_stage_margin()
+                    } else {
+                        config.skid_margin()
+                    },
+                )
             }
-            TimerEventRequest::Imprecise(ticks) => (ticks, ticks),
+            TimerEventRequest::Imprecise(ticks) => (ticks, 0),
         };
+        let notification = delivery.saturating_sub(margin);
         if delivery == 0 {
             return Err(Errno::EINVAL); // bail before setting timer
         }
@@ -1708,7 +1593,9 @@ impl TimerImpl {
         }
         self.recheck_kept_programming();
         self.armed_programming = None;
+        self.first_stage = None;
         if self.initial_command != InitialCommand::Ordinary {
+            self.event_margin = margin;
             self.event = Self::event_at(evt, self.read_clock() + delivery);
             self.held_initial_event = Some(self.event);
             self.set_status(EventStatus::Scheduled);
@@ -1716,6 +1603,7 @@ impl TimerImpl {
             return Ok(());
         }
         self.prepare_notification(notification)?;
+        self.event_margin = margin;
         self.event = Self::event_at(evt, self.read_clock() + delivery);
         self.set_status(EventStatus::Scheduled);
         if kept_programming_checks() {
@@ -1725,7 +1613,78 @@ impl TimerImpl {
                 programmings: self.timer.programmings(),
             });
         }
+        if margin > config.skid_margin() && self.overflow_period.is_some() {
+            // The guest has not run since the programming, so the time from
+            // here to its overflow is at least the time it ran.
+            self.first_stage = Some(FirstStage {
+                programmed_ns: monotonic_ns(),
+                programmed_clock: self.read_clock(),
+            });
+        }
         Ok(())
+    }
+
+    /// Re-arms the active precise event, staged and found at `clock` by its
+    /// first stage's notification, at its second stage, if `clock` is short
+    /// of the target by more than the second stage margin plus an artificial
+    /// notification's steps (see [`PmuConfig::stages`]). `sample_time` is the
+    /// time of the latest overflow whose sample record was read. Returns
+    /// whether it re-armed the event.
+    ///
+    /// Only the programming changes: the event, its target and offset, is
+    /// the one requested.
+    fn rearm_second_stage(
+        &mut self,
+        first_stage: FirstStage,
+        clock: u64,
+        sample_time: Option<u64>,
+    ) -> Result<bool, Errno> {
+        let ActiveEvent::Precise { clock_target, .. } = self.event else {
+            return Ok(false);
+        };
+        let config = get_pmu_config();
+        // A sample from before the programming is an earlier one's.
+        let elapsed_ns = sample_time
+            .filter(|&time| time > first_stage.programmed_ns)
+            .map(|time| time - first_stage.programmed_ns);
+        let rcbs = clock.saturating_sub(first_stage.programmed_clock);
+        let margin = config.second_stage_margin(rcbs, elapsed_ns);
+        let remaining = clock_target.saturating_sub(clock);
+        debug!(
+            rcbs,
+            ?elapsed_ns,
+            margin,
+            remaining,
+            "Second stage of a staged precise timer event"
+        );
+        if remaining <= margin.saturating_add(SINGLESTEP_TIMEOUT_RCBS) {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        {
+            self.preempted_overflow_counted = false;
+        }
+        self.recheck_kept_programming();
+        self.armed_programming = None;
+        self.prepare_notification(remaining - margin)?;
+        self.event_margin = margin;
+        self.set_status(EventStatus::Scheduled);
+        if kept_programming_checks() {
+            self.armed_programming = self.overflow_period.map(|period| ArmedProgramming {
+                overflow_point: clock + period,
+                programmings: self.timer.programmings(),
+            });
+        }
+        SECOND_STAGES_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// The most single steps the active precise event's latest programming
+    /// can need: its margin plus an artificial notification's steps.
+    fn max_single_step_count(&self) -> u64 {
+        self.event_margin
+            .max(get_pmu_config().skid_margin())
+            .saturating_add(SINGLESTEP_TIMEOUT_RCBS)
     }
 
     /// Sets the status of a new or cancelled event. Earlier stops and steps
@@ -2152,6 +2111,92 @@ impl TimerImpl {
         }
     }
 
+    fn disregard_sigreturn_stop(&mut self, notified_after_return: bool) -> Result<(), Errno> {
+        // Both read before the stop is disregarded, which consumes what the
+        // stop observed.
+        let past_keep_point = self.past_keep_point()?;
+        let undelivered = self
+            .undelivered_precise_event()
+            .filter(|_| notified_after_return);
+        match self.disregard_stop()? {
+            None if !past_keep_point => Ok(()),
+            _ => {
+                self.retire()?;
+                match undelivered {
+                    Some(undelivered) => self.request_again(undelivered),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// The active precise event if nothing has delivered it: before the
+    /// latest observed stop it was still Scheduled, or it was Armed with
+    /// single steps toward it under way, or with their cleanup failed. An
+    /// Armed event the stop did not interrupt was delivered. `None` too for
+    /// an imprecise event, and for a held initial-command request.
+    fn undelivered_precise_event(&self) -> Option<UndeliveredEvent> {
+        if self.initial_command != InitialCommand::Ordinary {
+            return None;
+        }
+        let ActiveEvent::Precise {
+            clock_target,
+            offset,
+        } = self.event
+        else {
+            return None;
+        };
+        let (scheduled, interrupted) = match &self.observed {
+            Some(observed) => (
+                observed.before == EventStatus::Scheduled,
+                observed.interrupted.is_some(),
+            ),
+            None => (
+                self.timer_status == EventStatus::Scheduled,
+                self.interrupted.is_some(),
+            ),
+        };
+        (scheduled || interrupted).then_some(UndeliveredEvent {
+            clock_target,
+            offset,
+            scheduled,
+        })
+    }
+
+    /// Requests the undelivered event that the stop retired again (see
+    /// [`Timer::disregard_sigreturn_stop`]). Short of its clock target, at
+    /// the same absolute target. Past its delivery point, if it was
+    /// Scheduled, one conditional branch after the return: the notification
+    /// was late, the stop recorded the overshoot (an observed stop finds a
+    /// Scheduled event's reached delivery point, and the retire or the
+    /// disregarded stop commits it), and without the reports the late
+    /// notification would have delivered it after the return too, at a
+    /// clock that host timing decided. An Armed event's steps do not pass
+    /// its target, and one whose cleanup failed may have, unrecorded, so
+    /// neither is requested past it. Nor is an event at its clock target
+    /// whose instruction offset is still ahead: a request needs at least one
+    /// conditional branch, and no in-tree Tool asks for instruction offsets.
+    fn request_again(&mut self, undelivered: UndeliveredEvent) -> Result<(), Errno> {
+        let UndeliveredEvent {
+            clock_target,
+            offset,
+            scheduled,
+        } = undelivered;
+        let clock = self.read_clock();
+        if clock < clock_target {
+            let ticks = clock_target - clock;
+            return self.request_event(if offset == 0 {
+                TimerEventRequest::Precise(ticks)
+            } else {
+                TimerEventRequest::PreciseInstruction(ticks, offset)
+            });
+        }
+        if scheduled && target_reached(clock, clock_target, offset) {
+            return self.request_event(TimerEventRequest::Precise(1));
+        }
+        Ok(())
+    }
+
     /// Checks, if the stop just disregarded kept a scheduled event whose
     /// request programmed a notification while kept programmings are
     /// checked (see [`KEPT_PROGRAMMING_CHECKS`]), that the stop left that
@@ -2336,7 +2381,7 @@ impl TimerImpl {
         &mut self,
         task: Stopped,
         unfinished: Unfinished,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -2516,7 +2561,7 @@ impl TimerImpl {
     async fn handle_signal(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -2595,7 +2640,7 @@ impl TimerImpl {
     async fn deliver(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -2604,8 +2649,12 @@ impl TimerImpl {
 
         // Last check to see if this an unexpected wakeup (a signal before the minimum expected)
         let ctr = self.read_clock();
+        let first_stage = self.first_stage.take();
 
-        if let Some(additional_timer_request) = self.event.reschedule_if_spurious_wakeup(ctr) {
+        if let Some(additional_timer_request) = self
+            .event
+            .reschedule_if_spurious_wakeup(ctr, self.max_single_step_count())
+        {
             debug!("Spurious wakeup - rescheduling new timer event");
             if let Err(errno) = self.request_event(additional_timer_request) {
                 warn!(
@@ -2615,6 +2664,17 @@ impl TimerImpl {
             } else {
                 return Err(HandleFailure::Cancelled(task));
             };
+        } else if let Some(first_stage) = first_stage {
+            // As after a spurious wakeup, the guest resumes with no Tool
+            // callback, toward the same target.
+            match self.rearm_second_stage(first_stage, ctr, self.timer.last_sample_time()) {
+                Ok(true) => return Err(HandleFailure::Cancelled(task)),
+                Ok(false) => {}
+                Err(errno) => warn!(
+                    "Attempted to re-arm a staged precise timer event at its second stage, but failed with - {:?}; single stepping from the first stage",
+                    errno
+                ),
+            }
         }
 
         // Before we drive the event to completion, clear `send_artificial_signal` flag so that:
@@ -2657,17 +2717,19 @@ impl TimerImpl {
         task: Stopped,
         mut current: ClockCounter,
         target_instr: u64,
-        step: &mut (dyn FnMut(Stopped) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         let target_rcb = current.target_rcb;
-        // The perf interrupt can arrive *past* the target when descheduling or
-        // migration delays signal handling long enough for the actual skid to
-        // exceed the margin. Single stepping cannot move the guest backward, so
-        // record the overshoot and deliver the timer event at the observed
-        // counter. The Tool can then account for the late event and either end
-        // the timeslice or re-arm the next timer through its normal callback.
+        // The perf interrupt can arrive *past* the target: the guest retires
+        // branches until the interrupt stops the counter, so the skid is its
+        // branch rate times the interrupt's latency, which can exceed the
+        // margin (https://github.com/rrnewton/hermit/issues/3810). Single
+        // stepping cannot move the guest backward, so record the overshoot and
+        // deliver the timer event at the observed counter. The Tool can then
+        // account for the late event and either end the timeslice or re-arm
+        // the next timer through its normal callback.
         if get_pmu_config().record_overshoot_if_past_target(current.rcbs(), target_rcb) {
             warn!(
                 "Precise timer interrupt arrived after target: actual {} > target {}; \
@@ -2679,7 +2741,7 @@ impl TimerImpl {
             count_host_timed(|events| events.overshoot += 1);
             return Ok(task);
         }
-        let max_single_step_count = get_pmu_config().max_single_step_count();
+        let max_single_step_count = self.max_single_step_count();
         assert!(
             target_rcb - current.rcbs() <= max_single_step_count,
             "Single steps from {} to {} requested ({} steps), but that exceeds the skid margin + minimum perf timer steps ({}). \
@@ -2703,6 +2765,9 @@ impl TimerImpl {
         // interrupted has run, so a TF that Linux set for stepping is hidden.
         #[cfg(target_arch = "x86_64")]
         let mut guest_trap_flag = regs.eflags & TRAP_FLAG != 0;
+        // Steps of each unit this approach takes, for the log.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let (mut instruction_steps, mut block_steps) = (0u64, 0u64);
         loop {
             if !current
                 .is_behind(target_rcb, target_instr)
@@ -2724,7 +2789,30 @@ impl TimerImpl {
                 rax: regs.rax,
                 clock: self.read_clock(),
             };
-            let wait = step(task)?.next_state_with_owner(waits).await?;
+            #[cfg(target_arch = "x86_64")]
+            let unit = self.step_unit(
+                &task,
+                &regs,
+                &start,
+                guest_trap_flag,
+                current.rcbs(),
+                target_rcb,
+            );
+            #[cfg(not(target_arch = "x86_64"))]
+            let unit = StepUnit::Instruction;
+            match unit {
+                StepUnit::Instruction => {
+                    instruction_steps += 1;
+                    &INSTRUCTION_STEPS
+                }
+                #[cfg(target_arch = "x86_64")]
+                StepUnit::Block => {
+                    block_steps += 1;
+                    &BLOCK_STEPS
+                }
+            }
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let wait = step(task, unit)?.next_state_with_owner(waits).await?;
             observe(&wait)?;
             task = match wait {
                 // a successful single step results in SIGTRAP stop
@@ -2743,8 +2831,8 @@ impl TimerImpl {
                 // loading r11, for example. The stop is passed on even if the
                 // cleanup fails, because it can be an event, such as a new
                 // child or a trap that Reverie handles, that must be handled.
-                // A seccomp stop is passed on separately, for the caller to
-                // classify.
+                // A seccomp stop is passed on separately, as
+                // `HandleFailure::SeccompStop`.
                 //
                 // How far the steps have come is kept for the stop's handler,
                 // which continues them if the Tool does not observe the stop
@@ -2762,6 +2850,7 @@ impl TimerImpl {
                         match remove_stepping_trap_flag(&mut new_task, &start, guest_trap_flag) {
                             Ok((_, regs)) => {
                                 let clock = self.read_clock();
+                                block_step_reached_target(unit, clock, target_rcb);
                                 if regs.rip != start.rip || clock != start.clock {
                                     current.single_step_with_clock(clock);
                                 }
@@ -2795,9 +2884,65 @@ impl TimerImpl {
                 (guest_trap_flag, regs) =
                     remove_stepping_trap_flag(&mut task, &start, guest_trap_flag)?;
             }
-            current.single_step_with_clock(self.read_clock());
+            let clock = self.read_clock();
+            if block_step_reached_target(unit, clock, target_rcb) {
+                // Delivered at the observed counter, as a late notification
+                // is; the marker makes the run fail closed.
+                return Ok(task);
+            }
+            current.single_step_with_clock(clock);
         }
+        debug!(
+            "Timer reached its target {} with {} block steps and {} single steps",
+            current, block_steps, instruction_steps
+        );
         Ok(task)
+    }
+
+    /// The unit of the next step from `start`, `clock` RCBs into a precise
+    /// event whose target is `target_rcb`.
+    ///
+    /// A block step runs the guest up to and including the next taken
+    /// branch, so it retires at most the conditional branches in the
+    /// straight-line code from rip to the first unconditional near jump,
+    /// call or return: a taken conditional branch ends the block early, and
+    /// one that is not taken falls through. That is the decoded bound (see
+    /// [`decode_block_bound`]). The step is a block step only if the bound
+    /// is below the RCBs left to the target, so that the block cannot reach
+    /// it: the counter then stays short of the target, and the last stretch
+    /// is single stepped exactly as before, to the same delivery point.
+    /// This holds whatever the processor's RCB event counts, taken
+    /// conditional branches only or all of them, since the bound counts
+    /// every conditional branch the block may retire.
+    ///
+    /// Everything else is single stepped: a guest that has set TF itself,
+    /// a step that restarts a syscall or starts at an instruction whose
+    /// stepped TF needs repair ([`FlagsInstruction`]), code that is not
+    /// 64-bit, and a bound that does not decode (see
+    /// [`decode_block_bound`] for what it refuses).
+    #[cfg(target_arch = "x86_64")]
+    fn step_unit(
+        &mut self,
+        task: &Stopped,
+        regs: &Regs,
+        start: &StepStart,
+        guest_trap_flag: bool,
+        clock: u64,
+        target_rcb: u64,
+    ) -> StepUnit {
+        if !block_steps_enabled()
+            || guest_trap_flag
+            || start.instruction != FlagsInstruction::Other
+            || regs.orig_rax as i32 != -1
+            || regs.cs != USER64_CS
+            || clock >= target_rcb
+        {
+            return StepUnit::Instruction;
+        }
+        match self.block_bounds.bound(task, regs.rip) {
+            Some(branches) if u64::from(branches) < target_rcb - clock => StepUnit::Block,
+            _ => StepUnit::Instruction,
+        }
     }
 
     /// Imagine our skid margin is 50 RCBs, and we set the timer for 5 RCBs.
@@ -2812,6 +2957,223 @@ impl TimerImpl {
             .disable()
             .expect("Must be able to disable timer before stepping");
         self.overflow_period = None;
+    }
+}
+
+/// Whether a block step left the counter at `clock`, at or past the precise
+/// target `target_rcb`, which the decoded bound rules out. If it did, the
+/// delivery point may be passed, so this is recorded as a skid overshoot,
+/// with its marker, and the run fails closed as for a late notification.
+fn block_step_reached_target(unit: StepUnit, clock: u64, target_rcb: u64) -> bool {
+    if unit == StepUnit::Instruction || clock < target_rcb {
+        return false;
+    }
+    warn!(
+        "A block step reached the precise timer target {} (clock {}), which its decoded bound \
+         rules out; delivering the timer event at the observed counter",
+        target_rcb, clock
+    );
+    get_pmu_config().emit_skid_overshoot_marker(clock, target_rcb);
+    reverie::record_skid_overshoot();
+    true
+}
+
+/// The code segment selector of 64-bit user code on x86-64 Linux
+/// (`__USER_CS`). Other code, such as 32-bit compatibility code, is single
+/// stepped.
+#[cfg(target_arch = "x86_64")]
+const USER64_CS: u64 = 0x33;
+
+/// How many bytes of code from rip a block bound decodes at most. The bytes
+/// sit in a buffer aligned to twice this, so they never include the byte just
+/// below a multiple of 4 GiB of the buffer's own address, where iced-x86
+/// 1.21.0 overflows (see `decode_each` in reverie-liteinst's census,
+/// <https://github.com/rrnewton/reverie/issues/855>).
+#[cfg(target_arch = "x86_64")]
+const BLOCK_WINDOW: usize = 512;
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(1024))]
+struct CodeWindow([u8; 2 * BLOCK_WINDOW]);
+
+/// What one block step from an address can retire, decoded from its code.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockBound {
+    /// The most conditional branches one block step can retire, or `None` if
+    /// it must be single stepped.
+    branches: Option<u32>,
+    /// How many bytes from the address decided it, or `None` if the decoded
+    /// window ran out first (the bound is then `None`).
+    decided_by: Option<usize>,
+}
+
+/// Decodes the straight-line 64-bit code in `code`, whose first byte is at
+/// `ip`, up to the first instruction that ends a block step for certain: a
+/// near unconditional jump, call or return. A block step from `ip` runs at
+/// most that far, so it retires at most the conditional branches before it
+/// (`Jcc`, `JrCXZ` and `LOOPcc`, each counted whether or not it is taken).
+///
+/// The bound is `None`, and the step a single step, if the code has, before
+/// that instruction, anything a block step must not run without the single
+/// step's own handling: an instruction whose stepped TF Linux or
+/// [`remove_stepping_trap_flag`] must repair (`pushf`, `popf`, `iret`,
+/// `uiret`, `syscall`, `sysenter`, a load of SS), an interrupt or exception
+/// instruction (`int`, `int3`, `ud2`, ...), a far transfer, a transactional
+/// region instruction, or bytes that do not decode. It is `None` too if the
+/// window ends first. Only a bound decided by whole decoded instructions has
+/// `decided_by`, and only such a bound is cached.
+#[cfg(target_arch = "x86_64")]
+fn decode_block_bound(ip: u64, code: &[u8]) -> BlockBound {
+    use iced_x86::Decoder;
+    use iced_x86::DecoderOptions;
+    use iced_x86::FlowControl;
+    use iced_x86::Instruction;
+    use iced_x86::Mnemonic;
+    use iced_x86::Register;
+
+    let refused = |decided_by: usize| BlockBound {
+        branches: None,
+        decided_by: Some(decided_by),
+    };
+    let mut decoder = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    let mut branches = 0u32;
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        let decided_by = decoder.position();
+        if instruction.is_invalid() {
+            // Not cached: how many bytes the decoder examined to refuse
+            // them, or to run out of them, is not its position.
+            return BlockBound {
+                branches: None,
+                decided_by: None,
+            };
+        }
+        let repaired = matches!(
+            instruction.mnemonic(),
+            Mnemonic::Pushf
+                | Mnemonic::Pushfd
+                | Mnemonic::Pushfq
+                | Mnemonic::Popf
+                | Mnemonic::Popfd
+                | Mnemonic::Popfq
+                | Mnemonic::Iret
+                | Mnemonic::Iretd
+                | Mnemonic::Iretq
+                | Mnemonic::Uiret
+                | Mnemonic::Syscall
+                | Mnemonic::Sysenter
+                | Mnemonic::Sysexit
+                | Mnemonic::Sysexitq
+                | Mnemonic::Sysret
+                | Mnemonic::Sysretq
+                | Mnemonic::Lss
+                | Mnemonic::Retf
+        ) || (matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Pop)
+            && instruction.op0_register() == Register::SS)
+            || instruction.is_jmp_far()
+            || instruction.is_jmp_far_indirect()
+            || instruction.is_call_far()
+            || instruction.is_call_far_indirect();
+        if repaired {
+            return refused(decided_by);
+        }
+        match instruction.flow_control() {
+            FlowControl::Next => {}
+            FlowControl::ConditionalBranch => branches += 1,
+            FlowControl::UnconditionalBranch
+            | FlowControl::IndirectBranch
+            | FlowControl::Call
+            | FlowControl::IndirectCall
+            | FlowControl::Return => {
+                return BlockBound {
+                    branches: Some(branches),
+                    decided_by: Some(decided_by),
+                };
+            }
+            FlowControl::Interrupt | FlowControl::Exception | FlowControl::XbeginXabortXend => {
+                return refused(decided_by);
+            }
+        }
+    }
+    BlockBound {
+        branches: None,
+        decided_by: None,
+    }
+}
+
+/// Reads up to `buf.len()` bytes of guest code at `addr`, and returns how
+/// many it read: fewer where the code is unmapped or unreadable.
+#[cfg(target_arch = "x86_64")]
+fn read_code(task: &Stopped, addr: u64, buf: &mut [u8]) -> usize {
+    match Addr::<u8>::from_raw(addr as usize) {
+        Some(addr) => task.read(addr, buf).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Decoded block bounds by code address, for one guest thread.
+///
+/// An entry keeps the exact code bytes that decided it, and a lookup reads
+/// those bytes from the guest again and uses the entry only if they are
+/// unchanged. The bound depends on nothing but those bytes and the address,
+/// so an entry can never be stale, whatever changed the code or the
+/// mappings meanwhile (munmap, mprotect, mremap, mmap, exec, a write through
+/// /proc, process_vm_writev or PTRACE_POKETEXT, or a patcher's), without
+/// relying on observing any of them. A hit saves the decode, not the read.
+/// [`BLOCK_STEP_VERIFY_CACHE_ENV`] checks each hit against a fresh decode.
+#[cfg(target_arch = "x86_64")]
+#[derive(Default)]
+struct BlockBounds {
+    entries: std::collections::HashMap<u64, (Box<[u8]>, Option<u32>)>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl std::fmt::Debug for BlockBounds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockBounds")
+            .field("entries", &self.entries.len())
+            .finish()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BlockBounds {
+    /// Entries kept before the cache starts over.
+    const CAPACITY: usize = 4096;
+
+    /// The bound of a block step from `rip` (see [`decode_block_bound`]).
+    fn bound(&mut self, task: &Stopped, rip: u64) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut window = CodeWindow([0; 2 * BLOCK_WINDOW]);
+        if let Some((code, branches)) = self.entries.get(&rip) {
+            let current = &mut window.0[..code.len()];
+            if read_code(task, rip, current) == code.len() && *current == **code {
+                BLOCK_BOUND_HITS.fetch_add(1, Relaxed);
+                if verify_block_bound_cache() {
+                    let mut fresh = CodeWindow([0; 2 * BLOCK_WINDOW]);
+                    let len = read_code(task, rip, &mut fresh.0[..BLOCK_WINDOW]);
+                    let decoded = decode_block_bound(rip, &fresh.0[..len]).branches;
+                    assert_eq!(
+                        decoded, *branches,
+                        "the block bound cached for {rip:#x} differs from a fresh decode"
+                    );
+                }
+                return *branches;
+            }
+        }
+        BLOCK_BOUND_MISSES.fetch_add(1, Relaxed);
+        let len = read_code(task, rip, &mut window.0[..BLOCK_WINDOW]);
+        let bound = decode_block_bound(rip, &window.0[..len]);
+        if let Some(decided_by) = bound.decided_by {
+            if self.entries.len() >= Self::CAPACITY {
+                self.entries.clear();
+            }
+            self.entries
+                .insert(rip, (window.0[..decided_by].into(), bound.branches));
+        }
+        bound.branches
     }
 }
 
@@ -3311,8 +3673,14 @@ mod tests {
         use crate::perf::terminal_close_tests;
 
         terminal_close_tests::reset_releases();
-        let clock = terminal_close_tests::counter(terminal_close_tests::release_with_errors);
-        let counter = terminal_close_tests::counter(terminal_close_tests::release_with_errors);
+        // SAFETY: the gate consumes only this fixture's owned resources, with
+        // state valid through terminal cleanup; the injected errors do not retry.
+        let clock =
+            unsafe { terminal_close_tests::counter(terminal_close_tests::release_with_errors) };
+        // SAFETY: the gate consumes only this fixture's owned resources, with
+        // state valid through terminal cleanup; the injected errors do not retry.
+        let counter =
+            unsafe { terminal_close_tests::counter(terminal_close_tests::release_with_errors) };
         let clock_fd = clock.raw_fd();
         let timer_fd = counter.raw_fd();
         let event = ActiveEvent::Precise {
@@ -3330,6 +3698,10 @@ mod tests {
                 overflow_period: None,
                 overflow_recorded: false,
                 programming_overflowed: false,
+                event_margin: get_pmu_config().skid_margin(),
+                first_stage: None,
+                #[cfg(target_arch = "x86_64")]
+                block_bounds: BlockBounds::default(),
                 initial_command: InitialCommand::Ordinary,
                 held_initial_event: Some(event),
                 interrupted: None,
@@ -3474,6 +3846,162 @@ mod tests {
         }
         let signo = unsafe { libc::sigtimedwait(&set, &mut info, &timeout) };
         (signo == super::MARKER_SIGNAL as i32).then_some(info)
+    }
+
+    /// Blocks the timer's signal on the calling thread, so that the test can
+    /// take its notifications.
+    fn block_timer_signal() {
+        let mut blocked: libc::sigset_t = unsafe { core::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, super::MARKER_SIGNAL as i32);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, core::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    // A staged precise event's first stage is programmed the first stage
+    // margin short of its target. At the first stage's notification, the
+    // re-arm programs the second stage the measured branch rate times the
+    // latency budget short of the same target, or the skid margin short
+    // without a time from the programming, and leaves the event, its target
+    // and offset, as requested. A notification too late for a second stage
+    // to come closer leaves the first stage's margin to step.
+    #[test]
+    fn a_staged_event_is_rearmed_short_of_the_same_target() {
+        use reverie::Pid;
+
+        use super::ActiveEvent;
+        use super::EventStatus;
+        use super::LARGEST_TABLE_SKID_MARGIN;
+        use super::SINGLESTEP_TIMEOUT_RCBS;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+        use super::get_pmu_config;
+
+        const TICKS: u64 = 1_000_000;
+        let config = get_pmu_config();
+        if !config.stages(TICKS) {
+            eprintln!("skipping: this processor's precise events are not staged");
+            return;
+        }
+        block_timer_signal();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        // The clock stands still, as a stopped guest's does, so that every
+        // read in a call is the same.
+        timer.clock.disable().unwrap();
+        let first = config.first_stage_margin();
+        let skid = config.skid_margin();
+        assert_eq!(first, LARGEST_TABLE_SKID_MARGIN);
+
+        timer
+            .request_event(TimerEventRequest::PreciseInstruction(TICKS, 3))
+            .unwrap();
+        timer.timer.disable().unwrap();
+        let requested = timer.event;
+        let ActiveEvent::Precise {
+            clock_target,
+            offset: 3,
+        } = requested
+        else {
+            panic!("a precise event: {requested:?}");
+        };
+        assert_eq!(timer.overflow_period, Some(TICKS - first));
+        assert_eq!(timer.event_margin, first);
+        assert_eq!(
+            timer.max_single_step_count(),
+            first + SINGLESTEP_TIMEOUT_RCBS
+        );
+        let stage = timer.first_stage.expect("the request is staged");
+        assert_eq!(stage.programmed_clock, clock_target - TICKS);
+
+        // Too late: the first stage's margin is stepped.
+        let clock = clock_target - skid - SINGLESTEP_TIMEOUT_RCBS;
+        assert_eq!(timer.rearm_second_stage(stage, clock, None), Ok(false));
+        assert_eq!(timer.event, requested);
+        assert_eq!(timer.overflow_period, Some(TICKS - first));
+        assert_eq!(timer.event_margin, first);
+
+        // The notification finds the guest 200 RCBs past the overflow, which
+        // it reached at 2 RCBs per ns.
+        let clock = clock_target - first + 200;
+        let rcbs = clock - stage.programmed_clock;
+        assert_eq!(rcbs % 2, 0);
+        let margin = (2 * config.skid_latency_budget_ns()).clamp(skid, first);
+        let remaining = clock_target - clock;
+        assert!(
+            margin + SINGLESTEP_TIMEOUT_RCBS < remaining,
+            "the default latency budget leaves a second stage: {margin}"
+        );
+        let sample_time = stage.programmed_ns + rcbs / 2;
+        assert_eq!(
+            timer.rearm_second_stage(stage, clock, Some(sample_time)),
+            Ok(true)
+        );
+        assert_eq!(timer.event, requested);
+        assert_eq!(timer.timer_status, EventStatus::Scheduled);
+        assert_eq!(timer.overflow_period, Some(remaining - margin));
+        assert_eq!(timer.event_margin, margin);
+        assert_eq!(
+            timer.max_single_step_count(),
+            margin + SINGLESTEP_TIMEOUT_RCBS
+        );
+        assert_eq!(
+            timer.armed_programming.map(|armed| armed.overflow_point),
+            Some(clock_target - margin)
+        );
+
+        // A sample from before the programming, or none, gives no rate.
+        for sample_time in [Some(stage.programmed_ns), None] {
+            assert_eq!(
+                timer.rearm_second_stage(stage, clock, sample_time),
+                Ok(true)
+            );
+            assert_eq!(timer.event, requested);
+            assert_eq!(timer.overflow_period, Some(remaining - skid));
+            assert_eq!(timer.event_margin, skid);
+        }
+        timer.timer.disable().unwrap();
+    }
+
+    // The first stage's overflow records its time, after the programming,
+    // where the re-arm reads it.
+    #[test]
+    fn an_overflow_records_when_it_happened() {
+        use reverie::Pid;
+
+        use super::TimerImpl;
+        use super::monotonic_ns;
+        use crate::perf::do_branches;
+
+        block_timer_signal();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        assert_eq!(timer.timer.take_sample_records(), Some(0));
+        if !timer.timer.records_sample_time() {
+            eprintln!("skipping: this PMU's overflow records have no time");
+            return;
+        }
+        const PERIOD: u64 = 10_000;
+
+        let before = monotonic_ns();
+        timer.prepare_notification(PERIOD).unwrap();
+        do_branches(PERIOD * 3);
+        timer.timer.disable().unwrap();
+        let after = monotonic_ns();
+        take_timer_signal().expect("the counter overflowed");
+        assert_eq!(timer.timer.last_sample_time(), None);
+        timer.mark_overflows_consumed();
+        let time = timer
+            .timer
+            .last_sample_time()
+            .expect("the overflow's record has its time");
+        assert!(before < time && time < after, "{before} < {time} < {after}");
     }
 
     #[test]
@@ -4035,8 +4563,111 @@ mod tests {
         assert_eq!(timer.disregard_stop_before_period(), Ok(()));
         assert_eq!(timer.timer_status, EventStatus::Cancelled);
         assert_eq!(timer.overflow_period, None);
+
+        // A reported handler return keeps the same events, and where the
+        // stop above cancels an event nothing has delivered, requests it
+        // again at the same target, with records and without.
+        let config = super::get_pmu_config();
+        let requested_again = |timer: &TimerImpl, target| {
+            assert_eq!(timer.timer_status, EventStatus::Scheduled);
+            assert_eq!(
+                timer.event,
+                super::ActiveEvent::Precise {
+                    clock_target: target,
+                    offset: 0,
+                }
+            );
+            let ticks = target - timer.read_clock();
+            let margin = if config.stages(ticks) {
+                config.first_stage_margin()
+            } else {
+                config.skid_margin()
+            };
+            let notification = ticks.saturating_sub(margin);
+            if notification <= super::SINGLESTEP_TIMEOUT_RCBS {
+                assert!(timer.send_artificial_signal);
+                assert_eq!(timer.overflow_period, None);
+            } else {
+                assert!(!timer.send_artificial_signal);
+                assert_eq!(timer.overflow_period, Some(notification));
+            }
+        };
+        for records in [true, false] {
+            if !records {
+                timer.timer.unmap_sample_records();
+            }
+            // Beyond the keep margin the event and its programming stay.
+            timer.set_status(EventStatus::Scheduled);
+            timer.prepare_notification(far).unwrap();
+            timer.event = precise(&timer, keep_margin + 100_000);
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Scheduled);
+            assert_eq!(timer.overflow_period, Some(far));
+            // Within it a Scheduled event is requested again.
+            timer.set_status(EventStatus::Scheduled);
+            timer.prepare_notification(far).unwrap();
+            let target = timer.read_clock() + keep_margin - 1_000;
+            timer.event = precise(&timer, keep_margin - 1_000);
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            requested_again(&timer, target);
+            // Ends the programming before this thread's own branches reach
+            // it; the clock is stopped, so the target is not reached.
+            timer.retire().unwrap();
+            // So is an Armed event whose single steps the stop interrupted.
+            let steps = InterruptedSteps {
+                steps: ClockCounter::new(PERIOD - 10, 0, PERIOD),
+                target_instr: 0,
+            };
+            timer.set_status(EventStatus::Armed);
+            timer.event = precise(&timer, 50);
+            timer.interrupted = Some(Interruption::At(steps));
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            requested_again(&timer, timer.read_clock() + 50);
+            timer.retire().unwrap();
+            // With the timer's signal blocked by the mask the frame installs,
+            // or that mask unknown, neither is requested again.
+            timer.set_status(EventStatus::Scheduled);
+            timer.prepare_notification(far).unwrap();
+            timer.event = precise(&timer, keep_margin - 1_000);
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(false), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Cancelled);
+            assert_eq!(timer.overflow_period, None);
+            assert!(!timer.send_artificial_signal);
+            timer.set_status(EventStatus::Armed);
+            timer.event = precise(&timer, 50);
+            timer.interrupted = Some(Interruption::At(steps));
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(false), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Cancelled);
+            assert!(!timer.send_artificial_signal);
+            // An Armed event that the stop did not interrupt was delivered,
+            // and is not requested again.
+            timer.set_status(EventStatus::Armed);
+            timer.event = precise(&timer, 50);
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Cancelled);
+            assert!(!timer.send_artificial_signal);
+            // Nor is one the guest's clock has reached, here with an
+            // instruction offset still ahead, so that the stop records no
+            // skid overshoot in the process-wide count.
+            timer.set_status(EventStatus::Scheduled);
+            timer.prepare_notification(far).unwrap();
+            timer.event = super::ActiveEvent::Precise {
+                clock_target: timer.read_clock(),
+                offset: 1,
+            };
+            timer.tick_observed();
+            assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
+            assert_eq!(timer.timer_status, EventStatus::Cancelled);
+            assert_eq!(timer.overflow_period, None);
+            assert!(!timer.send_artificial_signal);
+        }
         timer.event = super::ActiveEvent::Imprecise { clock_min: 0 };
-        timer.timer.unmap_sample_records();
 
         assert!(take_timer_signal_now().is_none());
         unsafe {
@@ -4190,7 +4821,11 @@ mod tests {
         guest.run(1_000);
         const TARGET: u64 = 1_000_000;
         let config = super::get_pmu_config();
-        let period = TARGET - config.skid_margin();
+        let period = if config.stages(TARGET) {
+            TARGET - config.first_stage_margin()
+        } else {
+            TARGET - config.skid_margin()
+        };
         fn inner(timer: &mut Timer) -> &mut TimerImpl {
             timer.inner.as_mut().unwrap()
         }
@@ -4609,7 +5244,7 @@ mod tests {
     fn amd_epyc_9d85_uses_reduced_skid_margin() {
         let config = PmuConfig::from_family_model(0x1A, 0x11);
         assert_eq!(config.raw_rcb_event(), 0x5100d1);
-        assert_eq!(config.skid_margin(), 1_000);
+        assert_eq!(config.skid_margin(), 2_000);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -4623,8 +5258,60 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn unknown_cpu_is_unavailable_to_fallible_in_guest_clock() {
-        assert_eq!(PmuConfig::try_from_family_model(0x06, 0xCF), None);
+        assert_eq!(PmuConfig::try_from_family_model(0x06, 0x01), None);
         assert_eq!(PmuConfig::try_from_family_model(0xFF, 0x01), None);
+    }
+
+    // A GitHub-hosted runner is family 6 model 0xCF (Emerald Rapids): every
+    // timer there panicked with "Unsupported Intel processor model: 0xcf"
+    // (https://github.com/rrnewton/hermit/actions/runs/37695112596).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn emerald_rapids_uses_sapphire_rapids_profile() {
+        let emerald = PmuConfig::from_family_model(0x06, 0xCF);
+        let sapphire = PmuConfig::from_family_model(0x06, 0x8F);
+        assert_eq!(emerald, sapphire);
+        assert_eq!(emerald.raw_rcb_event(), 0x5101c4);
+        assert_eq!(emerald.skid_margin(), 125);
+    }
+
+    // Ice Lake server and client parts, Azure's common Ice Lake-SP among
+    // them, use rr's Ice Lake profile with the same event as Sapphire Rapids.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ice_lake_models_have_a_profile() {
+        for model in [0x6A, 0x6C, 0x7D, 0x7E] {
+            let config = PmuConfig::from_family_model(0x06, model);
+            assert_eq!(config.raw_rcb_event(), 0x5101c4, "model {model:#x}");
+            assert_eq!(config.skid_margin(), 100, "model {model:#x}");
+        }
+    }
+
+    // A CPU with no profile is a typed refusal that names it, not a panic.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_cpu_with_no_profile_is_refused_with_its_family_and_model() {
+        assert!(matches!(
+            PmuConfig::for_family_model(0x06, 0x01),
+            Err(crate::validation::PmuValidationError::UnsupportedCpu {
+                family: 0x06,
+                model: 0x01
+            })
+        ));
+        assert!(PmuConfig::for_family_model(0x1A, 0x11).is_ok());
+    }
+
+    // A margin is recorded once, and only while the configuration it would
+    // change does not exist yet; otherwise it is handed back.
+    #[test]
+    fn a_skid_margin_is_recorded_once_and_only_before_the_configuration_is_built() {
+        let slot = std::sync::OnceLock::new();
+        assert_eq!(super::record_skid_margin(&slot, true, 7), Err(7));
+        assert_eq!(slot.get(), None);
+        assert_eq!(super::record_skid_margin(&slot, false, 4321), Ok(()));
+        assert_eq!(slot.get(), Some(&4321));
+        assert_eq!(super::record_skid_margin(&slot, false, 9), Err(9));
+        assert_eq!(slot.get(), Some(&4321));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -4671,16 +5358,95 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn second_stage_margin_is_the_rate_times_the_latency_budget() {
+        use super::DEFAULT_SKID_LATENCY_BUDGET_NS;
+        use super::LARGEST_TABLE_SKID_MARGIN;
+
+        // EPYC 9D85: skid margin 2000.
+        let config = PmuConfig::from_family_model(0x1A, 0x11);
+        assert_eq!(
+            config.skid_latency_budget_ns(),
+            DEFAULT_SKID_LATENCY_BUDGET_NS
+        );
+        assert_eq!(config.first_stage_margin(), LARGEST_TABLE_SKID_MARGIN);
+        // 2 RCBs per ns for 2,000 ns.
+        assert_eq!(
+            config.second_stage_margin(2_000_000, Some(1_000_000)),
+            4_000
+        );
+        // Rounded up.
+        assert_eq!(
+            config.second_stage_margin(2_000_001, Some(1_000_000)),
+            4_001
+        );
+        // 8 RCBs per ns, the measured rate of a dense branch loop, would need
+        // 16,000: no closer than the first stage.
+        assert_eq!(
+            config.second_stage_margin(8_000_000, Some(1_000_000)),
+            LARGEST_TABLE_SKID_MARGIN
+        );
+        // A low rate takes the skid margin, a high one the first stage's.
+        assert_eq!(config.second_stage_margin(100_000, Some(1_000_000)), 2_000);
+        assert_eq!(
+            config.second_stage_margin(100_000_000, Some(1_000_000)),
+            LARGEST_TABLE_SKID_MARGIN
+        );
+        // Without a time, or with none elapsed, it is the skid margin.
+        assert_eq!(config.second_stage_margin(8_000_000, None), 2_000);
+        assert_eq!(config.second_stage_margin(8_000_000, Some(0)), 2_000);
+        // No overflow in the product.
+        assert_eq!(
+            config.second_stage_margin(u64::MAX, Some(1)),
+            LARGEST_TABLE_SKID_MARGIN
+        );
+        let config = config.with_skid_latency_budget_ns(400);
+        assert_eq!(
+            config.second_stage_margin(8_000_000, Some(1_000_000)),
+            3_200
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn only_a_programmed_first_stage_short_of_a_smaller_margin_is_staged() {
+        use super::LARGEST_TABLE_SKID_MARGIN;
+        use super::SINGLESTEP_TIMEOUT_RCBS;
+
+        let config = PmuConfig::from_family_model(0x1A, 0x11);
+        let shortest = LARGEST_TABLE_SKID_MARGIN + SINGLESTEP_TIMEOUT_RCBS + 1;
+        assert!(config.stages(shortest));
+        assert!(config.stages(u64::MAX));
+        // Its first stage would be an artificial signal.
+        assert!(!config.stages(shortest - 1));
+        assert!(!config.stages(1));
+        // Staging is off.
+        assert!(
+            !config
+                .clone()
+                .with_skid_latency_budget_ns(0)
+                .stages(shortest)
+        );
+        // An overridden skid margin is kept, even below the table's.
+        assert!(!config.clone().with_skid_margin_override(0).stages(shortest));
+        // No second stage comes closer than a margin as large as the first
+        // stage's.
+        let amd = PmuConfig::from_family_model(0x17, 0x71);
+        assert_eq!(amd.skid_margin(), LARGEST_TABLE_SKID_MARGIN);
+        assert!(!amd.stages(u64::MAX));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn skid_overshoot_marker_has_canonical_shape() {
         use super::SKID_OVERSHOOT_MARKER;
-        // EPYC 9D85: skid margin 1000. Overshoot of 33_500 (the measured
+        // EPYC 9D85: skid margin 2000. Overshoot of 33_500 (the measured
         // baseline outlier) landing 500 RCB past a target of 33_000.
         let config = PmuConfig::from_family_model(0x1A, 0x11);
         let line = config.format_skid_overshoot_marker(33_500, 33_000);
         assert_eq!(
             line,
             format!(
-                "{} rcb_actual=33500 rcb_target=33000 skid_margin=1000 overshoot=500",
+                "{} rcb_actual=33500 rcb_target=33000 skid_margin=2000 overshoot=500",
                 SKID_OVERSHOOT_MARKER
             )
         );
@@ -4713,7 +5479,7 @@ mod tests {
         let _ = reverie::take_skid_overshoot_count();
 
         // The exact CPU is irrelevant to the decision, which keys only on
-        // `actual > target`; use EPYC 9D85 (default margin 1000).
+        // `actual > target`; use EPYC 9D85 (default margin 2000).
         let config = PmuConfig::from_family_model(0x1A, 0x11);
 
         // --- Negative bracket: a non-overshoot must record nothing. ---
@@ -4975,5 +5741,109 @@ mod tests {
                 "rip {rip:#x}"
             );
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod block_bound_tests {
+    use super::BLOCK_WINDOW;
+    use super::BlockBound;
+    use super::CodeWindow;
+    use super::decode_block_bound;
+
+    const IP: u64 = 0x40_1000;
+
+    /// The bound of `code`, decoded from an aligned window as `BlockBounds`
+    /// does.
+    fn bound(code: &[u8]) -> BlockBound {
+        let mut window = CodeWindow([0; 2 * BLOCK_WINDOW]);
+        window.0[..code.len()].copy_from_slice(code);
+        decode_block_bound(IP, &window.0[..code.len()])
+    }
+
+    fn bounded(branches: u32, len: usize) -> BlockBound {
+        BlockBound {
+            branches: Some(branches),
+            decided_by: Some(len),
+        }
+    }
+
+    fn refused(len: usize) -> BlockBound {
+        BlockBound {
+            branches: None,
+            decided_by: Some(len),
+        }
+    }
+
+    const UNDECIDED: BlockBound = BlockBound {
+        branches: None,
+        decided_by: None,
+    };
+
+    #[test]
+    fn counts_every_conditional_branch_before_the_first_unconditional_transfer() {
+        // jne +0; je +0; jmp rel8
+        assert_eq!(bound(&[0x75, 0x00, 0x74, 0x00, 0xeb, 0xfe]), bounded(2, 6));
+        // cmp eax, 1; jl rel32; ret
+        assert_eq!(
+            bound(&[0x83, 0xf8, 0x01, 0x0f, 0x8c, 0, 0, 0, 0, 0xc3]),
+            bounded(1, 10)
+        );
+        // jrcxz, loop, loopne: conditional too.
+        assert_eq!(
+            bound(&[0xe3, 0x00, 0xe2, 0x00, 0xe0, 0x00, 0xc3]),
+            bounded(3, 7)
+        );
+        // A near call, an indirect jump and an indirect call end the block.
+        assert_eq!(bound(&[0x90, 0xe8, 0, 0, 0, 0]), bounded(0, 6));
+        assert_eq!(bound(&[0x75, 0x00, 0xff, 0xe0]), bounded(1, 4));
+        assert_eq!(bound(&[0xff, 0xd0]), bounded(0, 2));
+        // Code past the end of the block is not read.
+        assert_eq!(bound(&[0xc3, 0x0f, 0x05]), bounded(0, 1));
+    }
+
+    #[test]
+    fn refuses_instructions_whose_single_step_handling_a_block_step_would_skip() {
+        for (name, code) in [
+            ("pushfq", &[0x9c][..]),
+            ("popfq", &[0x9d]),
+            ("iretq", &[0x48, 0xcf]),
+            ("syscall", &[0x0f, 0x05]),
+            ("sysenter", &[0x0f, 0x34]),
+            ("mov ss, ax", &[0x8e, 0xd0]),
+            ("int3", &[0xcc]),
+            ("int 0x80", &[0xcd, 0x80]),
+            ("ud2", &[0x0f, 0x0b]),
+            ("retf", &[0xcb]),
+            ("jmp far [rax]", &[0xff, 0x28]),
+            ("call far [rax]", &[0xff, 0x18]),
+            ("xbegin", &[0xc7, 0xf8, 0, 0, 0, 0]),
+            ("uiret", &[0xf3, 0x0f, 0x01, 0xec]),
+        ] {
+            // After a not-taken branch, so it is reached in the block.
+            let mut padded = vec![0x75, 0x00];
+            padded.extend_from_slice(code);
+            padded.push(0xc3);
+            assert_eq!(bound(&padded), refused(2 + code.len()), "{name}");
+        }
+    }
+
+    #[test]
+    fn code_that_does_not_reach_a_transfer_is_undecided() {
+        assert_eq!(bound(&[0x90; 16]), UNDECIDED);
+        // An instruction cut off by the end of the code.
+        assert_eq!(bound(&[0x90, 0x0f]), UNDECIDED);
+        assert_eq!(bound(&[]), UNDECIDED);
+    }
+
+    #[test]
+    fn bytes_that_do_not_decode_are_refused_uncached() {
+        // 0x06 (push es) is invalid in 64-bit mode.
+        assert_eq!(bound(&[0x90, 0x06, 0xc3]), UNDECIDED);
+    }
+
+    #[test]
+    fn a_full_window_without_a_transfer_is_undecided() {
+        assert_eq!(bound(&[0x90; BLOCK_WINDOW]), UNDECIDED);
     }
 }

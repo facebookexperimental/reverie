@@ -37,10 +37,23 @@ use reverie_syscalls::Sysno;
 #[cfg(target_arch = "x86_64")]
 mod canonical;
 mod image;
+mod process;
 
 #[cfg(target_arch = "x86_64")]
 pub use canonical::*;
 pub use image::*;
+pub use process::VdsoSyscallSite;
+#[doc(hidden)]
+pub use process::current_vdso_mapping_len;
+pub use process::is_patch_required;
+#[cfg(target_arch = "x86_64")]
+pub use process::patch_current_vdso;
+#[cfg(target_arch = "x86_64")]
+pub use process::patch_current_vdso_trapping;
+#[cfg(target_arch = "x86_64")]
+pub use process::patch_current_vdso_trapping_owned;
+#[doc(hidden)]
+pub use process::vdso_replacements;
 
 /// One function exported by the Linux vDSO, named as in the kernel's linker
 /// script. [`VdsoSymbol::name`] and [`Display`](fmt::Display) give that name.

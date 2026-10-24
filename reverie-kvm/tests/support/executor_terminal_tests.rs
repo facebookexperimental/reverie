@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Included inside executor::tests; the shared adapter is cfg(test) in lib.rs.
 #[test]
 fn terminal_cleanup_preserves_live_shared_table_and_does_not_wait_for_its_lock() {
@@ -160,35 +152,25 @@ fn terminal_cleanup_preserves_live_shared_table_and_does_not_wait_for_its_lock_b
     );
 }
 
+
 // Test-only join, compiled inside executor::tests where it can inspect the real
 // admission/reaper owner. No production readiness or cleanup rule is bypassed.
 impl RunAdmission {
     pub(crate) fn finish_fixture_cleanup(mut self) {
         let workers = Arc::new(crate::vm::GuestThreadGroup::default());
         AbandonedRuns::retire(&self.runs, &workers);
-        let reaper = self
-            .reaper
-            .take()
-            .expect("fixture admission already finished");
+        let reaper = self.reaper.take().expect("fixture admission already finished");
         let observed = reaper.shared.clone();
         drop(reaper);
-        self.reaping
-            .take()
-            .expect("fixture lost its real reaper join")
-            .join()
-            .expect("fixture cleanup reaper panicked");
+        self.reaping.take().expect("fixture lost its real reaper join")
+            .join().expect("fixture cleanup reaper panicked");
         let state = observed.lock();
         assert_eq!(state.handles, 0, "fixture leaked a cleanup owner");
-        assert!(
-            state.adopted.is_empty(),
-            "fixture left retirement work pending"
-        );
-        assert!(
-            state.retained_panics.is_empty(),
-            "fixture cleanup retained a panic"
-        );
+        assert!(state.adopted.is_empty(), "fixture left retirement work pending");
+        assert!(state.retained_panics.is_empty(), "fixture cleanup retained a panic");
     }
 }
+
 
 // A proc-fdinfo observer is not a guest task owner. Freeze exactly the strong
 // table upgrade at FdinfoTarget::observe, before its table lock or per-file dup,
@@ -215,14 +197,7 @@ fn terminal_cleanup_retires_socket_despite_fdinfo_observer_table_pin_body(
     assert_eq!(
         fixture.call(
             libc::SYS_socketpair,
-            [
-                libc::AF_UNIX as u64,
-                libc::SOCK_STREAM as u64,
-                0,
-                0x180,
-                0,
-                0
-            ],
+            [libc::AF_UNIX as u64, libc::SOCK_STREAM as u64, 0, 0x180, 0, 0],
         ),
         0
     );
@@ -272,13 +247,14 @@ fn terminal_cleanup_retires_socket_despite_fdinfo_observer_table_pin_body(
     assert_eq!(open_errno, Some(libc::EAGAIN));
 
     let info_fd = fixture.info(regular_fd);
-    let transient_observer = match &fixture.executor.state.fdinfo_files[&(info_fd as i32)].source {
-        SeqProcSource::Fdinfo(target) => {
-            assert_eq!(target.target_fd, regular_fd as i32);
-            target.table.upgrade().expect("live fdinfo target table")
-        }
-        SeqProcSource::Process { .. } => panic!("expected the real fdinfo target"),
-    };
+    let transient_observer =
+        match &fixture.executor.state.fdinfo_files[&(info_fd as i32)].source {
+            SeqProcSource::Fdinfo(target) => {
+                assert_eq!(target.target_fd, regular_fd as i32);
+                target.table.upgrade().expect("live fdinfo target table")
+            }
+            SeqProcSource::Process { .. } => panic!("expected the real fdinfo target"),
+        };
     assert!(Arc::ptr_eq(
         &transient_observer,
         &fixture.executor.file_table

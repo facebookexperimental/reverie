@@ -149,16 +149,16 @@ fn production_example_clis_run_real_program_with_kvm_guest() {
     }
 
     let counter1 = run(
-        env!("CARGO_BIN_EXE_reverie-kvm-counter1"),
-        &["/bin/echo", "counter1"],
+        env!("CARGO_BIN_EXE_counter1"),
+        &["--backend", "kvm", "/bin/echo", "counter1"],
     );
     assert_success(&counter1);
     assert_eq!(counter1.stdout, b"counter1\n");
     assert!(String::from_utf8_lossy(&counter1.stderr).contains("counter1-global syscalls="));
 
     let counter2 = run(
-        env!("CARGO_BIN_EXE_reverie-kvm-counter2"),
-        &["/bin/echo", "counter2"],
+        env!("CARGO_BIN_EXE_counter2"),
+        &["--backend", "kvm", "/bin/echo", "counter2"],
     );
     assert_success(&counter2);
     assert_eq!(counter2.stdout, b"counter2\n");
@@ -307,8 +307,15 @@ fn counter2_matches_ptrace_echo_syscall_count() {
         &["--no-host-envs", "--", "/bin/echo", "count-parity"],
     );
     let kvm = run(
-        env!("CARGO_BIN_EXE_reverie-kvm-counter2"),
-        &["/bin/echo", "count-parity"],
+        env!("CARGO_BIN_EXE_counter2"),
+        &[
+            "--backend",
+            "kvm",
+            "--no-host-envs",
+            "--",
+            "/bin/echo",
+            "count-parity",
+        ],
     );
 
     assert_success(&ptrace);
@@ -335,15 +342,15 @@ fn cross_backend_tool_startup_microbenchmark() {
         "counter1",
         env!("CARGO_BIN_EXE_counter1"),
         &["--no-host-envs", "--", "/bin/true"],
-        env!("CARGO_BIN_EXE_reverie-kvm-counter1"),
-        &["/bin/true"],
+        env!("CARGO_BIN_EXE_counter1"),
+        &["--backend", "kvm", "--no-host-envs", "--", "/bin/true"],
     );
     benchmark_pair(
         "counter2",
         env!("CARGO_BIN_EXE_counter2"),
         &["--no-host-envs", "--", "/bin/true"],
-        env!("CARGO_BIN_EXE_reverie-kvm-counter2"),
-        &["/bin/true"],
+        env!("CARGO_BIN_EXE_counter2"),
+        &["--backend", "kvm", "--no-host-envs", "--", "/bin/true"],
     );
     benchmark_pair(
         "noop",
@@ -459,8 +466,16 @@ fn counter2_matches_ptrace_fork_process_and_thread_counts() {
         &["--no-host-envs", "--", "/bin/sh", "-c", workload],
     );
     let kvm = run(
-        env!("CARGO_BIN_EXE_reverie-kvm-counter2"),
-        &["/bin/sh", "-c", workload],
+        env!("CARGO_BIN_EXE_counter2"),
+        &[
+            "--backend",
+            "kvm",
+            "--no-host-envs",
+            "--",
+            "/bin/sh",
+            "-c",
+            workload,
+        ],
     );
 
     assert_success(&ptrace);

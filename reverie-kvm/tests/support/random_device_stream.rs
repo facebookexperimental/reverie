@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use super::*;
 
 fn run_exhaustion(test: &str, vector: bool, with_tool: bool) {
@@ -80,32 +72,48 @@ fn random_device_vector_stream_tool() {
     run_exhaustion("random_device_vector_stream_tool", true, true);
 }
 
-fn run_partitioned_contract(with_tool: bool) {
-    Kvm::new().expect("random stream byte contract requires usable /dev/kvm");
+/// One stream read through three descriptors that share it (the opened one, a
+/// dup and an F_DUPFD_CLOEXEC copy), alternating read and readv with
+/// partitions that cross every page and call boundary. For an ordinary file
+/// every byte must be the file's byte at its offset; for the random device
+/// the count must be exact.
+fn run_partitioned_contract(with_tool: bool, regular: bool) {
+    Kvm::new().expect("partitioned stream contract requires usable /dev/kvm");
     let directory = TestDirectory::new();
     let executable = compile_c_program(
         &directory.0,
         "random-device-partitions",
         include_str!("../fixtures/random_device_stream.c"),
     );
+    let content: Vec<u8> = (0..70001u64)
+        .map(|index| ((index * 73 + 41) & 255) as u8)
+        .collect();
+    let mut arguments = vec![
+        executable.to_str().unwrap().to_owned(),
+        "partitioned".to_owned(),
+    ];
+    if regular {
+        let path = directory.0.join("stream");
+        std::fs::write(&path, &content).unwrap();
+        arguments.push(path.to_str().unwrap().to_owned());
+    }
     let native = std::process::Command::new(&executable)
-        .arg("partitioned")
+        .args(&arguments[1..])
         .output()
         .unwrap();
     assert!(native.status.success(), "native: {native:?}");
     assert!(native.stderr.is_empty());
     assert_eq!(native.stdout.len(), 70001);
-    // Independent oracle for the pre-existing seed-zero byte contract. Never
-    // obtain expected bytes from the implementation's carrier or generator.
-    let expected: Vec<u8> = (0..70001u64)
-        .map(|index| ((index * 73 + 41) & 255) as u8)
-        .collect();
+    if regular {
+        assert_eq!(native.stdout, content);
+    }
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
     for _ in 0..2 {
         let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
         backend
             .install_static_elf_file_with_context(
                 std::fs::File::open(&executable).unwrap(),
-                &[executable.to_str().unwrap(), "partitioned"],
+                &arguments,
                 &[],
                 &directory.0,
             )
@@ -123,19 +131,34 @@ fn run_partitioned_contract(with_tool: bool) {
         };
         assert_eq!(code, 0);
         assert!(stderr.is_empty());
-        assert_eq!(
-            stdout, expected,
-            "each byte must follow the original stream across syscall and alias boundaries"
-        );
+        assert_eq!(stdout.len(), 70001);
+        // The random device's bytes are the host's entropy without a Tool
+        // that answers them (Detcore does, under Hermit).
+        if regular {
+            assert_eq!(
+                stdout, content,
+                "each byte must follow the shared offset across syscall and alias boundaries"
+            );
+        }
     }
 }
 
 #[test]
 fn random_device_partitioned_byte_contract_direct() {
-    run_partitioned_contract(false);
+    run_partitioned_contract(false, false);
 }
 
 #[test]
 fn random_device_partitioned_byte_contract_tool() {
-    run_partitioned_contract(true);
+    run_partitioned_contract(true, false);
+}
+
+#[test]
+fn regular_file_partitioned_byte_contract_direct() {
+    run_partitioned_contract(false, true);
+}
+
+#[test]
+fn regular_file_partitioned_byte_contract_tool() {
+    run_partitioned_contract(true, true);
 }

@@ -542,3 +542,69 @@ mod tests {
         assert!(Arc::ptr_eq(&projection.failure.primary, &snapshot.primary));
     }
 }
+
+/// A guest thread had SIGTRAP blocked and one pending when Reverie had to
+/// single-step it (<https://github.com/rrnewton/hermit/issues/4409>).
+///
+/// Linux reports each single-step with `force_sig(SIGTRAP)`. While SIGTRAP is
+/// blocked, that trap is absorbed into the pending one, which is consumed,
+/// and SIGTRAP's action is reset to `SIG_DFL`; while it is unblocked, the
+/// pending SIGTRAP is taken before the stepped instruction. Either way the
+/// guest's signal cannot be kept as it would be natively, so Reverie ends the
+/// run rather than continue without it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "thread {tid} has SIGTRAP blocked with one pending, which Reverie's \
+     single-step at the {site} cannot keep; the run is ended instead of \
+     continuing without it"
+)]
+pub struct PendingSigtrapAtStep {
+    /// The thread that was to be stepped.
+    pub tid: i32,
+    /// The step that was to be made.
+    pub site: &'static str,
+}
+
+/// A guest made a syscall through the untraced `syscall` of Reverie's private
+/// page, outside any injection, and took the SIGILL of the `ud2` after it.
+///
+/// Reverie's seccomp filter lets every syscall issued from that instruction
+/// through untraced, because Reverie's own injections need it, and the page is
+/// at a fixed, public address. Reverie's injections single-step that `syscall`
+/// and never reach the `ud2`, so a SIGILL there is the guest's own call, which
+/// no tool saw. The call has already taken effect; Reverie ends the run rather
+/// than deliver the SIGILL, which a handler or a forked child could otherwise
+/// use to keep the result and continue
+/// (<https://github.com/rrnewton/reverie/issues/1064>).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the guest made a syscall through Reverie's untraced private-page stub \
+     (thread {tid}, instruction {address:#x}), which no tool sees; the run is \
+     ended instead of continuing without it"
+)]
+pub struct UntracedStubSyscall {
+    /// The thread that made the call.
+    pub tid: i32,
+    /// The address of the `ud2` it faulted on.
+    pub address: u64,
+}
+
+/// A Tool's signal callback approved a delivery (`Guest::deliver_signal`)
+/// and then broke the approval: an injection or a register write changed the
+/// stop the checks read, it returned another signal or none, or it executed a
+/// program. Delivering would hand the guest something the checks did not
+/// cover, and suppressing would lose an approved signal, so Reverie ends the
+/// run. It is a Tool defect.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a signal callback approved signal {signal} for delivery to thread {tid} but {reason}; \
+     the run is ended rather than resume the guest unchecked"
+)]
+pub struct BrokenSignalApproval {
+    /// The thread the signal was approved for.
+    pub tid: i32,
+    /// The approved signal's number.
+    pub signal: i32,
+    /// How the callback broke the approval.
+    pub reason: &'static str,
+}

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Native broker controls included by the ordinary-main test launcher,
 //! before libtest or any guest resources. This file does not bootstrap a broker.
 //! The caller retains BrokerOwner and uses its existing shutdown/actual-wait path.

@@ -10,7 +10,7 @@ ptrace and KVM installation does not require this transport.
 
 ```toml
 [dependencies]
-reverie-rpc-transport = "0.4"
+reverie-rpc-transport = "0.5"
 ```
 
 See the [API documentation](https://docs.rs/reverie-rpc-transport) for the

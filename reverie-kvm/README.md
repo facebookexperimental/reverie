@@ -20,12 +20,20 @@ The embedding process must reserve Linux real-time signal 64 exclusively for
 the backend. On first vCPU entry, the backend installs a process-wide handler;
 it does not restore that handler when a backend is dropped. Other libraries
 must not send this signal or replace its handler for the rest of the process's
-lifetime. An existing handler or `SIG_IGN` prevents entry. A changed handler or
-an unexplained pending instance before a later entry also causes an error.
+lifetime. An existing handler or `SIG_IGN` prevents entry. A changed handler is
+detected at each thread's first entry (not at that thread's later entries). An
+unexplained pending instance before an entry causes an error, and so does an
+instance no closer sent that interrupts an entry's `KVM_RUN`, even one queued
+alongside a closer's kick.
 These checks detect visible conflicts; they do not coordinate ownership with
-another signal user. Each entry restores the calling thread's original signal
-mask after draining its own notifications. The existing `SIGURG` worker
-cancellation mechanism remains separate and unchanged.
+another signal user. Signal 64 stays blocked on a thread from its first vCPU
+entry on: KVM unblocks it only inside `KVM_RUN`, through the vCPU's signal mask,
+and each entry drains its own notifications before it returns. Threads that
+such a thread creates, and host processes it spawns, inherit signal 64 blocked:
+Rust's `Command` and `posix_spawn` keep the parent's signal mask across exec.
+Neither this crate nor Hermit's Detcore spawns a host process from a vCPU
+thread. The existing `SIGURG` worker cancellation mechanism remains separate
+and unchanged.
 
 The private entry gate also stops every participant and callback memory copy
 sharing a Mapping when clock-interval setup or cleanup fails. That interval
@@ -70,7 +78,7 @@ instruction-fetch faults in virtual page zero produce `SIGSEGV` with
 `Error::GuestException`, reporting the vector, saved guest instruction pointer
 and `CR2`; this is not general synchronous-fault delivery.
 
-`run_static_elf` supplies a deliberately small Linux personality. It handles process exit, host-backed filesystem descriptors, stdout/stderr writes, deterministic identity, time and random queries, FS/GS bases, `brk`, anonymous and file-backed `mmap`, and common startup no-ops. Unsupported syscalls return `ENOSYS`.
+`run_static_elf` supplies a deliberately small Linux personality. It handles process exit, host-backed filesystem descriptors, stdout/stderr writes, host clock reads, FS/GS bases, `brk`, anonymous and file-backed `mmap`, and common startup no-ops. Unsupported syscalls return `ENOSYS`. The calls whose answers the Tool (Detcore) decides on every backend (the CPU, scheduling and priority calls, `membarrier`, `getrandom`, `prlimit64`, the user and group id calls, `seccomp` and `getpgrp`) also return `ENOSYS`, with the typed refusal `UnsupportedOperation::ToolDecided`.
 
 The host-backed filesystem layer includes descriptor duplication, file and
 filesystem metadata, permission and timestamp updates, and bounded
@@ -78,9 +86,7 @@ create/link/rename/unlink operations. A virtual umask is applied to creation
 modes before they are forwarded to the host. The executor retains signal
 actions, masks, pending state and alternate-stack configuration and delivers
 supported events at explicit execution boundaries, as described below.
-`mincore`, `getcpu`,
-`sched_getaffinity`, and `membarrier` report the deterministic single-vCPU
-topology.
+`mincore` reports every page of a mapped range resident.
 
 The process personality implements `fork`, `vfork`, process-only `clone`/`clone3`,
 `execve`/`execveat`, and `wait4`. Forked children receive an independent guest
@@ -267,25 +273,24 @@ is rejected instead of being forwarded as an untyped request. `install_syscalls`
 builds a small guest program containing consecutive hypercalls, with one
 page-aligned frame per request, so a single KVM run can route several syscalls.
 
-## CPUID policy
+## CPUID
 
-Every vCPU receives an explicit CPUID table through `KVM_SET_CPUID2` before
-its first `KVM_RUN`. The default `CpuidPolicy::deterministic` policy replaces
-the host table with a fixed x86-64-v3 profile based on Detcore's CPUID table,
-then removes `RDRAND`, `RDSEED`, TSX, AVX-512 feature bits, and the AVX-512
-extended register state. This keeps standard and extended identity, feature,
-cache, and topology leaves independent of the KVM host. VM creation fails if
-the host lacks an instruction feature required by that baseline. Callers that
-need KVM's full host-supported table can opt into
-`CpuidPolicy::host_supported`.
+The backend keeps no CPUID profile of its own. A Tool that subscribes to
+CPUID answers every guest CPUID: the vCPU's CPL3 CPUID faulting is enabled,
+and each fault goes to `Tool::handle_cpuid_event` (under Hermit, Detcore's
+machine description, the table its `/proc/cpuinfo` is rendered from).
 
-The KVM integration test executes CPUID inside the VM and copies the resulting
-registers to guest memory. This checks the vCPU-visible table rather than only
-unit-testing the host-side mask.
+For a Tool that does not subscribe, the guest reads the vCPU's table, which
+`KVM_SET_CPUID2` installs before the first `KVM_RUN`: KVM's host-supported
+leaves with the host's own registers, so the guest reads what the same
+program reads natively. Two exceptions: KVM's hypervisor leaves stay KVM's,
+and leaf 0xd advertises only the x87, SSE and YMM components the backend's
+signal frames carry, because KVM sizes the guest's XSAVE state from it. KVM
+still computes the fields that describe the vCPU itself, such as OSXSAVE and
+the XSAVE sizes.
 
-This is a static vCPU feature policy, not a per-instruction
-`Tool::handle_cpuid_event` callback. The latter still requires the planned
-Linux execution bridge to preserve task-local callback context.
+The KVM integration tests execute CPUID inside the VM and compare the
+registers with the host's.
 
 ## Relationship to gVisor
 

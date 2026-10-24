@@ -31,3 +31,8 @@ pub struct FpRegs {
     pub fpcr: u32,
     __reserved: [u32; 2],
 }
+
+#[cfg(target_arch = "x86_64")]
+mod xstate_pkru;
+#[cfg(target_arch = "x86_64")]
+pub use xstate_pkru::XStatePkruError;

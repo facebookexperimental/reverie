@@ -9,6 +9,7 @@
 //! The ptrace backend's implementation of the [`reverie::Backend`] contract.
 
 use reverie::Backend;
+use reverie::BackendCapabilities;
 use reverie::BackendStatsRequest;
 use reverie::BackendStatsSource;
 use reverie::Error;
@@ -51,6 +52,10 @@ pub struct PtraceBackend;
 #[reverie::backend(?Send)]
 impl Backend for PtraceBackend {
     type Stats = PtraceBackendStatsSnapshot;
+
+    fn capabilities() -> BackendCapabilities {
+        BackendCapabilities::PTRACE
+    }
 
     async fn run<T>(
         command: Command,
@@ -123,11 +128,14 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use reverie::BackendStatsSnapshot;
+    use reverie::Errno;
     use reverie::Guest;
     use reverie::Pid;
     use reverie::Subscription;
     use reverie::Tid;
     use reverie::syscalls::Syscall;
+    use reverie::syscalls::SyscallInfo;
+    use reverie::syscalls::Sysno;
 
     use super::*;
 
@@ -300,6 +308,113 @@ mod tests {
         assert!(stats.stop_events() > 0);
         assert_eq!(stats.exited_tracees(), 1);
         assert!(stats.exec_stops() > 0);
+    }
+
+    /// The fixed address `guest_traced_mmap.c` asks `mmap` for.
+    const TRACED_MMAP_HINT: u64 = 0x1000_0000_0000;
+
+    #[derive(Debug, Default)]
+    struct MappingCalls(AtomicU64);
+
+    #[reverie::global_tool]
+    impl GlobalTool for MappingCalls {
+        /// Whether the Tool subscribes to `mmap`.
+        type Config = bool;
+        type Request = ();
+        type Response = ();
+
+        async fn receive_rpc(&self, _from: Pid, _request: ()) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Refuses the fixture's own `mmap` with `EACCES` and counts every call it
+    /// sees, so a run shows whether that `mmap` reached the Tool.
+    #[derive(Debug, Default)]
+    struct RefuseFixtureMapping;
+
+    #[reverie::tool]
+    impl Tool for RefuseFixtureMapping {
+        type GlobalState = MappingCalls;
+        type ThreadState = ();
+
+        fn subscriptions(subscribe_mmap: &bool) -> Subscription {
+            let mut events = Subscription::none();
+            if *subscribe_mmap {
+                events.syscall(Sysno::mmap);
+            }
+            events
+        }
+
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            guest.send_rpc(()).await;
+            let (nr, args) = syscall.into_parts();
+            if nr == Sysno::mmap && args.arg0 as u64 == TRACED_MMAP_HINT {
+                return Err(Errno::EACCES.into());
+            }
+            guest.tail_inject(Syscall::from_raw(nr, args)).await
+        }
+    }
+
+    /// Builds `tests/fixtures/guest_traced_mmap.c` into the temporary
+    /// directory and returns the binary's path.
+    fn guest_traced_mmap() -> std::path::PathBuf {
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/guest_traced_mmap.c");
+        let output =
+            std::env::temp_dir().join(format!("reverie-guest-traced-mmap-{}", std::process::id()));
+        let status = std::process::Command::new("timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "10s",
+                "cc",
+                "-std=c11",
+                "-O1",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .expect("run cc");
+        assert!(status.success(), "cc {}: {status}", source.display());
+        output
+    }
+
+    /// A guest-installed seccomp filter can return `SECCOMP_RET_TRACE` for a
+    /// memory-mapping syscall the Tool did not subscribe to. The tracer runs
+    /// that call itself and counts it in `internal_seccomp_stops`; the Tool
+    /// never sees it, because only subscribed syscalls reach its handler.
+    /// When the Tool does subscribe, the same call reaches it, and the
+    /// tracer does not count it as internal.
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribed_mapping_syscall_at_a_guest_trace_stop_bypasses_the_tool() {
+        let binary = guest_traced_mmap();
+
+        let (output, calls, stats) =
+            PtraceBackend::run_with_output::<RefuseFixtureMapping>(Command::new(&binary), false)
+                .await
+                .unwrap();
+        assert_eq!(output.status, ExitStatus::Exited(0));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "mmap ok byte=42\n");
+        assert_eq!(calls.0.load(Ordering::SeqCst), 0);
+        assert_eq!(stats.internal_seccomp_stops(), 1);
+
+        let (output, calls, stats) =
+            PtraceBackend::run_with_output::<RefuseFixtureMapping>(Command::new(&binary), true)
+                .await
+                .unwrap();
+        assert_eq!(output.status, ExitStatus::Exited(0));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "mmap errno=13\n");
+        assert!(calls.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(stats.internal_seccomp_stops(), 0);
+
+        let _ = std::fs::remove_file(&binary);
     }
 
     /// Assert on guest output through the backend-agnostic front door.

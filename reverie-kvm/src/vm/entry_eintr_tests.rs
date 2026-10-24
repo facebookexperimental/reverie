@@ -51,12 +51,13 @@ mod entry_eintr_tests {
                 active: true,
             };
             // Only this worker's mask changes. Other blockable signals are
-            // excluded from the foreign-interrupt fixture; KVM's reserved64
-            // remains independently controlled by the production entry guard.
+            // excluded from the foreign-interrupt fixture. Reserved signal 64
+            // starts unblocked, as every production entry leaves it.
             unsafe {
                 let mut selected = std::mem::zeroed();
                 assert_eq!(libc::sigfillset(&mut selected), 0);
                 assert_eq!(libc::sigdelset(&mut selected, libc::SIGURG), 0);
+                assert_eq!(libc::sigdelset(&mut selected, 64), 0);
                 assert_eq!(
                     libc::pthread_sigmask(libc::SIG_SETMASK, &selected, std::ptr::null_mut()),
                     0
@@ -244,7 +245,7 @@ mod entry_eintr_tests {
         );
         assert_eq!(probe.untracked_runs.load(Ordering::SeqCst), 1);
         assert_eq!(probe.tracked_runs.load(Ordering::SeqCst), 0);
-        assert_eq!(probe.prepare.mask_installs.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.prepare.activations.load(Ordering::SeqCst), 1);
         assert_eq!(probe.clock_begins.load(Ordering::SeqCst), 0);
         assert_eq!(probe.intervals_created.load(Ordering::SeqCst), 0);
         assert_eq!(probe.shared_fd_accesses.load(Ordering::SeqCst), 0);
@@ -255,9 +256,13 @@ mod entry_eintr_tests {
         backend
             .run(|_, _| panic!("finite HLT fixture invoked a syscall"))
             .unwrap();
-        assert_eq!(mask_bytes(&current_mask()), caller_mask);
+        // This thread's first entry leaves signal 64 unblocked; nothing else
+        // moves.
+        let mut expected = caller_mask;
+        expected[7] &= !0x80;
+        assert_eq!(mask_bytes(&current_mask()), expected);
         assert_eq!(probe.untracked_runs.load(Ordering::SeqCst), 2);
-        assert_eq!(probe.prepare.mask_installs.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.prepare.activations.load(Ordering::SeqCst), 2);
         assert_eq!(probe.tracked_runs.load(Ordering::SeqCst), 0);
         assert_eq!(probe.clock_begins.load(Ordering::SeqCst), 0);
         assert_eq!(probe.intervals_created.load(Ordering::SeqCst), 0);

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -19,17 +11,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define CHECK(expression)                \
-  do {                                   \
-    if (!(expression)) {                 \
-      fprintf(                           \
-          stderr,                        \
-          "line=%d check=%s errno=%d\n", \
-          __LINE__,                      \
-          #expression,                   \
-          errno);                        \
-      exit(71);                          \
-    }                                    \
+#define CHECK(expression)                                                  \
+  do {                                                                     \
+    if (!(expression)) {                                                   \
+      fprintf(stderr, "line=%d check=%s errno=%d\n", __LINE__, #expression, \
+              errno);                                                      \
+      exit(71);                                                            \
+    }                                                                      \
   } while (0)
 
 enum { ALIASES = 6 };
@@ -80,7 +68,7 @@ static void refused_async_and_export(int fd, const int sockets[2]) {
       .msg_iovlen = 1,
       .msg_control = control.bytes,
       .msg_controllen = sizeof(control.bytes)};
-  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  struct cmsghdr *header = CMSG_FIRSTHDR(&message);
   header->cmsg_level = SOL_SOCKET;
   header->cmsg_type = SCM_RIGHTS;
   header->cmsg_len = CMSG_LEN(sizeof(int));
@@ -123,8 +111,7 @@ int main(void) {
   for (int i = 0; i < ALIASES; ++i)
     exact_configuration(aliases[i], parent, SIGUSR1);
 
-  static const char child_marker[] =
-      "child six=36 async=6 export=6 own_pipe=1\n";
+  static const char child_marker[] = "child six=36 async=6 export=6 own_pipe=1\n";
   pid_t child = fork();
   CHECK(child >= 0);
   if (child == 0) {
@@ -150,9 +137,8 @@ int main(void) {
 
     // The parent requires this marker and the actual child's successful wait
     // status; returning success without executing the child body cannot pass.
-    CHECK(
-        write(pipe_fds[1], child_marker, sizeof(child_marker)) ==
-        sizeof(child_marker));
+    CHECK(write(pipe_fds[1], child_marker, sizeof(child_marker)) ==
+          sizeof(child_marker));
     _exit(0);
   }
 
@@ -180,8 +166,7 @@ int main(void) {
     CHECK(close(aliases[i]) == 0);
   CHECK(close(pipe_fds[1]) == 0);
   CHECK(close(sockets[0]) == 0 && close(sockets[1]) == 0);
-  puts(
-      "fowner boundary child_six=36 child_async=6 child_export=6 "
-      "parent_exact=6 cleared_guards=6 pipe_io=1");
+  puts("fowner boundary child_six=36 child_async=6 child_export=6 "
+       "parent_exact=6 cleared_guards=6 pipe_io=1");
   return 0;
 }

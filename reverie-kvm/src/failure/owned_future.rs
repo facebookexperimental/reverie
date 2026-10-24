@@ -13,6 +13,7 @@ use std::future::Future;
 use std::future::poll_fn;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
+use std::pin::Pin;
 use std::task::Poll;
 
 pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
@@ -55,11 +56,26 @@ where
 /// while it is pending does not run this completion protocol. A double panic
 /// during unwinding can abort the process and cannot be recovered here.
 pub(crate) async fn catch_owned_future<F: Future>(future: F) -> CaughtFuture<F::Output> {
-    let mut owned = Some(Box::pin(future));
+    catch_pinned_future(Box::pin(Some(future)).as_mut()).await
+}
+
+/// [`catch_owned_future`] for a future its caller has already pinned in
+/// place, so a driver that runs on every guest syscall needs no allocation.
+/// The slot must hold a future. It is polled through the same caught poll and
+/// then destroyed in place, by setting the slot to `None`, under its own
+/// catch, exactly as the allocation is in [`catch_owned_future`]; the slot is
+/// `None` afterwards even if that destructor panicked.
+pub(crate) async fn catch_pinned_future<F: Future>(
+    mut owned: Pin<&mut Option<F>>,
+) -> CaughtFuture<F::Output> {
     let mut panics = Vec::new();
     let output = poll_fn(|cx| {
         match catch_unwind(AssertUnwindSafe(|| {
-            owned.as_mut().unwrap().as_mut().poll(cx)
+            owned
+                .as_mut()
+                .as_pin_mut()
+                .expect("caught future polled after destruction")
+                .poll(cx)
         })) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(output)) => Poll::Ready(Some(output)),
@@ -71,10 +87,9 @@ pub(crate) async fn catch_owned_future<F: Future>(future: F) -> CaughtFuture<F::
     })
     .await;
 
-    // Move the actual allocation into this separate catch, after no poll or
-    // reference to the future remains active. Never poll it after this point.
-    let future = owned.take().unwrap();
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
+    // Destroy the future in this separate catch, after no poll or reference
+    // to it remains active. Never poll it after this point.
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| owned.set(None))) {
         panics.push(payload);
     }
 

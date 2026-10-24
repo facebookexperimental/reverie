@@ -115,6 +115,40 @@ fn only_the_untraced_stub_return_address_bypasses_the_tracer() {
     );
 }
 
+/// For a Tool that observes sigreturns the guest's `rt_sigreturn` is traced
+/// at every address but one: Reverie's own, which returns to `0x7100_0002`
+/// from its private page, stays untraced, so its frame restore never stops.
+/// Without the opt-in every `rt_sigreturn` is allowed, as before.
+#[test]
+fn rt_sigreturn_is_traced_only_for_a_tool_that_observes_sigreturns() {
+    let untraced = (cp::TRAMPOLINE_BASE + cp::SYSCALL_INSTR_SIZE) as u64;
+    let rt_sigreturn = Sysno::rt_sigreturn as u32;
+    for (subscription, name) in [(Subscription::all(), "all"), (Subscription::none(), "none")] {
+        let observing = seccomp_filter(&subscription, true);
+        let plain = seccomp_filter(&subscription, false);
+        for ip in [
+            0,
+            0x40_0000,
+            untraced - 2,
+            untraced,
+            untraced + 1,
+            0x7fff_ffff_f000,
+        ] {
+            let expected = if ip == untraced { RET_ALLOW } else { RET_TRACE };
+            assert_eq!(
+                run(&observing, rt_sigreturn, AUDIT_ARCH_X86_64, ip),
+                expected,
+                "observing, subscription {name}, ip {ip:#x}"
+            );
+            assert_eq!(
+                run(&plain, rt_sigreturn, AUDIT_ARCH_X86_64, ip),
+                RET_ALLOW,
+                "plain, subscription {name}, ip {ip:#x}"
+            );
+        }
+    }
+}
+
 /// `getpgid` arguments that name no process (above the largest `pid_max`),
 /// one per call site, so each observed syscall identifies where it came from.
 const TAG_LIBC: u64 = 0x7fff_0001;

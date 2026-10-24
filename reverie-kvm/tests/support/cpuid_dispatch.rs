@@ -1,16 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-#![allow(
-    unexpected_cfgs,
-    reason = "`fbcode_build` is supplied by the internal Buck build"
-)]
-
 // Real CPUID Tool dispatch controls. All guest fixtures are loader-free unless
 // a test explicitly installs an executable image for its exec transition.
 use reverie::CpuIdResult;
@@ -195,10 +182,6 @@ fn run_cpuid(code: &[u8], config: (bool, u8), ownership: ThreadOwnership) -> (Cp
     (log, status)
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
-)]
 #[test]
 fn cpuid_tool_returns_exact_full_registers_flags_stack_and_one_rpc_per_instruction() {
     for prefix in [
@@ -242,13 +225,25 @@ fn cpuid_tool_returns_exact_full_registers_flags_stack_and_one_rpc_per_instructi
 
 #[test]
 fn cpuid_subscription_keeps_unrelated_locked_overlength_and_debug_faults_exact() {
+    // A genuine #UD (a locked CPUID, or ud2) is the guest's own fault: it is
+    // delivered as SIGILL, and never reaches the CPUID callback.
+    for code in [vec![0xf0, 0x0f, 0xa2], vec![0x0f, 0x0b]] {
+        let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+        backend
+            .install_static_elf(&static_elf(&code), "/cpuid-fault")
+            .unwrap();
+        let completion = futures::executor::block_on(
+            backend.run_static_elf_with_tool_completion::<CpuidTool>((true, 0), true),
+        )
+        .unwrap();
+        assert_invalid_opcode_signal(completion.result.unwrap().0);
+        assert_eq!(completion.global_state.calls.lock().unwrap().len(), 0);
+    }
     let mut overlong = vec![0x66; 14];
     overlong.extend_from_slice(&[0x0f, 0xa2]);
     for (code, vector, rip, calls) in [
-        (vec![0xf0, 0x0f, 0xa2], 6, LOAD_ADDRESS, 0),
         (overlong, 13, LOAD_ADDRESS, 0),
         (vec![0xfa], 13, LOAD_ADDRESS, 0),
-        (vec![0x0f, 0x0b], 6, LOAD_ADDRESS, 0),
         (
             vec![
                 0x9c, 0x48, 0x81, 0x0c, 0x24, 0x00, 0x01, 0, 0, 0x9d, 0x0f, 0xa2,
@@ -456,10 +451,17 @@ fn table_program(leaf: u32, subleaf: u32, values: [u32; 4]) -> Vec<u8> {
 }
 
 #[test]
-fn unsubscribed_cpuid_keeps_the_installed_table_and_indexed_xstate_policy() {
+fn unsubscribed_cpuid_reads_the_hosts_rows_and_the_frames_xstate() {
+    // Unsubscribed, the guest reads the vCPU's table: the host's rows, with
+    // leaf 0xd limited to the x87, SSE and YMM components.
+    let host = |leaf: u32, subleaf: u32| {
+        let row = core::arch::x86_64::__cpuid_count(leaf, subleaf);
+        [row.eax, row.ebx, row.ecx, row.edx]
+    };
     for (leaf, subleaf, expected) in [
-        (0x80000001, 0, [0x663, 0, 0x21, 0x20100800]),
-        (0xd, 1, [0; 4]),
+        (0x80000001, 0, host(0x80000001, 0)),
+        (0x80000002, 0, host(0x80000002, 0)),
+        (0xd, 2, host(0xd, 2)),
         (0xd, 17, [0; 4]),
         (0xd, 19, [0; 4]),
     ] {
@@ -549,10 +551,6 @@ fn cpuid_dispatch_survives_real_fork_and_same_pid_exec() {
     );
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
-)]
 #[test]
 fn cpuid_and_both_timestamp_forms_share_one_real_dispatcher_without_cross_charges() {
     let mut code = Vec::new();

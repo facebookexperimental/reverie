@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Actual KVM callbacks and driver cleanup; complementary to the Detcore RPC
 // control. These stimuli do not claim to reproduce a scheduler grant race.
 use super::*;
@@ -88,7 +80,7 @@ struct ParkedRetirementTool;
 impl Tool for ParkedRetirementTool {
     type GlobalState = RetirementGlobal;
     type ThreadState = ();
-    fn observe_signal_dequeues(_: &u8) -> bool {
+    fn may_observe_signal_dequeues(_: &u8) -> bool {
         true
     }
     async fn handle_syscall_event<G: Guest<Self>>(
@@ -97,6 +89,11 @@ impl Tool for ParkedRetirementTool {
         call: Syscall,
     ) -> Result<i64, reverie::Error> {
         if call.number() == Sysno::getpid && call.into_parts().1.arg0 == 0x72657469 {
+            // The Guest reports the mode this run's GlobalState installed.
+            assert_eq!(
+                guest.signal_control_mode(),
+                reverie::BackendSignalControlMode::ToolControlled
+            );
             let site = guest
                 .parked_signal_site()
                 .expect("real original syscall callback");
@@ -233,7 +230,7 @@ int main(void) { syscall(SYS_getpid, 0x72657469); return 87; }
             assert_eq!(receipts[0].outcome, reverie::SignalBoundaryOutcome::Failed);
         } else {
             let (status, stdout, stderr) = completion.result.unwrap();
-            assert_eq!(status, 0);
+            assert_eq!(status, reverie::ExitStatus::Exited(0));
             assert!(stdout.is_empty() && stderr.is_empty());
             assert_eq!(
                 receipts[0].outcome,
@@ -434,7 +431,7 @@ int main(int argc, char **argv) {
             );
         } else {
             let (actual, stdout, stderr) = completion.result.unwrap();
-            assert_eq!(actual, status);
+            assert_eq!(actual, reverie::ExitStatus::Exited(status));
             assert!(stdout.is_empty() && stderr.is_empty());
         }
         let events = completion.global_state.exits.into_inner().unwrap();

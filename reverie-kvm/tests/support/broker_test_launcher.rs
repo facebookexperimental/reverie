@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Ordinary-main launcher for the explicitly broker-routed libtest selectors.
 // This private proposal depends on the API contracts listed in API-CONTRACT.md.
 // No constructor, libtest worker or lazy backend path may assert startup authority.

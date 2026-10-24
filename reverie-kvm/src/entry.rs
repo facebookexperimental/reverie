@@ -30,15 +30,23 @@ use futures::channel::oneshot;
 use futures::future::Shared;
 
 use crate::Error;
+use crate::error::ErrorExt;
 use crate::failure::FailureContext;
 
 pub(crate) mod driver;
 pub(crate) mod owner;
 mod signal;
+pub(crate) use signal::ImmediateExit;
+#[cfg(test)]
+pub(crate) use signal::accept_delivered_for_test;
+#[cfg(test)]
+pub(crate) use signal::delivered_for_test;
 
 #[cfg(feature = "native-test-support")]
 pub(crate) fn check_reserved_signal_handler() -> crate::Result<()> {
-    signal::Mask::block()?.finish()
+    signal::Control::arm(signal::participant_key(), None)?
+        .finish(0)
+        .map(drop)
 }
 
 #[cfg(test)]
@@ -83,13 +91,16 @@ pub(crate) struct CleanupIdentity {
 #[cfg(test)]
 type CleanupHook = Box<dyn FnOnce(CleanupIdentity) + Send>;
 
-/// Observations of actual admission, mask installation and receiver polling.
+/// Observations of actual admission, activation and receiver polling.
 /// Test controllers arm this only after ordinary driver setup has completed.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct PrepareProbe {
     pub(crate) armed: std::sync::atomic::AtomicBool,
-    pub(crate) mask_installs: std::sync::atomic::AtomicUsize,
+    /// Entries that passed the final admission check under the registry lock.
+    pub(crate) activations: std::sync::atomic::AtomicUsize,
+    /// Entry cleanups that found a recorded kick.
+    pub(crate) kicked_cleanups: std::sync::atomic::AtomicUsize,
     pub(crate) closed_admissions: std::sync::atomic::AtomicUsize,
     pub(crate) closed_waits: std::sync::atomic::AtomicUsize,
     pub(crate) pending_subscriptions: std::sync::atomic::AtomicUsize,
@@ -312,6 +323,10 @@ struct Member {
     generation: Option<MappingGeneration>,
     activity: Activity,
     origin: EntryOrigin,
+    /// How many times a closer sent the reserved signal to this member's
+    /// current entry. Counted under the registry lock before each send and
+    /// taken by withdrawal, after which no closer can send to it.
+    kicks: usize,
 }
 
 struct State {
@@ -326,20 +341,90 @@ struct State {
     copies: usize,
     retained_operands: usize,
     failure: Option<Arc<PendingFailure>>,
-    sender: Option<oneshot::Sender<()>>,
-    changed: Change,
+    /// The change future. Its fields are private to [`change`], so every
+    /// subscriber must go through [`change::ChangeFuture::subscribe`], which
+    /// marks the future taken; a direct clone cannot compile.
+    change: change::ChangeFuture,
+    // Completed once, by the first change notification after a failure is
+    // recorded (`EntryGate::subscribe_failure`). A failure is never cleared.
+    failed_sender: Option<oneshot::Sender<()>>,
+    failed: Change,
     copy_changed: Arc<Condvar>,
+    /// Copies parked in `copy_blocking` on `copy_changed`. A change wakes the
+    /// condition variable only when one exists: Rust's futex `notify_all`
+    /// always makes a FUTEX_WAKE syscall, and nearly every change (a copy's
+    /// retirement, an entry's acknowledgement) happens with nobody waiting.
+    blocked_copiers: usize,
     owner_notifications: Vec<owner::OwnerNotification>,
     retired_origins: Vec<EntryOrigin>,
+    /// Set, under this lock, right after `failure` is first recorded; shared
+    /// with [`EntryGate::failure_recorded`] so `pending_failure` can skip the
+    /// lock while no failure exists.
+    failure_recorded: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     copy_waits: usize,
+    /// Every copy ever admitted, so tests can count admissions.
+    #[cfg(test)]
+    copy_admissions: usize,
     #[cfg(test)]
     copy_waiters: Vec<std::thread::ThreadId>,
 }
 
+/// The gate's change future, with its fields private to this module.
+mod change {
+    use futures::FutureExt;
+    use futures::channel::oneshot;
+
+    use super::Change;
+
+    pub(super) struct ChangeFuture {
+        sender: Option<oneshot::Sender<()>>,
+        changed: Change,
+        /// Whether anyone took `changed` since it was armed. Only then does a
+        /// change allocate the next future and complete this one.
+        taken: bool,
+    }
+
+    impl ChangeFuture {
+        pub(super) fn new() -> Self {
+            let (sender, receiver) = oneshot::channel();
+            Self {
+                sender: Some(sender),
+                changed: receiver.shared(),
+                taken: false,
+            }
+        }
+
+        /// The current future, marked taken so the next change completes it.
+        /// The caller holds the gate lock and has just checked the state.
+        pub(super) fn subscribe(&mut self) -> Change {
+            self.taken = true;
+            self.changed.clone()
+        }
+
+        /// For a change: if the current future was taken, arm a new one and
+        /// return the old sender for `notify` to complete; otherwise nothing.
+        pub(super) fn rearm_if_taken(&mut self) -> Option<oneshot::Sender<()>> {
+            if !std::mem::take(&mut self.taken) {
+                return None;
+            }
+            let (sender, receiver) = oneshot::channel();
+            self.changed = receiver.shared();
+            self.sender.replace(sender)
+        }
+
+        #[cfg(test)]
+        pub(super) fn taken(&self) -> bool {
+            self.taken
+        }
+    }
+}
+
 struct ChangeSignal {
     sender: Option<oneshot::Sender<()>>,
-    copies: Arc<Condvar>,
+    failed: Option<oneshot::Sender<()>>,
+    /// Present only when a copy was parked when the change was made.
+    copies: Option<Arc<Condvar>>,
     owners: Vec<owner::OwnerNotification>,
     origins: Vec<EntryOrigin>,
 }
@@ -370,6 +455,8 @@ impl State {
         });
         self.retired_origins.push(origin);
         self.failure = Some(failure.clone());
+        self.failure_recorded
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some(operation) = &failure.operation {
             match operation.capture(failure.clone()) {
                 Ok(notification) => {
@@ -396,15 +483,30 @@ impl State {
 
     /// The sender is consumed only after releasing the registry lock. A
     /// subscriber taken before a recheck therefore cannot miss this change.
+    ///
+    /// Both wake paths are skipped when nobody can be waiting, which is the
+    /// common case. No wakeup is lost: a parked copy registers in
+    /// `blocked_copiers`, and a subscriber marks the change future taken, under
+    /// this same lock before it waits, so every later change sees it.
     fn changed(&mut self) -> ChangeSignal {
-        let (sender, receiver) = oneshot::channel();
-        self.changed = receiver.shared();
+        let sender = self.change.rearm_if_taken();
         ChangeSignal {
-            sender: self.sender.replace(sender),
-            copies: self.copy_changed.clone(),
+            sender,
+            failed: if self.failure.is_some() {
+                self.failed_sender.take()
+            } else {
+                None
+            },
+            copies: (self.blocked_copiers != 0).then(|| self.copy_changed.clone()),
             owners: std::mem::take(&mut self.owner_notifications),
             origins: std::mem::take(&mut self.retired_origins),
         }
+    }
+
+    /// The current change future, marked as taken so the next change
+    /// completes it. Every subscriber goes through here, under the lock.
+    fn subscribe(&mut self) -> Change {
+        self.change.subscribe()
     }
 
     fn stopped(&self) -> bool {
@@ -419,13 +521,18 @@ impl State {
 fn notify(change: ChangeSignal) {
     // Both kinds of waiter recheck the state under the registry lock. Notify
     // only after releasing it; no wake callback may run inside that lock.
-    change.copies.notify_all();
+    if let Some(copies) = change.copies {
+        copies.notify_all();
+    }
     for owner in change.owners {
         owner.notify();
     }
     drop(change.origins);
     if let Some(sender) = change.sender {
         let _ = sender.send(());
+    }
+    if let Some(failed) = change.failed {
+        let _ = failed.send(());
     }
 }
 
@@ -439,6 +546,11 @@ fn protocol_failure(operation: &'static str) -> Error {
 
 pub(crate) struct EntryGate {
     state: Mutex<State>,
+    /// The same flag as `State::failure_recorded`. A failure is recorded once
+    /// and never cleared, so reading false is equivalent to taking the lock
+    /// before the failure was recorded; any thread that learned of the
+    /// failure through a synchronizing operation reads true.
+    failure_recorded: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     prepare_probe: Mutex<Option<Arc<PrepareProbe>>>,
 }
@@ -461,6 +573,7 @@ pub(crate) struct TestGateState {
     pub(crate) copies: usize,
     pub(crate) retained_operands: usize,
     pub(crate) copy_waits: usize,
+    pub(crate) copy_admissions: usize,
     pub(crate) copy_waiters: Vec<std::thread::ThreadId>,
     pub(crate) members: Vec<TestMemberState>,
 }
@@ -488,6 +601,7 @@ impl EntryGate {
             copies: state.copies,
             retained_operands: state.retained_operands,
             copy_waits: state.copy_waits,
+            copy_admissions: state.copy_admissions,
             copy_waiters: state.copy_waiters.clone(),
             members: state
                 .members
@@ -503,10 +617,12 @@ impl EntryGate {
     }
 
     pub(crate) fn new() -> Arc<Self> {
-        let (sender, receiver) = oneshot::channel();
+        let (failed_sender, failed) = oneshot::channel();
+        let failure_recorded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Arc::new(Self {
             #[cfg(test)]
             prepare_probe: Mutex::new(None),
+            failure_recorded: failure_recorded.clone(),
             state: Mutex::new(State {
                 admission: Admission::Open,
                 single_member_domain: false,
@@ -517,13 +633,18 @@ impl EntryGate {
                 copies: 0,
                 retained_operands: 0,
                 failure: None,
-                sender: Some(sender),
-                changed: receiver.shared(),
+                change: change::ChangeFuture::new(),
+                failed_sender: Some(failed_sender),
+                failed: failed.shared(),
                 copy_changed: Arc::new(Condvar::new()),
+                blocked_copiers: 0,
                 owner_notifications: Vec::new(),
                 retired_origins: Vec::new(),
+                failure_recorded: failure_recorded.clone(),
                 #[cfg(test)]
                 copy_waits: 0,
+                #[cfg(test)]
+                copy_admissions: 0,
                 #[cfg(test)]
                 copy_waiters: Vec::new(),
             }),
@@ -532,12 +653,12 @@ impl EntryGate {
 
     #[cfg(not(test))]
     pub(crate) fn subscribe(&self) -> Change {
-        self.state.lock().unwrap().changed.clone()
+        self.state.lock().unwrap().subscribe()
     }
 
     #[cfg(test)]
     pub(crate) fn subscribe(&self) -> ObservedChange {
-        let change = self.state.lock().unwrap().changed.clone();
+        let change = self.state.lock().unwrap().subscribe();
         let probe = self.prepare_probe.lock().unwrap().clone();
         ObservedChange {
             change,
@@ -546,13 +667,36 @@ impl EntryGate {
         }
     }
 
+    /// Completes once the gate has recorded a failure (or the gate is gone).
+    /// Unlike [`Self::subscribe`] it is not completed by the ordinary changes
+    /// every copy, entry and exit makes, so a waiter that only cares about
+    /// failure (`EntryDriverWatch`) is not woken by each of them.
+    pub(crate) fn subscribe_failure(&self) -> Change {
+        self.state.lock().unwrap().failed.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn notify_unchanged_for_test(&self) {
         let sender = self.state.lock().unwrap().changed();
         notify(sender);
     }
 
+    /// Whether [`Self::pending_failure`] may return a failure: the flag it
+    /// reads first. False means it would return None.
+    #[inline]
+    pub(crate) fn failure_recorded(&self) -> bool {
+        self.failure_recorded
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn pending_failure(&self) -> Option<Arc<PendingFailure>> {
+        // Every guest-memory copy checks this, usually more than once.
+        if !self
+            .failure_recorded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
         self.state.lock().unwrap().failure.clone()
     }
 
@@ -566,6 +710,24 @@ impl EntryGate {
     /// the lock before any RPC, syscall, callback poll, or asynchronous wait.
     pub(crate) fn admit_operation(&self) -> GateResult<()> {
         self.state.lock().unwrap().check()
+    }
+
+    /// `admit_operation`, and in the same critical section whether a copy
+    /// admitted now would see the image `generation` names: admission is
+    /// open and no publication has advanced the generation since. A caller
+    /// that read bytes under an admission of `generation` may use them in
+    /// place of a fresh copy only on `Ok(true)`: generations advance only by
+    /// publication, publication requires a close, and a close completes only
+    /// with no copy admitted, so on `Ok(true)` no installed image has changed
+    /// since that admission. `Ok(false)` changes nothing; the caller admits a
+    /// fresh copy exactly as it would have.
+    pub(crate) fn admit_operation_unchanged(
+        &self,
+        generation: MappingGeneration,
+    ) -> GateResult<bool> {
+        let state = self.state.lock().unwrap();
+        state.check()?;
+        Ok(state.admission == Admission::Open && state.generation == generation)
     }
 
     pub(crate) fn poison(
@@ -609,11 +771,13 @@ impl EntryGate {
                                 generation: None,
                                 activity: Activity::Stopped,
                                 origin: EntryOrigin::default(),
+                                kicks: 0,
                             },
                         );
                         Ok(Participant {
                             gate: self.clone(),
                             id,
+                            key: signal::participant_key(),
                             #[cfg(test)]
                             prepare_probe: None,
                         })
@@ -684,6 +848,7 @@ impl EntryGate {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn try_copy(
         self: &Arc<Self>,
         origin: impl Into<EntryOrigin>,
@@ -693,7 +858,24 @@ impl EntryGate {
         if state.admission != Admission::Open {
             return Ok(None);
         }
-        self.admit_copy(state, origin.into()).map(Some)
+        self.admit_copy(state, Origin::<fn() -> EntryOrigin>::Stored(origin.into()))
+            .map(Some)
+    }
+
+    /// As `try_copy`, for an issuer that can rebuild its origin on
+    /// demand. The copy stores no origin, so admitting it clones nothing;
+    /// `origin` runs only to attribute a failure, and every failure path of
+    /// the returned copy must be given it again (see [`CopyAccess::lazy`]).
+    pub(crate) fn try_copy_lazy(
+        self: &Arc<Self>,
+        origin: impl FnOnce() -> EntryOrigin,
+    ) -> GateResult<Option<CopyAccess>> {
+        let state = self.state.lock().unwrap();
+        state.check()?;
+        if state.admission != Admission::Open {
+            return Ok(None);
+        }
+        self.admit_copy(state, Origin::Lazy(origin)).map(Some)
     }
 
     /// Synchronous memory APIs wait without holding address-state or backing
@@ -703,7 +885,22 @@ impl EntryGate {
         self: &Arc<Self>,
         origin: impl Into<EntryOrigin>,
     ) -> GateResult<CopyAccess> {
-        let origin = origin.into();
+        self.copy_blocking_origin(Origin::<fn() -> EntryOrigin>::Stored(origin.into()))
+    }
+
+    /// As [`Self::copy_blocking`], with the origin rebuilt only on failure;
+    /// see [`Self::try_copy_lazy`].
+    pub(crate) fn copy_blocking_lazy(
+        self: &Arc<Self>,
+        origin: impl FnOnce() -> EntryOrigin,
+    ) -> GateResult<CopyAccess> {
+        self.copy_blocking_origin(Origin::Lazy(origin))
+    }
+
+    fn copy_blocking_origin(
+        self: &Arc<Self>,
+        origin: Origin<impl FnOnce() -> EntryOrigin>,
+    ) -> GateResult<CopyAccess> {
         let mut state = self.state.lock().unwrap();
         loop {
             state.check()?;
@@ -716,7 +913,9 @@ impl EntryGate {
                 state.copy_waits += 1;
                 state.copy_waiters.push(std::thread::current().id());
             }
+            state.blocked_copiers += 1;
             state = changed.wait(state).unwrap();
+            state.blocked_copiers -= 1;
             #[cfg(test)]
             state
                 .copy_waiters
@@ -727,19 +926,28 @@ impl EntryGate {
     fn admit_copy(
         self: &Arc<Self>,
         mut state: MutexGuard<'_, State>,
-        origin: EntryOrigin,
+        origin: Origin<impl FnOnce() -> EntryOrigin>,
     ) -> GateResult<CopyAccess> {
         let Some(copies) = state.copies.checked_add(1) else {
-            let failure = state.fail(origin, protocol_failure("copy accounting exhausted"));
+            let failure = state.fail(origin.get(), protocol_failure("copy accounting exhausted"));
             let sender = state.changed();
             drop(state);
             notify(sender);
             return Err(failure);
         };
         state.copies = copies;
+        #[cfg(test)]
+        {
+            state.copy_admissions += 1;
+        }
+        let (origin, lazy) = match origin {
+            Origin::Stored(origin) => (origin, false),
+            Origin::Lazy(_) => (EntryOrigin::default(), true),
+        };
         Ok(CopyAccess {
             gate: self.clone(),
             origin,
+            lazy,
             generation: state.generation,
             retired: false,
         })
@@ -749,18 +957,31 @@ impl EntryGate {
     /// waits only for short copies, so ordinary unchanged fences do not wait on
     /// a blocking kernel operation. Mapping publication checks this count and
     /// fails before changing the backing image.
+    #[cfg(test)]
     pub(crate) fn retain_operand(
         self: &Arc<Self>,
         copy: &CopyAccess,
+    ) -> GateResult<RetainedOperand> {
+        assert!(!copy.lazy, "a lazily admitted copy must supply its origin");
+        self.retain_operand_with(copy, || copy.origin.clone())
+    }
+
+    /// As `retain_operand`, for a lazily admitted copy, whose origin
+    /// the retained operand keeps for its own failure paths.
+    pub(crate) fn retain_operand_with(
+        self: &Arc<Self>,
+        copy: &CopyAccess,
+        origin: impl FnOnce() -> EntryOrigin,
     ) -> GateResult<RetainedOperand> {
         assert!(Arc::ptr_eq(self, &copy.gate));
         let mut state = self.state.lock().unwrap();
         state.check()?;
         assert!(state.copies != 0, "retained operand requires a live copy");
         assert_eq!(state.generation, copy.generation);
+        let origin = origin();
         let Some(retained_operands) = state.retained_operands.checked_add(1) else {
             let failure = state.fail(
-                copy.origin.clone(),
+                origin,
                 protocol_failure("retained host operand accounting exhausted"),
             );
             let sender = state.changed();
@@ -771,7 +992,7 @@ impl EntryGate {
         state.retained_operands = retained_operands;
         Ok(RetainedOperand {
             gate: self.clone(),
-            origin: copy.origin.clone(),
+            origin,
             generation: copy.generation,
         })
     }
@@ -825,8 +1046,11 @@ impl EntryGate {
         // Keep an operation's unwind from poisoning the registry mutex:
         // entry destructors still need it to withdraw and retire their target.
         let send_error = catch_unwind(AssertUnwindSafe(|| {
-            state.members.values().find_map(|member| {
+            state.members.values_mut().find_map(|member| {
                 if let Activity::Running(thread) = member.activity {
+                    // Record before sending: the entry's cleanup refuses any
+                    // instance beyond the kicks recorded.
+                    member.kicks = member.kicks.saturating_add(1);
                     send(thread).err()
                 } else {
                     None
@@ -861,6 +1085,8 @@ impl EntryGate {
 pub(crate) struct Participant {
     gate: Arc<EntryGate>,
     id: u64,
+    /// Process-unique; see [`signal::participant_key`].
+    key: u64,
     #[cfg(test)]
     prepare_probe: Option<Arc<PrepareProbe>>,
 }
@@ -908,9 +1134,15 @@ impl Participant {
         }))
     }
 
-    pub(crate) fn prepare(&mut self, fd: &kvm_ioctls::VcpuFd) -> GateResult<Option<RunEntry<'_>>> {
+    /// `immediate_exit` belongs to the vCPU this entry runs; tests that run
+    /// no vCPU pass None.
+    pub(crate) fn prepare(
+        &mut self,
+        immediate_exit: Option<ImmediateExit>,
+    ) -> GateResult<Option<RunEntry<'_>>> {
         #[cfg(test)]
         let probe = self.prepare_probe.clone();
+        let key = self.key;
         let Some(mut entry) = self.try_enter()? else {
             #[cfg(test)]
             if let Some(probe) = &probe {
@@ -918,39 +1150,38 @@ impl Participant {
             }
             return Ok(None);
         };
-        let mask = match signal::Mask::block() {
-            Ok(mask) => mask,
+        let control = match signal::Control::arm(key, immediate_exit) {
+            Ok(control) => control,
             Err(error) => {
                 entry.withdraw();
                 entry.acknowledge(Err(error))?;
-                unreachable!("failed mask setup acknowledged successfully");
+                unreachable!("failed signal setup acknowledged successfully");
             }
         };
         let mut guard = RunEntry {
             entry: Some(entry),
-            mask: Some(mask),
+            control: Some(control),
         };
-        // The test hook runs after mask blocking and outside the registry lock.
-        // The real final admission check and mask ioctl remain together below.
+        // The test hook runs after signal setup and outside the registry lock.
+        // The real final admission check and publication remain together below.
         #[cfg(test)]
         if let Some(probe) = &probe {
             probe.activate_hook();
         }
-        let admitted = guard.entry.as_mut().unwrap().activate(|| {
-            #[cfg(test)]
-            if let Some(probe) = &probe {
-                probe.increment(&probe.mask_installs);
-            }
-            guard.mask.as_ref().unwrap().install(fd)
-        });
+        let admitted = guard.entry.as_mut().unwrap().activate();
+        #[cfg(test)]
+        if let (Ok(true), Some(probe)) = (&admitted, &probe) {
+            probe.increment(&probe.activations);
+        }
         match admitted {
             Ok(true) => Ok(Some(guard)),
             Ok(false) => {
+                // Never Running, so no closer sent to it and no KVM_RUN ran.
                 guard.finish(Ok(()))?;
                 Ok(None)
             }
             Err(error) => {
-                // Retain a mask cleanup error alongside the original failure.
+                // Retain a cleanup error alongside the original failure.
                 let _ = guard.finish(Ok(()));
                 Err(error)
             }
@@ -982,7 +1213,7 @@ impl Drop for Participant {
 }
 
 /// This guard cannot move between pthreads and must not cross an async suspension.
-/// Its caller owns signal blocking/restoration and clock cleanup. A lost guard
+/// Its caller owns signal accounting and clock cleanup. A lost guard
 /// leaves failed accounting; it cannot manufacture a successful fence.
 pub(crate) struct Entry<'a> {
     participant: &'a mut Participant,
@@ -993,13 +1224,9 @@ pub(crate) struct Entry<'a> {
 }
 
 impl Entry<'_> {
-    /// The final open check, KVM mask installation, and target publication
-    /// occur under the registry lock. The supplied function must be only the
-    /// synchronous ioctl; it must not invoke Tool code or wait for admission.
-    pub(crate) fn activate(
-        &mut self,
-        install_mask: impl FnOnce() -> crate::Result<()>,
-    ) -> GateResult<bool> {
+    /// The final open check and target publication occur under the registry
+    /// lock.
+    pub(crate) fn activate(&mut self) -> GateResult<bool> {
         let mut state = self.participant.gate.state.lock().unwrap();
         state.check()?;
         let member = state.members.get(&self.participant.id).unwrap();
@@ -1008,29 +1235,6 @@ impl Entry<'_> {
         assert_eq!(state.generation, self.generation);
         if state.admission != Admission::Open {
             return Ok(false);
-        }
-        let installed = catch_unwind(AssertUnwindSafe(install_mask));
-        let installed = match installed {
-            Ok(result) => result,
-            Err(payload) => {
-                let origin = state.members[&self.participant.id].origin.clone();
-                state.fail(
-                    origin,
-                    protocol_failure("install KVM temporary signal mask unwound"),
-                );
-                let sender = state.changed();
-                drop(state);
-                notify(sender);
-                resume_unwind(payload);
-            }
-        };
-        if let Err(error) = installed {
-            let origin = state.members[&self.participant.id].origin.clone();
-            let error = state.fail(origin, error);
-            let sender = state.changed();
-            drop(state);
-            notify(sender);
-            return Err(error);
         }
         let member = state.members.get_mut(&self.participant.id).unwrap();
         // SAFETY: this guard remains on the current thread until withdrawal
@@ -1041,9 +1245,10 @@ impl Entry<'_> {
         Ok(true)
     }
 
-    /// Must precede the final drain. A closer cannot send after this returns.
-    /// Retirement stays counted through the caller's mask restoration.
-    pub(crate) fn withdraw(&mut self) {
+    /// Must precede signal cleanup. A closer cannot send after this returns.
+    /// Retirement stays counted through the caller's signal cleanup. Returns
+    /// how many times a closer sent the reserved signal to this entry.
+    pub(crate) fn withdraw(&mut self) -> usize {
         #[cfg(test)]
         let mut state = {
             let hook = self
@@ -1077,9 +1282,10 @@ impl Entry<'_> {
             Activity::Setup | Activity::Running(_)
         ));
         member.activity = Activity::Retiring;
+        std::mem::take(&mut member.kicks)
     }
 
-    /// Called only after clock cleanup, withdrawal, final drain and restoration.
+    /// Called only after clock cleanup, withdrawal and signal cleanup.
     pub(crate) fn acknowledge(mut self, cleanup: crate::Result<()>) -> GateResult<()> {
         let mut state = self.participant.gate.state.lock().unwrap();
         let member = state.members.get_mut(&self.participant.id).unwrap();
@@ -1117,11 +1323,12 @@ impl Drop for Entry<'_> {
     }
 }
 
-/// Owns the same-thread mask from setup through final withdrawal/drain/restore.
-/// CountedVcpu must finish its clock interval before calling finish.
+/// Owns the same-thread signal accounting from setup through final
+/// withdrawal. CountedVcpu must finish its clock interval before calling
+/// finish.
 pub(crate) struct RunEntry<'a> {
     entry: Option<Entry<'a>>,
-    mask: Option<signal::Mask>,
+    control: Option<signal::Control>,
 }
 
 impl RunEntry<'_> {
@@ -1142,13 +1349,18 @@ impl RunEntry<'_> {
         if let Some(probe) = &probe {
             probe.cleanup_hook(CleanupPhase::BeforeWithdraw, identity);
         }
-        entry.withdraw();
+        let kicks = entry.withdraw();
         #[cfg(test)]
         if let Some(probe) = &probe {
             probe.cleanup_hook(CleanupPhase::AfterWithdraw, identity);
         }
-        let mask = self.mask.take().unwrap().finish();
-        let cleanup = match (clock, mask) {
+        let signal = self.control.take().unwrap().finish(kicks);
+        #[cfg(test)]
+        if let (true, Some(probe)) = (kicks != 0, &probe) {
+            probe.increment(&probe.kicked_cleanups);
+        }
+        let signal = signal.map(drop);
+        let cleanup = match (clock, signal) {
             (Ok(()), result) | (result, Ok(())) => result,
             (Err(primary), Err(cleanup)) => Err(primary.with_cleanup(vec![cleanup])),
         };
@@ -1173,29 +1385,73 @@ impl Drop for RunEntry<'_> {
 pub(crate) struct CopyAccess {
     gate: Arc<EntryGate>,
     origin: EntryOrigin,
+    /// Admitted with [`EntryGate::try_copy_lazy`] or
+    /// [`EntryGate::copy_blocking_lazy`]: `origin` is empty, and the issuer
+    /// supplies the real one to [`Self::retire_deferred_with`] and
+    /// [`EntryGate::retain_operand_with`].
+    lazy: bool,
     generation: MappingGeneration,
     retired: bool,
 }
 
+/// A copy's issuing context, either owned by the copy or rebuilt by its
+/// issuer only when a failure must be attributed.
+enum Origin<F> {
+    Stored(EntryOrigin),
+    Lazy(F),
+}
+
+impl<F: FnOnce() -> EntryOrigin> Origin<F> {
+    fn get(self) -> EntryOrigin {
+        match self {
+            Self::Stored(origin) => origin,
+            Self::Lazy(origin) => origin(),
+        }
+    }
+}
+
 impl CopyAccess {
+    /// The mapping generation this copy was admitted against. It cannot
+    /// change while the copy is held.
+    pub(crate) fn generation(&self) -> MappingGeneration {
+        self.generation
+    }
+
     /// Retire the actual access now, while deferring every notification and
     /// the issuing context's destruction until the caller releases its locks.
     /// The returned token owns no memory or allocation transaction.
-    pub(crate) fn retire_deferred(mut self) -> CopyRetirement {
-        let change = self.retire();
+    #[cfg(test)]
+    pub(crate) fn retire_deferred(self) -> CopyRetirement {
+        assert!(!self.lazy, "a lazily admitted copy must supply its origin");
+        self.retire_deferred_with(|| unreachable!("a stored origin is used"))
+    }
+
+    /// As `retire_deferred`, with `origin` attributing an unwinding
+    /// retirement of a lazily admitted copy.
+    pub(crate) fn retire_deferred_with(
+        mut self,
+        origin: impl FnOnce() -> EntryOrigin,
+    ) -> CopyRetirement {
+        let change = self.retire(origin);
         CopyRetirement {
             change: Some(change),
             origin: Some(std::mem::take(&mut self.origin)),
+            lazy: self.lazy,
             _gate: self.gate.clone(),
         }
     }
 
-    fn retire(&mut self) -> ChangeSignal {
+    fn retire(&mut self, origin: impl FnOnce() -> EntryOrigin) -> ChangeSignal {
         assert!(!self.retired, "copy retired twice");
         {
             let mut state = self.gate.state.lock().unwrap();
             if std::thread::panicking() {
-                state.fail(self.origin.clone(), protocol_failure("host copy unwound"));
+                let origin = if self.lazy {
+                    origin()
+                } else {
+                    self.origin.clone()
+                };
+                state.fail(origin, protocol_failure("host copy unwound"));
             }
             state.copies = state.copies.checked_sub(1).expect("copy retired twice");
             self.retired = true;
@@ -1207,7 +1463,13 @@ impl CopyAccess {
 impl Drop for CopyAccess {
     fn drop(&mut self) {
         if !self.retired {
-            notify(self.retire());
+            // A lazily admitted copy is owned by an issuer that retires it
+            // with its origin; this fallback has only the empty one.
+            debug_assert!(
+                !self.lazy || std::thread::panicking(),
+                "a lazily admitted copy was dropped without its issuer's retirement"
+            );
+            notify(self.retire(EntryOrigin::default));
         }
     }
 }
@@ -1218,6 +1480,9 @@ impl Drop for CopyAccess {
 pub(crate) struct CopyRetirement {
     change: Option<ChangeSignal>,
     origin: Option<EntryOrigin>,
+    /// Retired from a lazily admitted copy, so `origin` is empty until
+    /// [`Self::keep_issuer`] supplies it.
+    lazy: bool,
     _gate: Arc<EntryGate>,
 }
 
@@ -1230,6 +1495,18 @@ impl std::fmt::Debug for CopyRetirement {
 }
 
 impl CopyRetirement {
+    /// A retirement queued beyond its issuer's borrow must keep the issuing
+    /// context alive until it is delivered, as an eagerly admitted copy's
+    /// stored origin does: destroying a last FailureContext can wake its
+    /// subscriber synchronously, which must not happen while the queue's
+    /// owner still holds its locks. A lazily admitted copy stored nothing,
+    /// so its issuer supplies the origin here; an eager copy already has it.
+    pub(crate) fn keep_issuer(&mut self, origin: impl FnOnce() -> EntryOrigin) {
+        if std::mem::take(&mut self.lazy) {
+            self.origin = Some(origin());
+        }
+    }
+
     pub(crate) fn notify(mut self) {
         self.notify_pending();
     }
@@ -1324,7 +1601,7 @@ impl Closing {
                         published_domain: false,
                     });
                 }
-                state.changed.clone()
+                state.subscribe()
             };
             let _ = changed.await;
         }
@@ -1563,7 +1840,7 @@ mod tests {
         assert_quiescent_refusal_is_quiet(&gate);
         // This only records this thread's identity. The quiescent operation
         // must never send its reserved signal to the unmasked test thread.
-        assert!(entry.activate(|| Ok(())).unwrap());
+        assert!(entry.activate().unwrap());
         assert_quiescent_refusal_is_quiet(&gate);
         entry.withdraw();
         assert_quiescent_refusal_is_quiet(&gate);
@@ -1867,6 +2144,60 @@ mod tests {
         }
     }
 
+    /// The failure subscription a parked callback waits on is not completed
+    /// by the copies, entries and exits every sibling vCPU makes (each of which
+    /// completes the ordinary change channel), only by a recorded failure.
+    /// Before, `EntryDriverWatch` waited on the ordinary channel, so each guest
+    /// syscall woke every parked sibling thread.
+    #[test]
+    fn failure_subscription_ignores_ordinary_changes_and_completes_on_failure() {
+        let gate = EntryGate::new();
+        let mut participant = gate.register().unwrap();
+        let waker = noop_waker();
+        let mut failed = pin!(gate.subscribe_failure());
+        let mut changed = pin!(gate.subscribe());
+        assert!(
+            failed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        drop(gate.try_copy(None).unwrap().unwrap());
+        let mut entry = participant.try_enter().unwrap().unwrap();
+        assert!(entry.activate().unwrap());
+        entry.withdraw();
+        entry.acknowledge(Ok(())).unwrap();
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready(),
+            "the ordinary channel still reports every change"
+        );
+        assert!(
+            failed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending(),
+            "an ordinary change completed the failure subscription"
+        );
+
+        gate.poison(None, protocol_failure("fail"));
+        assert!(
+            failed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+        // A subscription taken after the failure is already complete.
+        assert!(
+            pin!(gate.subscribe_failure())
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+    }
+
     #[test]
     fn copy_retirement_retains_then_releases_its_gate_without_leaking_a_copy() {
         let gate = EntryGate::new();
@@ -2086,6 +2417,58 @@ mod tests {
         drop(copy);
     }
 
+    /// The reuse check (`admit_operation_unchanged`) says yes only while the
+    /// gate admits at the generation a copy saw. Closed, published-since and
+    /// failed gates all refuse, a refusal changes no gate state, and a failure
+    /// is reported as the same Arc admit_operation reports.
+    #[test]
+    fn unchanged_admission_admits_only_the_open_generation_a_copy_saw() {
+        let gate = EntryGate::new();
+        let copy = gate.try_copy(None).unwrap().unwrap();
+        let seen = copy.generation();
+        assert_eq!(seen, gate.generation().unwrap());
+        // Held copies do not matter to the check; only admission does.
+        assert!(gate.admit_operation_unchanged(seen).unwrap());
+        drop(copy);
+        assert!(gate.admit_operation_unchanged(seen).unwrap());
+
+        // Closed (a closer may be changing the image): refused, quietly.
+        let mut closed = block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
+        let before = gate.test_state();
+        let changed = gate.subscribe();
+        assert!(!gate.admit_operation_unchanged(seen).unwrap());
+        assert_eq!(gate.test_state(), before);
+        assert!(changed.now_or_never().is_none(), "a refusal notified");
+
+        // Published and reopened: the old generation is refused, the new
+        // one admitted.
+        let published = closed
+            .publish(None, seen, |next| {
+                Ok(crate::memory::InstalledMapping::gate_control(next))
+            })
+            .unwrap();
+        drop(closed);
+        assert_ne!(published, seen);
+        assert!(!gate.admit_operation_unchanged(seen).unwrap());
+        assert!(gate.admit_operation_unchanged(published).unwrap());
+        let fresh = gate.try_copy(None).unwrap().unwrap();
+        assert_eq!(fresh.generation(), published);
+        drop(fresh);
+
+        // Failed: refused with the gate's own failure, for any generation.
+        let failure = gate.poison(None, protocol_failure("controlled reuse poison"));
+        for generation in [seen, published] {
+            let Err(actual) = gate.admit_operation_unchanged(generation) else {
+                panic!("a failed gate admitted reuse");
+            };
+            assert!(Arc::ptr_eq(&actual, &failure));
+        }
+        let Err(expected) = gate.admit_operation() else {
+            panic!("a failed gate admitted an operation");
+        };
+        assert!(Arc::ptr_eq(&expected, &failure));
+    }
+
     #[test]
     fn failed_or_unwound_publication_never_reopens_an_usable_gate() {
         for unwinds in [false, true] {
@@ -2162,6 +2545,9 @@ mod tests {
                 assert!(std::time::Instant::now() < deadline, "copy never waited");
                 std::thread::yield_now();
             }
+            // The parked copy is registered, so the waking change carries the
+            // condition variable.
+            assert_eq!(gate.state.lock().unwrap().blocked_copiers, 1);
             assert!(matches!(
                 receiver.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
@@ -2184,7 +2570,57 @@ mod tests {
             }
             worker.join().unwrap();
             assert_eq!(gate.state.lock().unwrap().copies, 0);
+            assert_eq!(gate.state.lock().unwrap().blocked_copiers, 0);
         }
+    }
+
+    #[test]
+    fn an_unwatched_change_allocates_and_wakes_nothing() {
+        let gate = EntryGate::new();
+        // No subscriber and no parked copy: a copy's retirement, the most
+        // frequent change, neither replaces the change future nor wakes the
+        // copy condition variable.
+        drop(gate.try_copy(None).unwrap().unwrap());
+        let signal = gate.state.lock().unwrap().changed();
+        assert!(signal.sender.is_none());
+        assert!(signal.copies.is_none());
+        notify(signal);
+        // A subscription arms exactly the next change.
+        let changed = gate.subscribe();
+        assert!(gate.state.lock().unwrap().change.taken());
+        let signal = gate.state.lock().unwrap().changed();
+        assert!(signal.sender.is_some());
+        assert!(signal.copies.is_none());
+        notify(signal);
+        assert!(changed.now_or_never().is_some());
+        assert!(!gate.state.lock().unwrap().change.taken());
+        let signal = gate.state.lock().unwrap().changed();
+        assert!(signal.sender.is_none());
+        notify(signal);
+    }
+
+    #[test]
+    fn a_subscriber_taken_between_changes_sees_the_next_one() {
+        let gate = EntryGate::new();
+        // Changes nobody watched leave the current future pending...
+        drop(gate.try_copy(None).unwrap().unwrap());
+        drop(gate.try_copy(None).unwrap().unwrap());
+        let changed = gate.subscribe();
+        assert!(changed.clone().now_or_never().is_none());
+        // ...and the first change after the subscription completes it.
+        drop(gate.try_copy(None).unwrap().unwrap());
+        assert!(changed.now_or_never().is_some());
+        // A closer, which subscribes inside its own loop, still drains.
+        let copy = gate.try_copy(None).unwrap().unwrap();
+        let mut closing = Box::pin(gate.try_close().unwrap().unwrap().finish());
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(closing.as_mut().poll(&mut cx).is_pending());
+        drop(copy);
+        assert!(matches!(
+            closing.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Ok(_))
+        ));
     }
 
     #[test]
@@ -2196,11 +2632,7 @@ mod tests {
         let close = gate.try_close().unwrap().unwrap();
         let mut closed = pin!(close.finish());
         assert!(poll(closed.as_mut()).is_pending());
-        assert!(
-            !entry
-                .activate(|| panic!("closed entry installed a KVM mask"))
-                .unwrap()
-        );
+        assert!(!entry.activate().unwrap());
         drop(copy);
         assert!(poll(closed.as_mut()).is_pending());
         entry.withdraw();
@@ -2218,7 +2650,7 @@ mod tests {
         let gate = EntryGate::new();
         let mut participant = gate.register().unwrap();
         let mut entry = participant.try_enter().unwrap().unwrap();
-        assert!(entry.activate(|| Ok(())).unwrap());
+        assert!(entry.activate().unwrap());
         entry.withdraw();
         let close = gate
             .try_close_with(|_| panic!("sent to an already withdrawn target"))
@@ -2236,7 +2668,7 @@ mod tests {
         let mut participant = gate.register().unwrap();
         let id = participant.id;
         let mut entry = participant.try_enter().unwrap().unwrap();
-        assert!(entry.activate(|| Ok(())).unwrap());
+        assert!(entry.activate().unwrap());
         let changed = gate.subscribe();
         let failure =
             match gate.try_close_with(|_| Err(std::io::Error::from_raw_os_error(libc::ESRCH))) {
@@ -2283,7 +2715,7 @@ mod tests {
         let mut participant = gate.register().unwrap();
         let id = participant.id;
         let mut entry = participant.try_enter().unwrap().unwrap();
-        assert!(entry.activate(|| Ok(())).unwrap());
+        assert!(entry.activate().unwrap());
         drop(entry);
         drop(participant);
         let state = gate.state.lock().unwrap();
@@ -2335,27 +2767,23 @@ mod tests {
 
         const CHILD: &str = "REVERIE_KVM_ENTRY_UNWIND_CHILD";
         let Ok(case) = std::env::var(CHILD) else {
-            let mut failures = Vec::new();
-            for case in ["mask", "send"] {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "entry::tests::unwinding_control_operations_preserve_cleanup_and_failure",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, case)
-                    .output()
-                    .unwrap();
-                if !output.status.success() {
-                    failures.push(format!(
-                        "{case}: status={}\n{}{}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    ));
-                }
-            }
-            assert!(failures.is_empty(), "{}", failures.join("\n"));
+            // The one control kicks its own thread; run it in a fresh process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "entry::tests::unwinding_control_operations_preserve_cleanup_and_failure",
+                    "--nocapture",
+                ])
+                .env(CHILD, "send")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "send: status={}\n{}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         };
 
@@ -2374,8 +2802,8 @@ mod tests {
         }
 
         if case == "send" {
-            // Leave signal 64 blocked in the original mask, so a missed drain
-            // cannot disappear through the handler when that mask is restored.
+            // Start with signal 64 blocked: the entry's setup unblocks it, so
+            // the kick below reaches the handler and is counted.
             unsafe {
                 let mut reserved: libc::sigset_t = std::mem::zeroed();
                 assert_eq!(libc::sigemptyset(&mut reserved), 0);
@@ -2400,23 +2828,19 @@ mod tests {
         let id = participant.id;
         let changed = gate.subscribe();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let key = participant.key;
             let entry = participant.try_enter().unwrap().unwrap();
-            let mask = signal::Mask::block().unwrap();
+            let control = signal::Control::arm(key, None).unwrap();
             let mut guard = RunEntry {
                 entry: Some(entry),
-                mask: Some(mask),
+                control: Some(control),
             };
             match case.as_str() {
-                "mask" => {
-                    let _ = guard.entry.as_mut().unwrap().activate(|| {
-                        panic!("mask operation unwound");
-                    });
-                }
                 "send" => {
-                    assert!(guard.entry.as_mut().unwrap().activate(|| Ok(())).unwrap());
+                    assert!(guard.entry.as_mut().unwrap().activate().unwrap());
                     let _ = gate.try_close_with(|thread| {
-                        // Queue a real control signal before the injected unwind.
-                        // Its drain must finish before the original mask returns.
+                        // Deliver a real control signal before the injected
+                        // unwind. Cleanup must still account for it.
                         assert_eq!(unsafe { libc::pthread_kill(thread, 64) }, 0);
                         panic!("send operation unwound");
                     });
@@ -2426,13 +2850,18 @@ mod tests {
             panic!("injected operation did not unwind");
         }));
         let payload = outcome.expect_err("operation panic was swallowed");
-        let expected = if case == "mask" {
-            "mask operation unwound"
-        } else {
-            "send operation unwound"
-        };
-        assert_eq!(payload.downcast_ref::<&str>().copied(), Some(expected));
-        assert_eq!(mask_bits(), original_mask, "unwind changed the host mask");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("send operation unwound")
+        );
+        assert_eq!(signal::delivered_for_test(), 1);
+        // The reserved signal stays unblocked after any entry; nothing else
+        // moves.
+        assert_eq!(
+            mask_bits(),
+            original_mask & !(1 << 63),
+            "unwind changed the host mask"
+        );
         assert!(
             !gate.state.is_poisoned(),
             "cleanup would panic on registry lock"
@@ -2442,18 +2871,13 @@ mod tests {
             "unwind lost the failure wake"
         );
         let pending = gate.pending_failure().unwrap();
-        let operation = if case == "mask" {
-            assert!(Arc::ptr_eq(
-                &pending.origin.as_ref().unwrap().run.upgrade().unwrap(),
-                &run
-            ));
-            "install KVM temporary signal mask unwound"
-        } else {
-            "interrupt running vCPU unwound"
-        };
-        assert!(
-            matches!(pending.error().primary(), Error::EntryControl { operation: actual, .. } if *actual == operation)
-        );
+        assert!(matches!(
+            pending.error().primary(),
+            Error::EntryControl {
+                operation: "interrupt running vCPU unwound",
+                ..
+            }
+        ));
         let Error::WithCleanup { cleanup, .. } = pending.error() else {
             panic!("unwind cleanup cause was lost");
         };
@@ -2473,9 +2897,12 @@ mod tests {
         assert!(participant.try_enter().is_err());
         assert!(gate.try_copy(None).is_err());
         assert!(gate.try_close().is_err());
-        // A second mask guard refuses a stale queued control signal.
-        signal::Mask::block().unwrap().finish().unwrap();
-        assert_eq!(mask_bits(), original_mask);
+        // A later entry on this thread finds the kick explained.
+        signal::Control::arm(participant.key, None)
+            .unwrap()
+            .finish(0)
+            .unwrap();
+        assert_eq!(mask_bits(), original_mask & !(1 << 63));
         drop(participant);
         assert!(gate.state.lock().unwrap().members.is_empty());
     }
@@ -2535,7 +2962,9 @@ mod tests {
 
         let gate = EntryGate::new();
         let mut participant = gate.register().unwrap();
-        let entry = participant.prepare(&vcpu).unwrap().unwrap();
+        // SAFETY: vcpu outlives every entry prepared below.
+        let immediate_exit = unsafe { ImmediateExit::new(&mut vcpu) };
+        let entry = participant.prepare(Some(immediate_exit)).unwrap().unwrap();
         let controller_gate = gate.clone();
         let observer_memory = memory.clone();
         let (close_acquired, close_observed) = std::sync::mpsc::channel();
@@ -2565,15 +2994,19 @@ mod tests {
             close_observed.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
+        // The kick's handler set immediate_exit; cleanup clears it for the
+        // next run.
+        assert!(immediate_exit.get());
         entry.finish(Ok(())).unwrap();
+        assert!(!immediate_exit.get());
         close_observed
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         let closed = controller.join().unwrap();
-        assert!(participant.prepare(&vcpu).unwrap().is_none());
+        assert!(participant.prepare(Some(immediate_exit)).unwrap().is_none());
         drop(closed);
         participant
-            .prepare(&vcpu)
+            .prepare(Some(immediate_exit))
             .unwrap()
             .unwrap()
             .finish(Ok(()))

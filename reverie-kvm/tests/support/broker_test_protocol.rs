@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Source-only launcher protocol shared by the two compiled artifacts.
 // These strings locate a capability; they are never admission authority.
 pub const CHANNEL_ENV: &str = "REVERIE_KVM_TEST_BROKER_CHANNEL";

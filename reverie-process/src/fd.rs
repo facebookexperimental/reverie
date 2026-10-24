@@ -241,23 +241,42 @@ impl From<OwnedFd> for Fd {
 impl AsyncFd {
     pub fn new(fd: Fd) -> Result<Self, Errno> {
         fd.set_nonblocking()?;
-        Ok(Self(
-            TokioAsyncFd::with_interest(fd, Interest::READABLE | Interest::WRITABLE).unwrap(),
-        ))
+        // tokio 1.53 deprecates `AsyncFd::with_interest` for lacking I/O safety
+        // (https://github.com/tokio-rs/tokio/pull/8587). This file descriptor is
+        // owned here and moves into the `AsyncFd`, so the call is sound as used.
+        // Migrating to `register_with_interest` needs a tokio >= 1.53 floor; it is
+        // tracked in the issue "Migrate reverie-process off the deprecated
+        // AsyncFd::with_interest".
+        #[allow(deprecated)]
+        let async_fd =
+            TokioAsyncFd::with_interest(fd, Interest::READABLE | Interest::WRITABLE).unwrap();
+        Ok(Self(async_fd))
     }
 
     pub fn readable(fd: Fd) -> Result<Self, Errno> {
         fd.set_nonblocking()?;
-        Ok(Self(
-            TokioAsyncFd::with_interest(fd, Interest::READABLE).unwrap(),
-        ))
+        // tokio 1.53 deprecates `AsyncFd::with_interest` for lacking I/O safety
+        // (https://github.com/tokio-rs/tokio/pull/8587). This file descriptor is
+        // owned here and moves into the `AsyncFd`, so the call is sound as used.
+        // Migrating to `register_with_interest` needs a tokio >= 1.53 floor; it is
+        // tracked in the issue "Migrate reverie-process off the deprecated
+        // AsyncFd::with_interest".
+        #[allow(deprecated)]
+        let async_fd = TokioAsyncFd::with_interest(fd, Interest::READABLE).unwrap();
+        Ok(Self(async_fd))
     }
 
     pub fn writable(fd: Fd) -> Result<Self, Errno> {
         fd.set_nonblocking()?;
-        Ok(Self(
-            TokioAsyncFd::with_interest(fd, Interest::WRITABLE).unwrap(),
-        ))
+        // tokio 1.53 deprecates `AsyncFd::with_interest` for lacking I/O safety
+        // (https://github.com/tokio-rs/tokio/pull/8587). This file descriptor is
+        // owned here and moves into the `AsyncFd`, so the call is sound as used.
+        // Migrating to `register_with_interest` needs a tokio >= 1.53 floor; it is
+        // tracked in the issue "Migrate reverie-process off the deprecated
+        // AsyncFd::with_interest".
+        #[allow(deprecated)]
+        let async_fd = TokioAsyncFd::with_interest(fd, Interest::WRITABLE).unwrap();
+        Ok(Self(async_fd))
     }
 }
 

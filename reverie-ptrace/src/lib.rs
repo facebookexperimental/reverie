@@ -50,31 +50,31 @@ pub mod decoder;
 mod error;
 mod failure;
 mod gdbstub;
-mod in_guest;
 mod injected_syscall;
-pub mod liteinst_census;
-mod liteinst_restart;
-mod liteinst_stats;
-mod liteinst_trap_only;
 mod perf;
 mod poll_on_wake;
 pub mod regs;
+mod segv_state;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod signal_action_boundary_tests;
+mod sigtrap_state;
 mod stack;
 mod stats;
-#[cfg(target_arch = "x86_64")]
-pub mod target_loader;
 mod task;
 pub mod testing;
 mod timer;
+mod tool_memory;
 mod tracer;
 mod validation;
 mod vdso;
 
 // Shared with the transient opens in reverie-core and safeptrace.
 pub use backend::PtraceBackend;
+pub use failure::BrokenSignalApproval;
 pub use failure::CapturedPrefix;
 pub use failure::LegacyCleanupDiagnostics;
 pub use failure::LegacyFailureProjection;
+pub use failure::PendingSigtrapAtStep;
 pub use failure::PtraceCallbackDecision;
 pub use failure::PtraceCallbackDiagnostic;
 pub use failure::PtraceCallbackOutcome;
@@ -83,24 +83,27 @@ pub use failure::PtraceCallbackStop;
 pub use failure::PtraceCleanupFailure;
 pub use failure::PtraceRunFailure;
 pub use failure::ToolRunCompletion;
-pub use in_guest::InGuestRcbCounter;
+pub use failure::UntracedStubSyscall;
 pub use injected_syscall::InjectedSyscallFrame;
-pub use liteinst_stats::LiteinstInstrumentationStats;
-pub use liteinst_stats::LiteinstInstrumentationStatsHandle;
-pub use liteinst_trap_only::Ia32EmulationProbe;
-pub use liteinst_trap_only::Ia32EmulationUnavailable;
-pub use liteinst_trap_only::Ia32EntryClobbersRegisters;
-pub use liteinst_trap_only::LiteinstTrapOnlyHandle;
-pub use liteinst_trap_only::SitePatching;
-pub use liteinst_trap_only::SiteTable;
-pub use liteinst_trap_only::probe_ia32_emulation;
 pub use perf::is_perf_supported;
+pub use perf::pmu_validation;
+pub use reverie::InGuestRcbCounter;
 use reverie::process::launch_window;
+pub use reverie::vdso::VdsoSyscallSite;
+#[cfg(target_arch = "x86_64")]
+pub use reverie::vdso::patch_current_vdso;
+#[cfg(target_arch = "x86_64")]
+pub use reverie::vdso::patch_current_vdso_trapping;
+#[cfg(target_arch = "x86_64")]
+pub use reverie::vdso::patch_current_vdso_trapping_owned;
 pub use stats::PtraceBackendStatsSnapshot;
 pub use stats::PtraceBackendStatsSource;
 pub use timer::PmuConfig;
 pub use timer::SKID_OVERSHOOT_MARKER;
+pub use timer::host_pmu_profile;
 pub use timer::set_pmu_config;
+pub use timer::set_skid_margin_override;
+pub use tool_memory::ToolMemory;
 pub use tracer::CleanupAdmissionRefused;
 pub use tracer::CleanupLookupError;
 pub use tracer::CleanupUnconfirmed;
@@ -115,8 +118,4 @@ pub use tracer::TracerBuilder;
 pub use tracer::quarantine_cleanup_resource;
 pub use tracer::spawn_fn;
 pub use tracer::spawn_fn_with_config;
-pub use vdso::VdsoSyscallSite;
-#[cfg(target_arch = "x86_64")]
-pub use vdso::patch_current_vdso;
-#[cfg(target_arch = "x86_64")]
-pub use vdso::patch_current_vdso_trapping;
+pub use validation::PmuValidationError;

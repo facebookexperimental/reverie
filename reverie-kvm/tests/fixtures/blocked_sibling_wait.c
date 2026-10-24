@@ -1,11 +1,5 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+/* Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Licensed under the BSD-style license in the LICENSE file. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -18,6 +12,17 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* The uid a signal from this process carries: its own. KVM leaves getuid to
+   the Tool (Detcore) and refuses it in a run without one, and its signals
+   then carry uid 0. errno is preserved, as this may run in a signal handler. */
+static uid_t sender_uid(void) {
+  int saved = errno;
+  long uid = syscall(SYS_getuid);
+  uid_t result = uid == -1 && errno == ENOSYS ? 0 : (uid_t)uid;
+  errno = saved;
+  return result;
+}
 
 /* Additive to cross_thread_waitid.c. That fixture's eight ready-child variants
  * and every existing assertion remain unchanged.
@@ -229,7 +234,7 @@ int main(int argc, char** argv) {
   require(c.wait4_mode || !strcmp(argv[3], "waitid"));
   c.process = getpid();
   c.leader = (pid_t)syscall(SYS_gettid);
-  c.uid = getuid();
+  c.uid = sender_uid();
   require(c.process == c.leader);
   require(pipe(c.announced) == 0 && pipe(c.acknowledged) == 0);
   pthread_t controller, thread;

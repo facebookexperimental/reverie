@@ -15,6 +15,7 @@
 use futures::future::BoxFuture;
 
 use super::*;
+use crate::error::ErrorExt;
 use crate::executor::ChildCompletionSlot;
 use crate::executor::ChildStartCommand;
 use crate::executor::ChildThread;
@@ -79,21 +80,48 @@ struct NoInstructions<'a> {
     executor: &'a ElfExecutor,
     failure: FailureContext,
 }
-impl<T: Tool> GuestSyscallExecutor<T> for NoInstructions<'_> {
-    fn parent_pid(&self) -> Option<Pid> {
-        self.executor.parent_pid()
+#[reverie::provider]
+impl LinuxProvider for NoInstructions<'_> {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        panic!("native Tool control must not inject a guest instruction")
     }
+}
+
+impl LinuxEmuSignalControl for NoInstructions<'_> {
     fn signal_task_identity(&self) -> Option<reverie::SignalTaskIdentity> {
         self.executor.signal_task_identity()
     }
+
+    // Native callbacks answer Guest::signal_control_mode from the same shared
+    // registry the production adapter reads, so they cannot disagree with the
+    // mode the root owner installed.
+    fn signal_controlled(&self) -> bool {
+        self.executor.signal_controlled()
+    }
+}
+
+impl LinuxEmuMemoryMap for NoInstructions<'_> {}
+
+impl<T: Tool> GuestSyscallExecutor<T> for NoInstructions<'_> {
+    fn traced_parent(&self) -> Option<Pid> {
+        self.executor.parent_pid()
+    }
+
     fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
         Some(self.failure.run.subscribe())
     }
+
     fn read_clock(&self) -> Result<u64> {
         panic!("native Tool control must disable guest clock operations")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("native Tool control must not inject a guest instruction")
     }
 }
 
@@ -232,9 +260,13 @@ where
         // Like the installed-ELF path, install once for the run before its
         // first callback. fork_child shares this registry and does not reinstall.
         // The caller has already constructed Tool/thread state in this native API.
-        let mode = match owner.global.install_backend_signal_control(Some(
-            owner.executor.as_ref().unwrap().backend_signal_control(),
-        )) {
+        // As there, a Tool that requires the control and declines it is refused.
+        let mode = match super::require_offered_signal_control::<T>(
+            &owner.config,
+            owner.global.install_backend_signal_control(Some(
+                owner.executor.as_ref().unwrap().backend_signal_control(),
+            )),
+        ) {
             Ok(mode) => mode,
             Err(error) => {
                 let error = owner

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::sync::atomic::AtomicU64;
 
 use reverie::CallbackSignalSite;
@@ -35,12 +27,29 @@ impl Tool for Upper {
 }
 
 struct Unsupported;
+#[reverie::provider]
+impl LinuxProvider for Unsupported {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
+        panic!("capability query executed a syscall")
+    }
+}
+
+impl LinuxEmuSignalControl for Unsupported {}
+
+impl LinuxEmuMemoryMap for Unsupported {}
+
 impl GuestSyscallExecutor<Upper> for Unsupported {
     fn read_clock(&self) -> Result<u64> {
         panic!("capability query read a clock")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
-        panic!("capability query executed a syscall")
     }
 }
 struct Capable {
@@ -48,17 +57,35 @@ struct Capable {
     site: CallbackSignalSite,
     queries: AtomicU64,
 }
-impl GuestSyscallExecutor<Upper> for Capable {
-    fn read_clock(&self) -> Result<u64> {
-        panic!("capability query read a clock")
-    }
-    fn execute(&mut self, _: &SyscallRequest, _: &GuestMemory) -> Result<i64> {
+#[reverie::provider]
+impl LinuxProvider for Capable {
+    type Context = GuestMemory;
+    type Plan = crate::executor::StagedProcessAction;
+    type Error = crate::Error;
+
+    async fn execute(
+        &mut self,
+        _: reverie::Tid,
+        _: &ProviderRequest,
+        _: &mut GuestMemory,
+    ) -> Result<ProviderOutcome> {
         panic!("capability query executed a syscall")
     }
+}
+
+impl LinuxEmuSignalControl for Capable {
     fn captured_write_signal_site(&self, call: Write) -> Option<CallbackSignalSite> {
         assert_eq!(call, self.call);
         self.queries.fetch_add(1, Ordering::SeqCst);
         Some(self.site)
+    }
+}
+
+impl LinuxEmuMemoryMap for Capable {}
+
+impl GuestSyscallExecutor<Upper> for Capable {
+    fn read_clock(&self) -> Result<u64> {
+        panic!("capability query read a clock")
     }
 }
 
@@ -128,4 +155,54 @@ fn captured_write_query_default_adapter_and_nested_guards_have_no_effects() {
     let mut bytes = [0; 64];
     memory.read(0, &mut bytes).unwrap();
     assert_eq!(bytes, [0; 64]);
+}
+
+#[test]
+fn guest_reports_the_user_address_limit_the_executor_enforces() {
+    // The executor's limit is Linux's on a four-level x86-64 kernel, which is
+    // what a tool's model of a guest range check assumes.
+    assert_eq!(
+        crate::executor::X86_64_GUEST_USER_LIMIT,
+        reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT
+    );
+    let memory = GuestMemory::new(0, STACK_CAPACITY).unwrap();
+    let mut executor = Unsupported;
+    let mut state = Box::new(());
+    let subscriptions = Subscription::none();
+    let signal = Arc::new(Mutex::new(None));
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let mut guest = KvmGuest::<Upper>::new(
+        Pid::from_raw(1),
+        Pid::from_raw(1),
+        Arc::new(Upper::default()),
+        memory,
+        &[],
+        unsafe { std::mem::zeroed() },
+        &mut state,
+        &mut executor,
+        &(),
+        None,
+        &(),
+        &subscriptions,
+        signal.clone(),
+        starts.clone(),
+        crate::bootstrap::TOOL_STACK_TOP,
+        Arc::new(AtomicBool::new(false)),
+    );
+    // Neither the guest nor its adapter to the inner tool asks the host
+    // kernel, whose limit can be the five-level one; `Unsupported` panics if
+    // the query executes a syscall.
+    // The executor shortens a lone vector to MAX_RW_COUNT before its range
+    // check whatever the host kernel does, so the guest reports that too.
+    let expected = reverie::UserAddressLimit {
+        max_end: crate::executor::X86_64_GUEST_USER_LIMIT,
+        caps_single_vector: true,
+    };
+    assert_eq!(guest.user_address_limit().unwrap(), expected);
+    assert_eq!(
+        <_ as Guest<Lower>>::user_address_limit(&guest.into_guest()).unwrap(),
+        expected
+    );
+    assert!(signal.lock().unwrap().is_none());
+    assert!(starts.lock().unwrap().is_empty());
 }

@@ -15,7 +15,6 @@ use std::io;
 
 /// An address to some immutable memory. We don't know where the memory lives;
 /// it can be either in the current process or a another process.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(transparent)]
 pub struct Addr<'a, T> {
     // This is our non-null pointer. Since this may not point to memory in the
@@ -27,6 +26,31 @@ pub struct Addr<'a, T> {
 impl<'a, T> From<usize> for Addr<'a, T> {
     fn from(raw: usize) -> Self {
         Self::from_raw(raw).unwrap()
+    }
+}
+
+// These traits describe numeric address identity, not the remote pointee.
+// Deriving them would unnecessarily require T: Copy/Clone/Eq/Ord.
+impl<T> Copy for Addr<'_, T> {}
+impl<T> Clone for Addr<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> PartialEq for Addr<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+impl<T> Eq for Addr<'_, T> {}
+impl<T> PartialOrd for Addr<'_, T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for Addr<'_, T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.inner.cmp(&other.inner)
     }
 }
 
@@ -159,13 +183,37 @@ impl<'a, T> fmt::Pointer for Addr<'a, T> {
 
 /// An address to some mutable memory. We don't know where the memory lives; it
 /// can be either in the current process or a another process.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(transparent)]
 pub struct AddrMut<'a, T> {
     // This is our non-null pointer. Since this may not point to memory in the
     // same process, we need to be very careful to never dereference this.
     inner: NonNull<T>,
     _p: PhantomData<&'a mut T>,
+}
+
+// These traits describe numeric address identity, not the remote pointee.
+// Deriving them would unnecessarily require T: Copy/Clone/Eq/Ord.
+impl<T> Copy for AddrMut<'_, T> {}
+impl<T> Clone for AddrMut<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> PartialEq for AddrMut<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+impl<T> Eq for AddrMut<'_, T> {}
+impl<T> PartialOrd for AddrMut<'_, T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for AddrMut<'_, T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.inner.cmp(&other.inner)
+    }
 }
 
 impl<'a, T> AddrMut<'a, T> {
@@ -492,5 +540,36 @@ mod test {
             size_of::<Option<AddrSliceMut<u8>>>(),
             size_of::<&mut [u8]>()
         );
+    }
+}
+
+#[cfg(test)]
+mod pointer_identity_traits {
+    use super::*;
+
+    // No Copy, Clone, Eq or Ord; there is no real pointee at these addresses.
+    struct Opaque;
+
+    fn clone_only<T: Clone>(value: &T) -> T {
+        value.clone()
+    }
+
+    #[test]
+    fn address_traits_never_require_or_access_pointee() {
+        let a = Addr::<Opaque>::from_raw(0x1000).unwrap();
+        let a_copy = a;
+        assert_eq!(a, clone_only(&a_copy));
+        let b = Addr::<Opaque>::from_raw(0x2000).unwrap();
+        assert!(a < b);
+        assert_eq!(a.partial_cmp(&b), Some(core::cmp::Ordering::Less));
+        let a = AddrMut::<Opaque>::from_raw(0x1000).unwrap();
+        let a_copy = a;
+        assert_eq!(a, clone_only(&a_copy));
+        let b = AddrMut::<Opaque>::from_raw(0x2000).unwrap();
+        assert!(a < b);
+        assert_eq!(a.partial_cmp(&b), Some(core::cmp::Ordering::Less));
+        let immutable: Addr<Opaque> = a.into();
+        assert_eq!(immutable.as_raw(), 0x1000);
+        assert_eq!(a.cast::<u8>().as_raw(), 0x1000);
     }
 }

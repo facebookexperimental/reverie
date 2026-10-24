@@ -352,12 +352,9 @@ mod adaptive_wait_tests {
     #[cfg(target_arch = "x86_64")]
     fn managed_waits_retain_controller_across_foreign_calls_and_newborns() {
         use std::io::Read;
-        use std::os::fd::AsRawFd;
-        use std::os::fd::FromRawFd;
-        use std::os::fd::OwnedFd;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
-        use std::process::Command;
-        use std::process::Stdio;
+        use std::process::{Command, Stdio};
 
         const CELL: &str = "REVERIE_ADAPTIVE_OWNER_CELL";
         const SELECTOR: &str = "tracer::tests::adaptive_wait_tests::managed_waits_retain_controller_across_foreign_calls_and_newborns";

@@ -16,6 +16,7 @@ use reverie::Pid;
 
 use super::*;
 use crate::entry::EntryOrigin;
+use crate::error::ErrorExt;
 use crate::failure::FailureContext;
 use crate::failure::RunFailure;
 
@@ -585,4 +586,79 @@ fn suspended_peer_rechecks_abandonment_when_terminal_notification_wins() {
     assert_eq!(occurrences(&result, &failure.causes()[0]), 1);
     let completed = run.complete::<()>(Err(result)).unwrap_err();
     assert_eq!(occurrences(&completed, &failure.causes()[0]), 1);
+}
+
+/// check_entry's inlined fast path returns Ok only where the full check
+/// returns Ok, and defers to the full check (same error) for each of the
+/// three conditions it screens: an owner's pending failure, a gate failure,
+/// and an owner whose registration has closed.
+#[test]
+fn check_entry_fast_path_agrees_with_the_full_check_in_every_state() {
+    fn same(owner: Option<&DriverOwner>, gate: &EntryGate) -> Result<()> {
+        let fast = check_entry(owner, gate);
+        let full = check_entry_observed(owner, gate);
+        assert_eq!(format!("{fast:?}"), format!("{full:?}"));
+        fast
+    }
+
+    // Clear: no owner, and an active owner with nothing pending.
+    let scope = DriverScope::new();
+    let owner = scope.owner();
+    let gate = EntryGate::new();
+    same(None, &gate).unwrap();
+    same(Some(&owner), &gate).unwrap();
+
+    // A failure pending on the owner only, captured through another gate.
+    let other = EntryGate::new();
+    let failure = other.poison(
+        EntryOrigin {
+            failure: None,
+            operation: Some(owner.origin()),
+        },
+        clock("owner-only cause"),
+    );
+    assert!(owner.has_pending());
+    assert!(!gate.failure_recorded());
+    assert!(
+        same(Some(&owner), &gate)
+            .unwrap_err()
+            .retains_primary(&failure.causes()[0])
+    );
+    // The gate itself is still clear for a check without that owner.
+    same(None, &gate).unwrap();
+
+    // A failure on the gate only.
+    let quiet_scope = DriverScope::new();
+    let quiet_owner = quiet_scope.owner();
+    let gate_failure = gate.poison(None, clock("gate-only cause"));
+    assert!(gate.failure_recorded());
+    assert!(!quiet_owner.has_pending());
+    for owner in [None, Some(&quiet_owner)] {
+        assert!(
+            same(owner, &gate)
+                .unwrap_err()
+                .retains_primary(&gate_failure.causes()[0])
+        );
+    }
+
+    // An owner whose registration closed, with a clear gate and nothing
+    // pending: refused by the lifecycle alone.
+    let closed_scope = DriverScope::new();
+    let closed_owner = closed_scope.owner();
+    let retired = closed_scope.retire();
+    retired.result.unwrap();
+    retired.notification.notify();
+    assert!(!closed_owner.has_pending());
+    let clear = EntryGate::new();
+    let error = same(Some(&closed_owner), &clear).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("operation after driver registration closed"),
+        "{error:?}"
+    );
+
+    let retired = scope.retire();
+    retired.notification.notify();
+    let retired = quiet_scope.retire();
+    retired.result.unwrap();
+    retired.notification.notify();
 }
