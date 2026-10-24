@@ -16,11 +16,50 @@ const AMD_DEFAULT_SKID_MARGIN: u64 = 10_000;
 const AMD_EPYC_9D85_SKID_MARGIN: u64 = 2_000;
 const AMD_FAMILY_19H_MODEL_A0H_SKID_MARGIN: u64 = 1_000;
 
+/// What a profile's event counts: the unit of every RCB coordinate a run
+/// records. Different raw selectors can count the same quantity (AMD `0xD1`,
+/// Intel `C4/01` before Ice Lake, Intel `C4/11` from Ice Lake on), so
+/// recorded histories compare this, not the selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum RcbMetric {
+    /// Every retired conditional branch, user mode only, per thread.
+    ConditionalBranchesRetiredUserV1,
+}
+
+impl RcbMetric {
+    /// The stable identifier histories store.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::ConditionalBranchesRetiredUserV1 => "rcb:cond-retired:user:v1",
+        }
+    }
+
+    /// The metric a stored identifier names, or `None` for one this build
+    /// does not know.
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "rcb:cond-retired:user:v1" => Some(Self::ConditionalBranchesRetiredUserV1),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `family` is a family of `vendor` (the CPUID leaf 0 string) that
+/// the profile table describes. The table is keyed by family and model only.
+pub fn vendor_has_family(vendor: &str, family_id: u8) -> bool {
+    match vendor {
+        "GenuineIntel" => family_id == 0x06,
+        "AuthenticAMD" => matches!(family_id, 0x17 | 0x19 | 0x1A),
+        _ => false,
+    }
+}
+
 /// A raw retired conditional branch event and its default ptrace timer margin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PmuProfile {
     rcb_event: u64,
     skid_margin: u64,
+    metric: Option<RcbMetric>,
 }
 
 impl PmuProfile {
@@ -90,10 +129,29 @@ impl PmuProfile {
             _ => return None,
         };
 
+        // What each event counts, from the vendors' event tables: Intel
+        // perfmon 8da58930a226 defines C4/01 as BR_INST_RETIRED.CONDITIONAL
+        // on every Intel family-6 entry above through Comet Lake and C4/11 as
+        // BR_INST_RETIRED.COND from Ice Lake on; Linux perf 5b0764a53235
+        // defines AMD D1 as retired conditional branches on Zen 1 to 6.
+        // Alder Lake is hybrid (its E-cores count C4/7E) and 0x86 has no
+        // C4/01 definition, so what their selectors count is not established.
+        let metric = match (family_id, model_id) {
+            (0x06, 0x9A | 0x86) => None,
+            _ => Some(RcbMetric::ConditionalBranchesRetiredUserV1),
+        };
+
         Some(Self {
             rcb_event,
             skid_margin,
+            metric,
         })
+    }
+
+    /// What this profile's event counts, or `None` where that is not
+    /// established.
+    pub fn metric(&self) -> Option<RcbMetric> {
+        self.metric
     }
 
     /// Returns the raw retired conditional branch event selector.

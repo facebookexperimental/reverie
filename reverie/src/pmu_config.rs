@@ -1,10 +1,12 @@
 //! Shared PMU configuration mechanics. One process configuration and override.
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use thiserror::Error;
 
 use crate::Errno;
 use crate::perf::Event;
+pub use crate::pmu::RcbMetric;
 // Used by both the preserved validation diagnostic and its ptrace probe.
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
@@ -235,11 +237,10 @@ pub const HALVE_STAGES_BY_DEFAULT: bool = cfg!(target_arch = "aarch64");
 /// marker in its plain (unauthenticated) shape.
 pub const WITNESS_TOKEN_ENV: &str = "HERMIT_SKID_WITNESS_TOKEN";
 
-static PMU_CONFIG: OnceLock<PmuConfig> = OnceLock::new();
-
-/// The skid margin [`set_skid_margin_override`] recorded, applied to the PMU
-/// configuration when it is first built.
-static SKID_MARGIN_OVERRIDE: OnceLock<u64> = OnceLock::new();
+/// The process's PMU state: its configuration, the margin
+/// [`set_skid_margin_override`] recorded, and the clock key a qualified
+/// history producer or consumer pinned.
+static PMU_STATE: PmuState = PmuState::new();
 
 /// The process's PMU configuration, which must already exist: every caller
 /// runs after `reverie_ptrace::timer::TimerImpl::new` or `reverie_ptrace::validation` has built it through
@@ -253,10 +254,13 @@ pub fn get_pmu_config() -> &'static PmuConfig {
 /// configuration was set and this CPU has no profile.
 #[doc(hidden)]
 pub fn try_get_pmu_config() -> Option<&'static PmuConfig> {
-    match PMU_CONFIG.get() {
-        Some(config) => Some(config),
-        None => PmuConfig::try_new().map(|config| PMU_CONFIG.get_or_init(|| config)),
-    }
+    PMU_STATE.get_or_install(PmuConfig::try_new)
+}
+
+/// The process's PMU state (see [`PmuState`]).
+#[doc(hidden)]
+pub fn pmu_state() -> &'static PmuState {
+    &PMU_STATE
 }
 
 /// Processor-specific PMU event settings used by precise ptrace timers.
@@ -268,6 +272,7 @@ pub struct PmuConfig {
     skid_margin_override: Option<u64>,
     skid_latency_budget_ns: u64,
     halve_stages: bool,
+    metric: Option<RcbMetric>,
 }
 
 impl PmuConfig {
@@ -337,6 +342,8 @@ impl PmuConfig {
             skid_margin_override: None,
             skid_latency_budget_ns: DEFAULT_SKID_LATENCY_BUDGET_NS,
             halve_stages: HALVE_STAGES_BY_DEFAULT,
+            // What BR_RETIRED counts is not qualified for recorded histories.
+            metric: None,
         }
         .with_env_overrides()
         .with_recorded_skid_margin())
@@ -358,7 +365,17 @@ impl PmuConfig {
             skid_margin_override: None,
             skid_latency_budget_ns: DEFAULT_SKID_LATENCY_BUDGET_NS,
             halve_stages: HALVE_STAGES_BY_DEFAULT,
+            metric: profile.metric(),
         })
+    }
+
+    /// The key a pinned history clock compares: this configuration's event
+    /// and what it counts.
+    pub fn clock_key(&self) -> ClockKey {
+        ClockKey {
+            raw_event: self.rcb_event,
+            metric: self.metric,
+        }
     }
 
     /// Overrides the processor-specific skid margin while preserving the detected PMU event.
@@ -410,10 +427,7 @@ impl PmuConfig {
     /// [`SKID_MARGIN_OVERRIDE_ENV`], as an explicit override built from
     /// [`Self::new`] always did.
     fn with_recorded_skid_margin(self) -> Self {
-        match SKID_MARGIN_OVERRIDE.get() {
-            Some(&margin) => self.with_skid_margin_override(margin),
-            None => self,
-        }
+        PMU_STATE.with_recorded_margin(self)
     }
 
     /// Applies the [`SKID_LATENCY_BUDGET_ENV`] override, if the env var is
@@ -760,7 +774,7 @@ impl PmuConfig {
 /// Returns the supplied configuration if a timer has already initialized the process-wide
 /// configuration. Callers should install overrides before spawning a `reverie_ptrace::Tracer`.
 pub fn set_pmu_config(config: PmuConfig) -> Result<(), PmuConfig> {
-    PMU_CONFIG.set(config)
+    PMU_STATE.set(config)
 }
 
 /// Records `skid_margin` as the margin of the PMU configuration this process
@@ -772,11 +786,7 @@ pub fn set_pmu_config(config: PmuConfig) -> Result<(), PmuConfig> {
 /// or the configuration was built or set, because it would then be lost.
 /// Record it before spawning a `reverie_ptrace::Tracer`.
 pub fn set_skid_margin_override(skid_margin: u64) -> Result<(), u64> {
-    record_skid_margin(
-        &SKID_MARGIN_OVERRIDE,
-        PMU_CONFIG.get().is_some(),
-        skid_margin,
-    )
+    PMU_STATE.set_skid_margin(skid_margin)
 }
 
 /// Whether this host's CPU has a PMU profile, the precondition for a ptrace
@@ -961,5 +971,584 @@ mod aarch64_tests {
             config.second_stage_margin(50_000_000, Some(1_000_000)),
             config.first_stage_margin()
         );
+    }
+}
+
+/// The key a pinned history clock compares: a configuration's raw event and
+/// what it counts ([`PmuConfig::clock_key`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ClockKey {
+    /// The raw perf event selector.
+    pub raw_event: u64,
+    /// What the event counts, if that is established.
+    pub metric: Option<RcbMetric>,
+}
+
+/// A host whose PMU profile's metric is established, so that the RCB
+/// coordinates it counts can be recorded and replayed as that metric.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QualifiedClock {
+    /// What the host's event counts.
+    pub metric: RcbMetric,
+    /// The host's raw event selector.
+    pub raw_event: u64,
+    /// The CPUID vendor string.
+    pub vendor: String,
+    /// The CPUID family.
+    pub family: u8,
+    /// The CPUID model.
+    pub model: u8,
+}
+
+impl QualifiedClock {
+    /// The key a qualified history clock pins.
+    pub fn key(&self) -> ClockKey {
+        ClockKey {
+            raw_event: self.raw_event,
+            metric: Some(self.metric),
+        }
+    }
+}
+
+/// Why a host's RCB coordinates are not qualified as a known metric.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnqualifiedReason {
+    /// CPUID could not be read.
+    CpuInfoUnreadable,
+    /// The vendor and family are not a pair the profile table describes.
+    VendorFamilyNotInTable {
+        /// The CPUID vendor string.
+        vendor: String,
+        /// The CPUID family.
+        family: u8,
+    },
+    /// The model has no profile.
+    ModelNotInTable {
+        /// The CPUID family.
+        family: u8,
+        /// The CPUID model.
+        model: u8,
+    },
+    /// The model's profile exists, but what its event counts is not established.
+    MetricNotEstablished {
+        /// The CPUID family.
+        family: u8,
+        /// The CPUID model.
+        model: u8,
+    },
+    /// This architecture's branch event is not qualified.
+    UnqualifiedArchitecture,
+}
+
+impl std::fmt::Display for UnqualifiedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CpuInfoUnreadable => write!(f, "cpuid-unreadable"),
+            Self::VendorFamilyNotInTable { vendor, family } => {
+                write!(f, "vendor-family-not-in-table:{vendor}:{family:#x}")
+            }
+            Self::ModelNotInTable { family, model } => {
+                write!(f, "model-not-in-table:{family:#x}:{model:#x}")
+            }
+            Self::MetricNotEstablished { family, model } => {
+                write!(f, "metric-not-established:{family:#x}:{model:#x}")
+            }
+            Self::UnqualifiedArchitecture => write!(f, "unqualified-architecture"),
+        }
+    }
+}
+
+/// Classifies a host from its CPUID vendor, family and model against the
+/// profile table. Pure: it builds, installs and records nothing.
+pub fn qualify_host(
+    vendor: &str,
+    family_id: u8,
+    model_id: u8,
+) -> Result<QualifiedClock, UnqualifiedReason> {
+    if !crate::pmu::vendor_has_family(vendor, family_id) {
+        return Err(UnqualifiedReason::VendorFamilyNotInTable {
+            vendor: vendor.to_owned(),
+            family: family_id,
+        });
+    }
+    let profile = crate::pmu::PmuProfile::for_family_model(family_id, model_id).ok_or(
+        UnqualifiedReason::ModelNotInTable {
+            family: family_id,
+            model: model_id,
+        },
+    )?;
+    let metric = profile
+        .metric()
+        .ok_or(UnqualifiedReason::MetricNotEstablished {
+            family: family_id,
+            model: model_id,
+        })?;
+    Ok(QualifiedClock {
+        metric,
+        raw_event: profile.raw_rcb_event(),
+        vendor: vendor.to_owned(),
+        family: family_id,
+        model: model_id,
+    })
+}
+
+/// [`qualify_host`] for this host. It only reads CPUID: it builds, installs
+/// and records no configuration, so it never prevents a later
+/// [`set_skid_margin_override`].
+#[cfg(target_arch = "x86_64")]
+pub fn resolve_host_clock() -> Result<QualifiedClock, UnqualifiedReason> {
+    let cpuid = raw_cpuid::CpuId::new();
+    let vendor = cpuid
+        .get_vendor_info()
+        .ok_or(UnqualifiedReason::CpuInfoUnreadable)?;
+    let features = cpuid
+        .get_feature_info()
+        .ok_or(UnqualifiedReason::CpuInfoUnreadable)?;
+    qualify_host(vendor.as_str(), features.family_id(), features.model_id())
+}
+
+/// No aarch64 branch event is qualified for recorded histories.
+#[cfg(target_arch = "aarch64")]
+pub fn resolve_host_clock() -> Result<QualifiedClock, UnqualifiedReason> {
+    Err(UnqualifiedReason::UnqualifiedArchitecture)
+}
+
+/// Why a qualified clock cannot be pinned, or a configuration installed, in a
+/// [`PmuState`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PinRefusal {
+    /// The installed configuration counts a different event or metric than
+    /// the qualified host clock.
+    InstalledDiffers {
+        /// The installed configuration's key.
+        installed: ClockKey,
+        /// The qualified key.
+        qualified: ClockKey,
+    },
+    /// Another key is already pinned.
+    PinnedDiffers {
+        /// The pinned key.
+        pinned: ClockKey,
+        /// The key asked for.
+        qualified: ClockKey,
+    },
+}
+
+impl std::fmt::Display for PinRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InstalledDiffers {
+                installed,
+                qualified,
+            } => write!(
+                f,
+                "the installed PMU configuration ({installed:?}) is not the host's qualified clock ({qualified:?})"
+            ),
+            Self::PinnedDiffers { pinned, qualified } => write!(
+                f,
+                "the PMU clock is already pinned to {pinned:?}, not {qualified:?}"
+            ),
+        }
+    }
+}
+
+/// A read-only qualification of a clock key against a [`PmuState`]. It
+/// authorizes nothing until [`PmuState::commit_pin`] rechecks and pins it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinTicket {
+    key: ClockKey,
+}
+
+impl PinTicket {
+    /// The key this ticket would pin.
+    pub fn key(&self) -> ClockKey {
+        self.key
+    }
+}
+
+/// The PMU configuration, recorded margin and pinned history clock of a
+/// process, under one lock.
+///
+/// Every check-then-publish (installing the configuration lazily or
+/// explicitly, recording a margin, pinning a clock key) holds `pinned`'s lock,
+/// so they linearize: once a key is pinned no configuration with another key
+/// is installed, and a key is pinned only if the installed configuration, if
+/// any, has it. The installed configuration is published while the lock is
+/// held and never changes, so reading it takes no lock. Building a
+/// configuration and reading the recorded margin take no lock either, so a
+/// constructor run in a forked child never waits for it.
+pub struct PmuState {
+    pinned: Mutex<Option<ClockKey>>,
+    installed: OnceLock<PmuConfig>,
+    margin: OnceLock<u64>,
+}
+
+impl PmuState {
+    /// An empty state: no configuration, margin or pin.
+    pub const fn new() -> Self {
+        Self {
+            pinned: Mutex::new(None),
+            installed: OnceLock::new(),
+            margin: OnceLock::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<ClockKey>> {
+        // Nothing under the lock panics, so a poisoned lock still holds a
+        // consistent key.
+        self.pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The installed configuration, without taking the lock.
+    pub fn installed(&self) -> Option<&PmuConfig> {
+        self.installed.get()
+    }
+
+    /// The pinned clock key, if any.
+    pub fn pinned(&self) -> Option<ClockKey> {
+        *self.lock()
+    }
+
+    /// `config` with the recorded margin applied, as the last override, without
+    /// taking the lock.
+    pub fn with_recorded_margin(&self, config: PmuConfig) -> PmuConfig {
+        match self.margin.get() {
+            Some(&margin) => config.with_skid_margin_override(margin),
+            None => config,
+        }
+    }
+
+    /// The installed configuration, or `build`'s, installed now. `build` runs
+    /// outside the lock. Under it, a configuration another thread installed
+    /// first wins, one whose key differs from the pinned key is not installed
+    /// (`None`), and the margin recorded by then is applied last, so a margin
+    /// [`Self::set_skid_margin`] accepted while `build` ran is not lost.
+    pub fn get_or_install(&self, build: impl FnOnce() -> Option<PmuConfig>) -> Option<&PmuConfig> {
+        if let Some(config) = self.installed.get() {
+            return Some(config);
+        }
+        let candidate = build();
+        let pinned = self.lock();
+        if let Some(config) = self.installed.get() {
+            return Some(config);
+        }
+        let candidate = candidate?;
+        if pinned.is_some_and(|key| key != candidate.clock_key()) {
+            return None;
+        }
+        let candidate = self.with_recorded_margin(candidate);
+        // Only this lock's holder installs, and nothing is installed yet.
+        let installed = self.installed.set(candidate);
+        debug_assert!(installed.is_ok());
+        drop(pinned);
+        self.installed.get()
+    }
+
+    /// Installs `config` as given, its own margin included. Returns it back if
+    /// a configuration is installed already or its key is not the pinned key.
+    pub fn set(&self, config: PmuConfig) -> Result<(), PmuConfig> {
+        let pinned = self.lock();
+        if self.installed.get().is_some()
+            || pinned.is_some_and(|key| key != config.clock_key())
+        {
+            return Err(config);
+        }
+        let result = self.installed.set(config);
+        drop(pinned);
+        result
+    }
+
+    /// Records `skid_margin` for the configuration this state installs
+    /// lazily. Returns it back, recording nothing, once a configuration is
+    /// installed or a margin was recorded, as [`set_skid_margin_override`]
+    /// always did. A pinned key does not prevent it.
+    pub fn set_skid_margin(&self, skid_margin: u64) -> Result<(), u64> {
+        let _pinned = self.lock();
+        record_skid_margin(&self.margin, self.installed.get().is_some(), skid_margin)
+    }
+
+    /// Checks, without changing anything, that `qualified` can be pinned: the
+    /// installed configuration, if any, has its key, and no other key is
+    /// pinned.
+    pub fn qualify(&self, qualified: &QualifiedClock) -> Result<PinTicket, PinRefusal> {
+        let pinned = self.lock();
+        self.check(&pinned, qualified.key())
+    }
+
+    /// Pins `ticket`'s key after rechecking it under the lock. Pinning the
+    /// same key again succeeds.
+    pub fn commit_pin(&self, ticket: PinTicket) -> Result<(), PinRefusal> {
+        let mut pinned = self.lock();
+        self.check(&pinned, ticket.key)?;
+        *pinned = Some(ticket.key);
+        Ok(())
+    }
+
+    fn check(&self, pinned: &Option<ClockKey>, key: ClockKey) -> Result<PinTicket, PinRefusal> {
+        if let Some(installed) = self.installed.get()
+            && installed.clock_key() != key
+        {
+            return Err(PinRefusal::InstalledDiffers {
+                installed: installed.clock_key(),
+                qualified: key,
+            });
+        }
+        if let Some(pinned) = *pinned
+            && pinned != key
+        {
+            return Err(PinRefusal::PinnedDiffers {
+                pinned,
+                qualified: key,
+            });
+        }
+        Ok(PinTicket { key })
+    }
+}
+
+impl Default for PmuState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod clock_state_tests {
+    use super::*;
+
+    fn profile(family: u8, model: u8) -> PmuConfig {
+        PmuConfig::try_from_family_model(family, model).expect("a model in the profile table")
+    }
+
+    fn amd() -> QualifiedClock {
+        qualify_host("AuthenticAMD", 0x1A, 0x11).unwrap()
+    }
+
+    #[test]
+    fn qualified_hosts_share_one_metric_across_raw_events() {
+        let metric = RcbMetric::ConditionalBranchesRetiredUserV1;
+        for (vendor, family, model, raw_event) in [
+            ("GenuineIntel", 0x06, 0x8F, 0x5111c4),
+            ("GenuineIntel", 0x06, 0x55, 0x5101c4),
+            ("AuthenticAMD", 0x1A, 0x11, 0x5100d1),
+            ("AuthenticAMD", 0x19, 0xA0, 0x5100d1),
+        ] {
+            let clock = qualify_host(vendor, family, model).unwrap();
+            assert_eq!(clock.metric, metric, "{vendor} {family:#x} {model:#x}");
+            assert_eq!(clock.raw_event, raw_event, "{vendor} {family:#x} {model:#x}");
+        }
+        assert_eq!(metric.id(), "rcb:cond-retired:user:v1");
+        assert_eq!(RcbMetric::from_id(metric.id()), Some(metric));
+        assert_eq!(RcbMetric::from_id("rcb:cond-retired:user:v2"), None);
+    }
+
+    #[test]
+    fn unqualified_hosts_are_named() {
+        use UnqualifiedReason::*;
+        for (vendor, family, model, reason) in [
+            ("GenuineIntel", 0x06, 0x9A, MetricNotEstablished { family: 0x06, model: 0x9A }),
+            ("GenuineIntel", 0x06, 0x86, MetricNotEstablished { family: 0x06, model: 0x86 }),
+            ("GenuineIntel", 0x06, 0x01, ModelNotInTable { family: 0x06, model: 0x01 }),
+            (
+                "AuthenticAMD",
+                0x06,
+                0x55,
+                VendorFamilyNotInTable { vendor: "AuthenticAMD".into(), family: 0x06 },
+            ),
+            (
+                "GenuineIntel",
+                0x19,
+                0x11,
+                VendorFamilyNotInTable { vendor: "GenuineIntel".into(), family: 0x19 },
+            ),
+            (
+                "HygonGenuine",
+                0x18,
+                0x00,
+                VendorFamilyNotInTable { vendor: "HygonGenuine".into(), family: 0x18 },
+            ),
+        ] {
+            assert_eq!(qualify_host(vendor, family, model), Err(reason));
+        }
+    }
+
+    #[test]
+    fn an_installed_profile_of_another_model_is_not_the_hosts_clock() {
+        let state = PmuState::new();
+        let spr = profile(0x06, 0x8F);
+        assert_ne!(spr.clock_key(), amd().key());
+        assert_eq!(state.set(spr.clone()), Ok(()));
+        assert_eq!(
+            state.qualify(&amd()),
+            Err(PinRefusal::InstalledDiffers {
+                installed: spr.clock_key(),
+                qualified: amd().key(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolving_and_qualifying_install_nothing() {
+        let before = PMU_STATE.installed().is_some();
+        let _ = resolve_host_clock();
+        assert_eq!(PMU_STATE.installed().is_some(), before);
+        let state = PmuState::new();
+        let ticket = state.qualify(&amd()).unwrap();
+        assert!(state.installed().is_none());
+        assert_eq!(state.pinned(), None);
+        assert_eq!(state.set_skid_margin(500), Ok(()));
+        assert_eq!(state.commit_pin(ticket), Ok(()));
+        assert!(state.installed().is_none());
+    }
+
+    // S1: a configuration installed between qualification and commit wins,
+    // and the commit is refused.
+    #[test]
+    fn a_profile_installed_after_qualification_refuses_the_commit() {
+        let state = PmuState::new();
+        let ticket = state.qualify(&amd()).unwrap();
+        let other = profile(0x06, 0x55);
+        assert_eq!(state.set(other.clone()), Ok(()));
+        assert_eq!(
+            state.commit_pin(ticket),
+            Err(PinRefusal::InstalledDiffers {
+                installed: other.clock_key(),
+                qualified: amd().key(),
+            })
+        );
+        assert_eq!(state.pinned(), None);
+        assert_eq!(state.installed(), Some(&other));
+    }
+
+    // S2: once pinned, another key is not installed, explicitly or lazily.
+    #[test]
+    fn a_pin_refuses_another_key() {
+        let state = PmuState::new();
+        state.commit_pin(state.qualify(&amd()).unwrap()).unwrap();
+        let other = profile(0x06, 0x55);
+        assert_eq!(state.set(other.clone()), Err(other.clone()));
+        assert_eq!(state.get_or_install(|| Some(other)), None);
+        assert!(state.installed().is_none());
+        assert_eq!(
+            state.get_or_install(|| Some(profile(0x1A, 0x11))),
+            Some(&profile(0x1A, 0x11))
+        );
+    }
+
+    // S3: an installed configuration of another key cannot be qualified.
+    #[test]
+    fn an_already_installed_other_key_is_not_qualified() {
+        let state = PmuState::new();
+        state.set(profile(0x06, 0x55)).unwrap();
+        assert!(matches!(
+            state.qualify(&amd()),
+            Err(PinRefusal::InstalledDiffers { .. })
+        ));
+    }
+
+    // S4: a lazy install of another key after a pin installs nothing.
+    #[test]
+    fn a_lazy_install_of_another_key_after_a_pin_installs_nothing() {
+        let state = PmuState::new();
+        state.commit_pin(state.qualify(&amd()).unwrap()).unwrap();
+        assert_eq!(state.get_or_install(|| Some(profile(0x06, 0x8F))), None);
+        assert!(state.installed().is_none());
+        assert_eq!(state.pinned(), Some(amd().key()));
+    }
+
+    // S5: the same key can be pinned and used again.
+    #[test]
+    fn the_same_key_is_pinned_and_used_repeatedly() {
+        let state = PmuState::new();
+        let ticket = state.qualify(&amd()).unwrap();
+        assert_eq!(state.commit_pin(ticket), Ok(()));
+        assert_eq!(state.commit_pin(ticket), Ok(()));
+        let config = profile(0x1A, 0x11);
+        assert_eq!(state.get_or_install(|| Some(config.clone())), Some(&config));
+        assert_eq!(state.qualify(&amd()), Ok(ticket));
+        assert_eq!(state.set(config.clone()), Err(config));
+    }
+
+    // S6: a pin does not stop the first margin override, which the lazy
+    // install then applies.
+    #[test]
+    fn a_pin_leaves_the_margin_override_open() {
+        let state = PmuState::new();
+        state.commit_pin(state.qualify(&amd()).unwrap()).unwrap();
+        assert_eq!(state.set_skid_margin(500), Ok(()));
+        assert!(state.installed().is_none());
+        let installed = state.get_or_install(|| Some(profile(0x1A, 0x11))).unwrap();
+        assert_eq!(installed.skid_margin(), 500);
+        assert_eq!(installed.clock_key(), amd().key());
+    }
+
+    // M1: a margin is recorded once, before installation; a second, equal or
+    // not, is refused, as `set_skid_margin_override` always did.
+    #[test]
+    fn a_second_margin_is_refused_before_installation() {
+        let state = PmuState::new();
+        assert_eq!(state.set_skid_margin(500), Ok(()));
+        assert_eq!(state.set_skid_margin(500), Err(500));
+        assert_eq!(state.set_skid_margin(700), Err(700));
+        let installed = state.get_or_install(|| Some(profile(0x1A, 0x11))).unwrap();
+        assert_eq!(installed.skid_margin(), 500);
+        assert_eq!(state.set_skid_margin(800), Err(800));
+    }
+
+    // M2: a margin accepted while a lazy candidate is being built is applied
+    // when the candidate is installed.
+    #[test]
+    fn a_margin_accepted_during_a_lazy_build_is_installed() {
+        let state = PmuState::new();
+        let installed = state
+            .get_or_install(|| {
+                let candidate = state.with_recorded_margin(profile(0x1A, 0x11));
+                assert_eq!(candidate.skid_margin(), 2_000);
+                assert_eq!(state.set_skid_margin(500), Ok(()));
+                Some(candidate)
+            })
+            .unwrap();
+        assert_eq!(installed.skid_margin(), 500);
+        assert_eq!(state.set_skid_margin(600), Err(600));
+    }
+
+    // An explicit configuration keeps its own margin.
+    #[test]
+    fn an_explicit_configuration_keeps_its_margin() {
+        let state = PmuState::new();
+        assert_eq!(state.set_skid_margin(500), Ok(()));
+        state.set(profile(0x1A, 0x11)).unwrap();
+        assert_eq!(state.installed().unwrap().skid_margin(), 2_000);
+    }
+
+    // Racing an explicit install of another key against a commit, from two
+    // threads: whichever wins, no configuration of another key coexists with
+    // the pin.
+    #[test]
+    fn a_racing_install_and_commit_never_leave_a_pin_with_another_key() {
+        for _ in 0..200 {
+            let state = std::sync::Arc::new(PmuState::new());
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let ticket = state.qualify(&amd()).unwrap();
+            let setter = {
+                let (state, barrier) = (state.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.set(profile(0x06, 0x55)).is_ok()
+                })
+            };
+            barrier.wait();
+            let committed = state.commit_pin(ticket).is_ok();
+            let installed = setter.join().unwrap();
+            assert!(committed != installed, "committed {committed}, installed {installed}");
+            if committed {
+                assert!(state.installed().is_none());
+                assert_eq!(state.pinned(), Some(amd().key()));
+            } else {
+                assert_eq!(state.installed().map(PmuConfig::clock_key), Some(profile(0x06, 0x55).clock_key()));
+                assert_eq!(state.pinned(), None);
+            }
+        }
     }
 }
