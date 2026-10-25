@@ -7027,3 +7027,407 @@ async fn a_handler_that_interrupts_an_injected_wait_has_the_native_masks() {
     );
     assert_eq!(after.repairs - before.repairs, 2);
 }
+
+/// Real first-exec transitions when private text changes at the exact decoder
+/// boundary. These tests do not replace the original native/inject/tail oracle.
+#[cfg(target_arch = "x86_64")]
+mod first_exec_boundaries {
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use reverie::syscalls::Addr;
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::MemoryAccess;
+    use safeptrace::Event;
+    use safeptrace::Stopped;
+    use safeptrace::Wait;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Default, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    enum Case {
+        #[default]
+        StepSyscall,
+        ContSyscall,
+        ContGuestTf,
+    }
+
+    impl Case {
+        fn period(self) -> Option<u64> {
+            match self {
+                Self::StepSyscall => None,
+                Self::ContSyscall => Some(8),
+                Self::ContGuestTf => Some(1_000_000),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    enum Observation {
+        PostExec {
+            rip: u64,
+            clock: Option<u64>,
+            period: Option<u64>,
+        },
+        Timer {
+            rip: u64,
+            clock: u64,
+            rax: u64,
+        },
+        Signal {
+            signal: i32,
+            rip: u64,
+        },
+    }
+
+    #[derive(Default)]
+    struct BoundaryLog(Mutex<Vec<(Pid, Observation)>>);
+
+    #[reverie::global_tool]
+    impl GlobalTool for BoundaryLog {
+        type Config = Case;
+        type Request = Observation;
+        type Response = ();
+
+        async fn receive_rpc(&self, from: Pid, observation: Observation) {
+            self.0.lock().unwrap().push((from, observation));
+        }
+    }
+
+    #[derive(Default)]
+    struct BoundaryTool;
+
+    #[reverie::tool]
+    impl Tool for BoundaryTool {
+        type GlobalState = BoundaryLog;
+        type ThreadState = ();
+
+        fn subscriptions(_config: &Case) -> Subscription {
+            // In particular, getpid is not subscribed. A controller syscall
+            // step must not be lent the native first-exec CONT authority.
+            Subscription::none()
+        }
+
+        fn enforces_serialized_execution(_config: &Case) -> bool {
+            true
+        }
+
+        async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+            let period = guest.config().period();
+            let rip = guest.regs().await.rip;
+            let clock = period.map(|_| guest.read_clock().expect("read the post-exec timer clock"));
+            if let Some(period) = period {
+                guest
+                    .set_timer_precise(reverie::TimerSchedule::Rcbs(period))
+                    .expect("accept the actual post-exec precise timer request");
+            }
+            guest
+                .send_rpc(Observation::PostExec { rip, clock, period })
+                .await;
+            Ok(())
+        }
+
+        async fn handle_timer_event<G: Guest<Self>>(&self, guest: &mut G) {
+            let regs = guest.regs().await;
+            let clock = guest.read_clock().expect("read the delivered timer clock");
+            guest
+                .send_rpc(Observation::Timer {
+                    rip: regs.rip,
+                    clock,
+                    rax: regs.rax,
+                })
+                .await;
+        }
+
+        async fn handle_signal_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            signal: reverie::Signal,
+        ) -> Result<Option<reverie::Signal>, Errno> {
+            let rip = guest.regs().await.rip;
+            guest
+                .send_rpc(Observation::Signal {
+                    signal: signal as i32,
+                    rip,
+                })
+                .await;
+            Ok(Some(signal))
+        }
+    }
+
+    struct TransitionHook(std::marker::PhantomData<Rc<()>>);
+
+    impl TransitionHook {
+        fn install(hook: crate::task::FirstExecTransitionForTest) -> Self {
+            crate::task::FIRST_EXEC_TRANSITION_FOR_TEST.with(|slot| {
+                assert!(slot.borrow_mut().replace(hook).is_none());
+            });
+            Self(std::marker::PhantomData)
+        }
+    }
+
+    impl Drop for TransitionHook {
+        fn drop(&mut self) {
+            crate::task::FIRST_EXEC_TRANSITION_FOR_TEST.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    fn authenticate_entry(
+        task: &Stopped,
+        target: &FirstExecGuest,
+    ) -> Result<(), safeptrace::Error> {
+        let regs = task.getregs()?;
+        assert_eq!(regs.rip, target.entry);
+        assert_eq!(
+            regs.eflags & 0x100,
+            0,
+            "TF must be established by guest POPFQ, not ptrace"
+        );
+        assert_ne!(task.getsigmask()? & (1 << (libc::SIGTRAP - 1)), 0);
+        let proc_exe = format!("/proc/{}/exe", task.pid());
+        assert_eq!(
+            std::fs::read_link(&proc_exe).expect("resolve the owned image"),
+            target.path
+        );
+        assert_eq!(
+            std::fs::read(&proc_exe).expect("read the owned image"),
+            target.image
+        );
+        let mut bytes = vec![0; target.opcode.len()];
+        task.read_exact(Addr::from_raw(target.entry as usize).unwrap(), &mut bytes)?;
+        assert_eq!(bytes, target.opcode);
+        Ok(())
+    }
+
+    /// The exact eight-byte Stopped write uses forced POKEDATA on this private
+    /// RX mapping. Keep the untouched tail of the final word and read it back.
+    /// No ToolMemory permission or production memory API is changed.
+    fn write_private_text(
+        task: &mut Stopped,
+        entry: u64,
+        bytes: &[u8],
+    ) -> Result<(), safeptrace::Error> {
+        for (index, chunk) in bytes.chunks(8).enumerate() {
+            let at = entry
+                .checked_add((index * 8) as u64)
+                .expect("bounded text offset");
+            let mut word = [0; 8];
+            task.read_exact(Addr::from_raw(at as usize).unwrap(), &mut word)?;
+            word[..chunk.len()].copy_from_slice(chunk);
+            task.write_exact(AddrMut::from_raw(at as usize).unwrap(), &word)?;
+            let mut actual = [0; 8];
+            task.read_exact(Addr::from_raw(at as usize).unwrap(), &mut actual)?;
+            assert_eq!(actual, word, "forced write at {at:#x}");
+        }
+        Ok(())
+    }
+
+    // syscall; cmp r12,rax; jne failure; mov ecx,1024; dec ecx; jne loop;
+    // exit(99); ud2; failure: exit(98); ud2. The live RAX is SYS_getpid,
+    // and R12 is the actual owned root PID. The timer target is eight RCBs;
+    // every early loop-branch target is the instruction at entry + 12.
+    const SYSCALL_LOOP: &[u8] = &[
+        0x0f, 0x05, 0x4c, 0x39, 0xe0, 0x75, 0x17, 0xb9, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc9, 0x75,
+        0xfc, 0xbf, 0x63, 0x00, 0x00, 0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x0b,
+        0xbf, 0x62, 0x00, 0x00, 0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x0b,
+    ];
+
+    // pushfq; orq $0x100,(rsp); popfq; nop; exit(99); ud2. Only guest
+    // execution sets TF. The resulting TRACE must stop at entry + 11.
+    const GUEST_TF: &[u8] = &[
+        0x9c, 0x48, 0x81, 0x0c, 0x24, 0x00, 0x01, 0x00, 0x00, 0x9d, 0x90, 0xbf, 0x63, 0x00, 0x00,
+        0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x0b,
+    ];
+
+    fn install_syscall(task: &mut Stopped, entry: u64) -> Result<(), safeptrace::Error> {
+        write_private_text(task, entry, SYSCALL_LOOP)?;
+        let mut regs = task.getregs()?;
+        regs.rax = libc::SYS_getpid as u64;
+        regs.r12 = task.pid().as_raw() as u64;
+        task.setregs(&regs)?;
+        Ok(())
+    }
+
+    async fn run_case(case: Case) {
+        if case.period().is_some() {
+            assert!(
+                crate::perf::is_perf_supported(),
+                "this case requires actual timer coverage"
+            );
+        }
+        let target = first_exec_guests()
+            .iter()
+            .find(|target| {
+                target.name
+                    == if case == Case::StepSyscall {
+                        "nop"
+                    } else {
+                        "f1"
+                    }
+            })
+            .expect("the exact no-CRT target");
+        let selected = Arc::new(Mutex::new(None));
+        let waited = Arc::new(AtomicBool::new(false));
+        let selected_hook = selected.clone();
+        let waited_hook = waited.clone();
+        let _hook = TransitionHook::install(crate::task::FirstExecTransitionForTest {
+            before_decode: Box::new(move |task| {
+                authenticate_entry(task, target)?;
+                if case == Case::StepSyscall {
+                    install_syscall(task, target.entry)?;
+                }
+                Ok(())
+            }),
+            after_decision: Box::new(move |task, continued| {
+                assert_eq!(
+                    continued,
+                    case != Case::StepSyscall,
+                    "actual STEP/CONT selection"
+                );
+                assert!(selected_hook.lock().unwrap().replace(continued).is_none());
+                let tid = task.pid();
+                assert_eq!(task.getregs()?.rip, target.entry);
+                if case == Case::ContSyscall {
+                    install_syscall(task, target.entry)?;
+                } else if case == Case::ContGuestTf {
+                    write_private_text(task, target.entry, GUEST_TF)?;
+                }
+                let hook: crate::task::FirstExecWaitForTest = Box::new(move |wait| {
+                    assert!(
+                        !waited_hook.swap(true, Ordering::SeqCst),
+                        "one actual immediate wait"
+                    );
+                    let Wait::Stopped(stopped, event) = wait else {
+                        panic!("{case:?}: expected an actual stopped event, got {wait:?}");
+                    };
+                    assert_eq!(stopped.pid(), tid, "the actual target of this transition");
+                    let regs = stopped.getregs()?;
+                    eprintln!(
+                        "first-exec-boundary {case:?} cont={continued} tid={tid} event={event:?} rip={:#x} rax={:#x}",
+                        regs.rip, regs.rax
+                    );
+                    if case == Case::ContSyscall {
+                        assert_ne!(
+                            *event,
+                            Event::Signal(Signal::SIGTRAP),
+                            "CONT may not manufacture a controller syscall trap"
+                        );
+                    } else {
+                        assert_eq!(*event, Event::Signal(Signal::SIGTRAP));
+                        let info = stopped.getsiginfo()?;
+                        assert_eq!(info.si_signo, libc::SIGTRAP);
+                        let (code, rip) = if case == Case::StepSyscall {
+                            (libc::TRAP_BRKPT, target.entry + 2)
+                        } else {
+                            (libc::TRAP_TRACE, target.entry + 11)
+                        };
+                        assert_eq!(info.si_code, code, "actual immediate trap kind");
+                        // SAFETY: the checks above establish a kernel trap's
+                        // fault-address member, not a queued signal payload.
+                        assert_eq!(unsafe { info.si_addr() } as u64, rip);
+                        assert_eq!(regs.rip, rip);
+                        if case == Case::StepSyscall {
+                            assert_eq!(
+                                regs.rax,
+                                tid.as_raw() as u64,
+                                "the unsubscribed syscall ran"
+                            );
+                        } else {
+                            assert_ne!(regs.eflags & 0x100, 0, "guest POPFQ established TF");
+                        }
+                    }
+                    Ok(())
+                });
+                Ok(hook)
+            }),
+        });
+        let mut command = Command::new(&target.path);
+        // SAFETY: this pre-exec callback only calls signal-state syscalls.
+        // Exec preserves the blocked bit and the default disposition.
+        unsafe {
+            command.pre_exec(|| {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&mut action.sa_mask);
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut mask);
+                libc::sigaddset(&mut mask, libc::SIGTRAP);
+                if libc::sigaction(libc::SIGTRAP, &action, std::ptr::null_mut()) != 0
+                    || libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0
+                {
+                    return Err(Errno::last());
+                }
+                Ok(())
+            });
+        }
+        let tracer = TracerBuilder::<BoundaryTool>::new(command)
+            .config(case)
+            .spawn()
+            .await
+            .expect("spawn the real first-exec boundary guest");
+        let (status, log) = tokio::time::timeout(Duration::from_secs(60), tracer.wait())
+            .await
+            .expect("first-exec boundary guest hung")
+            .expect("first-exec boundary guest failed");
+        assert_eq!(*selected.lock().unwrap(), Some(case != Case::StepSyscall));
+        assert!(
+            waited.load(Ordering::SeqCst),
+            "the real immediate wait must be observed"
+        );
+        let observations = log.0.into_inner().unwrap();
+        let tid = observations.first().expect("post-exec callback").0;
+        assert!(observations.iter().all(|(from, _)| *from == tid));
+        let actual: Vec<_> = observations.into_iter().map(|(_, row)| row).collect();
+        let Observation::PostExec { rip, clock, period } = actual[0] else {
+            panic!("first observation is not post-exec: {actual:?}");
+        };
+        assert_eq!(rip, target.entry);
+        assert_eq!(period, case.period());
+        let mut expected = vec![actual[0]];
+        match case {
+            Case::StepSyscall => {
+                assert_eq!(clock, None);
+                assert_eq!(status, ExitStatus::Exited(99));
+            }
+            Case::ContSyscall => {
+                assert_eq!(status, ExitStatus::Exited(99));
+                expected.push(Observation::Timer {
+                    rip: target.entry + 12,
+                    clock: clock.expect("measured post-exec clock") + 8,
+                    rax: tid.as_raw() as u64,
+                });
+            }
+            Case::ContGuestTf => {
+                assert!(matches!(status, ExitStatus::Signaled(Signal::SIGTRAP, _)));
+                assert!(clock.is_some());
+                expected.push(Observation::Signal {
+                    signal: libc::SIGTRAP,
+                    rip: target.entry + 11,
+                });
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "{case:?}: actual Tool event order and precise coordinate"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unsubscribed_syscall_step_is_not_a_guest_breakpoint() {
+        run_case(Case::StepSyscall).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changed_native_entry_cont_delivers_its_post_exec_timer() {
+        run_case(Case::ContSyscall).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_guest_popfq_after_native_entry_cont_delivers_trace() {
+        run_case(Case::ContGuestTf).await;
+    }
+}

@@ -10569,6 +10569,550 @@ mod tests {
         }
     }
 
+    // These two x86 tests exercise actual owned CONT, STEP and EXIT waits.
+    // Cleanup is separate from each test's oracle and never signals a numeric PID.
+    #[cfg(target_arch = "x86_64")]
+    fn first_exec_cont_log_status(pid: Pid, phase: &str, actual: &Wait) {
+        use std::io::Write;
+        let (event, status) = match actual {
+            Wait::Stopped(_, event) => (Some(event), None),
+            Wait::Exited(_, status) => (None, Some(status)),
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_STATUS pid={pid} phase={phase} actual_pid={} stop={event:?} exit={status:?}",
+            actual.pid()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    struct FirstExecContChild {
+        pid: Pid,
+        cleanup: PtracerCleanupDriver,
+        // Captured before the initial wait/options; cancellation only borrows it.
+        exit: Option<PtracerExitDriver>,
+        // Own a claimed EXIT before assertions, or a failed retaining resume.
+        stopped: Option<Stopped>,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl FirstExecContChild {
+        fn resume_stopped(&mut self) -> Result<Running, Errno> {
+            let stopped = self.stopped.take().expect("CONT lease retained stop");
+            match stopped.resume_retaining(None) {
+                Ok(running) => Ok(running),
+                Err((stopped, error)) => {
+                    self.stopped = Some(stopped);
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl Drop for FirstExecContChild {
+        fn drop(&mut self) {
+            use std::io::Write;
+            use std::task::Context;
+            use std::task::Poll;
+            if self.cleanup.shared().wait(Duration::ZERO) {
+                let status = self.cleanup.shared().observed_exit_status();
+                if !matches!(status, Ok(Some(_))) {
+                    cleanup_unconfirmed(
+                        self.pid,
+                        &format!("CONT lease retired without status: {status:?}"),
+                    );
+                    return;
+                }
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "CONT_LEASE_CLEANUP_RETIRED pid={} source=already-retired status={status:?}",
+                    self.pid
+                );
+                return;
+            }
+            let _ = writeln!(
+                std::io::stderr(),
+                "CONT_LEASE_CLEANUP_KILL_BEGIN pid={}",
+                self.pid
+            );
+            let killed = self.cleanup.shared().request_sigkill();
+            let _ = writeln!(
+                std::io::stderr(),
+                "CONT_LEASE_CLEANUP_KILL_RETURN pid={} result={killed:?}",
+                self.pid
+            );
+            if !matches!(killed, Ok(()) | Err(Errno::ESRCH)) {
+                cleanup_unconfirmed(self.pid, &format!("CONT lease cleanup kill: {killed:?}"));
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let waker = futures::task::noop_waker();
+            let mut context = Context::from_waker(&waker);
+            while Instant::now() < deadline {
+                match self.cleanup.wait_on_ptracer_thread(Duration::ZERO) {
+                    Ok(true) => {
+                        let status = self.cleanup.shared().observed_exit_status();
+                        if !matches!(status, Ok(Some(_))) {
+                            cleanup_unconfirmed(
+                                self.pid,
+                                &format!("CONT lease retired without status: {status:?}"),
+                            );
+                            return;
+                        }
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "CONT_LEASE_CLEANUP_RETIRED pid={} source=ptracer-wait status={status:?}",
+                            self.pid
+                        );
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        cleanup_unconfirmed(self.pid, &format!("CONT lease cleanup wait: {error}"));
+                        return;
+                    }
+                }
+                if self.stopped.is_none()
+                    && let Some(exit) = self.exit.as_mut()
+                {
+                    match exit.poll_on_ptracer_thread(&mut context) {
+                        Poll::Ready(Ok(stopped)) => {
+                            self.stopped = Some(stopped);
+                            self.exit = None;
+                        }
+                        Poll::Ready(Err(error)) => {
+                            if matches!(self.cleanup.shared().observed_exit_status(), Ok(Some(_))) {
+                                // A real terminal status may arrive without TRACEEXIT.
+                                self.exit = None;
+                            } else {
+                                cleanup_unconfirmed(
+                                    self.pid,
+                                    &format!("CONT lease cleanup EXIT: {error}"),
+                                );
+                                return;
+                            }
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+                if let Some(stopped) = self.stopped.take() {
+                    if stopped.pid() != self.pid
+                        || !stopped
+                            .terminal_cleanup()
+                            .same_generation(self.cleanup.shared())
+                    {
+                        self.stopped = Some(stopped);
+                        cleanup_unconfirmed(
+                            self.pid,
+                            "CONT lease cleanup stop generation mismatch",
+                        );
+                        return;
+                    }
+                    match stopped.resume_retaining(None) {
+                        Ok(running) => drop(running),
+                        Err((stopped, error)) => {
+                            self.stopped = Some(stopped);
+                            cleanup_unconfirmed(
+                                self.pid,
+                                &format!("CONT lease cleanup retained resume: {error}"),
+                            );
+                            return;
+                        }
+                    }
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if self.exit.is_some() {
+                    // SIGKILL advances old stops to EXIT. Do not resume a stale
+                    // FIFO stop behind the still-unclaimed exit capability.
+                    self.cleanup
+                        .shared()
+                        .wait(remaining.min(Duration::from_millis(1)));
+                    continue;
+                }
+                let pending = match self
+                    .cleanup
+                    .reserve_pending_on_ptracer_thread(remaining.min(Duration::from_millis(1)))
+                {
+                    Ok(Some(pending)) => pending,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        cleanup_unconfirmed(
+                            self.pid,
+                            &format!("CONT lease cleanup reserve: {error}"),
+                        );
+                        return;
+                    }
+                };
+                let actual = match pending.decode() {
+                    Ok(actual) => actual,
+                    Err(error) => {
+                        cleanup_unconfirmed(
+                            self.pid,
+                            &format!("CONT lease cleanup decode: {error}"),
+                        );
+                        return;
+                    }
+                };
+                first_exec_cont_log_status(self.pid, "cleanup-reserved", &actual);
+                pending.commit();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "CONT_LEASE_CLEANUP_COMMIT_RETURN pid={}",
+                    self.pid
+                );
+                if let Wait::Stopped(stopped, _) = actual
+                    && let Err((stopped, error)) = stopped.resume_retaining(None)
+                {
+                    self.stopped = Some(stopped);
+                    cleanup_unconfirmed(self.pid, &format!("CONT lease cleanup resume: {error}"));
+                    return;
+                }
+            }
+            cleanup_unconfirmed(self.pid, "CONT lease generation not retired within 2 s");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn first_exec_cont_wait(
+        pid: Pid,
+        phase: &str,
+        wait: safeptrace::PtracerOwnedWaitFuture,
+        deadline: Instant,
+    ) -> Wait {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_WAIT_BEGIN pid={pid} phase={phase} remaining={:?}",
+            deadline.saturating_duration_since(Instant::now())
+        );
+        let actual = tokio::time::timeout_at(deadline.into(), wait)
+            .await
+            .expect("CONT lease actual wait exceeded its fixed 3 s test deadline")
+            .expect("CONT lease original-generation wait refused");
+        first_exec_cont_log_status(pid, phase, &actual);
+        actual
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn first_exec_cont_exit(
+        child: &mut FirstExecContChild,
+        phase: &str,
+        deadline: Instant,
+    ) -> i32 {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_EXIT_BEGIN pid={} phase={phase} remaining={:?}",
+            child.pid,
+            deadline.saturating_duration_since(Instant::now())
+        );
+        let stopped = tokio::time::timeout_at(
+            deadline.into(),
+            future::poll_fn(|context| {
+                child
+                    .exit
+                    .as_mut()
+                    .expect("CONT lease original EXIT driver")
+                    .poll_on_ptracer_thread(context)
+            }),
+        )
+        .await
+        .expect("CONT lease actual EXIT exceeded its fixed 3 s test deadline")
+        .expect("CONT lease original-generation EXIT refused");
+        child.stopped = Some(stopped); // ownership precedes every fallible check
+        child.exit = None;
+        let stopped = child.stopped.as_ref().unwrap();
+        assert_eq!(stopped.pid(), child.pid);
+        assert!(
+            stopped
+                .terminal_cleanup()
+                .same_generation(child.cleanup.shared())
+        );
+        let info = stopped.getsiginfo().expect("actual EXIT stop siginfo");
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_EXIT_RETURN pid={} phase={phase} actual_pid={} signo={} code={:#x}",
+            child.pid,
+            stopped.pid(),
+            info.si_signo,
+            info.si_code
+        );
+        assert_eq!(info.si_signo, libc::SIGTRAP);
+        info.si_code
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn first_exec_cont_child(deadline: Instant) -> (FirstExecContChild, Stopped) {
+        let pid = match unsafe { unistd::fork() }.expect("fork CONT lease child") {
+            ForkResult::Child => unsafe {
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                if libc::signal(libc::SIGTRAP, libc::SIG_DFL) == libc::SIG_ERR
+                    || libc::sigemptyset(&mut mask) != 0
+                    || libc::sigaddset(&mut mask, libc::SIGTRAP) != 0
+                    || libc::sigprocmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut()) != 0
+                    || safeptrace::traceme_and_stop().is_err()
+                {
+                    libc::_exit(100);
+                }
+                // CONT reaches this real INT3. A subsequent STEP executes only NOP.
+                std::arch::asm!("int3", "nop", options(nomem, nostack));
+                libc::_exit(0);
+            },
+            ForkResult::Parent { child } => Pid::from(child),
+        };
+        // Before registration/TRACEEXIT, reuse the existing bounded fork owner.
+        let early = PausedChild::new(pid);
+        let running = Running::new_on_ptracer_thread(pid).expect("capture CONT lease child");
+        let exit = running.exit_event_on_ptracer_thread().into_driver();
+        let child = FirstExecContChild {
+            pid,
+            cleanup: running.terminal_cleanup_on_ptracer_thread().into_driver(),
+            exit: Some(exit),
+            stopped: None,
+        };
+        early.into_pid();
+        let (stopped, event) = first_exec_cont_wait(
+            pid,
+            "initial-SIGSTOP",
+            running.wait_owned_on_ptracer_thread(),
+            deadline,
+        )
+        .await
+        .assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGSTOP));
+        stopped
+            .setoptions(ptrace::Options::PTRACE_O_TRACEEXIT | ptrace::Options::PTRACE_O_EXITKILL)
+            .expect("set CONT lease TRACEEXIT and EXITKILL");
+        let running = stopped.resume(None).expect("CONT to actual INT3");
+        let (stopped, event) = first_exec_cont_wait(
+            pid,
+            "CONT-INT3",
+            running.wait_owned_on_ptracer_thread(),
+            deadline,
+        )
+        .await
+        .assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGTRAP));
+        let info = stopped.getsiginfo().expect("actual CONT INT3 siginfo");
+        assert_eq!(info.si_signo, libc::SIGTRAP);
+        assert_eq!(info.si_code, libc::SI_KERNEL);
+        // Bind the guard before external stopped values, so they drop first.
+        (child, stopped)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn first_exec_cont_reap(
+        running: Running,
+        child: &mut FirstExecContChild,
+        expected: ExitStatus,
+        deadline: Instant,
+    ) {
+        use std::io::Write;
+        let actual = first_exec_cont_wait(
+            child.pid,
+            "terminal-status",
+            running.wait_owned_on_ptracer_thread(),
+            deadline,
+        )
+        .await;
+        assert_eq!(actual.assume_exited(), (child.pid, expected));
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_RETIRE_BEGIN pid={} remaining={:?}",
+            child.pid,
+            deadline.saturating_duration_since(Instant::now())
+        );
+        assert!(
+            child
+                .cleanup
+                .wait_on_ptracer_thread(deadline.saturating_duration_since(Instant::now()))
+                .expect("CONT lease retirement refused"),
+            "CONT lease actual terminal status did not retire"
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "CONT_LEASE_RETIRE_RETURN pid={} retired=true",
+            child.pid
+        );
+        assert_eq!(
+            child.cleanup.shared().observed_exit_status(),
+            Ok(Some(expected))
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_exec_cont_authority_is_consumed_before_a_real_step_stop() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (mut child, stopped) = first_exec_cont_child(deadline).await;
+        let slot = Arc::new(StdMutex::new(Some(HeldRootStop::from_event(
+            &stopped,
+            &Event::Signal(Signal::SIGTRAP),
+        ))));
+        HeldRootStop::mark_first_exec_cont(&slot, &stopped).expect("mark actual CONT stop");
+        assert!(slot.lock().unwrap().as_ref().unwrap().first_exec_cont);
+
+        let (mut other_child, other) = first_exec_cont_child(deadline).await;
+        assert!(
+            !stopped
+                .terminal_cleanup()
+                .same_generation(&other.terminal_cleanup()),
+            "wrong-generation negative requires distinct actual children"
+        );
+        assert_eq!(
+            HeldRootStop::take_first_exec_cont(&slot, &other),
+            Err(TraceError::Errno(Errno::EINVAL))
+        );
+        assert!(slot.lock().unwrap().as_ref().unwrap().first_exec_cont);
+        let running = other.resume(None).expect("resume unrelated CONT child");
+        let event = first_exec_cont_exit(&mut other_child, "unrelated-EXIT-stop", deadline).await;
+        drop(running); // superseded only by this original generation's claimed EXIT
+        assert_eq!(event, libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8));
+        first_exec_cont_reap(
+            other_child
+                .resume_stopped()
+                .expect("resume unrelated actual EXIT"),
+            &mut other_child,
+            ExitStatus::Exited(0),
+            deadline,
+        )
+        .await;
+
+        let next_rip = stopped.getregs().expect("CONT stop registers").rip;
+        let running = RootStopLease::new(stopped, Some(Arc::clone(&slot)))
+            .step(None)
+            .expect("STEP the actual marked CONT stop");
+        // This check precedes the next wait/arm: an arm cannot hide stale authority.
+        assert!(slot.lock().unwrap().is_none());
+        let (stepped, event) = first_exec_cont_wait(
+            child.pid,
+            "marked-STEP-stop",
+            running.wait_owned_on_ptracer_thread(),
+            deadline,
+        )
+        .await
+        .assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGTRAP));
+        let info = stepped.getsiginfo().expect("actual STEP siginfo");
+        assert_eq!(info.si_signo, libc::SIGTRAP);
+        assert_eq!(info.si_code, libc::TRAP_TRACE);
+        assert_eq!(stepped.getregs().expect("STEP registers").rip, next_rip + 1);
+        HeldRootStop::arm_empty(&slot, &stepped, &event).expect("arm new actual TRACE stop");
+        assert!(!HeldRootStop::take_first_exec_cont(&slot, &stepped).unwrap());
+        let running = RootStopLease::new(stepped, Some(Arc::clone(&slot)))
+            .resume(None)
+            .expect("resume unmarked actual TRACE stop");
+        assert!(slot.lock().unwrap().is_none());
+        let event = first_exec_cont_exit(&mut child, "after-STEP-EXIT-stop", deadline).await;
+        drop(running); // superseded only by this original generation's claimed EXIT
+        assert_eq!(event, libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8));
+        first_exec_cont_reap(
+            child
+                .resume_stopped()
+                .expect("resume actual EXIT after STEP"),
+            &mut child,
+            ExitStatus::Exited(0),
+            deadline,
+        )
+        .await;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_actual_exit_stop_drops_still_held_first_exec_cont_authority() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (mut child, stopped) = first_exec_cont_child(deadline).await;
+        let slot = Arc::new(StdMutex::new(Some(HeldRootStop::from_event(
+            &stopped,
+            &Event::Signal(Signal::SIGTRAP),
+        ))));
+        HeldRootStop::mark_first_exec_cont(&slot, &stopped).expect("mark actual CONT stop");
+        assert!(slot.lock().unwrap().as_ref().unwrap().first_exec_cont);
+        child
+            .cleanup
+            .shared()
+            .request_sigkill()
+            .expect("kill only the retained original CONT generation");
+        // No RootStopLease transition or numeric recapture clears this old slot.
+        let event = first_exec_cont_exit(&mut child, "killed-EXIT-stop", deadline).await;
+        drop(stopped); // its old SIGTRAP stop is superseded by the claimed EXIT
+        assert_eq!(
+            event,
+            libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8),
+            "must observe actual PTRACE_EVENT_EXIT"
+        );
+        assert!(slot.lock().unwrap().as_ref().unwrap().first_exec_cont);
+        let exiting = child.stopped.as_ref().expect("guard owns actual EXIT");
+        HeldRootStop::supersede_with_exit(&slot, exiting)
+            .expect("actual same-generation EXIT supersedes the marked stop");
+        {
+            let held = slot.lock().unwrap();
+            let held = held
+                .as_ref()
+                .expect("actual EXIT must retain its own lease");
+            assert!(held.armed);
+            assert!(held.terminal.same_generation(child.cleanup.shared()));
+            assert_eq!(held.status, HeldRootStopStatus::Exit);
+            assert!(!held.first_exec_cont);
+        }
+        assert!(!HeldRootStop::take_first_exec_cont(&slot, exiting).unwrap());
+        // The existing consuming lease API owns the stop from this boundary.
+        // If it refuses, cleanup must report uncertainty, never remint a stop.
+        let exiting = child.stopped.take().expect("transfer actual EXIT to lease");
+        let running = RootStopLease::new(exiting, Some(Arc::clone(&slot)))
+            .resume(None)
+            .expect("resume only the actual EXIT stop");
+        assert!(slot.lock().unwrap().is_none());
+        first_exec_cont_reap(
+            running,
+            &mut child,
+            ExitStatus::Signaled(Signal::SIGKILL, false),
+            deadline,
+        )
+        .await;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_exec_cont_cleanup_retires_unclaimed_and_claimed_exit_stops() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        for claim_exit in [false, true] {
+            let (mut child, stopped) = first_exec_cont_child(deadline).await;
+            let terminal = stopped.terminal_cleanup();
+            assert!(terminal.same_generation(child.cleanup.shared()));
+            if claim_exit {
+                child
+                    .cleanup
+                    .shared()
+                    .request_sigkill()
+                    .expect("kill retained child before claiming cleanup EXIT");
+                let event =
+                    first_exec_cont_exit(&mut child, "cleanup-claimed-EXIT-stop", deadline).await;
+                assert_eq!(event, libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8));
+                assert!(child.exit.is_none());
+                assert!(child.stopped.is_some());
+            } else {
+                assert!(child.exit.is_some());
+                assert!(child.stopped.is_none());
+            }
+            drop(stopped); // no old stopped token outlives the cleanup owner
+            assert!(
+                !terminal.wait(Duration::ZERO),
+                "cleanup must retire a real child"
+            );
+            drop(child); // same original two-second Drop, no async cleanup substitute
+            assert!(
+                terminal.wait(Duration::ZERO),
+                "Drop did not confirm worker retirement"
+            );
+            assert_eq!(
+                terminal.observed_exit_status(),
+                Ok(Some(ExitStatus::Signaled(Signal::SIGKILL, false)))
+            );
+        }
+    }
+
     #[derive(Default)]
     struct InitFailureTool;
 

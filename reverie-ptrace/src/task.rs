@@ -2485,6 +2485,28 @@ fn record_exit_stop_guard_probe(task: &Stopped) {
     }
 }
 
+/// A one-shot, current-thread hook for the real first-exec transition tests.
+/// It borrows the owned stop; it cannot substitute a wait or resume the guest.
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) type FirstExecMutationForTest =
+    Box<dyn FnOnce(&mut Stopped) -> Result<(), TraceError> + Send>;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) type FirstExecWaitForTest = Box<dyn FnOnce(&Wait) -> Result<(), TraceError> + Send>;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) struct FirstExecTransitionForTest {
+    pub(crate) before_decode: FirstExecMutationForTest,
+    pub(crate) after_decision:
+        Box<dyn FnOnce(&mut Stopped, bool) -> Result<FirstExecWaitForTest, TraceError> + Send>,
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+thread_local! {
+    pub(crate) static FIRST_EXEC_TRANSITION_FOR_TEST:
+        std::cell::RefCell<Option<FirstExecTransitionForTest>> = const { std::cell::RefCell::new(None) };
+}
+
 /// A test-only action run just before the timer's next single step.
 #[cfg(test)]
 pub(crate) type TimerStepHook = Box<dyn FnOnce(&Stopped)>;
@@ -8904,6 +8926,19 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .await?;
             Ok(running.next_state_with_owner(&self.ptracer_waits).await?)
         } else {
+            #[cfg(all(test, target_arch = "x86_64"))]
+            let mut task = task;
+            #[cfg(all(test, target_arch = "x86_64"))]
+            let first_exec_hook =
+                FIRST_EXEC_TRANSITION_FOR_TEST.with(|slot| slot.borrow_mut().take());
+            #[cfg(all(test, target_arch = "x86_64"))]
+            let after_decision = match first_exec_hook {
+                Some(hook) => {
+                    (hook.before_decode)(&mut task)?;
+                    Some(hook.after_decision)
+                }
+                None => None,
+            };
             // This step runs the new image's first instruction; its trap must
             // not reset SIGTRAP either (`sigtrap_state`).
             // An instruction that raises its own SIGTRAP resets it natively too,
@@ -8926,6 +8961,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             let continue_native_trap = native_trap
                 && !self.stale_private_step_trap
                 && ProcSignalState::read(&task).is_ok_and(|state| state.pending & SIGTRAP_BIT == 0);
+            #[cfg(all(test, target_arch = "x86_64"))]
+            let first_exec_wait_hook = after_decision
+                .map(|hook| hook(&mut task, continue_native_trap))
+                .transpose()?;
             // A native trap supplies its own stop. CONT creates no syscall
             // single-step report, even if the decoded text changes meanwhile.
             let running = if continue_native_trap {
@@ -8939,6 +8978,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                 && let Wait::Stopped(stopped, Event::Signal(Signal::SIGTRAP)) = &wait
             {
                 HeldRootStop::mark_first_exec_cont(&self.ordinary_held_stop, stopped)?;
+            }
+            #[cfg(all(test, target_arch = "x86_64"))]
+            if let Some(hook) = first_exec_wait_hook {
+                hook(&wait)?;
             }
             if shielded {
                 reblock_sigtrap_after_step(&wait)?;
