@@ -33528,6 +33528,31 @@ mod tests {
         let (detcore_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
         assert_eq!(detcore_inventory.len(), 85);
+        for relative in [
+            "reverie-inguest/src/guest/pidfd_self.rs",
+            "reverie/src/pidfd_self.rs",
+            "reverie-inguest/src/lifecycle.rs",
+            "reverie/src/guest.rs",
+        ] {
+            assert_eq!(
+                CONTENT_REVERIE_CATALOG
+                    .iter()
+                    .filter(|&&(path, _, _)| path == relative)
+                    .count(),
+                1,
+                "catalog member {relative}"
+            );
+            for inventory in [&rv_inventory, &detcore_inventory] {
+                assert_eq!(
+                    inventory
+                        .iter()
+                        .filter(|entry| entry.relative == relative)
+                        .count(),
+                    1,
+                    "inventory member {relative}"
+                );
+            }
+        }
         assert_eq!(
             content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
                 .unwrap()
