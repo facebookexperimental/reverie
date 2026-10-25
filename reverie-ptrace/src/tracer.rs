@@ -180,6 +180,8 @@ pub(crate) struct HeldRootStop {
     observation: safeptrace::StoppedObservation,
     root_tid: Pid,
     status: HeldRootStopStatus,
+    /// One-use origin of this directly awaited first-exec CONT stop.
+    first_exec_cont: bool,
     /// The child generation a held `NewChild` stop names. Nothing reads it
     /// now; the held stop still retains the child's cleanup handle for as long
     /// as it did before.
@@ -2141,9 +2143,49 @@ impl HeldRootStop {
             observation: task.observation(),
             root_tid: task.pid(),
             status,
+            first_exec_cont: false,
             child,
             armed: true,
         }
+    }
+
+    /// Called synchronously after arming the directly awaited CONT result.
+    /// Every transition removes the held stop; EXIT replacement drops it too.
+    pub(crate) fn mark_first_exec_cont(
+        slot: &Arc<StdMutex<Option<Self>>>,
+        task: &Stopped,
+    ) -> Result<(), TraceError> {
+        let mut slot = slot.lock().unwrap();
+        let held = slot.as_mut().ok_or(Errno::EINVAL)?;
+        if !held.armed
+            || held.root_tid != task.pid()
+            || !held.terminal.same_generation(&task.terminal_cleanup())
+            || held.status != HeldRootStopStatus::Signal(Signal::SIGTRAP)
+            || held.first_exec_cont
+        {
+            return Err(Errno::EINVAL.into());
+        }
+        held.first_exec_cont = true;
+        Ok(())
+    }
+
+    pub(crate) fn take_first_exec_cont(
+        slot: &Arc<StdMutex<Option<Self>>>,
+        task: &Stopped,
+    ) -> Result<bool, TraceError> {
+        let mut slot = slot.lock().unwrap();
+        let Some(held) = slot.as_mut().filter(|held| held.first_exec_cont) else {
+            return Ok(false);
+        };
+        if !held.armed
+            || held.root_tid != task.pid()
+            || !held.terminal.same_generation(&task.terminal_cleanup())
+            || held.status != HeldRootStopStatus::Signal(Signal::SIGTRAP)
+        {
+            return Err(Errno::EINVAL.into());
+        }
+        held.first_exec_cont = false;
+        Ok(true)
     }
 
     pub(crate) fn callback_observation(

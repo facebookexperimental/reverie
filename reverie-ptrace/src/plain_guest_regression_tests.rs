@@ -1030,6 +1030,8 @@ impl Tool for GuestTool {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.send_rpc("post-exec".to_owned()).await;
+        #[cfg(target_arch = "x86_64")]
+        observe_first_exec_entry(guest).await?;
         Ok(())
     }
 
@@ -1443,6 +1445,229 @@ fn regression_guest() -> &'static std::path::Path {
     GUEST.as_path()
 }
 
+/// The no-CRT entry fixtures are only built by the first-exec test. The
+/// observer never initializes this cell on behalf of another regression.
+#[cfg(target_arch = "x86_64")]
+struct FirstExecGuest {
+    name: &'static str,
+    env: &'static str,
+    path: PathBuf,
+    entry: u64,
+    opcode: &'static [u8],
+    image: Vec<u8>,
+}
+
+#[cfg(target_arch = "x86_64")]
+static FIRST_EXEC_GUESTS: std::sync::OnceLock<Vec<FirstExecGuest>> = std::sync::OnceLock::new();
+
+// The current-thread regression owns this guard. Other libtest threads
+// never perform the added image/memory observations, even after fixture build.
+#[cfg(target_arch = "x86_64")]
+std::thread_local! {
+    static OBSERVE_FIRST_EXEC_ENTRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(target_arch = "x86_64")]
+struct FirstExecObservations(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(target_arch = "x86_64")]
+impl FirstExecObservations {
+    fn begin() -> Self {
+        OBSERVE_FIRST_EXEC_ENTRIES.with(|enabled| assert!(!enabled.replace(true)));
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for FirstExecObservations {
+    fn drop(&mut self) {
+        OBSERVE_FIRST_EXEC_ENTRIES.with(|enabled| enabled.set(false));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn first_exec_guests() -> &'static [FirstExecGuest] {
+    FIRST_EXEC_GUESTS.get_or_init(|| {
+        let source = crate::tracer::tests::fixture("sigtrap_first_exec.S");
+        let text = std::fs::read(&source).expect("read the first-exec assembly fixture");
+        let directory = std::env::current_exe()
+            .expect("locate the test binary")
+            .parent()
+            .expect("the test binary has a directory")
+            .to_path_buf();
+        let specs: [(&str, &str, &str, &[u8]); 4] = [
+            ("cc", "TP_FIRST_EXEC_CC", "first_exec_cc", &[0xcc]),
+            ("f1", "TP_FIRST_EXEC_F1", "first_exec_f1", &[0xf1]),
+            (
+                "cd03",
+                "TP_FIRST_EXEC_CD03",
+                "first_exec_cd03",
+                &[0xcd, 0x03],
+            ),
+            ("nop", "TP_FIRST_EXEC_NOP", "first_exec_nop", &[0x90]),
+        ];
+        specs
+            .into_iter()
+            .map(|(name, env, selector, opcode)| {
+                // The selector is part of the cache key: the four ELF headers
+                // differ even though their assembly source is the same.
+                let hash = text
+                    .iter()
+                    .chain(selector.as_bytes())
+                    .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                    });
+                let output = directory.join(format!("reverie-first-exec-{hash:016x}"));
+                let staging = directory.join(format!(
+                    "reverie-first-exec-{hash:016x}.{}.tmp",
+                    std::process::id()
+                ));
+                let status = std::process::Command::new("cc")
+                    .args(["-nostdlib", "-static", "-no-pie", "-Wl,--build-id=none"])
+                    .arg(format!("-Wl,-e,{selector}"))
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(&staging)
+                    .status()
+                    .expect("compile the first-exec ELF");
+                assert!(status.success(), "compile first-exec {name}: {status}");
+                std::fs::rename(&staging, &output).expect("publish the first-exec ELF");
+                let path = std::fs::canonicalize(&output).expect("resolve the first-exec ELF");
+                let image = std::fs::read(&path).expect("read the first-exec ELF");
+                let elf = goblin::elf::Elf::parse(&image).expect("parse the first-exec ELF");
+                assert!(elf.is_64 && elf.little_endian, "a little-endian ELF64");
+                assert_eq!(elf.header.e_machine, goblin::elf::header::EM_X86_64);
+                assert_eq!(elf.header.e_type, goblin::elf::header::ET_EXEC);
+                assert!(
+                    !elf.program_headers
+                        .iter()
+                        .any(|p| { p.p_type == goblin::elf::program_header::PT_INTERP }),
+                    "no interpreter may execute before the target entry"
+                );
+                let entry = elf.entry;
+                let offset = elf
+                    .program_headers
+                    .iter()
+                    .find_map(|p| {
+                        if p.p_type != goblin::elf::program_header::PT_LOAD
+                            || p.p_flags & goblin::elf::program_header::PF_X == 0
+                        {
+                            return None;
+                        }
+                        let within = entry.checked_sub(p.p_vaddr)?;
+                        if within.checked_add(opcode.len() as u64)? > p.p_filesz {
+                            return None;
+                        }
+                        usize::try_from(p.p_offset.checked_add(within)?).ok()
+                    })
+                    .expect("entry bytes belong to a file-backed executable segment");
+                assert_eq!(image.get(offset..offset + opcode.len()), Some(opcode));
+                FirstExecGuest {
+                    name,
+                    env,
+                    path,
+                    entry,
+                    opcode,
+                    image,
+                }
+            })
+            .collect()
+    })
+}
+
+/// This is a plain-ptrace test hook, not a portable Tool capability. Authenticate
+/// the stopped image through its owned TID's proc exe before recording bytes.
+/// A wrong entry RIP cannot supply coverage merely by having a post-exec hook.
+#[cfg(target_arch = "x86_64")]
+async fn observe_first_exec_entry<G: Guest<GuestTool>>(guest: &mut G) -> Result<(), Errno> {
+    use reverie::syscalls::MemoryAccess;
+    if !OBSERVE_FIRST_EXEC_ENTRIES.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    let Some(targets) = FIRST_EXEC_GUESTS.get() else {
+        return Ok(());
+    };
+    let regs = guest.regs().await;
+    if !targets.iter().any(|target| target.entry == regs.rip) {
+        return Ok(());
+    }
+    let proc_exe = format!("/proc/{}/exe", guest.tid());
+    let path = std::fs::read_link(&proc_exe).map_err(|_| Errno::EIO)?;
+    let Some(target) = targets.iter().find(|target| target.path == path) else {
+        return Ok(());
+    };
+    if regs.rip != target.entry || std::fs::read(&proc_exe).map_err(|_| Errno::EIO)? != target.image
+    {
+        return Err(Errno::EIO);
+    }
+    let mut bytes = vec![0; target.opcode.len()];
+    let address =
+        reverie::syscalls::Addr::<u8>::from_raw(regs.rip as usize).ok_or(Errno::EFAULT)?;
+    guest.memory().read_exact(address, &mut bytes)?;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .concat();
+    guest
+        .send_rpc(format!(
+            "elf-entry {} rip={:#x} bytes={hex}",
+            target.name, regs.rip
+        ))
+        .await;
+    Ok(())
+}
+
+/// A real, untraced prerequisite. Its private process group has a bounded
+/// kill/reap attempt on timeout; any cleanup uncertainty fails. No perf skip.
+#[cfg(target_arch = "x86_64")]
+fn native_first_exec_report() -> String {
+    use std::os::unix::process::CommandExt;
+    let report = tempfile_path("plain-guest-native-sigtrap-first-exec");
+    let mut command = std::process::Command::new(regression_guest());
+    command
+        .arg("sigtrap_first_exec")
+        .arg(&report)
+        .process_group(0);
+    for target in first_exec_guests() {
+        command.env(target.env, &target.path);
+    }
+    let mut child = command
+        .spawn()
+        .expect("run the real native first-exec prerequisite");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {}
+            Ok(None) => {
+                break Err("native first-exec deadline; root known unreaped".to_owned());
+            }
+            Err(error) => panic!(
+                "native first-exec wait error; ownership uncertain; no signal sent: {error:?}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let status = result.unwrap_or_else(|why| {
+        let kill = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let reap = loop {
+            match child.try_wait() {
+                Ok(None) if std::time::Instant::now() < deadline => {}
+                final_state => break final_state,
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        panic!("{why}; owned group kill={kill:?}; root reap={reap:?}");
+    });
+    assert!(status.success(), "native first-exec prerequisite: {status}");
+    std::fs::read_to_string(&report).expect("read the native first-exec report")
+}
+
 #[derive(Debug)]
 struct GuestRun {
     status: ExitStatus,
@@ -1582,6 +1807,12 @@ async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun
     let report_path = tempfile_path(&format!("plain-guest-{mode}"));
     let mut command = Command::new(regression_guest());
     command.arg(mode).arg(&report_path);
+    #[cfg(target_arch = "x86_64")]
+    if mode == "sigtrap_first_exec" {
+        for target in first_exec_guests() {
+            command.env(target.env, &target.path);
+        }
+    }
     if let Some(order) = options.order {
         command.env("TP_ORDER", order);
     }
@@ -3506,6 +3737,104 @@ async fn sigtrap_state_survives_reverie_preinit_at_exec() {
             ],
             "{}",
             run.report
+        );
+    }
+}
+
+/// Native force-SIGTRAP behavior at the ELF entry, before any guest opcode
+/// has run. Unlike the timer-window test this requires no perf support.
+#[cfg(target_arch = "x86_64")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_trap_at_elf_entry_takes_sigtraps_default_action() {
+    let targets = first_exec_guests();
+    let expected = [
+        "first-exec cc dfl-blocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec cc ign-unblocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec cc ign-blocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec f1 dfl-blocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec f1 ign-unblocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec f1 ign-blocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec cd03 dfl-blocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec cd03 ign-unblocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec cd03 ign-blocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec nop ign-blocked signaled=0 sig=0 exited=1 rc=99",
+        "done",
+    ];
+    let check_report = |phase: &str, report: &str| {
+        assert!(
+            report
+                .lines()
+                .next()
+                .unwrap_or("")
+                .starts_with("mode sigtrap_first_exec site=0x"),
+            "{phase}: {report}"
+        );
+        assert_eq!(
+            report.lines().skip(1).collect::<Vec<_>>(),
+            expected,
+            "{phase}: {report}"
+        );
+        assert!(report.ends_with("done\n"), "{phase}: {report}");
+    };
+    // A native mismatch fails this prerequisite; it is never a skip.
+    check_report("native", &native_first_exec_report());
+    let _observations = FirstExecObservations::begin();
+    let [inject, tail] = run_both_configurations("sigtrap_first_exec").await;
+    for (phase, run) in [("inject", inject), ("tail", tail)] {
+        check_report(phase, &run.report);
+        assert_eq!(
+            run.count_events("post-exec"),
+            11,
+            "{phase}: launcher plus ten target execs"
+        );
+        let mut actual = Vec::new();
+        for events in run.tool_events.values() {
+            let entries: Vec<_> = events
+                .iter()
+                .filter(|event| event.starts_with("elf-entry "))
+                .collect();
+            if !entries.is_empty() {
+                assert_eq!(
+                    entries.len(),
+                    1,
+                    "{phase}: one entry observation per child: {events:?}"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.as_str() == "post-exec")
+                        .count(),
+                    1,
+                    "{phase}: one post-exec per target entry: {events:?}"
+                );
+                actual.push(entries[0].to_owned());
+            }
+        }
+        assert_eq!(
+            actual.len(),
+            10,
+            "{phase}: exactly ten authenticated target-entry observations"
+        );
+        let mut expected_entries = Vec::new();
+        for target in targets {
+            let hex = target
+                .opcode
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .concat();
+            for _ in 0..if target.name == "nop" { 1 } else { 3 } {
+                expected_entries.push(format!(
+                    "elf-entry {} rip={:#x} bytes={hex}",
+                    target.name, target.entry
+                ));
+            }
+        }
+        actual.sort_unstable();
+        expected_entries.sort_unstable();
+        assert_eq!(
+            actual, expected_entries,
+            "{phase}: actual stopped RIP/bytes, not callback count alone"
         );
     }
 }

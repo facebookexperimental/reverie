@@ -118,7 +118,7 @@ use crate::sigtrap_state::KernelSigaction;
 use crate::sigtrap_state::SIGTRAP_BIT;
 use crate::sigtrap_state::SigtrapAction;
 use crate::sigtrap_state::StepKind;
-use crate::sigtrap_state::instruction_raises_sigtrap;
+use crate::sigtrap_state::instruction_raises_sigtrap_with_words;
 use crate::sigtrap_state::mask_after_sigprocmask;
 use crate::sigtrap_state::parse_sigtrap_disposition;
 use crate::sigtrap_state::step_kind;
@@ -1945,32 +1945,39 @@ fn shares_signal_actions(parent: &Stopped) -> bool {
 /// Whether the instruction at `rip` raises a SIGTRAP of its own (`int3`,
 /// `int 3` or `int1`, behind any prefixes: `instruction_raises_sigtrap`). Its
 /// `force_sig` resets a blocked or ignored SIGTRAP natively too, so a step
-/// over it is neither shielded nor repaired. Up to 15 bytes are read, the
-/// longest instruction, as aligned words with `PTRACE_PEEKDATA` (an 8-byte
-/// read), which reads an execute-only page as the CPU fetches it, where
-/// `process_vm_readv` fails; the read stops at the first unreadable word.
+/// over it is neither shielded nor repaired. The decoder reads its 15-byte
+/// window as demand-driven aligned `PTRACE_PEEKDATA` words (8-byte reads),
+/// preserving its original overflow-edge collection. Forced reads support
+/// execute-only pages, where `process_vm_readv` fails; a needed unreadable
+/// word ends decoding.
 fn instruction_at_raises_sigtrap(task: &Stopped, rip: u64) -> bool {
-    // The longest instruction: 15 bytes on x86-64; aarch64's are 4, aligned,
-    // so one word holds the whole of one.
     #[cfg(target_arch = "x86_64")]
-    const MAX_INSTRUCTION_LEN: usize = 15;
-    #[cfg(target_arch = "aarch64")]
-    const MAX_INSTRUCTION_LEN: usize = 4;
-    let rip = rip as usize;
-    let start = rip & !7;
-    let mut bytes = [0u8; 24];
-    let mut len = 0;
-    while len < bytes.len() && start + len < rip + MAX_INSTRUCTION_LEN {
-        let word =
-            Addr::<u64>::from_raw(start + len).and_then(|address| task.read_value(address).ok());
-        let Some(word) = word else {
-            break;
-        };
-        bytes[len..len + 8].copy_from_slice(&word.to_ne_bytes());
-        len += 8;
+    {
+        instruction_raises_sigtrap_with_words(rip as usize, |address| {
+            Addr::<u64>::from_raw(address).and_then(|address| task.read_value(address).ok())
+        })
     }
-    let skip = rip - start;
-    instruction_raises_sigtrap(bytes.get(skip..len).unwrap_or(&[]))
+    #[cfg(target_arch = "aarch64")]
+    {
+        // aarch64's instructions are 4 bytes, aligned, so one word holds the
+        // whole of one.
+        const MAX_INSTRUCTION_LEN: usize = 4;
+        let rip = rip as usize;
+        let start = rip & !7;
+        let mut bytes = [0u8; 24];
+        let mut len = 0;
+        while len < bytes.len() && start + len < rip + MAX_INSTRUCTION_LEN {
+            let word = Addr::<u64>::from_raw(start + len)
+                .and_then(|address| task.read_value(address).ok());
+            let Some(word) = word else {
+                break;
+            };
+            bytes[len..len + 8].copy_from_slice(&word.to_ne_bytes());
+            len += 8;
+        }
+        let skip = rip - start;
+        instruction_raises_sigtrap(bytes.get(skip..len).unwrap_or(&[]))
+    }
 }
 
 /// `instruction_at_raises_sigtrap` at the task's current rip.
@@ -7596,8 +7603,18 @@ impl<L: Tool + 'static> TracedTask<L> {
             HandleSignalResult::SignalSuppressed(
                 running.next_state_with_owner(&self.ptracer_waits).await?,
             )
-        } else if is_guest_int3_trap(&task, regs.ip())? {
-            // The guest's own `int3`, at a site that holds no breakpoint of
+        } else if is_guest_int3_trap(&task, regs.ip())?
+            || (HeldRootStop::take_first_exec_cont(&self.ordinary_held_stop, &task)? && {
+                let info = task.getsiginfo()?;
+                // CONT creates no controller step report. A guest-owned TF
+                // survives it and may report TRACE instead of BRKPT.
+                // SAFETY: these SIGTRAP codes fill the fault-address member.
+                info.si_signo == libc::SIGTRAP
+                    && matches!(info.si_code, libc::TRAP_BRKPT | libc::TRAP_TRACE)
+                    && unsafe { info.si_addr() } as u64 == regs.ip()
+            })
+        {
+            // The guest's own trap, at a site that holds no breakpoint of
             // Reverie's (the first arm). Linux delivers its SIGTRAP: a handler
             // runs, or the default action kills the guest with a core. Before,
             // it fell to the arm below, and the guest ran past its own
@@ -8891,10 +8908,11 @@ impl<L: Tool + 'static> TracedTask<L> {
             // not reset SIGTRAP either (`sigtrap_state`).
             // An instruction that raises its own SIGTRAP resets it natively too,
             // so its step is neither shielded nor repaired.
-            let (shielded, ignored) = if exec_sigtrap_quiet
-                || !self.keeps_sigtrap_state()
-                || next_instruction_raises_sigtrap(&task)?
-            {
+            let mut native_trap = false;
+            let (shielded, ignored) = if exec_sigtrap_quiet || !self.keeps_sigtrap_state() || {
+                native_trap = next_instruction_raises_sigtrap(&task)?;
+                native_trap
+            } {
                 (false, false)
             } else {
                 let ignored = sigtrap_disposition(&task)?.0;
@@ -8903,11 +8921,25 @@ impl<L: Tool + 'static> TracedTask<L> {
                     ignored,
                 )
             };
-            let wait = self
-                .step_stopped(task, None)?
-                .next_state_with_owner(&self.ptracer_waits)
-                .await?;
+            // Never lend CONT origin to a controller trap already queued by
+            // an earlier operation. A failed full-pending read keeps STEP.
+            let continue_native_trap = native_trap
+                && !self.stale_private_step_trap
+                && ProcSignalState::read(&task).is_ok_and(|state| state.pending & SIGTRAP_BIT == 0);
+            // A native trap supplies its own stop. CONT creates no syscall
+            // single-step report, even if the decoded text changes meanwhile.
+            let running = if continue_native_trap {
+                self.resume_stopped(task, None)?
+            } else {
+                self.step_stopped(task, None)?
+            };
+            let wait = running.next_state_with_owner(&self.ptracer_waits).await?;
             self.arm_liteinst_wait(&wait);
+            if continue_native_trap
+                && let Wait::Stopped(stopped, Event::Signal(Signal::SIGTRAP)) = &wait
+            {
+                HeldRootStop::mark_first_exec_cont(&self.ordinary_held_stop, stopped)?;
+            }
             if shielded {
                 reblock_sigtrap_after_step(&wait)?;
             }
@@ -8916,7 +8948,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
             match wait {
                 Wait::Stopped(task, Event::Signal(Signal::SIGTRAP))
-                    if task.getsiginfo()?.si_code == libc::TRAP_TRACE =>
+                    if !continue_native_trap && task.getsiginfo()?.si_code == libc::TRAP_TRACE =>
                 {
                     // A watch armed in post-exec that caught the first
                     // instruction's access fired with the step's trap.

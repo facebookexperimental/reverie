@@ -157,18 +157,70 @@ pub(crate) const SIGRETURN_UC_SIGMASK_OFFSET: usize = 128 + 8 + 8 + 24;
 /// directly precede the opcode, so `48 48 cc` and `48 66 cc` are as well.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn instruction_raises_sigtrap(bytes: &[u8]) -> bool {
-    let bytes = &bytes[..bytes.len().min(15)];
-    let mut i = 0;
-    while i < bytes.len()
-        && matches!(
-            bytes[i],
+    instruction_raises_sigtrap_from(|offset| bytes.get(offset).copied())
+}
+
+/// The single instruction grammar for both a slice and forced word reads.
+/// Request no byte after the deciding opcode/immediate or the 15-byte limit.
+fn instruction_raises_sigtrap_from(mut byte_at: impl FnMut(usize) -> Option<u8>) -> bool {
+    for i in 0..15 {
+        let Some(byte) = byte_at(i) else {
+            return false;
+        };
+        if matches!(
+            byte,
             0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3 | 0x40
                 ..=0x4f
-        )
-    {
-        i += 1;
+        ) {
+            continue;
+        }
+        return match byte {
+            0xcc | 0xf1 => true,
+            0xcd if i < 14 => byte_at(i + 1) == Some(0x03),
+            _ => false,
+        };
     }
-    matches!(bytes[i..], [0xcc, ..] | [0xf1, ..] | [0xcd, 0x03, ..])
+    false
+}
+
+/// Read aligned native-endian words only as the shared grammar needs them.
+/// The caller supplies the same stopped-generation forced read on every
+/// request. The word cache lasts for this call only; no read authorizes resume.
+pub(crate) fn instruction_raises_sigtrap_with_words(
+    rip: usize,
+    mut read_word: impl FnMut(usize) -> Option<u64>,
+) -> bool {
+    let start = rip & !7;
+    let mut bytes = [0u8; 24];
+    let mut len = 0;
+    let skip = rip - start;
+
+    // The old collector used unchecked `rip + 15` and `start + len`.
+    // Preserve its exact loop for the two highest aligned addresses: their
+    // panic/wrap behavior is not an address-overflow repair in this change.
+    if start > usize::MAX - 16 {
+        while len < bytes.len() && start + len < rip + 15 {
+            let Some(word) = read_word(start + len) else {
+                break;
+            };
+            bytes[len..len + 8].copy_from_slice(&word.to_ne_bytes());
+            len += 8;
+        }
+        return instruction_raises_sigtrap(bytes.get(skip..len).unwrap_or(&[]));
+    }
+
+    instruction_raises_sigtrap_from(|offset| {
+        let needed = skip + offset;
+        while needed >= len {
+            if len == bytes.len() || start + len >= rip + 15 {
+                return None;
+            }
+            let word = read_word(start + len)?;
+            bytes[len..len + 8].copy_from_slice(&word.to_ne_bytes());
+            len += 8;
+        }
+        Some(bytes[needed])
+    })
 }
 
 /// Whether the aarch64 instruction that begins with `bytes` raises a SIGTRAP
@@ -337,5 +389,250 @@ mod tests {
         assert!(!action.ignored());
         action.handler = 0x401000;
         assert!(!action.ignored());
+    }
+
+    /// A byte-backed word transport, without a second instruction grammar.
+    /// Address zero models the production Addr refusal before PEEKDATA.
+    fn decode_words(rip: usize, instruction: &[u8], unreadable: &[usize]) -> (bool, Vec<usize>) {
+        let start = rip & !7;
+        let skip = rip - start;
+        let mut memory = [0x90u8; 24];
+        assert!(instruction.len() <= 16);
+        memory[skip..skip + instruction.len()].copy_from_slice(instruction);
+        let mut reads = Vec::new();
+        let result = instruction_raises_sigtrap_with_words(rip, |address| {
+            reads.push(address);
+            if address == 0 || unreadable.contains(&address) {
+                return None;
+            }
+            let offset = address.checked_sub(start)?;
+            let mut word = [0u8; 8];
+            word.copy_from_slice(memory.get(offset..offset.checked_add(8)?)?);
+            Some(u64::from_ne_bytes(word))
+        });
+        (result, reads)
+    }
+
+    #[test]
+    fn word_reader_stops_at_first_deciding_opcode_in_every_alignment() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            for (bytes, expected) in [
+                (&[0xcc][..], true),
+                (&[0xf1][..], true),
+                (&[0x90][..], false),
+                (&[0x0f, 0xcc][..], false),
+            ] {
+                let (result, reads) = decode_words(rip, bytes, &[0x2008, 0x2010]);
+                assert_eq!(result, expected, "alignment={alignment} bytes={bytes:02x?}");
+                assert_eq!(result, instruction_raises_sigtrap(bytes));
+                assert_eq!(reads, [0x2000]);
+            }
+        }
+    }
+
+    #[test]
+    fn word_reader_fetches_the_int3_immediate_only_when_needed() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            for (bytes, expected) in [(&[0xcd, 0x03][..], true), (&[0xcd, 0x80][..], false)] {
+                let (result, reads) = decode_words(rip, bytes, &[]);
+                assert_eq!(result, expected, "alignment={alignment}");
+                assert_eq!(result, instruction_raises_sigtrap(bytes));
+                assert_eq!(
+                    reads,
+                    if alignment == 7 {
+                        vec![0x2000, 0x2008]
+                    } else {
+                        vec![0x2000]
+                    }
+                );
+            }
+        }
+        let (result, reads) = decode_words(0x2007, &[0xcd, 0x03], &[0x2008]);
+        assert!(!result, "an unreadable split immediate is not int 3");
+        assert_eq!(reads, [0x2000, 0x2008]);
+    }
+
+    #[test]
+    fn word_reader_needs_each_prefix_word_and_never_a_fourth() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            let words = (alignment + 15 + 7) / 8;
+            let expected_reads: Vec<_> = (0..words).map(|i| 0x2000 + 8 * i).collect();
+            let mut int3 = vec![0x66; 14];
+            int3.push(0xcc);
+            let mut int_3 = vec![0x48; 13];
+            int_3.extend_from_slice(&[0xcd, 0x03]);
+            for (bytes, expected) in [
+                (&int3[..], true),
+                (&int_3[..], true),
+                (&[0x66; 15][..], false),
+            ] {
+                let (result, reads) = decode_words(rip, bytes, &[0x2018]);
+                assert_eq!(result, expected, "alignment={alignment} bytes={bytes:02x?}");
+                assert_eq!(result, instruction_raises_sigtrap(bytes));
+                assert_eq!(reads, expected_reads);
+                assert!(reads.len() <= 3);
+                if words == 3 {
+                    let (result, reads) = decode_words(rip, bytes, &[0x2010]);
+                    assert!(!result);
+                    assert_eq!(reads, [0x2000, 0x2008, 0x2010]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn word_reader_preserves_every_prefix_and_fifteen_byte_limit() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            for prefix in [
+                0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0xf0, 0xf2, 0xf3,
+            ]
+            .into_iter()
+            .chain(0x40..=0x4f)
+            {
+                for opcode in [0xcc, 0xf1] {
+                    let bytes = [prefix, opcode];
+                    let (result, reads) = decode_words(rip, &bytes, &[]);
+                    assert!(result, "alignment={alignment} bytes={bytes:02x?}");
+                    assert_eq!(result, instruction_raises_sigtrap(&bytes));
+                    assert_eq!(reads.len(), if alignment == 7 { 2 } else { 1 });
+                }
+            }
+            let mut late_int3 = vec![0x66; 15];
+            late_int3.push(0xcc);
+            let mut late_immediate = vec![0x48; 14];
+            late_immediate.extend_from_slice(&[0xcd, 0x03]);
+            for bytes in [&late_int3[..], &late_immediate[..]] {
+                let (result, reads) = decode_words(rip, bytes, &[0x2018]);
+                assert!(!result);
+                assert_eq!(result, instruction_raises_sigtrap(bytes));
+                assert_eq!(reads.len(), (alignment + 15 + 7) / 8);
+            }
+        }
+        let mut requested = Vec::new();
+        let mut bytes = vec![0x66; 14];
+        bytes.extend_from_slice(&[0xcd, 0x03]);
+        assert!(!instruction_raises_sigtrap_from(|offset| {
+            assert!(offset < 15, "the sixteenth byte must not be requested");
+            requested.push(offset);
+            bytes.get(offset).copied()
+        }));
+        assert_eq!(requested, (0..15).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn word_reader_rejects_missing_needed_words_in_every_alignment() {
+        for alignment in 0..8 {
+            let rip = 0x2000 + alignment;
+            let (result, reads) = decode_words(rip, &[0xcc], &[0x2000]);
+            assert!(!result);
+            assert_eq!(reads, [0x2000]);
+
+            let mut bytes = vec![0x66; 8 - alignment];
+            bytes.push(0xcc);
+            let (result, reads) = decode_words(rip, &bytes, &[]);
+            assert!(result);
+            assert_eq!(reads, [0x2000, 0x2008]);
+            let (result, reads) = decode_words(rip, &bytes, &[0x2008]);
+            assert!(
+                !result,
+                "a prefix without its unreadable opcode cannot qualify"
+            );
+            assert_eq!(reads, [0x2000, 0x2008]);
+        }
+    }
+
+    #[test]
+    fn word_reader_does_not_touch_unused_failing_words() {
+        for alignment in 0..8 {
+            for (opcode, expected) in [(0xcc, true), (0xf1, true), (0x90, false)] {
+                let mut word = [0x90u8; 8];
+                word[alignment] = opcode;
+                let mut count = 0;
+                let result = instruction_raises_sigtrap_with_words(0x2000 + alignment, |address| {
+                    assert_eq!(address, 0x2000, "an unused word must not be requested");
+                    count += 1;
+                    Some(u64::from_ne_bytes(word))
+                });
+                assert_eq!(result, expected);
+                assert_eq!(count, 1, "do not pass without invoking the reader");
+            }
+        }
+    }
+
+    #[test]
+    fn word_reader_preserves_null_and_page_boundary_behavior() {
+        for rip in 0..8 {
+            let (result, reads) = decode_words(rip, &[0xcc], &[]);
+            assert!(
+                !result,
+                "the original Addr guard refuses the aligned null word"
+            );
+            assert_eq!(reads, [0]);
+        }
+        let (result, reads) = decode_words(0x2fff, &[0xcc], &[0x3000]);
+        assert!(result, "unreadable unused next page does not hide int3");
+        assert_eq!(reads, [0x2ff8]);
+        let (result, reads) = decode_words(0x2fff, &[0xcd, 0x03], &[0x3000]);
+        assert!(
+            !result,
+            "an unreadable necessary next page cannot supply int 3"
+        );
+        assert_eq!(reads, [0x2ff8, 0x3000]);
+        let (result, reads) = decode_words(0x2fff, &[0xcd, 0x03], &[]);
+        assert!(result);
+        assert_eq!(reads, [0x2ff8, 0x3000]);
+    }
+
+    #[test]
+    fn word_reader_preserves_the_original_address_overflow_path() {
+        // The base's eager transport, using the same slice-facing grammar.
+        // Compare panic/wrap behavior without assuming a build's overflow flags.
+        fn original(rip: usize, mut read_word: impl FnMut(usize) -> Option<u64>) -> bool {
+            let start = rip & !7;
+            let mut bytes = [0u8; 24];
+            let mut len = 0;
+            while len < bytes.len() && start + len < rip + 15 {
+                let Some(word) = read_word(start + len) else {
+                    break;
+                };
+                bytes[len..len + 8].copy_from_slice(&word.to_ne_bytes());
+                len += 8;
+            }
+            let skip = rip - start;
+            instruction_raises_sigtrap(bytes.get(skip..len).unwrap_or(&[]))
+        }
+        for rip in [
+            usize::MAX - 23,
+            usize::MAX - 15,
+            usize::MAX - 14,
+            usize::MAX,
+        ] {
+            let mut old_reads = Vec::new();
+            let old = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                original(rip, |address| {
+                    old_reads.push(address);
+                    (address != 0).then_some(0xcccccccccccccccc)
+                })
+            }));
+            let mut new_reads = Vec::new();
+            let new = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                instruction_raises_sigtrap_with_words(rip, |address| {
+                    new_reads.push(address);
+                    (address != 0).then_some(0xcccccccccccccccc)
+                })
+            }));
+            assert_eq!(new.is_err(), old.is_err(), "rip={rip:#x}");
+            assert_eq!(new.as_ref().ok(), old.as_ref().ok(), "rip={rip:#x}");
+            if rip > usize::MAX - 16 {
+                assert_eq!(new_reads, old_reads, "legacy overflow path rip={rip:#x}");
+            } else {
+                assert_eq!(new_reads, [rip & !7]);
+                assert_eq!(new.ok(), Some(true));
+            }
+        }
     }
 }

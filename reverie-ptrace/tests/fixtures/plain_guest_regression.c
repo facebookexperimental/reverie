@@ -1586,6 +1586,67 @@ static void exec_self(const char* mode) {
   die("execve");
 }
 
+#if defined(__x86_64__)
+/* No guest instruction precedes these static ELF entries. Setup errors
+ * (100..103) and failed exec (104) are distinct from the nop sentinel 99. */
+static void mode_sigtrap_first_exec(void) {
+  static const struct {
+    const char* name;
+    const char* env;
+  } encodings[] = {
+      {"cc", "TP_FIRST_EXEC_CC"},
+      {"f1", "TP_FIRST_EXEC_F1"},
+      {"cd03", "TP_FIRST_EXEC_CD03"},
+      {"nop", "TP_FIRST_EXEC_NOP"},
+  };
+  static const struct {
+    const char* name;
+    void (*action)(int);
+    int block;
+  } states[] = {
+      {"dfl-blocked", SIG_DFL, 1},
+      {"ign-unblocked", SIG_IGN, 0},
+      {"ign-blocked", SIG_IGN, 1},
+  };
+  for (unsigned e = 0; e < 4; e++) {
+    unsigned count = e == 3 ? 1 : 3;
+    for (unsigned c = 0; c < count; c++) {
+      unsigned s = e == 3 ? 2 : c;
+      pid_t pid = fork();
+      if (pid < 0)
+        die("fork first-exec child");
+      if (pid == 0) {
+        struct rlimit core = {1, 1};
+        if (setrlimit(RLIMIT_CORE, &core) != 0)
+          _exit(100);
+        struct sigaction action;
+        memset(&action, 0, sizeof action);
+        action.sa_handler = states[s].action;
+        if (sigemptyset(&action.sa_mask) != 0 || sigaction(SIGTRAP, &action, NULL) != 0)
+          _exit(101);
+        sigset_t mask;
+        if (sigemptyset(&mask) != 0 || (states[s].block && sigaddset(&mask, SIGTRAP) != 0) ||
+            sigprocmask(SIG_SETMASK, &mask, NULL) != 0)
+          _exit(102);
+        const char* path = getenv(encodings[e].env);
+        if (path == NULL || path[0] == '\0')
+          _exit(103);
+        char* args[] = {(char*)path, NULL};
+        execve(path, args, environ);
+        _exit(104);
+      }
+      int status;
+      if (waitpid(pid, &status, 0) != pid)
+        die("wait first-exec child");
+      say("first-exec %s %s signaled=%d sig=%d exited=%d rc=%d\n",
+          encodings[e].name, states[s].name, WIFSIGNALED(status),
+          WIFSIGNALED(status) ? WTERMSIG(status) : 0, WIFEXITED(status),
+          WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
+  }
+}
+#endif
+
 /* SIGTRAP's state across a guest fork run in place: Reverie single-steps the
  * parent from its clone event stop. Both processes read the state back. */
 static void mode_sigtrap_fork(void) {
@@ -5875,6 +5936,10 @@ int main(int argc, char** argv) {
     mode_sigtrap_profile();
   else if (!strcmp(m, "sigtrap_states"))
     mode_sigtrap_states();
+#if defined(__x86_64__)
+  else if (!strcmp(m, "sigtrap_first_exec"))
+    mode_sigtrap_first_exec();
+#endif
   else if (!strcmp(m, "segv_states"))
     mode_segv_states();
   else if (!strcmp(m, "segv_in_segv_handler"))
