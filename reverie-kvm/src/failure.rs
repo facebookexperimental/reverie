@@ -403,6 +403,15 @@ impl ProcessFailure {
 }
 
 impl FailureContext {
+    /// Whether `other` is this exact context: the same shared failure
+    /// records and the same task. A clone of one is always the same.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.run, &other.run)
+            && Arc::ptr_eq(&self.process, &other.process)
+            && self.pid == other.pid
+            && self.tid == other.tid
+    }
+
     pub(crate) fn observe(&self) -> FailureObservation {
         FailureObservation {
             #[cfg(test)]

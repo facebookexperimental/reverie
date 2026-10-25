@@ -535,6 +535,19 @@ impl OperationOrigin {
         Arc::ptr_eq(&self.witness, &other.witness)
     }
 
+    /// Whether `other` is this exact origin: the same driver allocation,
+    /// retirement witness and callback generation. A clone of one is always
+    /// the same, so replacing one with the other changes nothing observable.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.owner, &other.owner)
+            && Arc::ptr_eq(&self.witness, &other.witness)
+            && match (&self.callback, &other.callback) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
     /// Origins without callback receipts do not identify a callback.
     #[cfg(test)]
     pub(crate) fn same_callback(&self, other: &Self) -> bool {

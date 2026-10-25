@@ -3,7 +3,7 @@
 [package]
 name = "reverie-host"
 description = "Host-side runtime support for experimental Reverie in-process instrumentation."
-version = "0.5.1"
+version = "0.5.3"
 authors = ["Meta Platforms"]
 edition = "2021"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -12,10 +12,10 @@ license = "BSD-2-Clause"
 [dependencies]
 anyhow = "1.0.75"
 dirs = "2.0"
-reverie = { version = "0.5.1", path = "../../reverie", package = "reverie-core" }
-reverie-process = { version = "0.5.1", path = "../../reverie-process" }
-reverie-rpc = { version = "0.5.1", path = "../reverie-rpc" }
-reverie-rpc-transport = { version = "0.5.1", path = "../../reverie-rpc-transport" }
+reverie = { version = "0.5.3", path = "../../reverie", package = "reverie-core" }
+reverie-process = { version = "0.5.3", path = "../../reverie-process" }
+reverie-rpc = { version = "0.5.3", path = "../reverie-rpc" }
+reverie-rpc-transport = { version = "0.5.3", path = "../../reverie-rpc-transport" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 tempfile = "3.8"
 tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }

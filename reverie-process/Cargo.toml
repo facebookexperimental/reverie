@@ -3,7 +3,7 @@
 [package]
 name = "reverie-process"
 description = "Deterministic async process spawning and management for the Reverie framework."
-version = "0.5.1"
+version = "0.5.3"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"

@@ -1,6 +1,6 @@
 [package]
 name = "reverie-inguest"
-version = "0.5.1"
+version = "0.5.3"
 authors = ["Meta Platforms"]
 edition = "2024"
 repository = "https://github.com/facebookexperimental/reverie"
@@ -62,26 +62,26 @@ coordinator-rpc = ["dep:serde", "dep:bincode", "dep:reverie", "dep:reverie-rpc-t
 rcb-clock = ["dep:reverie"]
 
 [dependencies]
-reverie-loader = { version = "0.5.1", path = "../reverie-loader", optional = true }
-safeptrace = { version = "0.5.1", path = "../safeptrace", features = ["memory", "notifier"], optional = true }
-reverie-memory = { version = "0.5.1", path = "../reverie-memory", optional = true }
+reverie-loader = { version = "0.5.3", path = "../reverie-loader", optional = true }
+safeptrace = { version = "0.5.3", path = "../safeptrace", features = ["memory", "notifier"], optional = true }
+reverie-memory = { version = "0.5.3", path = "../reverie-memory", optional = true }
 nix = { version = "0.30.1", features = ["fs", "process", "signal"], optional = true }
 serde_json = { version = "1.0.149", optional = true }
 sha2 = { version = "0.10.9", optional = true }
 libc = "0.2.186"
 syscalls = "0.6.18"
-reverie-syscalls = { version = "0.5.1", path = "../reverie-syscalls" }
+reverie-syscalls = { version = "0.5.3", path = "../reverie-syscalls" }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }
-reverie = { version = "0.5.1", path = "../reverie", optional = true, package = "reverie-core" }
-reverie-rpc-transport = { version = "0.5.1", path = "../reverie-rpc-transport", optional = true }
+reverie = { version = "0.5.3", path = "../reverie", optional = true, package = "reverie-core" }
+reverie-rpc-transport = { version = "0.5.3", path = "../reverie-rpc-transport", optional = true }
 
 tempfile = { version = "3.27.0", optional = true }
 tokio = { version = "1.52.4", features = ["macros", "net", "rt", "time"], optional = true }
 tracing = { version = "0.1.41", optional = true }
 
 [dev-dependencies]
-reverie-loader = { version = "0.5.1", path = "../reverie-loader" }
+reverie-loader = { version = "0.5.3", path = "../reverie-loader" }
 tokio = { version = "1.52.4", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
