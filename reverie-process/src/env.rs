@@ -38,22 +38,14 @@ impl Env {
         self.vars.insert(key.to_owned(), Some(value.to_owned()));
     }
 
-    pub fn get<K: AsRef<OsStr>>(&self, key: K) -> Option<&OsStr> {
-        self.vars
-            .get(key.as_ref())
-            .and_then(|v| v.as_ref().map(|v| v.as_os_str()))
-    }
-
     pub fn get_captured<K: AsRef<OsStr>>(&self, key: K) -> Option<Cow<'_, OsStr>> {
         let key = key.as_ref();
-
-        if !self.clear
-            && let Some(var) = std::env::var_os(key)
-        {
-            return Some(Cow::Owned(var));
+        match self.vars.get(key) {
+            // Explicit settings and removals take precedence, as in capture().
+            Some(value) => value.as_deref().map(Cow::Borrowed),
+            None if self.clear => None,
+            None => std::env::var_os(key).map(Cow::Owned),
         }
-
-        self.get(key).map(Cow::Borrowed)
     }
 
     pub fn remove(&mut self, key: &OsStr) {
@@ -106,5 +98,83 @@ impl Env {
 
     pub fn iter(&self) -> impl Iterator<Item = (&OsStr, Option<&OsStr>)> {
         self.vars.iter().map(|(k, v)| (k.as_ref(), v.as_deref()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::ffi::OsStrExt;
+
+    use super::*;
+
+    fn assert_captured_value(env: &Env, key: &OsStr, expected: Option<&OsStr>) {
+        assert_eq!(env.get_captured(key).as_deref(), expected);
+        assert_eq!(env.capture().get(key).map(OsString::as_os_str), expected);
+    }
+
+    #[test]
+    fn get_captured_inherits_unmodified_environment() {
+        let inherited = std::env::var_os("PATH").expect("the test process has a PATH");
+        let env = Env::default();
+
+        assert_captured_value(&env, OsStr::new("PATH"), Some(&inherited));
+    }
+
+    #[test]
+    fn get_captured_prefers_explicit_value() {
+        let mut explicit = std::env::var_os("PATH").expect("the test process has a PATH");
+        // Appending guarantees a different value, including non-UTF8 bytes,
+        // without changing the test process's environment.
+        explicit.push(OsStr::from_bytes(b":/guest/\xff/bin"));
+        let mut env = Env::default();
+        env.set(OsStr::new("PATH"), &explicit);
+
+        assert_captured_value(&env, OsStr::new("PATH"), Some(&explicit));
+    }
+
+    #[test]
+    fn get_captured_honors_explicit_removal() {
+        assert!(std::env::var_os("PATH").is_some());
+        let mut env = Env::default();
+        env.remove(OsStr::new("PATH"));
+
+        assert_captured_value(&env, OsStr::new("PATH"), None);
+    }
+
+    #[test]
+    fn get_captured_clear_discards_explicit_and_inherited_values() {
+        let mut env = Env::default();
+        env.set(OsStr::new("PATH"), OsStr::new("/guest/bin"));
+        env.clear();
+
+        assert_captured_value(&env, OsStr::new("PATH"), None);
+        assert!(env.capture().is_empty());
+    }
+
+    #[test]
+    fn get_captured_uses_values_set_after_clear() {
+        let mut env = Env::default();
+        env.clear();
+        env.set(OsStr::new("PATH"), OsStr::new("/guest/bin"));
+
+        assert_captured_value(&env, OsStr::new("PATH"), Some(OsStr::new("/guest/bin")));
+
+        env.remove(OsStr::new("PATH"));
+        assert_captured_value(&env, OsStr::new("PATH"), None);
+        assert!(env.capture().is_empty());
+    }
+
+    #[test]
+    fn get_captured_preserves_non_utf8_keys_and_values() {
+        let key = OsStr::from_bytes(b"REVERIE_\xff");
+        let value = OsStr::from_bytes(b"value_\xfe");
+        let mut env = Env::default();
+        env.clear();
+        env.set(key, value);
+
+        assert_captured_value(&env, key, Some(value));
+
+        env.remove(key);
+        assert_captured_value(&env, key, None);
     }
 }

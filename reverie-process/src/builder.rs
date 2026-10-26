@@ -767,11 +767,153 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+
+    fn write_program(path: &Path, mode: u32) {
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn inherited_cat() -> PathBuf {
+        let program = Command::new("cat").find_program().unwrap();
+        // An unset PATH searches the current directory. Keep that existing
+        // behavior separate from searching the inherited PATH in these tests.
+        assert!(!Path::new("cat").exists());
+        assert!(std::env::var_os("PATH").is_some());
+        program
+    }
 
     #[test]
     fn find_program() {
         assert!(Command::new("cat").find_program().unwrap().is_absolute(),);
+    }
+
+    #[test]
+    fn find_program_prefers_explicit_path() {
+        let inherited = inherited_cat();
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("cat");
+        write_program(&program, 0o700);
+        assert_ne!(program, inherited);
+
+        assert_eq!(
+            Command::new("cat")
+                .env("PATH", directory.path())
+                .find_program()
+                .unwrap(),
+            program
+        );
+    }
+
+    #[test]
+    fn find_program_finds_program_only_on_explicit_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = "reverie-explicit-path-program";
+        assert!(Command::new(name).find_program().is_err());
+        let program = directory.path().join(name);
+        write_program(&program, 0o700);
+
+        assert_eq!(
+            Command::new(name)
+                .env("PATH", directory.path())
+                .find_program()
+                .unwrap(),
+            program
+        );
+    }
+
+    #[test]
+    fn find_program_does_not_inherit_removed_path() {
+        inherited_cat();
+
+        assert!(
+            Command::new("cat")
+                .env_remove("PATH")
+                .find_program()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn find_program_does_not_inherit_cleared_path() {
+        inherited_cat();
+
+        assert!(Command::new("cat").env_clear().find_program().is_err());
+    }
+
+    #[test]
+    fn find_program_uses_non_utf8_path_and_name_set_after_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join(OsStr::from_bytes(b"bin-\xff"));
+        fs::create_dir(&bin).unwrap();
+        let name = OsStr::from_bytes(b"tool-\xfe");
+        let program = bin.join(name);
+        write_program(&program, 0o700);
+
+        assert_eq!(
+            Command::new(name)
+                .env_clear()
+                .env("PATH", &bin)
+                .find_program()
+                .unwrap(),
+            program
+        );
+    }
+
+    #[test]
+    fn find_program_rejects_missing_path_target() {
+        let directory = tempfile::tempdir().unwrap();
+
+        assert!(
+            Command::new("missing-program")
+                .env_clear()
+                .env("PATH", directory.path())
+                .find_program()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn find_program_skips_non_executable_path_target() {
+        let blocked = tempfile::tempdir().unwrap();
+        let executable = tempfile::tempdir().unwrap();
+        write_program(&blocked.path().join("program"), 0o600);
+        let program = executable.path().join("program");
+        write_program(&program, 0o700);
+        let mut command = Command::new("program");
+        command.env_clear().env("PATH", blocked.path());
+        assert!(command.find_program().is_err());
+
+        command.env(
+            "PATH",
+            std::env::join_paths([blocked.path(), executable.path()]).unwrap(),
+        );
+        assert_eq!(command.find_program().unwrap(), program);
+    }
+
+    #[test]
+    fn find_program_rejects_missing_absolute_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-program");
+
+        assert_eq!(
+            Command::new(&missing).find_program().unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn find_program_rejects_non_executable_absolute_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("program");
+        write_program(&program, 0o600);
+
+        assert_eq!(
+            Command::new(&program).find_program().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
