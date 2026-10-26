@@ -3814,6 +3814,15 @@ const TRAP_HWBKPT: i32 = 4;
 /// back into `[pc, at]` (a loop of one block), the instruction just before
 /// pc. Otherwise the run ends at `at`, retiring nothing. A register branch's
 /// successor is known only from `at == pc`, where the register is current.
+///
+/// A run's breakpoint stop is a forced SIGTRAP, which, like a single step's,
+/// resets a blocked or ignored SIGTRAP. The step shield that prepares each
+/// unit decodes only the instruction at pc, and that is enough for a run
+/// too: every instruction that raises SIGTRAP itself (BRK, SVC and the other
+/// exception-generating instructions) is a stop point, so a run neither
+/// starts at nor executes one. The shield leaves SIGTRAP unblocked for the
+/// whole run rather than one instruction; the guest makes no syscall and
+/// takes no trap of its own before the run ends, so it cannot tell.
 #[cfg(target_arch = "aarch64")]
 fn decode_branch_run(
     task: &Stopped,
@@ -3897,6 +3906,12 @@ impl BranchBreakpoints {
     /// ENOSPC when others (the guest's own `perf_event_open` breakpoints)
     /// hold them, before anything is enabled. A later write then only
     /// changes registered breakpoints.
+    ///
+    /// The two stay registered, disabled, until the thread execs or exits:
+    /// ptrace has no request that unregisters one. From its first branch run
+    /// on, the thread's own `perf_event_open` breakpoints therefore find two
+    /// fewer free slots (of six on Neoverse V2), and may get ENOSPC where a
+    /// run with `REVERIE_BLOCK_STEP=0` would not.
     fn new(task: &Stopped) -> Result<Option<Self>, TraceError> {
         let saved = task.hw_breakpoints()?;
         let enabled = saved.regs[..saved.slots()].iter().map(|reg| reg.enabled());
