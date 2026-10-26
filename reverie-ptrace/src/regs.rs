@@ -70,6 +70,14 @@ pub trait RegAccess {
     ///
     /// NOTE: Depending on the context, this may not actually be a syscall
     /// number.
+    ///
+    /// On x86-64 this is `orig_rax`, which the kernel reads at a syscall-entry
+    /// or seccomp stop, so writing it changes (or, with -1, skips) the
+    /// syscall. On aarch64 it is `x8`, the same register as
+    /// [`RegAccess::syscall_mut`]: at such a stop the kernel has already
+    /// copied the number into its own `syscallno`, which only
+    /// `NT_ARM_SYSTEM_CALL` writes (`Stopped::set_syscall`), so writing this
+    /// skips nothing there.
     fn orig_syscall_mut(&mut self) -> &mut Reg;
 
     /// Returns the value of the register where the syscall return value is

@@ -1259,7 +1259,6 @@ impl TimerStepShield {
             self.native_trap = true;
             return Ok(());
         }
-        #[cfg(target_arch = "x86_64")]
         if let Some((address, rip)) = sigreturn_frame_mask_address(task, &regs)? {
             let frame = Addr::<u64>::from_raw(address).ok_or(Errno::EFAULT)?;
             let mask: u64 = task.read_value(frame)?;
@@ -1327,6 +1326,33 @@ fn sigreturn_frame_mask_address(
     Ok(Some((
         regs.rsp as usize + crate::sigtrap_state::SIGRETURN_UC_SIGMASK_OFFSET,
         regs.rip,
+    )))
+}
+
+/// If the task's next instruction is a guest `rt_sigreturn` (an `svc` with
+/// x8 139; Linux ignores the `svc` immediate), the address of the mask in the
+/// frame it restores, and the instruction's address.
+#[cfg(target_arch = "aarch64")]
+fn sigreturn_frame_mask_address(
+    task: &Stopped,
+    regs: &libc::user_regs_struct,
+) -> Result<Option<(usize, u64)>, TraceError> {
+    if regs.regs[8] != libc::SYS_rt_sigreturn as u64 {
+        return Ok(None);
+    }
+    let Some(pc) = Addr::<[u8; 4]>::from_raw(regs.pc as usize) else {
+        return Ok(None);
+    };
+    // `svc #imm16`: 0xd4000001 | imm16 << 5, little-endian.
+    let is_svc = task
+        .read_value(pc)
+        .is_ok_and(|insn| u32::from_le_bytes(insn) & 0xffe0_001f == 0xd400_0001);
+    if !is_svc {
+        return Ok(None);
+    }
+    Ok(Some((
+        regs.sp as usize + crate::sigtrap_state::SIGRETURN_UC_SIGMASK_OFFSET,
+        regs.pc,
     )))
 }
 
@@ -3594,8 +3620,9 @@ struct GlobalState<G: GlobalTool> {
     /// Whether Reverie keeps the guest's SIGTRAP action and mask across its
     /// own single-steps (`sigtrap_state`): only for a Tool that enforces a
     /// serialized-execution contract (`Tool::enforces_serialized_execution`),
-    /// and only on x86-64, whose instruction encodings and syscall rewind
-    /// this relies on. The repair injects `rt_sigaction` into a stopped
+    /// on x86-64 and aarch64, whose self-trapping instructions
+    /// (`instruction_raises_sigtrap`) and `rt_sigreturn` frames
+    /// (`sigreturn_frame_mask_address`) it knows. The repair injects `rt_sigaction` into a stopped
     /// thread, which a guest thread running meanwhile could defeat. Otherwise
     /// SIGTRAP is left as at base.
     keeps_sigtrap_state: bool,
@@ -3740,7 +3767,7 @@ thread_local! {
 
 /// Timer steps over a guest `rt_sigreturn` whose frame blocked SIGTRAP
 /// (`TimerStepShield::prepare`), counted for the test that must know one ran.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(test)]
 pub(crate) static FRAME_SHIELDS_FOR_TEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -4408,8 +4435,7 @@ impl<L: Tool> TracedTask<L> {
         // The report reads an x86-64 signal frame (`report_sigreturn`).
         let reports_sigreturns =
             cfg!(target_arch = "x86_64") && L::observes_sigreturns(&cfg) && gdbserver.is_none();
-        let keeps_sigtrap_state =
-            cfg!(target_arch = "x86_64") && L::enforces_serialized_execution(&cfg);
+        let keeps_sigtrap_state = L::enforces_serialized_execution(&cfg);
         let caches_sigtrap_disposition = options
             .events
             .iter_syscalls()
@@ -12838,9 +12864,17 @@ impl<L: Tool + 'static> TracedTask<L> {
             return Ok(task);
         }
         set_sigmask(&task, mask | BLOCKABLE_SIGNAL_BITS)?;
-        let mut skipped = regs;
-        *skipped.orig_syscall_mut() = -1i64 as Reg;
-        task.setregs(&skipped)?;
+        // Skip the syscall: x86_64 takes the number from orig_rax, aarch64
+        // from the kernel's own syscallno, which only NT_ARM_SYSTEM_CALL
+        // writes.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut skipped = regs;
+            *skipped.orig_syscall_mut() = -1i64 as Reg;
+            task.setregs(&skipped)?;
+        }
+        #[cfg(target_arch = "aarch64")]
+        task.set_syscall(-1)?;
         let mut wait = self
             .syscall_stopped(task, None)?
             .next_state_with_owner(&self.ptracer_waits)
@@ -12877,7 +12911,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         let mut again = regs;
         *again.ip_mut() = regs.ip() - cp::SYSCALL_INSTR_SIZE as Reg;
         *again.syscall_mut() = regs.orig_syscall();
-        *again.orig_syscall_mut() = -1i64 as Reg;
+        // x86_64: no restart of the skipped call. On aarch64 the number
+        // register is x8 itself, which must keep the call's number; the
+        // kernel's syscallno is already -1 from the skip, so nothing restarts
+        // there either, and x0 comes back from `regs` as the first argument.
+        #[cfg(target_arch = "x86_64")]
+        {
+            *again.orig_syscall_mut() = -1i64 as Reg;
+        }
         task.setregs(&again)?;
         let task = if owes_sigtrap {
             self.apply_sigtrap_repair(task).await?

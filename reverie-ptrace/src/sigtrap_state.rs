@@ -141,12 +141,21 @@ pub(crate) fn mask_after_sigprocmask(before: u64, how: i32, set: Option<u64>) ->
 #[cfg(target_arch = "x86_64")]
 pub(crate) const SIGRETURN_UC_SIGMASK_OFFSET: usize = 8 + 8 + 24 + 256;
 
+/// The offset from the stack pointer at an `rt_sigreturn` instruction to the
+/// frame's `uc_sigmask` on aarch64: the stack pointer is the frame
+/// (`struct rt_sigframe`), whose `siginfo` (128) precedes its `ucontext`,
+/// where `uc_sigmask` follows `uc_flags` (8), `uc_link` (8) and `uc_stack`
+/// (24).
+#[cfg(target_arch = "aarch64")]
+pub(crate) const SIGRETURN_UC_SIGMASK_OFFSET: usize = 128 + 8 + 8 + 24;
+
 /// Whether an x86-64 instruction that begins with `bytes` raises a SIGTRAP
 /// of its own: `int3` (`cc`), `int 3` (`cd 03`) or `int1` (`f1`), after any
 /// run of legacy and REX prefixes, within the 15-byte limit of an
 /// instruction. A prefix does not change what these instructions do, so
 /// `66 cc` is an `int3` too; and the CPU ignores a REX prefix that does not
 /// directly precede the opcode, so `48 48 cc` and `48 66 cc` are as well.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn instruction_raises_sigtrap(bytes: &[u8]) -> bool {
     let bytes = &bytes[..bytes.len().min(15)];
     let mut i = 0;
@@ -160,6 +169,17 @@ pub(crate) fn instruction_raises_sigtrap(bytes: &[u8]) -> bool {
         i += 1;
     }
     matches!(bytes[i..], [0xcc, ..] | [0xf1, ..] | [0xcd, 0x03, ..])
+}
+
+/// Whether the aarch64 instruction that begins with `bytes` raises a SIGTRAP
+/// of its own: `brk #imm` (`0xd4200000 | imm16 << 5`), which Linux reports
+/// with a forced SIGTRAP as it does a single-step. Instructions are 4 bytes,
+/// little-endian.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn instruction_raises_sigtrap(bytes: &[u8]) -> bool {
+    const BRK_MASK: u32 = 0xffe0_001f;
+    const BRK: u32 = 0xd420_0000;
+    matches!(bytes, [a, b, c, d, ..] if u32::from_le_bytes([*a, *b, *c, *d]) & BRK_MASK == BRK)
 }
 
 #[cfg(test)]
@@ -222,6 +242,7 @@ mod tests {
         assert_eq!(mask_after_sigprocmask(before, 7, Some(0)), before);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn trap_instructions_are_found_behind_prefixes() {
         for bytes in [
@@ -265,6 +286,44 @@ mod tests {
         assert!(instruction_raises_sigtrap(&rex_long));
         rex_long.insert(0, 0x48);
         assert!(!instruction_raises_sigtrap(&rex_long));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn brk_raises_sigtrap_and_other_instructions_do_not() {
+        // brk #0, brk #1, brk #0xffff, then trailing bytes after a brk.
+        for word in [0xd420_0000u32, 0xd420_0020, 0xd43f_ffe0] {
+            assert!(instruction_raises_sigtrap(&word.to_le_bytes()), "{word:#x}");
+        }
+        assert!(instruction_raises_sigtrap(&[
+            0x20, 0x00, 0x20, 0xd4, 0x1f, 0x20
+        ]));
+        // svc #0, hlt #0, udf #0, nop, a brk with nonzero low bits (not a
+        // brk encoding), and a partial word.
+        for word in [
+            0xd400_0001u32,
+            0xd440_0000,
+            0x0000_0000,
+            0xd503_201f,
+            0xd420_0001,
+        ] {
+            assert!(
+                !instruction_raises_sigtrap(&word.to_le_bytes()),
+                "{word:#x}"
+            );
+        }
+        assert!(!instruction_raises_sigtrap(&[0x00, 0x00, 0x20]));
+        assert!(!instruction_raises_sigtrap(&[]));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_sigreturn_mask_offset_matches_the_kernel_frame() {
+        // siginfo_t is 128 bytes; ucontext's uc_sigmask follows two words
+        // and a stack_t.
+        assert_eq!(std::mem::size_of::<libc::siginfo_t>(), 128);
+        assert_eq!(std::mem::size_of::<libc::stack_t>(), 24);
+        assert_eq!(SIGRETURN_UC_SIGMASK_OFFSET, 168);
     }
 
     #[test]

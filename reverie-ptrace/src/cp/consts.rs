@@ -21,7 +21,14 @@ pub const PRIVATE_PAGE_SIZE: usize = TRAMPOLINE_SIZE;
 /// image already has something there
 /// (<https://github.com/rrnewton/hermit/issues/4409>). Once sealed, no task
 /// can unmap, replace or reprotect it.
+#[cfg(target_arch = "x86_64")]
 pub const SCRATCH_BASE: usize = TRAMPOLINE_BASE + TRAMPOLINE_SIZE;
+/// The repair page on aarch64, at the next 64 KiB boundary after the
+/// trampoline: an aarch64 kernel's pages may be 4, 16 or 64 KiB, the
+/// trampoline's mapping then covers a whole page, and an `mmap` at an address
+/// inside it fails with `EINVAL`.
+#[cfg(target_arch = "aarch64")]
+pub const SCRATCH_BASE: usize = TRAMPOLINE_BASE + 0x1_0000;
 pub const SCRATCH_SIZE: usize = 0x1000;
 
 /// The size of the `ud2` instruction on x86_64.
