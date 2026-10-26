@@ -645,6 +645,32 @@ impl PmuConfig {
         }
     }
 
+    /// Decision-and-record site for the notification of a precise event with
+    /// an instruction offset, before any step: iff the notification found the
+    /// guest at or past the target branch, emit the canonical
+    /// [`SKID_OVERSHOOT_MARKER`] line, increment the process-global witness
+    /// counter, and return `true`. The guest may have run any number of
+    /// instructions past the target branch before the notification stopped
+    /// it, and counting the offset from there would place the event where
+    /// host timing left the guest, so it is delivered at the observed
+    /// counter instead, as a late notification is. Without an offset an
+    /// event at its target is delivered where it was found, as before, and
+    /// only one past it is recorded ([`Self::record_overshoot_if_past_target`]).
+    pub fn record_offset_notification_at_or_past_target(
+        &self,
+        rcb_actual: u64,
+        rcb_target: u64,
+        instr_offset: u64,
+    ) -> bool {
+        if instr_offset > 0 && rcb_actual >= rcb_target {
+            self.emit_skid_overshoot_marker(rcb_actual, rcb_target);
+            crate::record_skid_overshoot();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Single decision-and-record site for a precise event that another
     /// Tool-observable stop overtook: iff the guest had already reached the
     /// event's delivery point, emit the canonical [`SKID_OVERSHOOT_MARKER`]
@@ -652,25 +678,17 @@ impl PmuConfig {
     ///
     /// Unlike a late delivery, the event itself is lost here, so reaching the
     /// delivery point exactly already counts: the event was due before the
-    /// stop. With an instruction offset the delivery point lies `instr_offset`
-    /// instructions past the target branch, and those instructions may include
-    /// further branches (see `ClockCounter::single_step_with_clock`). The
-    /// counter alone cannot show instruction progress, but every branch past
-    /// the target is at least one instruction, so `rcb_actual - rcb_target >=
-    /// instr_offset` proves the guest got there. A stop with fewer branches
-    /// past the target is not recorded, even if the delivery point was in fact
-    /// reached. The runtime callers are reverie-ptrace's
-    /// `TimerImpl::commit_missed`, for a stop that retires the event, and
-    /// reverie-kvm's preemption timer, for an exit at which a precise
+    /// stop. With an instruction offset the delivery point lies some
+    /// instructions past the target branch, and the counter cannot show how
+    /// many instructions the guest ran past that branch before the stop, so
+    /// any stop at or past the target may have passed the delivery point and
+    /// is recorded too (see [`target_reached`]). The runtime callers are
+    /// reverie-ptrace's `TimerImpl::commit_missed`, for a stop that retires the
+    /// event, and reverie-kvm's preemption timer, for an exit at which a precise
     /// request's target was reached: such an exit does not stop the guest at
     /// the delivery point, so even an exact arrival there is late.
-    pub fn record_missed_if_target_reached(
-        &self,
-        rcb_actual: u64,
-        rcb_target: u64,
-        instr_offset: u64,
-    ) -> bool {
-        let reached = target_reached(rcb_actual, rcb_target, instr_offset);
+    pub fn record_missed_if_target_reached(&self, rcb_actual: u64, rcb_target: u64) -> bool {
+        let reached = target_reached(rcb_actual, rcb_target);
         if reached {
             self.emit_skid_overshoot_marker(rcb_actual, rcb_target);
             crate::record_skid_overshoot();
@@ -847,14 +865,16 @@ pub fn record_skid_margin(
     slot.set(skid_margin)
 }
 
-/// Whether a stop at `rcb_actual` has reached the delivery point of a precise
-/// event `instr_offset` instructions past `rcb_target`, as far as the counter
-/// can show. See [`PmuConfig::record_missed_if_target_reached`].
+/// Whether a stop at `rcb_actual` may have reached the delivery point of a
+/// precise event whose target branch is `rcb_target`. That holds at the
+/// target itself with or without an instruction offset: with one, the stop
+/// has run an unknown number of instructions past the target branch, each
+/// of which may be one of the offset's, so fewer further branches than
+/// offset instructions do not show that the delivery point is still ahead.
+/// See [`PmuConfig::record_missed_if_target_reached`].
 #[doc(hidden)]
-pub fn target_reached(rcb_actual: u64, rcb_target: u64, instr_offset: u64) -> bool {
-    rcb_actual
-        .checked_sub(rcb_target)
-        .is_some_and(|past| past >= instr_offset)
+pub fn target_reached(rcb_actual: u64, rcb_target: u64) -> bool {
+    rcb_actual >= rcb_target
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]

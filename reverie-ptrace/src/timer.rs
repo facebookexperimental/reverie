@@ -2237,7 +2237,7 @@ impl TimerImpl {
                 && !matches!(event, TraceEvent::Signal(signal) if *signal == MARKER_SIGNAL) =>
             {
                 let clock = self.read_clock();
-                target_reached(clock, clock_target, offset).then(|| MissedTarget {
+                target_reached(clock, clock_target).then(|| MissedTarget {
                     clock,
                     clock_target,
                     offset,
@@ -2309,11 +2309,7 @@ impl TimerImpl {
         let Some(missed) = missed else {
             return;
         };
-        if get_pmu_config().record_missed_if_target_reached(
-            missed.clock,
-            missed.clock_target,
-            missed.offset,
-        ) {
+        if get_pmu_config().record_missed_if_target_reached(missed.clock, missed.clock_target) {
             let detail = missed.evidence.detail(
                 self.guest_tid,
                 SkidOvershootKind::Missed {
@@ -2384,7 +2380,7 @@ impl TimerImpl {
                     return None;
                 }
             };
-            target_reached(clock, clock_target, offset).then(|| MissedTarget {
+            target_reached(clock, clock_target).then(|| MissedTarget {
                 clock,
                 clock_target,
                 offset,
@@ -2568,9 +2564,9 @@ impl TimerImpl {
     /// notification would have delivered it after the return too, at a
     /// clock that host timing decided. An Armed event's steps do not pass
     /// its target, and one whose cleanup failed may have, unrecorded, so
-    /// neither is requested past it. Nor is an event at its clock target
-    /// whose instruction offset is still ahead: a request needs at least one
-    /// conditional branch, and no in-tree Tool asks for instruction offsets.
+    /// neither is requested past it. A Scheduled event with an instruction
+    /// offset counts as past its delivery point at its clock target already
+    /// (see [`target_reached`]), so it is requested one branch later too.
     #[cfg(target_arch = "x86_64")]
     fn request_again(&mut self, undelivered: UndeliveredEvent) -> Result<(), Errno> {
         let UndeliveredEvent {
@@ -2587,7 +2583,7 @@ impl TimerImpl {
                 TimerEventRequest::PreciseInstruction(ticks, offset)
             });
         }
-        if scheduled && target_reached(clock, clock_target, offset) {
+        if scheduled && target_reached(clock, clock_target) {
             return self.request_event(TimerEventRequest::Precise(1));
         }
         Ok(())
@@ -2752,7 +2748,7 @@ impl TimerImpl {
             } = self.event
         {
             let clock = self.read_clock();
-            if target_reached(clock, clock_target, offset) {
+            if target_reached(clock, clock_target) {
                 let missed = MissedTarget {
                     clock,
                     clock_target,
@@ -3093,6 +3089,24 @@ impl TimerImpl {
                 if ctr == clock_target && offset == 0 {
                     count_host_timed(|events| events.unstepped_at_target += 1);
                 }
+                // Nor does one place an offset event that the notification
+                // finds at or past its target count: the guest has run an
+                // unknown number of instructions past the target branch.
+                if get_pmu_config().record_offset_notification_at_or_past_target(
+                    ctr,
+                    clock_target,
+                    offset,
+                ) {
+                    warn!(
+                        "Precise timer interrupt arrived at or after target {} with {} \
+                         instructions still to step (counter {}); delivering the timer event \
+                         at the observed counter",
+                        clock_target, offset, ctr
+                    );
+                    #[cfg(test)]
+                    count_host_timed(|events| events.overshoot += 1);
+                    return Ok(task);
+                }
                 let current = ClockCounter::new(ctr, 0, clock_target);
                 self.attempt_single_step(task, current, offset, step, observe, waits)
                     .await
@@ -3235,10 +3249,15 @@ impl TimerImpl {
                 // moved rip or the clock. A SIGTRAP from elsewhere that
                 // arrives before the step leaves both, and one that arrives
                 // during it replaces the step's report, so a step whose
-                // instruction moves neither is then not counted, and the event
-                // lands one instruction late. A `rep` string instruction does
-                // that on every iteration but its last, as does a jump to
-                // itself.
+                // instruction moves neither is then not counted. A `rep`
+                // string instruction does that on every iteration but its
+                // last, as does a jump to itself. Short of the target branch
+                // the clock alone counts, so that costs nothing; past it, while
+                // instructions are counted, such an instruction could make the
+                // event land one instruction late, so the overshoot is recorded
+                // instead (`uncounted_step_may_miscount`). Any other instruction
+                // moves rip when it runs, so one that did not move it did not
+                // run, and the next step runs it.
                 #[cfg(target_arch = "x86_64")]
                 Wait::Stopped(mut new_task, event) => {
                     self.interrupted = Some(
@@ -3248,6 +3267,17 @@ impl TimerImpl {
                                 block_step_reached_target(unit, clock, target_rcb);
                                 if regs.rip != start.rip || clock != start.clock {
                                     current.single_step_with_clock(clock);
+                                } else if uncounted_step_may_miscount(&current, target_instr)
+                                    && instruction_may_run_in_place(&new_task, start.rip)
+                                {
+                                    warn!(
+                                        "A stop interrupted a single step {} instructions past \
+                                         the precise timer target {} that moved neither rip nor \
+                                         the counter; the step may have run",
+                                        current.instr, target_rcb
+                                    );
+                                    get_pmu_config().emit_skid_overshoot_marker(clock, target_rcb);
+                                    reverie::record_skid_overshoot();
                                 }
                                 Interruption::At(InterruptedSteps {
                                     steps: current,
@@ -3383,6 +3413,72 @@ impl TimerImpl {
 /// target `target_rcb`, which the decoded bound rules out. If it did, the
 /// delivery point may be passed, so this is recorded as a skid overshoot,
 /// with its marker, and the run fails closed as for a late notification.
+/// Whether an interrupted single step that moved neither rip nor the clock,
+/// and so is not counted, may make the event land one instruction late, if
+/// its instruction can run in place ([`instruction_may_run_in_place`]): it
+/// may once the steps are counting instructions past the target branch.
+/// Short of the target branch only the clock counts.
+#[cfg(target_arch = "x86_64")]
+fn uncounted_step_may_miscount(current: &ClockCounter, target_instr: u64) -> bool {
+    target_instr > 0 && current.rcbs() >= current.target_rcb
+}
+
+/// [`runs_in_place`] for the guest instruction at `ip`. Code that cannot be
+/// read counts as able to.
+#[cfg(target_arch = "x86_64")]
+fn instruction_may_run_in_place(task: &Stopped, ip: u64) -> bool {
+    /// The longest x86 instruction, in bytes.
+    const LONGEST: usize = 15;
+    let mut code = CodeReader {
+        task,
+        word_addr: None,
+        word: [0; 8],
+    };
+    let mut bytes = [0u8; LONGEST];
+    let mut len = 0;
+    while len < LONGEST {
+        match code.byte(ip.wrapping_add(len as u64)) {
+            Some(byte) => bytes[len] = byte,
+            None => break,
+        }
+        len += 1;
+    }
+    runs_in_place(ip, &bytes[..len])
+}
+
+/// Whether the 64-bit instruction at the start of `code`, whose first byte
+/// is at `ip`, can run without moving rip: a `rep` or `repne` string
+/// instruction, which repeats in place until its count runs out, a direct
+/// branch to itself, or an indirect branch, whose target is not decoded.
+/// Bytes that do not decode count as able to.
+#[cfg(target_arch = "x86_64")]
+fn runs_in_place(ip: u64, code: &[u8]) -> bool {
+    use iced_x86::Decoder;
+    use iced_x86::DecoderOptions;
+    use iced_x86::FlowControl;
+    use iced_x86::Instruction;
+
+    let mut decoder = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    if !decoder.can_decode() {
+        return true;
+    }
+    decoder.decode_out(&mut instruction);
+    if instruction.is_invalid() {
+        return true;
+    }
+    match instruction.flow_control() {
+        FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::Call => {
+            instruction.near_branch_target() == ip
+        }
+        FlowControl::IndirectBranch | FlowControl::IndirectCall => true,
+        _ => {
+            instruction.is_string_instruction()
+                && (instruction.has_rep_prefix() || instruction.has_repne_prefix())
+        }
+    }
+}
+
 fn block_step_reached_target(unit: StepUnit, clock: u64, target_rcb: u64) -> bool {
     if unit == StepUnit::Instruction || clock < target_rcb {
         return false;
@@ -4085,6 +4181,10 @@ mod tests {
     use super::ClockCounter;
     #[cfg(target_arch = "x86_64")]
     use super::PmuConfig;
+    #[cfg(target_arch = "x86_64")]
+    use super::runs_in_place;
+    #[cfg(target_arch = "x86_64")]
+    use super::uncounted_step_may_miscount;
 
     /// The controller's marker reads as its own PID in a shared PID
     /// namespace, as 0 from a descendant one, and as its own PID on a kernel
@@ -5347,19 +5447,25 @@ mod tests {
             assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
             assert_eq!(timer.timer_status, EventStatus::Cancelled);
             assert!(!timer.send_artificial_signal);
-            // Nor is one the guest's clock has reached, here with an
-            // instruction offset still ahead, so that the stop records no
-            // skid overshoot in the process-wide count.
-            timer.set_status(EventStatus::Scheduled);
-            timer.prepare_notification(far).unwrap();
+            // Nor is an Armed event whose interrupted steps have reached its
+            // clock target and count its instruction offset: the return the
+            // steps reached ends it there. (A Scheduled event at its target
+            // with an offset ahead counts as reached and is requested again,
+            // which records a skid overshoot in the process-wide count; see
+            // `target_reached`.)
+            let clock = timer.read_clock();
+            timer.set_status(EventStatus::Armed);
             timer.event = super::ActiveEvent::Precise {
-                clock_target: timer.read_clock(),
+                clock_target: clock,
                 offset: 1,
             };
+            timer.interrupted = Some(Interruption::At(InterruptedSteps {
+                steps: ClockCounter::new(clock, 0, clock),
+                target_instr: 1,
+            }));
             timer.tick_observed();
             assert_eq!(timer.disregard_sigreturn_stop(true), Ok(()));
             assert_eq!(timer.timer_status, EventStatus::Cancelled);
-            assert_eq!(timer.overflow_period, None);
             assert!(!timer.send_artificial_signal);
         }
         timer.event = super::ActiveEvent::Imprecise { clock_min: 0 };
@@ -6664,29 +6770,80 @@ mod tests {
         // --- An event overtaken by another stop is lost, so reaching the
         // delivery point exactly already counts. It stays in this test so the
         // witness counter keeps a single direct writer. ---
-        assert!(!config.record_missed_if_target_reached(32_999, 33_000, 0));
+        // With or without an instruction offset: the stop may have run any
+        // number of the offset's instructions past the target branch.
+        assert!(!config.record_missed_if_target_reached(32_999, 33_000));
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
-        assert!(config.record_missed_if_target_reached(33_000, 33_000, 0));
+        assert!(config.record_missed_if_target_reached(33_000, 33_000));
         assert_eq!(reverie::take_skid_overshoot_count(), 1);
-        assert!(config.record_missed_if_target_reached(33_001, 33_000, 0));
+        assert!(config.record_missed_if_target_reached(33_001, 33_000));
         assert_eq!(reverie::take_skid_overshoot_count(), 1);
-        // With an instruction offset, the branches past the target must
-        // cover the offset: each is at least one instruction, while one
-        // branch past the target may be far short of the delivery point.
-        assert!(!config.record_missed_if_target_reached(32_999, 33_000, 7));
-        assert!(!config.record_missed_if_target_reached(33_000, 33_000, 7));
-        assert!(!config.record_missed_if_target_reached(33_001, 33_000, 7));
-        assert!(!config.record_missed_if_target_reached(33_006, 33_000, 7));
+        assert!(config.record_missed_if_target_reached(u64::MAX, 0));
+        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+
+        // --- The notification of an offset event before any step: one at
+        // the target itself cannot be placed either. Without an offset,
+        // `record_overshoot_if_past_target` alone decides, as before. ---
+        assert!(!config.record_offset_notification_at_or_past_target(32_999, 33_000, 7));
+        assert!(!config.record_offset_notification_at_or_past_target(33_000, 33_000, 0));
+        assert!(!config.record_offset_notification_at_or_past_target(33_001, 33_000, 0));
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
-        assert!(config.record_missed_if_target_reached(33_007, 33_000, 7));
+        assert!(config.record_offset_notification_at_or_past_target(33_000, 33_000, 7));
         assert_eq!(reverie::take_skid_overshoot_count(), 1);
-        assert!(config.record_missed_if_target_reached(66_000, 33_000, 7));
+        assert!(config.record_offset_notification_at_or_past_target(33_001, 33_000, 1));
         assert_eq!(reverie::take_skid_overshoot_count(), 1);
-        // The comparison cannot wrap at the top of the range.
-        assert!(!config.record_missed_if_target_reached(33_001, 33_000, u64::MAX));
-        assert_eq!(reverie::take_skid_overshoot_count(), 0);
-        assert!(config.record_missed_if_target_reached(u64::MAX, 0, u64::MAX));
-        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+    }
+
+    /// An uncounted interrupted step matters only while the steps count
+    /// instructions past the target branch.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn an_uncounted_step_may_miscount_only_past_the_target() {
+        // Short of the target branch the clock counts, with or without an offset.
+        assert!(!uncounted_step_may_miscount(
+            &ClockCounter::new(9, 0, 10),
+            3
+        ));
+        // At the target branch with instructions still to count.
+        assert!(uncounted_step_may_miscount(
+            &ClockCounter::new(10, 0, 10),
+            3
+        ));
+        assert!(uncounted_step_may_miscount(
+            &ClockCounter::new(10, 2, 10),
+            3
+        ));
+        // Without an offset no instruction is counted.
+        assert!(!uncounted_step_may_miscount(
+            &ClockCounter::new(10, 0, 10),
+            0
+        ));
+    }
+
+    /// Only an instruction that can repeat without moving rip leaves an
+    /// unmoved interrupted step ambiguous.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn only_repeats_and_branches_to_themselves_run_in_place() {
+        const IP: u64 = 0x40_1000;
+        let cases: [(&[u8], bool); 13] = [
+            (&[0xf3, 0xa4], true),        // rep movsb
+            (&[0xf2, 0xae], true),        // repne scasb
+            (&[0xa4], false),             // movsb
+            (&[0xf3, 0xc3], false),       // rep ret: not a string instruction
+            (&[0xeb, 0xfe], true),        // jmp to itself
+            (&[0x75, 0xfe], true),        // jne to itself
+            (&[0xe2, 0xfe], true),        // loop to itself
+            (&[0xeb, 0x00], false),       // jmp to the next instruction
+            (&[0xff, 0xe0], true),        // jmp rax: target not decoded
+            (&[0x90], false),             // nop
+            (&[0x48, 0x89, 0x07], false), // mov [rdi], rax
+            (&[], true),                  // nothing readable
+            (&[0x0f], true),              // a truncated instruction
+        ];
+        for (code, in_place) in cases {
+            assert_eq!(runs_in_place(IP, code), in_place, "{code:02x?}");
+        }
     }
 
     #[test_case(ClockCounter::new(0, 0, 10), 0, 1, Some(true))]

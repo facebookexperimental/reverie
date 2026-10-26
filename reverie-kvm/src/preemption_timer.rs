@@ -1297,7 +1297,7 @@ pub(crate) fn rcbs_for_duration(duration: std::time::Duration) -> u64 {
 fn record_late(due: &TimerDue) {
     match reverie::pmu_config::try_get_pmu_config() {
         Some(config) => {
-            config.record_missed_if_target_reached(due.clock, due.target, 0);
+            config.record_missed_if_target_reached(due.clock, due.target);
         }
         // A request takes its margin from this configuration, so it exists
         // whenever a request was armed. Should it not, keep the witness.
