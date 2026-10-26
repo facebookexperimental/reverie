@@ -264,6 +264,35 @@ impl UserTrap {
         }
     }
 
+    /// The vCPU's actual stopped state as a trap boundary: every register
+    /// read from KVM, the transport read from guest memory. For restoration
+    /// tests that need a stopped boundary other than an exception HLT.
+    #[cfg(test)]
+    pub(crate) fn capture_stopped_for_test(
+        backend: &KvmBackend,
+        event: reverie::SignalEvent,
+    ) -> Result<Self> {
+        let halted_registers = backend.vcpu.get_regs()?;
+        let mut transport = [0; FRAME_SIZE];
+        backend
+            .memory
+            .read_raw(backend.syscall_frame_address, &mut transport)?;
+        Ok(Self {
+            registers: halted_registers,
+            event,
+            code_segment: crate::signal::USER_CODE_SELECTOR,
+            stack_segment: crate::signal::USER_DATA_SELECTOR,
+            vector: 14,
+            error_code: 4,
+            address: 0,
+            halted_registers,
+            special_registers: kvm_ioctls::VcpuFd::get_sregs(&backend.vcpu)?,
+            xsave: Arc::new(backend.vcpu.get_xsave()?),
+            transport,
+            transport_address: backend.syscall_frame_address,
+        })
+    }
+
     pub(crate) fn pending(&self) -> crate::executor::PendingSignal {
         crate::executor::PendingSignal {
             event: self.event,
@@ -298,7 +327,13 @@ impl UserTrap {
         backend
             .memory
             .write_raw(self.transport_address, &self.transport)?;
-        backend.vcpu.set_sregs(&self.special_registers)?;
+        // KVM_SET_SREGS does not round-trip every captured value: VMX may
+        // rewrite an unusable segment's type. Write the special registers
+        // only when they actually changed; the raw ioctl reads KVM's state,
+        // never a synced exit copy.
+        if kvm_ioctls::VcpuFd::get_sregs(&backend.vcpu)? != self.special_registers {
+            backend.vcpu.set_sregs(&self.special_registers)?;
+        }
         backend.vcpu.set_regs(&self.halted_registers)?;
         unsafe {
             backend.vcpu.set_xsave(self.xsave.as_ref())?;
@@ -3413,13 +3448,18 @@ impl KvmBackend {
                 }
 
                 self.vcpu.set_regs(&parent_registers)?;
-                configure_process_syscall_return(
-                    &self.memory,
-                    &self.vcpu,
-                    self.syscall_frame_address,
-                    i64::from(child_tid),
-                    None,
-                )?;
+                // A fault-origin parent stays stopped at its exception; its
+                // caller restores the captured boundary (`UserTrap`), so a
+                // syscall return here would only rewrite its segments.
+                if fault.is_none() {
+                    configure_process_syscall_return(
+                        &self.memory,
+                        &self.vcpu,
+                        self.syscall_frame_address,
+                        i64::from(child_tid),
+                        None,
+                    )?;
+                }
 
                 let completion_notice = WorkerCompletionNotice::new(self.thread_group.clone());
                 let returning = completion_notice.returning.clone();
@@ -4080,14 +4120,19 @@ impl KvmBackend {
                     handle,
                     panic_owner,
                 );
-                configure_process_syscall_return(
-                    &self.memory,
-                    &self.vcpu,
-                    self.syscall_frame_address,
-                    i64::from(raw_child_pid),
-                    None,
-                )
-                .map(|()| ProcessActionOutcome::returned(i64::from(raw_child_pid)))
+                // A fault-origin parent stays stopped at its exception; its
+                // caller restores the captured boundary (`UserTrap`), so a
+                // syscall return here would only rewrite its segments.
+                if fault.is_none() {
+                    configure_process_syscall_return(
+                        &self.memory,
+                        &self.vcpu,
+                        self.syscall_frame_address,
+                        i64::from(raw_child_pid),
+                        None,
+                    )?;
+                }
+                Ok(ProcessActionOutcome::returned(i64::from(raw_child_pid)))
             }
             // `ThreadOwnership::Host`: CLONE_THREAD workers run uninstrumented on
             // the direct backend personality with host-backed synchronization,
@@ -4200,13 +4245,18 @@ impl KvmBackend {
                 let subscriptions = context.subscriptions;
 
                 self.vcpu.set_regs(&parent_registers)?;
-                configure_process_syscall_return(
-                    &self.memory,
-                    &self.vcpu,
-                    self.syscall_frame_address,
-                    i64::from(child_tid),
-                    None,
-                )?;
+                // A fault-origin parent stays stopped at its exception; its
+                // caller restores the captured boundary (`UserTrap`), so a
+                // syscall return here would only rewrite its segments.
+                if fault.is_none() {
+                    configure_process_syscall_return(
+                        &self.memory,
+                        &self.vcpu,
+                        self.syscall_frame_address,
+                        i64::from(child_tid),
+                        None,
+                    )?;
+                }
 
                 let child_tool = context.process_state.clone();
                 let child_thread_state = child_tool
@@ -9278,6 +9328,221 @@ mod tests {
                 assert_eq!(backend.vcpu.get_xsave().unwrap().region, fault.xsave.region);
             }
         }
+    }
+
+    /// The real page-zero fault of `page_fault_action_restores_complete_stopped_context`,
+    /// captured at its exception HLT. None when KVM is unavailable and not required.
+    fn captured_page_zero_fault(name: &str) -> Option<(KvmBackend, ElfExecutor, UserTrap)> {
+        let mut backend = match KvmBackend::new(16 * 1024 * 1024) {
+            Ok(backend) => backend,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("REVERIE_REQUIRE_KVM").is_none(),
+                    "KVM is required: {error}"
+                );
+                eprintln!("skipping {name} KVM test: {error}");
+                return None;
+            }
+        };
+        backend
+            .install_static_elf(
+                &minimal_test_elf(&[0x31, 0xc0, 0x48, 0x8b, 0x00]),
+                "/page-fault-boundary",
+            )
+            .unwrap();
+        let executor = ElfExecutor::new(backend.static_elf.take().unwrap(), false);
+        let mut registers = backend.vcpu.get_regs().unwrap();
+        registers.rcx = 0x7777;
+        registers.r11 = 0x8888;
+        backend.vcpu.set_regs(&registers).unwrap();
+        assert!(matches!(
+            backend
+                .vcpu
+                .run()
+                .unwrap()
+                .expect("test entry admission was unexpectedly closed"),
+            VcpuExit::Hlt
+        ));
+        let fault = backend.capture_user_trap(&executor).unwrap().unwrap();
+        Some((backend, executor, fault))
+    }
+
+    fn read_page(backend: &KvmBackend, address: u64) -> [u8; PAGE_SIZE as usize] {
+        let mut page = [0; PAGE_SIZE as usize];
+        backend.memory.read_raw(address, &mut page).unwrap();
+        page
+    }
+
+    /// Changes the transport, the general registers and an XMM register of a
+    /// captured fault, and proves each change is visible to KVM.
+    fn disturb_fault_boundary(backend: &mut KvmBackend, fault: &UserTrap) {
+        backend
+            .memory
+            .write_raw(backend.syscall_frame_address, &[0xa5; FRAME_SIZE])
+            .unwrap();
+        let mut registers = backend.vcpu.get_regs().unwrap();
+        registers.rax ^= 0x1111;
+        registers.rcx ^= 0x2222;
+        registers.r11 ^= 0x3333;
+        registers.rsp ^= 0x40;
+        backend.vcpu.set_regs(&registers).unwrap();
+        let mut xsave = backend.vcpu.get_xsave().unwrap();
+        // XMM0 starts at byte 160 of the legacy FXSAVE area; KVM loads it only
+        // when XSTATE_BV (byte 512) marks SSE state present.
+        xsave.region[40] ^= 0x5a5a_5a5a;
+        xsave.region[128] |= 1 << 1;
+        unsafe {
+            backend.vcpu.set_xsave(&xsave).unwrap();
+        }
+        assert_ne!(
+            &read_page(backend, backend.syscall_frame_address)[..FRAME_SIZE],
+            &fault.transport[..]
+        );
+        assert_ne!(backend.vcpu.get_regs().unwrap(), fault.halted_registers);
+        assert_ne!(backend.vcpu.get_xsave().unwrap().region, fault.xsave.region);
+    }
+
+    /// Each `(address, contents)` page reads back as recorded, and the vCPU
+    /// holds exactly the trap's GPRs, raw special registers and xsave.
+    fn assert_fault_boundary_restored(
+        backend: &KvmBackend,
+        fault: &UserTrap,
+        pages: &[(u64, [u8; PAGE_SIZE as usize])],
+    ) {
+        for (address, contents) in pages {
+            assert_eq!(&read_page(backend, *address), contents, "page {address:#x}");
+        }
+        assert_eq!(backend.vcpu.get_regs().unwrap(), fault.halted_registers);
+        assert_eq!(
+            kvm_ioctls::VcpuFd::get_sregs(&backend.vcpu).unwrap(),
+            fault.special_registers
+        );
+        assert_eq!(backend.vcpu.get_xsave().unwrap().region, fault.xsave.region);
+    }
+
+    /// A stopped boundary whose special registers changed after capture gets
+    /// the captured value back, along with its transport, GPRs and xsave.
+    ///
+    /// The boundary is the real VMCALL stop after a guest `syscall`, not an
+    /// exception HLT. An exception from user mode loads a null, unusable SS,
+    /// and KVM_SET_SREGS cannot write every unusable SS back as captured (VMX
+    /// may set its accessed bit), so no host can be required to restore one
+    /// after a real change. `syscall` loads SS from STAR and every segment
+    /// here is a loaded descriptor, whose accessed bit the CPU sets.
+    #[test]
+    fn trap_boundary_restore_rewrites_changed_special_registers() {
+        let Some((mut backend, executor, _boundary)) = backend_at_completed_tool_boundary() else {
+            return;
+        };
+        let trap = UserTrap::capture_stopped_for_test(
+            &backend,
+            executor.trap_signal_event(libc::SIGSEGV, crate::signal::SEGV_MAPERR, 0),
+        )
+        .unwrap();
+        let captured = trap.special_registers;
+        for segment in [
+            captured.cs,
+            captured.ds,
+            captured.es,
+            captured.fs,
+            captured.gs,
+            captured.ss,
+            captured.tr,
+        ] {
+            assert_eq!(segment.unusable, 0, "{segment:?}");
+            assert_eq!(segment.type_ & 1, 1, "{segment:?}");
+        }
+        // The trampoline's frame page holds the transport; the guest stack is
+        // a user mapping, not touched by restoration.
+        let frame_page = backend.syscall_frame_address & !(PAGE_SIZE - 1);
+        let pages = [(frame_page, read_page(&backend, frame_page))];
+        // The syscall-return user segments, plus a different CR2.
+        configure_user_segments(&backend.vcpu).unwrap();
+        let mut special = backend.vcpu.get_sregs().unwrap();
+        special.cr2 ^= 0x1000;
+        backend.vcpu.set_sregs(&special).unwrap();
+        let changed = kvm_ioctls::VcpuFd::get_sregs(&backend.vcpu).unwrap();
+        assert_ne!(changed.cs, captured.cs);
+        assert_ne!(changed.ss, captured.ss);
+        assert_ne!(changed.cr2, captured.cr2);
+        disturb_fault_boundary(&mut backend, &trap);
+
+        trap.restore_boundary(&mut backend).unwrap();
+
+        assert_fault_boundary_restored(&backend, &trap, &pages);
+    }
+
+    /// A stopped fault whose special registers did not change still gets its
+    /// transport, GPRs and xsave back.
+    #[test]
+    fn fault_boundary_restore_with_unchanged_special_registers_restores_the_rest() {
+        let Some((mut backend, _executor, fault)) =
+            captured_page_zero_fault("unchanged fault-boundary restore")
+        else {
+            return;
+        };
+        let exception_page = fault.halted_registers.rsp & !(PAGE_SIZE - 1);
+        let pages = [
+            (
+                backend.syscall_frame_address,
+                read_page(&backend, backend.syscall_frame_address),
+            ),
+            (exception_page, read_page(&backend, exception_page)),
+        ];
+        assert_eq!(
+            kvm_ioctls::VcpuFd::get_sregs(&backend.vcpu).unwrap(),
+            fault.special_registers
+        );
+        disturb_fault_boundary(&mut backend, &fault);
+
+        fault.restore_boundary(&mut backend).unwrap();
+
+        assert_fault_boundary_restored(&backend, &fault, &pages);
+    }
+
+    /// Diagnostic, run explicitly with `--ignored`: whether this host's
+    /// KVM_SET_SREGS round-trips the special registers of a real captured
+    /// fault. Every read is a raw KVM_GET_SREGS, never the synced exit copy.
+    /// Passes for an exact round trip and for exactly the one known VMX
+    /// canonicalization (unusable SS type 0 read back as type 1); any other
+    /// difference fails.
+    #[test]
+    #[ignore = "host diagnostic; run explicitly"]
+    fn diagnostic_actual_fault_sregs_roundtrip() {
+        let Some((backend, _executor, fault)) =
+            captured_page_zero_fault("fault sregs round-trip diagnostic")
+        else {
+            return;
+        };
+        let raw = |backend: &KvmBackend| kvm_ioctls::VcpuFd::get_sregs(&backend.vcpu).unwrap();
+        let captured = fault.special_registers;
+        let before = raw(&backend);
+        assert_eq!(raw(&backend), before, "repeated KVM_GET_SREGS is unstable");
+        if before != captured {
+            panic!("captured {captured:?} differs from raw KVM_GET_SREGS {before:?}");
+        }
+        backend.vcpu.set_sregs(&before).unwrap();
+        let after = raw(&backend);
+        eprintln!("fault sregs before SET: {before:?}");
+        eprintln!("fault sregs after SET:  {after:?}");
+        if after == before {
+            eprintln!("fault sregs round-trip: exact");
+            return;
+        }
+        let mut expected = before;
+        expected.ss.type_ = 1;
+        assert!(
+            before.ss.unusable == 1 && before.ss.type_ == 0 && after == expected,
+            "KVM_SET_SREGS changed more than the unusable SS type"
+        );
+        assert_eq!(raw(&backend), after, "repeated KVM_GET_SREGS is unstable");
+        backend.vcpu.set_sregs(&after).unwrap();
+        assert_eq!(
+            raw(&backend),
+            after,
+            "the canonical value does not round-trip"
+        );
+        eprintln!("fault sregs round-trip: unusable SS type 0 canonicalized to 1");
     }
 
     fn check_fatal_process_registration_preserves_memory(with_tool: bool, writable: bool) {

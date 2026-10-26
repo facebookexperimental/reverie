@@ -14289,6 +14289,165 @@ fn page_fault_hook_returning_thread_preserves_context() {
     check_page_fault_returning_action("page_fault_hook_returning_thread_preserves_context", true);
 }
 
+/// How far below the faulting stack pointer the Tool places a host-owned
+/// thread child's stack, clear of the parent's concurrent signal frame.
+const HOST_THREAD_CHILD_STACK_OFFSET: u64 = 0x10000;
+
+/// PAGE_ZERO_FAULT_CONTEXT_SOURCE plus a thread-child branch. A fault-origin
+/// thread child starts at the faulting instruction with RAX 0, so it faults
+/// again; its handler checks the inherited context, publishes the result in
+/// the shared address space and exits only itself. The parent, after its own
+/// handled resume, waits a bounded time for that result.
+fn host_thread_fault_source() -> String {
+    let handler = "static void handler(int number, siginfo_t *info, void *context) {\n";
+    let child = format!(
+        r#"static volatile int child_result;
+static void thread_child(siginfo_t *info, void *context) {{
+    greg_t *registers = ((ucontext_t *)context)->uc_mcontext.gregs;
+    const int indices[15] = {{REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13,
+        REG_R14, REG_R15, REG_RDI, REG_RSI, REG_RBP, REG_RBX, REG_RDX, REG_RAX, REG_RCX}};
+    const uint64_t values[15] = {{0x108,0x109,0x110,0x111,0x112,0x113,0x114,0x115,
+        0x101,0x102,0x103,0x104,0x105,0,0x107}};
+    int result = 1;
+    if (info->si_signo != SIGSEGV || info->si_code != SEGV_MAPERR || info->si_addr) result = 2;
+    if ((uintptr_t)registers[REG_RIP] != (uintptr_t)&read_fault) result = 3;
+    if ((uintptr_t)registers[REG_RSP] != expected_sp - {offset:#x}) result = 4;
+    for (int index = 0; index != 15; ++index)
+        if ((uint64_t)registers[indices[index]] != values[index]) result = 5;
+    if (!((ucontext_t *)context)->uc_mcontext.fpregs ||
+        memcmp((unsigned char *)((ucontext_t *)context)->uc_mcontext.fpregs + 160 + 15 * 16,
+            vector_input, 16)) result = 6;
+    __atomic_store_n(&child_result, result, __ATOMIC_SEQ_CST);
+    syscall(SYS_exit, 0);
+}}
+
+{handler}    if (syscall(SYS_gettid) != getpid()) thread_child(info, context);
+"#,
+        offset = HOST_THREAD_CHILD_STACK_OFFSET,
+    );
+    let resumed = "    if (write(1, \"resumed\\n\", 8) != 8) return 91;\n";
+    let wait = r#"    for (long spin = 0; !__atomic_load_n(&child_result, __ATOMIC_SEQ_CST); ++spin) {
+        if (spin == 10000000) return 97;
+        sched_yield();
+    }
+    if (child_result != 1) return 100 + child_result;
+    if (write(1, "child\n", 6) != 6) return 99;
+"#;
+    assert_eq!(PAGE_ZERO_FAULT_CONTEXT_SOURCE.matches(handler).count(), 1);
+    assert_eq!(PAGE_ZERO_FAULT_CONTEXT_SOURCE.matches(resumed).count(), 1);
+    PAGE_ZERO_FAULT_CONTEXT_SOURCE
+        .replacen(
+            "#include <unistd.h>\n",
+            "#include <unistd.h>\n#include <sched.h>\n#include <sys/syscall.h>\n",
+            1,
+        )
+        .replacen(handler, &child, 1)
+        .replacen(resumed, &format!("{resumed}{wait}"), 1)
+}
+
+/// Injects CLONE_THREAD from the page-fault signal hook, for a backend whose
+/// threads are host-owned.
+#[derive(Clone, Copy, Debug, Default)]
+struct HostThreadFaultTool;
+
+#[reverie::tool]
+impl Tool for HostThreadFaultTool {
+    type GlobalState = PageFaultInjectionLog;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &bool) -> Subscription {
+        Subscription::none()
+    }
+
+    async fn handle_thread_start<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), reverie::Error> {
+        guest
+            .send_rpc((0, guest.pid().as_raw() as u64, guest.tid().as_raw() as u64))
+            .await;
+        Ok(())
+    }
+
+    async fn handle_structured_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        event: SignalEvent,
+    ) -> Result<Option<SignalEvent>, Errno> {
+        assert_eq!(event.signal(), libc::SIGSEGV);
+        let registers = guest.regs().await;
+        assert_eq!(registers.orig_rax, u64::MAX);
+        assert_eq!((registers.cs, registers.ss), (0x23, 0x1b));
+        guest.send_rpc((1, 0, 0)).await;
+        let request = Syscall::from_raw(
+            Sysno::clone,
+            SyscallArgs::new(
+                (libc::CLONE_VM
+                    | libc::CLONE_FS
+                    | libc::CLONE_FILES
+                    | libc::CLONE_SIGHAND
+                    | libc::CLONE_THREAD) as usize,
+                (registers.rsp - HOST_THREAD_CHILD_STACK_OFFSET) as usize,
+                0,
+                0,
+                0,
+                0,
+            ),
+        );
+        assert!(guest.inject(request).await? > 0);
+        assert_eq!(guest.regs().await, registers);
+        Ok(Some(event))
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: Pid,
+        global: &G,
+        _state: (),
+        status: ExitStatus,
+    ) -> Result<(), reverie::Error> {
+        global.send_rpc((2, status.into_raw() as u64, 0)).await;
+        Ok(())
+    }
+}
+
+/// A host-owned CLONE_THREAD injected from a real page-fault signal hook: the
+/// child really runs with the interrupted context (RAX 0, its own stack) and
+/// exits, and the parent's handler still sees its exact faulting context and
+/// resumes.
+#[test]
+fn page_fault_hook_returning_host_thread_preserves_context() {
+    let name = "page_fault_hook_returning_host_thread_preserves_context";
+    if !kvm_available(name) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(&directory.0, name, &host_thread_fault_source());
+    let image = std::fs::read(&executable).unwrap();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend.set_thread_ownership(ThreadOwnership::Host);
+    backend
+        .install_static_elf_with_context(
+            &image,
+            &[executable.to_str().unwrap(), "read", "caught", "kvm"],
+            &["PATH=/usr/bin:/bin"],
+            &directory.0,
+        )
+        .unwrap();
+    let (log, status, stdout, stderr) = futures::executor::block_on(
+        backend.run_static_elf_with_tool::<HostThreadFaultTool>(false, true),
+    )
+    .unwrap();
+    assert_eq!(status, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, b"before\ncaught\nresumed\nchild\n");
+    assert!(stderr.is_empty(), "{stderr:?}");
+    assert_eq!(log.faults.load(Ordering::SeqCst), 1);
+    // The host-owned child runs uninstrumented: only the parent starts and
+    // exits through the Tool.
+    assert_eq!(log.starts.lock().unwrap().len(), 1);
+    assert_eq!(*log.exits.lock().unwrap(), vec![0]);
+}
+
 #[derive(Default, Debug)]
 struct PageFaultFilterLog {
     events: Mutex<Vec<Vec<u8>>>,
