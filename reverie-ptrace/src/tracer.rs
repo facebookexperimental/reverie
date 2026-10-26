@@ -5821,7 +5821,105 @@ mod tests {
         });
         &PAYLOAD
     }
+    /// How a test guest creates the thread that execs.
+    #[derive(Clone, Copy)]
+    enum GuestExecThread {
+        /// `std::thread::spawn`, i.e. glibc `pthread_create` and `clone3`.
+        Std,
+        /// A raw `clone(CLONE_THREAD)` (`spawn_raw_exec_thread`). Under
+        /// AddressSanitizer, `pthread_create` holds the runtime's
+        /// thread-argument lock across `clone3` and the new thread takes it
+        /// before running its body, so a leader that a test keeps stopped
+        /// after the clone keeps a `std` exec thread from ever exec'ing.
+        RawClone,
+    }
+
+    /// Starts the guest's exec thread: `std_body` on a `std` thread, or
+    /// `raw_body(raw_arg)` on a raw clone. The original tests keep `std`;
+    /// their `_raw_clone` twins differ only in this.
+    fn spawn_guest_exec_thread<F: FnOnce() + Send + 'static>(
+        thread: GuestExecThread,
+        raw_body: extern "C" fn(*mut libc::c_void) -> libc::c_int,
+        raw_arg: usize,
+        std_body: F,
+    ) {
+        match thread {
+            GuestExecThread::Std => {
+                std::thread::spawn(std_body);
+            }
+            GuestExecThread::RawClone => {
+                drop(std_body);
+                spawn_raw_exec_thread(raw_body, raw_arg as *mut libc::c_void);
+            }
+        }
+    }
+
+    /// Runs `body(arg)` on a new thread of the calling (guest) process made
+    /// by a raw `clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+    /// CLONE_THREAD | CLONE_SYSVSEM)` on a leaked stack. Without
+    /// `CLONE_SETTLS` the thread shares the leader's TLS, so `body` must not
+    /// touch Rust TLS, allocate, panic or assert: it may only load an atomic
+    /// through a raw pointer, `execv` and `_exit`.
+    fn spawn_raw_exec_thread(
+        body: extern "C" fn(*mut libc::c_void) -> libc::c_int,
+        arg: *mut libc::c_void,
+    ) {
+        let stack = Box::leak(vec![0u128; 4096].into_boxed_slice());
+        // SAFETY: one past the end of the leaked allocation.
+        let top = unsafe { stack.as_mut_ptr().add(stack.len()) }.cast::<libc::c_void>();
+        let flags = libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM;
+        // SAFETY: `body` obeys the raw-thread contract above.
+        let tid = unsafe { libc::clone(body, top, flags, arg) };
+        assert!(tid > 0, "raw clone of the exec thread failed");
+    }
+
+    /// Raw exec-thread body: `execv(arg, [arg])`, else `_exit(127)`. `arg` is
+    /// a NUL-terminated path that outlives the guest.
+    extern "C" fn raw_exec_payload(arg: *mut libc::c_void) -> libc::c_int {
+        let path = arg as *const libc::c_char;
+        let args = [path, std::ptr::null()];
+        // SAFETY: `path` is a static C string; `args` is NULL-terminated.
+        unsafe {
+            libc::execv(path, args.as_ptr());
+            libc::_exit(127)
+        }
+    }
+
+    /// Raw exec-thread body: when `arg` is non-null, spin until the
+    /// `AtomicUsize` it points to is nonzero; then
+    /// `execv("/bin/sh", ["/bin/sh", "-c", "printf survived"])`, else
+    /// `_exit(127)`.
+    extern "C" fn raw_wait_then_exec_sh(arg: *mut libc::c_void) -> libc::c_int {
+        if !arg.is_null() {
+            let word = arg as *const std::sync::atomic::AtomicUsize;
+            // SAFETY: a word shared with the tracer that outlives the guest.
+            while unsafe { (*word).load(Ordering::SeqCst) } == 0 {
+                std::hint::spin_loop();
+            }
+        }
+        let args = [
+            c"/bin/sh".as_ptr(),
+            c"-c".as_ptr(),
+            c"printf survived".as_ptr(),
+            std::ptr::null(),
+        ];
+        // SAFETY: static C strings; `args` is NULL-terminated.
+        unsafe {
+            libc::execv(c"/bin/sh".as_ptr(), args.as_ptr());
+            libc::_exit(127)
+        }
+    }
+
     async fn ordinary_exec_owner_control(fail: bool, timer_mode: u8) {
+        ordinary_exec_owner_control_with(fail, timer_mode, GuestExecThread::Std).await;
+    }
+
+    async fn ordinary_exec_owner_control_with(fail: bool, timer_mode: u8, thread: GuestExecThread) {
         let marker_observations = Arc::new(StdMutex::new(Vec::new()));
         crate::timer::EXEC_SIGNAL_OBSERVATIONS
             .with(|slot| *slot.borrow_mut() = Some(marker_observations.clone()));
@@ -5831,9 +5929,15 @@ mod tests {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(3);
         let payload = (timer_mode == 0 || timer_mode >= 3).then(fatal_exec_timer_payload);
+        // A raw exec thread runs only timer mode 0's body: exec the payload.
+        assert!(
+            matches!(thread, GuestExecThread::Std) || (timer_mode == 0 && payload.is_some()),
+            "a raw-clone exec thread runs only timer mode 0"
+        );
+        let raw_payload = payload.map_or(0, |payload| payload.as_ptr() as usize);
         let tracer = spawn_fn_with_config::<ExecOwnerTool, _>(
             move || {
-                std::thread::spawn(move || {
+                spawn_guest_exec_thread(thread, raw_exec_payload, raw_payload, move || {
                     if timer_mode >= 3 {
                         let mut signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
                         unsafe {
@@ -6863,9 +6967,17 @@ mod tests {
     /// including exactly one on_exit_thread for the old leader's state with
     /// Exited(0), and exactly one stop was retired.
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        reverie_asan,
+        ignore = "AddressSanitizer build (cfg reverie_asan): ASan's pthread_create interceptor holds its thread-argument lock across clone3, so the guest's std::thread cannot exec while LeaderStepExitHold keeps the leader stopped after the clone; the _raw_clone twin runs every assertion; not a product pass"
+    )]
     async fn ordinary_nonleader_exec_retires_leader_step_stop_queued_before_exit() {
+        nonleader_exec_retires_leader_step_stop_queued_before_exit(GuestExecThread::Std).await;
+    }
+
+    async fn nonleader_exec_retires_leader_step_stop_queued_before_exit(thread: GuestExecThread) {
         let hold = LeaderStepExitHoldGuard::arm();
-        ordinary_exec_owner_control(false, 0).await;
+        ordinary_exec_owner_control_with(false, 0, thread).await;
         hold.assert_step_stop_was_queued_before_exit();
         let terminal = hold
             .0
@@ -6886,7 +6998,15 @@ mod tests {
     /// one stop is retired and the run Completes with the real
     /// Signaled(SIGKILL) that the kernel reported after it.
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        reverie_asan,
+        ignore = "AddressSanitizer build (cfg reverie_asan): ASan's pthread_create interceptor holds its thread-argument lock across clone3, so the guest's std::thread cannot exec while LeaderStepExitHold keeps the leader stopped after the clone; the _raw_clone twin runs every assertion; not a product pass"
+    )]
     async fn ordinary_nonleader_exec_killed_exit_resume_retires_leader_step_stop() {
+        nonleader_exec_killed_exit_resume_retires_leader_step_stop(GuestExecThread::Std).await;
+    }
+
+    async fn nonleader_exec_killed_exit_resume_retires_leader_step_stop(thread: GuestExecThread) {
         struct Clear;
         impl Drop for Clear {
             fn drop(&mut self) {
@@ -6902,7 +7022,7 @@ mod tests {
         FATAL_REAP_CHRONOLOGY.with(|slot| *slot.borrow_mut() = Some((Vec::new(), 0)));
         let tracer = spawn_fn_with_config::<ExecOwnerTool, _>(
             || {
-                std::thread::spawn(|| {
+                spawn_guest_exec_thread(thread, raw_wait_then_exec_sh, 0, || {
                     let args = [
                         c"/bin/sh".as_ptr(),
                         c"-c".as_ptr(),
@@ -7436,6 +7556,10 @@ mod tests {
     /// leader's exit stop gets its one GETEVENTMSG and its one resume, and
     /// nothing more is issued for that TID by the terminal path.
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        reverie_asan,
+        ignore = "AddressSanitizer build (cfg reverie_asan): ASan's pthread_create interceptor holds its thread-argument lock across clone3, so the guest's std::thread cannot exec while LeaderStepExitHold keeps the leader stopped after the clone; the _raw_clone twin runs every assertion; not a product pass"
+    )]
     async fn ordinary_unexpected_nonexit_stop_after_exit_resume_fails_once_without_reentry() {
         unexpected_nonexit_stops_after_exit_resume(false, false).await;
     }
@@ -7446,6 +7570,10 @@ mod tests {
     /// groups, the second is only drained. Neither gets a GETEVENTMSG or a
     /// resume.
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        reverie_asan,
+        ignore = "AddressSanitizer build (cfg reverie_asan): ASan's pthread_create interceptor holds its thread-argument lock across clone3, so the guest's std::thread cannot exec while LeaderStepExitHold keeps the leader stopped after the clone; the _raw_clone twin runs every assertion; not a product pass"
+    )]
     async fn ordinary_two_unexpected_nonexit_stops_after_exit_resume_fail_once_without_reentry() {
         unexpected_nonexit_stops_after_exit_resume(true, false).await;
     }
@@ -7461,14 +7589,73 @@ mod tests {
     /// dead Exec is retired, the exit stop behind it is resumed once, and
     /// the run Completes with the one unexpected-stop failure.
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        reverie_asan,
+        ignore = "AddressSanitizer build (cfg reverie_asan): ASan's pthread_create interceptor holds its thread-argument lock across clone3, so the guest's std::thread cannot exec while LeaderStepExitHold keeps the leader stopped after the clone; the _raw_clone twin runs every assertion; not a product pass"
+    )]
     async fn ordinary_unexpected_nonexit_stop_with_exec_reported_before_the_kill_fails_once() {
         unexpected_nonexit_stops_after_exit_resume(false, true).await;
     }
 
     /// As above with two stale stops.
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        reverie_asan,
+        ignore = "AddressSanitizer build (cfg reverie_asan): ASan's pthread_create interceptor holds its thread-argument lock across clone3, so the guest's std::thread cannot exec while LeaderStepExitHold keeps the leader stopped after the clone; the _raw_clone twin runs every assertion; not a product pass"
+    )]
     async fn ordinary_two_unexpected_nonexit_stops_with_exec_reported_before_the_kill_fail_once() {
         unexpected_nonexit_stops_after_exit_resume(true, true).await;
+    }
+
+    /// The six LeaderStepExitHold exit-stop tests with the guest's exec thread
+    /// made by a raw clone (`GuestExecThread::RawClone`) instead of
+    /// `std::thread::spawn`: same hold, controls, deadlines and assertions.
+    /// They run in every build, including AddressSanitizer, where the
+    /// originals are ignored.
+    mod raw_clone {
+        use super::*;
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn ordinary_nonleader_exec_retires_leader_step_stop_queued_before_exit() {
+            nonleader_exec_retires_leader_step_stop_queued_before_exit(GuestExecThread::RawClone)
+                .await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn ordinary_nonleader_exec_killed_exit_resume_retires_leader_step_stop() {
+            nonleader_exec_killed_exit_resume_retires_leader_step_stop(GuestExecThread::RawClone)
+                .await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn ordinary_unexpected_nonexit_stop_after_exit_resume_fails_once_without_reentry() {
+            unexpected_nonexit_stops_after_exit_resume_with(
+                false,
+                false,
+                GuestExecThread::RawClone,
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn ordinary_two_unexpected_nonexit_stops_after_exit_resume_fail_once_without_reentry()
+        {
+            unexpected_nonexit_stops_after_exit_resume_with(true, false, GuestExecThread::RawClone)
+                .await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn ordinary_unexpected_nonexit_stop_with_exec_reported_before_the_kill_fails_once() {
+            unexpected_nonexit_stops_after_exit_resume_with(false, true, GuestExecThread::RawClone)
+                .await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn ordinary_two_unexpected_nonexit_stops_with_exec_reported_before_the_kill_fail_once()
+         {
+            unexpected_nonexit_stops_after_exit_resume_with(true, true, GuestExecThread::RawClone)
+                .await;
+        }
     }
 
     /// The interleavings of the group SIGKILL with the exec thread, told
@@ -7488,6 +7675,19 @@ mod tests {
     async fn unexpected_nonexit_stops_after_exit_resume(
         second_step: bool,
         force_exec_report: bool,
+    ) {
+        unexpected_nonexit_stops_after_exit_resume_with(
+            second_step,
+            force_exec_report,
+            GuestExecThread::Std,
+        )
+        .await;
+    }
+
+    async fn unexpected_nonexit_stops_after_exit_resume_with(
+        second_step: bool,
+        force_exec_report: bool,
+        thread: GuestExecThread,
     ) {
         struct Clear;
         impl Drop for Clear {
@@ -7517,7 +7717,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         let tracer = spawn_fn_with_config::<ExecOwnerTool, _>(
             move || {
-                std::thread::spawn(move || {
+                spawn_guest_exec_thread(thread, raw_wait_then_exec_sh, release, move || {
                     if release != 0 {
                         // Wait until the hold has queued the second step stop.
                         let word = unsafe { &*(release as *const std::sync::atomic::AtomicUsize) };

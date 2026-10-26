@@ -240,6 +240,10 @@ fn kernel_verdict(filter: &Filter, ip: u64) -> u32 {
 /// ENOSYS, and `SECCOMP_RET_ALLOW` returns the pid. The probes include
 /// `0x7100_0006` and addresses above the range in the same 4 GiB half.
 #[test]
+#[cfg_attr(
+    reverie_asan,
+    ignore = "AddressSanitizer build (cfg reverie_asan): ASan reserves [0x7fff7000, 0x10007fff8000), so MAP_FIXED_NOREPLACE of a probe stub page there fails with EEXIST; the feasible assertions run in the interpreter, low-page and high-memory tests; not a product pass"
+)]
 fn plain_ip_range_verdicts_match_the_kernel_witness() {
     let filter = seccomp_filter(&Subscription::all(), false);
     let all = insns(&filter);
@@ -277,6 +281,10 @@ fn plain_ip_range_verdicts_match_the_kernel_witness() {
 /// on the same page. (These are the plain-filter probes of the deleted
 /// trap-only slot rule test.)
 #[test]
+#[cfg_attr(
+    reverie_asan,
+    ignore = "AddressSanitizer build (cfg reverie_asan): ASan reserves [0x7fff7000, 0x10007fff8000), so MAP_FIXED_NOREPLACE of a probe stub page there fails with EEXIST; the feasible assertions run in the interpreter, low-page and high-memory tests; not a product pass"
+)]
 fn kernel_allows_every_ip_under_the_filter_for_no_syscalls() {
     let filter = seccomp_filter(&Subscription::none(), false);
     let program = insns(&filter);
@@ -289,6 +297,170 @@ fn kernel_allows_every_ip_under_the_filter_for_no_syscalls() {
         0x7100_0002,
         0x7100_000a,
     ] {
+        let interpreted = run(&program, 39, AUDIT_ARCH_X86_64, ip);
+        let kernel = kernel_verdict(&filter, ip);
+        if (interpreted, kernel) != (RET_ALLOW, RET_ALLOW) {
+            rows.push(format!(
+                "ip {ip:#x}: expected {RET_ALLOW:#x}, interpreter {interpreted:#x}, kernel {kernel:#x}"
+            ));
+        }
+    }
+    assert!(rows.is_empty(), "wrong verdicts:\n{}", rows.join("\n"));
+}
+
+/// The interpreter half of `plain_ip_range_verdicts_match_the_kernel_witness`:
+/// the same seven probes and expected verdicts without the kernel witness, so
+/// it also runs where the witness cannot map its stub pages (AddressSanitizer
+/// reserves [0x7fff7000, 0x10007fff8000)).
+#[test]
+fn plain_ip_range_interpreter_verdicts() {
+    let all = insns(&seccomp_filter(&Subscription::all(), false));
+    let mut rows = Vec::new();
+    for ip in [
+        0x7100_0001u64,
+        0x7100_0002,
+        0x7100_0003,
+        0x7100_0006,
+        0x7100_000a,
+        0x8000_0002,
+        0x2_0000_0002,
+    ] {
+        let expected = if ip == 0x7100_0002 {
+            RET_ALLOW
+        } else {
+            RET_TRACE
+        };
+        let interpreted = run(&all, 39, AUDIT_ARCH_X86_64, ip);
+        if interpreted != expected {
+            rows.push(format!(
+                "ip {ip:#x}: expected {expected:#x}, interpreter {interpreted:#x}"
+            ));
+        }
+    }
+    assert!(rows.is_empty(), "wrong verdicts:\n{}", rows.join("\n"));
+}
+
+/// `plain_ip_range_verdicts_match_the_kernel_witness` over its probes whose
+/// stub pages lie below AddressSanitizer's shadow (0x7fff7000), with the same
+/// assertion: the interpreter and the kernel both give the expected verdict.
+#[test]
+fn plain_ip_range_low_page_verdicts_match_the_kernel_witness() {
+    let filter = seccomp_filter(&Subscription::all(), false);
+    let all = insns(&filter);
+    let mut rows = Vec::new();
+    for ip in [
+        0x7100_0001u64,
+        0x7100_0002,
+        0x7100_0003,
+        0x7100_0006,
+        0x7100_000a,
+    ] {
+        let expected = if ip == 0x7100_0002 {
+            RET_ALLOW
+        } else {
+            RET_TRACE
+        };
+        let interpreted = run(&all, 39, AUDIT_ARCH_X86_64, ip);
+        let kernel = kernel_verdict(&filter, ip);
+        if (interpreted, kernel) != (expected, expected) {
+            rows.push(format!(
+                "ip {ip:#x}: expected {expected:#x}, interpreter {interpreted:#x}, kernel {kernel:#x}"
+            ));
+        }
+    }
+    assert!(rows.is_empty(), "wrong verdicts:\n{}", rows.join("\n"));
+}
+
+/// The interpreter half of
+/// `kernel_allows_every_ip_under_the_filter_for_no_syscalls`: the same six
+/// probes, each allowed, without the kernel witness.
+#[test]
+fn interpreter_allows_every_ip_under_the_filter_for_no_syscalls() {
+    let program = insns(&seccomp_filter(&Subscription::none(), false));
+    let mut rows = Vec::new();
+    for ip in [
+        0x7100_0006u64,
+        0x7100_0005,
+        0x7100_0007,
+        0x1_7100_0006,
+        0x7100_0002,
+        0x7100_000a,
+    ] {
+        let interpreted = run(&program, 39, AUDIT_ARCH_X86_64, ip);
+        if interpreted != RET_ALLOW {
+            rows.push(format!(
+                "ip {ip:#x}: expected {RET_ALLOW:#x}, interpreter {interpreted:#x}"
+            ));
+        }
+    }
+    assert!(rows.is_empty(), "wrong verdicts:\n{}", rows.join("\n"));
+}
+
+/// `kernel_allows_every_ip_under_the_filter_for_no_syscalls` over its probes
+/// whose stub pages lie below AddressSanitizer's shadow (0x7fff7000), with the
+/// same assertion: the interpreter and the kernel both allow `getpid`.
+#[test]
+fn kernel_allows_every_low_page_ip_under_the_filter_for_no_syscalls() {
+    let filter = seccomp_filter(&Subscription::none(), false);
+    let program = insns(&filter);
+    let mut rows = Vec::new();
+    for ip in [
+        0x7100_0006u64,
+        0x7100_0005,
+        0x7100_0007,
+        0x7100_0002,
+        0x7100_000a,
+    ] {
+        let interpreted = run(&program, 39, AUDIT_ARCH_X86_64, ip);
+        let kernel = kernel_verdict(&filter, ip);
+        if (interpreted, kernel) != (RET_ALLOW, RET_ALLOW) {
+            rows.push(format!(
+                "ip {ip:#x}: expected {RET_ALLOW:#x}, interpreter {interpreted:#x}, kernel {kernel:#x}"
+            ));
+        }
+    }
+    assert!(rows.is_empty(), "wrong verdicts:\n{}", rows.join("\n"));
+}
+
+/// The high 32-bit half of the plain filter's untraced range, from stub pages
+/// in high application memory (above AddressSanitizer's shadow, which ends at
+/// 0x10007fff8000, and ordinary user memory in every build): `0x1001_7100_0002`
+/// has the range's low word with a high word set and `0x1002_0000_0002` is
+/// another high address; both are traced, by the interpreter and the kernel,
+/// with the assertion of `plain_ip_range_verdicts_match_the_kernel_witness`.
+#[test]
+fn plain_ip_range_high_memory_verdicts_match_the_kernel_witness() {
+    let filter = seccomp_filter(&Subscription::all(), false);
+    let all = insns(&filter);
+    let mut rows = Vec::new();
+    for ip in [0x1001_7100_0002u64, 0x1002_0000_0002] {
+        let expected = if ip == 0x7100_0002 {
+            RET_ALLOW
+        } else {
+            RET_TRACE
+        };
+        let interpreted = run(&all, 39, AUDIT_ARCH_X86_64, ip);
+        let kernel = kernel_verdict(&filter, ip);
+        if (interpreted, kernel) != (expected, expected) {
+            rows.push(format!(
+                "ip {ip:#x}: expected {expected:#x}, interpreter {interpreted:#x}, kernel {kernel:#x}"
+            ));
+        }
+    }
+    assert!(rows.is_empty(), "wrong verdicts:\n{}", rows.join("\n"));
+}
+
+/// `kernel_allows_every_ip_under_the_filter_for_no_syscalls` from a stub page
+/// in high application memory: `0x1001_7100_0006`, the low 32 bits of the
+/// patch helper's former slot return with a high word set, is allowed by the
+/// interpreter and the kernel.
+#[test]
+fn kernel_allows_a_high_memory_ip_under_the_filter_for_no_syscalls() {
+    let filter = seccomp_filter(&Subscription::none(), false);
+    let program = insns(&filter);
+    let mut rows = Vec::new();
+    {
+        let ip = 0x1001_7100_0006u64;
         let interpreted = run(&program, 39, AUDIT_ARCH_X86_64, ip);
         let kernel = kernel_verdict(&filter, ip);
         if (interpreted, kernel) != (RET_ALLOW, RET_ALLOW) {

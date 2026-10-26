@@ -731,13 +731,15 @@ mod tests {
         );
     }
 
-    /// The kernel agrees with `run` and with `begin <= ip < end`: a child
-    /// maps a `syscall; ret` stub so that the syscall's return address is
-    /// exactly `ip`, installs `ip_range(begin, end, Errno(EXDEV))` and calls
-    /// `getppid` through the stub.
+    /// The kernel's verdict on `getppid` from return address `ip` under
+    /// `ip_range(begin, end, Errno(EXDEV))` must equal the interpreter's (`run`)
+    /// and `begin <= ip < end`, for every `(begin, end, ips)` case. A child maps
+    /// a `syscall; ret` stub (MAP_FIXED_NOREPLACE) so that the syscall's return
+    /// address is exactly `ip`, installs the filter and calls `getppid` through
+    /// the stub. Shared by every kernel ip_range test so their checks cannot
+    /// drift.
     #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn kernel_ip_range_verdicts_match_the_interpreter() {
+    fn assert_kernel_ip_range_verdicts_match_the_interpreter(cases: &[(u64, u64, &[u64])]) {
         use crate::seccomp::Action;
         use crate::seccomp::FilterBuilder;
 
@@ -805,26 +807,7 @@ mod tests {
         }
 
         let (mut unfaithful, mut wrong) = (Vec::new(), Vec::new());
-        for (begin, end, ips) in [
-            (
-                0x7100_0002u64,
-                0x7100_0003u64,
-                &[
-                    0x7100_0001u64,
-                    0x7100_0002,
-                    0x7100_0003,
-                    0x7200_0002,
-                    0x7fff_ffff,
-                    0xffff_ffff,
-                    0x1_7100_0002,
-                ][..],
-            ),
-            (
-                0xffff_f000,
-                0x1_0000_1000,
-                &[0xffff_efff, 0xffff_f000, 0x1_0000_0fff, 0x1_0000_1000][..],
-            ),
-        ] {
+        for &(begin, end, ips) in cases {
             let built = FilterBuilder::new()
                 .default_action(Action::Allow)
                 .ip_range(begin, end, Action::Errno(Errno::EXDEV))
@@ -853,5 +836,76 @@ mod tests {
             "kernel verdicts outside the interval:\n{}",
             wrong.join("\n")
         );
+    }
+
+    /// The kernel agrees with `run` and with `begin <= ip < end`: a child
+    /// maps a `syscall; ret` stub so that the syscall's return address is
+    /// exactly `ip`, installs `ip_range(begin, end, Errno(EXDEV))` and calls
+    /// `getppid` through the stub.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[cfg_attr(
+        reverie_asan,
+        ignore = "AddressSanitizer build (cfg reverie_asan): ASan reserves [0x7fff7000, 0x10007fff8000), so MAP_FIXED_NOREPLACE of the stub page at 0x7ffff000 fails with EEXIST; kernel_ip_range_low_page_verdicts_match_the_interpreter and kernel_ip_range_high_memory_verdicts_match_the_interpreter run its low-page probes and their high-memory counterparts; not a product pass"
+    )]
+    fn kernel_ip_range_verdicts_match_the_interpreter() {
+        assert_kernel_ip_range_verdicts_match_the_interpreter(&[
+            (
+                0x7100_0002u64,
+                0x7100_0003u64,
+                &[
+                    0x7100_0001u64,
+                    0x7100_0002,
+                    0x7100_0003,
+                    0x7200_0002,
+                    0x7fff_ffff,
+                    0xffff_ffff,
+                    0x1_7100_0002,
+                ][..],
+            ),
+            (
+                0xffff_f000,
+                0x1_0000_1000,
+                &[0xffff_efff, 0xffff_f000, 0x1_0000_0fff, 0x1_0000_1000][..],
+            ),
+        ]);
+    }
+
+    /// `kernel_ip_range_verdicts_match_the_interpreter` over its probes whose
+    /// stub pages lie below AddressSanitizer's shadow (0x7fff7000), with the
+    /// same assertions: the kernel agrees with `run` and with
+    /// `begin <= ip < end`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kernel_ip_range_low_page_verdicts_match_the_interpreter() {
+        assert_kernel_ip_range_verdicts_match_the_interpreter(&[(
+            0x7100_0002u64,
+            0x7100_0003u64,
+            &[0x7100_0001u64, 0x7100_0002, 0x7100_0003, 0x7200_0002][..],
+        )]);
+    }
+
+    /// The high 32-bit half of the kernel's ip_range comparison, from stub pages
+    /// in high application memory (above AddressSanitizer's shadow, which ends at
+    /// 0x10007fff8000, and ordinary user memory in every build): an IP with the
+    /// low word of `[0x7100_0002, 0x7100_0003)` and a high word set is outside
+    /// it, and a range that straddles the 0x1002_0000_0000 high-word boundary
+    /// holds exactly its interval, by the same assertions.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kernel_ip_range_high_memory_verdicts_match_the_interpreter() {
+        assert_kernel_ip_range_verdicts_match_the_interpreter(&[
+            (0x7100_0002u64, 0x7100_0003u64, &[0x1001_7100_0002u64][..]),
+            (
+                0x1001_ffff_f000,
+                0x1002_0000_1000,
+                &[
+                    0x1001_ffff_efff,
+                    0x1001_ffff_f000,
+                    0x1002_0000_0fff,
+                    0x1002_0000_1000,
+                ][..],
+            ),
+        ]);
     }
 }

@@ -154,11 +154,17 @@ fn rt_sigreturn_is_traced_only_for_a_tool_that_observes_sigreturns() {
 const TAG_LIBC: u64 = 0x7fff_0001;
 const TAG_LOW: u64 = 0x7fff_0002;
 const TAG_HIGH: u64 = 0x7fff_0003;
+const TAG_HIGH_MEMORY: u64 = 0x7fff_0004;
 
 /// Pages mapped by the guest, in the part of the low 4 GiB the old filter let
 /// through untraced (`[0x7100_0002, 0xffff_ffff]`).
 const LOW_PAGE: u64 = 0x7200_0000;
 const HIGH_PAGE: u64 = 0xffff_e000;
+/// A page in high application memory (above AddressSanitizer's shadow, which
+/// ends at 0x10007fff8000, and ordinary user memory in every build) whose low
+/// 32 bits are HIGH_PAGE's, so only the high word keeps its calls out of the
+/// old untraced window.
+const HIGH_MEMORY_PAGE: u64 = 0x1001_ffff_e000;
 
 const EXIT_MAP_FAILED: i32 = 71;
 
@@ -237,6 +243,10 @@ fn getpgid_from_page(page: u64, tag: u64) -> i64 {
 /// `0xffff_e000`; the tool must observe both, as it observes the ordinary
 /// libc call.
 #[test]
+#[cfg_attr(
+    reverie_asan,
+    ignore = "AddressSanitizer build (cfg reverie_asan): ASan reserves [0x7fff7000, 0x10007fff8000), so the guest cannot map HIGH_PAGE 0xffff_e000 (MAP_FIXED_NOREPLACE fails with EEXIST); subscribed_syscalls_from_libc_and_low_guest_code_are_traced runs the libc and low-page checks and subscribed_syscalls_from_libc_and_high_memory_guest_code_are_traced the high-word one; not a product pass"
+)]
 fn subscribed_syscalls_from_low_guest_code_are_traced() {
     let (output, observed) = crate::testing::test_fn::<GetpgidWatcher, _>(|| {
         let libc_ret = unsafe { libc::syscall(libc::SYS_getpgid, TAG_LIBC) };
@@ -281,4 +291,91 @@ fn subscribed_syscalls_from_low_guest_code_are_traced() {
         HIGH_PAGE + 2
     );
     assert_eq!(tagged.len(), 3, "each call observed once: {tagged:x?}");
+}
+
+/// `subscribed_syscalls_from_low_guest_code_are_traced` without its high page:
+/// a live guest issues a subscribed syscall from libc and from code at
+/// `0x7200_0000`, below AddressSanitizer's shadow (0x7fff7000), and the tool
+/// observes each exactly once.
+#[test]
+fn subscribed_syscalls_from_libc_and_low_guest_code_are_traced() {
+    let (output, observed) = crate::testing::test_fn::<GetpgidWatcher, _>(|| {
+        let libc_ret = unsafe { libc::syscall(libc::SYS_getpgid, TAG_LIBC) };
+        let low = getpgid_from_page(LOW_PAGE, TAG_LOW);
+        // No such process: each call reached the kernel (traced or not).
+        assert_eq!(libc_ret, -1);
+        assert_eq!(low, -(libc::ESRCH as i64));
+    })
+    .unwrap();
+    assert_ne!(
+        output.status,
+        ExitStatus::Exited(EXIT_MAP_FAILED),
+        "the guest could not map its stub pages"
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "guest failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let observed = observed.0.lock().unwrap().clone();
+    let tagged: Vec<(u64, u64)> = observed
+        .into_iter()
+        .filter(|(tag, _)| [TAG_LIBC, TAG_LOW, TAG_HIGH].contains(tag))
+        .collect();
+    let seen = |tag: u64, ip: Option<u64>| {
+        tagged
+            .iter()
+            .any(|&(t, rip)| t == tag && ip.is_none_or(|ip| rip == ip))
+    };
+    assert!(seen(TAG_LIBC, None), "control not traced: {tagged:x?}");
+    assert!(
+        seen(TAG_LOW, Some(LOW_PAGE + 2)),
+        "syscall returning to {:#x} escaped the tracer: {tagged:x?}",
+        LOW_PAGE + 2
+    );
+    assert_eq!(tagged.len(), 2, "each call observed once: {tagged:x?}");
+}
+
+/// A live guest issues a subscribed syscall from libc and from code at
+/// `0x1001_ffff_e000`, whose low 32 bits lie in the old untraced window, and
+/// the tool observes each exactly once.
+#[test]
+fn subscribed_syscalls_from_libc_and_high_memory_guest_code_are_traced() {
+    let (output, observed) = crate::testing::test_fn::<GetpgidWatcher, _>(|| {
+        let libc_ret = unsafe { libc::syscall(libc::SYS_getpgid, TAG_LIBC) };
+        let high = getpgid_from_page(HIGH_MEMORY_PAGE, TAG_HIGH_MEMORY);
+        // No such process: each call reached the kernel (traced or not).
+        assert_eq!(libc_ret, -1);
+        assert_eq!(high, -(libc::ESRCH as i64));
+    })
+    .unwrap();
+    assert_ne!(
+        output.status,
+        ExitStatus::Exited(EXIT_MAP_FAILED),
+        "the guest could not map its stub pages"
+    );
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "guest failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let observed = observed.0.lock().unwrap().clone();
+    let tagged: Vec<(u64, u64)> = observed
+        .into_iter()
+        .filter(|(tag, _)| [TAG_LIBC, TAG_HIGH_MEMORY].contains(tag))
+        .collect();
+    let seen = |tag: u64, ip: Option<u64>| {
+        tagged
+            .iter()
+            .any(|&(t, rip)| t == tag && ip.is_none_or(|ip| rip == ip))
+    };
+    assert!(seen(TAG_LIBC, None), "control not traced: {tagged:x?}");
+    assert!(
+        seen(TAG_HIGH_MEMORY, Some(HIGH_MEMORY_PAGE + 2)),
+        "syscall returning to {:#x} escaped the tracer: {tagged:x?}",
+        HIGH_MEMORY_PAGE + 2
+    );
+    assert_eq!(tagged.len(), 2, "each call observed once: {tagged:x?}");
 }
