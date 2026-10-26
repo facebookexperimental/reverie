@@ -180,18 +180,21 @@ pub const DEFAULT_SKID_LATENCY_BUDGET_NS: u64 = 2_000;
 
 /// On aarch64, the overflow interrupt latency that the second stage of a
 /// staged precise timer event leaves room for by default (see
-/// [`PmuConfig::stages`]). Measured on Neoverse V2 only and applied to every
-/// aarch64 core: on bare metal and in a KVM guest that passes the core
-/// through, the timer's own notifications came at most 379 RCBs past the
-/// overflow on a loop retiring about 2.1 RCBs per ns (about 180 ns; 358
+/// [`PmuConfig::stages`]). Measured on Neoverse V2 only, on bare metal and in
+/// a KVM guest that passes the core through, and untested on other cores such
+/// as Cortex-A78: the timer's own notifications came at most 379 RCBs past
+/// the overflow on a loop retiring about 2.1 RCBs per ns (about 180 ns; 358
 /// events, idle and with every CPU busy), and an overflow armed on a ptraced
-/// loop at about 3 RCBs per ns stopped at most 194 RCBs past it (about
-/// 65 ns). 400 ns is about twice the longer of the two latencies. The x86
+/// loop at about 3.3 RCBs per ns stopped at most 194 RCBs past it (about
+/// 60 ns). 400 ns is about twice the longer of the two latencies. The x86
 /// budget, sized for AMD's microsecond latency tail, put the second stage of
 /// that loop 4,200 to 4,800 RCBs short of its target, every one stepped an
-/// instruction at a time, as arm64 has no block step. Only a guest retiring
-/// more RCBs per ns than the skid margin over this budget gets a margin
-/// above the skid margin.
+/// instruction at a time, as arm64 has no block step. The budget changes a
+/// margin only where the rate times the budget exceeds the skid margin.
+/// No latency budget covers a notification that comes microseconds late or
+/// not at all, as a virtual PMU's sometimes does (seen 2,180 to 8,101 RCBs
+/// past the target in an emulator under load); such an event is reported as
+/// an overshoot.
 #[cfg(target_arch = "aarch64")]
 pub const DEFAULT_SKID_LATENCY_BUDGET_NS: u64 = 400;
 
