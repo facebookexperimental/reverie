@@ -137,7 +137,7 @@ pub enum PmuValidationError {
 pub const SINGLESTEP_TIMEOUT_RCBS: u64 = 5;
 
 /// The largest default skid margin of any processor in the PMU table
-/// (`crate::pmu::PmuProfile`, and 1000 on aarch64): that of the AMD Zen
+/// (`crate::pmu::PmuProfile`, and at most 2,700 on aarch64): that of the AMD Zen
 /// processors without a measured 1K entry. A unit test checks it against the
 /// whole table.
 pub const LARGEST_TABLE_SKID_MARGIN: u64 = 10_000;
@@ -299,19 +299,19 @@ impl PmuConfig {
     /// Creates / initializes the PMU config.
     #[cfg(target_arch = "aarch64")]
     pub fn new() -> Result<Self, PmuValidationError> {
-        // TODO:
-        //  1. Compute the microarchitecture from
-        //     `/sys/devices/system/cpu/cpu*/regs/identification/midr_el1`
-        //  2. Look up the microarchitecture in a table to determine what features
-        //     we can enable.
+        // Every Armv8 PMU implements the architectural BR_RETIRED event, and
+        // Linux's generic branch event does not map to it on every PMU driver,
+        // so the raw event is used.
         // References:
         //  - https://github.com/rr-debugger/rr/blob/master/src/PerfCounters.cc#L156
         const BR_RETIRED: u64 = 0x21;
 
-        // For now, always assume that we can get retired branch events.
+        let midrs = host_midrs();
+        let skid_margin = aarch64_skid_margin(&midrs);
+        tracing::debug!("aarch64 skid margin {skid_margin} for CPU MIDRs {midrs:x?}");
         Ok(Self {
             rcb_event: BR_RETIRED,
-            skid_margin: 1000,
+            skid_margin,
             skid_margin_override: None,
             skid_latency_budget_ns: DEFAULT_SKID_LATENCY_BUDGET_NS,
             halve_stages: HALVE_STAGES_BY_DEFAULT,
@@ -752,6 +752,74 @@ pub fn host_pmu_profile() -> Result<(), PmuValidationError> {
     PmuConfig::for_family_model(features.family_id(), features.model_id()).map(drop)
 }
 
+/// The `MIDR_EL1` of every CPU Linux lists (`cpuN`), `None` for one whose
+/// MIDR cannot be read: Linux removes an offline CPU's `regs/identification`
+/// and shows an empty `midr_el1` for one that never came up. A CPU that comes
+/// online later is not seen. A big.LITTLE host lists more than one part.
+#[cfg(target_arch = "aarch64")]
+fn host_midrs() -> Vec<Option<u64>> {
+    let Ok(cpus) = std::fs::read_dir("/sys/devices/system/cpu") else {
+        return Vec::new();
+    };
+    let is_cpu = |name: &str| {
+        name.strip_prefix("cpu")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    cpus.filter_map(Result::ok)
+        .filter(|cpu| cpu.file_name().to_str().is_some_and(is_cpu))
+        .map(|cpu| {
+            let path = cpu.path().join("regs/identification/midr_el1");
+            parse_midr(&std::fs::read_to_string(path).ok()?)
+        })
+        .collect()
+}
+
+/// A `midr_el1` file's value, which Linux prints as `0x%016llx\n`
+/// (`CPUREGS_ATTR_RO`, arch/arm64/kernel/cpuinfo.c). An empty file, for a CPU
+/// that never came up, is `None`.
+#[cfg(target_arch = "aarch64")]
+fn parse_midr(text: &str) -> Option<u64> {
+    u64::from_str_radix(text.trim().strip_prefix("0x")?, 16).ok()
+}
+
+/// The BR_RETIRED skid margin for a host whose CPUs have these `MIDR_EL1`
+/// values: the largest of their margins, where a part without a measured
+/// margin, or a MIDR that could not be read, counts as
+/// [`AARCH64_UNKNOWN_SKID_MARGIN`], as does a host with no CPUs listed.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_skid_margin(midrs: &[Option<u64>]) -> u64 {
+    const ARM: u64 = 0x41;
+    const NEOVERSE_V2: u64 = 0xd4f;
+    let part_margin = |midr: Option<u64>| match midr.map(|m| ((m >> 24) & 0xff, (m >> 4) & 0xfff)) {
+        Some((ARM, NEOVERSE_V2)) => NEOVERSE_V2_SKID_MARGIN,
+        _ => AARCH64_UNKNOWN_SKID_MARGIN,
+    };
+    midrs
+        .iter()
+        .map(|&midr| part_margin(midr))
+        .max()
+        .unwrap_or(AARCH64_UNKNOWN_SKID_MARGIN)
+}
+
+// The skid margins below were measured by arming an overflow signal on a
+// ptraced task and reading how far past the period it stopped, with periods of
+// 1e4 to 1e6 branches.
+
+/// Arm Neoverse V2: at most 194 branches, on bare metal and in a KVM guest.
+#[cfg(target_arch = "aarch64")]
+const NEOVERSE_V2_SKID_MARGIN: u64 = 1_000;
+
+/// Any other core: more than twice the largest skid measured on any core,
+/// Cortex-A78C's 1,301.
+#[cfg(target_arch = "aarch64")]
+const AARCH64_UNKNOWN_SKID_MARGIN: u64 = 2_700;
+
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(
+    NEOVERSE_V2_SKID_MARGIN <= LARGEST_TABLE_SKID_MARGIN
+        && AARCH64_UNKNOWN_SKID_MARGIN <= LARGEST_TABLE_SKID_MARGIN
+);
+
 /// Every aarch64 CPU gets a configuration ([`PmuConfig::new`]).
 #[cfg(target_arch = "aarch64")]
 pub fn host_pmu_profile() -> Result<(), PmuValidationError> {
@@ -780,4 +848,45 @@ pub fn target_reached(rcb_actual: u64, rcb_target: u64, instr_offset: u64) -> bo
     rcb_actual
         .checked_sub(rcb_target)
         .is_some_and(|past| past >= instr_offset)
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod aarch64_tests {
+    use super::*;
+
+    const NEOVERSE_V2: Option<u64> = Some(0x410f_d4f0);
+    // Cortex-A78C, which has no measured margin of its own.
+    const CORTEX_A78C: Option<u64> = Some(0x410f_d4b2);
+
+    #[test]
+    fn neoverse_v2_takes_its_measured_margin() {
+        assert_eq!(
+            aarch64_skid_margin(&[NEOVERSE_V2; 4]),
+            NEOVERSE_V2_SKID_MARGIN
+        );
+    }
+
+    #[test]
+    fn a_host_with_several_parts_takes_the_largest_margin() {
+        assert_eq!(
+            aarch64_skid_margin(&[NEOVERSE_V2, CORTEX_A78C, NEOVERSE_V2]),
+            AARCH64_UNKNOWN_SKID_MARGIN
+        );
+    }
+
+    #[test]
+    fn an_unread_cpu_or_no_cpus_take_the_unknown_margin() {
+        assert_eq!(
+            aarch64_skid_margin(&[NEOVERSE_V2, None]),
+            AARCH64_UNKNOWN_SKID_MARGIN
+        );
+        assert_eq!(aarch64_skid_margin(&[]), AARCH64_UNKNOWN_SKID_MARGIN);
+    }
+
+    #[test]
+    fn a_midr_parses_as_linux_prints_it() {
+        assert_eq!(parse_midr("0x00000000410fd4f0\n"), NEOVERSE_V2);
+        assert_eq!(parse_midr(""), None);
+        assert_eq!(parse_midr("410fd4f0\n"), None);
+    }
 }
