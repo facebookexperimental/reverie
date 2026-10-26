@@ -1152,11 +1152,12 @@ fn segv_ignored(task: &Stopped) -> Option<bool> {
         .map(|ignored| ignored & SIGSEGV_BIT != 0)
 }
 
-/// What `unblock_sigtrap_for_step_with` did before a Reverie single-step.
+/// What `unblock_sigtrap_for_step_known` did before a Reverie single-step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StepShield {
     /// Nothing: SIGTRAP is not blocked, or a temporary mask's restore is
-    /// pending, which a mask write would discard (`swaps_signal_mask`).
+    /// pending, which a mask write would discard (`swaps_signal_mask`), and
+    /// the step is not one `unblock_sigtrap_for_timer_step` shields anyway.
     None,
     /// SIGTRAP was unblocked, to be blocked again at the step's stop.
     Unblocked,
@@ -1168,14 +1169,9 @@ enum StepShield {
 }
 
 /// Unblocks SIGTRAP for one Reverie single-step (`sigtrap_state`'s shield),
-/// with the mask `PTRACE_GETSIGMASK` reported. procfs is read only when
-/// SIGTRAP is blocked.
-fn unblock_sigtrap_for_step_with(task: &Stopped, mask: u64) -> Result<StepShield, TraceError> {
-    unblock_sigtrap_for_step_known(task, mask, None)
-}
-
-/// `unblock_sigtrap_for_step_with`, with `known` the procfs state read for
-/// this same stop, if it was (`TracedTask::injection_proc_state`).
+/// with the mask `PTRACE_GETSIGMASK` reported, and `known` the procfs state
+/// read for this same stop, if it was (`TracedTask::injection_proc_state`).
+/// procfs is read only when SIGTRAP is blocked.
 fn unblock_sigtrap_for_step_known(
     task: &Stopped,
     mask: u64,
@@ -1198,8 +1194,49 @@ fn unblock_sigtrap_for_step_known(
     Ok(StepShield::Unblocked)
 }
 
+/// `unblock_sigtrap_for_step_known` for a timer step, which also shields a
+/// step taken while a temporary mask's restore is pending. The step resumes
+/// the thread with no signal, and the kernel performs the restore on its way
+/// back to the guest, before the step's instruction (`restore_saved_sigmask`
+/// in the signal-delivery path). So the trap meets the saved mask, `mask`,
+/// unless a signal that the temporary mask admits is delivered first. Where
+/// none is pending, `mask` without SIGTRAP is written now: the write does what
+/// the restore would have done, minus SIGTRAP, which the step's stop puts
+/// back, and it discards the restore, which then has nothing left to do.
+/// Where one is pending (`SIGSTOP` included, whose group stop natively keeps
+/// the temporary mask), the kernel delivers it under the temporary mask
+/// first, and the step is left unshielded as before. So it is too unless
+/// every mask-swapping call stops the step at its seccomp stop
+/// (`restore_shield`): where the interrupted call is restarted, the step's
+/// instruction is that call, which run untraced inside the step would take
+/// the shielded mask, without SIGTRAP, as its own restore target. As for the
+/// pending-SIGTRAP check, a signal sent from outside the guest between the
+/// procfs read and the resume is not seen.
+fn unblock_sigtrap_for_timer_step(
+    task: &Stopped,
+    mask: u64,
+    restore_shield: bool,
+) -> Result<StepShield, TraceError> {
+    if mask & SIGTRAP_BIT == 0 {
+        return Ok(StepShield::None);
+    }
+    let state = ProcSignalState::read(task)?;
+    if state.pending & SIGTRAP_BIT != 0 {
+        return Ok(StepShield::PendingTrap);
+    }
+    if state.blocked != mask {
+        if !restore_shield || state.pending & !state.blocked != 0 {
+            return Ok(StepShield::None);
+        }
+        #[cfg(test)]
+        TIMER_STEP_RESTORE_SHIELDS_FOR_TEST.fetch_add(1, Ordering::SeqCst);
+    }
+    set_sigmask(task, mask & !SIGTRAP_BIT)?;
+    Ok(StepShield::Unblocked)
+}
+
 /// Blocks SIGTRAP again at the stop a step shielded by
-/// `unblock_sigtrap_for_step_with` ended at, keeping any other change the stepped
+/// `unblock_sigtrap_for_step_known` ended at, keeping any other change the stepped
 /// instruction made to the mask.
 fn reblock_sigtrap_after_step(wait: &Wait) -> Result<(), TraceError> {
     if let Wait::Stopped(stopped, _) = wait {
@@ -1216,6 +1253,10 @@ struct TimerStepShield {
     /// Whether SIGTRAP is ignored for this sequence, read once at its start
     /// (`TracedTask::sigtrap_ignored`).
     ignored: bool,
+    /// Whether every mask-swapping call stops a step at its seccomp stop, as
+    /// for `quiet`: then a step at a pending mask restore is shielded
+    /// (`unblock_sigtrap_for_timer_step`).
+    restore_shield: bool,
     /// Whether no step of this sequence can reset SIGTRAP: it is neither
     /// ignored nor blocked at the start, and a step can change neither,
     /// because every syscall that could stops the step at its seccomp stop
@@ -1239,8 +1280,8 @@ struct TimerStepShield {
 }
 
 impl TimerStepShield {
-    /// Before a step: shield SIGTRAP as `unblock_sigtrap_for_step_with` does, or,
-    /// for a guest `rt_sigreturn`, in the frame it restores.
+    /// Before a step: shield SIGTRAP as `unblock_sigtrap_for_timer_step` does,
+    /// or, for a guest `rt_sigreturn`, in the frame it restores.
     fn prepare(&mut self, task: &Stopped) -> Result<(), TraceError> {
         if self.quiet {
             self.stepped = true;
@@ -1274,7 +1315,7 @@ impl TimerStepShield {
             self.stepped = true;
             return Ok(());
         }
-        match unblock_sigtrap_for_step_with(task, mask)? {
+        match unblock_sigtrap_for_timer_step(task, mask, self.restore_shield)? {
             StepShield::None => {}
             StepShield::Unblocked => self.reblock = true,
             StepShield::PendingTrap => {
@@ -3736,6 +3777,13 @@ pub(crate) type PreSyscallForTest = Arc<
 static STEP_COUNTS_GLOBAL: std::sync::Mutex<std::collections::BTreeMap<i32, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Timer steps shielded at a pending mask restore
+/// (`unblock_sigtrap_for_timer_step`), counted for the test that must know
+/// that case ran.
+#[cfg(test)]
+pub(crate) static TIMER_STEP_RESTORE_SHIELDS_FOR_TEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Timer sequences whose single-steps ran (`drive_timer`), counted for
 /// tests that must know a sequence stepped: the per-thread step count
 /// (`record_step_for_test`) counts only `step_stopped`'s steps.
@@ -6175,15 +6223,18 @@ impl<L: Tool + 'static> TracedTask<L> {
         // `pre_exec` installs, when pre-init sealed its repair page
         // (`seal_sigtrap_scratch`, which refuses otherwise), and the guest
         // installs none later under the contract.
-        let quiet = !filtered
-            && !sigtrap_ignored
+        let syscalls_stop = !filtered
             && self.global_state.traces_signal_state_syscalls
-            && self.global_state.reports_sigreturns
             && self.global_state.seccomp_filter_baseline == Some(1)
-            && self.sigtrap_scratch_state.load(Ordering::SeqCst) == SCRATCH_SEALED
+            && self.sigtrap_scratch_state.load(Ordering::SeqCst) == SCRATCH_SEALED;
+        let quiet = syscalls_stop
+            && !sigtrap_ignored
+            && self.global_state.reports_sigreturns
             && sigmask(&task)? & SIGTRAP_BIT == 0;
         let shield = Arc::new(StdMutex::new(TimerStepShield {
             ignored: sigtrap_ignored,
+            restore_shield: syscalls_stop
+                && (!cfg!(target_arch = "x86_64") || x32_syscalls_refused()),
             quiet,
             ..TimerStepShield::default()
         }));
@@ -11368,7 +11419,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
-    /// `unblock_sigtrap_for_step_with` before the Reverie single-step at `site`.
+    /// `unblock_sigtrap_for_step_known` before the Reverie single-step at `site`.
     /// Returns whether SIGTRAP was unblocked, to be blocked again at the
     /// step's stop; ends the run with the named failure
     /// `PendingSigtrapAtStep` when a blocked SIGTRAP is pending.

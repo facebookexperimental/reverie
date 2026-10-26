@@ -1290,8 +1290,16 @@ impl Tool for GuestTool {
             }
             _ => {}
         }
-        if signal == reverie::Signal::SIGWINCH {
-            // Suppressed: the interrupted call restarts.
+        if signal == reverie::Signal::SIGURG {
+            // `sigtrap_pending_restore_timer`: a short precise timer, whose
+            // artificial notification is taken at this stop's pending mask
+            // restore once SIGURG is suppressed.
+            guest
+                .set_timer_precise(reverie::TimerSchedule::Rcbs(3))
+                .expect("arm the precise timer");
+        }
+        if matches!(signal, reverie::Signal::SIGWINCH | reverie::Signal::SIGURG) {
+            // Suppressed: an interrupted call restarts, or returns EINTR.
             Ok(None)
         } else {
             Ok(Some(signal))
@@ -4773,6 +4781,55 @@ async fn sigtrap_state_survives_timer_steps() {
         );
     }
     panic!("no run in {ATTEMPTS} stepped all five timer sequences");
+}
+
+/// A timer sequence's first step taken while a temporary mask's restore is
+/// pending keeps a caught SIGTRAP that the guest blocks
+/// (`unblock_sigtrap_for_timer_step`). The guest's `epoll_pwait` returns
+/// EINTR at once with its restore pending, and the Tool arms a short precise
+/// timer from the interrupting signal's callback, whose artificial
+/// notification is taken at that same stop. Resuming for the first step
+/// performs the restore before the step's instruction, so without the shield
+/// the trap met the guest's mask, which blocks SIGTRAP, reset the handler to
+/// `SIG_DFL` and unblocked it. In the tail configuration, where the guest's
+/// own wait runs in place. (This module runs on x86-64; the shield's code is
+/// the same on aarch64.)
+#[tokio::test(flavor = "current_thread")]
+async fn a_timer_step_at_a_pending_restore_keeps_a_blocked_sigtrap() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    let shields = || crate::task::TIMER_STEP_RESTORE_SHIELDS_FOR_TEST.load(Ordering::SeqCst);
+    let before = shields();
+    let run = run_guest("sigtrap_pending_restore_timer", true).await;
+    assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+    assert!(
+        !timer_events(&run).is_empty(),
+        "no timer event: {}",
+        run.report
+    );
+    // The global count may include other tests' steps; it shows at least
+    // that the case ran.
+    assert!(
+        shields() > before,
+        "no timer step was shielded at a pending restore: {}",
+        run.report
+    );
+    let lines: Vec<&str> = run
+        .report
+        .lines()
+        .filter(|line| line.starts_with("pending-restore-timer "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "pending-restore-timer r=eintr sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=1"
+        ],
+        "{}",
+        run.report
+    );
 }
 
 /// A caught, blocked SIGTRAP survives a timer step over a guest

@@ -2658,6 +2658,46 @@ static void quiet_usr1(int sig) {
   (void)sig;
 }
 
+/* A timer sequence whose first step is taken while a temporary mask's
+ * restore is pending. SIGURG is blocked and pending before an epoll_pwait
+ * whose temporary mask admits it, so the wait returns EINTR at once with the
+ * restore pending (an EINTR from epoll_pwait is not restarted). The Tool
+ * suppresses SIGURG and arms a short precise timer from its callback, whose
+ * artificial notification is taken at that same pending restore. Resuming
+ * for the first step performs the restore, so the step's trap meets the
+ * guest's mask, which blocks a caught SIGTRAP. */
+static void mode_sigtrap_pending_restore_timer(void) {
+  warm();
+  struct sigaction urg;
+  memset(&urg, 0, sizeof urg);
+  urg.sa_handler = quiet_usr1;
+  if (sigaction(SIGURG, &urg, NULL) != 0)
+    die("install SIGURG");
+  int ep = epoll_create1(0);
+  if (ep < 0)
+    die("epoll_create1");
+  sigtrap_set(trap_handler, 1);
+  sigset_t urg_set;
+  sigemptyset(&urg_set);
+  sigaddset(&urg_set, SIGURG);
+  if (sigprocmask(SIG_BLOCK, &urg_set, NULL) != 0)
+    die("block SIGURG");
+  raise(SIGURG);
+  uint64_t admit_all = 0;
+  struct epoll_event event;
+  long r = syscall(SYS_epoll_pwait, ep, &event, 1, 1000, &admit_all, 8);
+  int err = errno;
+  for (volatile int j = 0; j < 64; j++)
+    ;
+  char tag[64];
+  snprintf(tag, sizeof tag, "pending-restore-timer r=%s",
+           r == -1 && err == EINTR ? "eintr" : "other");
+  sigtrap_full_state(tag);
+  if (sigprocmask(SIG_UNBLOCK, &urg_set, NULL) != 0)
+    die("unblock SIGURG");
+  close(ep);
+}
+
 /* SIGTRAP's state across a mask-swapping wait that a handled SIGUSR1
  * interrupts, injected on the private page (SHAPE_PRIVATE_CALL). SIGUSR1 is
  * blocked and pending before the call, so the wait returns at once with its
@@ -5112,6 +5152,8 @@ int main(int argc, char** argv) {
     mode_sigtrap_ppoll_hold_then_read();
   else if (!strcmp(m, "sigtrap_callback_restore"))
     mode_sigtrap_callback_restore();
+  else if (!strcmp(m, "sigtrap_pending_restore_timer"))
+    mode_sigtrap_pending_restore_timer();
   else if (!strcmp(m, "sigtrap_caught_blocked_injections"))
     mode_sigtrap_caught_blocked_injections();
   else if (!strcmp(m, "sigtrap_caught_blocked_no_repair"))
