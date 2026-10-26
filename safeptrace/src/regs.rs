@@ -36,3 +36,57 @@ pub struct FpRegs {
 mod xstate_pkru;
 #[cfg(target_arch = "x86_64")]
 pub use xstate_pkru::XStatePkruError;
+
+/// One breakpoint register pair of a thread's hardware breakpoints:
+/// `struct user_hwdebug_state`'s `dbg_regs` entry
+/// (arch/arm64/include/uapi/asm/ptrace.h).
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub struct HwBreakpoint {
+    /// The address of the instruction the breakpoint matches.
+    pub addr: u64,
+    /// The breakpoint control register (DBGBCR) value: bit 0 enables it.
+    pub ctrl: u32,
+    pad: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl HwBreakpoint {
+    /// An enabled breakpoint on the A64 instruction at `addr`, matched at
+    /// EL0: byte address select 0b1111, privilege EL0, enabled.
+    pub fn at(addr: u64) -> Self {
+        Self {
+            addr,
+            ctrl: (0b1111 << 5) | (0b10 << 1) | 1,
+            pad: 0,
+        }
+    }
+
+    /// Whether the breakpoint is enabled.
+    pub fn enabled(&self) -> bool {
+        self.ctrl & 1 != 0
+    }
+}
+
+/// A thread's hardware breakpoints, `NT_ARM_HW_BREAK`'s
+/// `struct user_hwdebug_state`.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct HwBreakpoints {
+    dbg_info: u32,
+    pad: u32,
+    /// The breakpoint registers. Only the first [`HwBreakpoints::slots`]
+    /// exist in hardware.
+    pub regs: [HwBreakpoint; 16],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl HwBreakpoints {
+    /// How many breakpoint registers the hardware has: the low byte of
+    /// `dbg_info`.
+    pub fn slots(&self) -> usize {
+        usize::from(self.dbg_info as u8).min(self.regs.len())
+    }
+}

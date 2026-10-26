@@ -6296,6 +6296,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                 StepUnit::Instruction => lease.step(None),
                 #[cfg(target_arch = "x86_64")]
                 StepUnit::Block => lease.block_step(),
+                // The hardware breakpoints at the run's stop points are armed.
+                #[cfg(target_arch = "aarch64")]
+                StepUnit::ToBranch { .. } => lease.resume(None),
             }
         };
         let observe_shield = Arc::clone(&shield);

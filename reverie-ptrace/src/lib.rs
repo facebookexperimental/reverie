@@ -39,6 +39,8 @@
 #![cfg_attr(feature = "nightly", feature(internal_output_capture))]
 
 mod backend;
+#[cfg(any(test, target_arch = "aarch64"))]
+mod branch_step;
 mod capture;
 mod children;
 mod cp;

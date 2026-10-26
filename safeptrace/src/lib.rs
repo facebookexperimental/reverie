@@ -564,6 +564,11 @@ impl Event {
     }
 }
 
+/// `NT_ARM_HW_BREAK` (include/uapi/linux/elf.h): a thread's hardware
+/// breakpoint registers.
+#[cfg(target_arch = "aarch64")]
+const NT_ARM_HW_BREAK: i32 = 0x402;
+
 /// `ptrace(request, pid, 0, sig)` for a resuming request, with the signal as a
 /// raw number so that one `nix` cannot name can be delivered.
 /// `PTRACE_SINGLEBLOCK` (arch/x86/include/uapi/asm/ptrace-abi.h), which the
@@ -1326,9 +1331,16 @@ impl Stopped {
     }
 
     fn setregset<T>(&self, which: i32, regs: &T) -> Result<(), Error> {
+        self.setregset_prefix(which, regs, core::mem::size_of::<T>())
+    }
+
+    /// Like `setregset`, writing only the first `len` bytes of `regs`, for a
+    /// regset whose kernel side takes a prefix, such as `NT_ARM_HW_BREAK`.
+    fn setregset_prefix<T>(&self, which: i32, regs: &T, len: usize) -> Result<(), Error> {
+        assert!(len <= core::mem::size_of::<T>());
         let iov = libc::iovec {
             iov_base: regs as *const _ as *mut _,
-            iov_len: core::mem::size_of::<T>(),
+            iov_len: len,
         };
 
         self.1
@@ -1661,6 +1673,34 @@ impl Stopped {
     pub fn set_syscall(&self, nr: i32) -> Result<(), Error> {
         const NT_ARM_SYSTEM_CALL: i32 = 0x404;
         self.setregset(NT_ARM_SYSTEM_CALL, &nr)
+    }
+
+    /// Reads this thread's ptrace hardware breakpoints (`NT_ARM_HW_BREAK`).
+    /// Breakpoints the thread holds through `perf_event_open` do not appear
+    /// here, though they take hardware slots.
+    #[cfg(target_arch = "aarch64")]
+    pub fn hw_breakpoints(&self) -> Result<HwBreakpoints, Error> {
+        self.getregset(NT_ARM_HW_BREAK)
+    }
+
+    /// Writes the first `count` breakpoint registers of `breakpoints` to
+    /// this thread (`NT_ARM_HW_BREAK`), leaving the others as they are.
+    /// Linux registers each written register as a ptrace breakpoint, in
+    /// order, and stops at the first that fails, so a failed write may have
+    /// applied in part. Writing one the hardware lacks, or more than the
+    /// slots that other breakpoints of the thread leave free, fails
+    /// (`ENOSPC` or `EINVAL`). A registered breakpoint keeps its hardware
+    /// slot, enabled or not, until the thread execs or exits.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_hw_breakpoints(
+        &self,
+        breakpoints: &HwBreakpoints,
+        count: usize,
+    ) -> Result<(), Error> {
+        let count = count.min(breakpoints.regs.len());
+        let len = core::mem::offset_of!(HwBreakpoints, regs)
+            + count * core::mem::size_of::<HwBreakpoint>();
+        self.setregset_prefix(NT_ARM_HW_BREAK, breakpoints, len)
     }
 
     /// Gets info about the signal that caused the process to be stopped.

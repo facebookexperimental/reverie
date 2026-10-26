@@ -105,6 +105,10 @@ pub struct PreciseTimerSteps {
     pub instruction: u64,
     /// Block steps (`PTRACE_SINGLEBLOCK`).
     pub block: u64,
+    /// Branch runs to a hardware breakpoint, on aarch64.
+    pub branch: u64,
+    /// Branch runs whose counter moved by more branches than decoded.
+    pub branch_mismatches: u64,
     /// Block bounds found in the cache, with their code unchanged.
     pub bound_hits: u64,
     /// Block bounds decoded afresh.
@@ -117,6 +121,8 @@ impl std::ops::Sub for PreciseTimerSteps {
         Self {
             instruction: self.instruction - earlier.instruction,
             block: self.block - earlier.block,
+            branch: self.branch - earlier.branch,
+            branch_mismatches: self.branch_mismatches - earlier.branch_mismatches,
             bound_hits: self.bound_hits - earlier.bound_hits,
             bound_misses: self.bound_misses - earlier.bound_misses,
         }
@@ -129,14 +135,17 @@ pub fn precise_timer_steps() -> PreciseTimerSteps {
     PreciseTimerSteps {
         instruction: crate::timer::INSTRUCTION_STEPS.load(Relaxed),
         block: crate::timer::BLOCK_STEPS.load(Relaxed),
+        branch: crate::timer::BRANCH_RUNS.load(Relaxed),
+        branch_mismatches: crate::timer::BRANCH_RUN_MISMATCHES.load(Relaxed),
         bound_hits: crate::timer::BLOCK_BOUND_HITS.load(Relaxed),
         bound_misses: crate::timer::BLOCK_BOUND_MISSES.load(Relaxed),
     }
 }
 
-/// Makes this process's timers take block steps toward precise targets where
-/// the decoded bound allows (`enabled`, the default), or only single
-/// instruction steps, as `REVERIE_BLOCK_STEP=0` does. For a test that compares
+/// Makes this process's timers take block steps (x86_64) or branch runs
+/// (aarch64) toward precise targets where the decode allows (`enabled`, the
+/// default), or only single instruction steps, as `REVERIE_BLOCK_STEP=0`
+/// does. For a test that compares
 /// the two in one process; it affects every timer in the process.
 pub fn set_block_steps(enabled: bool) {
     crate::timer::BLOCK_STEPS_OFF_FOR_TESTS.store(!enabled, std::sync::atomic::Ordering::Relaxed);
