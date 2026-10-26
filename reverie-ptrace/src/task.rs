@@ -1266,6 +1266,19 @@ struct TimerStepShield {
     /// (`GlobalState::traces_signal_state_syscalls`). Then nothing is read or
     /// written per step.
     quiet: bool,
+    /// As `quiet`, where a guest `rt_sigreturn` runs without a seccomp stop
+    /// (`GlobalState::reports_sigreturns` is false, as on aarch64): nothing
+    /// is read or written per step but the registers, until a step's
+    /// instruction is an `rt_sigreturn` (`sigreturn_frame_mask_address`),
+    /// which restores a mask from its frame. That step and every later one
+    /// take the full shield. Sound only while each resume runs one
+    /// instruction, or on x86-64 a block that holds no `syscall`
+    /// (`decode_block_bound`), so that only its first instruction can be an
+    /// `rt_sigreturn`; a resume that can run further must not use it. On
+    /// x86-64 the kernel must also refuse x32 syscalls, whose `rt_sigreturn`
+    /// and `rt_sigprocmask` are neither traced nor decoded
+    /// (`x32_syscalls_refused`).
+    quiet_unless_sigreturn: bool,
     /// Whether any step of the sequence ran.
     stepped: bool,
     /// Whether a step ran an instruction that raises its own SIGTRAP, whose
@@ -1290,6 +1303,16 @@ impl TimerStepShield {
             self.stepped = true;
             return Ok(());
         }
+        if self.quiet_unless_sigreturn {
+            let regs = task.getregs()?;
+            if sigreturn_frame_mask_address(task, &regs)?.is_none() {
+                self.stepped = true;
+                return Ok(());
+            }
+            self.quiet_unless_sigreturn = false;
+        }
+        #[cfg(test)]
+        TIMER_STEP_SHIELD_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
         let regs = task.getregs()?;
         // A guest `int3` (or `int 3`, `int1`, behind any prefixes) resets a
         // blocked or ignored SIGTRAP natively, and natively the process then
@@ -3988,6 +4011,18 @@ thread_local! {
     pub(crate) static UNSTEPPED_INJECTIONS_FOR_TEST: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
 
+    /// The timer steps that read SIGTRAP's state for their shield
+    /// (`TimerStepShield::prepare` past its quiet cases). Per thread, as
+    /// above.
+    pub(crate) static TIMER_STEP_SHIELD_READS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// The injections whose SIGTRAP state was read before their step
+    /// (`read_sigtrap_before_injection` past its quiet case). Per thread, as
+    /// above.
+    pub(crate) static SIGTRAP_INJECTION_READS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
     /// The repairs of SIGSEGV after an rdtsc or cpuid trap
     /// (`restore_segv_after_trap`): one per mask bit set again and one per
     /// action written back. Per thread, as above.
@@ -6421,6 +6456,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         // (`seal_sigtrap_scratch`, which refuses otherwise), and the guest
         // installs none later under the contract. An unsealed page counts
         // only while its canary is intact.
+        //
+        // Where a guest `rt_sigreturn` runs without a stop (aarch64, or a Tool
+        // that does not observe sigreturns), a step can restore a mask only
+        // by running one, which its registers and instruction show before
+        // the step, so only those are read per step until one does: on
+        // aarch64 every step read the mask, about one `PTRACE_GETSIGMASK` per
+        // resume of a preemption-heavy guest.
         let syscalls_stop = !filtered
             && self.global_state.traces_signal_state_syscalls
             && self.global_state.seccomp_filter_baseline == Some(1)
@@ -6429,15 +6471,17 @@ impl<L: Tool + 'static> TracedTask<L> {
                 SCRATCH_UNSEALED => scratch_canary_intact(task.pid()),
                 _ => false,
             };
-        let quiet = syscalls_stop
-            && !sigtrap_ignored
-            && self.global_state.reports_sigreturns
-            && sigmask(&task)? & SIGTRAP_BIT == 0;
+        let quiet_but_sigreturns =
+            !sigtrap_ignored && syscalls_stop && sigmask(&task)? & SIGTRAP_BIT == 0;
+        let quiet = quiet_but_sigreturns && self.global_state.reports_sigreturns;
         let shield = Arc::new(StdMutex::new(TimerStepShield {
             ignored: sigtrap_ignored,
             restore_shield: syscalls_stop
                 && (!cfg!(target_arch = "x86_64") || x32_syscalls_refused()),
             quiet,
+            quiet_unless_sigreturn: quiet_but_sigreturns
+                && !quiet
+                && (!cfg!(target_arch = "x86_64") || x32_syscalls_refused()),
             ..TimerStepShield::default()
         }));
         let step_shield = Arc::clone(&shield);
@@ -13567,20 +13611,21 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.injection_installs_caught = false;
         self.step_choice = None;
         // The quiet case, without procfs: a syscall that keeps the mask, with
-        // SIGTRAP unblocked in the guest's mask and its action `SIG_DFL`
-        // (neither ignored nor caught, `sigtrap_disposition_known`), and the
-        // call not setting SIGTRAP's action. The step's trap then resets
-        // nothing the guest keeps: the action is already `SIG_DFL`, and a
-        // temporary mask still to be restored (procfs `SigBlk`, unread here)
-        // gives way to the saved mask, which does not block SIGTRAP. Not
-        // read either: a pending SIGTRAP that such a temporary mask blocks,
-        // which the step would take as its trap, as it did before the keep.
-        // A Tool's polling loop of injections made two procfs reads each.
+        // no temporary mask's restore pending, SIGTRAP unblocked in the
+        // guest's mask and not ignored (`sigtrap_disposition_known`), and the
+        // call not setting SIGTRAP's action. The kernel then blocks under the
+        // guest's mask, and the step's trap, forced with the current handler,
+        // resets SIGTRAP's action only if it is blocked or ignored
+        // (`force_sig_info_to_task`), so it resets nothing here: neither
+        // `SIG_DFL` nor a caught handler, which Android's debuggerd installs
+        // in every process. A Tool's polling loop of injections made two
+        // procfs reads each, and every injection with a caught SIGTRAP read
+        // its signal mask and queues.
         if kind == StepKind::KeepsMask
             && !self.restore_maybe_pending
             && mask & SIGTRAP_BIT == 0
             && !sets_sigtrap_action(nr, args)
-            && self.sigtrap_disposition_known(&task)? == (false, false)
+            && !self.sigtrap_disposition_known(&task)?.0
         {
             return Ok((
                 task,
@@ -13598,6 +13643,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                 },
             ));
         }
+        #[cfg(test)]
+        SIGTRAP_INJECTION_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
         // With no temporary mask's restore possibly pending, the kernel blocks
         // under the guest's mask, the disposition is the remembered one, and
         // a pending SIGTRAP is in one of the two signal queues
