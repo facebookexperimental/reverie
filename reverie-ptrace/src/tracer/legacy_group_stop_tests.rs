@@ -166,6 +166,152 @@ fn block_fixture_sigcont() {
     );
 }
 
+/// A failed fixture initialization (the child exits before its readiness
+/// byte, or never sends it) closes the parent's pipe ends and leaves no child:
+/// it is killed and reaped within the bound.
+#[test]
+fn unready_fixture_failure_closes_its_pipes_and_reaps_its_child() {
+    for hang in [false, true] {
+        let mut ready = [-1; 2];
+        let mut start = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::pipe2(start.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let pid = match unsafe { unistd::fork() }.unwrap() {
+            ForkResult::Child => unsafe {
+                libc::close(ready[0]);
+                if hang {
+                    loop {
+                        libc::pause();
+                    }
+                }
+                libc::_exit(122)
+            },
+            ForkResult::Parent { child } => Pid::from_raw(child.as_raw()),
+        };
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(start[0]);
+        }
+        let mut unready = UnreadyFixture {
+            pid,
+            ready: ready[0],
+            start: start[1],
+            armed: true,
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let error = unready.await_ready(deadline).unwrap_err();
+        assert!(
+            error.contains(if hang {
+                "did not get ready"
+            } else {
+                "exited before"
+            }),
+            "{error}"
+        );
+        assert!(
+            Instant::now() < deadline + Duration::from_secs(1),
+            "{error}"
+        );
+        drop(unready);
+        assert_eq!(unsafe { libc::fcntl(ready[0], libc::F_GETFD) }, -1);
+        assert_eq!(unsafe { libc::fcntl(start[1], libc::F_GETFD) }, -1);
+        assert_eq!(
+            unsafe { libc::waitpid(pid.as_raw(), std::ptr::null_mut(), libc::WNOHANG) },
+            -1,
+            "fixture child {pid} was not reaped"
+        );
+        assert_eq!(Errno::last(), Errno::ECHILD);
+    }
+}
+
+/// A forked fixture root that has not yet reported ready, with the parent's
+/// ends of its readiness and start pipes. Until `into_ready` hands the child on,
+/// dropping this closes both ends and kills and reaps the child, waiting at
+/// most `FIXTURE_REAP_BOUND` for the reap.
+struct UnreadyFixture {
+    pid: Pid,
+    ready: libc::c_int,
+    start: libc::c_int,
+    armed: bool,
+}
+
+const FIXTURE_REAP_BOUND: Duration = Duration::from_secs(3);
+
+impl UnreadyFixture {
+    /// Waits until `deadline` for the child's readiness byte, retrying
+    /// interrupted calls against the same deadline.
+    fn await_ready(&mut self, deadline: Instant) -> Result<(), String> {
+        let pid = self.pid;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!("fixture root {pid} did not get ready in time"));
+            }
+            let mut query = libc::pollfd {
+                fd: self.ready,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = left.as_millis().clamp(1, i32::MAX as u128) as i32;
+            match unsafe { libc::poll(&mut query, 1, timeout) } {
+                1 => break,
+                0 => continue,
+                _ if Errno::last() == Errno::EINTR => continue,
+                _ => return Err(format!("polling fixture root {pid}: {}", Errno::last())),
+            }
+        }
+        let mut byte = 0u8;
+        loop {
+            match unsafe { libc::read(self.ready, (&mut byte as *mut u8).cast(), 1) } {
+                1 => return Ok(()),
+                0 => {
+                    return Err(format!(
+                        "fixture root {pid} exited before it led its own process group"
+                    ));
+                }
+                _ if Errno::last() == Errno::EINTR && Instant::now() < deadline => continue,
+                _ => return Err(format!("reading fixture root {pid}: {}", Errno::last())),
+            }
+        }
+    }
+
+    /// The ready child, now owned by the caller with the parent's start-pipe
+    /// end.
+    fn into_ready(mut self) -> Pid {
+        self.armed = false;
+        unsafe { libc::close(self.ready) };
+        self.pid
+    }
+}
+
+impl Drop for UnreadyFixture {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        unsafe {
+            libc::close(self.ready);
+            libc::close(self.start);
+            libc::kill(self.pid.as_raw(), libc::SIGKILL);
+        }
+        let deadline = Instant::now() + FIXTURE_REAP_BOUND;
+        while Instant::now() < deadline {
+            let reaped =
+                unsafe { libc::waitpid(self.pid.as_raw(), std::ptr::null_mut(), libc::WNOHANG) };
+            if reaped == self.pid.as_raw() || (reaped < 0 && Errno::last() != Errno::EINTR) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GroupFixtureAttach {
     Traceme,
@@ -188,12 +334,28 @@ async fn group_fixture_root(method: GroupFixtureAttach, forks: bool) -> Stopped 
         unsafe { libc::pipe2(start.as_mut_ptr(), libc::O_CLOEXEC) },
         0
     );
+    // The child reports here once it leads its own process group with SIGCONT
+    // blocked. Until then it is in the test harness's process group. When the
+    // harness leads its own session, that group is orphaned, and Linux
+    // discards SIGTSTP, SIGTTIN and SIGTTOU sent to a member of an orphaned
+    // group: a job-control signal delivered before setpgid would never stop
+    // the fixture. So the parent attaches only after this report.
+    let mut ready = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
     let root = match unsafe { unistd::fork() }.unwrap() {
         ForkResult::Child => {
+            unsafe { libc::close(ready[0]) };
             if unsafe { libc::setpgid(0, 0) } != 0 {
                 unsafe { libc::_exit(124) };
             }
             block_fixture_sigcont();
+            if unsafe { libc::write(ready[1], c"r".as_ptr().cast(), 1) } != 1 {
+                unsafe { libc::_exit(123) };
+            }
+            unsafe { libc::close(ready[1]) };
             unsafe { libc::close(start[1]) };
             if method == GroupFixtureAttach::Traceme {
                 safeptrace::traceme_and_stop().unwrap();
@@ -229,6 +391,18 @@ async fn group_fixture_root(method: GroupFixtureAttach, forks: bool) -> Stopped 
         ForkResult::Parent { child } => Pid::from_raw(child.as_raw()),
     };
     unsafe { libc::close(start[0]) };
+    unsafe { libc::close(ready[1]) };
+    let mut unready = UnreadyFixture {
+        pid: root,
+        ready: ready[0],
+        start: start[1],
+        armed: true,
+    };
+    if let Err(error) = unready.await_ready(Instant::now() + Duration::from_secs(3)) {
+        drop(unready);
+        panic!("{error}");
+    }
+    let root = unready.into_ready();
     let running = match method {
         GroupFixtureAttach::Traceme => Running::new_on_ptracer_thread(root).unwrap(),
         GroupFixtureAttach::Attach => Running::attach_on_ptracer_thread(root).unwrap(),
