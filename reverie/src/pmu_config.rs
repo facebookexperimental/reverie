@@ -805,9 +805,16 @@ fn aarch64_skid_margin(midrs: &[Option<u64>]) -> u64 {
 // ptraced task and reading how far past the period it stopped, with periods of
 // 1e4 to 1e6 branches.
 
-/// Arm Neoverse V2: at most 194 branches, on bare metal and in a KVM guest.
+/// Arm Neoverse V2: about twice the largest skid seen. On bare metal an
+/// overflow armed on a ptraced loop stopped at most 194 branches past its
+/// period (1,200 samples, idle and with every CPU busy), and the timer's own
+/// events overshot by at most 245 with a margin of 1 (2,001 events over four
+/// programs). In a KVM guest whose virtual PMU reports this core, the timer's
+/// own events skidded by at most 379 (358 events, idle and loaded). Every
+/// margin step costs single steps of about four instructions each, as arm64
+/// has no block step.
 #[cfg(target_arch = "aarch64")]
-const NEOVERSE_V2_SKID_MARGIN: u64 = 1_000;
+const NEOVERSE_V2_SKID_MARGIN: u64 = 750;
 
 /// Any other core: more than twice the largest skid measured on any core,
 /// Cortex-A78C's 1,301.
