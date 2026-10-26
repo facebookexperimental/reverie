@@ -162,10 +162,11 @@ pub const SKID_MARGIN_OVERRIDE_ENV: &str = "REVERIE_SKID_MARGIN_OVERRIDE";
 
 /// The overflow interrupt latency, in nanoseconds, that the second stage of a
 /// staged precise timer event leaves room for by default (see
-/// [`PmuConfig::stages`]). Measured on AMD family 1Ah, the latency was 43 ns
-/// at the median and 185 ns at the 99th percentile, and reached about 590 ns
-/// in a noisy hour (<https://github.com/rrnewton/hermit/issues/3810>). The
-/// tail grows with contention for the guest's core. For a loop retiring
+/// [`PmuConfig::stages`]), on every architecture but aarch64. Measured on AMD
+/// family 1Ah, the latency was 43 ns at the median and 185 ns at the 99th
+/// percentile, and reached about 590 ns in a noisy hour
+/// (<https://github.com/rrnewton/hermit/issues/3810>). The tail grows with
+/// contention for the guest's core. For a loop retiring
 /// about 2.9 RCBs per ns, the largest second-stage skid in 64 to 96
 /// notifications was 134 RCBs (about 45 ns) unloaded, 823 (about 280 ns)
 /// with the SMT sibling thrashing memory, and 1,631 (about 560 ns) with three
@@ -174,7 +175,25 @@ pub const SKID_MARGIN_OVERRIDE_ENV: &str = "REVERIE_SKID_MARGIN_OVERRIDE";
 /// times by 41 to 837 RCBs: notifications 0.7 to 0.95 µs late. 2,000 ns is
 /// about twice that. Only a guest retiring more than 1 RCB per ns
 /// (the skid margin over this budget) gets a margin above the skid margin.
+#[cfg(not(target_arch = "aarch64"))]
 pub const DEFAULT_SKID_LATENCY_BUDGET_NS: u64 = 2_000;
+
+/// On aarch64, the overflow interrupt latency that the second stage of a
+/// staged precise timer event leaves room for by default (see
+/// [`PmuConfig::stages`]). Measured on Neoverse V2 only and applied to every
+/// aarch64 core: on bare metal and in a KVM guest that passes the core
+/// through, the timer's own notifications came at most 379 RCBs past the
+/// overflow on a loop retiring about 2.1 RCBs per ns (about 180 ns; 358
+/// events, idle and with every CPU busy), and an overflow armed on a ptraced
+/// loop at about 3 RCBs per ns stopped at most 194 RCBs past it (about
+/// 65 ns). 400 ns is about twice the longer of the two latencies. The x86
+/// budget, sized for AMD's microsecond latency tail, put the second stage of
+/// that loop 4,200 to 4,800 RCBs short of its target, every one stepped an
+/// instruction at a time, as arm64 has no block step. Only a guest retiring
+/// more RCBs per ns than the skid margin over this budget gets a margin
+/// above the skid margin.
+#[cfg(target_arch = "aarch64")]
+pub const DEFAULT_SKID_LATENCY_BUDGET_NS: u64 = 400;
 
 /// When set to a parseable `u64`, this env var replaces
 /// [`DEFAULT_SKID_LATENCY_BUDGET_NS`] for the whole process. `0` stages no
@@ -915,5 +934,29 @@ mod aarch64_tests {
         assert_eq!(parse_midr("0x00000000410fd4f0\n"), NEOVERSE_V2);
         assert_eq!(parse_midr(""), None);
         assert_eq!(parse_midr("410fd4f0\n"), None);
+    }
+
+    #[test]
+    fn the_second_stage_leaves_room_for_400_ns() {
+        assert_eq!(DEFAULT_SKID_LATENCY_BUDGET_NS, 400);
+        // Without any override, which would turn staging off, and with a
+        // skid margin below the budget's margin for the measured loop.
+        let config = PmuConfig {
+            skid_margin: 750,
+            skid_margin_override: None,
+            skid_latency_budget_ns: DEFAULT_SKID_LATENCY_BUDGET_NS,
+            ..PmuConfig::new().expect("every aarch64 CPU has a configuration")
+        };
+        assert!(config.stages(1_000_000));
+        // 2.1 RCBs per ns, a measured spin loop: 840 RCBs, rounded up.
+        assert_eq!(config.second_stage_margin(2_100_000, Some(1_000_000)), 840);
+        assert_eq!(config.second_stage_margin(2_100_001, Some(1_000_000)), 841);
+        // A slower loop takes the skid margin.
+        assert_eq!(config.second_stage_margin(1_000_000, Some(1_000_000)), 750);
+        // 50 RCBs per ns would need 20,000: no closer than the first stage.
+        assert_eq!(
+            config.second_stage_margin(50_000_000, Some(1_000_000)),
+            config.first_stage_margin()
+        );
     }
 }
