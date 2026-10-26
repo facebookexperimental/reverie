@@ -109,6 +109,9 @@ pub struct PreciseTimerSteps {
     pub branch: u64,
     /// Branch runs whose counter moved by more branches than decoded.
     pub branch_mismatches: u64,
+    /// Branch runs that ran a load-exclusive sequence as one unit, on
+    /// aarch64.
+    pub exclusive: u64,
     /// Block bounds found in the cache, with their code unchanged.
     pub bound_hits: u64,
     /// Block bounds decoded afresh.
@@ -123,6 +126,7 @@ impl std::ops::Sub for PreciseTimerSteps {
             block: self.block - earlier.block,
             branch: self.branch - earlier.branch,
             branch_mismatches: self.branch_mismatches - earlier.branch_mismatches,
+            exclusive: self.exclusive - earlier.exclusive,
             bound_hits: self.bound_hits - earlier.bound_hits,
             bound_misses: self.bound_misses - earlier.bound_misses,
         }
@@ -137,6 +141,7 @@ pub fn precise_timer_steps() -> PreciseTimerSteps {
         block: crate::timer::BLOCK_STEPS.load(Relaxed),
         branch: crate::timer::BRANCH_RUNS.load(Relaxed),
         branch_mismatches: crate::timer::BRANCH_RUN_MISMATCHES.load(Relaxed),
+        exclusive: crate::timer::EXCLUSIVE_RUNS.load(Relaxed),
         bound_hits: crate::timer::BLOCK_BOUND_HITS.load(Relaxed),
         bound_misses: crate::timer::BLOCK_BOUND_MISSES.load(Relaxed),
     }

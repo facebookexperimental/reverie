@@ -15,6 +15,11 @@
 //! Every instruction before it falls through to the next one, so a run that
 //! a hardware breakpoint ends there retires no branch of its own. A run that
 //! starts at a branch whose successors are known retires exactly that branch.
+//!
+//! A load-exclusive and the code up to its store-exclusive run as one unit
+//! (see [`exclusive_sequence`]): a stop between the two clears the exclusive
+//! monitor, so a store reached by single steps fails on every attempt, and a
+//! retry loop stepped that way would spin until the timer's target.
 
 /// How many A64 instructions are decoded forward from an address, at most.
 pub(crate) const STOP_WINDOW: usize = 64;
@@ -168,6 +173,119 @@ pub(crate) fn first_stop(pc: u64, code: &[u8]) -> Option<(u64, Stop)> {
         .find_map(|(word, at)| classify(u32::from_le_bytes(*word), at).map(|stop| (at, stop)))
 }
 
+/// How many instructions from a load-exclusive its store-exclusive may lie,
+/// at most, for the two to run as one unit (the window gdb's software single
+/// step uses to step over such a sequence, `aarch64_software_single_step`).
+pub(crate) const EXCLUSIVE_WINDOW: usize = 16;
+
+/// Whether `insn` is a load exclusive (LDXR, LDAXR and their byte, halfword
+/// and pair forms) or, with `load` false, a store exclusive (STXR, STLXR and
+/// theirs). The load/store exclusive group with `o2` clear, less CASP, which
+/// shares it in ARMv8.1 (`o1` set with a size below 64 bits).
+fn is_exclusive(insn: u32, load: bool) -> bool {
+    let o1 = insn & (1 << 21) != 0;
+    let pair_size = insn >> 30 >= 2;
+    insn & 0x3f80_0000 == 0x0800_0000 && (insn & (1 << 22) != 0) == load && (!o1 || pair_size)
+}
+
+/// A load-exclusive sequence that runs as one unit: from its load-exclusive
+/// to a hardware breakpoint at one of `stops[..count]`, retiring exactly
+/// `branches[i]` branches on the way to `stops[i]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExclusiveSequence {
+    pub stops: [u64; 2],
+    pub branches: [u64; 2],
+    pub count: usize,
+}
+
+impl ExclusiveSequence {
+    /// The most branches the unit retires, at any of its ends.
+    pub(crate) fn most(&self) -> u64 {
+        self.branches[..self.count]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// The sequence from the load-exclusive at `pc` to its store-exclusive, in
+/// `code`, the guest's code bytes from `pc`; `None` if `pc` is not a load
+/// exclusive or the sequence is not one that runs as a unit.
+///
+/// The store-exclusive is the first exclusive instruction after the load,
+/// within [`EXCLUSIVE_WINDOW`] instructions. Between the two there may be
+/// only instructions that fall through without a branch, trap or exclusive
+/// access ([`classify`] gives `None`), and conditional branches with encoded
+/// targets outside the sequence, as the comparison of a compare-and-swap
+/// leaves it. So the unit executes no exception-generating instruction (SVC,
+/// BRK, HVC, SMC), no system instruction other than those `classify` lets a
+/// branch run execute, and no second exclusive access.
+///
+/// The unit ends at a breakpoint just after the store, having retired
+/// every one of those branches, none taken, or at a breakpoint at the target
+/// of the one it took, having retired the branches up to and including it:
+/// each end is reached along one straight-line path, so with one exact count.
+/// The ends lie outside `[pc, store]`, so no breakpoint stops the unit
+/// between its load and its store; a branch back to the load-exclusive
+/// itself is the retry edge, which belongs after the store, not inside. A
+/// sequence is not a unit if two of its paths reach one address with
+/// different counts, or it has more than two ends, the two breakpoint
+/// registers a branch run uses.
+pub(crate) fn exclusive_sequence(pc: u64, code: &[u8]) -> Option<ExclusiveSequence> {
+    if !pc.is_multiple_of(4) {
+        return None;
+    }
+    let words = code.as_chunks::<4>().0;
+    let insn = |index: usize| words.get(index).map(|word| u32::from_le_bytes(*word));
+    if !is_exclusive(insn(0)?, true) {
+        return None;
+    }
+    // (target, branches retired on reaching it) of each conditional branch.
+    let mut exits: Vec<(u64, u64)> = Vec::new();
+    for index in 1..EXCLUSIVE_WINDOW {
+        let at = pc + 4 * index as u64;
+        let word = insn(index)?;
+        if is_exclusive(word, false) {
+            let end = at + 4;
+            let mut ends = vec![(end, exits.len() as u64)];
+            for &(target, branches) in &exits {
+                if (pc..end).contains(&target) {
+                    return None;
+                }
+                ends.push((target, branches));
+            }
+            ends.sort_unstable();
+            ends.dedup();
+            if ends.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return None;
+            }
+            return match ends[..] {
+                [(stop, branches)] => Some(ExclusiveSequence {
+                    stops: [stop, stop],
+                    branches: [branches, branches],
+                    count: 1,
+                }),
+                [(first, first_branches), (second, second_branches)] => Some(ExclusiveSequence {
+                    stops: [first, second],
+                    branches: [first_branches, second_branches],
+                    count: 2,
+                }),
+                _ => None,
+            };
+        }
+        match classify(word, at) {
+            None => {}
+            Some(Stop::Direct {
+                target,
+                conditional: true,
+            }) => exits.push((target, exits.len() as u64 + 1)),
+            Some(_) => return None,
+        }
+    }
+    None
+}
+
 /// The first two breakpoint registers that are not enabled, given whether
 /// each register the hardware has is (`enabled`); `None` with fewer than two
 /// free. An enabled register belongs to someone else (a debugger of the
@@ -260,6 +378,163 @@ mod tests {
 
     const NOP: u32 = 0xd503_201f;
     const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+
+    // Encodings checked against GNU as 2.35 (aarch64).
+    const LDXR_W: u32 = 0x885f_7c20; // ldxr w0, [x1]
+    const LDAXR_W: u32 = 0x885f_fc40; // ldaxr w0, [x2]
+    const LDXP_X: u32 = 0xc87f_0440; // ldxp x0, x1, [x2]
+    const LDXRB: u32 = 0x085f_7c20; // ldxrb w0, [x1]
+    const LDAXRH: u32 = 0x485f_fc20; // ldaxrh w0, [x1]
+    const STXR_W: u32 = 0x8811_7c41; // stxr w17, w1, [x2]
+    const STLXR_W: u32 = 0x880f_fc31; // stlxr w15, w17, [x1]
+    const STXP_X: u32 = 0xc823_0440; // stxp w3, x0, x1, [x2]
+    const STLXRB: u32 = 0x0802_fc20; // stlxrb w2, w0, [x1]
+    const STXRB: u32 = 0x0802_7c20; // stxrb w2, w0, [x1]
+    const LDXRH: u32 = 0x485f_7c20; // ldxrh w0, [x1]
+    const STXRH: u32 = 0x4802_7c20; // stxrh w2, w0, [x1]
+    const STLXRH: u32 = 0x4802_fc20; // stlxrh w2, w0, [x1]
+    const LDAXP_X: u32 = 0xc87f_8440; // ldaxp x0, x1, [x2]
+    const STLXP_X: u32 = 0xc823_8440; // stlxp w3, x0, x1, [x2]
+    const BRK: u32 = 0xd420_0000; // brk #0
+    const HVC: u32 = 0xd400_0002; // hvc #0
+    const LDAR: u32 = 0x88df_fc20; // ldar w0, [x1]
+    const STLR: u32 = 0x889f_fc20; // stlr w0, [x1]
+    const CASP: u32 = 0x0820_7c82; // casp w0, w1, w2, w3, [x4]
+    const CASPAL: u32 = 0x4860_fc82; // caspal x0, x1, x2, x3, [x4]
+    const CAS: u32 = 0x88a0_7c41; // cas w0, w1, [x2]
+    const ADD_W: u32 = 0x0b10_0011; // add w17, w0, w16
+    const CMP_W: u32 = 0x6b10_001f; // cmp w0, w16
+    const SVC: u32 = 0xd400_0001; // svc #0
+    const DMB: u32 = 0xd503_3bbf; // dmb ish
+    const CLREX: u32 = 0xd503_3f5f; // clrex
+
+    /// `b.ne .+offset`.
+    fn b_ne(offset: i32) -> u32 {
+        0x5400_0001 | ((((offset / 4) as u32) & 0x7_ffff) << 5)
+    }
+
+    /// `cbnz w17, .+offset`.
+    fn cbnz_w17(offset: i32) -> u32 {
+        0x3500_0011 | ((((offset / 4) as u32) & 0x7_ffff) << 5)
+    }
+
+    #[test]
+    fn the_exclusive_instructions_are_told_from_their_neighbours() {
+        for load in [LDXR_W, LDAXR_W, LDXP_X, LDAXP_X, LDXRB, LDXRH, LDAXRH] {
+            assert!(is_exclusive(load, true), "{load:#x}");
+            assert!(!is_exclusive(load, false), "{load:#x}");
+        }
+        for store in [
+            STXR_W, STLXR_W, STXP_X, STLXP_X, STXRB, STLXRB, STXRH, STLXRH,
+        ] {
+            assert!(is_exclusive(store, false), "{store:#x}");
+            assert!(!is_exclusive(store, true), "{store:#x}");
+        }
+        for other in [LDAR, STLR, CASP, CASPAL, CAS, ADD_W, NOP, DMB, CLREX] {
+            assert!(!is_exclusive(other, true), "{other:#x}");
+            assert!(!is_exclusive(other, false), "{other:#x}");
+        }
+        assert_eq!(b_ne(12), 0x5400_0061);
+        assert_eq!(cbnz_w17(-16), 0x35ff_ff91);
+    }
+
+    #[test]
+    fn an_exclusive_sequence_runs_to_its_store_and_its_exits() {
+        let pc = 0x1000;
+        let unit = |stops: [u64; 2], branches: [u64; 2], count| {
+            Some(ExclusiveSequence {
+                stops,
+                branches,
+                count,
+            })
+        };
+        // libgcc's __aarch64_ldadd4_relax fallback: no branch inside.
+        assert_eq!(
+            exclusive_sequence(pc, &bytes(&[LDXR_W, ADD_W, STXR_W, cbnz_w17(-12)])),
+            unit([0x100c, 0x100c], [0, 0], 1)
+        );
+        // Its __aarch64_cas4_acq: the comparison leaves to the return, one
+        // branch either way.
+        let cas = exclusive_sequence(
+            pc,
+            &bytes(&[LDAXR_W, CMP_W, b_ne(12), STXR_W, cbnz_w17(-16), 0xd65f_03c0]),
+        );
+        assert_eq!(cas, unit([0x1010, 0x1014], [1, 1], 2));
+        assert_eq!(cas.unwrap().most(), 1);
+        // Two comparisons that leave to two places make three ends.
+        let two = exclusive_sequence(
+            pc,
+            &bytes(&[LDAXR_W, CMP_W, b_ne(0x40), CMP_W, b_ne(-0x80), STLXR_W]),
+        );
+        assert_eq!(two, None, "three ends");
+        let one_exit_each_side =
+            exclusive_sequence(pc, &bytes(&[LDAXR_W, CMP_W, b_ne(-0x100), STLXR_W]));
+        assert_eq!(one_exit_each_side, unit([0x0f08, 0x1010], [1, 1], 2));
+        // Every exclusive width and form, acquire and release included.
+        for (load, store) in [
+            (LDXR_W, STXR_W),
+            (LDAXR_W, STLXR_W),
+            (LDXP_X, STXP_X),
+            (LDAXP_X, STLXP_X),
+            (LDXRB, STXRB),
+            (LDXRB, STLXRB),
+            (LDXRH, STXRH),
+            (LDAXRH, STLXRH),
+        ] {
+            assert_eq!(
+                exclusive_sequence(pc, &bytes(&[load, NOP, store])),
+                unit([0x100c, 0x100c], [0, 0], 1),
+                "{load:#x} .. {store:#x}"
+            );
+        }
+        // A branch from the last comparison to just after the store retires
+        // as many branches as the path through the store: one end.
+        assert_eq!(
+            exclusive_sequence(pc, &bytes(&[LDAXR_W, CMP_W, b_ne(8), STXR_W])),
+            unit([0x1010, 0x1010], [1, 1], 1)
+        );
+    }
+
+    #[test]
+    fn other_sequences_are_not_units() {
+        let pc = 0x1000;
+        let refused = |insns: &[u32]| exclusive_sequence(pc, &bytes(insns));
+        // Not at a load-exclusive.
+        assert_eq!(refused(&[ADD_W, LDXR_W, STXR_W]), None);
+        assert_eq!(refused(&[STXR_W]), None);
+        assert_eq!(refused(&[LDAR, STLR]), None);
+        assert_eq!(refused(&[CASP, STXR_W]), None);
+        assert_eq!(refused(&[CAS, STXR_W]), None);
+        // Misaligned.
+        assert_eq!(exclusive_sequence(pc + 2, &bytes(&[LDXR_W, STXR_W])), None);
+        // No store within the window, or the code runs out first.
+        let mut long = vec![LDXR_W];
+        long.extend([NOP; EXCLUSIVE_WINDOW - 1]);
+        long.push(STXR_W);
+        assert_eq!(refused(&long), None);
+        assert_eq!(refused(&[LDXR_W, ADD_W]), None);
+        // Anything that would raise SIGTRAP or stop the unit before its
+        // store: an exception-generating instruction, a system instruction a
+        // branch run does not run, a second exclusive load.
+        for inside in [SVC, BRK, HVC, CLREX, LDXR_W, LDAXP_X] {
+            assert_eq!(refused(&[LDXR_W, inside, STXR_W]), None, "{inside:#x}");
+        }
+        // An unconditional or a register branch before the store.
+        assert_eq!(refused(&[LDXR_W, 0x1400_0002, STXR_W]), None);
+        assert_eq!(refused(&[LDXR_W, 0xd65f_03c0, STXR_W]), None);
+        // A branch that stays inside the sequence, or goes back to the
+        // load-exclusive itself.
+        assert_eq!(refused(&[LDXR_W, b_ne(8), NOP, STXR_W]), None);
+        assert_eq!(refused(&[LDXR_W, NOP, b_ne(-4), STXR_W]), None);
+        assert_eq!(refused(&[LDXR_W, b_ne(-4), STXR_W]), None);
+        // Two paths to one address with different counts.
+        assert_eq!(
+            refused(&[LDAXR_W, CMP_W, b_ne(16), CMP_W, b_ne(8), STLXR_W]),
+            None
+        );
+        // Three ends.
+        assert_eq!(refused(&[LDXR_W, b_ne(0x40), b_ne(0x80), STXR_W]), None);
+    }
 
     #[test]
     fn branches_with_their_targets() {

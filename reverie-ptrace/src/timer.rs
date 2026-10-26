@@ -180,15 +180,17 @@ pub(crate) enum StepUnit {
     #[cfg(target_arch = "x86_64")]
     Block,
     /// Up to, not including, the first of `stops[..count]` that the guest
-    /// reaches, each marked by a hardware breakpoint, retiring `branches`
-    /// branches on the way: none from before a stop point, the one branch
-    /// it starts at otherwise (see [`crate::branch_step`] and
-    /// [`TimerImpl::branch_run`]).
+    /// reaches, each marked by a hardware breakpoint, retiring `branches[i]`
+    /// branches on the way to `stops[i]`: none from before a stop point, the
+    /// one branch it starts at otherwise (see [`crate::branch_step`] and
+    /// [`TimerImpl::branch_run`]), the same at either end. A load-exclusive
+    /// sequence run as one unit ([`crate::branch_step::exclusive_sequence`])
+    /// may retire different counts at its two ends.
     #[cfg(target_arch = "aarch64")]
     ToBranch {
         stops: [u64; 2],
         count: usize,
-        branches: u64,
+        branches: [u64; 2],
     },
 }
 
@@ -206,6 +208,9 @@ pub(crate) static BRANCH_RUN_MISMATCHES: std::sync::atomic::AtomicU64 =
 /// were consumed there (see [`TimerImpl::own_notification_during_steps`]),
 /// for tests.
 pub(crate) static OWN_NOTIFICATIONS_DURING_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Branch runs that ran a load-exclusive sequence as one unit, for tests.
+pub(crate) static EXCLUSIVE_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static BLOCK_BOUND_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -3377,7 +3382,7 @@ impl TimerImpl {
                 // A branch run, which lets the guest run, may have come part
                 // of its way; its counter is checked as at any other stop.
                 #[cfg(target_arch = "aarch64")]
-                self.check_branch_run(&stopped, unit, current.rcbs(), target_rcb, false);
+                self.check_branch_run(&stopped, unit, current.rcbs(), target_rcb, None);
                 #[cfg(target_arch = "aarch64")]
                 let clock = self.read_clock_at(&stopped);
                 #[cfg(not(target_arch = "aarch64"))]
@@ -3397,7 +3402,7 @@ impl TimerImpl {
                     StepUnit::ToBranch { stops, count, .. },
                     Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)),
                 ) if !is_branch_run_report(&new_task, &stops[..count]) => {
-                    self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, false);
+                    self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, None);
                     restore_breakpoints(breakpoints.regs(), &new_task);
                     return Err(HandleFailure::Event(Wait::Stopped(
                         new_task,
@@ -3409,7 +3414,7 @@ impl TimerImpl {
                 {
                     // The check reads the clock, at a stop that may not have
                     // made a ptrace request yet (`read_clock_at`).
-                    self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, false);
+                    self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, None);
                     // Nothing to restore after an exec (forgotten above).
                     restore_breakpoints(breakpoints.regs(), &new_task);
                     Wait::Stopped(new_task, event)
@@ -3511,7 +3516,7 @@ impl TimerImpl {
                     remove_stepping_trap_flag(&mut task, &start, guest_trap_flag)?;
             }
             #[cfg(target_arch = "aarch64")]
-            self.check_branch_run(&task, unit, current.rcbs(), target_rcb, true);
+            self.check_branch_run(&task, unit, current.rcbs(), target_rcb, Some(&task));
             let clock = self.read_clock();
             if block_step_reached_target(unit, clock, target_rcb) {
                 // Delivered at the observed counter, as a late notification
@@ -3535,13 +3540,15 @@ impl TimerImpl {
     }
 
     /// Checks the counter after a branch run from counter `from` stopped, at
-    /// `task`'s stop: at its breakpoint (`at_breakpoint`) it must have moved
-    /// by exactly the branches decoded, at any other stop by no more.
+    /// `task`'s stop: at its breakpoint (`at_breakpoint`, the stopped thread)
+    /// it must have moved by exactly the branches decoded for the end it
+    /// stopped at, at any other stop by no more than the most at any end.
     /// Anything else ends branch runs for this thread; a counter at or past
     /// `target_rcb` is also reported as an overshoot
-    /// ([`block_step_reached_target`]). The clock is read only once the
-    /// thread is switched out ([`TimerImpl::read_clock_at`]): a stop other
-    /// than the run's own breakpoint has made no ptrace request before this.
+    /// ([`block_step_reached_target`]). The stop's pc is read only for a unit
+    /// whose two ends differ in count. The clock is read only once the thread
+    /// is switched out ([`TimerImpl::read_clock_at`]): a stop other than the
+    /// run's own breakpoint has made no ptrace request before this.
     #[cfg(target_arch = "aarch64")]
     fn check_branch_run(
         &mut self,
@@ -3549,23 +3556,43 @@ impl TimerImpl {
         unit: StepUnit,
         from: u64,
         target_rcb: u64,
-        at_breakpoint: bool,
+        at_breakpoint: Option<&Stopped>,
     ) {
-        let StepUnit::ToBranch { branches, .. } = unit else {
+        let StepUnit::ToBranch {
+            stops,
+            count,
+            branches,
+        } = unit
+        else {
             return;
         };
         let clock = self.read_clock_at(task);
         let moved = clock.wrapping_sub(from);
-        if moved == branches || (!at_breakpoint && moved < branches) {
+        let most = branches[..count].iter().copied().max().unwrap_or(0);
+        let expected = at_breakpoint.and_then(|task| {
+            if count == 2 && branches[0] != branches[1] {
+                let pc = task.getregs().ok()?.pc;
+                let end = stops[..count].iter().position(|&stop| stop == pc)?;
+                Some(branches[end])
+            } else {
+                Some(branches[0])
+            }
+        });
+        let consistent = match at_breakpoint {
+            Some(_) => expected == Some(moved),
+            None => moved <= most,
+        };
+        if consistent {
             return;
         }
         warn!(
-            "A branch run from counter {from} retired {moved} branches, decoded {branches}; \
-             single stepping from now on"
+            "A branch run from counter {from} retired {moved} branches, decoded {:?}; single \
+             stepping from now on",
+            &branches[..count]
         );
         BRANCH_RUN_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.branch_runs_off = true;
-        if !at_breakpoint {
+        if at_breakpoint.is_none() {
             // The breakpoint stop's own path reports this after restoring.
             block_step_reached_target(unit, clock, target_rcb);
         }
@@ -3585,12 +3612,22 @@ impl TimerImpl {
     /// - otherwise up to the first stop point, retiring no branch, whenever
     ///   the counter is short of the target.
     ///
+    /// A load-exclusive at pc runs with the code up to its store-exclusive
+    /// as one unit, when that sequence decodes and cannot reach the target
+    /// ([`crate::branch_step::exclusive_sequence`]). Single stepped, its store
+    /// would fail on every attempt, since every stop between the load and the
+    /// store clears the exclusive monitor, and a retry loop would spin until
+    /// the target, where the same code run without a stop takes one attempt.
+    ///
     /// The last stretch to the target, and its instruction offset, are then
     /// single stepped exactly as before, to the same delivery point.
     /// Everything else is single stepped: a stop point that is not such a
     /// branch, reached at pc; code that does not decode; a thread with fewer
     /// than two free breakpoint registers (they belong to someone else, and
-    /// are never written); and a thread whose branch runs are off.
+    /// are never written); and a thread whose branch runs are off. A
+    /// load-exclusive sequence single stepped for want of breakpoint
+    /// registers is reported, once per process
+    /// ([`report_stepped_exclusive_sequence`]).
     #[cfg(target_arch = "aarch64")]
     fn branch_run(
         &mut self,
@@ -3600,11 +3637,24 @@ impl TimerImpl {
         target_rcb: u64,
     ) -> Result<StepUnit, TraceError> {
         let run = if !block_steps_enabled() || self.branch_runs_off || clock >= target_rcb {
+            if self.branch_runs_off && clock < target_rcb {
+                report_stepped_exclusive_sequence(
+                    task,
+                    None,
+                    "branch runs are off for this thread",
+                );
+            }
             None
         } else {
             decode_branch_run(task, &task.getregs()?, clock, target_rcb)
         };
-        let Some((stops, count, branches)) = run else {
+        let Some(BranchRunPlan {
+            stops,
+            count,
+            branches,
+            exclusive,
+        }) = run
+        else {
             // A breakpoint elsewhere stays armed: a single step's trap is
             // taken before the next instruction's breakpoint could match.
             // Registers are read only then, so forced single steps take the
@@ -3620,11 +3670,25 @@ impl TimerImpl {
                 Ok(None) => {
                     debug!("Fewer than two free hardware breakpoints: single stepping");
                     self.branch_runs_off = true;
+                    if exclusive {
+                        report_stepped_exclusive_sequence(
+                            task,
+                            Some(stops[0]),
+                            "the thread has fewer than two free hardware breakpoint registers",
+                        );
+                    }
                     return Ok(StepUnit::Instruction);
                 }
                 Err(TraceError::Errno(error)) => {
                     warn!("Hardware breakpoints unusable ({error}): single stepping");
                     self.branch_runs_off = true;
+                    if exclusive {
+                        report_stepped_exclusive_sequence(
+                            task,
+                            Some(stops[0]),
+                            "the thread's hardware breakpoints are unusable",
+                        );
+                    }
                     return Ok(StepUnit::Instruction);
                 }
                 Err(error) => return Err(error),
@@ -3636,6 +3700,9 @@ impl TimerImpl {
             self.branch_runs_off = true;
             armed.recover(task)?;
             return Ok(StepUnit::Instruction);
+        }
+        if exclusive {
+            EXCLUSIVE_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(StepUnit::ToBranch {
             stops,
@@ -4000,6 +4067,17 @@ const TRAP_HWBKPT: i32 = 4;
 /// addresses whose breakpoints end it, how many of them, and the branches it
 /// retires.
 ///
+/// A load-exclusive at pc is planned first: the sequence up to its
+/// store-exclusive runs as one unit ([`crate::branch_step::exclusive_sequence`])
+/// if even its longest path leaves the counter short of the target, and is
+/// single stepped otherwise. The unit's ends lie outside the sequence, so no
+/// breakpoint stops it between its load and its store, and each end has the
+/// one count of the one straight-line path that reaches it. A store that
+/// fails in the unit, because the host interrupted the guest between its load
+/// and its store, fails as it would without the timer: the unit stops at the
+/// instruction after the store, and the retry branch is planned from there
+/// like any other, so retries are counted, not run past a breakpoint.
+///
 /// The run from pc meets the first stop point at or after pc, `at`. If that
 /// is a branch whose successors are known, and one more branch leaves the
 /// counter short of the target, the run retires it and ends, for each
@@ -4015,7 +4093,10 @@ const TRAP_HWBKPT: i32 = 4;
 /// unit decodes only the instruction at pc, and that is enough for a run
 /// too: every instruction that raises SIGTRAP itself (BRK, SVC and the other
 /// exception-generating instructions) is a stop point, so a run neither
-/// starts at nor executes one. The shield leaves SIGTRAP unblocked for the
+/// starts at nor executes one. A load-exclusive unit starts at its
+/// load-exclusive, which raises no SIGTRAP, and executes only instructions
+/// that are not stop points and conditional branches, so this holds for it
+/// too ([`crate::branch_step::exclusive_sequence`] refuses anything else). The shield leaves SIGTRAP unblocked for the
 /// whole run rather than one instruction; the guest makes no syscall and
 /// takes no trap of its own before the run ends, so it cannot tell.
 ///
@@ -4032,18 +4113,31 @@ fn decode_branch_run(
     regs: &Regs,
     clock: u64,
     target_rcb: u64,
-) -> Option<([u64; 2], usize, u64)> {
+) -> Option<BranchRunPlan> {
     use crate::branch_step::STOP_WINDOW;
     use crate::branch_step::Stop;
+    use crate::branch_step::exclusive_sequence;
     use crate::branch_step::first_stop;
 
     let mut code = [0u8; 4 * STOP_WINDOW];
+    let pc = regs.pc;
+    let len = read_code(task, pc, &mut code);
+    if let Some(sequence) = exclusive_sequence(pc, &code[..len]) {
+        // One unit or nothing: a sequence that could reach the target is
+        // single stepped as before, so that the event lands where single
+        // steps land it. Its store may then fail, as it does there.
+        return (clock + sequence.most() < target_rcb).then_some(BranchRunPlan {
+            stops: sequence.stops,
+            count: sequence.count,
+            branches: sequence.branches,
+            exclusive: true,
+        });
+    }
+    let (at, stop) = first_stop(pc, &code[..len])?;
     let mut stop_after = |from: u64| {
         let len = read_code(task, from, &mut code);
         first_stop(from, &code[..len])
     };
-    let pc = regs.pc;
-    let (at, stop) = stop_after(pc)?;
     let through = (clock + 1 < target_rcb)
         .then(|| match stop {
             Stop::Register { .. } if at != pc => None,
@@ -4068,7 +4162,62 @@ fn decode_branch_run(
                 (ends, 2, 1)
             })
         });
-    through.or_else(|| (at != pc).then_some(([at, at], 1, 0)))
+    through
+        .or_else(|| (at != pc).then_some(([at, at], 1, 0)))
+        .map(|(stops, count, branches)| BranchRunPlan {
+            stops,
+            count,
+            branches: [branches, branches],
+            exclusive: false,
+        })
+}
+
+/// A branch run as [`decode_branch_run`] plans it: its breakpoints'
+/// addresses `stops[..count]`, the branches it retires on the way to each,
+/// and whether it runs a load-exclusive sequence as one unit.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BranchRunPlan {
+    stops: [u64; 2],
+    count: usize,
+    branches: [u64; 2],
+    exclusive: bool,
+}
+
+/// Reports, once per process, that a load-exclusive sequence at the stopped
+/// thread's pc is single stepped although branch runs are on, for `reason`:
+/// its store-exclusive then fails on every attempt, and its retry loop, if
+/// it has one, retires branches until the timer's target, where a run
+/// without stops takes one attempt. A `decoded` sequence was found by
+/// [`decode_branch_run`]; otherwise the code at pc is read, and only a
+/// sequence that would run as a unit is reported. `REVERIE_BLOCK_STEP=0`,
+/// which turns branch runs off on purpose, is not reported.
+#[cfg(target_arch = "aarch64")]
+fn report_stepped_exclusive_sequence(task: &Stopped, decoded: Option<u64>, reason: &str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(regs) = task.getregs() else {
+        return;
+    };
+    if decoded.is_none() {
+        let mut code = [0u8; 4 * crate::branch_step::EXCLUSIVE_WINDOW];
+        let len = read_code(task, regs.pc, &mut code);
+        if crate::branch_step::exclusive_sequence(regs.pc, &code[..len]).is_none() {
+            return;
+        }
+    }
+    if REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    warn!(
+        "Single stepping the load-exclusive sequence at {:#x} toward a precise timer target \
+         because {reason}: a stop between its load and store clears the exclusive monitor, so \
+         its store fails on every attempt and a retry loop runs until the target, unlike the \
+         same code run without stops.",
+        regs.pc
+    );
 }
 
 /// Whether the SIGTRAP stop of a branch run is its breakpoint's: a hardware
