@@ -1229,7 +1229,7 @@ fn unblock_sigtrap_for_timer_step(
             return Ok(StepShield::None);
         }
         #[cfg(test)]
-        TIMER_STEP_RESTORE_SHIELDS_FOR_TEST.fetch_add(1, Ordering::SeqCst);
+        TIMER_STEP_RESTORE_SHIELDS_FOR_TEST.with(|count| count.set(count.get() + 1));
     }
     set_sigmask(task, mask & !SIGTRAP_BIT)?;
     Ok(StepShield::Unblocked)
@@ -1310,7 +1310,7 @@ impl TimerStepShield {
                     .write_value(frame, &(mask & !SIGTRAP_BIT))?;
                 self.frame_mask = Some((address, mask, rip));
                 #[cfg(test)]
-                FRAME_SHIELDS_FOR_TEST.fetch_add(1, Ordering::SeqCst);
+                FRAME_SHIELDS_FOR_TEST.with(|count| count.set(count.get() + 1));
             }
             self.stepped = true;
             return Ok(());
@@ -3777,22 +3777,28 @@ pub(crate) type PreSyscallForTest = Arc<
 static STEP_COUNTS_GLOBAL: std::sync::Mutex<std::collections::BTreeMap<i32, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Timer steps shielded at a pending mask restore
-/// (`unblock_sigtrap_for_timer_step`), counted for the test that must know
-/// that case ran.
-#[cfg(test)]
-pub(crate) static TIMER_STEP_RESTORE_SHIELDS_FOR_TEST: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Timer sequences whose single-steps ran (`drive_timer`), counted for
-/// tests that must know a sequence stepped: the per-thread step count
-/// (`record_step_for_test`) counts only `step_stopped`'s steps.
-#[cfg(test)]
-pub(crate) static TIMER_SEQUENCES_STEPPED_FOR_TEST: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 #[cfg(test)]
 thread_local! {
+    /// Timer steps shielded at a pending mask restore
+    /// (`unblock_sigtrap_for_timer_step`), counted for the test that must
+    /// know that case ran. Per thread, as below.
+    pub(crate) static TIMER_STEP_RESTORE_SHIELDS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Timer sequences whose single-steps ran (`drive_timer`), counted for
+    /// tests that must know a sequence stepped: the per-thread step count
+    /// (`record_step_for_test`) counts only `step_stopped`'s steps. Per
+    /// thread, as below: a test that needs exactly its own sequences cannot
+    /// have another test's added.
+    pub(crate) static TIMER_SEQUENCES_STEPPED_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Timer steps over a guest `rt_sigreturn` whose frame blocked SIGTRAP
+    /// (`TimerStepShield::prepare`), counted for the test that must know one
+    /// ran. Per thread, as below.
+    pub(crate) static FRAME_SHIELDS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
     /// The unstepped injections of SIGTRAP repairs (the action's query, its
     /// write, and an `act`'s re-install), counted for the tests that bound
     /// them. Pre-init's sealing of the repair page is not counted. Per
@@ -3812,12 +3818,6 @@ thread_local! {
     pub(crate) static SEGV_TRAP_QUERIES_FOR_TEST: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
 }
-
-/// Timer steps over a guest `rt_sigreturn` whose frame blocked SIGTRAP
-/// (`TimerStepShield::prepare`), counted for the test that must know one ran.
-#[cfg(test)]
-pub(crate) static FRAME_SHIELDS_FOR_TEST: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// Test-only: counts every tracer single-step request per tid, so a test
 /// tool can measure the forced-SIGTRAP profile of a run.
@@ -6375,7 +6375,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
         #[cfg(test)]
         if stepped {
-            TIMER_SEQUENCES_STEPPED_FOR_TEST.fetch_add(1, Ordering::SeqCst);
+            TIMER_SEQUENCES_STEPPED_FOR_TEST.with(|count| count.set(count.get() + 1));
         }
         // A guest instruction's own trap resets SIGTRAP natively too.
         if sigtrap_ignored && stepped && !native_trap {

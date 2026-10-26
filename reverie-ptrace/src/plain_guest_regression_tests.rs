@@ -4738,7 +4738,6 @@ async fn timer_steps_in_an_execute_only_page_survive_trace_logging() {
 /// (`TIMER_SEQUENCES_STEPPED_FOR_TEST`).
 #[tokio::test(flavor = "current_thread")]
 async fn sigtrap_state_survives_timer_steps() {
-    use std::sync::atomic::Ordering;
     if !crate::perf::is_perf_supported() {
         eprintln!("skipping: perf counters are not supported here");
         return;
@@ -4761,9 +4760,10 @@ async fn sigtrap_state_survives_timer_steps() {
     // stepped all five, so that each state is shown to survive real steps.
     const ATTEMPTS: usize = 4;
     for attempt in 1..=ATTEMPTS {
-        let before = crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.load(Ordering::SeqCst);
+        let before = crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.with(|count| count.get());
         let run = run_guest("sigtrap_timer", false).await;
-        let stepped = crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.load(Ordering::SeqCst) - before;
+        let stepped =
+            crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.with(|count| count.get()) - before;
         assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
         let timers = timer_events(&run);
         assert_eq!(timers.len(), 5, "{timers:#?}");
@@ -4800,8 +4800,7 @@ async fn a_timer_step_at_a_pending_restore_keeps_a_blocked_sigtrap() {
         eprintln!("skipping: perf counters are not supported here");
         return;
     }
-    use std::sync::atomic::Ordering;
-    let shields = || crate::task::TIMER_STEP_RESTORE_SHIELDS_FOR_TEST.load(Ordering::SeqCst);
+    let shields = || crate::task::TIMER_STEP_RESTORE_SHIELDS_FOR_TEST.with(|count| count.get());
     let before = shields();
     let run = run_guest("sigtrap_pending_restore_timer", true).await;
     assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
@@ -4810,8 +4809,6 @@ async fn a_timer_step_at_a_pending_restore_keeps_a_blocked_sigtrap() {
         "no timer event: {}",
         run.report
     );
-    // The global count may include other tests' steps; it shows at least
-    // that the case ran.
     assert!(
         shields() > before,
         "no timer step was shielded at a pending restore: {}",
@@ -4841,14 +4838,13 @@ async fn a_timer_step_at_a_pending_restore_keeps_a_blocked_sigtrap() {
 /// (`FRAME_SHIELDS_FOR_TEST`).
 #[tokio::test(flavor = "current_thread")]
 async fn sigtrap_state_survives_a_timer_step_over_sigreturn() {
-    use std::sync::atomic::Ordering;
     if !crate::perf::is_perf_supported() {
         eprintln!("skipping: perf counters are not supported here");
         return;
     }
-    let before = crate::task::FRAME_SHIELDS_FOR_TEST.load(Ordering::SeqCst);
+    let before = crate::task::FRAME_SHIELDS_FOR_TEST.with(|count| count.get());
     let run = run_guest("sigtrap_sigreturn_timer", false).await;
-    let shields = crate::task::FRAME_SHIELDS_FOR_TEST.load(Ordering::SeqCst) - before;
+    let shields = crate::task::FRAME_SHIELDS_FOR_TEST.with(|count| count.get()) - before;
     assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
     eprintln!("sigreturn timer events: {:#?}", timer_events(&run));
     assert!(
