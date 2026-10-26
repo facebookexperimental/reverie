@@ -9,41 +9,38 @@
 //! Tests that syscall suppression works. That is, when we intercept a syscall,
 //! we should not run the real syscall.
 
-use reverie::Error;
-use reverie::Guest;
-use reverie::Tool;
-use reverie::syscalls::Syscall;
-
-#[derive(Debug, Default, Clone)]
-struct TestTool;
-
-#[reverie::tool]
-impl Tool for TestTool {
-    type GlobalState = ();
-    type ThreadState = ();
-
-    async fn handle_syscall_event<T: Guest<Self>>(
-        &self,
-        guest: &mut T,
-        syscall: Syscall,
-    ) -> Result<i64, Error> {
-        match syscall {
-            Syscall::Tgkill(_) => {
-                // Suppress this syscall. This thread shall not be killed.
-                Ok(0)
-            }
-            _ => guest.tail_inject(syscall).await,
-        }
-    }
-}
-
 #[cfg(all(not(sanitized), test))]
 mod tests {
+    use reverie::Error;
+    use reverie::Guest;
+    use reverie::Tool;
+    use reverie::syscalls::Syscall;
     use reverie_ptrace::testing::check_fn;
     use syscalls::Sysno;
     use syscalls::syscall;
 
-    use super::*;
+    #[derive(Debug, Default, Clone)]
+    struct TestTool;
+
+    #[reverie::tool]
+    impl Tool for TestTool {
+        type GlobalState = ();
+        type ThreadState = ();
+
+        async fn handle_syscall_event<T: Guest<Self>>(
+            &self,
+            guest: &mut T,
+            syscall: Syscall,
+        ) -> Result<i64, Error> {
+            match syscall {
+                Syscall::Tgkill(_) => {
+                    // Suppress this syscall. This thread shall not be killed.
+                    Ok(0)
+                }
+                _ => guest.tail_inject(syscall).await,
+            }
+        }
+    }
 
     #[test]
     fn suppress_tgkill() {

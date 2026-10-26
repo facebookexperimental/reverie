@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![cfg(not(sanitized))]
+
 //! Tests surrounding exit logic.
 
 use std::sync::Mutex;
@@ -76,7 +78,6 @@ impl Tool for InjectExitTool {
     }
 }
 
-#[cfg(not(sanitized))]
 #[test]
 fn smoke() {
     use reverie_ptrace::testing::test_fn;

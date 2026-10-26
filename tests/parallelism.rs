@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![cfg(not(sanitized))]
+
 //! Tests for parallelism and concurrency
 use reverie::Error;
 use reverie::GlobalTool;

@@ -8,6 +8,8 @@
 
 //! Tests for process and thread state.
 
+#![cfg(not(sanitized))]
+
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -112,7 +114,6 @@ impl Tool for TestTool {
     }
 }
 
-#[cfg(not(sanitized))]
 #[test]
 fn basic_test() {
     use reverie_ptrace::testing::check_fn;
