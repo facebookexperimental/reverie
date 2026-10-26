@@ -1612,9 +1612,10 @@ mod sigtrap_tables_tests {
 
 /// Whether `pid`'s address space, a fork's child at its fork event, has a
 /// read-write mapping at Reverie's SIGTRAP repair page (`cp::SCRATCH_BASE`),
-/// by procfs `maps`. The child has not run, and its parent's page is sealed,
-/// so such a mapping can only be the kernel's sealed copy of it; `maps` tells
-/// that without the page-table walk `smaps` makes. Unreadable is false.
+/// by procfs `maps`. The child has not run, so such a mapping can only be the
+/// kernel's copy of its parent's page: sealed if the parent's is, and
+/// otherwise checked by its canary before use; `maps` tells that without the
+/// page-table walk `smaps` makes. Unreadable is false.
 fn repair_page_sealed_in(pid: Pid) -> bool {
     let Ok(maps) = read_status(format!("/proc/{pid}/maps")) else {
         return false;
@@ -1953,13 +1954,59 @@ fn guest_seccomp_filters(tid: Pid) -> Option<u64> {
 
 /// The states of an address space's SIGTRAP repair page
 /// (`TracedTask::sigtrap_scratch_state`): not set up yet (a new image before
-/// pre-init), sealed, or none.
+/// pre-init), sealed, unsealed (`mseal` unavailable; checked by its canary
+/// before each use), or none.
 const SCRATCH_PENDING: u8 = 0;
 const SCRATCH_SEALED: u8 = 1;
 const SCRATCH_UNAVAILABLE: u8 = 2;
+const SCRATCH_UNSEALED: u8 = 3;
 
-/// `mseal(2)`'s number on x86-64 (Linux 6.10), which `Sysno` does not name.
+/// Whether an address space in `state` has a repair page to use.
+fn scratch_usable(state: u8) -> bool {
+    matches!(state, SCRATCH_SEALED | SCRATCH_UNSEALED)
+}
+
+/// `mseal(2)`'s number on x86-64 and aarch64 (Linux 6.10), which `Sysno`
+/// does not name.
 const SYS_MSEAL: Reg = 462;
+
+/// The bytes Reverie writes at the end of an unsealed repair page
+/// ([`SCRATCH_CANARY_OFFSET`]) and checks before every use: a page the guest
+/// unmapped, replaced or overwrote no longer holds them, and then no repair is
+/// written there (a guest page is never written).
+const SCRATCH_CANARY: [u8; 16] = *b"reverie-sigtrap\0";
+
+/// Where in the repair page the canary sits: its last 16 bytes, past every
+/// action a repair writes or reads at its start.
+const SCRATCH_CANARY_OFFSET: usize = cp::SCRATCH_SIZE - SCRATCH_CANARY.len();
+
+/// When set (to anything), the repair page is used unsealed as if `mseal`
+/// were unavailable, as on kernels before Linux 6.10: for testing that path
+/// on a kernel that has `mseal`.
+pub const SIGTRAP_REPAIR_NO_MSEAL_ENV: &str = "REVERIE_SIGTRAP_REPAIR_NO_MSEAL";
+
+fn mseal_disabled_for_testing() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os(SIGTRAP_REPAIR_NO_MSEAL_ENV).is_some())
+}
+
+/// Whether thread `tid`'s address space still holds the canary at the end of
+/// its unsealed repair page, read with `process_vm_readv`.
+fn scratch_canary_intact(tid: Pid) -> bool {
+    let mut found = [0u8; SCRATCH_CANARY.len()];
+    let local = libc::iovec {
+        iov_base: found.as_mut_ptr().cast(),
+        iov_len: found.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: (cp::SCRATCH_BASE + SCRATCH_CANARY_OFFSET) as *mut libc::c_void,
+        iov_len: found.len(),
+    };
+    // SAFETY: `local` describes `found`, which outlives the call; the remote
+    // side is only read.
+    let read = unsafe { libc::process_vm_readv(tid.as_raw(), &local, 1, &remote, 1, 0) };
+    read == found.len() as isize && found == SCRATCH_CANARY
+}
 
 /// The `si_code` of a SIGILL for an illegal operand (`ud2`), which `libc`
 /// does not export.
@@ -4809,6 +4856,10 @@ impl<L: Tool> TracedTask<L> {
             let state = match self.sigtrap_scratch_state.load(Ordering::SeqCst) {
                 SCRATCH_SEALED if repair_page_sealed_in(child) => SCRATCH_SEALED,
                 SCRATCH_SEALED => SCRATCH_UNAVAILABLE,
+                // The child's copy of an unsealed page is checked by its
+                // canary before use, as the parent's is.
+                SCRATCH_UNSEALED if repair_page_sealed_in(child) => SCRATCH_UNSEALED,
+                SCRATCH_UNSEALED => SCRATCH_UNAVAILABLE,
                 state => state,
             };
             Arc::new(AtomicU8::new(state))
@@ -6226,13 +6277,18 @@ impl<L: Tool + 'static> TracedTask<L> {
         // `CONTINUE`): only Reverie's own launch filter may be there. The
         // tracer has none of its own (`GlobalState::seccomp_filter_baseline`
         // is 1), the address space had no other, such as one a caller's
-        // `pre_exec` installs, when pre-init sealed its repair page
+        // `pre_exec` installs, when pre-init set up its repair page
         // (`seal_sigtrap_scratch`, which refuses otherwise), and the guest
-        // installs none later under the contract.
+        // installs none later under the contract. An unsealed page counts
+        // only while its canary is intact.
         let syscalls_stop = !filtered
             && self.global_state.traces_signal_state_syscalls
             && self.global_state.seccomp_filter_baseline == Some(1)
-            && self.sigtrap_scratch_state.load(Ordering::SeqCst) == SCRATCH_SEALED;
+            && match self.sigtrap_scratch_state.load(Ordering::SeqCst) {
+                SCRATCH_SEALED => true,
+                SCRATCH_UNSEALED => scratch_canary_intact(task.pid()),
+                _ => false,
+            };
         let quiet = syscalls_stop
             && !sigtrap_ignored
             && self.global_state.reports_sigreturns
@@ -11705,7 +11761,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     fn keeps_signal_records(&self) -> bool {
         self.global_state.keeps_signal_records
             && self.global_state.seccomp_filter_baseline == Some(1)
-            && self.sigtrap_scratch_state.load(Ordering::SeqCst) == SCRATCH_SEALED
+            && scratch_usable(self.sigtrap_scratch_state.load(Ordering::SeqCst))
             && self.keeps_sigtrap_state()
             && x32_syscalls_refused()
     }
@@ -12185,12 +12241,28 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// without the contract no repair runs.
     fn sigtrap_scratch(&self, tid: Pid) -> Result<Option<usize>, ()> {
         match self.sigtrap_scratch_state.load(Ordering::SeqCst) {
-            SCRATCH_SEALED if self.guest_has_own_seccomp_filter(tid) => {
+            state if scratch_usable(state) && self.guest_has_own_seccomp_filter(tid) => {
                 self.sigtrap_scratch_state
                     .store(SCRATCH_UNAVAILABLE, Ordering::SeqCst);
                 Err(())
             }
             SCRATCH_SEALED => Ok(Some(cp::SCRATCH_BASE)),
+            // An unsealed page is used only while its canary is intact: one
+            // the guest unmapped, replaced or overwrote is not written to,
+            // and repairs end in this address space.
+            SCRATCH_UNSEALED if scratch_canary_intact(tid) => Ok(Some(cp::SCRATCH_BASE)),
+            SCRATCH_UNSEALED => {
+                self.sigtrap_scratch_state
+                    .store(SCRATCH_UNAVAILABLE, Ordering::SeqCst);
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "[scheduler/tool] (pid = {}) the unsealed SIGTRAP repair page was unmapped or replaced; a SIGTRAP repair is lost and repairs are off in this address space",
+                        tid
+                    );
+                }
+                Err(())
+            }
             SCRATCH_PENDING => Ok(None),
             _ => Err(()),
         }
@@ -12301,13 +12373,56 @@ impl<L: Tool + 'static> TracedTask<L> {
         };
         let (task, sealed) = if mapped == cp::SCRATCH_BASE {
             let args = SyscallArgs::new(cp::SCRATCH_BASE, cp::SCRATCH_SIZE, 0, 0, 0, 0);
-            let (task, result) = self
-                .untraced_syscall_number_unstepped(task, SYS_MSEAL, args)
-                .await?;
-            if let Err(errno) = result {
-                warn_once(task.pid(), format!("mseal: {}", errno));
+            let (task, result) = if mseal_disabled_for_testing() {
+                (task, Err(Errno::ENOSYS))
+            } else {
+                self.untraced_syscall_number_unstepped(task, SYS_MSEAL, args)
+                    .await?
+            };
+            match result {
+                // Without `mseal` (before Linux 6.10, or filtered by a
+                // container) the page is used unsealed. The guest could then
+                // unmap, replace or rewrite it; the canary written here is
+                // checked before every use (`sigtrap_scratch`), so a repair
+                // is never written into a page that is not Reverie's. That is
+                // detection, not prevention: such a page ends repairs in this
+                // address space.
+                Err(Errno::ENOSYS | Errno::EPERM) => {
+                    let canary = AddrMut::<[u8; SCRATCH_CANARY.len()]>::from_raw(
+                        cp::SCRATCH_BASE + SCRATCH_CANARY_OFFSET,
+                    )
+                    .ok_or(Errno::EFAULT)
+                    .and_then(|address| {
+                        task.generation()
+                            .assume_stopped()
+                            .write_value(address, &SCRATCH_CANARY)
+                    });
+                    match canary {
+                        Ok(()) => {
+                            static NOTED: AtomicBool = AtomicBool::new(false);
+                            if !NOTED.swap(true, Ordering::Relaxed) {
+                                tracing::info!(
+                                    "[scheduler/tool] (pid = {}) SIGTRAP repair page unsealed (mseal: {}); it is checked before each use",
+                                    task.pid(),
+                                    result.unwrap_err()
+                                );
+                            }
+                            self.sigtrap_scratch_state
+                                .store(SCRATCH_UNSEALED, Ordering::SeqCst);
+                            return Ok(task);
+                        }
+                        Err(errno) => {
+                            warn_once(task.pid(), format!("canary write: {}", errno));
+                            (task, false)
+                        }
+                    }
+                }
+                Err(errno) => {
+                    warn_once(task.pid(), format!("mseal: {}", errno));
+                    (task, false)
+                }
+                Ok(_) => (task, true),
             }
-            (task, result.is_ok())
         } else {
             warn_once(
                 task.pid(),
@@ -13059,9 +13174,25 @@ impl<L: Tool + 'static> TracedTask<L> {
         // What the write leaves is read again when next needed
         // (`sigtrap_ignored`).
         self.forget_sigtrap_ignored();
-        let (task, _written) = self
+        let (task, written) = self
             .write_signal_action_at(task, scratch, libc::SIGTRAP, action)
             .await?;
+        // Through an unsealed page the action is read back, and a repair
+        // whose handler did not take is reported as lost. Only the handler is
+        // compared: a trap resets nothing else, and the kernel normalises the
+        // flags and mask a guest passed (`do_sigaction`).
+        if written && self.sigtrap_scratch_state.load(Ordering::SeqCst) == SCRATCH_UNSEALED {
+            let (task, back) = self.query_sigtrap_action_at(task, scratch).await?;
+            if back.is_some_and(|back| back.handler != action.handler) {
+                tracing::warn!(
+                    "[scheduler/tool] (pid = {}) a SIGTRAP repair did not take (read back {:?}, wrote {:?})",
+                    task.pid(),
+                    back,
+                    action
+                );
+            }
+            return Ok(task);
+        }
         Ok(task)
     }
 
