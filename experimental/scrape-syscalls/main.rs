@@ -45,7 +45,7 @@ struct Opts {
 ///
 /// [syscall_metadata]: https://elixir.bootlin.com/linux/v5.5.3/source/include/trace/syscall.h
 #[repr(C)]
-#[derive(Debug, Pread)]
+#[derive(Debug)]
 struct SyscallMetadata {
     /// Address of the syscall name.
     name: u64,
@@ -70,28 +70,40 @@ struct SyscallMetadata {
     //struct trace_event_call *exit_event;
 }
 
-fn find_sym(elf: &Elf, search: &str) -> Option<Sym> {
-    for sym in elf.syms.iter() {
-        if let Some(name) = elf.strtab.get_at(sym.st_name) {
-            if name == search {
-                return Some(sym);
-            }
-        }
-    }
+impl<'a> scroll::ctx::TryFromCtx<'a, scroll::Endian> for SyscallMetadata {
+    type Error = scroll::Error;
 
-    None
+    #[inline]
+    fn try_from_ctx(src: &'a [u8], ctx: scroll::Endian) -> Result<(Self, usize), Self::Error> {
+        let offset = &mut 0;
+        let name = src.gread_with::<u64>(offset, ctx)?;
+        let syscall_nr = src.gread_with::<libc::c_int>(offset, ctx)?;
+        let nb_args = src.gread_with::<libc::c_int>(offset, ctx)?;
+        let types = src.gread_with::<u64>(offset, ctx)?;
+        let args = src.gread_with::<u64>(offset, ctx)?;
+        Ok((
+            Self {
+                name,
+                syscall_nr,
+                nb_args,
+                types,
+                args,
+            },
+            *offset,
+        ))
+    }
+}
+
+fn find_sym(elf: &Elf, search: &str) -> Option<Sym> {
+    elf.syms
+        .iter()
+        .find(|sym| elf.strtab.get_at(sym.st_name) == Some(search))
 }
 
 fn find_section<'a>(elf: &'a Elf, search: &'a str) -> Option<&'a SectionHeader> {
-    for sh in &elf.section_headers {
-        if let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) {
-            if name == search {
-                return Some(sh);
-            }
-        }
-    }
-
-    None
+    elf.section_headers
+        .iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(search))
 }
 
 fn get_array<'a, T>(elf: &'a Elf, buf: &'a [u8], sym: Sym) -> &'a [T] {
@@ -159,62 +171,63 @@ fn syscall_list(path: &Path) -> Result<Vec<SyscallInfo>, Box<dyn std::error::Err
     let mut list = Vec::new();
 
     for sym in elf.syms.iter() {
-        if let Some(sym_name) = elf.strtab.get_at(sym.st_name) {
-            if sym_name.starts_with("__syscall_meta") {
-                let syscall: SyscallMetadata = buf.pread(sym_offset(&elf, sym))?;
+        if elf
+            .strtab
+            .get_at(sym.st_name)
+            .is_some_and(|sym_name| sym_name.starts_with("__syscall_meta"))
+        {
+            let syscall: SyscallMetadata = buf.pread(sym_offset(&elf, sym))?;
 
-                // Look up the name in the .text section.
-                let name_offset = syscall.name - text_section.sh_addr + text_section.sh_offset;
-                let name: &str = buf.pread(name_offset as usize)?;
-                if name == "sys_ni_syscall" {
-                    // This is a placeholder for syscalls that are not implemented.
-                    continue;
+            // Look up the name in the .text section.
+            let name_offset = syscall.name - text_section.sh_addr + text_section.sh_offset;
+            let name: &str = buf.pread(name_offset as usize)?;
+            if name == "sys_ni_syscall" {
+                // This is a placeholder for syscalls that are not implemented.
+                continue;
+            }
+
+            if let Some(&nr) = mapping.get(name) {
+                let mut types = Vec::new();
+
+                // Chase pointers and gather arg types
+                if syscall.types != 0 {
+                    let mut types_offset =
+                        (syscall.types - data_section.sh_addr + data_section.sh_offset) as usize;
+
+                    for _ in 0..syscall.nb_args {
+                        let addr: u64 = buf.gread(&mut types_offset)?;
+                        let offset = addr - text_section.sh_addr + text_section.sh_offset;
+                        let name: &str = buf.pread(offset as usize)?;
+                        types.push(name);
+                    }
                 }
 
-                if let Some(&nr) = mapping.get(name) {
-                    let mut types = Vec::new();
+                let mut args = Vec::new();
 
-                    // Chase pointers and gather arg types
-                    if syscall.types != 0 {
-                        let mut types_offset = (syscall.types - data_section.sh_addr
-                            + data_section.sh_offset)
-                            as usize;
+                // Chase pointers and gather arg names
+                if syscall.args != 0 {
+                    let mut args_offset =
+                        (syscall.args - data_section.sh_addr + data_section.sh_offset) as usize;
 
-                        for _ in 0..syscall.nb_args {
-                            let addr: u64 = buf.gread(&mut types_offset)?;
-                            let offset = addr - text_section.sh_addr + text_section.sh_offset;
-                            let name: &str = buf.pread(offset as usize)?;
-                            types.push(name);
-                        }
+                    for _ in 0..syscall.nb_args {
+                        let addr: u64 = buf.gread(&mut args_offset)?;
+                        let offset = addr - text_section.sh_addr + text_section.sh_offset;
+                        let name: &str = buf.pread(offset as usize)?;
+                        args.push(name);
                     }
-
-                    let mut args = Vec::new();
-
-                    // Chase pointers and gather arg names
-                    if syscall.args != 0 {
-                        let mut args_offset =
-                            (syscall.args - data_section.sh_addr + data_section.sh_offset) as usize;
-
-                        for _ in 0..syscall.nb_args {
-                            let addr: u64 = buf.gread(&mut args_offset)?;
-                            let offset = addr - text_section.sh_addr + text_section.sh_offset;
-                            let name: &str = buf.pread(offset as usize)?;
-                            args.push(name);
-                        }
-                    }
-
-                    let params = types
-                        .into_iter()
-                        .zip(args)
-                        .map(|(t, a)| (t.to_string(), a.to_string()))
-                        .collect();
-
-                    list.push(SyscallInfo {
-                        num: nr,
-                        name: name.into(),
-                        params,
-                    });
                 }
+
+                let params = types
+                    .into_iter()
+                    .zip(args)
+                    .map(|(t, a)| (t.to_string(), a.to_string()))
+                    .collect();
+
+                list.push(SyscallInfo {
+                    num: nr,
+                    name: name.into(),
+                    params,
+                });
             }
         }
     }

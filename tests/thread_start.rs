@@ -45,8 +45,7 @@ fn thread_start_tail_inject() {
         type ThreadState = ();
 
         async fn handle_thread_start<T: Guest<Self>>(&self, guest: &mut T) -> Result<(), Error> {
-            guest.tail_inject(syscalls::Getpid::new()).await;
-            unreachable!()
+            guest.tail_inject(syscalls::Getpid::new()).await
         }
     }
 

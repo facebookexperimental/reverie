@@ -52,7 +52,7 @@ impl Tool for TestTool {
         guest: &mut T,
         call: Syscall,
     ) -> Result<i64, Error> {
-        let reps = guest.config().clone();
+        let reps = *guest.config();
         match call {
             Syscall::Gettid(_)
             | Syscall::Getgid(_)

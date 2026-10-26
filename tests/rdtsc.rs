@@ -9,23 +9,35 @@
 // rdtsc interception is only available on x86_64
 #![cfg(target_arch = "x86_64")]
 
+#[cfg(all(not(sanitized), test))]
 use std::sync::atomic::AtomicUsize;
+#[cfg(all(not(sanitized), test))]
 use std::sync::atomic::Ordering;
 
+#[cfg(all(not(sanitized), test))]
 use reverie::Errno;
+#[cfg(all(not(sanitized), test))]
 use reverie::GlobalTool;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Rdtsc;
+#[cfg(all(not(sanitized), test))]
 use reverie::RdtscResult;
+#[cfg(all(not(sanitized), test))]
 use reverie::Subscription;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tid;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default)]
 struct GlobalState {
     tsc: AtomicUsize,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::global_tool]
 impl GlobalTool for GlobalState {
     type Request = Rdtsc;
@@ -54,9 +66,11 @@ impl GlobalTool for GlobalState {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState {}
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = GlobalState;
@@ -89,8 +103,8 @@ mod tests {
     #[inline(never)]
     unsafe fn rdtscp() -> (u64, u32) {
         let mut aux_val = core::mem::MaybeUninit::uninit();
-        let tsc = core::arch::x86_64::__rdtscp(aux_val.as_mut_ptr());
-        (tsc, aux_val.assume_init())
+        let tsc = unsafe { core::arch::x86_64::__rdtscp(aux_val.as_mut_ptr()) };
+        (tsc, unsafe { aux_val.assume_init() })
     }
 
     #[test]

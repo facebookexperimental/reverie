@@ -11,44 +11,69 @@
 //! Syscalls are abused to communicate from the guest to the tool instructions
 //! necessary to carry out the test, such as setting timers or reading clocks.
 
+#[cfg(all(not(sanitized), test))]
 use std::sync::Mutex;
+#[cfg(all(not(sanitized), test))]
 use std::sync::atomic::AtomicU64;
+#[cfg(all(not(sanitized), test))]
 use std::sync::atomic::Ordering;
 
+#[cfg(all(not(sanitized), test))]
 use reverie::Errno;
+#[cfg(all(not(sanitized), test))]
 use reverie::Error;
+#[cfg(all(not(sanitized), test))]
 use reverie::GlobalTool;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Pid;
+#[cfg(all(not(sanitized), test))]
 use reverie::Signal;
+#[cfg(all(not(sanitized), test))]
 use reverie::Subscription;
+#[cfg(all(not(sanitized), test))]
 use reverie::TimerSchedule;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Getpid;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Gettid;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Syscall;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::SyscallInfo;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Sysno;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Tgkill;
+#[cfg(all(not(sanitized), test))]
 use reverie_ptrace::regs::RegAccess;
+#[cfg(all(not(sanitized), test))]
 use serde::Deserialize;
+#[cfg(all(not(sanitized), test))]
 use serde::Serialize;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default)]
 struct GlobalState {
     num_timer_evts: AtomicU64,
     num_signals: AtomicU64,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 enum IncrMsg {
     Timer,
     Signal,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct Config {
     sub_syscalls_only: bool,
@@ -57,6 +82,7 @@ struct Config {
     timeout_rcbs_alternate: u64,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct ThreadClockState {
     /// baseline for clock comparisons
@@ -65,6 +91,7 @@ struct ThreadClockState {
     timer_assertion: Option<u64>,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::global_tool]
 impl GlobalTool for GlobalState {
     type Request = IncrMsg;
@@ -86,8 +113,10 @@ impl GlobalTool for GlobalState {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 const BULK_INJECTION_COUNT: u64 = 10;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = GlobalState;
@@ -191,6 +220,7 @@ impl Tool for LocalState {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 async fn raise_sigwinch<T: Guest<LocalState>>(guest: &mut T) -> Tgkill {
     let pid = guest.inject(Getpid::new()).await.unwrap();
     let tid = guest.inject(Gettid::new()).await.unwrap();
@@ -200,27 +230,32 @@ async fn raise_sigwinch<T: Guest<LocalState>>(guest: &mut T) -> Tgkill {
         .with_sig(libc::SIGWINCH)
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Default)]
 struct InstructionTracingGlobal {
     timer_events: Mutex<Vec<TimerEvent>>,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(PartialEq, Default, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 struct TimerEvent {
     rcbs: u64,
     rip: reverie_ptrace::regs::Reg,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct InstructionTracingConfig {
     set_timer_after_syscall: Option<(u64, Option<u64>)>,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Serialize, Deserialize)]
 enum InstructionTracingRequest {
     Timer(TimerEvent),
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::global_tool]
 impl GlobalTool for InstructionTracingGlobal {
     type Request = InstructionTracingRequest;
@@ -234,9 +269,11 @@ impl GlobalTool for InstructionTracingGlobal {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct InstructionTracing;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for InstructionTracing {
     type GlobalState = InstructionTracingGlobal;
@@ -278,7 +315,6 @@ mod tests {
     //! into the tracee, otherwise underflow or overflow checks will break the
     //! tests.
 
-    use reverie_ptrace::regs::RegAccess;
     use reverie_ptrace::ret_without_perf;
     use reverie_ptrace::testing::check_fn;
     use reverie_ptrace::testing::check_fn_with_config;
@@ -342,9 +378,7 @@ mod tests {
 
     fn cpuid() {
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::x86_64::__cpuid(0);
-        }
+        core::arch::x86_64::__cpuid(0);
     }
 
     fn rdtsc() {
@@ -450,43 +484,55 @@ mod tests {
         // Final value is 2 because do_branches adds 1
         [rcbs / 2, 1000, 100, 10, 2]
             .iter()
-            .map(|x| *x)
+            .copied()
             .filter(|x| *x < rcbs)
             .collect()
     }
     const LET_PASS_STOP_RCBS: u64 = 1;
 
-    #[test_case(MANY_RCBS, do_syscall, sched_precise, 0)]
-    #[test_case(MANY_RCBS, do_syscall, sched_imprecise, 0)]
-    #[test_case(MANY_RCBS, cpuid, sched_precise, 0)]
-    #[test_case(MANY_RCBS, cpuid, sched_imprecise, 0)]
-    #[test_case(MANY_RCBS, rdtsc, sched_precise, 0)]
-    #[test_case(MANY_RCBS, rdtsc, sched_imprecise, 0)]
-    #[test_case(MANY_RCBS, rdtscp, sched_precise, 0)]
-    #[test_case(MANY_RCBS, rdtscp, sched_imprecise, 0)]
-    #[test_case(MANY_RCBS, sched_precise, sched_precise, 1)]
-    #[test_case(MANY_RCBS, sched_imprecise, sched_precise, 1)]
-    #[test_case(MANY_RCBS, sched_imprecise, sched_imprecise, 1)]
-    #[test_case(MANY_RCBS, sched_precise, sched_imprecise, 1)]
-    #[test_case(LESS_RCBS, do_syscall, sched_precise, 0)]
-    #[test_case(LESS_RCBS, do_syscall, sched_imprecise, 0)]
-    #[test_case(LESS_RCBS, cpuid, sched_precise, 0)]
-    #[test_case(LESS_RCBS, cpuid, sched_imprecise, 0)]
-    #[test_case(LESS_RCBS, rdtsc, sched_precise, 0)]
-    #[test_case(LESS_RCBS, rdtsc, sched_imprecise, 0)]
-    #[test_case(LESS_RCBS, rdtscp, sched_precise, 0)]
-    #[test_case(LESS_RCBS, rdtscp, sched_imprecise, 0)]
-    #[test_case(LESS_RCBS, sched_precise, sched_precise, 1)]
-    #[test_case(LESS_RCBS, sched_imprecise, sched_precise, 1)]
-    #[test_case(LESS_RCBS, sched_imprecise, sched_imprecise, 1)]
-    #[test_case(LESS_RCBS, sched_precise, sched_imprecise, 1)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TimerKind {
+        Precise,
+        Imprecise,
+    }
+
+    #[test_case(MANY_RCBS, do_syscall, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, do_syscall, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, cpuid, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, cpuid, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, rdtsc, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, rdtsc, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, rdtscp, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, rdtscp, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, sched_precise, TimerKind::Precise, 1)]
+    #[test_case(MANY_RCBS, sched_imprecise, TimerKind::Precise, 1)]
+    #[test_case(MANY_RCBS, sched_imprecise, TimerKind::Imprecise, 1)]
+    #[test_case(MANY_RCBS, sched_precise, TimerKind::Imprecise, 1)]
+    #[test_case(LESS_RCBS, do_syscall, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, do_syscall, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, cpuid, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, cpuid, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, rdtsc, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, rdtsc, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, rdtscp, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, rdtscp, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, sched_precise, TimerKind::Precise, 1)]
+    #[test_case(LESS_RCBS, sched_imprecise, TimerKind::Precise, 1)]
+    #[test_case(LESS_RCBS, sched_imprecise, TimerKind::Imprecise, 1)]
+    #[test_case(LESS_RCBS, sched_precise, TimerKind::Imprecise, 1)]
     fn assert_cancels_timers(
         rcbs: u64,
         fun: fn() -> (),
-        schedule_timer: fn() -> (),
+        timer_kind: TimerKind,
         additional_evts: u64,
     ) {
         ret_without_perf!();
+        // Select in the tracer so the guest executes the same timer function
+        // without adding branches to its measured work.
+        let schedule_timer: fn() = match timer_kind {
+            TimerKind::Precise => sched_precise,
+            TimerKind::Imprecise => sched_imprecise,
+        };
         let rcbx2 = rcbs * 2;
         for e in early_stop_rcbs(rcbs) {
             // Precompute to avoid underflow checks in the guest
@@ -499,14 +545,14 @@ mod tests {
             });
             assert_eq!(
                 gs.num_timer_evts.into_inner(),
-                0 + additional_evts,
+                additional_evts,
                 "iter: {}",
                 e
             );
         }
         // Imprecise events can be delayed, in which case nothing fires, so only
         // test this if precise:
-        if schedule_timer == sched_precise {
+        if timer_kind == TimerKind::Precise {
             // Precompute to avoid underflow checks in the guest
             let branch_ct = rcbs - LET_PASS_STOP_RCBS;
             let gs = ts_check_fn(rcbs, move || {
@@ -789,7 +835,6 @@ mod tests {
             },
             InstructionTracingConfig {
                 set_timer_after_syscall: Some((rcb_1, instr_1)),
-                ..Default::default()
             },
             true,
         );
@@ -801,7 +846,6 @@ mod tests {
             },
             InstructionTracingConfig {
                 set_timer_after_syscall: Some((rcb_2, instr_2)),
-                ..Default::default()
             },
             true,
         );

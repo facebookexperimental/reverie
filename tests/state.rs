@@ -10,28 +10,46 @@
 
 #![cfg(not(sanitized))]
 
+#[cfg(all(not(sanitized), test))]
 use std::sync::Mutex;
+#[cfg(all(not(sanitized), test))]
 use std::sync::atomic::AtomicUsize;
+#[cfg(all(not(sanitized), test))]
 use std::sync::atomic::Ordering;
 
+#[cfg(all(not(sanitized), test))]
 use reverie::Error;
+#[cfg(all(not(sanitized), test))]
 use reverie::ExitStatus;
+#[cfg(all(not(sanitized), test))]
 use reverie::GlobalRPC;
+#[cfg(all(not(sanitized), test))]
 use reverie::GlobalTool;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Pid;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Syscall;
+#[cfg(all(not(sanitized), test))]
 use serde::Deserialize;
+#[cfg(all(not(sanitized), test))]
 use serde::Serialize;
 
+#[cfg(all(not(sanitized), test))]
+type ProcessTree = Vec<(i32, Vec<(i32, usize, usize)>)>;
+
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default)]
 struct GlobalState {
     // Map of pids to parent pids and syscall counts. This is only updated when
     // a process exits.
-    tree: Mutex<Vec<(i32, Vec<(i32, usize, usize)>)>>,
+    tree: Mutex<ProcessTree>,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct ThreadState {
     // Number of syscalls executed by this thread.
@@ -41,6 +59,7 @@ struct ThreadState {
     children: AtomicUsize,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::global_tool]
 impl GlobalTool for GlobalState {
     type Request = Vec<(i32, usize, usize)>;
@@ -53,6 +72,7 @@ impl GlobalTool for GlobalState {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default)]
 struct TestTool {
     // Vec of thread ids and their syscall counts and children. This is only
@@ -60,6 +80,7 @@ struct TestTool {
     threads: Mutex<Vec<(i32, usize, usize)>>,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for TestTool {
     type GlobalState = GlobalState;

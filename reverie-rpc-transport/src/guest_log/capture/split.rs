@@ -917,31 +917,35 @@ impl<T, P, B> SplitCaptureRun<T, P, B> {
             self.freeze(self.report(None));
             return SplitCaptureOutcome::Unjoined(Box::new(self));
         }
-        if let Some(owner) = &self.workers.owner {
-            if let Some(lifecycle) = &owner.shared.split {
-                let facts = lifecycle.snapshot();
-                if facts.disposition != 0 {
-                    owner.handle.root_reaped();
-                    owner
-                        .handle
-                        .run_state(if facts.disposition == 1 && facts.guest_success {
-                            RunState::Succeeded
-                        } else {
-                            RunState::Failed
-                        });
-                }
-                if !facts.qualifies() {
-                    if facts.integrity_ready()
-                        && !facts.guest_success
-                        && self.status.is_some_and(|status| status.success())
-                        && self.result.is_some()
-                    {
-                        owner.shared.record_guest_outcome_policy_failure();
+        if let Some((owner, lifecycle)) = self.workers.owner.as_ref().and_then(|owner| {
+            owner
+                .shared
+                .split
+                .as_ref()
+                .map(|lifecycle| (owner, lifecycle))
+        }) {
+            let facts = lifecycle.snapshot();
+            if facts.disposition != 0 {
+                owner.handle.root_reaped();
+                owner
+                    .handle
+                    .run_state(if facts.disposition == 1 && facts.guest_success {
+                        RunState::Succeeded
                     } else {
-                        owner
-                            .shared
-                            .fail("split coordinator facts/teardown do not qualify");
-                    }
+                        RunState::Failed
+                    });
+            }
+            if !facts.qualifies() {
+                if facts.integrity_ready()
+                    && !facts.guest_success
+                    && self.status.is_some_and(|status| status.success())
+                    && self.result.is_some()
+                {
+                    owner.shared.record_guest_outcome_policy_failure();
+                } else {
+                    owner
+                        .shared
+                        .fail("split coordinator facts/teardown do not qualify");
                 }
             }
         }
@@ -1048,10 +1052,11 @@ fn terminal_guest_status(raw: i32) -> Option<std::process::ExitStatus> {
 
 impl<T, P, B> Drop for SplitCaptureRun<T, P, B> {
     fn drop(&mut self) {
-        if let Some(owner) = &self.workers.owner {
-            if self.child.is_some() {
+        match &self.workers.owner {
+            Some(owner) if self.child.is_some() => {
                 owner.shared.fail("split owner disposed before settlement");
             }
+            _ => {}
         }
         // A failed proc anchor leaves the real drainer parked. Recover it before
         // owned child cleanup, which may itself depend on active drainers.

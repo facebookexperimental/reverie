@@ -17,6 +17,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+#[cfg(all(not(sanitized), test))]
 use close_err::Closable;
 #[allow(unused_imports)]
 use nix::sys::wait;
@@ -234,7 +235,7 @@ fn i_should_segfault() {
     use reverie_ptrace::testing::test_fn;
     let (output, _) = test_fn::<NoopTool, _>(|| {
         unsafe {
-            let invalid_ptr = 0x8u64 as *mut u64;
+            let invalid_ptr = std::ptr::dangling_mut::<u64>();
             invalid_ptr.write_volatile(0xdeadbeefu64);
         };
     })
@@ -249,14 +250,14 @@ fn i_should_segfault_2() {
     use reverie_ptrace::testing::test_fn;
 
     pub fn do_segfault() {
-        let invalid_ptr = 0x8u64 as *const usize;
+        let invalid_ptr = std::ptr::dangling::<usize>();
         let result = unsafe { invalid_ptr.read_volatile() };
         // Print so the above doesn't get optimized out. We will never get here
         // because the above segfaults.
         println!("{}", result);
     }
 
-    let (output, _) = test_fn::<NoopTool, _>(|| do_segfault()).unwrap();
+    let (output, _) = test_fn::<NoopTool, _>(do_segfault).unwrap();
     assert_eq!(output.status, ExitStatus::Signaled(SIGSEGV, true),);
 }
 

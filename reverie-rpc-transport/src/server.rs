@@ -535,8 +535,8 @@ impl IssueGuard {
     }
     fn complete(&mut self, result: Result<(), RpcError>) {
         self.completed = true;
-        if let Err(error) = result {
-            if !matches!(error, RpcError::Closed) {
+        match result {
+            Err(error) if !matches!(error, RpcError::Closed) => {
                 if let Some(monitor) = &self.monitor {
                     monitor.record(
                         self.connection,
@@ -547,6 +547,7 @@ impl IssueGuard {
                     tracing_disconnect(&error);
                 }
             }
+            _ => {}
         }
         if let Some(monitor) = &self.monitor {
             monitor.reserved.fetch_sub(1, Ordering::Release);
@@ -911,8 +912,10 @@ where
         let mut accepting = true;
         let result = async {
             loop {
-                if !accepting && connections.is_empty() {
-                    if let Some(cancellation) = &cancellation { cancellation.drained(); }
+                if let (true, Some(cancellation)) =
+                    (!accepting && connections.is_empty(), &cancellation)
+                {
+                    cancellation.drained();
                 }
                 let (stream, _addr) = tokio::select! {
                     biased;
@@ -927,8 +930,10 @@ where
                     },
                     result = self.listener.accept(), if accepting => result?,
                     joined = connections.join_next(), if !connections.is_empty() => {
-                        if let Some(Ok(Some(outcome))) = joined {
-                            if let Some(cancellation) = &cancellation { cancellation.joined(outcome); }
+                        if let (Some(Ok(Some(outcome))), Some(cancellation)) =
+                            (joined, &cancellation)
+                        {
+                            cancellation.joined(outcome);
                         }
                         continue;
                     },
@@ -1024,10 +1029,8 @@ where
         .await;
         connections.abort_all();
         while let Some(joined) = connections.join_next().await {
-            if let Ok(Some(outcome)) = joined {
-                if let Some(cancellation) = &cancellation {
-                    cancellation.joined(outcome);
-                }
+            if let (Ok(Some(outcome)), Some(cancellation)) = (joined, &cancellation) {
+                cancellation.joined(outcome);
             }
         }
         result
@@ -1398,8 +1401,8 @@ where
         } else {
             admitted.take()
         };
-        if let Some(Admitted { process_id }) = request_owner {
-            if from.as_raw() != process_id {
+        match request_owner {
+            Some(Admitted { process_id }) if from.as_raw() != process_id => {
                 let which = if strict_sender { "a" } else { "its first" };
                 return Err(RpcError::Io(std::io::Error::other(format!(
                     "connection admitted for process {process_id} sent {which} request as {}",
@@ -1407,6 +1410,7 @@ where
                 )))
                 .into());
             }
+            _ => {}
         }
         if let Some(readiness) = &readiness {
             readiness.store(true, Ordering::Release);

@@ -8,21 +8,34 @@
 
 // signal handling related tests.
 
+#[cfg(all(not(sanitized), test))]
 use nix::sys::signal::Signal;
+#[cfg(all(not(sanitized), test))]
 use reverie::Error;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::AddrMut;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::ExitGroup;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::MemoryAccess;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::RtSigpending;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Syscall;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::SyscallInfo;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Sysno;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = ();
@@ -92,17 +105,19 @@ mod tests {
         let set = KernelSigset::from(signals);
         let mut oldset: MaybeUninit<u64> = MaybeUninit::uninit();
 
-        if libc::syscall(
-            libc::SYS_rt_sigprocmask,
-            libc::SIG_BLOCK,
-            &set as *const _,
-            oldset.as_mut_ptr(),
-            8,
-        ) != 0
+        if unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_BLOCK,
+                &set as *const _,
+                oldset.as_mut_ptr(),
+                8,
+            )
+        } != 0
         {
             Err(io::Error::last_os_error())
         } else {
-            Ok(KernelSigset(oldset.assume_init()))
+            Ok(KernelSigset(unsafe { oldset.assume_init() }))
         }
     }
 

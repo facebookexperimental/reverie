@@ -14,26 +14,43 @@
 //! NB: restarted syscalls should not count, as syscall
 //! returning ERESTARTSYS could be automatically restarted
 
+#[cfg(all(not(sanitized), test))]
 use nix::sys::signal;
+#[cfg(all(not(sanitized), test))]
 use nix::sys::signal::Signal;
+#[cfg(all(not(sanitized), test))]
 use reverie::Error;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Errno;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Syscall;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::SyscallInfo;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Sysno;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Tgkill;
+#[cfg(all(not(sanitized), test))]
 use serde::Deserialize;
+#[cfg(all(not(sanitized), test))]
 use serde::Serialize;
+#[cfg(all(not(sanitized), test))]
 use tokio::time::Duration;
+#[cfg(all(not(sanitized), test))]
 use tokio::time::sleep;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState;
 
+#[cfg(all(not(sanitized), test))]
 const GAP_MS: u64 = 500;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct ThreadState {
     sigpending: Option<i32>,
@@ -41,6 +58,7 @@ struct ThreadState {
 }
 
 // syscall is interrupted and may restart
+#[cfg(all(not(sanitized), test))]
 fn is_syscall_restarted(errno: Errno) -> bool {
     [
         Errno::ERESTARTSYS,
@@ -51,6 +69,7 @@ fn is_syscall_restarted(errno: Errno) -> bool {
     .contains(&errno)
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = ();
@@ -172,17 +191,19 @@ mod tests {
         let set = KernelSigset::from(signals);
         let mut oldset: MaybeUninit<u64> = MaybeUninit::uninit();
 
-        if libc::syscall(
-            libc::SYS_rt_sigprocmask,
-            libc::SIG_BLOCK,
-            &set as *const _,
-            oldset.as_mut_ptr(),
-            8,
-        ) != 0
+        if unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_BLOCK,
+                &set as *const _,
+                oldset.as_mut_ptr(),
+                8,
+            )
+        } != 0
         {
             Err(io::Error::last_os_error())
         } else {
-            Ok(KernelSigset(oldset.assume_init()))
+            Ok(KernelSigset(unsafe { oldset.assume_init() }))
         }
     }
 
@@ -191,23 +212,25 @@ mod tests {
         let set = KernelSigset::from(signals);
         let mut oldset: MaybeUninit<u64> = MaybeUninit::uninit();
 
-        if libc::syscall(
-            libc::SYS_rt_sigprocmask,
-            libc::SIG_UNBLOCK,
-            &set as *const _,
-            oldset.as_mut_ptr(),
-            8,
-        ) != 0
+        if unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_UNBLOCK,
+                &set as *const _,
+                oldset.as_mut_ptr(),
+                8,
+            )
+        } != 0
         {
             Err(io::Error::last_os_error())
         } else {
-            Ok(KernelSigset(oldset.assume_init()))
+            Ok(KernelSigset(unsafe { oldset.assume_init() }))
         }
     }
 
     unsafe fn restore_sig_handlers(signals: &[Signal]) -> io::Result<()> {
         for &sig in signals {
-            libc::signal(sig as i32, libc::SIG_DFL);
+            unsafe { libc::signal(sig as i32, libc::SIG_DFL) };
         }
         Ok(())
     }
@@ -225,11 +248,11 @@ mod tests {
     }
 
     unsafe fn install_sigprof_handler() -> i32 {
-        let mut sa: libc::sigaction = MaybeUninit::zeroed().assume_init();
+        let mut sa: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
         sa.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO | libc::SA_NODEFER;
-        sa.sa_sigaction = sigprof_handler as _;
+        sa.sa_sigaction = sigprof_handler as *const () as _;
 
-        libc::sigaction(libc::SIGPROF, &sa as *const _, std::ptr::null_mut())
+        unsafe { libc::sigaction(libc::SIGPROF, &sa as *const _, std::ptr::null_mut()) }
     }
 
     unsafe fn sigtimedwait(signals: &[Signal], timeout_ns: u64) -> io::Result<Signal> {
@@ -240,16 +263,18 @@ mod tests {
             tv_nsec: (timeout_ns % 1000000000) as i64,
         };
 
-        match Signal::try_from(libc::syscall(
-            libc::SYS_rt_sigtimedwait,
-            &sigset as *const _,
-            siginfo.as_mut_ptr(),
-            &timeout as *const _,
-            8,
-        ) as i32)
+        match Signal::try_from(unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigtimedwait,
+                &sigset as *const _,
+                siginfo.as_mut_ptr(),
+                &timeout as *const _,
+                8,
+            )
+        } as i32)
         {
             Ok(sig) => {
-                let siginfo = siginfo.assume_init();
+                let siginfo = unsafe { siginfo.assume_init() };
                 assert_eq!(siginfo.si_signo, sig as i32);
                 Ok(sig)
             }
@@ -263,7 +288,7 @@ mod tests {
             set |= 1u64 << (sig as usize - 1);
         }
 
-        libc::syscall(libc::SYS_rt_sigsuspend, &set as *const _, 8);
+        unsafe { libc::syscall(libc::SYS_rt_sigsuspend, &set as *const _, 8) };
         // always return Err.
         Err(io::Error::last_os_error())
     }
@@ -290,12 +315,14 @@ mod tests {
             it_value: next,
         };
 
-        if libc::syscall(
-            libc::SYS_setitimer,
-            libc::ITIMER_PROF,
-            &timer_val as *const _,
-            0,
-        ) != 0
+        if unsafe {
+            libc::syscall(
+                libc::SYS_setitimer,
+                libc::ITIMER_PROF,
+                &timer_val as *const _,
+                0,
+            )
+        } != 0
         {
             eprintln!("setitimer returned error: {:?}", io::Error::last_os_error());
             Err(io::Error::last_os_error())
@@ -393,7 +420,9 @@ mod tests {
             // timer should expire
             assert!(unsafe { unblock_signals(&[Signal::SIGPROF]) }.is_ok());
             assert!(unsafe { settimer(100000) }.is_ok());
-            loop {}
+            loop {
+                std::hint::spin_loop();
+            }
         });
     }
 
@@ -433,7 +462,10 @@ mod tests {
             // timer should expire
             assert!(unsafe { unblock_signals(&[Signal::SIGPROF, Signal::SIGVTALRM]) }.is_ok());
             assert!(unsafe { settimer(500000) }.is_ok());
-            loop { /* sigprof handler calls exit_group */ }
+            loop {
+                // sigprof handler calls exit_group.
+                std::hint::spin_loop();
+            }
         });
     }
 
@@ -460,7 +492,7 @@ mod tests {
                 assert!(unsafe { block_signals(&[Signal::SIGPROF]) }.is_ok());
                 assert!(unsafe { unblock_signals(&[Signal::SIGSYS]) }.is_ok());
                 assert_eq!(
-                    unsafe { sigtimedwait(&[Signal::SIGSYS], 1000_000_000) }.ok(),
+                    unsafe { sigtimedwait(&[Signal::SIGSYS], 1_000_000_000) }.ok(),
                     Some(Signal::SIGSYS)
                 );
 
@@ -473,7 +505,9 @@ mod tests {
                     );
                     // expected to timeout, because we delay signal delivery to next
                     // syscall which returns success
-                    loop {}
+                    loop {
+                        std::hint::spin_loop();
+                    }
                 }
             });
 
@@ -493,7 +527,9 @@ mod tests {
             assert!(unsafe { unblock_signals(&[Signal::SIGPROF, Signal::SIGVTALRM]) }.is_ok());
             assert!(unsafe { settimer(500000) }.is_ok());
 
-            loop {}
+            loop {
+                std::hint::spin_loop();
+            }
         });
     }
 
@@ -513,7 +549,7 @@ mod tests {
 
                 assert!(unsafe { unblock_signals(&[Signal::SIGSYS]) }.is_ok());
                 assert_eq!(
-                    unsafe { sigtimedwait(&[Signal::SIGSYS], 1000_000_000) }.ok(),
+                    unsafe { sigtimedwait(&[Signal::SIGSYS], 1_000_000_000) }.ok(),
                     Some(Signal::SIGSYS)
                 );
 

@@ -325,10 +325,11 @@ impl TaskExits {
         collector_result: Option<bool>,
         publication_result: Option<bool>,
     ) {
-        if collector_result.is_some() && publication_result.is_some() {
-            if let Some(completed) = &self.join_completion_probe {
-                completed.store(true, std::sync::atomic::Ordering::Release);
-            }
+        if let (true, Some(completed)) = (
+            collector_result.is_some() && publication_result.is_some(),
+            &self.join_completion_probe,
+        ) {
+            completed.store(true, std::sync::atomic::Ordering::Release);
         }
     }
 

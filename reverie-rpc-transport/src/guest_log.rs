@@ -339,8 +339,8 @@ impl LogHandle {
     }
     fn issue_with_origin(&self, kind: IssueKind, message: impl ToString, origin: IssueOrigin) {
         // Latch before conversion, deduplication or bounded diagnostic omission.
-        if let Some(capture) = self.0.capture.get() {
-            if matches!(origin, IssueOrigin::Integrity) {
+        match self.0.capture.get() {
+            Some(capture) if matches!(origin, IssueOrigin::Integrity) => {
                 capture.latch_integrity_fault(match kind {
                     IssueKind::Startup | IssueKind::Child => IntegrityFault::OwnedChild,
                     IssueKind::Cancelled | IssueKind::Interrupted | IssueKind::Cutoff => {
@@ -353,6 +353,7 @@ impl LogHandle {
                     IssueKind::Cleanup => IntegrityFault::Teardown,
                 });
             }
+            _ => {}
         }
         let mut state = self.0.state.lock().unwrap();
         {

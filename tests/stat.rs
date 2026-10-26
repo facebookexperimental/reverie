@@ -8,11 +8,14 @@
 
 // reinject stat* as fstatat unittest
 
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = ();
@@ -30,7 +33,7 @@ mod tests {
     #[test]
     fn stat_can_be_reinjected() {
         check_fn::<LocalState, _>(|| {
-            let path = "/proc/self/exe\0".as_ptr() as _;
+            let path = c"/proc/self/exe".as_ptr();
             let fd = unsafe { libc::open(path, libc::O_RDONLY) };
             assert!(fd > 0);
 
@@ -57,13 +60,13 @@ mod tests {
         mask: u32,
         statxbuf: *mut libc::statx,
     ) -> i64 {
-        libc::syscall(libc::SYS_statx, dirfd, path, flags, mask, statxbuf)
+        unsafe { libc::syscall(libc::SYS_statx, dirfd, path, flags, mask, statxbuf) }
     }
 
     #[test]
     fn statx_fstat_returns_same_ino() {
         check_fn::<LocalState, _>(|| {
-            let path = "/proc/self/exe\0".as_ptr() as _;
+            let path = c"/proc/self/exe".as_ptr();
             let dirfd = libc::AT_FDCWD;
 
             let mut fstatat_result: MaybeUninit<libc::stat> = MaybeUninit::uninit();
