@@ -6589,12 +6589,12 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 if mode == HELD_TIMER_STEP {
-                    // Arms the precise timer, then retires branches until
-                    // it fires.
+                    // Arms the precise timer, then retires conditional
+                    // branches until it fires. A loop without one never
+                    // advances the RCB clock to a programmed overflow.
                     unsafe { libc::syscall(libc::SYS_getpgid, 0) };
-                    let mut index = 0u64;
                     loop {
-                        index = std::hint::black_box(index.wrapping_add(1));
+                        crate::perf::do_branches(100);
                     }
                 }
                 unsafe {
