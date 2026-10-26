@@ -1419,8 +1419,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie/src/pmu_config.rs",
-        44533,
-        "516e9fd43e74a4aca895f83e78cfa106a685336b3a1f3b1d4e56416c5d518ada",
+        70097,
+        "3b3c336d9f7c5a3952899e837f3efb12d0aa17798c88b92068f9928b2b113e82",
     ),
     (
         "reverie/src/in_guest_rcb.rs",
@@ -1429,8 +1429,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie/src/pmu.rs",
-        5668,
-        "6866145a0c92bf70aa27ad432c2eddada55b34d582434f814f06032baed792bf",
+        8175,
+        "9ca37a8ef80bc02e2282f8f823fba954ad9d86a7be26aa5968347cd44305cba6",
     ),
     (
         "reverie-inguest/src/guest/clock.rs",
