@@ -7513,9 +7513,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         signal: Option<AnySignal>,
     ) -> Result<SignalResume, TraceError> {
         let taken = self.pending_signal_taken;
-        // Resumed from a signal-delivery stop, whose siginfo can be written.
-        let writable = self.latest_injection_stop.unwrap_or(stop_signal).is_some()
-            && !thread_may_be_seccomp_filtered();
+        // Resumed from a signal-delivery stop, whose siginfo can be written,
+        // as it stood before the callback's injections. Whether this tracer
+        // thread may be filtered (a procfs read) is asked below only for a
+        // signal whose siginfo is to be written back: most stops have none.
+        let at_delivery_stop = self.latest_injection_stop.unwrap_or(stop_signal).is_some();
         let mut resume = self
             .report_or_pass_held_signal(task, stop_signal, signal)
             .await?;
@@ -7527,9 +7529,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         // <https://github.com/rrnewton/reverie/issues/999>).
         if resume.reported.is_none()
             && resume.replacement.is_none()
-            && writable
+            && at_delivery_stop
             && let (Some(sig), Some(taken)) = (resume.signal, taken)
             && sig == taken.signal
+            && !thread_may_be_seccomp_filtered()
         {
             resume.replacement = Some((sig, taken.bytes));
         }
