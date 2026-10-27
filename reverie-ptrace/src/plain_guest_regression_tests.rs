@@ -5046,6 +5046,53 @@ async fn unblocked_sigtrap_costs_timer_steps_no_reads_without_sigreturn_reports(
     panic!("no run in {ATTEMPTS} stepped both timer sequences");
 }
 
+/// A timer sequence reads the guest's mask, and SIGTRAP's procfs state where
+/// the mask blocks it, for its first step only
+/// (`TimerStepShield::known_mask`): no step changes them but by an
+/// `rt_sigreturn` or a trap instruction of the guest's own, which this guest
+/// runs in none of its sequences, and every syscall that could stops the
+/// step. Across the five SIGTRAP states of `sigtrap_timer`, three of them
+/// blocked, each timer event reads at most one mask and one procfs state,
+/// however many steps it makes, the reblock after each step included, and
+/// every state survives as `sigtrap_state_survives_timer_steps` requires.
+#[tokio::test(flavor = "current_thread")]
+async fn a_timer_sequence_reads_the_mask_once() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let reads = || crate::task::TIMER_STEP_STATE_READS_FOR_TEST.with(|count| count.get());
+    let before = reads();
+    let run = run_guest("sigtrap_timer", false).await;
+    let read = reads() - before;
+    assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+    let timers = timer_events(&run);
+    assert_eq!(timers.len(), 5, "{timers:#?}");
+    let lines: Vec<&str> = run
+        .report
+        .lines()
+        .filter(|line| line.starts_with("timer "))
+        .collect();
+    let expected: Vec<String> = [
+        ("ign-blocked", "ign", 1),
+        ("ign", "ign", 0),
+        ("handler-blocked", "trap_handler", 1),
+        ("handler", "trap_handler", 0),
+        ("dfl-blocked", "dfl", 1),
+    ]
+    .into_iter()
+    .map(|(state, action, blocked)| {
+        format!("timer {state} sigtrap={action} flags=0x50000000 usr2-in-mask=1 blocked={blocked}")
+    })
+    .collect();
+    assert_eq!(lines, expected, "{}", run.report);
+    assert!(
+        read <= 2 * timers.len() as u64,
+        "{read} mask and procfs reads for {} timer events",
+        timers.len()
+    );
+}
+
 /// A caught, blocked SIGTRAP survives a timer step over a guest
 /// `rt_sigreturn` whose frame blocks SIGTRAP: the step clears SIGTRAP from the
 /// frame for its trap and blocks it again after

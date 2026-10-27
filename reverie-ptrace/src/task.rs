@@ -1173,8 +1173,9 @@ enum StepShield {
 
 /// Unblocks SIGTRAP for one Reverie single-step (`sigtrap_state`'s shield),
 /// with the mask `PTRACE_GETSIGMASK` reported, and `known` the procfs state
-/// read for this same stop, if it was (`TracedTask::injection_proc_state`).
-/// procfs is read only when SIGTRAP is blocked.
+/// read for this same stop (`TracedTask::injection_proc_state`) or for an
+/// earlier step of the same timer sequence (`TimerStepShield::known_mask`),
+/// if it was. procfs is read only when SIGTRAP is blocked.
 fn unblock_sigtrap_for_step_known(
     task: &Stopped,
     mask: u64,
@@ -1197,7 +1198,8 @@ fn unblock_sigtrap_for_step_known(
     Ok(StepShield::Unblocked)
 }
 
-/// `unblock_sigtrap_for_step_known` for a timer step, which also shields a
+/// `unblock_sigtrap_for_step_known` for a timer step, with `known` the procfs
+/// state read for it (`TimerStepShield::known_mask`), which also shields a
 /// step taken while a temporary mask's restore is pending. The step resumes
 /// the thread with no signal, and the kernel performs the restore on its way
 /// back to the guest, before the step's instruction (`restore_saved_sigmask`
@@ -1218,12 +1220,16 @@ fn unblock_sigtrap_for_step_known(
 fn unblock_sigtrap_for_timer_step(
     task: &Stopped,
     mask: u64,
+    known: Option<ProcSignalState>,
     restore_shield: bool,
 ) -> Result<StepShield, TraceError> {
     if mask & SIGTRAP_BIT == 0 {
         return Ok(StepShield::None);
     }
-    let state = ProcSignalState::read(task)?;
+    let state = match known {
+        Some(state) => state,
+        None => ProcSignalState::read(task)?,
+    };
     if state.pending & SIGTRAP_BIT != 0 {
         return Ok(StepShield::PendingTrap);
     }
@@ -1279,6 +1285,24 @@ struct TimerStepShield {
     /// and `rt_sigprocmask` are neither traced nor decoded
     /// (`x32_syscalls_refused`).
     quiet_unless_sigreturn: bool,
+    /// Whether no step of this sequence can change the mask but by a guest
+    /// `rt_sigreturn` or a trap of the guest's own, which the steps
+    /// recognize: every syscall that could stops the step at its seccomp stop
+    /// (`GlobalState::traces_signal_state_syscalls`), and no filter of higher
+    /// precedence than Reverie's can let one run without a stop (as for
+    /// `quiet_unless_sigreturn`). The mask read for one step then holds for
+    /// the next.
+    mask_stable: bool,
+    /// Under `mask_stable`, the guest's mask as read for an earlier step of
+    /// the sequence, and the procfs state read with it
+    /// (`unblock_sigtrap_for_step_known`), which no step changes either: no
+    /// syscall runs, so no temporary mask's restore starts, and no signal is
+    /// queued, since no other thread runs (the serialized-execution
+    /// contract). Kept only where no restore was pending at the step that
+    /// read them (procfs `SigBlk` equal to the mask), since a pending one
+    /// ends at that step's resume. Forgotten at a step over an
+    /// `rt_sigreturn` or over a trap instruction of the guest's own.
+    known_mask: Option<(u64, Option<ProcSignalState>)>,
     /// Whether any step of the sequence ran.
     stepped: bool,
     /// Whether a step ran an instruction that raises its own SIGTRAP, whose
@@ -1319,14 +1343,25 @@ impl TimerStepShield {
         // takes SIGTRAP's default action; neither the shield nor a repair may
         // undo that. With SIGTRAP neither blocked nor ignored, its trap resets
         // nothing, so the instruction is decoded only otherwise.
-        let mask = sigmask(task)?;
+        let (mask, known_state) = match self.known_mask {
+            Some(known) => known,
+            None => {
+                #[cfg(test)]
+                TIMER_STEP_STATE_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
+                (sigmask(task)?, None)
+            }
+        };
         let sensitive = self.ignored || mask & SIGTRAP_BIT != 0;
         if sensitive && instruction_at_raises_sigtrap(task, regs.ip()) {
+            // Its own trap may unblock SIGTRAP natively.
+            self.known_mask = None;
             self.stepped = true;
             self.native_trap = true;
             return Ok(());
         }
         if let Some((address, rip)) = sigreturn_frame_mask_address(task, &regs)? {
+            // The step restores a mask from the frame.
+            self.known_mask = None;
             let frame = Addr::<u64>::from_raw(address).ok_or(Errno::EFAULT)?;
             let mask: u64 = task.read_value(frame)?;
             if mask & SIGTRAP_BIT != 0 {
@@ -1341,7 +1376,21 @@ impl TimerStepShield {
             self.stepped = true;
             return Ok(());
         }
-        match unblock_sigtrap_for_timer_step(task, mask, self.restore_shield)? {
+        // procfs is read only while SIGTRAP is blocked
+        // (`unblock_sigtrap_for_step_known`), and once a sequence.
+        let state = match known_state {
+            Some(state) => Some(state),
+            None if mask & SIGTRAP_BIT != 0 => {
+                #[cfg(test)]
+                TIMER_STEP_STATE_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
+                Some(ProcSignalState::read(task)?)
+            }
+            None => None,
+        };
+        if self.mask_stable && state.is_none_or(|state| state.blocked == mask) {
+            self.known_mask = Some((mask, state));
+        }
+        match unblock_sigtrap_for_timer_step(task, mask, state, self.restore_shield)? {
             StepShield::None => {}
             StepShield::Unblocked => self.reblock = true,
             StepShield::PendingTrap => {
@@ -1366,7 +1415,16 @@ impl TimerStepShield {
             reblock = task.getregs()?.ip() != rip;
         }
         if reblock {
-            let mask = sigmask(task)?;
+            // The step changed no mask but the shield's own (`mask_stable`),
+            // unless it ran an `rt_sigreturn`, which forgot the known mask.
+            let mask = match self.known_mask {
+                Some((mask, _)) => mask,
+                None => {
+                    #[cfg(test)]
+                    TIMER_STEP_STATE_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
+                    sigmask(task)?
+                }
+            };
             set_sigmask(task, mask | SIGTRAP_BIT)?;
         }
         Ok(())
@@ -1755,11 +1813,17 @@ fn shares_signal_actions(parent: &Stopped) -> bool {
 /// read), which reads an execute-only page as the CPU fetches it, where
 /// `process_vm_readv` fails; the read stops at the first unreadable word.
 fn instruction_at_raises_sigtrap(task: &Stopped, rip: u64) -> bool {
+    // The longest instruction: 15 bytes on x86-64; aarch64's are 4, aligned,
+    // so one word holds the whole of one.
+    #[cfg(target_arch = "x86_64")]
+    const MAX_INSTRUCTION_LEN: usize = 15;
+    #[cfg(target_arch = "aarch64")]
+    const MAX_INSTRUCTION_LEN: usize = 4;
     let rip = rip as usize;
     let start = rip & !7;
     let mut bytes = [0u8; 24];
     let mut len = 0;
-    while len < bytes.len() && start + len < rip + 15 {
+    while len < bytes.len() && start + len < rip + MAX_INSTRUCTION_LEN {
         let word =
             Addr::<u64>::from_raw(start + len).and_then(|address| task.read_value(address).ok());
         let Some(word) = word else {
@@ -4015,6 +4079,12 @@ thread_local! {
     /// (`TimerStepShield::prepare` past its quiet cases). Per thread, as
     /// above.
     pub(crate) static TIMER_STEP_SHIELD_READS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// The guest masks and procfs states read for timer steps' shields
+    /// (`TimerStepShield::prepare` and `settle`), counted for the test that
+    /// bounds them to one of each a sequence. Per thread, as above.
+    pub(crate) static TIMER_STEP_STATE_READS_FOR_TEST: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
 
     /// The injections whose SIGTRAP state was read before their step
@@ -6463,6 +6533,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         // the step, so only those are read per step until one does: on
         // aarch64 every step read the mask, about one `PTRACE_GETSIGMASK` per
         // resume of a preemption-heavy guest.
+        // Not read under a tracer filter, where no shield runs at all.
         let syscalls_stop = !filtered
             && self.global_state.traces_signal_state_syscalls
             && self.global_state.seccomp_filter_baseline == Some(1)
@@ -6474,11 +6545,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         let quiet_but_sigreturns =
             !sigtrap_ignored && syscalls_stop && sigmask(&task)? & SIGTRAP_BIT == 0;
         let quiet = quiet_but_sigreturns && self.global_state.reports_sigreturns;
+        let mask_stable =
+            syscalls_stop && (!cfg!(target_arch = "x86_64") || x32_syscalls_refused());
         let shield = Arc::new(StdMutex::new(TimerStepShield {
             ignored: sigtrap_ignored,
             restore_shield: syscalls_stop
                 && (!cfg!(target_arch = "x86_64") || x32_syscalls_refused()),
             quiet,
+            mask_stable,
             quiet_unless_sigreturn: quiet_but_sigreturns
                 && !quiet
                 && (!cfg!(target_arch = "x86_64") || x32_syscalls_refused()),
