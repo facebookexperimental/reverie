@@ -567,7 +567,9 @@ const SEND_SIGWINCH: u64 = 0x200;
 const SEND_QUEUE: u64 = 0x400;
 /// The tracer leaves SIGUSR1 pending for its final resume of the stop.
 const SEND_RESUME: u64 = 0x800;
-/// The Tool requests a precise timer of r8 (the fifth argument) branches.
+/// The Tool requests a precise timer of r8 (the fifth argument) branches,
+/// followed by the number of instructions in r8's upper half, if any
+/// (`TimerSchedule::RcbsAndInstructions`).
 const ARM_TIMER: u64 = 0x1000;
 /// The Tool sends SIGSTOP to the calling thread while it is parked.
 const SEND_SIGSTOP: u64 = 0x2000;
@@ -1114,8 +1116,15 @@ impl Tool for GuestTool {
                 notify_parent(pid);
             }
             if regs.r9 & ARM_TIMER != 0 {
+                let schedule = match regs.r8 >> 32 {
+                    0 => reverie::TimerSchedule::Rcbs(regs.r8),
+                    instructions => reverie::TimerSchedule::RcbsAndInstructions(
+                        regs.r8 & 0xffff_ffff,
+                        instructions,
+                    ),
+                };
                 guest
-                    .set_timer_precise(reverie::TimerSchedule::Rcbs(regs.r8))
+                    .set_timer_precise(schedule)
                     .expect("arm the precise timer");
             }
         }
@@ -5098,6 +5107,108 @@ async fn timer_steps_in_an_execute_only_page_survive_trace_logging() {
         .collect();
     assert_eq!(lines, ["xo c=4", "xo c=8", "xo c=12"], "{}", run.report);
     assert!(!timer_events(&run).is_empty(), "{}", run.report);
+}
+
+/// A synchronous-class signal that a handler queues for itself under a mask
+/// that blocks it, as a crash handler does before returning, while a precise
+/// timer's steps run through the rest of the handler and its return. The
+/// kernel takes such a signal ahead of each step's report
+/// (`dequeue_synchronous_signal` ignores the mask while the step's SIGTRAP
+/// is pending), so the first step stopped at the SIGFPE with its report
+/// still queued. Handed on, that report stayed pending, the SIGFPE handler's
+/// mask blocked it, and the handler's private injection met a pending
+/// blocked SIGTRAP and ended the run (`PendingSigtrapAtStep`). Each such
+/// SIGFPE is now requeued behind the report
+/// (`timer::dequeued_ahead_of_step_report`), and the guest `rt_sigreturn`,
+/// which this Tool does not observe, as on aarch64, runs as a syscall to its
+/// exit stop (`TimerStepShield::syscall_step`). Each SIGFPE reaches its
+/// handler once, after the handler that queued it returned, with the code
+/// queued, and SIGTRAP keeps its handler: the shield stays up across a
+/// requeue, so no step's trap meets SIGTRAP blocked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_signal_taken_ahead_of_a_timer_step_report_leaves_no_step_trap() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let count = |counter: &'static std::thread::LocalKey<std::cell::Cell<u64>>| {
+        counter.with(|count| count.get())
+    };
+    let requeues = count(&crate::task::TIMER_STEP_REQUEUES_FOR_TEST);
+    let syscall_steps = count(&crate::task::TIMER_SYSCALL_STEPS_FOR_TEST);
+    let run = run_guest("sync_signal_behind_sigreturn", false).await;
+    assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+    let lines: Vec<&str> = run
+        .report
+        .lines()
+        .filter(|line| line.starts_with("sync behind sigreturn "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "sync behind sigreturn fpe=4 code=1",
+            "sync behind sigreturn state sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 \
+             blocked=0",
+        ],
+        "{}",
+        run.report
+    );
+    assert!(
+        count(&crate::task::TIMER_STEP_REQUEUES_FOR_TEST) > requeues,
+        "no timer step stopped at the SIGFPE ahead of its report: {}",
+        run.report
+    );
+    assert!(
+        count(&crate::task::TIMER_SYSCALL_STEPS_FOR_TEST) > syscall_steps,
+        "no timer step ran the rt_sigreturn as a syscall: {}",
+        run.report
+    );
+}
+
+/// The corner of `StepUnit::LastInstruction`: an instruction-precise target
+/// whose last instruction is the guest's `rt_sigreturn`, which unblocks a
+/// SIGFPE that its handler queued. A sequence must not end at a syscall-exit
+/// stop, so that step is single-stepped, not run as a syscall. On x86 its
+/// report carries `TRAP_BRKPT` at the next instruction, so the SIGFPE that
+/// the kernel takes ahead of it is requeued behind it like any other
+/// (`timer::dequeued_ahead_of_step_report`), and the run completes with each
+/// SIGFPE delivered once and SIGTRAP as installed. On aarch64 the report
+/// carries `SI_USER`, which the kernel never takes first: there it stays
+/// queued, and the run ends at its next step with `PendingSigtrapAtStep`,
+/// a loud failure rather than a silent one, which this x86-only module
+/// cannot show. Each round arms the timer at a different instruction count,
+/// so that one of them ends exactly at the `rt_sigreturn`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_last_step_over_a_sigreturn_that_unblocks_a_signal_is_single_stepped() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let count = |counter: &'static std::thread::LocalKey<std::cell::Cell<u64>>| {
+        counter.with(|count| count.get())
+    };
+    let last_steps = count(&crate::task::TIMER_LAST_SIGRETURN_STEPS_FOR_TEST);
+    let run = run_guest("sync_signal_at_last_sigreturn", false).await;
+    assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+    let lines: Vec<&str> = run
+        .report
+        .lines()
+        .filter(|line| line.starts_with("last sigreturn "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "last sigreturn fpe=8 code=1",
+            "last sigreturn state sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=0",
+        ],
+        "{}",
+        run.report
+    );
+    assert!(
+        count(&crate::task::TIMER_LAST_SIGRETURN_STEPS_FOR_TEST) > last_steps,
+        "no sequence ended at the rt_sigreturn: {}",
+        run.report
+    );
 }
 
 /// A guest's SIGTRAP state survives a precise timer's single-steps

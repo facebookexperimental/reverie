@@ -192,6 +192,42 @@ pub(crate) enum StepUnit {
         count: usize,
         branches: [u64; 2],
     },
+    /// One instruction (`PTRACE_SINGLESTEP`) that reaches the target, if it
+    /// retires no branch. Unlike [`StepUnit::Instruction`], never run as a
+    /// syscall: the sequence may end at the step's stop, and at an aarch64
+    /// syscall-exit stop x7 holds the stop's direction rather than the
+    /// guest's value, which a Tool reading registers there would see, and
+    /// which an injection there would save and restore. Only this step can
+    /// end a sequence at a syscall: a `syscall` or `svc` retires no counted
+    /// branch (measured on Neoverse V2, where the counter is `BR_RETIRED`:
+    /// no change across 501 `rt_sigreturn` syscall steps), so an earlier
+    /// one never reaches an RCB target. The cost: should this last
+    /// instruction be an aarch64 `rt_sigreturn` that unblocks a queued
+    /// synchronous-class signal, its `SI_USER` report stays queued, as it
+    /// did before syscall steps existed.
+    LastInstruction,
+    /// From the entry stop of a syscall that a step resumed with
+    /// `PTRACE_SYSCALL` to its exit stop (see [`TimerImpl::attempt_single_step`]).
+    /// The caller's step function chooses `PTRACE_SYSCALL` for a step over a
+    /// guest `rt_sigreturn` that no seccomp stop reports.
+    SyscallExit,
+    /// From the stop of a signal the kernel took ahead of the step's report,
+    /// back to that report: the signal is resumed while blocked, so the
+    /// kernel queues it again behind the report and runs no instruction
+    /// ([`dequeued_ahead_of_step_report`]).
+    Requeue(Signal),
+}
+
+/// What a stop handed to a step's observer is to the step that reached it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepStop {
+    /// The step's last stop.
+    Final,
+    /// A stop the step goes on from: the entry stop of a syscall it runs
+    /// (`StepUnit::SyscallExit`), or the stop of a signal it requeues
+    /// (`StepUnit::Requeue`). Whatever the step function changed for the
+    /// step stays in place until its last stop.
+    Passing,
 }
 
 /// Whether a branch run's counter, `moved` branches on from where it
@@ -1126,7 +1162,7 @@ impl Timer {
         &mut self,
         task: Stopped,
         step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
@@ -1146,7 +1182,7 @@ impl Timer {
         task: Stopped,
         unfinished: Unfinished,
         step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
@@ -2926,7 +2962,7 @@ impl TimerImpl {
         task: Stopped,
         unfinished: Unfinished,
         step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         match unfinished {
@@ -3122,7 +3158,7 @@ impl TimerImpl {
         &mut self,
         task: Stopped,
         step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         self.recheck_kept_programming();
@@ -3202,7 +3238,7 @@ impl TimerImpl {
         &mut self,
         task: Stopped,
         step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         // Ensure any new timer signals don't mess with us while single-stepping
@@ -3274,7 +3310,7 @@ impl TimerImpl {
         mut current: ClockCounter,
         target_instr: u64,
         step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait) -> Result<(), TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
         let target_rcb = current.target_rcb;
@@ -3358,8 +3394,21 @@ impl TimerImpl {
             let unit = self.branch_run(&task, breakpoints.regs(), current.rcbs(), target_rcb)?;
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let unit = StepUnit::Instruction;
+            // An instruction that retires no branch reaches the target here.
+            let unit = if unit == StepUnit::Instruction
+                && current.rcbs() == target_rcb
+                && current.instr + 1 >= target_instr
+            {
+                StepUnit::LastInstruction
+            } else {
+                unit
+            };
             match unit {
-                StepUnit::Instruction => {
+                // The loop chooses neither of the last two.
+                StepUnit::Instruction
+                | StepUnit::LastInstruction
+                | StepUnit::SyscallExit
+                | StepUnit::Requeue(_) => {
                     instruction_steps += 1;
                     &INSTRUCTION_STEPS
                 }
@@ -3375,24 +3424,101 @@ impl TimerImpl {
                 }
             }
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Every resuming request, the step's and those of its syscall
+            // exit and requeues below, leaves the borrowed breakpoints with
+            // the thread's next stop, as `Borrowed` requires.
+            #[cfg(target_arch = "aarch64")]
+            fn note_stop(
+                breakpoints: &mut crate::branch_step::Borrowed<BranchBreakpoints>,
+                wait: &Wait,
+            ) {
+                match wait {
+                    // A single-stepped execve: Linux flushed the old program's
+                    // breakpoints, and writing the saved ones would register
+                    // them in the new program.
+                    Wait::Stopped(_, TraceEvent::Exec(_)) => breakpoints.forget(),
+                    Wait::Stopped(new_task, _) => breakpoints.stopped(new_task.generation()),
+                    // The thread is gone, and its breakpoints with it.
+                    _ => breakpoints.forget(),
+                }
+            }
             // A failed step made no resuming request that took effect, so the
             // thread is still at its stop, where an early return gives the
             // breakpoints back.
             let running = step(task, unit)?;
             #[cfg(target_arch = "aarch64")]
             breakpoints.resumed();
-            let wait = running.next_state_with_owner(waits).await?;
+            let mut wait = running.next_state_with_owner(waits).await?;
             #[cfg(target_arch = "aarch64")]
-            match &wait {
-                // A single-stepped execve: Linux flushed the old program's
-                // breakpoints, and writing the saved ones would register them
-                // in the new program.
-                Wait::Stopped(_, TraceEvent::Exec(_)) => breakpoints.forget(),
-                Wait::Stopped(new_task, _) => breakpoints.stopped(new_task.generation()),
-                // The thread is gone, and its breakpoints with it.
-                _ => breakpoints.forget(),
+            note_stop(&mut breakpoints, &wait);
+            // A step the caller ran as a syscall (`StepUnit::SyscallExit`)
+            // stops at the syscall's entry first; it ends at its exit stop.
+            let mut ran_syscall = false;
+            if let Wait::Stopped(_, event) = &wait
+                && is_syscall_stop(event)
+            {
+                observe(&wait, StepStop::Passing)?;
+                let Wait::Stopped(entered, _) = wait else {
+                    unreachable!("matched a stop");
+                };
+                let running = step(entered, StepUnit::SyscallExit)?;
+                #[cfg(target_arch = "aarch64")]
+                breakpoints.resumed();
+                wait = running.next_state_with_owner(waits).await?;
+                #[cfg(target_arch = "aarch64")]
+                note_stop(&mut breakpoints, &wait);
+                ran_syscall = true;
             }
-            observe(&wait)?;
+            // Signals the kernel took ahead of the step's report go back
+            // behind it, so that the step ends at its own report and leaves
+            // nothing queued for a later step to find. Signals this blocked
+            // to requeue them are unblocked again at the report; those the
+            // guest blocked stay blocked. Nothing runs in between, so they
+            // are then delivered in their original order once the guest
+            // runs, each at a stop of its own.
+            // The code the step's report carries besides `TRAP_TRACE`: x86
+            // reports a stepped `syscall` with `TRAP_BRKPT`
+            // (`is_step_report`). aarch64 reports a stepped `svc` with
+            // `SI_USER`, which the kernel never takes first.
+            #[cfg(target_arch = "x86_64")]
+            let other_report_code = matches!(start.instruction, FlagsInstruction::Syscall { .. })
+                .then_some(libc::TRAP_BRKPT);
+            #[cfg(not(target_arch = "x86_64"))]
+            let other_report_code = None;
+            let (mut requeued, mut returned) = (0u64, 0u64);
+            while let Wait::Stopped(stopped, TraceEvent::Signal(sig)) = &wait
+                && dequeued_ahead_of_step_report(stopped, *sig, other_report_code, returned)?
+            {
+                let sig = *sig;
+                observe(&wait, StepStop::Passing)?;
+                let Wait::Stopped(stopped, _) = wait else {
+                    unreachable!("matched a stop");
+                };
+                let bit = signal_bit(sig);
+                let mask = stopped.getsigmask()?;
+                if mask & bit == 0 {
+                    stopped.setsigmask(mask | bit)?;
+                    requeued |= bit;
+                }
+                returned |= bit;
+                debug!(
+                    "Requeueing {} that a timer step stopped at, behind the step's report",
+                    sig
+                );
+                let running = step(stopped, StepUnit::Requeue(sig))?;
+                #[cfg(target_arch = "aarch64")]
+                breakpoints.resumed();
+                wait = running.next_state_with_owner(waits).await?;
+                #[cfg(target_arch = "aarch64")]
+                note_stop(&mut breakpoints, &wait);
+            }
+            if requeued != 0
+                && let Wait::Stopped(stopped, _) = &wait
+            {
+                let mask = stopped.getsigmask()?;
+                stopped.setsigmask(mask & !requeued)?;
+            }
+            observe(&wait, StepStop::Final)?;
             // A notification of this timer's own that reaches the thread
             // during its steps is consumed, and the stepping goes on from
             // where the stop found it (`own_notification_during_steps`).
@@ -3456,6 +3582,11 @@ impl TimerImpl {
                 (_, wait) => wait,
             };
             task = match wait {
+                // A syscall run to its exit stop completes its step; the
+                // stop sends no signal.
+                Wait::Stopped(new_task, event) if ran_syscall && is_syscall_stop(&event) => {
+                    new_task
+                }
                 // a successful single step results in SIGTRAP stop
                 #[cfg(target_arch = "x86_64")]
                 Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP))
@@ -3468,7 +3599,7 @@ impl TimerImpl {
                     // The clock is read below, and nothing at a single step's
                     // stop has made a ptrace request yet (x86 reads the
                     // registers here). A branch run's stop has.
-                    if matches!(unit, StepUnit::Instruction) {
+                    if matches!(unit, StepUnit::Instruction | StepUnit::LastInstruction) {
                         self.switch_out(&new_task);
                     }
                     new_task
@@ -3940,7 +4071,7 @@ fn runs_in_place(ip: u64, code: &[u8]) -> bool {
 /// delivery point may be passed, so this is recorded as a skid overshoot,
 /// with its marker, and the run fails closed as for a late notification.
 fn block_step_reached_target(unit: StepUnit, clock: u64, target_rcb: u64) -> bool {
-    if unit == StepUnit::Instruction || clock < target_rcb {
+    if matches!(unit, StepUnit::Instruction | StepUnit::LastInstruction) || clock < target_rcb {
         return false;
     }
     warn!(
@@ -4865,6 +4996,94 @@ fn memory_error(task: &Stopped, err: Errno) -> TraceError {
     TraceError::Errno(err)
 }
 
+/// The synchronous-class signals other than SIGTRAP (`SYNCHRONOUS_MASK` in
+/// kernel/signal.c).
+const SYNCHRONOUS_SIGNALS: [Signal; 5] = [
+    Signal::SIGSEGV,
+    Signal::SIGBUS,
+    Signal::SIGILL,
+    Signal::SIGFPE,
+    Signal::SIGSYS,
+];
+
+/// The bit for `sig` in a kernel signal mask.
+fn signal_bit(sig: Signal) -> u64 {
+    1u64 << (sig as i32 - 1)
+}
+
+/// Whether a step's stop at `sig` is a synchronous-class signal that the
+/// kernel took ahead of the step's own report, which is still queued.
+///
+/// `dequeue_synchronous_signal` takes the first queued synchronous-class
+/// signal with a positive `si_code` before any other, and it does so
+/// without consulting the mask whenever any unblocked synchronous-class
+/// signal is pending; the step's SIGTRAP is one. So a step taken while the
+/// guest has such a signal pending and blocked, as a crash handler does
+/// after queueing its signal to itself again, completes its instruction and
+/// then stops at that signal, as does a step whose instruction makes one
+/// deliverable. The report stays queued behind it. Handed on, the stop would
+/// leave that report for a later step to meet as a pending SIGTRAP, blocked
+/// once a handler's mask blocks it, which no step can keep.
+///
+/// The report is recognized in the thread's own queue by its siginfo, as
+/// the step loop recognizes it at its stop (`is_step_report`): an
+/// instruction step reports with `TRAP_TRACE` and `si_addr` at the next
+/// instruction, where the thread now stands, on both x86 and aarch64, and
+/// a stepped x86 `syscall` with `TRAP_BRKPT` there (`other_report_code`). A
+/// SIGTRAP that the stepped instruction raised itself (`int3` with
+/// `SI_KERNEL`, `icebp` or `brk` with `TRAP_BRKPT`) or that was sent is not
+/// one, and such a stop is handed on as before: requeueing would put the
+/// guest's trap ahead of its signal, and the step could take it for its
+/// report. A SIGTRAP the guest queued itself with those very fields
+/// (`rt_tgsigqueueinfo` allows any positive code for the caller) passes,
+/// as it already passes at the step's own stop; the shield refuses any
+/// SIGTRAP pending while SIGTRAP is blocked before a step
+/// (`PendingSigtrapAtStep`). Each signal is requeued once per step (`returned`): a second stop
+/// at it means the kernel did not take the report next, and it is handed on.
+/// The report must be deliverable, so that resuming takes it next and runs
+/// no instruction.
+fn dequeued_ahead_of_step_report(
+    task: &Stopped,
+    sig: Signal,
+    other_report_code: Option<i32>,
+    returned: u64,
+) -> Result<bool, TraceError> {
+    if !SYNCHRONOUS_SIGNALS.contains(&sig) || returned & signal_bit(sig) != 0 {
+        return Ok(false);
+    }
+    // A group stop has no siginfo.
+    let Ok(info) = task.getsiginfo() else {
+        return Ok(false);
+    };
+    // While a temporary mask's restore is pending, after a mask-swapping
+    // syscall that the step ran, `PTRACE_GETSIGMASK` reports the mask to be
+    // restored, but the kernel decides with the temporary one, which only
+    // procfs shows (`SigBlk`). Such a stop is handed on.
+    let mask = task.getsigmask()?;
+    if info.si_code <= 0
+        || mask & signal_bit(Signal::SIGTRAP) != 0
+        || crate::task::blocked_signal_mask(task.pid())
+            .map_err(|error| crate::task::dead_or(task, error))?
+            != mask
+    {
+        return Ok(false);
+    }
+    let next = crate::regs::RegAccess::ip(&task.getregs()?);
+    task.peeksiginfo_any(None, |info| {
+        // SAFETY: si_addr reads the fault-address member that a TRAP_TRACE
+        // report fills in.
+        info.si_signo == libc::SIGTRAP
+            && (info.si_code == libc::TRAP_TRACE || Some(info.si_code) == other_report_code)
+            && unsafe { info.si_addr() } as u64 == next
+    })
+}
+
+/// Whether `event` is a syscall stop (`PTRACE_SYSCALL`). Reverie's launch
+/// sets `PTRACE_O_TRACESYSGOOD`, so such a stop is never read as a trap.
+fn is_syscall_stop(event: &TraceEvent) -> bool {
+    matches!(event, TraceEvent::Syscall)
+}
+
 /// Reads the guest byte at `addr`.
 #[cfg(target_arch = "x86_64")]
 fn read_byte(task: &Stopped, addr: u64) -> Result<u8, Errno> {
@@ -5239,7 +5458,7 @@ mod tests {
             }
             Err(TraceError::Errno(super::Errno::EIO))
         };
-        let mut observe = |_: &super::Wait| Ok(());
+        let mut observe = |_: &super::Wait, _: super::StepStop| Ok(());
         let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
         let result = futures::executor::block_on(inner.attempt_single_step(
             task,
@@ -5463,7 +5682,7 @@ mod tests {
                 _ => task.step(None),
             }
         };
-        let mut observe = |_: &Wait| Ok(());
+        let mut observe = |_: &Wait, _: super::StepStop| Ok(());
         let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
         waits.bind_stopped(&task);
         if end_an_event_first {

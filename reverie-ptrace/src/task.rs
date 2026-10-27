@@ -126,6 +126,7 @@ use crate::stack::GuestStack;
 use crate::stack::StackArena;
 use crate::timer::HandleFailure;
 use crate::timer::OwnNotification;
+use crate::timer::StepStop;
 use crate::timer::StepUnit;
 use crate::timer::Timer;
 use crate::timer::TimerEventRequest;
@@ -1080,7 +1081,7 @@ fn sets_sigtrap_action(nr: Sysno, args: &SyscallArgs) -> bool {
 /// `PTRACE_GETSIGMASK` reports the saved mask instead while a mask-swapping
 /// syscall's restore is pending (`TIF_RESTORE_SIGMASK`), so it cannot tell
 /// whether that syscall's temporary mask blocks a signal.
-fn blocked_signal_mask(tid: Pid) -> Result<u64, TraceError> {
+pub(crate) fn blocked_signal_mask(tid: Pid) -> Result<u64, TraceError> {
     let status = read_status(format!("/proc/{tid}/status"))
         .map_err(|err| Errno::new(err.raw_os_error().unwrap_or(libc::EIO)))?;
     status
@@ -1345,6 +1346,20 @@ struct TimerStepShield {
     pending_trap: bool,
     /// Whether SIGTRAP is to be blocked again at the step's stop.
     reblock: bool,
+    /// Whether the next step is over a guest `rt_sigreturn`, which no
+    /// seccomp stop reports. It runs with `PTRACE_SYSCALL` to the syscall's
+    /// exit stop, which sends no signal (`StepUnit::SyscallExit`), rather
+    /// than single-stepped. A stepped syscall reports the step at its exit,
+    /// and when the `rt_sigreturn` unblocks a synchronous-class signal, such
+    /// as one its handler queued for itself, the kernel takes that signal
+    /// first (`dequeue_synchronous_signal`). The report can be put back
+    /// ahead of it only where the kernel prefers the report: on aarch64 it
+    /// carries `SI_USER` (`user_single_step_report`), so it would stay
+    /// queued, for a later step to find under a mask that blocks SIGTRAP.
+    syscall_step: bool,
+    /// Whether a guest `rt_sigreturn` stops at its seccomp stop
+    /// (`Tool::observes_sigreturns`), so that no step runs one.
+    sigreturns_stop: bool,
     /// For a step over a guest `rt_sigreturn` whose frame blocks SIGTRAP: the
     /// frame mask's address and value, and the step's rip. SIGTRAP is cleared
     /// from the frame for the step, so that its trap cannot see it blocked.
@@ -1394,6 +1409,7 @@ impl TimerStepShield {
         if let Some((address, rip)) = sigreturn_frame_mask_address(task, &regs)? {
             // The step restores a mask from the frame.
             self.known_mask = None;
+            self.syscall_step = !self.sigreturns_stop;
             let frame = Addr::<u64>::from_raw(address).ok_or(Errno::EFAULT)?;
             let mask: u64 = task.read_value(frame)?;
             if mask & SIGTRAP_BIT != 0 {
@@ -4169,6 +4185,23 @@ static STEP_COUNTS_GLOBAL: std::sync::Mutex<std::collections::BTreeMap<i32, u64>
 
 #[cfg(test)]
 thread_local! {
+    /// Timer steps run as a syscall to its exit stop rather than
+    /// single-stepped (`TimerStepShield::syscall_step`). Per thread, as below.
+    pub(crate) static TIMER_SYSCALL_STEPS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Last steps of a sequence over a guest `rt_sigreturn` that would
+    /// otherwise have run as a syscall (`StepUnit::LastInstruction`). Per
+    /// thread, as below.
+    pub(crate) static TIMER_LAST_SIGRETURN_STEPS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Signals a timer step stopped at ahead of its report and requeued
+    /// behind it (`timer::dequeued_ahead_of_step_report`). Per thread, as
+    /// below.
+    pub(crate) static TIMER_STEP_REQUEUES_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
     /// Timer steps shielded at a pending mask restore
     /// (`unblock_sigtrap_for_timer_step`), counted for the test that must
     /// know that case ran. Per thread, as below.
@@ -6734,6 +6767,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             restore_shield: syscalls_stop
                 && (!cfg!(target_arch = "x86_64") || x32_syscalls_refused()),
             quiet,
+            sigreturns_stop: self.global_state.reports_sigreturns,
             mask_stable,
             quiet_unless_sigreturn: quiet_but_sigreturns
                 && !quiet
@@ -6766,8 +6800,36 @@ impl<L: Tool + 'static> TracedTask<L> {
                 );
                 return Err(Errno::ECANCELED.into());
             }
-            if !filtered {
-                step_shield.lock().unwrap().prepare(&task)?;
+            // The second half of a step run as a syscall, and a requeue,
+            // go on from the step's own stops, and need no shield of their
+            // own.
+            let syscall = match unit {
+                StepUnit::SyscallExit => true,
+                StepUnit::Requeue(_) => false,
+                _ => {
+                    !filtered && {
+                        let mut shield = step_shield.lock().unwrap();
+                        shield.prepare(&task)?;
+                        let wanted = std::mem::take(&mut shield.syscall_step);
+                        #[cfg(test)]
+                        if wanted && unit == StepUnit::LastInstruction {
+                            TIMER_LAST_SIGRETURN_STEPS_FOR_TEST
+                                .with(|count| count.set(count.get() + 1));
+                        }
+                        wanted && unit != StepUnit::LastInstruction
+                    }
+                }
+            };
+            #[cfg(test)]
+            match unit {
+                StepUnit::Requeue(_) => {
+                    TIMER_STEP_REQUEUES_FOR_TEST.with(|count| count.set(count.get() + 1))
+                }
+                StepUnit::SyscallExit => {}
+                _ if syscall => {
+                    TIMER_SYSCALL_STEPS_FOR_TEST.with(|count| count.set(count.get() + 1))
+                }
+                _ => {}
             }
             // Each step resumes the held stop, exactly like the run loop's
             // wrappers (https://github.com/rrnewton/reverie/issues/1091).
@@ -6789,7 +6851,11 @@ impl<L: Tool + 'static> TracedTask<L> {
             let lease = RootStopLease::new(task, held_root_stop.clone())
                 .guard_exit_stop(guard.then_some(probe));
             match unit {
-                StepUnit::Instruction => lease.step(None),
+                StepUnit::Requeue(sig) => lease.step(Some(sig)),
+                _ if syscall => lease.syscall(None),
+                StepUnit::Instruction | StepUnit::LastInstruction | StepUnit::SyscallExit => {
+                    lease.step(None)
+                }
                 #[cfg(target_arch = "x86_64")]
                 StepUnit::Block => lease.block_step(),
                 // The hardware breakpoints at the run's stop points are armed.
@@ -6805,12 +6871,22 @@ impl<L: Tool + 'static> TracedTask<L> {
         let mut watches = self.watches;
         let watch_global = Arc::clone(&self.global_state.gs_ref);
         let tid = self.tid();
-        let mut observe = |wait: &Wait| {
-            if let Wait::Stopped(task, event) = wait {
+        // Whether a stop of the step, its last or one ahead of its report,
+        // was for a signal other than SIGTRAP, which the kernel may have
+        // forced (`TimerStepShield::settle`).
+        let mut other_signal = false;
+        let mut observe = |wait: &Wait, stop: StepStop| {
+            if let Wait::Stopped(_, event) = wait {
+                other_signal |= stopped_for_another_signal(event);
+            }
+            // The shield stays up until the step's last stop.
+            if stop == StepStop::Final
+                && let Wait::Stopped(task, _) = wait
+            {
                 observe_shield
                     .lock()
                     .unwrap()
-                    .settle(task, stopped_for_another_signal(event))?;
+                    .settle(task, std::mem::take(&mut other_signal))?;
             }
             // The step's own trap, which the shield accounts for, carried
             // the hit: the hit adds nothing to SIGTRAP's state.
