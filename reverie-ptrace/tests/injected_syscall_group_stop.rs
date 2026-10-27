@@ -45,6 +45,7 @@ use reverie::syscalls::Getppid;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::RtSigprocmask;
+use reverie::syscalls::RtSigqueueinfo;
 use reverie::syscalls::RtTgsigqueueinfo;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
@@ -5999,9 +6000,75 @@ fn without_restart(result: Result<i64, Errno>) -> Result<i64, Error> {
     }
 }
 
+/// A SIGTRAP siginfo with a trap's code (`TRAP_HWBKPT`), which a guest's
+/// `GETPPID_FD` marker carries for `TrapBeforeGetppid` and
+/// `TrapBeforeEachGetppid` (`make_sigtrap_pending`). Reverie cannot tell
+/// such a SIGTRAP from a trap of its own, so the injection's step it stops
+/// is retried without it, as on main. A sent SIGTRAP, which a marker without
+/// a siginfo asks for, is held for the guest instead
+/// (`a_sent_sigtrap_that_stops_an_injection_reaches_the_guest`). The tests
+/// using this code pin that gap: natively, the guest's own `TRAP_HWBKPT`
+/// SIGTRAP would be delivered to it.
+#[cfg(target_arch = "x86_64")]
+fn trap_coded_sigtrap() -> libc::siginfo_t {
+    // SAFETY: an all-zero siginfo is valid.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    info.si_signo = libc::SIGTRAP;
+    info.si_code = libc::TRAP_HWBKPT;
+    info
+}
+
+/// Makes a SIGTRAP pending for `guest`, to stop the step of the next
+/// injection before its `syscall` runs. When the `GETPPID_FD` marker
+/// `syscall` carries a siginfo (`trap_coded_sigtrap`), the guest queues that
+/// SIGTRAP to its own thread group: a positive code may be queued only with
+/// the caller's own pid (`rt_sigqueueinfo`), so only the group leader can
+/// queue it to its group. The group's queue keeps it across that
+/// injection's own step, whose report goes to the thread's queue and is
+/// taken first. Otherwise the tracer sends SIGTRAP to the guest's thread
+/// with `tgkill`, a sent SIGTRAP.
+#[cfg(target_arch = "x86_64")]
+async fn make_sigtrap_pending<T: Tool, G: Guest<T>>(
+    guest: &mut G,
+    syscall: &Syscall,
+) -> Result<(), Error> {
+    let siginfo = match syscall {
+        Syscall::Write(write) => write.buf().and_then(|buf| AddrMut::from_raw(buf.as_raw())),
+        _ => None,
+    };
+    if let Some(siginfo) = siginfo {
+        assert_eq!(
+            guest.tid(),
+            guest.pid(),
+            "only the group leader may queue its group a trap-coded SIGTRAP"
+        );
+        let queued = guest
+            .inject(
+                RtSigqueueinfo::new()
+                    .with_tgid(guest.pid().as_raw())
+                    .with_sig(libc::SIGTRAP)
+                    .with_siginfo(Some(siginfo)),
+            )
+            .await?;
+        assert_eq!(queued, 0, "queue the guest a trap-coded SIGTRAP");
+        return Ok(());
+    }
+    // SAFETY: tgkill has no memory-safety preconditions.
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_tgkill,
+            guest.pid().as_raw(),
+            guest.tid().as_raw(),
+            libc::SIGTRAP,
+        )
+    };
+    assert_eq!(sent, 0, "send SIGTRAP to the guest");
+    Ok(())
+}
+
 /// `ReplaceMarker`, whose hook for `GETPPID_FD` first injects `getpid`, then
-/// sends SIGTRAP to the guest's thread from the tracer, then SIGTSTP when
-/// `TSTP_AFTER_TRAP` is set. Linux dequeues the SIGTRAP when the injected `getppid` is stepped,
+/// makes a SIGTRAP pending (`make_sigtrap_pending`), then sends SIGTSTP to
+/// the guest's thread group when `TSTP_AFTER_TRAP` is set. Linux dequeues the SIGTRAP when the injected `getppid` is stepped,
 /// before its `syscall` runs. The marker gets the `getppid`'s result
 /// (`without_restart`).
 #[derive(Clone, Copy, Debug, Default)]
@@ -6035,21 +6102,15 @@ impl Tool for TrapBeforeGetppid {
             // coalesce with it and be discarded as that stale trap
             // (`TrapThenGetpidInSigusr1Hook`).
             guest.inject(Getpid::new()).await?;
-            let mut signals = vec![libc::SIGTRAP];
+            make_sigtrap_pending(guest, &syscall).await?;
             if TSTP_AFTER_TRAP.load(Ordering::Relaxed) {
-                signals.push(libc::SIGTSTP);
-            }
-            for signal in signals {
-                // SAFETY: tgkill has no memory-safety preconditions.
-                let sent = unsafe {
-                    libc::syscall(
-                        libc::SYS_tgkill,
-                        guest.pid().as_raw(),
-                        guest.tid().as_raw(),
-                        signal,
-                    )
-                };
-                assert_eq!(sent, 0, "send signal {signal} to the guest");
+                // To the thread group, so that Linux dequeues the SIGTRAP
+                // first wherever it is: a thread's own queue is taken before
+                // its group's, and SIGTRAP, a synchronous signal, before
+                // SIGTSTP within one queue (`dequeue_signal`).
+                // SAFETY: kill has no memory-safety preconditions.
+                let sent = unsafe { libc::kill(guest.pid().as_raw(), libc::SIGTSTP) };
+                assert_eq!(sent, 0, "send SIGTSTP to the guest");
             }
             let limited = GETPPID_WITHOUT_DESCRIPTORS.load(Ordering::Relaxed);
             if limited && SAVED_NOFILE.lock().unwrap().is_none() {
@@ -6118,7 +6179,13 @@ fn trap_before_getppid_guest(tstp: bool) -> impl FnOnce() + Send + 'static {
             assert_eq!(ret, 0, "the tracer is left without descriptors");
         }
         print_seccomp_trap(libc::syscall(libc::SYS_getppid));
-        let ret = libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
+        let trap = trap_coded_sigtrap();
+        let ret = libc::syscall(
+            libc::SYS_write,
+            GETPPID_FD,
+            std::ptr::addr_of!(trap).cast::<u8>(),
+            0usize,
+        );
         print_seccomp_trap(ret);
         println!("{}", SIGTSTP_HANDLER_CALLS.load(Ordering::Relaxed));
     }
@@ -6192,6 +6259,64 @@ fn sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs() {
     const NAME: &str = "sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs";
     in_child_process(NAME, || {
         sigtrap_before_an_injected_syscall_is_discarded("trap-before-getppid")
+    });
+}
+
+/// A SIGTRAP another process sends, here the tracer with `tgkill` (a marker
+/// without a siginfo, `make_sigtrap_pending`), that stops an injection's
+/// step before its `syscall` runs is held for the guest and delivered, as
+/// Linux delivers it natively. Main discarded it as one of Reverie's own
+/// traps (https://github.com/rrnewton/hermit/issues/4555). The injected
+/// `getppid` reports that it did not run (`ERESTARTSYS`), the marker fails
+/// with `EINTR` (`without_restart`), the Tool sees the SIGTRAP, and the
+/// guest's SIGTRAP handler runs once before the marker returns.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_sent_sigtrap_that_stops_an_injection_reaches_the_guest() {
+    const NAME: &str = "a_sent_sigtrap_that_stops_an_injection_reaches_the_guest";
+    in_child_process(NAME, || {
+        assert_tracer_unfiltered();
+        TSTP_AFTER_TRAP.store(false, Ordering::Relaxed);
+        let (output, log) = test_fn::<TrapBeforeGetppid, _>(|| unsafe {
+            HELD_TRAP_HANDLER_CALLS.store(0, Ordering::Relaxed);
+            install_counter(libc::SIGTRAP, count_held_trap);
+            let ret = libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
+            let errno = *libc::__errno_location();
+            println!(
+                "{ret} {errno} {}",
+                HELD_TRAP_HANDLER_CALLS.load(Ordering::Relaxed)
+            );
+        })
+        .expect("run sent-sigtrap guest");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!(
+            "PROBE sent-trap-before-getppid status={:?} guest={:?} injected={:?} signals={:?}",
+            output.status,
+            stdout.trim(),
+            *log.injected.lock().unwrap(),
+            *log.signals.lock().unwrap()
+        );
+        assert_eq!(
+            output.status,
+            ExitStatus::Exited(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            *log.injected.lock().unwrap(),
+            vec![Err(Errno::ERESTARTSYS.into_raw())],
+            "the SIGTRAP stops the getppid before it runs"
+        );
+        assert_eq!(
+            stdout.trim(),
+            format!("-1 {} 1", libc::EINTR),
+            "the marker fails with EINTR, and the guest's SIGTRAP handler runs once"
+        );
+        assert_eq!(
+            *log.signals.lock().unwrap(),
+            vec![libc::SIGTRAP],
+            "the sent SIGTRAP reaches the Tool"
+        );
     });
 }
 
@@ -6755,16 +6880,7 @@ impl Tool for TrapBeforeEachGetppid {
         let script = EACH_GETPPID_SCRIPT[turn].load(Ordering::Relaxed);
         // As in `TrapBeforeGetppid`, a complete injection first.
         guest.inject(Getpid::new()).await?;
-        // SAFETY: tgkill has no memory-safety preconditions.
-        let sent = unsafe {
-            libc::syscall(
-                libc::SYS_tgkill,
-                guest.pid().as_raw(),
-                guest.tid().as_raw(),
-                libc::SIGTRAP,
-            )
-        };
-        assert_eq!(sent, 0, "send SIGTRAP to the guest");
+        make_sigtrap_pending(guest, &syscall).await?;
         if script & LOWER != 0 {
             *SAVED_NOFILE.lock().unwrap() = Some(lower_nofile());
         }
@@ -6816,7 +6932,13 @@ fn sigtrap_before_each_injected_syscall(script: [u32; 2], retried: [bool; 2], pr
         trap_getppid();
         print_seccomp_trap(libc::syscall(libc::SYS_getppid));
         for _ in 0..2 {
-            let ret = libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
+            let trap = trap_coded_sigtrap();
+            let ret = libc::syscall(
+                libc::SYS_write,
+                GETPPID_FD,
+                std::ptr::addr_of!(trap).cast::<u8>(),
+                0usize,
+            );
             print_seccomp_trap(ret);
         }
     })
@@ -7001,7 +7123,13 @@ fn guest_syscall_is_restarted_when_its_handler_returns_an_injection_that_did_not
         let (output, log) = test_fn::<TrapBeforeEachGetppid, _>(|| unsafe {
             trap_getppid();
             print_seccomp_trap(libc::syscall(libc::SYS_getppid));
-            let ret = libc::syscall(libc::SYS_write, GETPPID_FD, std::ptr::null::<u8>(), 0usize);
+            let trap = trap_coded_sigtrap();
+            let ret = libc::syscall(
+                libc::SYS_write,
+                GETPPID_FD,
+                std::ptr::addr_of!(trap).cast::<u8>(),
+                0usize,
+            );
             print_seccomp_trap(ret);
         })
         .expect("run restarted-getppid guest");

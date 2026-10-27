@@ -626,6 +626,9 @@ struct GuestConfig {
     /// itself, as `SHAPE_PRIVATE_CALL` does for a tagged one. Lets a guest
     /// make such calls with all six arguments (the tag takes r9).
     private_mask_swaps: bool,
+    /// Leaves clone and clone3 unsubscribed, so a thread's creation stops
+    /// the run loop at its clone event rather than at a seccomp stop.
+    clone_unsubscribed: bool,
 }
 
 /// The `rt_sigreturn` reports the regression Tool was given, as (thread,
@@ -984,6 +987,10 @@ impl Tool for GuestTool {
 
     fn subscriptions(config: &GuestConfig) -> Subscription {
         let mut subscription = Subscription::all();
+        if config.clone_unsubscribed {
+            subscription.disable_syscall(reverie::syscalls::Sysno::clone);
+            subscription.disable_syscall(reverie::syscalls::Sysno::clone3);
+        }
         if config.partial {
             subscription.disable_syscall(reverie::syscalls::Sysno::getuid);
         }
@@ -1752,6 +1759,8 @@ struct GuestOptions {
     urg_arms_timer: bool,
     /// `GuestConfig::private_mask_swaps`.
     private_mask_swaps: bool,
+    /// `GuestConfig::clone_unsubscribed`.
+    clone_unsubscribed: bool,
 }
 
 /// Installs a seccomp filter on the calling thread that returns `action` for
@@ -1831,6 +1840,7 @@ async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun
             serialized: !options.no_serialization_contract,
             urg_arms_timer: options.urg_arms_timer,
             private_mask_swaps: options.private_mask_swaps,
+            clone_unsubscribed: options.clone_unsubscribed,
         })
         .backend_stats(BackendStatsRequest::ENABLED)
         .final_resume_signal_for_test(resume_recorder(resumes.clone()))
@@ -4046,7 +4056,9 @@ async fn a_guest_int3_in_a_timer_window_takes_sigtraps_default_action() {
 }
 
 /// A blocked SIGTRAP that is pending when Reverie must single-step the
-/// thread cannot be kept, so the run ends with the named failure
+/// thread, with another blocked signal pending too, cannot be kept: queued
+/// again, it could not keep its place among them
+/// (`TracedTask::sigtrap_to_absorb`). The run ends with the named failure
 /// `PendingSigtrapAtStep` instead of losing it
 /// (<https://github.com/rrnewton/hermit/issues/4409>). Both configurations.
 #[tokio::test(flavor = "current_thread")]
@@ -5359,6 +5371,7 @@ async fn a_guest_elf_segment_at_the_repair_page_address_keeps_every_byte() {
                 serialized: true,
                 urg_arms_timer: false,
                 private_mask_swaps: false,
+                clone_unsubscribed: false,
             })
             .spawn()
             .await
@@ -5560,6 +5573,312 @@ async fn a_last_step_over_a_sigreturn_that_unblocks_a_signal_is_single_stepped()
         count(&crate::task::TIMER_LAST_SIGRETURN_STEPS_FOR_TEST) > last_steps,
         "no sequence ended at the rt_sigreturn: {}",
         run.report
+    );
+}
+
+/// A SIGTRAP the guest queued itself while blocking it, with its own code
+/// and pid, is kept across Reverie's steps, as natively: the injected reads
+/// of the thread's status see it pending, before and after a private
+/// injection, a precise timer's steps and a thread's creation, and so does
+/// the new thread, which reads the parent's status while the parent, back
+/// from the bare clone, runs no syscall; a ppoll
+/// whose temporary mask unblocks it returns EINTR with the handler run
+/// once, with the queued code and pid, and is not restarted, both run in
+/// place and single-stepped on the private page; and an unblock on the
+/// private page delivers a
+/// third one.
+/// Before, each step refused it (`PendingSigtrapAtStep`). Injections let the
+/// step's trap be absorbed and keep the SIGTRAP the kernel then delivers
+/// (`TracedTask::absorb_sigtrap_at_step_end`); the timer takes it out of
+/// the queue for its steps (`TracedTask::stash_pending_sigtrap`). Both
+/// configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_steps() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let expected = [
+        "kept queued SigPnd=1 ShdPnd=0 handled=0",
+        "kept after-injection SigPnd=1 ShdPnd=0 handled=0",
+        "kept after-timer SigPnd=1 ShdPnd=0 handled=0",
+        "kept clone child saw SigPnd=1",
+        "kept after-clone SigPnd=1 ShdPnd=0 handled=0",
+        "kept ppoll r=-4 handled=1 code=-7 pid=4242",
+        "kept after-ppoll SigPnd=0 ShdPnd=0 handled=1",
+        "kept queued-again SigPnd=1 ShdPnd=0 handled=1",
+        "kept private ppoll r=-4 handled=2 code=-7 pid=4242",
+        "kept after-private-ppoll SigPnd=0 ShdPnd=0 handled=2",
+        "kept queued-third SigPnd=1 ShdPnd=0 handled=2",
+        "kept unblocked handled=3 code=-7 pid=4242",
+    ];
+    let left_for_injection =
+        || crate::task::STASHES_LEFT_FOR_INJECTION_FOR_TEST.with(|count| count.get());
+    let left_before = left_for_injection();
+    let mut runs = run_both_configurations("sigtrap_guest_pending_kept")
+        .await
+        .into_iter()
+        .collect::<Vec<_>>();
+    // With clone unsubscribed, the thread's creation stops the run loop at
+    // its clone event, and the parent's step hands the stop that delivered
+    // the SIGTRAP to the run loop, which queues it again before resuming:
+    // the new thread sees it pending before the parent's next syscall.
+    let options = GuestOptions {
+        clone_unsubscribed: true,
+        ..GuestOptions::default()
+    };
+    runs.push(
+        run_guest_options("sigtrap_guest_pending_kept", options)
+            .await
+            .expect("run with clone unsubscribed"),
+    );
+    // No SIGTRAP is left out of the queue for an injection to find: each
+    // path queues it again before the guest or the Tool can run.
+    assert_eq!(left_for_injection(), left_before);
+    // The Tool sees the same SIGTRAPs however the thread is created: none
+    // for a stop whose SIGTRAP Reverie queued again.
+    let tool_sigtraps: Vec<usize> = runs
+        .iter()
+        .map(|run| run.count_events("signal SIGTRAP "))
+        .collect();
+    assert!(
+        tool_sigtraps.windows(2).all(|pair| pair[0] == pair[1]),
+        "{tool_sigtraps:?}"
+    );
+    for run in runs {
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("kept "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+        // Each ppoll is interrupted and returns EINTR once, as natively:
+        // after the private one the SIGTRAP is held for the resume rather
+        // than queued again, which would leave the guest's call to restart.
+        assert_eq!(
+            run.count_events("entry ppoll "),
+            2,
+            "{:#?}",
+            run.all_events()
+        );
+    }
+}
+
+/// A SIGTRAP the guest queued itself while blocking it stays out of the
+/// queue for a precise timer's steps (`TracedTask::stash_pending_sigtrap`),
+/// which run through a handler's `rt_sigreturn` that no seccomp stop
+/// reports. The frame keeps SIGTRAP blocked, so the SIGTRAP is queued again
+/// when the steps end, and seen pending and delivered once at the unblock,
+/// as natively. In the injecting configuration.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stashed_sigtrap_is_kept_over_a_sigreturn_that_keeps_it_blocked() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let count = |counter: &'static std::thread::LocalKey<std::cell::Cell<u64>>| {
+        counter.with(|count| count.get())
+    };
+    let stashes = count(&crate::task::SIGTRAP_STASHES_FOR_TEST);
+    let syscall_steps = count(&crate::task::TIMER_SYSCALL_STEPS_FOR_TEST);
+    let run = run_guest("sigtrap_stash_sigreturn_keeps", false).await;
+    assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+    let lines: Vec<&str> = run
+        .report
+        .lines()
+        .filter(|line| line.starts_with("kept "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "kept after-rounds SigPnd=1 ShdPnd=0 handled=0",
+            "kept stash rounds handled=1 code=-7 pid=4242",
+        ],
+        "{}",
+        run.report
+    );
+    assert!(
+        count(&crate::task::SIGTRAP_STASHES_FOR_TEST) > stashes,
+        "no timer sequence took the SIGTRAP out of the queue: {}",
+        run.report
+    );
+    assert!(
+        count(&crate::task::TIMER_SYSCALL_STEPS_FOR_TEST) > syscall_steps,
+        "no timer step ran the rt_sigreturn: {}",
+        run.report
+    );
+}
+
+/// As `a_stashed_sigtrap_is_kept_over_a_sigreturn_that_keeps_it_blocked`,
+/// but the handler's frame unblocks SIGTRAP, which natively delivers the
+/// queued SIGTRAP as the `rt_sigreturn` returns. Out of the queue, it could
+/// be queued again only after the sequence's later steps, so the step is
+/// refused and the run ends with `PendingSigtrapAtStep`, rather than
+/// delivering it late. (An aarch64 `rt_sigreturn` never stops at a seccomp
+/// stop; on x86-64 this Tool does not observe sigreturns, so neither does
+/// it here.)
+#[tokio::test(flavor = "current_thread")]
+async fn a_stashed_sigtrap_refuses_a_step_over_a_sigreturn_that_unblocks_it() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let error = match run_guest_options("sigtrap_stash_sigreturn_unblocks", GuestOptions::default())
+        .await
+    {
+        Ok(run) => panic!("the run was not refused: {:?}\n{}", run.status, run.report),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("SIGTRAP blocked with one pending")
+            && error.contains("rt_sigreturn that unblocks it"),
+        "{error}"
+    );
+}
+
+/// A SIGTRAP the guest queued itself while blocking it, with a negative
+/// code, absorbed by a private-page injection that queues the thread a
+/// blocked SIGUSR2, is queued again behind it, where it keeps its place:
+/// unblocking both delivers the SIGTRAP first, as natively
+/// (`TracedTask::requeue_stashed_sigtrap`). Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sigtrap_queued_again_behind_a_later_signal_keeps_its_place() {
+    for run in run_both_configurations("sigtrap_requeue_behind_usr2").await {
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        assert!(run.report.contains("requeue order=tu\n"), "{}", run.report);
+    }
+}
+
+/// As `a_sigtrap_queued_again_behind_a_later_signal_keeps_its_place`, but the
+/// SIGTRAP has a positive code and the later signal is a SIGSEGV with a
+/// positive code: Linux takes the first such synchronous-class signal in
+/// queue order (`dequeue_synchronous_signal`), natively the SIGTRAP, which
+/// queued again behind the SIGSEGV would come second, so the run ends with
+/// `PendingSigtrapAtStep`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_requeue_that_would_reorder_synchronous_signals_ends_the_run() {
+    let error =
+        match run_guest_options("sigtrap_requeue_behind_segv", GuestOptions::default()).await {
+            Ok(run) => panic!("the run was not refused: {:?}\n{}", run.status, run.report),
+            Err(error) => format!("{error:#}"),
+        };
+    assert!(
+        error.contains("SIGTRAP blocked with one pending")
+            && error.contains("behind another synchronous signal"),
+        "{error}"
+    );
+}
+
+/// A SIGTRAP the guest queued itself while blocking it, out of the queue for
+/// a precise timer's steps, which step a `ud2`: the steps end at the
+/// SIGILL's stop, which goes to the run loop, where the SIGTRAP cannot be
+/// queued again before the guest runs, so the run ends with
+/// `PendingSigtrapAtStep` rather than letting the SIGILL handler run
+/// without it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stashed_sigtrap_ends_the_run_at_a_step_that_faults() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let error = match run_guest_options("sigtrap_stash_step_faults", GuestOptions::default()).await
+    {
+        Ok(run) => panic!("the run was not refused: {:?}\n{}", run.status, run.report),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("SIGTRAP blocked with one pending")
+            && error.contains("step that ended at another stop"),
+        "{error}"
+    );
+}
+
+/// A SIGTRAP queued for the thread group while every thread blocks it stays
+/// in the group's queue across private-page injections in the leader and in
+/// another thread: each thread's injected procfs reads show it in `ShdPnd`
+/// before and after, and the leader's unblock delivers it once, with its
+/// code and pid, as natively. The steps' traps go to the stepping thread's
+/// own queue and are taken first (`TracedTask::absorb_sigtrap_at_stop`).
+/// Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_group_queued_sigtrap_stays_queued_across_injections_in_any_thread() {
+    let expected = [
+        "kept leader-queued SigPnd=0 ShdPnd=1 handled=0",
+        "kept leader-after-injection SigPnd=0 ShdPnd=1 handled=0",
+        "kept thread-queued SigPnd=0 ShdPnd=1 handled=0",
+        "kept thread-after-injection SigPnd=0 ShdPnd=1 handled=0",
+        "kept shared unblocked handled=1 code=-7 pid=4242",
+    ];
+    for run in run_both_configurations("sigtrap_shared_pending_kept").await {
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("kept "))
+            .collect();
+        assert_eq!(lines, expected, "{}", run.report);
+    }
+}
+
+/// A SIGTRAP the leader queued for the thread group, with the very bytes of
+/// the trap Reverie's step over the private page's syscall reports, stays
+/// in the group's queue across a private injection: the trap goes to the
+/// thread's own queue and is taken first, so the stop is never taken for
+/// the guest's SIGTRAP (`TracedTask::absorb_sigtrap_at_stop`), and no copy
+/// lands in the thread's queue. A private unblock's step trap is not taken
+/// for it either: held, it would run the handler while the group's SIGTRAP
+/// is still queued (`dup`). The group's SIGTRAP is then delivered, and, a
+/// positive-code SIGTRAP that cannot be told from a trap, suppressed
+/// (`handle_sigtrap`, the gap in `is_sigtrap_sent_by_a_process`); natively its handler
+/// runs once, with `dup=0`. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_group_sigtrap_with_the_step_trap_bytes_is_not_taken_for_it() {
+    // The fixture writes the address of the instruction after the private
+    // page's syscall.
+    assert_eq!(
+        crate::cp::PRIVATE_PAGE_OFFSET + crate::cp::SYSCALL_INSTR_SIZE,
+        0x7100_0002
+    );
+    for run in run_both_configurations("sigtrap_shared_report_bytes").await {
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("kept "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "kept report-queued SigPnd=0 ShdPnd=1 handled=0",
+                "kept report-after-injection SigPnd=0 ShdPnd=1 handled=0",
+                "kept report-unblocked handled=0 dup=0",
+                "kept report-after-unblock SigPnd=0 ShdPnd=0 handled=0",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// A SIGTRAP queued for the thread group while blocked is not taken out of
+/// the queue for a precise timer's steps, which one thread alone would then
+/// hold: the run ends with `PendingSigtrapAtStep` at the first step.
+#[tokio::test(flavor = "current_thread")]
+async fn a_group_queued_sigtrap_ends_the_run_at_a_timer_step() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let error =
+        match run_guest_options("sigtrap_shared_timer_refused", GuestOptions::default()).await {
+            Ok(run) => panic!("the run was not refused: {:?}\n{}", run.status, run.report),
+            Err(error) => format!("{error:#}"),
+        };
+    assert!(
+        error.contains("SIGTRAP blocked with one pending")
+            && error.contains("single-step at the precise timer cannot keep"),
+        "{error}"
     );
 }
 
