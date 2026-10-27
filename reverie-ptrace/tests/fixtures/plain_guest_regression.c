@@ -3996,6 +3996,52 @@ static void mode_sigtrap_caught_unblocked_no_injections(void) {
   sigtrap_caught_unblocked_injections(0);
 }
 
+/* A caught SIGTRAP, blocked or not, through `count` private injections of a
+ * polling ppoll: no descriptor ready, a zero timeout and no temporary mask,
+ * as a Tool polls a guest's poll() (bionic and glibc pass a NULL mask).
+ * Without a temporary mask the call never swaps the mask, so its step
+ * resets SIGTRAP's state no more than a getppid's does. */
+static void sigtrap_caught_polls(int block, int count) {
+  int fds[2];
+  if (pipe(fds) != 0)
+    die("pipe");
+  struct pollfd poll_fd = {fds[0], POLLIN, 0};
+  struct timespec zero = {0, 0};
+  for (int i = 0; i < 3; i++)
+    SITE(SYS_getppid, 0, 0, 0, 0, 0);
+  sigtrap_set(trap_handler, block);
+  for (int i = 0; i < count; i++) {
+    long ready = SITEM(SYS_ppoll, &poll_fd, 1, &zero, 0, 0, SHAPE_PRIVATE_CALL);
+    if (ready != 0)
+      die("polling ppoll");
+  }
+  close(fds[0]);
+  close(fds[1]);
+  char label[64];
+  snprintf(label,
+           sizeof label,
+           "caught-%s polls %d",
+           block ? "blocked" : "unblocked",
+           count);
+  sigtrap_full_state(label);
+}
+
+static void mode_sigtrap_caught_unblocked_polls(void) {
+  sigtrap_caught_polls(0, 200);
+}
+
+static void mode_sigtrap_caught_unblocked_no_polls(void) {
+  sigtrap_caught_polls(0, 0);
+}
+
+static void mode_sigtrap_caught_blocked_polls(void) {
+  sigtrap_caught_polls(1, 200);
+}
+
+static void mode_sigtrap_caught_blocked_no_polls(void) {
+  sigtrap_caught_polls(1, 0);
+}
+
 /* A caught SIGTRAP that the guest blocks, after the guest installs a
  * seccomp filter that refuses rt_sigaction with Reverie's repair page
  * (0x71001000) as oldact, so that Reverie cannot read the handler a step's
@@ -5319,6 +5365,14 @@ int main(int argc, char** argv) {
     mode_sigtrap_caught_unblocked_injections();
   else if (!strcmp(m, "sigtrap_caught_unblocked_no_injections"))
     mode_sigtrap_caught_unblocked_no_injections();
+  else if (!strcmp(m, "sigtrap_caught_unblocked_polls"))
+    mode_sigtrap_caught_unblocked_polls();
+  else if (!strcmp(m, "sigtrap_caught_unblocked_no_polls"))
+    mode_sigtrap_caught_unblocked_no_polls();
+  else if (!strcmp(m, "sigtrap_caught_blocked_polls"))
+    mode_sigtrap_caught_blocked_polls();
+  else if (!strcmp(m, "sigtrap_caught_blocked_no_polls"))
+    mode_sigtrap_caught_blocked_no_polls();
   else if (!strcmp(m, "sigtrap_caught_blocked_no_repair"))
     mode_sigtrap_caught_blocked_no_repair();
   else if (!strcmp(m, "sigtrap_caught_blocked_filter_install"))

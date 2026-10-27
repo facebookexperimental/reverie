@@ -4044,6 +4044,65 @@ async fn a_caught_unblocked_sigtrap_costs_its_injections_no_reads() {
     assert_eq!(costs[1].1, 0, "unstepped injections");
 }
 
+/// A caught SIGTRAP, unblocked (as Android's debuggerd installs one in every
+/// process) or blocked, through 200 private injections of a polling `ppoll`
+/// with no temporary mask, as a Tool polls a guest's `poll()`: each is
+/// preceded by a getpid that takes the pending syscall's place
+/// (`SHAPE_PRIVATE_CALL`). With no temporary mask the call swaps nothing, so
+/// its step is taken as a getppid's is (`injection_swaps_signal_mask`): an
+/// unblocked SIGTRAP's trap resets nothing, and a blocked one's step is
+/// shielded or unshielded only where nothing can meet the reset. No poll
+/// repairs SIGTRAP (`UNSTEPPED_INJECTIONS_FOR_TEST`), the unblocked one reads
+/// nothing of its state (`SIGTRAP_INJECTION_READS_FOR_TEST`), and the handler
+/// and mask stay the guest's. Measured against the same guest without the
+/// polls. Before, each unblocked poll made one unstepped `rt_sigaction` (the
+/// handler's read) and one read; each blocked one three unstepped calls (the
+/// handler's read, and the repair's read-back and write) and two reads, of
+/// which the shield's two reads remain.
+#[tokio::test(flavor = "current_thread")]
+async fn a_caught_sigtrap_costs_a_maskless_poll_no_repair() {
+    let reads = || crate::task::SIGTRAP_INJECTION_READS_FOR_TEST.with(|count| count.get());
+    let repairs = || crate::task::UNSTEPPED_INJECTIONS_FOR_TEST.with(|count| count.get());
+    for blocked in ["unblocked", "blocked"] {
+        let mut costs = Vec::new();
+        for count in [0, 200] {
+            let mode = if count == 0 {
+                format!("sigtrap_caught_{blocked}_no_polls")
+            } else {
+                format!("sigtrap_caught_{blocked}_polls")
+            };
+            let (reads_before, repairs_before) = (reads(), repairs());
+            let run = run_guest(&mode, false).await;
+            costs.push((reads() - reads_before, repairs() - repairs_before));
+            assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+            let lines: Vec<&str> = run
+                .report
+                .lines()
+                .filter(|line| line.starts_with(&format!("caught-{blocked} ")))
+                .collect();
+            assert_eq!(
+                lines,
+                [format!(
+                    "caught-{blocked} polls {count} sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked={}",
+                    u8::from(blocked == "blocked")
+                )],
+                "{}",
+                run.report
+            );
+        }
+        assert_eq!(
+            costs[1].1, costs[0].1,
+            "{blocked}: unstepped injections with 200 maskless polls, against none"
+        );
+        if blocked == "unblocked" {
+            assert_eq!(
+                costs[1].0, costs[0].0,
+                "unblocked: SIGTRAP reads with 200 maskless polls, against none"
+            );
+        }
+    }
+}
+
 /// A caught SIGTRAP that the guest blocks, where Reverie cannot read its
 /// handler: a guest seccomp filter refuses `rt_sigaction` into Reverie's
 /// repair page. The steps are shielded, so the handler is never read or

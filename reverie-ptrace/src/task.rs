@@ -597,7 +597,8 @@ const NEVER_SHIELDED: u64 = 1 << (reverie::PERF_EVENT_SIGNAL as u64 - 1)
 /// signal mask that `temporary_signal_mask_prepared` reads: a non-NULL mask argument
 /// of size 8, or, for pselect6, a non-NULL wrapper. Checked before any read
 /// or ptrace request, so a call that installs no mask, such as a wait probe
-/// with a NULL mask, costs nothing.
+/// with a NULL mask, makes no read for its shield, and its step takes the
+/// path of a call that keeps the mask (`injection_swaps_signal_mask`).
 fn may_name_temporary_signal_mask(nr: Sysno, args: &SyscallArgs) -> bool {
     match nr {
         Sysno::rt_sigsuspend => args.arg0 != 0 && args.arg1 == 8,
@@ -616,6 +617,25 @@ fn preparation_word(
     match input {
         Some(input) => input.preparation_word(task, address),
         None => task.read_value(Addr::<u64>::from_raw(address)?).ok(),
+    }
+}
+
+/// Whether an injected syscall `nr` with `args` may swap the signal mask for
+/// its duration, as `swaps_signal_mask` names the calls that can: one whose
+/// registers name no temporary mask (`may_name_temporary_signal_mask`)
+/// swaps nothing. The kernel installs a temporary mask only from a non-NULL
+/// mask argument of `sizeof(sigset_t)` (`set_user_sigmask`, which returns
+/// at once for a NULL mask and fails with `EINVAL` on another size before
+/// it changes anything), and so sets no restore to take at the return
+/// either. Such a call's step is taken as any call that keeps the mask:
+/// bionic's and glibc's `poll()` call `ppoll` with a NULL mask, and a Tool
+/// polling one would otherwise pay for a mask swap that cannot happen at
+/// every injection. io_pgetevents and io_uring_enter, whose masks are not
+/// read, are taken as swapping.
+fn injection_swaps_signal_mask(nr: Sysno, args: &SyscallArgs) -> bool {
+    match nr {
+        Sysno::io_pgetevents | Sysno::io_uring_enter => true,
+        _ => swaps_signal_mask(nr) && may_name_temporary_signal_mask(nr, args),
     }
 }
 
@@ -11894,7 +11914,22 @@ impl<L: Tool + 'static> TracedTask<L> {
         // shield as before injected calls ran under the guest's own mask,
         // unless `may_unshield_step` finds that nothing another thread does
         // can meet the trap's reset.
-        let keeps_mask = step_kind(nr, swaps_signal_mask(nr)) == StepKind::KeepsMask;
+        // The step's kind as `read_sigtrap_before_injection` decided it,
+        // from the injected call's arguments, which the registers hold until
+        // the `syscall` instruction runs.
+        let swaps_mask = swaps_signal_mask(nr) && {
+            let (a0, a1, a2, a3, a4, a5) = task.getregs()?.args();
+            let args = SyscallArgs::new(
+                a0 as usize,
+                a1 as usize,
+                a2 as usize,
+                a3 as usize,
+                a4 as usize,
+                a5 as usize,
+            );
+            injection_swaps_signal_mask(nr, &args)
+        };
+        let keeps_mask = step_kind(nr, swaps_mask) == StepKind::KeepsMask;
         let unshielded_mask = if keeps_mask
             && !matches!(nr, Sysno::execve | Sysno::execveat)
             && self.keeps_sigtrap_state()
@@ -13735,7 +13770,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         args: &SyscallArgs,
         input: Option<&NativeCallContext>,
     ) -> Result<(Stopped, SigtrapBeforeInjection), TraceError> {
-        let kind = step_kind(nr, swaps_signal_mask(nr));
+        let kind = step_kind(nr, injection_swaps_signal_mask(nr, args));
         let mask = sigmask(&task)?;
         self.injection_proc_state = None;
         self.injection_installs_caught = false;
@@ -14690,8 +14725,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .unwrap()
                 .add_thread(self.sigtrap_table);
         }
-        // A mask-swapping call can leave its temporary mask's restore pending.
-        if swaps_signal_mask(nr) {
+        // A mask-swapping call can leave its temporary mask's restore pending;
+        // one that names no temporary mask installs none
+        // (`injection_swaps_signal_mask`).
+        if injection_swaps_signal_mask(nr, &args) {
             self.restore_maybe_pending = true;
         }
         let checks_clone = self.checks_segv_clone(nr, &args);
@@ -14895,7 +14932,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .unwrap()
                 .add_thread(self.sigtrap_table);
         }
-        if swaps_signal_mask(nr) {
+        if injection_swaps_signal_mask(nr, &args) {
             self.restore_maybe_pending = true;
         }
 
