@@ -602,6 +602,10 @@ struct GuestConfig {
     /// does not enforce it: the tests run guest threads at once, and install
     /// guest filters, to exercise the repair beyond the contract.
     serialized: bool,
+    /// Suppresses SIGURG and arms a short precise timer from its callback
+    /// (`a_timer_step_at_a_pending_restore_keeps_a_blocked_sigtrap`). Every
+    /// other run delivers SIGURG.
+    urg_arms_timer: bool,
 }
 
 /// The `rt_sigreturn` reports the regression Tool was given, as (thread,
@@ -1290,7 +1294,8 @@ impl Tool for GuestTool {
             }
             _ => {}
         }
-        if signal == reverie::Signal::SIGURG {
+        let urg_arms_timer = signal == reverie::Signal::SIGURG && guest.config().urg_arms_timer;
+        if urg_arms_timer {
             // `sigtrap_pending_restore_timer`: a short precise timer, whose
             // artificial notification is taken at this stop's pending mask
             // restore once SIGURG is suppressed.
@@ -1298,7 +1303,7 @@ impl Tool for GuestTool {
                 .set_timer_precise(reverie::TimerSchedule::Rcbs(3))
                 .expect("arm the precise timer");
         }
-        if matches!(signal, reverie::Signal::SIGWINCH | reverie::Signal::SIGURG) {
+        if signal == reverie::Signal::SIGWINCH || urg_arms_timer {
             // Suppressed: an interrupted call restarts, or returns EINTR.
             Ok(None)
         } else {
@@ -1422,6 +1427,8 @@ struct GuestOptions {
     /// (`GuestConfig::serialized`), as a plain Reverie Tool: SIGTRAP is left
     /// as at base.
     no_serialization_contract: bool,
+    /// `GuestConfig::urg_arms_timer`.
+    urg_arms_timer: bool,
 }
 
 /// Installs a seccomp filter on the calling thread that returns `action` for
@@ -1493,6 +1500,7 @@ async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun
             partial: options.partial,
             sigreturns: options.sigreturns,
             serialized: !options.no_serialization_contract,
+            urg_arms_timer: options.urg_arms_timer,
         })
         .backend_stats(BackendStatsRequest::ENABLED)
         .final_resume_signal_for_test(resume_recorder(resumes.clone()))
@@ -4627,6 +4635,7 @@ async fn a_guest_elf_segment_at_the_repair_page_address_keeps_every_byte() {
                 partial: false,
                 sigreturns: false,
                 serialized: true,
+                urg_arms_timer: false,
             })
             .spawn()
             .await
@@ -4802,7 +4811,14 @@ async fn a_timer_step_at_a_pending_restore_keeps_a_blocked_sigtrap() {
     }
     let shields = || crate::task::TIMER_STEP_RESTORE_SHIELDS_FOR_TEST.with(|count| count.get());
     let before = shields();
-    let run = run_guest("sigtrap_pending_restore_timer", true).await;
+    let options = GuestOptions {
+        tail: true,
+        urg_arms_timer: true,
+        ..GuestOptions::default()
+    };
+    let run = run_guest_options("sigtrap_pending_restore_timer", options)
+        .await
+        .expect("run the pending-restore timer fixture");
     assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
     assert!(
         !timer_events(&run).is_empty(),
