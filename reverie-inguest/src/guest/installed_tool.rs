@@ -37,6 +37,7 @@ trait ToolHandler: Send + Sync {
         context: &mut RegisterContext,
     );
     fn rpc(&self) -> &dyn std::any::Any;
+    fn relocate_coordinator(&self, from: libc::c_int) -> io::Result<libc::c_int>;
     #[cfg(feature = "exec-private-successor")]
     fn run_successor_post_exec(
         &self,
@@ -68,6 +69,10 @@ impl<T: Tool + 'static, R: HostRuntime> ToolHandler for ToolHost<T, R> {
 
     fn rpc(&self) -> &dyn std::any::Any {
         ToolHost::rpc(self)
+    }
+
+    fn relocate_coordinator(&self, from: libc::c_int) -> io::Result<libc::c_int> {
+        ToolHost::rpc(self).relocate(from)
     }
 
     #[cfg(feature = "exec-private-successor")]
@@ -464,6 +469,16 @@ pub unsafe fn dispatch_saved_syscall(
     if leave_rcb_handler().is_err() {
         unsafe { exit_now(122) };
     }
+}
+
+/// Moves the installed Tool's coordinator connection off `from`
+/// (`CoordinatorRpc::relocate`) and returns its new number. Fails with EBADF
+/// when no Tool is installed or `from` is not its connection's number.
+pub(crate) fn relocate_coordinator(from: libc::c_int) -> io::Result<libc::c_int> {
+    HANDLER
+        .get()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?
+        .relocate_coordinator(from)
 }
 
 fn instruction_handler() -> &'static dyn ToolHandler {

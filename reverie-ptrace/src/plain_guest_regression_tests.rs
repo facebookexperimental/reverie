@@ -2551,7 +2551,8 @@ fn timer_events(run: &GuestRun) -> Vec<&String> {
 /// When it ends with an ordinary getpid instead, its stop witnesses the
 /// event once and counts one overtaken event with its notification queued,
 /// and the stop decides the event after the overflow was due (one
-/// preempted-overflow outcome).
+/// preempted-overflow outcome). Either way the witness's detail names what
+/// ended the event.
 ///
 /// The witness and overtaken counts are process-global and other tests in
 /// this binary can write them, so the runs happen in a fresh exact-test
@@ -2595,13 +2596,14 @@ async fn late_timer_witnesses() {
         preempted_overflow: 1,
         ..Default::default()
     };
-    for (mode, child_report, witnesses, overtaken, host_timed) in [
+    for (mode, child_report, witnesses, overtaken, host_timed, missed_by) in [
         (
             "late_timer_int80",
             "child signaled=1 termsig=31 exited=0 status=0",
             1,
             0,
             Default::default(),
+            "the thread's exit",
         ),
         (
             "late_timer_getpid",
@@ -2609,13 +2611,16 @@ async fn late_timer_witnesses() {
             1,
             1,
             preempted,
+            "Seccomp stop",
         ),
     ] {
         let _ = reverie::take_skid_overshoot_count();
+        let _ = reverie::take_skid_overshoot_details();
         let _ = crate::timer::take_host_timed_timer_events();
         let overtaken_before = crate::testing::precise_events_overtaken_with_notification_queued();
         let ptrace = run_guest(mode, false).await;
         let ptrace_witnesses = reverie::take_skid_overshoot_count();
+        let ptrace_details = reverie::take_skid_overshoot_details();
         let ptrace_host_timed = crate::timer::take_host_timed_timer_events();
         let ptrace_overtaken =
             crate::testing::precise_events_overtaken_with_notification_queued() - overtaken_before;
@@ -2644,6 +2649,28 @@ async fn late_timer_witnesses() {
             ptrace_witnesses, witnesses,
             "{mode}: skid-overshoot witnesses"
         );
+        // Each witness carries its detail: the event, armed far beyond any
+        // skid margin, was missed by the stop or exit that ended it, with
+        // its notification queued only where it was overtaken, and the
+        // child ran past an overflow that the kernel did not lose.
+        let [detail] = &ptrace_details[..] else {
+            panic!("{mode}: one skid-overshoot detail: {ptrace_details:?}");
+        };
+        assert_eq!(
+            detail.kind,
+            reverie::SkidOvershootKind::Missed {
+                by: missed_by.to_owned(),
+                notification_queued: overtaken == 1,
+            },
+            "{mode}: {detail}"
+        );
+        assert!(
+            detail
+                .past_overflow()
+                .is_some_and(|past| past >= detail.past_target()),
+            "{mode}: {detail}"
+        );
+        assert_ne!(detail.overflow_recorded, Some(false), "{mode}: {detail}");
         assert_eq!(
             ptrace_overtaken, overtaken,
             "{mode}: events overtaken with their notification queued"

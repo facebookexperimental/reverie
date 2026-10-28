@@ -79,6 +79,46 @@ pub(crate) fn result_registers(
 /// access from the supervisor's physically mapped RAM. The caller has already
 /// checked long mode, paging, NXE and absence of LA57.
 pub(crate) fn fetch_user_byte(memory: &GuestMemory, cr3: u64, address: u64) -> Option<u8> {
+    let (physical, _) = user_code_physical(memory, cr3, address)?;
+    let mut byte = [0];
+    memory.read_raw(physical, &mut byte).ok()?;
+    Some(byte[0])
+}
+
+/// Resolves executable CPL3 bytes at `address` into `code`, as
+/// [`fetch_user_byte`] resolves one, with one page walk per page, and returns
+/// how many it fetched: fewer than `code.len()` where the executable bytes
+/// end.
+pub(crate) fn fetch_user_code(
+    memory: &GuestMemory,
+    cr3: u64,
+    address: u64,
+    code: &mut [u8],
+) -> usize {
+    let mut fetched = 0;
+    while fetched < code.len() {
+        let Some((physical, run)) = address
+            .checked_add(fetched as u64)
+            .and_then(|at| user_code_physical(memory, cr3, at))
+        else {
+            break;
+        };
+        let take = (code.len() - fetched).min(usize::try_from(run).unwrap_or(usize::MAX));
+        if memory
+            .read_raw(physical, &mut code[fetched..fetched + take])
+            .is_err()
+        {
+            break;
+        }
+        fetched += take;
+    }
+    fetched
+}
+
+/// The physical address of the executable CPL3 byte at `address`, and how
+/// many bytes from it to the end of its page, through the active guest page
+/// tables (see [`fetch_user_byte`]), or None.
+fn user_code_physical(memory: &GuestMemory, cr3: u64, address: u64) -> Option<(u64, u64)> {
     const PHYSICAL: u64 = 0x000f_ffff_ffff_f000;
     const NX: u64 = 1 << 63;
     // This backend's guest arena occupies the lower canonical half. Reject a
@@ -106,9 +146,7 @@ pub(crate) fn fetch_user_byte(memory: &GuestMemory, cr3: u64, address: u64) -> O
                 return None;
             }
             let physical = (entry & PHYSICAL & !offset_mask) | (address & offset_mask);
-            let mut byte = [0];
-            memory.read_raw(physical, &mut byte).ok()?;
-            return Some(byte[0]);
+            return Some((physical, (1 << shift) - (address & offset_mask)));
         }
         table = entry & PHYSICAL;
     }

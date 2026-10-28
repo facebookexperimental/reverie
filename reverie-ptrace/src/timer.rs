@@ -77,6 +77,8 @@ use reverie::Pid;
 use reverie::RegDisplay;
 use reverie::RegDisplayOptions;
 use reverie::Signal;
+use reverie::SkidOvershootDetail;
+use reverie::SkidOvershootKind;
 use reverie::Tid;
 pub use reverie::pmu_config::*;
 #[cfg(target_arch = "x86_64")]
@@ -1119,6 +1121,18 @@ struct TimerImpl {
     /// programmed. Consuming notifications does not clear it.
     programming_overflowed: bool,
 
+    /// The clock at which the programming of the active event's latest
+    /// successful request (or second stage) overflows `timer`, or `None` if
+    /// it programmed no overflow, as for an artificial notification or a
+    /// held initial-command request. The request sets it once
+    /// `prepare_notification` succeeds, from the clock it reads with the
+    /// thread stopped; a request that fails leaves the active event, and
+    /// this, as they were. Unlike `overflow_period`, it outlives the
+    /// programming, so that a skid overshoot of its event, found once
+    /// stepping has disabled `timer`, can say where the overflow was due
+    /// (see [`reverie::SkidOvershootDetail`]).
+    overflow_point: Option<u64>,
+
     /// How many RCBs short of the active precise event's target its latest
     /// programming put the notification: the first stage margin while a
     /// staged event's first stage is programmed, and at most that (see
@@ -1265,6 +1279,39 @@ struct MissedTarget {
     /// overflow records, where a queued notification cannot be told from a
     /// lost one.
     notification_queued: bool,
+    /// What the overflow records showed when the stop found the delivery
+    /// point reached.
+    evidence: OverflowEvidence,
+}
+
+/// What [`TimerImpl::overflow_evidence`] found of the latest programming at
+/// a skid overshoot: the fields of [`reverie::SkidOvershootDetail`] that the
+/// overflow records give.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+struct OverflowEvidence {
+    overflow_point: Option<u64>,
+    overflow_recorded: Option<bool>,
+    sample_age_ns: Option<u64>,
+}
+
+impl OverflowEvidence {
+    fn detail(
+        self,
+        tid: Tid,
+        kind: SkidOvershootKind,
+        rcb_actual: u64,
+        rcb_target: u64,
+    ) -> SkidOvershootDetail {
+        SkidOvershootDetail {
+            tid,
+            kind,
+            rcb_target,
+            rcb_actual,
+            overflow_point: self.overflow_point,
+            overflow_recorded: self.overflow_recorded,
+            sample_age_ns: self.sample_age_ns,
+        }
+    }
 }
 
 /// An overflow notification of this thread's timer, taken at an injected
@@ -1322,10 +1369,17 @@ impl ActiveEvent {
         match self {
             ActiveEvent::Precise {
                 clock_target,
-                offset: _,
+                offset,
             } => {
                 if clock_target.saturating_sub(curr_clock) > max_single_step_count {
-                    Some(TimerEventRequest::Precise(*clock_target - curr_clock))
+                    // The same event, its instruction offset included:
+                    // without the offset it would be delivered at the target
+                    // branch.
+                    let rcbs = *clock_target - curr_clock;
+                    Some(match *offset {
+                        0 => TimerEventRequest::Precise(rcbs),
+                        offset => TimerEventRequest::PreciseInstruction(rcbs, offset),
+                    })
                 } else {
                     None
                 }
@@ -1425,6 +1479,46 @@ impl ClockCounter {
 
     fn rcbs(&self) -> u64 {
         self.rcbs
+    }
+}
+
+/// Where the guest stands in the controller's PID namespaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestPidNamespace {
+    /// The guest shares the controller's PID namespace.
+    Same,
+    /// The guest is in a descendant of the controller's PID namespace.
+    Descendant,
+    /// The kernel has no PID namespaces, so both are in its only one.
+    Single,
+}
+
+/// Whether a marker `SI_TKILL` whose sender reads as `sender` came from the
+/// controller `controller`. Linux reports a sender from an ancestor PID
+/// namespace as 0, so with the guest in a descendant namespace only 0 matches.
+fn sent_by_controller(
+    sender: libc::pid_t,
+    controller: libc::pid_t,
+    guest: GuestPidNamespace,
+) -> bool {
+    match guest {
+        GuestPidNamespace::Descendant => sender == 0,
+        GuestPidNamespace::Same | GuestPidNamespace::Single => sender == controller,
+    }
+}
+
+/// The PID namespace that `ns_dir`, a `/proc/<task>/ns` directory, names, or
+/// `None` on a kernel without PID namespaces: there the directory lists `mnt`,
+/// as it always does, but no `pid` (`ns_entries`, fs/proc/namespaces.c). Any
+/// other failure, such as a procfs in which this task has no PID, keeps the
+/// error of the `pid` lookup.
+fn pid_namespace_of(ns_dir: &std::path::Path) -> nix::Result<Option<nix::sys::stat::FileStat>> {
+    match nix::sys::stat::stat(&ns_dir.join("pid")) {
+        Ok(namespace) => Ok(Some(namespace)),
+        Err(nix::errno::Errno::ENOENT) => nix::sys::stat::stat(&ns_dir.join("mnt"))
+            .map(|_| None)
+            .map_err(|_| nix::errno::Errno::ENOENT),
+        Err(error) => Err(error),
     }
 }
 
@@ -1538,6 +1632,7 @@ impl TimerImpl {
             overflow_period: None,
             overflow_recorded: false,
             programming_overflowed: false,
+            overflow_point: None,
             event_margin: get_pmu_config().skid_margin(),
             first_stage: None,
             #[cfg(target_arch = "x86_64")]
@@ -1596,6 +1691,7 @@ impl TimerImpl {
         self.first_stage = None;
         if self.initial_command != InitialCommand::Ordinary {
             self.event_margin = margin;
+            self.overflow_point = None;
             self.event = Self::event_at(evt, self.read_clock() + delivery);
             self.held_initial_event = Some(self.event);
             self.set_status(EventStatus::Scheduled);
@@ -1604,12 +1700,14 @@ impl TimerImpl {
         }
         self.prepare_notification(notification)?;
         self.event_margin = margin;
-        self.event = Self::event_at(evt, self.read_clock() + delivery);
+        // The thread is stopped, so the clock is the programming's.
+        let clock = self.read_clock();
+        self.overflow_point = self.overflow_period.map(|period| clock + period);
+        self.event = Self::event_at(evt, clock + delivery);
         self.set_status(EventStatus::Scheduled);
         if kept_programming_checks() {
-            // The thread is stopped, so the clock is the request's.
-            self.armed_programming = self.overflow_period.map(|period| ArmedProgramming {
-                overflow_point: self.read_clock() + period,
+            self.armed_programming = self.overflow_point.map(|overflow_point| ArmedProgramming {
+                overflow_point,
                 programmings: self.timer.programmings(),
             });
         }
@@ -1667,16 +1765,29 @@ impl TimerImpl {
         self.recheck_kept_programming();
         self.armed_programming = None;
         self.prepare_notification(remaining - margin)?;
+        self.overflow_point = self.overflow_period.map(|period| clock + period);
         self.event_margin = margin;
         self.set_status(EventStatus::Scheduled);
         if kept_programming_checks() {
-            self.armed_programming = self.overflow_period.map(|period| ArmedProgramming {
-                overflow_point: clock + period,
+            self.armed_programming = self.overflow_point.map(|overflow_point| ArmedProgramming {
+                overflow_point,
                 programmings: self.timer.programmings(),
             });
         }
         SECOND_STAGES_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// At a notification that finds the guest's clock `ctr` more than the
+    /// programming's steps short of the active event's target (a spurious
+    /// wakeup), requests the same event again, from `ctr`, and returns the
+    /// request's result; otherwise returns `None`.
+    fn reschedule_spurious_wakeup(&mut self, ctr: u64) -> Option<Result<(), Errno>> {
+        let request = self
+            .event
+            .reschedule_if_spurious_wakeup(ctr, self.max_single_step_count())?;
+        debug!("Spurious wakeup - rescheduling new timer event");
+        Some(self.request_event(request))
     }
 
     /// The most single steps the active precise event's latest programming
@@ -1726,6 +1837,32 @@ impl TimerImpl {
             false
         };
         Ok(())
+    }
+
+    /// What the overflow records show of the latest programming, for a skid
+    /// overshoot detected now: where it overflows, whether the kernel has
+    /// handled an overflow of it, and how long ago it handled the newest, by
+    /// that sample's time. A sample is this programming's only if the kernel
+    /// recorded an overflow since the programming: `prepare_notification`
+    /// releases earlier records when it programs. A programming without an
+    /// overflow point has no overflow to record.
+    fn overflow_evidence(&mut self) -> OverflowEvidence {
+        let overflow_recorded = self
+            .collect_overflow_records()
+            .then_some(self.programming_overflowed)
+            .filter(|_| self.overflow_point.is_some());
+        let now = monotonic_ns();
+        let sample_age_ns = self
+            .programming_overflowed
+            .then(|| self.timer.last_sample_time())
+            .flatten()
+            .filter(|_| now != u64::MAX)
+            .and_then(|time| now.checked_sub(time));
+        OverflowEvidence {
+            overflow_point: self.overflow_point,
+            overflow_recorded,
+            sample_age_ns,
+        }
     }
 
     /// Whether the current programming of `timer` has passed its period.
@@ -1882,6 +2019,7 @@ impl TimerImpl {
                     // Refined against the thread's pending signals by
                     // `expire_overflow_records`, which follows.
                     notification_queued: self.own_notification_queued(),
+                    evidence: self.overflow_evidence(),
                 })
             }
             _ => None,
@@ -1935,13 +2073,13 @@ impl TimerImpl {
     /// Ends the latest observed stop, which decided the event.
     fn settle_stop(&mut self) {
         if let Some(observed) = self.observed.take() {
-            Self::commit_missed(observed.missed);
+            self.commit_missed(observed.missed);
         }
     }
 
     /// Records a precise event that a stop retired past its delivery point as
-    /// a skid overshoot.
-    fn commit_missed(missed: Option<MissedTarget>) {
+    /// a skid overshoot, with its detail.
+    fn commit_missed(&self, missed: Option<MissedTarget>) {
         let Some(missed) = missed else {
             return;
         };
@@ -1950,11 +2088,21 @@ impl TimerImpl {
             missed.clock_target,
             missed.offset,
         ) {
+            let detail = missed.evidence.detail(
+                self.guest_tid,
+                SkidOvershootKind::Missed {
+                    by: missed.stop,
+                    notification_queued: missed.notification_queued,
+                },
+                missed.clock,
+                missed.clock_target,
+            );
             warn!(
                 "Precise timer target {} + {} instructions reached before its interrupt \
-                 was handled; {} at counter {} cancels the event",
-                missed.clock_target, missed.offset, missed.stop, missed.clock
+                 was handled; the event ends undelivered: {detail}",
+                missed.clock_target, missed.offset
             );
+            reverie::record_skid_overshoot_detail(detail);
             if missed.notification_queued {
                 OVERTAKEN_WITH_NOTIFICATION_QUEUED
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1981,7 +2129,12 @@ impl TimerImpl {
     fn settle_at_exit(&mut self) {
         self.recheck_kept_programming();
         self.settle_stop();
-        let missed = self.disregarded_missed.take().or_else(|| {
+        // A disregarded stop did not end the event: the exit does.
+        let disregarded = self.disregarded_missed.take().map(|missed| MissedTarget {
+            stop: format!("the thread's exit after a disregarded {}", missed.stop),
+            ..missed
+        });
+        let missed = disregarded.or_else(|| {
             let ActiveEvent::Precise {
                 clock_target,
                 offset,
@@ -2013,9 +2166,10 @@ impl TimerImpl {
                 // The exited thread's pending signals cannot be read, and no
                 // stop overtook the event.
                 notification_queued: false,
+                evidence: self.overflow_evidence(),
             })
         });
-        Self::commit_missed(missed);
+        self.commit_missed(missed);
     }
 
     fn disregard_stop(&mut self) -> Result<Option<Unfinished>, Errno> {
@@ -2094,7 +2248,7 @@ impl TimerImpl {
     /// [`TimerImpl::retire`], which records only a Scheduled event, does not
     /// record it again either way.
     fn cancel_at_disregarded_stop(&mut self, missed: Option<MissedTarget>) {
-        Self::commit_missed(missed);
+        self.commit_missed(missed);
         self.timer_status = EventStatus::Cancelled;
     }
 
@@ -2348,7 +2502,7 @@ impl TimerImpl {
         {
             let clock = self.read_clock();
             if target_reached(clock, clock_target, offset) {
-                Self::commit_missed(Some(MissedTarget {
+                let missed = MissedTarget {
                     clock,
                     clock_target,
                     offset,
@@ -2367,7 +2521,9 @@ impl TimerImpl {
                     // untested witness code in
                     // https://github.com/rrnewton/reverie/issues/748.
                     notification_queued: self.own_notification_queued(),
-                }));
+                    evidence: self.overflow_evidence(),
+                };
+                self.commit_missed(Some(missed));
             }
         }
         self.set_status(EventStatus::Cancelled);
@@ -2463,7 +2619,13 @@ impl TimerImpl {
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or(guest_path)
         });
-        let ours = nix::sys::stat::stat("/proc/thread-self/ns/pid")?;
+        let Some(ours) = pid_namespace_of(std::path::Path::new("/proc/thread-self/ns"))? else {
+            return Ok(sent_by_controller(
+                sender,
+                controller,
+                GuestPidNamespace::Single,
+            ));
+        };
         let theirs = nix::sys::stat::stat(guest_path.as_str());
         #[cfg(test)]
         CONTROLLER_QUERY_LOG.with(|slot| {
@@ -2476,14 +2638,20 @@ impl TimerImpl {
             }
         });
         let theirs = theirs?;
-        let same_namespace = (ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino);
-        // Namespace lookup failure propagates through the held-stop error
-        // path; it neither accepts an unknown sender nor makes construction
-        // newly fallible. This discriminates accidental guest markers under
-        // the existing reserved-signal convention, not hostile forgery:
-        // another ancestor also maps to zero and self rt_tgsigqueueinfo can
-        // supply SI_TKILL with a forged sender in either namespace.
-        Ok(sender == if same_namespace { controller } else { 0 })
+        let guest = if (ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino) {
+            GuestPidNamespace::Same
+        } else {
+            GuestPidNamespace::Descendant
+        };
+        // Namespace lookup failure propagates through the held-stop error path;
+        // it neither accepts an unknown sender nor makes construction newly
+        // fallible. Only positive evidence of a kernel without PID namespaces
+        // (`pid_namespace_of`) skips the comparison above. This discriminates
+        // accidental guest markers under the existing reserved-signal
+        // convention, not hostile forgery: another ancestor also maps to zero
+        // and self rt_tgsigqueueinfo can supply SI_TKILL with a forged sender
+        // in either namespace.
+        Ok(sent_by_controller(sender, controller, guest))
     }
 
     fn generated_signal(&self, signal: &libc::siginfo_t, controller: bool) -> bool {
@@ -2651,12 +2819,8 @@ impl TimerImpl {
         let ctr = self.read_clock();
         let first_stage = self.first_stage.take();
 
-        if let Some(additional_timer_request) = self
-            .event
-            .reschedule_if_spurious_wakeup(ctr, self.max_single_step_count())
-        {
-            debug!("Spurious wakeup - rescheduling new timer event");
-            if let Err(errno) = self.request_event(additional_timer_request) {
+        if let Some(rescheduled) = self.reschedule_spurious_wakeup(ctr) {
+            if let Err(errno) = rescheduled {
                 warn!(
                     "Attempted to reschedule a timer signal after an early wakeup, but failed with - {:?}. A panic will likely follow",
                     errno
@@ -2730,15 +2894,7 @@ impl TimerImpl {
         // deliver the timer event at the observed counter. The Tool can then
         // account for the late event and either end the timeslice or re-arm
         // the next timer through its normal callback.
-        if get_pmu_config().record_overshoot_if_past_target(current.rcbs(), target_rcb) {
-            warn!(
-                "Precise timer interrupt arrived after target: actual {} > target {}; \
-                 delivering timer event at the observed counter",
-                current.rcbs(),
-                target_rcb
-            );
-            #[cfg(test)]
-            count_host_timed(|events| events.overshoot += 1);
+        if self.record_late_delivery(current.rcbs(), target_rcb) {
             return Ok(task);
         }
         let max_single_step_count = self.max_single_step_count();
@@ -2897,6 +3053,30 @@ impl TimerImpl {
             current, block_steps, instruction_steps
         );
         Ok(task)
+    }
+
+    /// Records a precise event whose notification found the thread at
+    /// `rcb_actual`, past its target `rcb_target`, as a skid overshoot, with
+    /// its detail, and returns `true`. A notification at or short of the
+    /// target records nothing and returns `false`.
+    fn record_late_delivery(&mut self, rcb_actual: u64, rcb_target: u64) -> bool {
+        if !get_pmu_config().record_overshoot_if_past_target(rcb_actual, rcb_target) {
+            return false;
+        }
+        let detail = self.overflow_evidence().detail(
+            self.guest_tid,
+            SkidOvershootKind::DeliveredLate,
+            rcb_actual,
+            rcb_target,
+        );
+        warn!(
+            "Precise timer interrupt arrived after target: {detail}; delivering timer event \
+             at the observed counter"
+        );
+        reverie::record_skid_overshoot_detail(detail);
+        #[cfg(test)]
+        count_host_timed(|events| events.overshoot += 1);
+        true
     }
 
     /// The unit of the next step from `start`, `clock` RCBs into a precise
@@ -3667,6 +3847,43 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use super::PmuConfig;
 
+    /// The controller's marker reads as its own PID in a shared PID
+    /// namespace, as 0 from a descendant one, and as its own PID on a kernel
+    /// without PID namespaces, which has only one.
+    #[test]
+    fn controller_sender_by_namespace() {
+        use super::GuestPidNamespace::*;
+        use super::sent_by_controller;
+        assert!(sent_by_controller(77, 77, Same));
+        assert!(!sent_by_controller(0, 77, Same));
+        assert!(sent_by_controller(0, 77, Descendant));
+        assert!(!sent_by_controller(77, 77, Descendant));
+        assert!(sent_by_controller(77, 77, Single));
+        assert!(!sent_by_controller(0, 77, Single));
+    }
+
+    /// Only an `ns` directory that lists `mnt` but not `pid` means a kernel
+    /// without PID namespaces; a directory that lists neither keeps the
+    /// `pid` lookup's ENOENT.
+    #[test]
+    fn pid_namespace_needs_positive_evidence_of_its_absence() {
+        use super::pid_namespace_of;
+        let dir = std::env::temp_dir().join(format!("reverie-ns-{}", std::process::id()));
+        // A panicked run with the same PID may have left `mnt` behind.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            pid_namespace_of(&dir).err(),
+            Some(nix::errno::Errno::ENOENT)
+        );
+        std::fs::write(dir.join("mnt"), b"").unwrap();
+        assert!(matches!(pid_namespace_of(&dir), Ok(None)));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let listed = std::fs::symlink_metadata("/proc/thread-self/ns/pid").is_ok();
+        let this_task = pid_namespace_of(std::path::Path::new("/proc/thread-self/ns")).unwrap();
+        assert_eq!(this_task.is_some(), listed);
+    }
+
     #[test]
     fn terminal_close_attempts_both_counters_after_cancellation_error() {
         use super::*;
@@ -3698,6 +3915,7 @@ mod tests {
                 overflow_period: None,
                 overflow_recorded: false,
                 programming_overflowed: false,
+                overflow_point: None,
                 event_margin: get_pmu_config().skid_margin(),
                 first_stage: None,
                 #[cfg(target_arch = "x86_64")]
@@ -3862,6 +4080,56 @@ mod tests {
         }
     }
 
+    // A notification that finds the clock more than the programming's steps
+    // short of a precise target (a spurious wakeup) requests the same event
+    // again: the same target and the same instruction offset. Requested
+    // without its offset, the event was delivered at the target branch.
+    #[test]
+    fn a_spurious_wakeup_requests_the_same_event_with_its_instruction_offset() {
+        use reverie::Pid;
+
+        use super::ActiveEvent;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+
+        const TICKS: u64 = 1_000_000;
+        block_timer_signal();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        // The clock stands still, as a stopped guest's does, so that every
+        // read in a call is the same.
+        timer.clock.disable().unwrap();
+        for offset in [11, 0] {
+            timer
+                .request_event(TimerEventRequest::PreciseInstruction(TICKS, offset))
+                .unwrap();
+            timer.timer.disable().unwrap();
+            let requested = timer.event;
+            let ActiveEvent::Precise { clock_target, .. } = requested else {
+                panic!("a precise event: {requested:?}");
+            };
+            // The notification finds the clock where the request did, the
+            // whole request short of the target.
+            let clock = timer.read_clock();
+            assert_eq!(clock_target - clock, TICKS);
+            assert_eq!(timer.reschedule_spurious_wakeup(clock), Some(Ok(())));
+            timer.timer.disable().unwrap();
+            assert_eq!(timer.event, requested, "offset {offset}");
+            // Within the programming's steps of the target it is no
+            // spurious wakeup.
+            assert_eq!(timer.reschedule_spurious_wakeup(clock_target - 1), None);
+        }
+        let event = ActiveEvent::Precise {
+            clock_target: 30_233,
+            offset: 11,
+        };
+        assert!(matches!(
+            event.reschedule_if_spurious_wakeup(7_000, 200),
+            Some(TimerEventRequest::PreciseInstruction(23_233, 11))
+        ));
+    }
+
     // A staged precise event's first stage is programmed the first stage
     // margin short of its target. At the first stage's notification, the
     // re-arm programs the second stage the measured branch rate times the
@@ -3911,6 +4179,7 @@ mod tests {
             panic!("a precise event: {requested:?}");
         };
         assert_eq!(timer.overflow_period, Some(TICKS - first));
+        assert_eq!(timer.overflow_point, Some(clock_target - first));
         assert_eq!(timer.event_margin, first);
         assert_eq!(
             timer.max_single_step_count(),
@@ -3924,6 +4193,7 @@ mod tests {
         assert_eq!(timer.rearm_second_stage(stage, clock, None), Ok(false));
         assert_eq!(timer.event, requested);
         assert_eq!(timer.overflow_period, Some(TICKS - first));
+        assert_eq!(timer.overflow_point, Some(clock_target - first));
         assert_eq!(timer.event_margin, first);
 
         // The notification finds the guest 200 RCBs past the overflow, which
@@ -3945,6 +4215,7 @@ mod tests {
         assert_eq!(timer.event, requested);
         assert_eq!(timer.timer_status, EventStatus::Scheduled);
         assert_eq!(timer.overflow_period, Some(remaining - margin));
+        assert_eq!(timer.overflow_point, Some(clock_target - margin));
         assert_eq!(timer.event_margin, margin);
         assert_eq!(
             timer.max_single_step_count(),
@@ -3963,9 +4234,64 @@ mod tests {
             );
             assert_eq!(timer.event, requested);
             assert_eq!(timer.overflow_period, Some(remaining - skid));
+            assert_eq!(timer.overflow_point, Some(clock_target - skid));
             assert_eq!(timer.event_margin, skid);
         }
         timer.timer.disable().unwrap();
+    }
+
+    // A second stage re-programs the active event, and its overflow point
+    // moves with it, so that a second stage's overshoot reports the
+    // overflow it missed. Unlike
+    // `a_staged_event_is_rearmed_short_of_the_same_target`, this runs where
+    // events are not staged too: the re-arm itself does not ask.
+    #[test]
+    fn a_second_stage_moves_the_overflow_point() {
+        use reverie::Pid;
+
+        use super::ActiveEvent;
+        use super::EventStatus;
+        use super::FirstStage;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+        use super::get_pmu_config;
+
+        const TICKS: u64 = 1_000_000;
+        block_timer_signal();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        // The clock stands still, as a stopped guest's does.
+        timer.clock.disable().unwrap();
+        timer
+            .request_event(TimerEventRequest::Precise(TICKS))
+            .unwrap();
+        timer.timer.disable().unwrap();
+        let ActiveEvent::Precise { clock_target, .. } = timer.event else {
+            panic!("a precise event: {:?}", timer.event);
+        };
+        let period = timer
+            .overflow_period
+            .expect("the request programs an overflow");
+        assert_eq!(timer.overflow_point, Some(clock_target - TICKS + period));
+
+        // Without a time from the programming, the second stage is the skid
+        // margin short of the target.
+        let stage = FirstStage {
+            programmed_ns: 0,
+            programmed_clock: clock_target - TICKS,
+        };
+        let skid = get_pmu_config().skid_margin();
+        let clock = clock_target - TICKS / 2;
+        // Where events are not staged, both programmings are the skid margin
+        // short of the target, so forget the first stage's point to see the
+        // second stage set its own.
+        timer.overflow_point = None;
+        assert_eq!(timer.rearm_second_stage(stage, clock, None), Ok(true));
+        assert_eq!(timer.overflow_period, Some(clock_target - clock - skid));
+        assert_eq!(timer.overflow_point, Some(clock_target - skid));
+        timer.timer.disable().unwrap();
+        timer.set_status(EventStatus::Cancelled);
     }
 
     // The first stage's overflow records its time, after the programming,
@@ -4428,6 +4754,7 @@ mod tests {
             offset: 0,
             stop: "test".into(),
             notification_queued: false,
+            evidence: super::OverflowEvidence::default(),
         };
 
         // Before the period the stop leaves the event and its programming as
@@ -5119,6 +5446,180 @@ mod tests {
         unsafe {
             libc::pthread_sigmask(libc::SIG_UNBLOCK, &blocked, core::ptr::null_mut());
         }
+    }
+
+    // Both sites that detect a skid overshoot record its detail: where the
+    // event's programming overflowed and what the overflow records showed
+    // when the overshoot was found. A late notification is found once its
+    // signal is consumed and stepping has disabled the counter, which ends
+    // the programming but must not lose where its overflow was due. A stop
+    // past the delivery point retires the event, here with its
+    // notification queued. A programming that never overflowed reports no
+    // recorded overflow and no sample age. The witness count and details
+    // are process global, and other tests in this binary read the count, so
+    // the overshoots happen in a fresh exact-test process.
+    #[test]
+    fn both_detection_sites_record_a_skid_overshoot_detail() {
+        const CHILD: &str = "REVERIE_PTRACE_SKID_DETAIL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            record_skid_overshoot_details_at_both_sites();
+            return;
+        }
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("the module path names the crate");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("locate test binary"))
+                .args([
+                    "--exact",
+                    &format!("{module}::both_detection_sites_record_a_skid_overshoot_detail"),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("run the skid-detail child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "skid-detail child test failed:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The overshoots of [`both_detection_sites_record_a_skid_overshoot_detail`],
+    /// in the exact-test child process that owns the witness count.
+    fn record_skid_overshoot_details_at_both_sites() {
+        use reverie::Pid;
+        use reverie::SkidOvershootKind;
+
+        use super::ActiveEvent;
+        use super::EventStatus;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+        use crate::perf::do_branches;
+
+        block_timer_signal();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        assert_eq!(timer.timer.take_sample_records(), Some(0));
+        let _ = reverie::take_skid_overshoot_count();
+        let _ = reverie::take_skid_overshoot_details();
+        const PERIOD: u64 = 10_000;
+        // Far enough ahead that the request programs an overflow, at least
+        // `PERIOD` branches in, whatever margin it uses.
+        let config = super::get_pmu_config();
+        let ticks = config.first_stage_margin().max(config.skid_margin()) + PERIOD;
+        // The clock counts this thread only while it runs the guest's
+        // branches, so that it reads the same however often it is read (see
+        // `a_stop_that_nothing_continues_keeps_the_event_only_before_the_period`).
+        timer.clock.disable().unwrap();
+        // Requests an event `ticks` branches ahead and runs well past it,
+        // and so past the overflow the request programmed, which the kernel
+        // records and notifies. Returns where the overflow was due and the
+        // event's target.
+        let overflow = |timer: &mut TimerImpl| {
+            let requested = timer.read_clock();
+            timer
+                .request_event(TimerEventRequest::Precise(ticks))
+                .unwrap();
+            let period = timer
+                .overflow_period
+                .expect("the request programs an overflow");
+            assert_eq!(timer.overflow_point, Some(requested + period));
+            assert_eq!(
+                timer.event,
+                ActiveEvent::Precise {
+                    clock_target: requested + ticks,
+                    offset: 0,
+                }
+            );
+            timer.clock.enable().unwrap();
+            do_branches(ticks + 2 * PERIOD);
+            timer.clock.disable().unwrap();
+            timer.timer.disable().unwrap();
+            (requested + period, requested + ticks)
+        };
+        let sample_times = timer.timer.records_sample_time();
+        let check = |detail: &reverie::SkidOvershootDetail, point: u64, target: u64| {
+            assert_eq!(detail.tid, tid);
+            assert_eq!(detail.rcb_target, target);
+            assert_eq!(detail.overflow_point, Some(point));
+            assert!(detail.past_target() >= 2 * PERIOD, "{detail}");
+            assert_eq!(detail.overflow_recorded, Some(true));
+            assert_eq!(detail.sample_age_ns.is_some(), sample_times);
+            // An age is from the sample to now, within this test's run.
+            assert!(
+                detail.sample_age_ns.unwrap_or(0) < 60_000_000_000,
+                "{detail}"
+            );
+        };
+        // A late notification: consumed as `handle_signal` does, then the
+        // counter disabled for stepping as `deliver` does.
+        let (point, target) = overflow(&mut timer);
+        let notification = take_timer_signal().expect("the counter overflowed");
+        assert!(timer.owns_overflow_signal(&notification));
+        timer.mark_overflows_consumed();
+        timer.disable_timer_before_stepping();
+        assert_eq!(timer.overflow_period, None);
+        let actual = timer.read_clock();
+        assert!(!timer.record_late_delivery(target, target));
+        assert!(timer.record_late_delivery(actual, target));
+        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+        let details = reverie::take_skid_overshoot_details();
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert_eq!(details[0].kind, SkidOvershootKind::DeliveredLate);
+        assert_eq!(details[0].rcb_actual, actual);
+        check(&details[0], point, target);
+
+        // A stop past the delivery point, with the notification still
+        // queued, retires the event once it is settled.
+        let (point, target) = overflow(&mut timer);
+        let actual = timer.read_clock();
+        timer.observe_event(&super::TraceEvent::Signal(super::Signal::SIGUSR1));
+        let notification = take_timer_signal().expect("the counter overflowed");
+        timer.expire_overflow_records(&[notification]);
+        timer.settle_stop();
+        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+        let details = reverie::take_skid_overshoot_details();
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert_eq!(
+            details[0].kind,
+            SkidOvershootKind::Missed {
+                by: "Signal(SIGUSR1) stop".to_owned(),
+                notification_queued: true,
+            }
+        );
+        assert_eq!(details[0].rcb_actual, actual);
+        check(&details[0], point, target);
+
+        // A programming whose counter stopped before its period, so that
+        // the kernel recorded no overflow of it: the detail says so, and
+        // the previous programming's sample gives it no age.
+        let requested = timer.read_clock();
+        timer
+            .request_event(TimerEventRequest::Precise(ticks))
+            .unwrap();
+        timer.timer.disable().unwrap();
+        let point = timer
+            .overflow_point
+            .expect("the request programs an overflow");
+        timer.clock.enable().unwrap();
+        do_branches(ticks + 2 * PERIOD);
+        timer.clock.disable().unwrap();
+        let actual = timer.read_clock();
+        assert!(timer.record_late_delivery(actual, requested + ticks));
+        assert_eq!(reverie::take_skid_overshoot_count(), 1);
+        let details = reverie::take_skid_overshoot_details();
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert_eq!(details[0].overflow_point, Some(point));
+        assert_eq!(details[0].overflow_recorded, Some(false));
+        assert_eq!(details[0].sample_age_ns, None);
+
+        timer.set_status(EventStatus::Cancelled);
+        timer.event = ActiveEvent::Imprecise { clock_min: 0 };
+        assert!(take_timer_signal_now().is_none());
     }
 
     /// Overwrite `si_fd`, at the offset `get_si_fd` reads.

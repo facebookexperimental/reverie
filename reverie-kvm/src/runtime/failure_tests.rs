@@ -428,7 +428,7 @@ fn joined_rpc_control_with_panic(fail: bool, cleanup_fails: bool, worker_panics:
                 memory,
                 &[],
                 // No instruction executes; only send_rpc uses this guest.
-                unsafe { std::mem::zeroed() },
+                &crate::runtime::ZEROED_USER_REGISTERS,
                 &mut state,
                 &mut executor,
                 worker_global.as_ref(),

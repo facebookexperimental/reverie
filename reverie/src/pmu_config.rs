@@ -540,9 +540,10 @@ impl PmuConfig {
     /// then return `true`. A non-overshoot (`rcb_actual <= rcb_target`) records
     /// nothing and returns `false`.
     ///
-    /// `TimerImpl::attempt_single_step`'s late-delivery guard is the sole runtime
-    /// caller, so a unit test that drives real `(actual, target)` pairs through
-    /// this method exercises exactly the behaviour the supervisor runs — a
+    /// `TimerImpl::record_late_delivery`, the late-delivery guard of
+    /// `TimerImpl::attempt_single_step`, is the sole runtime caller, so a
+    /// unit test that drives real `(actual, target)` pairs through this
+    /// method exercises exactly the behaviour the supervisor runs — a
     /// genuine overshoot causes exactly one witness record — without needing a
     /// live guest or PMU. The boolean return is what makes that behaviour
     /// (not merely the marker arithmetic) observable in a test.
@@ -572,8 +573,11 @@ impl PmuConfig {
     /// the target is at least one instruction, so `rcb_actual - rcb_target >=
     /// instr_offset` proves the guest got there. A stop with fewer branches
     /// past the target is not recorded, even if the delivery point was in fact
-    /// reached. `TimerImpl::commit_missed`, for a stop that retires the event,
-    /// is the sole runtime caller.
+    /// reached. The runtime callers are reverie-ptrace's
+    /// `TimerImpl::commit_missed`, for a stop that retires the event, and
+    /// reverie-kvm's preemption timer, for an exit at which a precise
+    /// request's target was reached: such an exit does not stop the guest at
+    /// the delivery point, so even an exact arrival there is late.
     pub fn record_missed_if_target_reached(
         &self,
         rcb_actual: u64,

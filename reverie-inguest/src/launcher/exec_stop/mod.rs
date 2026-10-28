@@ -270,12 +270,14 @@ impl<'fd> ChildOwner<'fd> {
             }
             Err(error) => {
                 let receipt = self.receipt.clone();
+                let parent_stdio = self._request.take_parent_stdio();
                 let deferred = self.cancel().err();
                 Err(LaunchFailure {
                     error,
                     receipt,
                     owner: deferred,
                     pending: None,
+                    parent_stdio,
                 })
             }
         }
@@ -475,6 +477,13 @@ impl<'fd> InitialExecStop<'fd> {
             .duplicate_birth_pidfd_for_inherited(&self.task, fd)
     }
 
+    /// Take the original child's parent pipe endpoints once, before releasing
+    /// guest execution. Captured streams must be drained concurrently with the
+    /// original physical driver; neither EOF nor this take proves retirement.
+    pub fn take_parent_stdio(&mut self) -> Option<reverie::process::ParentStdio> {
+        self.owner._request.take_parent_stdio()
+    }
+
     /// Inspect the original entry and initial stack without reading environ.
     pub fn entry(&self) -> &EntryContext {
         &self.context
@@ -503,8 +512,15 @@ pub struct LaunchFailure<'fd> {
     receipt: CleanupReceipt,
     owner: Option<Box<ChildOwner<'fd>>>,
     pending: Option<Box<(child::PendingChild, PreparedExec<'fd>)>>,
+    parent_stdio: Option<reverie::process::ParentStdio>,
 }
 impl LaunchFailure<'_> {
+    /// Take actual parent pipe endpoints, if clone created them. This transfers
+    /// no wait or cleanup authority. Partial output remains failed-run data.
+    pub fn take_parent_stdio(&mut self) -> Option<reverie::process::ParentStdio> {
+        self.parent_stdio.take()
+    }
+
     /// Snapshot actual cleanup observations, including unconfirmed retirement.
     pub fn cleanup(&self) -> CleanupState {
         self.receipt.snapshot()
@@ -551,7 +567,7 @@ impl ExecStop {
     /// Clone one owned child and drain only its initial exec's kernel return.
     /// Caller must retain an external physical deadline for synchronous waits.
     pub fn spawn<'fd>(
-        request: PreparedExec<'fd>,
+        mut request: PreparedExec<'fd>,
         receipt: CleanupReceipt,
     ) -> std::result::Result<InitialExecStop<'fd>, LaunchFailure<'fd>> {
         if !receipt.claim() {
@@ -560,6 +576,7 @@ impl ExecStop {
                 receipt,
                 owner: None,
                 pending: None,
+                parent_stdio: None,
             });
         }
         let mut pending = match request.fork(receipt.clone()) {
@@ -570,6 +587,7 @@ impl ExecStop {
                     receipt,
                     owner: None,
                     pending: None,
+                    parent_stdio: None,
                 });
             }
         };
@@ -577,6 +595,7 @@ impl ExecStop {
         let birth_pidfd = match pending.duplicate_birth_pidfd() {
             Ok(fd) => fd,
             Err(error) => {
+                let parent_stdio = request.take_parent_stdio();
                 pending.retire();
                 let deferred = pending.is_owned().then(|| Box::new((pending, request)));
                 return Err(LaunchFailure {
@@ -584,6 +603,7 @@ impl ExecStop {
                     receipt,
                     owner: None,
                     pending: deferred,
+                    parent_stdio,
                 });
             }
         };
@@ -591,6 +611,7 @@ impl ExecStop {
         let running = match Running::new_on_ptracer_thread(pid) {
             Ok(running) => running,
             Err(error) => {
+                let parent_stdio = request.take_parent_stdio();
                 pending.retire();
                 let deferred = pending.is_owned().then(|| Box::new((pending, request)));
                 return Err(LaunchFailure {
@@ -598,6 +619,7 @@ impl ExecStop {
                     receipt,
                     owner: None,
                     pending: deferred,
+                    parent_stdio,
                 });
             }
         };
@@ -678,12 +700,14 @@ impl ExecStop {
                 owner,
             }),
             Err(error) => {
+                let parent_stdio = owner._request.take_parent_stdio();
                 let deferred = owner.cancel().err();
                 Err(LaunchFailure {
                     error,
                     receipt,
                     owner: deferred,
                     pending: None,
+                    parent_stdio,
                 })
             }
         }
@@ -725,3 +749,7 @@ pub fn register_words(r: &Regs) -> [u64; 27] {
 // operation documents SAFETY; production unsafe remains in the child boundary.
 #[allow(unsafe_code)]
 mod birth_pidfd_tests;
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod stdio_tests;

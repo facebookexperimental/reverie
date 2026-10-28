@@ -47,6 +47,13 @@ const _: () = {
     assert!(offset_of!(ToolHeapMetadata, next) == 0);
     assert!(offset_of!(ToolHeapMetadata, free_head) == 8);
     assert!(offset_of!(ToolHeapMetadata, locked) == 16);
+    assert!(size_of::<AtomicBool>() == 1);
+    assert!(size_of::<AtomicUsize>() == 8);
+    assert!(size_of::<UnsafeCell<usize>>() == 8);
+    assert!(offset_of!(Control, occupied) == 8);
+    assert!(TOOL_BAND.0 < TOOL_BAND.1 && PATCH_BAND.0 < PATCH_BAND.1);
+    assert!(IMAGE_BAND.1 <= BITMAP_WORDS * 64);
+    assert!(IMAGE_BAND.1 <= i32::MAX as usize);
     assert!(size_of::<FixedArenaMetadata>() == 32 && align_of::<FixedArenaMetadata>() == 8);
     assert!(size_of::<FixedArenaMetadata>() <= PAGE);
     assert!(METADATA_ADDRESS >= BASE + PAGE + size_of::<Control>());
@@ -121,8 +128,16 @@ pub struct FixedArenaMetadataAddresses {
 /// compile-time bounds keep every scalar access inside Control. Iterating over
 /// aggregate descriptors can copy through libc in native preparation, before the
 /// Tool is ready; keep this path scalar in every supported build profile.
+/// Its explicit C ABI is consumed by the source-owned setup assembly: mark is
+/// exactly 0/1 in CL and the boolean result is read only from AL. C ABI also
+/// forbids an unwind across that assembly boundary.
 #[inline(never)]
-unsafe fn fixed_bitmap_range(control: *mut Control, start: usize, end: usize, mark: bool) -> bool {
+unsafe extern "C" fn fixed_bitmap_range(
+    control: *mut Control,
+    start: usize,
+    end: usize,
+    mark: bool,
+) -> bool {
     // SAFETY: the fresh unpublished owner exclusively owns Control; all three
     // statically checked bands contain only valid bitmap indices.
     let bitmap = unsafe { (*control).occupied.get().cast::<u64>() };
@@ -161,59 +176,139 @@ unsafe fn fixed_bitmap_range(control: *mut Control, start: usize, end: usize, ma
 /// An authenticated mapped-image owner may already have exact qualified images
 /// there: this function never changes any image or guard protection. Initializing
 /// permanent occupancy is not itself mapping ownership or runtime readiness.
-#[inline(never)]
+#[inline(always)]
 pub(super) unsafe fn initialize_fixed_arenas(control: *mut Control) -> Result<(), i32> {
-    // SAFETY: each exact band is statically checked inside the owned bitmap.
-    if !unsafe { fixed_bitmap_range(control, TOOL_BAND.0, TOOL_BAND.1, false) }
-        || !unsafe { fixed_bitmap_range(control, PATCH_BAND.0, PATCH_BAND.1, false) }
-        || !unsafe { fixed_bitmap_range(control, IMAGE_BAND.0, IMAGE_BAND.1, false) }
-    {
-        return Err(libc::EINVAL);
-    }
-    // SAFETY: only the fresh owner's two payload interiors become writable;
-    // adjacent guards retain the initial PROT_NONE protection and key zero.
-    let tool_result = unsafe {
-        crate::trap::raw_syscall3(
-            libc::SYS_mprotect,
-            TOOL_BOTTOM as u64,
-            ARENA_BYTES as u64,
-            (libc::PROT_READ | libc::PROT_WRITE) as u64,
-        )
-    };
-    if tool_result < 0 {
-        return Err(tool_result.wrapping_neg() as i32);
-    }
-    // SAFETY: the patch payload is the second disjoint, exact owned interior.
-    let patch_result = unsafe {
-        crate::trap::raw_syscall3(
-            libc::SYS_mprotect,
-            PATCH_BOTTOM as u64,
-            ARENA_BYTES as u64,
-            (libc::PROT_READ | libc::PROT_WRITE) as u64,
-        )
-    };
-    if patch_result < 0 {
-        return Err(patch_result.wrapping_neg() as i32);
-    }
-    let metadata = METADATA_ADDRESS as *mut FixedArenaMetadata;
-    // SAFETY: the control-area page is aligned, writable and fresh. No reader
-    // can access it before the caller completes successful REGION publication.
-    unsafe {
-        ToolHeapMetadata::initialize_at(core::ptr::addr_of_mut!((*metadata).tool));
-        core::ptr::addr_of_mut!((*metadata).patch_cursor).write(AtomicUsize::new(0));
-    }
-    // SAFETY: protections and metadata are complete; permanently mark exactly
-    // the same three checked bands before their owner can be published. The
-    // image envelope retains its caller-owned protections; no image/guard
-    // mapping changes here.
-    unsafe {
-        fixed_bitmap_range(control, TOOL_BAND.0, TOOL_BAND.1, true);
-        fixed_bitmap_range(control, PATCH_BAND.0, PATCH_BAND.1, true);
-        fixed_bitmap_range(control, IMAGE_BAND.0, IMAGE_BAND.1, true);
-    }
-    Ok(())
+    // SAFETY: the caller supplies the fresh, exclusively owned control area.
+    // A scalar status crosses the separately qualified boundary; Rust Result's
+    // discriminant representation must not become its calling convention.
+    let status = unsafe { initialize_fixed_arenas_opaque(black_box(control.cast())) };
+    if status == 0 { Ok(()) } else { Err(status) }
 }
 
+// The assembly entry calls only explicit C-ABI helpers. This bridge preserves
+// raw_syscall3's selected legacy/fixed-gate mechanism; it does not create a new
+// gate, call libc, or use a Rust calling convention from assembly.
+#[inline(never)]
+unsafe extern "C" fn fixed_arena_mprotect(address: usize) -> i64 {
+    // SAFETY: the setup entry supplies one exact fresh owned payload interior.
+    unsafe {
+        crate::trap::raw_syscall3(
+            libc::SYS_mprotect,
+            address as u64,
+            ARENA_BYTES as u64,
+            (libc::PROT_READ | libc::PROT_WRITE) as u64,
+        )
+    }
+}
+
+/// Complete the fresh owner's arenas through one source-owned scalar entry.
+///
+/// # Safety
+/// Same fresh, exclusive Control/reservation contract as initialize_fixed_arenas.
+/// The caller supplies SysV x86-64 state with DF clear. Every callee uses an
+/// explicit C ABI and cannot unwind into this naked frame. Zero means all
+/// protections, metadata and permanent occupancy are complete; any nonzero
+/// status retains the caller's ownership and any completed protection change.
+/// This entry never publishes, releases INITIALIZING, or unmaps anything.
+#[unsafe(naked)]
+pub(super) unsafe extern "C" fn initialize_fixed_arenas_opaque(_control: *mut c_void) -> i32 {
+    // SAFETY: RBX alone retains Control across calls. Saving it aligns RSP to
+    // 16 before every CALL and it is restored on every return; other callee-saved
+    // registers are untouched. The three preflight calls precede every write.
+    // Both raw results are checked as signed 64-bit values before metadata is
+    // initialized. NEG EAX is the exact low 32-bit wrapping negation of the
+    // kernel error, matching the former wrapping_neg() as i32 conversion.
+    // The metadata stores preserve the former initializer's field order and do
+    // not write padding. All occupancy calls mark the same preflighted bands.
+    core::arch::naked_asm!(
+        "push rbx",
+        "mov rbx, rdi",
+        // Read-only preflight; stop on the first occupied band.
+        "mov esi, {tool_first}",
+        "mov edx, {tool_end}",
+        "xor ecx, ecx",
+        "call {bitmap}",
+        "test al, al",
+        "jz 90f",
+        "mov rdi, rbx",
+        "mov esi, {patch_first}",
+        "mov edx, {patch_end}",
+        "xor ecx, ecx",
+        "call {bitmap}",
+        "test al, al",
+        "jz 90f",
+        "mov rdi, rbx",
+        "mov esi, {image_first}",
+        "mov edx, {image_end}",
+        "xor ecx, ecx",
+        "call {bitmap}",
+        "test al, al",
+        "jz 90f",
+        // Only the two payload interiors become RW; every guard and the
+        // image envelope keep their original caller-owned protections.
+        "movabs rdi, {tool_bottom}",
+        "call {mprotect}",
+        "test rax, rax",
+        "js 91f",
+        "movabs rdi, {patch_bottom}",
+        "call {mprotect}",
+        "test rax, rax",
+        "js 91f",
+        // Match the former ToolHeapMetadata initializer, then patch_cursor. The
+        // fresh aligned scalar fields are not visible before publication.
+        "movabs rax, {metadata}",
+        "mov qword ptr [rax + {next}], 0",
+        "mov qword ptr [rax + {free_head}], 0",
+        "mov byte ptr [rax + {locked}], 0",
+        "mov qword ptr [rax + {patch_cursor}], 0",
+        // Marking returns true and cannot refuse under the same exclusive
+        // fresh-owner contract. As before, no mark result changes the order.
+        "mov rdi, rbx",
+        "mov esi, {tool_first}",
+        "mov edx, {tool_end}",
+        "mov ecx, 1",
+        "call {bitmap}",
+        "mov rdi, rbx",
+        "mov esi, {patch_first}",
+        "mov edx, {patch_end}",
+        "mov ecx, 1",
+        "call {bitmap}",
+        "mov rdi, rbx",
+        "mov esi, {image_first}",
+        "mov edx, {image_end}",
+        "mov ecx, 1",
+        "call {bitmap}",
+        "xor eax, eax",
+        "jmp 92f",
+        "90:",
+        "mov eax, {invalid}",
+        "jmp 92f",
+        "91:",
+        "neg eax",
+        "92:",
+        "pop rbx",
+        "ret",
+        tool_first = const TOOL_BAND.0,
+        tool_end = const TOOL_BAND.1,
+        patch_first = const PATCH_BAND.0,
+        patch_end = const PATCH_BAND.1,
+        image_first = const IMAGE_BAND.0,
+        image_end = const IMAGE_BAND.1,
+        bitmap = sym fixed_bitmap_range,
+        tool_bottom = const TOOL_BOTTOM,
+        patch_bottom = const PATCH_BOTTOM,
+        mprotect = sym fixed_arena_mprotect,
+        metadata = const METADATA_ADDRESS,
+        next = const offset_of!(FixedArenaMetadata, tool) + offset_of!(ToolHeapMetadata, next),
+        free_head = const offset_of!(FixedArenaMetadata, tool)
+            + offset_of!(ToolHeapMetadata, free_head),
+        locked = const offset_of!(FixedArenaMetadata, tool) + offset_of!(ToolHeapMetadata, locked),
+        patch_cursor = const offset_of!(FixedArenaMetadata, patch_cursor),
+        invalid = const libc::EINVAL,
+    );
+}
+
+#[inline(always)]
 fn published_metadata() -> Option<&'static FixedArenaMetadata> {
     // Do not expose REGION during the publication-to-READY interval or while
     // the ordinary initialization guard is still held. No guessed pointer is
@@ -228,19 +323,36 @@ fn published_metadata() -> Option<&'static FixedArenaMetadata> {
 }
 
 #[doc(hidden)]
+#[inline(never)]
 pub fn fixed_arena_backing() -> Option<&'static FixedArenaBacking> {
-    published_metadata()?;
-    // Return a pointer to immutable bounds, not a large aggregate whose copy
-    // can call the guest's interposable memcpy from the allocation path.
-    Some(&FIXED_BACKING)
+    let backing = published_metadata().map(|_| &FIXED_BACKING);
+    // Keep the complete scalar pointer result opaque, including None. A
+    // non-inlined getter alone need not hide its fixed successful return value.
+    // No large aggregate copy or interposable memory helper is needed here.
+    black_box(backing)
 }
 
+#[inline(never)]
+extern "C" fn fixed_tool_heap_metadata() -> *const c_void {
+    let metadata = match published_metadata() {
+        Some(metadata) => core::ptr::from_ref(&metadata.tool).cast::<c_void>(),
+        None => core::ptr::null(),
+    };
+    // Expose one scalar ABI, not a Rust Option<Span> whose fields may migrate
+    // into callers during interprocedural optimization. Both returns are opaque.
+    black_box(metadata)
+}
+
+#[inline(always)]
 pub(crate) fn fixed_tool_heap() -> Option<ToolHeapSpan<'static>> {
-    let metadata = published_metadata()?;
+    let metadata = fixed_tool_heap_metadata().cast::<ToolHeapMetadata>();
+    // SAFETY: the scalar getter returns null or the actual metadata only after
+    // completed arena setup and publication; that mapping lives until exit.
+    let metadata = unsafe { metadata.as_ref() }?;
     Some(ToolHeapSpan {
         base: TOOL_BOTTOM as *mut u8,
         bytes: ARENA_BYTES,
-        metadata: &metadata.tool,
+        metadata,
     })
 }
 

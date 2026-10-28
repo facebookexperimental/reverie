@@ -75,12 +75,14 @@ pub mod in_guest_rcb;
 mod inherited_input;
 /// Shared Linux perf event mechanics; no tracer or timer policy.
 pub mod perf;
+pub mod pidfd_self;
 #[cfg(target_arch = "x86_64")]
 pub mod pmu;
 /// Process-wide PMU configuration shared by counters and precise timers.
 pub mod pmu_config;
 pub use in_guest_rcb::InGuestRcbCounter;
 pub use perf::is_perf_supported;
+pub use pidfd_self::PidfdSelfSpelling;
 mod mapping_capture;
 mod process_signal_control;
 pub mod provider;
@@ -95,6 +97,9 @@ mod subscription;
 pub mod task_ids;
 mod timer;
 mod tool;
+mod tool_configuration;
+pub mod tool_outcome;
+mod tool_process;
 mod unsupported;
 mod user_address;
 pub mod vdso;
@@ -123,6 +128,9 @@ pub use stack::*;
 pub use subscription::*;
 pub use timer::*;
 pub use tool::*;
+pub use tool_configuration::ToolConfiguration;
+pub use tool_outcome::*;
+pub use tool_process::ToolProcess;
 pub use unsupported::*;
 pub use user_address::UserAddressLimit;
 pub use user_address::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT;

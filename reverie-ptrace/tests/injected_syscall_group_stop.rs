@@ -10165,17 +10165,19 @@ impl Tool for TrapAfterUnblockThenGetpid {
 /// (`untraced_syscall_with`), consuming the guest's trap. So the held signal is passed
 /// on unreported, as while any other signal is pending
 /// (`check_held_signal_with_another_pending`), and as on main: the hook's
-/// `getpid` never runs, and the SIGUSR1 handler runs once. Without the trap
-/// configuration nothing claims the SIGTRAP, so the main loop suppresses it
-/// (`handle_sigtrap`), as on main, and the Tool sees no signal. Known gap:
-/// the held SIGUSR1 is not reported
+/// `getpid` never runs, and the SIGUSR1 handler runs once. The SIGTRAP the
+/// Tool sent carries a sender's code (SI_TKILL), so the main loop delivers it
+/// (`handle_sigtrap`), as Linux does: the Tool sees SIGTRAP, and the guest's
+/// SIGTRAP handler runs once. Known gap: the held SIGUSR1 is not reported
 /// (https://github.com/rrnewton/reverie/issues/845).
 #[test]
 fn held_signal_is_not_reported_while_a_guest_sigtrap_is_pending() {
     let (output, log) = test_fn_bounded::<TrapAfterUnblockThenGetpid, _>(
         || unsafe {
             SIGUSR1_HANDLER_CALLS.store(0, Ordering::Relaxed);
+            HELD_TRAP_HANDLER_CALLS.store(0, Ordering::Relaxed);
             install_counter(libc::SIGUSR1, count_sigusr1);
+            install_counter(libc::SIGTRAP, count_held_trap);
             let set = block(&[libc::SIGUSR1]);
             assert_eq!(
                 libc::syscall(
@@ -10192,7 +10194,11 @@ fn held_signal_is_not_reported_while_a_guest_sigtrap_is_pending() {
                 &set as *const libc::sigset_t,
                 0usize,
             );
-            libc::_exit(SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed) as libc::c_int);
+            libc::_exit(
+                (SIGUSR1_HANDLER_CALLS.load(Ordering::Relaxed) * 10
+                    + HELD_TRAP_HANDLER_CALLS.load(Ordering::Relaxed))
+                    as libc::c_int,
+            );
         },
         "held signal with a guest SIGTRAP pending",
     );
@@ -10204,8 +10210,8 @@ fn held_signal_is_not_reported_while_a_guest_sigtrap_is_pending() {
     );
     assert_eq!(
         output.status,
-        ExitStatus::Exited(1),
-        "the SIGUSR1 handler runs once; stderr: {}",
+        ExitStatus::Exited(11),
+        "the SIGUSR1 handler and the SIGTRAP handler each run once; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
@@ -10215,8 +10221,8 @@ fn held_signal_is_not_reported_while_a_guest_sigtrap_is_pending() {
     );
     assert_eq!(
         *log.signals.lock().unwrap(),
-        Vec::<i32>::new(),
-        "the held SIGUSR1 passes unreported, and the unclaimed SIGTRAP is suppressed"
+        vec![libc::SIGTRAP],
+        "the held SIGUSR1 passes unreported, and the sent SIGTRAP reaches the Tool"
     );
 }
 

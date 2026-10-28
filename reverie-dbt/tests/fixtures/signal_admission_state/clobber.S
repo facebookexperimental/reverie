@@ -1,0 +1,93 @@
+.text
+.globl clobber_fp_state
+.hidden clobber_fp_state
+.type clobber_fp_state,@function
+clobber_fp_state:
+  fninit
+  sub $8,%rsp
+  movl $0x1f80,(%rsp)
+  ldmxcsr (%rsp)
+  add $8,%rsp
+  cmp $2,%edi
+  je 2f
+  cmp $1,%edi
+  je 1f
+  pxor %xmm0,%xmm0
+  pxor %xmm1,%xmm1
+  pxor %xmm2,%xmm2
+  pxor %xmm3,%xmm3
+  pxor %xmm4,%xmm4
+  pxor %xmm5,%xmm5
+  pxor %xmm6,%xmm6
+  pxor %xmm7,%xmm7
+  pxor %xmm8,%xmm8
+  pxor %xmm9,%xmm9
+  pxor %xmm10,%xmm10
+  pxor %xmm11,%xmm11
+  pxor %xmm12,%xmm12
+  pxor %xmm13,%xmm13
+  pxor %xmm14,%xmm14
+  pxor %xmm15,%xmm15
+  ret
+1:
+  vxorps %ymm0,%ymm0,%ymm0
+  vxorps %ymm1,%ymm1,%ymm1
+  vxorps %ymm2,%ymm2,%ymm2
+  vxorps %ymm3,%ymm3,%ymm3
+  vxorps %ymm4,%ymm4,%ymm4
+  vxorps %ymm5,%ymm5,%ymm5
+  vxorps %ymm6,%ymm6,%ymm6
+  vxorps %ymm7,%ymm7,%ymm7
+  vxorps %ymm8,%ymm8,%ymm8
+  vxorps %ymm9,%ymm9,%ymm9
+  vxorps %ymm10,%ymm10,%ymm10
+  vxorps %ymm11,%ymm11,%ymm11
+  vxorps %ymm12,%ymm12,%ymm12
+  vxorps %ymm13,%ymm13,%ymm13
+  vxorps %ymm14,%ymm14,%ymm14
+  vxorps %ymm15,%ymm15,%ymm15
+  ret
+2:
+  vxorps %zmm0,%zmm0,%zmm0
+  vxorps %zmm1,%zmm1,%zmm1
+  vxorps %zmm2,%zmm2,%zmm2
+  vxorps %zmm3,%zmm3,%zmm3
+  vxorps %zmm4,%zmm4,%zmm4
+  vxorps %zmm5,%zmm5,%zmm5
+  vxorps %zmm6,%zmm6,%zmm6
+  vxorps %zmm7,%zmm7,%zmm7
+  vxorps %zmm8,%zmm8,%zmm8
+  vxorps %zmm9,%zmm9,%zmm9
+  vxorps %zmm10,%zmm10,%zmm10
+  vxorps %zmm11,%zmm11,%zmm11
+  vxorps %zmm12,%zmm12,%zmm12
+  vxorps %zmm13,%zmm13,%zmm13
+  vxorps %zmm14,%zmm14,%zmm14
+  vxorps %zmm15,%zmm15,%zmm15
+  vxorps %zmm16,%zmm16,%zmm16
+  vxorps %zmm17,%zmm17,%zmm17
+  vxorps %zmm18,%zmm18,%zmm18
+  vxorps %zmm19,%zmm19,%zmm19
+  vxorps %zmm20,%zmm20,%zmm20
+  vxorps %zmm21,%zmm21,%zmm21
+  vxorps %zmm22,%zmm22,%zmm22
+  vxorps %zmm23,%zmm23,%zmm23
+  vxorps %zmm24,%zmm24,%zmm24
+  vxorps %zmm25,%zmm25,%zmm25
+  vxorps %zmm26,%zmm26,%zmm26
+  vxorps %zmm27,%zmm27,%zmm27
+  vxorps %zmm28,%zmm28,%zmm28
+  vxorps %zmm29,%zmm29,%zmm29
+  vxorps %zmm30,%zmm30,%zmm30
+  vxorps %zmm31,%zmm31,%zmm31
+  kxorw %k0,%k0,%k0
+  kxorw %k1,%k1,%k1
+  kxorw %k2,%k2,%k2
+  kxorw %k3,%k3,%k3
+  kxorw %k4,%k4,%k4
+  kxorw %k5,%k5,%k5
+  kxorw %k6,%k6,%k6
+  kxorw %k7,%k7,%k7
+  ret
+.size clobber_fp_state,.-clobber_fp_state
+.section .note.GNU-stack,"",@progbits

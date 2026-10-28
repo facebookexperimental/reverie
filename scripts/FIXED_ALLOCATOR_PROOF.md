@@ -27,3 +27,89 @@ Standalone Hermit source copies explicitly use declared-content authority rather
 Mapping diagnostic helper family: the five exact complete templates form one authenticated cohort, not an independent union. The original cohort is constructor266/generic266/set59/dealloc97/realloc254; the observed mapping diagnostic cohort is constructor277/generic277/set49/dealloc85/realloc242. After all whole-body, typed/read-only/GOT operand checks and the complete actual transfer census, the real operation closure requires exactly one full cohort. Every qualified incoming setter edge must be the sole direct constructor/generic call at+114 (original) or+125 (mapping diagnostic) to the same independently selected setter. No receipt label or extent classifies a family. Original callers supply RSI=the24B payload and RDI=result storage; the59B setter binds actual REGION/base+16/ready+24 through its exact global operands. New callers bind RSI to that same authenticated REGION through the literal LEA+108, supply RDX=payload and RDI=result, and the49B setter consumes that receiver without an intervening register overwrite. Both preserve24B payload, ready+24, error0xff/success0xfe and the exact old panic/owner/gate/postpublication proof. Get13, alloc116, ownership58 and from_native329 retain their original complete recipes. Shorter dealloc85/realloc242 retain the same actual REGION/get/null/error rejection, live pointer/layout/data paths and complete allocator/copy/refusal joins; the literal shift25/equality span check proves the same32MiB interval as the original shift28/lower-and-upper pair. All30 nonuniform five-role combinations must pass individual whole recipe/census authority and then be refused by the cohort join. Synthetic controls do not establish physical ELF qualification.
 
 Standalone event-pointer TLS correction: the DEV177B alloc retains its complete immutable Some-LocalKey/FnOnce/get/with/try/getter/callback/read chain and actual38B getter at retained0x48 or observed0x40. New DEV0x40 requires the complete typed/hash chain and exact direct LocalKey transfer; stripping or relabeling it cannot make an optimized record. Optimized186B alloc and22B FnOnce retain literal cell displacements at retained0x48/0x88 or observed0x40/0x80, with the complete None-LocalKey chain. The four new optimized accesses use the existing whole-authenticated TLS-chain/transfer-census route; PUBLICATION_WRAPPER_RECIPES remains unchanged. Detcore241B alloc/FnOnce22 likewise adds only observed0x98/0xd8 under the full None chain, preserving0xa0/0xe0. Every actual encoded displacement is checked against the independently authenticated LOCAL8 source identity, module descriptor, exact named TLS provider and physical loader/source joins. Structural shape discriminators do not qualify machine code. Original host mutations/recipes, all-profile physical qualification and original runtime placement/allocator/lifecycle suites remain required.
+
+## Constant-specialized publication and outlined Tool heap
+
+The native `exec-native-injection` images from the capability-descriptor and
+signal-delivery changes emit the same ten complete function shapes after only
+the enumerated address operands are normalized. Their source allocator and
+region implementations are unchanged. Local ThinLTO places the publication
+getter with its callers, specializes the receiver to `REGION`, and outlines
+`fixed_tool_heap`. This is a different machine-code composition, not permission
+to omit publication, ownership, or transfer checks. The existing profile is
+unchanged. Setting codegen-units to one would change optimization across the
+whole runtime, would not establish any of these invariants, and would require
+requalifying the other generated code as well.
+
+The admitted composition is getter23, heap79, backing57, require-owned75,
+alloc85, dealloc85, realloc222, from-native315 and constructor/generic255,
+with the already qualified global setter59 and three-band setup291. Whole
+bodies, every internal branch, every non-address operand and every call/tail
+remain literal. Each direct/GOT target is bound independently to its selected
+role, and every actual transfer is censused. The numeric `.llvm` suffix is only
+a symbol-identity normalization; it cannot qualify a body. The family join
+requires these actual authenticated operations together. A receiver-consuming
+getter cannot be substituted where the caller omits the receiver, nor may an
+unqualified heap-return ABI be used merely because its function is named
+`fixed_tool_heap`. Existing admitted families and their controls remain.
+
+Getter23 has no argument: its first RIP-relative operand addresses the exact
+writable, initially unpublished, 32-byte `REGION` object, and its second
+addresses that same object's ready byte at +24. It reads that byte, returns
+NULL when clear, and otherwise returns the exact object address. The acquire
+load is the existing x86-64 source/machine memory-order premise. There is no
+call, allocation, wait, TLS access or write. Backing57 still rejects
+`INITIALIZING`, requires a non-NULL getter result, and rejects the error tag
+0xff at result+16 before returning the independently authenticated immutable
+backing object. Only the now-unnecessary argument load is absent.
+
+Heap79 takes a caller-owned 24-byte result slot. It writes NULL to the first
+word if initialization is in progress, publication is absent, or the published
+result is an error. Otherwise its three words are exactly metadata
+0x600000023000, base 0x600010000000 and length 0x02000000. The latter base is
+formed by adding the literal 0x0ffdd000 to the literal metadata address; there
+is no data-dependent address selection. All four consumers use their own
+stack slots and test the first word before reading the other two words.
+Alloc85 preserves the original alignment/size, copies the complete span to its
+allocation-call slot, and calls the already qualified allocate operation.
+Require-owned75 and dealloc85 test base <= pointer < base+length; foreign or
+unpublished inputs still reach the exact refusal. Dealloc85 reads the live
+header at pointer-8 and supplies the actual metadata and base to the qualified
+deallocator. Realloc222 retains the old/new Layout checks, NULL-on-failure,
+copy of min(old size,new size), and deallocation of the genuine old header.
+None of these paths gains a guest-heap or libc fallback.
+
+The three outlined consumers retain checked-add overflow panic edges for
+base+length. Those edges are not removed: the complete authenticated helper
+returns the two literal bounds above, whose sum cannot carry. This premise is
+limited to those exact consumers joined to that helper, under the original
+intact-metadata/live-pointer contract. Their full Location data, panic target,
+and transfer remain checked; no general panic edge is admitted.
+
+Constructor/generic255 retain origin 1/2, the real saved stack pointer, the
+complete native-owner admission, and the same 24-byte publication payload.
+At their sole direct setter call +110, RDI is result storage and RSI is that
+payload. Setter59 binds its own global `REGION`, preserves the payload on
+already-published failure, and otherwise writes the value, release-publishes
+ready+24, and returns success tag 0xfe. On success each adopter writes phase 3,
+clears `INITIALIZING`, calls the specialized getter and checks its result and
+error tag again. Every incoming setter edge must still be the exact
+constructor/generic edge; a same-shaped foreign caller does not acquire this
+proof. The aligned-record/owner pointer panic and EH-only cannot-unwind edges
+retain their original premises and complete censuses.
+
+From-native315 preserves the closed-origin record, gate, owned-stack, gettid,
+version/body/stack-residue, unpublished-region, phase 1->2 and bitmap checks.
+Its direct setup call is at +274. Like the previously admitted full-result
+caller330, it compares the full EAX with 1 and takes EDX only on error; success
+stores the authenticated owner. Therefore it must join the actual setup291
+result ABI: every error returns EAX=1 with EDX=errno, and success EAX=0. The
+existing three-band bitmap and raw-syscall closure is unchanged. The different
+call offset is not a waiver of that join.
+
+Retained machine samples and unit mutation controls establish the recipe and
+its refusal boundaries; they do not establish source authority or execution.
+The landing evidence must separately run the physical qualifier with fresh
+locked source bindings and the real native producer. Unknown machine shapes,
+changed source catalogs, altered receiver/data bindings, missing roles, mixed
+ABIs and changed branch/constant bytes continue to refuse.

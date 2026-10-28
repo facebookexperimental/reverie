@@ -878,6 +878,44 @@ impl PerfCounter {
         self.fd
     }
 
+    /// Moves the perf descriptor to the lowest free number at or above
+    /// `minimum`, close-on-exec, and closes its old number. The counter's
+    /// mapping and programming belong to the open file, not to the number, so
+    /// they are unchanged. Returns the new number. When no number at or above
+    /// `minimum` can be had (`EINVAL` past `RLIMIT_NOFILE`, `EMFILE`), the
+    /// counter keeps its old number and the error is returned. When closing
+    /// the old number fails, the counter already uses the new one and that
+    /// error is returned. Either way the old number may still be open (a
+    /// seccomp filter can report success for a close it did not run), so a
+    /// caller that must know asks.
+    ///
+    /// # Safety
+    ///
+    /// No borrow of the old number (such as one from an `InGuestRcbCounter`'s
+    /// `boundary_fd`) may be live, and no other thread may use the counter.
+    pub unsafe fn move_fd_at_least(&mut self, minimum: libc::c_int) -> Result<libc::c_int, Errno> {
+        let moved = if let Some(raw_syscall) = self.raw_syscall {
+            Errno::from_ret(unsafe {
+                raw_syscall(
+                    libc::SYS_fcntl,
+                    [
+                        self.fd as u64,
+                        libc::F_DUPFD_CLOEXEC as u64,
+                        minimum as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                ) as usize
+            })? as libc::c_int
+        } else {
+            Errno::result(unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, minimum) })?
+        };
+        let old = std::mem::replace(&mut self.fd, moved);
+        try_close_perf_fd(old, self.raw_syscall)?;
+        Ok(moved)
+    }
+
     /// Consume terminal resources without allowing a release error to skip the
     /// other release or panic over the run's original failure. Each resource is
     /// taken before the syscall: Linux may have released an fd even when close

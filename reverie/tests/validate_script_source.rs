@@ -96,7 +96,7 @@ required-features = ["allocator-fixture"]"#;
         VALIDATE_SCRIPT
             .contains("build-liteinst-test-runtime.rs\" --for-ci \"$generation\" || return")
     );
-    assert!(WORKFLOW.contains("cargo test --workspace --exclude reverie-kvm --exclude reverie-inguest --all-features --no-fail-fast --"));
+    assert!(WORKFLOW.contains("cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --all-features --no-fail-fast --"));
     assert!(WORKFLOW.contains("cargo test --workspace --all-features -- --test-threads=1"));
     for job in ["  regular:", "  hardware:"] {
         let section = &WORKFLOW[WORKFLOW.find(job).unwrap()..];

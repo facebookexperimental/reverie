@@ -58,11 +58,17 @@ use core::task::Context;
 use core::task::Poll;
 use core::task::Waker;
 
+use reverie::CallbackDecision;
+use reverie::CallbackPhase;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
+use reverie::SyscallResult;
+use reverie::TailFact;
 use reverie::Tool;
-use reverie::syscalls::Errno;
+use reverie::ToolProcess;
+use reverie::classify_callback;
+use reverie::classify_syscall_result;
 use reverie::syscalls::Syscall;
 
 const TAIL_NONE: u8 = 0;
@@ -125,6 +131,26 @@ enum TailAction {
     },
 }
 
+impl From<TailAction> for TailFact<(i64, [u64; 6])> {
+    fn from(action: TailAction) -> Self {
+        match action {
+            TailAction::Result(value) => Self::Completed(value),
+            TailAction::Exit { number, args } => Self::Established((number, args)),
+            TailAction::ForkChild {
+                parent_tid,
+                parent_pid,
+                child_tid,
+                child_pid,
+            } => Self::ForkChild {
+                parent_tid,
+                parent_pid,
+                child_tid,
+                child_pid,
+            },
+        }
+    }
+}
+
 /// Poll one Tool `handle_syscall_event` future, consulting `tail` when it parks.
 ///
 /// A `tail_inject` (or a fork/exit inject) resolves the guest's syscall by
@@ -140,40 +166,35 @@ where
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
     loop {
-        match future.as_mut().poll(&mut context) {
-            // An exit or self-SIGKILL the handler staged ends the guest even
-            // if the handler then returned (it can stage one in a future it
-            // abandons): the staged ending wins over the returned value.
-            Poll::Ready(value) => {
-                return match tail.take() {
-                    Some(TailAction::Exit { number, args }) => {
-                        SyscallOutcome::Exit { number, args }
-                    }
-                    _ => SyscallOutcome::Return(value),
-                };
+        let poll = future.as_mut().poll(&mut context);
+        match classify_callback(
+            CallbackPhase::Syscall,
+            poll,
+            tail.take().map(Into::into),
+            None,
+        ) {
+            CallbackDecision::Ready(value) => return SyscallOutcome::Return(value),
+            CallbackDecision::Completed(value) => return SyscallOutcome::Return(Ok(value)),
+            CallbackDecision::Established((number, args)) => {
+                return SyscallOutcome::Exit { number, args };
             }
-            Poll::Pending => match tail.take() {
-                Some(TailAction::Result(value)) => {
-                    return SyscallOutcome::Return(Ok(value));
-                }
-                Some(TailAction::Exit { number, args }) => {
-                    return SyscallOutcome::Exit { number, args };
-                }
-                Some(TailAction::ForkChild {
+            CallbackDecision::ForkChild {
+                parent_tid,
+                parent_pid,
+                child_tid,
+                child_pid,
+            } => {
+                return SyscallOutcome::ForkChild {
                     parent_tid,
                     parent_pid,
                     child_tid,
                     child_pid,
-                }) => {
-                    return SyscallOutcome::ForkChild {
-                        parent_tid,
-                        parent_pid,
-                        child_tid,
-                        child_pid,
-                    };
-                }
-                None => core::hint::spin_loop(),
-            },
+                };
+            }
+            CallbackDecision::Wait => core::hint::spin_loop(),
+            CallbackDecision::Deferred { .. } | CallbackDecision::Refused(_) => {
+                unreachable!("trap syscall facts contain no deferred call or refusal")
+            }
         }
     }
 }
@@ -208,34 +229,24 @@ where
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
     loop {
-        match future.as_mut().poll(&mut context) {
-            // As in `drive_syscall`: a staged ending wins over a return.
-            Poll::Ready(value) => {
-                return match tail.take() {
-                    Some(TailAction::Exit { number, args }) => {
-                        CallbackOutcome::Exit { number, args }
-                    }
-                    _ => CallbackOutcome::Ready(value),
-                };
+        let poll = future.as_mut().poll(&mut context);
+        match classify_callback(
+            CallbackPhase::Callback,
+            poll,
+            tail.take().map(Into::into),
+            None,
+        ) {
+            CallbackDecision::Ready(value) => return CallbackOutcome::Ready(value),
+            CallbackDecision::Established((number, args)) => {
+                return CallbackOutcome::Exit { number, args };
             }
-            Poll::Pending => match tail.take() {
-                Some(TailAction::Exit { number, args }) => {
-                    return CallbackOutcome::Exit { number, args };
-                }
-                Some(TailAction::Result(_)) => {
-                    return CallbackOutcome::Unsupported(
-                        "tail_inject of a call that does not end the guest, outside a syscall handler",
-                    );
-                }
-                // The in-guest host refuses a fork outside a syscall handler
-                // before it is made; reaching this is a host defect.
-                Some(TailAction::ForkChild { .. }) => {
-                    return CallbackOutcome::Unsupported(
-                        "a plain fork injected outside a syscall handler",
-                    );
-                }
-                None => core::hint::spin_loop(),
-            },
+            CallbackDecision::Refused(reason) => return CallbackOutcome::Unsupported(reason),
+            CallbackDecision::Wait => core::hint::spin_loop(),
+            CallbackDecision::Completed(_)
+            | CallbackDecision::Deferred { .. }
+            | CallbackDecision::ForkChild { .. } => {
+                unreachable!("non-handler callback facts must be refused by shared classifier")
+            }
         }
     }
 }
@@ -300,6 +311,27 @@ where
     }
 }
 
+/// The actual shared host invokes its owned Tool through the core owner.
+/// Legacy callers of `drive_tool_syscall` retain their public borrowed-Tool
+/// entry; both entries use the same poller and result policy.
+pub(crate) fn drive_tool_process_syscall<T, G>(
+    process: &ToolProcess<T>,
+    guest: &mut G,
+    syscall: Syscall,
+    tail: &TailResult,
+) -> DrivenSyscall
+where
+    T: Tool,
+    G: Guest<T>,
+{
+    loop {
+        let outcome = drive_syscall(process.handle_syscall_event(guest, syscall), tail);
+        if let Some(driven) = classify_outcome(outcome) {
+            return driven;
+        }
+    }
+}
+
 /// Map a single driven [`SyscallOutcome`] onto a terminal [`DrivenSyscall`], or
 /// `None` when the shared restart protocol requires re-running the Tool callback
 /// (a private `ERESTARTSYS` from a restartable syscall).
@@ -308,14 +340,10 @@ where
 /// place; [`drive_tool_syscall`] owns only the re-invocation loop around it.
 fn classify_outcome(outcome: SyscallOutcome) -> Option<DrivenSyscall> {
     match outcome {
-        SyscallOutcome::Return(Ok(value)) => Some(DrivenSyscall::Result(value)),
-        SyscallOutcome::Return(Err(error)) => match error.into_errno() {
-            // The ptrace backend consumes this private errno through its kernel
-            // restart frame. A SIGSYS dispatcher has no such frame, so it must
-            // repeat the callback for every syscall rather than expose 512.
-            Ok(Errno::ERESTARTSYS) => None,
-            Ok(errno) => Some(DrivenSyscall::Result(-(errno.into_raw() as i64))),
-            Err(error) => Some(DrivenSyscall::Fatal(error)),
+        SyscallOutcome::Return(result) => match classify_syscall_result(result) {
+            SyscallResult::Value(value) => Some(DrivenSyscall::Result(value)),
+            SyscallResult::Restart => None,
+            SyscallResult::Fatal(error) => Some(DrivenSyscall::Fatal(error)),
         },
         SyscallOutcome::Exit { number, args } => Some(DrivenSyscall::Exit { number, args }),
         SyscallOutcome::ForkChild {
@@ -406,6 +434,8 @@ impl TailResult {
 
 #[cfg(test)]
 mod tests {
+    use reverie::syscalls::Errno;
+
     use super::*;
 
     #[test]
@@ -429,6 +459,100 @@ mod tests {
         match drive_syscall(core::future::pending::<Result<i64, Error>>(), &tail) {
             SyscallOutcome::Return(Ok(value)) => assert_eq!(value, 11),
             _ => panic!("expected the parked tail result"),
+        }
+    }
+
+    #[test]
+    fn completed_tail_is_consumed_once_without_repolling_its_effect() {
+        use core::cell::Cell;
+        let tail = TailResult::default();
+        let polls = Cell::new(0);
+        let future = core::future::poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            tail.set_result(23);
+            Poll::<Result<i64, Error>>::Pending
+        });
+        assert!(matches!(
+            drive_syscall(future, &tail),
+            SyscallOutcome::Return(Ok(23))
+        ));
+        assert_eq!(polls.get(), 1);
+        assert!(tail.take().is_none());
+    }
+
+    #[test]
+    fn actual_drivers_preserve_fork_identities_and_ready_discard() {
+        let identities = [11, 12, 13, 14].map(Pid::from_raw);
+        let tail = TailResult::default();
+        let stage =
+            || tail.set_fork_child(identities[0], identities[1], identities[2], identities[3]);
+        stage();
+        match drive_syscall(core::future::pending::<Result<i64, Error>>(), &tail) {
+            SyscallOutcome::ForkChild {
+                parent_tid,
+                parent_pid,
+                child_tid,
+                child_pid,
+            } => {
+                assert_eq!([parent_tid, parent_pid, child_tid, child_pid], identities);
+            }
+            _ => panic!("observed child must reach reconstruction"),
+        }
+        assert!(tail.take().is_none());
+        stage();
+        assert!(matches!(
+            drive_syscall(async { Ok(71) }, &tail),
+            SyscallOutcome::Return(Ok(71))
+        ));
+        assert!(tail.take().is_none());
+        stage();
+        assert!(matches!(
+            drive_callback(core::future::pending::<()>(), &tail),
+            CallbackOutcome::Unsupported("a plain fork injected outside a syscall handler")
+        ));
+        stage();
+        assert!(matches!(
+            drive_callback(async { 71 }, &tail),
+            CallbackOutcome::Ready(71)
+        ));
+        assert!(tail.take().is_none());
+        tail.set_result(23);
+        assert!(matches!(
+            drive_callback(core::future::pending::<()>(), &tail),
+            CallbackOutcome::Unsupported(_)
+        ));
+        tail.set_result(23);
+        assert!(matches!(
+            drive_callback(async { 71 }, &tail),
+            CallbackOutcome::Ready(71)
+        ));
+        assert!(tail.take().is_none());
+    }
+
+    #[test]
+    fn established_trap_exit_survives_ready_in_both_drivers() {
+        for callback in [false, true] {
+            let tail = TailResult::default();
+            tail.set_exit(libc::SYS_exit_group, [23, 0, 0, 0, 0, 0]);
+            if callback {
+                assert!(matches!(
+                    drive_callback(async { 71 }, &tail),
+                    CallbackOutcome::Exit {
+                        number: libc::SYS_exit_group,
+                        args: [23, 0, 0, 0, 0, 0]
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    drive_syscall(async { Ok(71) }, &tail),
+                    SyscallOutcome::Exit {
+                        number: libc::SYS_exit_group,
+                        args: [23, 0, 0, 0, 0, 0]
+                    }
+                ));
+            }
+            assert!(tail.ending());
+            assert!(tail.take().is_none());
         }
     }
 

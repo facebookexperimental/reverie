@@ -10,24 +10,26 @@
 fn explicit_ptracer_namespace_guard_requires_complete_original_self_field() {
     require_aligned_proc_pid_namespace().unwrap();
     let tid = super::Pid::from_raw(123);
+    // A kernel with PID namespaces, where only a missing NSpid line asks.
+    let pid_namespaces = || Ok(true);
     assert_eq!(
-        aligned_proc_pid_namespace(b"Name:\t\xff-name\nNSpid:\t123\n", tid),
+        aligned_proc_pid_namespace(b"Name:\t\xff-name\nNSpid:\t123\n", tid, pid_namespaces),
         Ok(())
     );
     assert_eq!(
-        aligned_proc_pid_namespace(b"NSpid:\t123 1\n", tid),
+        aligned_proc_pid_namespace(b"NSpid:\t123 1\n", tid, pid_namespaces),
         Err(Errno::EXDEV)
     );
     assert_eq!(
-        aligned_proc_pid_namespace(b"NSpid:\t456\n", tid),
+        aligned_proc_pid_namespace(b"NSpid:\t456\n", tid, pid_namespaces),
         Err(Errno::EXDEV)
     );
     assert_eq!(
-        aligned_proc_pid_namespace(b"NSpid:\t123", tid),
+        aligned_proc_pid_namespace(b"NSpid:\t123", tid, pid_namespaces),
         Err(Errno::EOPNOTSUPP)
     );
     assert_eq!(
-        aligned_proc_pid_namespace(b"NSpid:\t123 ", tid),
+        aligned_proc_pid_namespace(b"NSpid:\t123 ", tid, pid_namespaces),
         Err(Errno::EOPNOTSUPP)
     );
     let mut large = b"Name:\tlarge-groups\nGroups:\t".to_vec();
@@ -36,7 +38,10 @@ fn explicit_ptracer_namespace_guard_requires_complete_original_self_field() {
     }
     large.extend_from_slice(b"\nNSpid:\t123\n");
     assert!(large.len() < 1024 * 1024);
-    assert_eq!(aligned_proc_pid_namespace(&large, tid), Ok(()));
+    assert_eq!(
+        aligned_proc_pid_namespace(&large, tid, pid_namespaces),
+        Ok(())
+    );
 }
 
 #[test]
@@ -247,8 +252,12 @@ fn explicit_ptracer_mode_cannot_recapture_an_unbound_generic_token() {
 #[tokio::test(flavor = "current_thread")]
 #[cfg(all(feature = "memory", not(sanitized)))]
 async fn explicit_native_user_write_enforces_original_ptracer_owner() {
-    use reverie_memory::{Addr, AddrMut, MemoryAccess, RemoteIoVec};
     use std::io::IoSlice;
+
+    use reverie_memory::Addr;
+    use reverie_memory::AddrMut;
+    use reverie_memory::MemoryAccess;
+    use reverie_memory::RemoteIoVec;
 
     if run_legacy_test_outer("explicit_native_user_write_enforces_original_ptracer_owner") {
         return;

@@ -575,6 +575,7 @@ mod tests {
             #[cfg(feature = "exec-native-injection")]
             mapping_driver: None,
             unsupported_refusal: None,
+            injected_syscalls: 0,
         };
         // The guest's sets are on the heap, so the only stack address that
         // can reach the gate is the runtime's copy.

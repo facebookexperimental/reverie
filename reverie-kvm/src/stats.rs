@@ -122,12 +122,14 @@ impl From<&VcpuExit<'_>> for KvmExitReason {
 /// consumed. Disabled runs do not allocate this collector at all.
 pub(crate) struct KvmExitCollector {
     counts: [AtomicU64; KvmExitReason::ALL.len()],
+    timer_window_entries: AtomicU64,
 }
 
 impl Default for KvmExitCollector {
     fn default() -> Self {
         Self {
             counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            timer_window_entries: AtomicU64::new(0),
         }
     }
 }
@@ -137,12 +139,19 @@ impl KvmExitCollector {
         self.counts[KvmExitReason::from(exit).index()].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records an entry set up within a precise timer request's stepping
+    /// window (see `KvmBackend::prepare_timer_steps`).
+    pub(crate) fn record_timer_window_entry(&self) {
+        self.timer_window_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn snapshot(&self) -> KvmBackendStats {
         KvmBackendStats {
             exits: CounterSnapshot::new(KvmExitReason::ALL.into_iter().filter_map(|reason| {
                 let count = self.counts[reason.index()].load(Ordering::Relaxed);
                 (count != 0).then_some((reason, count))
             })),
+            timer_window_entries: self.timer_window_entries.load(Ordering::Relaxed),
         }
     }
 }
@@ -151,12 +160,14 @@ impl KvmExitCollector {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvmBackendStats {
     exits: CounterSnapshot<KvmExitReason>,
+    timer_window_entries: u64,
 }
 
 impl Default for KvmBackendStats {
     fn default() -> Self {
         Self {
             exits: CounterSnapshot::new([]),
+            timer_window_entries: 0,
         }
     }
 }
@@ -180,6 +191,13 @@ impl KvmBackendStats {
             .find(|(candidate, _)| *candidate == reason)
             .map_or(0, |(_, count)| *count)
     }
+
+    /// Returns the process-tree count of vCPU entries set up within a precise
+    /// timer request's stepping window, whatever each ran: a single step, a
+    /// run to a breakpoint, or an unstepped run to an exit.
+    pub fn timer_window_entries(&self) -> u64 {
+        self.timer_window_entries
+    }
 }
 
 impl fmt::Display for KvmBackendStats {
@@ -191,6 +209,13 @@ impl fmt::Display for KvmBackendStats {
         )?;
         for (reason, count) in self.exits.counts() {
             write!(formatter, "\n  {reason}: {count}")?;
+        }
+        if self.timer_window_entries != 0 {
+            write!(
+                formatter,
+                "\n  precise timer window entries: {}",
+                self.timer_window_entries
+            )?;
         }
         Ok(())
     }
@@ -217,8 +242,15 @@ mod tests {
         collector.record(&VcpuExit::IrqWindowOpen);
         collector.record(&VcpuExit::Hlt);
         collector.record(&VcpuExit::Intr);
+        collector.record_timer_window_entry();
 
         let snapshot = collector.snapshot();
+        assert_eq!(snapshot.timer_window_entries(), 1);
+        assert!(
+            snapshot
+                .to_string()
+                .ends_with("precise timer window entries: 1")
+        );
         assert_eq!(snapshot.total_exits(), 4);
         assert_eq!(snapshot.count(KvmExitReason::Hlt), 2);
         assert_eq!(snapshot.count(KvmExitReason::IrqWindowOpen), 1);

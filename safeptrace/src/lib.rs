@@ -229,11 +229,23 @@ impl TraceeToken {
         Ok(token)
     }
 
+    #[cfg(feature = "notifier")]
     fn capture_child(&self, pid: Pid) -> Result<Running, Errno> {
-        #[cfg(feature = "notifier")]
-        if self.policy == notifier::WaitPolicy::PtracerThread {
-            return Running::new_on_ptracer_thread(pid);
-        }
+        // Adopting the child's Event can run `Waker` callbacks. Those go
+        // through `WakerSlot`, which records them; recording them here too
+        // is deliberately cautious.
+        notifier::note_waker_callbacks();
+        let child = if self.policy == notifier::WaitPolicy::PtracerThread {
+            Running::new_on_ptracer_thread(pid)
+        } else {
+            Running::from_current_or_new(pid)
+        };
+        notifier::note_waker_callbacks();
+        child
+    }
+
+    #[cfg(not(feature = "notifier"))]
+    fn capture_child(&self, pid: Pid) -> Result<Running, Errno> {
         Running::from_current_or_new(pid)
     }
 

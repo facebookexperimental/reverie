@@ -246,7 +246,9 @@ int main(int argc, char **argv) {
   CHECK(file >= 0);
   CHECK(write(file, contents, sizeof(contents) - 1) == sizeof(contents) - 1);
   int directory = open(".", O_RDONLY | O_DIRECTORY);
-  int proc_root = open("/proc", O_RDONLY | O_DIRECTORY);
+  // The harness's /proc, which the program inherits as its standard input:
+  // the backend refuses a guest's own open of procfs.
+  int proc_root = dup(STDIN_FILENO);
   int proc_maps = open("/proc/self/maps", O_RDONLY);
   char path[64];
   CHECK(snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", file) > 0);
@@ -268,7 +270,6 @@ int main(int argc, char **argv) {
                  {"stderr", STDERR_FILENO, 1, 0, 0},
                  {"file", file, 0, 0, 0},
                  {"directory", directory, 0, 0, 1},
-                 {"proc-root", proc_root, 0, 1, 1},
                  {"proc-maps", proc_maps, 0, 1, 0},
                  {"fdinfo", fdinfo, 0, 1, 0}};
   struct observation stdout_stat = {0};

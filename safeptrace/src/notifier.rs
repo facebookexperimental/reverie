@@ -68,7 +68,6 @@
 //! in a tool's `handle_syscall_event`, without shuffling each report through
 //! Tokio's blocking thread pool. The cost is one worker per guest thread.
 
-#[cfg(test)]
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -531,11 +530,36 @@ const PTRACE_EVENT_EXIT_STOP: i32 = (libc::PTRACE_EVENT_EXIT << 16) | (libc::SIG
 /// The number we get when in a PTRACE_EVENT_EXEC stop.
 const PTRACE_EVENT_EXEC_STOP: i32 = (libc::PTRACE_EVENT_EXEC << 16) | (libc::SIGTRAP << 8) | 0x7f;
 
+thread_local! {
+    /// Whether this thread may have run a `Waker` callback (clone, wake or
+    /// drop) since its last successful [`PtracerThreadGuard::check_current`].
+    /// The code that runs such callbacks sets it before and after them: a
+    /// callback may fork, and the child returns through it as a new task.
+    static WAKER_CALLBACKS_MAY_HAVE_RUN: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Records, on this thread, that `Waker` callbacks are about to run or have
+/// just run, so the next [`PtracerThreadGuard::recheck_after_waker_callbacks`]
+/// checks the host again.
+pub(super) fn note_waker_callbacks() {
+    let _ = WAKER_CALLBACKS_MAY_HAVE_RUN.try_with(|flag| flag.set(true));
+}
+
 #[derive(Debug, Default)]
 struct WakerSlot {
     waker: Mutex<Option<Waker>>,
     data: AtomicPtr<()>,
     vtable: AtomicPtr<RawWakerVTable>,
+}
+
+impl Drop for WakerSlot {
+    fn drop(&mut self) {
+        if let Some(waker) = self.waker.get_mut().take() {
+            note_waker_callbacks();
+            drop(waker);
+            note_waker_callbacks();
+        }
+    }
 }
 
 impl WakerSlot {
@@ -560,7 +584,10 @@ impl WakerSlot {
             return false;
         }
 
+        // Cloning the new waker and dropping the old one run their callbacks.
+        note_waker_callbacks();
         *slot = Some(waker.clone());
+        note_waker_callbacks();
         self.vtable.store(vtable, Ordering::Relaxed);
         // Publish data last so an Acquire match also observes the vtable.
         self.data.store(data, Ordering::Release);
@@ -568,10 +595,12 @@ impl WakerSlot {
     }
 
     fn wake(&self) {
+        note_waker_callbacks();
         let waker = self.waker.lock().as_ref().cloned();
         if let Some(waker) = waker {
             waker.wake();
         }
+        note_waker_callbacks();
     }
 }
 
@@ -817,6 +846,7 @@ thread_local! {
     static ATTACHMENT_CAPTURE_HOOK: std::cell::RefCell<Option<AttachmentCaptureHook>> = const { std::cell::RefCell::new(None) };
     static PTRACER_OWNER_CAPTURES: Cell<usize> = const { Cell::new(0) };
     static PTRACER_HOST_PROOFS: Cell<usize> = const { Cell::new(0) };
+    static WAKER_CALLBACK_RECHECKS: Cell<usize> = const { Cell::new(0) };
     static PTRACER_ATTACHMENT_STATUS_READS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -1854,7 +1884,7 @@ impl Event {
         // Register may run arbitrary RawWaker clone/drop callbacks. A managed
         // controller must still be its original host before reserving a front.
         if let Some(guard) = guard
-            && let Err(error) = guard.check_current()
+            && let Err(error) = guard.recheck_after_waker_callbacks()
         {
             return Poll::Ready(Err(error));
         }
@@ -2129,9 +2159,10 @@ impl Event {
         };
         let decoded = decode(reservation.status);
         // Child Event adoption can notify an already registered waker. Check
-        // again before this transaction can remove its original FIFO front.
+        // again, if a callback may have run, before this transaction can
+        // remove its original FIFO front.
         if let Some(guard) = guard {
-            guard.check_current()?;
+            guard.recheck_after_waker_callbacks()?;
         }
         let decoded = match decoded {
             Ok(decoded) => decoded,
@@ -2475,7 +2506,11 @@ impl Event {
         self.exit_waiters.register(waiter, waker);
         // Serialize epoch validation with claim and kernel exec rearming.
         // A half-published status must yield Pending, never block the executor.
+        // The holder may be another poller whose own poll stays Pending; its
+        // release wakes nobody. A contended poll therefore asks to be polled
+        // again rather than wait for the next exit-state publication.
         let Some(publication) = self.exit_publication.try_lock() else {
+            waker.wake_by_ref();
             return Poll::Pending;
         };
         let result = self.poll_exit_epoch(waiter);
@@ -3759,8 +3794,27 @@ impl AlignedProcfs {
         let mut bounded = io::Read::take(fs::File::from(fd), 1024 * 1024);
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut bounded, &mut bytes).map_err(io_errno)?;
-        aligned_proc_pid_namespace(&bytes, Pid::from(nix::unistd::gettid()))?;
+        aligned_proc_pid_namespace(&bytes, Pid::from(nix::unistd::gettid()), || {
+            root.pid_namespaces()
+        })?;
         Ok(root)
+    }
+
+    /// Whether the kernel has PID namespaces, from what this procfs lists
+    /// for the calling thread. `ns/pid` exists exactly when the kernel was
+    /// built with CONFIG_PID_NS, while `ns/mnt` always exists (`ns_entries`,
+    /// fs/proc/namespaces.c). Any other failure, such as a procfs in which
+    /// this thread has no PID (`proc_thread_self_get_link`,
+    /// fs/proc/thread_self.c), is an error.
+    fn pid_namespaces(&self) -> Result<bool, Errno> {
+        match self.entry_key(c"thread-self/ns/pid", libc::AT_SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(Errno::ENOENT) => self
+                .entry_key(c"thread-self/ns/mnt", libc::AT_SYMLINK_NOFOLLOW)
+                .map(|_| false)
+                .map_err(|_| Errno::ENOENT),
+            Err(error) => Err(error),
+        }
     }
 
     fn open_pid(&self, pid: Pid, flags: i32) -> Result<OwnedFd, Errno> {
@@ -3804,13 +3858,19 @@ impl AlignedProcfs {
     }
 
     fn directory_key(&self, name: &std::ffi::CStr) -> Result<ProcDirectoryKey, Errno> {
+        self.entry_key(name, 0)
+    }
+
+    /// The identity of `name` under this procfs, looked up with `fstatat`
+    /// `flags`.
+    fn entry_key(&self, name: &std::ffi::CStr, flags: i32) -> Result<ProcDirectoryKey, Errno> {
         let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
         if unsafe {
             libc::fstatat(
                 self.root.as_raw_fd(),
                 name.as_ptr(),
                 metadata.as_mut_ptr(),
-                0,
+                flags,
             )
         } < 0
         {
@@ -3828,15 +3888,29 @@ fn require_aligned_proc_pid_namespace() -> Result<(), Errno> {
     AlignedProcfs::open().map(|_| ())
 }
 
-fn aligned_proc_pid_namespace(status: &[u8], caller: Pid) -> Result<(), Errno> {
-    // Decode only the genuine kernel ASCII field. comm need not be UTF-8;
-    // proc_task_name escapes its embedded newlines before this field.
-    let line = status
-        .split_inclusive(|byte| *byte == b'\n')
-        .find(|line| line.starts_with(b"NSpid:") && line.last() == Some(&b'\n'))
-        .ok_or(Errno::EOPNOTSUPP)?;
-    let line = std::str::from_utf8(&line[b"NSpid:".len()..]).map_err(|_| Errno::EIO)?;
-    let mut levels = line.split_ascii_whitespace();
+/// Whether `status`, the calling thread's `/proc/thread-self/status`, comes
+/// from a procfs mounted in the caller's PID namespace: its one NSpid level is
+/// the caller's TID. Without an NSpid line, `pid_namespaces` is asked whether
+/// the kernel has PID namespaces; only one built without them omits the line
+/// (`proc_pid_status`, fs/proc/array.c), and it has a single namespace, which
+/// every procfs shows, so there the `Pid:` line must be the caller's TID.
+fn aligned_proc_pid_namespace(
+    status: &[u8],
+    caller: Pid,
+    pid_namespaces: impl FnOnce() -> Result<bool, Errno>,
+) -> Result<(), Errno> {
+    let Some(levels) = status_field(status, b"NSpid:")? else {
+        if pid_namespaces()? {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let pid = status_field(status, b"Pid:")?.ok_or(Errno::EIO)?;
+        return match pid.trim().parse::<i32>() {
+            Ok(pid) if pid == caller.as_raw() => Ok(()),
+            Ok(_) => Err(Errno::EXDEV),
+            Err(_) => Err(Errno::EIO),
+        };
+    };
+    let mut levels = levels.split_ascii_whitespace();
     let mounted_tid = levels
         .next()
         .ok_or(Errno::EIO)?
@@ -3846,6 +3920,17 @@ fn aligned_proc_pid_namespace(status: &[u8], caller: Pid) -> Result<(), Errno> {
         return Err(Errno::EXDEV);
     }
     Ok(())
+}
+
+/// The text after `name` on the complete line of `status` that starts with
+/// it. Decode only the genuine kernel ASCII field: comm need not be UTF-8,
+/// and proc_task_name escapes its embedded newlines before these fields.
+fn status_field<'a>(status: &'a [u8], name: &[u8]) -> Result<Option<&'a str>, Errno> {
+    status
+        .split_inclusive(|byte| *byte == b'\n')
+        .find(|line| line.starts_with(name) && line.last() == Some(&b'\n'))
+        .map(|line| std::str::from_utf8(&line[name.len()..]).map_err(|_| Errno::EIO))
+        .transpose()
 }
 
 #[cfg(test)]
@@ -6843,9 +6928,11 @@ impl OwnedWaitFuture {
 
     /// Polls the Native wait for one retained execution-controller host.
     ///
-    /// The first admitted call retains this same guard. Waker callbacks are
-    /// followed by a new host check before reserving or decoding a FIFO front,
-    /// and decoding is checked before removal. A refusal leaves the original
+    /// The first admitted call retains this same guard, and every poll checks
+    /// the host when it starts. A `Waker` callback run during the poll (a
+    /// different waker's registration, a wake, a child Event's adoption) is
+    /// followed by a new host check before the FIFO front is reserved, and
+    /// before it is removed after decoding. A refusal leaves the original
     /// input and FIFO front available to that host. Completed results also
     /// require that same controller. The ordinary [`Future`] implementation
     /// keeps its generic Native polling contract.
@@ -7009,7 +7096,10 @@ impl ExitFuture {
         if let Err(error) = guard.check_current() {
             return Poll::Ready(Err(error.into()));
         }
+        // As in `Event::poll_exit`: a contending poller whose own poll stays
+        // Pending releases without a wake, so ask to be polled again.
         let Some(publication) = event.exit_publication.try_lock() else {
+            cx.waker().wake_by_ref();
             return Poll::Pending;
         };
         let result = event.poll_exit_epoch(&self.waiter);
@@ -7079,9 +7169,35 @@ impl PtracerThreadGuard {
     /// nor changes the original task's capabilities.
     pub fn check_current(&self) -> Result<(), Errno> {
         if self.owner.is_current()? {
+            let _ = WAKER_CALLBACKS_MAY_HAVE_RUN.try_with(|flag| flag.set(false));
             Ok(())
         } else {
             Err(Errno::EPERM)
+        }
+    }
+
+    /// [`Self::check_current`] again only if this thread may have run a
+    /// `Waker` callback since its last successful check.
+    ///
+    /// Valid only after an unconditional `check_current` of this guard
+    /// earlier in the same synchronous call on this thread: the flag is per
+    /// thread, not per guard. Within such a call the executing task changes
+    /// only if code that runs in between forks, and the only foreign code the
+    /// managed wait calls is `Waker` callbacks, each of which sets the flag
+    /// (`note_waker_callbacks`). Signal handlers and process-wide hooks can
+    /// run user code at any point, here as right after any check, and are
+    /// outside this argument. The proof compares no number, so a reused TID
+    /// cannot satisfy a skipped check.
+    fn recheck_after_waker_callbacks(&self) -> Result<(), Errno> {
+        if WAKER_CALLBACKS_MAY_HAVE_RUN
+            .try_with(Cell::get)
+            .unwrap_or(true)
+        {
+            #[cfg(test)]
+            WAKER_CALLBACK_RECHECKS.with(|rechecks| rechecks.set(rechecks.get() + 1));
+            self.check_current()
+        } else {
+            Ok(())
         }
     }
 
@@ -8835,6 +8951,49 @@ mod test {
         }
     }
 
+    /// The NSpid check proves that a procfs mount is the caller's: one
+    /// level, the caller's TID. Without the line, it asks whether the kernel
+    /// has PID namespaces, refuses where it does, and checks `Pid:` where it
+    /// does not.
+    #[test]
+    fn nspid_alignment_needs_the_line_only_where_pid_namespaces_exist() {
+        let caller = super::Pid::from_raw(4242);
+        let unasked = || -> Result<bool, Errno> { panic!("NSpid is present") };
+        let aligned = b"Name:\tx\nPid:\t4242\nNSpid:\t4242\n";
+        let outer_mount = b"Name:\tx\nPid:\t17\nNSpid:\t17\t4242\n";
+        let no_nspid = b"Name:\tx\nPid:\t4242\nPPid:\t1\n";
+        let other_pid = b"Name:\tx\nPid:\t17\nPPid:\t1\n";
+        assert_eq!(aligned_proc_pid_namespace(aligned, caller, unasked), Ok(()));
+        assert_eq!(
+            aligned_proc_pid_namespace(outer_mount, caller, unasked),
+            Err(Errno::EXDEV)
+        );
+        assert_eq!(
+            aligned_proc_pid_namespace(no_nspid, caller, || Ok(true)),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            aligned_proc_pid_namespace(no_nspid, caller, || Ok(false)),
+            Ok(())
+        );
+        assert_eq!(
+            aligned_proc_pid_namespace(other_pid, caller, || Ok(false)),
+            Err(Errno::EXDEV)
+        );
+        assert_eq!(
+            aligned_proc_pid_namespace(no_nspid, caller, || Err(Errno::EACCES)),
+            Err(Errno::EACCES)
+        );
+    }
+
+    /// The probe agrees with this kernel: procfs lists `ns/pid` exactly
+    /// where the kernel has PID namespaces.
+    #[test]
+    fn procfs_reports_whether_the_kernel_has_pid_namespaces() {
+        let listed = fs::symlink_metadata("/proc/thread-self/ns/pid").is_ok();
+        assert_eq!(AlignedProcfs::open().unwrap().pid_namespaces(), Ok(listed));
+    }
+
     #[test]
     fn stale_cleanup_guard_pid_projection_cannot_signal_replacement() {
         let (old_pid, mut old_cleanup) =
@@ -9167,6 +9326,53 @@ mod test {
                 Signal::SIGTRAP,
                 libc::PTRACE_EVENT_EXIT
             ))
+        );
+    }
+
+    #[test]
+    fn a_contended_exit_poll_wakes_its_waiter() {
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let event = Event::new();
+        let waiter = Arc::new(ExitWaiter::default());
+        event.update(PTRACE_EVENT_EXIT_STOP);
+
+        // Mechanism test: holding the lock stands in for any contender, and
+        // the only wake counted is the contended poll's own.
+        let contender = event.exit_publication.lock();
+        assert_eq!(event.poll_exit(&waiter, &waker), Poll::Pending);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            event.exit_capability.load(Ordering::Acquire),
+            EXIT_CAP_AVAILABLE
+        );
+        drop(contender);
+
+        assert_eq!(event.poll_exit(&waiter, &waker), Poll::Ready(Ok(())));
+    }
+
+    #[test]
+    fn a_stale_exit_waiter_contending_with_a_current_poller_is_woken() {
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let event = Event::new();
+        let stale = Arc::new(ExitWaiter::default());
+        event.update(PTRACE_EVENT_EXIT_STOP);
+        // The exec report advances the exit epoch and wakes the old waiters.
+        event.update(PTRACE_EVENT_EXEC_STOP);
+        assert_eq!(event.exit_status.load(Ordering::Acquire), EXIT_PENDING);
+
+        // A current-epoch poller finds the new epoch pending: its poll stays
+        // Pending, so its release wakes nobody. The stale waiter, which
+        // should see EALREADY, contends with it.
+        let current_poller = event.exit_publication.lock();
+        assert_eq!(event.poll_exit(&stale, &waker), Poll::Pending);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        drop(current_poller);
+
+        assert_eq!(
+            event.poll_exit(&stale, &waker),
+            Poll::Ready(Err(Errno::EALREADY))
         );
     }
 
@@ -10913,10 +11119,13 @@ mod test {
             EXIT_CAP_PENDING
         );
         assert_eq!(event.poll_exit(&waiter, &waker), Poll::Pending);
+        // The contended poll asks to be polled again.
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
 
         resume_tx.send(()).expect("release exit publication");
         publisher.join().expect("join exit publisher");
-        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        // The publication wakes the registered waiter too.
+        assert_eq!(counter.0.load(Ordering::SeqCst), 2);
         assert_eq!(event.poll_exit(&waiter, &waker), Poll::Ready(Ok(())));
     }
 

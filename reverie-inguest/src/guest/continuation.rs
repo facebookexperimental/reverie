@@ -317,6 +317,10 @@ struct Continuation {
     mapped_signal_mask: u64,
     #[cfg(feature = "exec-native-injection")]
     native_exec_resume: Option<NativeExecResumeReceipt>,
+    /// While the runtime delivers signals itself (`runtime_mask`): the
+    /// guest's mask, from the trap frame, which the completion installs; the
+    /// calls on the blocked set act on it meanwhile. Unused otherwise.
+    guest_mask: u64,
     phase: Phase,
     entries: u64,
     callbacks: u64,
@@ -552,6 +556,7 @@ pub fn initialize_with_stack_backing(backing: StackBacking) -> io::Result<()> {
             mapped_signal_mask: 0,
             #[cfg(feature = "exec-native-injection")]
             native_exec_resume: None,
+            guest_mask: 0,
             phase: Phase::Idle,
             entries: 0,
             callbacks: 0,
@@ -709,6 +714,13 @@ fn prepare_signal_for(
                 pkru: owner.saved.pkru(),
             });
     }
+    if super::runtime_mask::delivers_signals() {
+        // The guest's mask is kept for the completion, and the continuation
+        // is entered under the runtime mask, which the SIGSYS and SIGSEGV
+        // actions already installed for this handler (`runtime_mask`).
+        owner.guest_mask = frame.signal_mask();
+        frame.set_signal_mask(super::runtime_mask::runtime_mask());
+    }
     owner.phase = Phase::Captured;
     frame.set_register(libc::REG_RSP as usize, (owner.stack.top & !15) as i64);
     frame.set_register(libc::REG_RDI as usize, pointer as i64);
@@ -779,13 +791,56 @@ fn commit_context(owner: &mut Continuation, length: u64) -> Result<(), FrameErro
     Ok(())
 }
 
+/// While the runtime delivers signals itself (`runtime_mask`), the guest mask
+/// this thread's running continuation saved from its trap frame and its
+/// completion installs; `None` with no callback running on this thread, or
+/// with the gate off.
+pub fn saved_guest_mask() -> Option<u64> {
+    let pointer = running_owner()?;
+    // Raw field read: the running callback may hold a reference into the
+    // owner's context, a disjoint field.
+    Some(unsafe { core::ptr::addr_of!((*pointer).guest_mask).read() })
+}
+
+/// Replaces the mask [`saved_guest_mask`] reports, which the completion then
+/// installs. Returns false, changing nothing, where it reports `None`.
+pub fn set_saved_guest_mask(mask: u64) -> bool {
+    let Some(pointer) = running_owner() else {
+        return false;
+    };
+    unsafe { core::ptr::addr_of_mut!((*pointer).guest_mask).write(mask) };
+    true
+}
+
+/// This thread's continuation while a callback runs on it, under the gate.
+fn running_owner() -> Option<*mut Continuation> {
+    if !super::runtime_mask::delivers_signals() {
+        return None;
+    }
+    let pointer = OWNER.get();
+    if pointer.is_null()
+        || unsafe { core::ptr::addr_of!((*pointer).phase).read() } != Phase::Running
+    {
+        return None;
+    }
+    Some(pointer)
+}
+
 /// The current handler prefix has already opened runtime permissions before
 /// any memory access. Nested operations retain their own interrupted image.
 pub fn enable_nested_runtime_access() {}
 
 /// A raw fork copies the active image and ordinary stack. Rebind only after
 /// the real child result, in ordinary context, before child callbacks/return.
+///
+/// The saved guest mask is kept: Linux's child starts with its parent's
+/// blocked set (`copy_process` copies `blocked`), and the child's completion
+/// installs it. Under the gate the cached thread and process ids are the
+/// child's from here on.
 pub fn rebind_fork_child() {
+    if super::runtime_mask::delivers_signals() {
+        super::runtime_mask::rebind_identity();
+    }
     let pointer = OWNER.get();
     if !pointer.is_null() {
         unsafe {
@@ -917,6 +972,12 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
     }
     let owner = unsafe { &mut *pointer };
     frame.restore(&owner.saved)?;
+    if super::runtime_mask::delivers_signals() {
+        // The guest's own mask, saved at the trap and changed only by the
+        // calls on the blocked set; the kernel delivers what it lets in as
+        // this frame returns, before any guest instruction.
+        frame.set_signal_mask(owner.guest_mask);
+    }
     // Signal phase 1: a prepared SIGALRM delivery opens its window here, so
     // the queued instance arrives as this frame returns, before any guest
     // instruction.
@@ -992,7 +1053,7 @@ unsafe extern "C" {
 
 global_asm!(
     r#"
-    .text
+    .pushsection .text.reverie_inguest_fallback_entry,"ax",@progbits
     .p2align 4
     .global fallback_entry
     .hidden fallback_entry
@@ -1020,6 +1081,7 @@ fallback_completion_return:
     // A correct completion resumes the saved guest, never this continuation.
     ud2
     .size fallback_entry, .-fallback_entry
+    .popsection
 "#,
     dispatch = sym dispatch,
     generation = sym completion_generation,
@@ -1294,6 +1356,7 @@ mod tests {
             mapped_signal_mask: 0,
             #[cfg(feature = "exec-native-injection")]
             native_exec_resume: None,
+            guest_mask: 0,
             phase: Phase::Idle,
             entries: 0,
             callbacks: 0,

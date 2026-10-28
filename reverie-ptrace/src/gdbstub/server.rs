@@ -401,6 +401,7 @@ mod tests {
     async fn vfile_test_connection() -> (tokio::io::DuplexStream, GdbServerImpl) {
         use reverie::Pid;
 
+        use crate::gdbstub::ThreadView;
         use crate::gdbstub::commands::ExpediatedRegs;
         use crate::gdbstub::commands::StopEvent;
         use crate::gdbstub::commands::StopReason;
@@ -424,6 +425,7 @@ mod tests {
                 ),
                 request_tx,
                 resume_tx,
+                view: ThreadView::default(),
             })
             .await
             .expect("initial inert stop must fit the channel");

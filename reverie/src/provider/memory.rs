@@ -11,8 +11,7 @@
 //! user address space).
 //!
 //! These are step U1 of the minimal provider seam
-//! (<https://github.com/rrnewton/hermit/issues/4485>, epic
-//! <https://github.com/rrnewton/hermit/issues/4492>). Their contracts are
+//! (<https://github.com/rrnewton/hermit/issues/4659>). Their contracts are
 //! stated in Linux terms only, so that any implementation of Linux user-memory
 //! semantics could serve them, including a foreign user-space kernel. The KVM
 //! backend's guest arena (`reverie_kvm::GuestMemory`) is today's only

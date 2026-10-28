@@ -1,0 +1,99 @@
+.text
+.macro PROBE kind
+.globl clean_call_probe_\kind
+.type clean_call_probe_\kind,@function
+clean_call_probe_\kind:
+ push %rbx
+ push %rbp
+ push %r12
+ push %r13
+ push %r14
+ push %r15
+ mov %rdx,%r10
+ mov %rdi,%rcx
+ push %rsi
+ movabs $0xa0a0a0a0a0a0a0a0,%rax
+ movabs $0xd2d2d2d2d2d2d2d2,%rdx
+ movabs $0xb3b3b3b3b3b3b3b3,%rbx
+ movabs $0xb5b5b5b5b5b5b5b5,%rbp
+ movabs $0x5151515151515151,%rsi
+ movabs $0xd1d1d1d1d1d1d1d1,%rdi
+ movabs $0x0808080808080808,%r8
+ movabs $0x0909090909090909,%r9
+ movabs $0x1111111111111111,%r11
+ movabs $0x1212121212121212,%r12
+ movabs $0x1313131313131313,%r13
+ movabs $0x1414141414141414,%r14
+ movabs $0x1515151515151515,%r15
+ movdqu vector_pattern+0(%rip),%xmm0
+ movdqu vector_pattern+16(%rip),%xmm1
+ movdqu vector_pattern+32(%rip),%xmm2
+ movdqu vector_pattern+48(%rip),%xmm3
+ movdqu vector_pattern+64(%rip),%xmm4
+ movdqu vector_pattern+80(%rip),%xmm5
+ movdqu vector_pattern+96(%rip),%xmm6
+ movdqu vector_pattern+112(%rip),%xmm7
+ movdqu vector_pattern+128(%rip),%xmm8
+ movdqu vector_pattern+144(%rip),%xmm9
+ movdqu vector_pattern+160(%rip),%xmm10
+ movdqu vector_pattern+176(%rip),%xmm11
+ movdqu vector_pattern+192(%rip),%xmm12
+ movdqu vector_pattern+208(%rip),%xmm13
+ movdqu vector_pattern+224(%rip),%xmm14
+ movdqu vector_pattern+240(%rip),%xmm15
+ popfq
+ mov %rsp,136(%r10)
+ jmp clean_call_check_\kind
+.globl clean_call_check_\kind
+.type clean_call_check_\kind,@function
+clean_call_check_\kind:
+ nop
+ mov %rax,0(%r10)
+ mov %rcx,8(%r10)
+ mov %rdx,16(%r10)
+ mov %rbx,24(%r10)
+ mov %rsp,32(%r10)
+ mov %rbp,40(%r10)
+ mov %rsi,48(%r10)
+ mov %rdi,56(%r10)
+ mov %r8,64(%r10)
+ mov %r9,72(%r10)
+ mov %r10,80(%r10)
+ mov %r11,88(%r10)
+ mov %r12,96(%r10)
+ mov %r13,104(%r10)
+ mov %r14,112(%r10)
+ mov %r15,120(%r10)
+ pushfq
+ pop %r11
+ mov %r11,128(%r10)
+ movdqu %xmm0,144(%r10)
+ movdqu %xmm1,160(%r10)
+ movdqu %xmm2,176(%r10)
+ movdqu %xmm3,192(%r10)
+ movdqu %xmm4,208(%r10)
+ movdqu %xmm5,224(%r10)
+ movdqu %xmm6,240(%r10)
+ movdqu %xmm7,256(%r10)
+ movdqu %xmm8,272(%r10)
+ movdqu %xmm9,288(%r10)
+ movdqu %xmm10,304(%r10)
+ movdqu %xmm11,320(%r10)
+ movdqu %xmm12,336(%r10)
+ movdqu %xmm13,352(%r10)
+ movdqu %xmm14,368(%r10)
+ movdqu %xmm15,384(%r10)
+ pop %r15
+ pop %r14
+ pop %r13
+ pop %r12
+ pop %rbp
+ pop %rbx
+ ret
+.size clean_call_probe_\kind,.-clean_call_probe_\kind
+.endm
+PROBE inline
+PROBE rcx
+PROBE flags
+PROBE combined
+.section .note.GNU-stack,"",@progbits

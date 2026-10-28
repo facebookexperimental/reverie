@@ -256,6 +256,21 @@ impl<G: GlobalTool, S: AsRawFd> AsRawFd for InitialImageClient<G, S> {
 
 // TODO-HUMAN-REVIEW(PR-212): Review raw descriptor exposure for in-guest
 // runtimes that must hide coordinator transport descriptors from the guest.
+impl<G: GlobalTool, S> BlockingRpcClient<G, S> {
+    /// Replaces this client's stream with `stream` and returns the one it had,
+    /// without I/O, keeping the decoded config and the one-request-at-a-time
+    /// discipline. For an owner that moves the same connection to another
+    /// descriptor; `stream` must continue the exchange where the old one left
+    /// off.
+    pub fn replace_stream(&self, stream: S) -> S {
+        let mut current = self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut *current, stream)
+    }
+}
+
 impl<G: GlobalTool, S: AsRawFd> AsRawFd for BlockingRpcClient<G, S> {
     fn as_raw_fd(&self) -> RawFd {
         self.stream
@@ -569,6 +584,22 @@ pub fn read_config_frame(stream: &mut impl Read) -> Result<Vec<u8>, RpcError> {
     read_message(stream, DEFAULT_MAX_FRAME_LEN)
 }
 
+/// Exchange a reserved Tool lifecycle control on the existing primary stream.
+///
+/// The caller must exclusively borrow the same stream whose Config frame it
+/// consumed, using that frame's exact raw digest. No Tool, reconnect, fallback
+/// or application request is involved. Release this borrow before invoking any
+/// hook that can itself perform ordinary RPC.
+pub fn exchange_tool_control(
+    stream: &mut (impl Read + Write),
+    control: &crate::tool_activation::ToolControl,
+) -> Result<(), RpcError> {
+    write_message(stream, &control.encode())?;
+    let mut response = FrameBytes::empty();
+    read_message_into(stream, crate::tool_activation::FRAME_LEN, &mut response)?;
+    control.check_ack(&response)
+}
+
 fn exchange(
     stream: &mut (impl Read + Write),
     request_bytes: &[u8],
@@ -681,6 +712,132 @@ fn read_message_into(
 
 #[cfg(test)]
 mod connected_image_tests;
+
+#[cfg(test)]
+mod tool_control_tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::tool_activation::ExitOrigin;
+    use crate::tool_activation::FinishedReceipt;
+    use crate::tool_activation::ToolControl;
+
+    // Independent read/write halves let the production blocking framing consume
+    // a raw Config and reply while retaining exactly what it wrote to the peer.
+    struct Wire {
+        incoming: Cursor<Vec<u8>>,
+        outgoing: Vec<u8>,
+    }
+
+    impl Read for Wire {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            // Exercise read_exact across partial header and payload reads.
+            let len = bytes.len().min(3);
+            self.incoming.read(&mut bytes[..len])
+        }
+    }
+
+    impl Write for Wire {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let len = bytes.len().min(5);
+            self.outgoing.extend_from_slice(&bytes[..len]);
+            Ok(len)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn wire(config: &[u8], ack: &[u8]) -> Wire {
+        let mut incoming = Vec::new();
+        write_message(&mut incoming, config).unwrap();
+        write_message(&mut incoming, ack).unwrap();
+        Wire {
+            incoming: Cursor::new(incoming),
+            outgoing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tool_control_exact_v2_layout_on_config_consumed_stream() {
+        let config = encode(&(11u64, "nonunit Config")).unwrap();
+        let digest = crate::initial_image::config_digest(&config);
+        let controls = [
+            ToolControl::Claim { digest },
+            ToolControl::Started { digest },
+            ToolControl::Finished {
+                digest,
+                receipt: FinishedReceipt::explicit_exit(23, 231, ExitOrigin::Deferred).unwrap(),
+            },
+        ];
+        for (index, control) in controls.into_iter().enumerate() {
+            let mut request = vec![0xff; 4];
+            request.extend_from_slice(&[b'T', b'A', 2, (index as u8) * 2 + 1]);
+            request.extend_from_slice(&digest);
+            request.extend_from_slice(if index == 2 {
+                &[1, 23, 2, 2, 0, 0, 0, 231]
+            } else {
+                &[0; 8]
+            });
+            assert_eq!(request.len(), 48);
+            let mut ack = request.clone();
+            ack[7] += 1;
+            let mut wire = wire(&config, &ack);
+            assert_eq!(read_config_frame(&mut wire).unwrap(), config);
+            exchange_tool_control(&mut wire, &control).unwrap();
+            let mut expected = 48u32.to_be_bytes().to_vec();
+            expected.extend_from_slice(&request);
+            assert_eq!(wire.outgoing, expected);
+            assert_eq!(
+                wire.incoming.position() as usize,
+                wire.incoming.get_ref().len()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_control_rejects_every_nonidentical_ack_and_truncation() {
+        let config = encode(&17u64).unwrap();
+        let digest = crate::initial_image::config_digest(&config);
+        for control in [
+            ToolControl::Claim { digest },
+            ToolControl::Started { digest },
+            ToolControl::Finished {
+                digest,
+                receipt: FinishedReceipt::explicit_exit(255, 60, ExitOrigin::Original).unwrap(),
+            },
+        ] {
+            let ack = control.acknowledgement();
+            let mut invalid = Vec::new();
+            for index in 0..ack.len() {
+                let mut changed = ack.to_vec();
+                changed[index] ^= 1;
+                invalid.push(changed);
+            }
+            invalid.push(ack[..47].to_vec());
+            let mut trailing = ack.to_vec();
+            trailing.push(0);
+            invalid.push(trailing);
+            for bytes in invalid {
+                let mut wire = wire(&config, &bytes);
+                read_config_frame(&mut wire).unwrap();
+                assert!(exchange_tool_control(&mut wire, &control).is_err());
+                // No reconnect or repeated request after any bad reply.
+                assert_eq!(wire.outgoing.len(), 52);
+            }
+            for remaining in [0, 1, 3, 4, 5, 51] {
+                let mut wire = wire(&config, &ack);
+                wire.incoming
+                    .get_mut()
+                    .truncate(4 + config.len() + remaining);
+                read_config_frame(&mut wire).unwrap();
+                assert!(exchange_tool_control(&mut wire, &control).is_err());
+                assert_eq!(wire.outgoing.len(), 52);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod io_scope_tests;

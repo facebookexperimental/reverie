@@ -133,6 +133,13 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for SuccessorImageGuest<'a, T, R> {
         None
     }
 
+    /// The runtime's own descriptors in this process: the coordinator
+    /// connection, the Tool output socket, the performance counters and any
+    /// native-exec lease ([`crate::guest::protect::is_runtime_owned_fd`]).
+    fn is_runtime_owned_fd(&self, fd: i32) -> bool {
+        crate::guest::protect::is_runtime_owned_fd(fd)
+    }
+
     // Guest::auxv's ordinary implementation reads this actual process's
     // kernel auxv. Private GNU getauxval is deliberately not used.
     fn memory(&self) -> Self::Memory {

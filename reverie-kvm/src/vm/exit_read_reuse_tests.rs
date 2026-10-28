@@ -76,13 +76,15 @@ pub(crate) mod exit_read_reuse_tests {
         exit: Option<(&SyscallExitRead, &GuestMemory)>,
     ) -> Result<Option<CompletedSyscallBoundary>> {
         let mut pending = std::pin::pin!(std::future::pending());
+        let mut slot = CompletedBoundarySlot::new();
         futures::executor::block_on(CompletedSyscallBoundary::capture_admitted_reusing(
             backend,
             frame_address,
-            None,
             pending.as_mut(),
             exit,
+            &mut slot,
         ))
+        .map(Option::<&CompletedSyscallBoundary>::cloned)
     }
 
     #[test]
@@ -116,6 +118,129 @@ pub(crate) mod exit_read_reuse_tests {
             .unwrap();
         assert_eq!(admissions(&backend), before + 1);
         assert_same(&control, &expected);
+    }
+
+    /// A boundary filled with values no capture produces: every field must
+    /// be overwritten by the next capture into the same slot.
+    fn spoil(boundary: &mut CompletedSyscallBoundary) {
+        boundary.frame_address = 0xdead_0000;
+        boundary.frame = [0x5a; FRAME_SIZE];
+        boundary.registers = kvm_regs {
+            rax: u64::MAX,
+            rip: u64::MAX,
+            rflags: u64::MAX,
+            ..Default::default()
+        };
+        boundary.special_registers = kvm_bindings::kvm_sregs {
+            cr0: u64::MAX,
+            interrupt_bitmap: [7; 4],
+            ..Default::default()
+        };
+        boundary.action_return_registers = Some(kvm_regs {
+            rax: 0x77,
+            ..Default::default()
+        });
+        boundary.stage_action_outcome = true;
+    }
+
+    /// The run loop keeps one slot for every syscall callback's boundary. A
+    /// capture into it, fresh or reusing the exit read, leaves exactly what
+    /// a capture by value builds, whatever the slot held (an earlier
+    /// capture, or the partial values of a capture that failed), and lends
+    /// that.
+    #[test]
+    fn a_slot_capture_overwrites_everything_an_earlier_capture_left() {
+        let Fixture {
+            mut backend,
+            frame_address,
+            hypercall_address,
+            registers,
+        } = fixture();
+        let memory = backend.memory.clone();
+        let expected = fresh(&backend, frame_address);
+        let mut slot = CompletedBoundarySlot::new();
+        for reuse in [false, true, false] {
+            spoil(&mut slot.boundary);
+            let (_, exit) = backend.read_syscall_exit(&memory, frame_address).unwrap();
+            let mut pending = std::pin::pin!(std::future::pending());
+            let lent = futures::executor::block_on(
+                CompletedSyscallBoundary::capture_admitted_reusing(
+                    &mut backend,
+                    frame_address,
+                    pending.as_mut(),
+                    reuse.then_some((&exit, &memory)),
+                    &mut slot,
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(std::ptr::eq(lent, &slot.boundary));
+            assert_same(&slot.boundary, &expected);
+        }
+        // A capture that fails part way (the boundary RIP check, after the
+        // frame and general registers were written and before the hypercall
+        // instruction is read) is an error; the next capture into the same
+        // slot still leaves exactly a fresh capture.
+        let (_, exit) = backend.read_syscall_exit(&memory, frame_address).unwrap();
+        let mut invalid = registers;
+        invalid.rip = hypercall_address + 1;
+        backend.vcpu.set_regs(&invalid).unwrap();
+        spoil(&mut slot.boundary);
+        let mut pending = std::pin::pin!(std::future::pending());
+        assert!(matches!(
+            futures::executor::block_on(CompletedSyscallBoundary::capture_admitted_reusing(
+                &mut backend,
+                frame_address,
+                pending.as_mut(),
+                Some((&exit, &memory)),
+                &mut slot,
+            )),
+            Err(Error::UnexpectedVcpuExit(_))
+        ));
+        backend.vcpu.set_regs(&registers).unwrap();
+        let mut pending = std::pin::pin!(std::future::pending());
+        futures::executor::block_on(CompletedSyscallBoundary::capture_admitted_reusing(
+            &mut backend,
+            frame_address,
+            pending.as_mut(),
+            None,
+            &mut slot,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_same(&slot.boundary, &expected);
+    }
+
+    /// The exit read into the run loop's kept storage overwrites every field
+    /// an earlier exit left, and decodes the same request, as a read into
+    /// new storage.
+    #[test]
+    fn an_exit_read_into_kept_storage_overwrites_every_field() {
+        let Fixture {
+            backend,
+            frame_address,
+            ..
+        } = fixture();
+        let memory = backend.memory.clone();
+        let (expected_request, expected) =
+            backend.read_syscall_exit(&memory, frame_address).unwrap();
+        let mut exit = SyscallExitRead {
+            frame_address: 0xdead_0000,
+            frame: [0x5a; FRAME_SIZE],
+            hypercall_address: 0xdead_1000,
+            hypercall: Some([1, 2, 3]),
+            generation: crate::entry::MappingGeneration::INITIAL,
+        };
+        let request = backend
+            .read_syscall_exit_into(&memory, frame_address, &mut exit)
+            .unwrap();
+        assert_eq!(request, expected_request);
+        assert_eq!(exit.frame_address, expected.frame_address);
+        assert_eq!(exit.frame, expected.frame);
+        assert_eq!(exit.hypercall_address, expected.hypercall_address);
+        assert_eq!(exit.hypercall, expected.hypercall);
+        assert_eq!(exit.generation, expected.generation);
+        assert_eq!(exit.user_entry(), expected.user_entry());
     }
 
     #[test]
@@ -258,13 +383,14 @@ pub(crate) mod exit_read_reuse_tests {
                 pending.as_mut()
             };
             let before = admissions(&backend);
+            let mut slot = CompletedBoundarySlot::new();
             let result = futures::executor::block_on(
                 CompletedSyscallBoundary::capture_admitted_reusing(
                     &mut backend,
                     frame_address,
-                    None,
                     stop,
                     Some((&exit, &memory)),
+                    &mut slot,
                 ),
             );
             match (event, result) {
@@ -383,14 +509,15 @@ pub(crate) mod exit_read_reuse_tests {
             let before = admissions(&backend);
             let result = futures::executor::block_on(backend.prepare_action_read_or_reuse(
                 pending.as_mut(),
-                reuse.then_some((exit.generation, |_: &KvmBackend| {
+                reuse.then_some((exit.generation, |_: &KvmBackend, _: &mut ()| {
                         // After the check that precedes the reused bytes.
                         assert!(memory.check_copy_failures().is_ok());
                         defer(&memory);
                         ran.store(true, std::sync::atomic::Ordering::SeqCst);
                         Ok(7_u32)
                     })),
-                |_, _| {
+                &mut (),
+                |_, _, _| {
                     defer(&memory);
                     ran.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(7_u32)
@@ -441,11 +568,12 @@ pub(crate) mod exit_read_reuse_tests {
             let before = admissions(&backend);
             let result = futures::executor::block_on(backend.prepare_action_read_or_reuse(
                 pending.as_mut(),
-                reuse.then_some((exit.generation, |_: &KvmBackend| {
+                reuse.then_some((exit.generation, |_: &KvmBackend, _: &mut ()| {
                         ran.store(true, std::sync::atomic::Ordering::SeqCst);
                         Ok(7_u32)
                     })),
-                |_, _| {
+                &mut (),
+                |_, _, _| {
                     ran.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(7_u32)
                 },
@@ -476,12 +604,13 @@ pub(crate) mod exit_read_reuse_tests {
             futures::executor::block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
         let before = admissions(&backend);
         let mut pending = std::pin::pin!(std::future::pending());
+        let mut slot = CompletedBoundarySlot::new();
         let mut capture = Box::pin(CompletedSyscallBoundary::capture_admitted_reusing(
             &mut backend,
             frame_address,
-            None,
             pending.as_mut(),
             Some((&exit, &memory)),
+            &mut slot,
         ));
         let waker = futures::task::noop_waker();
         let mut context = Context::from_waker(&waker);
@@ -494,6 +623,6 @@ pub(crate) mod exit_read_reuse_tests {
         };
         drop(capture);
         assert_eq!(admissions(&backend), before + 1, "reopened capture did not copy");
-        assert_same(&actual, &expected);
+        assert_same(actual, &expected);
     }
 }

@@ -1,0 +1,42 @@
+[package]
+name = "reverie-linuxemu"
+description = "LinuxEmu: the Linux syscall emulation that the Reverie KVM backend runs its guests on."
+version = "0.5.4"
+authors = ["Meta Platforms"]
+edition = "2024"
+repository = "https://github.com/facebookexperimental/reverie"
+license = "BSD-2-Clause"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/reverie-linuxemu"
+keywords = ["linux", "instrumentation", "hermit"]
+categories = ["development-tools::debugging", "os::linux-apis"]
+build = "build.rs"
+
+[features]
+default = []
+native-test-support = ["reverie-kvm-core/native-test-support"]
+test-support = ["reverie-kvm-core/test-support"]
+
+[dependencies]
+futures = { version = "0.3.31", features = ["async-await"] }
+goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
+kvm-bindings = "0.14.1"
+libc = "0.2.186"
+reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
+reverie-kvm-core = { version = "0.5.4", path = "../reverie-kvm-core" }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+reverie-kvm-core = { version = "0.5.4", path = "../reverie-kvm-core", features = ["test-support"] }
+
+[build-dependencies]
+cc = "1.5.1"
+
+# Ordinary-main startup for explicitly broker-routed library tests.
+[[bin]]
+name = "reverie-linuxemu-broker-test-launcher"
+path = "tests/support/broker_test_launcher.rs"
+test = false
+bench = false
+doc = false

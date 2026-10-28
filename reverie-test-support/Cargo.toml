@@ -1,0 +1,31 @@
+# Hand-maintained alongside :reverie-test-support and :generic-basics in BUCK.
+# Keep the dependencies and basics integration registration synchronized.
+
+[package]
+name = "reverie-test-support"
+description = "Command helpers for generic Reverie conformance tests."
+version = "0.5.4"
+authors = ["Meta Platforms"]
+edition = "2024"
+license = "BSD-2-Clause"
+publish = false
+
+[dependencies]
+reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
+reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace" }
+
+[dev-dependencies]
+close-err = "1.0.2"
+libc = "0.2.186"
+nix = { version = "0.30.1", features = ["fs", "process", "signal"] }
+# Inherited function guests must clear libtest's thread-local output capture.
+# The workspace already pins nightly; ordinary library users need no feature.
+reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace", features = ["nightly"] }
+serde = { version = "1.0.219", features = ["derive"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sanitized)"] }
+
+[[test]]
+name = "basics"
+path = "../tests/basics.rs"
