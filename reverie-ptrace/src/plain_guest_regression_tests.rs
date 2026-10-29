@@ -5008,7 +5008,6 @@ async fn a_timer_step_at_a_pending_restore_keeps_a_blocked_sigtrap() {
 /// one run must have stepped both sequences.
 #[tokio::test(flavor = "current_thread")]
 async fn unblocked_sigtrap_costs_timer_steps_no_reads_without_sigreturn_reports() {
-    use std::sync::atomic::Ordering;
     if !crate::perf::is_perf_supported() {
         eprintln!("skipping: perf counters are not supported here");
         return;
@@ -5022,12 +5021,13 @@ async fn unblocked_sigtrap_costs_timer_steps_no_reads_without_sigreturn_reports(
         .collect();
     const ATTEMPTS: usize = 4;
     for attempt in 1..=ATTEMPTS {
-        let stepped_before = crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.load(Ordering::SeqCst);
+        let stepped_before =
+            crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.with(|count| count.get());
         let reads_before = reads();
         let run = run_guest("sigtrap_timer_unblocked", false).await;
         let read = reads() - reads_before;
-        let stepped =
-            crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.load(Ordering::SeqCst) - stepped_before;
+        let stepped = crate::task::TIMER_SEQUENCES_STEPPED_FOR_TEST.with(|count| count.get())
+            - stepped_before;
         assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
         let lines: Vec<&str> = run
             .report
@@ -5036,8 +5036,8 @@ async fn unblocked_sigtrap_costs_timer_steps_no_reads_without_sigreturn_reports(
             .collect();
         assert_eq!(lines, expected, "{}", run.report);
         assert_eq!(read, 0, "timer steps that read SIGTRAP's state");
-        // The global count may include other tests' sequences, so it only
-        // shows that some ran; this run's own are its timer events.
+        // The count is this test's own (per tracer thread); the run's own
+        // sequences are also its timer events.
         if stepped >= 2 && timer_events(&run).len() == 2 {
             return;
         }
@@ -5093,7 +5093,6 @@ async fn sigtrap_state_survives_a_timer_step_over_sigreturn() {
 /// `FRAME_SHIELDS_FOR_TEST`), and SIGTRAP reads back caught and blocked.
 #[tokio::test(flavor = "current_thread")]
 async fn a_quiet_timer_sequence_takes_the_full_shield_at_an_unreported_sigreturn() {
-    use std::sync::atomic::Ordering;
     if !crate::perf::is_perf_supported() {
         eprintln!("skipping: perf counters are not supported here");
         return;
@@ -5101,11 +5100,11 @@ async fn a_quiet_timer_sequence_takes_the_full_shield_at_an_unreported_sigreturn
     let reads = || crate::task::TIMER_STEP_SHIELD_READS_FOR_TEST.with(|count| count.get());
     let (reads_before, shields_before) = (
         reads(),
-        crate::task::FRAME_SHIELDS_FOR_TEST.load(Ordering::SeqCst),
+        crate::task::FRAME_SHIELDS_FOR_TEST.with(|count| count.get()),
     );
     let run = run_guest("sigtrap_sigreturn_handover_timer", false).await;
     let read = reads() - reads_before;
-    let shields = crate::task::FRAME_SHIELDS_FOR_TEST.load(Ordering::SeqCst) - shields_before;
+    let shields = crate::task::FRAME_SHIELDS_FOR_TEST.with(|count| count.get()) - shields_before;
     assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
     eprintln!("handover timer events: {:#?}", timer_events(&run));
     assert!(read > 0, "no timer step took the full shield");
