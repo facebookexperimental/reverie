@@ -206,8 +206,6 @@ pub(crate) static BLOCK_BOUND_MISSES: std::sync::atomic::AtomicU64 =
 /// instruction step, as before block steps (x86_64) and branch runs
 /// (aarch64) existed. Any other value, or none,
 /// leaves block steps on. For measurement and as an escape hatch.
-// Block steps (`PTRACE_SINGLEBLOCK`) exist only on x86_64.
-#[cfg(target_arch = "x86_64")]
 pub const BLOCK_STEP_ENV: &str = "REVERIE_BLOCK_STEP";
 
 /// When set (to anything), every hit in the block bound cache re-reads the
@@ -226,7 +224,6 @@ pub(crate) static BLOCK_STEPS_OFF_FOR_TESTS: std::sync::atomic::AtomicBool =
 pub(crate) static VERIFY_BLOCK_BOUNDS_FOR_TESTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(target_arch = "x86_64")]
 fn block_steps_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var(BLOCK_STEP_ENV).map_or(true, |v| v.trim() != "0"))
