@@ -5051,13 +5051,18 @@ mod tests {
         let unit = StepUnit::ToBranch {
             stops: [0, 0],
             count: 1,
-            branches: 0,
+            branches: [0, 0],
         };
         SWITCH_OUT_FORCED_FOR_TEST.set(true);
-        for at_breakpoint in [false, true] {
+        for at_breakpoint in [None, Some(&task)] {
             let before = SWITCH_OUTS_FOR_TEST.get();
             inner.check_branch_run(&task, unit, from, from + 1_000, at_breakpoint);
-            assert_eq!(SWITCH_OUTS_FOR_TEST.get(), before + 1, "{at_breakpoint}");
+            assert_eq!(
+                SWITCH_OUTS_FOR_TEST.get(),
+                before + 1,
+                "{}",
+                at_breakpoint.is_some()
+            );
         }
         SWITCH_OUT_FORCED_FOR_TEST.set(false);
         assert!(!inner.branch_runs_off);
