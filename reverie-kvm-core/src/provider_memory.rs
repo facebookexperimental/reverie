@@ -204,6 +204,21 @@ impl AddressSpace for ProviderMemory<'_> {
         if !self.0.user_range_is_mapped(address, length) {
             return refuse(MapError::NotMapped);
         }
+        if self.0.shares_parent_address_space()
+            && self
+                .0
+                .range_contains_retained_shared(address, length as usize)
+        {
+            // On Linux a vfork child's mprotect changes its parent's view
+            // too; this copy cannot, so the change is refused whole, as a
+            // capability failure the allocation owner publishes on unlock.
+            let _ = self
+                .0
+                .capture_shared_file_error(GuestMemory::vfork_shared_view_change(
+                    "mprotect in a vfork child",
+                ));
+            return refuse(MapError::Unsupported);
+        }
         if protection & libc::PROT_EXEC != 0
             && self.0.range_contains_shared_file(address, length as usize)
         {

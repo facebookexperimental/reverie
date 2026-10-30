@@ -3484,13 +3484,15 @@ impl KvmBackend {
         fault: Option<&UserTrap>,
         stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
     ) -> Result<Option<ForkedProcess>> {
+        // A process clone that shares the address space on Linux is the
+        // provider's vfork-style child (it admits CLONE_VM only with
+        // CLONE_VFORK), whose parent waits for its exec or exit. Like a
+        // fork's, its copy of shared-file views gets an arena and entry gate
+        // of its own (`GuestMemory::snapshot_sharing_address_space`), so this
+        // gate keeps its one participant, and the copy refuses changes to the
+        // views until the child execs. Thread creation is refused before any
+        // process action exists.
         let shared_file_snapshot = self.memory.contains_shared_file();
-        if shared_file_snapshot && share_address_space {
-            return Err(Error::SharedFileCapability {
-                operation: "CLONE_VM/thread creation",
-                reason: "ordinary shared-file views require one vCPU per address space",
-            });
-        }
         // Preserve the existing private-fork preparation order. For real file
         // views, duplication may fail after unmapping a child destination;
         // finish that owned snapshot/VM preparation before publishing a child
@@ -3564,7 +3566,8 @@ impl KvmBackend {
         let mut child_executor = match prepared_executor {
             Some(child) => child,
             None => {
-                let mut child_executor = executor.fork_child(child_pid, clear_sighand, false)?;
+                let mut child_executor =
+                    executor.fork_child(child_pid, clear_sighand, share_address_space)?;
                 #[cfg(test)]
                 tests::entry_action_tests::observe("fork_executor");
                 child_executor.set_clear_child_tid(clear_child_tid);

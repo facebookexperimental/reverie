@@ -273,6 +273,13 @@ struct Mapping {
     /// checks it twice.
     deferred_queued: std::sync::atomic::AtomicBool,
     sync_mmu: Mutex<Option<bool>>,
+    /// Whether this memory is a vfork child's copy of an address space that
+    /// the child shares with its parent on Linux
+    /// ([`GuestMemory::snapshot_sharing_address_space`]), from the copy until
+    /// the child's exec ([`GuestMemory::retire_shared_files_for_exec`]). While
+    /// it is, the shared views the child holds may not change
+    /// ([`GuestMemory::shares_parent_address_space`]).
+    shares_parent_address_space: std::sync::atomic::AtomicBool,
 }
 
 /// The end of the x86-64 user address space with 4-level paging.
@@ -1345,6 +1352,7 @@ impl GuestMemory {
                 deferred: Mutex::new(shared_file::DeferredFailures::default()),
                 deferred_queued: std::sync::atomic::AtomicBool::new(false),
                 sync_mmu: Mutex::new(None),
+                shares_parent_address_space: std::sync::atomic::AtomicBool::new(false),
             }),
             failure_context: None,
             operation_origin: None,
@@ -1630,8 +1638,48 @@ impl GuestMemory {
     /// unknown ([`GuestMemory::user_stack_window_pages`]), while the child
     /// runs and after it exits, until the child's new image takes a record of
     /// its own ([`GuestMemory::detach_user_stack_window_watch`]).
+    ///
+    /// The copy inherits this memory's shared views (ordinary files and
+    /// fork-shared anonymous memory) as a fork's does, so a store through a
+    /// view on either side is visible on the other at once. The copy has its
+    /// own arena and entry gate, so it adds no participant to this memory's
+    /// gate, and taking it requires what a fork's copy of shared views does:
+    /// this memory's one participant stopped, or none. Until the child execs,
+    /// the copy refuses a change to the shared views it holds
+    /// ([`GuestMemory::shares_parent_address_space`]).
     pub fn snapshot_sharing_address_space(&self) -> Result<Self> {
         self.snapshot_keeping(copy_sparse_file, true)
+    }
+
+    /// Whether this memory is a vfork child's copy of an address space the
+    /// child shares with its parent on Linux
+    /// ([`GuestMemory::snapshot_sharing_address_space`]), and the child has
+    /// not exec'd since ([`GuestMemory::retire_shared_files_for_exec`]).
+    ///
+    /// On Linux such a child maps, unmaps and protects memory in its
+    /// parent's address space; here those changes reach only the copy. While
+    /// this holds, a publication that would install, replace or withdraw a
+    /// shared view (an ordinary file, or fork-shared anonymous memory), and a
+    /// protection change over one, are refused with
+    /// [`Error::SharedFileCapability`] before they change anything, so that
+    /// the parent's shared views, which the copy's stores still reach, are
+    /// exactly the child's when the parent resumes. Changes to private memory
+    /// keep reaching only the copy, as before.
+    pub fn shares_parent_address_space(&self) -> bool {
+        self.mapping
+            .shares_parent_address_space
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The refusal of a change to a shared view while
+    /// [`GuestMemory::shares_parent_address_space`] holds.
+    pub(crate) fn vfork_shared_view_change(operation: &'static str) -> Error {
+        Error::SharedFileCapability {
+            operation,
+            reason: "a vfork child shares its parent's address space until it execs or exits, \
+                     and runs on a copy here, so it cannot change a shared view it inherited \
+                     or map a new one",
+        }
     }
 
     fn snapshot_with_sparse_copy(
@@ -1736,7 +1784,17 @@ impl GuestMemory {
         // The sparse fd operation is not a copy lease or a global snapshot
         // fence. Fallback byte copies each take their own short admission.
         self.check_copy_failure()?;
+        snapshot.mark_shares_parent_address_space(share_record);
         Ok(snapshot)
+    }
+
+    /// Marks a finished snapshot as a vfork child's copy when `share_record`
+    /// says it is one ([`GuestMemory::shares_parent_address_space`]). The
+    /// copy is not yet reachable by any vCPU, so no publication races this.
+    fn mark_shares_parent_address_space(&self, share_record: bool) {
+        self.mapping
+            .shares_parent_address_space
+            .store(share_record, std::sync::atomic::Ordering::Release);
     }
 
     /// The declared mapping of the page that holds physical `address`, if it

@@ -281,6 +281,21 @@ the root tool's shared `GlobalState`. Tool-owned workers run the corresponding
 Tool lifecycle callbacks; opting into unmonitored threads does not provide that
 instrumentation.
 
+A vfork child (`vfork(2)`, or `clone(2)` and `clone3(2)` with
+`CLONE_VM|CLONE_VFORK`, as glibc's `posix_spawn(3)` issues it) runs on a copy
+of its parent's memory, with a VM and vCPU of its own. The copy inherits the
+parent's shared views of ordinary files and of fork-shared anonymous memory,
+so a store through one reaches the parent and the file at once, and it adds no
+vCPU to the parent's address space, so a parent that holds such a view can
+create one. Until the child execs, the copy refuses with the named
+`SharedFileCapability` error an `munmap(2)`, `mmap(2)` or `mprotect(2)` that
+would change a shared view, or map a new one, before the call changes
+anything: on Linux the change would reach the parent's address space as well.
+A vfork child's changes to private memory reach only its copy. A thread, or a
+`CLONE_VM` process clone without `CLONE_VFORK`, is still refused while the
+process holds an ordinary shared-file view
+(https://github.com/rrnewton/reverie/issues/1108).
+
 ## Vectored I/O
 
 `readv`, `writev`, `preadv`, `pwritev`, `preadv2`, and `pwritev2` preserve vector

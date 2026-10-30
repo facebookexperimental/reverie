@@ -482,6 +482,20 @@ impl GuestMemory {
         source: InstallSource,
     ) -> Result<()> {
         self.check_copy_failure()?;
+        // A vfork child's copy may not change its shared views: on Linux the
+        // change would reach its parent's address space too. Only a guest's
+        // own mapping change is a Fresh publication; a fork's inheritance and
+        // the sharing of anonymous memory before a fork change no mapping the
+        // guest can see. The allocation guard excludes a concurrent change.
+        if matches!(source, InstallSource::Fresh)
+            && self.shares_parent_address_space()
+            && (slice.backing.kind.retained_shared()
+                || self.range_contains_retained_shared(address, slice.length))
+        {
+            return Err(Self::vfork_shared_view_change(
+                "mapping change in a vfork child",
+            ));
+        }
         if self.mapping.sync_mmu.lock().unwrap().as_ref() == Some(&false) {
             return Err(Error::SynchronousMmuUnsupported);
         }
@@ -924,6 +938,9 @@ impl GuestMemory {
         self.check_copy_failure()?;
         child.check_copy_failure()?;
         drop(authority);
+        // Only now, after the inherited views above are published: a vfork
+        // child's copy refuses later changes to them until its exec.
+        child.mark_shares_parent_address_space(share_record);
         Ok(child)
     }
 
@@ -969,6 +986,9 @@ impl GuestMemory {
     }
 
     pub fn retire_shared_files_for_exec(&self) -> Result<()> {
+        // The new image is a new address space: a vfork child that execs no
+        // longer shares its parent's, and its outgoing views retire below.
+        self.mark_shares_parent_address_space(false);
         loop {
             let allocation = self.allocation_guard();
             let range = {
@@ -3275,5 +3295,205 @@ mod tests {
         assert!(!memory.contains_shared_file());
         assert!(!memory.entry_gate().single_member_domain_active());
         drop(member);
+    }
+
+    fn vfork_refusal(result: Result<()>) {
+        match result {
+            Err(Error::SharedFileCapability { operation, reason }) => {
+                assert_eq!(operation, "mapping change in a vfork child");
+                assert!(reason.starts_with("a vfork child shares its parent's address space"));
+            }
+            other => panic!("expected the vfork child's shared-view refusal, got {other:?}"),
+        }
+    }
+
+    /// A vfork child's copy of a memory that holds shared views has an arena
+    /// and an entry gate of its own, so the parent's gate keeps its one
+    /// stopped participant. The copy inherits the views, so a store through
+    /// one reaches the other side and the file at once, and copies private
+    /// memory. It is marked until its exec; a fork of it is another address
+    /// space and is not, and a vfork of it is.
+    #[test]
+    fn vfork_copy_inherits_shared_views_on_a_gate_of_its_own() {
+        let memory = fixture(4);
+        let original = file(2);
+        install(&memory, &original, BASE + P, 2, 0);
+        memory.write_raw(BASE, b"parent").unwrap();
+        let participant = memory.entry_gate().register().unwrap();
+        let child = memory.snapshot_sharing_address_space().unwrap();
+        assert!(child.shares_parent_address_space());
+        assert!(!memory.shares_parent_address_space());
+        assert!(!Arc::ptr_eq(&memory.mapping, &child.mapping));
+        assert!(!Arc::ptr_eq(&memory.entry_gate(), &child.entry_gate()));
+        assert!(memory.entry_gate().single_member_domain_active());
+        assert!(child.entry_gate().single_member_domain_active());
+        assert_eq!(memory.entry_gate().test_state().members.len(), 1);
+        assert!(child.entry_gate().test_state().members.is_empty());
+        assert_eq!(child.separately_backed_pages(), 2);
+        child.write_raw(BASE + P + 3, b"child").unwrap();
+        assert_eq!(read(&memory, BASE + P + 3, 5), b"child");
+        assert_eq!(bytes(&original, 3, 5), b"child");
+        memory.write_raw(BASE + 2 * P + 5, b"parent").unwrap();
+        assert_eq!(read(&child, BASE + 2 * P + 5, 6), b"parent");
+        child.write_raw(BASE, b"child!").unwrap();
+        assert_eq!(read(&memory, BASE, 6), b"parent");
+        assert!(!child.snapshot().unwrap().shares_parent_address_space());
+        let grandchild = child.snapshot_sharing_address_space().unwrap();
+        assert!(grandchild.shares_parent_address_space());
+        assert!(child.shares_parent_address_space());
+        grandchild.write_raw(BASE + P, b"grand").unwrap();
+        assert_eq!(read(&memory, BASE + P, 5), b"grand");
+        assert!(memory.entry_gate().pending_failure().is_none());
+        drop(participant);
+    }
+
+    /// Every vfork copy is marked, whether or not its source holds a view,
+    /// and no fork copy is.
+    #[test]
+    fn vfork_copies_are_marked_and_fork_copies_are_not() {
+        let memory = fixture(2);
+        assert!(!memory.shares_parent_address_space());
+        assert!(
+            memory
+                .snapshot_sharing_address_space()
+                .unwrap()
+                .shares_parent_address_space()
+        );
+        assert!(!memory.snapshot().unwrap().shares_parent_address_space());
+    }
+
+    /// Until its exec, a vfork child's copy refuses every change to a shared
+    /// view before it changes anything: withdrawing part of an inherited
+    /// view, a private mapping over part of one, and a new view elsewhere.
+    /// A private publication that touches no view goes ahead. The exec ends
+    /// the window: the copy's views retire, the new image may map files, and
+    /// the parent's views and file are unchanged throughout.
+    #[test]
+    fn vfork_copy_refuses_shared_view_changes_until_exec() {
+        let memory = fixture(5);
+        let original = file(2);
+        install(&memory, &original, BASE + P, 2, 0);
+        let participant = memory.entry_gate().register().unwrap();
+        let child = memory.snapshot_sharing_address_space().unwrap();
+        let before = (access_maps(&child), child.separately_backed_pages());
+        let parent_before = (access_maps(&memory), memory.separately_backed_pages());
+        let other = file(1);
+        vfork_refusal(child.publish_private_range(
+            child.allocation_guard(),
+            PrivateRangePlan {
+                address: BASE + P,
+                length: PAGE_SIZE,
+                contents: None,
+                permissions: None,
+                cursors: None,
+            },
+        ));
+        vfork_refusal(child.publish_private_range(
+            child.allocation_guard(),
+            PrivateRangePlan {
+                address: BASE + 2 * P,
+                length: PAGE_SIZE,
+                contents: Some(b"private"),
+                permissions: Some((true, true)),
+                cursors: None,
+            },
+        ));
+        vfork_refusal(child.publish_shared_file_range(
+            child.allocation_guard(),
+            SharedFileRangePlan {
+                address: BASE + 3 * P,
+                length: PAGE_SIZE,
+                file: other.try_clone().unwrap().into(),
+                offset: 0,
+                readable: true,
+                writable: true,
+                max_writable: true,
+                cursors: None,
+            },
+        ));
+        assert_eq!(
+            (access_maps(&child), child.separately_backed_pages()),
+            before
+        );
+        assert!(child.entry_gate().pending_failure().is_none());
+        // A private publication over private memory changes no view.
+        replace(&child, BASE + 4 * P, 1, Some(b"private"), true);
+        assert_eq!(read(&child, BASE + 4 * P, 7), b"private");
+        assert!(child.range_contains_shared_file(BASE + P, 2 * PAGE_SIZE));
+        // The exec: the new image is another address space.
+        child.retire_shared_files_for_exec().unwrap();
+        assert!(!child.shares_parent_address_space());
+        assert!(!child.contains_shared_file());
+        install(&child, &other, BASE + 3 * P, 1, 0);
+        assert!(child.range_contains_shared_file(BASE + 3 * P, PAGE_SIZE));
+        assert_eq!(
+            (access_maps(&memory), memory.separately_backed_pages()),
+            parent_before
+        );
+        memory.write_raw(BASE + P, b"parent").unwrap();
+        assert_eq!(bytes(&original, 0, 6), b"parent");
+        assert!(memory.entry_gate().pending_failure().is_none());
+        drop(participant);
+    }
+
+    /// A vfork child's copy of shared views needs what a fork's does: the
+    /// source's one participant stopped and no host copy in flight. A second
+    /// participant cannot join a memory that holds a view, and a memory with
+    /// two participants cannot publish one, so the source of such a copy
+    /// never has a second vCPU running in its address space.
+    #[test]
+    fn vfork_copy_needs_the_sources_one_participant_quiescent() {
+        let memory = fixture(2);
+        let original = file(1);
+        install(&memory, &original, BASE, 1, 0);
+        let participant = memory.entry_gate().register().unwrap();
+        let gate = memory.entry_gate();
+        let copy = gate.try_copy(None).unwrap().unwrap();
+        assert!(matches!(
+            memory.snapshot_sharing_address_space().unwrap_err(),
+            Error::SharedFileCapability {
+                operation: "shared-file fork snapshot",
+                ..
+            }
+        ));
+        drop(copy);
+        assert!(
+            memory
+                .snapshot_sharing_address_space()
+                .unwrap()
+                .shares_parent_address_space()
+        );
+        assert!(gate.pending_failure().is_none());
+        // A second vCPU cannot join the view's address space.
+        let joined = fixture(2);
+        install(&joined, &original, BASE, 1, 0);
+        let first = joined.entry_gate().register().unwrap();
+        assert!(joined.entry_gate().register().is_err());
+        drop(first);
+        // Two vCPUs cannot take a view.
+        let threaded = fixture(2);
+        let one = threaded.entry_gate().register().unwrap();
+        let two = threaded.entry_gate().register().unwrap();
+        assert!(matches!(
+            threaded.publish_shared_file_range(
+                threaded.allocation_guard(),
+                SharedFileRangePlan {
+                    address: BASE,
+                    length: PAGE_SIZE,
+                    file: original.try_clone().unwrap().into(),
+                    offset: 0,
+                    readable: true,
+                    writable: false,
+                    max_writable: true,
+                    cursors: None,
+                },
+            ),
+            Err(Error::SharedFileCapability {
+                operation: "mapping publication",
+                ..
+            })
+        ));
+        assert!(!threaded.contains_shared_file());
+        drop((one, two, participant));
     }
 }

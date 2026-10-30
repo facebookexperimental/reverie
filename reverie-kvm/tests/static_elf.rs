@@ -12195,6 +12195,8 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "msync_lifecycle::shared_coherence_and_mapping_lifetime_match_native",
         "shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native",
         "shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner",
+        "shared_file_vfork_and_posix_spawn_children_match_native",
+        "shared_file_vfork_child_view_changes_and_threads_are_refused_by_name",
         "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native",
         "pdeathsig::unchanged_six_check_state_matches_native_controlled",
         "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
@@ -22263,6 +22265,219 @@ fn shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native(
         assert_eq!(stderr, native.stderr, "mode={name}");
         assert_eq!(stdout, native.stdout, "mode={name}");
         eprintln!("shared-file-fork completed {name}: child=0 syncs=2");
+    }
+}
+
+/// The three ways the shared-file vfork fixture runs on KVM: without a tool,
+/// and with the strace tool owning threads on the host and through the tool.
+const SHARED_FILE_VFORK_MODES: [(&str, Option<ThreadOwnership>); 3] = [
+    ("direct", None),
+    ("host", Some(ThreadOwnership::Host)),
+    ("tool", Some(ThreadOwnership::Tool)),
+];
+
+/// Runs the shared-file vfork fixture with `args` natively, in a directory
+/// of its own under `directory`, and returns its status and output.
+fn run_shared_file_vfork_natively(
+    directory: &std::path::Path,
+    program: &std::path::Path,
+    name: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let native_directory = directory.join(name);
+    std::fs::create_dir(&native_directory).unwrap();
+    std::process::Command::new(program)
+        .args(args)
+        .current_dir(&native_directory)
+        .output()
+        .unwrap()
+}
+
+/// A KVM run of the shared-file vfork fixture: with a tool, the strace
+/// trace's syscall names; then the exit code, stdout and stderr.
+type SharedFileVforkRun = (Option<Vec<String>>, i32, Vec<u8>, Vec<u8>);
+
+/// Runs the shared-file vfork fixture with `args` on KVM in `mode`, in a
+/// directory of its own under `directory`.
+fn run_shared_file_vfork_on_kvm(
+    directory: &std::path::Path,
+    program: &std::path::Path,
+    mode: (&str, Option<ThreadOwnership>),
+    args: &[&str],
+) -> reverie_kvm::Result<SharedFileVforkRun> {
+    let (name, ownership) = mode;
+    let guest_directory = directory.join(format!("{name}-{}", args.join("-")));
+    std::fs::create_dir(&guest_directory).unwrap();
+    let image = std::fs::read(program).unwrap();
+    let mut argv = vec![program.to_str().unwrap()];
+    argv.extend_from_slice(args);
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_with_context(&image, &argv, &[], &guest_directory)
+        .unwrap();
+    match ownership {
+        Some(ownership) => {
+            backend.set_thread_ownership(ownership);
+            let (trace, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )?;
+            Ok((Some(trace.syscalls()), code, stdout, stderr))
+        }
+        None => {
+            let (code, stdout, stderr) = backend.run_static_elf_captured()?;
+            Ok((None, code, stdout, stderr))
+        }
+    }
+}
+
+/// A process that holds MAP_SHARED views of an ordinary file can create
+/// children that share its address space until they exec or exit (vfork,
+/// and posix_spawn's clone or clone3 with CLONE_VM|CLONE_VFORK): a child that
+/// execs, one that exits, one whose execve fails, signals handled in the child
+/// and in the parent, a child killed by a signal, a nested vfork, and
+/// posix_spawn. Each store through the views reaches the other processes and
+/// the file, and the parent's views still show the file's bytes afterwards,
+/// with the same output as native Linux.
+#[test]
+fn shared_file_vfork_and_posix_spawn_children_match_native() {
+    const TEST: &str = "shared_file_vfork_and_posix_spawn_children_match_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-vfork",
+        include_str!("fixtures/shared_file_vfork.c"),
+    );
+    // A signal a vfork child sends its parent is left out ("child-signal-
+    // only"): with or without shared views, reverie-kvm answers that kill
+    // with ENOSYS here, from the Direct driver, where the parent is suspended
+    // on the child's call stack, and with the strace tool.
+    let args: &[&str] = &["child-signal-only"];
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native", args);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    assert_eq!(
+        native.stdout,
+        b"shared-file vfork exec=ok exit=ok failed-exec=ok signals=child killed=ok nested=ok \
+          spawn=ok views=ok\n"
+    );
+    for mode in SHARED_FILE_VFORK_MODES {
+        let (trace, code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, mode, args).unwrap();
+        let name = mode.0;
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(stdout, native.stdout, "mode={name}");
+        if let Some(trace) = trace {
+            let count = |names: &[&str]| {
+                trace
+                    .iter()
+                    .filter(|name| names.contains(&name.as_str()))
+                    .count()
+            };
+            // Six vforks in the parent and the nested one in its child, and
+            // one posix_spawn clone. A successful execve does not return, so
+            // the tool records only the failed one; the helper images prove
+            // the others by the counter they bump.
+            assert_eq!(count(&["vfork"]), 7, "mode={name}: {trace:?}");
+            assert_eq!(count(&["clone", "clone3"]), 1, "mode={name}: {trace:?}");
+            assert_eq!(count(&["execve"]), 1, "mode={name}: {trace:?}");
+        }
+        eprintln!("shared-file-vfork completed {name}");
+    }
+}
+
+/// A vfork child that changes a shared view it inherited is refused by name
+/// on KVM before the change: Linux would apply an unmapping, a protection
+/// change, a private mapping over the view or a new shared view to the
+/// parent's address space too, and the child here runs on a copy of it. A
+/// thread is refused while the process holds a view, and a view while a
+/// second thread is alive, as before.
+#[test]
+fn shared_file_vfork_child_view_changes_and_threads_are_refused_by_name() {
+    const TEST: &str = "shared_file_vfork_child_view_changes_and_threads_are_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-vfork",
+        include_str!("fixtures/shared_file_vfork.c"),
+    );
+    let vfork_refusal = |operation: &str| {
+        format!(
+            "unsupported KVM shared-file operation {operation}: a vfork child shares its \
+             parent's address space until it execs or exits"
+        )
+    };
+    let cases = [
+        (
+            vec!["change", "munmap"],
+            "shared-file vfork change=munmap child=ok\n",
+            vfork_refusal("mapping change in a vfork child"),
+        ),
+        (
+            vec!["change", "fixed"],
+            "shared-file vfork change=fixed child=ok\n",
+            vfork_refusal("mapping change in a vfork child"),
+        ),
+        (
+            vec!["change", "map"],
+            "shared-file vfork change=map child=ok\n",
+            vfork_refusal("mapping change in a vfork child"),
+        ),
+        (
+            vec!["change", "mprotect"],
+            "shared-file vfork change=mprotect child=ok\n",
+            vfork_refusal("mprotect in a vfork child"),
+        ),
+        (
+            vec!["map-then-thread"],
+            "shared-file vfork threads=map-then-thread ok\n",
+            "unsupported KVM shared-file operation CLONE_VM/thread creation: ordinary shared-file \
+             views require one vCPU per address space"
+                .to_owned(),
+        ),
+        (
+            vec!["thread-then-map"],
+            "shared-file vfork threads=thread-then-map ok\n",
+            "unsupported KVM shared-file operation mapping publication: requires one stopped \
+             vCPU"
+                .to_owned(),
+        ),
+    ];
+    for (args, native_stdout, refusal) in cases {
+        let label = args.join("-");
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{label}"),
+            &args,
+        );
+        assert_eq!(native.status.code(), Some(0), "{label}: {native:?}");
+        assert_eq!(
+            native.stdout,
+            native_stdout.as_bytes(),
+            "{label}: {native:?}"
+        );
+        for mode in SHARED_FILE_VFORK_MODES {
+            let name = mode.0;
+            let error = match run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &args) {
+                Ok((_, code, stdout, stderr)) => panic!(
+                    "{label} mode={name}: expected the refusal, got code={code} \
+                     stdout={stdout:?} stderr={stderr:?}"
+                ),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&refusal),
+                "{label} mode={name}: expected {refusal:?} in {error:?}"
+            );
+            eprintln!("shared-file-vfork refused {label} {name}");
+        }
     }
 }
 
