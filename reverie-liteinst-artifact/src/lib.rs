@@ -1061,8 +1061,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie/src/pmu_config.rs",
-        41989,
-        "cd227f6d6b3f4d7820d6cdcc3dbf7ef542534c19d96617cfe839349dffef344f",
+        44533,
+        "516e9fd43e74a4aca895f83e78cfa106a685336b3a1f3b1d4e56416c5d518ada",
     ),
     (
         "reverie/src/in_guest_rcb.rs",
