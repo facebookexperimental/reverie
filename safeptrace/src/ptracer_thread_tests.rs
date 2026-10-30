@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
-*/
+ */
 
 #[test]
 fn explicit_ptracer_namespace_guard_requires_complete_original_self_field() {
@@ -1390,7 +1390,13 @@ async fn explicit_copied_owner_namespace_refuses_before_consuming_any_report() {
         return;
     }
     assert_eq!(nix::unistd::getpid().as_raw(), 1);
-    assert_eq!(nix::unistd::gettid().as_raw(), 2);
+    // The inner test thread is not the namespace init thread; its exact
+    // tid depends on how many threads the test runtime starts first
+    // (2 with a bare libtest harness, more with tokio), so do not pin it.
+    assert_ne!(
+        nix::unistd::gettid().as_raw(),
+        nix::unistd::getpid().as_raw()
+    );
     for forced in [false, true] {
         for realign_proc in [false, true] {
             let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
@@ -1415,7 +1421,7 @@ async fn explicit_copied_owner_namespace_refuses_before_consuming_any_report() {
             running.interrupt().unwrap();
             let mut owned = running.wait_owned_on_ptracer_thread().into_driver();
             let owner = owned.affinity.owner.as_ref().unwrap().clone();
-            assert_eq!(owner.tid.as_raw(), 2);
+            assert_eq!(owner.tid.as_raw(), nix::unistd::gettid().as_raw());
             assert!(owner.is_current().unwrap());
             assert_eq!(original.identity().unwrap().pidfd_is_live(), Ok(true));
             let (resume, capture) = if native {
@@ -1478,7 +1484,10 @@ async fn explicit_copied_owner_namespace_refuses_before_consuming_any_report() {
                                 let mut sync = sync;
                                 let mut exit = exit;
                                 let mut cleanup = cleanup;
-                                assert_eq!(nix::unistd::gettid().as_raw(), owner.tid.as_raw());
+                                // First thread spawned by the inner
+                                // namespace init: tid 2 in this namespace,
+                                // independent of the outer owner's tid.
+                                assert_eq!(nix::unistd::gettid().as_raw(), 2);
                                 assert_eq!(nix::unistd::getpid().as_raw(), owner.tgid.as_raw());
                                 assert!(
                                     owner.is_live().unwrap(),
@@ -1844,7 +1853,13 @@ async fn explicit_copied_stopped_namespace_refuses_numeric_ptrace() {
         return;
     }
     assert_eq!(nix::unistd::getpid().as_raw(), 1);
-    assert_eq!(nix::unistd::gettid().as_raw(), 2);
+    // The inner test thread is not the namespace init thread; its exact
+    // tid depends on how many threads the test runtime starts first
+    // (2 with a bare libtest harness, more with tokio), so do not pin it.
+    assert_ne!(
+        nix::unistd::gettid().as_raw(),
+        nix::unistd::getpid().as_raw()
+    );
     for forced in [false, true] {
         for realign_proc in [false, true] {
             let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
@@ -1933,7 +1948,10 @@ async fn explicit_copied_stopped_namespace_refuses_numeric_ptrace() {
                                 );
                             }
                             let proof = thread::spawn(move || {
-                                assert_eq!(nix::unistd::gettid().as_raw(), owner.tid.as_raw());
+                                // First thread spawned by the inner
+                                // namespace init: tid 2 in this namespace,
+                                // independent of the outer owner's tid.
+                                assert_eq!(nix::unistd::gettid().as_raw(), 2);
                                 assert_eq!(nix::unistd::getpid().as_raw(), owner.tgid.as_raw());
                                 assert!(owner.is_live().unwrap());
                                 assert!(!owner.is_current().unwrap());
@@ -2158,7 +2176,13 @@ async fn explicit_first_binding_uses_original_native_event_mount() {
         return;
     }
     assert_eq!(nix::unistd::getpid().as_raw(), 1);
-    assert_eq!(nix::unistd::gettid().as_raw(), 2);
+    // The inner test thread is not the namespace init thread; its exact
+    // tid depends on how many threads the test runtime starts first
+    // (2 with a bare libtest harness, more with tokio), so do not pin it.
+    assert_ne!(
+        nix::unistd::gettid().as_raw(),
+        nix::unistd::getpid().as_raw()
+    );
     for realign_proc in [false, true] {
         let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
         match pidfd_open_with_flags(tid.into(), libc::O_EXCL) {
