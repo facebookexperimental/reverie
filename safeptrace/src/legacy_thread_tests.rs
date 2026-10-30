@@ -36,10 +36,12 @@ impl Drop for LegacyThreadGroup {
     }
 }
 
+#[cfg(not(sanitized))]
 fn run_legacy_test_outer(name: &str) -> bool {
     run_legacy_test_outer_with_outcome(name, None)
 }
 
+#[cfg(not(sanitized))]
 fn run_legacy_test_outer_with_outcome(name: &str, marker: Option<&str>) -> bool {
     const INNER: &str = "SAFEPTRACE_LEGACY_THREAD_INNER";
     if env::var(INNER).as_deref() == Ok(name) {
@@ -99,6 +101,7 @@ fn spawn_legacy_thread_tracee(
     spawn_legacy_thread_tracee_with_options(pause_thread, legacy_thread_options())
 }
 
+#[cfg(not(sanitized))]
 fn legacy_thread_options() -> Options {
     Options::PTRACE_O_TRACECLONE
         | Options::PTRACE_O_TRACEEXEC
@@ -106,6 +109,7 @@ fn legacy_thread_options() -> Options {
         | Options::PTRACE_O_EXITKILL
 }
 
+#[cfg(not(sanitized))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LegacyAttachMethod {
     Traceme,
@@ -222,6 +226,7 @@ fn spawn_legacy_thread_tracee_with_method(
     (root, stopped, cleanup, force)
 }
 
+#[cfg(not(sanitized))]
 fn legacy_child_cleanup(child: &Running) -> TraceeCleanupGuard {
     let identity = child.terminal_cleanup().event.identity().unwrap().clone();
     assert_ne!(
@@ -244,6 +249,7 @@ fn legacy_child_cleanup(child: &Running) -> TraceeCleanupGuard {
 // generation alive until the test's retained wait owner reaps it. This raw
 // test stimulus checks notifier stop delivery; production cancellation never
 // substitutes a numeric signal for a retained thread lifetime descriptor.
+#[cfg(not(sanitized))]
 fn request_fixture_thread_sigstop(root: Pid, tid: crate::Pid) {
     assert_eq!(
         unsafe { libc::syscall(libc::SYS_tgkill, root.as_raw(), tid.as_raw(), libc::SIGSTOP) },
@@ -252,6 +258,7 @@ fn request_fixture_thread_sigstop(root: Pid, tid: crate::Pid) {
     );
 }
 
+#[cfg(not(sanitized))]
 fn assert_no_pending_sigstop(stopped: &Stopped) {
     for flags in [None, Some(crate::PeekSigInfoFlags::SHARED)] {
         assert!(
@@ -623,6 +630,7 @@ async fn forced_legacy_nonleader_exec_preserves_epochs_and_exact_wait_owners() {
     actual_nonleader_exec_owned_case(true).await;
 }
 
+#[cfg(not(sanitized))]
 async fn kill_legacy_family(
     parent: Stopped,
     child: Stopped,
@@ -894,6 +902,7 @@ async fn forced_legacy_detach_preserves_cancellation_and_failed_owner() {
     root_cleanup.disarm();
 }
 
+#[cfg(not(sanitized))]
 fn legacy_pipe() -> [OwnedFd; 2] {
     let mut descriptors = [-1; 2];
     assert_eq!(
