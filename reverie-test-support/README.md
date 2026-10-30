@@ -278,20 +278,43 @@ multiplicity or wrong-Tool evidence. These are command executions within the
 existing identity, without a new libtest selection or independent RPC-count
 witness.
 
-The ordinary command keeps empty arguments as its `clock_getres` mode and
-accepts exactly one `gettimeofday` argument for that shared body. All other
-argument vectors are refused before either body with exit 2, empty stdout,
-and exactly `usage: vdso-rust-command-guest [gettimeofday]\n` on stderr. This
-argument validation is new; the earlier command ignored its arguments. The
-direct `invalid` selector control checks this exact refusal using the same
-Cargo-built image. It does not exercise either body or prove Tool dispatch.
-
 Native microseconds can also end in 345, so native or Noop failure of the Rust
 gettimeofday body is not a negative control. The existing native-first C
 controls and typed missing-manifest refusal remain; their results are not
 substituted for execution of the original Rust body. No timestamps are
 compared or normalized across processes, and no wrong-Tool sensitivity is
 claimed.
+
+The original Rust `run_guest_vdso_getcpu_test` also shares its literal body
+with the ordinary command. Its inherited ptrace function still uses the
+versioned entry resolved in the parent before the fork, keeping the handle
+alive through the call. With `dbt`, the same identity additionally runs the
+ordinary image with `getcpu` through ptrace and authenticated DBT. That command
+resolves `__vdso_getcpu@LINUX_2.6` in its own address space, checks its mapping
+against `AT_SYSINFO_EHDR`, and calls the shared body. The original mapping,
+return-zero and CPU-zero assertions remain unchanged.
+
+After the body returns, the wrapper writes exactly
+`vdso-rust-getcpu-complete\n`. Both traced commands require exit 0, that whole
+26-byte stdout and empty stderr. Actual status and streams are printed before
+assertions. A real DBT child of the same image with no arguments first passes
+the unchanged quiet `clock_getres` oracle, then must fail the same getcpu
+output predicate. This checks body/route completion sensitivity, not callback
+counts or arbitrary wrong-Tool detection. A native execution of the original
+CPU-zero body can legitimately pass or fail; it is not a native success or
+Noop negative control, and no affinity is forced. Existing native C controls
+remain separate.
+
+The ordinary command keeps empty arguments as its quiet `clock_getres` mode
+and accepts exactly one `gettimeofday` or `getcpu` selector for the corresponding
+shared body. All other argument vectors are refused before any body with exit 2,
+empty stdout, and exactly
+`usage: vdso-rust-command-guest [gettimeofday|getcpu]\n` on stderr (53 bytes).
+This argument validation is new relative to the earlier fixture that ignored
+arguments. The direct `invalid` selector control checks the exact combined
+refusal using the same Cargo-built image; it does not exercise a body or prove
+Tool dispatch. Each accepted mode retains its own post-body marker and real
+passing-clock rejection predicate.
 
 The `vdso` target retains all four original ptrace function tests and shares
 their actual `LocalState` with a command fixture. The fixture resolves the

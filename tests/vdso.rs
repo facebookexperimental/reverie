@@ -75,20 +75,11 @@ mod tests {
         let getcpu = unsafe { std::mem::transmute::<*mut libc::c_void, Getcpu>(symbol) };
 
         check_fn::<LocalState, _>(move || {
-            // This function guest inherits the parent's mapping; ptrace patches
-            // the entry in place before the closure runs.
-            assert_eq!(
-                unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) } as usize,
-                vdso_base
-            );
-            let mut cpu = libc::c_uint::MAX;
-            let ret = unsafe { getcpu(&mut cpu, std::ptr::null_mut(), std::ptr::null_mut()) };
-            assert_eq!(ret, 0);
-            // NB: getcpu in vdso area always set cpu to 0.
-            // see symbol __vdso_getcpu.
-            assert_eq!(cpu, 0);
+            rust_guest::getcpu(getcpu, vdso_base);
         });
         drop(handle);
+        #[cfg(feature = "dbt")]
+        rust_getcpu_command();
     }
 
     #[test]
@@ -245,4 +236,47 @@ fn rust_gettimeofday_command() {
     )
     .unwrap();
     assert_gettimeofday_command_output("rust/gettimeofday/dbt", &output);
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn getcpu_command_output_matches(output: &reverie::process::Output) -> bool {
+    output.status == reverie::ExitStatus::Exited(0)
+        && output.stdout == b"vdso-rust-getcpu-complete\n"
+        && output.stderr.is_empty()
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn assert_getcpu_command_output(label: &str, output: &reverie::process::Output) {
+    eprintln!(
+        "vdso command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(getcpu_command_output_matches(output));
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn rust_getcpu_command() {
+    let manifest = caller_manifest();
+    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
+    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    eprintln!("vdso Rust getcpu command: image={program}");
+
+    let (output, ()) = reverie_test_support::test_cmd::<LocalState>(program, &["getcpu"]).unwrap();
+    assert_getcpu_command_output("rust/getcpu/ptrace", &output);
+
+    let (output, ()) = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
+        program,
+        &["getcpu"],
+        (),
+        &manifest,
+    )
+    .unwrap();
+    assert_getcpu_command_output("rust/getcpu/dbt", &output);
+
+    let (output, ()) =
+        reverie_test_support::test_dbt_cmd_with_config::<LocalState>(program, &[], (), &manifest)
+            .unwrap();
+    assert_command_output("rust/getcpu/control-clock_getres/dbt", &output);
+    assert!(!getcpu_command_output_matches(&output));
+    eprintln!("vdso Rust getcpu control: clock_getres rejected=true");
 }

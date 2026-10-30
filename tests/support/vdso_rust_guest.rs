@@ -32,3 +32,21 @@ pub fn gettimeofday() {
     let tod = unsafe { tod.assume_init() };
     assert_eq!(tod.tv_usec % 1000, 345);
 }
+
+pub type Getcpu =
+    unsafe extern "C" fn(*mut libc::c_uint, *mut libc::c_uint, *mut libc::c_void) -> libc::c_long;
+
+pub fn getcpu(getcpu: Getcpu, vdso_base: usize) {
+    // This function guest inherits the parent's mapping; ptrace patches
+    // the entry in place before the closure runs.
+    assert_eq!(
+        unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) } as usize,
+        vdso_base
+    );
+    let mut cpu = libc::c_uint::MAX;
+    let ret = unsafe { getcpu(&mut cpu, std::ptr::null_mut(), std::ptr::null_mut()) };
+    assert_eq!(ret, 0);
+    // NB: getcpu in vdso area always set cpu to 0.
+    // see symbol __vdso_getcpu.
+    assert_eq!(cpu, 0);
+}
