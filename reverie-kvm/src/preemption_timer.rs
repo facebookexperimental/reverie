@@ -263,10 +263,14 @@
 //!   unless an entry asks for it, and a register write since the last step
 //!   sets it again before the next.
 //!
-//! `BackendCapabilities::KVM` keeps `delivers_preemption_timer_events` false,
-//! so no Tool can rely on a timer event from this backend.
+//! `BackendCapabilities::KVM` reports `delivers_preemption_timer_events`, so a
+//! Tool may rely on the timer events this module delivers, within the limits
+//! below. A late precise event is always recorded (the canonical marker and the
+//! process-global witness count, see above) and never delivered as on time, so
+//! a Tool or host that refuses a run with a late event refuses this backend's
+//! runs exactly as it refuses reverie-ptrace's.
 //!
-//! Limits, to address before that capability is set:
+//! Limits:
 //! - Nothing checks the timer event's residency. A pinned event that the PMU
 //!   cannot schedule never kicks: a guest that makes no exit runs on, and its
 //!   next exit finds the request due, late if it is precise.
@@ -334,9 +338,9 @@
 //!   later, and recorded. A Tool that serializes
 //!   guest threads never runs such a peer. Linux's ptrace single step, which
 //!   reverie-ptrace uses, shows TF to every stepped PUSHF and decodes POPF
-//!   and IRET just as racily (`arch/x86/kernel/step.c`). Before the
-//!   capability is set, decide whether a Tool that does not serialize
-//!   threads needs byte-stable stepping.
+//!   and IRET just as racily (`arch/x86/kernel/step.c`). This backend does
+//!   not make stepping byte-stable for a Tool that does not serialize guest
+//!   threads: such a Tool sees the races of Linux's ptrace single step.
 //! - A signal sent to a running thread waits for that thread's next timer
 //!   event, syscall or fault; Linux interrupts the thread for it at once.
 //! - A timer event's callback cannot make a signal deliverable to its own

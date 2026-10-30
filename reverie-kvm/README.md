@@ -131,9 +131,10 @@ sees the trap flag a step sets; inside the window IRETQ, MOV SS and a guest
 that loads its own TF are refused by name, and `src/preemption_timer.rs` says
 how each instruction runs. An exit that finds the target passed is late,
 recorded with the skid overshoot marker, and delivered at the clock it
-found, as reverie-ptrace delivers one. The backend's capabilities keep
-`delivers_preemption_timer_events` false, so no Tool can rely on a timer event
-from this backend.
+found, as reverie-ptrace delivers one. The backend's capabilities report
+`delivers_preemption_timer_events`, so a Tool may rely on its timer events
+within the limits below; a late precise event is always recorded, never
+delivered as on time.
 
 Only a Tool callback for another event cancels a request. A fork, clone or
 vfork that the Tool does not subscribe to makes no callback on the parent, so
@@ -178,9 +179,9 @@ request adds at most one `KVM_GET_SREGS`; delivering it at a kick adds one
 pending signal delivered after it at a user instruction boundary adds one
 `KVM_GET_VCPU_EVENTS` before the delivery's own register reads and writes.
 
-The timer's remaining limits must be addressed before that capability is set.
-Nothing checks that the timer event is resident on a counter; an uncounted
-vCPU on the same host task advances an armed timer, which then kicks late;
+The timer has these known limits. Nothing checks that the timer event is
+resident on a counter; an uncounted vCPU on the same host task advances an
+armed timer, which then kicks late;
 nothing refuses PREEMPT_RT kernels or nested virtualization; the parent's
 request survives an unsubscribed fork, clone or vfork, where
 reverie-ptrace cancels it; and code that unblocks `SIGSTKFLT` on a vCPU thread
@@ -189,9 +190,11 @@ signal deliverable to its own thread, where reverie-ptrace delivers one that
 the callback sends once it returns. After a refused injection, the
 timer callback's own guest-memory and stack writes, through handles it already
 holds, still reach memory until the callback returns or suspends; the run then
-fails with the named reason. A precise event is late when the interrupt behind
-its last kick comes after the margin: at 2,000 RCBs on an EPYC 9D85, about one
-kick in a thousand on an idle host, and up to one in a hundred on a busy one.
+fails with the named reason. A precise event is late when the kick before its
+stepping window comes past its target: on an EPYC 9D85, a two-thread spin
+loop saw one or two late requests in a thousand, and staging the request
+farther short of the target did not reduce them (`src/preemption_timer.rs`;
+https://github.com/rrnewton/reverie/issues/1214).
 Every other instruction in the window costs a step of its own, with no block
 steps yet: in a release build about 3.3 microseconds under following
 placement, and about 17 under pinned placement, whose every entry also pins
@@ -205,11 +208,11 @@ ptrace single step always does) or a SYSCALL, or make the event late; one
 rewritten into a stepped POPF or IRETQ whose image sets TF has that TF dropped
 when the steps stop, instead of refused by name. An on-time event is never
 delivered at another point; a late one is delivered later, and recorded.
-Whether a Tool that does not serialize threads needs byte-stable stepping is
-to be decided first (see `src/preemption_timer.rs`). While the
-vCPU mask stays installed, a signal that code outside reverie-kvm unblocks on
-the vCPU thread does not end
-`KVM_RUN` until the mask is composed again; the mask can outlive its timer
+Stepping is not byte-stable for a Tool that does not serialize threads, which
+sees the races of Linux's ptrace single step (see `src/preemption_timer.rs`).
+While the vCPU mask stays installed, a signal that code outside reverie-kvm
+unblocks on the vCPU thread does not end `KVM_RUN` until the mask is composed
+again; the mask can outlive its timer
 event, since a binding reopened on the same thread (on another CPU under pinned
 placement, or with another raw encoding) while the request is idle or already
 due opens no new timer event and keeps the mask composed before. The existing
