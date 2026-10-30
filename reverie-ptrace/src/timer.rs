@@ -3820,6 +3820,14 @@ const TRAP_HWBKPT: i32 = 4;
 /// starts at nor executes one. The shield leaves SIGTRAP unblocked for the
 /// whole run rather than one instruction; the guest makes no syscall and
 /// takes no trap of its own before the run ends, so it cannot tell.
+///
+/// A guest `rt_sigreturn` is an `svc` (x8 = 139), so it is a stop point as
+/// well, and a run never executes one. That is the only instruction that can
+/// change the guest's signal mask without a stop where no seccomp stop
+/// reports it. So a shield that decides from the instruction at pc whether a
+/// unit can change the mask may treat a run as it treats a single step. A
+/// change that lets a run execute an `svc` must turn such a shortcut off for
+/// runs (`branch_step::tests::an_rt_sigreturn_ends_a_run_before_it`).
 #[cfg(target_arch = "aarch64")]
 fn decode_branch_run(
     task: &Stopped,

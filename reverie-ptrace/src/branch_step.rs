@@ -291,6 +291,16 @@ mod tests {
         }
     }
 
+    /// A guest `rt_sigreturn` (`mov x8, #139; svc #0`) ends a run before
+    /// its `svc`, so no run executes one. Shields that decide from the
+    /// instruction at pc whether a unit can change the guest's signal mask
+    /// rely on this for branch runs.
+    #[test]
+    fn an_rt_sigreturn_ends_a_run_before_it() {
+        let code = bytes(&[ADD, 0xd280_1168, 0xd400_0001, ADD]);
+        assert_eq!(first_stop(0x3000, &code), Some((0x3008, Stop::Other)));
+    }
+
     #[test]
     fn straight_line_instructions() {
         for insn in [
