@@ -1877,6 +1877,7 @@ dependencies = [
  "reverie-dbt",
  "reverie-ptrace",
  "serde",
+ "syscalls",
  "tempfile",
  "tracing",
 ]

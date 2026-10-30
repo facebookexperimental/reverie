@@ -29,7 +29,6 @@ use reverie::ToolConfiguration;
 use reverie::ToolProcess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
-use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie_rpc_transport::tool_activation::ExitOrigin;
 use reverie_rpc_transport::tool_activation::FinishedReceipt;
@@ -427,7 +426,10 @@ impl<T: Tool> CallerRuntime<T> {
                 return Err(crate::caller_error("caller syscall outside running phase"));
             }
             let args = unsafe { *args.cast::<[u64; 6]>() };
-            if crate::caller_effects::unsupported_operation(number, &args, false) {
+            let suppression_only = number == libc::SYS_tgkill;
+            if !suppression_only
+                && crate::caller_effects::unsupported_operation(number, &args, false)
+            {
                 return Err(crate::caller_error(
                     "caller-application-lifecycle-unsupported",
                 ));
@@ -436,15 +438,22 @@ impl<T: Tool> CallerRuntime<T> {
                 .configuration
                 .get()
                 .ok_or_else(|| crate::caller_error("caller configuration missing"))?;
-            self.observed.fetch_add(1, Ordering::Relaxed);
-            self.branches.store(branches, Ordering::Relaxed);
-            let syscall = raw_syscall(number, args)?;
-            if !config
+            let selected = config
                 .selected
                 .subscriptions()
                 .iter_syscalls()
-                .any(|selected| selected == syscall.number())
-            {
+                .any(|selected| selected.id() as i64 == number);
+            // An unselected Tgkill must never reach descriptor protection or
+            // native forwarding. Keep refused operations out of these counters.
+            if suppression_only && !selected {
+                return Err(crate::caller_error(
+                    "caller-application-lifecycle-unsupported",
+                ));
+            }
+            self.observed.fetch_add(1, Ordering::Relaxed);
+            self.branches.store(branches, Ordering::Relaxed);
+            let syscall = raw_syscall(number, args)?;
+            if !selected {
                 if let Some(value) =
                     crate::sync_rpc::protect_guest_operation(context, invoke, number, &args, false)
                 {
@@ -487,6 +496,11 @@ impl<T: Tool> CallerRuntime<T> {
                     Ok(1)
                 }
                 crate::CallerSyscallOutcome::ExecuteOriginal(call) => {
+                    if suppression_only {
+                        return Err(crate::caller_error(
+                            "caller-suppression-only-forwarding-unsupported",
+                        ));
+                    }
                     self.rewritten.fetch_add(1, Ordering::Relaxed);
                     unsafe { crate::write_deferred_syscall(call, deferred_number, deferred_args) };
                     Ok(2)

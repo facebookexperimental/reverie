@@ -746,3 +746,231 @@ fn native_notifications_do_not_repeat_consumption_or_invent_status() {
     assert!(!caller.contains("runtime_ready_for_image"));
     assert!(!caller.contains("reverie_dbt_runtime_signal_event"));
 }
+
+fn check_suppression_only_boundaries(native: &str, runtime: &str, driver: &str) {
+    check_refusal_symbols(native, CALLER_EFFECTS);
+    let pre = between(
+        native,
+        "static bool pre_syscall(void* drcontext, int sysnum) {",
+        "static void compare_exchange_increment_many(",
+    );
+    let dispatch = pre
+        .split_once("capture_observe_lifecycle(sysnum, args);")
+        .unwrap()
+        .0;
+    assert!(dispatch.contains(
+        "(sysnum != SYS_tgkill &&\n        caller_unsupported_operation(sysnum, args, false))"
+    ));
+    ordered(
+        dispatch,
+        &[
+            "!caller_live_context(drcontext, counters, true)",
+            "sysnum != SYS_tgkill",
+            "caller_unsupported_operation(sysnum, args, false)",
+            "caller application operation refused before effect (%d)",
+            "exit_runtime_tree(101);",
+            "return false;",
+        ],
+    );
+    let suppress = between(pre, "  if (action == 1) {", "  if (action == 2) {");
+    ordered(
+        suppress,
+        &[
+            "dr_syscall_set_result(drcontext, (reg_t)result);",
+            "return false;",
+        ],
+    );
+    for effect in ["prepare_", "invoke_syscall(", "dr_syscall_set_sysnum("] {
+        assert!(!suppress.contains(effect));
+    }
+    let deferred = between(pre, "  if (action == 2) {", "  /* A declined call");
+    assert!(deferred.contains("if (caller_mode() && sysnum == SYS_tgkill &&\n        counters->caller_terminal_state == CALLER_NOT_ENDING)"));
+    ordered(
+        deferred,
+        &[
+            "sysnum == SYS_tgkill",
+            "counters->caller_terminal_state == CALLER_NOT_ENDING",
+            "caller suppression-only forwarding refused before effect",
+            "exit_runtime_tree(101);",
+            "return false;",
+            "caller_unsupported_operation(deferred_sysnum, deferred_args, false)",
+            "caller deferred operation refused before effect",
+            "exit_runtime_tree(101);",
+            "return false;",
+            "sysnum = (int)deferred_sysnum;",
+            "memcpy(args, deferred_args, sizeof(args));",
+            "!caller_terminal_matches(drcontext, counters, deferred_sysnum, args, 2)",
+            "runtime replaced an established terminal reservation",
+            "capture_observe_lifecycle(sysnum, args);",
+            "dr_syscall_set_sysnum(drcontext, sysnum);",
+            "prepare_caller_terminal_forward(drcontext, counters, sysnum, args, 2)",
+            "protect_evidence_socket_syscall(",
+            "preserve_internal_descriptors(",
+            "prepare_original_task_syscall(",
+        ],
+    );
+    let original = pre.split_once("  /* A declined call").unwrap().1;
+    ordered(
+        original,
+        &[
+            "if (caller_mode() && caller_unsupported_operation(sysnum, args, false))",
+            "caller application operation refused before effect (%d)",
+            "exit_runtime_tree(101);",
+            "return false;",
+            "prepare_caller_terminal_forward(drcontext, counters, sysnum, args, 1)",
+            "complete_runtime_thread_exit(",
+            "prepare_original_task_syscall(",
+            "return execute;",
+        ],
+    );
+    let runtime = between(
+        runtime,
+        "    pub unsafe fn pre_syscall(",
+        "    unsafe fn attachment",
+    );
+    ordered(
+        runtime,
+        &[
+            "self.attachment(counters, context, pid, tid, image)",
+            "attachment.phase != Phase::Running",
+            "let suppression_only = number == libc::SYS_tgkill;",
+            "if !suppression_only",
+            "crate::caller_effects::unsupported_operation(number, &args, false)",
+            "caller-application-lifecycle-unsupported",
+            "let config = self",
+            "let selected = config",
+            ".any(|selected| selected.id() as i64 == number)",
+            "if suppression_only && !selected",
+            "caller-application-lifecycle-unsupported",
+            "self.observed.fetch_add",
+            "let syscall = raw_syscall(number, args)?;",
+            "if !selected",
+            "crate::sync_rpc::protect_guest_operation(",
+            "crate::run_caller_syscall_with_guest(",
+        ],
+    );
+    let execute = between(
+        runtime,
+        "crate::CallerSyscallOutcome::ExecuteOriginal(call) => {",
+        "crate::CallerSyscallOutcome::Terminal(fact) => {",
+    );
+    ordered(
+        execute,
+        &[
+            "if suppression_only",
+            "caller-suppression-only-forwarding-unsupported",
+            "self.rewritten.fetch_add",
+            "crate::write_deferred_syscall(",
+        ],
+    );
+    let driver = between(
+        driver,
+        "pub fn run_caller_syscall_with_guest<T: Tool>(",
+        "fn protect_tool_syscall(",
+    );
+    ordered(
+        driver,
+        &[
+            "reverie::CallbackDecision::Established(fact)",
+            "return Ok(CallerSyscallOutcome::Terminal(fact));",
+            "reverie::CallbackDecision::Deferred { number, args }",
+            "if matches!(syscall, Syscall::Tgkill(_))",
+            "caller-suppression-only-forwarding-unsupported",
+            "let number = reverie::syscalls::Sysno::from(",
+            "let syscall = Syscall::from_raw(",
+            "match protect_tool_syscall(",
+        ],
+    );
+}
+
+#[test]
+fn tgkill_suppression_dispatch_and_final_effect_boundaries_are_exact() {
+    check_suppression_only_boundaries(
+        NATIVE,
+        include_str!("../src/caller_runtime.rs"),
+        include_str!("../src/lib.rs"),
+    );
+}
+
+#[test]
+fn suppression_boundary_controls_reject_forwarding_and_widening_mutations() {
+    let runtime = include_str!("../src/caller_runtime.rs");
+    let driver = include_str!("../src/lib.rs");
+    check_suppression_only_boundaries(NATIVE, runtime, driver);
+    let refused = |native: &str, runtime: &str, driver: &str| {
+        assert!(
+            std::panic::catch_unwind(|| check_suppression_only_boundaries(native, runtime, driver))
+                .is_err()
+        );
+    };
+    let original_start = NATIVE.find("  /* A declined call").unwrap();
+    let guard_start = original_start
+        + NATIVE[original_start..]
+            .find("  if (caller_mode()")
+            .unwrap();
+    let guard_end = guard_start + NATIVE[guard_start..].find("\n  }\n").unwrap() + "\n  }\n".len();
+    let original_guard = &NATIVE[guard_start..guard_end];
+    let removed = NATIVE.replacen(original_guard, "", 1);
+    refused(&removed, runtime, driver);
+    let marker = "  bool execute = prepare_original_task_syscall(\n      drcontext, counters, sysnum, args, false);";
+    assert_eq!(removed.matches(marker).count(), 1);
+    let late = removed.replacen(marker, &format!("{marker}\n{original_guard}"), 1);
+    refused(&late, runtime, driver);
+
+    let deferred_start = NATIVE
+        .find("    if (caller_mode() && sysnum == SYS_tgkill &&")
+        .unwrap();
+    let deferred_end =
+        deferred_start + NATIVE[deferred_start..].find("\n    }\n").unwrap() + "\n    }\n".len();
+    let deferred_guard = &NATIVE[deferred_start..deferred_end];
+    let removed = NATIVE.replacen(deferred_guard, "", 1);
+    refused(&removed, runtime, driver);
+    let late = removed.replacen(
+        "    sysnum = (int)deferred_sysnum;",
+        &format!("    sysnum = (int)deferred_sysnum;\n{deferred_guard}"),
+        1,
+    );
+    refused(&late, runtime, driver);
+    let widened = NATIVE.replacen(
+        "sysnum != SYS_tgkill &&",
+        "sysnum != SYS_tgkill && sysnum != SYS_kill &&",
+        1,
+    );
+    refused(&widened, runtime, driver);
+    let widened = runtime.replacen(
+        "number == libc::SYS_tgkill;",
+        "matches!(number, libc::SYS_tgkill | libc::SYS_kill);",
+        1,
+    );
+    refused(NATIVE, &widened, driver);
+    let suppress = between(NATIVE, "  if (action == 1) {", "  if (action == 2) {");
+    let fallthrough = NATIVE.replacen(suppress, &suppress.replacen("    return false;", "", 1), 1);
+    refused(&fallthrough, runtime, driver);
+
+    let early = "                if matches!(syscall, Syscall::Tgkill(_)) {\n                    return Err(caller_error(\n                        \"caller-suppression-only-forwarding-unsupported\",\n                    ));\n                }";
+    assert_eq!(driver.matches(early).count(), 1);
+    let removed = driver.replacen(early, "", 1);
+    refused(NATIVE, runtime, &removed);
+    let original_start = runtime
+        .find("                crate::CallerSyscallOutcome::ExecuteOriginal(call) => {")
+        .unwrap();
+    let guard = between(
+        &runtime[original_start..],
+        "                    if suppression_only {",
+        "                    self.rewritten.fetch_add",
+    );
+    let removed = runtime.replacen(
+        &format!("                    if suppression_only {{{guard}"),
+        "",
+        1,
+    );
+    refused(NATIVE, &removed, driver);
+    let unselected = "            if suppression_only && !selected {\n                return Err(crate::caller_error(\n                    \"caller-application-lifecycle-unsupported\",\n                ));\n            }";
+    assert_eq!(runtime.matches(unselected).count(), 1);
+    let late = runtime.replacen(unselected, "", 1).replacen(
+        "            self.observed.fetch_add(1, Ordering::Relaxed);",
+        &format!("            self.observed.fetch_add(1, Ordering::Relaxed);\n{unselected}"),
+        1,
+    );
+    refused(NATIVE, &late, driver);
+}

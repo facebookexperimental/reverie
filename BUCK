@@ -226,6 +226,7 @@ rust_library(
                 {"name": "inject_then_tail", "path": "../tests/inject_then_tail.rs"},
                 {"name": "at_random", "path": "../tests/at_random.rs"},
                 {"name": "stack", "path": "../tests/stack.rs"},
+                {"name": "suppression", "path": "../tests/suppression.rs"},
                 {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
             ],
             "bin": [
@@ -272,6 +273,12 @@ rust_library(
                 "test": False,
                 "bench": False,
                 "required-features": ["dbt"],
+            }, {
+                "name": "suppression-rust-command-guest",
+                "path": "../tests/fixtures/suppression-rust-command.rs",
+                "test": False,
+                "bench": False,
+                "required-features": ["dbt"],
             }],
             "dependencies_override": {
                 "dependencies": {
@@ -304,6 +311,7 @@ rust_library(
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:syscalls",
         ":reverie",
         ":reverie-ptrace",
     ],
@@ -438,6 +446,24 @@ rust_unittest(
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
+        ":reverie",
+        ":reverie-ptrace",
+        ":reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "generic-suppression",
+    srcs = [
+        "tests/suppression.rs",
+        "tests/support/suppression_rust_guest.rs",
+        "tests/tool_fixtures/suppression.rs",
+    ],
+    crate_root = "tests/suppression.rs",
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:syscalls",
         ":reverie",
         ":reverie-ptrace",
         ":reverie-test-support",

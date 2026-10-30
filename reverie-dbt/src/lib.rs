@@ -2265,6 +2265,14 @@ pub fn run_caller_syscall_with_guest<T: Tool>(
                 return Ok(CallerSyscallOutcome::Terminal(fact));
             }
             reverie::CallbackDecision::Deferred { number, args } => {
+                // Tgkill is admitted only for a completed Tool answer. Refuse
+                // before descriptor protection can execute a rewritten call.
+                // Established terminal owners were handled above.
+                if matches!(syscall, Syscall::Tgkill(_)) {
+                    return Err(caller_error(
+                        "caller-suppression-only-forwarding-unsupported",
+                    ));
+                }
                 let number = reverie::syscalls::Sysno::from(
                     i32::try_from(number)
                         .map_err(|_| caller_error("caller deferred an invalid syscall"))?,

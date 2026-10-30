@@ -410,3 +410,44 @@ before using addresses, while DBT guards own their arena. The bad sibling expect
 ptrace's single-live-checkout invariant; DBT uses independent arenas. Neither is
 ported to DBT here.
 
+## Original Rust Tgkill suppression guest
+
+The `suppression` target retains `tests::suppress_tgkill`: raw PID/TID reads,
+100 `tgkill(SIGTERM)` calls and an exact `Ok(0)` assertion for every call. Its
+shared Tool intentionally adds one awaited unit RPC before each suppressed
+answer. The original ptrace function route and the ordinary Rust command routes
+check the actual returned global count is 100. The function helper also retains
+its exit-zero check; only the command helpers expose raw child streams.
+
+With the `dbt` feature, the same Cargo ordinary image runs under ptrace and the
+`suppression-tgkill` caller. The positive expectation remains exit zero, empty
+child streams and count 100. The same original test runs without the feature
+under ptrace. A separate missing-manifest test requires a typed NotFound error;
+an authenticated basics Noop caller must refuse the same image with actual
+child status 101 and the exact Tgkill tail-injection diagnostic. Failed-launch
+capture retains actual optional status and streams without inventing state.
+The feature/default listings contain three/one identities. The original
+SIGTERM guest is not an ordinary native-success control.
+
+The count witnesses Tool/RPC participation; it alone does not prove absence of
+native signal effects. The selected Tool may complete a Tgkill answer, while
+unselected forwarding, returning Tgkill injection and tail/deferred Tgkill
+remain refused. **Original Tgkill rewritten to any nonterminal deferred call,
+even an otherwise safe call, is also unsupported.** The early caller guard
+runs before protected-descriptor rewrites can execute. Supported independent
+returning injections followed by suppression and existing admitted terminal
+owners retain their behavior. This is suppression conformance, not general
+signal or full ptrace parity; no signal validation/delivery policy is added.
+Synthetic caller tests distinguish guest-operation effects from real RPC I/O,
+and source guards bind the native action boundaries. These controls do not
+claim a physical signal-delivery or pending-signal measurement.
+
+The caller artifact is produced with
+`reverie-dbt/scripts/build-client.sh --caller-manifest tests/fixtures/suppression-dbt-runtime/Cargo.toml --profile debug --jobs 8 --check`
+before its feature tests, matching `validate.sh` and both CI jobs.
+
+The wrong-Tool control additionally requires the maintained
+`tests/fixtures/basics-noop-dbt-runtime/Cargo.toml` producer, already included in
+those validation routes. Both helpers explicitly install `reverie=trace` even
+when `RUST_LOG` is unset. Focused validate-profile evidence does not establish
+full workspace validation, CI or debug-profile route execution.

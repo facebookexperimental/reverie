@@ -30,6 +30,7 @@ use reverie::Subscription;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::SyscallInfo;
 use reverie_rpc_transport::ConnectionMonitor;
 use reverie_rpc_transport::RpcIssueMonitor;
 use reverie_rpc_transport::RpcServer;
@@ -55,6 +56,20 @@ const ASYNC_CASES: [&str; 8] = [
     "application-exit-ready-err-mismatch",
     "application-exit-group-ready-ok-mismatch",
 ];
+const SUPPRESSION_CASES: [&str; 11] = [
+    "tgkill-suppress",
+    "tgkill-arbitrary",
+    "tgkill-unselected",
+    "tgkill-returning-caught",
+    "tgkill-tail",
+    "getpid-tail-tgkill",
+    "tgkill-deferred-getpid",
+    "tgkill-deferred-primary-close",
+    "tgkill-deferred-primary-range",
+    "tgkill-safe-returning",
+    "tgkill-terminal",
+];
+const TGKILL_ARGS: [u64; 6] = [0, u64::MAX, 999, 17, 34, 51];
 static EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 static DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SELECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -109,12 +124,49 @@ impl AsyncInjection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Suppression {
+    Zero,
+    Arbitrary,
+    Unselected,
+    ReturningCaught,
+    Tail,
+    SafeOriginal,
+    DeferredGetpid,
+    DeferredClose,
+    DeferredRange,
+    SafeReturning,
+    Terminal,
+}
+impl Suppression {
+    fn for_case(case: &str) -> Option<Self> {
+        Some(match case {
+            "tgkill-suppress" => Self::Zero,
+            "tgkill-arbitrary" => Self::Arbitrary,
+            "tgkill-unselected" => Self::Unselected,
+            "tgkill-returning-caught" => Self::ReturningCaught,
+            "tgkill-tail" => Self::Tail,
+            "getpid-tail-tgkill" => Self::SafeOriginal,
+            "tgkill-deferred-getpid" => Self::DeferredGetpid,
+            "tgkill-deferred-primary-close" => Self::DeferredClose,
+            "tgkill-deferred-primary-range" => Self::DeferredRange,
+            "tgkill-safe-returning" => Self::SafeReturning,
+            "tgkill-terminal" => Self::Terminal,
+            _ => return None,
+        })
+    }
+    fn suppresses(self) -> bool {
+        matches!(self, Self::Zero | Self::Arbitrary | Self::SafeReturning)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Config {
     seed: u64,
     label: String,
     instructions: u8,
     async_injection: Option<AsyncInjection>,
+    suppression: Option<Suppression>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -124,6 +176,7 @@ enum Request {
     ThreadExit,
     ProcessExit,
     AfterFinished,
+    Suppression,
 }
 
 impl Request {
@@ -137,6 +190,7 @@ impl Request {
             Self::ThreadExit => "remote-thread-exit",
             Self::ProcessExit => "remote-process-exit",
             Self::AfterFinished => panic!("RPC escaped the finished primary"),
+            Self::Suppression => "remote-suppression",
         }
     }
 }
@@ -174,6 +228,10 @@ impl GlobalTool for RemoteGlobal {
 struct State {
     tid: i32,
     stamp: u64,
+    primary: Option<i32>,
+    original: Option<(i64, [u64; 6])>,
+    requested: Option<(i64, [u64; 6])>,
+    injection_count: Option<u64>,
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -289,6 +347,104 @@ fn exercise_async_injection<G: Guest<Probe>>(
     }
 }
 
+fn syscall_parts(syscall: Syscall) -> (i64, [u64; 6]) {
+    let (number, args) = syscall.into_parts();
+    (
+        number.id() as i64,
+        [
+            args.arg0 as u64,
+            args.arg1 as u64,
+            args.arg2 as u64,
+            args.arg3 as u64,
+            args.arg4 as u64,
+            args.arg5 as u64,
+        ],
+    )
+}
+fn requested_call<G: Guest<Probe>>(guest: &mut G, number: Sysno, args: [u64; 6]) -> Syscall {
+    guest.thread_state_mut().requested = Some((number.id() as i64, args));
+    Syscall::from_raw(
+        number,
+        SyscallArgs::new(
+            args[0] as usize,
+            args[1] as usize,
+            args[2] as usize,
+            args[3] as usize,
+            args[4] as usize,
+            args[5] as usize,
+        ),
+    )
+}
+
+async fn exercise_suppression_callback<G: Guest<Probe>>(
+    guest: &mut G,
+    syscall: Syscall,
+    mode: Suppression,
+) -> Result<i64, Error> {
+    check_config(guest.config());
+    assert_eq!(guest.thread_state().stamp, SEED + 3);
+    event("syscall");
+    guest.thread_state_mut().stamp += 4;
+    guest.thread_state_mut().original = Some(syscall_parts(syscall));
+    let _drop = CallbackDrop;
+    if mode.suppresses() {
+        assert_eq!(
+            guest.send_rpc(Request::Suppression).await,
+            Request::Suppression.response()
+        );
+    }
+    match mode {
+        Suppression::Zero | Suppression::Arbitrary => {}
+        Suppression::ReturningCaught => {
+            let call = requested_call(guest, Sysno::tgkill, TGKILL_ARGS);
+            assert_eq!(guest.inject(call).await, Err(Errno::EOPNOTSUPP));
+        }
+        Suppression::Tail | Suppression::SafeOriginal => {
+            let call = requested_call(guest, Sysno::tgkill, TGKILL_ARGS);
+            pending(guest.tail_inject(call));
+        }
+        Suppression::DeferredGetpid => {
+            let call = requested_call(guest, Sysno::getpid, [0; 6]);
+            // Snapshot before the nonreturning tail; the common snapshot below
+            // is unreachable. Await it so the callback stays Pending, not Ready(Ok(0)).
+            let count = guest.injected_syscalls();
+            guest.thread_state_mut().injection_count = count;
+            guest.tail_inject(call).await
+        }
+        Suppression::DeferredClose | Suppression::DeferredRange => {
+            let fd = guest.thread_state().primary.unwrap();
+            assert!(crate::sync_rpc::is_runtime_owned_fd(fd));
+            let (number, args) = if mode == Suppression::DeferredClose {
+                (Sysno::close, [fd as u64, 0, 0, 0, 0, 0])
+            } else {
+                // A nonempty gap follows the actual primary. The invoker
+                // records a regressed gap without closing any Rust-owned FD.
+                (Sysno::close_range, [fd as u64, fd as u64 + 1, 0, 0, 0, 0])
+            };
+            let call = requested_call(guest, number, args);
+            let count = guest.injected_syscalls();
+            guest.thread_state_mut().injection_count = count;
+            guest.tail_inject(call).await
+        }
+        Suppression::SafeReturning => {
+            let call = requested_call(guest, Sysno::getpid, [0; 6]);
+            assert_eq!(guest.inject(call).await, Ok(317));
+        }
+        Suppression::Terminal => {
+            let call = requested_call(guest, Sysno::exit_group, FINAL_ARGS);
+            guest.tail_inject(call).await
+        }
+        Suppression::Unselected => panic!("unselected Tgkill reached the Tool"),
+    }
+    let count = guest.injected_syscalls();
+    guest.thread_state_mut().injection_count = count;
+    Ok(if mode == Suppression::Arbitrary {
+        917
+    } else {
+        0
+    })
+}
+
 fn check_config(config: &Config) {
     assert_eq!(config.seed, SEED);
     assert_eq!(config.label, "received-config");
@@ -312,6 +468,12 @@ impl Tool for Probe {
         event("select");
         let mut selected = Subscription::none();
         selected.syscall(Sysno::getpid);
+        if config
+            .suppression
+            .is_some_and(|mode| mode != Suppression::Unselected)
+        {
+            selected.syscall(Sysno::tgkill);
+        }
         if config.instructions & 1 != 0 {
             selected.cpuid();
         }
@@ -340,6 +502,7 @@ impl Tool for Probe {
         State {
             tid: tid.as_raw(),
             stamp: SEED,
+            ..State::default()
         }
     }
 
@@ -376,6 +539,9 @@ impl Tool for Probe {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
+        if let Some(mode) = guest.config().suppression {
+            return exercise_suppression_callback(guest, syscall, mode).await;
+        }
         assert_eq!(syscall.number(), Sysno::getpid);
         check_config(guest.config());
         assert_eq!(guest.thread_state().stamp, SEED + 3);
@@ -472,6 +638,13 @@ impl Frames {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Invocation {
+    number: i64,
+    args: [u64; 6],
+    purpose: u32,
+}
+
 /// Only this context/filter/reservation is synthetic. Transport calls below
 /// execute real Linux socket I/O. No exit or lifecycle syscall is executed.
 #[derive(Default)]
@@ -484,6 +657,9 @@ struct NativeFixture {
     register_reads: Cell<usize>,
     sent: RefCell<Frames>,
     received: RefCell<Frames>,
+    probing_suppression: Cell<bool>,
+    guest_invocations: RefCell<Vec<Invocation>>,
+    transport_invocations: RefCell<Vec<Invocation>>,
 }
 impl NativeFixture {
     fn context(&self) -> usize {
@@ -515,6 +691,21 @@ unsafe extern "C" fn invoke(context: usize, number: i64, args: *const u64, purpo
         event("unit-filter-probe");
         return 0; // Unit native-admission fixture, never a host filter claim.
     }
+    let invocation = Invocation {
+        number,
+        args,
+        purpose,
+    };
+    if fixture.probing_suppression.get()
+        && (matches!(
+            number,
+            libc::SYS_tgkill | libc::SYS_getpid | libc::SYS_close_range
+        ) || number == libc::SYS_close && Some(args[0] as i32) == fixture.primary.get())
+    {
+        fixture.guest_invocations.borrow_mut().push(invocation);
+        return 317;
+    }
+    fixture.transport_invocations.borrow_mut().push(invocation);
     assert!(matches!(
         number,
         libc::SYS_socket
@@ -871,6 +1062,7 @@ fn exercise(case: &str) {
             _ => 0,
         },
         async_injection: AsyncInjection::for_case(case),
+        suppression: Suppression::for_case(case),
     };
     fixture.async_injection.set(config.async_injection);
     let run = ActivationRun::new();
@@ -1017,9 +1209,28 @@ fn exercise(case: &str) {
     let mut deferred_args = [0xa5; 6];
     let number = if case == "original" {
         libc::SYS_exit_group
+    } else if config
+        .suppression
+        .is_some_and(|mode| mode != Suppression::SafeOriginal)
+    {
+        libc::SYS_tgkill
     } else {
         libc::SYS_getpid
     };
+    let args = if config.suppression.is_some() {
+        TGKILL_ARGS
+    } else {
+        FINAL_ARGS
+    };
+    if config.suppression.is_some() {
+        let fd = fixture
+            .primary
+            .get()
+            .expect("actual primary connected during admission");
+        assert!(crate::sync_rpc::is_runtime_owned_fd(fd));
+        attachment.state.as_mut().unwrap().primary = Some(fd);
+        fixture.probing_suppression.set(true);
+    }
     let before_callback = events();
     let before_calls = fixture.calls.get();
     let before_registers = fixture.register_reads.get();
@@ -1031,7 +1242,7 @@ fn exercise(case: &str) {
             pid().as_raw(),
             1,
             number,
-            FINAL_ARGS.as_ptr(),
+            args.as_ptr(),
             41,
             &mut result,
             &mut deferred_number,
@@ -1042,6 +1253,190 @@ fn exercise(case: &str) {
             read_memory,
         )
     };
+    fixture.probing_suppression.set(false);
+    if let Some(mode) = config
+        .suppression
+        .filter(|mode| *mode != Suppression::Terminal)
+    {
+        let attachment = unsafe {
+            runtime
+                .attachment(
+                    &mut counters,
+                    fixture.context(),
+                    pid().as_raw(),
+                    pid().as_raw(),
+                    1,
+                )
+                .unwrap()
+        };
+        let state = attachment.state.as_ref().unwrap();
+        let diagnostics = DIAGNOSTICS.lock().unwrap().clone();
+        println!(
+            "CallerRuntime suppression: case={case}; action={action}; result={result}; deferred={deferred_number}/{deferred_args:?}; original={:?}; requested={:?}; primary={:?}; injected={:?}; guest_invocations={:?}; transport_invocations={:?}; remote_calls={}; observed={}; rewritten={}; ending={:?}; refusal={:?}; diagnostics={diagnostics:?}; events={:?}",
+            state.original,
+            state.requested,
+            state.primary,
+            state.injection_count,
+            fixture.guest_invocations.borrow(),
+            fixture.transport_invocations.borrow(),
+            server.global.calls.load(Ordering::SeqCst),
+            runtime.observed.load(Ordering::Relaxed),
+            runtime.rewritten.load(Ordering::Relaxed),
+            attachment.effects.ending(),
+            attachment.effects.refusal(),
+            events()
+        );
+        assert_eq!(deferred_number, -4321);
+        assert_eq!(deferred_args, [0xa5; 6]);
+        assert!(fixture.reservation.get().is_none());
+        assert!(attachment.effects.ending().is_none());
+        assert_eq!(fixture.admissions.get(), 0);
+        assert_eq!(fixture.register_reads.get(), before_registers);
+        assert_eq!(
+            runtime.observed.load(Ordering::Relaxed),
+            u64::from(mode != Suppression::Unselected)
+        );
+        assert_eq!(
+            runtime.rewritten.load(Ordering::Relaxed),
+            u64::from(mode.suppresses())
+        );
+        assert_eq!(
+            state.original,
+            if mode == Suppression::Unselected {
+                None
+            } else {
+                Some((number, args))
+            }
+        );
+        assert_eq!(
+            state.stamp,
+            if mode == Suppression::Unselected {
+                SEED + 3
+            } else {
+                SEED + 7
+            }
+        );
+        let expected_request = match mode {
+            Suppression::ReturningCaught | Suppression::Tail | Suppression::SafeOriginal => {
+                Some((libc::SYS_tgkill, TGKILL_ARGS))
+            }
+            Suppression::DeferredGetpid | Suppression::SafeReturning => {
+                Some((libc::SYS_getpid, [0; 6]))
+            }
+            Suppression::DeferredClose => Some((
+                libc::SYS_close,
+                [state.primary.unwrap() as u64, 0, 0, 0, 0, 0],
+            )),
+            Suppression::DeferredRange => Some((
+                libc::SYS_close_range,
+                [
+                    state.primary.unwrap() as u64,
+                    state.primary.unwrap() as u64 + 1,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )),
+            _ => None,
+        };
+        assert_eq!(state.requested, expected_request);
+        assert_eq!(
+            state.injection_count,
+            if mode == Suppression::Unselected {
+                None
+            } else {
+                Some(u64::from(matches!(
+                    mode,
+                    Suppression::ReturningCaught | Suppression::SafeReturning
+                )))
+            }
+        );
+        let expected_invocations = if mode == Suppression::SafeReturning {
+            vec![Invocation {
+                number: libc::SYS_getpid,
+                args: [0; 6],
+                purpose: InjectionPurpose::Application as u32,
+            }]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(*fixture.guest_invocations.borrow(), expected_invocations);
+        // Real startup/callback RPC socket I/O is deliberately not counted as
+        // execution of the suppressed or refused application operation.
+        assert!(!fixture.transport_invocations.borrow().is_empty());
+        assert_eq!(
+            server.global.calls.load(Ordering::SeqCst),
+            if mode.suppresses() { 3 } else { 2 }
+        );
+        let reason = match mode {
+            Suppression::Unselected => Some("caller-application-lifecycle-unsupported"),
+            Suppression::ReturningCaught => Some("caller-returning-lifecycle-unsupported"),
+            Suppression::Tail | Suppression::SafeOriginal => {
+                Some("caller-tail-lifecycle-unsupported")
+            }
+            Suppression::DeferredGetpid
+            | Suppression::DeferredClose
+            | Suppression::DeferredRange => Some("caller-suppression-only-forwarding-unsupported"),
+            _ => None,
+        };
+        let latched = match mode {
+            Suppression::ReturningCaught | Suppression::Tail | Suppression::SafeOriginal => reason,
+            _ => None,
+        };
+        assert_eq!(attachment.effects.refusal(), latched);
+        if let Some(reason) = reason {
+            assert_eq!(action, -1);
+            assert_eq!(result, -1234);
+            assert_eq!(diagnostics, [format!("reverie-dbt: {reason}\n")]);
+        } else {
+            assert_eq!(action, 1);
+            assert_eq!(
+                result,
+                if mode == Suppression::Arbitrary {
+                    917
+                } else {
+                    0
+                }
+            );
+            assert!(diagnostics.is_empty());
+        }
+        assert_eq!(
+            events()[before_callback.len()..]
+                .iter()
+                .filter(|e| **e == "syscall")
+                .count(),
+            usize::from(mode != Suppression::Unselected)
+        );
+        assert_eq!(
+            events()[before_callback.len()..]
+                .iter()
+                .filter(|e| **e == "callback-drop")
+                .count(),
+            usize::from(mode != Suppression::Unselected)
+        );
+        assert!(!events().contains(&"thread-exit") && !events().contains(&"finished"));
+        assert!(run.completed().is_err());
+        // These rows stop at one nonterminal callback outcome. Dispose only
+        // the fixture-owned attachment; do not invent a consuming completion.
+        unsafe {
+            drop(Box::from_raw(
+                counters.runtime_state.cast::<RootAttachment<Probe>>(),
+            ));
+        }
+        counters.runtime_state = std::ptr::null_mut();
+        assert!(counters.runtime_state.is_null());
+        fixture.shutdown();
+        server.finish();
+        println!(
+            "CallerRuntime suppression closed: case={case}; issues={:?}; completed={:?}",
+            server.issues.snapshot(),
+            run.completed()
+        );
+        assert!(!events().contains(&"finished"));
+        assert!(run.completed().is_err());
+        return;
+    }
     let fact = if case == "original" {
         assert_eq!(action, 0);
         assert_eq!(deferred_number, -4321);
@@ -1311,6 +1706,7 @@ fn caller_runtime_protocol() {
                     | "missing-fatal"
                     | "missing-finished"
             ) || ASYNC_CASES.contains(&case)
+                || SUPPRESSION_CASES.contains(&case)
         );
         exercise(case);
         println!("{WITNESS}:{case}");
@@ -1331,6 +1727,7 @@ fn caller_runtime_protocol() {
     ]
     .into_iter()
     .chain(ASYNC_CASES)
+    .chain(SUPPRESSION_CASES)
     {
         let directory = tempfile::tempdir().unwrap();
         let dirfd = std::fs::File::open(directory.path()).unwrap();
@@ -1359,6 +1756,9 @@ fn caller_runtime_protocol() {
             std::thread::sleep(Duration::from_millis(5));
         }
         let output = child.0.take().unwrap().wait_with_output().unwrap();
+        if SUPPRESSION_CASES.contains(&case) {
+            println!("CallerRuntime {case} actual output: {output:?}");
+        }
         assert!(output.status.success(), "CallerRuntime {case}: {output:?}");
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(

@@ -6588,9 +6588,12 @@ static bool pre_syscall(void* drcontext, int sysnum) {
   for (i = 0; i != 6; ++i)
     args[i] = (uint64_t)dr_syscall_get_param(drcontext, i);
 
+  /* Only a selected Tool may answer Tgkill. Native execution remains refused
+   * at the returning bridge and the final action boundaries below. */
   if (caller_mode() &&
       (!caller_live_context(drcontext, counters, true) ||
-       caller_unsupported_operation(sysnum, args, false))) {
+       (sysnum != SYS_tgkill &&
+        caller_unsupported_operation(sysnum, args, false)))) {
     dr_fprintf(diagnostic_file,
                "reverie-dbt: caller application operation refused before effect (%d)\n",
                sysnum);
@@ -6821,6 +6824,16 @@ static bool pre_syscall(void* drcontext, int sysnum) {
     uint64_t clone_flags = 0;
     uint64_t clone_ctid = 0;
     int i;
+    /* Check the original operation before replacing sysnum/args or protecting
+     * descriptors. An existing terminal owner still requires the exact match
+     * and once-only preparation below. */
+    if (caller_mode() && sysnum == SYS_tgkill &&
+        counters->caller_terminal_state == CALLER_NOT_ENDING) {
+      dr_fprintf(diagnostic_file,
+                 "reverie-dbt: caller suppression-only forwarding refused before effect\n");
+      exit_runtime_tree(101);
+      return false;
+    }
     if (caller_mode() &&
         caller_unsupported_operation(deferred_sysnum, deferred_args, false)) {
       dr_fprintf(diagnostic_file,
@@ -6864,6 +6877,16 @@ static bool pre_syscall(void* drcontext, int sysnum) {
       require_evidence_flush(EVIDENCE_FRAME_EXEC);
     }
     return execute;
+  }
+
+  /* A declined call is not permission to execute an operation admitted only
+   * for Tool suppression. Refuse before terminal/task preparation or Linux. */
+  if (caller_mode() && caller_unsupported_operation(sysnum, args, false)) {
+    dr_fprintf(diagnostic_file,
+               "reverie-dbt: caller application operation refused before effect (%d)\n",
+               sysnum);
+    exit_runtime_tree(101);
+    return false;
   }
 
   /* A runtime that declines a call leaves it to the host. The client keeps
