@@ -1295,13 +1295,20 @@ struct TimerStepShield {
     mask_stable: bool,
     /// Under `mask_stable`, the guest's mask as read for an earlier step of
     /// the sequence, and the procfs state read with it
-    /// (`unblock_sigtrap_for_step_known`), which no step changes either: no
-    /// syscall runs, so no temporary mask's restore starts, and no signal is
-    /// queued, since no other thread runs (the serialized-execution
-    /// contract). Kept only where no restore was pending at the step that
-    /// read them (procfs `SigBlk` equal to the mask), since a pending one
+    /// (`unblock_sigtrap_for_step_known`), whose masks and SIGTRAP disposition
+    /// no step changes either: no syscall runs, so no temporary mask's
+    /// restore starts. Kept only where no restore was pending at the step
+    /// that read them (procfs `SigBlk` equal to the mask), since a pending one
     /// ends at that step's resume. Forgotten at a step over an
     /// `rt_sigreturn` or over a trap instruction of the guest's own.
+    ///
+    /// Its pending sets are not kept. A signal can be queued between two
+    /// steps although no other guest thread runs: a guest's POSIX timer
+    /// (`timer_create` with `SIGEV_SIGNAL`) queues its signal when it expires,
+    /// and that signal may be SIGTRAP. So every shielded step reads SIGTRAP's
+    /// pending state again (`sigtrap_queued`), and a pending SIGTRAP still
+    /// refuses the step (`StepShield::PendingTrap`), as on the step that read
+    /// procfs.
     known_mask: Option<(u64, Option<ProcSignalState>)>,
     /// Whether any step of the sequence ran.
     stepped: bool,
@@ -1377,9 +1384,31 @@ impl TimerStepShield {
             return Ok(());
         }
         // procfs is read only while SIGTRAP is blocked
-        // (`unblock_sigtrap_for_step_known`), and once a sequence.
+        // (`unblock_sigtrap_for_step_known`), and once a sequence. Its
+        // pending sets do not hold from one step to the next (`known_mask`),
+        // so a kept state takes SIGTRAP's pending bit from the queues now.
+        // `PTRACE_PEEKSIGINFO` on both queues shows every SIGTRAP that can be
+        // queued during a sequence: a POSIX timer's comes with the siginfo
+        // the timer owns, allocated when the timer was created, and a trap
+        // the kernel forces is queued past `RLIMIT_SIGPENDING`
+        // (`override_rlimit`). A sent SIGTRAP can be pending without siginfo,
+        // where the guest's user is at that limit, but no guest thread can
+        // send one during a sequence, and one sent from outside the guest
+        // between this read and the resume is not seen in any case, as for
+        // the procfs read. The kept state's other pending bits are not read:
+        // it was kept only with `SigBlk` equal to the mask, so
+        // `unblock_sigtrap_for_timer_step` reads only SIGTRAP's.
         let state = match known_state {
-            Some(state) => Some(state),
+            Some(state) => {
+                #[cfg(test)]
+                TIMER_STEP_PENDING_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
+                let pending = if sigtrap_queued(task)? {
+                    SIGTRAP_BIT
+                } else {
+                    0
+                };
+                Some(ProcSignalState { pending, ..state })
+            }
             None if mask & SIGTRAP_BIT != 0 => {
                 #[cfg(test)]
                 TIMER_STEP_STATE_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
@@ -4085,6 +4114,12 @@ thread_local! {
     /// (`TimerStepShield::prepare` and `settle`), counted for the test that
     /// bounds them to one of each a sequence. Per thread, as above.
     pub(crate) static TIMER_STEP_STATE_READS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// The timer steps that read SIGTRAP's pending state from the signal
+    /// queues because their shield kept the mask and procfs state of an
+    /// earlier step (`TimerStepShield::known_mask`). Per thread, as above.
+    pub(crate) static TIMER_STEP_PENDING_READS_FOR_TEST: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
 
     /// The injections whose SIGTRAP state was read before their step
@@ -17341,6 +17376,131 @@ mod tests {
                 "task::tests::fatal_marker_capture_tests::ordinary_return_uses_real_capture_without_fatal_marker",
             )
         }
+    }
+
+    /// A SIGTRAP queued between two steps of a timer sequence, after the
+    /// first step's shield read and kept the guest's mask and procfs state:
+    /// the tracee's own POSIX timer (`timer_create` with `SIGEV_SIGNAL` =
+    /// SIGTRAP) expires while it is stopped, with SIGTRAP blocked. The later
+    /// step's shield, through the production `TimerStepShield::prepare`,
+    /// reads SIGTRAP's pending state again and refuses the step
+    /// (`PendingTrap`), so SIGTRAP stays blocked and pending and no step lets
+    /// the kernel select it. It still reads neither the mask nor procfs
+    /// again. Drives a real stopped tracee.
+    #[test]
+    fn a_timer_step_refuses_a_sigtrap_queued_after_an_earlier_step() {
+        use std::time::Duration;
+        use std::time::Instant;
+
+        use nix::unistd::ForkResult;
+
+        /// Kills and reaps the tracee on every exit from the test.
+        struct Reap(Pid);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let pid = self.0.as_raw();
+                // SAFETY: kill and waitpid take plain values and a local status.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    let mut status = 0;
+                    while libc::waitpid(pid, &mut status, libc::__WALL) < 0
+                        && *libc::__errno_location() == libc::EINTR
+                    {}
+                }
+            }
+        }
+
+        const EXPIRY: Duration = Duration::from_secs(1);
+        // SAFETY: the child makes only raw syscalls, `traceme_and_stop` and
+        // `_exit`, each async-signal-safe.
+        let pid = match unsafe { nix::unistd::fork() }.expect("fork the tracee") {
+            ForkResult::Child => unsafe {
+                // Block SIGTRAP, then arm a one-shot process timer that
+                // queues it after EXPIRY.
+                let mut trap: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut trap);
+                libc::sigaddset(&mut trap, libc::SIGTRAP);
+                let mut event: libc::sigevent = std::mem::zeroed();
+                event.sigev_notify = libc::SIGEV_SIGNAL;
+                event.sigev_signo = libc::SIGTRAP;
+                let mut timer: libc::c_int = 0;
+                let expiry = libc::itimerspec {
+                    it_interval: libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    },
+                    it_value: libc::timespec {
+                        tv_sec: EXPIRY.as_secs() as libc::time_t,
+                        tv_nsec: 0,
+                    },
+                };
+                if libc::sigprocmask(libc::SIG_BLOCK, &trap, std::ptr::null_mut()) != 0
+                    || libc::syscall(
+                        libc::SYS_timer_create,
+                        libc::CLOCK_MONOTONIC,
+                        &mut event,
+                        &mut timer,
+                    ) != 0
+                    || libc::syscall(
+                        libc::SYS_timer_settime,
+                        timer,
+                        0,
+                        &expiry,
+                        std::ptr::null_mut::<libc::itimerspec>(),
+                    ) != 0
+                {
+                    libc::_exit(2);
+                }
+                safeptrace::traceme_and_stop().expect("TRACEME");
+                libc::_exit(0)
+            },
+            ForkResult::Parent { child } => Pid::from(child),
+        };
+        let _reap = Reap(pid);
+        let (task, event) = Running::new(pid).wait().expect("wait").assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGSTOP));
+        let blocked = task.getsigmask().expect("mask");
+        assert_ne!(blocked & SIGTRAP_BIT, 0, "the tracee blocked SIGTRAP");
+        let mut shield = TimerStepShield {
+            mask_stable: true,
+            ..TimerStepShield::default()
+        };
+        let state_reads = || TIMER_STEP_STATE_READS_FOR_TEST.with(|count| count.get());
+        let pending_reads = || TIMER_STEP_PENDING_READS_FOR_TEST.with(|count| count.get());
+
+        // The first step reads the mask and procfs, keeps them, and unblocks
+        // SIGTRAP for the step's trap; its stop blocks SIGTRAP again.
+        shield.prepare(&task).expect("the first step's shield");
+        assert!(
+            !shield.pending_trap,
+            "the timer expired before the first step; EXPIRY is too short for this host"
+        );
+        assert!(shield.known_mask.is_some(), "the first step kept its reads");
+        assert_eq!(task.getsigmask().expect("mask"), blocked & !SIGTRAP_BIT);
+        shield.settle(&task).expect("the first step's stop");
+        assert_eq!(task.getsigmask().expect("mask"), blocked);
+
+        // The timer queues SIGTRAP while the tracee is stopped.
+        let deadline = Instant::now() + EXPIRY * 10;
+        while ProcSignalState::read(&task).expect("procfs").pending & SIGTRAP_BIT == 0 {
+            assert!(Instant::now() < deadline, "the timer never queued SIGTRAP");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (states_before, pendings_before) = (state_reads(), pending_reads());
+        assert!(shield.prepare(&task).is_err(), "the later step must refuse");
+        assert!(shield.pending_trap, "refused for the pending SIGTRAP");
+        assert!(!shield.reblock, "nothing to block again");
+        assert_eq!(
+            task.getsigmask().expect("mask"),
+            blocked,
+            "SIGTRAP stays blocked"
+        );
+        let state = ProcSignalState::read(&task).expect("procfs");
+        assert_ne!(state.pending & SIGTRAP_BIT, 0, "SIGTRAP stays pending");
+        assert_eq!(state.blocked, blocked);
+        assert_eq!(state_reads(), states_before, "the kept mask was used");
+        assert_eq!(pending_reads(), pendings_before + 1);
     }
 
     /// A thread offered after the run has failed carries the failed run's
