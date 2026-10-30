@@ -8,6 +8,13 @@
 
 use std::mem::MaybeUninit;
 
+pub fn tod() {
+    use std::time;
+
+    // this calls clock_gettime.
+    let _now = time::Instant::now();
+}
+
 pub fn clock_getres() {
     let mut res = libc::timespec {
         tv_sec: 1,

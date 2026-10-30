@@ -305,11 +305,35 @@ CPU-zero body can legitimately pass or fail; it is not a native success or
 Noop negative control, and no affinity is forced. Existing native C controls
 remain separate.
 
+The original Rust `run_guest_vdso_tod_test` retains its broad `should_panic`
+attribute and ptrace `check_fn` path. Its literal `Instant::now` body is shared
+with the ordinary command, but the inherited guest still lets the unwind reach
+the tracer and trigger the parent check's panic. That outer panic alone does
+not identify the inner error.
+
+The separate feature-only `rust_vdso_tod_command` runs the same Cargo image
+with `tod` through ptrace and authenticated DBT. Only this ordinary fixture
+temporarily silences the panic hook and catches the shared body; it restores
+the prior hook before validation or output. A normal return, an unknown payload
+type, or a payload other than the exact String or `&str` EINVAL panic fails.
+After validation, the fixture writes the actual 109-byte caught payload,
+a newline, then `vdso-rust-tod-unwind-complete\n`. Both traced children must
+exit 0 with exactly those 140 stdout bytes and empty stderr. Actual image,
+status and streams are recorded before assertions; an abort, signal, Tool or
+launcher failure is not an accepted unwind.
+
+The same selection then runs a real DBT child with empty arguments. It must
+first pass the unchanged quiet clock_getres oracle, then fail the identical
+TOD output predicate used by both positives. The rejection record follows
+those assertions. This adds precise body-unwind and route evidence without
+replacing the inherited expected-panic test. Native TOD execution, callback
+counts and wrong-Tool sensitivity are not claimed.
+
 The ordinary command keeps empty arguments as its quiet `clock_getres` mode
-and accepts exactly one `gettimeofday` or `getcpu` selector for the corresponding
-shared body. All other argument vectors are refused before any body with exit 2,
-empty stdout, and exactly
-`usage: vdso-rust-command-guest [gettimeofday|getcpu]\n` on stderr (53 bytes).
+and accepts exactly one `gettimeofday`, `getcpu` or `tod` selector for the
+corresponding shared body. All other argument vectors are refused before any
+body with exit 2, empty stdout, and exactly
+`usage: vdso-rust-command-guest [gettimeofday|getcpu|tod]\n` on stderr (57 bytes).
 This argument validation is new relative to the earlier fixture that ignored
 arguments. The direct `invalid` selector control checks the exact combined
 refusal using the same Cargo-built image; it does not exercise a body or prove
@@ -346,7 +370,8 @@ cargo test -p reverie-test-support --features dbt --test vdso -- \
 ```
 
 The default target has five tests. The optional `dbt` feature adds the actual
-caller command and a missing-manifest guard, which authenticates the valid
+caller command, the separate Rust TOD command and a missing-manifest guard,
+for eight tests. The missing-manifest guard authenticates the valid
 pair before checking refusal. Unit global state alone does not authenticate
 the selected Tool. No wrong-Tool sensitivity, DBT function-guest execution,
 or expanded lifecycle/signal support is claimed. The helper installs

@@ -15,8 +15,9 @@ fn main() -> std::process::ExitCode {
         [] => rust_guest::clock_getres(),
         [selector] if selector == "gettimeofday" => gettimeofday_command(),
         [selector] if selector == "getcpu" => getcpu_command(),
+        [selector] if selector == "tod" => tod_command(),
         _ => {
-            eprintln!("usage: vdso-rust-command-guest [gettimeofday|getcpu]");
+            eprintln!("usage: vdso-rust-command-guest [gettimeofday|getcpu|tod]");
             return std::process::ExitCode::from(2);
         }
     }
@@ -76,5 +77,35 @@ fn getcpu_command() {
     drop(handle);
     std::io::stdout()
         .write_all(b"vdso-rust-getcpu-complete\n")
+        .unwrap();
+}
+
+fn tod_command() {
+    use std::io::Write;
+
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(rust_guest::tod);
+    std::panic::set_hook(hook);
+
+    let payload = result.expect_err("Instant::now returned normally");
+    let message = if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        *message
+    } else {
+        panic!("unexpected Instant::now panic payload type");
+    };
+    assert_eq!(
+        message,
+        r#"called `Result::unwrap()` on an `Err` value: Os { code: 22, kind: InvalidInput, message: "Invalid argument" }"#,
+    );
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(message.as_bytes()).unwrap();
+    stdout.write_all(b"\n").unwrap();
+    stdout
+        .write_all(b"vdso-rust-tod-unwind-complete\n")
         .unwrap();
 }

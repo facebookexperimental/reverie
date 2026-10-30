@@ -20,7 +20,6 @@ mod rust_guest;
 #[cfg(all(not(sanitized), test))]
 mod tests {
     use std::mem::MaybeUninit;
-    use std::time;
 
     use reverie_ptrace::testing::check_fn;
 
@@ -29,10 +28,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn run_guest_vdso_tod_test() {
-        check_fn::<LocalState, _>(|| {
-            // this calls clock_gettime.
-            let _now = time::Instant::now();
-        });
+        check_fn::<LocalState, _>(rust_guest::tod);
     }
 
     #[test]
@@ -279,4 +275,53 @@ fn rust_getcpu_command() {
     assert_command_output("rust/getcpu/control-clock_getres/dbt", &output);
     assert!(!getcpu_command_output_matches(&output));
     eprintln!("vdso Rust getcpu control: clock_getres rejected=true");
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn tod_command_output_matches(output: &reverie::process::Output) -> bool {
+    output.status == reverie::ExitStatus::Exited(0)
+        && output.stdout.as_slice()
+            == concat!(
+                r#"called `Result::unwrap()` on an `Err` value: Os { code: 22, kind: InvalidInput, message: "Invalid argument" }"#,
+                "\nvdso-rust-tod-unwind-complete\n",
+            )
+            .as_bytes()
+        && output.stderr.is_empty()
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn assert_tod_command_output(label: &str, output: &reverie::process::Output) {
+    eprintln!(
+        "vdso command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(tod_command_output_matches(output));
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[test]
+fn rust_vdso_tod_command() {
+    let manifest = caller_manifest();
+    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
+    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    eprintln!("vdso Rust tod command: image={program}");
+
+    let (output, ()) = reverie_test_support::test_cmd::<LocalState>(program, &["tod"]).unwrap();
+    assert_tod_command_output("rust/tod/ptrace", &output);
+
+    let (output, ()) = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
+        program,
+        &["tod"],
+        (),
+        &manifest,
+    )
+    .unwrap();
+    assert_tod_command_output("rust/tod/dbt", &output);
+
+    let (output, ()) =
+        reverie_test_support::test_dbt_cmd_with_config::<LocalState>(program, &[], (), &manifest)
+            .unwrap();
+    assert_command_output("rust/tod/control-clock_getres/dbt", &output);
+    assert!(!tod_command_output_matches(&output));
+    eprintln!("vdso Rust tod control: clock_getres rejected=true");
 }
