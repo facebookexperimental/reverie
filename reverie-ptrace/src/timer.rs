@@ -54,7 +54,7 @@
 //!
 //! Proper use of timers requires that all delivered signals of type
 //! `Timer::signal_type()` be passed through `Timer::handle_signal`, and that
-//! `Timer::observe_event()` be called whenever a Tool-observable reverie event
+//! `Timer::observe_stop()` be called whenever a Tool-observable reverie event
 //! occurs. A caller that observes a stop before it knows whether the Tool
 //! observes it must pass a stop that the Tool does not observe to
 //! `Timer::disregard_stop()`, and finish what of the active event this
@@ -148,6 +148,11 @@ thread_local! {
     /// Turns halving on or off on this thread whatever the configuration
     /// says, so that a test does not depend on the architecture's default.
     static HALVED_STAGES_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Makes [`TimerImpl::switch_out`] wait on this thread as where the
+    /// counter's page needs it, whatever this host's page publishes.
+    static SWITCH_OUT_FORCED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The waits [`TimerImpl::switch_out`] made on this thread.
+    static SWITCH_OUTS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a notification due `notification` RCBs ahead, `margin` short of
@@ -779,13 +784,24 @@ impl Timer {
     /// unless the thread exits before anything decides the event (see
     /// [`Timer::settle_at_exit`]); one that cancels the event instead records
     /// it at once, as does [`Timer::retire`].
-    pub fn observe_event(&mut self, event: &TraceEvent) {
+    ///
+    /// The stop is `task`'s, by `event`, and the clock it may read must be
+    /// current first: the counter's page is current only once the thread is
+    /// switched out (see `PerfCounter::ctr_value_fast`), and a plain signal,
+    /// seccomp or group stop is decoded with no ptrace request that would
+    /// wait for that. A request is made only where the page needs it, and
+    /// only when the event reads the clock: while a precise event is
+    /// scheduled.
+    pub fn observe_stop(&mut self, task: &Stopped, event: &TraceEvent) {
         if let Some(t) = self.inner_mut_noinit() {
+            if t.reads_clock_at(event) {
+                t.switch_out(task);
+            }
             t.observe_event(event);
         }
     }
 
-    /// Undoes what the latest [`Timer::observe_event`] did to the active
+    /// Undoes what the latest [`Timer::observe_stop`] did to the active
     /// event, for a stop that turns out to be one the Tool does not observe,
     /// such as a trap that Reverie consumes without a Tool callback. Such a
     /// stop neither cancels the event nor ends its single steps.
@@ -2236,6 +2252,41 @@ impl TimerImpl {
         }
     }
 
+    /// Makes sure the stopped `task` is switched out before the clock is read,
+    /// where reading the clock needs that (see
+    /// `PerfCounter::fast_read_needs_switch_out`): a ptrace request waits for
+    /// it. Only its waiting matters; a thread that died surfaces at the next
+    /// request.
+    fn switch_out(&self, task: &Stopped) {
+        #[cfg(test)]
+        let forced = SWITCH_OUT_FORCED_FOR_TEST.get();
+        #[cfg(not(test))]
+        let forced = false;
+        if forced || self.clock.fast_read_needs_switch_out() {
+            #[cfg(test)]
+            SWITCH_OUTS_FOR_TEST.set(SWITCH_OUTS_FOR_TEST.get() + 1);
+            let _ = task.getsiginfo();
+        }
+    }
+
+    /// The clock at the stop of `task`, read once the thread is switched out
+    /// ([`TimerImpl::switch_out`]). A read that may come before any ptrace
+    /// request at its stop goes through this.
+    #[cfg(any(test, target_arch = "aarch64"))]
+    fn read_clock_at(&self, task: &Stopped) -> u64 {
+        self.switch_out(task);
+        self.read_clock()
+    }
+
+    /// Whether [`TimerImpl::observe_event`] reads the clock at a stop by
+    /// `event`: a scheduled precise event that the stop may find reached.
+    fn reads_clock_at(&self, event: &TraceEvent) -> bool {
+        matches!(self.event, ActiveEvent::Precise { .. })
+            && self.timer_status == EventStatus::Scheduled
+            && self.initial_command == InitialCommand::Ordinary
+            && !matches!(event, TraceEvent::Signal(signal) if *signal == MARKER_SIGNAL)
+    }
+
     pub fn observe_event(&mut self, event: &TraceEvent) {
         // The first stop after a request decides the event: a stop by this
         // timer's signal delivers it, and any other stop cancels it. When that
@@ -2250,10 +2301,7 @@ impl TimerImpl {
             ActiveEvent::Precise {
                 clock_target,
                 offset,
-            } if self.timer_status == EventStatus::Scheduled
-                && self.initial_command == InitialCommand::Ordinary
-                && !matches!(event, TraceEvent::Signal(signal) if *signal == MARKER_SIGNAL) =>
-            {
+            } if self.reads_clock_at(event) => {
                 let clock = self.read_clock();
                 target_reached(clock, clock_target).then(|| MissedTarget {
                     clock,
@@ -3261,7 +3309,7 @@ impl TimerImpl {
                     StepUnit::ToBranch { stops, count, .. },
                     Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)),
                 ) if !is_branch_run_report(&new_task, &stops[..count]) => {
-                    self.check_branch_run(unit, current.rcbs(), target_rcb, false);
+                    self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, false);
                     restore_breakpoints(&mut breakpoints, &new_task);
                     return Err(HandleFailure::Event(Wait::Stopped(
                         new_task,
@@ -3271,7 +3319,9 @@ impl TimerImpl {
                 (_, Wait::Stopped(new_task, event))
                     if !matches!(event, TraceEvent::Signal(Signal::SIGTRAP)) =>
                 {
-                    self.check_branch_run(unit, current.rcbs(), target_rcb, false);
+                    // The check reads the clock, at a stop that may not have
+                    // made a ptrace request yet (`read_clock_at`).
+                    self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, false);
                     if matches!(event, TraceEvent::Exec(_)) {
                         // A single-stepped execve: Linux flushed the old
                         // program's breakpoints, and writing the saved ones
@@ -3293,7 +3343,15 @@ impl TimerImpl {
                     new_task
                 }
                 #[cfg(not(target_arch = "x86_64"))]
-                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) => new_task,
+                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) => {
+                    // The clock is read below, and nothing at a single step's
+                    // stop has made a ptrace request yet (x86 reads the
+                    // registers here). A branch run's stop has.
+                    if matches!(unit, StepUnit::Instruction) {
+                        self.switch_out(&new_task);
+                    }
+                    new_task
+                }
                 // Any other stop ends the stepping, and so does a SIGTRAP that
                 // the step did not report, such as an `int3`'s, or one whose
                 // siginfo cannot be read. The step's instruction may still
@@ -3371,7 +3429,7 @@ impl TimerImpl {
                     remove_stepping_trap_flag(&mut task, &start, guest_trap_flag)?;
             }
             #[cfg(target_arch = "aarch64")]
-            self.check_branch_run(unit, current.rcbs(), target_rcb, true);
+            self.check_branch_run(&task, unit, current.rcbs(), target_rcb, true);
             let clock = self.read_clock();
             if block_step_reached_target(unit, clock, target_rcb) {
                 // Delivered at the observed counter, as a late notification
@@ -3391,14 +3449,18 @@ impl TimerImpl {
         Ok(task)
     }
 
-    /// Checks the counter after a branch run from counter `from` stopped: at
-    /// its breakpoint (`at_breakpoint`) it must have moved by exactly the
-    /// branches decoded, at any other stop by no more. Anything else ends
-    /// branch runs for this thread; a counter at or past `target_rcb` is
-    /// also reported as an overshoot ([`block_step_reached_target`]).
+    /// Checks the counter after a branch run from counter `from` stopped, at
+    /// `task`'s stop: at its breakpoint (`at_breakpoint`) it must have moved
+    /// by exactly the branches decoded, at any other stop by no more.
+    /// Anything else ends branch runs for this thread; a counter at or past
+    /// `target_rcb` is also reported as an overshoot
+    /// ([`block_step_reached_target`]). The clock is read only once the
+    /// thread is switched out ([`TimerImpl::read_clock_at`]): a stop other
+    /// than the run's own breakpoint has made no ptrace request before this.
     #[cfg(target_arch = "aarch64")]
     fn check_branch_run(
         &mut self,
+        task: &Stopped,
         unit: StepUnit,
         from: u64,
         target_rcb: u64,
@@ -3407,7 +3469,7 @@ impl TimerImpl {
         let StepUnit::ToBranch { branches, .. } = unit else {
             return;
         };
-        let clock = self.read_clock();
+        let clock = self.read_clock_at(task);
         let moved = clock.wrapping_sub(from);
         if moved == branches || (!at_breakpoint && moved < branches) {
             return;
@@ -4591,6 +4653,116 @@ mod tests {
         let listed = std::fs::symlink_metadata("/proc/thread-self/ns/pid").is_ok();
         let this_task = pid_namespace_of(std::path::Path::new("/proc/thread-self/ns")).unwrap();
         assert_eq!(this_task.is_some(), listed);
+    }
+
+    /// A stopped child of this test's thread with a timer on it, killed and
+    /// reaped when the guard drops; `None` where perf counters are missing.
+    fn timer_on_a_stopped_child() -> Option<(super::Timer, super::Stopped, impl Drop)> {
+        use nix::unistd::ForkResult;
+        use reverie::Pid;
+        use reverie::Tid;
+
+        if !crate::perf::is_perf_supported() || super::try_get_pmu_config().is_none() {
+            eprintln!("skipping: perf counters are not supported here");
+            return None;
+        }
+        struct Reap(i32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: kill and waitpid take plain values and a local status.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    let mut status = 0;
+                    while libc::waitpid(self.0, &mut status, libc::__WALL) < 0
+                        && *libc::__errno_location() == libc::EINTR
+                    {}
+                }
+            }
+        }
+        // SAFETY: the child calls only `traceme_and_stop` and `_exit`.
+        let raw = match unsafe { nix::unistd::fork() }.expect("fork the tracee") {
+            ForkResult::Child => {
+                safeptrace::traceme_and_stop().expect("TRACEME");
+                // SAFETY: _exit takes a plain value.
+                unsafe { libc::_exit(0) }
+            }
+            ForkResult::Parent { child } => child.as_raw(),
+        };
+        let reap = Reap(raw);
+        let (task, event) = super::Running::new(Pid::from_raw(raw))
+            .wait()
+            .expect("wait")
+            .assume_stopped();
+        assert_eq!(event, super::TraceEvent::Signal(reverie::Signal::SIGSTOP));
+        let timer = super::Timer::new(Pid::from_raw(raw), Tid::from_raw(raw));
+        Some((timer, task, reap))
+    }
+
+    /// A clock read at a stop that may not have made a ptrace request yet
+    /// (`TimerImpl::read_clock_at`, which the branch-run check uses) first
+    /// waits for the stopped thread to be switched out, where the counter's
+    /// page needs that (forced here, since this host's page may publish a
+    /// live counter's index), and only there.
+    #[test]
+    fn a_clock_read_at_a_stop_waits_for_the_switch_out_first() {
+        use super::SWITCH_OUT_FORCED_FOR_TEST;
+        use super::SWITCH_OUTS_FOR_TEST;
+
+        let Some((timer, task, _reap)) = timer_on_a_stopped_child() else {
+            return;
+        };
+        let inner = timer.inner();
+        let waits = || SWITCH_OUTS_FOR_TEST.get();
+
+        SWITCH_OUT_FORCED_FOR_TEST.set(true);
+        let before = waits();
+        let at_stop = inner.read_clock_at(&task);
+        SWITCH_OUT_FORCED_FOR_TEST.set(false);
+        assert_eq!(waits(), before + 1, "the read waited for the switch-out");
+        assert_eq!(
+            at_stop,
+            inner.read_clock(),
+            "a stopped thread's clock holds"
+        );
+
+        let before = waits();
+        inner.read_clock_at(&task);
+        let needs = inner.clock.fast_read_needs_switch_out();
+        assert_eq!(
+            waits(),
+            before + u64::from(needs),
+            "waits only where needed"
+        );
+    }
+
+    /// The branch-run check reads the clock only after the switch-out wait,
+    /// at a stop other than the run's breakpoint as at the breakpoint. A run
+    /// that retired the branches it decoded leaves branch runs on.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_branch_run_check_reads_the_clock_after_the_switch_out() {
+        use super::SWITCH_OUT_FORCED_FOR_TEST;
+        use super::SWITCH_OUTS_FOR_TEST;
+        use super::StepUnit;
+
+        let Some((mut timer, task, _reap)) = timer_on_a_stopped_child() else {
+            return;
+        };
+        let inner = timer.inner_mut_noinit().expect("a timer");
+        let from = inner.read_clock();
+        let unit = StepUnit::ToBranch {
+            stops: [0, 0],
+            count: 1,
+            branches: 0,
+        };
+        SWITCH_OUT_FORCED_FOR_TEST.set(true);
+        for at_breakpoint in [false, true] {
+            let before = SWITCH_OUTS_FOR_TEST.get();
+            inner.check_branch_run(&task, unit, from, from + 1_000, at_breakpoint);
+            assert_eq!(SWITCH_OUTS_FOR_TEST.get(), before + 1, "{at_breakpoint}");
+        }
+        SWITCH_OUT_FORCED_FOR_TEST.set(false);
+        assert!(!inner.branch_runs_off);
     }
 
     #[test]
