@@ -15,3 +15,16 @@ pub fn run_fn_body() {
     }
     let _gid = nix::unistd::getgid();
 }
+
+#[cfg(not(sanitized))]
+pub fn write_body(msg: &str) {
+    use std::io::Write;
+
+    std::io::stdout().write_all(msg.as_bytes()).unwrap();
+    std::io::stdout().flush().unwrap();
+}
+
+#[cfg(not(sanitized))]
+pub fn print_body(msg: &str) {
+    println!("{}", msg);
+}

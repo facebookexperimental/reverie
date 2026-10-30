@@ -95,6 +95,41 @@ need Cargo's binary-path environment variable. Rust/libc/loader startup is part
 of command execution, not inherited-function execution. No Tool policy or
 caller lifecycle/signal contract changes.
 
+The existing `run_guest_func_write_test` and `run_guest_func_print_test`
+also retain their inherited ptrace calls, captured `"abcd"` messages and
+literal exit/stdout assertions. Their original write_all/flush and println
+statements are shared with the ordinary binary. Both new shared helpers have
+`cfg(not(sanitized))`, matching the original tests; the write helper imports
+`std::io::Write` locally. No new lint allowance or sanitized runtime claim is
+introduced.
+
+With `dbt`, each of these same identities runs one Cargo-discovered image
+natively, through ptrace CounterLocal and through the authenticated DBT
+CounterLocal caller. Selector `write` must exit0 with exactly `abcd` on stdout;
+`print` must exit0 with exactly `abcd\n`. Both require empty stderr, and actual
+image/status/full raw streams are printed before assertions. No marker is added
+to either output. Each identity also runs that same image through DBT with the
+opposite selector: the real result must first pass its own byte oracle, then
+be rejected by the identical selected-mode predicate. A rejection record is
+printed only after those assertions. Newline bytes are never trimmed or
+normalized. These are eight ordinary children inside two existing identities,
+not new tests or a replacement for the inherited function calls.
+
+Empty arguments preserve the existing `run_fn_body` command and its marker and
+failure path. Exactly one `write` or `print` argument selects the corresponding
+shared body. Every other argument vector is refused before a body with exit2,
+empty stdout and exactly `usage: basics-rust-command-guest [write|print]\n` on
+stderr. This selector/refusal behavior is new; the previous binary ignored
+arguments. The direct invalid-selector control checks that refusal, not Tool
+dispatch.
+
+The two original output tests ignore returned state. This extension adds no
+Counter threshold/equality or Noop rejection; existing `run_fn_test` and
+support count controls remain separate. Literal output and real opposite-mode
+rejection distinguish these two routes, not syscall-PC attribution, callback
+multiplicity or a separately fabricated output wrapper.
+Feature/default basics identities remain 18/13 and support identities three.
+
 ## Injected-exit commands
 
 The `exit` target keeps the original ptrace function guest and adds a command

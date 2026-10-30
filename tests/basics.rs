@@ -192,26 +192,102 @@ fn run_guest_command_test_closure() {
 #[test]
 fn run_guest_func_write_test() {
     let msg = "abcd";
-    let (output, _state) = test_fn::<CounterLocal, _>(move || {
-        std::io::stdout().write_all(msg.as_bytes()).unwrap();
-        std::io::stdout().flush().unwrap();
-    })
-    .unwrap();
+    let (output, _state) = test_fn::<CounterLocal, _>(move || rust_guest::write_body(msg)).unwrap();
     assert_eq!(output.status, ExitStatus::Exited(0));
     assert_eq!(output.stdout.as_slice(), msg.as_bytes());
+    #[cfg(feature = "dbt")]
+    rust_output_command_test("write");
 }
 
 #[cfg(not(sanitized))]
 #[test]
 fn run_guest_func_print_test() {
     let msg = "abcd";
-    let (output, _state) = test_fn::<CounterLocal, _>(move || {
-        println!("{}", msg);
-    })
-    .unwrap();
+    let (output, _state) = test_fn::<CounterLocal, _>(move || rust_guest::print_body(msg)).unwrap();
 
     assert_eq!(output.status, ExitStatus::Exited(0));
     assert_eq!(output.stdout.as_slice(), b"abcd\n");
+    #[cfg(feature = "dbt")]
+    rust_output_command_test("print");
+}
+
+#[cfg(all(feature = "dbt", not(sanitized)))]
+fn rust_output_matches(mode: &str, exited_zero: bool, stdout: &[u8], stderr: &[u8]) -> bool {
+    let expected: &[u8] = match mode {
+        "write" => b"abcd",
+        "print" => b"abcd\n",
+        _ => panic!("unknown Rust output mode: {mode}"),
+    };
+    exited_zero && stdout == expected && stderr.is_empty()
+}
+
+#[cfg(all(feature = "dbt", not(sanitized)))]
+fn rust_output_command_test(mode: &str) {
+    let opposite = match mode {
+        "write" => "print",
+        "print" => "write",
+        _ => panic!("unknown Rust output mode: {mode}"),
+    };
+    let program = env!("CARGO_BIN_EXE_basics-rust-command-guest");
+    eprintln!("basics Rust output mode={mode} image={program}");
+
+    let output = std::process::Command::new(program)
+        .arg(mode)
+        .output()
+        .unwrap();
+    eprintln!(
+        "basics Rust output mode={mode} role=native selector={mode}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(rust_output_matches(
+        mode,
+        output.status.code() == Some(0),
+        &output.stdout,
+        &output.stderr,
+    ));
+
+    let (output, _state) = test_cmd::<CounterLocal>(program, &[mode]).unwrap();
+    eprintln!(
+        "basics Rust output mode={mode} role=ptrace selector={mode}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(rust_output_matches(
+        mode,
+        output.status == ExitStatus::Exited(0),
+        &output.stdout,
+        &output.stderr,
+    ));
+
+    let (output, _state) = commands::counter_command(program, &[mode]).unwrap();
+    eprintln!(
+        "basics Rust output mode={mode} role=dbt selector={mode}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(rust_output_matches(
+        mode,
+        output.status == ExitStatus::Exited(0),
+        &output.stdout,
+        &output.stderr,
+    ));
+
+    let (output, _state) = commands::counter_command(program, &[opposite]).unwrap();
+    eprintln!(
+        "basics Rust output mode={mode} role=opposite-dbt selector={opposite}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(rust_output_matches(
+        opposite,
+        output.status == ExitStatus::Exited(0),
+        &output.stdout,
+        &output.stderr,
+    ));
+    assert!(!rust_output_matches(
+        mode,
+        output.status == ExitStatus::Exited(0),
+        &output.stdout,
+        &output.stderr,
+    ));
+    eprintln!("basics Rust output mode={mode} opposite={opposite} rejected=true");
 }
 
 #[cfg(not(sanitized))]
