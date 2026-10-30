@@ -455,11 +455,23 @@ mod tests {
 
     use super::*;
 
-    /// What `dlvsym` reports for `name` at `version`, as the reference.
+    /// What `dlvsym` reports for `name` at `version` in libc, as the
+    /// reference. The handle is libc itself, not `RTLD_DEFAULT`: a test
+    /// binary that statically links a copy of a libc function (the opt
+    /// test binary does for `dl_iterate_phdr`) makes `RTLD_DEFAULT` find
+    /// the executable's copy first, while the lookup under test finds
+    /// libc's. Comparing the two then fails on a correct lookup.
     fn dlvsym(name: &str, version: &str) -> Option<usize> {
         let (name, version) = (CString::new(name).unwrap(), CString::new(version).unwrap());
-        // SAFETY: both names are NUL-terminated.
-        let symbol = unsafe { libc::dlvsym(libc::RTLD_DEFAULT, name.as_ptr(), version.as_ptr()) };
+        // SAFETY: the library name is NUL-terminated; the handle is
+        // deliberately never closed (dlopen is refcounted).
+        let library = CString::new("libc.so.6").unwrap();
+        let libc = unsafe { libc::dlopen(library.as_ptr(), libc::RTLD_NOW) };
+        if libc.is_null() {
+            return None;
+        }
+        // SAFETY: both names are NUL-terminated and `libc` is a live handle.
+        let symbol = unsafe { libc::dlvsym(libc, name.as_ptr(), version.as_ptr()) };
         (!symbol.is_null()).then_some(symbol as usize)
     }
 
