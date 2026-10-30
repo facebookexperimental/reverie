@@ -93,16 +93,9 @@ mod tests {
 
     #[test]
     fn run_guest_vdso_gettimeofday_test() {
-        check_fn::<LocalState, _>(|| {
-            let mut tod = MaybeUninit::zeroed();
-            let mut tz = MaybeUninit::zeroed();
-            assert_eq!(
-                unsafe { libc::gettimeofday(tod.as_mut_ptr(), tz.as_mut_ptr()) },
-                0
-            );
-            let tod = unsafe { tod.assume_init() };
-            assert_eq!(tod.tv_usec % 1000, 345);
-        });
+        check_fn::<LocalState, _>(rust_guest::gettimeofday);
+        #[cfg(feature = "dbt")]
+        rust_gettimeofday_command();
     }
 
     #[test]
@@ -208,4 +201,48 @@ fn rust_clock_getres_command() {
         reverie_test_support::test_dbt_cmd_with_config::<LocalState>(program, &[], (), &manifest)
             .unwrap();
     assert_command_output("rust/clock_getres/dbt", &output);
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn gettimeofday_command_output_matches(output: &reverie::process::Output) -> bool {
+    output.status == reverie::ExitStatus::Exited(0)
+        && output.stdout.as_slice() == b"vdso-rust-gettimeofday-complete\n"
+        && output.stderr.is_empty()
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn assert_gettimeofday_command_output(label: &str, output: &reverie::process::Output) {
+    eprintln!(
+        "vdso command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert!(gettimeofday_command_output_matches(output));
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn rust_gettimeofday_command() {
+    let manifest = caller_manifest();
+    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
+    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    eprintln!("vdso Rust gettimeofday command: image={program}");
+
+    let (control, ()) =
+        reverie_test_support::test_dbt_cmd_with_config::<LocalState>(program, &[], (), &manifest)
+            .unwrap();
+    assert_command_output("rust/gettimeofday/control-clock_getres/dbt", &control);
+    assert!(!gettimeofday_command_output_matches(&control));
+    eprintln!("vdso Rust gettimeofday control: clock_getres rejected=true");
+
+    let (output, ()) =
+        reverie_test_support::test_cmd::<LocalState>(program, &["gettimeofday"]).unwrap();
+    assert_gettimeofday_command_output("rust/gettimeofday/ptrace", &output);
+
+    let (output, ()) = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
+        program,
+        &["gettimeofday"],
+        (),
+        &manifest,
+    )
+    .unwrap();
+    assert_gettimeofday_command_output("rust/gettimeofday/dbt", &output);
 }

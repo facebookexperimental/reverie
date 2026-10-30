@@ -221,6 +221,43 @@ checks libc-mediated original-body execution, not DBT inherited-function
 support, deterministic time, exact syscall parity, or the unresolved libc/rseq
 getcpu path.
 
+The original Rust `run_guest_vdso_gettimeofday_test` likewise keeps its ptrace
+function invocation and shares its literal body with the ordinary command.
+The body zeroes the timeval and timezone, calls libc `gettimeofday`, and
+requires return 0 and `tv_usec % 1000 == 345`. With `dbt`, that same test also
+runs one Cargo-discovered image with argument `gettimeofday` through ptrace
+and the authenticated DBT caller using the existing `LocalState`. The selected
+command enters a fixture-only wrapper that calls the unchanged shared body and,
+only after its assertions return, writes exactly
+`vdso-rust-gettimeofday-complete\n`. Both runs require exit 0, that exact stdout,
+and empty stderr; actual image, status and streams are printed before assertions.
+The inherited function invocation still calls the original body directly.
+
+Within the same selection, one additional real DBT command runs the same image
+with empty arguments. Its clock_getres result must first satisfy the unchanged
+exit 0 and empty-stream checks, then fail the identical gettimeofday result
+predicate used by the two positive commands. This deterministically rejects a
+passing clock_getres route substituted for the selected completion wrapper. The
+marker is a post-body completion witness, not syscall-PC attribution, callback
+multiplicity or wrong-Tool evidence. These are command executions within the
+existing identity, without a new libtest selection or independent RPC-count
+witness.
+
+The ordinary command keeps empty arguments as its `clock_getres` mode and
+accepts exactly one `gettimeofday` argument for that shared body. All other
+argument vectors are refused before either body with exit 2, empty stdout,
+and exactly `usage: vdso-rust-command-guest [gettimeofday]\n` on stderr. This
+argument validation is new; the earlier command ignored its arguments. The
+direct `invalid` selector control checks this exact refusal using the same
+Cargo-built image. It does not exercise either body or prove Tool dispatch.
+
+Native microseconds can also end in 345, so native or Noop failure of the Rust
+gettimeofday body is not a negative control. The existing native-first C
+controls and typed missing-manifest refusal remain; their results are not
+substituted for execution of the original Rust body. No timestamps are
+compared or normalized across processes, and no wrong-Tool sensitivity is
+claimed.
+
 The `vdso` target retains all four original ptrace function tests and shares
 their actual `LocalState` with a command fixture. The fixture resolves the
 versioned `LINUX_2.6` clock_gettime, gettimeofday, getcpu and clock_getres entries

@@ -9,6 +9,24 @@
 #[path = "../support/vdso_rust_guest.rs"]
 mod rust_guest;
 
-fn main() {
-    rust_guest::clock_getres();
+fn main() -> std::process::ExitCode {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    match arguments.as_slice() {
+        [] => rust_guest::clock_getres(),
+        [selector] if selector == "gettimeofday" => gettimeofday_command(),
+        _ => {
+            eprintln!("usage: vdso-rust-command-guest [gettimeofday]");
+            return std::process::ExitCode::from(2);
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+fn gettimeofday_command() {
+    use std::io::Write;
+
+    rust_guest::gettimeofday();
+    std::io::stdout()
+        .write_all(b"vdso-rust-gettimeofday-complete\n")
+        .unwrap();
 }
