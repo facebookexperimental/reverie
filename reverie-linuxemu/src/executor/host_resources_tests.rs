@@ -347,9 +347,146 @@ fn an_exec_whose_image_the_loader_cannot_copy_is_refused_as_host_resources() {
         &[
             "host memory ran out: loading the new image into the validation memory failed"
                 .to_owned(),
-            format!("allocating {HOST_RESOURCES_PADDED_IMAGE} bytes for a copy of the new image"),
+            format!(
+                "allocating {HOST_RESOURCES_PADDED_IMAGE} bytes of host memory for a copy of the \
+                 new image"
+            ),
         ],
     );
+}
+
+/// The loader reads an image's ELF header and program headers only, as
+/// Linux's ELF loader does, so an image whose section-header table fills its
+/// 64 MiB file costs the exec nothing for its metadata. A full parse would
+/// allocate the section table (about a million entries) and an index of the
+/// string table it names, sized by the file and infallibly, and a host short of
+/// memory would abort the process. Here the limit leaves room for the image's
+/// read buffer, the validation memory and the loader's copy of the image, 16 MiB
+/// to spare, and not for that metadata: the exec is published.
+#[test]
+fn an_exec_of_an_image_with_vast_section_metadata_reads_only_its_program_headers() {
+    const TEST: &str =
+        "an_exec_of_an_image_with_vast_section_metadata_reads_only_its_program_headers";
+    if !host_resources_is_child(TEST) {
+        return host_resources_run_isolated(TEST);
+    }
+    let root = TestDir::new();
+    let path = root.0.join("vast-sections");
+    host_resources_write_executable(
+        &path,
+        &crate::elf::minimal_test_elf_with_vast_metadata(
+            &[0x0f, 0x0b],
+            HOST_RESOURCES_PADDED_IMAGE,
+        ),
+    );
+    let mut memory = GuestMemory::new(0, HOST_RESOURCES_MEMORY).unwrap();
+    let request = host_resources_exec_request(&mut memory, path.as_os_str().as_bytes());
+    let mut leader = ElfExecutor::new(test_state(&root.0), false);
+    let headroom =
+        (2 * HOST_RESOURCES_PADDED_IMAGE + HOST_RESOURCES_MEMORY + 16 * 1024 * 1024) as u64;
+    let ((result, refusal, action), _) =
+        host_resources_with_address_space_headroom(headroom, || {
+            let result = leader.execute_process_action(&request, &memory);
+            (
+                result,
+                leader.take_unsupported_refusal(),
+                leader.take_process_action(),
+            )
+        });
+    assert_eq!(result, Some(0), "refusal: {refusal:?}");
+    assert_eq!(refusal, None);
+    assert!(matches!(action, Some(ProcessAction::Exec { .. })));
+}
+
+/// A PT_INTERP larger than Linux reads (`PATH_MAX`) is refused with Linux's
+/// ENOEXEC before the loader copies the path it holds. Here one fills the
+/// image's 64 MiB file: natively the exec is ENOEXEC, and here too, under a
+/// limit that leaves room for the image's read buffer and the validation
+/// memory, 16 MiB to spare, and not for a copy of that path. A loader that
+/// copied the path first would abort the process.
+#[test]
+fn an_exec_whose_pt_interp_linux_refuses_is_enoexec_before_its_path_is_copied() {
+    const TEST: &str = "an_exec_whose_pt_interp_linux_refuses_is_enoexec_before_its_path_is_copied";
+    if !host_resources_is_child(TEST) {
+        return host_resources_run_isolated(TEST);
+    }
+    let root = TestDir::new();
+    let path = root.0.join("vast-interpreter");
+    let mut interpreter = vec![b'a'; HOST_RESOURCES_PADDED_IMAGE - 0x2000];
+    interpreter[0] = b'/';
+    *interpreter.last_mut().unwrap() = 0;
+    host_resources_write_executable(
+        &path,
+        &crate::elf::minimal_test_elf_with_interpreter(&[0x0f, 0x0b], &interpreter),
+    );
+    drop(interpreter);
+    let native = std::process::Command::new(&path)
+        .output()
+        .expect_err("Linux refuses the exec");
+    assert_eq!(native.raw_os_error(), Some(libc::ENOEXEC), "{native}");
+    let mut memory = GuestMemory::new(0, HOST_RESOURCES_MEMORY).unwrap();
+    let request = host_resources_exec_request(&mut memory, path.as_os_str().as_bytes());
+    let mut leader = ElfExecutor::new(test_state(&root.0), false);
+    let headroom = (HOST_RESOURCES_PADDED_IMAGE + HOST_RESOURCES_MEMORY + 16 * 1024 * 1024) as u64;
+    let ((result, refusal, action), _) =
+        host_resources_with_address_space_headroom(headroom, || {
+            let result = leader.execute_process_action(&request, &memory);
+            (
+                result,
+                leader.take_unsupported_refusal(),
+                leader.take_process_action(),
+            )
+        });
+    assert_eq!(
+        result,
+        Some(negative_errno(libc::ENOEXEC)),
+        "refusal: {refusal:?}"
+    );
+    assert_eq!(refusal, None);
+    assert!(action.is_none());
+}
+
+/// An interpreter with more than a page of program headers runs. Linux has
+/// read tables of up to 64 KiB (1170 entries) since 6.17, which dropped the
+/// one-page bound (kernel commit 8030790477e8), and this loader follows it.
+/// A program whose interpreter has 74, or 1170, program headers runs natively
+/// (the interpreter exits 0) and its exec is published here.
+#[test]
+fn an_exec_whose_interpreter_has_more_than_a_page_of_program_headers_runs() {
+    // mov eax, 60 (exit); xor edi, edi; syscall
+    const EXIT_ZERO: [u8; 9] = [0xb8, 0x3c, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05];
+    for headers in [74_u16, 1170] {
+        let root = TestDir::new();
+        let interpreter = root.0.join("interpreter");
+        host_resources_write_executable(
+            &interpreter,
+            &crate::elf::minimal_test_interpreter(&EXIT_ZERO, headers),
+        );
+        let mut interpreter_path = interpreter.as_os_str().as_bytes().to_vec();
+        interpreter_path.push(0);
+        let program = root.0.join("program");
+        host_resources_write_executable(
+            &program,
+            &crate::elf::minimal_test_elf_with_interpreter(&[0x0f, 0x0b], &interpreter_path),
+        );
+        let native = std::process::Command::new(&program).status().unwrap();
+        assert_eq!(
+            native.code(),
+            Some(0),
+            "{headers} headers natively: {native:?}"
+        );
+        let mut memory = GuestMemory::new(0, HOST_RESOURCES_MEMORY).unwrap();
+        let request = host_resources_exec_request(&mut memory, program.as_os_str().as_bytes());
+        let mut leader = ElfExecutor::new(test_state(&root.0), false);
+        let result = leader.execute_process_action(&request, &memory);
+        let refusal = leader.take_unsupported_refusal();
+        assert_eq!(result, Some(0), "{headers} headers: {refusal:?}");
+        assert_eq!(refusal, None);
+        assert!(matches!(
+            leader.take_process_action(),
+            Some(ProcessAction::Exec { .. })
+        ));
+    }
 }
 
 /// The refusal of a validation memory names the host's error and what ran

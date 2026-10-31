@@ -654,7 +654,7 @@ impl ElfExecutor {
             ));
         }
         let image = &self.state.executable_image;
-        let elf = goblin::elf::Elf::parse(image).map_err(|_| {
+        let elf = crate::elf::parse_elf(image).map_err(|_| {
             Self::parent_death_exec_error("enrolled exec requires a retained static ELF")
         })?;
         if elf
@@ -784,40 +784,36 @@ impl ElfExecutor {
     /// of the retained image for the exec to load. The copy is as large as
     /// the image, so its buffer is allocated fallibly: one this process
     /// cannot allocate is the inner error, the typed refusal of host
-    /// resources, which the exec answers ENOMEM.
+    /// resources, which the exec answers ENOMEM, and the authority stays
+    /// unspent, as for any other exec that does not run.
     pub(super) fn take_parent_death_exec(
         &self,
         request: &SyscallRequest,
     ) -> crate::Result<std::result::Result<ResolvedExecutable, reverie::UnsupportedRefusal>> {
-        let (alias, file, image) = {
-            let mut slot = self
-                .parent_death_exec
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let staged = slot
-                .as_mut()
-                .filter(|staged| self.parent_death_exec_matches(staged, request))
-                .ok_or_else(|| {
-                    Self::parent_death_exec_error("retained exec authority is stale or consumed")
-                })?;
-            staged.consumed = true;
-            (
-                staged.alias.clone(),
-                staged.file.clone(),
-                staged.image.clone(),
-            )
-        };
+        let mut slot = self
+            .parent_death_exec
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let staged = slot
+            .as_mut()
+            .filter(|staged| self.parent_death_exec_matches(staged, request))
+            .ok_or_else(|| {
+                Self::parent_death_exec_error("retained exec authority is stale or consumed")
+            })?;
+        // Copied before the authority is spent: an exec the host cannot
+        // give the copy's memory to is refused with the authority unspent.
         let mut copy = Vec::new();
-        if copy.try_reserve_exact(image.len()).is_err() {
+        if copy.try_reserve_exact(staged.image.len()).is_err() {
             return Ok(Err(exec_allocation_refusal(
-                image.len(),
+                staged.image.len(),
                 "a copy of the running program's retained image",
             )));
         }
-        copy.extend_from_slice(&image);
+        copy.extend_from_slice(&staged.image);
+        staged.consumed = true;
         Ok(Ok(ResolvedExecutable {
-            path: std::path::PathBuf::from(std::ffi::OsString::from_vec(alias)),
-            file: Some(file),
+            path: std::path::PathBuf::from(std::ffi::OsString::from_vec(staged.alias.clone())),
+            file: Some(staged.file.clone()),
             image: copy,
         }))
     }

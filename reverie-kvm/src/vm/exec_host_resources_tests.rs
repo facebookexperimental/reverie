@@ -121,14 +121,22 @@ fn an_exec_the_host_cannot_finish_past_its_point_of_no_return_is_the_host_resour
 
     let error = result.expect_err("the host refused the new image's copy");
     assert!(error.is_host_resources_refusal(), "{error}");
-    let Error::HostResources { diagnostic } = &error else {
+    let Error::HostResources {
+        resource,
+        diagnostic,
+    } = &error
+    else {
         panic!("not the named refusal: {error}");
     };
+    assert_eq!(*resource, crate::HostResource::Memory);
     for named in [
         "KVM exec: host memory ran out after the old image was discarded: replacing the image \
          failed"
             .to_owned(),
-        format!("allocating {EXEC_HOST_RESOURCES_IMAGE} bytes for a copy of the new image"),
+        format!(
+            "allocating {EXEC_HOST_RESOURCES_IMAGE} bytes of host memory for a copy of the new \
+             image"
+        ),
         format!("under this process's RLIMIT_AS (soft {limit} bytes, "),
         "the old image cannot be restored, so the run ends here".to_owned(),
     ] {
@@ -154,21 +162,130 @@ fn an_exec_the_host_cannot_finish_past_its_point_of_no_return_is_the_host_resour
         .expect("the same exec succeeds under the original limit");
 }
 
+/// The reload past an exec's point of no return reads the new image's ELF
+/// header and program headers only, as Linux's ELF loader does. An image
+/// whose section-header table fills its 64 MiB file costs the reload nothing
+/// for that metadata, where a full parse would allocate the section table and
+/// a string-table index, sized by the file and infallibly, before the loader's
+/// copy of the image. Here an isolated child lowers its limit to leave room
+/// for that copy, with 16 MiB to spare, and not for the metadata: the reload
+/// succeeds.
+#[test]
+fn an_exec_reload_of_an_image_with_vast_section_metadata_reads_only_its_program_headers() {
+    const TEST: &str = "vm::tests::an_exec_reload_of_an_image_with_vast_section_metadata_reads_only_its_program_headers";
+    if std::env::var_os(EXEC_HOST_RESOURCES_CHILD_ENV).is_none() {
+        if exec_host_resources_backend().is_none() {
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(TEST)
+            .arg("--exact")
+            .env(EXEC_HOST_RESOURCES_CHILD_ENV, "1")
+            .output()
+            .expect("failed to run the isolated exec reload check");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated exec reload check failed with {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let (mut backend, mut executor) =
+        exec_host_resources_backend().expect("the parent found KVM available");
+    let image = crate::elf::minimal_test_elf_with_vast_metadata(&[HLT], EXEC_HOST_RESOURCES_IMAGE);
+    let argv = ["/bin/exec-vast-section-metadata".to_owned()];
+    let mut original = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only `original`.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut original) },
+        0
+    );
+    let limit = (exec_host_resources_address_space_bytes()
+        + EXEC_HOST_RESOURCES_IMAGE as u64
+        + 16 * 1024 * 1024)
+        .min(original.rlim_max);
+    let lowered = libc::rlimit {
+        rlim_cur: limit,
+        rlim_max: original.rlim_max,
+    };
+    // SAFETY: setrlimit reads only `lowered`; only the soft limit drops, so
+    // the original can be restored without privilege.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &lowered) }, 0);
+    let result = backend.exec_process(
+        &mut executor,
+        (Path::new(&argv[0]), None),
+        None,
+        &image,
+        &argv,
+        &[],
+    );
+    // SAFETY: as above, with the original limits.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &original) }, 0);
+    result.expect("the reload needs no memory for section metadata");
+}
+
 /// Only a host resource of this process's own that ran out becomes the named
-/// refusal past an exec's point of no return; any other error is returned as
-/// it is, and the refusal is found beneath the wrappers a run's failure is
+/// refusal past an exec's point of no return, whether a host call, a fallible
+/// allocation or a KVM ioctl reported it, and the refusal carries the
+/// resource. Any other error, an ordinary ioctl fault included, is returned as
+/// it is. The refusal is found beneath the wrappers a run's failure is
 /// aggregated in.
 #[test]
 fn only_a_host_resource_that_ran_out_past_the_point_of_no_return_is_the_named_refusal() {
-    for error in [
-        Error::HostIo(std::io::Error::from_raw_os_error(libc::ENOMEM)),
-        Error::HostIo(std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
-        Error::MemoryMapping(std::io::Error::from_raw_os_error(libc::ENOMEM)),
-        Error::HostIo(std::io::Error::from_raw_os_error(libc::EMFILE)),
-        Error::HostIo(std::io::Error::from_raw_os_error(libc::ENFILE)),
+    use crate::HostResource;
+    for (error, expected) in [
+        (
+            Error::HostIo(std::io::Error::from_raw_os_error(libc::ENOMEM)),
+            HostResource::Memory,
+        ),
+        (
+            Error::HostIo(std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
+            HostResource::Memory,
+        ),
+        (
+            Error::MemoryMapping(std::io::Error::from_raw_os_error(libc::ENOMEM)),
+            HostResource::Memory,
+        ),
+        (
+            Error::HostAllocation {
+                what: "a copy of the new image",
+                bytes: 4096,
+            },
+            HostResource::Memory,
+        ),
+        (
+            Error::Kvm(kvm_ioctls::Error::new(libc::ENOMEM)),
+            HostResource::Memory,
+        ),
+        (
+            Error::HostIo(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            HostResource::Descriptors,
+        ),
+        (
+            Error::Kvm(kvm_ioctls::Error::new(libc::EMFILE)),
+            HostResource::Descriptors,
+        ),
+        (
+            Error::HostIo(std::io::Error::from_raw_os_error(libc::ENFILE)),
+            HostResource::FileTable,
+        ),
+        (
+            Error::Kvm(kvm_ioctls::Error::new(libc::ENFILE)),
+            HostResource::FileTable,
+        ),
     ] {
         let refusal = exec_after_point_of_no_return_error(error);
         assert!(refusal.is_host_resources_refusal(), "{refusal}");
+        assert!(
+            matches!(&refusal, Error::HostResources { resource, .. } if *resource == expected),
+            "{refusal}"
+        );
         let shared = Arc::new(refusal);
         assert!(Error::SharedFailure(shared.clone()).is_host_resources_refusal());
         assert!(
@@ -181,6 +298,8 @@ fn only_a_host_resource_that_ran_out_past_the_point_of_no_return_is_the_named_re
     }
     for error in [
         Error::HostIo(std::io::Error::from_raw_os_error(libc::EIO)),
+        Error::Kvm(kvm_ioctls::Error::new(libc::EINVAL)),
+        Error::Kvm(kvm_ioctls::Error::new(libc::EFAULT)),
         Error::UnsupportedElf("not an ELF image".to_owned()),
         Error::LongModeMemoryTooSmall,
         Error::RunAborted,

@@ -1899,13 +1899,15 @@ impl CompletedBoundarySlot {
 
 /// The error an exec past its point of no return ends the run with. The old
 /// image is gone, so no errno can answer the guest. A host resource of this
-/// process's own that ran out (memory, a descriptor, the host's file table) is
+/// process's own that ran out (memory, a descriptor, the host's file table),
+/// whether a host call, a fallible allocation or a KVM ioctl reported it, is
 /// this backend's to refuse: the named refusal [`Error::HostResources`], which
-/// names the resource, the error and the limit. Any other error is returned
-/// as it is.
+/// carries the resource and names it, the error and the limit. Any other error
+/// is returned as it is.
 pub(crate) fn exec_after_point_of_no_return_error(error: Error) -> Error {
     match error.host_resource_exhaustion() {
         Some(exhaustion) => Error::HostResources {
+            resource: exhaustion.resource,
             diagnostic: format!(
                 "KVM exec: {} after the old image was discarded: replacing the image failed \
                  ({error}) under {}; the old image cannot be restored, so the run ends here",
@@ -3064,10 +3066,13 @@ impl KvmBackend {
         // this reset onward, any exceptional loader or KVM failure is fatal to
         // the backend and is never reported back to the old guest image. This
         // is the same point-of-no-return behavior as the prior zero_raw reset.
-        // The preflight loaded the same image, so what can still fail here is
-        // the host: a host resource of this process's own that ran out since
-        // (memory for the new image's copy or its interpreter, a descriptor)
-        // ends the run with the named refusal, not as a backend fault.
+        // The reload loads the image the preflight read, but it opens the
+        // program interpreter and the working directory again by path. If
+        // either changed since the preflight, the reload can fail where the
+        // preflight did not, or load an interpreter the preflight did not
+        // check. A host resource of this process's own that ran out (memory,
+        // a descriptor, the host's file table) ends the run with the named
+        // refusal; any other failure ends it as a backend fault.
         self.replace_process_image(executor, executable, execfn, image, argv, envp)
             .map_err(exec_after_point_of_no_return_error)
     }

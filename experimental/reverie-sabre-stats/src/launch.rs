@@ -94,15 +94,20 @@ pub fn spec_fd(bytes: &[u8]) -> std::io::Result<OwnedFd> {
     Ok(owned)
 }
 
-/// The bytes the loader's `parse_shebang` reads from a script: its first line,
-/// at most this many bytes including the newline (`BINPRM_BUF_SIZE`).
+/// The bytes Linux's script loader reads from a script: its first line, at
+/// most this many bytes including the newline (`BINPRM_BUF_SIZE`).
 const SHEBANG_BYTES: usize = 256;
 
-/// A script's interpreter and its one optional argument, as the loader's
-/// `parse_shebang` reads them from `first_bytes`, the start of the file: the
-/// first two words, split at spaces, tabs, newlines and carriage returns, of
-/// the first line after `#!`. `None` when the file does not start with `#!`
-/// or names no interpreter.
+/// A script's interpreter and its one optional argument, read from
+/// `first_bytes`, the start of the file: the first two words, split at
+/// spaces, tabs, newlines and carriage returns, of the first line after
+/// `#!`. `None` when the file does not start with `#!` or names no
+/// interpreter. This simplifies Linux's rule (`load_script`), which
+/// reverie-linuxemu's loader follows: Linux passes the rest of the line after
+/// the interpreter as one argument, spaces included, keeps a carriage return
+/// as part of the line, and refuses an interpreter its 256-byte buffer cuts
+/// off. The two agree on a line shorter than 255 bytes, without a carriage
+/// return, with at most one word after the interpreter.
 pub fn shebang(first_bytes: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     let line = first_bytes.get(..first_bytes.len().min(SHEBANG_BYTES - 1))?;
     // The loader reads the line as a C string, which ends at a NUL.

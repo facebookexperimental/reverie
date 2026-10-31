@@ -56,17 +56,26 @@ impl HostResourceExhaustion {
     /// The exhaustion `error` reports, or `None` when `error` is not the host
     /// refusing this process a resource of its own.
     pub fn of(error: &io::Error) -> Option<Self> {
-        let resource = if error.raw_os_error() == Some(libc::ENOMEM)
-            || error.kind() == io::ErrorKind::OutOfMemory
-        {
-            HostResource::Memory
-        } else {
-            match error.raw_os_error() {
-                Some(libc::EMFILE) => HostResource::Descriptors,
-                Some(libc::ENFILE) => HostResource::FileTable,
-                _ => return None,
-            }
-        };
+        if error.kind() == io::ErrorKind::OutOfMemory {
+            return Some(Self::new(HostResource::Memory));
+        }
+        error.raw_os_error().and_then(Self::of_errno)
+    }
+
+    /// The exhaustion the host errno `errno` reports, or `None` when it is not
+    /// the host refusing this process a resource of its own: ENOMEM is memory,
+    /// EMFILE this process's descriptors, ENFILE the host's file table.
+    pub fn of_errno(errno: i32) -> Option<Self> {
+        match errno {
+            libc::ENOMEM => Some(Self::new(HostResource::Memory)),
+            libc::EMFILE => Some(Self::new(HostResource::Descriptors)),
+            libc::ENFILE => Some(Self::new(HostResource::FileTable)),
+            _ => None,
+        }
+    }
+
+    /// `resource` ran out, under the limit that governs it.
+    pub fn new(resource: HostResource) -> Self {
         let limit = match resource {
             HostResource::Memory => {
                 format!("this process's RLIMIT_AS ({})", address_space_limit_text())
@@ -76,7 +85,7 @@ impl HostResourceExhaustion {
             }
             HostResource::FileTable => "the host's system-wide open-file limit".to_owned(),
         };
-        Some(Self { resource, limit })
+        Self { resource, limit }
     }
 }
 
@@ -178,6 +187,19 @@ mod tests {
             assert_eq!(
                 HostResourceExhaustion::of(&io::Error::from_raw_os_error(errno)),
                 None,
+                "{errno}"
+            );
+            assert_eq!(HostResourceExhaustion::of_errno(errno), None, "{errno}");
+        }
+        // A bare errno, as a KVM ioctl reports it, is told apart the same way.
+        for (errno, resource) in [
+            (libc::ENOMEM, HostResource::Memory),
+            (libc::EMFILE, HostResource::Descriptors),
+            (libc::ENFILE, HostResource::FileTable),
+        ] {
+            assert_eq!(
+                HostResourceExhaustion::of_errno(errno).map(|exhaustion| exhaustion.resource),
+                Some(resource),
                 "{errno}"
             );
         }

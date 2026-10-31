@@ -576,6 +576,7 @@ mod tests {
     include!("executor/descriptor_generic_tests.rs");
     include!("executor/tool_directory_tests.rs");
     include!("executor/host_resources_tests.rs");
+    include!("executor/script_line_tests.rs");
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::io::Seek;

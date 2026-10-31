@@ -67,6 +67,7 @@ use reverie_kvm_core::bootstrap;
 use reverie_kvm_core::entry;
 use reverie_kvm_core::error_ext as error;
 use reverie_kvm_core::failure;
+pub use reverie_kvm_core::host_limits::HostResource;
 use reverie_kvm_core::memory;
 use reverie_kvm_core::supervisor_thread;
 use reverie_kvm_core::syscall;

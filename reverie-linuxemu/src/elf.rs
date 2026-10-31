@@ -67,6 +67,11 @@ pub const STACK_LIMIT: u64 = 8 * 1024 * 1024;
 /// `getppid() == 1`. KVM synthesizes the guest identity rather than using a real
 /// namespace, so it must reproduce the same parent value for parity.
 pub const CONTAINER_INIT_PID: i32 = 1;
+/// The largest program-header table of a main image this loader runs: the
+/// one boot page it copies the table to (`PROGRAM_HEADERS_ADDRESS`), 73
+/// entries. That is a limit of this backend's own, not Linux's: Linux reads a
+/// table of up to 64 KiB ([`MAX_PROGRAM_HEADER_TABLE`]), and an interpreter's
+/// table, which is not copied, is accepted up to that.
 const MAX_PROGRAM_HEADERS_SIZE: usize = PAGE_SIZE as usize;
 const MAX_INTERPRETER_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SCRIPT_INTERPRETERS: usize = 4;
@@ -1935,7 +1940,7 @@ fn load_executable(
         );
     }
 
-    let elf = Elf::parse(image)?;
+    let elf = parse_elf(image)?;
     validate_elf(&elf, true)?;
 
     for entry in argv
@@ -1957,7 +1962,7 @@ fn load_executable(
     let interpreter = interpreter_image
         .as_deref()
         .map(|interpreter_image| -> Result<_> {
-            let interpreter = Elf::parse(interpreter_image)?;
+            let interpreter = parse_elf(interpreter_image)?;
             validate_elf(&interpreter, false)?;
             if interpreter.header.e_type != ET_DYN {
                 return Err(Error::UnsupportedElf(
@@ -2300,26 +2305,26 @@ pub fn initial_thread_name(executable_path: &Path) -> [u8; TASK_COMM_LEN] {
 }
 
 // TODO-HUMAN-REVIEW(PR-92): Review Linux shebang parsing limits.
+/// `image`'s `#!` line, read as Linux reads it ([`parse_script_line`]): the
+/// interpreter and at most one optional argument. Both must be UTF-8 here,
+/// since the loader passes them on as `&str`.
 fn parse_shebang(image: &[u8]) -> Result<Option<(String, Option<String>)>> {
-    let Some(rest) = image.strip_prefix(b"#!") else {
+    let Some(line) = parse_script_line(image).map_err(|()| {
+        Error::UnsupportedElf(
+            "script shebang has no interpreter, or one Linux's 256-byte buffer cuts off"
+                .to_string(),
+        )
+    })?
+    else {
         return Ok(None);
     };
-    let line = rest.split(|byte| *byte == b'\n').next().unwrap_or(rest);
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    let line = std::str::from_utf8(line)
-        .map_err(|_| Error::UnsupportedElf("script shebang is not UTF-8".to_string()))?
-        .trim_matches([' ', '\t']);
-    let split = line.find([' ', '\t']).unwrap_or(line.len());
-    let interpreter = line[..split].to_string();
-    if interpreter.is_empty() {
-        return Err(Error::UnsupportedElf(
-            "script shebang has no interpreter".to_string(),
-        ));
-    }
-    let argument = line[split..].trim_matches([' ', '\t']);
+    let utf8 = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .map_err(|_| Error::UnsupportedElf("script shebang is not UTF-8".to_string()))
+    };
     Ok(Some((
-        interpreter,
-        (!argument.is_empty()).then(|| argument.to_string()),
+        utf8(line.interpreter)?,
+        line.argument.map(utf8).transpose()?,
     )))
 }
 
@@ -2407,6 +2412,14 @@ fn interpreter_path(image: &[u8], elf: &Elf<'_>) -> Result<Option<String>> {
         .map_err(|_| Error::UnsupportedElf("PT_INTERP offset is too large".to_string()))?;
     let size = usize::try_from(header.p_filesz)
         .map_err(|_| Error::UnsupportedElf("PT_INTERP size is too large".to_string()))?;
+    // Linux reads a PT_INTERP of 2 to PATH_MAX bytes, its NUL included, and
+    // refuses any other size with ENOEXEC (`load_elf_binary`,
+    // fs/binfmt_elf.c), so the path this copies is at most 4095 bytes.
+    if !(2..=MAX_INTERPRETER_PATH).contains(&size) {
+        return Err(Error::UnsupportedElf(format!(
+            "PT_INTERP of {size} bytes: Linux reads only 2 to {MAX_INTERPRETER_PATH} bytes"
+        )));
+    }
     let end = start
         .checked_add(size)
         .ok_or_else(|| Error::UnsupportedElf("PT_INTERP range overflow".to_string()))?;
@@ -2435,17 +2448,148 @@ fn interpreter_path(image: &[u8], elf: &Elf<'_>) -> Result<Option<String>> {
 /// this backend's own, rather than aborting the process.
 fn copy_image(image: &[u8]) -> Result<std::sync::Arc<Vec<u8>>> {
     let mut copy = Vec::new();
-    copy.try_reserve_exact(image.len()).map_err(|error| {
-        Error::HostIo(std::io::Error::new(
-            std::io::ErrorKind::OutOfMemory,
-            format!(
-                "allocating {} bytes for a copy of the new image: {error}",
-                image.len()
-            ),
-        ))
-    })?;
+    copy.try_reserve_exact(image.len())
+        .map_err(|_| Error::HostAllocation {
+            what: "a copy of the new image",
+            bytes: image.len(),
+        })?;
     copy.extend_from_slice(image);
     Ok(std::sync::Arc::new(copy))
+}
+
+/// The largest PT_INTERP Linux reads, its NUL included: `PATH_MAX`
+/// (`load_elf_binary`, fs/binfmt_elf.c).
+const MAX_INTERPRETER_PATH: usize = libc::PATH_MAX as usize;
+
+/// The size of an ELF64 program header, the only entry size Linux accepts
+/// (`load_elf_phdrs`, fs/binfmt_elf.c).
+const ELF64_PROGRAM_HEADER_SIZE: usize = 56;
+
+/// The largest program-header table Linux reads: 64 KiB, 1170 entries
+/// (`load_elf_phdrs`, fs/binfmt_elf.c). Linux 6.16 and earlier also refused a
+/// table larger than one page; 6.17 dropped that (kernel commit 8030790477e8,
+/// "binfmt_elf: remove the 4k limitation of program header size").
+const MAX_PROGRAM_HEADER_TABLE: usize = 65536;
+
+/// `image`'s ELF header and program headers: the only parts of an image this
+/// loader reads.
+///
+/// Linux's ELF loader reads exactly these, and never a section header or a
+/// string table (`load_elf_binary` and `load_elf_phdrs`, fs/binfmt_elf.c). A
+/// full parse (`goblin::elf::Elf::parse`) would also build the section-header
+/// table and an index of every string table, both sized by the file and
+/// allocated infallibly, so a host short of memory would abort the process
+/// rather than refuse the exec. This parse allocates only the program-header
+/// table, which, as Linux does, it accepts only with 56-byte entries, and only
+/// when it is not empty and at most [`MAX_PROGRAM_HEADER_TABLE`] (64 KiB) long;
+/// Linux loads no image with any other table. A main image's table must also
+/// fit the one page this loader copies it to ([`MAX_PROGRAM_HEADERS_SIZE`]),
+/// a limit of this backend's own that `copy_program_headers` checks.
+pub(crate) fn parse_elf(image: &[u8]) -> Result<Elf<'_>> {
+    let header = Elf::parse_header(image)?;
+    let mut elf = Elf::lazy_parse(header)?;
+    let count = usize::from(header.e_phnum);
+    let table = count * ELF64_PROGRAM_HEADER_SIZE;
+    if usize::from(header.e_phentsize) != ELF64_PROGRAM_HEADER_SIZE
+        || count == 0
+        || table > MAX_PROGRAM_HEADER_TABLE
+    {
+        return Err(Error::UnsupportedElf(format!(
+            "program header table of {count} entries of {} bytes: Linux loads only \
+             {ELF64_PROGRAM_HEADER_SIZE}-byte entries, at least one and at most \
+             {MAX_PROGRAM_HEADER_TABLE} bytes of them",
+            header.e_phentsize
+        )));
+    }
+    let offset = usize::try_from(header.e_phoff)
+        .map_err(|_| Error::UnsupportedElf("program header offset overflow".to_string()))?;
+    let ctx = goblin::container::Ctx::new(header.container()?, header.endianness()?);
+    elf.program_headers =
+        goblin::elf::program_header::ProgramHeader::parse(image, offset, count, ctx)?;
+    Ok(elf)
+}
+
+/// How much of a file Linux reads to recognize its format, and so the most of
+/// a `#!` line it reads (`BINPRM_BUF_SIZE`, include/uapi/linux/binfmts.h).
+pub(crate) const BINPRM_BUF_SIZE: usize = 256;
+
+/// A `#!` line as Linux's script loader reads it: the interpreter's path and
+/// at most one optional argument.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScriptLine {
+    /// The interpreter's path, byte for byte.
+    pub(crate) interpreter: Vec<u8>,
+    /// The rest of the line after the interpreter, if any: one argument,
+    /// whatever spaces it holds.
+    pub(crate) argument: Option<Vec<u8>>,
+}
+
+/// `image`'s `#!` line read exactly as Linux's `load_script` reads it
+/// (fs/binfmt_script.c): from the first [`BINPRM_BUF_SIZE`] bytes only, the
+/// interpreter's path up to the first space, tab or NUL after any leading
+/// spaces and tabs, then at most one optional argument, the rest of the line
+/// with leading and trailing spaces and tabs removed, never split. A line
+/// that the buffer cuts off keeps its interpreter only if a space, tab or NUL
+/// follows the interpreter within the buffer; the argument is then cut at the
+/// buffer's last byte. `Ok(None)` for an image that does not start with
+/// `#!`; `Err(())`, Linux's ENOEXEC, for a line with no interpreter or one the
+/// buffer cuts off. Both fields are at most 253 bytes, so nothing here grows
+/// with the file.
+pub(crate) fn parse_script_line(image: &[u8]) -> std::result::Result<Option<ScriptLine>, ()> {
+    // bprm->buf: the file's first BINPRM_BUF_SIZE bytes, zero-padded.
+    let mut buf = [0_u8; BINPRM_BUF_SIZE];
+    let length = image.len().min(BINPRM_BUF_SIZE);
+    buf[..length].copy_from_slice(&image[..length]);
+    if buf[0] != b'#' || buf[1] != b'!' {
+        return Ok(None);
+    }
+    let spacetab = |byte: u8| byte == b' ' || byte == b'\t';
+    let next_non_spacetab =
+        |buf: &[u8], first: usize, last: usize| (first..=last).find(|&at| !spacetab(buf[at]));
+    let next_terminator = |buf: &[u8], first: usize, last: usize| {
+        (first..=last).find(|&at| spacetab(buf[at]) || buf[at] == 0)
+    };
+    let buf_end = BINPRM_BUF_SIZE - 1;
+    // strnchr(buf, BINPRM_BUF_SIZE, '\n'): it stops at a NUL.
+    let newline = buf
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .position(|&byte| byte == b'\n');
+    let mut end = match newline {
+        Some(newline) => newline,
+        None => {
+            // Entirely spaces and tabs, or an interpreter the buffer cuts off.
+            let first = next_non_spacetab(&buf, 2, buf_end).ok_or(())?;
+            next_terminator(&buf, first, buf_end).ok_or(())?;
+            buf_end
+        }
+    };
+    // buf[1] is '!', so this stops at 2 at the latest.
+    while spacetab(buf[end - 1]) {
+        end -= 1;
+    }
+    let name = next_non_spacetab(&buf, 2, end)
+        .filter(|&name| name != end)
+        .ok_or(())?;
+    let separator = next_terminator(&buf, name, end);
+    let argument = separator
+        .filter(|&separator| buf[separator] != 0)
+        .and_then(|separator| next_non_spacetab(&buf, separator, end));
+    buf[end] = 0;
+    if let (Some(_), Some(separator)) = (argument, separator) {
+        buf[separator] = 0;
+    }
+    let c_string = |at: usize| {
+        let end = buf[at..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .map_or(buf.len(), |length| at + length);
+        buf[at..end].to_vec()
+    };
+    Ok(Some(ScriptLine {
+        interpreter: c_string(name),
+        argument: argument.map(c_string),
+    }))
 }
 
 /// The loader's error for an open or stat of the program interpreter at
@@ -2481,17 +2625,22 @@ fn read_interpreter_image(path: &str) -> Result<Vec<u8>> {
 
     // A buffer this process cannot allocate is the host running out of
     // memory, not a defect of the image: report it as the host error it is.
+    let length = metadata.len() as usize;
     let mut image = Vec::new();
     image
-        .try_reserve_exact(metadata.len() as usize)
-        .map_err(|error| {
-            Error::HostIo(std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))
+        .try_reserve_exact(length)
+        .map_err(|_| Error::HostAllocation {
+            what: "the program interpreter's image",
+            bytes: length,
         })?;
     file.take(MAX_INTERPRETER_BYTES + 1)
         .read_to_end(&mut image)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::OutOfMemory {
-                Error::HostIo(error)
+                Error::HostAllocation {
+                    what: "the program interpreter's image, which grew while it was read",
+                    bytes: length,
+                }
             } else {
                 Error::UnsupportedElf(format!("cannot read interpreter {path:?}: {error}"))
             }
@@ -2627,9 +2776,11 @@ fn copy_program_headers(memory: &mut GuestMemory, image: &[u8], elf: &Elf<'_>) -
         .checked_mul(usize::from(elf.header.e_phnum))
         .ok_or_else(|| Error::UnsupportedElf("program-header size overflow".to_string()))?;
     if size > MAX_PROGRAM_HEADERS_SIZE {
-        return Err(Error::UnsupportedElf(
-            "program-header table exceeds one page".to_string(),
-        ));
+        return Err(Error::UnsupportedElf(format!(
+            "the main image's program-header table of {size} bytes exceeds the one page \
+             ({MAX_PROGRAM_HEADERS_SIZE} bytes) this loader copies it to for AT_PHDR, a limit of \
+             this backend's own"
+        )));
     }
     let end = start
         .checked_add(size)
@@ -3049,6 +3200,85 @@ pub fn minimal_test_elf(code: &[u8]) -> Vec<u8> {
     put_u64(&mut image, 104, 0x2000);
     put_u64(&mut image, 112, 0x1000);
     image[CODE_OFFSET..].copy_from_slice(code);
+    image
+}
+
+/// [`minimal_test_elf`] padded to `length` bytes past its only segment with
+/// valid ELF metadata as large as the file allows: a section-header table of
+/// 64-byte entries filling the first half of the file from offset 0x2000, its
+/// size counted in the first entry's `sh_size` (extended numbering: `e_shnum`
+/// is 0), and, filling the second half, the section-name string table that its
+/// second entry names, holding one one-byte string in every two bytes. Linux
+/// reads no section header and no string table, so the image loads exactly as
+/// [`minimal_test_elf`] does; a parser that reads them allocates in
+/// proportion to `length` (a full goblin parse indexes about `length / 2`
+/// strings, at 24 bytes each). For tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn minimal_test_elf_with_vast_metadata(code: &[u8], length: usize) -> Vec<u8> {
+    const TABLE: usize = 0x2000;
+    let mut image = minimal_test_elf(code);
+    let half = (length / 2) & !0xfff;
+    assert!(image.len() <= TABLE && half >= TABLE + 2 * 64);
+    image.resize(length, 0);
+    let count = ((half - TABLE) / 64) as u64;
+    image[40..48].copy_from_slice(&(TABLE as u64).to_le_bytes());
+    image[58..60].copy_from_slice(&64_u16.to_le_bytes());
+    image[60..62].copy_from_slice(&0_u16.to_le_bytes());
+    image[62..64].copy_from_slice(&1_u16.to_le_bytes());
+    image[TABLE + 32..TABLE + 40].copy_from_slice(&count.to_le_bytes());
+    let strtab = TABLE + 64;
+    image[strtab + 4..strtab + 8].copy_from_slice(&3_u32.to_le_bytes());
+    image[strtab + 24..strtab + 32].copy_from_slice(&(half as u64).to_le_bytes());
+    image[strtab + 32..strtab + 40].copy_from_slice(&((length - half) as u64).to_le_bytes());
+    for byte in image[half..].iter_mut().step_by(2) {
+        *byte = b'a';
+    }
+    image
+}
+
+/// A minimal program interpreter: an `ET_DYN` image of `program_headers`
+/// program headers, one PT_LOAD of the whole file at address 0 and PT_NULL
+/// entries after it, whose entry point holds `code` just past the table.
+/// `code` must be position-independent. For tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn minimal_test_interpreter(code: &[u8], program_headers: u16) -> Vec<u8> {
+    let table_end = 64 + usize::from(program_headers) * 56;
+    let code_offset = table_end.next_multiple_of(PAGE_SIZE as usize);
+    let mut image = vec![0; code_offset + code.len()];
+    image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    for (offset, value) in [(16, ET_DYN), (18, EM_X86_64), (52, 64), (54, 56)] {
+        image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    image[56..58].copy_from_slice(&program_headers.to_le_bytes());
+    image[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    image[24..32].copy_from_slice(&(code_offset as u64).to_le_bytes());
+    image[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    let length = image.len() as u64;
+    image[64..68].copy_from_slice(&PT_LOAD.to_le_bytes());
+    image[68..72].copy_from_slice(&5_u32.to_le_bytes());
+    for (offset, value) in [(96, length), (104, length), (112, PAGE_SIZE)] {
+        image[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    image[code_offset..].copy_from_slice(code);
+    image
+}
+
+/// [`minimal_test_elf`] with a second program header, a PT_INTERP whose
+/// contents are `interpreter` (a path and its NUL, as Linux reads them),
+/// placed at the end of the image. For tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn minimal_test_elf_with_interpreter(code: &[u8], interpreter: &[u8]) -> Vec<u8> {
+    let mut image = minimal_test_elf(code);
+    let offset = image.len().next_multiple_of(8);
+    image.resize(offset, 0);
+    image.extend_from_slice(interpreter);
+    image[56..58].copy_from_slice(&2_u16.to_le_bytes());
+    image[120..124].copy_from_slice(&PT_INTERP.to_le_bytes());
+    image[124..128].copy_from_slice(&4_u32.to_le_bytes());
+    image[128..136].copy_from_slice(&(offset as u64).to_le_bytes());
+    image[152..160].copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
+    image[160..168].copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
+    image[168..176].copy_from_slice(&1_u64.to_le_bytes());
     image
 }
 
@@ -4327,6 +4557,197 @@ mod tests {
                 .host_resource_exhaustion()
                 .map(|exhaustion| exhaustion.resource),
             Some(reverie_kvm_core::host_limits::HostResource::Descriptors)
+        );
+    }
+
+    /// The loader reads an image's ELF header and program headers only, as
+    /// Linux's ELF loader does: an image whose section-header table and string
+    /// table fill its file (a full parse reads every entry and indexes every
+    /// string) parses with no section header at all, and its program headers
+    /// are the image's own.
+    #[test]
+    fn an_image_is_parsed_for_its_program_headers_only() {
+        let image = minimal_test_elf_with_vast_metadata(&[0xf4], 1024 * 1024);
+        let full = Elf::parse(&image).expect("a full parse reads the section table");
+        assert_eq!(full.section_headers.len(), (512 * 1024 - 0x2000) / 64);
+        assert_eq!(full.shdr_strtab.len(), 512 * 1024);
+        assert_eq!(full.shdr_strtab.get_at(2), Some("a"));
+        let elf = parse_elf(&image).unwrap();
+        assert!(elf.section_headers.is_empty());
+        assert_eq!(elf.program_headers, full.program_headers);
+        assert_eq!(elf.header, full.header);
+        assert_eq!(elf.entry, full.entry);
+    }
+
+    /// [`minimal_test_elf`] with its program-header table moved to 0x2000 and
+    /// grown to `count` entries of `entry_size` bytes: its PT_LOAD first, then
+    /// PT_NULL entries.
+    fn program_header_table_test_elf(count: u16, entry_size: u16) -> Vec<u8> {
+        let mut image = minimal_test_elf(&[0xf4]);
+        let load = image[64..120].to_vec();
+        image.resize(
+            0x2000 + usize::from(count) * usize::from(entry_size) + 0x1000,
+            0,
+        );
+        image[32..40].copy_from_slice(&0x2000_u64.to_le_bytes());
+        image[54..56].copy_from_slice(&entry_size.to_le_bytes());
+        image[56..58].copy_from_slice(&count.to_le_bytes());
+        image[0x2000..0x2000 + load.len()].copy_from_slice(&load);
+        image
+    }
+
+    /// The program-header table is accepted only as Linux's
+    /// `load_elf_phdrs` accepts it (fs/binfmt_elf.c): 56-byte entries, at
+    /// least one, and no more than 64 KiB of them (1170 entries). Linux 6.16
+    /// and earlier stopped at one page (73 entries); 6.17 lifted that (kernel
+    /// commit 8030790477e8), so 74 entries parse. Any other table is not an
+    /// image Linux loads.
+    #[test]
+    fn a_program_header_table_is_accepted_only_within_linuxs_bounds() {
+        for count in [73_u16, 74, 1170] {
+            let image = program_header_table_test_elf(count, 56);
+            let elf = parse_elf(&image).unwrap_or_else(|error| panic!("{count} entries: {error}"));
+            assert_eq!(elf.program_headers.len(), usize::from(count));
+            assert_eq!(elf.program_headers[0].p_type, PT_LOAD);
+        }
+        for (count, entry_size) in [(1171, 56), (0, 56), (1, 64), (1, 32)] {
+            assert!(
+                matches!(
+                    parse_elf(&program_header_table_test_elf(count, entry_size)),
+                    Err(Error::UnsupportedElf(_))
+                ),
+                "{count} entries of {entry_size} bytes"
+            );
+        }
+    }
+
+    /// A main image's program-header table must also fit the one page this
+    /// loader copies it to for AT_PHDR: 73 entries load, 74 are refused, with
+    /// an error that names the limit as this backend's own. Linux runs both;
+    /// an interpreter's table is not copied and parses up to Linux's 64 KiB.
+    #[test]
+    fn a_main_images_program_header_table_must_fit_the_page_this_loader_copies_it_to() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        load_static_elf(
+            &mut memory,
+            &program_header_table_test_elf(73, 56),
+            &["main"],
+            &[],
+            &cwd,
+        )
+        .expect("73 entries fit one page");
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let error = load_static_elf(
+            &mut memory,
+            &program_header_table_test_elf(74, 56),
+            &["main"],
+            &[],
+            &cwd,
+        )
+        .expect_err("74 entries exceed the page");
+        assert!(
+            matches!(&error, Error::UnsupportedElf(message)
+                if message.contains("a limit of this backend's own")),
+            "{error}"
+        );
+    }
+
+    /// A PT_INTERP is read only within Linux's bounds (`load_elf_binary`,
+    /// fs/binfmt_elf.c): 2 to `PATH_MAX` (4096) bytes, its NUL included. Any
+    /// other size is refused before the path is copied, so the copy is at most
+    /// 4095 bytes, whatever the file holds.
+    #[test]
+    fn a_pt_interp_is_read_only_within_linuxs_bounds() {
+        let path = |size: usize| {
+            let mut contents = vec![b'a'; size];
+            if let Some(first) = contents.first_mut() {
+                *first = b'/';
+            }
+            if let Some(last) = contents.last_mut() {
+                *last = 0;
+            }
+            contents
+        };
+        let read = |contents: &[u8]| {
+            let image = minimal_test_elf_with_interpreter(&[0xf4], contents);
+            interpreter_path(&image, &parse_elf(&image).unwrap())
+        };
+        assert_eq!(read(&path(2)).unwrap().as_deref(), Some("/"));
+        let longest = read(&path(4096)).unwrap().unwrap();
+        assert_eq!(longest.len(), 4095);
+        assert!(longest.starts_with("/a"));
+        for size in [0, 1, 4097, 64 * 1024] {
+            assert!(
+                matches!(read(&path(size)), Err(Error::UnsupportedElf(_))),
+                "{size} bytes"
+            );
+        }
+    }
+
+    /// Parses `image`'s `#!` line as UTF-8, for the assertions below.
+    fn script_line(image: &[u8]) -> std::result::Result<Option<(String, Option<String>)>, ()> {
+        parse_script_line(image).map(|line| {
+            line.map(|line| {
+                (
+                    String::from_utf8(line.interpreter).unwrap(),
+                    line.argument
+                        .map(|argument| String::from_utf8(argument).unwrap()),
+                )
+            })
+        })
+    }
+
+    /// A `#!` line is read as Linux's `load_script` reads it
+    /// (fs/binfmt_script.c): the interpreter, then at most one optional
+    /// argument, the rest of the line, never split; only the first 256 bytes
+    /// count.
+    #[test]
+    fn a_script_line_is_read_as_linux_reads_it() {
+        let some = |interpreter: &str, argument: Option<&str>| {
+            Ok(Some((interpreter.to_owned(), argument.map(str::to_owned))))
+        };
+        assert_eq!(script_line(b"\x7fELF"), Ok(None));
+        assert_eq!(script_line(b"#"), Ok(None));
+        assert_eq!(script_line(b"#!/bin/sh\n"), some("/bin/sh", None));
+        // One argument, trimmed of spaces and tabs at both ends, whatever it
+        // holds in between.
+        assert_eq!(
+            script_line(b"#! \t/bin/sh -e  -x \t\nexit 1\n"),
+            some("/bin/sh", Some("-e  -x"))
+        );
+        assert_eq!(
+            script_line(b"#!/usr/bin/env -S python3 -u\n"),
+            some("/usr/bin/env", Some("-S python3 -u"))
+        );
+        // A carriage return is part of the line.
+        assert_eq!(script_line(b"#!/bin/sh\r\n"), some("/bin/sh\r", None));
+        assert_eq!(
+            script_line(b"#!/bin/sh -e\r\n"),
+            some("/bin/sh", Some("-e\r"))
+        );
+        // A NUL ends the interpreter, and the line has no argument.
+        assert_eq!(script_line(b"#!/bin/sh\0 -e\n"), some("/bin/sh", None));
+        // A file shorter than the buffer ends at its zero padding.
+        assert_eq!(script_line(b"#!/bin/sh"), some("/bin/sh", None));
+        assert_eq!(script_line(b"#!/bin/sh -x"), some("/bin/sh", Some("-x")));
+        // No interpreter.
+        assert_eq!(script_line(b"#!\n"), Err(()));
+        assert_eq!(script_line(b"#!  \t \n"), Err(()));
+        assert_eq!(
+            script_line(" ".repeat(300).replacen("  ", "#!", 1).as_bytes()),
+            Err(())
+        );
+        // A long line's argument is cut at the buffer's last byte...
+        let long = format!("#!/bin/echo {}\n", "x ".repeat(200));
+        assert_eq!(
+            script_line(long.as_bytes()),
+            some("/bin/echo", Some(long[12..BINPRM_BUF_SIZE - 1].trim_end()))
+        );
+        // ...and an interpreter that the buffer cuts off is refused.
+        assert_eq!(
+            script_line(format!("#!/{}\n", "a".repeat(300)).as_bytes()),
+            Err(())
         );
     }
 }

@@ -274,15 +274,20 @@ pub(super) fn resolve_guest_exec_image(
 /// `BINPRM_MAX_RECURSION` limit for chained script interpreters.
 pub(super) const MAX_SHEBANG_DEPTH: usize = 4;
 
-/// Resolve `#!` interpreter scripts for in-guest `execve(2)`, mirroring the
-/// kernel's `binfmt_script` loader (`fs/binfmt_script.c`).
+/// Resolve `#!` interpreter scripts for in-guest `execve(2)`, as the kernel's
+/// script loader does (`load_script`, fs/binfmt_script.c).
 ///
 /// The reverie-kvm ELF loader can only map ELF images, so a guest that execs a
 /// `#!`-script (for example a `sh` wrapper that execs another wrapper) must have
-/// its interpreter resolved here. On success the returned image is the
+/// its interpreter resolved here. Each line is read as Linux reads it
+/// ([`crate::elf::parse_script_line`]): only its first 256 bytes, the
+/// interpreter, then at most one optional argument, the rest of the line,
+/// never split on its spaces. On success the returned image is the
 /// interpreter's file contents and `argv` is rewritten in kernel order:
-/// `[interp, shebang_args.., script_path, <original argv[1..]>]`. Errors are
-/// returned as negative errnos.
+/// `[interp, optional argument, script_path, <original argv[1..]>]`. Each
+/// level therefore replaces `argv[0]` with at most two entries made from at
+/// most 253 bytes of the line each, and the script's path, and there are at
+/// most [`MAX_SHEBANG_DEPTH`] levels. Errors are returned as negative errnos.
 pub(super) fn resolve_exec_shebang(
     mut path: std::path::PathBuf,
     mut image: Vec<u8>,
@@ -295,48 +300,28 @@ pub(super) fn resolve_exec_shebang(
         if depth > MAX_SHEBANG_DEPTH {
             return Err(negative_errno(libc::ELOOP));
         }
-        let line_end = image
-            .iter()
-            .position(|&b| b == b'\n')
-            .unwrap_or(image.len());
-        // Skip "#!" and any leading blanks, then take the interpreter token.
-        let mut start = 2;
-        while start < line_end && matches!(image[start], b' ' | b'\t') {
-            start += 1;
-        }
-        let mut end = start;
-        while end < line_end && !matches!(image[end], b' ' | b'\t' | b'\r') {
-            end += 1;
-        }
-        if start == end {
-            return Err(negative_errno(libc::ENOEXEC));
-        }
-        // Each copy below is as long as the directive line, whose length the
-        // file decides, so each is allocated fallibly: one this process cannot
-        // allocate is ENOMEM, which an exec refuses as this backend's own
-        // (`exec_host_memory_refusal`).
-        let mut interpreter = Vec::new();
-        interpreter
-            .try_reserve_exact(end - start)
-            .map_err(exec_out_of_memory)?;
-        interpreter.extend_from_slice(&image[start..end]);
-        let interpreter = std::path::PathBuf::from(std::ffi::OsString::from_vec(interpreter));
-        // Remaining tokens on the directive line become interpreter arguments.
-        let line = try_lossy_string(&image[end..line_end]).map_err(exec_out_of_memory)?;
-        let mut shebang_args = Vec::new();
-        for token in line.split_ascii_whitespace() {
-            shebang_args.try_reserve(1).map_err(exec_out_of_memory)?;
-            shebang_args.push(try_lossy_string(token.as_bytes()).map_err(exec_out_of_memory)?);
-        }
-
+        let Some(line) =
+            crate::elf::parse_script_line(&image).map_err(|()| negative_errno(libc::ENOEXEC))?
+        else {
+            unreachable!("the image starts with #!");
+        };
+        let interpreter = std::path::PathBuf::from(std::ffi::OsString::from_vec(line.interpreter));
+        // The guest's argv was read under the executor's limits (4096 entries,
+        // 128 KiB in all); this level replaces argv[0] with at most two entries
+        // made from at most 253 bytes of the line each, and the script's path,
+        // and moves the rest. Allocated fallibly all the same: one this process
+        // cannot allocate is ENOMEM, which an exec refuses as this backend's
+        // own (`exec_host_memory_refusal`). An empty argv still gets all three.
         let mut rewritten = Vec::new();
         rewritten
-            .try_reserve_exact(argv.len() + shebang_args.len() + 2)
+            .try_reserve_exact(argv.len().max(1) + 2)
             .map_err(exec_out_of_memory)?;
         rewritten.push(
             try_lossy_string(interpreter.as_os_str().as_bytes()).map_err(exec_out_of_memory)?,
         );
-        rewritten.append(&mut shebang_args);
+        if let Some(argument) = line.argument {
+            rewritten.push(try_lossy_string(&argument).map_err(exec_out_of_memory)?);
+        }
         rewritten.push(try_lossy_string(path.as_os_str().as_bytes()).map_err(exec_out_of_memory)?);
         if argv.len() > 1 {
             rewritten.extend(argv.drain(1..));

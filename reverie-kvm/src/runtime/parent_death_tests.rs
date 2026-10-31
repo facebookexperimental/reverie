@@ -311,15 +311,19 @@ fn original_exec_callback_drop_revokes_staged_image_without_injection() {
     };
     use std::io::Write;
     use std::os::fd::FromRawFd;
-    // A parsed static ELF header suffices for this admission/teardown test;
-    // ordinary loader errors remain possible and no image is executed here.
-    let mut image = vec![0_u8; 64];
+    // A static ELF header and one program header (Linux loads no image with
+    // fewer) suffice for this admission/teardown test; ordinary loader errors
+    // remain possible and no image is executed here.
+    let mut image = vec![0_u8; 64 + 56];
     image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
     image[16..18].copy_from_slice(&2_u16.to_le_bytes());
     image[18..20].copy_from_slice(&62_u16.to_le_bytes());
     image[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    image[32..40].copy_from_slice(&64_u64.to_le_bytes());
     image[52..54].copy_from_slice(&64_u16.to_le_bytes());
     image[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    image[56..58].copy_from_slice(&1_u16.to_le_bytes());
+    image[64..68].copy_from_slice(&goblin::elf::program_header::PT_LOAD.to_le_bytes());
     let raw =
         unsafe { libc::memfd_create(c"pdeath-exec-lifetime-test".as_ptr(), libc::MFD_CLOEXEC) };
     assert!(raw >= 0, "{}", std::io::Error::last_os_error());

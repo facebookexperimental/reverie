@@ -285,6 +285,16 @@ pub enum Error {
     #[error("failed to allocate guest memory: {0}")]
     MemoryMapping(#[source] std::io::Error),
 
+    /// A fallible allocation of host memory for the backend's own use failed:
+    /// `bytes` bytes for `what`, such as a copy of an image an exec loads.
+    #[error("allocating {bytes} bytes of host memory for {what} failed")]
+    HostAllocation {
+        /// What the memory was for.
+        what: &'static str,
+        /// The size of the request.
+        bytes: usize,
+    },
+
     /// A host resource of this process's own (memory or address space,
     /// descriptors, the host's file table) ran out while the backend carried
     /// out an operation past the point where it could still answer the
@@ -295,6 +305,8 @@ pub enum Error {
     /// ([`crate::host_limits::HostResourceExhaustion`]).
     #[error("{diagnostic}")]
     HostResources {
+        /// The host resource that ran out.
+        resource: crate::host_limits::HostResource,
         /// What ran out, in which step, under which limit.
         diagnostic: String,
     },
@@ -538,15 +550,20 @@ impl Error {
     }
 
     /// The host resource this error reports running out of, when it is a
-    /// host call or allocation of this process's own that the host refused
-    /// ([`Self::MemoryMapping`] or [`Self::HostIo`] carrying ENOMEM, an
-    /// allocation's `OutOfMemory`, EMFILE or ENFILE); `None` for any other
-    /// error, such as a malformed image.
+    /// host call or allocation of this process's own that the host refused:
+    /// [`Self::MemoryMapping`] or [`Self::HostIo`] carrying ENOMEM, an
+    /// allocation's `OutOfMemory`, EMFILE or ENFILE; a KVM ioctl
+    /// ([`Self::Kvm`]) failing with one of those errnos, as `KVM_GET_SREGS`
+    /// can when the kernel cannot allocate; or a failed
+    /// [`Self::HostAllocation`]. `None` for any other error, such as a
+    /// malformed image or an ordinary ioctl fault.
     pub fn host_resource_exhaustion(&self) -> Option<crate::host_limits::HostResourceExhaustion> {
+        use crate::host_limits::HostResource;
+        use crate::host_limits::HostResourceExhaustion;
         match self {
-            Self::MemoryMapping(error) | Self::HostIo(error) => {
-                crate::host_limits::HostResourceExhaustion::of(error)
-            }
+            Self::MemoryMapping(error) | Self::HostIo(error) => HostResourceExhaustion::of(error),
+            Self::Kvm(error) => HostResourceExhaustion::of_errno(error.errno()),
+            Self::HostAllocation { .. } => Some(HostResourceExhaustion::new(HostResource::Memory)),
             _ => None,
         }
     }

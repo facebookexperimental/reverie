@@ -245,7 +245,7 @@ for injected and unsubscribed syscalls.
 
 ## ELF execution
 
-`install_static_elf` accepts little-endian x86-64 `ET_EXEC` and `ET_DYN` images. It copies `PT_LOAD` segments, zeros BSS, loads one `PT_INTERP` image when present, creates a Linux-style `argc`/`argv`/`envp`/auxv stack, and installs an identity-mapped long-mode address space. The vCPU starts at CPL3. `EFER.SCE`, `STAR`, `LSTAR`, and
+`install_static_elf` accepts little-endian x86-64 `ET_EXEC` and `ET_DYN` images. It copies `PT_LOAD` segments, zeros BSS, loads one `PT_INTERP` image when present, creates a Linux-style `argc`/`argv`/`envp`/auxv stack, and installs an identity-mapped long-mode address space. It reads an image's ELF header and program headers only, and accepts a program-header table as Linux 6.17 and later do: 56-byte entries, at least one, at most 64 KiB (1170 entries). A main image's table must also fit the one page the loader copies it to for `AT_PHDR` (73 entries), a limit of this backend's own: Linux runs a main image with more, and an interpreter's table, which is not copied, is accepted up to 64 KiB. The vCPU starts at CPL3. `EFER.SCE`, `STAR`, `LSTAR`, and
 `SFMASK` direct real `SYSCALL` instructions to a ring-0 trampoline that
 serializes the Linux ABI register frame, exits KVM, then returns with
 `SYSRETQ`.
@@ -532,26 +532,41 @@ at the first reservation or allocation that does not fit, at a point the
 process tree and host thread scheduling decide:
 
 - an exec whose validation memory the host refuses, whose image (or its copy
-  of `/proc/self/exe`, its `#!` line, or the loader's copy) this process
-  cannot allocate, or whose program interpreter it cannot open for want of a
-  descriptor or memory, is answered `ENOMEM` with the typed refusal
+  of `/proc/self/exe`, or the loader's copy) this process cannot allocate, or
+  whose program interpreter it cannot open or read for want of a descriptor
+  or memory, is answered `ENOMEM` with the typed refusal
   `UnsupportedOperation::HostResources`. Its diagnostic names what ran out,
   the request or the step, and the limit: `RLIMIT_AS`, or `RLIMIT_NOFILE`
   for descriptors. The exec runs none of the new image. A Tool that ends the
-  run on the refusal keeps the guest from ever seeing the `ENOMEM`; no
-  `ENOMEM` an exec returns is one Linux would give for the guest's own
-  reasons;
+  run on the refusal keeps the guest from ever seeing the `ENOMEM`; no exec
+  `ENOMEM` is one Linux would give for the guest's own reasons. ENFILE, the
+  host's whole file table being full, is one Linux could give an exec; the
+  backend refuses it by name too, since it says nothing about the guest;
 - an exec that runs out of a host resource past its point of no return, with
-  the old image discarded and the new one loading into the live memory, ends
-  the run with the named refusal `Error::HostResources`; the guest sees no
-  errno. The exec's preflight loaded the same image, so this happens only
-  when the host's resources shrank in between, as a limit lowered during the
-  run can make them;
+  the old image discarded and the new one loading into the live memory,
+  ends the run with the named refusal `Error::HostResources`, which carries
+  the resource (`HostResource`); the guest sees no errno. That covers the
+  loader's fallible allocations, its host calls, and the KVM ioctls that set
+  up the new image (`KVM_GET_SREGS`, for one, allocates and can fail with
+  ENOMEM). The reload loads the image the preflight read, but it opens the
+  program interpreter and the working directory again by path. If either
+  changed since the preflight, the reload can fail where the preflight did
+  not, which ends the run as a backend failure rather than this refusal, or
+  it can load an interpreter the preflight did not check;
 - a fork whose child memory the host refuses ends the run with
   `Error::MemoryMapping`;
-- an allocation of a fixed size, or of one bounded by the executor's own
-  limits (an exec's path, `argv` and `envp`), is not fallible: when one of
-  those fails, the process is out of memory everywhere, and it aborts.
+- the rest of what an exec allocates is bounded, and not fallible: buffers
+  of a fixed size; the path (at most 4 KiB); `argv` and `envp` (each at most
+  4096 entries and 128 KiB in all); what a `#!` line adds to `argv` (Linux
+  reads only the line's first 256 bytes and passes at most one optional
+  argument, so each level replaces `argv[0]` with at most two entries made
+  from at most 253 bytes of the line each, and the script's path, at each of
+  at most four levels); the PT_INTERP path (at most 4 KiB, as Linux bounds
+  it); the program-header table (at most 64 KiB, as Linux bounds it since
+  6.17; see "ELF execution" for the main image's one-page limit); and the
+  initial stack built from these. The loader reads no section header and
+  no string table, as Linux's ELF loader does not. When one of these bounded
+  allocations fails, the process is out of memory everywhere, and it aborts.
 
 An embedder that needs the same outcome on every run should refuse to start
 under a finite `RLIMIT_AS`.
