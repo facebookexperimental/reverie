@@ -3187,8 +3187,13 @@ static register_orig_t enter_instruction_register_orig(
     prototype_counters_t* counters, void* drcontext) {
   register_orig_t previous = counters->register_orig;
   clear_register_orig(counters);
+  /* Only successful external-global, non-vfork rebasing in pre_syscall
+   * publishes this PID. Admit the child's current instruction, never inherited
+   * startup/saved metadata or an unrebound nested copy. */
   if (drcontext != NULL && drcontext == dr_get_current_drcontext() &&
-      !has_copied_runtime() &&
+      (!has_copied_runtime() ||
+       (runtime_uses_external_global() && !is_copied_vfork_process() &&
+        copied_process_runtime_pid == dr_get_process_id())) &&
       counters->signal_token == 0 && counters->preempt_pending == 0 &&
       !counters->in_syscall_event && counters->pending_thread_start == 0)
     bind_register_orig(

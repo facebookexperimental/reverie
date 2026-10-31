@@ -1438,6 +1438,7 @@ static prototype_counters_t state;
 static dr_mcontext_t machine;
 static _Atomic uint64_t image_generation = 17, branch_count = 19, virtual_tsc;
 static process_id_t current_pid = 100;
+static process_id_t copied_process_runtime_pid;
 static thread_id_t current_tid = 100;
 static void* current_context = (void*)0x1234;
 static int thread_state_index, diagnostic_file;
@@ -1658,6 +1659,8 @@ static void reset(void) {
   machine.size = sizeof(machine); machine.flags = DR_MC_ALL;
   machine.xax = 7; machine.xcx = 8; machine.xip = (app_pc)0x400100;
   machine.xsp = 0x700000; machine.xflags = 0x246;
+  current_pid = current_tid = 100;
+  copied_process_runtime_pid = 0;
   copied = external_global = copied_vfork = nest = false;
   ready = set_ok = expect_access = true;
   runtime_answer = 1;
@@ -1706,6 +1709,46 @@ int main(void) {
   assert_scope_closed(expected_exit_owner);
   puts("instruction callback RDTSCP: owned read/write and completion");
 
+  // Model the marker published only after successful external-global rebase.
+  // These are actual production callback bodies under controlled state, not a
+  // live fork/rebase claim. An inherited image-start fact never becomes the
+  // child's instruction view; UNKNOWN and retired current facts work too.
+  for (int prior = 0; prior != 3; ++prior) {
+    for (int event = 1; event != 4; ++event) {
+      reset();
+      if (prior == 1)
+        bind_register_orig(&state, current_context, REGISTER_ORIG_IMAGE_START,
+            SYS_execve);
+      copied = external_global = true;
+      current_pid = current_tid = 101;
+      copied_process_runtime_pid = current_pid;
+      if (prior == 2)
+        bind_register_orig(&state, current_context, REGISTER_ORIG_SYSCALL,
+            SYS_getpid);
+      register_orig_t previous = state.register_orig;
+      expected_exit_owner = previous;
+      assert_unavailable(read_registers, write_registers);
+      memcpy(&expected, &machine, sizeof(machine));
+      bool nested_child = prior == 2 && event == 1;
+      nest = nested_child;
+      if (event == 1) {
+        call_cpuid();
+        expected.xax = 11; expected.xbx = 22; expected.xcx = 33; expected.xdx = 44;
+      } else {
+        expected_event = event;
+        if (event == 2) emulate_rdtsc(); else emulate_rdtscp();
+        expected.xax = (uint32_t)callback_tsc; expected.xdx = callback_tsc >> 32;
+        if (event == 3) expected.xcx = callback_aux;
+      }
+      assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+      assert(callbacks[event] == 1 && entered == (nested_child ? 2u : 1u));
+      if (nested_child) assert(callbacks[2] == 1);
+      assert(exits == 0);
+      assert_scope_closed(previous);
+      assert_unavailable(read_registers, write_registers);
+    }
+  }
+
   // Prior metadata can be UNKNOWN, a retired syscall, or an outer instruction
   // with an explicit Tool write. No prior valid origin is needed for entry.
   reset();
@@ -1743,11 +1786,29 @@ int main(void) {
   assert(guest_tsc(current_context, false, &aux) == VIRTUAL_TSC_STRIDE);
   assert(aux == 0 && entered == 0);
   assert_scope_closed(expected_exit_owner);
+
+  // A matching PID is not enough outside the supported rebase lifecycle.
+  // Both the owner helper and physical callback routing retain their refusals.
+  for (int vfork = 0; vfork != 2; ++vfork) {
+    reset(); copied = true;
+    external_global = copied_vfork = vfork;
+    current_pid = current_tid = 101;
+    copied_process_runtime_pid = current_pid;
+    register_orig_t previous = enter_instruction_register_orig(&state, current_context);
+    assert_unavailable(read_registers, write_registers);
+    state.register_orig = previous;
+    call_cpuid();
+    assert(exits == 1 && entered == 0 && callbacks[1] == 0);
+    assert(strstr(diagnostic, "refusing cpuid in a copied child") != NULL);
+    assert(guest_tsc(current_context, true, &aux) == VIRTUAL_TSC_STRIDE);
+    assert(aux == 0 && entered == 0 && callbacks[3] == 0);
+    assert_scope_closed(previous);
+  }
   puts("instruction callback scopes: nested and returned branches restored");
 
   // Enter the actual runtime callback while each disallowed context is active.
   // This tests controlled state, not live delayed/nested-signal provenance.
-  for (int refused = 0; refused != 5; ++refused) {
+  for (int refused = 0; refused != 6; ++refused) {
     reset(); expect_access = false;
     switch (refused) {
       case 0: state.signal_token = 1; break;
@@ -1758,6 +1819,11 @@ int main(void) {
         bind_register_orig(&state, current_context, REGISTER_ORIG_SYSCALL, SYS_getpid);
         break;
       case 4: copied = external_global = true; break;
+      case 5:
+        copied = external_global = true;
+        copied_process_runtime_pid = current_pid;
+        ++current_pid; ++current_tid; // A nested child must rebase again.
+        break;
     }
     register_orig_t before = state.register_orig;
     call_cpuid();
