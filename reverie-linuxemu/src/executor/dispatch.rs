@@ -28,6 +28,35 @@ pub(crate) fn is_process_syscall(number: u64) -> bool {
         || number == libc::SYS_waitid as u64
 }
 
+/// Why a vfork child may not move its program break before it execs
+/// ([`vfork_child_moves_break`]).
+pub(super) const VFORK_CHILD_BREAK_REASON: &str = concat!(
+    "a vfork child shares its parent's address space until it execs or exits, and runs on ",
+    "a copy here whose changes to private memory go back to the parent, but whose program ",
+    "break cannot: on Linux this call would move the parent's break too"
+);
+
+/// Whether this call is a `brk` by which a vfork child's copy of its parent's
+/// address space ([`GuestMemory::shares_parent_address_space`]) would move
+/// the program break before the child execs. The break is the address
+/// space's, so on Linux the parent's moves too, even by less than a page,
+/// which changes no mapping; the copy cannot carry it back. `brk(0)`, and a
+/// request below the minimum break, which Linux answers with the old break,
+/// go on. The copy's other mapping changes are checked when its window ends
+/// (`GuestMemory::return_vfork_changes`), so a mapping the child creates and
+/// removes in between, as a tool's scratch page is, goes on.
+pub(super) fn vfork_child_moves_break(
+    owner: &GuestMemory,
+    state: &LoadedStaticElf,
+    number: u64,
+    args: &[u64; 6],
+) -> bool {
+    owner.shares_parent_address_space()
+        && number == libc::SYS_brk as u64
+        && args[0] >= state.min_break
+        && args[0] != state.program_break
+}
+
 /// Whether a `clone` or `clone3` with `flags` would run its child in the
 /// caller's address space beside the caller: a thread (`CLONE_THREAD`), or a
 /// `CLONE_VM` process that the caller does not wait for (no `CLONE_VFORK`).
@@ -161,6 +190,13 @@ fn execute_basic_syscall_dispatch(
     state.mmap_limit = cursors.mmap_limit;
     let number = request.number();
     let args = request.args();
+    if vfork_child_moves_break(&owner, state, number, args) {
+        drop(transaction);
+        return SyscallAction::Failure(crate::Error::VforkChildCapability {
+            operation: "brk in a vfork child",
+            reason: VFORK_CHILD_BREAK_REASON,
+        });
+    }
     let new_shared_file = number == libc::SYS_mmap as u64
         && args[3] & libc::MAP_ANONYMOUS as u64 == 0
         && args[3] & libc::MAP_SHARED as u64 != 0;

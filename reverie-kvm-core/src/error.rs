@@ -330,6 +330,20 @@ pub enum Error {
         retention_id: usize,
     },
 
+    /// A vfork child runs on a copy of the address space it shares with its
+    /// parent on Linux, and its changes to private memory go back to the
+    /// parent when it execs or exits
+    /// ([`crate::GuestMemory::return_vfork_changes`]). An operation that the
+    /// copy cannot carry back is refused before its effect. This is terminal,
+    /// not a Linux syscall errno.
+    #[error("unsupported KVM vfork child operation {operation}: {reason}")]
+    VforkChildCapability {
+        /// Operation refused before its effect.
+        operation: &'static str,
+        /// Why the copy cannot carry it back.
+        reason: &'static str,
+    },
+
     /// An ordinary shared-file history requires an unsupported backend capability.
     /// This is terminal, not a Linux syscall errno or fabricated guest SIGBUS.
     #[error("unsupported KVM shared-file operation {operation}: {reason}")]

@@ -3580,6 +3580,8 @@ mod memory_map_tests {
             let (mut executor, memory) = loaded(&directory);
             let tid = executor.state.tid;
             let mut child_memory = memory.snapshot_sharing_address_space().unwrap();
+            // What an exec does first: the new image is another address space.
+            child_memory.retire_shared_files_for_exec().unwrap();
             let mut state = crate::elf::load_static_elf(
                 &mut child_memory,
                 &crate::elf::minimal_test_elf(&[0xf4]),

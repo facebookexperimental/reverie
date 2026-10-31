@@ -104,8 +104,11 @@
 //!   - reverie-ptrace: the kernel keeps the parent inside the call until the
 //!     child execs or exits, so the child has registered before the parent's
 //!     call returns.
-//!   - reverie-kvm starts the child only after the parent's call has returned
-//!     to the tool, so the child registers after it.
+//!   - reverie-kvm, likewise, keeps the parent inside the call until the
+//!     child execs or exits (and the child's changes to its copy of the
+//!     parent's private memory went back), and starts the child while the
+//!     call is pending, so the child has registered before the parent's call
+//!     returns.
 //!
 //! # Adding a field
 //!

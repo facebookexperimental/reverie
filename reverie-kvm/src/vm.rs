@@ -2046,6 +2046,12 @@ pub struct KvmBackend {
     trampoline_return: Option<u64>,
     /// Whether a single step's fault frame still holds the step's trap flag.
     stepped_fault: crate::preemption_timer::SteppedFault,
+    /// In a vfork child's backend, what lets its parent, kept inside its
+    /// `CLONE_VFORK` call (`run_process_action_with_tool`), go on: sent when
+    /// the child's window ends, after its changes to private memory went
+    /// back to the parent (`release_vfork_parent`), or dropped with this
+    /// backend, so every end of the child releases the parent once.
+    vfork_release: Option<futures::channel::oneshot::Sender<()>>,
 }
 
 /// RFLAGS' trap flag.
@@ -2400,7 +2406,19 @@ impl KvmBackend {
             pending_segment: None,
             trampoline_return: None,
             stepped_fault: Default::default(),
+            vfork_release: None,
         })
+    }
+
+    /// Ends this vfork child's window for its parent: lets the parent, kept
+    /// inside its `CLONE_VFORK` call, go on. Called after the child's changes
+    /// to private memory went back (`GuestMemory::return_vfork_changes`), at
+    /// its successful exec and at its last exit; dropping the backend does the
+    /// same for every other end. Without a waiting parent it does nothing.
+    pub(crate) fn release_vfork_parent(&mut self) {
+        if let Some(release) = self.vfork_release.take() {
+            let _ = release.send(());
+        }
     }
 
     /// Enables or disables completed-process-tree KVM exit statistics.
@@ -3090,6 +3108,11 @@ impl KvmBackend {
     ) -> Result<()> {
         let user_length = usize::try_from(self.memory.guest_end() - BOOT_RESERVED_END)
             .expect("guest memory length must fit usize");
+        // A vfork child's window ends at its exec: its changes to private
+        // memory go back to the parent before the new image replaces them,
+        // and then the parent, kept inside its call, may go on.
+        self.memory.return_vfork_changes(BOOT_RESERVED_END)?;
+        self.release_vfork_parent();
         // Replace file-backed HVA pages before discarding the new private
         // image. Clearing the outgoing file mapping would corrupt its file.
         self.memory.retire_shared_files_for_exec()?;
@@ -3513,6 +3536,11 @@ impl KvmBackend {
             return Ok(None);
         }
         let child_snapshot = self.snapshot_process(share_address_space)?;
+        if share_address_space && executor.has_live_sibling_thread() {
+            // Another thread of the parent may change the parent's memory
+            // during the window: only the child's own changes may go back.
+            child_snapshot.memory.keep_vfork_baseline()?;
+        }
         if !shared_file_snapshot {
             write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
         }
@@ -3619,12 +3647,20 @@ impl KvmBackend {
         stderr: Vec<u8>,
     ) -> Result<ForkedProcessCompletion> {
         // A process clone has a private snapshot, so no surviving task can
-        // observe this clear; preserve the child-side ABI.
+        // observe this clear; preserve the child-side ABI. A vfork child's
+        // copy carries it back with its other changes, below.
         write_tid_best_effort(
             &mut child.backend.memory,
             child.executor.take_clear_child_tid(),
             0,
         );
+        // A vfork child that did not exec ends its window here: its changes
+        // to private memory reach the parent before the parent's call returns.
+        child
+            .backend
+            .memory
+            .return_vfork_changes(BOOT_RESERVED_END)?;
+        child.backend.release_vfork_parent();
         child.backend.check_entry_owner()?;
         let family = child.executor.claim_process_family_exit()?;
         let snapshot = match family {
@@ -4399,6 +4435,12 @@ impl KvmBackend {
                     crate::executor::ChildProcessPanicOwner::new(failure.run.clone())
                 });
                 let child_panic_owner = panic_owner.clone();
+                let mut child = child;
+                let vfork_released = share_address_space.then(|| {
+                    let (release, released) = futures::channel::oneshot::channel();
+                    child.backend.vfork_release = Some(release);
+                    released
+                });
                 let (start_sender, start_receiver) = std::sync::mpsc::channel();
                 let start_gate = ChildStartGate::new(start_sender);
                 let handle = ChildThread::spawn_owned(
@@ -4575,6 +4617,7 @@ impl KvmBackend {
                         raw_child_pid,
                         start_gate.clone(),
                     ));
+                let vfork_start = vfork_released.is_some().then(|| start_gate.clone());
                 executor.register_child_process_with_panic_owner(
                     raw_child_pid,
                     start_gate,
@@ -4593,6 +4636,24 @@ impl KvmBackend {
                         i64::from(raw_child_pid),
                         None,
                     )?;
+                }
+                if let (Some(released), Some(start)) = (vfork_released, vfork_start) {
+                    // Linux keeps a CLONE_VFORK caller inside its call until
+                    // the child execs or exits (`wait_for_vfork_done()`), as
+                    // reverie-ptrace's kernel does. So the child starts now,
+                    // while this call is pending, and registers before the
+                    // call returns; the gate's later start by the callback's
+                    // driver is a no-op. The child ends the wait once its
+                    // changes to private memory went back to this parent
+                    // (`release_vfork_parent`), or as its backend goes away
+                    // (a child that cannot start drops it at once). A run
+                    // failure ends the wait too.
+                    let _ = start.start();
+                    if let futures::future::Either::Right(_) =
+                        futures::future::select(released, stop.as_mut()).await
+                    {
+                        return Ok(ProcessActionOutcome::cancelled());
+                    }
                 }
                 Ok(ProcessActionOutcome::returned(i64::from(raw_child_pid)))
             }

@@ -30,10 +30,12 @@
 //! mappings as `pthread_getattr_np` computes it from the maps file (it ends
 //! the stack at the line before `[stack]`), is Linux's answer. The list is
 //! empty after an mprotect that fails part way, which Linux applies to the
-//! mappings before the hole and the backend refuses whole, and after a change
-//! a child sharing the address space (vfork, and clone or clone3 with
-//! CLONE_VM|CLONE_VFORK) makes, which its parent's copy lacks, or the
-//! reverse. A call the backend refuses where Linux applies it (MADV_DONTFORK,
+//! mappings before the hole and the backend refuses whole, and in a vfork
+//! child after its parent's sibling thread changed the parent's stack, which
+//! the child's copy lacks. A child sharing the address space (vfork, and
+//! clone or clone3 with CLONE_VM|CLONE_VFORK) that stores into the stack
+//! leaves the store to its parent and the map as it was; such a child may not
+//! change a mapping before it execs, which the backend refuses by name. A call the backend refuses where Linux applies it (MADV_DONTFORK,
 //! and a MAP_FIXED mapping in the window) leaves the list as it was, and mlock,
 //! which it refuses too, is compared with Linux's stack without the mlock.
 //! Another process's map is not provided, and a number no task has is ESRCH.
@@ -548,20 +550,21 @@ fn a_kvm_guest_lists_its_stack_window_as_linux_does() {
     assert_eq!(native.results[&REMAPPED], (0, 0));
     assert_eq!(stack_area(&native.map(REMAPPED)).len(), 3);
 
+    // A child sharing the address space, made with vfork, with clone and
+    // with clone3, stored into a page of the stack: its parent sees the
+    // store once the child exited, and the map as it was.
+    for point in [VFORKED, CLONED, CLONED3] {
+        assert_window(point, &fact(point), &native.map(point));
+        assert_eq!(kvm.results[&point], (0, 0), "point {point}");
+        assert_eq!(native.results[&point], (0, 0), "point {point}");
+    }
+
     // Unknown: nothing is listed where the backend's pages do not hold what
     // Linux did. An mprotect of the top page and the page past it, which
     // fails on both with ENOMEM after Linux protected the top page (two
-    // lines); a page made executable by a child sharing the address space,
-    // made with vfork, with clone and with clone3, asked in the parent once
-    // the child exited (three lines each); the same, in a vfork child,
-    // around the page a sibling thread of its parent made executable.
-    for (point, linux_parts) in [
-        (PARTIAL, 2),
-        (VFORKED, 3),
-        (CLONED, 3),
-        (CLONED3, 3),
-        (VFORK_SEES, 3),
-    ] {
+    // lines); in a vfork child, around the page a sibling thread of its
+    // parent made executable (three lines).
+    for (point, linux_parts) in [(PARTIAL, 2), (VFORK_SEES, 3)] {
         assert_eq!(
             fact(point),
             MemoryMap::new(Vec::new(), false).unwrap(),

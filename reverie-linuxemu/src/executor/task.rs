@@ -2285,6 +2285,19 @@ impl ElfExecutor {
         })
     }
 
+    /// Whether another thread of this task's process is alive. A vfork
+    /// child of such a process runs while that thread may change the
+    /// parent's memory, so the backend keeps a baseline of the child's copy
+    /// to return only the child's own changes
+    /// (`GuestMemory::keep_vfork_baseline`).
+    pub fn has_live_sibling_thread(&self) -> bool {
+        self.state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .has_live_sibling(self.state.tid, self.state.pid)
+    }
+
     pub fn take_clear_child_tid(&mut self) -> Option<u64> {
         self.clear_child_tid.take()
     }

@@ -12197,6 +12197,9 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner",
         "shared_file_vfork_and_posix_spawn_children_match_native",
         "shared_file_vfork_child_view_changes_and_threads_are_refused_by_name",
+        "vfork_children_share_private_memory_with_their_parent_like_native",
+        "a_vfork_child_cannot_leave_a_mapping_changed",
+        "a_vfork_child_and_a_parent_thread_storing_one_byte_are_refused_by_name",
         "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native",
         "pdeathsig::unchanged_six_check_state_matches_native_controlled",
         "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
@@ -22480,6 +22483,172 @@ fn shared_file_vfork_child_view_changes_and_threads_are_refused_by_name() {
             );
             eprintln!("shared-file-vfork refused {label} {name}");
         }
+    }
+}
+
+/// A vfork child shares its parent's whole address space until it execs or
+/// exits, and the parent's call returns only then. The child's stores to
+/// private memory and the file bytes it reads into a parent buffer are the
+/// parent's afterwards, whether the child execs, fails to exec and exits,
+/// exits, or dies by a signal; through vfork, clone and clone3 with
+/// CLONE_VM|CLONE_VFORK; while the process holds no shared view of a file and
+/// while it holds one. posix_spawn of a missing program reports ENOENT, which
+/// glibc's child writes into the parent's memory. A child that blocks in its
+/// window on a pipe another process writes keeps its parent inside vfork
+/// while that process runs; and a child's and another parent thread's stores
+/// to different bytes of one page both survive. The output is native Linux's
+/// in every mode.
+#[test]
+fn vfork_children_share_private_memory_with_their_parent_like_native() {
+    const TEST: &str = "vfork_children_share_private_memory_with_their_parent_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native", &[]);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    for line in [
+        "vfork exit no-view: stored=93 read=file failed=0 exit 0\n",
+        "clone3 signal view: stored=102 read=file failed=0 signal 15\n",
+        "posix_spawn missing view: ENOENT\n",
+        "blocking: child read \"written by another process\" (27 bytes), child ok, writer ok\n",
+        "threads: child ok, page[0]=0x91 page[64]=0x55\n",
+    ] {
+        assert!(stdout.contains(line), "native lacks {line:?}: {stdout}");
+    }
+    for mode in SHARED_FILE_VFORK_MODES {
+        let (_, code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &[]).unwrap();
+        let name = mode.0;
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&native.stdout),
+            "mode={name}"
+        );
+        eprintln!("vfork-shares-memory completed {name}");
+    }
+}
+
+/// A vfork child of a process that holds no shared view may change a mapping
+/// only for a while: on Linux the change is its parent's too, and the copy it
+/// runs on here carries back only its contents. A mapping it creates, stores
+/// into and removes, with its protection changed and restored in between,
+/// leaves its parent as on Linux. A change still in place when the child
+/// exits (mmap, munmap, mprotect or mremap) is refused by name then, and a
+/// brk that moves the break is refused at the call.
+#[test]
+fn a_vfork_child_cannot_leave_a_mapping_changed() {
+    const TEST: &str = "a_vfork_child_cannot_leave_a_mapping_changed";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    for call in ["scratch", "mmap", "munmap", "mprotect", "mremap", "brk"] {
+        let args = ["map-change", call];
+        let label = args.join("-");
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{label}"),
+            &args,
+        );
+        assert_eq!(native.status.code(), Some(0), "{label}: {native:?}");
+        assert_eq!(
+            native.stdout,
+            format!("vfork map-change={call} child=ok\n").into_bytes(),
+            "{label}: {native:?}"
+        );
+        let refusal = match call {
+            "scratch" => None,
+            "brk" => Some(
+                "unsupported KVM vfork child operation brk in a vfork child: a vfork child \
+                 shares its parent's address space until it execs or exits",
+            ),
+            _ => Some(
+                "unsupported KVM vfork child operation vfork write-back: the vfork child left \
+                 a mapping changed",
+            ),
+        };
+        for mode in SHARED_FILE_VFORK_MODES {
+            let name = mode.0;
+            let run = run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &args);
+            match (refusal, run) {
+                (None, Ok((_, code, stdout, stderr))) => {
+                    assert_eq!(code, 0, "{label} mode={name}: stderr={stderr:?}");
+                    assert_eq!(stdout, native.stdout, "{label} mode={name}");
+                    assert_eq!(stderr, native.stderr, "{label} mode={name}");
+                }
+                (None, Err(error)) => panic!("{label} mode={name}: {error}"),
+                (Some(_), Ok((_, code, stdout, stderr))) => panic!(
+                    "{label} mode={name}: expected the refusal, got code={code} \
+                     stdout={stdout:?} stderr={stderr:?}"
+                ),
+                (Some(refusal), Err(error)) => {
+                    let error = error.to_string();
+                    assert!(
+                        error.contains(refusal),
+                        "{label} mode={name}: expected {refusal:?} in {error:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A vfork child and another thread of its parent store to the same byte
+/// during the window, the thread after the child, ordered by pipes: Linux
+/// keeps the thread's value. The child runs on a copy here, whose changes go
+/// back when it exits, and a copy cannot order two stores to one byte, so
+/// that write-back is refused by name.
+#[test]
+fn a_vfork_child_and_a_parent_thread_storing_one_byte_are_refused_by_name() {
+    const TEST: &str = "a_vfork_child_and_a_parent_thread_storing_one_byte_are_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    let args = ["conflict"];
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native-conflict", &args);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert_eq!(
+        native.stdout, b"conflict: child ok, page[0]=0x55 page[64]=0\n",
+        "{native:?}"
+    );
+    for mode in SHARED_FILE_VFORK_MODES {
+        let name = mode.0;
+        let error = match run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &args) {
+            Ok((_, code, stdout, stderr)) => panic!(
+                "mode={name}: expected the refusal, got code={code} stdout={stdout:?} \
+                 stderr={stderr:?}"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(
+                "unsupported KVM vfork child operation vfork write-back: the vfork child and \
+                 another thread of its parent changed the same bytes during the window"
+            ),
+            "mode={name}: {error:?}"
+        );
     }
 }
 

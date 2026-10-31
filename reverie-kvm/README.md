@@ -282,16 +282,54 @@ Tool lifecycle callbacks; opting into unmonitored threads does not provide that
 instrumentation.
 
 A vfork child (`vfork(2)`, or `clone(2)` and `clone3(2)` with
-`CLONE_VM|CLONE_VFORK`, as glibc's `posix_spawn(3)` issues it) runs on a copy
-of its parent's memory, with a VM and vCPU of its own. The copy inherits the
-parent's shared views of ordinary files and of fork-shared anonymous memory,
-so a store through one reaches the parent and the file at once, and it adds no
-vCPU to the parent's address space, so a parent that holds such a view can
-create one. Until the child execs, the copy refuses with the named
-`SharedFileCapability` error an `munmap(2)`, `mmap(2)` or `mprotect(2)` that
-would change a shared view, or map a new one, before the call changes
-anything: on Linux the change would reach the parent's address space as well.
-A vfork child's changes to private memory reach only its copy. A thread, or a
+`CLONE_VM|CLONE_VFORK`, as glibc's `posix_spawn(3)` issues it) shares its
+parent's whole address space on Linux until it execs or exits, and the
+parent's call returns only then. Here the child runs on a copy of its parent's
+memory, with a VM and vCPU of its own, and the parent stays inside its call,
+as reverie-ptrace's kernel keeps it, until the child's window ends: the child
+starts while the call is pending, and registers with the tool before the call
+returns. The copy inherits the parent's shared views of ordinary files and of
+fork-shared anonymous memory, so a store through one reaches the parent and
+the file at once, and it adds no vCPU to the parent's address space, so a
+parent that holds such a view can create one. When the window ends, at the
+child's successful exec or at its last exit (a death by a signal included),
+the child's changes to private memory, its own stores and what the kernel
+wrote for it (a `read(2)` into a parent buffer, for example), go back to the
+parent before the parent's call returns: glibc's `posix_spawn(3)` child
+reports a failed exec this way, through the parent's memory.
+
+The copy carries back contents, not mappings, so the child may change a
+mapping only for a while. When the window ends, a mapping still changed (by
+`mmap(2)`, `munmap(2)`, `mprotect(2)` or `mremap(2)`) is refused by name,
+with the `VforkChildCapability` error for the operation `vfork write-back`,
+before anything goes back: on Linux the change would be the parent's too. A
+mapping the child creates and removes again in between, as a tool's scratch
+page for an injected call is, leaves nothing to refuse, and the stores to it
+do not go back, as Linux discards them with it. A `brk(2)` that moves the
+break is refused at the call, since the break is the parent's too even where
+it moves within a page. Both apply to vfork children of processes that hold
+no shared view as well, which used to change only their copy. A call that
+would change an inherited shared view or map a new one is refused at the
+call, as before.
+
+When the parent has another live thread, the copy keeps a baseline of itself
+as the child started, and only the bytes the child changed go back, so the
+other thread's stores during the window stay. A byte the child and such a
+thread both changed to different values, and a page the child changed whose
+mapping such a thread replaced or removed, are refused by name when the window
+ends: a copy cannot order those stores. What remains different from Linux is
+that during the window the child and the parent's other threads do not see
+each other's stores to private memory: a child that reads memory another
+thread of its parent changed during the window sees the value from before the
+window, a thread that reads memory the child changed sees the value from
+before the child's store, and a store that leaves a byte as it was cannot be
+told from no store, so the child's change to that byte goes back over it.
+While the changes go back, the parent's other threads run unless the tool
+holds them. A tool that serializes the guest's threads, and runs none of them
+from the child's exit or exec until the parent's call returns, has the
+write-back see no concurrent store; without one, a store another thread makes
+while the changes go back, to a byte the child changed, can be overwritten by
+the child's value, although on Linux it would come after it. A thread, or a
 `CLONE_VM` process clone without `CLONE_VFORK`, is still refused while the
 process holds an ordinary shared-file view
 (https://github.com/rrnewton/reverie/issues/1108).

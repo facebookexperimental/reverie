@@ -40,8 +40,9 @@
  * - mprotect of the stack's top page and the page past the top of the user
  *   address space, which Linux applies to the top page before it fails;
  * - a child that shares the address space, made with vfork, with clone and
- *   with clone3 (CLONE_VM|CLONE_VFORK), protects a page of the stack and
- *   exits;
+ *   with clone3 (CLONE_VM|CLONE_VFORK), stores into a page of the stack and
+ *   exits, and the parent prints whether it sees the store (such a child may
+ *   not change a mapping before it execs on KVM, which refuses that by name);
  * - a vfork child asks about itself once a sibling thread of its parent has
  *   changed the parent's stack;
  * - a child posix_spawn made executes this program again, which asks as the
@@ -404,16 +405,24 @@ static void partial(void) {
   point(PARTIAL, gettid_raw());
 }
 
-/* A page of the stack that a child sharing the address space protects. */
+/* A page of the stack that a child sharing the address space stores into. */
 static uintptr_t shared_page;
 
-/* What that child does: protect the page, executable as well, and exit, with
- * system calls alone, as a vfork child may. */
-static int share_and_protect(void *argument) {
+/* What that child does: store into the page and exit, with a system call
+ * alone, as a vfork child may. */
+static int share_and_store(void *argument) {
   (void)argument;
-  long rc = syscall(SYS_mprotect, shared_page, PAGE,
-                    PROT_READ | PROT_WRITE | PROT_EXEC);
-  return rc == 0 ? 0 : 91;
+  *(volatile unsigned char *)(shared_page + 17) = 0x91;
+  return 0;
+}
+
+/* Prints whether the parent sees the store of a child that shared its
+ * address space. */
+static void stored(int at) {
+  int seen = *(volatile unsigned char *)(shared_page + 17) == 0x91;
+  result(at, seen ? 0 : -1, seen ? 0 : EIO);
+  *(volatile unsigned char *)(shared_page + 17) = 0;
+  point(at, gettid_raw());
 }
 
 static void vforked(void) {
@@ -421,10 +430,10 @@ static void vforked(void) {
   pid_t child = vfork();
   CHECK(child >= 0);
   if (child == 0) {
-    _exit(share_and_protect(NULL));
+    _exit(share_and_store(NULL));
   }
   reap(child);
-  point(VFORKED, gettid_raw());
+  stored(VFORKED);
 }
 
 /* The stack of a clone or clone3 child that shares the address space. */
@@ -432,17 +441,17 @@ static char child_stack[64 * 1024] __attribute__((aligned(16)));
 
 static void cloned(void) {
   shared_page = stack_page();
-  pid_t child = clone(share_and_protect, child_stack + sizeof(child_stack),
+  pid_t child = clone(share_and_store, child_stack + sizeof(child_stack),
                       CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);
   CHECK(child >= 0);
   reap(child);
-  point(CLONED, gettid_raw());
+  stored(CLONED);
 }
 
 /* The clone3 child: it starts on its own stack, so it returns through no
  * frame of the parent's. */
 static void __attribute__((noreturn)) clone3_child(void) {
-  syscall(SYS_exit, share_and_protect(NULL));
+  syscall(SYS_exit, share_and_store(NULL));
   __builtin_unreachable();
 }
 
@@ -470,7 +479,7 @@ static void cloned3(void) {
                    : "rcx", "r11", "memory");
   CHECK(rc > 0);
   reap((pid_t)rc);
-  point(CLONED3, gettid_raw());
+  stored(CLONED3);
 }
 
 /* A sibling thread of a vfork child's parent: once the child runs, it

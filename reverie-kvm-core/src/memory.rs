@@ -39,12 +39,14 @@ const PAGE_SIZE: usize = 4096;
 
 mod page_maps;
 mod shared_file;
+mod vfork;
 use page_maps::UserPages;
 use page_maps::Versioned;
 pub use shared_file::AllocationGuard;
 use shared_file::MemoryCopyAccess;
 pub use shared_file::PrivateRangePlan;
 pub use shared_file::SharedFileRangePlan;
+pub use vfork::VforkWriteBack;
 
 #[cfg(any(test, feature = "test-support"))]
 type SyscallDispatchObserver = Arc<dyn Fn(&crate::SyscallRequest) + Send + Sync>;
@@ -277,9 +279,16 @@ struct Mapping {
     /// the child shares with its parent on Linux
     /// ([`GuestMemory::snapshot_sharing_address_space`]), from the copy until
     /// the child's exec ([`GuestMemory::retire_shared_files_for_exec`]). While
-    /// it is, the shared views the child holds may not change
+    /// it is, the child's mappings may not change
     /// ([`GuestMemory::shares_parent_address_space`]).
     shares_parent_address_space: std::sync::atomic::AtomicBool,
+    /// The parent of a vfork child's copy, until the child's changes to
+    /// private memory go back to it ([`GuestMemory::return_vfork_changes`])
+    /// or the child execs.
+    vfork_parent: Mutex<Option<vfork::VforkParent>>,
+    /// How many times this memory's image has been replaced by an exec
+    /// ([`GuestMemory::retire_shared_files_for_exec`]).
+    exec_count: std::sync::atomic::AtomicU64,
 }
 
 /// The end of the x86-64 user address space with 4-level paging.
@@ -1353,6 +1362,8 @@ impl GuestMemory {
                 deferred_queued: std::sync::atomic::AtomicBool::new(false),
                 sync_mmu: Mutex::new(None),
                 shares_parent_address_space: std::sync::atomic::AtomicBool::new(false),
+                vfork_parent: Mutex::new(None),
+                exec_count: std::sync::atomic::AtomicU64::new(0),
             }),
             failure_context: None,
             operation_origin: None,
@@ -1644,11 +1655,15 @@ impl GuestMemory {
     /// view on either side is visible on the other at once. The copy has its
     /// own arena and entry gate, so it adds no participant to this memory's
     /// gate, and taking it requires what a fork's copy of shared views does:
-    /// this memory's one participant stopped, or none. Until the child execs,
-    /// the copy refuses a change to the shared views it holds
+    /// this memory's one participant stopped, or none. The copy keeps this
+    /// memory as its parent: when the child's window ends, its changes to
+    /// private memory go back here ([`GuestMemory::return_vfork_changes`]),
+    /// and until then its provider refuses every change to its mappings
     /// ([`GuestMemory::shares_parent_address_space`]).
     pub fn snapshot_sharing_address_space(&self) -> Result<Self> {
-        self.snapshot_keeping(copy_sparse_file, true)
+        let copy = self.snapshot_keeping(copy_sparse_file, true)?;
+        copy.link_vfork_parent(self);
+        Ok(copy)
     }
 
     /// Whether this memory is a vfork child's copy of an address space the
@@ -1657,14 +1672,17 @@ impl GuestMemory {
     /// not exec'd since ([`GuestMemory::retire_shared_files_for_exec`]).
     ///
     /// On Linux such a child maps, unmaps and protects memory in its
-    /// parent's address space; here those changes reach only the copy. While
-    /// this holds, a publication that would install, replace or withdraw a
-    /// shared view (an ordinary file, or fork-shared anonymous memory), and a
-    /// protection change over one, are refused with
-    /// [`Error::SharedFileCapability`] before they change anything, so that
-    /// the parent's shared views, which the copy's stores still reach, are
-    /// exactly the child's when the parent resumes. Changes to private memory
-    /// keep reaching only the copy, as before.
+    /// parent's address space; here only the changes to the contents of
+    /// private memory go back to the parent, when the window ends
+    /// ([`GuestMemory::return_vfork_changes`]). While this holds, the provider
+    /// refuses every guest call that would change the copy's mappings (mmap,
+    /// munmap, mprotect, mremap and a brk that moves the break) with
+    /// [`Error::VforkChildCapability`] before it changes anything. As a
+    /// backstop below the provider, a publication that would install, replace
+    /// or withdraw a shared view, and a protection change over one, are
+    /// refused with [`Error::SharedFileCapability`], so that the parent's
+    /// shared views, which the copy's stores still reach, are exactly the
+    /// child's when the parent resumes.
     pub fn shares_parent_address_space(&self) -> bool {
         self.mapping
             .shares_parent_address_space
