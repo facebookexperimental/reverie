@@ -403,15 +403,17 @@ where
 {
     let runner =
         reverie_dbt::DbtRunner::new(reverie_dbt::bundled_drrun_path(), artifact.native_client())?;
-    let mut command = std::process::Command::new(&args.program);
-    command.args(&args.program_args);
-    if args.no_host_envs {
-        command.env_clear();
-        command.env("PATH", "/bin/:/usr/bin");
-    }
-    command.envs(args.envs.iter().cloned());
+    let command: reverie::process::Command = args.clone().into();
+    // Capture the shared inheritance/clear/remove policy before converting to
+    // std::Command, whose getters cannot reveal whether env_clear was used.
+    let environment = command.get_captured_envs();
+    let command = command.try_into_std().map_err(anyhow::Error::new)?;
     let (status, global_state) = runner
-        .status_with_caller_tool::<T::GlobalState>(&command, config)
+        .status_with_captured_environment_and_caller_tool::<T::GlobalState>(
+            &command,
+            &environment,
+            config,
+        )
         .await
         .map_err(anyhow::Error::new)?;
     use std::os::unix::process::ExitStatusExt as _;

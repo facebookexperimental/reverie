@@ -115,6 +115,9 @@ pub struct DbtRunner {
     defer_evidence_finish: bool,
     tool_answers_brk: bool,
     caller_tool: bool,
+    // Only the captured-environment caller entrypoint sets this. Legacy
+    // methods retain prepare_program's existing lookup contract.
+    selected_caller_program: Option<PathBuf>,
 }
 
 // A blocking socket-to-pipe splice can hold the child's stdin pipe mutex
@@ -228,6 +231,7 @@ impl DbtRunner {
             defer_evidence_finish: false,
             tool_answers_brk: false,
             caller_tool: false,
+            selected_caller_program: None,
         })
     }
 
@@ -790,6 +794,56 @@ impl DbtRunner {
         let mut runner = self.clone();
         runner.caller_tool = true;
         runner.status_with_global::<G>(guest, config).await
+    }
+
+    /// Runs a paired caller Tool with a complete captured environment and
+    /// inherited stdin, stdout and stderr.
+    ///
+    /// Capture [`reverie::process::Command::get_captured_envs`] before converting
+    /// the shared command with [`reverie::process::Command::try_into_std`]. The
+    /// supplied map is authoritative, including absent and removed entries;
+    /// this method does not merge the standard command's environment deltas.
+    /// Program selection uses [`reverie::process::Command::find_program`], as
+    /// the ptrace frontend does, while retaining the original ELF argv0, args
+    /// and configured guest cwd. In particular, absent PATH stays absent and
+    /// bare-name relative PATH entries are resolved in the controller's cwd.
+    ///
+    /// Caller activation, completion and failures have the same ownership as
+    /// [`Self::status_with_caller_tool`]. Preparation errors are launch errors.
+    /// This does not recover an opaque standard command's inheritance flag,
+    /// custom argv0, pre-exec callbacks or stdio configuration; the streams are
+    /// inherited. Other standard-command entrypoints keep their existing
+    /// environment and program-lookup behavior.
+    pub async fn status_with_captured_environment_and_caller_tool<G>(
+        &self,
+        guest: &Command,
+        environment: &BTreeMap<OsString, OsString>,
+        config: G::Config,
+    ) -> io::Result<(ExitStatus, G)>
+    where
+        G: GlobalTool + 'static,
+    {
+        self.with_captured_caller_program(guest, environment)?
+            .status_with_environment_and_global::<G>(guest, environment, config)
+            .await
+    }
+
+    fn with_captured_caller_program(
+        &self,
+        guest: &Command,
+        environment: &BTreeMap<OsString, OsString>,
+    ) -> io::Result<Self> {
+        check_guest_directory(guest)?;
+        let mut shared = reverie::process::Command::new(guest.get_program());
+        shared.env_clear().envs(environment);
+        if let Some(directory) = guest.get_current_dir() {
+            shared.current_dir(directory);
+        }
+        let selected = shared.find_program()?;
+        let mut runner = self.clone();
+        runner.caller_tool = true;
+        runner.selected_caller_program = Some(selected);
+        Ok(runner)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1429,7 +1483,13 @@ impl DbtRunner {
         guest: &Command,
         environment: Option<&BTreeMap<OsString, OsString>>,
     ) -> io::Result<Command> {
-        let prepared = prepare_program(guest, environment)?;
+        let prepared = match &self.selected_caller_program {
+            Some(selected) => {
+                check_guest_directory(guest)?;
+                prepare_candidate(guest, selected.clone())?
+            }
+            None => prepare_program(guest, environment)?,
+        };
         let mut command = Command::new(&self.drrun);
         command
             .arg("-quiet")
@@ -1826,10 +1886,7 @@ struct PreparedProgram {
     execute_paths: Vec<CString>,
 }
 
-fn prepare_program(
-    guest: &Command,
-    environment: Option<&BTreeMap<OsString, OsString>>,
-) -> io::Result<PreparedProgram> {
+fn check_guest_directory(guest: &Command) -> io::Result<()> {
     if let Some(directory) = guest.get_current_dir() {
         // Command applies chdir before attempting exec. Preserve that ordering
         // before our parent-side image inspection, without changing parent cwd.
@@ -1839,6 +1896,14 @@ fn prepare_program(
         }
         query_execute_access(&execute_path(directory)?).map_err(parent_execute_access_error)?;
     }
+    Ok(())
+}
+
+fn prepare_program(
+    guest: &Command,
+    environment: Option<&BTreeMap<OsString, OsString>>,
+) -> io::Result<PreparedProgram> {
+    check_guest_directory(guest)?;
     let program = guest.get_program();
     if program.is_empty() {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
@@ -2678,6 +2743,7 @@ mod tests {
             defer_evidence_finish: false,
             tool_answers_brk: false,
             caller_tool: false,
+            selected_caller_program: None,
         }
     }
 
@@ -3480,6 +3546,184 @@ mod tests {
         assert_eq!(args[2], executable.as_os_str());
         assert_eq!(args[11], OsStr::new("guest-elf"));
         assert_eq!(args[12], OsStr::new("argument"));
+    }
+
+    #[test]
+    fn captured_caller_environment_preserves_removed_and_non_utf8_entries() {
+        let mut shared = reverie::process::Command::new("/usr/bin/env");
+        shared
+            .env_clear()
+            .env("REMOVED", "public-controller-value")
+            .env_remove("REMOVED")
+            .env("VALUE", "captured")
+            .env("BYTES", OsStr::from_bytes(b"public-\xff-value"));
+        let environment = shared.get_captured_envs();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                (OsString::from("VALUE"), OsString::from("captured")),
+                (
+                    OsString::from("BYTES"),
+                    OsStr::from_bytes(b"public-\xff-value").to_os_string(),
+                ),
+            ])
+        );
+        let mut guest = shared.try_into_std().unwrap();
+        // A supplied snapshot is authoritative even if the std command has
+        // subsequently acquired different deltas.
+        guest
+            .env("VALUE", "must-not-override-snapshot")
+            .env("REMOVED", "must-not-reappear");
+        let selected = runner()
+            .with_captured_caller_program(&guest, &environment)
+            .unwrap();
+        assert!(selected.caller_tool);
+        let wrapped = selected.command(&guest, Some(&environment)).unwrap();
+        let mut expected = environment.clone();
+        expected.insert(
+            HIDE_ENV_PREFIXES_ENV.into(),
+            selected.encoded_private_environment(),
+        );
+        assert_eq!(
+            wrapped
+                .get_envs()
+                .map(|(key, value)| (key.to_os_string(), value.unwrap().to_os_string()))
+                .collect::<BTreeMap<_, _>>(),
+            expected
+        );
+        assert!(!environment.contains_key(OsStr::new(PATH_ENV)));
+        assert!(!environment.contains_key(OsStr::new("REMOVED")));
+    }
+
+    #[test]
+    fn captured_caller_program_uses_shared_path_resolution() {
+        const CHILD: &str = "REVERIE_TEST_CAPTURED_CALLER_PATH_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            // Only this owned subprocess gets a different cwd/environment;
+            // parallel tests in this process never observe a global mutation.
+            let output = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "launcher::tests::captured_caller_program_uses_shared_path_resolution",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("LC_ALL", "C")
+                .env(PATH_ENV, directory.path().join("host"))
+                .current_dir(directory.path())
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            eprintln!("captured caller path subprocess: {output:?}");
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                output
+                    .stdout
+                    .windows(b"captured-caller-path-controls-complete".len())
+                    .any(|bytes| bytes == b"captured-caller-path-controls-complete"),
+                "{output:?}"
+            );
+            return;
+        }
+        assert_eq!(env::var_os(CHILD).unwrap(), "1");
+        let root = env::current_dir().unwrap();
+        let host = root.join("host");
+        let desired = root.join("desired");
+        let guest_directory = root.join("guest");
+        let relative = root.join("relative");
+        let non_utf8 = root.join(OsStr::from_bytes(b"bin-\xff"));
+        for directory in [&host, &desired, &guest_directory, &relative, &non_utf8] {
+            std::fs::create_dir(directory).unwrap();
+            write_executable_script(&directory.join("probe"), b"\x7fELFplaceholder");
+        }
+        std::fs::create_dir(guest_directory.join("relative")).unwrap();
+        write_executable_script(
+            &guest_directory.join("relative/probe"),
+            b"\x7fELFguest-cwd-trap",
+        );
+        write_executable_script(&root.join("probe"), b"\x7fELFcontroller-cwd");
+        assert_eq!(env::var_os(PATH_ENV).unwrap().as_os_str(), host.as_os_str());
+
+        let check = |program: &str, environment: &BTreeMap<OsString, OsString>, expected: &Path| {
+            let mut guest = Command::new(program);
+            guest
+                .arg("argument")
+                .current_dir(&guest_directory)
+                .env(PATH_ENV, &host);
+            let mut shared = reverie::process::Command::new(program);
+            shared
+                .env_clear()
+                .envs(environment)
+                .current_dir(&guest_directory);
+            let selected = shared.find_program().unwrap();
+            assert_eq!(selected, expected);
+            let runner = runner()
+                .with_captured_caller_program(&guest, environment)
+                .unwrap();
+            assert!(runner.caller_tool);
+            assert_eq!(
+                runner.selected_caller_program.as_deref(),
+                Some(selected.as_path())
+            );
+            let wrapped = runner.command(&guest, Some(environment)).unwrap();
+            let args = wrapped.get_args().collect::<Vec<_>>();
+            assert_eq!(args[1], OsStr::new("-app_path"));
+            assert_eq!(args[2], selected.as_os_str());
+            let separator = args
+                .iter()
+                .position(|argument| *argument == OsStr::new("--"))
+                .unwrap();
+            assert_eq!(
+                &args[separator + 1..],
+                [OsStr::new(program), OsStr::new("argument")]
+            );
+            assert_eq!(wrapped.get_current_dir(), Some(guest_directory.as_path()));
+            let actual_path = wrapped
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new(PATH_ENV));
+            assert_eq!(
+                actual_path.map(|(_, value)| value.unwrap()),
+                environment
+                    .get(OsStr::new(PATH_ENV))
+                    .map(OsString::as_os_str)
+            );
+        };
+        for (path, selected) in [
+            (desired.as_os_str(), desired.join("probe")),
+            (non_utf8.as_os_str(), non_utf8.join("probe")),
+            (OsStr::new("relative"), relative.join("probe")),
+            (OsStr::new(""), root.join("probe")),
+        ] {
+            check(
+                "probe",
+                &BTreeMap::from([(PATH_ENV.into(), path.to_os_string())]),
+                &selected,
+            );
+        }
+        check("probe", &BTreeMap::new(), &root.join("probe"));
+        check("./probe", &BTreeMap::new(), &guest_directory.join("probe"));
+        for environment in [
+            BTreeMap::new(),
+            BTreeMap::from([(PATH_ENV.into(), OsString::new())]),
+        ] {
+            let mut guest = Command::new("missing-captured-caller-probe");
+            guest.current_dir(&guest_directory);
+            let mut shared = reverie::process::Command::new(guest.get_program());
+            shared
+                .env_clear()
+                .envs(&environment)
+                .current_dir(&guest_directory);
+            let expected = shared.find_program().unwrap_err();
+            let actual = runner()
+                .with_captured_caller_program(&guest, &environment)
+                .unwrap_err();
+            assert_eq!(actual.kind(), expected.kind());
+            assert_eq!(actual.to_string(), expected.to_string());
+        }
+        println!("captured-caller-path-controls-complete");
     }
 
     #[test]

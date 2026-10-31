@@ -15,9 +15,14 @@
 //! the basics-noop caller. The separate Counter1 local-Global case requires the no-argument
 //! prototype producer `reverie-dbt/scripts/build-client.sh`, or `REVERIE_DBT_CLIENT`.
 
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1041,6 +1046,10 @@ fn counter2_reports_exit_after_echo_closes_stdio(backend: &str) {
 
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"hello\n");
+    assert_counter2_report(&output);
+}
+
+fn assert_counter2_report(output: &Output) {
     let stderr = std::str::from_utf8(&output.stderr).unwrap();
     let reports = stderr
         .lines()
@@ -1117,6 +1126,206 @@ fn dbt_counter2_bad_override_never_uses_the_valid_default_pair() {
         assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
         assert!(!stderr.contains("counter2-local thread="), "{stderr}");
     }
+}
+
+fn assert_counter2_environment(output: &Output, expected: &BTreeMap<OsString, OsString>) {
+    assert!(output.status.success(), "{output:?}");
+    assert_counter2_report(output);
+    assert_eq!(
+        output.stdout.last(),
+        Some(&0),
+        "environment has no final NUL: {output:?}"
+    );
+    let mut actual = BTreeMap::new();
+    for record in output.stdout[..output.stdout.len() - 1].split(|byte| *byte == 0) {
+        let separator = record
+            .iter()
+            .position(|byte| *byte == b'=')
+            .expect("environment entry has no '='");
+        assert!(separator > 0, "environment entry has an empty key");
+        let key = OsStr::from_bytes(&record[..separator]).to_os_string();
+        let value = OsStr::from_bytes(&record[separator + 1..]).to_os_string();
+        assert!(
+            actual.insert(key, value).is_none(),
+            "duplicate environment entry: {output:?}"
+        );
+    }
+    // Compare every entry; in particular do not filter sanitizer additions or
+    // private runtime controls out of an unexpected actual environment.
+    assert_eq!(
+        &actual, expected,
+        "captured environment differs: {output:?}"
+    );
+}
+
+fn counter2_captured_environment_controls(backend: &str) {
+    let env_image = std::fs::canonicalize("/usr/bin/env").unwrap();
+    let echo_image = std::fs::canonicalize("/bin/echo").unwrap();
+    let env_metadata = std::fs::metadata(&env_image).unwrap();
+    let echo_metadata = std::fs::metadata(&echo_image).unwrap();
+    let env_bytes = std::fs::read(&env_image).unwrap();
+    let echo_bytes = std::fs::read(&echo_image).unwrap();
+    // Foreign argv0 must not select another applet of one multicall image.
+    assert_ne!(env_image, echo_image, "env/echo fixture is a shared image");
+    assert_ne!(
+        (env_metadata.dev(), env_metadata.ino()),
+        (echo_metadata.dev(), echo_metadata.ino())
+    );
+    assert!(env_bytes.starts_with(b"\x7fELF") && echo_bytes.starts_with(b"\x7fELF"));
+    assert_ne!(
+        env_bytes, echo_bytes,
+        "env/echo fixture has identical image bytes"
+    );
+    eprintln!(
+        "counter2 environment fixtures: env={env_image:?} dev={} ino={} bytes={}; echo={echo_image:?} dev={} ino={} bytes={}",
+        env_metadata.dev(),
+        env_metadata.ino(),
+        env_bytes.len(),
+        echo_metadata.dev(),
+        echo_metadata.ino(),
+        echo_bytes.len(),
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let host_bin = directory.path().join("host-bin");
+    let guest_bin = directory.path().join("guest-bin");
+    std::fs::create_dir(&host_bin).unwrap();
+    std::fs::create_dir(&guest_bin).unwrap();
+    for (link, target) in [
+        (host_bin.join("probe"), &echo_image),
+        (guest_bin.join("probe"), &env_image),
+        (directory.path().join("echo"), &env_image),
+    ] {
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        assert_eq!(std::fs::canonicalize(&link).unwrap(), *target);
+    }
+    let program = Path::new(env!("CARGO_BIN_EXE_counter2"));
+    assert!(program.is_absolute());
+    let manifest = program
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers/counter2/manifest.json");
+    if backend == "dbt" {
+        // An absent or stale producer is a setup failure, never a skipped case.
+        reverie_dbt::CallerArtifact::load(&manifest).unwrap();
+    }
+    let controller = BTreeMap::from([
+        (OsString::from("PATH"), OsString::from("/bin:/usr/bin")),
+        (OsString::from("LC_ALL"), OsString::from("C")),
+        (
+            OsString::from("REVERIE_TEST_CONTROLLER_ONLY"),
+            OsString::from("public-sentinel"),
+        ),
+        (
+            OsString::from("REVERIE_TEST_OBSERVATION_PATH"),
+            OsString::from("/unused-public-observation"),
+        ),
+        (
+            OsString::from("REVERIE_TEST_VALUE"),
+            OsString::from("controller-value"),
+        ),
+        (
+            OsString::from("REVERIE_TEST_BYTES"),
+            OsStr::from_bytes(b"public-\xff-value").to_os_string(),
+        ),
+    ]);
+    for case in [
+        "clear",
+        "inherit",
+        "override",
+        "explicit-path",
+        "absent-path",
+    ] {
+        let mut environment = controller.clone();
+        let mut expected = environment.clone();
+        let mut options: Vec<OsString> = Vec::new();
+        let guest = match case {
+            "clear" | "explicit-path" => {
+                let path = if case == "clear" {
+                    OsString::from("/bin/:/usr/bin")
+                } else {
+                    environment.insert("PATH".into(), host_bin.as_os_str().to_os_string());
+                    guest_bin.as_os_str().to_os_string()
+                };
+                expected = BTreeMap::from([
+                    (OsString::from("PATH"), path.clone()),
+                    (OsString::from("LC_ALL"), OsString::from("C")),
+                    (
+                        OsString::from("REVERIE_TEST_VALUE"),
+                        OsString::from("guest-clear"),
+                    ),
+                ]);
+                options.extend(
+                    [
+                        "--no-host-envs",
+                        "--env",
+                        "LC_ALL=C",
+                        "--env",
+                        "REVERIE_TEST_VALUE=guest-clear",
+                    ]
+                    .map(OsString::from),
+                );
+                if case == "explicit-path" {
+                    let mut entry = OsString::from("PATH=");
+                    entry.push(path);
+                    options.extend([OsString::from("--env"), entry]);
+                    "probe"
+                } else {
+                    "/usr/bin/env"
+                }
+            }
+            "inherit" => "/usr/bin/env",
+            "override" => {
+                options.extend(["--env", "REVERIE_TEST_VALUE=guest-override"].map(OsString::from));
+                expected.insert("REVERIE_TEST_VALUE".into(), "guest-override".into());
+                "/usr/bin/env"
+            }
+            "absent-path" => {
+                environment.remove(OsStr::new("PATH"));
+                expected.remove(OsStr::new("PATH"));
+                // No --no-host-envs: its documented minimal PATH would hide
+                // the distinction between shared cwd lookup and _CS_PATH.
+                "echo"
+            }
+            _ => unreachable!(),
+        };
+        if backend == "ptrace" {
+            // Existing TracerBuilder::spawn -> turn_off_leak_check policy.
+            // The controller has none of these keys; UBSAN stays absent.
+            expected.insert("ASAN_OPTIONS".into(), "detect_leaks=0".into());
+            expected.insert("LSAN_OPTIONS".into(), "detect_leaks=0".into());
+        }
+        let mut command = Command::new(program);
+        command
+            .env_clear()
+            .envs(&environment)
+            .current_dir(directory.path())
+            .stdin(Stdio::null())
+            .args(["--backend", backend]);
+        if backend == "dbt" {
+            command.arg("--dbt-artifact").arg(&manifest);
+        }
+        command.args(&options).args(["--", guest, "-0"]);
+        eprintln!("counter2 environment {backend}/{case}: begin");
+        let output = output_with_timeout(&mut command);
+        eprintln!(
+            "counter2 environment {backend}/{case}: status={:?} stdout={:?} stderr={:?}",
+            output.status, output.stdout, output.stderr,
+        );
+        assert_counter2_environment(&output, &expected);
+        eprintln!("counter2 environment {backend}/{case}: exact-result-accepted");
+        // A failure stops here; later cases have no begin/result record and
+        // must be reported UNRUN. env output itself makes no cwd claim.
+    }
+}
+
+#[test]
+fn ptrace_counter2_captured_environment_controls() {
+    counter2_captured_environment_controls("ptrace");
+}
+
+#[test]
+fn dbt_counter2_captured_environment_controls() {
+    counter2_captured_environment_controls("dbt");
 }
 
 #[test]
