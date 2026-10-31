@@ -258,6 +258,7 @@ typedef enum {
   REGISTER_ORIG_IMAGE_START,
   REGISTER_ORIG_SYSCALL,
   REGISTER_ORIG_PREEMPT_SYSCALL,
+  REGISTER_ORIG_INSTRUCTION,
 } register_orig_kind_t;
 
 /* Native-private metadata: dr_mcontext_t has no independent orig_rax. */
@@ -3174,6 +3175,27 @@ static void bind_register_orig(
   };
 }
 
+/* Ptrace's armed CPUID/RDTSC/RDTSCP instructions fault with #GP. Linux sets
+ * ORIG_RAX=-1 on that exception entry, before ptrace's optional signal repair:
+ * https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/entry/entry_64.S?h=v6.9#n307
+ * This is the reference instruction-event view, not a claimed physical DR
+ * exception or a rule for arbitrary SIGSEGV/saved-signal contexts. Own it only
+ * during the actual translated instruction callback, then restore its caller's
+ * metadata. In particular, neither image-start59 nor a previous syscall is the
+ * instruction's origin. */
+static register_orig_t enter_instruction_register_orig(
+    prototype_counters_t* counters, void* drcontext) {
+  register_orig_t previous = counters->register_orig;
+  clear_register_orig(counters);
+  if (drcontext != NULL && drcontext == dr_get_current_drcontext() &&
+      !has_copied_runtime() &&
+      counters->signal_token == 0 && counters->preempt_pending == 0 &&
+      !counters->in_syscall_event && counters->pending_thread_start == 0)
+    bind_register_orig(
+        counters, drcontext, REGISTER_ORIG_INSTRUCTION, UINT64_MAX);
+  return previous;
+}
+
 static bool register_orig_available(
     const prototype_counters_t* counters, void* drcontext) {
   if (counters == NULL || drcontext != dr_get_current_drcontext() ||
@@ -3193,6 +3215,9 @@ static bool register_orig_available(
           counters->pending_thread_start == 0;
     case REGISTER_ORIG_PREEMPT_SYSCALL:
       return counters->preempt_pending != 0 && counters->in_syscall_event &&
+          counters->pending_thread_start == 0;
+    case REGISTER_ORIG_INSTRUCTION:
+      return counters->preempt_pending == 0 && !counters->in_syscall_event &&
           counters->pending_thread_start == 0;
     case REGISTER_ORIG_UNKNOWN:
       return false;
@@ -3229,6 +3254,8 @@ static uint64_t guest_tsc(void* drcontext, bool with_aux, uint32_t* aux) {
       ensure_runtime_background();
     if (!wait_for_runtime_ready(false))
       return 0;
+    register_orig_t previous_orig =
+        enter_instruction_register_orig(counters, drcontext);
     evidence_callback_enter();
     answered = reverie_dbt_runtime_rdtsc(
         drcontext,
@@ -3244,6 +3271,7 @@ static uint64_t guest_tsc(void* drcontext, bool with_aux, uint32_t* aux) {
         &tsc,
         &runtime_aux);
     evidence_callback_leave();
+    counters->register_orig = previous_orig;
     if (answered == 1) {
       *aux = runtime_aux;
       return tsc;
@@ -3276,6 +3304,8 @@ static void emulate_cpuid(void) {
       ensure_runtime_background();
     if (!wait_for_runtime_ready(false))
       return;
+    register_orig_t previous_orig =
+        enter_instruction_register_orig(counters, drcontext);
     evidence_callback_enter();
     answered = reverie_dbt_runtime_cpuid(
         drcontext,
@@ -3291,6 +3321,7 @@ static void emulate_cpuid(void) {
         reverie_dbt_emit,
         result);
     evidence_callback_leave();
+    counters->register_orig = previous_orig;
   } else {
     dr_fprintf(
         diagnostic_file,
@@ -5191,7 +5222,8 @@ static int32_t write_registers(
   /* A changed orig_rax at an application/private syscall stop would require
    * dispatch rewriting. Do not pretend that a view-only write executed it.
    * Refuse before changing either the machine context or stored metadata. */
-  if (counters->register_orig.kind != REGISTER_ORIG_IMAGE_START &&
+  if ((counters->register_orig.kind == REGISTER_ORIG_SYSCALL ||
+       counters->register_orig.kind == REGISTER_ORIG_PREEMPT_SYSCALL) &&
       in->orig_rax != counters->register_orig.value) {
     dr_fprintf(diagnostic_file,
         "reverie-dbt: register-view-orig-rax-write-unsupported\n");

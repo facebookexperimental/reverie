@@ -1366,4 +1366,480 @@ fn suppression_boundary_controls_reject_forwarding_and_widening_mutations() {
         1,
     );
     refused(NATIVE, &late, driver);
+#[test]
+fn native_instruction_callbacks_own_register_view() {
+    use std::process::Command;
+
+    use sha2::Digest;
+
+    // Execute the actual production instruction callbacks and register owners,
+    // with controlled DR/runtime callbacks. This is C body/state coverage, not
+    // a loaded DR image, a hardware trap, or live saved-signal qualification.
+    let declarations = NATIVE
+        .split_once("typedef enum {\n  REGISTER_ORIG_UNKNOWN,")
+        .expect("native register origin declarations")
+        .1
+        .split_once("} register_orig_t;")
+        .unwrap()
+        .0;
+    let mut source = String::from(
+        r#"
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/user.h>
+typedef int process_id_t;
+typedef int thread_id_t;
+typedef unsigned char* app_pc;
+typedef uint64_t reg_t;
+#define DR_MC_INTEGER 1
+#define DR_MC_CONTROL 2
+#define DR_MC_ALL 7
+#define DR_ASSERT assert
+typedef struct {
+  size_t size;
+  unsigned int flags;
+  uint64_t r15, r14, r13, r12, xbp, xbx, r11, r10, r9, r8;
+  uint64_t xax, xcx, xdx, xsi, xdi;
+  union { app_pc xip; app_pc pc; };
+  uint64_t xflags, xsp;
+  uint64_t other_context[8];
+} dr_mcontext_t;
+"#,
+    );
+    source.push_str("typedef enum {\n  REGISTER_ORIG_UNKNOWN,");
+    source.push_str(declarations);
+    source.push_str("} register_orig_t;\n");
+    source.push_str(
+        NATIVE
+            .lines()
+            .find(|line| line.starts_with("#define VIRTUAL_TSC_STRIDE "))
+            .expect("existing fallback stride"),
+    );
+    source.push_str(
+        r#"
+typedef struct {
+  register_orig_t register_orig;
+  uint64_t signal_token, pending_thread_start, preempt_pending;
+  bool in_syscall_event, signal_registers_changed;
+  app_pc admission_pc;
+  dr_mcontext_t* signal_mcontext;
+} prototype_counters_t;
+typedef int64_t (*invoker_t)(uintptr_t, int64_t, const uint64_t*, uint32_t);
+typedef int32_t (*reader_t)(uintptr_t, struct user_regs_struct*);
+typedef int32_t (*writer_t)(uintptr_t, const struct user_regs_struct*);
+typedef void (*emitter_t)(const char*, size_t);
+static prototype_counters_t state;
+static dr_mcontext_t machine;
+static _Atomic uint64_t image_generation = 17, branch_count = 19, virtual_tsc;
+static process_id_t current_pid = 100;
+static thread_id_t current_tid = 100;
+static void* current_context = (void*)0x1234;
+static int thread_state_index, diagnostic_file;
+static bool copied, external_global, copied_vfork, ready = true, set_ok = true;
+static bool expect_access = true, nest;
+static unsigned gets, sets, depth, entered, left, exits, callbacks[4];
+static int expected_event, runtime_answer = 1;
+static uint32_t expected_leaf, expected_subleaf;
+static register_orig_t expected_exit_owner;
+static char diagnostic[256];
+static const uint64_t callback_tsc = UINT64_C(0x123456789abcdef0);
+static const uint32_t callback_aux = UINT32_C(0x76543210);
+static bool same_orig(register_orig_t a, register_orig_t b) {
+  return a.value == b.value && a.image == b.image && a.pid == b.pid &&
+      a.tid == b.tid && a.kind == b.kind;
+}
+static void* dr_get_current_drcontext(void) { return current_context; }
+static process_id_t dr_get_process_id(void) { return current_pid; }
+static thread_id_t dr_get_thread_id(void* context) { (void)context; return current_tid; }
+static void* drmgr_get_tls_field(void* context, int index) {
+  (void)index;
+  return context == current_context ? &state : NULL;
+}
+static bool dr_get_mcontext(void* context, dr_mcontext_t* out) {
+  assert(context == current_context);
+  ++gets;
+  unsigned flags = out->flags;
+  memcpy(out, &machine, sizeof(machine));
+  out->flags = flags;
+  return true;
+}
+static bool dr_set_mcontext(void* context, dr_mcontext_t* in) {
+  assert(context == current_context);
+  ++sets;
+  if (!set_ok) return false;
+  if (in->flags & DR_MC_INTEGER) {
+    machine.r15 = in->r15; machine.r14 = in->r14; machine.r13 = in->r13;
+    machine.r12 = in->r12; machine.xbp = in->xbp; machine.xbx = in->xbx;
+    machine.r11 = in->r11; machine.r10 = in->r10; machine.r9 = in->r9;
+    machine.r8 = in->r8; machine.xax = in->xax; machine.xcx = in->xcx;
+    machine.xdx = in->xdx; machine.xsi = in->xsi; machine.xdi = in->xdi;
+  }
+  if (in->flags & DR_MC_CONTROL) {
+    machine.xip = in->xip; machine.xsp = in->xsp; machine.xflags = in->xflags;
+  }
+  if (in->flags & 4)
+    memcpy(machine.other_context, in->other_context, sizeof(machine.other_context));
+  return true;
+}
+static void dr_fprintf(int channel, const char* format, ...) {
+  assert(channel == diagnostic_file);
+  va_list args;
+  va_start(args, format);
+  vsnprintf(diagnostic, sizeof(diagnostic), format, args);
+  va_end(args);
+}
+static bool has_copied_runtime(void) { return copied; }
+static bool runtime_uses_external_global(void) { return external_global; }
+static bool is_copied_vfork_process(void) { return copied_vfork; }
+static void ensure_runtime_background(void) {}
+static bool wait_for_runtime_ready(bool finished) { assert(!finished); return ready; }
+static void evidence_callback_enter(void) { ++depth; ++entered; }
+static void evidence_callback_leave(void) { assert(depth != 0); --depth; ++left; }
+static void exit_runtime_tree(int status) {
+  assert(status == 101 && depth == 0);
+  assert(same_orig(state.register_orig, expected_exit_owner));
+  ++exits;
+}
+static int64_t invoke_syscall(uintptr_t context, int64_t number,
+    const uint64_t* args, uint32_t purpose) {
+  (void)context; (void)number; (void)args; (void)purpose;
+  assert(false); // These controls do not fabricate an injected syscall result.
+  return 0;
+}
+static void reverie_dbt_emit(const char* bytes, size_t len) {
+  (void)bytes; (void)len;
+  assert(false);
+}
+static int32_t reverie_dbt_runtime_rdtsc(void*, prototype_counters_t*,
+    int32_t, int32_t, uint64_t, int32_t, invoker_t, reader_t, writer_t,
+    emitter_t, uint64_t*, uint32_t*);
+static int32_t reverie_dbt_runtime_cpuid(void*, prototype_counters_t*,
+    int32_t, int32_t, uint64_t, uint32_t, uint32_t, invoker_t, reader_t,
+    writer_t, emitter_t, uint32_t*);
+"#,
+    );
+    for signature in [
+        "static void clear_register_orig(",
+        "static void bind_register_orig(",
+        "static register_orig_t enter_instruction_register_orig(",
+        "static bool register_orig_available(",
+        "static int32_t refuse_register_orig(",
+        "static int32_t read_registers(",
+        "static int32_t write_registers(",
+        "static uint64_t next_virtual_tsc(",
+        "static uint64_t guest_tsc(",
+        "static void emulate_cpuid(",
+        "static void emulate_rdtsc(",
+        "static void emulate_rdtscp(",
+    ] {
+        source.push_str(native_function(signature));
+        source.push('\n');
+    }
+    source.push_str(
+        r#"
+static void assert_unavailable(reader_t reader, writer_t writer) {
+  struct user_regs_struct observed, untouched, requested = {0};
+  memset(&observed, 0xa5, sizeof(observed));
+  untouched = observed;
+  requested.rax = 999;
+  requested.orig_rax = 888;
+  dr_mcontext_t before;
+  memcpy(&before, &machine, sizeof(machine));
+  register_orig_t owner = state.register_orig;
+  unsigned old_gets = gets, old_sets = sets;
+  assert(reader((uintptr_t)current_context, &observed) == 0);
+  assert(strcmp(diagnostic,
+      "reverie-dbt: register-view-orig-rax-unavailable (read)\n") == 0);
+  assert(memcmp(&observed, &untouched, sizeof(observed)) == 0);
+  assert(writer((uintptr_t)current_context, &requested) == 0);
+  assert(strcmp(diagnostic,
+      "reverie-dbt: register-view-orig-rax-unavailable (write)\n") == 0);
+  assert(gets == old_gets && sets == old_sets);
+  assert(memcmp(&machine, &before, sizeof(machine)) == 0);
+  assert(same_orig(state.register_orig, owner));
+}
+static void observe_callback(void* context, prototype_counters_t* counters,
+    int32_t tid, int32_t pid, uint64_t branches, int event,
+    invoker_t invoke, reader_t reader, writer_t writer, emitter_t emit) {
+  assert(context == current_context && counters == &state);
+  assert(tid == current_tid && pid == current_pid && branches == 19);
+  assert(event == expected_event && depth != 0);
+  assert(invoke == invoke_syscall && reader == read_registers &&
+      writer == write_registers && emit == reverie_dbt_emit);
+  ++callbacks[event];
+  if (!expect_access) {
+    assert_unavailable(reader, writer);
+    return;
+  }
+  struct user_regs_struct before, requested, observed;
+  assert(reader((uintptr_t)context, &before) == 1);
+  assert(before.orig_rax == UINT64_MAX && before.rax == machine.xax);
+  assert(before.rip == (uint64_t)machine.xip && before.rsp == machine.xsp);
+  assert(state.register_orig.kind == REGISTER_ORIG_INSTRUCTION);
+
+  // RAX-only writes do not alias orig_rax; all other physical fields survive.
+  requested = before;
+  requested.rax = 1515847937 + (uint64_t)event;
+  dr_mcontext_t expected;
+  memcpy(&expected, &machine, sizeof(machine));
+  expected.xax = requested.rax;
+  assert(writer((uintptr_t)context, &requested) == 1);
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(reader((uintptr_t)context, &observed) == 1);
+  assert(memcmp(&observed, &requested, sizeof(observed)) == 0);
+
+  // This no-pending instruction hook permits an independent explicit orig
+  // write/readback. It does not request a syscall or rewrite instruction outputs.
+  requested.orig_rax = UINT64_C(0x123456780000003d);
+  assert(writer((uintptr_t)context, &requested) == 1);
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(reader((uintptr_t)context, &observed) == 1);
+  assert(memcmp(&observed, &requested, sizeof(observed)) == 0);
+  register_orig_t owner = state.register_orig;
+  requested.orig_rax = 999;
+  requested.rax = 888;
+  set_ok = false;
+  assert(writer((uintptr_t)context, &requested) == 0);
+  set_ok = true;
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(same_orig(state.register_orig, owner));
+
+  // Current owner checks still apply inside a real callback invocation.
+  ++current_pid; assert_unavailable(reader, writer); --current_pid;
+  ++current_tid; assert_unavailable(reader, writer); --current_tid;
+  atomic_fetch_add(&image_generation, 1);
+  assert_unavailable(reader, writer);
+  atomic_fetch_sub(&image_generation, 1);
+  state.signal_token = 1; assert_unavailable(reader, writer); state.signal_token = 0;
+  state.preempt_pending = 1; assert_unavailable(reader, writer); state.preempt_pending = 0;
+  state.pending_thread_start = 1; assert_unavailable(reader, writer); state.pending_thread_start = 0;
+  state.in_syscall_event = true; assert_unavailable(reader, writer); state.in_syscall_event = false;
+  if (nest) {
+    nest = false;
+    int outer = expected_event;
+    expected_event = 2;
+    uint32_t aux;
+    assert(guest_tsc(context, false, &aux) == callback_tsc);
+    assert(aux == callback_aux && depth == 1);
+    expected_event = outer;
+    assert(same_orig(state.register_orig, owner));
+  }
+}
+static int32_t reverie_dbt_runtime_rdtsc(void* context,
+    prototype_counters_t* counters, int32_t tid, int32_t pid, uint64_t branches,
+    int32_t with_aux, invoker_t invoke, reader_t reader, writer_t writer,
+    emitter_t emit, uint64_t* tsc, uint32_t* aux) {
+  assert(with_aux == 0 || with_aux == 1);
+  observe_callback(context, counters, tid, pid, branches, with_aux ? 3 : 2,
+      invoke, reader, writer, emit);
+  *tsc = callback_tsc;
+  *aux = callback_aux;
+  return runtime_answer;
+}
+static int32_t reverie_dbt_runtime_cpuid(void* context,
+    prototype_counters_t* counters, int32_t tid, int32_t pid, uint64_t branches,
+    uint32_t leaf, uint32_t subleaf, invoker_t invoke, reader_t reader,
+    writer_t writer, emitter_t emit, uint32_t* result) {
+  assert(leaf == expected_leaf && subleaf == expected_subleaf);
+  observe_callback(context, counters, tid, pid, branches, 1,
+      invoke, reader, writer, emit);
+  result[0] = 11; result[1] = 22; result[2] = 33; result[3] = 44;
+  return runtime_answer;
+}
+static void reset(void) {
+  memset(&state, 0, sizeof(state));
+  memset(&machine, 0x3c, sizeof(machine));
+  machine.size = sizeof(machine); machine.flags = DR_MC_ALL;
+  machine.xax = 7; machine.xcx = 8; machine.xip = (app_pc)0x400100;
+  machine.xsp = 0x700000; machine.xflags = 0x246;
+  copied = external_global = copied_vfork = nest = false;
+  ready = set_ok = expect_access = true;
+  runtime_answer = 1;
+  gets = sets = depth = entered = left = exits = 0;
+  memset(callbacks, 0, sizeof(callbacks));
+  diagnostic[0] = '\0';
+  atomic_store(&virtual_tsc, 0);
+  expected_exit_owner = state.register_orig;
+}
+static void call_cpuid(void) {
+  expected_event = 1;
+  expected_leaf = (uint32_t)machine.xax;
+  expected_subleaf = (uint32_t)machine.xcx;
+  emulate_cpuid();
+}
+static void assert_scope_closed(register_orig_t owner) {
+  assert(depth == 0 && entered == left);
+  assert(same_orig(state.register_orig, owner));
+}
+int main(void) {
+  reset();
+  dr_mcontext_t expected;
+  memcpy(&expected, &machine, sizeof(machine));
+  call_cpuid();
+  expected.xax = 11; expected.xbx = 22; expected.xcx = 33; expected.xdx = 44;
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(callbacks[1] == 1 && entered == 1 && exits == 0);
+  assert_scope_closed(expected_exit_owner);
+  assert_unavailable(read_registers, write_registers);
+  puts("instruction callback CPUID: owned read/write and completion");
+
+  reset(); memcpy(&expected, &machine, sizeof(machine)); expected_event = 2;
+  emulate_rdtsc();
+  expected.xax = (uint32_t)callback_tsc; expected.xdx = callback_tsc >> 32;
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(callbacks[2] == 1 && entered == 1 && exits == 0);
+  assert_scope_closed(expected_exit_owner);
+  puts("instruction callback RDTSC: owned read/write and completion");
+
+  reset(); memcpy(&expected, &machine, sizeof(machine)); expected_event = 3;
+  emulate_rdtscp();
+  expected.xax = (uint32_t)callback_tsc; expected.xdx = callback_tsc >> 32;
+  expected.xcx = callback_aux;
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(callbacks[3] == 1 && entered == 1 && exits == 0);
+  assert_scope_closed(expected_exit_owner);
+  puts("instruction callback RDTSCP: owned read/write and completion");
+
+  // Prior metadata can be UNKNOWN, a retired syscall, or an outer instruction
+  // with an explicit Tool write. No prior valid origin is needed for entry.
+  reset();
+  bind_register_orig(&state, current_context, REGISTER_ORIG_SYSCALL, SYS_getpid);
+  register_orig_t retired = state.register_orig;
+  expected_exit_owner = retired;
+  nest = true;
+  call_cpuid();
+  assert(callbacks[1] == 1 && callbacks[2] == 1 && entered == 2);
+  assert_scope_closed(retired);
+  assert_unavailable(read_registers, write_registers);
+  for (int answer = -1; answer <= 1; ++answer) {
+    reset(); runtime_answer = answer; expected_event = 2;
+    uint32_t aux = 999;
+    uint64_t tsc = guest_tsc(current_context, false, &aux);
+    assert(tsc == (answer == 1 ? callback_tsc : answer == 0 ? VIRTUAL_TSC_STRIDE : 0));
+    assert(aux == (answer == 1 ? callback_aux : 0));
+    assert(exits == (answer < 0 ? 1u : 0u) && callbacks[2] == 1);
+    assert_scope_closed(expected_exit_owner);
+    reset(); runtime_answer = answer;
+    call_cpuid();
+    assert(exits == (answer == 1 ? 0u : 1u) && callbacks[1] == 1);
+    assert_scope_closed(expected_exit_owner);
+  }
+  reset(); ready = false;
+  call_cpuid();
+  uint32_t aux = 999;
+  assert(guest_tsc(current_context, true, &aux) == 0 && aux == 0);
+  assert(entered == 0 && exits == 0);
+  assert_scope_closed(expected_exit_owner);
+  reset(); copied = true;
+  call_cpuid();
+  assert(exits == 1 && entered == 0);
+  assert(strstr(diagnostic, "refusing cpuid in a copied child") != NULL);
+  assert(guest_tsc(current_context, false, &aux) == VIRTUAL_TSC_STRIDE);
+  assert(aux == 0 && entered == 0);
+  assert_scope_closed(expected_exit_owner);
+  puts("instruction callback scopes: nested and returned branches restored");
+
+  // Enter the actual runtime callback while each disallowed context is active.
+  // This tests controlled state, not live delayed/nested-signal provenance.
+  for (int refused = 0; refused != 5; ++refused) {
+    reset(); expect_access = false;
+    switch (refused) {
+      case 0: state.signal_token = 1; break;
+      case 1: state.preempt_pending = 1; break;
+      case 2: state.pending_thread_start = 1; break;
+      case 3:
+        state.in_syscall_event = true;
+        bind_register_orig(&state, current_context, REGISTER_ORIG_SYSCALL, SYS_getpid);
+        break;
+      case 4: copied = external_global = true; break;
+    }
+    register_orig_t before = state.register_orig;
+    call_cpuid();
+    assert(callbacks[1] == 1);
+    assert_scope_closed(before);
+    expected_event = 3;
+    assert(guest_tsc(current_context, true, &aux) == callback_tsc);
+    assert(callbacks[3] == 1);
+    assert_scope_closed(before);
+  }
+  for (int private_yield = 0; private_yield != 2; ++private_yield) {
+    reset();
+    state.in_syscall_event = true;
+    state.preempt_pending = private_yield;
+    bind_register_orig(&state, current_context,
+        private_yield ? REGISTER_ORIG_PREEMPT_SYSCALL : REGISTER_ORIG_SYSCALL,
+        private_yield ? SYS_sched_yield : SYS_getpid);
+    struct user_regs_struct requested;
+    assert(read_registers((uintptr_t)current_context, &requested) == 1);
+    requested.orig_rax = SYS_getppid; requested.rax = 999;
+    dr_mcontext_t before;
+    memcpy(&before, &machine, sizeof(machine));
+    register_orig_t owner = state.register_orig;
+    unsigned old_gets = gets, old_sets = sets;
+    assert(write_registers((uintptr_t)current_context, &requested) == 0);
+    assert(strcmp(diagnostic,
+        "reverie-dbt: register-view-orig-rax-write-unsupported\n") == 0);
+    assert(gets == old_gets && sets == old_sets);
+    assert(memcmp(&machine, &before, sizeof(machine)) == 0);
+    assert(same_orig(state.register_orig, owner));
+  }
+  puts("instruction callback refusals: unknown and pending writes preserved");
+  return 0;
+}
+"#,
+    );
+    let directory = tempfile::tempdir().expect("native instruction-view control directory");
+    let input = directory.path().join("instruction-view-control.c");
+    let output = directory.path().join("instruction-view-control");
+    std::fs::write(&input, source.as_bytes()).expect("write native instruction-view control");
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let mut command = Command::new(&compiler);
+    command
+        .args(["-std=gnu11", "-Wall", "-Werror", "-O0"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output);
+    eprintln!("native instruction-view control compiler={command:?}");
+    let compiled = command
+        .output()
+        .expect("compile native instruction-view control");
+    eprintln!(
+        "native instruction-view control compile status={:?} stdout={:?} stderr={:?}",
+        compiled.status.code(),
+        compiled.stdout,
+        compiled.stderr
+    );
+    assert!(
+        compiled.status.success(),
+        "native instruction-view control compile failed"
+    );
+    let bytes = std::fs::read(&output).expect("read native instruction-view control image");
+    eprintln!(
+        "native instruction-view control source_sha256={:x} image_sha256={:x} image_bytes={}",
+        sha2::Sha256::digest(source.as_bytes()),
+        sha2::Sha256::digest(&bytes),
+        bytes.len()
+    );
+    let result = Command::new(&output)
+        .output()
+        .expect("run native instruction-view control");
+    eprintln!(
+        "native instruction-view control status={:?} stdout={:?} stderr={:?}",
+        result.status.code(),
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        result.status.success(),
+        "native instruction-view control failed"
+    );
+    assert_eq!(result.stdout, b"instruction callback CPUID: owned read/write and completion\ninstruction callback RDTSC: owned read/write and completion\ninstruction callback RDTSCP: owned read/write and completion\ninstruction callback scopes: nested and returned branches restored\ninstruction callback refusals: unknown and pending writes preserved\n");
+    assert!(result.stderr.is_empty());
+>>>>>>> 01451eddc (Scope DBT instruction register views to callbacks)
 }
