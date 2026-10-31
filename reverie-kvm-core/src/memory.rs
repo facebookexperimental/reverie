@@ -4442,9 +4442,32 @@ fn create_memory_backing() -> io::Result<OwnedFd> {
 /// this slower. It must not report stored data as a hole. The caller falls
 /// back to a byte-for-byte mapping copy on every error or incomplete extent.
 fn copy_sparse_file(source: RawFd, destination: RawFd, length: usize) -> io::Result<()> {
-    let end = libc::off_t::try_from(length)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mapping exceeds off_t"))?;
-    let mut cursor: libc::off_t = 0;
+    copy_sparse_range(source, 0, destination, 0, length)
+}
+
+/// Copies the data extents (`SEEK_DATA`/`SEEK_HOLE`) of the `length` bytes of
+/// `source` at `source_start` to `destination` at `destination_start`, with
+/// `copy_file_range`, and skips the holes: the caller's destination range must
+/// already read as zeros, as a new file's does. An error can leave part of the
+/// range copied; the caller then overwrites the whole range.
+fn copy_sparse_range(
+    source: RawFd,
+    source_start: usize,
+    destination: RawFd,
+    destination_start: usize,
+    length: usize,
+) -> io::Result<()> {
+    let exceeds = || io::Error::new(io::ErrorKind::InvalidInput, "mapping exceeds off_t");
+    let offset = |value: usize| libc::off_t::try_from(value).map_err(|_| exceeds());
+    let start = offset(source_start)?;
+    let end = start.checked_add(offset(length)?).ok_or_else(exceeds)?;
+    let destination_base = offset(destination_start)?;
+    destination_base
+        .checked_add(offset(length)?)
+        .ok_or_else(exceeds)?;
+    // Where a source offset lands in the destination.
+    let shift = destination_base - start;
+    let mut cursor = start;
 
     while cursor < end {
         // SAFETY: source is a live descriptor owned by the source Mapping.
@@ -4475,12 +4498,13 @@ fn copy_sparse_file(source: RawFd, destination: RawFd, length: usize) -> io::Res
         }
         let extent_end = hole.min(end);
         let mut source_offset = data;
-        let mut destination_offset = data;
+        let mut destination_offset = data + shift;
         while source_offset < extent_end {
             let remaining = usize::try_from(extent_end - source_offset)
                 .expect("nonnegative extent length must fit usize");
             // SAFETY: both descriptors are live for the call, the offsets are
-            // within their equal file sizes, and both offset pointers are valid.
+            // within the caller's ranges of the two files, and both offset
+            // pointers are valid.
             let copied = unsafe {
                 libc::copy_file_range(
                     source,
@@ -4500,7 +4524,7 @@ fn copy_sparse_file(source: RawFd, destination: RawFd, length: usize) -> io::Res
                     "copy_file_range stopped before the end of an extent",
                 ));
             }
-            if source_offset != destination_offset || source_offset > extent_end {
+            if destination_offset - source_offset != shift || source_offset > extent_end {
                 return Err(io::Error::other(
                     "copy_file_range returned inconsistent offsets",
                 ));

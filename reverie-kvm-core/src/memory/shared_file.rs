@@ -866,6 +866,7 @@ impl GuestMemory {
             self.copy_private_snapshot_interval(
                 authority.closed.as_ref().unwrap(),
                 &child,
+                &parent_state.backing_pages,
                 cursor,
                 address,
                 &mut buffer,
@@ -876,6 +877,7 @@ impl GuestMemory {
         self.copy_private_snapshot_interval(
             authority.closed.as_ref().unwrap(),
             &child,
+            &parent_state.backing_pages,
             cursor,
             self.guest_end(),
             &mut buffer,
@@ -951,17 +953,100 @@ impl GuestMemory {
         }));
     }
 
+    /// Copies the private bytes of `[address, end)`, which holds no retained
+    /// shared page, into `child`, a new arena of the same size and base. A
+    /// page with a private backing of its own is copied byte for byte. The
+    /// others live in this arena's base backing, and the child's base backing
+    /// is new, so it holds no data: only the data extents of each run of them
+    /// are copied (`copy_sparse_range`), as a fork's private snapshot copies
+    /// its arena, and a page the guest never wrote costs the child nothing. A
+    /// run the sparse copy cannot finish is copied byte for byte, which
+    /// overwrites whatever part of it the sparse copy wrote.
     fn copy_private_snapshot_interval(
         &self,
         closed: &Closed,
         child: &GuestMemory,
-        mut address: u64,
+        backing_pages: &BTreeMap<u64, InstalledBackingPage>,
+        address: u64,
         end: u64,
         buffer: &mut [u8],
     ) -> Result<()> {
         if !closed.belongs_to(&self.entry_gate()) {
             return Err(Error::MappingPublicationGateMismatch);
         }
+        let page_size = PAGE_SIZE as u64;
+        let mut cursor = address;
+        if address < end {
+            for &page in backing_pages
+                .range(address / page_size..end.div_ceil(page_size))
+                .map(|(page, _)| page)
+            {
+                let separate = page * page_size;
+                self.copy_base_snapshot_run(child, cursor, separate, buffer)?;
+                self.copy_private_snapshot_bytes(child, separate, separate + page_size, buffer)?;
+                cursor = separate + page_size;
+            }
+        }
+        self.copy_base_snapshot_run(child, cursor, end, buffer)
+    }
+
+    /// Copies `[start, end)`, pages of this arena's base backing, into the
+    /// same range of `child`'s new base backing: its data extents only, or, if
+    /// that cannot finish, every byte.
+    fn copy_base_snapshot_run(
+        &self,
+        child: &GuestMemory,
+        start: u64,
+        end: u64,
+        buffer: &mut [u8],
+    ) -> Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+        let length = usize::try_from(end - start).expect("guest range must fit usize");
+        let source = self.checked_offset(start, length)?;
+        let destination = child.checked_offset(start, length)?;
+        let sparse = {
+            let _source_guard = self
+                .mapping
+                .slice
+                .backing
+                .host_access
+                .lock()
+                .expect("guest memory lock poisoned");
+            let _destination_guard = child
+                .mapping
+                .slice
+                .backing
+                .host_access
+                .lock()
+                .expect("guest memory lock poisoned");
+            let copied = copy_sparse_range(
+                self.mapping.slice.backing.fd.as_raw_fd(),
+                self.mapping.slice.offset + source,
+                child.mapping.slice.backing.fd.as_raw_fd(),
+                child.mapping.slice.offset + destination,
+                length,
+            );
+            #[cfg(test)]
+            let copied = copied.and_then(|()| tests::injected_sparse_copy_failure());
+            copied
+        };
+        match sparse {
+            Ok(()) => Ok(()),
+            Err(_) => self.copy_private_snapshot_bytes(child, start, end, buffer),
+        }
+    }
+
+    /// Copies every byte of `[address, end)`, which holds no retained shared
+    /// page, into `child`.
+    fn copy_private_snapshot_bytes(
+        &self,
+        child: &GuestMemory,
+        mut address: u64,
+        end: u64,
+        buffer: &mut [u8],
+    ) -> Result<()> {
         while address < end {
             let length = usize::try_from(end - address).unwrap().min(buffer.len());
             let offset = self.checked_offset(address, length)?;
@@ -1422,6 +1507,20 @@ mod tests {
 
     use super::*;
     use crate::error_ext::ErrorExt;
+
+    thread_local! {
+        /// Makes this thread's shared-file snapshot copies report a failure
+        /// after their sparse copy, so a test sees the byte-for-byte fallback.
+        static FAIL_SPARSE_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn injected_sparse_copy_failure() -> io::Result<()> {
+        if FAIL_SPARSE_COPY.with(std::cell::Cell::get) {
+            Err(io::Error::other("injected sparse copy failure"))
+        } else {
+            Ok(())
+        }
+    }
 
     const BASE: u64 = 0x10000;
     const P: u64 = PAGE_SIZE as u64;
@@ -3495,5 +3594,108 @@ mod tests {
         ));
         assert!(!threaded.contains_shared_file());
         drop((one, two, participant));
+    }
+
+    /// The bytes the host has allocated for the base backing of `memory`.
+    fn allocated_bytes(memory: &GuestMemory) -> u64 {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the descriptor is live and metadata is valid for a stat.
+        let rc = unsafe {
+            libc::fstat(
+                memory.mapping.slice.backing.fd.as_raw_fd(),
+                metadata.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        // SAFETY: fstat succeeded.
+        unsafe { metadata.assume_init() }.st_blocks as u64 * 512
+    }
+
+    /// 16 MiB, eight 2 MiB regions: a host that backs shared memory with
+    /// huge pages allocates a written region whole.
+    const SPARSE_PAGES: usize = 4096;
+
+    /// A memory of `SPARSE_PAGES` pages that holds a two-page shared view at
+    /// page 10, a private page with a backing of its own at page 20, and
+    /// private bytes the guest wrote at pages 3 and 40, in its first 2 MiB,
+    /// and at each edge of the three runs of base pages a copy copies
+    /// (`[0, 10)`, `[12, 20)` and `[21, SPARSE_PAGES)`): pages 9, 12, 19, 21
+    /// and the last page. Every other page was never written.
+    fn sparse_snapshot_fixture() -> (GuestMemory, File) {
+        let memory = fixture(SPARSE_PAGES);
+        let original = file(2);
+        install(&memory, &original, BASE + 10 * P, 2, 0);
+        replace(&memory, BASE + 20 * P, 1, Some(b"own-backing"), true);
+        memory.write_raw(BASE + 3 * P + 7, b"early").unwrap();
+        memory.write_raw(BASE + 40 * P, b"late").unwrap();
+        for page in SPARSE_EDGE_PAGES {
+            memory
+                .write_raw(BASE + page * P + P - 8, &page.to_ne_bytes())
+                .unwrap();
+        }
+        (memory, original)
+    }
+
+    /// The first and last page of each run of base pages in
+    /// [`sparse_snapshot_fixture`].
+    const SPARSE_EDGE_PAGES: [u64; 5] = [9, 12, 19, 21, SPARSE_PAGES as u64 - 1];
+
+    fn assert_private_pages_match(memory: &GuestMemory, child: &GuestMemory) {
+        let mut source = vec![0; PAGE_SIZE];
+        let mut copy = vec![0; PAGE_SIZE];
+        for page in (0..SPARSE_PAGES as u64).filter(|page| !(10..12).contains(page)) {
+            memory.read_raw(BASE + page * P, &mut source).unwrap();
+            child.read_raw(BASE + page * P, &mut copy).unwrap();
+            assert!(source == copy, "page {page}");
+        }
+        assert_eq!(read(child, BASE + 3 * P + 7, 5), b"early");
+        assert_eq!(read(child, BASE + 20 * P, 11), b"own-backing");
+        assert_eq!(read(child, BASE + 40 * P, 4), b"late");
+        for page in SPARSE_EDGE_PAGES {
+            assert_eq!(
+                read(child, BASE + page * P + P - 8, 8),
+                page.to_ne_bytes(),
+                "page {page}"
+            );
+        }
+    }
+
+    /// A copy of a memory that holds shared views, a fork's or a vfork
+    /// child's, copies only the private pages the guest wrote into its new
+    /// base backing, so the 2 MiB regions it never wrote stay unallocated,
+    /// and every private page reads as the source's, a page with a backing
+    /// of its own included.
+    #[test]
+    fn shared_file_snapshots_copy_only_written_private_pages() {
+        let (memory, original) = sparse_snapshot_fixture();
+        for child in [
+            memory.snapshot().unwrap(),
+            memory.snapshot_sharing_address_space().unwrap(),
+        ] {
+            // Before any read of the copy: at most the first region and the
+            // last of the eight.
+            let allocated = allocated_bytes(&child);
+            assert!(allocated <= 4 << 20, "{allocated} bytes allocated");
+            assert_private_pages_match(&memory, &child);
+            child.write_raw(BASE + 10 * P + 1, b"view").unwrap();
+            assert_eq!(bytes(&original, 1, 4), b"view");
+        }
+    }
+
+    /// When the sparse copy reports a failure, the run is copied byte for
+    /// byte instead, and the copy still reads as its source.
+    #[test]
+    fn a_failed_sparse_snapshot_copy_falls_back_to_every_byte() {
+        let (memory, _original) = sparse_snapshot_fixture();
+        FAIL_SPARSE_COPY.with(|fail| fail.set(true));
+        let copies = [memory.snapshot(), memory.snapshot_sharing_address_space()];
+        FAIL_SPARSE_COPY.with(|fail| fail.set(false));
+        for child in copies {
+            let child = child.unwrap();
+            // Every private page was written, zeros included.
+            let allocated = allocated_bytes(&child);
+            assert!(allocated >= 14 << 20, "{allocated} bytes allocated");
+            assert_private_pages_match(&memory, &child);
+        }
     }
 }
