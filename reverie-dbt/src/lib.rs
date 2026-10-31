@@ -5334,6 +5334,31 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "DynamoRIO failed to translate the guest registers")]
+    fn regs_rejects_a_failed_native_reader() {
+        unsafe extern "C" fn fail_read(_context: usize, _out: *mut libc::user_regs_struct) -> i32 {
+            0
+        }
+        let mut counters = PrototypeCounters::default();
+        let mut guest: DbtGuest<'_, PrototypeTool> = DbtGuest::new(
+            0,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            invoke,
+            fail_read,
+            write_regs_fail,
+        );
+        // This covers the Rust failure contract, not native signal provenance
+        // or whether unwinding can be caught inside DynamoRIO.
+        let _ = run_ready(guest.regs(), &TailInjectResult::default());
+    }
+
+    #[test]
     fn set_regs_forwards_exact_register_file_to_native_writer() {
         let mut counters = PrototypeCounters::default();
         let mut captured: Option<libc::user_regs_struct> = None;
@@ -5356,6 +5381,8 @@ mod tests {
         regs.r15 = 0xDEAD_BEEF_CAFE_F00D;
         regs.rdi = 0x1111_2222_3333_4444;
         regs.rip = 0x5555_6666_7777_8888;
+        regs.rax = 0x5A5A_0001;
+        regs.orig_rax = 59;
         let tail_result = TailInjectResult::default();
         let outcome = run_ready(guest.set_regs(regs), &tail_result)
             .expect("set_regs must resolve without suspending");
@@ -5365,13 +5392,25 @@ mod tests {
         assert_eq!(written.r15, 0xDEAD_BEEF_CAFE_F00D);
         assert_eq!(written.rdi, 0x1111_2222_3333_4444);
         assert_eq!(written.rip, 0x5555_6666_7777_8888);
+        assert_eq!(written.rax, 0x5A5A_0001);
+        assert_eq!(written.orig_rax, 59);
     }
 
     #[test]
     fn set_regs_surfaces_writer_failure_as_errno() {
+        unsafe extern "C" fn refuse_write(
+            context: usize,
+            regs: *const libc::user_regs_struct,
+        ) -> i32 {
+            let observed = unsafe { &mut *(context as *mut Option<(u64, u64)>) };
+            let regs = unsafe { &*regs };
+            *observed = Some((regs.rax, regs.orig_rax));
+            0
+        }
         let mut counters = PrototypeCounters::default();
+        let mut observed = None;
         let mut guest: DbtGuest<'_, PrototypeTool> = DbtGuest::new(
-            0,
+            &mut observed as *mut Option<(u64, u64)> as usize,
             Pid::from_raw(10),
             Pid::from_raw(10),
             None,
@@ -5381,10 +5420,12 @@ mod tests {
             &CONFIG,
             invoke,
             read_regs,
-            write_regs_fail,
+            refuse_write,
         );
 
-        let regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.rax = 0x5A5A_0001;
+        regs.orig_rax = 59;
         let tail_result = TailInjectResult::default();
         let outcome = run_ready(guest.set_regs(regs), &tail_result)
             .expect("set_regs must resolve without suspending");
@@ -5392,6 +5433,7 @@ mod tests {
             matches!(outcome, Err(Error::Errno(Errno::EIO))),
             "a failing native writer must surface EIO, got {outcome:?}"
         );
+        assert_eq!(observed, Some((0x5A5A_0001, 59)));
     }
 
     #[test]

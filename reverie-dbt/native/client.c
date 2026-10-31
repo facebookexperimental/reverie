@@ -253,6 +253,22 @@ typedef struct {
   uint64_t nonce;
 } mapping_capture_refusal_t;
 
+typedef enum {
+  REGISTER_ORIG_UNKNOWN,
+  REGISTER_ORIG_IMAGE_START,
+  REGISTER_ORIG_SYSCALL,
+  REGISTER_ORIG_PREEMPT_SYSCALL,
+} register_orig_kind_t;
+
+/* Native-private metadata: dr_mcontext_t has no independent orig_rax. */
+typedef struct {
+  uint64_t value;
+  uint64_t image;
+  process_id_t pid;
+  thread_id_t tid;
+  register_orig_kind_t kind;
+} register_orig_t;
+
 typedef struct {
   uint64_t branches;
   uint64_t observed_syscalls;
@@ -341,6 +357,9 @@ typedef struct {
   // This is not park/read authority and never survives a callback return.
   bool mapping_capture_callback_active;
   mapping_capture_refusal_t mapping_capture_refusal;
+  register_orig_t register_orig;
+  register_orig_t preempt_register_orig;
+  bool initial_register_view_pending;
 } prototype_counters_t;
 static void mapping_capture_begin_callback(prototype_counters_t*);
 static bool mapping_capture_take_fatal_refusal(prototype_counters_t*, uintptr_t, int32_t);
@@ -3126,6 +3145,67 @@ static int32_t write_registers(
     uintptr_t context,
     const struct user_regs_struct* in);
 
+static void clear_register_orig(prototype_counters_t* counters) {
+  memset(&counters->register_orig, 0, sizeof(counters->register_orig));
+}
+
+static void save_preempt_register_orig(prototype_counters_t* counters) {
+  counters->preempt_register_orig = counters->register_orig;
+  clear_register_orig(counters);
+}
+
+static void restore_preempt_register_orig(prototype_counters_t* counters) {
+  counters->register_orig = counters->preempt_register_orig;
+  memset(&counters->preempt_register_orig, 0,
+      sizeof(counters->preempt_register_orig));
+}
+
+static void bind_register_orig(
+    prototype_counters_t* counters,
+    void* drcontext,
+    register_orig_kind_t kind,
+    uint64_t value) {
+  counters->register_orig = (register_orig_t){
+      .value = value,
+      .image = atomic_load_explicit(&image_generation, memory_order_acquire),
+      .pid = dr_get_process_id(),
+      .tid = dr_get_thread_id(drcontext),
+      .kind = kind,
+  };
+}
+
+static bool register_orig_available(
+    const prototype_counters_t* counters, void* drcontext) {
+  if (counters == NULL || drcontext != dr_get_current_drcontext() ||
+      counters->signal_token != 0 ||
+      counters->register_orig.pid != dr_get_process_id() ||
+      counters->register_orig.tid != dr_get_thread_id(drcontext) ||
+      counters->register_orig.image !=
+          atomic_load_explicit(&image_generation, memory_order_acquire))
+    return false;
+  switch (counters->register_orig.kind) {
+    case REGISTER_ORIG_IMAGE_START:
+      return counters->preempt_pending == 0 && counters->admission_pc != NULL &&
+          counters->pending_thread_start != 0;
+    case REGISTER_ORIG_SYSCALL:
+      /* A late thread-start callback is not the intercepted syscall callback. */
+      return counters->preempt_pending == 0 && counters->in_syscall_event &&
+          counters->pending_thread_start == 0;
+    case REGISTER_ORIG_PREEMPT_SYSCALL:
+      return counters->preempt_pending != 0 && counters->in_syscall_event &&
+          counters->pending_thread_start == 0;
+    case REGISTER_ORIG_UNKNOWN:
+      return false;
+  }
+  return false;
+}
+
+static int32_t refuse_register_orig(const char* operation) {
+  dr_fprintf(diagnostic_file,
+      "reverie-dbt: register-view-orig-rax-unavailable (%s)\n", operation);
+  return 0;
+}
+
 static void ensure_runtime_background(void);
 // The TSC an rdtsc or rdtscp returns. A runtime whose tool answers it is asked
 // first: under Detcore that is Detcore's virtual clock, charged and logged as
@@ -3555,7 +3635,21 @@ static void start_pending_thread(app_pc pc) {
   }
   app_pc previous = counters->admission_pc;
   counters->admission_pc = pc;
+  if (counters->initial_register_view_pending) {
+    counters->initial_register_view_pending = false;
+    if (pc != NULL && !counters->in_syscall_event && !has_copied_runtime()) {
+      /* Linux native-ELF post_exec normalizes orig_ax to execve, including
+       * execveat (arch/x86/kernel/process_64.c:set_personality_64bit). This is
+       * the reference image-start view: DR privately maps the ELF instead of
+       * observing that application exec syscall. Delayed/saved continuations
+       * remain unresolved: https://github.com/rrnewton/reverie/issues/1226. */
+      bind_register_orig(counters, dr_get_current_drcontext(),
+          REGISTER_ORIG_IMAGE_START, SYS_execve);
+    }
+  }
   admit_pending_thread();
+  if (counters->register_orig.kind == REGISTER_ORIG_IMAGE_START)
+    clear_register_orig(counters);
   counters->admission_pc = previous;
 }
 
@@ -5044,6 +5138,8 @@ static int32_t read_registers(uintptr_t context, struct user_regs_struct* out) {
   dr_mcontext_t registers = {sizeof(registers), DR_MC_ALL};
   prototype_counters_t* counters =
       drmgr_get_tls_field((void*)context, thread_state_index);
+  if (!register_orig_available(counters, (void*)context))
+    return refuse_register_orig("read");
   memset(out, 0, sizeof(*out));
   if (counters != NULL && counters->signal_token != 0)
     registers = *counters->signal_mcontext;
@@ -5065,7 +5161,7 @@ static int32_t read_registers(uintptr_t context, struct user_regs_struct* out) {
   out->rdx = registers.xdx;
   out->rsi = registers.xsi;
   out->rdi = registers.xdi;
-  out->orig_rax = registers.xax;
+  out->orig_rax = counters->register_orig.value;
   out->rip = (uint64_t)(counters != NULL && counters->signal_token == 0 &&
                                counters->admission_pc != NULL
                            ? counters->admission_pc
@@ -5090,6 +5186,17 @@ static int32_t write_registers(
   dr_mcontext_t registers = {sizeof(registers), DR_MC_ALL};
   prototype_counters_t* counters =
       drmgr_get_tls_field((void*)context, thread_state_index);
+  if (!register_orig_available(counters, (void*)context))
+    return refuse_register_orig("write");
+  /* A changed orig_rax at an application/private syscall stop would require
+   * dispatch rewriting. Do not pretend that a view-only write executed it.
+   * Refuse before changing either the machine context or stored metadata. */
+  if (counters->register_orig.kind != REGISTER_ORIG_IMAGE_START &&
+      in->orig_rax != counters->register_orig.value) {
+    dr_fprintf(diagnostic_file,
+        "reverie-dbt: register-view-orig-rax-write-unsupported\n");
+    return 0;
+  }
   bool signal_owned = counters != NULL && counters->signal_token != 0;
   if (signal_owned)
     registers = *counters->signal_mcontext;
@@ -5120,6 +5227,7 @@ static int32_t write_registers(
     counters->signal_registers_changed = true;
   } else if (!dr_set_mcontext((void*)context, &registers))
     return 0;
+  counters->register_orig.value = in->orig_rax;
   return 1;
 }
 
@@ -6126,6 +6234,7 @@ static void maybe_preempt(app_pc pc) {
   if (!dr_get_mcontext(drcontext, saved))
     return;
   saved->pc = pc;
+  save_preempt_register_orig(counters);
   counters->preempt_pending = 1;
   // Redirect into the stub with rax set to the sched_yield syscall number; the
   // rest of the machine state is the guest's own captured state.
@@ -6152,6 +6261,7 @@ static void preempt_return(void) {
       counters->preempt_pending == 0)
     return; // unreachable in normal flow; the stub's ud2 traps if we fall
             // through
+  restore_preempt_register_orig(counters);
   counters->preempt_pending = 0;
   dr_redirect_execution(counters->preempt_mcontext);
   // dr_redirect_execution does not return on success.
@@ -6634,6 +6744,10 @@ static bool pre_syscall(void* drcontext, int sysnum) {
       !copied_vfork_clone && !is_copied_vfork_process() &&
       copied_process_runtime_pid != dr_get_process_id()) {
     bind_capture_owner(counters);
+    /* The current syscall entry is known, but it is not an image-start or
+     * copied-startup register observation. Suspend it around that callback. */
+    register_orig_t syscall_orig = counters->register_orig;
+    clear_register_orig(counters);
     evidence_callback_enter();
     int32_t initialized = reverie_dbt_runtime_thread_init(
         counters,
@@ -6647,6 +6761,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
         read_registers,
         write_registers);
     evidence_callback_leave();
+    counters->register_orig = syscall_orig;
     if (initialized != 0) {
       dr_fprintf(
           diagnostic_file,
@@ -7257,27 +7372,61 @@ static void set_in_syscall_event(void* drcontext, bool value) {
  * harmlessly: its return restores the whole interrupted context.
  */
 static void canonicalize_syscall_clobbers(void* drcontext, int sysnum) {
-  struct user_regs_struct registers;
+  dr_mcontext_t registers = {sizeof(registers), DR_MC_ALL};
   prototype_counters_t* counters =
       drmgr_get_tls_field(drcontext, thread_state_index);
   if (sysnum == SYS_rt_sigreturn)
     return;
   if (counters != NULL && counters->signal_token != 0)
     return;
-  DR_ASSERT(read_registers((uintptr_t)drcontext, &registers));
-  if (registers.rcx == registers.rip && registers.r11 == registers.eflags)
+  /* This internal physical-context repair needs no orig_rax view. In
+   * particular it must not invent provenance for a signal continuation. */
+  DR_ASSERT(dr_get_mcontext(drcontext, &registers));
+  if (registers.xcx == (reg_t)registers.xip && registers.r11 == registers.xflags)
     return;
-  registers.rcx = registers.rip;
-  registers.r11 = registers.eflags;
-  DR_ASSERT(write_registers((uintptr_t)drcontext, &registers));
+  registers.xcx = (reg_t)registers.xip;
+  registers.r11 = registers.xflags;
+  DR_ASSERT(dr_set_mcontext(drcontext, &registers));
+}
+
+static void capture_syscall_register_orig(void* drcontext, int sysnum) {
+  prototype_counters_t* counters =
+      drmgr_get_tls_field(drcontext, thread_state_index);
+  if (counters == NULL)
+    return;
+  counters->initial_register_view_pending = false;
+  clear_register_orig(counters);
+  /* The private Gettid enters a saved signal callback, whose orig_rax is not
+   * supplied by DR. It must never become the interrupted register view. */
+  if (counters->signal_token != 0)
+    return;
+  dr_mcontext_t registers = {sizeof(registers), DR_MC_ALL};
+  if (!dr_get_mcontext(drcontext, &registers))
+    return;
+  register_orig_kind_t kind = REGISTER_ORIG_SYSCALL;
+  if (counters->preempt_pending != 0) {
+    /* This is the temporary private SchedYield execution, not the saved
+     * interrupted context. A genuine application SchedYield stays ordinary. */
+    if (sysnum != SYS_sched_yield)
+      return;
+    kind = REGISTER_ORIG_PREEMPT_SYSCALL;
+  }
+  bind_register_orig(counters, drcontext, kind, (uint64_t)registers.xax);
 }
 
 static bool pre_syscall_event(void* drcontext, int sysnum) {
+  capture_syscall_register_orig(drcontext, sysnum);
   set_in_syscall_event(drcontext, true);
   bool execute = pre_syscall(drcontext, sysnum);
   if (!execute)
     canonicalize_syscall_clobbers(drcontext, sysnum);
   set_in_syscall_event(drcontext, false);
+  if (!execute) {
+    prototype_counters_t* counters =
+        drmgr_get_tls_field(drcontext, thread_state_index);
+    if (counters != NULL)
+      clear_register_orig(counters);
+  }
   return execute;
 }
 
@@ -7286,6 +7435,10 @@ static void post_syscall_event(void* drcontext, int sysnum) {
   post_syscall(drcontext, sysnum);
   canonicalize_syscall_clobbers(drcontext, sysnum);
   set_in_syscall_event(drcontext, false);
+  prototype_counters_t* counters =
+      drmgr_get_tls_field(drcontext, thread_state_index);
+  if (counters != NULL)
+    clear_register_orig(counters);
 }
 
 static void thread_init(void* drcontext) {
@@ -7362,6 +7515,8 @@ static void thread_init(void* drcontext) {
   // neither a fork nor vfork is a new-image/post-exec admission.
   bool pending_image_start =
       host_tid == dr_get_process_id() && !has_copied_runtime();
+  counters->initial_register_view_pending = pending_image_start &&
+      pending_child == 0 && dr_get_process_id() == runtime_owner_pid;
   counters->pending_birth_token = 0;
   counters->pending_clone_flags = pending_child != 0 ? clone_flags : 0;
 

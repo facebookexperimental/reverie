@@ -133,6 +133,399 @@ fn ordered(source: &str, markers: &[&str]) {
     }
 }
 
+fn native_function(signature: &str) -> &str {
+    let source = &NATIVE[NATIVE.rfind(signature).expect("native function signature")..];
+    let start = source.find('{').expect("native function body");
+    let mut depth = 0;
+    for (offset, byte) in source.bytes().enumerate().skip(start) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[..=offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated native function {signature}");
+}
+
+#[test]
+fn native_register_view_ownership_refuses_without_mutation() {
+    use std::process::Command;
+
+    use sha2::Digest;
+
+    // Compile the actual C owner/read/write bodies, with controlled DR context
+    // callbacks. This executes native-state refusal and commit logic; it does
+    // not establish live SDK signal provenance or a loaded caller identity.
+    let declarations = NATIVE
+        .split_once("typedef enum {\n  REGISTER_ORIG_UNKNOWN,")
+        .expect("native register origin declarations")
+        .1
+        .split_once("} register_orig_t;")
+        .unwrap()
+        .0;
+    let mut source = String::from(
+        r#"
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/user.h>
+typedef int process_id_t;
+typedef int thread_id_t;
+typedef unsigned char* app_pc;
+typedef uint64_t reg_t;
+#define DR_MC_ALL 7
+#define DR_ASSERT assert
+typedef struct {
+  size_t size;
+  unsigned int flags;
+  uint64_t r15, r14, r13, r12, xbp, xbx, r11, r10, r9, r8;
+  uint64_t xax, xcx, xdx, xsi, xdi;
+  union { app_pc xip; app_pc pc; };
+  uint64_t xflags, xsp;
+  uint64_t other_context[8];
+} dr_mcontext_t;
+"#,
+    );
+    source.push_str("typedef enum {\n  REGISTER_ORIG_UNKNOWN,");
+    source.push_str(declarations);
+    source.push_str("} register_orig_t;\n");
+    source.push_str(
+        r#"
+typedef struct {
+  register_orig_t register_orig, preempt_register_orig;
+  uint64_t signal_token, pending_thread_start, preempt_pending;
+  bool in_syscall_event, signal_registers_changed, initial_register_view_pending;
+  app_pc admission_pc;
+  dr_mcontext_t* signal_mcontext;
+} prototype_counters_t;
+static prototype_counters_t state;
+static dr_mcontext_t machine, interrupted;
+static _Atomic uint64_t image_generation = 17;
+static process_id_t current_pid = 100;
+static thread_id_t current_tid = 100;
+static void* current_context = (void*)0x1234;
+static int thread_state_index, diagnostic_file;
+static bool get_ok = true, set_ok = true;
+static unsigned get_calls, set_calls;
+static char diagnostic[256];
+static void* dr_get_current_drcontext(void) { return current_context; }
+static process_id_t dr_get_process_id(void) { return current_pid; }
+static thread_id_t dr_get_thread_id(void* context) { (void)context; return current_tid; }
+static void* drmgr_get_tls_field(void* context, int index) {
+  (void)index;
+  return context == current_context ? &state : NULL;
+}
+static bool dr_get_mcontext(void* context, dr_mcontext_t* out) {
+  assert(context == current_context);
+  ++get_calls;
+  if (!get_ok) return false;
+  memcpy(out, &machine, sizeof(machine));
+  return true;
+}
+static bool dr_set_mcontext(void* context, dr_mcontext_t* in) {
+  assert(context == current_context);
+  ++set_calls;
+  if (!set_ok) return false;
+  memcpy(&machine, in, sizeof(machine));
+  return true;
+}
+static void dr_fprintf(int channel, const char* format, ...) {
+  assert(channel == diagnostic_file);
+  va_list args;
+  va_start(args, format);
+  vsnprintf(diagnostic, sizeof(diagnostic), format, args);
+  va_end(args);
+}
+"#,
+    );
+    for signature in [
+        "static void clear_register_orig(",
+        "static void save_preempt_register_orig(",
+        "static void restore_preempt_register_orig(",
+        "static void bind_register_orig(",
+        "static bool register_orig_available(",
+        "static int32_t refuse_register_orig(",
+        "static int32_t read_registers(",
+        "static int32_t write_registers(",
+        "static void canonicalize_syscall_clobbers(",
+        "static void capture_syscall_register_orig(",
+    ] {
+        source.push_str(native_function(signature));
+        source.push('\n');
+    }
+    source.push_str(
+        r#"
+static void reset_calls(void) {
+  get_calls = set_calls = 0;
+  diagnostic[0] = '\0';
+}
+static bool same_orig(register_orig_t a, register_orig_t b) {
+  return a.value == b.value && a.image == b.image && a.pid == b.pid &&
+      a.tid == b.tid && a.kind == b.kind;
+}
+static void assert_refused(struct user_regs_struct* requested) {
+  dr_mcontext_t before, saved_before;
+  register_orig_t origin_before;
+  memcpy(&before, &machine, sizeof(before));
+  memcpy(&origin_before, &state.register_orig, sizeof(origin_before));
+  memcpy(&saved_before, &interrupted, sizeof(saved_before));
+  reset_calls();
+  assert(write_registers((uintptr_t)current_context, requested) == 0);
+  assert(strstr(diagnostic, "register-view-orig-rax-") != NULL);
+  assert(get_calls == 0 && set_calls == 0);
+  assert(memcmp(&machine, &before, sizeof(machine)) == 0);
+  assert(memcmp(&state.register_orig, &origin_before, sizeof(origin_before)) == 0);
+  assert(memcmp(&interrupted, &saved_before, sizeof(interrupted)) == 0);
+}
+int main(void) {
+  memset(&machine, 0x3c, sizeof(machine));
+  machine.size = sizeof(machine);
+  machine.flags = DR_MC_ALL;
+  machine.xax = 7;
+  machine.xip = (app_pc)0x400100;
+  machine.xsp = 0x700000;
+  machine.xflags = 0x246;
+  memcpy(&interrupted, &machine, sizeof(interrupted));
+  state.signal_mcontext = &interrupted;
+  struct user_regs_struct requested = {0}, observed, untouched;
+  requested.rax = 1515847937;
+  requested.orig_rax = 59;
+  memset(&observed, 0xa5, sizeof(observed));
+  untouched = observed;
+  assert(read_registers((uintptr_t)current_context, &observed) == 0);
+  assert(strcmp(diagnostic,
+      "reverie-dbt: register-view-orig-rax-unavailable (read)\n") == 0);
+  fputs(diagnostic, stdout);
+  assert(memcmp(&observed, &untouched, sizeof(observed)) == 0);
+  assert_refused(&requested);
+  fputs(diagnostic, stdout);
+
+  state.pending_thread_start = 1;
+  state.admission_pc = (app_pc)0x400000;
+  bind_register_orig(&state, current_context, REGISTER_ORIG_IMAGE_START, 59);
+  assert(read_registers((uintptr_t)current_context, &observed) == 1);
+  assert(observed.rax == 7 && observed.orig_rax == 59);
+  assert(observed.rip == 0x400000);
+  requested = observed;
+  requested.rax = 1515847937;
+  dr_mcontext_t expected;
+  memcpy(&expected, &machine, sizeof(expected));
+  expected.xax = requested.rax;
+  assert(write_registers((uintptr_t)current_context, &requested) == 1);
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(read_registers((uintptr_t)current_context, &observed) == 1);
+  assert(observed.rax == 1515847937 && observed.orig_rax == 59);
+  requested = observed;
+  requested.orig_rax = 61;
+  assert(write_registers((uintptr_t)current_context, &requested) == 1);
+  assert(machine.xax == 1515847937 && state.register_orig.value == 61);
+  requested.orig_rax = 63;
+  requested.rax = 123;
+  set_ok = false;
+  assert(write_registers((uintptr_t)current_context, &requested) == 0);
+  assert(machine.xax == 1515847937 && state.register_orig.value == 61);
+  set_ok = true;
+
+  register_orig_t owned;
+  memcpy(&owned, &state.register_orig, sizeof(owned));
+  ++current_pid;
+  assert_refused(&requested); // fork-copy storage has the parent's PID
+  --current_pid;
+  ++current_tid;
+  assert_refused(&requested);
+  --current_tid;
+  atomic_fetch_add(&image_generation, 1);
+  assert_refused(&requested);
+  atomic_fetch_sub(&image_generation, 1);
+  assert(memcmp(&state.register_orig, &owned, sizeof(owned)) == 0);
+  state.admission_pc = NULL;
+  assert_refused(&requested); // a late start does not acquire image-start59
+
+  state.in_syscall_event = true;
+  machine.xax = UINT64_C(0x1234567800000027);
+  state.initial_register_view_pending = true;
+  capture_syscall_register_orig(current_context, SYS_getpid);
+  assert(!state.initial_register_view_pending);
+  assert(state.register_orig.kind == REGISTER_ORIG_SYSCALL);
+  assert(state.register_orig.value == UINT64_C(0x1234567800000027));
+  assert_refused(&requested); // still in the late thread-start callback
+  state.pending_thread_start = 0;
+  machine.xax = (uint64_t)-9;
+  assert(read_registers((uintptr_t)current_context, &observed) == 1);
+  assert(observed.rax == (uint64_t)-9);
+  assert(observed.orig_rax == UINT64_C(0x1234567800000027));
+  requested = observed;
+  requested.rax = 123;
+  requested.orig_rax = SYS_getppid;
+  assert_refused(&requested);
+  assert(strcmp(diagnostic,
+      "reverie-dbt: register-view-orig-rax-write-unsupported\n") == 0);
+  fputs(diagnostic, stdout);
+  requested.orig_rax = observed.orig_rax;
+  assert(write_registers((uintptr_t)current_context, &requested) == 1);
+  assert(machine.xax == 123);
+  state.in_syscall_event = false;
+  assert_refused(&requested); // a last syscall is not a continuation fact
+
+  // The saved preemption view and temporary SchedYield view are independent.
+  register_orig_t interrupted_orig;
+  memcpy(&interrupted_orig, &state.register_orig, sizeof(interrupted_orig));
+  save_preempt_register_orig(&state);
+  assert(state.register_orig.kind == REGISTER_ORIG_UNKNOWN);
+  state.preempt_pending = 1;
+  state.in_syscall_event = true;
+  machine.xax = SYS_sched_yield;
+  capture_syscall_register_orig(current_context, SYS_sched_yield);
+  assert(state.register_orig.kind == REGISTER_ORIG_PREEMPT_SYSCALL);
+  assert(state.register_orig.value == SYS_sched_yield);
+  assert(same_orig(state.preempt_register_orig, interrupted_orig));
+  machine.xcx = 77;
+  machine.r11 = 88;
+  memcpy(&expected, &machine, sizeof(expected));
+  expected.xcx = (reg_t)expected.xip;
+  expected.r11 = expected.xflags;
+  dr_mcontext_t saved_interrupted;
+  memcpy(&saved_interrupted, &interrupted, sizeof(saved_interrupted));
+  canonicalize_syscall_clobbers(current_context, SYS_sched_yield);
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(memcmp(&interrupted, &saved_interrupted, sizeof(interrupted)) == 0);
+  assert(same_orig(state.preempt_register_orig, interrupted_orig));
+  assert(state.register_orig.value == SYS_sched_yield);
+  restore_preempt_register_orig(&state);
+  state.preempt_pending = 0;
+  assert(same_orig(state.register_orig, interrupted_orig));
+  assert(state.preempt_register_orig.kind == REGISTER_ORIG_UNKNOWN);
+  machine.xax = SYS_sched_yield;
+  capture_syscall_register_orig(current_context, SYS_sched_yield);
+  assert(state.register_orig.kind == REGISTER_ORIG_SYSCALL);
+
+  // Private Gettid never supplies the missing saved-signal origin. No stored
+  // context or application metadata is guessed from its live XAX.
+  state.signal_token = 1;
+  machine.xax = SYS_gettid;
+  capture_syscall_register_orig(current_context, SYS_gettid);
+  assert(state.register_orig.kind == REGISTER_ORIG_UNKNOWN);
+  assert(read_registers((uintptr_t)current_context, &observed) == 0);
+  assert_refused(&requested);
+  reset_calls();
+  memcpy(&expected, &machine, sizeof(expected));
+  canonicalize_syscall_clobbers(current_context, SYS_gettid);
+  assert(get_calls == 0 && set_calls == 0);
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(memcmp(&interrupted, &saved_interrupted, sizeof(interrupted)) == 0);
+  state.signal_token = 0;
+  canonicalize_syscall_clobbers(current_context, SYS_rt_sigreturn);
+  assert(get_calls == 0 && set_calls == 0);
+
+  // Internal clobber repair remains valid even when no Tool register view is
+  // available, and modifies exactly RCX/R11 in the physical context.
+  clear_register_orig(&state);
+  machine.xcx = 1;
+  machine.r11 = 2;
+  memcpy(&expected, &machine, sizeof(expected));
+  expected.xcx = (reg_t)expected.xip;
+  expected.r11 = expected.xflags;
+  canonicalize_syscall_clobbers(current_context, SYS_getpid);
+  assert(memcmp(&machine, &expected, sizeof(machine)) == 0);
+  assert(state.register_orig.kind == REGISTER_ORIG_UNKNOWN);
+  puts("native register view ownership controls passed");
+  return 0;
+}
+"#,
+    );
+    let directory = tempfile::tempdir().expect("native register-view control directory");
+    let input = directory.path().join("register-view-control.c");
+    let output = directory.path().join("register-view-control");
+    std::fs::write(&input, source.as_bytes()).expect("write native register-view control");
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let mut command = Command::new(&compiler);
+    command
+        .args(["-std=gnu11", "-Wall", "-Werror", "-O0"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output);
+    eprintln!("native register-view control compiler={command:?}");
+    let compiled = command
+        .output()
+        .expect("compile native register-view control");
+    eprintln!(
+        "native register-view control compile status={:?} stdout={:?} stderr={:?}",
+        compiled.status.code(),
+        compiled.stdout,
+        compiled.stderr
+    );
+    assert!(
+        compiled.status.success(),
+        "native register-view control compile failed"
+    );
+    let bytes = std::fs::read(&output).expect("read native register-view control image");
+    eprintln!(
+        "native register-view control source_sha256={:x} image_sha256={:x} image_bytes={}",
+        sha2::Sha256::digest(source.as_bytes()),
+        sha2::Sha256::digest(&bytes),
+        bytes.len()
+    );
+    let result = Command::new(&output)
+        .output()
+        .expect("run native register-view control");
+    eprintln!(
+        "native register-view control status={:?} stdout={:?} stderr={:?}",
+        result.status.code(),
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        result.status.success(),
+        "native register-view control failed"
+    );
+    assert_eq!(result.stdout, b"reverie-dbt: register-view-orig-rax-unavailable (read)\nreverie-dbt: register-view-orig-rax-unavailable (write)\nreverie-dbt: register-view-orig-rax-write-unsupported\nnative register view ownership controls passed\n");
+    assert!(result.stderr.is_empty());
+
+    // These bind the actual production call sites to the exercised helpers.
+    let gate = between(
+        NATIVE,
+        "static void start_pending_thread(app_pc pc) {",
+        "static void maybe_preempt(app_pc pc);",
+    );
+    ordered(
+        gate,
+        &[
+            "initial_register_view_pending = false;",
+            "pc != NULL",
+            "REGISTER_ORIG_IMAGE_START, SYS_execve",
+            "admit_pending_thread();",
+            "clear_register_orig(counters);",
+        ],
+    );
+    let pre = native_function("static bool pre_syscall_event(");
+    ordered(
+        pre,
+        &[
+            "capture_syscall_register_orig(drcontext, sysnum);",
+            "set_in_syscall_event(drcontext, true);",
+            "pre_syscall(drcontext, sysnum)",
+            "canonicalize_syscall_clobbers(drcontext, sysnum);",
+            "set_in_syscall_event(drcontext, false);",
+        ],
+    );
+    assert!(
+        !native_function("static void try_start_pending_thread(").contains("bind_register_orig")
+    );
+    let init = native_function("static void thread_init(");
+    assert!(init.contains("host_tid == dr_get_process_id() && !has_copied_runtime()"));
+    assert!(init.contains("pending_child == 0 && dr_get_process_id() == runtime_owner_pid"));
+}
+
 fn c_layout(name: &str, size: usize, fields: &[(&str, usize)]) {
     assert!(NATIVE.contains(&format!("sizeof({name}) == {size}")));
     for (field, offset) in fields {
