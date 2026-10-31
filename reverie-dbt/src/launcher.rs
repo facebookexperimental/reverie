@@ -823,7 +823,8 @@ impl DbtRunner {
     where
         G: GlobalTool + 'static,
     {
-        self.with_captured_caller_program(guest, environment)?
+        self.with_captured_caller_program(guest, environment)
+            .map_err(|error| self.refuse_preparation(error))?
             .status_with_environment_and_global::<G>(guest, environment, config)
             .await
     }
@@ -1459,23 +1460,23 @@ impl DbtRunner {
         guest: &Command,
         environment: Option<&BTreeMap<OsString, OsString>>,
     ) -> io::Result<Command> {
-        match self.prepare_command(guest, environment) {
-            Ok(command) => Ok(command),
-            Err(error) => {
-                if let Some(evidence) = &self.evidence {
-                    if let Err(claim) = evidence.claim_run() {
-                        return Err(io::Error::new(
-                            claim.kind(),
-                            format!("{claim}; launch preparation failed: {error}"),
-                        ));
-                    }
-                    // A refused preparation consumes its own one-shot attempt,
-                    // closes pending evidence resources and cannot publish success.
-                    let _ = evidence.finish(false);
-                }
-                Err(error)
+        self.prepare_command(guest, environment)
+            .map_err(|error| self.refuse_preparation(error))
+    }
+
+    fn refuse_preparation(&self, error: io::Error) -> io::Error {
+        if let Some(evidence) = &self.evidence {
+            if let Err(claim) = evidence.claim_run() {
+                return io::Error::new(
+                    claim.kind(),
+                    format!("{claim}; launch preparation failed: {error}"),
+                );
             }
+            // A refused preparation consumes its own one-shot attempt,
+            // closes pending evidence resources and cannot publish success.
+            let _ = evidence.finish(false);
         }
+        error
     }
 
     fn prepare_command(
@@ -3246,6 +3247,74 @@ mod tests {
                 .contains("never started")
         );
         assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
+    async fn assert_captured_caller_preparation_refusal(already_claimed: bool) {
+        for cwd_case in ["unchanged", "missing", "non-directory"] {
+            let directory = tempfile::tempdir().unwrap();
+            let non_directory = directory.path().join("not-a-directory");
+            std::fs::write(&non_directory, b"public fixture").unwrap();
+            let (base_runner, marker) = marker_runner(directory.path());
+            let file = tempfile::tempfile().unwrap();
+            let selected = base_runner.evidence_file(&file).unwrap();
+            let mut guest = Command::new(directory.path().join("missing-program"));
+            match cwd_case {
+                "missing" => {
+                    guest.current_dir(directory.path().join("missing-directory"));
+                }
+                "non-directory" => {
+                    guest.current_dir(&non_directory);
+                }
+                _ => {}
+            }
+            let environment = BTreeMap::from([(
+                OsString::from("DBT_LAUNCH_WITNESS"),
+                marker.as_os_str().to_os_string(),
+            )]);
+            let primary = runner()
+                .with_captured_caller_program(&guest, &environment)
+                .unwrap_err();
+            let evidence = selected.evidence.as_ref().unwrap();
+            if already_claimed {
+                evidence.claim_run().unwrap();
+            }
+            let error = selected
+                .status_with_captured_environment_and_caller_tool::<()>(&guest, &environment, ())
+                .await
+                .unwrap_err();
+            assert!(!marker.exists());
+            assert_eq!(file.metadata().unwrap().len(), 0);
+            if already_claimed {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                assert!(error.to_string().contains("one-shot"), "{error}");
+                assert!(error.to_string().contains(&primary.to_string()), "{error}");
+                // The refused second attempt must leave the first RUNNING,
+                // including its still-unused root publication slot.
+                evidence.publish_root(std::process::id()).unwrap();
+            } else {
+                assert_eq!(error.kind(), primary.kind());
+                assert_eq!(error.raw_os_error(), primary.raw_os_error());
+                assert_eq!(error.to_string(), primary.to_string());
+                assert_eq!(
+                    evidence.claim_run().unwrap_err().kind(),
+                    io::ErrorKind::AlreadyExists
+                );
+            }
+            let first = evidence.finish(false).unwrap_err().to_string();
+            assert!(first.contains("never started"), "{first}");
+            assert_eq!(evidence.finish(false).unwrap_err().to_string(), first);
+            assert_eq!(file.metadata().unwrap().len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_caller_preparation_refusal_finishes_evidence_without_publication() {
+        assert_captured_caller_preparation_refusal(false).await;
+    }
+
+    #[tokio::test]
+    async fn captured_caller_refused_preparation_preserves_an_already_claimed_evidence_attempt() {
+        assert_captured_caller_preparation_refusal(true).await;
     }
 
     #[test]
