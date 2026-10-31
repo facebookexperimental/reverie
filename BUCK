@@ -425,6 +425,7 @@ rust_unittest(
         "tests/support/thread_start_guest.rs",
         "tests/tool_fixtures/thread_start.rs",
         "tests/tool_fixtures/thread_start_tail.rs",
+        "tests/tool_fixtures/thread_start_tail_witness.rs",
     ],
     crate_root = "tests/thread_start.rs",
     rustc_flags = sanitized_feature,
