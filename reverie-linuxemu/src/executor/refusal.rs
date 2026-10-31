@@ -78,6 +78,119 @@ pub(super) fn flock_refusal(
     })
 }
 
+/// Diagnostic carried by this backend's typed refusal of a clone that would
+/// make a new process sharing its parent's memory.
+pub(crate) const SHARED_MEMORY_PROCESS_REFUSAL: &str =
+    "KVM cannot create a process that shares its parent's memory: CLONE_VM without CLONE_VFORK";
+
+/// Diagnostic carried by this backend's typed refusal of a clone that would
+/// make a thread with a working directory or descriptor table of its own.
+pub(crate) const UNSHARED_THREAD_REFUSAL: &str = "KVM cannot create a thread with a working \
+     directory or descriptor table of its own: CLONE_THREAD without CLONE_FS or CLONE_FILES";
+
+/// Diagnostic carried by this backend's typed refusal of a thread clone that
+/// names no stack, whose child would run on its parent's stack.
+pub(crate) const STACKLESS_THREAD_REFUSAL: &str =
+    "KVM cannot create a thread on its parent's stack: CLONE_THREAD with no child stack";
+
+/// Diagnostic carried by this backend's typed refusal of any other clone it
+/// declines.
+pub(crate) const CLONE_FLAGS_REFUSAL: &str = "KVM does not implement this clone: it creates only \
+     a forked process, a vfork child sharing memory until it execs or exits, or a thread sharing \
+     what a pthread shares";
+
+/// Why this backend refuses a clone: the errno it answers with, and, unless
+/// the answer is a rule of Linux's own that the backend checks, the
+/// diagnostic of the typed refusal it carries (`UnsupportedOperation::Clone`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CloneFlagsRefused {
+    errno: libc::c_int,
+    diagnostic: Option<&'static str>,
+}
+
+impl CloneFlagsRefused {
+    /// Refused with `errno` by a rule of Linux's own, with no typed refusal.
+    pub(super) const fn linux(errno: libc::c_int) -> Self {
+        Self {
+            errno,
+            diagnostic: None,
+        }
+    }
+
+    /// Refused with `errno` for want of support, which `diagnostic` names.
+    pub(super) const fn unsupported(errno: libc::c_int, diagnostic: &'static str) -> Self {
+        Self {
+            errno,
+            diagnostic: Some(diagnostic),
+        }
+    }
+
+    /// The clone's answer.
+    pub(super) const fn result(self) -> i64 {
+        negative_errno(self.errno)
+    }
+
+    /// The typed refusal the answer carries, if any.
+    pub(super) fn refusal(self) -> Option<reverie::UnsupportedRefusal> {
+        self.diagnostic.map(|diagnostic| {
+            reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Clone,
+                reverie::Errno::new(self.errno),
+                diagnostic,
+            )
+        })
+    }
+}
+
+/// Diagnostic carried by this backend's typed refusal of the protection-key
+/// calls.
+pub(crate) const PROTECTION_KEY_REFUSAL: &str =
+    "KVM does not implement memory protection keys (pkey_alloc, pkey_mprotect, pkey_free)";
+
+/// The typed refusal, if any, that a `pkey_alloc`, `pkey_mprotect` or
+/// `pkey_free` result carries. This executor forwards none of them and
+/// answers each with ENOSYS before any effect, so every ENOSYS answer to one
+/// is its own refusal; every other result carries none.
+pub(super) fn protection_key_refusal(
+    request: &SyscallRequest,
+    result: i64,
+) -> Option<reverie::UnsupportedRefusal> {
+    (matches!(
+        request.number(),
+        n if n == libc::SYS_pkey_alloc as u64
+            || n == libc::SYS_pkey_mprotect as u64
+            || n == libc::SYS_pkey_free as u64
+    ) && result == negative_errno(libc::ENOSYS))
+    .then(|| {
+        reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::ProtectionKeys,
+            reverie::Errno::ENOSYS,
+            PROTECTION_KEY_REFUSAL,
+        )
+    })
+}
+
+/// Diagnostic carried by this backend's typed refusal of `userfaultfd`.
+pub(crate) const USERFAULTFD_REFUSAL: &str = "KVM does not implement userfaultfd";
+
+/// The typed refusal, if any, that a `userfaultfd` result carries. This
+/// executor does not forward it and answers it with ENOSYS before any
+/// effect, so every ENOSYS answer is its own refusal; every other result
+/// carries none.
+pub(super) fn userfaultfd_refusal(
+    request: &SyscallRequest,
+    result: i64,
+) -> Option<reverie::UnsupportedRefusal> {
+    (request.number() == libc::SYS_userfaultfd as u64 && result == negative_errno(libc::ENOSYS))
+        .then(|| {
+            reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Userfaultfd,
+                reverie::Errno::ENOSYS,
+                USERFAULTFD_REFUSAL,
+            )
+        })
+}
+
 /// The typed refusal for a signal syscall the backend refused (`reason`, set
 /// by `refuse_signal`) when it answered ENOSYS. Linux's signal syscalls
 /// never return ENOSYS, so the answer cannot be mistaken for a kernel one.

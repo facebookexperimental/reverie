@@ -890,19 +890,22 @@ impl ElfExecutor {
                 // to create the ProcessAction, not a second mutable copyin.
                 let clone = match read_clone3(&ProviderMemory(memory), args[0], args[1]) {
                     Ok(clone) => clone,
-                    Err(error) => return Ok(error),
+                    Err(error) => return Ok(self.refuse_clone3_fields(error)),
                 };
                 if clone.flags & (libc::CLONE_VM | libc::CLONE_THREAD) as u64 != 0 {
                     return Err(refusal());
                 }
-                if let Err(error) = validate_process_clone_flags(clone.flags) {
-                    return Ok(error);
+                if let Err(refused) = validate_process_clone_flags(clone.flags) {
+                    return Ok(self.refuse_clone_flags(refused));
                 }
                 if clone.flags & PROCESS_CLONE_TID_FLAGS != 0
                     || clone.parent_tid.is_some()
                     || clone.child_tid.is_some()
                 {
-                    return Ok(negative_errno(libc::ENOTSUP));
+                    return Ok(self.refuse_clone_flags(CloneFlagsRefused::unsupported(
+                        libc::ENOTSUP,
+                        CLONE_FLAGS_REFUSAL,
+                    )));
                 }
                 return Ok(self.prepare_fork(
                     clone.child_stack,
@@ -1016,6 +1019,8 @@ impl ElfExecutor {
                     .or_else(|| tool_decided_refusal(request, result))
                     .or_else(|| madvise_refusal(request, result))
                     .or_else(|| signalfd_refusal(&self.state, request, result))
+                    .or_else(|| protection_key_refusal(request, result))
+                    .or_else(|| userfaultfd_refusal(request, result))
                 {
                     self.unsupported_refusal = Some(refusal);
                 }

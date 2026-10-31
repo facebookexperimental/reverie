@@ -513,8 +513,8 @@ pub(super) fn ppoll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u
     // handle_ppoll (hermit detcore/src/syscalls/io.rs:824-828): the kernel
     // rejects a malformed timeout (bad pointer or out-of-range nanoseconds)
     // regardless of whether a signal mask is present.
-    let timeout = if args[2] == 0 {
-        -1
+    let (timeout, zero_timeout) = if args[2] == 0 {
+        (-1, false)
     } else {
         let timeout = match read_guest_struct::<libc::timespec>(&ProviderMemory(memory), args[2]) {
             Ok(timeout) => timeout,
@@ -526,7 +526,10 @@ pub(super) fn ppoll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u
         let milliseconds = (timeout.tv_sec as u128)
             .saturating_mul(1_000)
             .saturating_add((timeout.tv_nsec as u128).div_ceil(1_000_000));
-        milliseconds.min(libc::c_int::MAX as u128) as libc::c_int
+        (
+            milliseconds.min(libc::c_int::MAX as u128) as libc::c_int,
+            timeout.tv_sec == 0 && timeout.tv_nsec == 0,
+        )
     };
     if args[3] != 0 {
         if args[4] != KERNEL_SIGSET_SIZE as u64 {
@@ -544,20 +547,45 @@ pub(super) fn ppoll(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u
         if memory.user().read(args[3], &mut signal_mask).is_err() {
             return negative_errno(libc::EFAULT);
         }
-        // A masked ppoll mirrors detcore's handle_internal_ppoll (hermit
-        // detcore/src/syscalls/io.rs:922-939): a zero-timeout probe can honor a
-        // temporary signal mask atomically, but keeping the mask active across a
-        // parked wait would require scheduler-level pending-signal state. So
-        // probe non-blocking and fail closed with ENOSYS only when the call
-        // would have blocked (nothing ready). The mask cannot affect an
-        // instantaneous poll, so a plain non-blocking poll reproduces the kernel
-        // result: a ready descriptor returns its count exactly as the unmasked
-        // path would, and a poll/read error propagates unchanged.
+        let mut signal_mask = KernelSigset::from_bytes(signal_mask);
+        signal_mask.clear_unmaskable();
+        // A zero-timeout poll honors a temporary signal mask atomically, but
+        // keeping the mask in place across a parked wait would need
+        // scheduler-level pending-signal state. The mask cannot affect an
+        // instantaneous poll, so a plain non-blocking poll gives the kernel's
+        // readiness: a ready descriptor returns its count exactly as the
+        // unmasked path would, and a poll error propagates unchanged.
         let ready = poll_with_timeout(&mut ProviderMemory(memory), state, args, 0);
-        if ready == 0 {
-            return negative_errno(libc::ENOSYS);
+        if ready != 0 {
+            return ready;
         }
-        return ready;
+        // Nothing is ready, so the pending signals decide before any wait, as
+        // in Linux's do_poll, which tests for one after a sample that found
+        // nothing ready, whatever the timeout: ERESTARTNOHAND if a signal the
+        // temporary mask lets in is pending. The descriptors were sampled
+        // above, before signal_transaction is taken; the classification of the
+        // pending signals and the mask's installation below are made under it,
+        // as for pselect6. With no such signal, a zero timeout returns 0 and a
+        // call that would wait is declined (ENOSYS): keeping the mask in place
+        // across a parked wait needs scheduler-level pending-signal state. A
+        // Tool that runs a masked wait as zero-timeout probes never asks for
+        // that wait; one that passes the call on with its own timeout gets the
+        // ENOSYS, which Linux's ppoll never returns.
+        let transaction = state.signal_transaction.clone();
+        let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
+        return match temporary_mask_signal(state, signal_mask) {
+            TemporaryMaskSignal::None if zero_timeout => 0,
+            TemporaryMaskSignal::None => negative_errno(libc::ENOSYS),
+            TemporaryMaskSignal::Interrupts => {
+                install_temporary_mask_for_delivery(state, signal_mask);
+                negative_errno(libc::EINTR)
+            }
+            // A signal Linux would discard (an ignored one) or stop on: Linux
+            // then restarts or stops the call, which this scalar return cannot
+            // express. Nothing is dequeued or installed; the Tool decides, by
+            // its own rule, whether to discard ignored signals and ask again.
+            TemporaryMaskSignal::Unrepresentable => negative_errno(libc::ENOSYS),
+        };
     }
     poll_with_timeout(&mut ProviderMemory(memory), state, args, timeout)
 }

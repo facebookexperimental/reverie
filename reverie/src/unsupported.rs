@@ -84,6 +84,22 @@ pub enum UnsupportedOperation {
     /// signal, created nothing and registered nothing; the refusal's
     /// diagnostic names the operation.
     Signalfd,
+    /// `clone` or `clone3` asking for a child the backend cannot create: flags,
+    /// an exit signal or `struct clone_args` fields it does not implement,
+    /// such as `CLONE_VM` for a new process without `CLONE_VFORK`, or
+    /// `CLONE_THREAD` without `CLONE_FS` or `CLONE_FILES`. The backend does
+    /// not check every rule by which Linux refuses a clone, so a tool that
+    /// gives Linux's answers to those first sees this only for clones Linux
+    /// would perform. A backend that refuses one created no child and the
+    /// caller runs on unchanged; the refusal's diagnostic names the case.
+    Clone,
+    /// `pkey_alloc`, `pkey_mprotect` or `pkey_free`, on a backend that does
+    /// not implement memory protection keys. A backend that refuses one
+    /// allocated, applied and freed no key and changed no mapping.
+    ProtectionKeys,
+    /// `userfaultfd(2)`, on a backend that does not implement it. A backend
+    /// that refuses it created no descriptor.
+    Userfaultfd,
 }
 
 /// A backend's refusal of an injected syscall, or of a `Guest` operation,

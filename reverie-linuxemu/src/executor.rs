@@ -11388,6 +11388,106 @@ mod tests {
         assert_eq!(executor.take_unsupported_refusal(), None);
     }
 
+    /// The protection-key calls and userfaultfd are refused with ENOSYS and
+    /// their typed refusals (`ProtectionKeys`, `Userfaultfd`), which no other
+    /// result carries: not a ppoll, which this executor answers for a zero
+    /// timeout with or without a temporary mask (0: nothing is ready and no
+    /// signal is pending) and declines without one for a wait, and not a call
+    /// that succeeds.
+    #[test]
+    fn unimplemented_calls_carry_their_typed_refusals() {
+        const MASK: u64 = 0x100;
+        const ZERO_TIMEOUT: u64 = 0x200;
+        let root = TestDir::new();
+        let memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut executor = ElfExecutor::new(test_state(&root.0), false);
+        let refusal = |operation, diagnostic| {
+            Some(reverie::UnsupportedRefusal::new(
+                operation,
+                reverie::Errno::ENOSYS,
+                diagnostic,
+            ))
+        };
+        let protection_keys = refusal(
+            reverie::UnsupportedOperation::ProtectionKeys,
+            PROTECTION_KEY_REFUSAL,
+        );
+        for (number, args) in [
+            (libc::SYS_pkey_alloc, [0; 6]),
+            (
+                libc::SYS_pkey_mprotect,
+                [PAGE_SIZE, PAGE_SIZE, libc::PROT_READ as u64, 1, 0, 0],
+            ),
+            (libc::SYS_pkey_free, [1, 0, 0, 0, 0, 0]),
+        ] {
+            assert_eq!(
+                executor.execute(&SyscallRequest::new(number as u64, args), &memory),
+                negative_errno(libc::ENOSYS),
+                "syscall {number}"
+            );
+            assert_eq!(
+                executor.take_unsupported_refusal(),
+                protection_keys,
+                "syscall {number}"
+            );
+        }
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_userfaultfd as u64,
+                    [libc::O_CLOEXEC as u64, 0, 0, 0, 0, 0]
+                ),
+                &memory
+            ),
+            negative_errno(libc::ENOSYS)
+        );
+        assert_eq!(
+            executor.take_unsupported_refusal(),
+            refusal(
+                reverie::UnsupportedOperation::Userfaultfd,
+                USERFAULTFD_REFUSAL
+            )
+        );
+        // No descriptors and no timeout: nothing is ready, so a masked ppoll
+        // would wait, which this executor declines without a refusal: the
+        // Tool runs masked waits as zero-timeout probes.
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_ppoll as u64,
+                    [0, 0, 0, MASK, KERNEL_SIGSET_SIZE as u64, 0]
+                ),
+                &memory
+            ),
+            negative_errno(libc::ENOSYS)
+        );
+        assert_eq!(executor.take_unsupported_refusal(), None);
+        // With a zero timeout, the same ppoll answers 0, with a temporary
+        // mask as without one, as Linux's does when nothing is ready and no
+        // signal is pending.
+        for mask in [MASK, 0] {
+            assert_eq!(
+                executor.execute(
+                    &SyscallRequest::new(
+                        libc::SYS_ppoll as u64,
+                        [0, 0, ZERO_TIMEOUT, mask, KERNEL_SIGSET_SIZE as u64, 0]
+                    ),
+                    &memory
+                ),
+                0,
+                "mask {mask:#x}"
+            );
+            assert_eq!(executor.take_unsupported_refusal(), None);
+        }
+        assert!(
+            executor.execute(
+                &SyscallRequest::new(libc::SYS_getpid as u64, [0; 6]),
+                &memory
+            ) > 0
+        );
+        assert_eq!(executor.take_unsupported_refusal(), None);
+    }
+
     /// Every call that Detcore decides on every backend
     /// (`TOOL_DECIDED_SYSCALLS`) answers ENOSYS with the typed refusal
     /// `UnsupportedOperation::ToolDecided`. That nothing is forwarded is shown
@@ -32956,6 +33056,166 @@ mod tests {
         assert!(thread_signals.pending.contains(libc::SIGUSR1));
     }
 
+    /// A zero-timeout ppoll with a temporary mask that finds nothing ready
+    /// answers as Linux's do_poll does after its one sample: 0 while the mask
+    /// blocks every pending signal, and, where it lets a pending caught signal
+    /// in, EINTR with the temporary mask installed and the thread's own saved,
+    /// so the signal is delivered under the temporary mask, as for pselect6.
+    #[test]
+    fn masked_ppoll_probe_delivers_under_its_temporary_mask() {
+        const TIMEOUT: u64 = 0x100;
+        const MASK: u64 = 0x180;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let (pid, tid) = (state.pid, state.tid);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let own = test_sigset(&[libc::SIGUSR1]);
+        state.thread_signals.lock().blocked = own;
+        test_catch_signal(&state, libc::SIGUSR1);
+        assert_eq!(
+            write_struct(
+                &mut ProviderMemory(&memory),
+                TIMEOUT,
+                &libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0
+                }
+            ),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_tgkill,
+                [pid as u64, tid as u64, libc::SIGUSR1 as u64, 0, 0, 0],
+            ),
+            0
+        );
+        let ppoll = [0, 0, TIMEOUT, MASK, KERNEL_SIGSET_SIZE as u64, 0];
+
+        // A temporary mask that also blocks it: 0, own mask kept.
+        memory.write(MASK, &own.to_bytes()).unwrap();
+        assert_eq!(
+            syscall_result(&mut memory, &mut state, libc::SYS_ppoll, ppoll),
+            0
+        );
+        assert_eq!(state.thread_signals.lock().blocked, own);
+        assert_eq!(state.thread_signals.lock().saved_sigmask, None);
+
+        // One that admits it: EINTR, delivered under the temporary mask.
+        let temporary = test_sigset(&[libc::SIGTERM]);
+        memory.write(MASK, &temporary.to_bytes()).unwrap();
+        assert_eq!(
+            syscall_result(&mut memory, &mut state, libc::SYS_ppoll, ppoll),
+            negative_errno(libc::EINTR)
+        );
+        let thread_signals = state.thread_signals.lock();
+        assert_eq!(thread_signals.blocked, temporary);
+        assert_eq!(thread_signals.saved_sigmask, Some(own));
+        assert!(thread_signals.pending.contains(libc::SIGUSR1));
+    }
+
+    /// With nothing ready, a masked ppoll tests the pending signals before it
+    /// would wait, as Linux's do_poll does at any timeout: a call with a
+    /// timeout answers EINTR for a pending caught signal its mask lets in,
+    /// with that mask installed for the delivery, and is declined (ENOSYS)
+    /// only when no such signal is pending. A pending ignored signal the mask
+    /// lets in leaves ENOSYS at either timeout, read only: nothing is
+    /// dequeued and the thread's mask stays its own.
+    #[test]
+    fn masked_ppoll_tests_pending_signals_before_it_would_wait() {
+        const TIMEOUT: u64 = 0x100;
+        const MASK: u64 = 0x180;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let (pid, tid) = (state.pid, state.tid);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let own = test_sigset(&[libc::SIGUSR1, libc::SIGWINCH]);
+        state.thread_signals.lock().blocked = own;
+        test_catch_signal(&state, libc::SIGUSR1);
+        let ppoll = [0, 0, TIMEOUT, MASK, KERNEL_SIGSET_SIZE as u64, 0];
+        let set_timeout = |memory: &GuestMemory, nanoseconds: i64| {
+            assert_eq!(
+                write_struct(
+                    &mut ProviderMemory(memory),
+                    TIMEOUT,
+                    &libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: nanoseconds
+                    }
+                ),
+                0
+            );
+        };
+        memory
+            .write(MASK, &test_sigset(&[libc::SIGTERM]).to_bytes())
+            .unwrap();
+
+        // Nothing pending: 0 at a zero timeout, a wait declined.
+        set_timeout(&memory, 0);
+        assert_eq!(
+            syscall_result(&mut memory, &mut state, libc::SYS_ppoll, ppoll),
+            0
+        );
+        set_timeout(&memory, 100_000_000);
+        assert_eq!(
+            syscall_result(&mut memory, &mut state, libc::SYS_ppoll, ppoll),
+            negative_errno(libc::ENOSYS)
+        );
+
+        // SIGWINCH, ignored by default, pending under the thread's mask and
+        // let in by the temporary one: ENOSYS at both timeouts, read only.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_tgkill,
+                [pid as u64, tid as u64, libc::SIGWINCH as u64, 0, 0, 0],
+            ),
+            0
+        );
+        for nanoseconds in [0, 100_000_000] {
+            set_timeout(&memory, nanoseconds);
+            assert_eq!(
+                syscall_result(&mut memory, &mut state, libc::SYS_ppoll, ppoll),
+                negative_errno(libc::ENOSYS),
+                "{nanoseconds}"
+            );
+            let thread_signals = state.thread_signals.lock();
+            assert_eq!(thread_signals.blocked, own);
+            assert_eq!(thread_signals.saved_sigmask, None);
+            assert!(thread_signals.pending.contains(libc::SIGWINCH));
+        }
+
+        // A caught SIGUSR1 pending too, with SIGWINCH blocked by the temporary
+        // mask: a call with a timeout answers EINTR, the mask installed for
+        // the delivery and the thread's own saved.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_tgkill,
+                [pid as u64, tid as u64, libc::SIGUSR1 as u64, 0, 0, 0],
+            ),
+            0
+        );
+        let temporary = test_sigset(&[libc::SIGTERM, libc::SIGWINCH]);
+        memory.write(MASK, &temporary.to_bytes()).unwrap();
+        set_timeout(&memory, 100_000_000);
+        assert_eq!(
+            syscall_result(&mut memory, &mut state, libc::SYS_ppoll, ppoll),
+            negative_errno(libc::EINTR)
+        );
+        let thread_signals = state.thread_signals.lock();
+        assert_eq!(thread_signals.blocked, temporary);
+        assert_eq!(thread_signals.saved_sigmask, Some(own));
+        assert!(thread_signals.pending.contains(libc::SIGUSR1));
+        assert!(thread_signals.pending.contains(libc::SIGWINCH));
+    }
+
     #[test]
     fn standard_input_access_checks_precede_memory_validation() {
         const PAYLOAD: u64 = 0x100;
@@ -38713,69 +38973,132 @@ mod tests {
         assert!(executor.take_process_action().is_none());
     }
 
+    /// A clone this backend cannot perform keeps its answer, creates no child,
+    /// and records the typed refusal `UnsupportedOperation::Clone`, naming the
+    /// case: CLONE_VM for a new process without CLONE_VFORK (EOPNOTSUPP), by
+    /// clone and by clone3; a thread without CLONE_FS or without CLONE_FILES
+    /// (EINVAL); a thread with no stack (EINVAL); and every other declined
+    /// shape, among them an exit signal other than SIGCHLD and a thread's exit
+    /// signal from clone (EINVAL), CLONE_VM with CLONE_FS for a process, a
+    /// vfork with a child tid, and clone3's set_tid (EOPNOTSUPP). Linux's own
+    /// refusals that the backend checks record none: a thread without
+    /// CLONE_SIGHAND, and a clone3 struct shorter than its first version
+    /// (EINVAL).
     #[test]
-    fn clone3_accepts_glibc_pthread_profile_with_tls_and_tid_addresses() {
+    fn clone_the_backend_cannot_perform_is_a_typed_refusal() {
         const CLONE3_ARGS: u64 = 0x200;
-        const CHILD_TID_ADDRESS: u64 = 0x300;
-        const PARENT_TID_ADDRESS: u64 = 0x308;
         const CHILD_STACK: u64 = 0x4000;
-        const CHILD_STACK_SIZE: u64 = 0x9000;
-        const TLS: u64 = 0x1_234_000;
 
         let root = TestDir::new();
         let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
-        let mut clone3 = [0_u8; 88];
-        let flags = THREAD_CLONE_REQUIRED_FLAGS
-            | libc::CLONE_SYSVSEM as u64
-            | libc::CLONE_SETTLS as u64
-            | libc::CLONE_PARENT_SETTID as u64
-            | libc::CLONE_CHILD_CLEARTID as u64;
-        clone3[0..8].copy_from_slice(&flags.to_le_bytes());
-        // glibc leaves clone_args.pidfd aliased to the thread descriptor even
-        // though CLONE_PIDFD is absent; Linux ignores the slot in that case.
-        clone3[8..16].copy_from_slice(&CHILD_TID_ADDRESS.to_le_bytes());
-        clone3[16..24].copy_from_slice(&CHILD_TID_ADDRESS.to_le_bytes());
-        clone3[24..32].copy_from_slice(&PARENT_TID_ADDRESS.to_le_bytes());
-        clone3[40..48].copy_from_slice(&CHILD_STACK.to_le_bytes());
-        clone3[48..56].copy_from_slice(&CHILD_STACK_SIZE.to_le_bytes());
-        clone3[56..64].copy_from_slice(&TLS.to_le_bytes());
-        memory.write(CLONE3_ARGS, &clone3).unwrap();
         let mut executor = ElfExecutor::new(test_state(&root.0), false);
-        let request = SyscallRequest::new(
-            libc::SYS_clone3 as u64,
-            [CLONE3_ARGS, clone3.len() as u64, 0, 0, 0, 0],
-        );
-
-        assert!(is_thread_clone_request(&request, &memory));
-        let legacy_thread = SyscallRequest::new(
-            libc::SYS_clone as u64,
-            [THREAD_CLONE_REQUIRED_FLAGS, CHILD_STACK, 0, 0, TLS, 0],
-        );
-        assert!(is_thread_clone_request(&legacy_thread, &memory));
-        let process_clone = SyscallRequest::new(
-            libc::SYS_clone as u64,
-            [libc::SIGCHLD as u64, 0, 0, 0, 0, 0],
-        );
-        assert!(!is_thread_clone_request(&process_clone, &memory));
-
-        assert_eq!(executor.execute_process_action(&request, &memory), Some(2));
-        match executor.take_process_action() {
-            Some(ProcessAction::Thread {
-                child_tid,
-                child_stack,
-                parent_tid,
-                child_tid_address,
-                clear_child_tid,
-                tls,
-            }) => {
-                assert_eq!(child_tid, 2);
-                assert_eq!(child_stack, CHILD_STACK + CHILD_STACK_SIZE);
-                assert_eq!(parent_tid, Some(PARENT_TID_ADDRESS));
-                assert_eq!(child_tid_address, None);
-                assert_eq!(clear_child_tid, Some(CHILD_TID_ADDRESS));
-                assert_eq!(tls, Some(TLS));
+        let refusal = |errno, diagnostic| {
+            Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::Clone,
+                reverie::Errno::new(errno),
+                diagnostic,
+            ))
+        };
+        let clone = |flags: u64, stack| {
+            SyscallRequest::new(libc::SYS_clone as u64, [flags, stack, 0, 0, 0, 0])
+        };
+        let mut clone3 = |at: u64, fields: &[(usize, u64)]| {
+            let mut args = [0_u8; 88];
+            for (offset, value) in fields {
+                args[*offset..*offset + 8].copy_from_slice(&value.to_le_bytes());
             }
-            _ => panic!("glibc pthread clone3 did not produce a thread action"),
+            memory.write(at, &args).unwrap();
+            SyscallRequest::new(libc::SYS_clone3 as u64, [at, args.len() as u64, 0, 0, 0, 0])
+        };
+        let vm = libc::CLONE_VM as u64;
+        let sigchld = libc::SIGCHLD as u64;
+        let thread = THREAD_CLONE_REQUIRED_FLAGS;
+        let cases = [
+            (
+                clone(vm | sigchld, CHILD_STACK),
+                refusal(libc::ENOTSUP, SHARED_MEMORY_PROCESS_REFUSAL),
+            ),
+            (
+                clone3(CLONE3_ARGS, &[(0, vm)]),
+                refusal(libc::ENOTSUP, SHARED_MEMORY_PROCESS_REFUSAL),
+            ),
+            (
+                clone(thread & !(libc::CLONE_FS as u64), CHILD_STACK),
+                refusal(libc::EINVAL, UNSHARED_THREAD_REFUSAL),
+            ),
+            (
+                clone(thread & !(libc::CLONE_FILES as u64), CHILD_STACK),
+                refusal(libc::EINVAL, UNSHARED_THREAD_REFUSAL),
+            ),
+            (
+                clone(thread, 0),
+                refusal(libc::EINVAL, STACKLESS_THREAD_REFUSAL),
+            ),
+            (
+                clone(libc::SIGUSR1 as u64, 0),
+                refusal(libc::EINVAL, CLONE_FLAGS_REFUSAL),
+            ),
+            (
+                clone(thread | sigchld, CHILD_STACK),
+                refusal(libc::EINVAL, CLONE_FLAGS_REFUSAL),
+            ),
+            (
+                clone(thread | libc::CLONE_PTRACE as u64, CHILD_STACK),
+                refusal(libc::ENOTSUP, CLONE_FLAGS_REFUSAL),
+            ),
+            (
+                clone(vm | libc::CLONE_FS as u64 | sigchld, CHILD_STACK),
+                refusal(libc::ENOTSUP, CLONE_FLAGS_REFUSAL),
+            ),
+            (
+                clone(libc::CLONE_VFORK as u64 | sigchld, 0),
+                refusal(libc::ENOTSUP, CLONE_FLAGS_REFUSAL),
+            ),
+            (
+                clone(
+                    vm | libc::CLONE_VFORK as u64 | libc::CLONE_CHILD_SETTID as u64 | sigchld,
+                    0,
+                ),
+                refusal(libc::ENOTSUP, CLONE_FLAGS_REFUSAL),
+            ),
+            (
+                clone(libc::CLONE_NEWNS as u64 | sigchld, 0),
+                refusal(libc::ENOTSUP, CLONE_FLAGS_REFUSAL),
+            ),
+            (
+                clone3(CLONE3_ARGS + 0x100, &[(32, sigchld), (64, 0x100), (72, 1)]),
+                refusal(libc::ENOTSUP, CLONE_FLAGS_REFUSAL),
+            ),
+            (
+                clone3(
+                    CLONE3_ARGS + 0x200,
+                    &[
+                        (0, libc::CLONE_CHILD_SETTID as u64),
+                        (16, 0x100),
+                        (32, sigchld),
+                    ],
+                ),
+                refusal(libc::ENOTSUP, CLONE_FLAGS_REFUSAL),
+            ),
+            (
+                clone(thread & !(libc::CLONE_SIGHAND as u64), CHILD_STACK),
+                None,
+            ),
+        ];
+        let errno = |refusal: &Option<reverie::UnsupportedRefusal>| {
+            refusal.map_or(libc::EINVAL, |refusal| refusal.errno.into_raw())
+        };
+        for (request, expected) in cases.into_iter().chain([(
+            SyscallRequest::new(libc::SYS_clone3 as u64, [CLONE3_ARGS, 56, 0, 0, 0, 0]),
+            None,
+        )]) {
+            assert_eq!(
+                executor.execute_process_action(&request, &memory),
+                Some(negative_errno(errno(&expected))),
+                "{request:?}"
+            );
+            assert!(executor.take_process_action().is_none(), "{request:?}");
+            assert_eq!(executor.take_unsupported_refusal(), expected, "{request:?}");
         }
     }
 
