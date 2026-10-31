@@ -182,7 +182,7 @@ fn returning_output(
     for (index, (sender, record)) in rows.iter().enumerate() {
         let (phase, kind, ordinal, call_ordinal, pid, tid, call, frames, byte) = record;
         let syscall = call.map(|(syscall, _)| syscall as usize);
-        let result = call.map(|(_, result)| result.map_err(|errno| errno as i32));
+        let result = call.map(|(_, result)| result.map_err(reverie::Errno::into_raw));
         let before = frames.map(|(before, _)| before);
         let after = frames.map(|(_, after)| after);
         eprintln!(
@@ -353,7 +353,7 @@ fn assert_returning_records(mode: u8, run: &ReturningRun) {
                     "returning-injection result accepted: callback={phase} call={} syscall={} result={:?}",
                     record.3.unwrap(),
                     syscall as usize,
-                    result.map_err(|errno| errno as i32)
+                    result.map_err(reverie::Errno::into_raw)
                 );
             }
             None => {
