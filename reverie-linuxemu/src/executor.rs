@@ -25455,6 +25455,32 @@ mod tests {
             ],
         );
         assert!(signal_fd >= 0, "signalfd failed: {signal_fd}");
+        // The guest sees the eventfd's own device and inode, as Linux reports
+        // them; no number is allocated here for it.
+        let signal_fd = signal_fd as libc::c_int;
+        let mut kernel = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: kernel is writable and the eventfd's host descriptor is live.
+        assert_eq!(
+            unsafe { libc::fstat(host_fd(&state, signal_fd).unwrap(), kernel.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: fstat initialized kernel on success.
+        let kernel = unsafe { kernel.assume_init() };
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fstat,
+                [signal_fd as u64, 0x1000, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let stat: libc::stat = read_struct(&memory, 0x1000);
+        assert_eq!(
+            (stat.st_dev, stat.st_ino),
+            (kernel.st_dev, kernel.st_ino),
+            "signalfd reports the eventfd's device and inode"
+        );
         assert_descriptor_through_dup_and_fork(
             &mut memory,
             &mut state,
@@ -25478,6 +25504,32 @@ mod tests {
             [pid as u64, 0, 0, 0, 0, 0],
         );
         assert!(pidfd >= 0, "pidfd_open failed: {pidfd}");
+        // The guest sees the pidfd's own device and inode, as Linux reports
+        // them; no number is allocated here for it.
+        let pidfd_guest = pidfd as libc::c_int;
+        let mut kernel = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: kernel is writable and the pidfd's host descriptor is live.
+        assert_eq!(
+            unsafe { libc::fstat(host_fd(&state, pidfd_guest).unwrap(), kernel.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: fstat initialized kernel on success.
+        let kernel = unsafe { kernel.assume_init() };
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fstat,
+                [pidfd_guest as u64, 0x1000, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let stat: libc::stat = read_struct(&memory, 0x1000);
+        assert_eq!(
+            (stat.st_dev, stat.st_ino),
+            (kernel.st_dev, kernel.st_ino),
+            "self pidfd reports the pidfd's device and inode"
+        );
         assert_descriptor_through_dup_and_fork(
             &mut memory,
             &mut state,
