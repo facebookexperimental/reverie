@@ -27,6 +27,7 @@ use reverie::Rdtsc;
 use reverie::Stack;
 use reverie::TimerSchedule;
 use reverie::Tool;
+#[cfg(any(test, feature = "rcb-clock"))]
 use reverie::ToolConfiguration;
 use reverie::ToolProcess;
 use reverie::syscalls::Addr;
@@ -342,6 +343,7 @@ where
 
     /// Retain the standard installer's selected configuration for later forks.
     /// The Tool has already been constructed after that installer's preflight.
+    #[cfg(any(test, feature = "rcb-clock"))]
     pub(crate) fn with_configuration(
         tool: T,
         rpc: CoordinatorRpc<T::GlobalState>,

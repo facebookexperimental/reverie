@@ -1018,8 +1018,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 82] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        204454,
-        "759f40b5b627ce55a17f6dba5462f2d80e009413d2e8e1bf0cef940236b64214",
+        204540,
+        "6a520d8b59d47925e83ebc2a11f8d0167b894dc4c9f2a8f4ff9c17a1a0cc8ad7",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
@@ -32924,7 +32924,7 @@ mod tests {
                 include_bytes!("lib.rs"),
             ),
         ];
-        // Startup completion changes exactly these three reviewed sources.
+        // These four reviewed sources changed for startup completion or gating.
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 77);
         for (relative, old_size, old_digest) in [
@@ -32942,6 +32942,11 @@ mod tests {
                 "reverie-inguest/src/tool_host.rs",
                 24858,
                 "571d9604b2894cfb51256bc713d155b3d3ce42eb2cda54c5bc9912435ad96eb3",
+            ),
+            (
+                "reverie-inguest/src/guest/host.rs",
+                204181,
+                "3f3a6486819a5af8212f1d6abe42cc1e1cb098ddd45f8bf137790da50ee8c392",
             ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG
