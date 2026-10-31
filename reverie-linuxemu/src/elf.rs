@@ -654,6 +654,19 @@ impl TaskLifecycleTable {
             .any(|task| task.tgid == tgid && task.process_generation == generation)
     }
 
+    /// Whether `process` has committed its exit: its thread group's exit
+    /// (the first `exit` with `group`), or the exit of its last task. From
+    /// then on none of its tasks returns to user mode, whatever their host
+    /// threads have yet to notice.
+    pub(crate) fn process_exit_committed(&self, process: reverie::SignalProcessId) -> bool {
+        let (tgid, generation) = (process.tgid.as_raw(), process.generation);
+        !self.contains_process(tgid, generation)
+            || self
+                .process_exits
+                .get(&(tgid, generation))
+                .is_some_and(|exit| exit.group.is_some())
+    }
+
     pub(crate) fn has_live_sibling(&self, tid: i32, tgid: i32) -> bool {
         self.tasks
             .iter()

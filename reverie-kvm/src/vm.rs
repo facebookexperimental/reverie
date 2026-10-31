@@ -2411,29 +2411,39 @@ impl KvmBackend {
     }
 
     /// Ends this vfork child's window for its parent: lets the parent, kept
-    /// inside its `CLONE_VFORK` call, go on. Called after the child's changes
-    /// to private memory went back (`GuestMemory::return_vfork_changes`), at
-    /// its successful exec and at its last exit; dropping the backend does the
+    /// inside its `CLONE_VFORK` call, go on. Called after the child's
+    /// window's end released its address space (`release_vfork_mm`), at its
+    /// successful exec and at its last exit; dropping the backend does the
     /// same for every other end. Without a waiting parent it does nothing.
     pub(crate) fn release_vfork_parent(&mut self) {
         if let Some(release) = self.vfork_release.take() {
+            #[cfg(test)]
+            crate::memory::vfork_window_steps::note("release");
             let _ = release.send(());
         }
     }
 
-    /// The `clear_child_tid` registration that this vfork child's window end
-    /// releases (`GuestMemory::return_vfork_changes`), taken from the
-    /// executor. Linux's `mm_release()` clears and wakes the word, at a
-    /// successful exec and at the child's exit, a death by a signal included,
-    /// whenever another user of the mm exists, as the waiting parent is.
-    /// Outside a vfork child's window, and for a thread, it takes nothing and
-    /// leaves the registration as it is: a process that is the only user of
-    /// its mm drops the word unwritten at exec (`replace_after_exec`).
-    pub(crate) fn take_vfork_clear_child_tid(&self, executor: &mut ElfExecutor) -> Option<u64> {
-        if self.is_guest_thread || !self.memory.has_vfork_parent() {
-            return None;
-        }
-        executor.take_clear_child_tid()
+    /// The end of this vfork child's window, short of the parent's release:
+    /// what Linux's `mm_release()` does there, which the Linux provider
+    /// decides and makes (`ElfExecutor::release_vfork_mm`: the
+    /// clear_child_tid store, this backend's write-back of the child's
+    /// changes to private memory, and the wake), and nothing outside a
+    /// window. Returns whether a window ended.
+    pub(crate) fn release_vfork_mm(&self, executor: &mut ElfExecutor) -> Result<bool> {
+        executor.release_vfork_mm(&self.memory, |child| {
+            child.return_vfork_changes(BOOT_RESERVED_END)
+        })
+    }
+
+    /// Ends this vfork child's window, if one is open (`release_vfork_mm`),
+    /// and then lets its parent go on (`release_vfork_parent`), as Linux
+    /// completes a vfork after mm_release()'s effects. A refused write-back
+    /// returns before the release, so that the caller can publish the
+    /// failure first. Returns whether a window ended.
+    pub(crate) fn end_vfork_window(&mut self, executor: &mut ElfExecutor) -> Result<bool> {
+        let ended = self.release_vfork_mm(executor)?;
+        self.release_vfork_parent();
+        Ok(ended)
     }
 
     /// Enables or disables completed-process-tree KVM exit statistics.
@@ -3124,15 +3134,13 @@ impl KvmBackend {
         let user_length = usize::try_from(self.memory.guest_end() - BOOT_RESERVED_END)
             .expect("guest memory length must fit usize");
         // A vfork child's window ends at its exec, at Linux's
-        // exec_mm_release(): its clear_child_tid word is cleared and woken,
-        // and its changes to private memory go back to the parent before the
-        // new image replaces them; then the parent, kept inside its call, may
-        // go on. A refused write-back returns before the release; the run
-        // fails, and the parent's wait sees that failure before it returns.
-        let clear_child_tid = self.take_vfork_clear_child_tid(executor);
-        self.memory
-            .return_vfork_changes(BOOT_RESERVED_END, clear_child_tid)?;
-        self.release_vfork_parent();
+        // exec_mm_release(): its changes to private memory go back to the
+        // parent before the new image replaces them, with what the provider
+        // makes of mm_release() around them; then the parent, kept inside its
+        // call, may go on. A refused write-back returns before the release;
+        // the run fails, and the parent's wait sees that failure before it
+        // returns.
+        self.end_vfork_window(executor)?;
         // Replace file-backed HVA pages before discarding the new private
         // image. Clearing the outgoing file mapping would corrupt its file.
         self.memory.retire_shared_files_for_exec()?;
@@ -3677,22 +3685,16 @@ impl KvmBackend {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     ) -> Result<ForkedProcessCompletion> {
-        // A vfork child that did not exec ends its window here: Linux's
-        // mm_release() clears and wakes its clear_child_tid word, which its
-        // parent shares, and its changes to private memory reach the parent
-        // before the parent's call returns.
-        let clear_child_tid = child.executor.take_clear_child_tid();
-        if child.backend.memory.has_vfork_parent() {
-            child
-                .backend
-                .memory
-                .return_vfork_changes(BOOT_RESERVED_END, clear_child_tid)?;
-        } else {
+        // A vfork child that did not exec ends its window here, with Linux's
+        // mm_release(): its changes to private memory, and what the provider
+        // makes of its clear_child_tid word, reach the parent before the
+        // parent's call returns.
+        if !child.backend.end_vfork_window(&mut child.executor)? {
             // A process clone has a private snapshot, so no surviving task
             // can observe this clear; preserve the child-side ABI.
+            let clear_child_tid = child.executor.take_clear_child_tid();
             write_tid_best_effort(&mut child.backend.memory, clear_child_tid, 0);
         }
-        child.backend.release_vfork_parent();
         child.backend.check_entry_owner()?;
         let family = child.executor.claim_process_family_exit()?;
         let snapshot = match family {
@@ -6096,13 +6098,11 @@ impl KvmBackend {
     }
 
     /// A process killed by a signal drops its clear_child_tid registration
-    /// unwritten, as Linux's mm_release() does for the last user of an mm. A
-    /// vfork child's mm is its parent's too, so it keeps the registration for
-    /// the end of its window, which clears and wakes the word
-    /// (`take_vfork_clear_child_tid`).
+    /// unwritten, unless the end of a vfork window holds it; the Linux
+    /// provider decides (`ElfExecutor::drop_clear_child_tid_at_fatal_signal`).
     pub(crate) fn discard_process_clear_tid_at_signal_return(&self, executor: &mut ElfExecutor) {
-        if !self.is_guest_thread && !self.memory.has_vfork_parent() {
-            let _ = executor.take_clear_child_tid();
+        if !self.is_guest_thread {
+            executor.drop_clear_child_tid_at_fatal_signal(&self.memory);
         }
     }
 
@@ -6129,10 +6129,9 @@ impl KvmBackend {
         #[cfg(test)]
         clear_tid_diagnostic::begin();
         self.release_thread_slot();
-        if !self.is_guest_thread && self.memory.has_vfork_parent() {
+        if executor.vfork_window_holds_clear_child_tid(&self.memory) {
             // A vfork child's word lies in memory its parent shares: the end
-            // of its window clears it in the copy, which takes it back, and
-            // wakes the parent's word (`take_vfork_clear_child_tid`).
+            // of its window releases it (`release_vfork_mm`).
             #[cfg(test)]
             clear_tid_diagnostic::stopped("vfork child's window end clears it");
             return;
@@ -9917,6 +9916,47 @@ mod tests {
                 assert_eq!(window_extents(other), expected, "{label}");
             }
         }
+    }
+
+    /// A vfork child's window ends in Linux's order
+    /// (`KvmBackend::end_vfork_window`): mm_release()'s store of zero to the
+    /// child's clear_child_tid word, in the child's copy; the write-back that
+    /// carries the copy's changes, the store among them, to the parent; the
+    /// wake of the parent's word, which then holds the store; and only then
+    /// the parent's release from its call, as Linux completes the vfork after
+    /// mm_release(). A wake before the write-back would let a waiter read the
+    /// old word, and a release before the wake would let the parent run
+    /// before it.
+    #[test]
+    fn a_vfork_window_ends_in_linux_order() {
+        use crate::memory::vfork_window_steps;
+        let (mut parent, executor) = stack_window_parent();
+        let window = window_extents(&parent.memory).unwrap();
+        // A word in the stack window, below the initial stack.
+        let word = window[0].0 + 16 * PAGE_SIZE + 8;
+        parent
+            .memory
+            .user()
+            .write(word, &91_i32.to_ne_bytes())
+            .unwrap();
+        let mut child = parent
+            .prepare_forked_process(
+                &executor, 2, None, None, None, None, false, true, false, None,
+            )
+            .unwrap();
+        let (release, mut released) = futures::channel::oneshot::channel();
+        child.backend.vfork_release = Some(release);
+        child.executor.set_clear_child_tid(Some(word));
+        vfork_window_steps::record();
+        assert!(child.backend.end_vfork_window(&mut child.executor).unwrap());
+        assert_eq!(
+            vfork_window_steps::take(),
+            ["clear", "write-back", "wake", "release"]
+        );
+        let mut bytes = [0; 4];
+        parent.memory.user().read(word, &mut bytes).unwrap();
+        assert_eq!(i32::from_ne_bytes(bytes), 0);
+        assert_eq!(released.try_recv(), Ok(Some(())));
     }
 
     /// The Linux provider keeps apart the stack window's mappings a forked

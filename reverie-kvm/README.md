@@ -296,15 +296,23 @@ child's successful exec or at its last exit (a death by a signal included),
 the child's changes to private memory, its own stores and what the kernel
 wrote for it (a `read(2)` into a parent buffer, for example), go back to the
 parent before the parent's call returns: glibc's `posix_spawn(3)` child
-reports a failed exec this way, through the parent's memory. Before they go
-back, the child's `clear_child_tid` word (registered by
-`set_tid_address(2)`) is cleared and one waiter on the parent's word is
-woken, as Linux's `mm_release()` does for an mm another task still uses; a
-failed exec keeps the registration for the child's later exit. The parent's
-wait is killable, as Linux's is: another thread's exec or exit of the whole
-group, or a run failure, ends it with no result, and the child runs on,
-handed to the process as the waiting thread retires; its changes then go
-back to nothing if the parent exec'd. This holds for threads the tool runs.
+reports a failed exec this way, through the parent's memory. What Linux's
+`mm_release()` does for an mm another task still uses is the Linux
+provider's, in this order: the child's `clear_child_tid` word (registered by
+`set_tid_address(2)`) is cleared in the copy, the changes go back with that
+store among them, one waiter on the parent's word is woken, and then the
+parent's call returns. A failed exec keeps the registration for the child's
+later exit. The parent's wait is killable, as Linux's is: another thread's
+exec or exit of the whole group, or a run failure, ends it with no result,
+and the child runs on, handed to the process as the waiting thread retires.
+Its changes then go back to nothing if the parent exec'd, and nothing at all
+goes back once the parent's process has committed its exit: the child is
+then the only user of the address space, so neither its stores nor its
+mapping changes are refused for the parent's sake, and its `clear_child_tid`
+word is not stored, as Linux stores it only while another task uses the mm.
+The decision reads the exit's commit, not whether the waiting thread has
+noticed it yet, so a tool that orders the guest's tasks makes it the same in
+every run. This holds for threads the tool runs.
 A thread run without the tool (no tool at all, or host-owned threads) runs
 its fork and vfork children inline, on its own host thread, so it cannot end
 its call before the child ends: a child that waits for that thread's exec or

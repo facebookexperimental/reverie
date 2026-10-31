@@ -46,6 +46,11 @@
  *   a page of an anonymous mapping, and the thread then maps a new anonymous
  *   page over it with MAP_FIXED, during the window: on Linux the child's store
  *   went with the old page, and the parent sees zero;
+ * - "parent-regrow": as "parent-remap", but the child stores into the second
+ *   page of a zeroed two-page anonymous mapping, and the thread shrinks the
+ *   mapping in place to its first page and grows it back (mremap) during the
+ *   window: on Linux the child's store went with the page the shrink
+ *   removed, the grow brings back a zero page, and the parent sees zero;
  * - "clear-tid ENDING": a vfork child registers a parent word holding 91 as
  *   its clear_child_tid (set_tid_address) and ends its window by ENDING (exec,
  *   failed-exec, exit, signal, or segv, a store to an unmapped address that
@@ -65,7 +70,13 @@
  * - "parent-dies": the main thread vforks a child that blocks reading a pipe
  *   only the parent's process can write, and another thread exits the
  *   process with status 3 during the window: on Linux the waiting thread
- *   dies, the process exits 3, and the child reads end of file.
+ *   dies, the process exits 3, and the child reads end of file;
+ * - "parent-dies conflict": as "parent-dies", but the child and the exiting
+ *   thread first store different values to the same byte;
+ * - "parent-dies map": as "parent-dies", but the child maps a page after it
+ *   reads end of file and keeps it. On Linux neither changes the outcome:
+ *   once the parent's process has exited, the child is the only user of the
+ *   address space.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -431,6 +442,54 @@ static void *remap_thread(void *unused) {
   return NULL;
 }
 
+static volatile unsigned char *regrow_mapping;
+
+static void *regrow_thread(void *unused) {
+  (void)unused;
+  char byte;
+  if (read(to_thread[0], &byte, 1) != 1) {
+    return (void *)1;
+  }
+  /* syscall() rather than mremap(), which resolve_before_window() leaves
+   * unresolved. */
+  if (syscall(SYS_mremap, regrow_mapping, 8192, 4096, 0) != (long)regrow_mapping ||
+      syscall(SYS_mremap, regrow_mapping, 4096, 8192, 0) != (long)regrow_mapping) {
+    return (void *)2;
+  }
+  if (write(to_child[1], "k", 1) != 1) {
+    return (void *)3;
+  }
+  return NULL;
+}
+
+/* The parent's other thread shrinks, in place, a two-page mapping whose second
+ * page the child stored into, and grows it back, during the window. */
+static int parent_regrow(void) {
+  resolve_before_window();
+  regrow_mapping = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  REQUIRE(regrow_mapping != MAP_FAILED, "mmap regrow mapping");
+  REQUIRE(pipe(to_thread) == 0 && pipe(to_child) == 0, "pipes");
+  pthread_t thread;
+  REQUIRE(pthread_create(&thread, NULL, regrow_thread, NULL) == 0, "pthread_create");
+  pid_t child = vfork();
+  REQUIRE(child >= 0, "vfork parent-regrow");
+  if (child == 0) {
+    regrow_mapping[4096 + 100] = 0x91;
+    char byte;
+    if (write(to_thread[1], "c", 1) != 1 || read(to_child[0], &byte, 1) != 1) {
+      _exit(1);
+    }
+    _exit(0);
+  }
+  unsigned seen = regrow_mapping[4096 + 100];
+  int status = wait_for(child);
+  void *result;
+  REQUIRE(pthread_join(thread, &result) == 0 && result == NULL, "pthread_join");
+  printf("parent-regrow: child %s, page[1][100]=%#x\n",
+         WIFEXITED(status) && WEXITSTATUS(status) == 0 ? "ok" : "failed", seen);
+  return 0;
+}
+
 /* The parent's other thread replaces the mapping of a page the child stored
  * into, during the window. */
 static int parent_remap(void) {
@@ -553,15 +612,16 @@ static int thread_in_child(void) {
   pid_t child = vfork();
   REQUIRE(child >= 0, "vfork thread-in-child");
   if (child == 0) {
-    pid_t parent_tid = 0;
+    /* The kernel stores the new thread's ID in thread_tid before the thread
+     * runs (CLONE_PARENT_SETTID) and clears it when the thread exits
+     * (CLONE_CHILD_CLEARTID), so the exit cannot come before the store. */
     long tid = clone(thread_body, thread_stack + sizeof(thread_stack),
                      CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
                          CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID,
-                     NULL, &parent_tid, NULL, &thread_tid);
+                     NULL, (pid_t *)&thread_tid, NULL, (pid_t *)&thread_tid);
     if (tid < 0) {
       _exit(20);
     }
-    thread_tid = (pid_t)tid;
     while (thread_tid != 0) {
       syscall(SYS_futex, &thread_tid, FUTEX_WAIT, (int)tid, NULL, NULL, 0);
     }
@@ -626,28 +686,46 @@ static int leader_exec_image(const char *child_arg, const char *fd_arg) {
 }
 
 static int dies_pipe[2];
+static volatile unsigned char dies_byte;
 
-static void *exit_process(void *unused) {
-  (void)unused;
+/* Exits the process after a pause, storing 2 to dies_byte first when
+ * `conflict` is not null. */
+static void *exit_process(void *conflict) {
   struct timespec pause = {0, 50 * 1000 * 1000};
   nanosleep(&pause, NULL);
+  if (conflict != NULL) {
+    dies_byte = 2;
+  }
   _exit(3);
 }
 
 /* Another thread exits the process while the main thread waits in vfork for
- * a child that blocks until the process's end closes a pipe. */
-static int parent_dies(void) {
+ * a child that blocks until the process's end closes a pipe; `variant` is
+ * null, "conflict" or "map". */
+static int parent_dies(const char *variant) {
+  int conflict = variant != NULL && strcmp(variant, "conflict") == 0;
+  int map = variant != NULL && strcmp(variant, "map") == 0;
+  REQUIRE(variant == NULL || conflict || map, "parent-dies variant");
   resolve_before_window();
   REQUIRE(pipe(dies_pipe) == 0, "pipe");
   pthread_t thread;
-  REQUIRE(pthread_create(&thread, NULL, exit_process, NULL) == 0, "pthread_create");
+  REQUIRE(pthread_create(&thread, NULL, exit_process, conflict ? (void *)&dies_byte : NULL) == 0,
+          "pthread_create");
   pid_t child = vfork();
   REQUIRE(child >= 0, "vfork parent-dies");
   if (child == 0) {
     char byte;
+    if (conflict) {
+      dies_byte = 1;
+    }
     /* The child's own file table holds a copy of the write end. */
     close(dies_pipe[1]);
-    _exit(read(dies_pipe[0], &byte, 1) == 0 ? 0 : 1);
+    int end_of_file = read(dies_pipe[0], &byte, 1) == 0;
+    if (map &&
+        mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) {
+      _exit(2);
+    }
+    _exit(end_of_file ? 0 : 1);
   }
   /* Not reached on Linux: the other thread ends the process first. */
   printf("parent returned from vfork\n");
@@ -665,10 +743,16 @@ int main(int argc, char **argv) {
     return leader_exec(argv[0]);
   }
   if (argc == 2 && strcmp(argv[1], "parent-dies") == 0) {
-    return parent_dies();
+    return parent_dies(NULL);
+  }
+  if (argc == 3 && strcmp(argv[1], "parent-dies") == 0) {
+    return parent_dies(argv[2]);
   }
   if (argc == 2 && strcmp(argv[1], "parent-remap") == 0) {
     return parent_remap();
+  }
+  if (argc == 2 && strcmp(argv[1], "parent-regrow") == 0) {
+    return parent_regrow();
   }
   if (argc == 3 && strcmp(argv[1], "clear-tid") == 0) {
     return clear_tid(argv[2], argv[0]);

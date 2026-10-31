@@ -17,12 +17,15 @@
 //! child's last exit (a death by a signal included),
 //! [`GuestMemory::return_vfork_changes`] writes what the child changed in
 //! private memory into the parent, so the parent resumes with the memory Linux
-//! would give it. It first makes the old mm's release effects of Linux's
-//! `mm_release()`, which runs before the vfork completion whenever another
-//! user of the mm exists, as the waiting parent is: the word the child
-//! registered as its `clear_child_tid` (by `set_tid_address(2)`) is cleared
-//! in the copy, so the store goes back with the child's other changes, and
-//! one waiter on the parent's word is woken once it holds the store.
+//! would give it. This module is that mechanism only. What Linux's
+//! `mm_release()` makes at the window's end, and whether anything goes back
+//! at all, are the Linux provider's decisions: it stores zero to the child's
+//! `clear_child_tid` word in the copy before the changes go back, so the store
+//! goes back with them, and wakes a waiter on the parent's word
+//! ([`GuestMemory::vfork_parent`]) once the write-back reached it; and once the
+//! parent's process has exited, which leaves the child the only user of the
+//! address space, it ends the window with nothing written back
+//! ([`GuestMemory::abandon_vfork_changes`]).
 //!
 //! The comparison cannot miss a change. Every guest-visible page of user
 //! memory is one of three kinds, in the child and in the parent alike:
@@ -185,6 +188,27 @@ impl GuestMemory {
         self.mapping.vfork_parent.lock().unwrap().is_some()
     }
 
+    /// The memory of the parent whose address space this vfork child's copy
+    /// stands in for, while the child's window is open: where a word the
+    /// child shares with its parent is, for the parent's threads.
+    pub fn vfork_parent(&self) -> Option<GuestMemory> {
+        self.mapping
+            .vfork_parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|link| link.memory.clone())
+    }
+
+    /// Ends this vfork child's window with nothing written back to its
+    /// parent: the caller found that the parent no longer uses the address
+    /// space this copy stands in for, as after its process exited, so the
+    /// child is the only user left and its changes are its own. Without a
+    /// vfork parent it does nothing.
+    pub fn abandon_vfork_changes(&self) {
+        self.mapping.vfork_parent.lock().unwrap().take();
+    }
+
     /// Ends this vfork child's window: writes what the child changed in
     /// private user memory, the pages from physical `user_start` on, into its
     /// parent, once. The pages below `user_start` are the backend's own (page
@@ -199,15 +223,10 @@ impl GuestMemory {
     /// [`Error::VforkChildCapability`] before anything is written, and a page
     /// the copy no longer maps is not written.
     ///
-    /// `clear_child_tid` is the address the child registered as its
-    /// `clear_child_tid`, which the caller has taken from the child: Linux's
-    /// `mm_release()` stores zero there and wakes one waiter before the vfork
-    /// completes, since the parent still uses the mm. The store goes to this
-    /// copy before the comparison, so it goes back with the child's other
-    /// changes, best effort as Linux's `put_user` (a bad address stores
-    /// nothing); the wake goes to the parent's word once the write-back
-    /// reached it, and to nothing when the parent exec'd. Without a vfork
-    /// parent the address is not used.
+    /// Returns what went back once the changes reached the parent, and `None`
+    /// without a vfork parent or when the parent exec'd since the copy was
+    /// taken: its new address space is not the one the child shared, which
+    /// the child's changes do not reach on Linux either.
     ///
     /// The parent's calling thread must not run while this runs: the backend
     /// keeps it inside its call until afterwards. With a baseline
@@ -218,24 +237,16 @@ impl GuestMemory {
     /// another thread replaced or removed: a copy cannot order those stores.
     /// The module documentation says what holds for the parent's other
     /// threads.
-    pub fn return_vfork_changes(
-        &self,
-        user_start: u64,
-        clear_child_tid: Option<u64>,
-    ) -> Result<VforkWriteBack> {
+    pub fn return_vfork_changes(&self, user_start: u64) -> Result<Option<VforkWriteBack>> {
         let Some(link) = self.mapping.vfork_parent.lock().unwrap().take() else {
-            return Ok(VforkWriteBack::default());
+            return Ok(None);
         };
-        if let Some(address) = clear_child_tid {
-            let _ = self.user().put_user_i32(address, 0);
+        let returned = self.write_back_to(&link, user_start)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if returned.is_some() {
+            vfork_window_steps::note("write-back");
         }
-        let Some(result) = self.write_back_to(&link, user_start)? else {
-            return Ok(VforkWriteBack::default());
-        };
-        if let Some(address) = clear_child_tid {
-            wake_one_waiter(&link.memory, address);
-        }
-        Ok(result)
+        Ok(returned)
     }
 
     /// The write-back of [`GuestMemory::return_vfork_changes`], under the
@@ -462,10 +473,11 @@ impl GuestMemory {
         let mine = self.mapping.address_space.lock().unwrap();
         let theirs = reference.mapping.address_space.lock().unwrap();
         mine.pages.range(first..).eq(theirs.pages.range(first..))
-            && mine
-                .mapping_incarnations
-                .range(first..)
-                .eq(theirs.mapping_incarnations.range(first..))
+            && (Arc::ptr_eq(&mine.mapping_incarnations, &theirs.mapping_incarnations)
+                || mine
+                    .mapping_incarnations
+                    .range(first..)
+                    .eq(theirs.mapping_incarnations.range(first..)))
             && mine
                 .file_pages
                 .range(first..)
@@ -559,29 +571,36 @@ impl GuestMemory {
     }
 }
 
-/// Linux's `FUTEX_WAKE` of one waiter on the word at `address` in `memory`,
-/// as `mm_release()` wakes a cleared `clear_child_tid` word: shared, not
-/// private, as the kernel's wake is. A word that is not accessible user memory
-/// wakes nobody, as Linux's wake then fails with `EFAULT`.
-fn wake_one_waiter(memory: &GuestMemory, address: u64) {
-    if memory.user().user_accessible_prefix(address, 4).ok() != Some(4) {
-        return;
+/// The steps that end a vfork child's window, as each crate that takes one
+/// notes it on the thread that takes it: the Linux provider's
+/// `clear_child_tid` store (`"clear"`) and wake (`"wake"`), this module's
+/// write-back once it reached the parent (`"write-back"`), and the backend's
+/// release of the parent (`"release"`). For tests that pin their order.
+#[cfg(any(test, feature = "test-support"))]
+pub mod vfork_window_steps {
+    use std::cell::RefCell;
+
+    std::thread_local! {
+        static STEPS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
     }
-    let Ok(operand) = memory.user().retain_translated_range(address, 4) else {
-        return;
-    };
-    // SAFETY: the word is accessible user memory, and the operand keeps its
-    // host mapping alive for this call. FUTEX_WAKE reads nothing through it.
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            operand.address(),
-            libc::FUTEX_WAKE,
-            1,
-            0,
-            0,
-            0,
-        );
+
+    /// Starts recording the steps this thread takes.
+    pub fn record() {
+        STEPS.with(|steps| *steps.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Notes `step`, if this thread records.
+    pub fn note(step: &'static str) {
+        STEPS.with(|steps| {
+            if let Some(steps) = steps.borrow_mut().as_mut() {
+                steps.push(step);
+            }
+        });
+    }
+
+    /// Stops recording, and returns the steps noted since it started.
+    pub fn take() -> Vec<&'static str> {
+        STEPS.with(|steps| steps.borrow_mut().take().unwrap_or_default())
     }
 }
 

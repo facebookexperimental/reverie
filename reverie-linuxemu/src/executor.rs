@@ -404,6 +404,10 @@ pub struct ElfExecutor {
     exit_status: Option<ExitStatus>,
     exit_group: bool,
     clear_child_tid: Option<u64>,
+    /// The process whose address space this task shares as a vfork child
+    /// (`CLONE_VM | CLONE_VFORK`), until its window ends
+    /// ([`ElfExecutor::release_vfork_mm`]).
+    vfork_parent: Option<reverie::SignalProcessId>,
     signal_callback_nonce: u64,
     parent_death_exec: Mutex<Option<ParentDeathExecSnapshot>>,
     terminal_factory: Option<crate::terminal_cleanup::CleanupFactory>,

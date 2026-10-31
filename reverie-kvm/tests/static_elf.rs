@@ -22835,19 +22835,24 @@ fn a_vfork_parent_thread_killed_by_its_leaders_exec_leaves_the_child_running_lik
 /// waiting thread here ends its wait as the group exits. Without a tool the
 /// main thread runs its child inline, as the test above says, so that mode is
 /// left out.
+///
+/// The child is then the only user of the address space, so nothing of its
+/// copy goes back, and what would be refused while the parent lives is not:
+/// a byte the child and the exiting thread both changed to different values,
+/// or a page the child mapped after end of file and kept.
 #[test]
 fn a_vfork_parent_whose_process_exits_during_the_window_exits_like_native() {
     const TEST: &str = "a_vfork_parent_whose_process_exits_during_the_window_exits_like_native";
     if !leader_self_exec_bounded(TEST) {
         return;
     }
-    assert_vfork_fixture_matches_native_in(
-        TEST,
-        &["parent-dies"],
-        "",
-        3,
-        &SHARED_FILE_VFORK_MODES[1..],
-    );
+    for args in [
+        &["parent-dies"][..],
+        &["parent-dies", "conflict"],
+        &["parent-dies", "map"],
+    ] {
+        assert_vfork_fixture_matches_native_in(TEST, args, "", 3, &SHARED_FILE_VFORK_MODES[1..]);
+    }
 }
 
 /// A vfork child that creates a thread is refused by name at the call: Linux
@@ -22869,12 +22874,13 @@ fn a_vfork_child_creating_a_thread_is_refused_by_name() {
     );
 }
 
-/// Another thread of a vfork child's parent maps a new anonymous page with
-/// MAP_FIXED over a page the child stored into, during the window, with the
-/// protection the page had. On Linux the child's store went with the old
-/// page, and the parent reads zero. The copy cannot tell that store from one
-/// to the new page, so the write-back is refused by name rather than leave
-/// the child's byte in the new page.
+/// Another thread of a vfork child's parent replaces a page the child stored
+/// into, during the window: it maps a new anonymous page with MAP_FIXED over
+/// it, with the protection the page had, or it shrinks the page's mapping off
+/// it in place and grows the mapping back (mremap). On Linux the child's
+/// store went with the old page, and the parent reads zero. The copy cannot
+/// tell that store from one to the new page, so the write-back is refused by
+/// name rather than leave the child's byte in the new page.
 #[test]
 fn a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name() {
     const TEST: &str =
@@ -22882,13 +22888,19 @@ fn a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name()
     if !leader_self_exec_bounded(TEST) {
         return;
     }
-    assert_vfork_fixture_refused(
-        TEST,
-        &["parent-remap"],
-        "parent-remap: child ok, page[100]=0\n",
-        "unsupported KVM vfork child operation vfork write-back: another thread of the parent \
-         removed or replaced the mapping of a page the vfork child changed during the window",
-    );
+    for (mode, native_stdout) in [
+        ("parent-remap", "parent-remap: child ok, page[100]=0\n"),
+        ("parent-regrow", "parent-regrow: child ok, page[1][100]=0\n"),
+    ] {
+        assert_vfork_fixture_refused(
+            TEST,
+            &[mode],
+            native_stdout,
+            "unsupported KVM vfork child operation vfork write-back: another thread of the \
+             parent removed or replaced the mapping of a page the vfork child changed during \
+             the window",
+        );
+    }
 }
 
 #[test]

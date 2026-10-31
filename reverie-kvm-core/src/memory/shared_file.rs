@@ -550,7 +550,7 @@ impl GuestMemory {
                     prepared.pages.remove(&page);
                     prepared.file_pages.edit().remove(&page);
                     prepared.shared_anonymous_pages.edit().remove(&page);
-                    prepared.mapping_incarnations.remove(&page);
+                    prepared.set_mapping_incarnation(page, None);
                     if !prepared
                         .reservations
                         .get(&page)
@@ -3455,10 +3455,10 @@ mod tests {
         grandchild.write_raw(BASE + P, b"grand").unwrap();
         assert_eq!(read(&memory, BASE + P, 5), b"grand");
         grandchild.write_raw(BASE + 3 * P, b"grandchild").unwrap();
-        grandchild.return_vfork_changes(BASE, None).unwrap();
+        grandchild.return_vfork_changes(BASE).unwrap();
         assert_eq!(read(&child, BASE + 3 * P, 10), b"grandchild");
         assert_eq!(read(&memory, BASE + 3 * P, 10), [0; 10]);
-        let returned = child.return_vfork_changes(BASE, None).unwrap();
+        let returned = child.return_vfork_changes(BASE).unwrap().unwrap();
         assert_eq!(read(&memory, BASE, 6), b"child!");
         assert_eq!(read(&memory, BASE + 3 * P, 10), b"grandchild");
         // Pages 0 and 3; the views are the same object and are not written.
@@ -3754,7 +3754,7 @@ mod tests {
         let last = BASE + (SPARSE_PAGES as u64 - 1) * P;
         child.write_raw(last, b"last").unwrap();
         assert_eq!(read(&memory, user + 3 * P, 8), b"parent-3");
-        let returned = child.return_vfork_changes(user, None).unwrap();
+        let returned = child.return_vfork_changes(user).unwrap().unwrap();
         assert_eq!(read(&memory, BASE, 8), b"reserved");
         assert_eq!(read(&memory, user + 3 * P, 8), b"pCHILD-3");
         assert_eq!(read(&memory, user + 9 * P, 8), [0; 8]);
@@ -3767,18 +3767,12 @@ mod tests {
         // memory uses huge pages.
         assert!(returned.pages_compared <= 1024, "{returned:?}");
         child.write_raw(user + 3 * P, b"again").unwrap();
-        assert_eq!(
-            child.return_vfork_changes(user, None).unwrap(),
-            VforkWriteBack::default()
-        );
+        assert_eq!(child.return_vfork_changes(user).unwrap(), None);
         assert_eq!(read(&memory, user + 3 * P, 8), b"pCHILD-3");
         // A fork's copy has no parent to return to.
         let fork = memory.snapshot().unwrap();
         fork.write_raw(user + 3 * P, b"fork").unwrap();
-        assert_eq!(
-            fork.return_vfork_changes(user, None).unwrap(),
-            VforkWriteBack::default()
-        );
+        assert_eq!(fork.return_vfork_changes(user).unwrap(), None);
         assert_eq!(read(&memory, user + 3 * P, 8), b"pCHILD-3");
     }
 
@@ -3799,7 +3793,7 @@ mod tests {
         child.discard_pages(BASE + 6 * P, PAGE_SIZE).unwrap();
         child.write_raw(BASE + 2 * P, b"view").unwrap();
         assert_eq!(bytes(&original, 0, 4), b"view");
-        let returned = child.return_vfork_changes(BASE, None).unwrap();
+        let returned = child.return_vfork_changes(BASE).unwrap().unwrap();
         assert_eq!(read(&memory, BASE + 5 * P, 11), b"OWN-backing");
         assert_eq!(read(&memory, BASE + 6 * P, 7), [0; 7]);
         assert_eq!(read(&memory, BASE + 2 * P, 4), b"view");
@@ -3838,7 +3832,7 @@ mod tests {
             let child = memory.snapshot_sharing_address_space().unwrap();
             child.write_raw(BASE + 3 * P, b"child").unwrap();
             change(&child);
-            match child.return_vfork_changes(BASE, None) {
+            match child.return_vfork_changes(BASE) {
                 Err(Error::VforkChildCapability {
                     operation: "vfork write-back",
                     reason,
@@ -3868,7 +3862,7 @@ mod tests {
         as_it_was(&child);
         assert!(
             matches!(
-                child.return_vfork_changes(BASE, None),
+                child.return_vfork_changes(BASE),
                 Err(Error::VforkChildCapability {
                     operation: "vfork write-back",
                     ..
@@ -3890,7 +3884,7 @@ mod tests {
         child
             .protect_user_range(BASE + 5 * P, P, (libc::PROT_READ | libc::PROT_WRITE) as u8)
             .unwrap();
-        let returned = child.return_vfork_changes(BASE, None).unwrap();
+        let returned = child.return_vfork_changes(BASE).unwrap().unwrap();
         assert_eq!(read(&memory, BASE + 3 * P, 5), b"child");
         assert_eq!(read(&memory, BASE + 6 * P, 7), [0; 7]);
         assert_eq!(returned.bytes_written, PAGE_SIZE);
@@ -3913,7 +3907,7 @@ mod tests {
         child.write_raw(BASE + 2 * P + 32, b"child").unwrap();
         child.write_raw(BASE + 5 * P + 10, &[7]).unwrap();
         child.write_raw(BASE + 6 * P, b"page six").unwrap();
-        let returned = child.return_vfork_changes(BASE, None).unwrap();
+        let returned = child.return_vfork_changes(BASE).unwrap().unwrap();
         assert_eq!(read(&memory, BASE + 2 * P, 6), b"thread");
         assert_eq!(read(&memory, BASE + 2 * P + 6, 26), [1; 26]);
         assert_eq!(read(&memory, BASE + 2 * P + 32, 5), b"child");
@@ -3930,7 +3924,10 @@ mod tests {
     /// mapping over it with the protection it had (the provider's
     /// `mmap(MAP_FIXED)`), whose zeros the child's bytes would otherwise land
     /// in, or by an unmap and such a mapping, whether or not the page's
-    /// mapping had been recorded before the window.
+    /// mapping had been recorded before the window, or by a remap that shrank
+    /// the mapping off the page and grew it back (the provider's in-place
+    /// `mremap`), which leaves a fresh page there on Linux. A shrink that
+    /// keeps the page keeps its mapping.
     #[test]
     fn a_vfork_baseline_refuses_what_a_copy_cannot_order() {
         for (case, recorded) in [
@@ -3940,6 +3937,7 @@ mod tests {
             ("mapped over", false),
             ("mapped over", true),
             ("unmapped and mapped", true),
+            ("shrunk and grown back", true),
         ] {
             let memory = fixture(8);
             if recorded {
@@ -3957,10 +3955,21 @@ mod tests {
                     memory.unmap_user_range(BASE + 3 * P, P).unwrap();
                     map_anonymous_again(&memory, BASE + 3 * P, 1);
                 }
+                "shrunk and grown back" => {
+                    // As the provider's mremap: the tail goes to zero, the
+                    // mapping shrinks to one page, and then grows back.
+                    memory.zero_raw(BASE + 3 * P, 2 * PAGE_SIZE).unwrap();
+                    memory
+                        .remap_user_range(BASE + 2 * P, 3 * P, BASE + 2 * P, P)
+                        .unwrap();
+                    memory
+                        .remap_user_range(BASE + 2 * P, P, BASE + 2 * P, 3 * P)
+                        .unwrap();
+                }
                 _ => memory.unmap_user_range(BASE + 3 * P, P).unwrap(),
             }
             let before = read(&memory, BASE + 3 * P, 128);
-            match child.return_vfork_changes(BASE, None) {
+            match child.return_vfork_changes(BASE) {
                 Err(Error::VforkChildCapability {
                     operation: "vfork write-back",
                     ..
@@ -3969,6 +3978,19 @@ mod tests {
             }
             assert_eq!(read(&memory, BASE + 3 * P, 128), before, "{case}");
         }
+        // A shrink that keeps the page the child changed keeps its mapping,
+        // so the child's bytes go back.
+        let memory = fixture(8);
+        map_anonymous_again(&memory, BASE + 2 * P, 3);
+        let child = memory.snapshot_sharing_address_space().unwrap();
+        child.keep_vfork_baseline().unwrap();
+        child.write_raw(BASE + 3 * P + 1, b"child").unwrap();
+        memory.zero_raw(BASE + 4 * P, PAGE_SIZE).unwrap();
+        memory
+            .remap_user_range(BASE + 2 * P, 3 * P, BASE + 2 * P, 2 * P)
+            .unwrap();
+        child.return_vfork_changes(BASE).unwrap().unwrap();
+        assert_eq!(read(&memory, BASE + 3 * P + 1, 5), b"child");
         // A protection change, by the other thread, of a page the child
         // changed keeps the mapping, so the child's bytes go back.
         let memory = fixture(8);
@@ -3982,36 +4004,49 @@ mod tests {
         memory
             .protect_user_range(BASE + 3 * P, P, (libc::PROT_READ | libc::PROT_WRITE) as u8)
             .unwrap();
-        child.return_vfork_changes(BASE, None).unwrap();
+        child.return_vfork_changes(BASE).unwrap();
         assert_eq!(read(&memory, BASE + 3 * P + 1, 5), b"child");
     }
 
-    /// A vfork child's registered clear_child_tid word is cleared in the copy
-    /// before its changes go back, so the parent reads zero, as Linux's
-    /// mm_release() leaves the shared word; with no window, nothing is
-    /// written, and a parent that exec'd gets nothing.
+    /// Copies of an address space share the mapping-incarnation map until one
+    /// of them changes it: a fork's copy shares its parent's, an edit that
+    /// changes no page's incarnation (an unmap of pages that have none, as a
+    /// fork child's hidden Tool-scratch pages are) copies nothing, and the
+    /// first real change copies the map into that copy alone, so the other
+    /// keeps its own values.
     #[test]
-    fn a_vfork_window_end_clears_the_childs_clear_child_tid_word() {
-        let memory = fixture(4);
-        let word = BASE + 2 * P + 8;
-        memory.write_raw(word, &91_i32.to_ne_bytes()).unwrap();
-        let child = memory.snapshot_sharing_address_space().unwrap();
-        assert!(child.has_vfork_parent());
-        child.return_vfork_changes(BASE, Some(word)).unwrap();
-        assert!(!child.has_vfork_parent());
-        assert_eq!(read(&memory, word, 4), 0_i32.to_ne_bytes());
-        assert_eq!(read(&child, word, 4), 0_i32.to_ne_bytes());
-        // A fork's copy has no window: the address is not used.
-        memory.write_raw(word, &91_i32.to_ne_bytes()).unwrap();
+    fn copies_share_the_incarnation_map_until_one_changes_it() {
+        let incarnations = |memory: &GuestMemory| {
+            memory
+                .mapping
+                .address_space
+                .lock()
+                .unwrap()
+                .mapping_incarnations
+                .clone()
+        };
+        let memory = fixture(8);
+        map_anonymous_again(&memory, BASE + 2 * P, 3);
         let fork = memory.snapshot().unwrap();
-        assert!(!fork.has_vfork_parent());
-        fork.return_vfork_changes(BASE, Some(word)).unwrap();
-        assert_eq!(read(&fork, word, 4), 91_i32.to_ne_bytes());
-        // A parent that exec'd during the window receives nothing.
+        assert!(Arc::ptr_eq(&incarnations(&memory), &incarnations(&fork)));
+        assert_eq!(incarnations(&memory).get(&((BASE + 6 * P) / P)), None);
+        fork.unmap_user_range(BASE + 6 * P, P).unwrap();
+        assert!(Arc::ptr_eq(&incarnations(&memory), &incarnations(&fork)));
+        let page = (BASE + 3 * P) / P;
+        let before = incarnations(&memory).get(&page).copied();
+        assert!(before.is_some());
+        fork.unmap_user_range(BASE + 3 * P, P).unwrap();
+        assert!(!Arc::ptr_eq(&incarnations(&memory), &incarnations(&fork)));
+        assert_eq!(incarnations(&fork).get(&page), None);
+        assert_eq!(incarnations(&memory).get(&page).copied(), before);
+        // The parent's own change, after the copy, is the parent's alone too.
         let child = memory.snapshot_sharing_address_space().unwrap();
-        memory.retire_shared_files_for_exec().unwrap();
-        child.return_vfork_changes(BASE, Some(word)).unwrap();
-        assert_eq!(read(&memory, word, 4), 91_i32.to_ne_bytes());
+        map_anonymous_again(&memory, BASE + 4 * P, 1);
+        let page = (BASE + 4 * P) / P;
+        assert_ne!(
+            incarnations(&memory).get(&page),
+            incarnations(&child).get(&page)
+        );
     }
 
     /// The window also ends at the child's exec, after which nothing of the
@@ -4024,18 +4059,12 @@ mod tests {
         let child = memory.snapshot_sharing_address_space().unwrap();
         child.retire_shared_files_for_exec().unwrap();
         child.write_raw(BASE + P, b"new image").unwrap();
-        assert_eq!(
-            child.return_vfork_changes(BASE, None).unwrap(),
-            VforkWriteBack::default()
-        );
+        assert_eq!(child.return_vfork_changes(BASE).unwrap(), None);
         assert_eq!(read(&memory, BASE + P, 9), [0; 9]);
         let child = memory.snapshot_sharing_address_space().unwrap();
         child.write_raw(BASE + P, b"old image").unwrap();
         memory.retire_shared_files_for_exec().unwrap();
-        assert_eq!(
-            child.return_vfork_changes(BASE, None).unwrap(),
-            VforkWriteBack::default()
-        );
+        assert_eq!(child.return_vfork_changes(BASE).unwrap(), None);
         assert_eq!(read(&memory, BASE + P, 9), [0; 9]);
     }
 }

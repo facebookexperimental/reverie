@@ -1149,7 +1149,7 @@ mod shared_file_dispatch_tests {
                 &file[PAGE_SIZE as usize + 17..PAGE_SIZE as usize + 23],
                 b"shared"
             );
-            child.return_vfork_changes(BOOT_RESERVED_END, None).unwrap();
+            child.return_vfork_changes(BOOT_RESERVED_END).unwrap();
             f.memory.read_raw(private, &mut bytes).unwrap();
             assert_eq!(&bytes, b"child!", "{label}");
             assert!(f.memory.entry_gate().pending_failure().is_none(), "{label}");
@@ -1232,6 +1232,91 @@ mod shared_file_dispatch_tests {
             ),
             "{result:?}"
         );
+    }
+
+    /// The end of a vfork child's window makes Linux's mm_release() effects
+    /// (`ElfExecutor::release_vfork_mm`), in order: the store of zero to the
+    /// word the child registered as its clear_child_tid, in the copy, which
+    /// carries it back with the child's other changes, so the parent reads
+    /// zero; the write-back; and the wake of the parent's word. Without a
+    /// window nothing is taken or written. A parent that exec'd during the
+    /// window gets nothing back and no wake. Nor does a parent whose process
+    /// has committed its exit: the child is then the only user of the address
+    /// space, so nothing is stored, nothing goes back, and a change both made
+    /// is no longer refused.
+    #[test]
+    fn a_vfork_window_end_releases_the_childs_address_space_as_linux_does() {
+        use crate::memory::vfork_window_steps;
+        // A word above the backend's own pages, which never go back.
+        const WORD: u64 = BOOT_RESERVED_END + 0x208;
+        let fixture = || {
+            let f = Fixture::new();
+            f.memory
+                .map_user_permissions(BOOT_RESERVED_END, PAGE_SIZE, true, true)
+                .unwrap();
+            f
+        };
+        let word = |memory: &GuestMemory| {
+            let mut bytes = [0; 4];
+            memory.read_raw(WORD, &mut bytes).unwrap();
+            i32::from_ne_bytes(bytes)
+        };
+        let write_back = |copy: &GuestMemory| copy.return_vfork_changes(BOOT_RESERVED_END);
+        // The window ends while the parent still uses the address space.
+        let mut f = fixture();
+        let parent = f.take_executor();
+        f.memory.write_raw(WORD, &91_i32.to_ne_bytes()).unwrap();
+        let mut child = parent.fork_child(2, false, true).unwrap();
+        let copy = f.memory.snapshot_sharing_address_space().unwrap();
+        child.set_clear_child_tid(Some(WORD));
+        vfork_window_steps::record();
+        assert!(child.release_vfork_mm(&copy, write_back).unwrap());
+        assert_eq!(vfork_window_steps::take(), ["clear", "write-back", "wake"]);
+        assert!(!copy.has_vfork_parent());
+        assert_eq!(child.take_clear_child_tid(), None);
+        assert_eq!((word(&f.memory), word(&copy)), (0, 0));
+        // A fork's copy has no window: the registration stays for the
+        // child's own exit, and nothing is written.
+        f.memory.write_raw(WORD, &91_i32.to_ne_bytes()).unwrap();
+        let mut forked = parent.fork_child(3, false, false).unwrap();
+        let fork = f.memory.snapshot().unwrap();
+        forked.set_clear_child_tid(Some(WORD));
+        assert!(!forked.release_vfork_mm(&fork, write_back).unwrap());
+        assert_eq!(forked.take_clear_child_tid(), Some(WORD));
+        assert_eq!((word(&f.memory), word(&fork)), (91, 91));
+        // A parent that exec'd during the window has another address space,
+        // which gets neither the store nor the wake.
+        let mut child = parent.fork_child(4, false, true).unwrap();
+        let copy = f.memory.snapshot_sharing_address_space().unwrap();
+        child.set_clear_child_tid(Some(WORD));
+        f.memory.retire_shared_files_for_exec().unwrap();
+        vfork_window_steps::record();
+        assert!(child.release_vfork_mm(&copy, write_back).unwrap());
+        assert_eq!(vfork_window_steps::take(), ["clear"]);
+        assert_eq!(word(&f.memory), 91);
+        // A parent whose process committed its exit (here its only task's
+        // group exit) leaves the child the address space's only user. The
+        // child's change to a byte another thread of the parent also changed
+        // would otherwise be refused.
+        let mut f = fixture();
+        let mut parent = f.take_executor();
+        f.memory.write_raw(WORD, &91_i32.to_ne_bytes()).unwrap();
+        let mut child = parent.fork_child(2, false, true).unwrap();
+        let copy = f.memory.snapshot_sharing_address_space().unwrap();
+        copy.keep_vfork_baseline().unwrap();
+        child.set_clear_child_tid(Some(WORD));
+        copy.write_raw(WORD + 8, b"child").unwrap();
+        f.memory.write_raw(WORD + 8, b"other").unwrap();
+        parent.retire_current_thread(ExitStatus::Exited(3), true);
+        vfork_window_steps::record();
+        assert!(child.release_vfork_mm(&copy, write_back).unwrap());
+        assert_eq!(vfork_window_steps::take(), Vec::<&str>::new());
+        assert!(!copy.has_vfork_parent());
+        assert_eq!(child.take_clear_child_tid(), None);
+        assert_eq!((word(&f.memory), word(&copy)), (91, 91));
+        let mut bytes = [0; 5];
+        f.memory.read_raw(WORD + 8, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"other");
     }
 
     const VFORK_VIEW_REASON: &str = "a vfork child shares its parent's address space until it \
@@ -1379,7 +1464,7 @@ mod shared_file_dispatch_tests {
             let (mut state, _) = child_state(&f, &child);
             let result = syscall_result(&mut child, &mut state, number, args);
             assert!(result >= 0, "{label}: {result}");
-            let error = child.return_vfork_changes(BOOT_RESERVED_END, None).unwrap_err();
+            let error = child.return_vfork_changes(BOOT_RESERVED_END).unwrap_err();
             vfork_child_refusal(
                 &error,
                 "vfork write-back",
@@ -1451,7 +1536,7 @@ mod shared_file_dispatch_tests {
         );
         let mut unmapped_before = [0; 7];
         f.memory.read_raw(scratch, &mut unmapped_before).unwrap();
-        let returned = child.return_vfork_changes(BOOT_RESERVED_END, None).unwrap();
+        let returned = child.return_vfork_changes(BOOT_RESERVED_END).unwrap().unwrap();
         // Only the zeroed page; the removed scratch mapping's stores stay
         // behind.
         assert_eq!(returned.bytes_written, PAGE_SIZE as usize);

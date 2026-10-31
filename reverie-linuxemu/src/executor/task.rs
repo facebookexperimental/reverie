@@ -737,6 +737,7 @@ impl ElfExecutor {
             exit_status: None,
             exit_group: false,
             clear_child_tid: None,
+            vfork_parent: None,
         }
     }
 
@@ -1363,6 +1364,10 @@ impl ElfExecutor {
             exit_status: None,
             exit_group: false,
             clear_child_tid: None,
+            vfork_parent: share_address_space.then_some(reverie::SignalProcessId {
+                tgid: reverie::Pid::from_raw(self.state.pid),
+                generation: self.process_generation,
+            }),
         };
         Ok(child)
     }
@@ -1495,6 +1500,7 @@ impl ElfExecutor {
             exit_status: None,
             exit_group: false,
             clear_child_tid: None,
+            vfork_parent: None,
         };
         Ok(child)
     }
@@ -2300,6 +2306,96 @@ impl ElfExecutor {
 
     pub fn take_clear_child_tid(&mut self) -> Option<u64> {
         self.clear_child_tid.take()
+    }
+
+    /// Whether the end of a vfork window, not this task's own exit or death,
+    /// releases its `clear_child_tid` registration: the task leads a vfork
+    /// child whose copy, `memory`, still stands in for its parent's address
+    /// space. Linux's `mm_release()` clears and wakes the word whenever
+    /// another user of the mm exists, as the waiting parent is, and the copy
+    /// carries the store back only when the window ends
+    /// ([`ElfExecutor::release_vfork_mm`]).
+    pub fn vfork_window_holds_clear_child_tid(&self, memory: &GuestMemory) -> bool {
+        self.is_thread_group_leader() && memory.has_vfork_parent()
+    }
+
+    /// At the return from a fatal signal of this task's process: a process
+    /// killed by a signal drops its `clear_child_tid` registration unwritten,
+    /// as Linux's `mm_release()` does for the last user of an mm. A vfork
+    /// child's mm is its parent's too, so it keeps the registration for the
+    /// end of its window, which clears and wakes the word.
+    pub fn drop_clear_child_tid_at_fatal_signal(&mut self, memory: &GuestMemory) {
+        if !self.vfork_window_holds_clear_child_tid(memory) {
+            let _ = self.take_clear_child_tid();
+        }
+    }
+
+    /// Ends this task's vfork window, if one is open, as Linux's
+    /// `mm_release()` does for a vfork child at its successful exec
+    /// (`exec_mm_release()`) or its exit (`exit_mm_release()`), a death by a
+    /// signal included
+    /// (<https://github.com/gregkh/linux/blob/v7.1.3/kernel/fork.c#L1463-L1494>).
+    /// `child` is the copy the child ran on, and `write_back` the backend's
+    /// write-back of the child's changes into its parent
+    /// (`GuestMemory::return_vfork_changes`). Returns whether a window ended.
+    ///
+    /// While the parent's process still uses the address space,
+    /// `mm_release()` stores zero to the word the child registered as its
+    /// `clear_child_tid` and wakes one waiter on it, shared, before the vfork
+    /// completes. Here that is, in order: the store, to the copy, so that it
+    /// goes back with the child's other changes; the write-back; and the
+    /// wake, of the parent's word, which by then holds the store, and only
+    /// when the write-back reached the parent (a parent that exec'd has
+    /// another address space). The store is best effort, as Linux's
+    /// `put_user()`, and a word that is not accessible wakes nobody, as
+    /// Linux's wake then fails. The backend releases the parent afterwards,
+    /// as Linux completes the vfork after these effects.
+    ///
+    /// Once the parent's process has committed its exit, the child is the
+    /// address space's only user: `mm_release()` then stores nothing, and
+    /// nothing goes back (`GuestMemory::abandon_vfork_changes`). The decision
+    /// reads the commit in the run's task lifecycle
+    /// ([`TaskLifecycleTable::process_exit_committed`]), not whether the
+    /// parent's waiting thread has noticed it yet, so a tool that orders
+    /// the guest's tasks orders the commit with this window end, and the
+    /// decision with it.
+    ///
+    /// [`TaskLifecycleTable::process_exit_committed`]: crate::elf::TaskLifecycleTable
+    pub fn release_vfork_mm(
+        &mut self,
+        child: &GuestMemory,
+        write_back: impl FnOnce(&GuestMemory) -> crate::Result<Option<crate::memory::VforkWriteBack>>,
+    ) -> crate::Result<bool> {
+        if !self.vfork_window_holds_clear_child_tid(child) {
+            return Ok(false);
+        }
+        let clear_child_tid = self.take_clear_child_tid();
+        if self.vfork_parent.take().is_some_and(|parent| {
+            self.state
+                .task_lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .process_exit_committed(parent)
+        }) {
+            child.abandon_vfork_changes();
+            return Ok(true);
+        }
+        let parent = child.vfork_parent();
+        if let Some(address) = clear_child_tid {
+            let _ = ProviderMemory(child).put_user_i32(address, 0);
+            #[cfg(any(test, feature = "test-support"))]
+            crate::memory::vfork_window_steps::note("clear");
+        }
+        let reached = write_back(child)?.is_some();
+        if let (Some(address), Some(parent), true) = (clear_child_tid, parent, reached) {
+            let _ = futex(
+                &ProviderMemory(&parent),
+                &[address, libc::FUTEX_WAKE as u64, 1, 0, 0, 0],
+            );
+            #[cfg(any(test, feature = "test-support"))]
+            crate::memory::vfork_window_steps::note("wake");
+        }
+        Ok(true)
     }
 
     pub fn take_process_action(&mut self) -> Option<ProcessAction> {

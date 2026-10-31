@@ -596,8 +596,6 @@ fn a_kvm_guest_lists_its_stack_window_as_linux_does() {
     assert_eq!(native.reads[&NO_TASK], Err(libc::ENOENT));
 }
 
-/// An image whose `PT_GNU_STACK` header has `PF_X`: Linux maps its stack
-/// executable, and the entry says so.
 /// A child sharing the address space (vfork, and clone or clone3 with
 /// CLONE_VM|CLONE_VFORK) protects a page of the stack, executable as well,
 /// and exits. On Linux the change is its parent's: the parent's stack is
@@ -651,6 +649,8 @@ fn a_child_sharing_the_address_space_cannot_leave_the_stack_protected() {
     }
 }
 
+/// An image whose `PT_GNU_STACK` header has `PF_X`: Linux maps its stack
+/// executable, and the entry says so.
 #[test]
 fn a_kvm_guest_with_an_executable_stack_reports_it() {
     Kvm::new().expect("memory map test requires usable /dev/kvm");
