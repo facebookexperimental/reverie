@@ -642,4 +642,3 @@ on its initial-image owner. Late or missing observations return `None`; copied
 processes and successor exec remain outside the caller's admitted domain. This
 does not complete each-exec/fork initial-stack semantics or the generic state
 suite's 21-thread contract, and it provides no Detcore assurance claim.
->>>>>>> 4a0247e5d (Expose authenticated initial-image stack pointers to caller guests)

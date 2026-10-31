@@ -10800,7 +10800,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             Some(&native),
             InjectionRestoration::PreserveResult,
         )
-            .await
+        .await
     }
 
     /// `untraced_syscall`; `original` marks a frame-mode injection
@@ -14101,7 +14101,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                     }
                     Ok(result)
                 }
-                Some(_) => self.private_inject(task, nr, args, input, restoration).await,
+                Some(_) => {
+                    self.private_inject(task, nr, args, input, restoration)
+                        .await
+                }
                 // Also covers subsequent calls in a syscall callback after
                 // its pending event was consumed. Each call snapshots its own
                 // current frame, including intervening explicit Tool writes.
@@ -14228,7 +14231,15 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         if is_liteinst_mapping_syscall(nr) && self.pending_syscall == Some((nr, args)) {
             self.pending_syscall = None;
-            let result = self.private_inject(task, nr, args, Some(&native), InjectionRestoration::PreserveResult).await?;
+            let result = self
+                .private_inject(
+                    task,
+                    nr,
+                    args,
+                    Some(&native),
+                    InjectionRestoration::PreserveResult,
+                )
+                .await?;
             let task = self.assume_stopped();
             set_ret(
                 &task,
@@ -14261,10 +14272,26 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .store(nr as u64 + 1, Ordering::SeqCst);
                 Ok(Ok(0))
             }
-            Some(_) => self.private_inject(task, nr, args, Some(&native), InjectionRestoration::PreserveResult).await,
+            Some(_) => {
+                self.private_inject(
+                    task,
+                    nr,
+                    args,
+                    Some(&native),
+                    InjectionRestoration::PreserveResult,
+                )
+                .await
+            }
             None => {
-                self.untraced_syscall_with(task, nr, args, false, Some(&native), InjectionRestoration::PreserveResult)
-                    .await
+                self.untraced_syscall_with(
+                    task,
+                    nr,
+                    args,
+                    false,
+                    Some(&native),
+                    InjectionRestoration::PreserveResult,
+                )
+                .await
             }
         }
     }

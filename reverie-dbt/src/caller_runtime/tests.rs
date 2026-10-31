@@ -139,7 +139,6 @@ impl StartupInjection {
     }
 }
 
->>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
 static EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 static DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SELECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -238,7 +237,6 @@ struct Config {
     async_injection: Option<AsyncInjection>,
     suppression: Option<Suppression>,
     startup: Option<StartupInjection>,
->>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -803,7 +801,7 @@ unsafe extern "C" fn invoke(context: usize, number: i64, args: *const u64, purpo
     let args = unsafe { args.cast::<[u64; 6]>().read() };
     assert_eq!(purpose, InjectionPurpose::Application as u32);
     fixture.calls.set(fixture.calls.get() + 1);
-    if number == libc::SYS_getpid {
+    if number == libc::SYS_getpid && fixture.startup.get().is_some() {
         let mode = fixture
             .startup
             .get()
@@ -1253,7 +1251,6 @@ fn exercise(case: &str) {
         async_injection: AsyncInjection::for_case(case),
         suppression: Suppression::for_case(case),
         startup: StartupInjection::for_case(case),
->>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
     };
     fixture.async_injection.set(config.async_injection);
     fixture.startup.set(config.startup);
@@ -2061,7 +2058,6 @@ fn caller_runtime_protocol() {
             ) || ASYNC_CASES.contains(&case)
                 || SUPPRESSION_CASES.contains(&case)
                 || STARTUP_CASES.contains(&case)
->>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
         );
         exercise(case);
         println!("{WITNESS}:{case}");
@@ -2084,7 +2080,6 @@ fn caller_runtime_protocol() {
     .chain(ASYNC_CASES)
     .chain(SUPPRESSION_CASES)
     .chain(STARTUP_CASES)
->>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
     {
         let directory = tempfile::tempdir().unwrap();
         let dirfd = std::fs::File::open(directory.path()).unwrap();
@@ -2549,4 +2544,3 @@ fn initial_stack_fact_owner_and_lifetime() {
         );
     }
 }
->>>>>>> 4a0247e5d (Expose authenticated initial-image stack pointers to caller guests)

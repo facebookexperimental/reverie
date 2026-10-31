@@ -1366,6 +1366,8 @@ fn suppression_boundary_controls_reject_forwarding_and_widening_mutations() {
         1,
     );
     refused(NATIVE, &late, driver);
+}
+
 #[test]
 fn native_instruction_callbacks_own_register_view() {
     use std::process::Command;
@@ -1907,7 +1909,6 @@ int main(void) {
     );
     assert_eq!(result.stdout, b"instruction callback CPUID: owned read/write and completion\ninstruction callback RDTSC: owned read/write and completion\ninstruction callback RDTSCP: owned read/write and completion\ninstruction callback scopes: nested and returned branches restored\ninstruction callback refusals: unknown and pending writes preserved\n");
     assert!(result.stderr.is_empty());
->>>>>>> 01451eddc (Scope DBT instruction register views to callbacks)
 }
 
 #[test]

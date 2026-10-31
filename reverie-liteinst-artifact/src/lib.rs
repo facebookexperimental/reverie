@@ -808,8 +808,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 82] = [
     ),
     (
         "Cargo.toml",
-        2190,
-        "c99de31c4e8231015d714fedf23deea8ee36a4f5f273773e6161c972a96d7624",
+        2236,
+        "329be568fa7e882bfda1af0f68edf2517a6acdfe6e00cb73e5bc153eedc44a8c",
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
@@ -32926,7 +32926,7 @@ mod tests {
         ];
         // These reviewed sources changed for startup or returning-injection contracts.
         // Keep the fixed catalog authoritative and reject their prior tuples.
-        assert_eq!(CONTENT_REVERIE_CATALOG.len(), 77);
+        assert_eq!(CONTENT_REVERIE_CATALOG.len(), 82);
         for (relative, old_size, old_digest) in [
             (
                 "Cargo.toml",
