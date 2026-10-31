@@ -2229,7 +2229,7 @@ fn exercise_initial_stack(case: &str) {
     let image = runtime.image_init();
     let run = ActivationRun::new();
     run.bind_root(pid().as_raw()).unwrap();
-    let mut server = Server::start(Config::default(), run);
+    let mut server = Server::start(Config::default(), run.clone());
     // Drop the fixture (EOF) before the server on an assertion failure.
     let fixture = Box::<NativeFixture>::default();
     let mut counters = CallerCounters {
@@ -2418,6 +2418,38 @@ fn exercise_initial_stack(case: &str) {
                     .any(|line| line.contains("caller-application-admission-repeated"))
             );
         }
+        // Model the existing native original-exit notification before closing
+        // the claimed primary. This is unit teardown, not an actual kernel exit.
+        let terminal = TerminalFact {
+            size: std::mem::size_of::<TerminalFact>() as u32,
+            kind: 1,
+            image: image.image_generation,
+            context: fixture.context() as u64,
+            pid: pid().as_raw(),
+            tid: pid().as_raw(),
+            sysno: libc::SYS_exit_group,
+            args: FINAL_ARGS,
+            cookie: 92,
+            origin: 1,
+            reserved: 0,
+        };
+        assert!(run.completed().is_err());
+        assert_eq!(
+            unsafe {
+                runtime.thread_exit(
+                    &mut counters,
+                    fixture.context(),
+                    pid().as_raw(),
+                    invoke,
+                    &terminal,
+                )
+            },
+            0
+        );
+        let completed = run.completed().unwrap();
+        assert_eq!(completed.exit_code(), 47);
+        assert_eq!(completed.syscall(), libc::SYS_exit_group);
+        assert_eq!(completed.origin(), ExitOrigin::Original);
         // The fixture owns this allocation; this is not a kernel exit claim.
         unsafe {
             drop(Box::from_raw(
