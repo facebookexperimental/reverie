@@ -5408,7 +5408,7 @@ mod tests {
             0
         }
         let mut counters = PrototypeCounters::default();
-        let mut observed = None;
+        let mut observed: Option<(u64, u64)> = None;
         let mut guest: DbtGuest<'_, PrototypeTool> = DbtGuest::new(
             &mut observed as *mut Option<(u64, u64)> as usize,
             Pid::from_raw(10),
