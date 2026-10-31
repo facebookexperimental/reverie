@@ -955,14 +955,15 @@ impl GuestMemory {
     }
 
     /// Copies the private bytes of `[address, end)`, which holds no retained
-    /// shared page, into `child`, a new arena of the same size and base. A
-    /// page with a private backing of its own is copied byte for byte. The
-    /// others live in this arena's base backing, and the child's base backing
-    /// is new, so it holds no data: only the data extents of each run of them
-    /// are copied (`copy_sparse_range`), as a fork's private snapshot copies
-    /// its arena, and a page the guest never wrote costs the child nothing. A
-    /// run the sparse copy cannot finish is copied byte for byte, which
-    /// overwrites whatever part of it the sparse copy wrote.
+    /// shared page, into `child`, a new arena of the same size and base. The
+    /// child's base backing is new, so it holds no data, and only data
+    /// extents are copied: of each run of pages that live in this arena's base
+    /// backing (`copy_base_snapshot_run`), and of each page with a private
+    /// backing of its own, from that backing's descriptor
+    /// (`GuestMemory::copy_sparse_separate_run`). So a page the guest never
+    /// wrote costs the child nothing and is not read, which would commit it.
+    /// A run or page the sparse copy cannot finish is copied byte for byte,
+    /// which overwrites whatever part of it the sparse copy wrote.
     fn copy_private_snapshot_interval(
         &self,
         closed: &Closed,
@@ -978,13 +979,22 @@ impl GuestMemory {
         let page_size = PAGE_SIZE as u64;
         let mut cursor = address;
         if address < end {
-            for &page in backing_pages
-                .range(address / page_size..end.div_ceil(page_size))
-                .map(|(page, _)| page)
+            for (&page, installed) in
+                backing_pages.range(address / page_size..end.div_ceil(page_size))
             {
                 let separate = page * page_size;
                 self.copy_base_snapshot_run(child, cursor, separate, buffer)?;
-                self.copy_private_snapshot_bytes(child, separate, separate + page_size, buffer)?;
+                let copied = self.copy_sparse_separate_run(child, separate, installed, 1);
+                #[cfg(test)]
+                let copied = copied.and_then(|()| tests::injected_sparse_copy_failure());
+                if copied.is_err() {
+                    self.copy_private_snapshot_bytes(
+                        child,
+                        separate,
+                        separate + page_size,
+                        buffer,
+                    )?;
+                }
                 cursor = separate + page_size;
             }
         }
@@ -1005,34 +1015,11 @@ impl GuestMemory {
             return Ok(());
         }
         let length = usize::try_from(end - start).expect("guest range must fit usize");
-        let source = self.checked_offset(start, length)?;
-        let destination = child.checked_offset(start, length)?;
-        let sparse = {
-            let _source_guard = self
-                .mapping
-                .slice
-                .backing
-                .host_access
-                .lock()
-                .expect("guest memory lock poisoned");
-            let _destination_guard = child
-                .mapping
-                .slice
-                .backing
-                .host_access
-                .lock()
-                .expect("guest memory lock poisoned");
-            let copied = copy_sparse_range(
-                self.mapping.slice.backing.fd.as_raw_fd(),
-                self.mapping.slice.offset + source,
-                child.mapping.slice.backing.fd.as_raw_fd(),
-                child.mapping.slice.offset + destination,
-                length,
-            );
-            #[cfg(test)]
-            let copied = copied.and_then(|()| tests::injected_sparse_copy_failure());
-            copied
-        };
+        self.checked_offset(start, length)?;
+        child.checked_offset(start, length)?;
+        let sparse = self.copy_sparse_base_run(child, start, end);
+        #[cfg(test)]
+        let sparse = sparse.and_then(|()| tests::injected_sparse_copy_failure());
         match sparse {
             Ok(()) => Ok(()),
             Err(_) => self.copy_private_snapshot_bytes(child, start, end, buffer),
@@ -3701,6 +3688,68 @@ mod tests {
             child.write_raw(BASE + 10 * P + 1, b"view").unwrap();
             assert_eq!(bytes(&original, 1, 4), b"view");
         }
+    }
+
+    /// A fork of a memory that holds a shared file view inherits the view as
+    /// the same file and copies its private pages by data extents, reading
+    /// no hole: a private page with a backing of its own that holds no data
+    /// leaves that backing as unallocated as before, and reads as zeros in
+    /// the copy. After the fork, a store through the view by the parent, one
+    /// by the child, and one by another holder of the file (a write to the
+    /// file itself) are all seen through both views, while each side's
+    /// private pages stay as they were at the fork.
+    #[test]
+    fn a_fork_shares_a_view_changed_after_it_and_keeps_private_pages_apart() {
+        let separate_allocated = |memory: &GuestMemory, page: u64| {
+            let state = memory.mapping.address_space.lock().unwrap();
+            let fd = state.backing_pages[&page]._slice.backing.fd.as_raw_fd();
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the descriptor is live and metadata is valid for a stat.
+            assert_eq!(unsafe { libc::fstat(fd, metadata.as_mut_ptr()) }, 0);
+            // SAFETY: fstat succeeded.
+            unsafe { metadata.assume_init() }.st_blocks as u64 * 512
+        };
+        let memory = fixture(SPARSE_PAGES);
+        // A memfd, so that this test writes no file outside its own memory.
+        // SAFETY: the name is a NUL-terminated string.
+        let fd = unsafe { libc::memfd_create(c"view".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create: {}", io::Error::last_os_error());
+        // SAFETY: fd is a new descriptor that nothing else owns.
+        let original = unsafe { File::from_raw_fd(fd) };
+        original.set_len(2 * P).unwrap();
+        original.write_all_at(&[0x11; 2 * PAGE_SIZE], 0).unwrap();
+        install(&memory, &original, BASE + 10 * P, 2, 0);
+        memory
+            .write_raw(BASE + 3 * P, b"private before the fork")
+            .unwrap();
+        replace(&memory, BASE + 20 * P, 1, Some(b"own backing"), true);
+        // Alone in its 2 MiB region, so that copying its zeros would show.
+        replace(&memory, BASE + 3000 * P, 1, None, true);
+        let hole_page = (BASE + 3000 * P) / P;
+        let before = separate_allocated(&memory, hole_page);
+        let child = memory.snapshot().unwrap();
+        assert_eq!(separate_allocated(&memory, hole_page), before);
+        // Before any read of the copy: the first 2 MiB region only.
+        let allocated = allocated_bytes(&child);
+        assert!(allocated <= 2 << 20, "{allocated} bytes allocated");
+        assert_eq!(read(&child, BASE + 3000 * P, PAGE_SIZE), vec![0; PAGE_SIZE]);
+        assert_eq!(read(&child, BASE + 20 * P, 11), b"own backing");
+        assert_user_pages_match(&memory, &child, BASE);
+        // After the fork: the parent, the child, and another holder of the
+        // file each store one byte of the view's first page.
+        memory.write_raw(BASE + 10 * P, b"P").unwrap();
+        child.write_raw(BASE + 10 * P + 1, b"C").unwrap();
+        original.write_all_at(b"O", 2).unwrap();
+        assert_eq!(read(&memory, BASE + 10 * P, 3), b"PCO");
+        assert_eq!(read(&child, BASE + 10 * P, 3), b"PCO");
+        assert_eq!(bytes(&original, 0, 3), b"PCO");
+        // Private pages stay as they were at the fork on the other side.
+        memory
+            .write_raw(BASE + 3 * P, b"parent after the fork..")
+            .unwrap();
+        child.write_raw(BASE + 20 * P, b"child after").unwrap();
+        assert_eq!(read(&child, BASE + 3 * P, 23), b"private before the fork");
+        assert_eq!(read(&memory, BASE + 20 * P, 11), b"own backing");
     }
 
     /// When the sparse copy reports a failure, the run is copied byte for

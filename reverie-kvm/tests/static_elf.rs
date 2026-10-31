@@ -12205,6 +12205,7 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "a_vfork_parent_whose_process_exits_during_the_window_exits_like_native",
         "a_vfork_child_creating_a_thread_is_refused_by_name",
         "a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name",
+        "a_fork_copies_every_page_its_parent_can_read_like_native",
         "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native",
         "pdeathsig::unchanged_six_check_state_matches_native_controlled",
         "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
@@ -22900,6 +22901,62 @@ fn a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name()
              parent removed or replaced the mapping of a page the vfork child changed during \
              the window",
         );
+    }
+}
+
+/// A fork's child reads every page of private memory as its parent did at
+/// the fork: a page written in full, one written with zeros, one never
+/// written, a heap buffer, a run that may be backed by huge pages, a buffer
+/// the kernel wrote for it with read(2), and pages that keep a backing of
+/// their own on KVM after a shared file view at their address went, by an
+/// unmap and by an exec. A MAP_SHARED file mapping inherited across the fork
+/// shows a byte the parent stores, one the child stores and one a third
+/// process writes to the file, on both sides, while the parent's later
+/// change to a private page stays its own. KVM's output must be native's in
+/// the host and tool modes. The parent and the child take turns through
+/// pipes, which a thread run without the tool cannot do: it runs its fork
+/// children inline, so that mode is left out.
+#[test]
+fn a_fork_copies_every_page_its_parent_can_read_like_native() {
+    const TEST: &str = "a_fork_copies_every_page_its_parent_can_read_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "fork-copies-every-page",
+        include_str!("fixtures/fork_copies_every_page.c"),
+    );
+    let expected = "child: every page ok\n\
+                    child: shared PCO, private page kept\n\
+                    parent: child exit 0, shared PCO, file PCO\n\
+                    after exec: child: every page ok\n\
+                    after exec: parent: child exit 0\n";
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native", &[]);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        expected,
+        "{native:?}"
+    );
+    assert!(native.stderr.is_empty(), "{native:?}");
+    for mode in &SHARED_FILE_VFORK_MODES[1..] {
+        let name = mode.0;
+        let (_, code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, *mode, &[])
+                .unwrap_or_else(|error| panic!("{TEST} mode={name}: {error}"));
+        assert_eq!(
+            code, 0,
+            "{TEST} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            expected,
+            "{TEST} mode={name}"
+        );
+        assert_eq!(stderr, native.stderr, "{TEST} mode={name}");
+        eprintln!("{TEST} completed {name}");
     }
 }
 

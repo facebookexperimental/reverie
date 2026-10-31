@@ -1787,13 +1787,20 @@ impl GuestMemory {
             user_access.pages.detach_watch();
         }
 
-        // The sparse helper requires whole, equal-sized files at offset zero.
-        // A subset uses the existing view-relative copy without extending that
-        // contract or copying bytes outside the view.
-        let copied_sparse = if user_access.backing_pages.is_empty()
-            && self.mapping.slice.offset == 0
-            && self.len() == self.mapping.slice.backing.length
-        {
+        // The sparse copy requires whole, equal-sized files at offset zero. A
+        // subset uses the existing view-relative copy without extending that
+        // contract or copying bytes outside the view. Without a separately
+        // backed page the base backing is the whole arena, and one sparse copy
+        // copies it; with some, each run of base pages and each separately
+        // backed page is copied from its own backing, by its data extents.
+        let whole =
+            self.mapping.slice.offset == 0 && self.len() == self.mapping.slice.backing.length;
+        let copied_sparse = if !whole {
+            false
+        } else if !user_access.backing_pages.is_empty() {
+            self.copy_sparse_snapshot(&snapshot, &user_access.backing_pages)
+                .is_ok()
+        } else {
             let _source_guard = self
                 .mapping
                 .slice
@@ -1814,8 +1821,6 @@ impl GuestMemory {
                 self.len(),
             )
             .is_ok()
-        } else {
-            false
         };
 
         // SEEK_DATA/SEEK_HOLE and copy_file_range are Linux optimizations, not
@@ -1849,6 +1854,133 @@ impl GuestMemory {
         self.check_copy_failure()?;
         snapshot.mark_shares_parent_address_space(share_record);
         Ok(snapshot)
+    }
+
+    /// Copies every page of this arena, which holds separately backed pages
+    /// (`backing_pages`) but no retained shared view, into `snapshot`, a new
+    /// arena of the same base and size, reading no hole: each run of base
+    /// pages by the data extents of the base backing
+    /// ([`GuestMemory::copy_sparse_base_run`]), and each separately backed
+    /// page by the data extent of its own backing at that page
+    /// ([`GuestMemory::copy_sparse_separate_run`]), into its place in the
+    /// snapshot's base backing. A page whose backing holds no data there is a
+    /// hole of the snapshot, and reads as zeros, as it does here. Reading such
+    /// a page through the arena would commit it on both sides, which is why a
+    /// fork used to cost as much as the whole arena once one page had a
+    /// backing of its own. An error can leave part of the snapshot copied; the
+    /// caller then copies every byte, which overwrites it.
+    fn copy_sparse_snapshot(
+        &self,
+        snapshot: &GuestMemory,
+        backing_pages: &BTreeMap<u64, InstalledBackingPage>,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        tests::injected_sparse_snapshot_failure()?;
+        let mut cursor = self.guest_base();
+        let mut separate = backing_pages.iter().peekable();
+        while let Some((&page, installed)) = separate.next() {
+            // A run of consecutive pages at consecutive offsets of one backing,
+            // as one publication installs them.
+            let mut pages = 1;
+            while let Some(&(&next, following)) = separate.peek()
+                && next == page + pages as u64
+                && Arc::ptr_eq(&following._slice.backing, &installed._slice.backing)
+                && following._slice.offset == installed._slice.offset + pages * PAGE_SIZE
+            {
+                pages += 1;
+                separate.next();
+            }
+            let address = page * PAGE_SIZE as u64;
+            self.copy_sparse_base_run(snapshot, cursor, address)?;
+            self.copy_sparse_separate_run(snapshot, address, installed, pages)?;
+            cursor = address + (pages * PAGE_SIZE) as u64;
+        }
+        self.copy_sparse_base_run(snapshot, cursor, self.guest_end())
+    }
+
+    /// Copies the pages of `[start, end)` of this arena's base backing, none of
+    /// them separately backed, into the same range of `child`'s base backing,
+    /// a new arena of the same base and size: their data extents only
+    /// (`copy_sparse_range`), so a hole is never read and stays a hole of the
+    /// child. An error can leave part of the range copied.
+    fn copy_sparse_base_run(&self, child: &GuestMemory, start: u64, end: u64) -> io::Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+        let length = usize::try_from(end - start).expect("guest range must fit usize");
+        let invalid = |_| io::Error::new(io::ErrorKind::InvalidInput, "range outside the arena");
+        let source = self.checked_offset(start, length).map_err(invalid)?;
+        let destination = child.checked_offset(start, length).map_err(invalid)?;
+        let _source_guard = self
+            .mapping
+            .slice
+            .backing
+            .host_access
+            .lock()
+            .expect("guest memory lock poisoned");
+        let _destination_guard = child
+            .mapping
+            .slice
+            .backing
+            .host_access
+            .lock()
+            .expect("guest memory lock poisoned");
+        copy_sparse_range(
+            self.mapping.slice.backing.fd.as_raw_fd(),
+            self.mapping.slice.offset + source,
+            child.mapping.slice.backing.fd.as_raw_fd(),
+            child.mapping.slice.offset + destination,
+            length,
+        )
+    }
+
+    /// Copies `pages` separately backed pages from `address` on, which
+    /// `installed` begins (a private backing of their own, at consecutive
+    /// offsets of it), into the same range of `child`'s base backing, which
+    /// must read as zeros there: the data extents of their backing at those
+    /// pages only (`copy_sparse_range`), from its descriptor, so a page the
+    /// backing holds no data for is neither read nor written and reads as
+    /// zeros in the child too. A retained shared view is never copied; the
+    /// caller inherits it. An error can leave part of the range copied.
+    fn copy_sparse_separate_run(
+        &self,
+        child: &GuestMemory,
+        address: u64,
+        installed: &InstalledBackingPage,
+        pages: usize,
+    ) -> io::Result<()> {
+        if installed._slice.backing.kind != BackingKind::Fixed {
+            return Err(io::Error::other(
+                "a retained shared view is inherited, not copied",
+            ));
+        }
+        let length = pages * PAGE_SIZE;
+        let destination = child
+            .checked_offset(address, length)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "range outside the arena"))?;
+        // This arena's host-access guard serializes every host access to its
+        // pages, separately backed ones included (`read_host_chunks`).
+        let _source_guard = self
+            .mapping
+            .slice
+            .backing
+            .host_access
+            .lock()
+            .expect("guest memory lock poisoned");
+        let _destination_guard = child
+            .mapping
+            .slice
+            .backing
+            .host_access
+            .lock()
+            .expect("guest memory lock poisoned");
+        copy_sparse_range(
+            installed._slice.backing.fd.as_raw_fd(),
+            installed._slice.offset,
+            child.mapping.slice.backing.fd.as_raw_fd(),
+            child.mapping.slice.offset + destination,
+            length,
+        )
     }
 
     /// Marks a finished snapshot as a vfork child's copy when `share_record`
@@ -3465,25 +3597,47 @@ impl GuestMemory {
             .host_access
             .lock()
             .expect("guest memory lock poisoned");
-        for chunk in chunks {
-            let address = chunk.mapping.as_ptr().expose_provenance();
-            // SAFETY: checked_offset proved that this complete page lies in a
-            // live MAP_SHARED memfd view. madvise consumes only its numeric
-            // address; Rust dereferences below retain the exact mmap pointer.
+        // Once a page has a backing of its own, the range comes back one chunk
+        // per page; an exec's discard of the whole user range then made one
+        // call per page of the arena. Consecutive chunks of one backing at
+        // consecutive host addresses go in one call instead.
+        let mut chunks = chunks.into_iter().peekable();
+        while let Some(first) = chunks.next() {
+            let mut run = vec![first];
+            while let Some(next) = chunks.peek() {
+                let last = run.last().expect("a run has a chunk");
+                if !Arc::ptr_eq(&next.backing, &last.backing)
+                    || last.mapping.as_ptr().addr() + last.length != next.mapping.as_ptr().addr()
+                {
+                    break;
+                }
+                run.push(chunks.next().expect("peeked"));
+            }
+            let address = run[0].mapping.as_ptr().expose_provenance();
+            let length: usize = run.iter().map(|chunk| chunk.length).sum();
+            #[cfg(test)]
+            tests::note_discard_call(length);
+            // SAFETY: checked_offset proved that every page of the run lies in a
+            // live MAP_SHARED memfd view, and the run's chunks are consecutive
+            // in host addresses. madvise consumes only its numeric address
+            // range; Rust dereferences below retain each chunk's exact mmap
+            // pointer.
             let result = unsafe {
                 libc::madvise(
                     std::ptr::with_exposed_provenance_mut::<u8>(address).cast(),
-                    chunk.length,
+                    length,
                     libc::MADV_REMOVE,
                 )
             };
             if result != 0 {
                 // MADV_REMOVE is an optimization. Preserve reset semantics on
-                // kernels that reject it by zeroing this exact mapping chunk.
-                // SAFETY: host_chunks supplied the current pointer and length,
-                // and the host-access guard serializes this write.
-                unsafe {
-                    std::ptr::write_bytes(chunk.mapping.as_ptr(), 0, chunk.length);
+                // kernels that reject it by zeroing each exact mapping chunk.
+                for chunk in &run {
+                    // SAFETY: host_chunks supplied the current pointer and
+                    // length, and the host-access guard serializes this write.
+                    unsafe {
+                        std::ptr::write_bytes(chunk.mapping.as_ptr(), 0, chunk.length);
+                    }
                 }
             }
         }
@@ -5568,6 +5722,32 @@ mod tests {
 
     use super::*;
 
+    std::thread_local! {
+        static FAIL_SPARSE_SNAPSHOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static DISCARD_CALLS: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The failure the plain snapshot's sparse copy of an arena with
+    /// separately backed pages reports, when a test asks for one on this
+    /// thread (`FAIL_SPARSE_SNAPSHOT`).
+    pub(super) fn injected_sparse_snapshot_failure() -> io::Result<()> {
+        if FAIL_SPARSE_SNAPSHOT.with(std::cell::Cell::get) {
+            Err(io::Error::other("injected sparse snapshot failure"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Notes the length of one discard call, while a test records them on
+    /// this thread (`DISCARD_CALLS`).
+    pub(super) fn note_discard_call(length: usize) {
+        DISCARD_CALLS.with(|calls| {
+            if let Some(calls) = calls.borrow_mut().as_mut() {
+                calls.push(length);
+            }
+        });
+    }
+
     mod entry_copy_tests {
         use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;
@@ -7413,6 +7593,261 @@ mod tests {
         let mut bytes = [0; 21];
         snapshot.read(PAGE_SIZE as u64, &mut bytes).unwrap();
         assert_eq!(&bytes, b"backed after dontneed");
+    }
+
+    /// The allocated bytes of the file behind `fd`.
+    fn allocated_bytes(fd: RawFd) -> u64 {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: stat points to writable storage and fd is a live descriptor.
+        assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
+        // SAFETY: fstat succeeded and initialized the structure.
+        unsafe { stat.assume_init() }.st_blocks as u64 * 512
+    }
+
+    const SEPARATE_BASE: u64 = 0x10000;
+    const SEPARATE_PAGES: u64 = 16384;
+
+    /// The address of page `index` of the arena of [`separately_backed_arena`].
+    fn separate_page(index: u64) -> u64 {
+        SEPARATE_BASE + index * PAGE_SIZE as u64
+    }
+
+    /// Gives `pages` pages of `memory` from `address` on a private backing of
+    /// their own, holding `contents` from its start.
+    fn give_own_backing(memory: &GuestMemory, address: u64, pages: usize, contents: Option<&[u8]>) {
+        memory
+            .publish_private_range(
+                memory.allocation_guard(),
+                PrivateRangePlan {
+                    address,
+                    length: pages * PAGE_SIZE,
+                    contents,
+                    permissions: Some((true, true)),
+                    cursors: None,
+                },
+            )
+            .unwrap();
+    }
+
+    /// A 64 MiB arena with every page mapped writable (`map_user_range`'s
+    /// last argument is "no access") and pages of every kind a fork must
+    /// copy, in three of its 32 huge-page-sized regions:
+    /// - base pages: page 1 written in full, page 7000 in part, page 9
+    ///   written with zeros (a data extent that holds zeros), and page 5
+    ///   written by the kernel, as `read(2)` into a guest buffer writes;
+    /// - separately backed pages: 3 and 4, two pages of one backing, of which
+    ///   only the first holds data; 9000, given a backing with no data and
+    ///   then written through the arena; and 15000, a hole of its backing;
+    /// - under 3 and 9000, base bytes the arena no longer shows, as an exec
+    ///   that retires a view over written pages leaves them;
+    /// - and every other page a hole.
+    fn separately_backed_arena() -> GuestMemory {
+        let memory = GuestMemory::new(SEPARATE_BASE, SEPARATE_PAGES as usize * PAGE_SIZE).unwrap();
+        memory
+            .map_user_range(SEPARATE_BASE, SEPARATE_PAGES * PAGE_SIZE as u64, false)
+            .unwrap();
+        memory.enable_user_access();
+        memory
+            .write_raw(separate_page(1), &[0x11; PAGE_SIZE])
+            .unwrap();
+        memory
+            .write_raw(separate_page(7000) + 100, b"partial")
+            .unwrap();
+        memory.write_raw(separate_page(9), &[0; PAGE_SIZE]).unwrap();
+        memory
+            .write_raw(separate_page(3), &[0x33; PAGE_SIZE])
+            .unwrap();
+        memory
+            .write_raw(separate_page(9000), &[0x20; PAGE_SIZE])
+            .unwrap();
+        // The kernel's write for the guest, through the writable alias.
+        let mut pipe = [0; 2];
+        // SAFETY: pipe points to two writable descriptors' storage.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let message = b"the kernel wrote this";
+        // SAFETY: the message is a live buffer of the given length.
+        assert_eq!(
+            unsafe { libc::write(pipe[1], message.as_ptr().cast(), message.len()) },
+            message.len() as isize
+        );
+        let alias = memory
+            .writable_alias(separate_page(5), message.len())
+            .unwrap();
+        // SAFETY: the alias is a writable kernel operand of message.len() bytes.
+        assert_eq!(
+            unsafe { libc::read(pipe[0], alias.address(), message.len()) },
+            message.len() as isize
+        );
+        alias.finish().unwrap();
+        // SAFETY: both descriptors are owned here and closed once.
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        give_own_backing(&memory, separate_page(3), 2, Some(b"separate page 3"));
+        give_own_backing(&memory, separate_page(9000), 1, None);
+        memory
+            .write_raw(separate_page(9000) + 8, b"written later")
+            .unwrap();
+        give_own_backing(&memory, separate_page(15000), 1, None);
+        memory
+    }
+
+    /// The descriptors of `memory`'s separately backed pages' backings, one
+    /// for each backing.
+    fn separate_backing_fds(memory: &GuestMemory) -> Vec<RawFd> {
+        let state = memory.mapping.address_space.lock().unwrap();
+        let mut fds: Vec<RawFd> = state
+            .backing_pages
+            .values()
+            .map(|installed| installed._slice.backing.fd.as_raw_fd())
+            .collect();
+        fds.dedup();
+        fds
+    }
+
+    /// Every byte of `memory`'s arena, read through it (which commits holes,
+    /// so measure allocations first).
+    fn arena_bytes(memory: &GuestMemory) -> Vec<u8> {
+        let mut bytes = vec![0; memory.len()];
+        memory.read_raw(memory.guest_base(), &mut bytes).unwrap();
+        bytes
+    }
+
+    /// A fork's copy of an arena with separately backed pages copies only data
+    /// extents, of the base backing and of each page's own backing, and reads
+    /// no hole on either side, yet reads exactly as the arena does on every
+    /// page: base pages written in full, in part, with zeros and by the
+    /// kernel; separately backed pages with data, written later, and holes;
+    /// and holes. Before, one page with a backing of its own made the copy
+    /// read and write every byte of the arena, committing every hole on both
+    /// sides. The copy has no separately backed page, and the two are
+    /// independent afterwards.
+    #[test]
+    fn a_snapshot_with_separately_backed_pages_copies_data_and_reads_no_hole() {
+        let memory = separately_backed_arena();
+        let base = memory.mapping.slice.backing.fd.as_raw_fd();
+        let separate = separate_backing_fds(&memory);
+        assert_eq!(separate.len(), 3);
+        let before: Vec<u64> = std::iter::once(base)
+            .chain(separate.iter().copied())
+            .map(allocated_bytes)
+            .collect();
+        let snapshot = memory.snapshot().unwrap();
+        let after: Vec<u64> = std::iter::once(base)
+            .chain(separate.iter().copied())
+            .map(allocated_bytes)
+            .collect();
+        assert_eq!(after, before, "the copy committed a hole of the source");
+        // Pages 1, 3, 5, 7000, 9 and 9000 hold data, in 3 of the arena's 32
+        // huge-page-sized regions; the stale base bytes under 3 and 9000 are
+        // not copied, and nothing else is: neither the hole at 15000, alone
+        // in its region, nor any other. A shared-memory file may take a folio
+        // as large as a huge page for a write within its size, so a region's
+        // one page can cost 2 MiB; a copy of every byte costs 64.
+        let copied = allocated_bytes(snapshot.mapping.slice.backing.fd.as_raw_fd());
+        assert!(
+            copied <= 6 * 1024 * 1024,
+            "the copy allocated {copied} bytes for 6 pages of data in 3 regions"
+        );
+        assert!(
+            snapshot
+                .mapping
+                .address_space
+                .lock()
+                .unwrap()
+                .backing_pages
+                .is_empty()
+        );
+        let expected = arena_bytes(&memory);
+        assert_eq!(
+            &expected[3 * PAGE_SIZE..3 * PAGE_SIZE + 15],
+            b"separate page 3"
+        );
+        assert_eq!(&expected[4 * PAGE_SIZE..5 * PAGE_SIZE], &[0; PAGE_SIZE]);
+        assert_eq!(
+            &expected[5 * PAGE_SIZE..5 * PAGE_SIZE + 21],
+            b"the kernel wrote this"
+        );
+        assert_eq!(&expected[9000 * PAGE_SIZE..9000 * PAGE_SIZE + 8], &[0; 8]);
+        assert_eq!(
+            &expected[9000 * PAGE_SIZE + 8..9000 * PAGE_SIZE + 21],
+            b"written later"
+        );
+        assert_eq!(arena_bytes(&snapshot), expected);
+        // Independent afterwards.
+        snapshot.write_raw(separate_page(3), b"child").unwrap();
+        memory
+            .write_raw(separate_page(9000) + 8, b"parent")
+            .unwrap();
+        let mut bytes = [0; 15];
+        memory.read_raw(separate_page(3), &mut bytes).unwrap();
+        assert_eq!(&bytes, b"separate page 3");
+        snapshot
+            .read_raw(separate_page(9000) + 8, &mut bytes[..13])
+            .unwrap();
+        assert_eq!(&bytes[..13], b"written later");
+    }
+
+    /// A sparse copy that cannot finish falls back to copying every byte,
+    /// which gives the same copy.
+    #[test]
+    fn a_failed_sparse_snapshot_of_separately_backed_pages_falls_back_to_bytes() {
+        let memory = separately_backed_arena();
+        FAIL_SPARSE_SNAPSHOT.with(|fail| fail.set(true));
+        let snapshot = memory.snapshot();
+        FAIL_SPARSE_SNAPSHOT.with(|fail| fail.set(false));
+        let snapshot = snapshot.unwrap();
+        assert_eq!(arena_bytes(&snapshot), arena_bytes(&memory));
+    }
+
+    /// Discarding a range with separately backed pages makes one call for
+    /// each run of consecutive pages of one backing, not one for each page:
+    /// an exec's discard of the whole user range made one call per page of
+    /// the arena once a page had a backing of its own. Every page reads as
+    /// zeros afterwards.
+    #[test]
+    fn discarding_separately_backed_pages_coalesces_runs() {
+        let memory = separately_backed_arena();
+        DISCARD_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+        let discarded = memory.discard_pages(SEPARATE_BASE, memory.len());
+        let calls = DISCARD_CALLS.with(|calls| calls.borrow_mut().take().unwrap());
+        discarded.unwrap();
+        let p = PAGE_SIZE;
+        assert_eq!(calls, [3 * p, 2 * p, 8995 * p, p, 5999 * p, p, 1383 * p]);
+        assert_eq!(arena_bytes(&memory), vec![0; memory.len()]);
+    }
+
+    /// Pages in huge-page folios, where the host gives shared memory huge
+    /// pages (shmem THP), copy as exactly as small ones, a separately backed
+    /// page inside such a folio's range included.
+    #[test]
+    fn a_snapshot_copies_huge_page_ranges_exactly() {
+        const HUGE: usize = 2 * 1024 * 1024;
+        let memory = GuestMemory::new(0, 4 * HUGE).unwrap();
+        memory.map_user_range(0, (4 * HUGE) as u64, false).unwrap();
+        memory.enable_user_access();
+        // SAFETY: the range is page-aligned and lies in the live arena mapping.
+        unsafe {
+            libc::madvise(
+                memory.mapping.mapping.as_ptr().add(HUGE).cast(),
+                2 * HUGE,
+                libc::MADV_HUGEPAGE,
+            );
+        }
+        let pattern: Vec<u8> = (0..HUGE).map(|byte| (byte % 251) as u8).collect();
+        memory.write_raw(HUGE as u64, &pattern).unwrap();
+        memory
+            .write_raw((2 * HUGE + 4096) as u64, b"second folio")
+            .unwrap();
+        give_own_backing(
+            &memory,
+            (HUGE + 64 * PAGE_SIZE) as u64,
+            1,
+            Some(b"own page in a folio"),
+        );
+        let snapshot = memory.snapshot().unwrap();
+        assert_eq!(arena_bytes(&snapshot), arena_bytes(&memory));
     }
 
     #[test]
