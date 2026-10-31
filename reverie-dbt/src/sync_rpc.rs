@@ -961,12 +961,344 @@ mod mapping_capture_tests;
 #[cfg(test)]
 mod initial_config_tests {
     use std::os::unix::net::UnixListener;
+    use std::process::Child;
+    use std::process::Command;
+    use std::process::Stdio;
     use std::time::Duration;
+    use std::time::Instant;
 
     use reverie_rpc_transport::codec::encode;
     use serde::Deserialize;
 
     use super::*;
+
+    const CHILD_CASE: &str = "REVERIE_DBT_INITIAL_CONFIG_TEST_CASE";
+    const LEAF_PREFIX: &str = "initial-config leaf:";
+
+    struct ChildGuard(Option<Child>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    // Parents create no socket fixtures. A leaf starts after exec and never
+    // spawns another process, so unrelated libtest spawns cannot retain a copy
+    // of its socket and delay the last-reference EOF observation.
+    fn isolated_case(test: &str, cases: &[&str]) -> Option<String> {
+        let selector = format!("sync_rpc::initial_config_tests::{test}");
+        if let Some(marker) = std::env::var_os(CHILD_CASE) {
+            let marker = marker.to_str().expect("non-UTF8 initial-config child case");
+            let (selected, case) = marker
+                .split_once('|')
+                .expect("malformed initial-config child case");
+            assert_eq!(selected, selector, "wrong initial-config child selector");
+            assert!(cases.contains(&case), "unknown initial-config child case");
+            return Some(case.to_owned());
+        }
+
+        for case in cases {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--test-threads=1", "--nocapture"])
+                .env(CHILD_CASE, format!("{selector}|{case}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut child = ChildGuard(Some(child));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "initial-config child {selector}/{case} timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            eprintln!(
+                "initial-config child: test={selector} case={case} status={:?} stdout={:?} stderr={:?}",
+                output.status, output.stdout, output.stderr
+            );
+            assert!(output.status.success(), "initial-config child: {output:?}");
+            let stdout = std::str::from_utf8(&output.stdout).unwrap();
+            let tests: Vec<_> = stdout
+                .lines()
+                .filter(|line| line.starts_with("test ") && !line.starts_with("test result:"))
+                .collect();
+            assert_eq!(tests.len(), 1, "wrong child selection: {stdout}");
+            assert_eq!(tests[0], format!("test {selector} ... ok"));
+            let summaries: Vec<_> = stdout
+                .lines()
+                .filter(|line| line.starts_with("test result:"))
+                .collect();
+            assert_eq!(summaries.len(), 1, "wrong child summary: {stdout}");
+            assert!(
+                summaries[0]
+                    .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "),
+                "wrong child completion: {stdout}"
+            );
+            let stderr = std::str::from_utf8(&output.stderr).unwrap();
+            let witnesses: Vec<_> = stderr
+                .lines()
+                .filter(|line| line.starts_with(LEAF_PREFIX))
+                .collect();
+            assert_eq!(witnesses.len(), 1, "wrong child witnesses: {stderr}");
+            assert_eq!(
+                witnesses[0],
+                format!("{LEAF_PREFIX} test={selector} case={case}")
+            );
+        }
+        None
+    }
+
+    fn leaf_witness(test: &str, case: &str) {
+        eprintln!("{LEAF_PREFIX} test=sync_rpc::initial_config_tests::{test} case={case}");
+    }
+
+    #[derive(Debug)]
+    enum ProbeError {
+        Io {
+            stage: &'static str,
+            error: io::Error,
+        },
+        Count {
+            stage: &'static str,
+            expected: usize,
+            actual: usize,
+        },
+        Byte {
+            stage: &'static str,
+            expected: u8,
+            actual: u8,
+        },
+    }
+
+    impl fmt::Display for ProbeError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Io { stage, error } => write!(formatter, "{stage}: {error}"),
+                Self::Count {
+                    stage,
+                    expected,
+                    actual,
+                } => {
+                    write!(
+                        formatter,
+                        "{stage}: expected count {expected}, got {actual}"
+                    )
+                }
+                Self::Byte {
+                    stage,
+                    expected,
+                    actual,
+                } => {
+                    write!(formatter, "{stage}: expected byte {expected}, got {actual}")
+                }
+            }
+        }
+    }
+
+    fn probe_count(
+        stage: &'static str,
+        result: io::Result<usize>,
+        expected: usize,
+    ) -> Result<(), ProbeError> {
+        let actual = result.map_err(|error| ProbeError::Io { stage, error })?;
+        if actual != expected {
+            return Err(ProbeError::Count {
+                stage,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn probe_byte(stage: &'static str, actual: u8, expected: u8) -> Result<(), ProbeError> {
+        if actual != expected {
+            return Err(ProbeError::Byte {
+                stage,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    // The caller has made this peer nonblocking. No retry/readiness wait is
+    // allowed: only EOF, not data or any error, establishes the close.
+    fn probe_eof(peer: &mut UnixStream, stage: &'static str) -> Result<(), ProbeError> {
+        probe_count(stage, peer.read(&mut [0_u8; 1]), 0)
+    }
+
+    fn raw_write_byte(fd: RawFd, byte: u8) -> io::Result<usize> {
+        let count = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(count as usize)
+    }
+
+    fn raw_read_byte(fd: RawFd, byte: &mut u8) -> io::Result<usize> {
+        let count = unsafe { libc::read(fd, (byte as *mut u8).cast(), 1) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(count as usize)
+    }
+
+    // Raw syscall access also lets the extra-close control probe a deliberately
+    // closed number without manufacturing a Rust owner for an invalid FD.
+    fn probe_replacement(fd: RawFd, peer: &mut UnixStream) -> Result<(), ProbeError> {
+        probe_count("duplicate-write", raw_write_byte(fd, 65), 1)?;
+        let mut byte = [0_u8; 1];
+        probe_count("peer-read", peer.read(&mut byte), 1)?;
+        probe_byte("peer-read", byte[0], 65)?;
+        probe_count("peer-write", peer.write(&[90]), 1)?;
+        probe_count("duplicate-read", raw_read_byte(fd, &mut byte[0]), 1)?;
+        probe_byte("duplicate-read", byte[0], 90)
+    }
+
+    fn assert_close_errors(error: &InitialConfigError, primary: bool) {
+        assert_eq!(
+            error.close.as_ref().unwrap().raw_os_error(),
+            Some(libc::EINTR)
+        );
+        if primary {
+            assert!(matches!(error.primary,
+                Some(InitialConfigFailure::Read(ref error))
+                if error.raw_os_error() == Some(libc::EIO)));
+        } else {
+            assert!(error.primary.is_none());
+        }
+    }
+
+    fn exercise_reuse(case: &str, primary: bool, extra_close: bool) {
+        let (source, mut replacement_peer) = UnixStream::pair().unwrap();
+        let (stream, mut original_peer) = UnixStream::pair().unwrap();
+        source.set_nonblocking(true).unwrap();
+        replacement_peer.set_nonblocking(true).unwrap();
+        original_peer.set_nonblocking(true).unwrap();
+        let original_fd = stream.as_raw_fd();
+        assert_ne!(source.as_raw_fd(), original_fd);
+        let mut duplicate: Option<OwnedFd> = None;
+        let mut calls = 0;
+        let result = if primary {
+            Err(InitialConfigFailure::Read(io::Error::from_raw_os_error(
+                libc::EIO,
+            )))
+        } else {
+            Ok(config())
+        };
+        let error = finish_initial_config(stream, result, |raw| {
+            calls += 1;
+            assert_eq!(raw, original_fd);
+            close_initial_socket(raw).unwrap();
+            // The replacement is installed INSIDE the real close callback.
+            // F_DUPFD_CLOEXEC never overwrites another descriptor. If an
+            // unexpected allocator occupied this slot, exact equality fails.
+            let reused = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, raw) };
+            if reused < 0 {
+                let error = io::Error::last_os_error();
+                panic!("initial-config descriptor duplication failed: {error}");
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(reused) };
+            assert_eq!(owned.as_raw_fd(), original_fd, "wrong reused slot");
+            duplicate = Some(owned);
+            // A modeled close error, not a claim that Linux returned EINTR.
+            Err(io::Error::from_raw_os_error(libc::EINTR))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_close_errors(&error, primary);
+        probe_eof(&mut original_peer, "original-eof").unwrap();
+        let duplicate = duplicate.unwrap();
+        let reused_fd = duplicate.as_raw_fd();
+        assert_eq!(reused_fd, original_fd);
+        let flags = unsafe { libc::fcntl(reused_fd, libc::F_GETFD) };
+        if flags < 0 {
+            let error = io::Error::last_os_error();
+            panic!("replacement slot is not open: {error}");
+        }
+        assert_ne!(flags, -1, "the old numeric-vacancy predicate must be false");
+        let primary_errno = primary.then_some(libc::EIO);
+        let close_errno = error.close.as_ref().unwrap().raw_os_error();
+        drop(error);
+        drop(source);
+        if extra_close {
+            let raw = duplicate.into_raw_fd();
+            close_initial_socket(raw).unwrap();
+            // No allocation or new descriptor operation between close and probe.
+            let failure = probe_replacement(raw, &mut replacement_peer).unwrap_err();
+            let ProbeError::Io { stage, error } = failure else {
+                panic!("wrong extra-close rejection: {failure}");
+            };
+            assert_eq!(stage, "duplicate-write");
+            assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+            probe_eof(&mut replacement_peer, "replacement-eof").unwrap();
+            eprintln!(
+                "initial-config reuse: case={case} calls={calls} original_fd={original_fd} reused_fd={reused_fd} primary_errno={primary_errno:?} close_errno={close_errno:?} original_eof=true slot_flags={flags} rejected_stage={stage} rejected_errno={:?} replacement_eof=true",
+                error.raw_os_error()
+            );
+        } else {
+            probe_replacement(reused_fd, &mut replacement_peer).unwrap();
+            drop(duplicate);
+            probe_eof(&mut replacement_peer, "replacement-eof").unwrap();
+            eprintln!(
+                "initial-config reuse: case={case} calls={calls} original_fd={original_fd} reused_fd={reused_fd} primary_errno={primary_errno:?} close_errno={close_errno:?} original_eof=true slot_flags={flags} exchange=[65, 90] replacement_eof=true"
+            );
+        }
+    }
+
+    fn exercise_omitted_close() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let original_fd = stream.as_raw_fd();
+        let mut calls = 0;
+        let error = finish_initial_config::<Config>(
+            stream,
+            Err(InitialConfigFailure::Read(io::Error::from_raw_os_error(
+                libc::EIO,
+            ))),
+            |raw| {
+                calls += 1;
+                assert_eq!(raw, original_fd);
+                // Deliberately omit the real close; production is unchanged.
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            },
+        )
+        .unwrap_err();
+        // finish_initial_config consumed the stream, but this deliberately
+        // non-closing callback left its descriptor live. Reclaim exactly once.
+        let original = unsafe { OwnedFd::from_raw_fd(original_fd) };
+        assert_eq!(calls, 1);
+        assert_close_errors(&error, true);
+        let failure = probe_eof(&mut peer, "original-eof").unwrap_err();
+        let ProbeError::Io {
+            stage,
+            error: rejected,
+        } = failure
+        else {
+            panic!("wrong omitted-close rejection: {failure}");
+        };
+        assert_eq!(stage, "original-eof");
+        assert_eq!(rejected.kind(), io::ErrorKind::WouldBlock);
+        let close_errno = error.close.as_ref().unwrap().raw_os_error();
+        drop(error);
+        drop(original);
+        probe_eof(&mut peer, "cleanup-eof").unwrap();
+        eprintln!(
+            "initial-config reuse: case=omitted-actual-close calls={calls} original_fd={original_fd} primary_errno={:?} close_errno={close_errno:?} rejected_stage={stage} rejected_kind={:?} rejected_errno={:?} cleanup_eof=true",
+            Some(libc::EIO),
+            rejected.kind(),
+            rejected.raw_os_error()
+        );
+    }
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
     struct Config {
@@ -1012,6 +1344,10 @@ mod initial_config_tests {
 
     #[test]
     fn exact_config_is_returned_after_close_without_a_request_or_eof_wait() {
+        const TEST: &str = "exact_config_is_returned_after_close_without_a_request_or_eof_wait";
+        if isolated_case(TEST, &["original"]).is_none() {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -1032,10 +1368,16 @@ mod initial_config_tests {
         assert_eq!(actual, expected);
         assert_eq!(encode(&actual).unwrap(), encode(&expected).unwrap());
         server.join().unwrap();
+        leaf_witness(TEST, "original");
     }
 
     #[test]
     fn strict_initial_frame_rejects_truncation_size_decode_and_trailing_errors() {
+        const TEST: &str =
+            "strict_initial_frame_rejects_truncation_size_decode_and_trailing_errors";
+        if isolated_case(TEST, &["original"]).is_none() {
+            return;
+        }
         let payload = encode(&config()).unwrap();
         let header_error = with_server::<Config>(vec![0, 0, 0]).unwrap_err();
         assert!(matches!(header_error.primary,
@@ -1088,10 +1430,15 @@ mod initial_config_tests {
             Some(InitialConfigFailure::Decode(_))
         ));
         assert!(truncated_config.close.is_none());
+        leaf_witness(TEST, "original");
     }
 
     #[test]
     fn address_and_connect_failures_keep_their_original_error_classes() {
+        const TEST: &str = "address_and_connect_failures_keep_their_original_error_classes";
+        if isolated_case(TEST, &["original"]).is_none() {
+            return;
+        }
         let long_path = "x".repeat(108);
         for path in [
             Path::new(""),
@@ -1111,12 +1458,18 @@ mod initial_config_tests {
             Some(InitialConfigFailure::Connect(ref error))
             if error.raw_os_error() == Some(libc::ENOENT)));
         assert!(error.close.is_none());
+        leaf_witness(TEST, "original");
     }
 
     #[test]
     fn close_is_consumed_once_and_preserves_primary_and_secondary_errors() {
+        const TEST: &str = "close_is_consumed_once_and_preserves_primary_and_secondary_errors";
+        if isolated_case(TEST, &["original"]).is_none() {
+            return;
+        }
         for primary in [false, true] {
-            let (stream, _peer) = UnixStream::pair().unwrap();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
             let fd = stream.as_raw_fd();
             let mut calls = 0;
             let result = if primary {
@@ -1136,8 +1489,7 @@ mod initial_config_tests {
             })
             .unwrap_err();
             assert_eq!(calls, 1);
-            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            probe_eof(&mut peer, "original-eof").unwrap();
             assert_eq!(error.close.unwrap().raw_os_error(), Some(libc::EINTR));
             if primary {
                 assert!(matches!(error.primary,
@@ -1147,6 +1499,31 @@ mod initial_config_tests {
                 assert!(error.primary.is_none());
             }
         }
+        leaf_witness(TEST, "original");
+    }
+
+    #[test]
+    fn reused_descriptor_survives_consumed_close_without_retry_or_drop() {
+        const TEST: &str = "reused_descriptor_survives_consumed_close_without_retry_or_drop";
+        let Some(case) = isolated_case(
+            TEST,
+            &[
+                "primary-success",
+                "primary-EIO",
+                "omitted-actual-close",
+                "extra-close-after-reuse",
+            ],
+        ) else {
+            return;
+        };
+        match case.as_str() {
+            "primary-success" => exercise_reuse(&case, false, false),
+            "primary-EIO" => exercise_reuse(&case, true, false),
+            "omitted-actual-close" => exercise_omitted_close(),
+            "extra-close-after-reuse" => exercise_reuse(&case, true, true),
+            _ => unreachable!("isolated_case validated the case"),
+        }
+        leaf_witness(TEST, &case);
     }
 }
 
