@@ -21,7 +21,9 @@ use crate::syscalls::Errno;
 pub enum CallbackPhase {
     /// The attempt may resolve the intercepted syscall.
     Syscall,
-    /// Startup, instruction, signal, or another non-syscall callback.
+    /// The thread-start hook may abandon itself after an authenticated effect.
+    ThreadStart,
+    /// Post-exec, instruction, signal, or another non-syscall callback.
     Callback,
 }
 
@@ -58,6 +60,8 @@ pub enum TailFact<E> {
 pub enum CallbackDecision<V, E> {
     /// The callback returned; discard any non-ending staged fact.
     Ready(V),
+    /// Abandon thread-start after its effect and register writeback completed.
+    StartupCompleted(i64),
     /// Resolve the syscall with this already-executed tail result.
     Completed(i64),
     /// Hand the exact unexecuted operands back to frontend validation.
@@ -89,9 +93,12 @@ pub enum CallbackDecision<V, E> {
 /// Classify a poll with fixed established-ending precedence and phase rules.
 ///
 /// Established endings survive both `Ready` and later attempted effects.
-/// Otherwise a latched refusal ends the attempt. `Ready` discards completed,
-/// deferred and fork facts, as the trap host has always done. Only a pending
-/// syscall attempt may consume one of those non-ending facts.
+/// Otherwise a latched refusal ends the attempt. An authenticated thread-start
+/// completion abandons the enclosing hook even if its poll returned `Ready`,
+/// matching cancellation after an effect. That frontend must publish the fact
+/// only after execution and successful register writeback. Other phases retain
+/// their original rule: `Ready` discards non-ending facts, and only a pending
+/// syscall attempt may consume them.
 pub fn classify_callback<V, E>(
     phase: CallbackPhase,
     poll: Poll<V>,
@@ -104,6 +111,16 @@ pub fn classify_callback<V, E>(
     };
     if let Some(reason) = refusal {
         return CallbackDecision::Refused(reason);
+    }
+    if phase == CallbackPhase::ThreadStart {
+        match tail {
+            Some(TailFact::Completed(value)) => return CallbackDecision::StartupCompleted(value),
+            Some(TailFact::Deferred { .. } | TailFact::ForkChild { .. }) => {
+                return CallbackDecision::Refused("unexecuted or lifecycle tail in thread-start");
+            }
+            None => {}
+            Some(TailFact::Established(_)) => unreachable!("ending handled before callback result"),
+        }
     }
     if let Poll::Ready(value) = poll {
         return CallbackDecision::Ready(value);
@@ -137,6 +154,9 @@ pub fn classify_callback<V, E>(
         }
         (CallbackPhase::Callback, Some(TailFact::ForkChild { .. })) => {
             CallbackDecision::Refused("a plain fork injected outside a syscall handler")
+        }
+        (CallbackPhase::ThreadStart, Some(_)) => {
+            unreachable!("thread-start facts handled before callback result")
         }
         (_, Some(TailFact::Established(_))) => {
             unreachable!("ending handled before callback result")
@@ -281,5 +301,61 @@ mod tests {
         }
         assert_eq!(exit_status_from_raw(0x123), ExitStatus::Exited(0x23));
         assert_eq!(exit_status_from_raw(u64::MAX), ExitStatus::Exited(255));
+    }
+
+    #[test]
+    fn startup_completed_tail_preserves_raw_values() {
+        for value in [73, -9, -512, -516] {
+            for poll in [
+                Poll::Pending,
+                Poll::Ready(Ok(())),
+                Poll::Ready(Err("outer error")),
+            ] {
+                assert_eq!(
+                    classify_callback::<_, u64>(
+                        CallbackPhase::ThreadStart,
+                        poll,
+                        Some(TailFact::Completed(value)),
+                        None
+                    ),
+                    CallbackDecision::StartupCompleted(value),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_refuses_unexecuted_or_lifecycle_facts() {
+        for poll in [
+            Poll::Pending,
+            Poll::Ready(Ok(())),
+            Poll::Ready(Err("outer error")),
+        ] {
+            for (index, fact) in facts().into_iter().enumerate() {
+                let decision = classify_callback(CallbackPhase::ThreadStart, poll, fact, None);
+                match index {
+                    0 => assert_eq!(
+                        decision,
+                        match poll {
+                            Poll::Ready(value) => CallbackDecision::Ready(value),
+                            Poll::Pending => CallbackDecision::Wait,
+                        }
+                    ),
+                    1 => assert_eq!(decision, CallbackDecision::StartupCompleted(-9)),
+                    3 => assert_eq!(decision, CallbackDecision::Established(23)),
+                    _ => assert!(matches!(decision, CallbackDecision::Refused(_))),
+                }
+            }
+            for (index, fact) in facts().into_iter().enumerate() {
+                assert_eq!(
+                    classify_callback(CallbackPhase::ThreadStart, poll, fact, Some("refused")),
+                    if index == 3 {
+                        CallbackDecision::Established(23)
+                    } else {
+                        CallbackDecision::Refused("refused")
+                    },
+                );
+            }
+        }
     }
 }

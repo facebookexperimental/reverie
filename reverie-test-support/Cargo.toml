@@ -64,6 +64,10 @@ name = "at_random"
 path = "../tests/at_random.rs"
 
 [[test]]
+name = "thread_start"
+path = "../tests/thread_start.rs"
+
+[[test]]
 name = "stack"
 path = "../tests/stack.rs"
 

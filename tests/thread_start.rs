@@ -10,15 +10,13 @@
 
 #[path = "support/thread_start_guest.rs"]
 mod thread_start_guest;
+#[path = "tool_fixtures/thread_start_tail.rs"]
+mod thread_start_tail_tool;
 #[path = "tool_fixtures/thread_start.rs"]
 mod thread_start_tool;
 
 use std::sync::atomic::Ordering;
 
-use reverie::Error;
-use reverie::Guest;
-use reverie::Tool;
-use reverie::syscalls;
 use thread_start_tool::TestTool;
 
 #[test]
@@ -34,18 +32,7 @@ fn thread_start_inject() {
 
 #[test]
 fn thread_start_tail_inject() {
-    #[derive(Debug, Default)]
-    struct TestTool;
-
-    #[reverie::tool]
-    impl Tool for TestTool {
-        type GlobalState = ();
-        type ThreadState = ();
-
-        async fn handle_thread_start<T: Guest<Self>>(&self, guest: &mut T) -> Result<(), Error> {
-            guest.tail_inject(syscalls::Getpid::new()).await
-        }
-    }
+    use thread_start_tail_tool::TestTool;
 
     reverie_ptrace::testing::check_fn::<TestTool, _>(|| {});
 }
@@ -117,6 +104,52 @@ fn dbt_thread_start_missing_artifact_refuses() {
             .unwrap_err();
     eprintln!(
         "explicit missing thread-start artifact {}: {error}",
+        missing.display()
+    );
+    let reverie::Error::Io(error) = error else {
+        panic!("expected missing manifest I/O error: {error}");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn rust_thread_start_tail_command() {
+    use thread_start_tail_tool::TestTool;
+
+    let manifest = caller_manifest()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("thread-start-tail/manifest.json");
+    let _valid = reverie_dbt::CallerArtifact::load(&manifest).unwrap();
+    let program = env!("CARGO_BIN_EXE_thread-start-rust-command-guest");
+    eprintln!("thread-start tail Rust command image={program}");
+    let check = |label: &str, output: &reverie::process::Output| {
+        eprintln!(
+            "thread-start tail Rust command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
+            output.status, output.stdout, output.stderr,
+        );
+        assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    };
+    let (ptrace, ()) =
+        reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], ()).unwrap();
+    check("ptrace", &ptrace);
+    let (dbt, ()) =
+        reverie_test_support::test_dbt_cmd_with_config::<TestTool>(program, &[], (), &manifest)
+            .unwrap();
+    check("dbt", &dbt);
+
+    let missing = manifest.with_file_name("missing-thread-start-tail-manifest.json");
+    assert!(!missing.exists());
+    let error =
+        reverie_test_support::test_dbt_cmd_with_config::<TestTool>(program, &[], (), &missing)
+            .unwrap_err();
+    eprintln!(
+        "explicit missing thread-start tail artifact {}: {error}",
         missing.display()
     );
     let reverie::Error::Io(error) = error else {

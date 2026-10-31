@@ -696,6 +696,13 @@ impl<T: Tool> GuestRpc<'_, T> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallerIntent {
+    Syscall,
+    ThreadStart,
+    Other,
+}
+
 /// In-process guest state passed to a Reverie tool handler.
 pub struct DbtGuest<'a, T>
 where
@@ -721,7 +728,7 @@ where
     // Only the explicit caller adapter supplies this per-thread lifetime.
     // Legacy constructors retain their existing behavior and authority.
     caller_effects: Option<Arc<caller_effects::CallerEffects>>,
-    caller_syscall_phase: bool,
+    caller_intent: CallerIntent,
 }
 
 impl<'a, T> DbtGuest<'a, T>
@@ -829,17 +836,17 @@ where
             signal_info_replacement: None,
             injected_syscalls: 0,
             caller_effects: None,
-            caller_syscall_phase: false,
+            caller_intent: CallerIntent::Other,
         }
     }
 
     fn with_caller_effects(
         mut self,
         effects: Arc<caller_effects::CallerEffects>,
-        syscall_phase: bool,
+        intent: CallerIntent,
     ) -> Self {
         self.caller_effects = Some(effects);
-        self.caller_syscall_phase = syscall_phase;
+        self.caller_intent = intent;
         self
     }
 
@@ -860,7 +867,7 @@ where
     ) -> Result<i64, Errno> {
         self.wait_if_caller_stopped().await;
         let (number, args) = syscall.into_parts();
-        if self.caller_syscall_phase
+        if self.caller_intent == CallerIntent::Syscall
             && purpose == InjectionPurpose::Application
             && matches!(number.id() as i64, libc::SYS_exit | libc::SYS_exit_group)
             && let Some(effects) = &self.caller_effects
@@ -1292,12 +1299,12 @@ where
     // TODO-HUMAN-REVIEW(PR-154): Review exact syscall deferral for DBT tail injection.
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
         self.wait_if_caller_stopped().await;
-        // A tail injection never resumes the handler, so execute it only after
-        // this future and every Rust state borrow have been dropped. Besides
-        // preserving DynamoRIO lifecycle bookkeeping, this keeps blocking calls
-        // such as futex out of `dr_invoke_syscall_as_app`.
+        // Syscall-phase tails forward only after the future and its borrows
+        // are dropped, preserving native lifecycle/blocking-call ownership.
+        // Startup has no intercepted syscall; its distinct branch completes
+        // the admitted effect before abandoning the hook, as ptrace does.
         let (number, args) = syscall.into_parts();
-        if let Some(effects) = &self.caller_effects {
+        if let Some(effects) = self.caller_effects.clone() {
             let raw = [
                 args.arg0 as u64,
                 args.arg1 as u64,
@@ -1306,8 +1313,52 @@ where
                 args.arg4 as u64,
                 args.arg5 as u64,
             ];
-            if !self.caller_syscall_phase {
+            if self.caller_intent == CallerIntent::Other {
                 effects.refuse("caller-startup-terminal-unsupported");
+                return std::future::pending().await;
+            }
+            if self.caller_intent == CallerIntent::ThreadStart {
+                if caller_effects::unsupported_operation(number.id() as i64, &raw, true) {
+                    effects.refuse("caller-startup-tail-lifecycle-unsupported");
+                    return std::future::pending().await;
+                }
+                let completed = self
+                    .tail_inject_result
+                    .startup_completed
+                    .lock()
+                    .unwrap()
+                    .is_some();
+                if completed {
+                    effects.refuse("caller-startup-tail-already-completed");
+                    return std::future::pending().await;
+                }
+                let mut saved: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+                if unsafe { (self.read_registers)(self.context, &mut saved) } == 0 {
+                    effects.refuse("caller-startup-register-read-failed");
+                    return std::future::pending().await;
+                }
+                // Unlike syscall forwarding, startup has no intercepted call
+                // to resume. Match ptrace: execute while the hook is alive,
+                // retain its raw return, then abandon the enclosing future.
+                let result = self.inject_for_purpose(
+                    Syscall::from_raw(number, args),
+                    InjectionPurpose::Application,
+                );
+                let raw_result = match result {
+                    Ok(value) => value,
+                    Err(errno) => -i64::from(errno.into_raw()),
+                };
+                if effects.stopped() {
+                    return std::future::pending().await;
+                }
+                saved.rax = raw_result as u64;
+                if unsafe { (self.write_registers)(self.context, &saved) } == 0 {
+                    // The effect already happened. Admission must fail without
+                    // replay or guest activation when its writeback fails.
+                    effects.refuse("caller-startup-register-write-failed");
+                    return std::future::pending().await;
+                }
+                *self.tail_inject_result.startup_completed.lock().unwrap() = Some(raw_result);
                 return std::future::pending().await;
             }
             if caller_effects::unsupported_operation(number.id() as i64, &raw, false) {
@@ -1676,10 +1727,14 @@ enum TailInjectAction {
 #[derive(Debug, Default)]
 struct TailInjectResult {
     action: Mutex<Option<TailInjectAction>>,
+    // Independent of the enclosing future's Poll: only startup execution plus
+    // successful writeback publishes this consumed-once cancellation fact.
+    startup_completed: Mutex<Option<i64>>,
 }
 
 impl TailInjectResult {
     fn clear(&self) {
+        *self.startup_completed.lock().unwrap() = None;
         *self
             .action
             .lock()
@@ -2193,6 +2248,8 @@ fn run_caller_callback<F: Future>(
             let polled = future.as_mut().poll(cx);
             let fact = if let Some(ending) = effects.ending() {
                 Some(reverie::TailFact::Established(ending))
+            } else if let Some(value) = tail.startup_completed.lock().unwrap().take() {
+                Some(reverie::TailFact::Completed(value))
             } else {
                 tail.take().map(|action| match action {
                     TailInjectAction::ExecuteOriginal(syscall) => {
@@ -2297,7 +2354,9 @@ pub fn run_caller_syscall_with_guest<T: Tool>(
                 );
             }
             reverie::CallbackDecision::Refused(reason) => return Err(caller_error(reason)),
-            reverie::CallbackDecision::ForkChild { .. } | reverie::CallbackDecision::Wait => {
+            reverie::CallbackDecision::StartupCompleted(_)
+            | reverie::CallbackDecision::ForkChild { .. }
+            | reverie::CallbackDecision::Wait => {
                 return Err(caller_error(
                     "caller driver received an impossible transition",
                 ));
@@ -4108,7 +4167,7 @@ mod tests {
     fn caller_injection_guest<'a>(
         native: &mut RecordedCallback,
         counters: &'a mut PrototypeCounters,
-        syscall_phase: bool,
+        intent: CallerIntent,
     ) -> (
         DbtGuest<'a, PrototypeTool>,
         Arc<caller_effects::CallerEffects>,
@@ -4136,7 +4195,7 @@ mod tests {
             read_regs,
             write_regs_noop,
         )
-        .with_caller_effects(Arc::clone(&effects), syscall_phase);
+        .with_caller_effects(Arc::clone(&effects), intent);
         (guest, effects)
     }
 
@@ -4840,7 +4899,7 @@ mod tests {
             read_regs,
             write_regs_noop,
         )
-        .with_caller_effects(Arc::clone(&effects), true);
+        .with_caller_effects(Arc::clone(&effects), CallerIntent::Syscall);
         let args = [0x117, 17, 34, 51, 68, 85];
         let syscall = Syscall::from_raw(
             Sysno::exit_group,
@@ -4902,7 +4961,8 @@ mod tests {
                 host_linux::take_observed();
                 let mut native = RecordedCallback::default();
                 let mut counters = PrototypeCounters::default();
-                let (mut guest, effects) = caller_injection_guest(&mut native, &mut counters, true);
+                let (mut guest, effects) =
+                    caller_injection_guest(&mut native, &mut counters, CallerIntent::Syscall);
                 let call = async_exit_call(number);
                 match api {
                     InjectionApi::Ordinary => drop(Box::pin(guest.inject(call))),
@@ -4985,7 +5045,7 @@ mod tests {
                     };
                     let mut counters = PrototypeCounters::default();
                     let (mut guest, effects) =
-                        caller_injection_guest(&mut native, &mut counters, true);
+                        caller_injection_guest(&mut native, &mut counters, CallerIntent::Syscall);
                     let mut future = Box::pin(invoke_test_injection(
                         &mut guest,
                         async_exit_call(number),
@@ -5036,7 +5096,11 @@ mod tests {
             Sysno::execve,
             Sysno::tgkill,
         ] {
-            for syscall_phase in [false, true] {
+            for intent in [
+                CallerIntent::ThreadStart,
+                CallerIntent::Other,
+                CallerIntent::Syscall,
+            ] {
                 for api in [
                     InjectionApi::Ordinary,
                     InjectionApi::Purpose(application),
@@ -5047,7 +5111,7 @@ mod tests {
                     // The eligible async terminal cells have their own success
                     // and admission-refusal tables; every remaining cell stays
                     // an immediate returning-lifecycle refusal.
-                    if syscall_phase
+                    if intent == CallerIntent::Syscall
                         && matches!(number, Sysno::exit | Sysno::exit_group)
                         && matches!(
                             api,
@@ -5061,7 +5125,7 @@ mod tests {
                     let mut native = RecordedCallback::default();
                     let mut counters = PrototypeCounters::default();
                     let (mut guest, effects) =
-                        caller_injection_guest(&mut native, &mut counters, syscall_phase);
+                        caller_injection_guest(&mut native, &mut counters, intent);
                     let mut future = Box::pin(invoke_test_injection(
                         &mut guest,
                         async_exit_call(number),
@@ -5072,7 +5136,7 @@ mod tests {
                         .poll(&mut Context::from_waker(Waker::noop()));
                     drop(future);
                     eprintln!(
-                        "caller_returning_refusal: api={api:?}; syscall={number:?}; syscall_phase={syscall_phase}; result={result:?}; count={:?}; ending={:?}; refusal={:?}; requests={:?}; invocations={:?}",
+                        "caller_returning_refusal: api={api:?}; syscall={number:?}; intent={intent:?}; result={result:?}; count={:?}; ending={:?}; refusal={:?}; requests={:?}; invocations={:?}",
                         guest.injected_syscalls(),
                         effects.ending(),
                         effects.refusal(),
@@ -5108,7 +5172,7 @@ mod tests {
                     let mut native = RecordedCallback::default();
                     let mut counters = PrototypeCounters::default();
                     let (mut guest, effects) =
-                        caller_injection_guest(&mut native, &mut counters, true);
+                        caller_injection_guest(&mut native, &mut counters, CallerIntent::Syscall);
                     if established {
                         let mut fact =
                             async_exit_fact(guest.context, libc::SYS_exit_group, ASYNC_EXIT_ARGS);
@@ -5157,8 +5221,11 @@ mod tests {
                             ..Default::default()
                         };
                         let mut counters = PrototypeCounters::default();
-                        let (mut guest, effects) =
-                            caller_injection_guest(&mut native, &mut counters, true);
+                        let (mut guest, effects) = caller_injection_guest(
+                            &mut native,
+                            &mut counters,
+                            CallerIntent::Syscall,
+                        );
                         if !caller {
                             guest.caller_effects = None;
                         }

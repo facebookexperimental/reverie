@@ -243,6 +243,33 @@ jobs:
         reverie-dbt/scripts/build-client.sh
         --caller-manifest tests/fixtures/inject-then-tail-dbt-runtime/Cargo.toml
         --profile debug --jobs 8 --check
+    - name: DBT generic thread-start caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest tests/fixtures/thread-start-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT generic thread-start-tail caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest tests/fixtures/thread-start-tail-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT generic thread-start-tail-witness caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest tests/fixtures/thread-start-tail-witness-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
     - name: DBT generic at-random caller artifact and standalone gates
       timeout-minutes: 15
       env:
@@ -560,6 +587,33 @@ jobs:
       run: >-
         reverie-dbt/scripts/build-client.sh
         --caller-manifest tests/fixtures/inject-then-tail-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT generic thread-start caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest tests/fixtures/thread-start-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT generic thread-start-tail caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest tests/fixtures/thread-start-tail-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT generic thread-start-tail-witness caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest tests/fixtures/thread-start-tail-witness-dbt-runtime/Cargo.toml
         --profile debug --jobs 8 --check
     - name: DBT generic at-random caller artifact and standalone gates
       timeout-minutes: 15

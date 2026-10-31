@@ -1,0 +1,29 @@
+# OSS-only caller artifact over the shared startup tail-injection test Tool.
+# The explicit producer keeps this package separate from workspace features.
+[package]
+name = "reverie-thread-start-tail-witness-dbt-runtime"
+version = "0.5.4"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "thread_start_tail_witness_caller_tool"
+crate-type = ["cdylib"]
+
+[package.metadata.reverie-dbt]
+artifact-label = "thread-start-tail-witness"
+input-roots = ["../../tool_fixtures"]
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+reverie = { version = "0.5.4", path = "../../../reverie", package = "reverie-core" }
+reverie-dbt = { version = "0.5.4", path = "../../../reverie-dbt", default-features = false }
+
+[profile.validate]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+lto = "off"

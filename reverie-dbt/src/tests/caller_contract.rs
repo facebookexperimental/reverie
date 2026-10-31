@@ -260,7 +260,7 @@ fn guest<'a>(
         registers,
         set_registers,
     )
-    .with_caller_effects(effects, true)
+    .with_caller_effects(effects, CallerIntent::Syscall)
 }
 fn effects(native_state: &Native) -> Arc<CallerEffects> {
     Arc::new(CallerEffects::new(

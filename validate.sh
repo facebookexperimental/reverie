@@ -826,6 +826,18 @@ run_check "DBT generic inject-then-tail caller artifact and standalone gates" \
     "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
     --caller-manifest "$ROOT_DIR/tests/fixtures/inject-then-tail-dbt-runtime/Cargo.toml" \
     --profile debug --jobs 8 --check
+run_check "DBT generic thread-start caller artifact and standalone gates" \
+    "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
+    --caller-manifest "$ROOT_DIR/tests/fixtures/thread-start-dbt-runtime/Cargo.toml" \
+    --profile debug --jobs 8 --check
+run_check "DBT generic thread-start-tail caller artifact and standalone gates" \
+    "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
+    --caller-manifest "$ROOT_DIR/tests/fixtures/thread-start-tail-dbt-runtime/Cargo.toml" \
+    --profile debug --jobs 8 --check
+run_check "DBT generic thread-start-tail-witness caller artifact and standalone gates" \
+    "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
+    --caller-manifest "$ROOT_DIR/tests/fixtures/thread-start-tail-witness-dbt-runtime/Cargo.toml" \
+    --profile debug --jobs 8 --check
 run_check "DBT generic at-random caller artifact and standalone gates" \
     "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
     --caller-manifest "$ROOT_DIR/tests/fixtures/at-random-dbt-runtime/Cargo.toml" \

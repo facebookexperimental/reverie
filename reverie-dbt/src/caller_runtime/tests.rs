@@ -70,6 +70,76 @@ const SUPPRESSION_CASES: [&str; 11] = [
     "tgkill-terminal",
 ];
 const TGKILL_ARGS: [u64; 6] = [0, u64::MAX, 999, 17, 34, 51];
+const STARTUP_CASES: [&str; 12] = [
+    "startup-pending",
+    "startup-ready-ok",
+    "startup-ready-err",
+    "startup-errno",
+    "startup-read-failed",
+    "startup-write-failed",
+    "startup-unsupported",
+    "startup-duplicate",
+    "startup-post-exec",
+    "startup-completed-post-exec",
+    "startup-stale-owner",
+    "startup-repeated-owner",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum StartupInjection {
+    Pending,
+    ReadyOk,
+    ReadyErr,
+    Errno,
+    ReadFailed,
+    WriteFailed,
+    Unsupported,
+    Duplicate,
+    PostExec,
+    CompletedPostExec,
+    StaleOwner,
+    RepeatedOwner,
+}
+impl StartupInjection {
+    fn for_case(case: &str) -> Option<Self> {
+        Some(match case {
+            "startup-pending" => Self::Pending,
+            "startup-ready-ok" => Self::ReadyOk,
+            "startup-ready-err" => Self::ReadyErr,
+            "startup-errno" => Self::Errno,
+            "startup-read-failed" => Self::ReadFailed,
+            "startup-write-failed" => Self::WriteFailed,
+            "startup-unsupported" => Self::Unsupported,
+            "startup-duplicate" => Self::Duplicate,
+            "startup-post-exec" => Self::PostExec,
+            "startup-completed-post-exec" => Self::CompletedPostExec,
+            "startup-stale-owner" => Self::StaleOwner,
+            "startup-repeated-owner" => Self::RepeatedOwner,
+            _ => return None,
+        })
+    }
+    fn raw_result(self) -> i64 {
+        if self == Self::Errno {
+            -i64::from(libc::EBADF)
+        } else {
+            i64::from(pid().as_raw())
+        }
+    }
+    fn refusal(self) -> Option<&'static str> {
+        match self {
+            Self::ReadFailed => Some("caller-startup-register-read-failed"),
+            Self::WriteFailed => Some("caller-startup-register-write-failed"),
+            Self::Unsupported => Some("caller-startup-tail-lifecycle-unsupported"),
+            Self::Duplicate => Some("caller-startup-tail-already-completed"),
+            Self::PostExec | Self::CompletedPostExec => Some("caller-startup-terminal-unsupported"),
+            Self::StaleOwner => Some("caller-initial-single-thread-owner-required"),
+            Self::RepeatedOwner => Some("caller-application-admission-repeated"),
+            _ => None,
+        }
+    }
+}
+
+>>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
 static EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 static DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SELECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -167,6 +237,8 @@ struct Config {
     instructions: u8,
     async_injection: Option<AsyncInjection>,
     suppression: Option<Suppression>,
+    startup: Option<StartupInjection>,
+>>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -261,6 +333,13 @@ impl Drop for InjectionDrop<'_> {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
         event("injection-future-drop");
+    }
+}
+
+struct StartupDrop;
+impl Drop for StartupDrop {
+    fn drop(&mut self) {
+        event("startup-drop");
     }
 }
 
@@ -519,6 +598,34 @@ impl Tool for Probe {
             Request::Start.response()
         );
         guest.thread_state_mut().stamp += 1;
+        if let Some(mode) = guest.config().startup {
+            if mode == StartupInjection::PostExec {
+                return Ok(());
+            }
+            let _drop = StartupDrop;
+            let call = Syscall::from_raw(
+                if mode == StartupInjection::Unsupported {
+                    Sysno::execve
+                } else {
+                    Sysno::getpid
+                },
+                SyscallArgs::new(0, 0, 0, 0, 0, 0),
+            );
+            if mode == StartupInjection::Duplicate {
+                pending(guest.tail_inject(call));
+                guest.tail_inject(call).await;
+            }
+            let mut tail = Box::pin(guest.tail_inject(call));
+            return std::future::poll_fn(|cx| {
+                assert!(tail.as_mut().poll(cx).is_pending());
+                match mode {
+                    StartupInjection::ReadyOk => std::task::Poll::Ready(Ok(())),
+                    StartupInjection::ReadyErr => std::task::Poll::Ready(Err(Errno::EACCES.into())),
+                    _ => std::task::Poll::Pending,
+                }
+            })
+            .await;
+        }
         Ok(())
     }
 
@@ -526,6 +633,12 @@ impl Tool for Probe {
         check_config(guest.config());
         assert_eq!(guest.thread_state().stamp, SEED + 1);
         event("post");
+        if matches!(
+            guest.config().startup,
+            Some(StartupInjection::PostExec | StartupInjection::CompletedPostExec)
+        ) {
+            guest.tail_inject(reverie::syscalls::Getpid::new()).await;
+        }
         assert_eq!(
             guest.send_rpc(Request::PostExec).await,
             Request::PostExec.response()
@@ -655,6 +768,10 @@ struct NativeFixture {
     async_injection: Cell<Option<AsyncInjection>>,
     admissions: Cell<usize>,
     register_reads: Cell<usize>,
+    startup: Cell<Option<StartupInjection>>,
+    startup_calls: Cell<usize>,
+    startup_writes: Cell<usize>,
+    written: RefCell<Option<libc::user_regs_struct>>,
     sent: RefCell<Frames>,
     received: RefCell<Frames>,
     probing_suppression: Cell<bool>,
@@ -686,6 +803,17 @@ unsafe extern "C" fn invoke(context: usize, number: i64, args: *const u64, purpo
     let args = unsafe { args.cast::<[u64; 6]>().read() };
     assert_eq!(purpose, InjectionPurpose::Application as u32);
     fixture.calls.set(fixture.calls.get() + 1);
+    if number == libc::SYS_getpid {
+        let mode = fixture
+            .startup
+            .get()
+            .expect("only startup fixture admits this unit effect");
+        assert_eq!(args, [0; 6]);
+        fixture.startup_calls.set(fixture.startup_calls.get() + 1);
+        assert_eq!(fixture.startup_calls.get(), 1, "startup effect replayed");
+        event("startup-effect");
+        return mode.raw_result();
+    }
     if number == libc::SYS_prctl {
         assert_eq!(args, [libc::PR_GET_SECCOMP as u64, 0, 0, 0, 0, 0]);
         event("unit-filter-probe");
@@ -812,13 +940,74 @@ unsafe extern "C" fn idle() {
 unsafe extern "C" fn read_registers(context: usize, output: *mut libc::user_regs_struct) -> i32 {
     let fixture = unsafe { &*(context as *const NativeFixture) };
     fixture.register_reads.set(fixture.register_reads.get() + 1);
-    unsafe {
-        output.write(std::mem::zeroed());
+    if fixture.startup.get().is_some() {
+        event("startup-read");
+        if fixture.startup.get() == Some(StartupInjection::ReadFailed) {
+            return 0;
+        }
+        unsafe {
+            output.write(startup_registers());
+        }
+    } else {
+        unsafe {
+            output.write(std::mem::zeroed());
+        }
     }
     1
 }
-unsafe extern "C" fn write_registers(_: usize, _: *const libc::user_regs_struct) -> i32 {
-    panic!("unexpected register write")
+unsafe extern "C" fn write_registers(
+    context: usize,
+    registers: *const libc::user_regs_struct,
+) -> i32 {
+    let fixture = unsafe { &*(context as *const NativeFixture) };
+    let mode = fixture.startup.get().expect("unexpected register write");
+    fixture.startup_writes.set(fixture.startup_writes.get() + 1);
+    assert_eq!(fixture.startup_writes.get(), 1);
+    let actual = unsafe { registers.read() };
+    let mut expected = startup_registers();
+    expected.rax = mode.raw_result() as u64;
+    assert_eq!(register_words(&actual), register_words(&expected));
+    *fixture.written.borrow_mut() = Some(actual);
+    event("startup-write");
+    i32::from(mode != StartupInjection::WriteFailed)
+}
+fn startup_registers() -> libc::user_regs_struct {
+    libc::user_regs_struct {
+        r15: 15,
+        r14: 14,
+        r13: 13,
+        r12: 12,
+        rbp: 17,
+        rbx: 3,
+        r11: 11,
+        r10: 10,
+        r9: 9,
+        r8: 8,
+        rax: 0x55,
+        rcx: 0x33,
+        rdx: 4,
+        rsi: 5,
+        rdi: 6,
+        orig_rax: 0x77,
+        rip: 0x401000,
+        cs: 0x33,
+        eflags: 0x202,
+        rsp: 0x700000,
+        ss: 0x2b,
+        fs_base: 0x1000,
+        gs_base: 0x2000,
+        ds: 0,
+        es: 0,
+        fs: 0,
+        gs: 0,
+    }
+}
+fn register_words(r: &libc::user_regs_struct) -> [u64; 27] {
+    [
+        r.r15, r.r14, r.r13, r.r12, r.rbp, r.rbx, r.r11, r.r10, r.r9, r.r8, r.rax, r.rcx, r.rdx,
+        r.rsi, r.rdi, r.orig_rax, r.rip, r.cs, r.eflags, r.rsp, r.ss, r.fs_base, r.gs_base, r.ds,
+        r.es, r.fs, r.gs,
+    ]
 }
 unsafe extern "C" fn read_memory(_: usize, _: *mut u8, _: usize) -> i32 {
     panic!("unexpected memory read")
@@ -1063,8 +1252,11 @@ fn exercise(case: &str) {
         },
         async_injection: AsyncInjection::for_case(case),
         suppression: Suppression::for_case(case),
+        startup: StartupInjection::for_case(case),
+>>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
     };
     fixture.async_injection.set(config.async_injection);
+    fixture.startup.set(config.startup);
     let run = ActivationRun::new();
     run.bind_root(pid().as_raw()).unwrap();
     let mut server = Server::start(config.clone(), run.clone());
@@ -1127,6 +1319,10 @@ fn exercise(case: &str) {
         return;
     }
 
+    if let Some(mode) = config.startup {
+        exercise_startup(mode, &runtime, &mut counters, &fixture, &mut server, &run);
+        return;
+    }
     assert_eq!(init(&runtime, &mut counters, &fixture, 0), 0);
     assert_eq!(
         events(),
@@ -1680,6 +1876,163 @@ fn exercise(case: &str) {
     }
 }
 
+fn exercise_startup(
+    mode: StartupInjection,
+    runtime: &CallerRuntime<Probe>,
+    counters: &mut CallerCounters,
+    fixture: &NativeFixture,
+    server: &mut Server,
+    run: &ActivationRun,
+) {
+    let status = if mode == StartupInjection::StaleOwner {
+        unsafe {
+            runtime.thread_init(
+                counters,
+                fixture.context(),
+                pid().as_raw() + 1,
+                pid().as_raw(),
+                0,
+                0,
+                0,
+                invoke,
+                read_registers,
+                write_registers,
+            )
+        }
+    } else {
+        init(runtime, counters, fixture, 0)
+    };
+    if mode == StartupInjection::RepeatedOwner {
+        assert_eq!(status, 0);
+        let before = events();
+        let calls = fixture.startup_calls.get();
+        assert_eq!(init(runtime, counters, fixture, 0), -1);
+        assert_eq!(fixture.startup_calls.get(), calls);
+        assert_eq!(events(), before);
+    }
+    if let Some(reason) = mode.refusal() {
+        if mode != StartupInjection::RepeatedOwner {
+            assert_eq!(status, -1);
+        }
+        assert!(
+            DIAGNOSTICS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains(reason))
+        );
+        let effects = usize::from(matches!(
+            mode,
+            StartupInjection::WriteFailed
+                | StartupInjection::Duplicate
+                | StartupInjection::CompletedPostExec
+                | StartupInjection::RepeatedOwner
+        ));
+        assert_eq!(fixture.startup_calls.get(), effects);
+        assert_eq!(fixture.startup_writes.get(), effects);
+        assert_eq!(
+            events().iter().filter(|e| **e == "started").count(),
+            usize::from(mode == StartupInjection::RepeatedOwner)
+        );
+        assert!(!events().contains(&"thread-exit"));
+        assert!(run.completed().is_err());
+        if matches!(
+            mode,
+            StartupInjection::PostExec | StartupInjection::CompletedPostExec
+        ) {
+            assert!(events().contains(&"post"));
+            assert!(!events().contains(&"remote-post"));
+            assert_eq!(
+                fixture.register_reads.get(),
+                usize::from(mode == StartupInjection::CompletedPostExec)
+            );
+            assert_eq!(server.global.calls.load(Ordering::SeqCst), 1);
+        }
+        if mode != StartupInjection::StaleOwner {
+            assert!(fixture.calls.get() > 0);
+        }
+    } else {
+        assert_eq!(status, 0);
+        assert_eq!(fixture.startup_calls.get(), 1);
+        assert_eq!(fixture.register_reads.get(), 1);
+        assert_eq!(fixture.startup_writes.get(), 1);
+        let rows = events();
+        let locate = |name| rows.iter().position(|row| *row == name).unwrap();
+        assert!(locate("startup-effect") < locate("startup-write"));
+        assert!(locate("startup-write") < locate("startup-drop"));
+        assert!(locate("startup-drop") < locate("post"));
+        assert!(locate("remote-post") < locate("started"));
+        assert!(locate("started-ack") < locate("native-ack-call"));
+        assert_eq!(rows.iter().filter(|e| **e == "startup-drop").count(), 1);
+        assert_eq!(
+            fixture.written.borrow().as_ref().unwrap().rax,
+            mode.raw_result() as u64
+        );
+        let mut result = -1234;
+        let mut number = -4321;
+        let mut args = [0xa5; 6];
+        assert_eq!(
+            unsafe {
+                runtime.pre_syscall(
+                    fixture.context(),
+                    counters,
+                    pid().as_raw(),
+                    pid().as_raw(),
+                    1,
+                    libc::SYS_getpid,
+                    FINAL_ARGS.as_ptr(),
+                    41,
+                    &mut result,
+                    &mut number,
+                    args.as_mut_ptr(),
+                    invoke,
+                    read_registers,
+                    write_registers,
+                    read_memory,
+                )
+            },
+            2
+        );
+        assert_eq!(result, -1234);
+        assert_eq!(number, libc::SYS_exit_group);
+        assert_eq!(args, FINAL_ARGS);
+        let fact = fixture.reservation.get().unwrap();
+        assert_eq!(
+            unsafe {
+                runtime.thread_exit(counters, fixture.context(), pid().as_raw(), invoke, &fact)
+            },
+            0
+        );
+        assert_eq!(
+            fixture.startup_calls.get(),
+            1,
+            "no replay during completion"
+        );
+        assert_eq!(server.global.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(run.completed().unwrap().exit_code(), 47);
+        assert!(DIAGNOSTICS.lock().unwrap().is_empty());
+    }
+    eprintln!(
+        "caller startup protocol: mode={mode:?} status={status} effect_calls={} reads={} writes={} rows={:?} raw={:?} diagnostics={:?}",
+        fixture.startup_calls.get(),
+        fixture.register_reads.get(),
+        fixture.startup_writes.get(),
+        events(),
+        fixture.written.borrow().as_ref().map(register_words),
+        DIAGNOSTICS.lock().unwrap()
+    );
+    if !counters.runtime_state.is_null() {
+        unsafe {
+            drop(Box::from_raw(
+                counters.runtime_state.cast::<RootAttachment<Probe>>(),
+            ));
+        }
+        counters.runtime_state = std::ptr::null_mut();
+    }
+    fixture.shutdown();
+    server.finish();
+}
+
 struct ChildGuard(Option<Child>);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -1707,6 +2060,8 @@ fn caller_runtime_protocol() {
                     | "missing-finished"
             ) || ASYNC_CASES.contains(&case)
                 || SUPPRESSION_CASES.contains(&case)
+                || STARTUP_CASES.contains(&case)
+>>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
         );
         exercise(case);
         println!("{WITNESS}:{case}");
@@ -1728,6 +2083,8 @@ fn caller_runtime_protocol() {
     .into_iter()
     .chain(ASYNC_CASES)
     .chain(SUPPRESSION_CASES)
+    .chain(STARTUP_CASES)
+>>>>>>> 21c83193c (Preserve startup tail completion in the generic caller)
     {
         let directory = tempfile::tempdir().unwrap();
         let dirfd = std::fs::File::open(directory.path()).unwrap();
@@ -1760,6 +2117,12 @@ fn caller_runtime_protocol() {
             println!("CallerRuntime {case} actual output: {output:?}");
         }
         assert!(output.status.success(), "CallerRuntime {case}: {output:?}");
+        if STARTUP_CASES.contains(&case) {
+            eprintln!(
+                "caller startup protocol child {case}: status={:?} stdout={:?} stderr={:?}",
+                output.status, output.stdout, output.stderr
+            );
+        }
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(
             stdout.contains("test result: ok. 1 passed;"),

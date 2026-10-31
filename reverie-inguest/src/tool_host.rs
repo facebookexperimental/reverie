@@ -192,7 +192,9 @@ where
                 };
             }
             CallbackDecision::Wait => core::hint::spin_loop(),
-            CallbackDecision::Deferred { .. } | CallbackDecision::Refused(_) => {
+            CallbackDecision::StartupCompleted(_)
+            | CallbackDecision::Deferred { .. }
+            | CallbackDecision::Refused(_) => {
                 unreachable!("trap syscall facts contain no deferred call or refusal")
             }
         }
@@ -242,7 +244,8 @@ where
             }
             CallbackDecision::Refused(reason) => return CallbackOutcome::Unsupported(reason),
             CallbackDecision::Wait => core::hint::spin_loop(),
-            CallbackDecision::Completed(_)
+            CallbackDecision::StartupCompleted(_)
+            | CallbackDecision::Completed(_)
             | CallbackDecision::Deferred { .. }
             | CallbackDecision::ForkChild { .. } => {
                 unreachable!("non-handler callback facts must be refused by shared classifier")

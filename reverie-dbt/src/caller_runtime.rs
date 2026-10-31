@@ -34,6 +34,7 @@ use reverie_rpc_transport::tool_activation::ExitOrigin;
 use reverie_rpc_transport::tool_activation::FinishedReceipt;
 use reverie_rpc_transport::tool_activation::ToolControl;
 
+use crate::CallerIntent;
 use crate::DbtGuest;
 use crate::DbtRuntimeCallbacks;
 use crate::MemoryReader;
@@ -488,7 +489,7 @@ impl<T: Tool> CallerRuntime<T> {
                 write,
             )
             .with_memory_reader(memory)
-            .with_caller_effects(Arc::clone(&attachment.effects), true);
+            .with_caller_effects(Arc::clone(&attachment.effects), CallerIntent::Syscall);
             match crate::run_caller_syscall_with_guest(&attachment.process, guest, syscall)? {
                 crate::CallerSyscallOutcome::Suppress(value) => {
                     self.rewritten.fetch_add(1, Ordering::Relaxed);
@@ -787,15 +788,16 @@ fn run_start_hooks<T: Tool>(
         read,
         write,
     )
-    .with_caller_effects(Arc::clone(&attachment.effects), false);
+    .with_caller_effects(Arc::clone(&attachment.effects), CallerIntent::ThreadStart);
     let tail = Arc::clone(&guest.tail_inject_result);
     match crate::run_caller_callback(
         attachment.process.handle_thread_start(&mut guest),
         &tail,
         &attachment.effects,
-        CallbackPhase::Callback,
+        CallbackPhase::ThreadStart,
     ) {
         CallbackDecision::Ready(result) => result?,
+        CallbackDecision::StartupCompleted(_) => {}
         CallbackDecision::Refused(reason) => return Err(crate::caller_error(reason)),
         _ => {
             return Err(crate::caller_error(
@@ -803,6 +805,10 @@ fn run_start_hooks<T: Tool>(
             ));
         }
     }
+    // The same Guest survives both hooks, but only thread-start owns startup
+    // effects. Retire its fact before constructing the post-exec future.
+    guest.caller_intent = CallerIntent::Other;
+    tail.clear();
     match crate::run_caller_callback(
         attachment.process.handle_post_exec(&mut guest),
         &tail,

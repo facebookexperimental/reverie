@@ -808,8 +808,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 82] = [
     ),
     (
         "Cargo.toml",
-        2030,
-        "ec6ca86a7e751e556ce92ae82ac349e56b90d509cbddb554abe8b8e7b91cf9e9",
+        2142,
+        "b3c19cd3f242ba6185a61c596dea3b417be61543c2c83d1d4d358ee6f7fe4930",
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
@@ -1099,13 +1099,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 82] = [
     ),
     (
         "reverie/src/tool_outcome.rs",
-        10307,
-        "ee28ac21532ccc32d15116a3bab71aea074e5177a8c3f630c09e74e8a16b798c",
+        13455,
+        "09904e7dcaf30866b7a4b64871a18efbaa586cf2fe43c5601e068c5c1a3778b3",
     ),
     (
         "reverie-inguest/src/tool_host.rs",
-        24858,
-        "571d9604b2894cfb51256bc713d155b3d3ce42eb2cda54c5bc9912435ad96eb3",
+        24974,
+        "0d89164860a668c9f9a9ce153b439ade155927a03ba435748bf0000cebbd78cf",
     ),
     (
         "reverie-rpc-transport/src/lib.rs",
@@ -32924,6 +32924,45 @@ mod tests {
                 include_bytes!("lib.rs"),
             ),
         ];
+        // Startup completion changes exactly these three reviewed sources.
+        // Keep the fixed catalog authoritative and reject their prior tuples.
+        assert_eq!(CONTENT_REVERIE_CATALOG.len(), 77);
+        for (relative, old_size, old_digest) in [
+            (
+                "Cargo.toml",
+                2030,
+                "ec6ca86a7e751e556ce92ae82ac349e56b90d509cbddb554abe8b8e7b91cf9e9",
+            ),
+            (
+                "reverie/src/tool_outcome.rs",
+                10307,
+                "ee28ac21532ccc32d15116a3bab71aea074e5177a8c3f630c09e74e8a16b798c",
+            ),
+            (
+                "reverie-inguest/src/tool_host.rs",
+                24858,
+                "571d9604b2894cfb51256bc713d155b3d3ce42eb2cda54c5bc9912435ad96eb3",
+            ),
+        ] {
+            let entries: Vec<_> = CONTENT_REVERIE_CATALOG
+                .iter()
+                .filter(|entry| entry.0 == relative)
+                .collect();
+            assert_eq!(entries.len(), 1, "one declared source {relative}");
+            let bytes = compiled_files
+                .iter()
+                .find(|entry| entry.0 == relative)
+                .unwrap()
+                .1;
+            let (_, size, digest) = *entries[0];
+            assert_eq!(size, bytes.len() as u64);
+            assert_eq!(digest, sha256(bytes));
+            content_catalog_matches(relative, size, digest).unwrap();
+            assert!(
+                content_catalog_matches(relative, old_size, old_digest).is_err(),
+                "prior startup source tuple must refuse: {relative}"
+            );
+        }
         for rv in [&rv_one, &rv_two] {
             for &(relative, bytes) in &compiled_files {
                 fs::create_dir_all(rv.join(relative).parent().unwrap()).unwrap();

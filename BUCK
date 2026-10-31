@@ -225,6 +225,7 @@ rust_library(
                 {"name": "vdso", "path": "../tests/vdso.rs"},
                 {"name": "inject_then_tail", "path": "../tests/inject_then_tail.rs"},
                 {"name": "at_random", "path": "../tests/at_random.rs"},
+                {"name": "thread_start", "path": "../tests/thread_start.rs"},
                 {"name": "stack", "path": "../tests/stack.rs"},
                 {"name": "suppression", "path": "../tests/suppression.rs"},
                 {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
@@ -413,6 +414,23 @@ rust_unittest(
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tracing",
         ":reverie",
+        ":reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "generic-thread-start",
+    srcs = [
+        "tests/thread_start.rs",
+        "tests/support/thread_start_guest.rs",
+        "tests/tool_fixtures/thread_start.rs",
+        "tests/tool_fixtures/thread_start_tail.rs",
+    ],
+    crate_root = "tests/thread_start.rs",
+    rustc_flags = sanitized_feature,
+    deps = [
+        ":reverie",
+        ":reverie-ptrace",
         ":reverie-test-support",
     ],
 )

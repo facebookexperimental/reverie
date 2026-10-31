@@ -497,10 +497,28 @@ reverie-dbt/scripts/build-client.sh --caller-manifest tests/fixtures/thread-star
 The alias exports the shared test Tool with its mandatory producer-supplied
 input identity. Its existing `tool_fixtures` input root covers the observing
 Tool; the producer authenticates the complete current dependency closure.
-`thread_start_tail_inject` remains byte-preserved and ptrace-only, including
-when the test target enables `dbt`. DBT startup tail completion is unsupported;
-this returning-injection case does not claim otherwise. These generic tests do
-not establish syscall-stream parity, exact hook counts, or deterministic time.
+The registered default target has the two inherited ptrace identities. The
+`dbt` feature also includes the missing-artifact control and
+`rust_thread_start_tail_command` (four identities). The latter uses the
+original tail Tool from `tests/tool_fixtures/thread_start_tail.rs`, preserving
+its `Getpid` injection and the inherited test's empty closure and exit assertion.
+Its ordinary ptrace and DBT children use the same empty ELF and must exit 0 with
+empty streams. The new tail alias must be produced in the consumer's profile:
+
+```sh
+reverie-dbt/scripts/build-client.sh --caller-manifest tests/fixtures/thread-start-tail-dbt-runtime/Cargo.toml --profile validate --jobs 4 --check
+reverie-dbt/scripts/build-client.sh --caller-manifest tests/fixtures/thread-start-tail-witness-dbt-runtime/Cargo.toml --profile validate --jobs 4 --check
+```
+
+The separate `caller_thread_start_tail` native integration uses a fixture Tool
+and authenticated fixed-entry ELF to check effect-before-continuation, actual
+Getpid and write results, raw kernel errno, register/PC preservation and startup
+future abandonment. A real no-effect child must first pass its own successful
+frame oracle and then fail the same write-effect predicate. Copied-record
+controls supplement the real children. This witness does not replace the
+original ptrace test or establish inherited-function execution under DBT.
+Post-exec tails and unsupported startup lifecycle effects still refuse.
+
 ## Guarded stack allocations through the shared Tool
 
 The `stack` target registers all three original ptrace identities in both default
