@@ -277,4 +277,36 @@ mod tests {
         assert_eq!(error.worker_tid(), Some(2));
         assert!(matches!(error.primary(), Error::Reverie(_)));
     }
+
+    #[test]
+    fn a_refusal_by_name_is_one_through_every_wrapper_and_nothing_else_is() {
+        let wrapped = |cause| {
+            Error::ExecWorkerTeardown(Box::new(Error::WorkerFailure {
+                tid: 5,
+                error: Arc::new(cause),
+            }))
+            .with_cleanup(vec![Error::GuestClock("secondary".to_owned())])
+        };
+        for refusal in [
+            Error::PotentiallyBlockingZeroRead { fd: 3 },
+            Error::BlockingInotifyRead { fd: 4 },
+        ] {
+            assert!(refusal.is_named_refusal(), "{refusal}");
+            let refusal = wrapped(refusal);
+            assert!(refusal.is_named_refusal(), "{refusal}");
+        }
+        for failure in [
+            Error::UnexpectedVcpuExit("hlt".to_owned()),
+            Error::RunAborted,
+            Error::Reverie(reverie::syscalls::Errno::EIO.into()),
+        ] {
+            assert!(!failure.is_named_refusal(), "{failure}");
+            let failure = wrapped(failure);
+            assert!(!failure.is_named_refusal(), "{failure}");
+        }
+        // A refusal that is only a secondary cleanup error is not the cause.
+        let secondary =
+            Error::RunAborted.with_cleanup(vec![Error::PotentiallyBlockingZeroRead { fd: 3 }]);
+        assert!(!secondary.is_named_refusal());
+    }
 }

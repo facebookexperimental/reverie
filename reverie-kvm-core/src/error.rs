@@ -594,4 +594,16 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Whether this failure's original cause ([`Self::primary`]) is a refusal
+    /// by name: the executor declined an operation it cannot perform
+    /// faithfully, rather than failing at one. A consumer reports a run that
+    /// ends this way as a refusal under its fail-closed policy, not as a
+    /// failure of its own. Every other variant is a failure.
+    pub fn is_named_refusal(&self) -> bool {
+        matches!(
+            self.primary(),
+            Self::PotentiallyBlockingZeroRead { .. } | Self::BlockingInotifyRead { .. }
+        )
+    }
 }
