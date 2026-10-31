@@ -2329,6 +2329,7 @@ fn exercise_initial_stack(case: &str) {
             )
         }
     };
+    let mut admitted = false;
     if matches!(case, "invalid-version" | "null" | "invalid-owner") {
         assert_eq!(status, -1);
         assert!(counters.runtime_state.is_null());
@@ -2349,6 +2350,7 @@ fn exercise_initial_stack(case: &str) {
         );
     } else {
         assert_eq!(status, 0);
+        admitted = true;
         let mut result = -1234;
         let mut deferred_number = -4321;
         let mut deferred_args = [0xa5; 6];
@@ -2446,10 +2448,6 @@ fn exercise_initial_stack(case: &str) {
             },
             0
         );
-        let completed = run.completed().unwrap();
-        assert_eq!(completed.exit_code(), 47);
-        assert_eq!(completed.syscall(), libc::SYS_exit_group);
-        assert_eq!(completed.origin(), ExitOrigin::Original);
         // The fixture owns this allocation; this is not a kernel exit claim.
         unsafe {
             drop(Box::from_raw(
@@ -2472,6 +2470,13 @@ fn exercise_initial_stack(case: &str) {
     }
     fixture.shutdown();
     server.finish();
+    if admitted {
+        // Joining the server orders this read after its FinishedAck commit.
+        let completed = run.completed().unwrap();
+        assert_eq!(completed.exit_code(), 47);
+        assert_eq!(completed.syscall(), libc::SYS_exit_group);
+        assert_eq!(completed.origin(), ExitOrigin::Original);
+    }
     assert!(server.issues.snapshot().is_empty());
 }
 
