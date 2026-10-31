@@ -13,7 +13,9 @@
  *
  * - vfork, then execve of this program, whose new image maps the file
  *   itself and bumps a counter in it;
- * - vfork, then a store through the writable view, then _exit;
+ * - vfork, then a store through the writable view and a change to the
+ *   THP-disable flag, which Linux keeps per address space (prctl(2)
+ *   PR_SET_THP_DISABLE), then _exit; the parent sees both;
  * - vfork whose execve fails: the child records errno in the view and exits,
  *   as execvp's callers do;
  * - a signal the vfork child sends itself, whose handler stores into the
@@ -45,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -251,15 +254,22 @@ int main(int argc, char **argv) {
   wait_ok(child, "exec child");
   REQUIRE(record->exec_count == 1, "exec child bumped the counter");
 
-  /* A vfork child stores through the view and exits. */
+  /* A vfork child stores through the view, clears the THP-disable flag of
+   * the address space it shares with the parent, and exits. */
+  REQUIRE(prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) == 0, "set THP disable");
   child = vfork();
   REQUIRE(child >= 0, "vfork exit");
   if (child == 0) {
     record->exit_store = 0x5a5a;
+    if (prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0) != 0) {
+      _exit(2);
+    }
     _exit(0);
   }
   wait_ok(child, "exit child");
   REQUIRE(record->exit_store == 0x5a5a, "exit child's store");
+  REQUIRE(prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0) == 0,
+          "exit child's THP-disable change");
 
   /* A vfork child's execve fails; it goes on in the shared address space,
    * records the error in the view and exits. */

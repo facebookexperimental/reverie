@@ -22336,8 +22336,10 @@ fn run_shared_file_vfork_on_kvm(
 /// execs, one that exits, one whose execve fails, signals handled in the child
 /// and in the parent, a child killed by a signal, a nested vfork, and
 /// posix_spawn. Each store through the views reaches the other processes and
-/// the file, and the parent's views still show the file's bytes afterwards,
-/// with the same output as native Linux.
+/// the file, the THP-disable flag the exiting child clears is clear in the
+/// parent too (Linux keeps it per address space), and the parent's views
+/// still show the file's bytes afterwards, with the same output as native
+/// Linux.
 #[test]
 fn shared_file_vfork_and_posix_spawn_children_match_native() {
     const TEST: &str = "shared_file_vfork_and_posix_spawn_children_match_native";
