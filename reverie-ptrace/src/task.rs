@@ -14263,7 +14263,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
             Some(_) => self.private_inject(task, nr, args, Some(&native), InjectionRestoration::PreserveResult).await,
             None => {
-                self.untraced_syscall_with(task, nr, args, false, Some(&native))
+                self.untraced_syscall_with(task, nr, args, false, Some(&native), InjectionRestoration::PreserveResult)
                     .await
             }
         }

@@ -1085,7 +1085,6 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 82] = [
         "reverie/src/guest.rs",
         109625,
         "2c63259b9f669aebab8931d02598ef25d066184c3e9af57328eece6eef81e9c5",
->>>>>>> 6296fe447 (Restore returning injection frames at stopped completion)
     ),
     (
         "reverie/src/pidfd_self.rs",
