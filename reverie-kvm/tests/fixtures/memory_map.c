@@ -42,7 +42,8 @@
  * - a child that shares the address space, made with vfork, with clone and
  *   with clone3 (CLONE_VM|CLONE_VFORK), stores into a page of the stack and
  *   exits, and the parent prints whether it sees the store (such a child may
- *   not change a mapping before it execs on KVM, which refuses that by name);
+ *   not leave a mapping changed when it exits on KVM, which refuses that by
+ *   name; the mode "protect FAMILY" below has it do so);
  * - a vfork child asks about itself once a sibling thread of its parent has
  *   changed the parent's stack;
  * - a child posix_spawn made executes this program again, which asks as the
@@ -51,6 +52,11 @@
  * about the leader, then changes the leader's stack and sets it back, and
  * the leader asks again; last, the process asks about a live child and
  * about a number no task has.
+ *
+ * With "protect FAMILY" (vfork, clone or clone3) as its second and third
+ * arguments, the process only makes that child, which protects the page,
+ * executable as well, and exits, leaving the change to its parent's stack on
+ * Linux, and prints "protected POINT" once the child exited.
  *
  * A call whose result the test checks prints "result POINT RC ERRNO". The
  * page each change touches lies 32 KiB below the frame that computes it,
@@ -408,17 +414,30 @@ static void partial(void) {
 /* A page of the stack that a child sharing the address space stores into. */
 static uintptr_t shared_page;
 
+/* Whether that child protects the page instead ("protect FAMILY"). */
+static int protecting;
+
 /* What that child does: store into the page and exit, with a system call
- * alone, as a vfork child may. */
+ * alone, as a vfork child may; or protect the page, executable as well, and
+ * exit, which on Linux changes its parent's stack too. */
 static int share_and_store(void *argument) {
   (void)argument;
+  if (protecting) {
+    long rc = syscall(SYS_mprotect, shared_page, PAGE,
+                      PROT_READ | PROT_WRITE | PROT_EXEC);
+    return rc == 0 ? 0 : 91;
+  }
   *(volatile unsigned char *)(shared_page + 17) = 0x91;
   return 0;
 }
 
 /* Prints whether the parent sees the store of a child that shared its
- * address space. */
+ * address space, or that the child protected the page. */
 static void stored(int at) {
+  if (protecting) {
+    printf("protected %d\n", at);
+    return;
+  }
   int seen = *(volatile unsigned char *)(shared_page + 17) == 0x91;
   result(at, seen ? 0 : -1, seen ? 0 : EIO);
   *(volatile unsigned char *)(shared_page + 17) = 0;
@@ -550,6 +569,17 @@ int main(int argc, char **argv) {
   }
   if (argc >= 3 && strcmp(argv[2], "spawned") == 0) {
     ask(SPAWNED);
+    return 0;
+  }
+  if (argc >= 4 && strcmp(argv[2], "protect") == 0) {
+    protecting = 1;
+    if (strcmp(argv[3], "vfork") == 0) {
+      vforked();
+    } else if (strcmp(argv[3], "clone") == 0) {
+      cloned();
+    } else {
+      cloned3();
+    }
     return 0;
   }
   ask(START);

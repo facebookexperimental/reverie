@@ -2946,6 +2946,12 @@ pub(super) fn validate_process_clone_flags(flags: u64) -> Result<(), CloneFlagsR
     {
         return unsupported(libc::ENOTSUP);
     }
+    // reverie-kvm runs a vfork-style child on a copy whose changes go back to
+    // the parent when its window ends (`GuestMemory::return_vfork_changes`).
+    // That write-back is exact only while the parent gets no TID store after
+    // the copy is taken: a CLONE_PARENT_SETTID store there would be undone by
+    // the copy's stale page. Admitting these flags must store into the copy
+    // as well.
     if shared_address_space != 0 && flags & PROCESS_CLONE_TID_FLAGS != 0 {
         return unsupported(libc::ENOTSUP);
     }

@@ -34,8 +34,10 @@
 //! child after its parent's sibling thread changed the parent's stack, which
 //! the child's copy lacks. A child sharing the address space (vfork, and
 //! clone or clone3 with CLONE_VM|CLONE_VFORK) that stores into the stack
-//! leaves the store to its parent and the map as it was; such a child may not
-//! change a mapping before it execs, which the backend refuses by name. A call the backend refuses where Linux applies it (MADV_DONTFORK,
+//! leaves the store to its parent and the map as it was; such a child that
+//! leaves a page of the stack protected when it exits, which Linux leaves to
+//! its parent, is refused by name. A call the backend refuses where Linux
+//! applies it (MADV_DONTFORK,
 //! and a MAP_FIXED mapping in the window) leaves the list as it was, and mlock,
 //! which it refuses too, is compared with Linux's stack without the mlock.
 //! Another process's map is not provided, and a number no task has is ESRCH.
@@ -596,6 +598,59 @@ fn a_kvm_guest_lists_its_stack_window_as_linux_does() {
 
 /// An image whose `PT_GNU_STACK` header has `PF_X`: Linux maps its stack
 /// executable, and the entry says so.
+/// A child sharing the address space (vfork, and clone or clone3 with
+/// CLONE_VM|CLONE_VFORK) protects a page of the stack, executable as well,
+/// and exits. On Linux the change is its parent's: the parent's stack is
+/// split around that page. The child runs on a copy here, which carries back
+/// contents, not mappings, so a mapping change still in place when the
+/// child's window ends is refused by name, for each of the three, rather
+/// than lost.
+#[test]
+fn a_child_sharing_the_address_space_cannot_leave_the_stack_protected() {
+    Kvm::new().expect("memory map test requires usable /dev/kvm");
+    let directory = Directory::new();
+    let executable = compile(&directory, "memory_map", MEMORY_MAP_C, &[]);
+    for (family, point) in [("vfork", VFORKED), ("clone", CLONED), ("clone3", CLONED3)] {
+        let run = std::process::Command::new(&executable)
+            .args(["native", "protect", family])
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(run.status.success(), "{family} native: {run:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            format!("protected {point}\n"),
+            "{family} native"
+        );
+        let argv = [executable.to_str().unwrap(), "tool", "protect", family];
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_file_with_context(
+                std::fs::File::open(&executable).unwrap(),
+                &argv,
+                &[],
+                &directory.0,
+            )
+            .unwrap();
+        let error = match futures::executor::block_on(
+            backend.run_static_elf_with_tool::<FactTool>((), true),
+        ) {
+            Ok((_, code, stdout, stderr)) => panic!(
+                "{family}: expected the refusal, got code={code} stdout={stdout:?} \
+                 stderr={stderr:?}"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(
+                "unsupported KVM vfork child operation vfork write-back: the vfork child left \
+                 a mapping changed"
+            ),
+            "{family}: {error:?}"
+        );
+    }
+}
+
 #[test]
 fn a_kvm_guest_with_an_executable_stack_reports_it() {
     Kvm::new().expect("memory map test requires usable /dev/kvm");

@@ -12200,6 +12200,11 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "vfork_children_share_private_memory_with_their_parent_like_native",
         "a_vfork_child_cannot_leave_a_mapping_changed",
         "a_vfork_child_and_a_parent_thread_storing_one_byte_are_refused_by_name",
+        "a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native",
+        "a_vfork_parent_thread_killed_by_its_leaders_exec_leaves_the_child_running_like_native",
+        "a_vfork_parent_whose_process_exits_during_the_window_exits_like_native",
+        "a_vfork_child_creating_a_thread_is_refused_by_name",
+        "a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name",
         "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native",
         "pdeathsig::unchanged_six_check_state_matches_native_controlled",
         "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
@@ -22543,8 +22548,9 @@ fn vfork_children_share_private_memory_with_their_parent_like_native() {
 /// runs on here carries back only its contents. A mapping it creates, stores
 /// into and removes, with its protection changed and restored in between,
 /// leaves its parent as on Linux. A change still in place when the child
-/// exits (mmap, munmap, mprotect or mremap) is refused by name then, and a
-/// brk that moves the break is refused at the call.
+/// exits (mmap, munmap, mprotect or mremap, and a page unmapped and mapped
+/// again with the protection it had) is refused by name then, and a brk that
+/// moves the break is refused at the call.
 #[test]
 fn a_vfork_child_cannot_leave_a_mapping_changed() {
     const TEST: &str = "a_vfork_child_cannot_leave_a_mapping_changed";
@@ -22557,7 +22563,9 @@ fn a_vfork_child_cannot_leave_a_mapping_changed() {
         "vfork-shares-memory",
         include_str!("fixtures/vfork_shares_memory.c"),
     );
-    for call in ["scratch", "mmap", "munmap", "mprotect", "mremap", "brk"] {
+    for call in [
+        "scratch", "mmap", "munmap", "mprotect", "mremap", "remap", "brk",
+    ] {
         let args = ["map-change", call];
         let label = args.join("-");
         let native = run_shared_file_vfork_natively(
@@ -22650,6 +22658,237 @@ fn a_vfork_child_and_a_parent_thread_storing_one_byte_are_refused_by_name() {
             "mode={name}: {error:?}"
         );
     }
+}
+
+/// Runs the vfork fixture with `args` natively and on KVM in every mode, and
+/// requires KVM's exit code, stdout and stderr to be native's, with `expected`
+/// native's stdout and `code` its exit code.
+fn assert_vfork_fixture_matches_native(test: &str, args: &[&str], expected: &str, code: i32) {
+    assert_vfork_fixture_matches_native_in(test, args, expected, code, &SHARED_FILE_VFORK_MODES);
+}
+
+/// [`assert_vfork_fixture_matches_native`] in `modes` only.
+fn assert_vfork_fixture_matches_native_in(
+    test: &str,
+    args: &[&str],
+    expected: &str,
+    code: i32,
+    modes: &[(&str, Option<ThreadOwnership>)],
+) {
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    let label = args.join("-");
+    let native =
+        run_shared_file_vfork_natively(&directory.0, &program, &format!("native-{label}"), args);
+    assert_eq!(
+        native.status.code(),
+        Some(code),
+        "{test} {label}: {native:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        expected,
+        "{test} {label}: {native:?}"
+    );
+    assert!(native.stderr.is_empty(), "{test} {label}: {native:?}");
+    for &mode in modes {
+        let name = mode.0;
+        let (_, kvm_code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, mode, args)
+                .unwrap_or_else(|error| panic!("{test} {label} mode={name}: {error}"));
+        assert_eq!(
+            kvm_code, code,
+            "{test} {label} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            expected,
+            "{test} {label} mode={name}"
+        );
+        assert_eq!(stderr, native.stderr, "{test} {label} mode={name}");
+        eprintln!("{test} {label} completed {name}");
+    }
+}
+
+/// Runs the vfork fixture with `args` natively, requiring `native_stdout`,
+/// and on KVM in every mode, requiring the run to be refused with `refusal`
+/// in its error.
+fn assert_vfork_fixture_refused(test: &str, args: &[&str], native_stdout: &str, refusal: &str) {
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "vfork-shares-memory",
+        include_str!("fixtures/vfork_shares_memory.c"),
+    );
+    let label = args.join("-");
+    let native =
+        run_shared_file_vfork_natively(&directory.0, &program, &format!("native-{label}"), args);
+    assert_eq!(native.status.code(), Some(0), "{test} {label}: {native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        native_stdout,
+        "{test} {label}: {native:?}"
+    );
+    for mode in SHARED_FILE_VFORK_MODES {
+        let name = mode.0;
+        let error = match run_shared_file_vfork_on_kvm(&directory.0, &program, mode, args) {
+            Ok((_, code, stdout, stderr)) => panic!(
+                "{test} {label} mode={name}: expected the refusal, got code={code} \
+                 stdout={stdout:?} stderr={stderr:?}"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(refusal),
+            "{test} {label} mode={name}: expected {refusal:?} in {error:?}"
+        );
+        eprintln!("{test} {label} refused {name}");
+    }
+}
+
+/// A vfork child registers a word of its parent holding 91 as its
+/// clear_child_tid (set_tid_address) and ends its window: by a successful
+/// exec, by a failed exec and an exit, by an exit, by death from SIGTERM, or
+/// by death from a fault (SIGSEGV).
+/// Linux's mm_release() clears the word before the parent's call returns,
+/// since the parent shares the mm, so the parent reads 0 in every case; a
+/// failed exec keeps the registration (the child still reads 91 after it),
+/// and the child's exit clears it. Another thread of the parent waiting on
+/// the word is woken, rather than left to its 5 s timeout.
+#[test]
+fn a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native() {
+    const TEST: &str = "a_vfork_child_clears_its_clear_child_tid_word_in_its_parent_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    for (ending, expected) in [
+        (
+            "exec",
+            "clear-tid exec: word=0 after-failed-exec=0 exit 0\n",
+        ),
+        (
+            "failed-exec",
+            "clear-tid failed-exec: word=0 after-failed-exec=91 exit 0\n",
+        ),
+        (
+            "exit",
+            "clear-tid exit: word=0 after-failed-exec=0 exit 0\n",
+        ),
+        (
+            "signal",
+            "clear-tid signal: word=0 after-failed-exec=0 signal 15\n",
+        ),
+        // A death by a fault, which the backend takes at the fault's
+        // boundary rather than at a system call's return.
+        (
+            "segv",
+            "clear-tid segv: word=0 after-failed-exec=0 signal 11\n",
+        ),
+        // Another thread of the parent waits on the word: the wake reaches
+        // the parent's word, not the copy's.
+        (
+            "exit-wake",
+            "clear-tid exit-wake: word=0 waiter woken exit 0\n",
+        ),
+    ] {
+        assert_vfork_fixture_matches_native(TEST, &["clear-tid", ending], expected, 0);
+    }
+}
+
+/// A second thread of a process vforks a child that blocks in its window,
+/// and the main thread execs meanwhile. Linux's vfork wait is killable: the
+/// exec kills the waiting thread, the child runs on as the process's child,
+/// and the new image releases and reaps it, whose store went to the old
+/// image. The waiting thread here retires as the exec cancels it, and keeps
+/// its child for the process, rather than holding the exec up.
+///
+/// Only threads the tool runs wait this way. A thread run without the tool
+/// (no tool at all, or host-owned threads) runs its children inline, on its
+/// own host thread, as it runs every fork child: such a thread cannot retire
+/// before its child ends, so the exec waits for the child, which here waits
+/// for the exec. That limit is the direct personality's, for fork children
+/// as well.
+#[test]
+fn a_vfork_parent_thread_killed_by_its_leaders_exec_leaves_the_child_running_like_native() {
+    const TEST: &str =
+        "a_vfork_parent_thread_killed_by_its_leaders_exec_leaves_the_child_running_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    assert_vfork_fixture_matches_native_in(
+        TEST,
+        &["leader-exec"],
+        "leader-exec: stored=7 after=7 child exit 7\n",
+        0,
+        &[("tool", Some(ThreadOwnership::Tool))],
+    );
+}
+
+/// The main thread vforks a child that blocks until a pipe only its parent's
+/// process can write reaches end of file, and another thread exits the process
+/// with status 3 during the window. Linux's vfork wait is killable, so the
+/// process exits 3 at once, and its end closes the pipe for the child. The
+/// waiting thread here ends its wait as the group exits. Without a tool the
+/// main thread runs its child inline, as the test above says, so that mode is
+/// left out.
+#[test]
+fn a_vfork_parent_whose_process_exits_during_the_window_exits_like_native() {
+    const TEST: &str = "a_vfork_parent_whose_process_exits_during_the_window_exits_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    assert_vfork_fixture_matches_native_in(
+        TEST,
+        &["parent-dies"],
+        "",
+        3,
+        &SHARED_FILE_VFORK_MODES[1..],
+    );
+}
+
+/// A vfork child that creates a thread is refused by name at the call: Linux
+/// completes the vfork when the creating task execs or exits, whatever
+/// threads of the child remain, and the child's copy cannot go back to its
+/// parent while another thread still changes it.
+#[test]
+fn a_vfork_child_creating_a_thread_is_refused_by_name() {
+    const TEST: &str = "a_vfork_child_creating_a_thread_is_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    assert_vfork_fixture_refused(
+        TEST,
+        &["thread-in-child"],
+        "thread-in-child: exit 0\n",
+        "unsupported KVM vfork child operation thread creation in a vfork child: a vfork child \
+         shares its parent's address space until it execs or exits",
+    );
+}
+
+/// Another thread of a vfork child's parent maps a new anonymous page with
+/// MAP_FIXED over a page the child stored into, during the window, with the
+/// protection the page had. On Linux the child's store went with the old
+/// page, and the parent reads zero. The copy cannot tell that store from one
+/// to the new page, so the write-back is refused by name rather than leave
+/// the child's byte in the new page.
+#[test]
+fn a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name() {
+    const TEST: &str =
+        "a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    assert_vfork_fixture_refused(
+        TEST,
+        &["parent-remap"],
+        "parent-remap: child ok, page[100]=0\n",
+        "unsupported KVM vfork child operation vfork write-back: another thread of the parent \
+         removed or replaced the mapping of a page the vfork child changed during the window",
+    );
 }
 
 #[test]

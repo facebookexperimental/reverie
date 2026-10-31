@@ -5567,18 +5567,22 @@ impl KvmBackend {
         self.release_thread_slot();
         self.clear_registered_worker_tid_before_exit(executor);
         // A vfork child whose last thread has ended can change its copy no
-        // more. Its changes to private memory go back now, before its
-        // descriptors close, as Linux releases a vfork child's mm
-        // (`exit_mm()`) before it closes the child's files (`exit_files()`):
-        // another thread of the parent that sees a pipe the child held close
-        // sees them too. With another thread of the child still running in
-        // the copy they go back below, once that thread has been joined.
+        // more. Its clear_child_tid word is cleared and woken and its changes
+        // to private memory go back now, before its descriptors close, as
+        // Linux releases a vfork child's mm (`exit_mm()`, whose
+        // mm_release() makes both) before it closes the child's files
+        // (`exit_files()`): another thread of the parent that sees a pipe the
+        // child held close sees them too. With another thread of the child
+        // still running in the copy they go back below, once that thread has
+        // been joined.
         let outcome = match outcome {
-            Ok(exit) if pid == tid && !executor.has_live_sibling_thread() => self
-                .memory
-                .return_vfork_changes(crate::bootstrap::BOOT_RESERVED_END)
-                .map(|_| exit)
-                .map_err(|error| self.report_tool_failure("vfork write-back", error)),
+            Ok(exit) if pid == tid && !executor.has_live_sibling_thread() => {
+                let clear_child_tid = self.take_vfork_clear_child_tid(executor);
+                self.memory
+                    .return_vfork_changes(crate::bootstrap::BOOT_RESERVED_END, clear_child_tid)
+                    .map(|_| exit)
+                    .map_err(|error| self.report_tool_failure("vfork write-back", error))
+            }
             outcome => outcome,
         };
         let cleanup = executor.finish_terminal_cleanup().await;
@@ -5621,20 +5625,25 @@ impl KvmBackend {
             // or here once its other threads have been joined) before the
             // parent, kept inside its call, goes on, and before a wait can
             // see this exit. The parent goes on only after the child's
-            // descriptors have closed.
+            // descriptors have closed. A refused write-back is published as
+            // the run's failure before the release, so the parent's wait
+            // returns no result.
             let returned = match (&outcome, &workers) {
-                (Ok(_), Ok(())) => self
-                    .memory
-                    .return_vfork_changes(crate::bootstrap::BOOT_RESERVED_END)
-                    .map(drop),
+                (Ok(_), Ok(())) => {
+                    let clear_child_tid = self.take_vfork_clear_child_tid(executor);
+                    self.memory
+                        .return_vfork_changes(crate::bootstrap::BOOT_RESERVED_END, clear_child_tid)
+                        .map(drop)
+                }
                 _ => Ok(()),
             };
-            self.release_vfork_parent();
-            match (outcome, returned) {
+            let outcome = match (outcome, returned) {
                 (outcome, Ok(())) => outcome,
                 (Ok(_), Err(error)) => Err(self.report_tool_failure("vfork write-back", error)),
                 (Err(error), Err(_)) => Err(error),
-            }
+            };
+            self.release_vfork_parent();
+            outcome
         } else {
             outcome
         };

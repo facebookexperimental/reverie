@@ -17,7 +17,12 @@
 //! child's last exit (a death by a signal included),
 //! [`GuestMemory::return_vfork_changes`] writes what the child changed in
 //! private memory into the parent, so the parent resumes with the memory Linux
-//! would give it.
+//! would give it. It first makes the old mm's release effects of Linux's
+//! `mm_release()`, which runs before the vfork completion whenever another
+//! user of the mm exists, as the waiting parent is: the word the child
+//! registered as its `clear_child_tid` (by `set_tid_address(2)`) is cleared
+//! in the copy, so the store goes back with the child's other changes, and
+//! one waiter on the parent's word is woken once it holds the store.
 //!
 //! The comparison cannot miss a change. Every guest-visible page of user
 //! memory is one of three kinds, in the child and in the parent alike:
@@ -41,7 +46,10 @@
 //! that does not map its user pages exactly as the parent does (with a
 //! baseline, as the copy did when the child started) is refused by name: on
 //! Linux the change would be the parent's too, and a copy carries back
-//! contents, not mappings. The executor refuses a `brk` that moves the break
+//! contents, not mappings. Exactly means the same mapping too, not only the
+//! same protection: each new mapping has an incarnation of its own, so a page
+//! the child unmapped and mapped again, or replaced with `MAP_FIXED`, with
+//! the protection and file offset it had, still differs. The executor refuses a `brk` that moves the break
 //! at the call, since the break is the parent's too even where it moves
 //! within a page. So the copy and the parent map the same pages, and writing
 //! contents back is enough. A page the child no longer maps held a mapping it
@@ -54,8 +62,10 @@
 //! thread can: the copy then keeps a baseline from before the child ran
 //! ([`GuestMemory::keep_vfork_baseline`]), and only the bytes the child changed
 //! go back. A byte that another thread also changed, to a different value, and
-//! a changed page whose mapping another thread replaced or removed, are refused
-//! by name: a copy cannot order those stores. What remains different from
+//! a changed page whose mapping another thread replaced (by a new mapping over
+//! it, `MAP_FIXED` or an unmap and a new mapping, whatever its protection) or
+//! removed, are refused by name: a copy cannot order those stores, and on
+//! Linux a store to a replaced mapping went with it. What remains different from
 //! Linux, where the two share the address space, is that during the window
 //! neither sees the other's stores to private memory: a child that reads memory
 //! another thread of its parent changed during the window sees the value from
@@ -63,6 +73,19 @@
 //! value from before the child's store, and a store that leaves a byte as it
 //! was cannot be told from no store, so the child's change to that byte goes
 //! back over it.
+//!
+//! Comparing the end of the window with its start cannot see what happened in
+//! between, so three more cases are documented limits rather than refusals: a
+//! byte the child changed and changed back (or another thread did, an ABA),
+//! which reads as never changed; a store back to the baseline's value, which
+//! reads as no store; and the same final value written independently by the
+//! child and another thread, which merges silently, so a counter that both
+//! incremented once ends one short of Linux's value.
+//!
+//! The child must not create threads during its window: the provider refuses
+//! that by name at the call. Linux completes the vfork when the creating task
+//! execs or exits, whatever threads of the child survive, and a copy whose
+//! other threads still run cannot go back then.
 //!
 //! While the changes go back, the parent's calling thread is still in its
 //! call, but its other threads run unless the tool holds them. A tool that
@@ -80,8 +103,9 @@ use super::*;
 pub(super) struct VforkParent {
     memory: GuestMemory,
     /// The parent's exec count when the copy was taken. A parent that execs
-    /// during the window (from another of its threads) has a new address
-    /// space, which the child's changes do not reach on Linux either.
+    /// during the window (from another of its threads, which kills the
+    /// waiting caller) has a new address space, which the child's changes do
+    /// not reach on Linux either.
     exec_count: u64,
     baseline: Option<VforkBaseline>,
 }
@@ -154,6 +178,13 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Whether this memory is a vfork child's copy whose window is still
+    /// open: its changes have yet to go back to its parent
+    /// ([`GuestMemory::return_vfork_changes`]), and the child has not exec'd.
+    pub fn has_vfork_parent(&self) -> bool {
+        self.mapping.vfork_parent.lock().unwrap().is_some()
+    }
+
     /// Ends this vfork child's window: writes what the child changed in
     /// private user memory, the pages from physical `user_start` on, into its
     /// parent, once. The pages below `user_start` are the backend's own (page
@@ -168,6 +199,16 @@ impl GuestMemory {
     /// [`Error::VforkChildCapability`] before anything is written, and a page
     /// the copy no longer maps is not written.
     ///
+    /// `clear_child_tid` is the address the child registered as its
+    /// `clear_child_tid`, which the caller has taken from the child: Linux's
+    /// `mm_release()` stores zero there and wakes one waiter before the vfork
+    /// completes, since the parent still uses the mm. The store goes to this
+    /// copy before the comparison, so it goes back with the child's other
+    /// changes, best effort as Linux's `put_user` (a bad address stores
+    /// nothing); the wake goes to the parent's word once the write-back
+    /// reached it, and to nothing when the parent exec'd. Without a vfork
+    /// parent the address is not used.
+    ///
     /// The parent's calling thread must not run while this runs: the backend
     /// keeps it inside its call until afterwards. With a baseline
     /// ([`GuestMemory::keep_vfork_baseline`]) only the bytes the child
@@ -177,21 +218,44 @@ impl GuestMemory {
     /// another thread replaced or removed: a copy cannot order those stores.
     /// The module documentation says what holds for the parent's other
     /// threads.
-    pub fn return_vfork_changes(&self, user_start: u64) -> Result<VforkWriteBack> {
+    pub fn return_vfork_changes(
+        &self,
+        user_start: u64,
+        clear_child_tid: Option<u64>,
+    ) -> Result<VforkWriteBack> {
         let Some(link) = self.mapping.vfork_parent.lock().unwrap().take() else {
             return Ok(VforkWriteBack::default());
         };
+        if let Some(address) = clear_child_tid {
+            let _ = self.user().put_user_i32(address, 0);
+        }
+        let Some(result) = self.write_back_to(&link, user_start)? else {
+            return Ok(VforkWriteBack::default());
+        };
+        if let Some(address) = clear_child_tid {
+            wake_one_waiter(&link.memory, address);
+        }
+        Ok(result)
+    }
+
+    /// The write-back of [`GuestMemory::return_vfork_changes`], under the
+    /// parent's allocation guard; `None` when the parent exec'd since the
+    /// copy was taken.
+    fn write_back_to(&self, link: &VforkParent, user_start: u64) -> Result<Option<VforkWriteBack>> {
         let parent = &link.memory;
+        // No layout change in the parent while its memory is compared. The
+        // exec count is read under the same guard: an exec increments it
+        // before it takes the guard to replace the image, so either this
+        // write-back ends before the old image goes, or it sees the exec.
+        let _allocation = parent.allocation_guard();
         if parent
             .mapping
             .exec_count
             .load(std::sync::atomic::Ordering::Acquire)
             != link.exec_count
         {
-            return Ok(VforkWriteBack::default());
+            return Ok(None);
         }
-        // No layout change in the parent while its memory is compared.
-        let _allocation = parent.allocation_guard();
         let page_size = PAGE_SIZE as u64;
         let first = user_start.max(self.guest_base()).div_ceil(page_size);
         let end = self.guest_end() / page_size;
@@ -257,7 +321,7 @@ impl GuestMemory {
             };
             index = last;
         }
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Writes the pages of `[first, end)` that differ between this copy and
@@ -357,14 +421,26 @@ impl GuestMemory {
 
     /// Refuses a page the child changed whose mapping another thread of this
     /// parent removed or replaced during the window: on Linux the child's
-    /// stores went to the old mapping.
+    /// stores went to the old mapping. A replaced page has another mapping
+    /// incarnation than the baseline's, whatever its protection, and a
+    /// separately backed one another installation.
     fn check_vfork_page_unchanged(&self, page: u64, baseline: &VforkBaseline) -> Result<()> {
+        let started = baseline
+            .memory
+            .mapping
+            .address_space
+            .lock()
+            .unwrap()
+            .mapping_incarnations
+            .get(&page)
+            .copied();
         let state = self.mapping.address_space.lock().unwrap();
         let installed = state
             .backing_pages
             .get(&page)
             .map(|installed| installed._generation);
         if !state.pages.contains_key(&page)
+            || state.mapping_incarnations.get(&page).copied() != started
             || installed != baseline.parent_backing.get(&page).copied()
         {
             return Err(Error::VforkChildCapability {
@@ -378,13 +454,18 @@ impl GuestMemory {
 
     /// Whether this memory maps every user page from `first` on exactly as
     /// `reference` does: the same pages, with the same access and declared
-    /// mapping, of the same files at the same offsets, and the same shared
-    /// anonymous pages. (The backend's Tool-scratch pages lie below the user
-    /// range.)
+    /// mapping, of the same mapping incarnation (so a page mapped again is
+    /// not the same, see `AddressSpaceState::mapping_incarnations`), of the
+    /// same files at the same offsets, and the same shared anonymous pages.
+    /// (The backend's Tool-scratch pages lie below the user range.)
     fn maps_user_pages_as(&self, reference: &GuestMemory, first: u64) -> bool {
         let mine = self.mapping.address_space.lock().unwrap();
         let theirs = reference.mapping.address_space.lock().unwrap();
         mine.pages.range(first..).eq(theirs.pages.range(first..))
+            && mine
+                .mapping_incarnations
+                .range(first..)
+                .eq(theirs.mapping_incarnations.range(first..))
             && mine
                 .file_pages
                 .range(first..)
@@ -475,6 +556,32 @@ impl GuestMemory {
             cursor = extent_end;
         }
         ranges
+    }
+}
+
+/// Linux's `FUTEX_WAKE` of one waiter on the word at `address` in `memory`,
+/// as `mm_release()` wakes a cleared `clear_child_tid` word: shared, not
+/// private, as the kernel's wake is. A word that is not accessible user memory
+/// wakes nobody, as Linux's wake then fails with `EFAULT`.
+fn wake_one_waiter(memory: &GuestMemory, address: u64) {
+    if memory.user().user_accessible_prefix(address, 4).ok() != Some(4) {
+        return;
+    }
+    let Ok(operand) = memory.user().retain_translated_range(address, 4) else {
+        return;
+    };
+    // SAFETY: the word is accessible user memory, and the operand keeps its
+    // host mapping alive for this call. FUTEX_WAKE reads nothing through it.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            operand.address(),
+            libc::FUTEX_WAKE,
+            1,
+            0,
+            0,
+            0,
+        );
     }
 }
 

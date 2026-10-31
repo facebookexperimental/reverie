@@ -279,7 +279,8 @@ struct Mapping {
     /// the child shares with its parent on Linux
     /// ([`GuestMemory::snapshot_sharing_address_space`]), from the copy until
     /// the child's exec ([`GuestMemory::retire_shared_files_for_exec`]). While
-    /// it is, the child's mappings may not change
+    /// it is, the child may change a mapping only for a while: a change still
+    /// in place when its window ends is refused then
     /// ([`GuestMemory::shares_parent_address_space`]).
     shares_parent_address_space: std::sync::atomic::AtomicBool,
     /// The parent of a vfork child's copy, until the child's changes to
@@ -326,6 +327,12 @@ impl UserWindow {
     }
 }
 
+/// The next mapping incarnation (`AddressSpaceState::mapping_incarnations`),
+/// unique in the process, so two copies of one address space never give two
+/// different mappings the same one.
+static NEXT_MAPPING_INCARNATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Clone, Debug)]
 struct AddressSpaceState {
     coverage: IdentityCoverage,
@@ -343,6 +350,15 @@ struct AddressSpaceState {
     /// The physical pages of `MAP_SHARED | MAP_ANONYMOUS` mappings. Their
     /// contents survive `MADV_DONTNEED`, which drops private anonymous pages.
     shared_anonymous_pages: Versioned<BTreeSet<u64>>,
+    /// The incarnation of the mapping each page belongs to, by physical page:
+    /// one value per new mapping ([`GuestMemory::record_page_backing`]),
+    /// unique in the process, which a move keeps and an unmap removes, and
+    /// which a protection change does not touch. A page that holds the same
+    /// state in two copies of one address space but another incarnation was
+    /// mapped again in one of them, though nothing else about it differs: a
+    /// vfork child's write-back compares them
+    /// ([`GuestMemory::return_vfork_changes`]).
+    mapping_incarnations: BTreeMap<u64, u64>,
     /// Facts about hidden Tool-scratch pages that let the next expose and
     /// hide skip every tree; see [`ScratchCache`].
     scratch_cache: ScratchCache,
@@ -546,6 +562,7 @@ impl AddressSpaceState {
             pages: UserPages::new(),
             file_pages: Versioned::new(BTreeMap::new()),
             shared_anonymous_pages: Versioned::new(BTreeSet::new()),
+            mapping_incarnations: BTreeMap::new(),
             scratch_cache: ScratchCache::default(),
             backing_pages: BTreeMap::new(),
         }
@@ -1658,8 +1675,8 @@ impl GuestMemory {
     /// this memory's one participant stopped, or none. The copy keeps this
     /// memory as its parent: when the child's window ends, its changes to
     /// private memory go back here ([`GuestMemory::return_vfork_changes`]),
-    /// and until then its provider refuses every change to its mappings
-    /// ([`GuestMemory::shares_parent_address_space`]).
+    /// once the copy maps its pages as this memory did when the copy was
+    /// taken ([`GuestMemory::shares_parent_address_space`]).
     pub fn snapshot_sharing_address_space(&self) -> Result<Self> {
         let copy = self.snapshot_keeping(copy_sparse_file, true)?;
         copy.link_vfork_parent(self);
@@ -1674,15 +1691,17 @@ impl GuestMemory {
     /// On Linux such a child maps, unmaps and protects memory in its
     /// parent's address space; here only the changes to the contents of
     /// private memory go back to the parent, when the window ends
-    /// ([`GuestMemory::return_vfork_changes`]). While this holds, the provider
-    /// refuses every guest call that would change the copy's mappings (mmap,
-    /// munmap, mprotect, mremap and a brk that moves the break) with
-    /// [`Error::VforkChildCapability`] before it changes anything. As a
-    /// backstop below the provider, a publication that would install, replace
-    /// or withdraw a shared view, and a protection change over one, are
-    /// refused with [`Error::SharedFileCapability`], so that the parent's
-    /// shared views, which the copy's stores still reach, are exactly the
-    /// child's when the parent resumes.
+    /// ([`GuestMemory::return_vfork_changes`]). So the child may change a
+    /// mapping only for a while: a copy that does not map its pages as when
+    /// the child started, when its window ends, is refused then with
+    /// [`Error::VforkChildCapability`] before anything goes back. While this
+    /// holds, the provider refuses a brk that moves the break, and the
+    /// creation of a thread, at the call. As a backstop below the provider, a
+    /// publication that would install, replace or withdraw a shared view,
+    /// and a protection change over one, are refused at once with
+    /// [`Error::SharedFileCapability`], so that the parent's shared views,
+    /// which the copy's stores still reach, are exactly the child's when the
+    /// parent resumes.
     pub fn shares_parent_address_space(&self) -> bool {
         self.mapping
             .shares_parent_address_space
@@ -2318,6 +2337,7 @@ impl GuestMemory {
         access.pages.clear();
         access.file_pages.edit().clear();
         access.shared_anonymous_pages.edit().clear();
+        access.mapping_incarnations.clear();
         access.reservations.edit().clear();
         access.cursors = None;
     }
@@ -2626,6 +2646,7 @@ impl GuestMemory {
             access.pages.remove(&page);
             access.file_pages.edit().remove(&page);
             access.shared_anonymous_pages.edit().remove(&page);
+            access.mapping_incarnations.remove(&page);
             if !access
                 .reservations
                 .get(&page)
@@ -2646,7 +2667,9 @@ impl GuestMemory {
 
     /// Records what a new mapping of physical `[guest_address, guest_address +
     /// length)` maps: a regular file from byte `offset` (or none), and whether
-    /// it is `MAP_SHARED | MAP_ANONYMOUS`. Whatever the range held before goes.
+    /// it is `MAP_SHARED | MAP_ANONYMOUS`. Whatever the range held before goes,
+    /// and the range takes an incarnation of its own (see
+    /// `AddressSpaceState::mapping_incarnations`).
     pub fn record_page_backing(
         &self,
         guest_address: u64,
@@ -2675,6 +2698,11 @@ impl GuestMemory {
             } else {
                 access.shared_anonymous_pages.edit().remove(&page);
             }
+        }
+        let incarnation =
+            NEXT_MAPPING_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for page in first_page..=last_page {
+            access.mapping_incarnations.insert(page, incarnation);
         }
     }
 
@@ -2926,10 +2954,16 @@ impl GuestMemory {
         let old_shared_anonymous = (old_first..=old_last)
             .map(|page| access.shared_anonymous_pages.contains(&page))
             .collect::<Vec<_>>();
+        // A moved mapping is the same mapping, and a grown one grows its last
+        // page's.
+        let old_incarnations = (old_first..=old_last)
+            .map(|page| access.mapping_incarnations.get(&page).copied())
+            .collect::<Vec<_>>();
         for page in old_first..=old_last {
             access.pages.remove(&page);
             access.file_pages.edit().remove(&page);
             access.shared_anonymous_pages.edit().remove(&page);
+            access.mapping_incarnations.remove(&page);
             if !access
                 .reservations
                 .get(&page)
@@ -2967,6 +3001,15 @@ impl GuestMemory {
             } else {
                 access.shared_anonymous_pages.edit().remove(&page);
             }
+            match old_incarnations
+                .get(index)
+                .or(old_incarnations.last())
+                .copied()
+                .flatten()
+            {
+                Some(incarnation) => access.mapping_incarnations.insert(page, incarnation),
+                None => access.mapping_incarnations.remove(&page),
+            };
             if !access
                 .reservations
                 .get(&page)

@@ -296,13 +296,27 @@ child's successful exec or at its last exit (a death by a signal included),
 the child's changes to private memory, its own stores and what the kernel
 wrote for it (a `read(2)` into a parent buffer, for example), go back to the
 parent before the parent's call returns: glibc's `posix_spawn(3)` child
-reports a failed exec this way, through the parent's memory.
+reports a failed exec this way, through the parent's memory. Before they go
+back, the child's `clear_child_tid` word (registered by
+`set_tid_address(2)`) is cleared and one waiter on the parent's word is
+woken, as Linux's `mm_release()` does for an mm another task still uses; a
+failed exec keeps the registration for the child's later exit. The parent's
+wait is killable, as Linux's is: another thread's exec or exit of the whole
+group, or a run failure, ends it with no result, and the child runs on,
+handed to the process as the waiting thread retires; its changes then go
+back to nothing if the parent exec'd. This holds for threads the tool runs.
+A thread run without the tool (no tool at all, or host-owned threads) runs
+its fork and vfork children inline, on its own host thread, so it cannot end
+its call before the child ends: a child that waits for that thread's exec or
+exit then waits forever, a limit of that personality.
 
 The copy carries back contents, not mappings, so the child may change a
 mapping only for a while. When the window ends, a mapping still changed (by
 `mmap(2)`, `munmap(2)`, `mprotect(2)` or `mremap(2)`) is refused by name,
 with the `VforkChildCapability` error for the operation `vfork write-back`,
-before anything goes back: on Linux the change would be the parent's too. A
+before anything goes back: on Linux the change would be the parent's too.
+Each new mapping has an incarnation of its own, so a page mapped again with
+the protection it had is a change as well. A
 mapping the child creates and removes again in between, as a tool's scratch
 page for an injected call is, leaves nothing to refuse, and the stores to it
 do not go back, as Linux discards them with it. A `brk(2)` that moves the
@@ -310,21 +324,34 @@ break is refused at the call, since the break is the parent's too even where
 it moves within a page. Both apply to vfork children of processes that hold
 no shared view as well, which used to change only their copy. A call that
 would change an inherited shared view or map a new one is refused at the
-call, as before.
+call, as before. A vfork child may not create a thread (`clone(2)` or
+`clone3(2)` with `CLONE_THREAD`) before it execs, a known limitation refused
+by name at the call (`thread creation in a vfork child`): Linux ends the
+window when the creating task execs or exits, whatever threads of the child
+remain, and a copy cannot go back while another thread still changes it. A
+multithreaded parent is not affected.
 
 When the parent has another live thread, the copy keeps a baseline of itself
 as the child started, and only the bytes the child changed go back, so the
 other thread's stores during the window stay. A byte the child and such a
 thread both changed to different values, and a page the child changed whose
-mapping such a thread replaced or removed, are refused by name when the window
-ends: a copy cannot order those stores. What remains different from Linux is
+mapping such a thread replaced (by any new mapping over it, whatever its
+protection) or removed, are refused by name when the window ends: a copy
+cannot order those stores. What remains different from Linux is
 that during the window the child and the parent's other threads do not see
 each other's stores to private memory: a child that reads memory another
 thread of its parent changed during the window sees the value from before the
 window, a thread that reads memory the child changed sees the value from
 before the child's store, and a store that leaves a byte as it was cannot be
 told from no store, so the child's change to that byte goes back over it.
-While the changes go back, the parent's other threads run unless the tool
+Since only the end of the window is compared with its start, three cases are
+documented limits rather than refusals: a byte changed and changed back
+during the window (an ABA) reads as unchanged, a store of the baseline's
+value reads as no store, and the same final value written independently by
+the child and another thread merges silently (a counter that both
+incremented once ends one short of Linux's value). The write-back compares
+every page that holds data, so it costs time in proportion to the memory the
+parent has touched, for each vfork-style child. While the changes go back, the parent's other threads run unless the tool
 holds them. A tool that serializes the guest's threads, and runs none of them
 from the child's exit or exec until the parent's call returns, has the
 write-back see no concurrent store; without one, a store another thread makes

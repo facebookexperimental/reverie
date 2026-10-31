@@ -57,6 +57,48 @@ pub(super) fn vfork_child_moves_break(
         && args[0] != state.program_break
 }
 
+/// Why a vfork child may not create a thread before it execs
+/// ([`vfork_child_creates_thread`]).
+pub(super) const VFORK_CHILD_THREAD_REASON: &str = concat!(
+    "a vfork child shares its parent's address space until it execs or exits, and runs on ",
+    "a copy here whose changes go back to the parent when its window ends; Linux ends that ",
+    "window when the creating task execs or exits, whatever threads of the child still run, ",
+    "and a copy cannot go back while another thread still changes it"
+);
+
+/// Whether this call creates a thread (`CLONE_THREAD`) in a vfork child's
+/// copy of its parent's address space
+/// ([`GuestMemory::shares_parent_address_space`]) before the child execs.
+/// The window ends, on Linux, at the creating task's exec or exit
+/// (`mm_release()` completes the vfork whatever other users of the mm
+/// remain), while here the copy's changes can go back only once nothing
+/// else runs in it, so the thread is refused before task-ID allocation,
+/// child copyout or any process action. A multithreaded parent is not
+/// affected, and a nested vfork-style child (`CLONE_VM|CLONE_VFORK`) goes on.
+/// `clone3`'s flags are read here and again by the call itself: nothing else
+/// runs in the copy, whose only thread is this caller, so the two reads agree.
+pub(super) fn vfork_child_creates_thread(
+    memory: &GuestMemory,
+    number: u64,
+    args: &[u64; 6],
+) -> bool {
+    if !memory.shares_parent_address_space() {
+        return false;
+    }
+    let flags = if number == libc::SYS_clone as u64 {
+        args[0]
+    } else if number == libc::SYS_clone3 as u64 {
+        match read_clone3(&ProviderMemory(memory), args[0], args[1]) {
+            Ok(clone) => clone.flags,
+            // The call itself answers a bad argument.
+            Err(_) => return false,
+        }
+    } else {
+        return false;
+    };
+    flags & libc::CLONE_THREAD as u64 != 0
+}
+
 /// Whether a `clone` or `clone3` with `flags` would run its child in the
 /// caller's address space beside the caller: a thread (`CLONE_THREAD`), or a
 /// `CLONE_VM` process that the caller does not wait for (no `CLONE_VFORK`).
@@ -923,6 +965,12 @@ impl ElfExecutor {
         // without CLONE_VFORK, would be another owner of this arena running
         // beside the caller, and is refused before task-ID allocation, child
         // copyout or ProcessAction.
+        if vfork_child_creates_thread(memory, request.number(), request.args()) {
+            return Err(crate::Error::VforkChildCapability {
+                operation: "thread creation in a vfork child",
+                reason: VFORK_CHILD_THREAD_REASON,
+            });
+        }
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-919): Review shared-file fork admission.
         if memory.entry_gate().single_member_domain_active() {

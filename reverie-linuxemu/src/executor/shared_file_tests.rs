@@ -1149,12 +1149,89 @@ mod shared_file_dispatch_tests {
                 &file[PAGE_SIZE as usize + 17..PAGE_SIZE as usize + 23],
                 b"shared"
             );
-            child.return_vfork_changes(BOOT_RESERVED_END).unwrap();
+            child.return_vfork_changes(BOOT_RESERVED_END, None).unwrap();
             f.memory.read_raw(private, &mut bytes).unwrap();
             assert_eq!(&bytes, b"child!", "{label}");
             assert!(f.memory.entry_gate().pending_failure().is_none(), "{label}");
             assert!(child.entry_gate().pending_failure().is_none(), "{label}");
         }
+    }
+
+    /// A vfork child's copy refuses the creation of a thread by name, with
+    /// clone and with clone3 (CLONE_THREAD), before it allocates a task ID or
+    /// publishes a process action: Linux ends the window at the creating
+    /// task's exec or exit, whatever threads remain, and the copy can go back
+    /// only once nothing else runs in it. A nested vfork-style clone goes on,
+    /// and so does a thread of a process that is not a vfork child.
+    #[test]
+    fn a_vfork_child_cannot_create_a_thread() {
+        let thread = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM) as u64;
+        let vm_vfork = (libc::CLONE_VM | libc::CLONE_VFORK) as u64;
+        for (number, flags, refused) in [
+            (libc::SYS_clone, thread, true),
+            (libc::SYS_clone3, thread, true),
+            (libc::SYS_clone, vm_vfork | libc::SIGCHLD as u64, false),
+            (libc::SYS_clone3, vm_vfork, false),
+        ] {
+            let mut f = Fixture::new();
+            let child = f.memory.snapshot_sharing_address_space().unwrap();
+            let args = if number == libc::SYS_clone {
+                [flags, 0, 0, 0, 0, 0]
+            } else {
+                let mut raw = [0_u8; 88];
+                raw[..8].copy_from_slice(&flags.to_ne_bytes());
+                if flags & libc::CLONE_THREAD as u64 == 0 {
+                    raw[32..40].copy_from_slice(&(libc::SIGCHLD as u64).to_ne_bytes());
+                }
+                child.write_raw(0x100, &raw).unwrap();
+                [0x100, 88, 0, 0, 0, 0]
+            };
+            let label = format!("syscall={number} flags={flags:#x}");
+            let mut executor = f.take_executor();
+            let next = executor.next_pid.load(Ordering::SeqCst);
+            let result =
+                executor.execute_checked(&SyscallRequest::new(number as u64, args), &child);
+            if refused {
+                vfork_child_refusal(
+                    &result.unwrap_err(),
+                    "thread creation in a vfork child",
+                    super::dispatch::VFORK_CHILD_THREAD_REASON,
+                );
+                assert_eq!(executor.next_pid.load(Ordering::SeqCst), next, "{label}");
+                assert!(executor.take_process_action().is_none(), "{label}");
+            } else {
+                assert_eq!(result.unwrap(), i64::from(next), "{label}");
+                assert!(
+                    matches!(
+                        executor.take_process_action(),
+                        Some(ProcessAction::Fork {
+                            share_address_space: true,
+                            ..
+                        })
+                    ),
+                    "{label}"
+                );
+            }
+        }
+        // Not a vfork child: the same thread request is no refusal of this kind.
+        let mut f = Fixture::new();
+        let mut executor = f.take_executor();
+        let result = executor.execute_checked(
+            &SyscallRequest::new(libc::SYS_clone as u64, [thread, 0, 0, 0, 0, 0]),
+            &f.memory,
+        );
+        assert!(
+            !matches!(
+                result.as_ref().map_err(crate::Error::primary),
+                Err(crate::Error::VforkChildCapability { .. })
+            ),
+            "{result:?}"
+        );
     }
 
     const VFORK_VIEW_REASON: &str = "a vfork child shares its parent's address space until it \
@@ -1302,7 +1379,7 @@ mod shared_file_dispatch_tests {
             let (mut state, _) = child_state(&f, &child);
             let result = syscall_result(&mut child, &mut state, number, args);
             assert!(result >= 0, "{label}: {result}");
-            let error = child.return_vfork_changes(BOOT_RESERVED_END).unwrap_err();
+            let error = child.return_vfork_changes(BOOT_RESERVED_END, None).unwrap_err();
             vfork_child_refusal(
                 &error,
                 "vfork write-back",
@@ -1374,7 +1451,7 @@ mod shared_file_dispatch_tests {
         );
         let mut unmapped_before = [0; 7];
         f.memory.read_raw(scratch, &mut unmapped_before).unwrap();
-        let returned = child.return_vfork_changes(BOOT_RESERVED_END).unwrap();
+        let returned = child.return_vfork_changes(BOOT_RESERVED_END, None).unwrap();
         // Only the zeroed page; the removed scratch mapping's stores stay
         // behind.
         assert_eq!(returned.bytes_written, PAGE_SIZE as usize);
