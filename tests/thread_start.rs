@@ -543,3 +543,43 @@ fn dbt_returning_post_exec_preserves_frame_and_effect() {
         thread_start_tail_witness::POST_NO_EFFECT,
     );
 }
+
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_and_ptrace_post_exec_orig_rax_before_injection() {
+    use thread_start_tail_witness::*;
+
+    let before = |backend: &str, run: &ReturningRun| {
+        assert_returning_records(POST_SEQUENCE, run);
+        assert_returning_completion(run, &[BYTE]);
+        assert!(
+            full_returning_effect(run),
+            "returning-injection full effect predicate"
+        );
+        let mut first_calls = run
+            .rows
+            .iter()
+            .filter(|(_, row)| row.0 == POST_EXEC && row.1 == CALL && row.3 == Some(0));
+        let (_, record) = first_calls.next().expect("missing first post_exec call");
+        assert!(
+            first_calls.next().is_none(),
+            "duplicate first post_exec call"
+        );
+        let frame = record.7.expect("missing first post_exec call frames").0;
+        let values = (frame[10], frame[15]);
+        eprintln!(
+            "post-exec-orig-rax {backend} image=/bin/true mode={POST_SEQUENCE} callback={POST_EXEC} call_ordinal=0 frame=before rax={} orig_rax={}",
+            values.0, values.1,
+        );
+        assert_eq!(values, (0, 59), "native ELF post_exec register view");
+        values
+    };
+
+    let ptrace = before("ptrace", &ptrace_returning(POST_SEQUENCE));
+    let dbt = before("dbt", &dbt_returning(POST_SEQUENCE));
+    assert_eq!(dbt, ptrace, "post_exec BEFORE register views differ");
+    eprintln!(
+        "post-exec-orig-rax comparison accepted: ptrace_rax={} ptrace_orig_rax={} dbt_rax={} dbt_orig_rax={}",
+        ptrace.0, ptrace.1, dbt.0, dbt.1,
+    );
+}
