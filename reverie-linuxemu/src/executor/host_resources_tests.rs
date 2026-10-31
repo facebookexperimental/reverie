@@ -1,6 +1,7 @@
 // Tests of this backend's typed refusal of host resources (refusal.rs): an
-// exec the host cannot give the memory it needs is refused by name, never
-// answered with an errno the guest would take for one of its own.
+// exec the host cannot give the memory or the descriptors it needs is refused
+// by name, never answered with an errno the guest would take for one of its
+// own.
 
 /// A minimal valid static x86-64 executable: one PT_LOAD of a page at
 /// 0x20_0000 whose entry point holds `ud2`.
@@ -29,6 +30,26 @@ fn host_resources_test_image() -> Vec<u8> {
     image
 }
 
+/// [`host_resources_test_image`] padded with zeros to
+/// [`HOST_RESOURCES_PADDED_IMAGE`] bytes. The padding lies past its only
+/// segment, so the image loads exactly as before; only the file, and so every
+/// buffer an exec reads or copies it into, grows.
+fn host_resources_padded_test_image() -> Vec<u8> {
+    let mut image = host_resources_test_image();
+    image.resize(HOST_RESOURCES_PADDED_IMAGE, 0);
+    image
+}
+
+/// The size of [`host_resources_padded_test_image`]: 64 MiB.
+const HOST_RESOURCES_PADDED_IMAGE: usize = 64 * 1024 * 1024;
+
+/// The guest memory the exec tests run in, so each exec's validation memory:
+/// 32 MiB.
+const HOST_RESOURCES_MEMORY: usize = 32 * 1024 * 1024;
+
+/// The environment variable that names the test an isolated child runs.
+const HOST_RESOURCES_CHILD_ENV: &str = "REVERIE_KVM_EXEC_HOST_RESOURCES_CHILD";
+
 /// This process's address-space size (`VmSize`), in bytes.
 fn host_resources_address_space_bytes() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -41,6 +62,163 @@ fn host_resources_address_space_bytes() -> u64 {
     kib * 1024
 }
 
+/// Whether this process is the isolated child that runs `test`
+/// ([`host_resources_run_isolated`]).
+fn host_resources_is_child(test: &str) -> bool {
+    std::env::var(HOST_RESOURCES_CHILD_ENV).as_deref() == Ok(test)
+}
+
+/// Runs `executor::tests::<test>` in a child process of this test binary and
+/// asserts that it passed. A child, because the test lowers a limit of its
+/// own process, which must bind no other test.
+fn host_resources_run_isolated(test: &str) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg(format!("executor::tests::{test}"))
+        .arg("--exact")
+        .env(HOST_RESOURCES_CHILD_ENV, test)
+        .output()
+        .expect("failed to run the isolated host-resources check");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "isolated host-resources check {test} failed with {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Runs `f` with this process's soft `RLIMIT_AS` lowered to `headroom` bytes
+/// above its address space now, as a supervisor whose limit was lowered while
+/// it ran would be, then restores the original limits. Returns `f`'s result
+/// and the lowered limit.
+fn host_resources_with_address_space_headroom<T>(headroom: u64, f: impl FnOnce() -> T) -> (T, u64) {
+    let mut original = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only `original`.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut original) },
+        0
+    );
+    let limit = (host_resources_address_space_bytes() + headroom).min(original.rlim_max);
+    let lowered = libc::rlimit {
+        rlim_cur: limit,
+        rlim_max: original.rlim_max,
+    };
+    // SAFETY: setrlimit reads only `lowered`; only the soft limit drops, so
+    // the original can be restored without privilege.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &lowered) }, 0);
+    let result = f();
+    // SAFETY: as above, with the original limits.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &original) }, 0);
+    (result, limit)
+}
+
+/// Guest addresses of the exec request's path, argv and envp.
+const HOST_RESOURCES_PATH_ADDRESS: u64 = 0x200;
+const HOST_RESOURCES_ARGV_ADDRESS: u64 = 0x1200;
+const HOST_RESOURCES_ENVP_ADDRESS: u64 = 0x1300;
+
+/// Writes `execve(path, [path], [])` into `memory` and returns the request.
+fn host_resources_exec_request(memory: &mut GuestMemory, path: &[u8]) -> SyscallRequest {
+    let path = CString::new(path).unwrap();
+    memory
+        .write(HOST_RESOURCES_PATH_ADDRESS, path.as_bytes_with_nul())
+        .unwrap();
+    memory
+        .write(
+            HOST_RESOURCES_ARGV_ADDRESS,
+            &HOST_RESOURCES_PATH_ADDRESS.to_le_bytes(),
+        )
+        .unwrap();
+    memory
+        .write(HOST_RESOURCES_ARGV_ADDRESS + 8, &0_u64.to_le_bytes())
+        .unwrap();
+    memory
+        .write(HOST_RESOURCES_ENVP_ADDRESS, &0_u64.to_le_bytes())
+        .unwrap();
+    SyscallRequest::new(
+        libc::SYS_execve as u64,
+        [
+            HOST_RESOURCES_PATH_ADDRESS,
+            HOST_RESOURCES_ARGV_ADDRESS,
+            HOST_RESOURCES_ENVP_ADDRESS,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Writes `image` to `path`, executable by its owner.
+fn host_resources_write_executable(path: &std::path::Path, image: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, image).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Execs `request` from `leader` with this process's soft `RLIMIT_AS`
+/// lowered to `headroom` above its address space, then checks that the exec
+/// was refused, ENOMEM with the typed `HostResources` refusal whose
+/// diagnostic holds every one of `named` and names the lowered limit, and
+/// that it published no replacement and left the old image's memory and
+/// identity untouched. Then, with the limit restored, execs the same request
+/// again: it publishes the exec, so the request was valid all along and only
+/// the host refused it. Returns the refusal's diagnostic.
+fn host_resources_assert_refused_then_admitted(
+    leader: &mut ElfExecutor,
+    memory: &mut GuestMemory,
+    request: &SyscallRequest,
+    headroom: u64,
+    named: &[String],
+) -> &'static str {
+    const SENTINEL_ADDRESS: u64 = 0x30_0000;
+    const SENTINEL: [u8; 8] = *b"old-live";
+    memory.write(SENTINEL_ADDRESS, &SENTINEL).unwrap();
+    let identity = (leader.state.pid, leader.state.tid);
+
+    let ((result, refusal, action), limit) =
+        host_resources_with_address_space_headroom(headroom, || {
+            let result = leader.execute_process_action(request, memory);
+            (
+                result,
+                leader.take_unsupported_refusal(),
+                leader.take_process_action(),
+            )
+        });
+
+    assert_eq!(result, Some(negative_errno(libc::ENOMEM)));
+    let refusal = refusal.expect("a refused host resource carries the typed refusal");
+    assert_eq!(
+        refusal.operation,
+        reverie::UnsupportedOperation::HostResources
+    );
+    assert_eq!(refusal.errno, reverie::Errno::ENOMEM);
+    let mut expected = named.to_vec();
+    expected.push(format!("RLIMIT_AS (soft {limit} bytes, "));
+    for named in expected {
+        assert!(
+            refusal.diagnostic.contains(&named),
+            "{named:?} missing from {:?}",
+            refusal.diagnostic
+        );
+    }
+    assert!(action.is_none(), "a refused exec published a replacement");
+    let mut observed = [0; SENTINEL.len()];
+    memory.read(SENTINEL_ADDRESS, &mut observed).unwrap();
+    assert_eq!(observed, SENTINEL);
+    assert_eq!((leader.state.pid, leader.state.tid), identity);
+
+    assert_eq!(leader.execute_process_action(request, memory), Some(0));
+    assert_eq!(leader.take_unsupported_refusal(), None);
+    assert!(matches!(
+        leader.take_process_action(),
+        Some(ProcessAction::Exec { .. })
+    ));
+    refusal.diagnostic
+}
+
 /// An exec validates its new image in a second guest memory as large as the
 /// live one before it replaces the old image. Here an isolated child lowers
 /// its own soft `RLIMIT_AS` to leave that reservation half the room it
@@ -51,113 +229,133 @@ fn host_resources_address_space_bytes() -> u64 {
 /// same request publishes the exec, so the request was valid all along.
 #[test]
 fn an_exec_whose_validation_memory_the_host_refuses_is_refused_as_host_resources() {
-    const CHILD_ENV: &str = "REVERIE_KVM_EXEC_HOST_ADDRESS_SPACE_CHILD";
-    const MEMORY: usize = 32 * 1024 * 1024;
-    const SENTINEL_ADDRESS: u64 = 0x30_0000;
-    const SENTINEL: [u8; 8] = *b"old-live";
-    const PATH_ADDRESS: u64 = 0x200;
-    const ARGV_ADDRESS: u64 = 0x400;
-    const ENVP_ADDRESS: u64 = 0x500;
-
-    if std::env::var_os(CHILD_ENV).is_some() {
-        let root = TestDir::new();
-        let path = root.0.join("valid");
-        std::fs::write(&path, host_resources_test_image()).unwrap();
-        let mut memory = GuestMemory::new(0, MEMORY).unwrap();
-        memory.write(SENTINEL_ADDRESS, &SENTINEL).unwrap();
-        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        memory
-            .write(PATH_ADDRESS, path.as_bytes_with_nul())
-            .unwrap();
-        memory
-            .write(ARGV_ADDRESS, &PATH_ADDRESS.to_le_bytes())
-            .unwrap();
-        memory
-            .write(ARGV_ADDRESS + 8, &0_u64.to_le_bytes())
-            .unwrap();
-        memory.write(ENVP_ADDRESS, &0_u64.to_le_bytes()).unwrap();
-        let request = SyscallRequest::new(
-            libc::SYS_execve as u64,
-            [PATH_ADDRESS, ARGV_ADDRESS, ENVP_ADDRESS, 0, 0, 0],
-        );
-        let mut leader = ElfExecutor::new(test_state(&root.0), false);
-        let identity = (leader.state.pid, leader.state.tid);
-
-        let mut original = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes only `original`.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut original) },
-            0
-        );
-        let limit =
-            (host_resources_address_space_bytes() + MEMORY as u64 / 2).min(original.rlim_max);
-        let lowered = libc::rlimit {
-            rlim_cur: limit,
-            rlim_max: original.rlim_max,
-        };
-        // SAFETY: setrlimit reads only `lowered`; only the soft limit drops,
-        // so the original can be restored without privilege.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &lowered) }, 0);
-        let result = leader.execute_process_action(&request, &memory);
-        let refusal = leader.take_unsupported_refusal();
-        let action = leader.take_process_action();
-        // SAFETY: as above, with the original limits.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &original) }, 0);
-
-        assert_eq!(result, Some(negative_errno(libc::ENOMEM)));
-        let refusal = refusal.expect("a refused validation memory carries the typed refusal");
-        assert_eq!(
-            refusal.operation,
-            reverie::UnsupportedOperation::HostResources
-        );
-        assert_eq!(refusal.errno, reverie::Errno::ENOMEM);
-        for named in [
-            "host address space ran out".to_owned(),
-            format!("reserving {MEMORY} bytes of host address space"),
-            format!("RLIMIT_AS (soft {limit} bytes, "),
-        ] {
-            assert!(
-                refusal.diagnostic.contains(&named),
-                "{named:?} missing from {:?}",
-                refusal.diagnostic
-            );
-        }
-        assert!(action.is_none(), "a refused exec published a replacement");
-        let mut observed = [0; SENTINEL.len()];
-        memory.read(SENTINEL_ADDRESS, &mut observed).unwrap();
-        assert_eq!(observed, SENTINEL);
-        assert_eq!((leader.state.pid, leader.state.tid), identity);
-
-        assert_eq!(leader.execute_process_action(&request, &memory), Some(0));
-        assert_eq!(leader.take_unsupported_refusal(), None);
-        assert!(matches!(
-            leader.take_process_action(),
-            Some(ProcessAction::Exec { .. })
-        ));
-        return;
+    const TEST: &str =
+        "an_exec_whose_validation_memory_the_host_refuses_is_refused_as_host_resources";
+    if !host_resources_is_child(TEST) {
+        return host_resources_run_isolated(TEST);
     }
-
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("executor::tests::an_exec_whose_validation_memory_the_host_refuses_is_refused_as_host_resources")
-        .arg("--exact")
-        .env(CHILD_ENV, "1")
-        .output()
-        .expect("failed to run the isolated address-space exec check");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "isolated address-space exec check failed with {}\nstdout:\n{stdout}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+    let root = TestDir::new();
+    let path = root.0.join("valid");
+    host_resources_write_executable(&path, &host_resources_test_image());
+    let mut memory = GuestMemory::new(0, HOST_RESOURCES_MEMORY).unwrap();
+    let request = host_resources_exec_request(&mut memory, path.as_os_str().as_bytes());
+    let mut leader = ElfExecutor::new(test_state(&root.0), false);
+    host_resources_assert_refused_then_admitted(
+        &mut leader,
+        &mut memory,
+        &request,
+        HOST_RESOURCES_MEMORY as u64 / 2,
+        &[
+            "host address space ran out".to_owned(),
+            format!("reserving {HOST_RESOURCES_MEMORY} bytes of host address space"),
+        ],
     );
 }
 
-/// The refusal of a validation memory names the host's error and whether it
-/// was address space that ran out (ENOMEM, or an allocation's OutOfMemory)
-/// or another host resource.
+/// The case an adversarial review found aborting the supervisor: an exec of
+/// the caller's own `/proc/self/exe`, whose image (a 64 MiB file, padded past
+/// its only segment) the exec copies, under a limit lowered after launch to
+/// just above what the process uses. Before, the copy's allocation failure
+/// aborted the whole process ("memory allocation of N bytes failed"); now the
+/// buffer is allocated fallibly and the exec is the typed refusal naming the
+/// request, with nothing published, and the same exec succeeds once the limit
+/// is raised.
+#[test]
+fn an_exec_of_proc_self_exe_whose_image_copy_the_host_refuses_is_refused_as_host_resources() {
+    const TEST: &str =
+        "an_exec_of_proc_self_exe_whose_image_copy_the_host_refuses_is_refused_as_host_resources";
+    if !host_resources_is_child(TEST) {
+        return host_resources_run_isolated(TEST);
+    }
+    let root = TestDir::new();
+    let path = root.0.join("padded");
+    let image = host_resources_padded_test_image();
+    host_resources_write_executable(&path, &image);
+    let mut state = test_state(&root.0);
+    state.executable_file = Some(Arc::new(std::fs::File::open(&path).unwrap()));
+    state.executable_image = Arc::new(image);
+    let mut memory = GuestMemory::new(0, HOST_RESOURCES_MEMORY).unwrap();
+    let request = host_resources_exec_request(&mut memory, b"/proc/self/exe");
+    let mut leader = ElfExecutor::new(state, false);
+    host_resources_assert_refused_then_admitted(
+        &mut leader,
+        &mut memory,
+        &request,
+        16 * 1024 * 1024,
+        &[format!(
+            "host memory ran out: allocating {HOST_RESOURCES_PADDED_IMAGE} bytes for a copy of \
+             the running program's image (/proc/self/exe) failed"
+        )],
+    );
+}
+
+/// An exec reads its new image into a buffer as large as the file. Under a
+/// limit that leaves less room than the file needs, the buffer is refused by
+/// name, naming the request, rather than answered with the guest's EIO or
+/// aborting the process.
+#[test]
+fn an_exec_whose_image_the_host_cannot_buffer_is_refused_as_host_resources() {
+    const TEST: &str = "an_exec_whose_image_the_host_cannot_buffer_is_refused_as_host_resources";
+    if !host_resources_is_child(TEST) {
+        return host_resources_run_isolated(TEST);
+    }
+    let root = TestDir::new();
+    let path = root.0.join("padded");
+    host_resources_write_executable(&path, &host_resources_padded_test_image());
+    let mut memory = GuestMemory::new(0, HOST_RESOURCES_MEMORY).unwrap();
+    let request = host_resources_exec_request(&mut memory, path.as_os_str().as_bytes());
+    let mut leader = ElfExecutor::new(test_state(&root.0), false);
+    host_resources_assert_refused_then_admitted(
+        &mut leader,
+        &mut memory,
+        &request,
+        16 * 1024 * 1024,
+        &[format!(
+            "host memory ran out: allocating {HOST_RESOURCES_PADDED_IMAGE} bytes for the new \
+             program's image failed"
+        )],
+    );
+}
+
+/// The loader keeps a copy of every image it loads, the one a later exec of
+/// `/proc/self/exe` reads, and loads each image twice for an exec: into the
+/// validation memory, then, past the point of no return, into the live
+/// memory. Here the limit leaves room for the image's read and the
+/// validation memory, but not for the loader's copy: the copy's allocation
+/// is fallible, so the validation load reports the host error and the exec
+/// is refused by name. The live load allocates the same copy the same way.
+#[test]
+fn an_exec_whose_image_the_loader_cannot_copy_is_refused_as_host_resources() {
+    const TEST: &str = "an_exec_whose_image_the_loader_cannot_copy_is_refused_as_host_resources";
+    if !host_resources_is_child(TEST) {
+        return host_resources_run_isolated(TEST);
+    }
+    let root = TestDir::new();
+    let path = root.0.join("padded");
+    host_resources_write_executable(&path, &host_resources_padded_test_image());
+    let mut memory = GuestMemory::new(0, HOST_RESOURCES_MEMORY).unwrap();
+    let request = host_resources_exec_request(&mut memory, path.as_os_str().as_bytes());
+    let mut leader = ElfExecutor::new(test_state(&root.0), false);
+    // The image's read buffer and the validation memory fit, with 16 MiB to
+    // spare; the loader's 64 MiB copy does not.
+    let headroom = (HOST_RESOURCES_PADDED_IMAGE + HOST_RESOURCES_MEMORY + 16 * 1024 * 1024) as u64;
+    host_resources_assert_refused_then_admitted(
+        &mut leader,
+        &mut memory,
+        &request,
+        headroom,
+        &[
+            "host memory ran out: loading the new image into the validation memory failed"
+                .to_owned(),
+            format!("allocating {HOST_RESOURCES_PADDED_IMAGE} bytes for a copy of the new image"),
+        ],
+    );
+}
+
+/// The refusal of a validation memory names the host's error and what ran
+/// out, with the limit it ran out under: address space and `RLIMIT_AS` for
+/// ENOMEM or an allocation's OutOfMemory, descriptors and `RLIMIT_NOFILE`
+/// for EMFILE (the memfd behind the memory needs one).
 #[test]
 fn a_refused_validation_memory_names_the_request_the_error_and_the_limit() {
     let out_of_memory = exec_validation_memory_refusal(
@@ -178,33 +376,133 @@ fn a_refused_validation_memory_names_the_request_the_error_and_the_limit() {
             reverie::UnsupportedOperation::HostResources
         );
         assert_eq!(refusal.errno, reverie::Errno::ENOMEM);
-        assert!(refusal.diagnostic.contains("RLIMIT_AS (soft "));
     }
-    assert!(
-        out_of_memory
-            .diagnostic
-            .contains("host address space ran out: reserving 4096 bytes")
-    );
+    for refusal in [out_of_memory, allocation] {
+        assert!(
+            refusal
+                .diagnostic
+                .contains("host address space ran out: reserving 4096 bytes"),
+            "{}",
+            refusal.diagnostic
+        );
+        assert!(
+            refusal
+                .diagnostic
+                .contains("under this process's RLIMIT_AS (soft "),
+            "{}",
+            refusal.diagnostic
+        );
+    }
     assert!(
         out_of_memory
             .diagnostic
             .contains(&std::io::Error::from_raw_os_error(libc::ENOMEM).to_string())
     );
     assert!(
-        allocation
+        descriptors
             .diagnostic
-            .contains("host address space ran out: reserving 4096 bytes")
+            .contains("host file descriptors ran out: reserving 8192 bytes"),
+        "{}",
+        descriptors.diagnostic
     );
     assert!(
         descriptors
             .diagnostic
-            .contains("a host resource ran out: reserving 8192 bytes")
+            .contains("under this process's RLIMIT_NOFILE (soft "),
+        "{}",
+        descriptors.diagnostic
     );
     assert!(
         descriptors
             .diagnostic
             .contains(&std::io::Error::from_raw_os_error(libc::EMFILE).to_string())
     );
+}
+
+/// A host call an exec makes (opening the image, reading it) that fails for
+/// want of a host resource of this process's own is refused by name: ENOMEM,
+/// and a refusal naming the resource, the step, the error and the limit.
+/// Every other failure is the guest's errno, unchanged, with no refusal.
+#[test]
+fn an_exec_step_refuses_only_the_host_resources_it_ran_out_of() {
+    for (errno, named) in [
+        (
+            libc::EMFILE,
+            "host file descriptors ran out: opening the new program failed",
+        ),
+        (
+            libc::ENFILE,
+            "the host's file table ran out: opening the new program failed",
+        ),
+        (
+            libc::ENOMEM,
+            "host memory ran out: opening the new program failed",
+        ),
+    ] {
+        let mut refusal = None;
+        assert_eq!(
+            exec_step_errno(
+                negative_errno(errno),
+                "opening the new program",
+                &mut refusal
+            ),
+            negative_errno(libc::ENOMEM)
+        );
+        let refusal = refusal.expect("a host resource that ran out is refused");
+        assert_eq!(
+            refusal.operation,
+            reverie::UnsupportedOperation::HostResources
+        );
+        assert!(
+            refusal
+                .diagnostic
+                .starts_with(&format!("KVM exec: {named}")),
+            "{}",
+            refusal.diagnostic
+        );
+    }
+    for errno in [
+        libc::ENOENT,
+        libc::EACCES,
+        libc::ELOOP,
+        libc::ENOTDIR,
+        libc::ENAMETOOLONG,
+        libc::EIO,
+    ] {
+        let mut refusal = None;
+        assert_eq!(
+            exec_step_errno(
+                negative_errno(errno),
+                "opening the new program",
+                &mut refusal
+            ),
+            negative_errno(errno)
+        );
+        assert_eq!(refusal, None, "{errno}");
+        assert_eq!(
+            exec_step_io_error(
+                std::io::Error::from_raw_os_error(errno),
+                "reading the new program's image",
+                &mut refusal
+            ),
+            negative_errno(errno)
+        );
+        assert_eq!(refusal, None, "{errno}");
+    }
+    let mut refusal = None;
+    assert_eq!(
+        exec_step_io_error(
+            std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+            "reading the new program's image",
+            &mut refusal
+        ),
+        negative_errno(libc::ENOMEM)
+    );
+    assert!(refusal.is_some_and(|refusal| {
+        refusal
+            .diagnostic
+            .contains("host memory ran out: reading the new program's image failed")
+    }),);
 }
 
 /// Every ENOMEM an exec preparation returns is the host's, and carries the
@@ -241,24 +539,36 @@ fn only_an_exec_preparation_enomem_is_a_host_resources_refusal() {
     }
 }
 
-/// A loader failure is this backend's only when the host ran out of memory;
-/// a malformed or oversized image stays the guest's ENOEXEC.
+/// A loader failure is this backend's only when a host resource of this
+/// process's own ran out (memory, a descriptor, the host's file table); a
+/// malformed image, one too large for the guest memory (the out-of-bounds
+/// address its segments reach) or any other host error stays the guest's
+/// ENOEXEC.
 #[test]
-fn loader_host_memory_errors_are_told_apart_from_image_errors() {
+fn loader_host_resource_errors_are_told_apart_from_image_errors() {
     for error in [
         crate::Error::HostIo(std::io::Error::from_raw_os_error(libc::ENOMEM)),
         crate::Error::HostIo(std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
         crate::Error::MemoryMapping(std::io::Error::from_raw_os_error(libc::ENOMEM)),
+        crate::Error::HostIo(std::io::Error::from_raw_os_error(libc::EMFILE)),
+        crate::Error::HostIo(std::io::Error::from_raw_os_error(libc::ENFILE)),
+        crate::Error::MemoryMapping(std::io::Error::from_raw_os_error(libc::EMFILE)),
     ] {
-        assert!(is_host_memory_error(&error), "{error}");
+        assert!(error.host_resource_exhaustion().is_some(), "{error}");
     }
     for error in [
         crate::Error::HostIo(std::io::Error::from_raw_os_error(libc::EACCES)),
-        crate::Error::MemoryMapping(std::io::Error::from_raw_os_error(libc::EMFILE)),
+        crate::Error::HostIo(std::io::Error::from_raw_os_error(libc::ENOENT)),
         crate::Error::UnsupportedElf("not an ELF image".to_owned()),
         crate::Error::LongModeMemoryTooSmall,
+        crate::Error::InvalidGuestAddress {
+            address: 0x1_0000_0000,
+            length: 0x1000,
+            guest_base: 0,
+            guest_end: HOST_RESOURCES_MEMORY as u64,
+        },
     ] {
-        assert!(!is_host_memory_error(&error), "{error}");
+        assert!(error.host_resource_exhaustion().is_none(), "{error}");
     }
 }
 

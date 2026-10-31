@@ -14,6 +14,8 @@ pub(super) const MAX_HOST_IO: usize = 16 * 1024 * 1024;
 pub(super) const MAX_CAPTURED_OUTPUT: usize = 64 * 1024 * 1024;
 pub(super) const PAGE_SIZE: u64 = 4096;
 pub(super) const MAX_RW_COUNT: usize = (i32::MAX as usize) & !(PAGE_SIZE as usize - 1);
+pub(super) use reverie_kvm_core::host_limits::HostResource;
+pub(super) use reverie_kvm_core::host_limits::HostResourceExhaustion;
 pub use reverie_kvm_core::layout::GUEST_USER_ADDRESS_LIMIT;
 pub use reverie_kvm_core::layout::X86_64_GUEST_USER_LIMIT;
 /// Diagnostic carried by this backend's typed refusal of an exec from a thread
@@ -86,43 +88,13 @@ pub(super) fn keep_host_resources_diagnostic(
     text
 }
 
-/// This process's `RLIMIT_AS` as a host-resource diagnostic names it.
-pub(super) fn address_space_limit_text() -> String {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit writes only `limit`.
-    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
-        return format!("unreadable ({})", std::io::Error::last_os_error());
-    }
-    let bytes = |value: libc::rlim_t| {
-        if value == libc::RLIM_INFINITY {
-            "unlimited".to_owned()
-        } else {
-            format!("{value} bytes")
-        }
-    };
-    format!(
-        "soft {}, hard {}",
-        bytes(limit.rlim_cur),
-        bytes(limit.rlim_max)
-    )
-}
-
-/// Whether `error` is the host running out of memory: an ENOMEM from a host
-/// call, or Rust's `OutOfMemory` from a fallible allocation.
-pub(super) fn is_host_out_of_memory(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::ENOMEM) || error.kind() == std::io::ErrorKind::OutOfMemory
-}
-
-/// Whether a loader `error` is the host running out of memory (see
-/// [`is_host_out_of_memory`]) rather than something about the image.
-pub(super) fn is_host_memory_error(error: &crate::Error) -> bool {
-    matches!(
-        error,
-        crate::Error::MemoryMapping(host) | crate::Error::HostIo(host)
-            if is_host_out_of_memory(host)
+/// A typed `HostResources` refusal of an exec, answered ENOMEM, with
+/// `diagnostic`.
+fn exec_host_resources_refusal(diagnostic: String) -> reverie::UnsupportedRefusal {
+    reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::HostResources,
+        reverie::Errno::ENOMEM,
+        intern_host_resources_diagnostic(diagnostic),
     )
 }
 
@@ -131,52 +103,122 @@ pub(super) fn is_host_memory_error(error: &crate::Error) -> bool {
 /// replaces the old one: the host refused them with `error`. Every such
 /// failure is this backend's own (the layout is the caller's live one, so it
 /// is valid), and no guest request decides it. The answer is ENOMEM, and the
-/// diagnostic names the request, the error and this process's `RLIMIT_AS`.
+/// diagnostic names the request, the error and the limit it ran out under:
+/// this process's `RLIMIT_AS` when memory ran out (the reservation is host
+/// address space), its `RLIMIT_NOFILE` when the memfd behind it found no
+/// descriptor.
 pub(super) fn exec_validation_memory_refusal(
     request: usize,
     error: &crate::Error,
 ) -> reverie::UnsupportedRefusal {
-    let (resource, detail) = match error {
-        crate::Error::MemoryMapping(host) | crate::Error::HostIo(host) => (
-            if is_host_out_of_memory(host) {
-                "host address space ran out"
-            } else {
-                "a host resource ran out"
-            },
-            host.to_string(),
-        ),
-        other => ("a host resource ran out", other.to_string()),
+    let detail = match error {
+        crate::Error::MemoryMapping(host) | crate::Error::HostIo(host) => host.to_string(),
+        other => other.to_string(),
     };
-    reverie::UnsupportedRefusal::new(
-        reverie::UnsupportedOperation::HostResources,
-        reverie::Errno::ENOMEM,
-        intern_host_resources_diagnostic(format!(
-            "KVM exec: {resource}: reserving {request} bytes of host address space for the guest \
-             memory that validates the new image failed ({detail}) under this process's \
-             RLIMIT_AS ({}); this backend reserves its guest memory size for every guest \
-             process and once more during each exec",
-            address_space_limit_text(),
-        )),
-    )
+    let (resource, limit) = match error.host_resource_exhaustion() {
+        Some(exhaustion) if exhaustion.resource == HostResource::Memory => {
+            ("host address space ran out", exhaustion.limit)
+        }
+        Some(exhaustion) => (exhaustion.resource.ran_out(), exhaustion.limit),
+        None => (
+            "a host resource ran out",
+            format!(
+                "this process's RLIMIT_AS ({})",
+                reverie_kvm_core::host_limits::address_space_limit_text()
+            ),
+        ),
+    };
+    exec_host_resources_refusal(format!(
+        "KVM exec: {resource}: reserving {request} bytes of host address space for the guest \
+         memory that validates the new image failed ({detail}) under {limit}; this backend \
+         reserves its guest memory size for every guest process and once more during each exec"
+    ))
+}
+
+/// The typed refusal of an exec whose preparation could not allocate the
+/// `request` bytes it needs for `what`: an image, or a copy of one, whose
+/// size the file decides. The answer is ENOMEM, and the diagnostic names the
+/// request and this process's `RLIMIT_AS`.
+pub(super) fn exec_allocation_refusal(request: usize, what: &str) -> reverie::UnsupportedRefusal {
+    exec_host_resources_refusal(format!(
+        "KVM exec: {}: allocating {request} bytes for {what} failed under this process's \
+         RLIMIT_AS ({})",
+        HostResource::Memory.ran_out(),
+        reverie_kvm_core::host_limits::address_space_limit_text(),
+    ))
+}
+
+/// The typed refusal of an exec whose preparation failed in `step` with
+/// `error` because a host resource of this process's own ran out
+/// (`exhaustion`). The answer is ENOMEM, and the diagnostic names the
+/// resource, the step, the error and the limit.
+pub(super) fn exec_host_resource_refusal(
+    step: &str,
+    error: &dyn std::fmt::Display,
+    exhaustion: &HostResourceExhaustion,
+) -> reverie::UnsupportedRefusal {
+    exec_host_resources_refusal(format!(
+        "KVM exec: {}: {step} failed ({error}) under {}",
+        exhaustion.resource.ran_out(),
+        exhaustion.limit,
+    ))
+}
+
+/// The answer to a host call that an exec preparation made in `step` and
+/// that failed with `error`. When a host resource of this process's own ran
+/// out (a descriptor, memory), the exec is this backend's to refuse:
+/// `refusal` records the typed refusal and the answer is ENOMEM. Any other
+/// error is the guest's, as Linux reports it.
+pub(super) fn exec_step_io_error(
+    error: std::io::Error,
+    step: &str,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
+) -> i64 {
+    match HostResourceExhaustion::of(&error) {
+        Some(exhaustion) => {
+            *refusal = Some(exec_host_resource_refusal(step, &error, &exhaustion));
+            negative_errno(libc::ENOMEM)
+        }
+        None => io_error(error),
+    }
+}
+
+/// [`exec_step_io_error`] for a host call whose failure is already the
+/// negative errno `errno`.
+pub(super) fn exec_step_errno(
+    errno: i64,
+    step: &str,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
+) -> i64 {
+    match i32::try_from(-errno) {
+        Ok(raw) if raw > 0 => {
+            exec_step_io_error(std::io::Error::from_raw_os_error(raw), step, refusal)
+        }
+        _ => errno,
+    }
 }
 
 /// The typed refusal, if any, that an exec preparation result carries for a
-/// host that ran out of memory. Linux's execve answers ENOMEM only when the
-/// kernel cannot allocate what the exec needs, and this executor models no
-/// limit of the guest's own that an exec could exceed, so every ENOMEM its
-/// exec preparation returns comes from a host call or allocation of this
-/// process: reading the image or its interpreter, or loading it into the
-/// validation memory. Every other result carries none.
+/// host that ran out of memory, where the step that failed recorded no more
+/// specific refusal. Linux's execve answers ENOMEM only when the kernel
+/// cannot allocate what the exec needs, and this executor models no limit of
+/// the guest's own that an exec could exceed, so every ENOMEM its exec
+/// preparation returns comes from a host call or allocation of this process:
+/// reading the image or its interpreter, or loading it into the validation
+/// memory. Every other result carries none.
+///
+/// This maps by value, so it holds only while no exec preparation step
+/// returns an ENOMEM that is the guest's own. A step that comes to model one
+/// (an exec exceeding a limit the guest set, say) must answer it without
+/// passing through here, or this refusal would end a run Linux continues;
+/// steps that fail for want of a host resource record their own refusal
+/// where they observe it (`exec_step_io_error`, `exec_allocation_refusal`).
 pub(super) fn exec_host_memory_refusal(result: i64) -> Option<reverie::UnsupportedRefusal> {
     (result == negative_errno(libc::ENOMEM)).then(|| {
-        reverie::UnsupportedRefusal::new(
-            reverie::UnsupportedOperation::HostResources,
-            reverie::Errno::ENOMEM,
-            intern_host_resources_diagnostic(format!(
-                "{HOST_RESOURCES_REFUSAL}, under this process's RLIMIT_AS ({})",
-                address_space_limit_text(),
-            )),
-        )
+        exec_host_resources_refusal(format!(
+            "{HOST_RESOURCES_REFUSAL}, under this process's RLIMIT_AS ({})",
+            reverie_kvm_core::host_limits::address_space_limit_text(),
+        ))
     })
 }
 

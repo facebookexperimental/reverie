@@ -1112,7 +1112,10 @@ pub struct LoadedStaticElf {
     pub mmap_limit: u64,
     pub executable_path: PathBuf,
     pub executable_file: Option<std::sync::Arc<std::fs::File>>,
-    pub executable_image: std::sync::Arc<[u8]>,
+    /// The image this process was loaded from, which an exec of its
+    /// `/proc/self/exe` loads again. Its buffer is allocated fallibly, as
+    /// large as the file it came from (`copy_image`).
+    pub executable_image: std::sync::Arc<Vec<u8>>,
     pub argv0: Vec<u8>,
     pub cwd: PathBuf,
     pub cwd_fd: std::fs::File,
@@ -2199,6 +2202,9 @@ fn load_executable(
         mmap_next,
         mmap_limit,
     });
+    // Last, once every check of the image has passed: a host that cannot
+    // allocate the copy refuses only an image Linux would load.
+    let executable_image = copy_image(image)?;
     Ok(LoadedStaticElf {
         entry_point,
         stack_pointer,
@@ -2212,7 +2218,7 @@ fn load_executable(
         mmap_limit,
         executable_path,
         executable_file,
-        executable_image: std::sync::Arc::from(image),
+        executable_image,
         argv0,
         cwd: cwd.to_owned(),
         cwd_fd,
@@ -2422,13 +2428,46 @@ fn interpreter_path(image: &[u8], elf: &Elf<'_>) -> Result<Option<String>> {
     Ok(Some(path.to_string()))
 }
 
+/// A copy of `image` for the loaded process to keep ([`LoadedStaticElf`]'s
+/// `executable_image`). An image is as large as the file it came from, so the
+/// buffer is allocated fallibly: a host that cannot allocate it reports the
+/// host error (`OutOfMemory`, naming the request), which an exec refuses as
+/// this backend's own, rather than aborting the process.
+fn copy_image(image: &[u8]) -> Result<std::sync::Arc<Vec<u8>>> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(image.len()).map_err(|error| {
+        Error::HostIo(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            format!(
+                "allocating {} bytes for a copy of the new image: {error}",
+                image.len()
+            ),
+        ))
+    })?;
+    copy.extend_from_slice(image);
+    Ok(std::sync::Arc::new(copy))
+}
+
+/// The loader's error for an open or stat of the program interpreter at
+/// `path` that failed with `error`. Linux opens the interpreter inside the
+/// kernel, with no descriptor of the process's, so a descriptor, memory or
+/// file-table entry this process could not get (EMFILE, ENOMEM, ENFILE) is
+/// this backend's own: the host error itself, which an exec refuses by name.
+/// Any other failure stays the image's (ENOEXEC), as before.
+fn interpreter_open_error(path: &str, action: &str, error: std::io::Error) -> Error {
+    if reverie_kvm_core::host_limits::HostResourceExhaustion::of(&error).is_some() {
+        Error::HostIo(error)
+    } else {
+        Error::UnsupportedElf(format!("cannot {action} interpreter {path:?}: {error}"))
+    }
+}
+
 fn read_interpreter_image(path: &str) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(path).map_err(|error| {
-        Error::UnsupportedElf(format!("cannot open interpreter {path:?}: {error}"))
-    })?;
-    let metadata = file.metadata().map_err(|error| {
-        Error::UnsupportedElf(format!("cannot stat interpreter {path:?}: {error}"))
-    })?;
+    let file =
+        std::fs::File::open(path).map_err(|error| interpreter_open_error(path, "open", error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| interpreter_open_error(path, "stat", error))?;
     if !metadata.is_file() {
         return Err(Error::UnsupportedElf(format!(
             "interpreter {path:?} is not a regular file",
@@ -4185,5 +4224,109 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The program interpreter's open or stat failing for want of a host
+    /// resource of this process's own (a descriptor, memory, the host's file
+    /// table) is reported as the host error, which an exec refuses by name.
+    /// Any other failure, such as a missing interpreter, stays the image's
+    /// `UnsupportedElf` (ENOEXEC), as before.
+    #[test]
+    fn interpreter_open_failures_are_host_errors_only_for_host_resources() {
+        const INTERPRETER: &str = "/lib64/ld-linux-x86-64.so.2";
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM] {
+            let error = interpreter_open_error(
+                INTERPRETER,
+                "open",
+                std::io::Error::from_raw_os_error(errno),
+            );
+            assert!(
+                matches!(&error, Error::HostIo(host) if host.raw_os_error() == Some(errno)),
+                "{error}"
+            );
+            assert!(error.host_resource_exhaustion().is_some(), "{error}");
+        }
+        for errno in [
+            libc::ENOENT,
+            libc::EACCES,
+            libc::ELOOP,
+            libc::ENOTDIR,
+            libc::EIO,
+        ] {
+            let error = interpreter_open_error(
+                INTERPRETER,
+                "stat",
+                std::io::Error::from_raw_os_error(errno),
+            );
+            assert!(
+                matches!(&error, Error::UnsupportedElf(message)
+                    if message.starts_with(&format!("cannot stat interpreter {INTERPRETER:?}: "))),
+                "{error}"
+            );
+            assert!(error.host_resource_exhaustion().is_none(), "{error}");
+        }
+    }
+
+    /// With no descriptor left under this process's `RLIMIT_NOFILE`, opening
+    /// the program interpreter fails with EMFILE. The loader reports it as the
+    /// host error, which an exec refuses by name, where it used to report the
+    /// image's ENOEXEC. Runs in an isolated child, since it lowers a limit of
+    /// its own process.
+    #[test]
+    fn an_interpreter_this_process_has_no_descriptor_to_open_is_a_host_error() {
+        const CHILD_ENV: &str = "REVERIE_KVM_INTERPRETER_DESCRIPTOR_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(
+                    "elf::tests::an_interpreter_this_process_has_no_descriptor_to_open_is_a_host_error",
+                )
+                .arg("--exact")
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("failed to run the isolated interpreter check");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated interpreter check failed with {}\nstdout:\n{stdout}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let interpreter = std::env::current_exe().unwrap();
+        let interpreter = interpreter.to_str().expect("UTF-8 test binary path");
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes only `original`.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: original.rlim_max,
+        };
+        // SAFETY: setrlimit reads only `lowered`; only the soft limit drops,
+        // so the original can be restored without privilege.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let result = read_interpreter_image(interpreter);
+        // SAFETY: as above, with the original limits.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
+            0
+        );
+        let error = result.expect_err("no descriptor is left to open the interpreter");
+        assert!(
+            matches!(&error, Error::HostIo(host) if host.raw_os_error() == Some(libc::EMFILE)),
+            "{error}"
+        );
+        assert_eq!(
+            error
+                .host_resource_exhaustion()
+                .map(|exhaustion| exhaustion.resource),
+            Some(reverie_kvm_core::host_limits::HostResource::Descriptors)
+        );
     }
 }

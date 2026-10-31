@@ -1897,6 +1897,26 @@ impl CompletedBoundarySlot {
     }
 }
 
+/// The error an exec past its point of no return ends the run with. The old
+/// image is gone, so no errno can answer the guest. A host resource of this
+/// process's own that ran out (memory, a descriptor, the host's file table) is
+/// this backend's to refuse: the named refusal [`Error::HostResources`], which
+/// names the resource, the error and the limit. Any other error is returned
+/// as it is.
+pub(crate) fn exec_after_point_of_no_return_error(error: Error) -> Error {
+    match error.host_resource_exhaustion() {
+        Some(exhaustion) => Error::HostResources {
+            diagnostic: format!(
+                "KVM exec: {} after the old image was discarded: replacing the image failed \
+                 ({error}) under {}; the old image cannot be restored, so the run ends here",
+                exhaustion.resource.ran_out(),
+                exhaustion.limit,
+            ),
+        },
+        None => error,
+    }
+}
+
 pub(crate) enum ProcessActionContinuation {
     Restore(Box<CompletedSyscallBoundary>),
     Exec(Box<CompletedSyscallBoundary>),
@@ -3044,6 +3064,25 @@ impl KvmBackend {
         // this reset onward, any exceptional loader or KVM failure is fatal to
         // the backend and is never reported back to the old guest image. This
         // is the same point-of-no-return behavior as the prior zero_raw reset.
+        // The preflight loaded the same image, so what can still fail here is
+        // the host: a host resource of this process's own that ran out since
+        // (memory for the new image's copy or its interpreter, a descriptor)
+        // ends the run with the named refusal, not as a backend fault.
+        self.replace_process_image(executor, executable, execfn, image, argv, envp)
+            .map_err(exec_after_point_of_no_return_error)
+    }
+
+    /// [`Self::exec_process`] from its point of no return: discards the old
+    /// image and loads the new one.
+    fn replace_process_image(
+        &mut self,
+        executor: &mut ElfExecutor,
+        executable: (&Path, Option<Arc<File>>),
+        execfn: Option<&[u8]>,
+        image: &[u8],
+        argv: &[String],
+        envp: &[String],
+    ) -> Result<()> {
         let user_length = usize::try_from(self.memory.guest_end() - BOOT_RESERVED_END)
             .expect("guest memory length must fit usize");
         // Replace file-backed HVA pages before discarding the new private
@@ -13556,6 +13595,7 @@ mod tests {
     include!("vm/instruction_callback_panic_tests.rs");
     include!("vm/timer_signal_deferral_tests.rs");
     include!("vm/lazy_arming_tests.rs");
+    include!("vm/exec_host_resources_tests.rs");
 }
 
 #[cfg(test)]

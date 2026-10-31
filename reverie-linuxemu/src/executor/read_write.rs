@@ -149,25 +149,40 @@ pub(super) struct ResolvedExecutable {
     pub(super) image: Vec<u8>,
 }
 
+/// Reads the executable at `path` for an exec. Every host resource this
+/// process spends doing so is its own: the descriptors that open the file,
+/// and the buffer the image is read into, which is as large as the file. One
+/// that the host refuses (EMFILE, ENFILE, ENOMEM, or a buffer this process
+/// cannot allocate) is answered ENOMEM, with `refusal` recording the typed
+/// refusal that names it, so that the exec is refused by name rather than
+/// answered with an errno Linux would give for the guest's own reasons. Every
+/// other failure is the errno Linux gives the guest.
 pub(super) fn read_executable_file(
     state: &LoadedStaticElf,
     path: &std::path::Path,
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
 ) -> Result<ResolvedExecutable, i64> {
     use std::io::Read;
-    let pinned = open_metadata_path(state, libc::AT_FDCWD, path.as_os_str().as_bytes(), false)?;
-    let mut file =
-        std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd())).map_err(io_error)?;
+    const OPENING: &str = "opening the new program";
+    let pinned = open_metadata_path(state, libc::AT_FDCWD, path.as_os_str().as_bytes(), false)
+        .map_err(|errno| exec_step_errno(errno, OPENING, refusal))?;
+    let mut file = std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|error| exec_step_io_error(error, OPENING, refusal))?;
     let mut image = Vec::new();
-    // A buffer this process cannot allocate is the host running out of
-    // memory (read_to_end reports OutOfMemory, which has no errno): ENOMEM,
-    // which an exec refuses as this backend's own (`exec_host_memory_refusal`).
-    file.read_to_end(&mut image).map_err(|error| {
-        if is_host_out_of_memory(&error) {
-            negative_errno(libc::ENOMEM)
-        } else {
-            io_error(error)
-        }
-    })?;
+    // Reserved whole and up front, so that a buffer this process cannot
+    // allocate is refused naming the request. read_to_end's own growth, for a
+    // file that grew since, is fallible too: it reports OutOfMemory.
+    if let Some(length) = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        && image.try_reserve_exact(length).is_err()
+    {
+        *refusal = Some(exec_allocation_refusal(length, "the new program's image"));
+        return Err(negative_errno(libc::ENOMEM));
+    }
+    file.read_to_end(&mut image)
+        .map_err(|error| exec_step_io_error(error, "reading the new program's image", refusal))?;
     Ok(ResolvedExecutable {
         path: path.to_owned(),
         file: Some(Arc::new(file)),
@@ -175,10 +190,16 @@ pub(super) fn read_executable_file(
     })
 }
 
+/// Resolves and reads the image an exec of the guest's `path` runs, as
+/// [`read_executable_file`] reads it; `refusal` records the typed refusal of
+/// a host resource this process ran out of. An exec of the caller's own
+/// `/proc/self/exe` runs the image the caller was loaded from, which this
+/// copies into a buffer allocated fallibly: it is as large as that image.
 pub(super) fn resolve_guest_exec_image(
     state: &LoadedStaticElf,
     path: Vec<u8>,
     envp: &[String],
+    refusal: &mut Option<reverie::UnsupportedRefusal>,
 ) -> Result<ResolvedExecutable, i64> {
     match guest_proc_exe_path(state, &path) {
         Some(true) => {
@@ -198,10 +219,22 @@ pub(super) fn resolve_guest_exec_image(
             if result != 0 {
                 return Err(io_error(std::io::Error::last_os_error()));
             }
+            let mut image = Vec::new();
+            if image
+                .try_reserve_exact(state.executable_image.len())
+                .is_err()
+            {
+                *refusal = Some(exec_allocation_refusal(
+                    state.executable_image.len(),
+                    "a copy of the running program's image (/proc/self/exe)",
+                ));
+                return Err(negative_errno(libc::ENOMEM));
+            }
+            image.extend_from_slice(&state.executable_image);
             return Ok(ResolvedExecutable {
                 path: std::path::PathBuf::from(std::ffi::OsString::from_vec(path)),
                 file: Some(file.clone()),
-                image: state.executable_image.to_vec(),
+                image,
             });
         }
         Some(false) => return Err(negative_errno(libc::ENOENT)),
@@ -234,7 +267,7 @@ pub(super) fn resolve_guest_exec_image(
             Err(_) => return Err(negative_errno(libc::ENOENT)),
         }
     };
-    read_executable_file(state, &path)
+    read_executable_file(state, &path, refusal)
 }
 
 /// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
@@ -278,19 +311,35 @@ pub(super) fn resolve_exec_shebang(
         if start == end {
             return Err(negative_errno(libc::ENOEXEC));
         }
-        let interpreter = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&image[start..end]));
+        // Each copy below is as long as the directive line, whose length the
+        // file decides, so each is allocated fallibly: one this process cannot
+        // allocate is ENOMEM, which an exec refuses as this backend's own
+        // (`exec_host_memory_refusal`).
+        let mut interpreter = Vec::new();
+        interpreter
+            .try_reserve_exact(end - start)
+            .map_err(exec_out_of_memory)?;
+        interpreter.extend_from_slice(&image[start..end]);
+        let interpreter = std::path::PathBuf::from(std::ffi::OsString::from_vec(interpreter));
         // Remaining tokens on the directive line become interpreter arguments.
-        let mut shebang_args: Vec<String> = String::from_utf8_lossy(&image[end..line_end])
-            .split_ascii_whitespace()
-            .map(str::to_owned)
-            .collect();
+        let line = try_lossy_string(&image[end..line_end]).map_err(exec_out_of_memory)?;
+        let mut shebang_args = Vec::new();
+        for token in line.split_ascii_whitespace() {
+            shebang_args.try_reserve(1).map_err(exec_out_of_memory)?;
+            shebang_args.push(try_lossy_string(token.as_bytes()).map_err(exec_out_of_memory)?);
+        }
 
-        let mut rewritten = Vec::with_capacity(argv.len() + shebang_args.len() + 2);
-        rewritten.push(interpreter.to_string_lossy().into_owned());
+        let mut rewritten = Vec::new();
+        rewritten
+            .try_reserve_exact(argv.len() + shebang_args.len() + 2)
+            .map_err(exec_out_of_memory)?;
+        rewritten.push(
+            try_lossy_string(interpreter.as_os_str().as_bytes()).map_err(exec_out_of_memory)?,
+        );
         rewritten.append(&mut shebang_args);
-        rewritten.push(path.to_string_lossy().into_owned());
+        rewritten.push(try_lossy_string(path.as_os_str().as_bytes()).map_err(exec_out_of_memory)?);
         if argv.len() > 1 {
-            rewritten.extend_from_slice(&argv[1..]);
+            rewritten.extend(argv.drain(1..));
         }
         argv = rewritten;
 
@@ -298,6 +347,29 @@ pub(super) fn resolve_exec_shebang(
         image = read_interpreter(&path)?;
     }
     Ok((path, image, argv))
+}
+
+/// The answer of an exec preparation to an allocation this process could not
+/// make.
+fn exec_out_of_memory(_: std::collections::TryReserveError) -> i64 {
+    negative_errno(libc::ENOMEM)
+}
+
+/// `bytes` as UTF-8 with each invalid sequence replaced, exactly as
+/// `String::from_utf8_lossy` replaces it, in a buffer allocated fallibly.
+fn try_lossy_string(bytes: &[u8]) -> Result<String, std::collections::TryReserveError> {
+    let mut text = String::new();
+    for chunk in bytes.utf8_chunks() {
+        let replacement = if chunk.invalid().is_empty() {
+            ""
+        } else {
+            "\u{FFFD}"
+        };
+        text.try_reserve(chunk.valid().len() + replacement.len())?;
+        text.push_str(chunk.valid());
+        text.push_str(replacement);
+    }
+    Ok(text)
 }
 
 pub(super) fn ensure_read_capable(file: &std::fs::File) -> Result<(), i64> {

@@ -285,6 +285,20 @@ pub enum Error {
     #[error("failed to allocate guest memory: {0}")]
     MemoryMapping(#[source] std::io::Error),
 
+    /// A host resource of this process's own (memory or address space,
+    /// descriptors, the host's file table) ran out while the backend carried
+    /// out an operation past the point where it could still answer the
+    /// guest: an exec that had already discarded the old image. The guest
+    /// asked for nothing Linux would have refused, and it sees no errno; the
+    /// run ends with this named refusal. The diagnostic names the resource,
+    /// the step that failed and the limit
+    /// ([`crate::host_limits::HostResourceExhaustion`]).
+    #[error("{diagnostic}")]
+    HostResources {
+        /// What ran out, in which step, under which limit.
+        diagnostic: String,
+    },
+
     /// A writable syscall alias could not be physically retired. This is a
     /// terminal backend failure, never a guest errno. A process-lifetime ledger
     /// owns the exact refused range and its backing until host process exit;
@@ -513,6 +527,27 @@ impl Error {
             | Self::Cleanup { error, .. } => error.primary(),
             Self::ExecWorkerTeardown(error) => error.primary(),
             _ => self,
+        }
+    }
+
+    /// Whether this error's [`Self::primary`] cause is the named refusal
+    /// [`Self::HostResources`]: a host resource of this process's own ran out
+    /// past the point where the backend could answer the guest.
+    pub fn is_host_resources_refusal(&self) -> bool {
+        matches!(self.primary(), Self::HostResources { .. })
+    }
+
+    /// The host resource this error reports running out of, when it is a
+    /// host call or allocation of this process's own that the host refused
+    /// ([`Self::MemoryMapping`] or [`Self::HostIo`] carrying ENOMEM, an
+    /// allocation's `OutOfMemory`, EMFILE or ENFILE); `None` for any other
+    /// error, such as a malformed image.
+    pub fn host_resource_exhaustion(&self) -> Option<crate::host_limits::HostResourceExhaustion> {
+        match self {
+            Self::MemoryMapping(error) | Self::HostIo(error) => {
+                crate::host_limits::HostResourceExhaustion::of(error)
+            }
+            _ => None,
         }
     }
 }

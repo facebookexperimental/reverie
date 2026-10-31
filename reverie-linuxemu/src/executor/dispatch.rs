@@ -967,8 +967,13 @@ impl ElfExecutor {
                 libc::SYS_execve | libc::SYS_execveat
             )
         {
-            let retained = self.take_parent_death_exec(request)?;
-            return Ok(self.prepare_exec(memory, request, Some(retained)));
+            return Ok(match self.take_parent_death_exec(request)? {
+                Ok(retained) => self.prepare_exec(memory, request, Some(retained)),
+                Err(refusal) => {
+                    self.unsupported_refusal = Some(refusal);
+                    negative_errno(libc::ENOMEM)
+                }
+            });
         }
         if let Some(result) = self.execute_process_action(request, memory) {
             return Ok(result);

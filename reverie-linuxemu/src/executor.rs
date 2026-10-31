@@ -478,7 +478,7 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         mmap_limit: BOOT_RESERVED_END + 2 * PAGE_SIZE,
         executable_path: std::path::PathBuf::from("test"),
         executable_file: None,
-        executable_image: Arc::from([]),
+        executable_image: Arc::default(),
         argv0: b"test".to_vec(),
         cwd: cwd.to_owned(),
         cwd_fd: std::fs::File::open(cwd).unwrap(),
@@ -43464,7 +43464,7 @@ mod tests {
         ));
         leader.executable_path = executable.clone();
         leader.executable_file = Some(Arc::new(std::fs::File::open(&executable).unwrap()));
-        leader.executable_image = Arc::from(b"loaded image".as_slice());
+        leader.executable_image = Arc::new(b"loaded image".to_vec());
         leader
             .task_lifecycle
             .lock()
@@ -43492,7 +43492,7 @@ mod tests {
         for state in [&leader, &worker] {
             for alias in aliases(state.tid) {
                 let invoked = PathBuf::from(std::ffi::OsString::from_vec(alias.clone()));
-                let resolved = resolve_guest_exec_image(state, alias, &envp).unwrap();
+                let resolved = resolve_guest_exec_image(state, alias, &envp, &mut None).unwrap();
                 assert_eq!(resolved.path, invoked);
                 assert!(resolved.file.is_some());
                 assert!(Arc::ptr_eq(
@@ -43503,7 +43503,8 @@ mod tests {
             }
         }
         assert_eq!(
-            resolve_guest_exec_image(&leader, b"/proc/39/exe".to_vec(), &envp).unwrap_err(),
+            resolve_guest_exec_image(&leader, b"/proc/39/exe".to_vec(), &envp, &mut None)
+                .unwrap_err(),
             negative_errno(libc::ENOENT),
         );
         for foreign in [
@@ -43512,7 +43513,7 @@ mod tests {
             b"/proc/39/task/38/exe".to_vec(),
         ] {
             assert_eq!(
-                resolve_guest_exec_image(&leader, foreign, &envp).unwrap_err(),
+                resolve_guest_exec_image(&leader, foreign, &envp, &mut None).unwrap_err(),
                 negative_errno(libc::ENOENT),
             );
         }
@@ -43521,14 +43522,15 @@ mod tests {
         let supervisor_exe = format!("/proc/{supervisor_pid}/exe").into_bytes();
         assert!(std::path::Path::new(std::ffi::OsStr::from_bytes(&supervisor_exe)).exists());
         assert_eq!(
-            resolve_guest_exec_image(&leader, supervisor_exe, &envp).unwrap_err(),
+            resolve_guest_exec_image(&leader, supervisor_exe, &envp, &mut None).unwrap_err(),
             negative_errno(libc::ENOENT),
             "a live supervisor proc entry must not become a guest executable",
         );
 
         std::fs::remove_file(&executable).unwrap();
         let resolved =
-            resolve_guest_exec_image(&worker, b"/proc/thread-self/exe".to_vec(), &envp).unwrap();
+            resolve_guest_exec_image(&worker, b"/proc/thread-self/exe".to_vec(), &envp, &mut None)
+                .unwrap();
         assert_eq!(resolved.path, Path::new("/proc/thread-self/exe"));
         assert!(resolved.file.is_some());
         assert_eq!(resolved.image, b"loaded image");
@@ -43537,14 +43539,19 @@ mod tests {
         let relative = dir.0.join("relative/program");
         std::fs::write(&relative, b"relative image").unwrap();
         let resolved =
-            resolve_guest_exec_image(&leader, b"relative/program".to_vec(), &envp).unwrap();
+            resolve_guest_exec_image(&leader, b"relative/program".to_vec(), &envp, &mut None)
+                .unwrap();
         assert_eq!(resolved.path, relative);
         assert_eq!(resolved.image, b"relative image");
         let absolute = dir.0.join("absolute-program");
         std::fs::write(&absolute, b"absolute image").unwrap();
-        let resolved =
-            resolve_guest_exec_image(&leader, absolute.as_os_str().as_bytes().to_vec(), &envp)
-                .unwrap();
+        let resolved = resolve_guest_exec_image(
+            &leader,
+            absolute.as_os_str().as_bytes().to_vec(),
+            &envp,
+            &mut None,
+        )
+        .unwrap();
         assert_eq!(resolved.path, absolute);
         assert_eq!(resolved.image, b"absolute image");
 
@@ -43554,7 +43561,8 @@ mod tests {
         std::fs::write(&searched, b"image").unwrap();
         let envp = vec![format!("PATH={}", bin.display())];
         let resolved =
-            resolve_guest_exec_image(&leader, b"searched-program".to_vec(), &envp).unwrap();
+            resolve_guest_exec_image(&leader, b"searched-program".to_vec(), &envp, &mut None)
+                .unwrap();
         assert_eq!(resolved.path, searched.canonicalize().unwrap());
         assert_eq!(resolved.image, b"image");
 
@@ -43562,9 +43570,13 @@ mod tests {
         std::fs::write(&target, b"target image").unwrap();
         let alias = dir.0.join("program-link");
         std::os::unix::fs::symlink(&target, &alias).unwrap();
-        let resolved =
-            resolve_guest_exec_image(&leader, alias.as_os_str().as_bytes().to_vec(), &envp)
-                .unwrap();
+        let resolved = resolve_guest_exec_image(
+            &leader,
+            alias.as_os_str().as_bytes().to_vec(),
+            &envp,
+            &mut None,
+        )
+        .unwrap();
         assert_eq!(resolved.path, alias);
         assert_eq!(resolved.image, b"target image");
     }

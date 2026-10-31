@@ -780,10 +780,15 @@ impl ElfExecutor {
         }
     }
 
+    /// Takes the staged authority of the enrolled exec `request`, with a copy
+    /// of the retained image for the exec to load. The copy is as large as
+    /// the image, so its buffer is allocated fallibly: one this process
+    /// cannot allocate is the inner error, the typed refusal of host
+    /// resources, which the exec answers ENOMEM.
     pub(super) fn take_parent_death_exec(
         &self,
         request: &SyscallRequest,
-    ) -> crate::Result<ResolvedExecutable> {
+    ) -> crate::Result<std::result::Result<ResolvedExecutable, reverie::UnsupportedRefusal>> {
         let (alias, file, image) = {
             let mut slot = self
                 .parent_death_exec
@@ -802,11 +807,19 @@ impl ElfExecutor {
                 staged.image.clone(),
             )
         };
-        Ok(ResolvedExecutable {
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(image.len()).is_err() {
+            return Ok(Err(exec_allocation_refusal(
+                image.len(),
+                "a copy of the running program's retained image",
+            )));
+        }
+        copy.extend_from_slice(&image);
+        Ok(Ok(ResolvedExecutable {
             path: std::path::PathBuf::from(std::ffi::OsString::from_vec(alias)),
             file: Some(file),
-            image: image.to_vec(),
-        })
+            image: copy,
+        }))
     }
 
     fn parent_death_operation_preflight(

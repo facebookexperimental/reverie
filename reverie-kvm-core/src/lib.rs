@@ -15,6 +15,8 @@
 //! - [`syscall`]: the guest's syscall frame ([`SyscallRequest`]).
 //! - [`entry`]: the entry gate between vCPU entries and memory operations.
 //! - [`failure`]: run-failure ownership.
+//! - [`host_limits`]: the host resources the backend's own process can run
+//!   out of, and the limits its refusals name.
 //! - [`supervisor_thread`]: the host threads that drive guest processes and
 //!   guest threads, and their stack size.
 //! - [`provider_memory`]: the `reverie::provider` guest-memory traits over
@@ -33,6 +35,7 @@ pub mod entry;
 pub mod error;
 pub mod error_ext;
 pub mod failure;
+pub mod host_limits;
 pub mod layout;
 pub mod memory;
 pub mod provider_memory;

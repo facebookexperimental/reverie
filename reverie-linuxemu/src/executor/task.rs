@@ -19,7 +19,7 @@ pub(super) struct ParentDeathExecSnapshot {
     pub(super) original: SyscallRequest,
     pub(super) alias: Vec<u8>,
     pub(super) file: Arc<std::fs::File>,
-    pub(super) image: Arc<[u8]>,
+    pub(super) image: Arc<Vec<u8>>,
     pub(super) consumed: bool,
 }
 
@@ -1031,9 +1031,10 @@ impl ElfExecutor {
         request: &SyscallRequest,
         retained: Option<ResolvedExecutable>,
     ) -> i64 {
-        // The refusal describes this exec alone. Preparation records the
-        // specific refusal of a validation memory the host refused; any other
-        // ENOMEM is also the host's (`exec_host_memory_refusal`).
+        // The refusal describes this exec alone. A preparation step that
+        // finds a host resource of this process's own exhausted records the
+        // refusal that names it; any other ENOMEM is also the host's
+        // (`exec_host_memory_refusal`).
         self.unsupported_refusal = None;
         let result = self.prepare_exec_image(memory, request, retained);
         if self.unsupported_refusal.is_none() {
@@ -1105,7 +1106,12 @@ impl ElfExecutor {
                 }
                 executable
             }
-            None => match resolve_guest_exec_image(&self.state, path.clone(), &envp) {
+            None => match resolve_guest_exec_image(
+                &self.state,
+                path.clone(),
+                &envp,
+                &mut self.unsupported_refusal,
+            ) {
                 Ok(executable) => executable,
                 Err(error) => return error,
             },
@@ -1140,7 +1146,8 @@ impl ElfExecutor {
         } else {
             let script_name = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&execfn));
             match resolve_exec_shebang(script_name, image, argv, |interpreter| {
-                let resolved = read_executable_file(&self.state, interpreter)?;
+                let resolved =
+                    read_executable_file(&self.state, interpreter, &mut self.unsupported_refusal)?;
                 executable_file = resolved.file;
                 Ok(resolved.image)
             }) {
@@ -1174,13 +1181,21 @@ impl ElfExecutor {
             &envp_refs,
             &self.state.cwd,
         ) {
-            // A loader host call or allocation that ran out of memory says
-            // nothing about the image (`prepare_exec` refuses the ENOMEM);
-            // every other loader failure is a malformed image.
-            return if is_host_memory_error(&error) {
-                negative_errno(libc::ENOMEM)
-            } else {
-                negative_errno(libc::ENOEXEC)
+            // A host resource this process ran out of while loading (memory
+            // for the image's copy or its PT_INTERP image, a descriptor to
+            // open the interpreter) says nothing about the image, so the exec
+            // is refused by name. Every other loader failure is an image that
+            // is malformed or that this loader cannot place: ENOEXEC.
+            return match error.host_resource_exhaustion() {
+                Some(exhaustion) => {
+                    self.unsupported_refusal = Some(exec_host_resource_refusal(
+                        "loading the new image into the validation memory",
+                        &error,
+                        &exhaustion,
+                    ));
+                    negative_errno(libc::ENOMEM)
+                }
+                None => negative_errno(libc::ENOEXEC),
             };
         }
         // Linux makes a non-leader caller the new thread-group leader while it

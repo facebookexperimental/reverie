@@ -514,20 +514,44 @@ reserves four guest memories at its peak (the shell, both commands and one
 exec's validation memory), and an exited earlier command can briefly add a
 fifth.
 
-Run the backend with an unlimited `RLIMIT_AS`, and bound its memory with a
-cgroup (`memory.max`) instead, which counts only the pages guests touch.
-Under a finite limit, a run fails at the first reservation that does not fit,
-at a point the process tree and host thread scheduling decide:
+Every guest process of the backend lives in its one host process, so these
+reservations are that process's own, and so are the memory it allocates for
+the guests and the descriptors it opens for them: an exec, for one, reads its
+new image into a buffer as large as the file, and the loader keeps a copy of
+every image it loads (an exec of `/proc/self/exe` loads it again).
 
-- an exec whose validation memory the host refuses, or whose image or
-  interpreter this process cannot allocate memory to read, is answered
-  `ENOMEM` with the typed refusal `UnsupportedOperation::HostResources`. Its
-  diagnostic names the reservation, the host error and the process's
-  `RLIMIT_AS`. The exec runs none of the new image. A Tool that ends the run
-  on the refusal keeps the guest from ever seeing the `ENOMEM`; no `ENOMEM`
-  an exec returns is one Linux would give for the guest's own reasons;
+Run the backend with an unlimited `RLIMIT_AS`, and bound its memory with a
+cgroup (`memory.max`) instead. `memory.max` charges the memory a run uses:
+the pages guests touch, the backend's own heap, page cache and kernel memory
+such as KVM's, but not address space that is only reserved. A run that
+reaches it is stopped by the kernel's OOM killer wherever it then is, not
+refused by name, so size the bound for the workload.
+
+Under a finite `RLIMIT_AS`, or one lowered while the run goes on, a run fails
+at the first reservation or allocation that does not fit, at a point the
+process tree and host thread scheduling decide:
+
+- an exec whose validation memory the host refuses, whose image (or its copy
+  of `/proc/self/exe`, its `#!` line, or the loader's copy) this process
+  cannot allocate, or whose program interpreter it cannot open for want of a
+  descriptor or memory, is answered `ENOMEM` with the typed refusal
+  `UnsupportedOperation::HostResources`. Its diagnostic names what ran out,
+  the request or the step, and the limit: `RLIMIT_AS`, or `RLIMIT_NOFILE`
+  for descriptors. The exec runs none of the new image. A Tool that ends the
+  run on the refusal keeps the guest from ever seeing the `ENOMEM`; no
+  `ENOMEM` an exec returns is one Linux would give for the guest's own
+  reasons;
+- an exec that runs out of a host resource past its point of no return, with
+  the old image discarded and the new one loading into the live memory, ends
+  the run with the named refusal `Error::HostResources`; the guest sees no
+  errno. The exec's preflight loaded the same image, so this happens only
+  when the host's resources shrank in between, as a limit lowered during the
+  run can make them;
 - a fork whose child memory the host refuses ends the run with
-  `Error::MemoryMapping`.
+  `Error::MemoryMapping`;
+- an allocation of a fixed size, or of one bounded by the executor's own
+  limits (an exec's path, `argv` and `envp`), is not fallible: when one of
+  those fails, the process is out of memory everywhere, and it aborts.
 
 An embedder that needs the same outcome on every run should refuse to start
 under a finite `RLIMIT_AS`.
