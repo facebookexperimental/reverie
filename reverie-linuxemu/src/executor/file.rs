@@ -2123,19 +2123,23 @@ pub(super) fn fcntl(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u
                 }
                 return result;
             }
-            if flags & libc::O_NONBLOCK == 0 {
-                // Blocking inotify waits are refused the same way.
+            // An inotify instance's host description stays nonblocking
+            // (inotify.rs): the other flags apply, and the blocking mode the
+            // guest asks for is the Tool's to keep.
+            let host_flags = if flags & libc::O_NONBLOCK == 0 {
                 match host_fd_is_inotify(host_fd) {
-                    Ok(true) => return negative_errno(libc::ENOSYS),
-                    Ok(false) => {}
+                    Ok(true) => flags | libc::O_NONBLOCK,
+                    Ok(false) => flags,
                     Err(error) => return error,
                 }
-            }
+            } else {
+                flags
+            };
             // SAFETY: host_fd names a live descriptor; F_SETFL consumes one int flag word.
             if let Some(owner) = source_pipe_owner {
-                owner.set_flags(host_fd, flags)
+                owner.set_flags(host_fd, host_flags)
             } else {
-                zero_or_errno(unsafe { libc::fcntl(host_fd, libc::F_SETFL, flags) })
+                zero_or_errno(unsafe { libc::fcntl(host_fd, libc::F_SETFL, host_flags) })
             }
         }
         // AUTONOMOUS-BOT-IMPLEMENTED

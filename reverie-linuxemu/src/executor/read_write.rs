@@ -1959,9 +1959,6 @@ fn staged_vectored_transfer<M: GuestMemoryAccess<Error = crate::Error> + Address
     } else {
         false
     };
-    if inotify && let Err(error) = ensure_inotify_nonblocking(host_fd) {
-        return error;
-    }
     let staging_alignment = direct_io_memory_alignment(host_fd);
 
     // Give the host one iovec for every bounded guest iovec, with the same

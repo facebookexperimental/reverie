@@ -140,15 +140,23 @@ mod inotify_tests {
         assert_eq!(host_fd_is_inotify(directory.as_raw_fd()), Ok(false));
     }
 
+    fn guest_status_flags(state: &mut LoadedStaticElf, memory: &mut GuestMemory, fd: u64) -> i64 {
+        syscall_result(
+            memory,
+            state,
+            libc::SYS_fcntl,
+            [fd, libc::F_GETFL as u64, 0, 0, 0, 0],
+        )
+    }
+
     #[test]
-    fn inotify_creation_validates_flags_and_refuses_blocking_mode() {
+    fn inotify_creation_validates_flags_and_keeps_every_host_instance_nonblocking() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 4 * PAGE_SIZE as usize).unwrap();
         assert!(mutates_file_table(libc::SYS_inotify_init as u64));
         assert!(mutates_file_table(libc::SYS_inotify_init1 as u64));
-        // Undefined flags are EINVAL before the blocking-mode refusal, as the
-        // native kernel rejects them.
+        // Undefined flags are EINVAL, as the native kernel rejects them.
         // SAFETY: an invalid flag word fails without creating a descriptor.
         assert_eq!(unsafe { libc::inotify_init1(libc::O_RDWR) }, -1);
         assert_eq!(
@@ -164,65 +172,99 @@ mod inotify_tests {
             ),
             negative_errno(libc::EINVAL)
         );
-        for (number, flags) in [
-            (libc::SYS_inotify_init, 0),
-            (libc::SYS_inotify_init1, 0),
-            (libc::SYS_inotify_init1, libc::IN_CLOEXEC as u64),
-        ] {
-            assert_eq!(
-                syscall_result(&mut memory, &mut state, number, [flags, 0, 0, 0, 0, 0]),
-                negative_errno(libc::ENOSYS)
-            );
-        }
         assert!(
             state.files.is_empty(),
             "a refused creation installed a descriptor"
         );
-
-        let cloexec = create(&mut state, &mut memory);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fcntl,
-                [cloexec as u64, libc::F_GETFD as u64, 0, 0, 0, 0]
-            ),
-            i64::from(libc::FD_CLOEXEC)
-        );
-        let plain = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_inotify_init1,
-            [libc::IN_NONBLOCK as u64, 0, 0, 0, 0, 0],
-        );
-        assert!(plain > cloexec);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_fcntl,
-                [plain as u64, libc::F_GETFD as u64, 0, 0, 0, 0]
-            ),
-            0
-        );
-        let host = host_fd(&state, plain as i32).unwrap();
-        assert_eq!(host_fd_is_inotify(host), Ok(true));
-        assert_ne!(fd_status_flags(host).unwrap() & libc::O_NONBLOCK, 0);
-        // The supervisor descriptor stays private regardless of guest CLOEXEC.
-        // SAFETY: host is live and F_GETFD takes no argument.
-        assert_eq!(
-            unsafe { libc::fcntl(host, libc::F_GETFD) },
-            libc::FD_CLOEXEC
-        );
+        // A blocking instance, from inotify_init or inotify_init1 without
+        // IN_NONBLOCK, is created with a nonblocking host instance: a read
+        // that finds nothing queued answers EAGAIN, as a native nonblocking
+        // instance does, which reports to the Tool that it would block. Guest
+        // CLOEXEC is still the guest's.
+        let native = native_instance();
+        for (number, flags) in [
+            (libc::SYS_inotify_init, 0),
+            (libc::SYS_inotify_init1, 0),
+            (libc::SYS_inotify_init1, libc::IN_CLOEXEC as u64),
+            (libc::SYS_inotify_init1, libc::IN_NONBLOCK as u64),
+        ] {
+            let fd = syscall_result(&mut memory, &mut state, number, [flags, 0, 0, 0, 0, 0]);
+            assert!(fd >= 3, "{number} with flags {flags:#x} returned {fd}");
+            let host = host_fd(&state, fd as i32).unwrap();
+            assert_eq!(host_fd_is_inotify(host), Ok(true));
+            assert_ne!(fd_status_flags(host).unwrap() & libc::O_NONBLOCK, 0);
+            assert_ne!(
+                guest_status_flags(&mut state, &mut memory, fd as u64)
+                    & i64::from(libc::O_NONBLOCK),
+                0
+            );
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_fcntl,
+                    [fd as u64, libc::F_GETFD as u64, 0, 0, 0, 0]
+                ),
+                if flags == libc::IN_CLOEXEC as u64 {
+                    i64::from(libc::FD_CLOEXEC)
+                } else {
+                    0
+                }
+            );
+            let mut native_bytes = [0_u8; 64];
+            assert_eq!(
+                guest_read(&mut state, &mut memory, fd as u64, 64).0,
+                native_read(native.as_raw_fd(), native_bytes.as_mut_ptr(), 64)
+            );
+            assert_eq!(
+                guest_read(&mut state, &mut memory, fd as u64, 64).0,
+                negative_errno(libc::EAGAIN)
+            );
+            // The supervisor descriptor stays private regardless of guest
+            // CLOEXEC.
+            // SAFETY: host is live and F_GETFD takes no argument.
+            assert_eq!(
+                unsafe { libc::fcntl(host, libc::F_GETFD) },
+                libc::FD_CLOEXEC
+            );
+        }
     }
 
     #[test]
-    fn inotify_blocking_mode_switches_and_reads_are_refused() {
+    fn inotify_blocking_mode_switches_keep_the_host_instance_nonblocking() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 4 * PAGE_SIZE as usize).unwrap();
+        let native = native_instance();
         let fd = create(&mut state, &mut memory) as u64;
         let host = host_fd(&state, fd as i32).unwrap();
+        let root_bytes = root.0.as_os_str().as_bytes().to_vec();
+        let wd = add_watch(&mut state, &mut memory, fd, &root_bytes, libc::IN_CREATE);
+        assert_eq!(wd, native_watch(&native, &root.0, libc::IN_CREATE));
+        // Clearing O_NONBLOCK succeeds and leaves the host nonblocking; the
+        // other flags apply as natively (O_APPEND here).
+        // SAFETY: native is live; F_SETFL consumes one int flag word.
+        let native_result =
+            unsafe { libc::fcntl(native.as_raw_fd(), libc::F_SETFL, libc::O_APPEND) };
+        assert_eq!(native_result, 0);
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_fcntl,
+                [fd, libc::F_SETFL as u64, libc::O_APPEND as u64, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            fd_status_flags(host).unwrap(),
+            fd_status_flags(native.as_raw_fd()).unwrap() | libc::O_NONBLOCK
+        );
+        // SAFETY: as above, back to the native instance's nonblocking mode.
+        assert_eq!(
+            unsafe { libc::fcntl(native.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -230,10 +272,13 @@ mod inotify_tests {
                 libc::SYS_fcntl,
                 [fd, libc::F_SETFL as u64, 0, 0, 0, 0]
             ),
-            negative_errno(libc::ENOSYS)
+            0
         );
         assert_ne!(fd_status_flags(host).unwrap() & libc::O_NONBLOCK, 0);
-        assert_eq!(write_struct(&mut ProviderMemory(&memory), BUFFER, &0_i32), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), BUFFER, &0_i32),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -241,9 +286,34 @@ mod inotify_tests {
                 libc::SYS_ioctl,
                 [fd, libc::FIONBIO, BUFFER, 0, 0, 0]
             ),
-            negative_errno(libc::ENOSYS)
+            0
         );
         assert_ne!(fd_status_flags(host).unwrap() & libc::O_NONBLOCK, 0);
+        // Reads of the "blocking" descriptor never wait: with nothing queued
+        // they answer EAGAIN through both the scalar and vectored paths.
+        let iovec = libc::iovec {
+            iov_base: BUFFER as *mut libc::c_void,
+            iov_len: 64,
+        };
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), PATH, &iovec), 0);
+        assert_eq!(
+            guest_read(&mut state, &mut memory, fd, 64).0,
+            negative_errno(libc::EAGAIN)
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_readv,
+                [fd, PATH, 1, 0, 0, 0]
+            ),
+            negative_errno(libc::EAGAIN)
+        );
+        // With an event queued they return it, as the native instance does.
+        std::fs::write(root.0.join("created"), b"x").unwrap();
+        let (result, bytes) = guest_read(&mut state, &mut memory, fd, 64);
+        assert_eq!((result, bytes), drain(native.as_raw_fd()));
+        assert!(result > 0);
         // Keeping or setting nonblocking mode remains a native operation.
         assert_eq!(
             syscall_result(
@@ -254,7 +324,10 @@ mod inotify_tests {
             ),
             0
         );
-        assert_eq!(write_struct(&mut ProviderMemory(&memory), BUFFER, &1_i32), 0);
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), BUFFER, &1_i32),
+            0
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -264,31 +337,7 @@ mod inotify_tests {
             ),
             0
         );
-
-        // An instance that reached the table in blocking mode (it cannot be
-        // created through the dispatcher) is refused rather than waited on,
-        // through both the scalar and vectored read paths.
-        // SAFETY: successful inotify_init1 returns a new owned descriptor.
-        let blocking = unsafe { std::fs::File::from_raw_fd(libc::inotify_init1(libc::IN_CLOEXEC)) };
-        let blocking = insert_file_with_flags(&mut state, blocking, true, None) as u64;
-        assert_eq!(
-            guest_read(&mut state, &mut memory, blocking, 64).0,
-            negative_errno(libc::ENOSYS)
-        );
-        let iovec = libc::iovec {
-            iov_base: BUFFER as *mut libc::c_void,
-            iov_len: 64,
-        };
-        assert_eq!(write_struct(&mut ProviderMemory(&memory), PATH, &iovec), 0);
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_readv,
-                [blocking, PATH, 1, 0, 0, 0]
-            ),
-            negative_errno(libc::ENOSYS)
-        );
+        assert_ne!(fd_status_flags(host).unwrap() & libc::O_NONBLOCK, 0);
     }
 
     #[test]

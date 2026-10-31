@@ -124,9 +124,11 @@ fn fionbio(
         return 0;
     }
     if value == 0 {
-        // Keep F_SETFL's inotify policy for the same reason.
+        // As for F_SETFL: an inotify instance's host description stays
+        // nonblocking (inotify.rs), and the blocking mode the guest asks for
+        // is the Tool's to keep.
         match host_fd_is_inotify(host_fd) {
-            Ok(true) => return negative_errno(libc::ENOSYS),
+            Ok(true) => return 0,
             Ok(false) => {}
             Err(error) => return error,
         }

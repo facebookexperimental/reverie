@@ -33,11 +33,21 @@
 // backend, so this executor neither renumbers a cookie nor restores any byte
 // of an event.
 //
-// One thing is not left to the host: blocking mode. A blocking read waits for
-// an event that only another guest task can produce, in a host wait that the
-// Tool cannot see or order. As for signalfd, creating or switching an instance
-// into blocking mode is refused with ENOSYS, and the read path refuses a
-// blocking instance as a defensive invariant.
+// One thing is not left to the host: waiting. Every host instance this
+// executor makes is nonblocking, whatever mode the guest asks for, and F_SETFL
+// and FIONBIO never clear that (file.rs, ioctl.rs), so no read of one waits in
+// the host, where the Tool could neither see nor order the wait. A read that
+// finds nothing queued answers EAGAIN, a nonblocking read's answer, in either
+// mode: for a blocking descriptor that is the report that the read would
+// block, and whether the guest then waits, and until when, is the Tool's
+// decision. The descriptor's blocking mode is the Tool's to keep as well: a
+// Tool that makes its guest wait for such a read itself can ask for a
+// nonblocking instance and present the guest's mode through the guest's
+// F_GETFL and FIONBIO, while this executor's F_GETFL reports the host
+// instance's flags, O_NONBLOCK included. A Tool that passes a blocking read
+// through unchanged gets EAGAIN when nothing is queued, where Linux would wait.
+// A descriptor received from outside the guest keeps the mode its sender gave
+// it, as any other received descriptor does.
 
 pub(super) fn host_fd_is_inotify(host_fd: RawFd) -> Result<bool, i64> {
     host_fd_mode_is_inotify(host_fd, fd_mode(host_fd)?)
@@ -52,15 +62,6 @@ pub(super) fn host_fd_mode_is_inotify(host_fd: RawFd, mode: libc::mode_t) -> Res
     }
     let target = canonical_fd_path(host_fd)?;
     Ok(target.as_os_str().as_bytes() == b"anon_inode:inotify")
-}
-
-/// Refuse a blocking inotify wait: no event can arrive while the reading task
-/// holds its turn, and a host wait would escape the Tool.
-pub(super) fn ensure_inotify_nonblocking(host_fd: RawFd) -> Result<(), i64> {
-    if fd_status_flags(host_fd)? & libc::O_NONBLOCK == 0 {
-        return Err(negative_errno(libc::ENOSYS));
-    }
-    Ok(())
 }
 
 /// The bytes queued on the host inotify instance `host_fd`, as FIONREAD there
@@ -103,14 +104,11 @@ pub(super) fn inotify_init1(state: &mut LoadedStaticElf, raw_flags: u64) -> i64 
     if flags & !(libc::IN_CLOEXEC | libc::IN_NONBLOCK) != 0 {
         return negative_errno(libc::EINVAL);
     }
-    if flags & libc::IN_NONBLOCK == 0 {
-        // See ensure_inotify_nonblocking: blocking waits are unsupported.
-        return negative_errno(libc::ENOSYS);
-    }
-    // Keep the supervisor descriptor private; guest CLOEXEC is modeled
-    // separately in the guest file table.
+    // The host instance is nonblocking whatever the guest asked for (see the
+    // top of this file), and the supervisor descriptor stays private: guest
+    // CLOEXEC is modeled separately in the guest file table.
     // SAFETY: inotify_init1 takes only flags and returns a new descriptor.
-    let host_fd = unsafe { libc::inotify_init1(flags | libc::IN_CLOEXEC) };
+    let host_fd = unsafe { libc::inotify_init1(flags | libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
     if host_fd < 0 {
         return io_error(std::io::Error::last_os_error());
     }
