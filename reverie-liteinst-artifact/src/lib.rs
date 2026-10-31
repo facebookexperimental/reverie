@@ -1083,8 +1083,9 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 82] = [
     ),
     (
         "reverie/src/guest.rs",
-        109308,
-        "2026a8f2997acb7977da5e48b6c2a079442aa894552fab9bf8eb4db61f0e345a",
+        109625,
+        "2c63259b9f669aebab8931d02598ef25d066184c3e9af57328eece6eef81e9c5",
+>>>>>>> 6296fe447 (Restore returning injection frames at stopped completion)
     ),
     (
         "reverie/src/pidfd_self.rs",
@@ -32924,7 +32925,7 @@ mod tests {
                 include_bytes!("lib.rs"),
             ),
         ];
-        // These four reviewed sources changed for startup completion or gating.
+        // These five reviewed sources changed for startup or returning-injection contracts.
         // Keep the fixed catalog authoritative and reject their prior tuples.
         assert_eq!(CONTENT_REVERIE_CATALOG.len(), 77);
         for (relative, old_size, old_digest) in [
@@ -32947,6 +32948,11 @@ mod tests {
                 "reverie-inguest/src/guest/host.rs",
                 204181,
                 "3f3a6486819a5af8212f1d6abe42cc1e1cb098ddd45f8bf137790da50ee8c392",
+            ),
+            (
+                "reverie/src/guest.rs",
+                81764,
+                "b8e45c8b40b0e711fdd01a4a71bbd671c4debcfd1977d44d920446067119dc3a",
             ),
         ] {
             let entries: Vec<_> = CONTENT_REVERIE_CATALOG

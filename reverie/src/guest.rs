@@ -455,15 +455,18 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     async fn daemonize(&mut self);
 
     /// Inject a system call into the guest and wait for the return value. This
-    /// function dirties the register file while its executing, but restores at
-    /// the end.
+    /// function temporarily changes the computational and control-register
+    /// frame to execute the injection, then restores that frame on return.
     ///
     /// Preconditions: the guest is in a stopped state and Reverie is currently
     /// running a handler on that guest thread's behalf.
     ///
-    /// Postconditions: the register file is the same as before the call to this
-    /// function. However, any side effects, including to guest memory, persist
-    /// after the injected call.
+    /// Postconditions: general-purpose registers (including the return-value
+    /// register), instruction and stack pointers, and flags are restored to
+    /// their values before this call. Architectural segment/TLS state changed
+    /// by the syscall, such as FS/GS bases, is retained, as are other syscall
+    /// side effects, including changes to guest memory. The syscall's result is
+    /// returned separately from the restored register frame.
     ///
     /// # Caveats
     ///

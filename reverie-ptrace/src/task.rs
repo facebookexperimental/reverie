@@ -5170,6 +5170,62 @@ impl SegfaultTrapInfo {
     }
 }
 
+/// Invocation-local register policy, not ownership of a ptrace stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InjectionRestoration {
+    PreserveResult,
+    PublicReturning,
+}
+
+impl InjectionRestoration {
+    fn for_public_returning(
+        pending_syscall: bool,
+        injected_frame: bool,
+        signal_callback: bool,
+        held_signal_callback: bool,
+    ) -> Self {
+        if cfg!(target_arch = "x86_64")
+            && !pending_syscall
+            && !injected_frame
+            && !signal_callback
+            && !held_signal_callback
+        {
+            Self::PublicReturning
+        } else {
+            Self::PreserveResult
+        }
+    }
+}
+
+/// Restore the invocation's computational/control frame without undoing
+/// architectural effects such as ARCH_SET_FS/GS. The caller separately owns
+/// the extracted syscall result and the authentic stopped task.
+fn public_returning_regs(
+    post_call: libc::user_regs_struct,
+    context: &libc::user_regs_struct,
+) -> libc::user_regs_struct {
+    #[cfg(target_arch = "x86_64")]
+    {
+        libc::user_regs_struct {
+            fs_base: post_call.fs_base,
+            gs_base: post_call.gs_base,
+            cs: post_call.cs,
+            ss: post_call.ss,
+            ds: post_call.ds,
+            es: post_call.es,
+            fs: post_call.fs,
+            gs: post_call.gs,
+            ..*context
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // The new disposition is selected only on x86_64. Keep the existing
+        // result/argument policy on other architectures.
+        restored_regs(post_call, context, None, false)
+    }
+}
+
 // restore syscall context when it returns. This is needed because we might
 // have injected a different syscall (or arguments) in handle_seccomp.
 fn restore_context(
@@ -10736,7 +10792,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         args: SyscallArgs,
     ) -> Result<Result<i64, Errno>, TraceError> {
         let native = NativeCallContext::application(None);
-        self.untraced_syscall_with(task, nr, args, false, Some(&native))
+        self.untraced_syscall_with(
+            task,
+            nr,
+            args,
+            false,
+            Some(&native),
+            InjectionRestoration::PreserveResult,
+        )
             .await
     }
 
@@ -10753,6 +10816,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         args: SyscallArgs,
         original: bool,
         input: Option<&NativeCallContext>,
+        restoration: InjectionRestoration,
     ) -> Result<Result<i64, Errno>, TraceError> {
         self.timer.expire_overflow_records(&task);
         tracing::trace!(
@@ -10862,7 +10926,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .step_shielded_injection(task, nr, shield, requeue, input)
                 .await?;
             let result = self
-                .status_to_result(wait, Some(oldregs), child_context, input, seccomp_trapped)
+                .status_to_result(
+                    wait,
+                    Some(oldregs),
+                    child_context,
+                    input,
+                    seccomp_trapped,
+                    restoration,
+                )
                 .await?;
             if let Some(sigtrap) = sigtrap {
                 self.repair_sigtrap_after_injection(sigtrap, &result)
@@ -10917,7 +10988,14 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         // Get the result of the syscall to return to the caller.
         let result = self
-            .status_to_result(wait, Some(oldregs), child_context, input, seccomp_trapped)
+            .status_to_result(
+                wait,
+                Some(oldregs),
+                child_context,
+                input,
+                seccomp_trapped,
+                restoration,
+            )
             .await?;
         if let Some(sigtrap) = sigtrap {
             self.repair_sigtrap_after_injection(sigtrap, &result)
@@ -13522,10 +13600,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         args: SyscallArgs,
         input: Option<&NativeCallContext>,
+        restoration: InjectionRestoration,
     ) -> Result<Result<i64, Errno>, TraceError> {
         let task = self.skip_seccomp_syscall(task).await?;
 
-        self.untraced_syscall_with(task, nr, args, false, input)
+        self.untraced_syscall_with(task, nr, args, false, input, restoration)
             .await
     }
 
@@ -13584,6 +13663,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         child_context: Option<libc::user_regs_struct>,
         input: Option<&NativeCallContext>,
         seccomp_trapped: bool,
+        restoration: InjectionRestoration,
     ) -> Result<Result<i64, Errno>, TraceError> {
         self.note_injection_stop(&wait_status)?;
         self.last_injection_ran = true;
@@ -13700,6 +13780,13 @@ impl<L: Tool + 'static> TracedTask<L> {
                             // leaving even a callee-saved register would
                             // corrupt the code that resumes after injection.
                             stopped.setregs(&context)?;
+                        } else if restoration == InjectionRestoration::PublicReturning {
+                            // `result` above is the actual classified kernel
+                            // outcome, including errno. Restore at this real
+                            // Wait::Stopped, before releasing the invocation;
+                            // neither its saved frame nor its policy is a
+                            // substitute stop owner.
+                            stopped.setregs(&public_returning_regs(regs, &context))?;
                         } else {
                             // Restore syscall args to original values. This is
                             // needed when we convert syscalls like SYS_open ->
@@ -13939,6 +14026,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         input: Option<&NativeCallContext>,
     ) -> Result<Result<i64, Errno>, TraceError> {
         let mut task = self.assume_stopped();
+        let restoration = InjectionRestoration::for_public_returning(
+            self.pending_syscall.is_some(),
+            self.injected_syscall_frame.is_some(),
+            self.in_signal_callback,
+            self.in_held_signal_callback,
+        );
 
         tracing::debug!(
             "[tool] (tid {}) beginning inject of syscall: {}, args {:?}",
@@ -13950,8 +14043,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         if self.injected_syscall_frame.is_some() {
             let original = self.pending_syscall.take() == Some((nr, args));
             self.pending_syscall = None;
-            self.untraced_syscall_with(task, nr, args, original, input)
-                .await
+            self.untraced_syscall_with(
+                task,
+                nr,
+                args,
+                original,
+                input,
+                InjectionRestoration::PreserveResult,
+            )
+            .await
         } else {
             match self.pending_syscall.take() {
                 Some(original) if original == (nr, args) => {
@@ -13983,7 +14083,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                         .await?;
                     self.arm_liteinst_wait(&wait);
                     let result = self
-                        .status_to_result(wait, None, None, input, false)
+                        .status_to_result(
+                            wait,
+                            None,
+                            None,
+                            input,
+                            false,
+                            InjectionRestoration::PreserveResult,
+                        )
                         .await?;
                     // A clone run in place steps its parent once
                     // (`handle_new_task`); an ignored SIGTRAP its trap reset is
@@ -13994,9 +14101,12 @@ impl<L: Tool + 'static> TracedTask<L> {
                     }
                     Ok(result)
                 }
-                Some(_) => self.private_inject(task, nr, args, input).await,
+                Some(_) => self.private_inject(task, nr, args, input, restoration).await,
+                // Also covers subsequent calls in a syscall callback after
+                // its pending event was consumed. Each call snapshots its own
+                // current frame, including intervening explicit Tool writes.
                 None => {
-                    self.untraced_syscall_with(task, nr, args, false, input)
+                    self.untraced_syscall_with(task, nr, args, false, input, restoration)
                         .await
                 }
             }
@@ -14100,7 +14210,14 @@ impl<L: Tool + 'static> TracedTask<L> {
         if self.injected_syscall_frame.is_some() {
             let original = self.pending_syscall.take() == Some((nr, args));
             let result = self
-                .untraced_syscall_with(task, nr, args, original, Some(&native))
+                .untraced_syscall_with(
+                    task,
+                    nr,
+                    args,
+                    original,
+                    Some(&native),
+                    InjectionRestoration::PreserveResult,
+                )
                 .await?;
             // `handle_injected_syscall` owns the frame and applies this after
             // the callback is dropped, restarting the trap for a Linux restart
@@ -14111,7 +14228,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         if is_liteinst_mapping_syscall(nr) && self.pending_syscall == Some((nr, args)) {
             self.pending_syscall = None;
-            let result = self.private_inject(task, nr, args, Some(&native)).await?;
+            let result = self.private_inject(task, nr, args, Some(&native), InjectionRestoration::PreserveResult).await?;
             let task = self.assume_stopped();
             set_ret(
                 &task,
@@ -14144,7 +14261,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .store(nr as u64 + 1, Ordering::SeqCst);
                 Ok(Ok(0))
             }
-            Some(_) => self.private_inject(task, nr, args, Some(&native)).await,
+            Some(_) => self.private_inject(task, nr, args, Some(&native), InjectionRestoration::PreserveResult).await,
             None => {
                 self.untraced_syscall_with(task, nr, args, false, Some(&native))
                     .await
@@ -15837,6 +15954,155 @@ mod restored_regs_tests {
         // The guest's own stack comes back when asked for.
         let regs = restored_regs(injected_clone3(), &guest_clone(), Some(CHILD_PID), true);
         assert_restored(&regs, CHILD_PID, GUEST_SP);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn distinct_regs(seed: u64) -> libc::user_regs_struct {
+        libc::user_regs_struct {
+            r15: seed,
+            r14: seed + 1,
+            r13: seed + 2,
+            r12: seed + 3,
+            rbp: seed + 4,
+            rbx: seed + 5,
+            r11: seed + 6,
+            r10: seed + 7,
+            r9: seed + 8,
+            r8: seed + 9,
+            rax: seed + 10,
+            rcx: seed + 11,
+            rdx: seed + 12,
+            rsi: seed + 13,
+            rdi: seed + 14,
+            orig_rax: seed + 15,
+            rip: seed + 16,
+            cs: seed + 17,
+            eflags: seed + 18,
+            rsp: seed + 19,
+            ss: seed + 20,
+            fs_base: seed + 21,
+            gs_base: seed + 22,
+            ds: seed + 23,
+            es: seed + 24,
+            fs: seed + 25,
+            gs: seed + 26,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn all_fields(regs: libc::user_regs_struct) -> [u64; 27] {
+        [
+            regs.r15,
+            regs.r14,
+            regs.r13,
+            regs.r12,
+            regs.rbp,
+            regs.rbx,
+            regs.r11,
+            regs.r10,
+            regs.r9,
+            regs.r8,
+            regs.rax,
+            regs.rcx,
+            regs.rdx,
+            regs.rsi,
+            regs.rdi,
+            regs.orig_rax,
+            regs.rip,
+            regs.cs,
+            regs.eflags,
+            regs.rsp,
+            regs.ss,
+            regs.fs_base,
+            regs.gs_base,
+            regs.ds,
+            regs.es,
+            regs.fs,
+            regs.gs,
+        ]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn public_returning_disposition_restores_each_entry_frame() {
+        use reverie::syscalls::Errno;
+
+        use super::InjectionRestoration;
+        use super::public_returning_regs;
+
+        assert_eq!(
+            InjectionRestoration::for_public_returning(false, false, false, false),
+            InjectionRestoration::PublicReturning,
+        );
+        let mut entry = distinct_regs(0x100);
+        for (seed, expected_result) in [(0x1000, Ok(321)), (0x2000, Err(Errno::EBADF))] {
+            let mut post_call = distinct_regs(seed);
+            post_call.rax =
+                expected_result.unwrap_or_else(|errno| -i64::from(errno.into_raw())) as u64;
+            let result = Errno::from_ret(post_call.rax as usize).map(|value| value as i64);
+            let restored = public_returning_regs(post_call, &entry);
+            let mut expected = all_fields(entry);
+            let post = all_fields(post_call);
+            // All eight values deliberately differ. Restoring a whole saved
+            // user_regs_struct would incorrectly undo these syscall effects.
+            for field in [17, 20, 21, 22, 23, 24, 25, 26] {
+                assert_ne!(expected[field], post[field]);
+                expected[field] = post[field];
+            }
+            assert_eq!(all_fields(restored), expected);
+            assert_eq!(result, expected_result);
+            assert_eq!(restored.rax, entry.rax);
+            assert_ne!(restored.rax, post_call.rax);
+
+            // The second invocation starts after an explicit Tool write. Its
+            // saved frame must be that new entry, never the first call's frame.
+            entry = restored;
+            entry.rax = 0x5a5a_0101;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn legacy_restoration_dispositions_keep_precedence() {
+        use super::InjectionRestoration;
+
+        for pending in [false, true] {
+            for frame in [false, true] {
+                for signal in [false, true] {
+                    for held in [false, true] {
+                        let expected = if pending || frame || signal || held {
+                            InjectionRestoration::PreserveResult
+                        } else {
+                            InjectionRestoration::PublicReturning
+                        };
+                        assert_eq!(
+                            InjectionRestoration::for_public_returning(
+                                pending, frame, signal, held
+                            ),
+                            expected,
+                        );
+                    }
+                }
+            }
+        }
+        let entry = distinct_regs(0x100);
+        let mut post_call = distinct_regs(0x1000);
+        for raw in [321, -9i64] {
+            post_call.rax = raw as u64;
+            // Direct-signal, pending, tail and private injections retain the
+            // common helper's raw result; held-signal callers can supply the
+            // existing guest-result override. Neither mode restores the stack.
+            for retval in [None, Some(entry.rax)] {
+                let restored = restored_regs(post_call, &entry, retval, false);
+                assert_eq!(restored.rax, retval.unwrap_or(post_call.rax));
+                assert_eq!(restored.rsp, post_call.rsp);
+                let fields = all_fields(restored);
+                let post = all_fields(post_call);
+                for field in [17, 20, 21, 22, 23, 24, 25, 26] {
+                    assert_eq!(fields[field], post[field]);
+                }
+            }
+        }
     }
 }
 

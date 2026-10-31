@@ -497,9 +497,10 @@ reverie-dbt/scripts/build-client.sh --caller-manifest tests/fixtures/thread-star
 The alias exports the shared test Tool with its mandatory producer-supplied
 input identity. Its existing `tool_fixtures` input root covers the observing
 Tool; the producer authenticates the complete current dependency closure.
-The registered default target has the two inherited ptrace identities. The
-`dbt` feature also includes the missing-artifact control and
-`rust_thread_start_tail_command` (four identities). The latter uses the
+The registered default target has the two inherited ptrace identities and four
+returning-frame controls described below (six identities). The `dbt` feature
+also includes the missing-artifact control, `rust_thread_start_tail_command`
+and four DBT returning-frame controls (twelve identities). The tail command uses the
 original tail Tool from `tests/tool_fixtures/thread_start_tail.rs`, preserving
 its `Getpid` injection and the inherited test's empty closure and exit assertion.
 Its ordinary ptrace and DBT children use the same empty ELF and must exit 0 with
@@ -518,6 +519,40 @@ frame oracle and then fail the same write-effect predicate. Copied-record
 controls supplement the real children. This witness does not replace the
 original ptrace test or establish inherited-function execution under DBT.
 Post-exec tails and unsupported startup lifecycle effects still refuse.
+
+The returning-frame controls use the same additive witness Tool with `/bin/true`
+through ptrace and the actual DBT caller. They require the real Getpid result,
+handled Close(-1)/EBADF, and equality of all 27 Guest register fields immediately
+before and after each call. A sequence explicitly changes RAX between calls,
+then checks that the next call restores that new entry frame. The startup and
+post_exec sequences each inject one Write of `T`, require exit 0, exactly that
+one output byte and empty stderr, and run a successful NoEffect child that must
+fail the same effect predicate. Their temporary byte is saved/restored below
+the x86-64 red zone with readback checks. Raw streams, results and frames precede
+assertions. The original Tool/body and all legacy tail modes remain unchanged.
+
+The failing-first ptrace baseline retained the correct Getpid and EBADF results
+while observing RAX change from 0 to the PID and from 0 to -9 respectively; the
+other 26 fields were equal. The EBADF child exited 1 before post_exec, so it did
+not establish a successful ordinary launch. The fix applies to public returning
+injections without a pending syscall, outside direct/held signal callbacks and
+injected-frame ownership. It also covers later calls after a syscall callback
+consumes its pending event. On x86-64 the saved computational/control fields are
+restored while actual post-call `fs_base`, `gs_base`, `cs`, `ss`, `ds`, `es`, `fs`
+and `gs` are retained. These three witness syscalls do not change those fields;
+their 27-field equality checks have no exclusions. A local control forces all
+eight post-call fields to differ, preserving effects such as ARCH_SET_FS/GS.
+
+Restoration uses the actual stopped completion and returns the kernel result
+separately; a saved frame is not stop authority. Tail/private defaults and
+signal/frame/restart precedence remain unchanged. This does not repair the
+NewChild parent-RAX path, the separate Event::Syscall no-restore arm, injected
+rt_sigreturn, direct-signal #892 or held restart-block #845 behavior. General
+restart-block and SIGSYS-frame equivalence remain unqualified. Timer, CPUID and
+preinit/vDSO callers use the public route, but routing checks do not establish
+independent runtime coverage of each callback. The new controls depend on the
+queued, unlanded thread-start-tail slice (dh-72uih); neither source registration
+nor these predicates establish landing or whole-backend contract completion.
 
 ## Guarded stack allocations through the shared Tool
 
