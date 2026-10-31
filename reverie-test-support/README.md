@@ -624,3 +624,22 @@ The wrong-Tool control additionally requires the maintained
 those validation routes. Both helpers explicitly install `reverie=trace` even
 when `RUST_LOG` is unset. Focused validate-profile evidence does not establish
 full workspace validation, CI or debug-profile route execution.
+
+### Initial-image stack observation
+
+`initial_stack_pointer` shares the original ptrace test's argc/argv/NULL memory
+reads and success predicates. Its collection is explicitly adapted to awaited
+typed RPC; the original `reverie-ptrace/tests/initial_stack_pointer.rs` remains
+the unchanged reference. The default support context has one ptrace test; the
+`dbt` context additionally has a real DBT positive and a successful reversed-argv
+run rejected by the same positive predicate. These are source registrations,
+not measured results or full image-lifecycle coverage.
+
+Before DBT consumers, produce the explicit caller pair with
+`reverie-dbt/scripts/build-client.sh --caller-manifest tests/fixtures/initial-stack-dbt-runtime/Cargo.toml --profile debug --jobs 4 --check`.
+The caller reports only an authenticated first-block application RSP retained
+on its initial-image owner. Late or missing observations return `None`; copied
+processes and successor exec remain outside the caller's admitted domain. This
+does not complete each-exec/fork initial-stack semantics or the generic state
+suite's 21-thread contract, and it provides no Detcore assurance claim.
+>>>>>>> 4a0247e5d (Expose authenticated initial-image stack pointers to caller guests)

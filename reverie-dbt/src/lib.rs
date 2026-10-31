@@ -729,6 +729,7 @@ where
     // Legacy constructors retain their existing behavior and authority.
     caller_effects: Option<Arc<caller_effects::CallerEffects>>,
     caller_intent: CallerIntent,
+    initial_stack_pointer: Option<u64>,
 }
 
 impl<'a, T> DbtGuest<'a, T>
@@ -837,7 +838,13 @@ where
             injected_syscalls: 0,
             caller_effects: None,
             caller_intent: CallerIntent::Other,
+            initial_stack_pointer: None,
         }
+    }
+
+    fn with_initial_stack_pointer(mut self, observed: Option<u64>) -> Self {
+        self.initial_stack_pointer = observed;
+        self
     }
 
     fn with_caller_effects(
@@ -1074,6 +1081,10 @@ where
 
     type Memory = DbtMemory;
     type Stack = DbtStack;
+
+    fn initial_stack_pointer(&self) -> Option<u64> {
+        self.initial_stack_pointer
+    }
 
     fn pidfd_self_spelling(&self) -> reverie::PidfdSelfSpelling {
         crate::pidfd_self::spelling()

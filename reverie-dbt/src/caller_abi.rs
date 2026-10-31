@@ -55,6 +55,64 @@ impl ImageDescriptor {
     }
 }
 
+/// Private caller admission fact, distinct from the runtime callback-table ABI.
+/// A kind-0 record reports no observation; kind 1 records the actual first block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InitialStackFact {
+    /// Exact record size.
+    pub size: u32,
+    /// This record's version, currently one.
+    pub version: u32,
+    /// Zero for unobserved, one for a first-block observation.
+    pub kind: u32,
+    /// Must be zero.
+    pub reserved: u32,
+    /// Actual native admission context.
+    pub context: u64,
+    /// Actual application process ID.
+    pub pid: i32,
+    /// Actual application thread ID.
+    pub tid: i32,
+    /// Immutable image incarnation.
+    pub image: u64,
+    /// Application PC supplied by first-block instrumentation.
+    pub pc: u64,
+    /// Application stack pointer read before any Tool hook.
+    pub rsp: u64,
+}
+
+impl InitialStackFact {
+    /// Check structure independently of observation/owner availability.
+    pub fn is_valid(&self) -> bool {
+        self.size as usize == std::mem::size_of::<Self>()
+            && self.version == 1
+            && self.reserved == 0
+            && matches!(self.kind, 0 | 1)
+    }
+
+    pub(crate) fn observed_for(
+        &self,
+        context: usize,
+        pid: i32,
+        tid: i32,
+        image: u64,
+    ) -> Option<u64> {
+        (self.is_valid()
+            && self.kind == 1
+            && self.context == context as u64
+            && self.pid == pid
+            && self.tid == tid
+            && self.image == image
+            && context != 0
+            && pid > 0
+            && tid > 0
+            && image != 0
+            && self.pc != 0)
+            .then_some(self.rsp)
+    }
+}
+
 /// Snapshot written only after a typed configuration owner was published.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,6 +182,19 @@ impl TerminalFact {
 pub type TerminalAdmission = unsafe extern "C" fn(usize, i64, *const u64, *mut TerminalFact) -> i32;
 
 const _: () = {
+    assert!(std::mem::size_of::<InitialStackFact>() == 56);
+    assert!(std::mem::align_of::<InitialStackFact>() == 8);
+    assert!(std::mem::offset_of!(InitialStackFact, size) == 0);
+    assert!(std::mem::offset_of!(InitialStackFact, version) == 4);
+    assert!(std::mem::offset_of!(InitialStackFact, kind) == 8);
+    assert!(std::mem::offset_of!(InitialStackFact, reserved) == 12);
+    assert!(std::mem::offset_of!(InitialStackFact, context) == 16);
+    assert!(std::mem::offset_of!(InitialStackFact, pid) == 24);
+    assert!(std::mem::offset_of!(InitialStackFact, tid) == 28);
+    assert!(std::mem::offset_of!(InitialStackFact, image) == 32);
+    assert!(std::mem::offset_of!(InitialStackFact, pc) == 40);
+    assert!(std::mem::offset_of!(InitialStackFact, rsp) == 48);
+
     assert!(std::mem::size_of::<ImageDescriptor>() == 56);
     assert!(std::mem::offset_of!(ImageDescriptor, capabilities) == 8);
     assert!(std::mem::offset_of!(ImageDescriptor, image_generation) == 16);

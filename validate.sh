@@ -842,6 +842,10 @@ run_check "DBT generic at-random caller artifact and standalone gates" \
     "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
     --caller-manifest "$ROOT_DIR/tests/fixtures/at-random-dbt-runtime/Cargo.toml" \
     --profile debug --jobs 8 --check
+run_check "DBT generic initial-stack caller artifact and standalone gates" \
+    "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
+    --caller-manifest "$ROOT_DIR/tests/fixtures/initial-stack-dbt-runtime/Cargo.toml" \
+    --profile debug --jobs 8 --check
 run_check "DBT generic good stack caller artifact and standalone gates" \
     "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
     --caller-manifest "$ROOT_DIR/tests/fixtures/stack-dbt-runtime/Cargo.toml" \

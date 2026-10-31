@@ -82,6 +82,9 @@
 
 /* ABI 16: immutable caller contract and native reservation, not kernel exit. */
 #define REVERIE_DBT_CALLER_CAPABILITIES UINT64_C(7)
+#ifdef REVERIE_DBT_CALLER_INPUT_IDENTITY
+#define REVERIE_DBT_CALLER_INITIAL_STACK_V1 1
+#endif
 #ifndef REVERIE_DBT_CALLER_INPUT_IDENTITY
 #define REVERIE_DBT_CALLER_INPUT_IDENTITY ""
 #endif
@@ -253,6 +256,32 @@ typedef struct {
   uint64_t nonce;
 } mapping_capture_refusal_t;
 
+/* Private versioned caller admission record, independent of callback ABI16. */
+typedef struct {
+  uint32_t size;
+  uint32_t version;
+  uint32_t kind;
+  uint32_t reserved;
+  uint64_t context;
+  int32_t pid;
+  int32_t tid;
+  uint64_t image;
+  uint64_t pc;
+  uint64_t rsp;
+} initial_stack_fact_t;
+_Static_assert(sizeof(initial_stack_fact_t) == 56, "initial stack fact size");
+_Static_assert(_Alignof(initial_stack_fact_t) == 8, "initial stack fact alignment");
+_Static_assert(offsetof(initial_stack_fact_t, size) == 0, "initial stack size offset");
+_Static_assert(offsetof(initial_stack_fact_t, version) == 4, "initial stack version offset");
+_Static_assert(offsetof(initial_stack_fact_t, kind) == 8, "initial stack kind offset");
+_Static_assert(offsetof(initial_stack_fact_t, reserved) == 12, "initial stack reserved offset");
+_Static_assert(offsetof(initial_stack_fact_t, context) == 16, "initial stack context offset");
+_Static_assert(offsetof(initial_stack_fact_t, pid) == 24, "initial stack pid offset");
+_Static_assert(offsetof(initial_stack_fact_t, tid) == 28, "initial stack tid offset");
+_Static_assert(offsetof(initial_stack_fact_t, image) == 32, "initial stack image offset");
+_Static_assert(offsetof(initial_stack_fact_t, pc) == 40, "initial stack pc offset");
+_Static_assert(offsetof(initial_stack_fact_t, rsp) == 48, "initial stack rsp offset");
+
 typedef enum {
   REGISTER_ORIG_UNKNOWN,
   REGISTER_ORIG_IMAGE_START,
@@ -361,6 +390,10 @@ typedef struct {
   register_orig_t register_orig;
   register_orig_t preempt_register_orig;
   bool initial_register_view_pending;
+  // Independent one-shot observation, after every existing scratch field.
+  bool initial_stack_pending;
+  bool initial_stack_attempted;
+  initial_stack_fact_t initial_stack_fact;
 } prototype_counters_t;
 static void mapping_capture_begin_callback(prototype_counters_t*);
 static bool mapping_capture_take_fatal_refusal(prototype_counters_t*, uintptr_t, int32_t);
@@ -534,6 +567,12 @@ extern int32_t reverie_dbt_runtime_thread_init(
     syscall_invoker_t invoke_syscall,
     register_reader_t read_registers,
     register_writer_t write_registers);
+#ifdef REVERIE_DBT_CALLER_INITIAL_STACK_V1
+extern int32_t reverie_dbt_runtime_caller_thread_init_v1(
+    prototype_counters_t*, void*, int32_t, int32_t, int32_t, uint64_t, int32_t,
+    syscall_invoker_t, register_reader_t, register_writer_t,
+    const initial_stack_fact_t*);
+#endif
 extern uint32_t reverie_dbt_runtime_abi_version(void);
 extern size_t reverie_dbt_runtime_callbacks_size(void);
 extern int32_t reverie_dbt_runtime_thread_created_v2(
@@ -3461,6 +3500,48 @@ static void set_pending_thread_start(
   slots[0] = pending;
 }
 
+static void capture_initial_stack_fact(
+    void* drcontext, prototype_counters_t* counters, app_pc first_pc) {
+  if (counters->initial_stack_attempted)
+    return;
+  counters->initial_stack_attempted = true;
+  bool eligible = counters->initial_stack_pending;
+  counters->initial_stack_pending = false;
+  counters->initial_stack_fact = (initial_stack_fact_t){
+      .size = sizeof(initial_stack_fact_t), .version = 1};
+  // Only the actual first-block clean call may provide this observation.
+  // The pre-syscall NULL fallback consumes eligibility without resampling.
+  if (!eligible || first_pc == NULL || !caller_mode() ||
+      !caller_live_context(drcontext, counters, false) ||
+      drmgr_get_tls_field(drcontext, thread_state_index) != counters ||
+      counters->in_syscall_event || counters->signal_token != 0 ||
+      counters->preempt_pending != 0)
+    return;
+  dr_mcontext_t application = {.size = sizeof(application),
+      .flags = DR_MC_INTEGER | DR_MC_CONTROL};
+  if (!dr_get_mcontext(drcontext, &application))
+    return;
+  counters->initial_stack_fact = (initial_stack_fact_t){
+      .size = sizeof(initial_stack_fact_t), .version = 1, .kind = 1,
+      .context = (uintptr_t)drcontext,
+      .pid = (int32_t)dr_get_process_id(),
+      .tid = (int32_t)dr_get_thread_id(drcontext),
+      .image = counters->caller_image,
+      .pc = (uintptr_t)first_pc, .rsp = application.xsp};
+}
+
+#ifdef REVERIE_DBT_CALLER_INITIAL_STACK_V1
+static int32_t caller_thread_init_with_stack(
+    prototype_counters_t* counters, void* drcontext) {
+  return reverie_dbt_runtime_caller_thread_init_v1(
+      counters, drcontext, (int32_t)dr_get_thread_id(drcontext),
+      (int32_t)dr_get_process_id(), in_tree_parent_pid(),
+      atomic_load_explicit(&branch_count, memory_order_relaxed), 0,
+      invoke_syscall, read_registers, write_registers,
+      &counters->initial_stack_fact);
+}
+#endif
+
 static void try_start_pending_thread(void) {
   void* drcontext = dr_get_current_drcontext();
   prototype_counters_t* counters =
@@ -3561,6 +3642,9 @@ static void try_start_pending_thread(void) {
       (runtime_uses_external_global() && !is_copied_vfork_process())) {
     bind_capture_owner(counters);
     evidence_callback_enter();
+#ifdef REVERIE_DBT_CALLER_INITIAL_STACK_V1
+    init_result = caller_thread_init_with_stack(counters, drcontext);
+#else
     init_result = reverie_dbt_runtime_thread_init(
         counters,
         drcontext,
@@ -3572,6 +3656,7 @@ static void try_start_pending_thread(void) {
         invoke_syscall,
         read_registers,
         write_registers);
+#endif
     evidence_callback_leave();
   }
   // TODO-HUMAN-REVIEW(PR-134): Confirm retryable native child startup.
@@ -3660,6 +3745,7 @@ static void start_pending_thread(app_pc pc) {
       dr_get_current_drcontext(), thread_state_index);
   if (counters == NULL || counters->pending_thread_start == 0)
     return;
+  capture_initial_stack_fact(dr_get_current_drcontext(), counters, pc);
   // Legacy keeps its existing readiness wait. Caller readiness is retried by
   // admit_pending_thread under the existing admission deadline. This runs
   // after DynamoRIO thread-init, when starting the helper is allowed; copied
@@ -7553,6 +7639,8 @@ static void thread_init(void* drcontext) {
   bool pending_image_start =
       host_tid == dr_get_process_id() && !has_copied_runtime();
   counters->initial_register_view_pending = pending_image_start &&
+      pending_child == 0 && dr_get_process_id() == runtime_owner_pid;
+  counters->initial_stack_pending = pending_image_start &&
       pending_child == 0 && dr_get_process_id() == runtime_owner_pid;
   counters->pending_birth_token = 0;
   counters->pending_clone_flags = pending_child != 0 ? clone_flags : 0;

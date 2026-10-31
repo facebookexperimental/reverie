@@ -2133,3 +2133,383 @@ fn caller_runtime_protocol() {
 }
 
 mod facility_admission;
+// This selector uses the existing real RPC/exec isolation harness. Native
+// registers and admission are controlled; no live DR/fork claim follows.
+const STACK_CASE: &str = "REVERIE_DBT_INITIAL_STACK_UNIT_CASE";
+const STACK_TEST: &str = "caller_runtime::tests::initial_stack_fact_owner_and_lifetime";
+static STACK_OBSERVATIONS: Mutex<Vec<(u8, Option<u64>, u64)>> = Mutex::new(Vec::new());
+
+#[derive(Default)]
+struct StackProbe;
+
+#[reverie::tool]
+impl Tool for StackProbe {
+    type GlobalState = RemoteGlobal;
+    type ThreadState = ();
+
+    fn subscriptions(_: &Config) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscall(Sysno::getpid);
+        subscriptions
+    }
+
+    async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        let observed = guest.initial_stack_pointer();
+        let mut regs = guest.regs().await;
+        STACK_OBSERVATIONS
+            .lock()
+            .unwrap()
+            .push((0, observed, regs.rsp));
+        assert_eq!(
+            guest.send_rpc(Request::Start).await,
+            Request::Start.response()
+        );
+        regs.rsp = 0x710000;
+        guest.set_regs(regs).await?;
+        assert_eq!(guest.initial_stack_pointer(), observed);
+        Ok(())
+    }
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        let rsp = guest.regs().await.rsp;
+        STACK_OBSERVATIONS
+            .lock()
+            .unwrap()
+            .push((1, guest.initial_stack_pointer(), rsp));
+        assert_eq!(
+            guest.send_rpc(Request::PostExec).await,
+            Request::PostExec.response()
+        );
+        Ok(())
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        assert_eq!(call.number(), Sysno::getpid);
+        let rsp = guest.regs().await.rsp;
+        STACK_OBSERVATIONS
+            .lock()
+            .unwrap()
+            .push((2, guest.initial_stack_pointer(), rsp));
+        Ok(0)
+    }
+}
+
+unsafe extern "C" fn stack_read(context: usize, out: *mut libc::user_regs_struct) -> i32 {
+    let fixture = unsafe { &*(context as *const NativeFixture) };
+    let regs = fixture
+        .written
+        .borrow()
+        .as_ref()
+        .copied()
+        .unwrap_or_else(startup_registers);
+    unsafe { out.write(regs) };
+    1
+}
+
+unsafe extern "C" fn stack_write(context: usize, regs: *const libc::user_regs_struct) -> i32 {
+    let fixture = unsafe { &*(context as *const NativeFixture) };
+    let actual = unsafe { regs.read() };
+    let mut expected = startup_registers();
+    expected.rsp = 0x710000;
+    assert_eq!(register_words(&actual), register_words(&expected));
+    assert!(
+        fixture.written.borrow().is_none(),
+        "one explicit Tool write"
+    );
+    *fixture.written.borrow_mut() = Some(actual);
+    1
+}
+
+fn exercise_initial_stack(case: &str) {
+    let runtime = CallerRuntime::<StackProbe>::new([0x6b; 32]);
+    let image = runtime.image_init();
+    let run = ActivationRun::new();
+    run.bind_root(pid().as_raw()).unwrap();
+    let mut server = Server::start(Config::default(), run);
+    // Drop the fixture (EOF) before the server on an assertion failure.
+    let fixture = Box::<NativeFixture>::default();
+    let mut counters = CallerCounters {
+        branches: 0,
+        observed_syscalls: 0,
+        rewritten_syscalls: 0,
+        runtime_state: std::ptr::null_mut(),
+    };
+    let mut table = callbacks();
+    assert_eq!(
+        unsafe {
+            runtime.background_init(
+                (&mut table as *mut DbtRuntimeCallbacks).cast(),
+                crate::DbtStartupMode::Coordinated as u32,
+            )
+        },
+        0
+    );
+    let mut fact = InitialStackFact {
+        size: std::mem::size_of::<InitialStackFact>() as u32,
+        version: 1,
+        kind: 1,
+        context: fixture.context() as u64,
+        pid: pid().as_raw(),
+        tid: pid().as_raw(),
+        image: image.image_generation,
+        pc: 0x401000,
+        rsp: 0x700000,
+        reserved: 0,
+    };
+    let expected = match case {
+        "observed" | "repeated" => Some(fact.rsp),
+        "zero" => {
+            fact.rsp = 0;
+            Some(0)
+        }
+        "unobserved" => {
+            fact.kind = 0;
+            None
+        }
+        "wrong-context" => {
+            fact.context += 1;
+            None
+        }
+        "wrong-pid" => {
+            fact.pid += 1;
+            None
+        }
+        "wrong-tid" => {
+            fact.tid += 1;
+            None
+        }
+        "wrong-image" => {
+            fact.image += 1;
+            None
+        }
+        "invalid-version" => {
+            fact.version += 1;
+            None
+        }
+        "legacy" | "null" | "invalid-owner" => None,
+        _ => panic!("unknown initial-stack case {case}"),
+    };
+    let tid = pid().as_raw() + i32::from(case == "invalid-owner");
+    let fact_pointer = if case == "null" {
+        std::ptr::null()
+    } else {
+        &fact
+    };
+    let status = unsafe {
+        if case == "legacy" {
+            runtime.thread_init(
+                &mut counters,
+                fixture.context(),
+                tid,
+                pid().as_raw(),
+                -1,
+                37,
+                0,
+                invoke,
+                stack_read,
+                stack_write,
+            )
+        } else {
+            runtime.thread_init_with_stack(
+                &mut counters,
+                fixture.context(),
+                tid,
+                pid().as_raw(),
+                -1,
+                37,
+                0,
+                invoke,
+                stack_read,
+                stack_write,
+                fact_pointer,
+            )
+        }
+    };
+    if matches!(case, "invalid-version" | "null" | "invalid-owner") {
+        assert_eq!(status, -1);
+        assert!(counters.runtime_state.is_null());
+        assert!(STACK_OBSERVATIONS.lock().unwrap().is_empty());
+        assert!(fixture.written.borrow().is_none());
+        assert_eq!(fixture.calls.get(), 0, "refusal before native effects");
+        let reason = if case == "invalid-owner" {
+            "caller-initial-single-thread-owner-required"
+        } else {
+            "caller-initial-stack-fact-invalid"
+        };
+        assert!(
+            DIAGNOSTICS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains(reason))
+        );
+    } else {
+        assert_eq!(status, 0);
+        let mut result = -1234;
+        let mut deferred_number = -4321;
+        let mut deferred_args = [0xa5; 6];
+        assert_eq!(
+            unsafe {
+                runtime.pre_syscall(
+                    fixture.context(),
+                    &mut counters,
+                    pid().as_raw(),
+                    pid().as_raw(),
+                    image.image_generation,
+                    libc::SYS_getpid,
+                    [0; 6].as_ptr(),
+                    41,
+                    &mut result,
+                    &mut deferred_number,
+                    deferred_args.as_mut_ptr(),
+                    invoke,
+                    stack_read,
+                    stack_write,
+                    read_memory,
+                )
+            },
+            1
+        );
+        assert_eq!(result, 0);
+        assert_eq!(deferred_number, -4321);
+        assert_eq!(deferred_args, [0xa5; 6]);
+        let rows = STACK_OBSERVATIONS.lock().unwrap().clone();
+        eprintln!("initial-stack owner {case}: observations={rows:?}");
+        assert_eq!(
+            rows,
+            [
+                (0, expected, 0x700000),
+                (1, expected, 0x710000),
+                (2, expected, 0x710000)
+            ]
+        );
+        assert_eq!(server.global.calls.load(Ordering::SeqCst), 2);
+        if case == "repeated" {
+            let owner = counters.runtime_state;
+            assert_eq!(
+                unsafe {
+                    runtime.thread_init_with_stack(
+                        &mut counters,
+                        fixture.context(),
+                        tid,
+                        pid().as_raw(),
+                        -1,
+                        37,
+                        0,
+                        invoke,
+                        stack_read,
+                        stack_write,
+                        &fact,
+                    )
+                },
+                -1
+            );
+            assert_eq!(counters.runtime_state, owner);
+            assert_eq!(*STACK_OBSERVATIONS.lock().unwrap(), rows);
+            assert!(
+                DIAGNOSTICS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|line| line.contains("caller-application-admission-repeated"))
+            );
+        }
+        // The fixture owns this allocation; this is not a kernel exit claim.
+        unsafe {
+            drop(Box::from_raw(
+                counters.runtime_state.cast::<RootAttachment<StackProbe>>(),
+            ));
+        }
+        counters.runtime_state = std::ptr::null_mut();
+        assert!(
+            unsafe {
+                runtime.attachment(
+                    &mut counters,
+                    fixture.context(),
+                    pid().as_raw(),
+                    pid().as_raw(),
+                    image.image_generation,
+                )
+            }
+            .is_err()
+        );
+    }
+    fixture.shutdown();
+    server.finish();
+    assert!(server.issues.snapshot().is_empty());
+}
+
+#[test]
+fn initial_stack_fact_owner_and_lifetime() {
+    const CASES: [&str; 12] = [
+        "observed",
+        "zero",
+        "unobserved",
+        "legacy",
+        "wrong-context",
+        "wrong-pid",
+        "wrong-tid",
+        "wrong-image",
+        "invalid-version",
+        "null",
+        "invalid-owner",
+        "repeated",
+    ];
+    if let Some(case) = std::env::var_os(STACK_CASE) {
+        let case = case.to_str().unwrap();
+        assert!(CASES.contains(&case));
+        exercise_initial_stack(case);
+        println!("INITIAL_STACK_OWNER_COMPLETED:{case}");
+        return;
+    }
+    for case in CASES {
+        let directory = tempfile::tempdir().unwrap();
+        let dirfd = std::fs::File::open(directory.path()).unwrap();
+        let socket = format!(
+            "/proc/{}/fd/{}/initial-stack.sock",
+            std::process::id(),
+            dirfd.as_raw_fd()
+        );
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", STACK_TEST, "--test-threads=1", "--nocapture"])
+            .env(STACK_CASE, case)
+            .env(crate::sync_rpc::RPC_SOCKET_ENV, socket)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(Some(child));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "initial-stack {case} child timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        eprintln!(
+            "initial-stack owner child {case}: status={:?} stdout={:?} stderr={:?}",
+            output.status.code(),
+            output.stdout,
+            output.stderr
+        );
+        assert!(output.status.success(), "initial-stack {case}: {output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "{stdout}"
+        );
+        assert_eq!(
+            stdout
+                .matches(&format!("INITIAL_STACK_OWNER_COMPLETED:{case}"))
+                .count(),
+            1
+        );
+    }
+}
+>>>>>>> 4a0247e5d (Expose authenticated initial-image stack pointers to caller guests)

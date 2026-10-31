@@ -93,6 +93,42 @@ macro_rules! export_caller_tool {
             }
         }
         #[unsafe(no_mangle)]
+        /// Versioned private admission with a first-entry observation record.
+        ///
+        /// # Safety
+        /// Native holds the same live, unique counters/context as thread_init.
+        /// A non-null fact must point to one complete readable InitialStackFact
+        /// for this call. NULL is refused, never interpreted as a v1 None.
+        pub unsafe extern "C" fn reverie_dbt_runtime_caller_thread_init_v1(
+            counters: *mut $crate::caller_runtime::CallerCounters,
+            context: *mut ::std::ffi::c_void,
+            tid: i32,
+            pid: i32,
+            ppid: i32,
+            branches: u64,
+            defer: i32,
+            invoke: $crate::SyscallInvoker,
+            read: $crate::RegisterReader,
+            write: $crate::RegisterWriter,
+            fact: *const $crate::caller_abi::InitialStackFact,
+        ) -> i32 {
+            unsafe {
+                __REVERIE_CALLER_RUNTIME.thread_init_with_stack(
+                    counters,
+                    context as usize,
+                    tid,
+                    pid,
+                    ppid,
+                    branches,
+                    defer,
+                    invoke,
+                    read,
+                    write,
+                    fact,
+                )
+            }
+        }
+        #[unsafe(no_mangle)]
         /// Native caller ABI entry.
         ///
         /// # Safety

@@ -1909,3 +1909,315 @@ int main(void) {
     assert!(result.stderr.is_empty());
 >>>>>>> 01451eddc (Scope DBT instruction register views to callbacks)
 }
+
+#[test]
+fn native_initial_stack_fact_capture_and_layout() {
+    use std::process::Command;
+
+    use reverie_dbt::caller_abi::InitialStackFact;
+    use sha2::Digest;
+
+    assert_eq!(size_of::<InitialStackFact>(), 56);
+    assert_eq!(align_of::<InitialStackFact>(), 8);
+    c_layout(
+        "initial_stack_fact_t",
+        size_of::<InitialStackFact>(),
+        &[
+            ("size", offset_of!(InitialStackFact, size)),
+            ("version", offset_of!(InitialStackFact, version)),
+            ("kind", offset_of!(InitialStackFact, kind)),
+            ("reserved", offset_of!(InitialStackFact, reserved)),
+            ("context", offset_of!(InitialStackFact, context)),
+            ("pid", offset_of!(InitialStackFact, pid)),
+            ("tid", offset_of!(InitialStackFact, tid)),
+            ("image", offset_of!(InitialStackFact, image)),
+            ("pc", offset_of!(InitialStackFact, pc)),
+            ("rsp", offset_of!(InitialStackFact, rsp)),
+        ],
+    );
+    // Actual production capture, admission forwarding and live-owner predicate;
+    // DR and Rust callback implementations are controlled, not live DR proof.
+    let mut source = String::from(
+        r#"
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
+typedef unsigned char* app_pc;
+#define DR_MC_INTEGER 1
+#define DR_MC_CONTROL 2
+typedef struct { size_t size; unsigned flags; uint64_t xsp; } dr_mcontext_t;
+"#,
+    );
+    source.push_str(between(
+        NATIVE,
+        "/* Private versioned caller admission record, independent of callback ABI16. */",
+        "typedef enum {\n  REGISTER_ORIG_UNKNOWN,",
+    ));
+    source.push_str(r#"
+typedef struct {
+  uintptr_t caller_context;
+  uint64_t caller_image;
+  int32_t kernel_pid, kernel_ppid, kernel_tid, pending_birth_token;
+  uint64_t pending_thread_clone, pending_process_clone_result, pending_thread_start;
+  bool caller_admitted, in_syscall_event;
+  uint64_t signal_token, preempt_pending, register_orig_sentinel;
+  bool initial_register_view_pending;
+  bool initial_stack_pending, initial_stack_attempted;
+  initial_stack_fact_t initial_stack_fact;
+} prototype_counters_t;
+static prototype_counters_t state;
+static void* current_context = (void*)0x1234;
+static int current_pid = 100, current_tid = 100, parent_pid = 10;
+static int thread_state_index;
+static int runtime_owner_pid = 100;
+static struct { int root_pid; } task = {100}, *task_state = &task;
+static struct { uint64_t image_generation; } runtime_image_descriptor = {17};
+static _Atomic uint64_t image_generation = 17, branch_count = 23;
+static bool copied, caller = true, read_ok = true, tls_ok = true;
+static uint64_t app_rsp = 0x700000;
+static unsigned reads, forwards;
+static initial_stack_fact_t forwarded;
+static void* dr_get_current_drcontext(void) { return current_context; }
+static int dr_get_process_id(void) { return current_pid; }
+static int dr_get_thread_id(void* context) { assert(context == current_context); return current_tid; }
+static int dr_get_parent_id(void) { return parent_pid; }
+static bool has_copied_runtime(void) { return copied; }
+static bool caller_mode(void) { return caller; }
+static void* drmgr_get_tls_field(void* context, int index) {
+  assert(context == current_context && index == thread_state_index);
+  return tls_ok ? &state : NULL;
+}
+static bool dr_get_mcontext(void* context, dr_mcontext_t* out) {
+  assert(context == current_context);
+  assert(out->size == sizeof(*out) && out->flags == (DR_MC_INTEGER | DR_MC_CONTROL));
+  ++reads;
+  if (!read_ok) return false;
+  out->xsp = app_rsp;
+  return true;
+}
+static int in_tree_parent_pid(void) { return -1; }
+typedef int (*test_callback_t)(void);
+static int invoke_syscall(void) { return 0; }
+static int read_registers(void) { return 0; }
+static int write_registers(void) { return 0; }
+static int32_t reverie_dbt_runtime_caller_thread_init_v1(
+    prototype_counters_t* counters, void* context, int32_t tid, int32_t pid,
+    int32_t ppid, uint64_t branches, int32_t defer,
+    test_callback_t invoke, test_callback_t read, test_callback_t write,
+    const initial_stack_fact_t* fact) {
+  assert(counters == &state && context == current_context);
+  assert(tid == current_tid && pid == current_pid && ppid == -1);
+  assert(branches == 23 && defer == 0);
+  assert(invoke == invoke_syscall && read == read_registers && write == write_registers);
+  assert(fact == &state.initial_stack_fact && state.initial_stack_attempted);
+  assert(fact->size == 56 && fact->version == 1);
+  forwarded = *fact;
+  ++forwards;
+  return 7; /* controlled readiness retry, not actual Tool execution */
+}
+"#);
+    source.push_str(native_function("static bool caller_live_context("));
+    source.push_str(native_function("static void capture_initial_stack_fact("));
+    source.push_str(native_function(
+        "static int32_t caller_thread_init_with_stack(",
+    ));
+    source.push_str(
+        r#"
+static void reset(void) {
+  memset(&state, 0, sizeof(state));
+  current_pid = current_tid = runtime_owner_pid = task.root_pid = 100;
+  parent_pid = 10;
+  runtime_image_descriptor.image_generation = 17;
+  atomic_store(&image_generation, 17);
+  caller = read_ok = tls_ok = true;
+  copied = false;
+  reads = forwards = 0;
+  app_rsp = 0x700000;
+  state.caller_context = (uintptr_t)current_context;
+  state.caller_image = 17;
+  state.kernel_pid = state.kernel_tid = 100;
+  state.kernel_ppid = 10;
+  state.initial_stack_pending = state.initial_register_view_pending = true;
+  state.register_orig_sentinel = 0xdeadbeef;
+}
+static void check_old_fields(const prototype_counters_t* before) {
+  assert(memcmp(before, &state,
+      offsetof(prototype_counters_t, initial_stack_pending)) == 0);
+}
+int main(void) {
+  reset();
+  prototype_counters_t before;
+  memcpy(&before, &state, sizeof(state));
+  capture_initial_stack_fact(current_context, &state, (app_pc)0x401000);
+  check_old_fields(&before);
+  assert(reads == 1 && state.initial_stack_attempted && !state.initial_stack_pending);
+  initial_stack_fact_t fact = state.initial_stack_fact;
+  assert(fact.kind == 1 && fact.reserved == 0 && fact.context == (uintptr_t)current_context);
+  assert(fact.pid == 100 && fact.tid == 100 && fact.image == 17);
+  assert(fact.pc == 0x401000 && fact.rsp == 0x700000);
+  assert(caller_thread_init_with_stack(&state, current_context) == 7);
+  assert(memcmp(&forwarded, &fact, sizeof(fact)) == 0);
+  app_rsp = 0x710000;
+  capture_initial_stack_fact(current_context, &state, (app_pc)0x402000);
+  assert(reads == 1 && memcmp(&state.initial_stack_fact, &fact, sizeof(fact)) == 0);
+  assert(caller_thread_init_with_stack(&state, current_context) == 7);
+  assert(forwards == 2 && memcmp(&forwarded, &fact, sizeof(fact)) == 0);
+  reset(); app_rsp = 0;
+  capture_initial_stack_fact(current_context, &state, (app_pc)0x401000);
+  assert(state.initial_stack_fact.kind == 1 && state.initial_stack_fact.rsp == 0);
+  puts("native initial-stack first-block and immutable retry passed");
+  for (unsigned scenario = 0; scenario < 17; ++scenario) {
+    reset();
+    app_pc pc = (app_pc)0x401000;
+    switch (scenario) {
+      case 0: pc = NULL; break; /* actual late fallback argument */
+      case 1: state.initial_stack_pending = false; break;
+      case 2: read_ok = false; break;
+      case 3: ++state.caller_context; break;
+      case 4: ++state.kernel_pid; break;
+      case 5: ++current_tid; break;
+      case 6: ++state.caller_image; break;
+      case 7: atomic_store(&image_generation, 18); break;
+      case 8: copied = true; break; /* copied/vfork forbidden owner */
+      case 9: copied = true; current_pid = current_tid = 102; break; /* nested copy */
+      case 10: state.in_syscall_event = true; break;
+      case 11: state.signal_token = 1; break;
+      case 12: state.preempt_pending = 1; break;
+      case 13: state.pending_birth_token = 1; break;
+      case 14: tls_ok = false; break;
+      case 15: caller = false; break;
+      case 16: ++state.kernel_tid; break;
+    }
+    memcpy(&before, &state, sizeof(state));
+    capture_initial_stack_fact(current_context, &state, pc);
+    check_old_fields(&before);
+    assert(state.initial_stack_attempted && !state.initial_stack_pending);
+    assert(state.initial_stack_fact.size == 56 && state.initial_stack_fact.version == 1);
+    assert(state.initial_stack_fact.kind == 0 && state.initial_stack_fact.rsp == 0);
+    assert(reads == (scenario == 2 ? 1U : 0U));
+    fact = state.initial_stack_fact;
+    // A later valid-looking callback cannot upgrade the consumed opportunity.
+    state.caller_context = (uintptr_t)current_context;
+    state.caller_image = 17;
+    state.kernel_pid = state.kernel_tid = current_pid = current_tid = 100;
+    atomic_store(&image_generation, 17);
+    copied = false; caller = read_ok = tls_ok = true;
+    state.in_syscall_event = false; state.signal_token = state.preempt_pending = 0;
+    state.pending_birth_token = 0;
+    capture_initial_stack_fact(current_context, &state, (app_pc)0x401000);
+    assert(memcmp(&fact, &state.initial_stack_fact, sizeof(fact)) == 0);
+  }
+  // An inherited observed record cannot create a valid copied caller owner.
+  reset(); capture_initial_stack_fact(current_context, &state, (app_pc)0x401000);
+  fact = state.initial_stack_fact;
+  copied = true; current_pid = current_tid = 101;
+  assert(!caller_live_context(current_context, &state, false));
+  capture_initial_stack_fact(current_context, &state, (app_pc)0x401000);
+  assert(memcmp(&fact, &state.initial_stack_fact, sizeof(fact)) == 0);
+  puts("native initial-stack late missing wrong-owner copied controls passed");
+  puts("native initial-stack versioned admission forwarding passed");
+  return 0;
+}
+"#,
+    );
+    let directory = tempfile::tempdir().expect("native initial-stack control directory");
+    let input = directory.path().join("initial-stack-control.c");
+    let output = directory.path().join("initial-stack-control");
+    std::fs::write(&input, &source).unwrap();
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let mut command = Command::new(&compiler);
+    command
+        .args(["-std=gnu11", "-Wall", "-Werror", "-O0"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output);
+    eprintln!("native initial-stack control compiler={command:?}");
+    let compiled = command
+        .output()
+        .expect("compile native initial-stack control");
+    eprintln!(
+        "native initial-stack control compile status={:?} stdout={:?} stderr={:?}",
+        compiled.status.code(),
+        compiled.stdout,
+        compiled.stderr
+    );
+    assert!(
+        compiled.status.success(),
+        "native initial-stack control compile failed"
+    );
+    let bytes = std::fs::read(&output).unwrap();
+    eprintln!(
+        "native initial-stack control source_sha256={:x} image_sha256={:x} image_bytes={}",
+        sha2::Sha256::digest(source.as_bytes()),
+        sha2::Sha256::digest(&bytes),
+        bytes.len()
+    );
+    let result = Command::new(&output)
+        .output()
+        .expect("run native initial-stack control");
+    eprintln!(
+        "native initial-stack control status={:?} stdout={:?} stderr={:?}",
+        result.status.code(),
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        result.status.success(),
+        "native initial-stack control failed"
+    );
+    assert_eq!(result.stdout, b"native initial-stack first-block and immutable retry passed\nnative initial-stack late missing wrong-owner copied controls passed\nnative initial-stack versioned admission forwarding passed\n");
+    assert!(result.stderr.is_empty());
+
+    // Keep every old first-occurrence marker bound to its original statement.
+    let gate = native_function("static void start_pending_thread(");
+    ordered(
+        gate,
+        &[
+            "capture_initial_stack_fact(dr_get_current_drcontext(), counters, pc);",
+            "ensure_runtime_background();",
+            "counters->admission_pc = pc;",
+            "initial_register_view_pending = false;",
+            "pc != NULL",
+            "REGISTER_ORIG_IMAGE_START, SYS_execve",
+            "admit_pending_thread();",
+        ],
+    );
+    let admission = native_function("static void try_start_pending_thread(");
+    ordered(
+        admission,
+        &[
+            "caller_live_context(drcontext, counters, false)",
+            "if (!runtime_ready_for_image())",
+            "caller_unfiltered(drcontext)",
+            "#ifdef REVERIE_DBT_CALLER_INITIAL_STACK_V1",
+            "init_result = caller_thread_init_with_stack(counters, drcontext);",
+            "#else",
+            "init_result = reverie_dbt_runtime_thread_init(",
+            "if (init_result > 0)",
+        ],
+    );
+    ordered(
+        NATIVE,
+        &[
+            "#ifdef REVERIE_DBT_CALLER_INPUT_IDENTITY",
+            "#define REVERIE_DBT_CALLER_INITIAL_STACK_V1 1",
+            "#ifndef REVERIE_DBT_CALLER_INPUT_IDENTITY",
+        ],
+    );
+    let init = native_function("static void thread_init(");
+    ordered(
+        init,
+        &[
+            "bool pending_image_start =",
+            "host_tid == dr_get_process_id() && !has_copied_runtime()",
+            "counters->initial_stack_pending = pending_image_start &&",
+            "pending_child == 0 && dr_get_process_id() == runtime_owner_pid;",
+            "evidence_emit_image_initialization();",
+            "int32_t init_result = reverie_dbt_runtime_thread_init(",
+        ],
+    );
+}

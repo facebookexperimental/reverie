@@ -225,6 +225,7 @@ rust_library(
                 {"name": "vdso", "path": "../tests/vdso.rs"},
                 {"name": "inject_then_tail", "path": "../tests/inject_then_tail.rs"},
                 {"name": "at_random", "path": "../tests/at_random.rs"},
+                {"name": "initial_stack_pointer", "path": "../tests/initial_stack_pointer.rs"},
                 {"name": "thread_start", "path": "../tests/thread_start.rs"},
                 {"name": "stack", "path": "../tests/stack.rs"},
                 {"name": "suppression", "path": "../tests/suppression.rs"},
@@ -432,6 +433,21 @@ rust_unittest(
     deps = [
         ":reverie",
         ":reverie-ptrace",
+        ":reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "generic-initial-stack-pointer",
+    srcs = [
+        "tests/initial_stack_pointer.rs",
+        "tests/tool_fixtures/initial_stack_pointer.rs",
+    ],
+    crate_root = "tests/initial_stack_pointer.rs",
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:serde",
+        ":reverie",
         ":reverie-test-support",
     ],
 )

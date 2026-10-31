@@ -43,6 +43,7 @@ use crate::RegisterWriter;
 use crate::SyscallInvoker;
 use crate::caller_abi::CALLER_CAPABILITIES;
 use crate::caller_abi::ImageDescriptor;
+use crate::caller_abi::InitialStackFact;
 use crate::caller_abi::ReadySnapshot;
 use crate::caller_abi::TerminalFact;
 use crate::caller_effects::CallerEffects;
@@ -69,6 +70,7 @@ struct RootAttachment<T: Tool> {
     pid: i32,
     tid: i32,
     image: u64,
+    initial_stack_pointer: Option<u64>,
     phase: Phase,
 }
 
@@ -263,6 +265,72 @@ impl<T: Tool> CallerRuntime<T> {
         read: RegisterReader,
         write: RegisterWriter,
     ) -> i32 {
+        unsafe {
+            self.thread_init_inner(
+                counters, context, tid, pid, ppid, branches, defer, invoke, read, write, None,
+            )
+        }
+    }
+
+    /// Admit through the private versioned initial-stack transport.
+    ///
+    /// # Safety
+    /// The thread_init ownership requirements apply. A non-null fact points to
+    /// a complete readable record for this call; it is copied, never retained.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn thread_init_with_stack(
+        &self,
+        counters: *mut CallerCounters,
+        context: usize,
+        tid: i32,
+        pid: i32,
+        ppid: i32,
+        branches: u64,
+        defer: i32,
+        invoke: SyscallInvoker,
+        read: RegisterReader,
+        write: RegisterWriter,
+        fact: *const InitialStackFact,
+    ) -> i32 {
+        let Some(fact) = (unsafe { fact.as_ref() })
+            .copied()
+            .filter(InitialStackFact::is_valid)
+        else {
+            self.fail("caller-initial-stack-fact-invalid");
+            return -1;
+        };
+        unsafe {
+            self.thread_init_inner(
+                counters,
+                context,
+                tid,
+                pid,
+                ppid,
+                branches,
+                defer,
+                invoke,
+                read,
+                write,
+                Some(fact),
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn thread_init_inner(
+        &self,
+        counters: *mut CallerCounters,
+        context: usize,
+        tid: i32,
+        pid: i32,
+        ppid: i32,
+        branches: u64,
+        defer: i32,
+        invoke: SyscallInvoker,
+        read: RegisterReader,
+        write: RegisterWriter,
+        fact: Option<InitialStackFact>,
+    ) -> i32 {
         if defer != 0 {
             return 0;
         }
@@ -275,7 +343,7 @@ impl<T: Tool> CallerRuntime<T> {
         }
         let result = unsafe {
             self.admit(
-                counters, context, tid, pid, ppid, branches, invoke, read, write,
+                counters, context, tid, pid, ppid, branches, invoke, read, write, fact,
             )
         };
         match result {
@@ -299,6 +367,7 @@ impl<T: Tool> CallerRuntime<T> {
         invoke: SyscallInvoker,
         read: RegisterReader,
         write: RegisterWriter,
+        fact: Option<InitialStackFact>,
     ) -> Result<(), Error> {
         if counters.is_null() || context == 0 || tid <= 0 || tid != pid || ppid > 0 {
             return Err(crate::caller_error(
@@ -373,6 +442,8 @@ impl<T: Tool> CallerRuntime<T> {
             pid,
             tid,
             image,
+            initial_stack_pointer: fact
+                .and_then(|fact| fact.observed_for(context, pid, tid, image)),
             phase: Phase::Starting,
         });
         // Publication precedes hooks and Started, but is not activation itself.
@@ -488,6 +559,7 @@ impl<T: Tool> CallerRuntime<T> {
                 read,
                 write,
             )
+            .with_initial_stack_pointer(attachment.initial_stack_pointer)
             .with_memory_reader(memory)
             .with_caller_effects(Arc::clone(&attachment.effects), CallerIntent::Syscall);
             match crate::run_caller_syscall_with_guest(&attachment.process, guest, syscall)? {
@@ -788,6 +860,7 @@ fn run_start_hooks<T: Tool>(
         read,
         write,
     )
+    .with_initial_stack_pointer(attachment.initial_stack_pointer)
     .with_caller_effects(Arc::clone(&attachment.effects), CallerIntent::ThreadStart);
     let tail = Arc::clone(&guest.tail_inject_result);
     match crate::run_caller_callback(
