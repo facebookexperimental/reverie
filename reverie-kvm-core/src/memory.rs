@@ -1310,13 +1310,26 @@ impl GuestMemory {
         let mapping: NonNull<u8> =
             NonNull::new(mapping.cast()).expect("mmap returned a null mapping");
         let base_address = mapping.as_ptr().expose_provenance();
-        let original_pages = (0..slice.length / PAGE_SIZE)
-            .map(|page| {
-                // SAFETY: this is derived while the original whole-range mmap
-                // is intact, and every offset names the start of a live page.
-                unsafe { NonNull::new_unchecked(mapping.as_ptr().add(page * PAGE_SIZE)) }
-            })
-            .collect();
+        // One pointer per page, 2 MiB per GiB of guest memory: a host that
+        // cannot allocate it has run out of memory like a refused mmap, so
+        // report it the same way rather than abort the process.
+        let page_count = slice.length / PAGE_SIZE;
+        let mut original_pages = Vec::new();
+        if let Err(error) = original_pages.try_reserve_exact(page_count) {
+            // SAFETY: the mapping was created above and nothing refers to it.
+            unsafe { libc::munmap(mapping.as_ptr().cast(), slice.length) };
+            return Err(Error::MemoryMapping(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                error,
+            )));
+        }
+        original_pages.extend((0..page_count).map(|page| {
+            // SAFETY: this is derived while the original whole-range mmap
+            // is intact, and every offset names the start of a live page.
+            unsafe { NonNull::new_unchecked(mapping.as_ptr().add(page * PAGE_SIZE)) }
+        }));
+        // Exactly the reserved capacity, so this does not reallocate.
+        let original_pages = original_pages.into_boxed_slice();
         let size = slice.length;
         Ok(Self {
             mapping: Arc::new(Mapping {

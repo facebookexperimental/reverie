@@ -43,6 +43,143 @@ pub(super) fn nonleader_exec_refusal(
     })
 }
 
+/// Diagnostic of this backend's typed refusal of an exec whose preparation a
+/// host call or allocation failed with ENOMEM, where no more specific
+/// diagnostic was recorded, and the one every refusal of host resources falls
+/// back to once [`MAX_HOST_RESOURCES_DIAGNOSTICS`] distinct ones are kept.
+pub(crate) const HOST_RESOURCES_REFUSAL: &str = "KVM exec: host memory ran out: a host call or \
+     allocation preparing the new image failed with ENOMEM";
+
+/// The most distinct host-resource diagnostics this process keeps (see
+/// [`intern_host_resources_diagnostic`]).
+pub(crate) const MAX_HOST_RESOURCES_DIAGNOSTICS: usize = 64;
+
+/// `text` as the `&'static str` that a [`reverie::UnsupportedRefusal`]
+/// carries. A host-resource diagnostic names values known only when it is
+/// made (the request and the limit), so each distinct text is allocated once
+/// and kept for the rest of the process. That stays small: an embedder that
+/// ends the run on the first refusal makes one, and one that lets the guest
+/// continue repeats the same few texts, since the request (the guest memory
+/// size) and the limit do not change. Past
+/// [`MAX_HOST_RESOURCES_DIAGNOSTICS`] distinct texts, [`HOST_RESOURCES_REFUSAL`].
+pub(super) fn intern_host_resources_diagnostic(text: String) -> &'static str {
+    static KEPT: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    keep_host_resources_diagnostic(
+        &mut KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        text,
+    )
+}
+
+/// [`intern_host_resources_diagnostic`], with `kept` the texts kept so far.
+pub(super) fn keep_host_resources_diagnostic(
+    kept: &mut Vec<&'static str>,
+    text: String,
+) -> &'static str {
+    if let Some(existing) = kept.iter().find(|kept| **kept == text) {
+        return existing;
+    }
+    if kept.len() >= MAX_HOST_RESOURCES_DIAGNOSTICS {
+        return HOST_RESOURCES_REFUSAL;
+    }
+    let text: &'static str = Box::leak(text.into_boxed_str());
+    kept.push(text);
+    text
+}
+
+/// This process's `RLIMIT_AS` as a host-resource diagnostic names it.
+pub(super) fn address_space_limit_text() -> String {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only `limit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
+        return format!("unreadable ({})", std::io::Error::last_os_error());
+    }
+    let bytes = |value: libc::rlim_t| {
+        if value == libc::RLIM_INFINITY {
+            "unlimited".to_owned()
+        } else {
+            format!("{value} bytes")
+        }
+    };
+    format!(
+        "soft {}, hard {}",
+        bytes(limit.rlim_cur),
+        bytes(limit.rlim_max)
+    )
+}
+
+/// Whether `error` is the host running out of memory: an ENOMEM from a host
+/// call, or Rust's `OutOfMemory` from a fallible allocation.
+pub(super) fn is_host_out_of_memory(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOMEM) || error.kind() == std::io::ErrorKind::OutOfMemory
+}
+
+/// Whether a loader `error` is the host running out of memory (see
+/// [`is_host_out_of_memory`]) rather than something about the image.
+pub(super) fn is_host_memory_error(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::MemoryMapping(host) | crate::Error::HostIo(host)
+            if is_host_out_of_memory(host)
+    )
+}
+
+/// The typed refusal of an exec whose preparation could not reserve the
+/// `request` bytes of guest memory it validates the new image in before it
+/// replaces the old one: the host refused them with `error`. Every such
+/// failure is this backend's own (the layout is the caller's live one, so it
+/// is valid), and no guest request decides it. The answer is ENOMEM, and the
+/// diagnostic names the request, the error and this process's `RLIMIT_AS`.
+pub(super) fn exec_validation_memory_refusal(
+    request: usize,
+    error: &crate::Error,
+) -> reverie::UnsupportedRefusal {
+    let (resource, detail) = match error {
+        crate::Error::MemoryMapping(host) | crate::Error::HostIo(host) => (
+            if is_host_out_of_memory(host) {
+                "host address space ran out"
+            } else {
+                "a host resource ran out"
+            },
+            host.to_string(),
+        ),
+        other => ("a host resource ran out", other.to_string()),
+    };
+    reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::HostResources,
+        reverie::Errno::ENOMEM,
+        intern_host_resources_diagnostic(format!(
+            "KVM exec: {resource}: reserving {request} bytes of host address space for the guest \
+             memory that validates the new image failed ({detail}) under this process's \
+             RLIMIT_AS ({}); this backend reserves its guest memory size for every guest \
+             process and once more during each exec",
+            address_space_limit_text(),
+        )),
+    )
+}
+
+/// The typed refusal, if any, that an exec preparation result carries for a
+/// host that ran out of memory. Linux's execve answers ENOMEM only when the
+/// kernel cannot allocate what the exec needs, and this executor models no
+/// limit of the guest's own that an exec could exceed, so every ENOMEM its
+/// exec preparation returns comes from a host call or allocation of this
+/// process: reading the image or its interpreter, or loading it into the
+/// validation memory. Every other result carries none.
+pub(super) fn exec_host_memory_refusal(result: i64) -> Option<reverie::UnsupportedRefusal> {
+    (result == negative_errno(libc::ENOMEM)).then(|| {
+        reverie::UnsupportedRefusal::new(
+            reverie::UnsupportedOperation::HostResources,
+            reverie::Errno::ENOMEM,
+            intern_host_resources_diagnostic(format!(
+                "{HOST_RESOURCES_REFUSAL}, under this process's RLIMIT_AS ({})",
+                address_space_limit_text(),
+            )),
+        )
+    })
+}
+
 /// Diagnostic carried by this backend's typed refusal of `flock`.
 pub(crate) const FLOCK_REFUSAL: &str =
     "KVM flock is unsupported: no host lock can follow the guest description's lifetime";

@@ -2440,11 +2440,22 @@ fn read_interpreter_image(path: &str) -> Result<Vec<u8>> {
         )));
     }
 
-    let mut image = Vec::with_capacity(metadata.len() as usize);
+    // A buffer this process cannot allocate is the host running out of
+    // memory, not a defect of the image: report it as the host error it is.
+    let mut image = Vec::new();
+    image
+        .try_reserve_exact(metadata.len() as usize)
+        .map_err(|error| {
+            Error::HostIo(std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))
+        })?;
     file.take(MAX_INTERPRETER_BYTES + 1)
         .read_to_end(&mut image)
         .map_err(|error| {
-            Error::UnsupportedElf(format!("cannot read interpreter {path:?}: {error}"))
+            if error.kind() == std::io::ErrorKind::OutOfMemory {
+                Error::HostIo(error)
+            } else {
+                Error::UnsupportedElf(format!("cannot read interpreter {path:?}: {error}"))
+            }
         })?;
     if image.len() as u64 > MAX_INTERPRETER_BYTES {
         return Err(Error::UnsupportedElf(format!(

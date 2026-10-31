@@ -1031,8 +1031,15 @@ impl ElfExecutor {
         request: &SyscallRequest,
         retained: Option<ResolvedExecutable>,
     ) -> i64 {
+        // The refusal describes this exec alone. Preparation records the
+        // specific refusal of a validation memory the host refused; any other
+        // ENOMEM is also the host's (`exec_host_memory_refusal`).
+        self.unsupported_refusal = None;
         let result = self.prepare_exec_image(memory, request, retained);
-        self.unsupported_refusal = nonleader_exec_refusal(result, self.state.tid, self.state.pid);
+        if self.unsupported_refusal.is_none() {
+            self.unsupported_refusal = exec_host_memory_refusal(result)
+                .or_else(|| nonleader_exec_refusal(result, self.state.tid, self.state.pid));
+        }
         result
     }
 
@@ -1144,23 +1151,37 @@ impl ElfExecutor {
         // TODO-HUMAN-REVIEW(PR-156): Review preflight validation before exec image replacement.
         // Loading the live image clears guest memory, so validate against an
         // isolated mapping before reporting exec success to the Reverie tool.
+        // The validation memory is this backend's own host reservation, as
+        // large as the live guest memory. A host that refuses it (address
+        // space under RLIMIT_AS, for one) refused nothing the guest asked
+        // for, so the guest's exec is refused by name rather than answered
+        // with an errno Linux would give for the guest's own reasons.
         let mut validation_memory = match GuestMemory::new(memory.guest_base(), memory.len()) {
             Ok(memory) => memory,
-            Err(_) => return negative_errno(libc::ENOMEM),
+            Err(error) => {
+                self.unsupported_refusal =
+                    Some(exec_validation_memory_refusal(memory.len(), &error));
+                return negative_errno(libc::ENOMEM);
+            }
         };
         let argv_refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
         let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
-        if load_static_elf_with_execfn(
+        if let Err(error) = load_static_elf_with_execfn(
             &mut validation_memory,
             &image,
             Some(&execfn),
             &argv_refs,
             &envp_refs,
             &self.state.cwd,
-        )
-        .is_err()
-        {
-            return negative_errno(libc::ENOEXEC);
+        ) {
+            // A loader host call or allocation that ran out of memory says
+            // nothing about the image (`prepare_exec` refuses the ENOMEM);
+            // every other loader failure is a malformed image.
+            return if is_host_memory_error(&error) {
+                negative_errno(libc::ENOMEM)
+            } else {
+                negative_errno(libc::ENOEXEC)
+            };
         }
         // Linux makes a non-leader caller the new thread-group leader while it
         // tears down every sibling. The KVM backend does not yet implement that

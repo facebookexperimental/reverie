@@ -158,7 +158,16 @@ pub(super) fn read_executable_file(
     let mut file =
         std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd())).map_err(io_error)?;
     let mut image = Vec::new();
-    file.read_to_end(&mut image).map_err(io_error)?;
+    // A buffer this process cannot allocate is the host running out of
+    // memory (read_to_end reports OutOfMemory, which has no errno): ENOMEM,
+    // which an exec refuses as this backend's own (`exec_host_memory_refusal`).
+    file.read_to_end(&mut image).map_err(|error| {
+        if is_host_out_of_memory(&error) {
+            negative_errno(libc::ENOMEM)
+        } else {
+            io_error(error)
+        }
+    })?;
     Ok(ResolvedExecutable {
         path: path.to_owned(),
         file: Some(Arc::new(file)),

@@ -492,6 +492,46 @@ This backend follows the same separation between the architecture transport and 
 
 No gVisor code is copied. Unlike the gVisor Sentry VFS and `pkg/sentry/fsimpl/` stack, this crate does not provide a virtual mount namespace, dentry cache, or filesystem implementation. Hermit container setup remains the isolation boundary, not this standalone crate, and a changing host-backed filesystem remains outside the determinism guarantee. Host procfs descriptors are rejected because they would identify the Hermit supervisor rather than a separate guest process.
 
+## Host address space
+
+Each guest process owns a guest memory of the `memory_size` the embedder
+gives `KvmBackend::new`: one `MAP_SHARED | MAP_NORESERVE` host mapping of a
+memfd. Host memory backs only the pages a guest touches, but the whole size
+is reserved host address space, and `RLIMIT_AS` counts every reserved byte.
+The backend reserves `memory_size`:
+
+- for each live guest process, since a fork copies the parent's memory into
+  a new mapping of the same size;
+- once more while an exec validates its new image in a scratch memory before
+  it replaces the old image;
+- for an exited child until its host thread releases the mapping, which it
+  does after the exit is published, so the parent can already be forking or
+  execing again.
+
+The peak therefore grows with the guest's process tree, and the order in
+which host threads run moves it: a shell running a two-command pipeline
+reserves four guest memories at its peak (the shell, both commands and one
+exec's validation memory), and an exited earlier command can briefly add a
+fifth.
+
+Run the backend with an unlimited `RLIMIT_AS`, and bound its memory with a
+cgroup (`memory.max`) instead, which counts only the pages guests touch.
+Under a finite limit, a run fails at the first reservation that does not fit,
+at a point the process tree and host thread scheduling decide:
+
+- an exec whose validation memory the host refuses, or whose image or
+  interpreter this process cannot allocate memory to read, is answered
+  `ENOMEM` with the typed refusal `UnsupportedOperation::HostResources`. Its
+  diagnostic names the reservation, the host error and the process's
+  `RLIMIT_AS`. The exec runs none of the new image. A Tool that ends the run
+  on the refusal keeps the guest from ever seeing the `ENOMEM`; no `ENOMEM`
+  an exec returns is one Linux would give for the guest's own reasons;
+- a fork whose child memory the host refuses ends the run with
+  `Error::MemoryMapping`.
+
+An embedder that needs the same outcome on every run should refuse to start
+under a finite `RLIMIT_AS`.
+
 ## Current limits
 
 Zero-count scalar reads use the actual selected host descriptor, including
