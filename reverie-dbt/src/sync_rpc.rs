@@ -975,6 +975,37 @@ mod initial_config_tests {
     const CHILD_CASE: &str = "REVERIE_DBT_INITIAL_CONFIG_TEST_CASE";
     const LEAF_PREFIX: &str = "initial-config leaf:";
 
+    // Keep scratch under TMPDIR while keeping AF_UNIX addresses short. Only
+    // an isolated leaf enters this directory, and its scoped server threads
+    // finish before the guard restores cwd and removes the temporary directory.
+    struct SocketDirectory {
+        previous_cwd: std::path::PathBuf,
+        _directory: tempfile::TempDir,
+    }
+
+    impl SocketDirectory {
+        fn enter() -> Self {
+            assert!(
+                std::env::var_os(CHILD_CASE).is_some(),
+                "socket directory requires an isolated initial-config leaf"
+            );
+            let previous_cwd = std::env::current_dir().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            std::env::set_current_dir(directory.path()).unwrap();
+            Self {
+                previous_cwd,
+                _directory: directory,
+            }
+        }
+    }
+
+    impl Drop for SocketDirectory {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous_cwd)
+                .expect("restore isolated initial-config leaf cwd");
+        }
+    }
+
     struct ChildGuard(Option<Child>);
 
     impl Drop for ChildGuard {
@@ -1322,24 +1353,26 @@ mod initial_config_tests {
     }
 
     fn with_server<C: DeserializeOwned>(bytes: Vec<u8>) -> Result<C, InitialConfigError> {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            socket.write_all(&bytes).unwrap();
-            // A malformed frame may need EOF to establish truncation. This
-            // preserves the independent read half, which must see no request.
-            socket.shutdown(std::net::Shutdown::Write).unwrap();
-            let mut request = [0_u8; 1];
-            assert_eq!(socket.read(&mut request).unwrap(), 0);
-        });
-        let result = read_initial_config(&path);
-        server.join().unwrap();
-        result
+        let _directory = SocketDirectory::enter();
+        let path = Path::new("config.sock");
+        std::thread::scope(|scope| {
+            let listener = UnixListener::bind(path).unwrap();
+            let server = scope.spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                socket.write_all(&bytes).unwrap();
+                // A malformed frame may need EOF to establish truncation. This
+                // preserves the independent read half, which must see no request.
+                socket.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut request = [0_u8; 1];
+                assert_eq!(socket.read(&mut request).unwrap(), 0);
+            });
+            let result = read_initial_config(path);
+            server.join().unwrap();
+            result
+        })
     }
 
     #[test]
@@ -1348,26 +1381,29 @@ mod initial_config_tests {
         if isolated_case(TEST, &["original"]).is_none() {
             return;
         }
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let expected = config();
-        let payload = encode(&expected).unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            socket.write_all(&framed(&payload)).unwrap();
-            // Keep the sending half open like the real coordinator waiting
-            // for a request. A reader that waits for EOF cannot finish here.
-            let mut request = [0_u8; 1];
-            assert_eq!(socket.read(&mut request).unwrap(), 0);
+        let directory = SocketDirectory::enter();
+        let path = Path::new("config.sock");
+        std::thread::scope(|scope| {
+            let listener = UnixListener::bind(path).unwrap();
+            let expected = config();
+            let payload = encode(&expected).unwrap();
+            let server = scope.spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                socket.write_all(&framed(&payload)).unwrap();
+                // Keep the sending half open like the real coordinator waiting
+                // for a request. A reader that waits for EOF cannot finish here.
+                let mut request = [0_u8; 1];
+                assert_eq!(socket.read(&mut request).unwrap(), 0);
+            });
+            let actual: Config = read_initial_config(path).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(encode(&actual).unwrap(), encode(&expected).unwrap());
+            server.join().unwrap();
         });
-        let actual: Config = read_initial_config(&path).unwrap();
-        assert_eq!(actual, expected);
-        assert_eq!(encode(&actual).unwrap(), encode(&expected).unwrap());
-        server.join().unwrap();
+        drop(directory);
         leaf_witness(TEST, "original");
     }
 
@@ -1451,13 +1487,13 @@ mod initial_config_tests {
                 if error.kind() == io::ErrorKind::InvalidInput));
             assert!(error.close.is_none());
         }
-        let directory = tempfile::tempdir().unwrap();
-        let error =
-            read_initial_config::<Config>(&directory.path().join("missing.sock")).unwrap_err();
+        let directory = SocketDirectory::enter();
+        let error = read_initial_config::<Config>(Path::new("missing.sock")).unwrap_err();
         assert!(matches!(error.primary,
             Some(InitialConfigFailure::Connect(ref error))
             if error.raw_os_error() == Some(libc::ENOENT)));
         assert!(error.close.is_none());
+        drop(directory);
         leaf_witness(TEST, "original");
     }
 
