@@ -4843,7 +4843,14 @@ mod tests {
                     (stat.st_size, stat.st_blocks, stat.st_uid, stat.st_gid),
                     (0, 0, 0, 0)
                 );
-                assert_eq!(stat.st_mtime, DETERMINISTIC_METADATA_SECONDS);
+                assert_eq!(
+                    [
+                        (stat.st_atime, stat.st_atime_nsec),
+                        (stat.st_mtime, stat.st_mtime_nsec),
+                        (stat.st_ctime, stat.st_ctime_nsec),
+                    ],
+                    identity.timestamps
+                );
             }
             assert_eq!(
                 syscall_result(
@@ -5090,7 +5097,60 @@ mod tests {
             assert_eq!(stat.st_mode, libc::S_IFIFO | 0o600);
             assert_eq!(stat.st_size, 0);
             assert_eq!(stat.st_blocks, 0);
-            assert_eq!(stat.st_mtime, DETERMINISTIC_METADATA_SECONDS);
+            assert_eq!(
+                [
+                    (stat.st_atime, stat.st_atime_nsec),
+                    (stat.st_mtime, stat.st_mtime_nsec),
+                    (stat.st_ctime, stat.st_ctime_nsec),
+                ],
+                identity.timestamps
+            );
+            // The statx route reports the same keeper timestamps, nanoseconds
+            // included, not a seconds-only copy.
+            let statx_address = address + 0x400;
+            write_c_string(&mut memory, 0x1800, "");
+            let action = execute_basic_syscall_with_output(
+                &mut memory,
+                &mut state,
+                &SyscallRequest::new(
+                    libc::SYS_statx as u64,
+                    [
+                        fd as u64,
+                        0x1800,
+                        libc::AT_EMPTY_PATH as u64,
+                        libc::STATX_BASIC_STATS as u64,
+                        statx_address,
+                        0,
+                    ],
+                ),
+                None,
+                Some(&mut output),
+            );
+            assert!(matches!(
+                action,
+                SyscallAction::Continue {
+                    result: 0,
+                    segment: None
+                }
+            ));
+            let extended: libc::statx = read_struct(&memory, statx_address);
+            assert_eq!(
+                [
+                    (
+                        extended.stx_atime.tv_sec,
+                        i64::from(extended.stx_atime.tv_nsec)
+                    ),
+                    (
+                        extended.stx_mtime.tv_sec,
+                        i64::from(extended.stx_mtime.tv_nsec)
+                    ),
+                    (
+                        extended.stx_ctime.tv_sec,
+                        i64::from(extended.stx_ctime.tv_nsec)
+                    ),
+                ],
+                identity.timestamps,
+            );
             stats.push(stat);
         }
 
@@ -25271,31 +25331,27 @@ mod tests {
     }
 
     /// Asserts that `fd`, a duplicate of it, and both in a forked child report
-    /// only the fixed metadata time.
-    fn assert_fixed_through_dup_and_fork(
+    /// the expected metadata times: a fixed time, or with `None` the kernel's
+    /// timestamps of the host object behind `fd`.
+    fn assert_descriptor_through_dup_and_fork(
         memory: &mut GuestMemory,
         state: &mut LoadedStaticElf,
         fd: libc::c_int,
+        fixed: Option<libc::time_t>,
         name: &str,
     ) {
-        assert_fixed_descriptor_timestamps(memory, state, fd, DETERMINISTIC_METADATA_SECONDS, name);
+        assert_descriptor_timestamps(memory, state, fd, fixed, name);
         let duplicate = syscall_result(memory, state, libc::SYS_dup, [fd as u64, 0, 0, 0, 0, 0]);
         assert!(duplicate >= 0, "{name}: dup failed: {duplicate}");
         let duplicate = duplicate as libc::c_int;
-        assert_fixed_descriptor_timestamps(
-            memory,
-            state,
-            duplicate,
-            DETERMINISTIC_METADATA_SECONDS,
-            &format!("{name} dup"),
-        );
+        assert_descriptor_timestamps(memory, state, duplicate, fixed, &format!("{name} dup"));
         let mut child = state.try_clone_for_fork(2).unwrap();
         for (fd, alias) in [(fd, "original"), (duplicate, "dup")] {
-            assert_fixed_descriptor_timestamps(
+            assert_descriptor_timestamps(
                 memory,
                 &mut child,
                 fd,
-                DETERMINISTIC_METADATA_SECONDS,
+                fixed,
                 &format!("{name} {alias} in a forked child"),
             );
         }
@@ -25375,7 +25431,7 @@ mod tests {
     }
 
     #[test]
-    fn host_metadata_timestamps_keep_signalfd_fixed_through_dup_and_fork() {
+    fn host_metadata_timestamps_keep_signalfd_on_host_times_through_dup_and_fork() {
         const SIGNAL_MASK: u64 = 0x100;
 
         let root = TestDir::new();
@@ -25399,16 +25455,17 @@ mod tests {
             ],
         );
         assert!(signal_fd >= 0, "signalfd failed: {signal_fd}");
-        assert_fixed_through_dup_and_fork(
+        assert_descriptor_through_dup_and_fork(
             &mut memory,
             &mut state,
             signal_fd as libc::c_int,
+            None,
             "signalfd",
         );
     }
 
     #[test]
-    fn host_metadata_timestamps_keep_self_pidfd_fixed_through_dup_and_fork() {
+    fn host_metadata_timestamps_keep_self_pidfd_on_host_times_through_dup_and_fork() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = true;
@@ -25421,10 +25478,11 @@ mod tests {
             [pid as u64, 0, 0, 0, 0, 0],
         );
         assert!(pidfd >= 0, "pidfd_open failed: {pidfd}");
-        assert_fixed_through_dup_and_fork(
+        assert_descriptor_through_dup_and_fork(
             &mut memory,
             &mut state,
             pidfd as libc::c_int,
+            None,
             "self pidfd",
         );
     }
@@ -25645,13 +25703,12 @@ mod tests {
         }
     }
 
-    /// Only the backend's own pidfd, which names the supervisor process that
-    /// holds every guest process of the run, reports the fixed time. A pidfd
-    /// for another host process received from outside the run is a real host
-    /// object and keeps its host timestamps. The backend's pidfd keeps the
-    /// fixed time when one guest socket passes it to another.
+    /// Every pidfd is a real host object and keeps its host timestamps: one
+    /// the backend made for the supervisor process, including when one guest
+    /// socket passes it to another, and one for another host process received
+    /// from outside the run alike.
     #[test]
-    fn host_metadata_timestamps_keep_host_times_for_an_imported_native_pidfd() {
+    fn host_metadata_timestamps_keep_host_times_for_pidfds() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         state.host_metadata_timestamps = true;
@@ -25674,11 +25731,11 @@ mod tests {
             receive_guest_rights(&mut memory, &mut state, receiver, RIGHTS_CONTROL_CAPACITY);
         assert_eq!(result, 1);
         assert_eq!(passed.len(), 1);
-        assert_fixed_descriptor_timestamps(
+        assert_descriptor_timestamps(
             &mut memory,
             &mut state,
             passed[0],
-            DETERMINISTIC_METADATA_SECONDS,
+            None,
             "the backend's pidfd passed between guest sockets",
         );
 
@@ -25693,37 +25750,6 @@ mod tests {
         assert!(native >= 0, "native pidfd_open failed");
         // SAFETY: successful pidfd_open transfers descriptor ownership to File.
         let native = unsafe { std::fs::File::from_raw_fd(native) };
-        // A kernel without pidfs compares the fdinfo Pid lines instead of
-        // inodes; both name a live process visible to this procfs, and differ.
-        let own_host = host_fd(&state, own as libc::c_int).unwrap();
-        let (native_pid, own_pid) = (
-            pidfd_fdinfo_pid(native.as_raw_fd()),
-            pidfd_fdinfo_pid(own_host),
-        );
-        assert!(
-            native_pid.is_some_and(|pid| pid > 0)
-                && own_pid.is_some_and(|pid| pid > 0)
-                && native_pid != own_pid,
-            "fdinfo Pid lines: native {native_pid:?}, own {own_pid:?}"
-        );
-        // pidfd_open recorded the supervisor's signature. Both comparison
-        // paths tell the two processes apart, the fdinfo path included on a
-        // kernel with pidfs, and a pidfd whose value cannot be read counts as
-        // the supervisor's.
-        let own_signature = pidfd_signature(own_host).unwrap();
-        assert_eq!(recorded_self_pidfd_signature(), Some(own_signature));
-        assert_ne!(pidfd_signature(native.as_raw_fd()).unwrap(), own_signature);
-        for signature in [own_signature, PidfdSignature::Fdinfo(own_pid.unwrap())] {
-            assert!(
-                pidfd_matches_signature(own_host, signature),
-                "{signature:?}"
-            );
-            assert!(
-                !pidfd_matches_signature(native.as_raw_fd(), signature),
-                "{signature:?}"
-            );
-            assert!(pidfd_matches_signature(-1, signature), "{signature:?}");
-        }
         let (outside, inside) = std::os::unix::net::UnixDatagram::pair().unwrap();
         let inside = insert_file_with_flags(
             &mut state,
@@ -25902,12 +25928,13 @@ mod tests {
         None
     }
 
-    /// The backend's own pidfd reports the fixed time when the supervisor has
-    /// no descriptor left, as after a guest's shared mappings have pinned
-    /// every descriptor number: recognizing it allocates no descriptor.
+    /// The backend's own pidfd reports its kernel timestamps when the
+    /// supervisor has no descriptor left, as after a guest's shared mappings
+    /// have pinned every descriptor number: no classification runs on it, so
+    /// nothing needs a descriptor to recognize it.
     #[test]
-    fn host_metadata_timestamps_keep_self_pidfd_fixed_when_descriptors_run_out() {
-        const TEST: &str = "executor::tests::host_metadata_timestamps_keep_self_pidfd_fixed_when_descriptors_run_out";
+    fn host_metadata_timestamps_keep_self_pidfd_on_host_times_when_descriptors_run_out() {
+        const TEST: &str = "executor::tests::host_metadata_timestamps_keep_self_pidfd_on_host_times_when_descriptors_run_out";
         const EMPTY_ADDRESS: u64 = 0x2c0;
         const STAT_ADDRESS: u64 = 0x1000;
         const STATX_ADDRESS: u64 = 0x1200;
@@ -25928,6 +25955,21 @@ mod tests {
             [pid as u64, 0, 0, 0, 0, 0],
         );
         assert!(pidfd >= 0, "pidfd_open failed: {pidfd}");
+        let pidfd = pidfd as libc::c_int;
+        let mut kernel = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: kernel is writable and the pidfd's host descriptor is live.
+        assert_eq!(
+            unsafe { libc::fstat(host_fd(&state, pidfd).unwrap(), kernel.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: fstat initialized kernel on success.
+        let kernel = unsafe { kernel.assume_init() };
+        let host_times = [
+            (kernel.st_atime, kernel.st_atime_nsec),
+            (kernel.st_mtime, kernel.st_mtime_nsec),
+            (kernel.st_ctime, kernel.st_ctime_nsec),
+        ];
+        assert_ne!(host_times, [(DETERMINISTIC_METADATA_SECONDS, 0); 3]);
         let (exhausted, observed) = with_full_descriptor_table(|| {
             let probe = descriptor_allocation_errno();
             let fstat = syscall_result(
@@ -25963,16 +26005,16 @@ mod tests {
                 (stat.st_mtime, stat.st_mtime_nsec),
                 (stat.st_ctime, stat.st_ctime_nsec),
             ],
-            [(DETERMINISTIC_METADATA_SECONDS, 0); 3],
+            host_times,
             "fstat of the self pidfd with no descriptor left"
         );
         assert_eq!(
             [
-                (statx.stx_atime.tv_sec, statx.stx_atime.tv_nsec),
-                (statx.stx_mtime.tv_sec, statx.stx_mtime.tv_nsec),
-                (statx.stx_ctime.tv_sec, statx.stx_ctime.tv_nsec),
+                (statx.stx_atime.tv_sec, i64::from(statx.stx_atime.tv_nsec)),
+                (statx.stx_mtime.tv_sec, i64::from(statx.stx_mtime.tv_nsec)),
+                (statx.stx_ctime.tv_sec, i64::from(statx.stx_ctime.tv_nsec)),
             ],
-            [(DETERMINISTIC_METADATA_SECONDS, 0); 3],
+            host_times,
             "statx of the self pidfd with no descriptor left"
         );
         eprintln!("{DESCRIPTOR_EXHAUSTION_COMPLETE}");

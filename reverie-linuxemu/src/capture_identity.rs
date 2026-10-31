@@ -1,5 +1,7 @@
 // Private identities for the in-memory capture streams. An owned anonymous
-// pipe endpoint reserves each native inode for the whole capture lifetime.
+// pipe endpoint reserves each native inode for the whole capture lifetime,
+// and the pipe's own kernel timestamps are the ones the capture sink
+// reports: the sink is modeled as that pipe, so its metadata is the pipe's.
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
@@ -29,6 +31,11 @@ pub(super) type CaptureDropProbe = Box<dyn FnOnce([std::os::fd::RawFd; 2]) + Sen
 pub(super) struct CaptureObjectIdentity {
     pub(super) device: libc::dev_t,
     pub(super) inode: libc::ino_t,
+    /// The keeper pipe's kernel timestamps, (seconds, nanoseconds) for
+    /// atime, mtime and ctime in that order, read when the pipe was made.
+    /// Nothing writes to or reads from the keeper, so they stay the pipe's
+    /// creation timestamps for the whole capture lifetime.
+    pub(super) timestamps: [(libc::time_t, libc::c_long); 3],
 }
 
 struct CapturePipe {
@@ -84,6 +91,11 @@ impl CapturePipe {
             identity: CaptureObjectIdentity {
                 device: stat.st_dev,
                 inode: stat.st_ino,
+                timestamps: [
+                    (stat.st_atime, stat.st_atime_nsec),
+                    (stat.st_mtime, stat.st_mtime_nsec),
+                    (stat.st_ctime, stat.st_ctime_nsec),
+                ],
             },
             _keeper: keeper,
         })

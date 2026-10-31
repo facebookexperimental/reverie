@@ -1228,13 +1228,13 @@ pub(super) fn sanitize_guest_fd_statx(
 /// host object, or a run with that setting off, and the descriptor reports
 /// the kernel's timestamps.
 ///
-/// A `/proc` snapshot is classified by its identity, which every alias
-/// shares. The virtual signalfd's private eventfd and the
-/// self-pidfd proxy are classified by the descriptor instead: on a kernel
-/// without pidfs, every anonymous-inode descriptor shares one host inode, so
-/// their identity is shared with native descriptors and cannot carry a class.
-/// A pidfd counts only when it names the supervisor process, see
-/// [`is_self_pidfd`].
+/// Only a `/proc` snapshot is classified here, by its identity, which every
+/// alias shares; its synthetic metadata is rendered with the snapshot
+/// itself. Every other descriptor the backend makes for its own plumbing (a
+/// virtual signalfd's private eventfd, the pidfd for the supervisor process)
+/// is a real kernel object with real kernel timestamps, and reports them
+/// like any other host object: what a guest finally sees is the Tool's
+/// decision, as on a backend whose objects the kernel makes directly.
 fn synthetic_descriptor_seconds(
     state: &LoadedStaticElf,
     guest_fd: libc::c_int,
@@ -1247,11 +1247,7 @@ fn synthetic_descriptor_seconds(
         .get(&guest_fd)
         .map(|identity| identity.timestamps)
     {
-        Some(IdentityTimestamps::ProcSnapshot) => return Some(0),
-        Some(IdentityTimestamps::Host) | None => {}
+        Some(IdentityTimestamps::ProcSnapshot) => Some(0),
+        Some(IdentityTimestamps::Host) | None => None,
     }
-    if signalfd_mask(state, guest_fd).is_some() || is_self_pidfd(state, guest_fd) {
-        return Some(DETERMINISTIC_METADATA_SECONDS);
-    }
-    None
 }

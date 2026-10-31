@@ -60,7 +60,19 @@ fn synthetic_captured_output_stat(identity: CaptureObjectIdentity) -> libc::stat
     stat.st_uid = 0;
     stat.st_gid = 0;
     stat.st_blksize = PAGE_SIZE as libc::blksize_t;
-    sanitize_stat_timestamps(&mut stat);
+    // The sink reports the keeper pipe's own kernel timestamps, as a real
+    // pipe made when capture was set up would; no fixed time is chosen here.
+    let [
+        (atime, atime_nsec),
+        (mtime, mtime_nsec),
+        (ctime, ctime_nsec),
+    ] = identity.timestamps;
+    stat.st_atime = atime;
+    stat.st_atime_nsec = atime_nsec;
+    stat.st_mtime = mtime;
+    stat.st_mtime_nsec = mtime_nsec;
+    stat.st_ctime = ctime;
+    stat.st_ctime_nsec = ctime_nsec;
     stat
 }
 
@@ -78,8 +90,11 @@ fn synthetic_captured_output_statx(identity: CaptureObjectIdentity) -> libc::sta
     extended.stx_dev_major = libc::major(stat.st_dev);
     extended.stx_dev_minor = libc::minor(stat.st_dev);
     extended.stx_atime.tv_sec = stat.st_atime;
+    extended.stx_atime.tv_nsec = stat.st_atime_nsec as u32;
     extended.stx_mtime.tv_sec = stat.st_mtime;
+    extended.stx_mtime.tv_nsec = stat.st_mtime_nsec as u32;
     extended.stx_ctime.tv_sec = stat.st_ctime;
+    extended.stx_ctime.tv_nsec = stat.st_ctime_nsec as u32;
     extended
 }
 
