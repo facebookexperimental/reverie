@@ -239,7 +239,7 @@ impl SeccompFilter {
         Ok(bytes)
     }
 
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(all(feature = "exec-native-injection", feature = "launcher"))]
     pub(crate) fn native_program(&mut self) -> libc::sock_fprog {
         // Only a prebuilt exact native recipe is passed by the child owner.
         libc::sock_fprog {
