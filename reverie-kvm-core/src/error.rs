@@ -68,14 +68,27 @@ pub enum Error {
     #[error("inherited stdin read retired after terminal cancellation")]
     TerminalReadCancelled,
 
-    /// The consumer cannot yet release its scheduler turn safely around this
-    /// external zero-count read. This is a terminal backend refusal, never a
-    /// successful read or a Linux syscall errno.
-    #[error(
-        "unsupported KVM zero-count read on guest fd {fd}: potentially blocking external endpoint requires consumer scheduling support"
-    )]
+    /// The executor cannot show that this zero-count read of a host endpoint
+    /// returns without waiting in the host, so it does not make it. This is a
+    /// terminal backend refusal, never a successful read or a Linux syscall
+    /// errno.
+    #[error("unsupported KVM zero-count read on guest fd {fd}: the endpoint may wait in the host")]
     PotentiallyBlockingZeroRead {
         /// The guest's low-word descriptor, including inherited stdin aliases.
+        fd: i32,
+    },
+
+    /// A read of an inotify instance whose host description is blocking,
+    /// which would wait in the host for an event, where the Tool can neither
+    /// see nor order the wait. Every instance this executor creates is
+    /// nonblocking on the host, so such an instance came from outside the
+    /// guest (received, or inherited). This is a terminal backend refusal,
+    /// never a Linux syscall errno.
+    #[error(
+        "unsupported KVM read of inotify guest fd {fd}: its host description is blocking, so the read would wait in the host"
+    )]
+    BlockingInotifyRead {
+        /// The guest's low-word descriptor.
         fd: i32,
     },
 

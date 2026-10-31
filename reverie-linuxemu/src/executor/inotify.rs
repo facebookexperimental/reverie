@@ -46,8 +46,17 @@
 // F_GETFL and FIONBIO, while this executor's F_GETFL reports the host
 // instance's flags, O_NONBLOCK included. A Tool that passes a blocking read
 // through unchanged gets EAGAIN when nothing is queued, where Linux would wait.
-// A descriptor received from outside the guest keeps the mode its sender gave
-// it, as any other received descriptor does.
+//
+// An instance whose host description is blocking cannot come from this
+// executor; it came from outside the guest (received over SCM_RIGHTS, or
+// inherited), and keeps the mode its sender gave it, as any other received
+// descriptor does. A read of one would wait in the host, so a read, readv or
+// preadv2 of it is refused by name before any host call (BlockingInotifyRead,
+// `refuse_blocking_inotify_read`). A zero-count read of any inotify instance
+// into an address the host would accept is refused as well (read_write.rs,
+// `admit_host_read_zero`): its O_NONBLOCK can be cleared through an alias
+// outside the guest, so the executor cannot show that the host read returns
+// at once.
 
 pub(super) fn host_fd_is_inotify(host_fd: RawFd) -> Result<bool, i64> {
     host_fd_mode_is_inotify(host_fd, fd_mode(host_fd)?)
@@ -62,6 +71,53 @@ pub(super) fn host_fd_mode_is_inotify(host_fd: RawFd, mode: libc::mode_t) -> Res
     }
     let target = canonical_fd_path(host_fd)?;
     Ok(target.as_os_str().as_bytes() == b"anon_inode:inotify")
+}
+
+/// Refuse, before any host call, a read of the inotify instance `host_fd`
+/// (guest descriptor `guest_fd`) whose host description is blocking: the read
+/// would wait in the host for an event (see the top of this file). A
+/// description whose flags cannot be read is left to the read, which reports
+/// that descriptor's own error.
+pub(super) fn refuse_blocking_inotify_read(
+    host_fd: RawFd,
+    guest_fd: libc::c_int,
+) -> crate::Result<()> {
+    match fd_status_flags(host_fd) {
+        Ok(flags) if flags & libc::O_NONBLOCK == 0 => {
+            Err(crate::Error::BlockingInotifyRead { fd: guest_fd })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`refuse_blocking_inotify_read`] for a readv, or a preadv2 that reads at
+/// the current position as readv does (offset -1, no flag but RWF_HIPRI),
+/// of guest descriptor `args[0]`; any other call is left alone, as are
+/// descriptors that are no inotify instance. An anonymous inode is the only
+/// kind that can be one, so other descriptors pay only the file type the
+/// entry already records.
+pub(super) fn blocking_inotify_vectored_read(
+    state: &LoadedStaticElf,
+    number: u64,
+    args: &[u64; 6],
+) -> Option<crate::Error> {
+    if number == libc::SYS_preadv2 as u64
+        && (args[3] as i64 != -1 || (args[5] as libc::c_int) & !libc::RWF_HIPRI != 0)
+    {
+        return None;
+    }
+    // Linux consumes only the low 32-bit descriptor word.
+    let guest_fd = args[0] as libc::c_int;
+    let host = host_fd(state, guest_fd)?;
+    let mode = match state.fd_entry_ids.get(&guest_fd) {
+        Some(entry) => entry.file_type(|| fd_mode(host)),
+        None => fd_mode(host),
+    }
+    .ok()?;
+    if !host_fd_mode_is_inotify(host, mode).ok()? {
+        return None;
+    }
+    refuse_blocking_inotify_read(host, guest_fd).err()
 }
 
 /// The bytes queued on the host inotify instance `host_fd`, as FIONREAD there

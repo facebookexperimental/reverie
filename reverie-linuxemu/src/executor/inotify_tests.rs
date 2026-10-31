@@ -341,6 +341,104 @@ mod inotify_tests {
     }
 
     #[test]
+    fn a_read_of_an_instance_blocking_on_the_host_is_refused_before_any_host_call() {
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 4 * PAGE_SIZE as usize).unwrap();
+        // An instance that reached the table blocking on the host, as one
+        // received from outside the guest can (this executor creates none),
+        // with an event queued, which a host read would take.
+        // SAFETY: successful inotify_init1 returns a new owned descriptor.
+        let blocking = unsafe { std::fs::File::from_raw_fd(libc::inotify_init1(libc::IN_CLOEXEC)) };
+        let host = blocking.as_raw_fd();
+        let path = CString::new(root.0.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is NUL-terminated and host is a live inotify instance.
+        assert!(unsafe { libc::inotify_add_watch(host, path.as_ptr(), libc::IN_CREATE) } >= 0);
+        std::fs::write(root.0.join("created"), b"x").unwrap();
+        let queued_before = queued(host);
+        assert!(queued_before > 0);
+        let fd = insert_file_with_flags(&mut state, blocking, true, None);
+        assert!(fd >= 3);
+        let iovec = libc::iovec {
+            iov_base: BUFFER as *mut libc::c_void,
+            iov_len: 64,
+        };
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), PATH, &iovec), 0);
+        let refused = |action: SyscallAction| {
+            matches!(
+                action,
+                SyscallAction::Failure(crate::Error::BlockingInotifyRead { fd: actual })
+                    if i64::from(actual) == fd
+            )
+        };
+        for (number, args) in [
+            (libc::SYS_read, [fd as u64, BUFFER, 64, 0, 0, 0]),
+            (libc::SYS_readv, [fd as u64, PATH, 1, 0, 0, 0]),
+            (libc::SYS_preadv2, [fd as u64, PATH, 1, u64::MAX, 0, 0]),
+            (
+                libc::SYS_preadv2,
+                [fd as u64, PATH, 1, u64::MAX, 0, libc::RWF_HIPRI as u64],
+            ),
+        ] {
+            let action = execute_basic_syscall(
+                &mut memory,
+                &mut state,
+                &SyscallRequest::new(number as u64, args),
+            );
+            assert!(refused(action), "{number} {args:?} was not refused by name");
+            assert_eq!(queued(host), queued_before, "{number} took an event");
+        }
+        // A positioned preadv2, or one with a flag Linux refuses first, never
+        // reads, and answers as a native blocking instance does.
+        // SAFETY: successful inotify_init1 returns a new owned descriptor.
+        let native = unsafe { std::fs::File::from_raw_fd(libc::inotify_init1(libc::IN_CLOEXEC)) };
+        let mut native_bytes = [0_u8; 64];
+        let native_iovec = libc::iovec {
+            iov_base: native_bytes.as_mut_ptr().cast(),
+            iov_len: native_bytes.len(),
+        };
+        for (offset, flags) in [(0_u64, 0_u64), (u64::MAX, libc::RWF_NOWAIT as u64)] {
+            // SAFETY: native_iovec names native_bytes, which outlive the call;
+            // neither call reads (ESPIPE and EOPNOTSUPP come first).
+            let native_result = unsafe {
+                libc::syscall(
+                    libc::SYS_preadv2,
+                    native.as_raw_fd(),
+                    &native_iovec as *const libc::iovec,
+                    1,
+                    offset,
+                    0,
+                    flags,
+                )
+            };
+            let native_result = if native_result < 0 {
+                io_error(std::io::Error::last_os_error())
+            } else {
+                native_result
+            };
+            assert!(native_result < 0, "native preadv2 read {native_result}");
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_preadv2,
+                    [fd as u64, PATH, 1, offset, 0, flags]
+                ),
+                native_result
+            );
+        }
+        assert_eq!(queued(host), queued_before);
+        assert_eq!(fd_status_flags(host).unwrap() & libc::O_NONBLOCK, 0);
+        // An instance this executor made is never refused: with nothing
+        // queued its read answers EAGAIN.
+        let made = create(&mut state, &mut memory) as u64;
+        assert_eq!(
+            guest_read(&mut state, &mut memory, made, 64).0,
+            negative_errno(libc::EAGAIN)
+        );
+    }
+
+    #[test]
     fn inotify_watch_lifecycle_and_errors_match_native() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);

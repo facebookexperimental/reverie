@@ -362,12 +362,20 @@ fn execute_basic_syscall_inner(
         vectored_io(memory, state, args, libc::SYS_writev, output)
     } else if number == libc::SYS_readv as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // A blocking inotify instance is refused before any host call: its
+        // read would wait in the host (inotify.rs).
+        if let Some(error) = blocking_inotify_vectored_read(state, number, args) {
+            return SyscallAction::Failure(error);
+        }
         vectored_io(memory, state, args, libc::SYS_readv, output)
     } else if number == libc::SYS_preadv as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         vectored_io(memory, state, args, libc::SYS_preadv, output)
     } else if number == libc::SYS_preadv2 as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
+        if let Some(error) = blocking_inotify_vectored_read(state, number, args) {
+            return SyscallAction::Failure(error);
+        }
         vectored_io(memory, state, args, libc::SYS_preadv2, output)
     } else if number == libc::SYS_pwritev as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
