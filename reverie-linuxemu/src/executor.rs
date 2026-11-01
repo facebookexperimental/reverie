@@ -488,6 +488,7 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         argv0: b"test".to_vec(),
         cwd: cwd.to_owned(),
         cwd_fd: std::fs::File::open(cwd).unwrap(),
+        private_copy_gate: Default::default(),
         stdin: Some(std::fs::File::open("/dev/null").unwrap()),
         stdin_entry_id: Arc::new(()),
         auxv: Vec::new(),
@@ -3793,7 +3794,7 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
         let fd = open_with_flags(&mut memory, &mut state, "/proc/self/maps", libc::O_PATH);
-        let shared = FileTableState::try_from_elf(&state).unwrap();
+        let mut shared = FileTableState::try_from_elf(&state).unwrap();
         assert!(shared.installed_matches(&state));
         // Installing over an equal state keeps every entry and its host fd.
         let host_before = host_fd(&state, fd as i32);
@@ -3839,7 +3840,7 @@ mod tests {
             .files
             .insert(fd, std::fs::File::open(&a_path).unwrap());
         state.fd_entry_ids.remove(&fd);
-        let shared = FileTableState::try_from_elf(&state).unwrap();
+        let mut shared = FileTableState::try_from_elf(&state).unwrap();
         let a_inode = inode(&state.files[&fd]);
         // The task now holds a different file under the same fd. Identical
         // (empty) identities must not count as the same entry: install puts
@@ -3919,7 +3920,7 @@ mod tests {
             );
         }
 
-        let shared = FileTableState::try_from_elf(&state).unwrap();
+        let mut shared = FileTableState::try_from_elf(&state).unwrap();
         assert_eq!(
             shared.synthetic_proc_nofollow_fds,
             state.synthetic_proc_nofollow_fds
@@ -18428,7 +18429,7 @@ mod tests {
 
         let event_host_fd = state.files.get(&(event_fd as i32)).unwrap().as_raw_fd();
         let epoll_host_fd = state.files.get(&(epoll_fd as i32)).unwrap().as_raw_fd();
-        let shared_files = FileTableState::try_from_elf(&state).unwrap();
+        let mut shared_files = FileTableState::try_from_elf(&state).unwrap();
         shared_files.install(&mut state).unwrap();
         assert_eq!(
             state.files.get(&(event_fd as i32)).unwrap().as_raw_fd(),
@@ -22416,7 +22417,7 @@ mod tests {
         let old_metadata = metadata(&f.executor.state);
         assert!(f.executor.state.fdinfo_files.is_empty());
         let shared = f.executor.file_table.clone();
-        let authoritative = shared.lock().unwrap();
+        let mut authoritative = shared.lock().unwrap();
         for fd in [first as i32, second as i32] {
             assert!(!Arc::ptr_eq(
                 &old_entries[&fd],
@@ -22427,7 +22428,9 @@ mod tests {
                 &authoritative.fd_object_inodes[&fd]
             ));
         }
-        let clone_source = authoritative.stdin.as_ref().unwrap();
+        // An owned duplicate of stdin's description: install below takes the
+        // table mutably.
+        let clone_source = authoritative.stdin.as_ref().unwrap().try_clone().unwrap();
         let original_limit = nofile_limit();
         let reduced = libc::rlimit {
             rlim_cur: original_limit.rlim_cur.min(256),
@@ -22510,11 +22513,15 @@ mod tests {
         }
         assert_eq!(metadata(&f.executor.state), old_metadata);
         assert!(f.executor.state.fdinfo_files.is_empty());
-        for (fd, position) in [(first, 1), (second, 2)] {
-            assert_eq!(
-                unsafe { libc::lseek(old_handles[&(fd as i32)], 0, libc::SEEK_CUR) },
-                position
-            );
+        // The sibling's closes retired the entries this snapshot copied for
+        // `first` and `second`, and with them this task's copies (the record
+        // of private copies in fd_table.rs): each handle is still this task's,
+        // as the failed install left it, but it holds the revocation
+        // placeholder instead of the closed description and its offset.
+        for fd in [first, second] {
+            let raw = old_handles[&(fd as i32)];
+            assert_ne!(flags(raw).0 & libc::O_PATH, 0);
+            assert_eq!(unsafe { libc::lseek(raw, 0, libc::SEEK_CUR) }, -1);
         }
         let epoll_host = old_handles[&(epoll as i32)];
         let event_host = old_handles[&(event as i32)];
@@ -45133,3 +45140,7 @@ mod exit_descriptor_tests;
 #[cfg(test)]
 #[path = "executor/fd_link_path_tests.rs"]
 mod fd_link_path_tests;
+
+#[cfg(test)]
+#[path = "executor/revoked_copy_tests.rs"]
+mod revoked_copy_tests;

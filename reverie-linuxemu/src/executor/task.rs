@@ -754,7 +754,7 @@ impl ElfExecutor {
         };
         let file_table = self.file_table.clone();
         {
-            let shared_files = file_table.lock().expect("KVM file-table lock poisoned");
+            let mut shared_files = file_table.lock().expect("KVM file-table lock poisoned");
             if let Err(error) = shared_files.install(&mut self.state) {
                 return Some(io_error(error));
             }
@@ -1469,7 +1469,7 @@ impl ElfExecutor {
                 task_generation,
             },
         );
-        let child = Self {
+        let mut child = Self {
             state,
             task_generation,
             process_generation,
@@ -1504,6 +1504,17 @@ impl ElfExecutor {
             clear_child_tid: None,
             vfork_parent: None,
         };
+        // The child's copies are copies of this task's. Install the table into
+        // them under its lock, which comes before the signal transaction, so
+        // they are current and registered before a sibling can retire an entry
+        // they copy (PrivateCopies): a thread that parks before its first call
+        // must not keep a closed pipe end open.
+        drop(_transaction);
+        let file_table = child.file_table.clone();
+        file_table
+            .lock()
+            .expect("KVM file-table lock poisoned")
+            .install(&mut child.state)?;
         Ok(child)
     }
 
@@ -1792,6 +1803,10 @@ impl ElfExecutor {
         self.state.file_retirement.drain_unlocked();
         let stdin = self.state.take_stdin();
         let retired = std::mem::take(&mut self.state.files);
+        // From here no sibling's retirement replaces these copies, which the
+        // cleanup service closes with the task's other descriptors: it reads
+        // each one's description, so they keep theirs until it closes them.
+        self.state.private_copy_gate.close(std::iter::empty());
         self.state.fd_entry_ids.clear();
         self.state.native_poll_fds.clear();
         self.state.pipe_owners.clear();
@@ -1857,14 +1872,37 @@ impl ElfExecutor {
         // a peer's host syscall (and its interrupt) during terminal cleanup.
         let stdin = self.state.take_stdin();
         let retired = std::mem::take(&mut self.state.files);
+        // From here no sibling's retirement replaces these copies, and none of
+        // them holds a description for one to miss (PrivateCopies).
+        self.state
+            .private_copy_gate
+            .close(retired.values().chain(stdin.as_ref()));
         self.state.fd_entry_ids.clear();
         // Snapshot retirement is not a logical close in a surviving table.
         self.state.native_poll_fds.clear();
         self.state.pipe_owners.clear();
         self.state.poll_table_id = Default::default();
         self.state.epoll_domain = Default::default();
-        self.file_table = Arc::new(Mutex::new(FileTableState::default()));
-        drop(self.file_table_task_owner.take());
+        let table = std::mem::replace(
+            &mut self.file_table,
+            Arc::new(Mutex::new(FileTableState::default())),
+        );
+        // The last task closes the table's own descriptors in its exit, as
+        // Linux's exit_files does, rather than whenever a transient observer
+        // of the table lets it go. No peer remains to hold the lock.
+        let last_task = self
+            .file_table_task_owner
+            .take()
+            .is_some_and(|owner| Arc::into_inner(owner).is_some());
+        if last_task {
+            let mut table = table.lock().unwrap_or_else(|p| p.into_inner());
+            let stdin = table.stdin.take();
+            let files = std::mem::take(&mut table.files);
+            self.state
+                .file_retirement
+                .retire(stdin.into_iter().chain(files.into_values()));
+        }
+        drop(table);
         let action = self.process_action.take();
         self.state
             .file_retirement

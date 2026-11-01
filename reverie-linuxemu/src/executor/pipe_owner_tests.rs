@@ -465,7 +465,7 @@ fn fcntl_owner_dup_close_reuse_and_snapshots_preserve_description_identity() {
         owner_test_call(&mut memory, &mut state, fd, libc::F_DUPFD_CLOEXEC, 30) as i32;
     assert_eq!(fcntl_duplicate, 30);
     let retained = state.pipe_owners[&fd].clone();
-    let snapshot = FileTableState::try_from_elf(&state).unwrap();
+    let mut snapshot = FileTableState::try_from_elf(&state).unwrap();
     snapshot.install(&mut state).unwrap();
     drop(snapshot);
     for alias in [fd, duplicate, fcntl_duplicate] {

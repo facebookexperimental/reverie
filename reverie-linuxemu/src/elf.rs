@@ -1138,6 +1138,11 @@ pub struct LoadedStaticElf {
     pub argv0: Vec<u8>,
     pub cwd: PathBuf,
     pub cwd_fd: std::fs::File,
+    /// Whether another task's retirement of a shared entry may still replace
+    /// this task's copy of it ([`crate::executor::PrivateCopyGate`]).
+    /// Declared before `stdin` and `files`, so dropping the state closes it
+    /// before any copy is closed.
+    pub private_copy_gate: crate::executor::PrivateCopyGate,
     pub stdin: Option<std::fs::File>,
     /// Identity of the inherited stdin slot, distinct from its inode/OFD.
     /// Loader setup precedes table publication; fork and exec retain this
@@ -1417,6 +1422,7 @@ impl LoadedStaticElf {
             argv0: self.argv0.clone(),
             cwd: self.cwd.clone(),
             cwd_fd: cwd_fd.into_file(),
+            private_copy_gate: Default::default(),
             stdin: stdin.map(StagedFile::into_file),
             stdin_entry_id: self.stdin_entry_id.clone(),
             auxv: self.auxv.clone(),
@@ -2251,6 +2257,7 @@ fn load_executable(
         argv0,
         cwd: cwd.to_owned(),
         cwd_fd,
+        private_copy_gate: Default::default(),
         stdin: None,
         stdin_entry_id: std::sync::Arc::new(()),
         auxv,

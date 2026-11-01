@@ -29,6 +29,8 @@ pub struct FileTableState {
     pub(super) fdinfo_files: std::collections::BTreeMap<i32, Arc<FdinfoDescription>>,
     pub(super) signalfd_fds: std::collections::BTreeSet<i32>,
     pub(super) fd_object_inodes: std::collections::BTreeMap<i32, Arc<GuestFileIdentity>>,
+    /// The private copies of this table's entries that its tasks hold.
+    pub(super) private_copies: PrivateCopies,
 }
 
 /// A seq_file-backed synthetic proc open description. Its content is rendered
@@ -62,7 +64,10 @@ impl FileTableState {
     }
 
     pub(super) fn try_from_elf(state: &LoadedStaticElf) -> std::io::Result<Self> {
-        Self::prepare_from_elf(state, false, None)
+        let mut table = Self::prepare_from_elf(state, false, None)?;
+        // The state a table is made from is its first task.
+        table.private_copies.register(state);
+        Ok(table)
     }
 
     fn same_stdin_entry(&self, state: &LoadedStaticElf) -> bool {
@@ -89,9 +94,24 @@ impl FileTableState {
                     .expect("an unchanged entry has its published clone")
             });
         }
+        // What is left of the published clones is what this publication
+        // retires: each entry the guest closed or replaced, and stdin when it
+        // changed. Every other task's copy of one goes now, in this call
+        // (PrivateCopies).
+        let retired: Vec<_> = self
+            .files
+            .keys()
+            .map(|&fd| (fd, self.fd_entry_ids.get(&fd).cloned()))
+            .collect();
+        let retired_stdin = self.stdin.is_some().then(|| self.stdin_entry_id.clone());
+        next.private_copies = std::mem::take(&mut self.private_copies);
+        let revoked = next
+            .private_copies
+            .revoke(state.tid, &retired, retired_stdin.as_ref());
+        next.private_copies.register(state);
         let retired = std::mem::replace(self, next);
         retired.retire(&state.file_retirement);
-        Ok(())
+        revoked
     }
 
     /// The table for `state`. With `published`, entries whose identity
@@ -153,6 +173,7 @@ impl FileTableState {
                 .copied()
                 .collect(),
             fd_object_inodes: state.fd_object_inodes.clone(),
+            private_copies: PrivateCopies::default(),
         })
     }
 
@@ -191,6 +212,9 @@ impl FileTableState {
             // install never writes the task's signalfd set.
             signalfd_fds: _,
             fd_object_inodes,
+            // A record of the task's copies, not a descriptor fact; install
+            // keeps it current either way.
+            private_copies: _,
         } = self;
         // same_stdin_entry compares stdin and stdin_entry_id.
         self.same_stdin_entry(state)
@@ -214,12 +238,15 @@ impl FileTableState {
     }
 
     // TODO-HUMAN-REVIEW(PR-235): Review stable host-fd preservation during table sync.
-    pub(super) fn install(&self, state: &mut LoadedStaticElf) -> std::io::Result<()> {
+    pub(super) fn install(&mut self, state: &mut LoadedStaticElf) -> std::io::Result<()> {
         // Every guest syscall installs the shared table, and it almost never
         // changed. Installing over an equal state rebuilds every collection
         // to the same contents, keeps every host fd, and retires no file; its
-        // only other effect is the retirement flush below, kept here.
+        // only other effects are the retirement flush below, kept here, and
+        // registering the copies of a task whose state already matched, as a
+        // new thread's does.
         if self.installed_matches(state) {
+            self.private_copies.ensure_registered(state);
             state.file_retirement.retire(std::iter::empty());
             return Ok(());
         }
@@ -292,7 +319,246 @@ impl FileTableState {
             .clone_from(&self.synthetic_proc_nofollow_fds);
         state.fdinfo_files.clone_from(&self.fdinfo_files);
         state.fd_object_inodes.clone_from(&self.fd_object_inodes);
+        self.private_copies.register(state);
         Ok(())
+    }
+}
+
+/// The private copies of a shared table's entries that its tasks hold.
+///
+/// Each task's executor state holds a host descriptor of its own for every
+/// entry it has installed. A guest close, or a dup2 or dup3 over a
+/// descriptor, retires the entry's published clone and the closing task's
+/// copy, but each other task's copy holds the open file description until
+/// that task's next call installs the table again. A task that makes no
+/// call, as one parked in a futex wait, keeps it open for good: a pipe's
+/// reader then never sees EOF, and its waiter never wakes.
+///
+/// So every publication that retires an entry replaces each other task's
+/// copy of it before the call returns, in the retiring task's turn: under the
+/// table lock (which every install and publication holds) and the copy's
+/// [`PrivateCopyGate`], `dup3` puts an `O_PATH` description of /dev/null on
+/// the copy's descriptor. The descriptor stays its owner's, to close when
+/// its next install replaces it, but it no longer holds the entry's
+/// description, so the description is released when the guest's last
+/// reference to it goes, as on Linux. A retirement's cost is one lookup per
+/// task sharing the table for each retired entry.
+///
+/// The record of a task is its descriptors as of its last install or
+/// publication, the only times its copies change while its gate is open.
+/// Tables split only at fork, which makes the child a table, and a record,
+/// of its own; no copy of one table is ever replaced by a retirement in
+/// another. LinuxEmu shares a table only between the threads of a process
+/// (a thread without CLONE_FILES, or a process with it, is refused), and has
+/// no unshare.
+#[derive(Debug, Default)]
+pub(super) struct PrivateCopies {
+    tasks: std::collections::BTreeMap<i32, TaskCopies>,
+}
+
+/// One task's copies: its gate, and for stdin and each descriptor, the
+/// entry it copies and the host descriptor that holds the copy.
+#[derive(Debug)]
+struct TaskCopies {
+    gate: std::sync::Weak<Mutex<bool>>,
+    stdin: Option<(Arc<()>, RawFd)>,
+    files: std::collections::BTreeMap<i32, (Option<Arc<crate::elf::FdEntry>>, RawFd)>,
+}
+
+impl PrivateCopies {
+    /// Records `state`'s copies as its task's, in place of any earlier
+    /// record, and forgets the tasks whose state is gone.
+    fn register(&mut self, state: &LoadedStaticElf) {
+        self.tasks.retain(|_, task| task.gate.strong_count() > 0);
+        self.tasks.insert(
+            state.tid,
+            TaskCopies {
+                gate: Arc::downgrade(&state.private_copy_gate.0),
+                stdin: state
+                    .stdin
+                    .as_ref()
+                    .map(|file| (state.stdin_entry_id.clone(), file.as_raw_fd())),
+                files: state
+                    .files
+                    .iter()
+                    .map(|(&fd, file)| {
+                        (fd, (state.fd_entry_ids.get(&fd).cloned(), file.as_raw_fd()))
+                    })
+                    .collect(),
+            },
+        );
+    }
+
+    /// Registers `state` unless its record is already this state's.
+    fn ensure_registered(&mut self, state: &LoadedStaticElf) {
+        let current = self.tasks.get(&state.tid).is_some_and(|task| {
+            std::ptr::eq(task.gate.as_ptr(), Arc::as_ptr(&state.private_copy_gate.0))
+        });
+        if !current {
+            self.register(state);
+        }
+    }
+
+    /// Replaces each copy that a task other than `publisher` holds of a
+    /// retired entry (`retired`, with stdin's old identity when it changed).
+    /// A task whose gate is closed holds no copy and is forgotten. Every
+    /// copy is tried; the first failure is returned.
+    fn revoke(
+        &mut self,
+        publisher: i32,
+        retired: &[(i32, Option<Arc<crate::elf::FdEntry>>)],
+        retired_stdin: Option<&Arc<()>>,
+    ) -> std::io::Result<()> {
+        if retired.is_empty() && retired_stdin.is_none() {
+            return Ok(());
+        }
+        let mut result = Ok(());
+        let mut gone = Vec::new();
+        for (&tid, task) in &mut self.tasks {
+            if tid == publisher {
+                continue;
+            }
+            let targets: Vec<i32> = retired
+                .iter()
+                .filter(|(fd, entry)| {
+                    task.files
+                        .get(fd)
+                        .is_some_and(|(copy, _)| same_entry(copy.as_ref(), entry.as_ref()))
+                })
+                .map(|(fd, _)| *fd)
+                .collect();
+            let stdin = retired_stdin.is_some_and(|retired| {
+                task.stdin
+                    .as_ref()
+                    .is_some_and(|(copy, _)| Arc::ptr_eq(copy, retired))
+            });
+            if targets.is_empty() && !stdin {
+                continue;
+            }
+            let Some(gate) = task.gate.upgrade() else {
+                gone.push(tid);
+                continue;
+            };
+            let open = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !*open {
+                gone.push(tid);
+                continue;
+            }
+            let hosts = targets
+                .iter()
+                .filter_map(|fd| task.files.remove(fd))
+                .map(|(_, host)| host)
+                .chain(
+                    stdin
+                        .then(|| task.stdin.take())
+                        .flatten()
+                        .map(|(_, host)| host),
+                );
+            for host in hosts {
+                if let Err(error) = revoked_copy_placeholder()
+                    .and_then(|placeholder| revoke_copy(placeholder, host))
+                {
+                    result = result.and(Err(error));
+                }
+            }
+            drop(open);
+        }
+        for tid in gone {
+            self.tasks.remove(&tid);
+        }
+        result
+    }
+}
+
+/// Whether two copies are of one entry. An entry without an identity is
+/// matched by its descriptor alone, as install treats it.
+fn same_entry(
+    copy: Option<&Arc<crate::elf::FdEntry>>,
+    retired: Option<&Arc<crate::elf::FdEntry>>,
+) -> bool {
+    match (copy, retired) {
+        (Some(copy), Some(retired)) => Arc::ptr_eq(copy, retired),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Whether a task's private copies may still be replaced by another task's
+/// retirement of their entries (`PrivateCopies`). A task's state declares
+/// it before its descriptors, so dropping the state closes the gate before
+/// any copy is closed, and a task's exit closes it, giving up its copies'
+/// descriptions under it, before it closes the copies. A revocation holds
+/// the gate while it replaces a copy, so it never replaces one after the
+/// copy's descriptor number could have been reused, and a closed gate means
+/// the task holds no copy to replace. The one exception is an exit through a
+/// terminal cleanup service, which reads each descriptor it is given: there
+/// the copies keep their descriptions until the service closes them.
+#[derive(Debug)]
+pub struct PrivateCopyGate(Arc<Mutex<bool>>);
+
+impl Default for PrivateCopyGate {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(true)))
+    }
+}
+
+impl PrivateCopyGate {
+    /// Closes the gate and, under it, makes each of `copies` drop its
+    /// description: its descriptor stays open, for its owner to close, on
+    /// the placeholder. A retirement after this skips the task.
+    pub(crate) fn close<'a>(&self, copies: impl IntoIterator<Item = &'a std::fs::File>) {
+        let mut open = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *open = false;
+        // Without a placeholder each copy keeps its description until its
+        // owner closes it, later in this exit.
+        if let Ok(placeholder) = revoked_copy_placeholder() {
+            for copy in copies {
+                let _ = revoke_copy(placeholder, copy.as_raw_fd());
+            }
+        }
+    }
+}
+
+impl Drop for PrivateCopyGate {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+    }
+}
+
+/// The description a revoked copy is left on: `O_PATH` on /dev/null, which
+/// reads, writes and path lookups all refuse.
+fn revoked_copy_placeholder() -> std::io::Result<RawFd> {
+    use std::os::unix::fs::OpenOptionsExt;
+    static PLACEHOLDER: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+    if let Some(file) = PLACEHOLDER.get() {
+        return Ok(file.as_raw_fd());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open("/dev/null")?;
+    Ok(PLACEHOLDER.get_or_init(|| file).as_raw_fd())
+}
+
+/// Puts the placeholder's description on `host`, dropping `host`'s own.
+fn revoke_copy(placeholder: RawFd, host: RawFd) -> std::io::Result<()> {
+    loop {
+        // SAFETY: the placeholder is open for the life of the process, and
+        // `host` is a copy owned by a task whose open gate the caller holds,
+        // so the descriptor is still that copy's.
+        if unsafe { libc::dup3(placeholder, host, libc::O_CLOEXEC) } >= 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
     }
 }
 

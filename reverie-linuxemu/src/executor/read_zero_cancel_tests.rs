@@ -68,11 +68,27 @@ impl ReadZeroEntry {
     }
 
     fn assert_unchanged(&self, state: &LoadedStaticElf, fd: i32) {
-        assert_eq!(state.files[&fd].as_raw_fd(), self.raw);
         assert_eq!(
             unsafe { libc::fcntl(self.raw, libc::F_GETFL) },
             self.status_flags
         );
+        self.assert_same_handle(state, fd);
+    }
+
+    /// The handle and its metadata are as captured, but a sibling retired
+    /// the entry, which revoked this task's copy (the record of private
+    /// copies in fd_table.rs): the handle now holds the `O_PATH`
+    /// placeholder, not the retired description.
+    fn assert_unchanged_but_revoked(&self, state: &LoadedStaticElf, fd: i32) {
+        assert_ne!(
+            unsafe { libc::fcntl(self.raw, libc::F_GETFL) } & libc::O_PATH,
+            0
+        );
+        self.assert_same_handle(state, fd);
+    }
+
+    fn assert_same_handle(&self, state: &LoadedStaticElf, fd: i32) {
+        assert_eq!(state.files[&fd].as_raw_fd(), self.raw);
         assert_eq!(
             unsafe { libc::fcntl(self.raw, libc::F_GETFD) },
             self.descriptor_flags
@@ -382,7 +398,7 @@ fn read_zero_count_alias_test_admission_restore_does_not_resurrect_sibling_repla
         .take()
         .unwrap()
         .assert_retired(&registry);
-    before.assert_unchanged(&executor.state, fd);
+    before.assert_unchanged_but_revoked(&executor.state, fd);
     let replacement = replaced_entry.lock().unwrap().take().unwrap();
     assert!(!Arc::ptr_eq(&before.entry, &replacement));
     assert!(Arc::ptr_eq(

@@ -1053,7 +1053,7 @@ impl ElfExecutor {
         let mut notifications = Some(memory.defer_notifications());
         let mut shared_files = Some(file_table.lock().expect("KVM file-table lock poisoned"));
         if let Err(error) = shared_files
-            .as_ref()
+            .as_mut()
             .expect("file-table guard disappeared")
             .install(&mut self.state)
         {
