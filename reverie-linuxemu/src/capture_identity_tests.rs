@@ -194,7 +194,7 @@ fn captured_output_alias_identity_survives_thread_fork_exec_and_replacement() {
     assert!(child.state.fd_object_inodes.contains_key(&fcntl_alias));
     assert!(!child.state.cloexec_fds.contains(&alias));
 
-    child.replace_after_exec(test_state(&root.0));
+    child.replace_after_exec(test_state(&root.0)).unwrap();
     assert!(!child.state.files.contains_key(&fcntl_alias));
     assert!(!child.state.cloexec_fds.contains(&fcntl_alias));
     assert!(output_alias(&child.state, fcntl_alias).is_none());

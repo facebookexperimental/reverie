@@ -745,18 +745,18 @@ impl ElfExecutor {
         &mut self,
         request: &SyscallRequest,
         memory: &GuestMemory,
-    ) -> Option<i64> {
+    ) -> Option<crate::Result<i64>> {
         let _retirement = self.state.file_retirement.hold();
         let raw_flags = accept_flags(request)?;
         let flags = match raw_flags {
             Ok(flags) => flags,
-            Err(error) => return Some(error),
+            Err(error) => return Some(Ok(error)),
         };
         let file_table = self.file_table.clone();
         {
             let mut shared_files = file_table.lock().expect("KVM file-table lock poisoned");
             if let Err(error) = shared_files.install(&mut self.state) {
-                return Some(io_error(error));
+                return Some(Ok(io_error(error)));
             }
         }
         self.state.file_retirement.drain_unlocked();
@@ -764,12 +764,12 @@ impl ElfExecutor {
         let mut memory = memory.clone();
         let accepted = match accept_socket(&mut memory, &self.state, request.args(), flags) {
             Ok(file) => self.state.file_retirement.stage(file),
-            Err(error) => return Some(error),
+            Err(error) => return Some(Ok(error)),
         };
 
         let mut shared_files = file_table.lock().expect("KVM file-table lock poisoned");
         if let Err(error) = shared_files.install(&mut self.state) {
-            return Some(io_error(error));
+            return Some(Ok(io_error(error)));
         }
         let result = insert_file_with_flags(
             &mut self.state,
@@ -777,12 +777,12 @@ impl ElfExecutor {
             flags & libc::SOCK_CLOEXEC != 0,
             None,
         );
-        if result >= 0 {
-            shared_files
-                .update_from_elf(&self.state)
-                .expect("clone updated KVM file table");
+        if result >= 0
+            && let Err(error) = shared_files.update_from_elf(&self.state)
+        {
+            return Some(Err(error));
         }
-        Some(result)
+        Some(Ok(result))
     }
 
     pub(super) fn execute_process_action(
@@ -1234,6 +1234,12 @@ impl ElfExecutor {
         let file_table;
         let _child_retirement;
         let _retirement = self.state.file_retirement.hold();
+        // The child copies the table as it is now, under its lock, which the
+        // lock order takes before the signal transaction: this task's private
+        // copies are as of its last install, and a sibling's close or dup2
+        // since may have replaced some (`FileTableState::fork_descriptors`).
+        let parent_table = self.file_table.clone();
+        let shared_files = parent_table.lock().expect("KVM file-table lock poisoned");
         let transaction = self.state.signal_transaction.clone();
         let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
         if !self
@@ -1248,7 +1254,11 @@ impl ElfExecutor {
                 "cannot fork a KVM process while a virtual signalfd is open".to_owned(),
             ));
         }
-        state = self.state.try_clone_for_fork_locked(child_pid)?;
+        state = self.state.try_clone_for_fork_locked(
+            child_pid,
+            shared_files.fork_descriptors(&self.state.file_retirement)?,
+        )?;
+        drop(shared_files);
         _child_retirement = state.file_retirement.hold();
         if share_address_space {
             state.thp_disabled = self.state.thp_disabled.clone();
@@ -1407,7 +1417,9 @@ impl ElfExecutor {
                     .to_owned(),
             ));
         }
-        state = self.state.try_clone_for_fork_locked(child_tid)?;
+        state = self
+            .state
+            .try_clone_for_fork_locked(child_tid, ForkDescriptors::of_state(&self.state)?)?;
         _child_retirement = state.file_retirement.hold();
         state.pid = self.state.pid;
         state.ppid = self.state.ppid;
@@ -1802,7 +1814,7 @@ impl ElfExecutor {
         // their original semantics, never be reclassified as task-exit closes.
         self.state.file_retirement.drain_unlocked();
         let stdin = self.state.take_stdin();
-        let retired = std::mem::take(&mut self.state.files);
+        let retired = self.state.files.take_map();
         // From here no sibling's retirement replaces these copies, which the
         // cleanup service closes with the task's other descriptors: it reads
         // each one's description, so they keep theirs until it closes them.
@@ -1871,7 +1883,7 @@ impl ElfExecutor {
         // table is untouched, so waiting on its locks would add a dependency on
         // a peer's host syscall (and its interrupt) during terminal cleanup.
         let stdin = self.state.take_stdin();
-        let retired = std::mem::take(&mut self.state.files);
+        let retired = self.state.files.take_map();
         // From here no sibling's retirement replaces these copies, and none of
         // them holds a description for one to miss (PrivateCopies).
         self.state
@@ -2466,10 +2478,18 @@ impl ElfExecutor {
         self.state.tid
     }
 
-    pub fn replace_after_exec(&mut self, state: LoadedStaticElf) {
+    /// Installs `state`, the image an exec loaded, in place of this task's,
+    /// which it inherits from. The exec is past its point of no return, so a
+    /// failure here ends the run.
+    pub fn replace_after_exec(&mut self, state: LoadedStaticElf) -> crate::Result<()> {
         let _retirement = self.state.file_retirement.hold();
         let file_table = self.file_table.clone();
         let mut files = file_table.lock().expect("KVM file-table lock poisoned");
+        // The new image inherits the table as it is now, under its lock: this
+        // task's private copies are as of its last install, and a sibling's
+        // close or dup2 since may have replaced some (`PrivateCopies`), whose
+        // placeholders the new image must neither inherit nor publish.
+        files.install(&mut self.state)?;
         let transaction = self.state.signal_transaction.clone();
         let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
         let previous = std::mem::replace(&mut self.state, state);
@@ -2493,9 +2513,7 @@ impl ElfExecutor {
         if let Some(memory) = &self.address_space {
             memory.set_allocation_cursors(AllocationCursors::from_elf(&self.state));
         }
-        files
-            .update_from_elf(&self.state)
-            .expect("clone post-exec KVM file table");
+        let published = files.update_from_elf(&self.state);
         #[cfg(test)]
         EXEC_WINDOW_TEST_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -2516,6 +2534,7 @@ impl ElfExecutor {
         self.clear_child_tid = None;
         drop(_transaction);
         drop(files);
+        published
     }
 
     pub fn append_output(&mut self, stdout: Vec<u8>, stderr: Vec<u8>) {

@@ -28,12 +28,21 @@ pub(super) const GUEST_FD_TABLE_CAPACITY: libc::c_int = 1 << 20;
 pub(super) fn guest_nofile_limit() -> libc::c_int {
     // SAFETY: limit is writable for the call.
     let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // Never the soft limit a copy's replacement raises for one call.
+    let _adjustment = NOFILE_LIMIT_ADJUSTMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
         return GUEST_FD_TABLE_CAPACITY;
     }
     let soft = libc::c_int::try_from(limit.rlim_cur).unwrap_or(libc::c_int::MAX);
     soft.min(GUEST_FD_TABLE_CAPACITY)
 }
+/// Held while a retirement raises this process's soft `RLIMIT_NOFILE` for
+/// one `dup3` over a copy above it (`replace_copy` in fd_table.rs), and while
+/// the guest's limit is read (`guest_nofile_limit`), so that no guest
+/// allocation sees the raised value. Nothing is taken while it is held.
+pub(super) static NOFILE_LIMIT_ADJUSTMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(super) const ROBUST_LIST_HEAD_SIZE: u64 = 3 * std::mem::size_of::<u64>() as u64;
 // prctl(2) PR_CAPBSET_READ and PR_CAPBSET_DROP options.
 pub(super) const PR_CAPBSET_READ: u64 = 23;

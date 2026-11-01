@@ -171,7 +171,9 @@ fn close_on_exec_drops_every_threads_copy_at_the_exec() {
         state.cloexec_fds.insert(3);
     });
     assert_write_end_open(&reader, "before the exec");
-    leader.replace_after_exec(native_loaded_state(&std::env::current_dir().unwrap()));
+    leader
+        .replace_after_exec(native_loaded_state(&std::env::current_dir().unwrap()))
+        .unwrap();
     assert_eq!(
         read_byte(&reader).unwrap(),
         None,
@@ -226,4 +228,503 @@ fn a_close_of_another_descriptor_leaves_every_threads_copy_working() {
     );
     assert_eq!(read_byte(&reader).unwrap(), Some(b'y'));
     drop(second);
+}
+
+// Calls that use a copy while another thread retires its entry (Codex review
+// of the retirement above): a copy a call has reached stays that call's, as
+// Linux's fdget holds a file for the call that looked it up, and a call that
+// had not reached it finds the descriptor closed. Fork and exec copy the
+// table as it is, never a replaced copy. Each race is made deterministic by a
+// one-shot hook that runs the other thread's call at the racing point.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// Runs `then` on this thread, once, right after the next call that does not
+/// change the table releases the table lock.
+fn when_the_table_is_released(then: impl FnOnce() + 'static) {
+    TABLE_RELEASED_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(then)));
+}
+
+/// Runs `then` on this thread, once, right after the next lookup that
+/// reaches a copy.
+fn when_a_copy_is_reached(then: impl FnOnce() + 'static) {
+    COPY_REACHED_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(then)));
+}
+
+fn closer(executor: &Rc<RefCell<ElfExecutor>>, fd: u64) -> impl FnOnce() + 'static {
+    let executor = executor.clone();
+    move || {
+        let memory = GuestMemory::new(0, 4096).unwrap();
+        assert_eq!(
+            call(
+                &mut executor.borrow_mut(),
+                &memory,
+                libc::SYS_close,
+                [fd, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+    }
+}
+
+/// A leader whose guest descriptor 3 is the read end of a host pipe holding
+/// `bytes`, a thread that copied its table, and a fork child of the leader,
+/// which shares descriptor 3's entry but not its table.
+fn reader_leader_thread_and_child(
+    bytes: &[u8],
+) -> (File, Rc<RefCell<ElfExecutor>>, ElfExecutor, ElfExecutor) {
+    let (reader, writer) = nonblocking_pipe();
+    (&writer).write_all(bytes).unwrap();
+    let mut state = native_loaded_state(&std::env::current_dir().unwrap());
+    assert!(state.insert_file(3, reader).is_empty());
+    let leader = ElfExecutor::new(state, false);
+    let thread = leader.thread_child(2).unwrap();
+    let child = leader
+        .fork_child(leader.state.pid + 30, false, false)
+        .unwrap();
+    (writer, Rc::new(RefCell::new(leader)), thread, child)
+}
+
+/// A call that reached its descriptor keeps the description when another
+/// thread closes it meanwhile: its probes see the description, never the
+/// placeholder, so they cache nothing false on the entry a fork child shares,
+/// and the read completes. The copy is replaced when the call returns.
+#[test]
+fn a_read_that_reached_its_descriptor_finishes_on_it_when_another_thread_closes_it() {
+    if run_isolated(
+        "a_read_that_reached_its_descriptor_finishes_on_it_when_another_thread_closes_it",
+    ) {
+        return;
+    }
+    let (_writer, leader, mut thread, mut child) = reader_leader_thread_and_child(b"ab");
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    when_a_copy_is_reached(closer(&leader, 3));
+    assert_eq!(
+        call(&mut thread, &memory, libc::SYS_read, [3, 0x100, 1, 0, 0, 0]),
+        1,
+        "the read reached descriptor 3 before the close, so it reads"
+    );
+    let mut byte = [0];
+    memory.read(0x100, &mut byte).unwrap();
+    assert_eq!(&byte, b"a");
+    // The call has returned: its copy is gone, as the leader's close made it.
+    assert_eq!(
+        call(&mut thread, &memory, libc::SYS_read, [3, 0x100, 1, 0, 0, 0]),
+        negative_errno(libc::EBADF)
+    );
+    // The fork child's descriptor 3 is its own and still open.
+    let child_memory = GuestMemory::new(0, 4096).unwrap();
+    assert_eq!(
+        call(
+            &mut child,
+            &child_memory,
+            libc::SYS_read,
+            [3, 0x100, 1, 0, 0, 0]
+        ),
+        1,
+        "the fork child's inherited descriptor must still read"
+    );
+    child_memory.read(0x100, &mut byte).unwrap();
+    assert_eq!(&byte, b"b");
+}
+
+/// A call that had not reached its descriptor when another thread closed it
+/// finds it closed, as a Linux call that starts after the close does, and
+/// probes nothing: the fork child that shares the entry still reads.
+#[test]
+fn a_read_that_had_not_reached_its_descriptor_finds_it_closed() {
+    if run_isolated("a_read_that_had_not_reached_its_descriptor_finds_it_closed") {
+        return;
+    }
+    let (_writer, leader, mut thread, mut child) = reader_leader_thread_and_child(b"ab");
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    when_the_table_is_released(closer(&leader, 3));
+    assert_eq!(
+        call(&mut thread, &memory, libc::SYS_read, [3, 0x100, 1, 0, 0, 0]),
+        negative_errno(libc::EBADF),
+        "the close came first, so the read finds descriptor 3 closed"
+    );
+    let child_memory = GuestMemory::new(0, 4096).unwrap();
+    assert_eq!(
+        call(
+            &mut child,
+            &child_memory,
+            libc::SYS_read,
+            [3, 0x100, 1, 0, 0, 0]
+        ),
+        1,
+        "the fork child's inherited descriptor must still read"
+    );
+    let mut byte = [0];
+    child_memory.read(0x100, &mut byte).unwrap();
+    assert_eq!(&byte, b"a");
+}
+
+/// A write that reached the write end keeps it when another thread closes
+/// it, and gives it up when the call returns: the reader gets the byte and
+/// then EOF, with no further call of the writing thread.
+#[test]
+fn a_call_that_reached_a_copy_gives_it_up_when_it_returns() {
+    if run_isolated("a_call_that_reached_a_copy_gives_it_up_when_it_returns") {
+        return;
+    }
+    let (reader, leader, mut first, second) = leader_and_parked_threads(|_| {});
+    let leader = Rc::new(RefCell::new(leader));
+    let mut memory = GuestMemory::new(0, 4096).unwrap();
+    memory.write(0x100, b"z").unwrap();
+    when_a_copy_is_reached(closer(&leader, 3));
+    assert_eq!(
+        call(&mut first, &memory, libc::SYS_write, [3, 0x100, 1, 0, 0, 0]),
+        1
+    );
+    assert_eq!(read_byte(&reader).unwrap(), Some(b'z'));
+    assert_eq!(
+        read_byte(&reader).unwrap(),
+        None,
+        "the writer's call returned, so its copy must be gone"
+    );
+    drop(second);
+}
+
+/// A lookup outside any call reaches nothing that a call end would release:
+/// a later close replaces that copy at once.
+#[test]
+fn a_lookup_outside_a_call_reaches_nothing() {
+    if run_isolated("a_lookup_outside_a_call_reaches_nothing") {
+        return;
+    }
+    let (reader, mut leader, first, mut second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    assert!(first.state.files.get(&3).is_some());
+    assert!(second.state.files.get_mut(&3).is_some());
+    assert_eq!(
+        call(&mut leader, &memory, libc::SYS_close, [3, 0, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(read_byte(&reader).unwrap(), None);
+}
+
+/// A copy lent to a borrower that kept it (as the terminal reader keeps a
+/// cancelled read's) is the borrower's to close: another thread's close
+/// leaves it alone, and the description goes when the borrower closes it.
+#[test]
+fn a_copy_its_borrower_kept_is_never_replaced() {
+    if run_isolated("a_copy_its_borrower_kept_is_never_replaced") {
+        return;
+    }
+    let (reader, mut leader, mut first, second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    let kept = first.state.files.remove(&3).unwrap();
+    first.state.files.mark_foreign(kept.as_raw_fd());
+    assert_eq!(
+        call(&mut leader, &memory, libc::SYS_close, [3, 0, 0, 0, 0, 0]),
+        0
+    );
+    drop(second);
+    assert_write_end_open(&reader, "while the borrower holds the lent copy");
+    (&kept).write_all(b"k").unwrap();
+    assert_eq!(read_byte(&reader).unwrap(), Some(b'k'));
+    drop(kept);
+    assert_eq!(read_byte(&reader).unwrap(), None);
+    drop(first);
+}
+
+/// The status of guest `fstat(fd)` in `executor`.
+fn fstat_status(executor: &mut ElfExecutor, fd: u64) -> i64 {
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    call(executor, &memory, libc::SYS_fstat, [fd, 0x200, 0, 0, 0, 0])
+}
+
+/// A fork after another thread closed a descriptor copies the table as it
+/// is now: the child has no descriptor 3, never the placeholder that the
+/// close left on the forking thread's private copy.
+#[test]
+fn a_fork_after_another_thread_closes_a_descriptor_copies_the_table() {
+    if run_isolated("a_fork_after_another_thread_closes_a_descriptor_copies_the_table") {
+        return;
+    }
+    let (reader, leader, mut first, second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    assert_eq!(
+        call(&mut first, &memory, libc::SYS_close, [3, 0, 0, 0, 0, 0]),
+        0
+    );
+    let mut child = leader
+        .fork_child(leader.state.pid + 30, false, false)
+        .unwrap();
+    assert!(!child.state.files.copies().contains_key(&3));
+    assert_eq!(fstat_status(&mut child, 3), negative_errno(libc::EBADF));
+    assert_eq!(read_byte(&reader).unwrap(), None);
+    drop(second);
+}
+
+/// A fork before another thread closes a descriptor gives the child its own
+/// copy, which the close leaves open.
+#[test]
+fn a_fork_before_another_thread_closes_a_descriptor_keeps_the_childs_copy() {
+    if run_isolated("a_fork_before_another_thread_closes_a_descriptor_keeps_the_childs_copy") {
+        return;
+    }
+    let (reader, leader, mut first, second) = leader_and_parked_threads(|_| {});
+    let mut child = leader
+        .fork_child(leader.state.pid + 30, false, false)
+        .unwrap();
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    assert_eq!(
+        call(&mut first, &memory, libc::SYS_close, [3, 0, 0, 0, 0, 0]),
+        0
+    );
+    let mut child_memory = GuestMemory::new(0, 4096).unwrap();
+    child_memory.write(0x100, b"c").unwrap();
+    assert_eq!(
+        call(
+            &mut child,
+            &child_memory,
+            libc::SYS_write,
+            [3, 0x100, 1, 0, 0, 0]
+        ),
+        1
+    );
+    assert_eq!(read_byte(&reader).unwrap(), Some(b'c'));
+    drop((leader, second));
+}
+
+/// An exec after another thread closed a descriptor inherits the table as it
+/// is now, so the new image neither has nor publishes the placeholder.
+#[test]
+fn an_exec_after_another_thread_closes_a_descriptor_inherits_the_table() {
+    if run_isolated("an_exec_after_another_thread_closes_a_descriptor_inherits_the_table") {
+        return;
+    }
+    let (reader, mut leader, mut first, second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    assert_eq!(
+        call(&mut first, &memory, libc::SYS_close, [3, 0, 0, 0, 0, 0]),
+        0
+    );
+    leader
+        .replace_after_exec(native_loaded_state(&std::env::current_dir().unwrap()))
+        .unwrap();
+    assert!(!leader.state.files.copies().contains_key(&3));
+    assert!(!leader.file_table.lock().unwrap().files.contains_key(&3));
+    assert_eq!(fstat_status(&mut leader, 3), negative_errno(libc::EBADF));
+    assert_eq!(read_byte(&reader).unwrap(), None);
+    drop(second);
+}
+
+/// Sets RLIMIT_NOFILE, and restores the previous limits when dropped.
+struct NofileLimit(libc::rlimit);
+
+impl NofileLimit {
+    /// `soft`, and `hard` (or the current hard limit).
+    fn set(soft: libc::rlim_t, hard: Option<libc::rlim_t>) -> Self {
+        let mut previous = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes only `previous`, and setrlimit reads only
+        // the new limits.
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut previous), 0);
+            let limit = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: hard.unwrap_or(previous.rlim_max),
+            };
+            assert_eq!(
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Self(previous)
+    }
+
+    fn soft() -> libc::rlim_t {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes only `limit`.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur
+    }
+}
+
+impl Drop for NofileLimit {
+    fn drop(&mut self) {
+        // SAFETY: setrlimit reads only the saved limits. A lowered hard limit
+        // cannot be raised again; the isolated child process just ends.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) };
+    }
+}
+
+/// A retirement opens no descriptor: with this process's descriptor table
+/// full, a close still replaces every other thread's copy, and the reader
+/// sees EOF.
+#[test]
+fn a_retirement_opens_no_descriptor() {
+    if run_isolated("a_retirement_opens_no_descriptor") {
+        return;
+    }
+    let (reader, mut leader, first, second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    let highest = [&first, &second]
+        .iter()
+        .map(|thread| thread.state.files.copies()[&3].as_raw_fd())
+        .max()
+        .unwrap();
+    let _limit = NofileLimit::set((highest + 16) as libc::rlim_t, None);
+    let mut filler = Vec::new();
+    loop {
+        // SAFETY: dup returns a new owned descriptor or fails.
+        let fd = unsafe { libc::dup(0) };
+        if fd < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EMFILE)
+            );
+            break;
+        }
+        // SAFETY: fd is a fresh descriptor this test owns.
+        filler.push(unsafe { File::from_raw_fd(fd) });
+    }
+    assert_eq!(
+        call(&mut leader, &memory, libc::SYS_close, [3, 0, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(read_byte(&reader).unwrap(), None);
+    drop((filler, first, second));
+}
+
+/// A copy at or above a lowered soft RLIMIT_NOFILE, where dup3 refuses the
+/// number, is still replaced, and the soft limit is as it was afterwards.
+#[test]
+fn a_copy_above_a_lowered_soft_limit_is_replaced() {
+    if run_isolated("a_copy_above_a_lowered_soft_limit_is_replaced") {
+        return;
+    }
+    let (reader, mut leader, first, second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    let lowest = [&first, &second]
+        .iter()
+        .map(|thread| thread.state.files.copies()[&3].as_raw_fd())
+        .min()
+        .unwrap();
+    let soft = lowest as libc::rlim_t;
+    let _limit = NofileLimit::set(soft, None);
+    assert_eq!(
+        call(&mut leader, &memory, libc::SYS_close, [3, 0, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(read_byte(&reader).unwrap(), None);
+    assert_eq!(NofileLimit::soft(), soft, "the soft limit must be restored");
+    drop((first, second));
+}
+
+fn assert_descriptors_refusal(error: &crate::Error) {
+    assert!(
+        matches!(
+            error,
+            crate::Error::HostResources {
+                resource: reverie_kvm_core::host_limits::HostResource::Descriptors,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+/// The lowest host descriptor among `threads`' copies of guest descriptor 3.
+fn lowest_copy(threads: [&ElfExecutor; 2]) -> RawFd {
+    threads
+        .iter()
+        .map(|thread| thread.state.files.copies()[&3].as_raw_fd())
+        .min()
+        .unwrap()
+}
+
+/// A copy at or above a lowered hard RLIMIT_NOFILE cannot be replaced, and
+/// the retirement finds it before it changes anything: the run ends with a
+/// named refusal rather than a panic, the table still has the entry, and
+/// every copy is still recorded and still holds the description.
+#[test]
+fn a_copy_above_a_lowered_hard_limit_ends_the_run_before_anything_changes() {
+    if run_isolated("a_copy_above_a_lowered_hard_limit_ends_the_run_before_anything_changes") {
+        return;
+    }
+    let (reader, mut leader, first, second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    let lowest = lowest_copy([&first, &second]);
+    let _limit = NofileLimit::set(lowest as libc::rlim_t, Some(lowest as libc::rlim_t));
+    let error = leader
+        .execute_checked(
+            &SyscallRequest::new(libc::SYS_close as u64, [3, 0, 0, 0, 0, 0]),
+            &memory,
+        )
+        .unwrap_err();
+    assert_descriptors_refusal(&error);
+    let table = leader.file_table.lock().unwrap();
+    assert!(table.files.contains_key(&3), "nothing was published");
+    for thread in [&first, &second] {
+        assert!(table.records_copy(thread.state.tid, 3));
+        let copy = thread.state.files.copies()[&3].as_raw_fd();
+        // SAFETY: F_GETFL reads only the descriptor's status flags.
+        let flags = unsafe { libc::fcntl(copy, libc::F_GETFL) };
+        assert!(
+            flags >= 0 && flags & libc::O_PATH == 0,
+            "no copy was replaced"
+        );
+    }
+    drop(table);
+    assert_write_end_open(&reader, "after a refused retirement");
+}
+
+/// A copy whose hard limit falls below it after the retirement checked it
+/// (here, through a test hook at that point) cannot be replaced either: the
+/// close is published, the run ends with the named refusal rather than a
+/// panic, and the copy stays in its thread's record, holding the
+/// description. Its thread's next install still closes it.
+#[test]
+fn a_copy_whose_limit_falls_after_the_check_ends_the_run_and_stays_recorded() {
+    if run_isolated("a_copy_whose_limit_falls_after_the_check_ends_the_run_and_stays_recorded") {
+        return;
+    }
+    let (reader, mut leader, mut first, mut second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    let lowest = lowest_copy([&first, &second]);
+    PUBLICATION_CHECKED_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // The isolated child ends with the test; a hard limit cannot be
+            // raised again anyway.
+            std::mem::forget(NofileLimit::set(
+                lowest as libc::rlim_t,
+                Some(lowest as libc::rlim_t),
+            ));
+        }))
+    });
+    let error = leader
+        .execute_checked(
+            &SyscallRequest::new(libc::SYS_close as u64, [3, 0, 0, 0, 0, 0]),
+            &memory,
+        )
+        .unwrap_err();
+    assert_descriptors_refusal(&error);
+    assert!(!leader.file_table.lock().unwrap().files.contains_key(&3));
+    let first_tid = first.state.tid;
+    let second_tid = second.state.tid;
+    let recorded = {
+        let table = leader.file_table.lock().unwrap();
+        table.records_copy(first_tid, 3) || table.records_copy(second_tid, 3)
+    };
+    assert!(recorded, "a copy that could not be replaced stays recorded");
+    assert_write_end_open(&reader, "while the unreplaced copy holds it");
+    for thread in [&mut first, &mut second] {
+        assert!(call(thread, &memory, libc::SYS_getpid, [0; 6]) > 0);
+    }
+    assert_eq!(read_byte(&reader).unwrap(), None);
 }

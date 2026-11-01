@@ -647,7 +647,9 @@ fn fcntl_owner_threads_and_exec_preserve_creator_and_cloexec_filtering() {
     drop(thread);
     let creator = f.executor.state.pipe_owner_process.clone();
     let description = f.executor.state.pipe_owners[&fd].clone();
-    f.executor.replace_after_exec(test_state(&f.root.0));
+    f.executor
+        .replace_after_exec(test_state(&f.root.0))
+        .unwrap();
     assert!(Arc::ptr_eq(&creator, &f.executor.state.pipe_owner_process));
     assert!(Arc::ptr_eq(
         &description,

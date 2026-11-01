@@ -391,7 +391,7 @@ pub(super) fn write(
         return negative_errno(libc::EBADF);
     }
     let descriptor = if standard && fd == libc::STDIN_FILENO {
-        state.stdin.as_ref()
+        state.stdin_copy()
     } else if standard {
         None
     } else {
@@ -462,8 +462,7 @@ pub(super) fn write(
         "an owned descriptor writes through the staged path"
     );
     state
-        .stdin
-        .as_mut()
+        .stdin_copy_mut()
         .expect("open standard input disappeared")
         .write(&bytes)
         .map_or_else(io_error, |count| count as i64)
@@ -962,25 +961,25 @@ fn finish_host_read(memory: &mut GuestMemory, address: u64, bytes: &[u8], count:
 /// exact File on success, error, or unwind without changing entry metadata or
 /// publishing a stale entry back into the authoritative shared file table.
 pub(super) struct ReadEndpoint<'a> {
-    pub(super) files: &'a mut std::collections::BTreeMap<i32, std::fs::File>,
+    pub(super) files: &'a mut PrivateFiles,
     pub(super) fd: i32,
     pub(super) endpoint: Option<std::fs::File>,
+    /// The lent copy's host descriptor, which stays the reader's when it
+    /// keeps the File (`PrivateFiles::mark_foreign`).
+    host: RawFd,
 }
 
 impl<'a> ReadEndpoint<'a> {
-    pub(super) fn take(
-        files: &'a mut std::collections::BTreeMap<i32, std::fs::File>,
-        fd: i32,
-    ) -> Self {
-        let endpoint = Some(
-            files
-                .remove(&fd)
-                .expect("prechecked read descriptor disappeared"),
-        );
+    pub(super) fn take(files: &'a mut PrivateFiles, fd: i32) -> Self {
+        let endpoint = files
+            .remove(&fd)
+            .expect("prechecked read descriptor disappeared");
+        let host = endpoint.as_raw_fd();
         Self {
             files,
             fd,
-            endpoint,
+            endpoint: Some(endpoint),
+            host,
         }
     }
 }
@@ -990,9 +989,12 @@ impl Drop for ReadEndpoint<'_> {
         if let Some(endpoint) = self.endpoint.take() {
             // The exclusive map borrow prevents a competing local insertion.
             self.files.insert(self.fd, endpoint);
+        } else {
+            // None means the registry still owns the actual File because
+            // physical retirement was not proven. Never duplicate, close, or
+            // replace it: nor may another thread's retirement.
+            self.files.mark_foreign(self.host);
         }
-        // None means the registry still owns the actual File because physical
-        // retirement was not proven. Never duplicate, close, or replace it.
     }
 }
 
@@ -1019,12 +1021,13 @@ pub(super) fn read(
         if fd != libc::STDIN_FILENO {
             return Ok(negative_errno(libc::EBADF));
         }
-        let Some(stdin) = state.stdin.as_ref() else {
+        let Some(stdin) = state.stdin_copy() else {
             return Ok(negative_errno(libc::EBADF));
         };
         if requested_length == 0 {
             admit_host_read_zero(stdin, fd, args[1])?;
             if let Some((context, identity)) = terminal_read {
+                let host = stdin.as_raw_fd();
                 // Preserve the owned C reader's cancellation and join protocol.
                 // Adapt only its host operand; retain the original request and
                 // let the kernel enforce descriptor-before-address ordering.
@@ -1034,7 +1037,13 @@ pub(super) fn read(
                     *request,
                     zero_read_host_address(args[1]),
                     0,
-                )?;
+                );
+                if state.stdin.is_none() {
+                    // The reader kept the copy, as for a lent descriptor
+                    // (`ReadEndpoint`).
+                    state.files.mark_foreign(host);
+                }
+                let returned = returned?;
                 return Ok(if returned.count < 0 {
                     io_error(std::io::Error::from_raw_os_error(returned.errno))
                 } else {
@@ -2195,7 +2204,7 @@ fn validate_sendfile_rejected_input(
         // Stdin has a separate modeled backing until it is closed or rebound.
         // Check that backing, never the executor's own host descriptor zero.
         if in_fd == libc::STDIN_FILENO && is_open_standard(state, in_fd) {
-            state.stdin.as_ref()
+            state.stdin_copy()
         } else {
             None
         }
@@ -2260,10 +2269,7 @@ pub(super) fn sendfile(
             Some(file) => (Some(file), ensure_writable(file).err()),
             None if is_open_standard(state, out_fd) => {
                 let error = if out_fd == libc::STDIN_FILENO {
-                    let stdin = state
-                        .stdin
-                        .as_ref()
-                        .expect("open standard input disappeared");
+                    let stdin = state.stdin_copy().expect("open standard input disappeared");
                     ensure_writable(stdin).err()
                 } else {
                     None
@@ -2425,10 +2431,7 @@ pub(super) fn sendfile(
             }
         }
         None => {
-            let mut stdin = state
-                .stdin
-                .as_ref()
-                .expect("open standard input disappeared");
+            let mut stdin = state.stdin_copy().expect("open standard input disappeared");
             stdin
                 .write(&bytes)
                 .map_or_else(io_error, |count| count as i64)

@@ -213,9 +213,11 @@ fn initial_exec_preflight_requires_original_context_and_keeps_enrollment_after_r
     // Ordinary exec reaches ImageReplaced, not a second synthetic initial
     // syscall. The next real callback must keep enrollment with a fresh nonce.
     let old = site;
-    executor.replace_after_exec(crate::executor::native_loaded_state(std::path::Path::new(
-        "/tmp",
-    )));
+    executor
+        .replace_after_exec(crate::executor::native_loaded_state(std::path::Path::new(
+            "/tmp",
+        )))
+        .unwrap();
     assert!(executor.parent_death_enrolled());
     let site = executor.begin_signal_callback().unwrap();
     assert_ne!(site, old);

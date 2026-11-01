@@ -52,7 +52,7 @@ struct ReadZeroEntry {
 
 impl ReadZeroEntry {
     fn capture(state: &LoadedStaticElf, fd: i32) -> Self {
-        let raw = state.files[&fd].as_raw_fd();
+        let raw = state.files.copies()[&fd].as_raw_fd();
         let status_flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
         let descriptor_flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
         assert!(status_flags >= 0 && descriptor_flags >= 0);
@@ -88,7 +88,7 @@ impl ReadZeroEntry {
     }
 
     fn assert_same_handle(&self, state: &LoadedStaticElf, fd: i32) {
-        assert_eq!(state.files[&fd].as_raw_fd(), self.raw);
+        assert_eq!(state.files.copies()[&fd].as_raw_fd(), self.raw);
         assert_eq!(
             unsafe { libc::fcntl(self.raw, libc::F_GETFD) },
             self.descriptor_flags
@@ -128,7 +128,7 @@ fn read_zero_alias_with_test_admission(
     assert_eq!(request.number(), libc::SYS_read as u64);
     assert_eq!(request.args()[2], 0);
     let fd = request.args()[0] as libc::c_int;
-    let host_fd = executor.state.files[&fd].as_raw_fd();
+    let host_fd = executor.state.files.copies()[&fd].as_raw_fd();
     struct Admission;
     impl Drop for Admission {
         fn drop(&mut self) {

@@ -471,6 +471,7 @@ const fn negative_errno(errno: libc::c_int) -> i64 {
 
 #[cfg(any(test, feature = "test-support", feature = "native-test-support"))]
 pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
+    let private_copy_gate = PrivateCopyGate::default();
     LoadedStaticElf {
         entry_point: 0,
         stack_pointer: 0,
@@ -488,7 +489,8 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         argv0: b"test".to_vec(),
         cwd: cwd.to_owned(),
         cwd_fd: std::fs::File::open(cwd).unwrap(),
-        private_copy_gate: Default::default(),
+        files: private_copy_gate.bind(std::collections::BTreeMap::new()),
+        private_copy_gate,
         stdin: Some(std::fs::File::open("/dev/null").unwrap()),
         stdin_entry_id: Arc::new(()),
         auxv: Vec::new(),
@@ -528,7 +530,6 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         task_lifecycle: Arc::new(std::sync::Mutex::new(
             crate::elf::TaskLifecycleTable::with_root(1, 1, 1, true),
         )),
-        files: std::collections::BTreeMap::new(),
         file_retirement: crate::elf::FileRetirement::default(),
         signal_refusal: None,
         pipe_owners: Default::default(),
@@ -20240,7 +20241,15 @@ mod tests {
         );
         // The parent still retains its old File and binding before dispatch sync.
         // Keeping this Arc alive rules out accidental success via Weak expiry.
-        assert!(f.executor.state.files.contains_key(&(event as i32)));
+        // (The closer's retirement replaced that File's description with the
+        // placeholder, so a guest lookup no longer finds it: `copies()`.)
+        assert!(
+            f.executor
+                .state
+                .files
+                .copies()
+                .contains_key(&(event as i32))
+        );
         assert!(Arc::ptr_eq(
             &parent_binding,
             &f.executor.state.native_poll_fds[&(event as i32)],
@@ -20337,7 +20346,9 @@ mod tests {
             .map(|fd| (fd, f.executor.state.native_poll_fds[&(fd as i32)].clone()));
         let retired = [cloexec_event, cloexec_ep]
             .map(|fd| (fd, f.executor.state.native_poll_fds[&(fd as i32)].clone()));
-        f.executor.replace_after_exec(test_state(&f.root.0));
+        f.executor
+            .replace_after_exec(test_state(&f.root.0))
+            .unwrap();
         assert!(Arc::ptr_eq(&table, &f.executor.state.poll_table_id));
         assert!(Arc::ptr_eq(&domain, &f.executor.state.epoll_domain));
         for (fd, binding) in surviving {
@@ -21595,7 +21606,7 @@ mod tests {
             authoritative
         );
         let replacement = test_state(&f.root.0);
-        f.executor.replace_after_exec(replacement);
+        f.executor.replace_after_exec(replacement).unwrap();
         assert_eq!(f.executor.state.stdin.as_ref().unwrap().as_raw_fd(), local);
         assert_eq!(
             f.executor
@@ -21620,7 +21631,9 @@ mod tests {
             ),
             0
         );
-        f.executor.replace_after_exec(test_state(&f.root.0));
+        f.executor
+            .replace_after_exec(test_state(&f.root.0))
+            .unwrap();
         assert!(f.executor.state.stdin.is_none());
         assert!(f.executor.file_table.lock().unwrap().stdin.is_none());
         assert_eq!(
@@ -21823,7 +21836,7 @@ mod tests {
             let replacement_cwd = replacement.cwd_fd.as_raw_fd();
             let replacement_stdin = replacement.stdin.as_ref().unwrap().as_raw_fd();
             let observed = observe_unlocked_retirement(&f.executor);
-            f.executor.replace_after_exec(replacement);
+            f.executor.replace_after_exec(replacement).unwrap();
             f.executor.state.file_retirement.set_probe(None);
             let retired = observed_retired_fds(&observed);
             for fd in [
@@ -22924,7 +22937,9 @@ mod tests {
         f.check_object(&bytes, target, 47);
         let table = f.executor.file_table.clone();
         let generation = f.executor.task_generation;
-        f.executor.replace_after_exec(test_state(&f.root.0));
+        f.executor
+            .replace_after_exec(test_state(&f.root.0))
+            .unwrap();
         assert!(Arc::ptr_eq(&table, &f.executor.file_table));
         assert_eq!(f.executor.task_generation, generation);
         assert!(f.executor.state.fdinfo_files.contains_key(&(info as i32)));
@@ -39383,7 +39398,7 @@ mod tests {
         let request =
             SyscallRequest::new(libc::SYS_set_tid_address as u64, [CLEAR_TID, 0, 0, 0, 0, 0]);
         assert_eq!(executor.execute_process_action(&request, &memory), Some(1));
-        executor.replace_after_exec(test_state(&root.0));
+        executor.replace_after_exec(test_state(&root.0)).unwrap();
         assert_eq!(executor.take_clear_child_tid(), None);
     }
 
@@ -39428,7 +39443,7 @@ mod tests {
             );
 
             for exec_depth in 1..=2 {
-                executor.replace_after_exec(test_state(&root.0));
+                executor.replace_after_exec(test_state(&root.0)).unwrap();
                 assert!(
                     executor
                         .state
@@ -40708,7 +40723,7 @@ mod tests {
 
         // Exec retains the task but clears its robust head and resets
         // dumpability. Peer lookup must still succeed with the empty state.
-        child.replace_after_exec(test_state(&root.0));
+        child.replace_after_exec(test_state(&root.0)).unwrap();
         assert_eq!(
             get_robust_list(
                 &mut memory,
@@ -41790,7 +41805,7 @@ mod tests {
         let mut leader = ElfExecutor::new(test_state(&root.0), false);
         let mut old_worker = leader.thread_child(2).unwrap();
         commit_test_exit(&mut old_worker, 61, false);
-        leader.replace_after_exec(test_state(&root.0));
+        leader.replace_after_exec(test_state(&root.0)).unwrap();
         let mut new_worker = leader.thread_child(2).unwrap();
         assert_ne!(old_worker.task_generation, new_worker.task_generation);
         old_worker.retire_current_thread(ExitStatus::Exited(99), true);
@@ -43493,7 +43508,7 @@ mod tests {
         let old_target = leader.state.thread_signals.downgrade();
         // Successful exec's runtime tears down siblings before replacing state.
         drop(sender);
-        leader.replace_after_exec(test_state(&root.0));
+        leader.replace_after_exec(test_state(&root.0)).unwrap();
         assert!(old_target.upgrade().is_none());
         assert!(
             leader
@@ -44615,7 +44630,9 @@ mod tests {
             syscall_result(&mut memory, &mut leader.state, libc::SYS_prctl, get),
             0,
         );
-        shared_child.replace_after_exec(test_state(&root.0));
+        shared_child
+            .replace_after_exec(test_state(&root.0))
+            .unwrap();
         assert_eq!(
             syscall_result(&mut memory, &mut leader.state, libc::SYS_prctl, set(1)),
             0,

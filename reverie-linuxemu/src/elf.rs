@@ -1272,7 +1272,9 @@ pub struct LoadedStaticElf {
     // with each executor, reset across exec, and removed when that executor is
     // destroyed.
     pub task_lifecycle: std::sync::Arc<std::sync::Mutex<TaskLifecycleTable>>,
-    pub files: std::collections::BTreeMap<i32, std::fs::File>,
+    /// This task's private copies of its descriptor table's entries, looked
+    /// up through `private_copy_gate`'s ledger ([`crate::executor::PrivateFiles`]).
+    pub files: crate::executor::PrivateFiles,
     pub file_retirement: FileRetirement,
     pub(crate) pipe_owners:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::pipe_owner::PipeOwner>>,
@@ -1357,6 +1359,26 @@ impl LoadedStaticElf {
         retired
     }
 
+    /// This task's copy of standard input, for a guest operation: `None`
+    /// when there is none, or when another task's retirement of it replaced
+    /// it since this task's last install (the guest's descriptor 0 is then
+    /// closed). A copy returned stays this task's original until the call
+    /// ends, as for [`crate::executor::PrivateFiles::get`].
+    pub(crate) fn stdin_copy(&self) -> Option<&std::fs::File> {
+        self.stdin
+            .as_ref()
+            .filter(|file| self.private_copy_gate.reach(file.as_raw_fd()))
+    }
+
+    /// [`Self::stdin_copy`], mutably.
+    pub(crate) fn stdin_copy_mut(&mut self) -> Option<&mut std::fs::File> {
+        let reached = self
+            .stdin
+            .as_ref()
+            .is_some_and(|file| self.private_copy_gate.reach(file.as_raw_fd()));
+        if reached { self.stdin.as_mut() } else { None }
+    }
+
     pub(crate) fn take_stdin(&mut self) -> Option<std::fs::File> {
         let stdin = self.stdin.take();
         if stdin.is_some() {
@@ -1384,22 +1406,36 @@ impl LoadedStaticElf {
         let _retirement = self.file_retirement.hold();
         let transaction = self.signal_transaction.clone();
         let _transaction = transaction.lock().unwrap_or_else(|p| p.into_inner());
-        self.try_clone_for_fork_locked(child_pid)
+        self.try_clone_for_fork_locked(child_pid, crate::executor::ForkDescriptors::of_state(self)?)
     }
 
-    pub(crate) fn try_clone_for_fork_locked(&self, child_pid: i32) -> Result<Self> {
+    /// A new task's state: this one's, with the descriptors `descriptors`.
+    pub(crate) fn try_clone_for_fork_locked(
+        &self,
+        child_pid: i32,
+        descriptors: crate::executor::ForkDescriptors,
+    ) -> Result<Self> {
         // TODO-HUMAN-REVIEW(PR-136): Review shared file identity inheritance across fork.
-        let files = self
-            .files
-            .iter()
-            .map(|(&fd, file)| Ok((fd, self.file_retirement.stage_clone(file)?)))
-            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        let crate::executor::ForkDescriptors {
+            files,
+            stdin,
+            stdin_entry_id,
+            fd_entry_ids,
+            epoll_domain,
+            poll_table_id,
+            native_poll_fds,
+            pipe_owners,
+            stdout_alias_fds,
+            stderr_alias_fds,
+            cloexec_fds,
+            closed_standard_fds,
+            proc_files,
+            synthetic_proc_nofollow_fds,
+            fdinfo_files,
+            fd_object_inodes,
+        } = descriptors;
         let cwd_fd = self.file_retirement.stage_clone(&self.cwd_fd)?;
-        let stdin = self
-            .stdin
-            .as_ref()
-            .map(|file| self.file_retirement.stage_clone(file))
-            .transpose()?;
+        let private_copy_gate = crate::executor::PrivateCopyGate::default();
         let process_signals = self
             .process_signals
             .lock()
@@ -1422,9 +1458,15 @@ impl LoadedStaticElf {
             argv0: self.argv0.clone(),
             cwd: self.cwd.clone(),
             cwd_fd: cwd_fd.into_file(),
-            private_copy_gate: Default::default(),
+            files: private_copy_gate.bind(
+                files
+                    .into_iter()
+                    .map(|(fd, file)| (fd, file.into_file()))
+                    .collect(),
+            ),
+            private_copy_gate,
             stdin: stdin.map(StagedFile::into_file),
-            stdin_entry_id: self.stdin_entry_id.clone(),
+            stdin_entry_id,
             auxv: self.auxv.clone(),
             fs_base: self.fs_base,
             gs_base: self.gs_base,
@@ -1462,33 +1504,25 @@ impl LoadedStaticElf {
             thread_signals: self.thread_signals.for_fork(),
             signal_dequeue_failure: None,
             task_lifecycle: self.task_lifecycle.clone(),
-            files: files
-                .into_iter()
-                .map(|(fd, file)| (fd, file.into_file()))
-                .collect(),
             file_retirement: FileRetirement::default(),
             signal_refusal: None,
-            pipe_owners: self.pipe_owners.clone(),
-            fd_entry_ids: self.fd_entry_ids.clone(),
-            epoll_domain: self.epoll_domain.clone(),
-            poll_table_id: self.poll_table_id.fork_identity(),
-            native_poll_fds: self
-                .native_poll_fds
-                .iter()
-                .map(|(&fd, binding)| (fd, binding.fork_binding()))
-                .collect(),
-            stdout_alias_fds: self.stdout_alias_fds.clone(),
-            stderr_alias_fds: self.stderr_alias_fds.clone(),
-            cloexec_fds: self.cloexec_fds.clone(),
-            closed_standard_fds: self.closed_standard_fds.clone(),
+            pipe_owners,
+            fd_entry_ids,
+            epoll_domain,
+            poll_table_id,
+            native_poll_fds,
+            stdout_alias_fds,
+            stderr_alias_fds,
+            cloexec_fds,
+            closed_standard_fds,
             children: crate::executor::ChildWaitContext::default(),
             consumed_child_wait: None,
-            proc_files: self.proc_files.clone(),
-            synthetic_proc_nofollow_fds: self.synthetic_proc_nofollow_fds.clone(),
+            proc_files,
+            synthetic_proc_nofollow_fds,
             regular_create_directory_policy: self.regular_create_directory_policy,
-            fdinfo_files: self.fdinfo_files.clone(),
+            fdinfo_files,
             fdinfo_table: self.fdinfo_table.clone(),
-            fd_object_inodes: self.fd_object_inodes.clone(),
+            fd_object_inodes,
             file_identity_table: self.file_identity_table.clone(),
         })
     }
@@ -1546,6 +1580,7 @@ impl LoadedStaticElf {
         let mut stdin_entry_id = previous.stdin_entry_id;
         let files: std::collections::BTreeMap<_, _> = previous
             .files
+            .into_map()
             .into_iter()
             .filter_map(|(fd, file)| {
                 if cloexec_fds.contains(&fd) {
@@ -1691,7 +1726,7 @@ impl LoadedStaticElf {
         self.signal_transaction = previous.signal_transaction;
         self.thread_signals = thread_signals;
         self.task_lifecycle = task_lifecycle;
-        retired.extend(std::mem::replace(&mut self.files, files).into_values());
+        retired.extend(self.files.replace_map(files).into_values());
         self.file_retirement = previous.file_retirement;
         self.pipe_owner_process = previous.pipe_owner_process;
         self.pipe_owners = pipe_owners;
@@ -2240,6 +2275,7 @@ fn load_executable(
     // Last, once every check of the image has passed: a host that cannot
     // allocate the copy refuses only an image Linux would load.
     let executable_image = copy_image(image)?;
+    let private_copy_gate = crate::executor::PrivateCopyGate::default();
     Ok(LoadedStaticElf {
         entry_point,
         stack_pointer,
@@ -2257,7 +2293,8 @@ fn load_executable(
         argv0,
         cwd: cwd.to_owned(),
         cwd_fd,
-        private_copy_gate: Default::default(),
+        files: private_copy_gate.bind(std::collections::BTreeMap::new()),
+        private_copy_gate,
         stdin: None,
         stdin_entry_id: std::sync::Arc::new(()),
         auxv,
@@ -2297,7 +2334,6 @@ fn load_executable(
         task_lifecycle: std::sync::Arc::new(std::sync::Mutex::new(TaskLifecycleTable::with_root(
             1, 1, 1, true,
         ))),
-        files: std::collections::BTreeMap::new(),
         file_retirement: FileRetirement::default(),
         signal_refusal: None,
         pipe_owners: Default::default(),

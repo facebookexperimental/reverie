@@ -940,6 +940,10 @@ impl ElfExecutor {
         // leave it for the next caller's injection to report.
         self.unsupported_refusal = None;
         self.state.signal_refusal = None;
+        // The copies this call reaches stay its own until it returns, and
+        // any whose entries another thread retired meanwhile are replaced
+        // then (`PrivateCopies`).
+        let _call = self.state.private_copy_gate.call_scope();
         let result = self
             .execute_checked_dispatch(request, memory, terminal_read)
             .map_err(|error| memory.capture_shared_file_error(error));
@@ -1037,7 +1041,7 @@ impl ElfExecutor {
             return result;
         }
         if let Some(result) = self.execute_accept(request, memory) {
-            return Ok(result);
+            return result;
         }
         // TODO-HUMAN-REVIEW(PR-172): Review CLONE_FILES descriptor-table sharing.
         // Thread children retain private executor state, but synchronize their
@@ -1068,6 +1072,8 @@ impl ElfExecutor {
             shared_files.take();
             drop(notifications.take());
             self.state.file_retirement.drain_unlocked();
+            #[cfg(test)]
+            run_one_shot_test_hook(&TABLE_RELEASED_TEST_HOOK);
         }
         if self.parent_death_enrolled()
             && matches!(
@@ -1110,9 +1116,7 @@ impl ElfExecutor {
             }
         }
         if let Some(mut shared_files) = shared_files {
-            shared_files
-                .update_from_elf(&self.state)
-                .expect("clone updated KVM file table");
+            shared_files.update_from_elf(&self.state)?;
         }
         // The mutating path has now updated and released its table guard.
         // Accounting retired at each copy; callbacks may run only now.

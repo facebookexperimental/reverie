@@ -113,8 +113,19 @@ mod file_table_publish_tests {
         );
         // Three entries changed and one is kept; the second needed clone fails.
         state.file_retirement.fail_clone_after(Some(1));
+        // The calling task's change has happened, so the failure ends the run
+        // as a named refusal for the descriptor that ran out.
         let error = table.update_from_elf(&state).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+        assert!(
+            matches!(
+                error,
+                crate::Error::HostResources {
+                    resource: reverie_kvm_core::host_limits::HostResource::Descriptors,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
         state.file_retirement.fail_clone_after(None);
         assert_eq!(snapshot(&table), before, "a failed publication changes nothing");
 

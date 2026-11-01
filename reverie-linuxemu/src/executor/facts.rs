@@ -2306,7 +2306,7 @@ mod signal_sets_tests {
             let (parent, during) = (parent.clone(), during.clone());
             move || during.borrow_mut().push(parent.signal_sets(child_tid))
         });
-        child.replace_after_exec(test_state(&directory.0));
+        child.replace_after_exec(test_state(&directory.0)).unwrap();
         drop(hook);
         assert_eq!(*during.borrow(), [Ok(before)]);
         assert_eq!(
@@ -2418,7 +2418,7 @@ mod signal_sets_tests {
                     }
                 }
             });
-            child.replace_after_exec(test_state(&image));
+            child.replace_after_exec(test_state(&image)).unwrap();
             drop(hook);
             let late = answered.recv_timeout(std::time::Duration::from_secs(10));
             let during = during.borrow().clone();

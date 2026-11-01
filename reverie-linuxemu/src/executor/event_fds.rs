@@ -412,7 +412,7 @@ pub(super) fn refresh_signalfd_readiness_for_signal_locked(
 fn refresh_signalfd_readiness_from_files_locked(
     state: &LoadedStaticElf,
     signal: Option<i32>,
-    files: &std::collections::BTreeMap<i32, std::fs::File>,
+    files: &PrivateFiles,
 ) -> Result<(), i64> {
     let readiness = {
         let process_signals = state

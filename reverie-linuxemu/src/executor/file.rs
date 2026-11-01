@@ -1960,7 +1960,7 @@ pub(super) fn getdents64<M: GuestMemoryAccess<Error = crate::Error>>(
 
 pub(super) fn is_open_standard(state: &LoadedStaticElf, guest_fd: libc::c_int) -> bool {
     (0..=2).contains(&guest_fd)
-        && (guest_fd != libc::STDIN_FILENO || state.stdin.is_some())
+        && (guest_fd != libc::STDIN_FILENO || state.stdin_copy().is_some())
         && !state.closed_standard_fds.contains(&guest_fd)
         && !state.files.contains_key(&guest_fd)
 }
@@ -1974,7 +1974,7 @@ pub(super) fn host_fd(state: &LoadedStaticElf, guest_fd: libc::c_int) -> Option<
             if !is_open_standard(state, guest_fd) {
                 None
             } else if guest_fd == libc::STDIN_FILENO {
-                state.stdin.as_ref().map(AsRawFd::as_raw_fd)
+                state.stdin_copy().map(AsRawFd::as_raw_fd)
             } else {
                 Some(guest_fd)
             }

@@ -2030,7 +2030,9 @@ mod tests {
             !ready(&parent, alias),
             "another process cannot publish to this carrier"
         );
-        parent.replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")));
+        parent
+            .replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")))
+            .unwrap();
         assert_eq!(identity(&parent), parent_id);
         assert_eq!(
             parent
@@ -2466,7 +2468,9 @@ mod tests {
         };
         control.reserve_delivery(permit).unwrap();
         assert_eq!(executor.delivery_permit(), Some(permit));
-        executor.replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")));
+        executor
+            .replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")))
+            .unwrap();
         assert_eq!(executor.delivery_permit(), None);
         assert_eq!(executor.owned_delivery_permit(), Some(permit));
         assert!(matches!(
@@ -2703,7 +2707,9 @@ mod tests {
         let id = identity(&executor);
         let first = receipt(control.publish_alarm(id, alarm(id)));
         let old = executor.state.process_signals.clone();
-        executor.replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")));
+        executor
+            .replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")))
+            .unwrap();
         // Exec preserves pending SIGALRM but resets the image binding.
         let second = receipt(control.publish_alarm(id, alarm(id)));
         assert_ne!(first.image, second.image);
@@ -7381,7 +7387,9 @@ mod tests {
             let control = control.clone();
             move || control.signal_sets(task)
         });
-        child.replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")));
+        child
+            .replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")))
+            .unwrap();
         assert_eq!(
             reading.resume(),
             Err(reverie::FactError::Errno(Errno::EAGAIN))
@@ -7415,7 +7423,9 @@ mod tests {
             let control = control.clone();
             move || control.alarm_recipients(process)
         });
-        child.replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")));
+        child
+            .replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")))
+            .unwrap();
         assert_eq!(reading.resume(), Err(Errno::EAGAIN));
         assert_eq!(control.alarm_recipients(process), Ok(recipients));
     }
@@ -7441,7 +7451,9 @@ mod tests {
             let control = control.clone();
             move || control.publish_child_exit(completion)
         });
-        parent.replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")));
+        parent
+            .replace_after_exec(native_loaded_state(std::path::Path::new("/tmp")))
+            .unwrap();
         assert_eq!(
             publishing.resume(),
             reverie::ChildExitPublicationResult::RejectedBeforeCommit(Errno::EAGAIN)

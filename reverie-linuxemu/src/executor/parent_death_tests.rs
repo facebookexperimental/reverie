@@ -236,7 +236,7 @@ fn pdeath_signal_zero_covers_group_exec_empty_and_ignored_batches() {
                 assert_eq!(pdeath_zero_probe(&child, Some(task.process.tgid.as_raw()), task.tid.as_raw()), 0,
                     "empty/ignored batch still holds existence");
             }
-            if image_replaced { leader.replace_after_exec(test_state(&root.0)); }
+            if image_replaced { leader.replace_after_exec(test_state(&root.0)).unwrap(); }
             let result = leader.backend_signal_control().process.publish_parent_death(boundary);
             let reverie::ParentDeathPublicationResult::Committed(receipt) = result else { panic!("{result:?}"); };
             assert_eq!(receipt.signals.len(), usize::from(ignored));
@@ -321,12 +321,12 @@ fn pdeath_registration_reset_sticky_domain_and_exec_capability_gain() {
     assert_eq!(pdeath_set(&mut leader, &memory, 0), 0);
     assert!(leader.thread_child(4).is_err(), "clear does not revoke already pending obligations");
     assert_eq!(pdeath_set(&mut leader, &memory, libc::SIGUSR2 as u64), 0);
-    leader.replace_after_exec(test_state(&root.0));
+    leader.replace_after_exec(test_state(&root.0)).unwrap();
     assert_eq!(leader.state.task_lifecycle.lock().unwrap().parent_death_signal(leader.admitted_signal_identity()), Ok(libc::SIGUSR2));
     assert!(leader.parent_death_enrolled());
     leader.state.capability_permitted = 0;
     leader.state.capability_effective = 0;
-    leader.replace_after_exec(test_state(&root.0));
+    leader.replace_after_exec(test_state(&root.0)).unwrap();
     assert_eq!(leader.state.task_lifecycle.lock().unwrap().parent_death_signal(leader.admitted_signal_identity()), Ok(0));
     assert!(leader.parent_death_enrolled());
 }
@@ -417,7 +417,7 @@ fn pdeath_exec_uses_image_boundary_and_cleanup_never_impersonates_it() {
     leader.prepare_parent_death_exec().unwrap();
     creator.retire_current_thread(ExitStatus::SUCCESS, false);
     assert!(!child.has_eligible_pending_signal(), "cleanup is not publication authority");
-    leader.replace_after_exec(test_state(&root.0));
+    leader.replace_after_exec(test_state(&root.0)).unwrap();
     let boundary = reverie::SignalBoundaryReceipt { permit, outcome: reverie::SignalBoundaryOutcome::ImageReplaced };
     let wrong = reverie::SignalBoundaryReceipt { outcome:
         reverie::SignalBoundaryOutcome::Terminated { group: false, wait_status: 0 }, ..boundary };

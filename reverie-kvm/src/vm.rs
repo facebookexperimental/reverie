@@ -3177,7 +3177,7 @@ impl KvmBackend {
             self.hypercall_instruction,
         )?;
         self.memory.enable_user_access();
-        executor.replace_after_exec(loaded);
+        executor.replace_after_exec(loaded)?;
         // An exec discards a base staged for the old image, as
         // replace_after_exec discards the executor's.
         self.clear_pending_segment();

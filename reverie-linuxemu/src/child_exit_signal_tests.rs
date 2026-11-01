@@ -659,7 +659,7 @@ fn child_exit_signal_lifecycle_keeps_pending_process_state_private_across_fork_a
             .shared_pending
             .contains(libc::SIGCHLD)
     );
-    leader.replace_after_exec(test_state(&root.0));
+    leader.replace_after_exec(test_state(&root.0)).unwrap();
     assert!(
         leader
             .state
