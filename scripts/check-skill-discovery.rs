@@ -381,8 +381,15 @@ fn check_policy_files(host: &Path, root: &Path) -> Result<&'static str, String> 
         (false, false) => Ok("absent (tolerated while skills are regrown)"),
         _ => {
             require_real_file(&agents, root)?;
-            require_internal_symlink(&claude, Path::new("AGENTS.md"), root)?;
-            Ok("AGENTS.md with CLAUDE.md symlink")
+            let meta = fs::symlink_metadata(&claude).map_err(|e| format!("inspect {}: {e}", claude.display()))?;
+            if meta.file_type().is_symlink() {
+                return Err(format!("{}: CLAUDE.md must not be a symlink; Claude Code reads AGENTS.md natively", claude.display()));
+            }
+            let text = fs::read_to_string(&claude).map_err(|e| format!("read {}: {e}", claude.display()))?;
+            if text.lines().next() != Some("@AGENTS.md") {
+                return Err(format!("{}: a regular CLAUDE.md must start with @AGENTS.md", claude.display()));
+            }
+            Ok("AGENTS.md with optional CLAUDE.md alias")
         }
     }
 }
@@ -638,9 +645,8 @@ fn filesystem_regression_tests() -> Result<(), String> {
         .map_err(|error| format!("cannot create filesystem fixture: {error}"))?;
     fs::write(root.join("AGENTS.md"), "fixture policy\n")
         .map_err(|error| format!("cannot write filesystem fixture: {error}"))?;
-    symlink("AGENTS.md", root.join("CLAUDE.md"))
-        .map_err(|error| format!("cannot create positive symlink fixture: {error}"))?;
-    require_internal_symlink(&root.join("CLAUDE.md"), Path::new("AGENTS.md"), &root)?;
+    fs::write(root.join("CLAUDE.md"), "@AGENTS.md\n")
+        .map_err(|error| format!("cannot write fixture: {error}"))?;
 
     symlink("missing", root.join("dangling"))
         .map_err(|error| format!("cannot create dangling symlink fixture: {error}"))?;
@@ -780,7 +786,7 @@ fn discovery_regression_tests() -> Result<(), String> {
     fs::create_dir_all(root.join(".llms")).map_err(|error| format!("cannot create: {error}"))?;
     fs::write(root.join("AGENTS.md"), "fixture policy\n")
         .map_err(|error| format!("cannot write fixture: {error}"))?;
-    link("AGENTS.md", &root.join("CLAUDE.md"))?;
+    fs::write(root.join("CLAUDE.md"), "@AGENTS.md\n").map_err(|error| format!("cannot write fixture: {error}"))?;
     link("../.claude/skills", &root.join(".llms/skills"))?;
     fs::write(a_canonical.join(README), "# canonical fixture\n")
         .map_err(|error| format!("cannot write fixture: {error}"))?;
