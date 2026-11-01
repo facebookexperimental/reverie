@@ -217,9 +217,15 @@ static void check_guest_stat(const struct stat *value, int captured, int proc,
       CHECK(value->st_size == 0);
     check_timestamps(value, 0);
   } else if (captured) {
-    // Captured output is synthetic; a host file or directory reports the
-    // kernel's timestamps, which the Tool decides about.
-    check_timestamps(value, 1640995199);
+    // Captured output is modeled as the keeper pipe made when capture was
+    // set up, so it reports that pipe's kernel creation timestamps: all
+    // three are the one creation instant, with a real (nonzero) time.
+    CHECK(value->st_atim.tv_sec == value->st_mtim.tv_sec &&
+          value->st_atim.tv_sec == value->st_ctim.tv_sec);
+    CHECK(value->st_atim.tv_nsec == value->st_mtim.tv_nsec &&
+          value->st_atim.tv_nsec == value->st_ctim.tv_nsec);
+    CHECK(value->st_atim.tv_sec > 0);
+    CHECK(value->st_atim.tv_nsec >= 0 && value->st_atim.tv_nsec < 1000000000);
     CHECK(value->st_dev != 0 && value->st_ino != 0);
     CHECK(value->st_mode == (S_IFIFO | 0600));
     CHECK(value->st_nlink == 1 && value->st_uid == 0 && value->st_gid == 0);

@@ -116,10 +116,9 @@ impl AdmissionServer {
                     replay_mode: false,
                     marker: 0x63ad_1198,
                 };
-                let mut server =
-                    RpcServer::from_prebound(listener, Arc::new(AdmissionGlobal), config)
-                        .unwrap()
-                        .tool_activation(run);
+                let server = RpcServer::from_prebound(listener, Arc::new(AdmissionGlobal), config)
+                    .unwrap()
+                    .tool_activation(run);
                 let monitor = server.connection_monitor();
                 send.send(monitor.clone()).unwrap();
                 server
@@ -244,6 +243,7 @@ fn exercise_admission<const ROLE: u8>() {
             ));
         }
         counters.runtime_state = std::ptr::null_mut();
+        assert!(counters.runtime_state.is_null());
         fixture.shutdown();
     }
 }
