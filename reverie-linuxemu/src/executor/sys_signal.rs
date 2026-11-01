@@ -1074,6 +1074,10 @@ impl ElfExecutor {
                     | libc::SYS_pidfd_open
                     | libc::SYS_pipe
                     | libc::SYS_pipe2
+                    // In-memory, and they never wait (`executor/pkeys.rs`).
+                    | libc::SYS_pkey_alloc
+                    | libc::SYS_pkey_free
+                    | libc::SYS_pkey_mprotect
                     | libc::SYS_poll
                     | libc::SYS_ppoll
                     | libc::SYS_prctl

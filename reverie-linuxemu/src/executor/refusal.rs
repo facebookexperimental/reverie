@@ -321,34 +321,6 @@ impl CloneFlagsRefused {
     }
 }
 
-/// Diagnostic carried by this backend's typed refusal of the protection-key
-/// calls.
-pub(crate) const PROTECTION_KEY_REFUSAL: &str =
-    "KVM does not implement memory protection keys (pkey_alloc, pkey_mprotect, pkey_free)";
-
-/// The typed refusal, if any, that a `pkey_alloc`, `pkey_mprotect` or
-/// `pkey_free` result carries. This executor forwards none of them and
-/// answers each with ENOSYS before any effect, so every ENOSYS answer to one
-/// is its own refusal; every other result carries none.
-pub(super) fn protection_key_refusal(
-    request: &SyscallRequest,
-    result: i64,
-) -> Option<reverie::UnsupportedRefusal> {
-    (matches!(
-        request.number(),
-        n if n == libc::SYS_pkey_alloc as u64
-            || n == libc::SYS_pkey_mprotect as u64
-            || n == libc::SYS_pkey_free as u64
-    ) && result == negative_errno(libc::ENOSYS))
-    .then(|| {
-        reverie::UnsupportedRefusal::new(
-            reverie::UnsupportedOperation::ProtectionKeys,
-            reverie::Errno::ENOSYS,
-            PROTECTION_KEY_REFUSAL,
-        )
-    })
-}
-
 /// Diagnostic carried by this backend's typed refusal of `userfaultfd`.
 pub(crate) const USERFAULTFD_REFUSAL: &str = "KVM does not implement userfaultfd";
 

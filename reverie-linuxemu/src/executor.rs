@@ -142,6 +142,8 @@ mod xattr;
 use xattr::*;
 mod mm;
 pub(crate) use mm::*;
+mod pkeys;
+use pkeys::*;
 mod time;
 use time::*;
 mod sys_signal;
@@ -506,6 +508,7 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         thread_name: *b"test\0\0\0\0\0\0\0\0\0\0\0\0",
         thread_group_leader_name: Arc::new(Mutex::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0")),
         thp_disabled: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        pkey_zero_claimed: Arc::new(AtomicBool::new(false)),
         keep_capabilities: false,
         capability_effective: crate::credentials::capability_mask(),
         capability_permitted: crate::credentials::capability_mask(),
@@ -581,6 +584,7 @@ mod tests {
     include!("executor/tool_directory_tests.rs");
     include!("executor/host_resources_tests.rs");
     include!("executor/script_line_tests.rs");
+    include!("executor/pkeys_tests.rs");
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::io::Seek;
@@ -11454,9 +11458,10 @@ mod tests {
         assert_eq!(executor.take_unsupported_refusal(), None);
     }
 
-    /// The protection-key calls and userfaultfd are refused with ENOSYS and
-    /// their typed refusals (`ProtectionKeys`, `Userfaultfd`), which no other
-    /// result carries: not a ppoll, which this executor answers for a zero
+    /// userfaultfd is refused with ENOSYS and its typed refusal
+    /// (`Userfaultfd`), which no other result carries: not a protection-key
+    /// call, which this executor answers as a CPU without protection keys
+    /// does (`executor/pkeys.rs`), not a ppoll, which it answers for a zero
     /// timeout with or without a temporary mask (0: nothing is ready and no
     /// signal is pending) and declines without one for a wait, and not a call
     /// that succeeds.
@@ -11474,26 +11479,24 @@ mod tests {
                 diagnostic,
             ))
         };
-        let protection_keys = refusal(
-            reverie::UnsupportedOperation::ProtectionKeys,
-            PROTECTION_KEY_REFUSAL,
-        );
-        for (number, args) in [
-            (libc::SYS_pkey_alloc, [0; 6]),
+        for (number, args, result) in [
+            (libc::SYS_pkey_alloc, [0; 6], libc::EINVAL),
+            (libc::SYS_pkey_alloc, [0; 6], libc::ENOSPC),
             (
                 libc::SYS_pkey_mprotect,
                 [PAGE_SIZE, PAGE_SIZE, libc::PROT_READ as u64, 1, 0, 0],
+                libc::EINVAL,
             ),
-            (libc::SYS_pkey_free, [1, 0, 0, 0, 0, 0]),
+            (libc::SYS_pkey_free, [1, 0, 0, 0, 0, 0], libc::EINVAL),
         ] {
             assert_eq!(
                 executor.execute(&SyscallRequest::new(number as u64, args), &memory),
-                negative_errno(libc::ENOSYS),
+                negative_errno(result),
                 "syscall {number}"
             );
             assert_eq!(
                 executor.take_unsupported_refusal(),
-                protection_keys,
+                None,
                 "syscall {number}"
             );
         }

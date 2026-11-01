@@ -206,7 +206,8 @@ fn execute_basic_syscall_dispatch(
     let mutates_layout = matches!(request.number(), number if
         number == libc::SYS_brk as u64 || number == libc::SYS_mmap as u64
         || number == libc::SYS_mremap as u64 || number == libc::SYS_munmap as u64
-        || number == libc::SYS_mprotect as u64 || number == libc::SYS_madvise as u64);
+        || number == libc::SYS_mprotect as u64 || number == libc::SYS_madvise as u64
+        || number == libc::SYS_pkey_mprotect as u64);
     if !mutates_layout {
         return execute_basic_syscall_inner(
             memory,
@@ -801,6 +802,15 @@ fn execute_basic_syscall_inner(
     } else if number == libc::SYS_mprotect as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         mprotect(&ProviderMemory(memory), args)
+    } else if number == libc::SYS_pkey_mprotect as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        pkey_mprotect(&ProviderMemory(memory), args)
+    } else if number == libc::SYS_pkey_alloc as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        pkey_alloc(state, args)
+    } else if number == libc::SYS_pkey_free as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        pkey_free(args)
     } else if number == libc::SYS_madvise as u64 {
         // Advice answered as a hint that changes the flags Linux keeps on the
         // mappings it covers: the pages keep them (`DeclaredMapping::flags`).
@@ -1122,7 +1132,6 @@ impl ElfExecutor {
                     .or_else(|| tool_decided_refusal(request, result))
                     .or_else(|| madvise_refusal(request, result))
                     .or_else(|| signalfd_refusal(&self.state, request, result))
-                    .or_else(|| protection_key_refusal(request, result))
                     .or_else(|| userfaultfd_refusal(request, result))
                 {
                     self.unsupported_refusal = Some(refusal);

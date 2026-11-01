@@ -20,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
@@ -1223,6 +1224,13 @@ pub struct LoadedStaticElf {
     /// Threads share this flag; fork takes an independent copy and exec keeps
     /// the existing value.
     pub thp_disabled: std::sync::Arc<AtomicU8>,
+    /// Bit 0 of Linux's `mm->context.pkey_allocation_map` on a CPU without
+    /// protection keys, which this vCPU is: the first `pkey_alloc` that passes
+    /// its argument checks takes key 0 and cannot give it back, so every later
+    /// one in this address space finds every key taken (`pkey_alloc` in
+    /// `executor/pkeys.rs`). Threads and a vfork child share it, fork takes
+    /// an independent copy, and exec starts a new address space without it.
+    pub pkey_zero_claimed: std::sync::Arc<AtomicBool>,
     // TODO-HUMAN-REVIEW(PR-181): Review virtual capability lifecycle state.
     pub keep_capabilities: bool,
     pub capability_effective: u64,
@@ -1431,6 +1439,9 @@ impl LoadedStaticElf {
             thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(self.thread_name)),
             thp_disabled: std::sync::Arc::new(AtomicU8::new(
                 self.thp_disabled.load(Ordering::SeqCst),
+            )),
+            pkey_zero_claimed: std::sync::Arc::new(AtomicBool::new(
+                self.pkey_zero_claimed.load(Ordering::SeqCst),
             )),
             keep_capabilities: self.keep_capabilities,
             capability_effective: self.capability_effective,
@@ -2263,6 +2274,7 @@ fn load_executable(
         thread_name,
         thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(thread_name)),
         thp_disabled: std::sync::Arc::new(AtomicU8::new(0)),
+        pkey_zero_claimed: std::sync::Arc::new(AtomicBool::new(false)),
         keep_capabilities: false,
         capability_effective: capabilities.effective,
         capability_permitted: capabilities.permitted,

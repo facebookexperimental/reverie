@@ -489,7 +489,7 @@ impl ElfExecutor {
     /// A call this executor refuses where Linux applies it leaves the window
     /// as it was where Linux shows it changed: `mlock(2)` and `mlock2(2)`,
     /// `madvise(2)` with `MADV_DONTFORK`, `MADV_DONTDUMP` or
-    /// `MADV_WIPEONFORK`, `mseal(2)`, `pkey_mprotect(2)`, `mbind(2)` and
+    /// `MADV_WIPEONFORK`, `mseal(2)`, `mbind(2)` and
     /// `prctl(PR_SET_VMA)` (ENOSYS); `mprotect(2)` with `PROT_GROWSDOWN` or
     /// `PROT_SEM`, `mremap(2)` with `MREMAP_DONTUNMAP`, and a same-size
     /// `mremap(2)` move of a range with a hole after its start, which Linux

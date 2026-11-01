@@ -1252,6 +1252,7 @@ impl ElfExecutor {
         _child_retirement = state.file_retirement.hold();
         if share_address_space {
             state.thp_disabled = self.state.thp_disabled.clone();
+            state.pkey_zero_claimed = self.state.pkey_zero_claimed.clone();
         }
         state.dumpable = self.current_dumpable();
         if clear_sighand {
@@ -1417,6 +1418,7 @@ impl ElfExecutor {
         state.dumpable = self.current_dumpable();
         state.thread_group_leader_name = self.state.thread_group_leader_name.clone();
         state.thp_disabled = self.state.thp_disabled.clone();
+        state.pkey_zero_claimed = self.state.pkey_zero_claimed.clone();
         state.process_signals = self.state.process_signals.clone();
         state.pipe_owner_process = self.state.pipe_owner_process.clone();
         // The fork helper made private-table bindings. CLONE_FILES instead
