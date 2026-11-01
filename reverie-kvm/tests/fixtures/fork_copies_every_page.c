@@ -16,7 +16,10 @@
  * cache under a UTF-8 locale, writes through it, unmaps it, and maps private
  * anonymous memory at the same address, where it writes one page of two: on
  * KVM those two pages keep a backing of their own after the shared view
- * goes. A second file stays mapped MAP_SHARED through the fork.
+ * goes. Three more pages go the same way, all written, and then a view over
+ * the first of them alone goes too: on KVM that page takes a backing of its
+ * own, and the other two are a run of the first backing that starts one page
+ * into it. A second file stays mapped MAP_SHARED through the fork.
  *
  * The child checks every page. Then the parent changes a private page and
  * stores one byte through the shared mapping, the child stores another, and
@@ -60,6 +63,7 @@ struct pages {
   unsigned char *heap;
   unsigned char *huge;
   unsigned char *separate;
+  unsigned char *run;
 };
 
 static unsigned char pattern(size_t index, unsigned seed) {
@@ -114,6 +118,36 @@ static void write_pages(struct pages *pages) {
   for (size_t i = 0; i < PAGE; i++) {
     pages->separate[i] = pattern(i, 5);
   }
+  /* Three pages that keep one backing of their own after their view goes, as
+   * above, all written; then a second view over the first page alone, which
+   * goes too: on KVM the first page takes a backing of its own, and the other
+   * two are a run of the first backing that starts one page into it. */
+  fd = open("fork-copies-every-page.run", O_RDWR | O_CREAT | O_TRUNC, 0600);
+  REQUIRE(fd >= 0, "open run file");
+  REQUIRE(ftruncate(fd, 3 * PAGE) == 0, "size run file");
+  unsigned char *run =
+      mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  REQUIRE(run != MAP_FAILED, "mmap run view");
+  memset(run, 'r', 3 * PAGE);
+  REQUIRE(munmap(run, 3 * PAGE) == 0, "munmap run view");
+  pages->run = mmap(run, 3 * PAGE, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+  REQUIRE(pages->run == run, "mmap where the run view was");
+  for (size_t i = 0; i < 3 * PAGE; i++) {
+    pages->run[i] = pattern(i, 6 + i / PAGE);
+  }
+  REQUIRE(mmap(run, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd,
+               0) == run,
+          "mmap a view over the first run page");
+  REQUIRE(munmap(run, PAGE) == 0, "munmap the first run page's view");
+  REQUIRE(mmap(run, PAGE, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1,
+               0) == run,
+          "mmap the first run page again");
+  for (size_t i = 0; i < PAGE; i++) {
+    pages->run[i] = pattern(i, 9);
+  }
+  REQUIRE(close(fd) == 0, "close run file");
 }
 
 /* The first byte of the pages that differ from what write_pages wrote, or
@@ -140,6 +174,10 @@ static long first_difference(const struct pages *pages) {
   for (size_t i = 0; i < 2 * PAGE; i++) {
     unsigned char expected = i < PAGE ? pattern(i, 5) : 0;
     if (pages->separate[i] != expected) return 7;
+  }
+  for (size_t i = 0; i < 3 * PAGE; i++) {
+    unsigned char expected = i < PAGE ? pattern(i, 9) : pattern(i, 6 + i / PAGE);
+    if (pages->run[i] != expected) return 8;
   }
   return -1;
 }
