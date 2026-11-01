@@ -50,7 +50,7 @@ const PKEY_ACCESS_MASK: u64 = 0x3;
 
 /// `pkey_alloc(flags, init_val)` without protection keys.
 pub(super) fn pkey_alloc(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    // TODO-HUMAN-REVIEW(PR-id): Review the answers of a CPU without protection keys.
+    // TODO-HUMAN-REVIEW(PR-1233): Review the answers of a CPU without protection keys.
     let (flags, init_val) = (args[0], args[1]);
     if flags != 0 || init_val & !PKEY_ACCESS_MASK != 0 {
         return negative_errno(libc::EINVAL);
@@ -66,13 +66,13 @@ pub(super) fn pkey_alloc(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
 
 /// `pkey_free(pkey)` without protection keys: no key is allocated.
 pub(super) fn pkey_free(_args: &[u64; 6]) -> i64 {
-    // TODO-HUMAN-REVIEW(PR-id): Review the answers of a CPU without protection keys.
+    // TODO-HUMAN-REVIEW(PR-1233): Review the answers of a CPU without protection keys.
     negative_errno(libc::EINVAL)
 }
 
 /// `pkey_mprotect(start, len, prot, pkey)` without protection keys.
 pub(super) fn pkey_mprotect(memory: &ProviderMemory<'_>, args: &[u64; 6]) -> i64 {
-    // TODO-HUMAN-REVIEW(PR-id): Review the answers of a CPU without protection keys.
+    // TODO-HUMAN-REVIEW(PR-1233): Review the answers of a CPU without protection keys.
     // The key is an `int`: Linux reads the register's low 32 bits.
     if args[3] as u32 as i32 == -1 {
         return mprotect(memory, args);
