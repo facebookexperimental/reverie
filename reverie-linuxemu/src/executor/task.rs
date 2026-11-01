@@ -2457,6 +2457,13 @@ impl ElfExecutor {
         self.process_action.is_some()
     }
 
+    /// Whether the staged process action is an exec, without taking it: one
+    /// whose every fallible step is done (`prepare_exec_image` staged it), so
+    /// it can no longer fail and the old image is still in place.
+    pub fn has_staged_exec(&self) -> bool {
+        matches!(self.process_action, Some(ProcessAction::Exec { .. }))
+    }
+
     // TODO-HUMAN-REVIEW(PR-156): Review non-returning exit injection state.
     pub fn has_pending_exit(&self) -> bool {
         self.exit_status.is_some()

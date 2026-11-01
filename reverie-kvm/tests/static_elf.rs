@@ -4520,6 +4520,222 @@ impl Tool for PostExecTool {
     }
 }
 
+/// The events an exec-commit test tool saw, in order: `commit <path>` from
+/// `handle_exec_commit`, with the exec's path read from the old image,
+/// `post-exec` from `handle_post_exec`, and `injected` if a hook's injection
+/// returned.
+#[derive(Default)]
+struct ExecCommitLog {
+    events: Mutex<Vec<String>>,
+}
+
+impl ExecCommitLog {
+    fn events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("exec-commit log lock poisoned")
+            .clone()
+    }
+}
+
+#[reverie::global_tool]
+impl GlobalTool for ExecCommitLog {
+    type Request = String;
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, _from: Pid, event: String) {
+        self.events
+            .lock()
+            .expect("exec-commit log lock poisoned")
+            .push(event);
+    }
+}
+
+/// Injects each `execve` and returns its result, so a failed exec returns to
+/// the guest. Its exec-commit hook reports the path it reads at the exec's
+/// path argument in the old image, then overwrites the path's first byte
+/// there: the exec read the path and the argument strings before the hook,
+/// so the new image still receives them as they were.
+#[derive(Clone, Copy, Debug, Default)]
+struct ExecCommitTool;
+
+#[reverie::tool]
+impl Tool for ExecCommitTool {
+    type GlobalState = ExecCommitLog;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscalls([Sysno::execve]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+
+    async fn handle_exec_commit<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        let path = guest.regs().await.rdi as usize;
+        let read = reverie::syscalls::Addr::<u8>::from_raw(path).ok_or(Errno::EFAULT)?;
+        let read = guest.memory().read_cstring(read)?;
+        guest
+            .send_rpc(format!("commit {}", read.to_string_lossy()))
+            .await;
+        let write = AddrMut::<u8>::from_raw(path).ok_or(Errno::EFAULT)?;
+        guest.memory().write_value(write, &b'X')
+    }
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        guest.send_rpc("post-exec".to_owned()).await;
+        Ok(())
+    }
+}
+
+/// [`ExecCommitTool`], except that its exec-commit hook injects a syscall,
+/// which a hook may not do.
+#[derive(Clone, Copy, Debug, Default)]
+struct ExecCommitInjectingTool;
+
+#[reverie::tool]
+impl Tool for ExecCommitInjectingTool {
+    type GlobalState = ExecCommitLog;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscalls([Sysno::execve]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        Ok(guest.inject(syscall).await?)
+    }
+
+    async fn handle_exec_commit<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        guest.inject(reverie::syscalls::Getpid::new()).await?;
+        guest.send_rpc("injected".to_owned()).await;
+        Ok(())
+    }
+}
+
+/// Fails one exec, then execs itself with argument `after`, which prints the
+/// argv[0] the new image received.
+const EXEC_COMMIT_PROGRAM: &str = r###"
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "after") == 0) {
+        printf("after-exec argv0=%s\n", argv[0]);
+        return 0;
+    }
+    char *missing[] = {"missing", NULL};
+    execve("/nonexistent/exec-commit", missing, NULL);
+    printf("failed-exec errno=%d\n", errno);
+    fflush(stdout);
+    char *again[] = {argv[0], "after", NULL};
+    execve(argv[0], again, NULL);
+    return 99;
+}
+"###;
+
+/// What a run of [`EXEC_COMMIT_PROGRAM`] gives: the tool's log, the exit
+/// code, stdout and stderr.
+type ExecCommitRun = Result<(ExecCommitLog, i32, Vec<u8>, Vec<u8>), Error>;
+
+/// Installs [`EXEC_COMMIT_PROGRAM`] in a fresh directory and runs it under
+/// `T`, returning the run and the program's path.
+fn run_exec_commit_program<T>() -> (ExecCommitRun, String)
+where
+    T: Tool<GlobalState = ExecCommitLog> + 'static,
+    T::ThreadState: 'static,
+{
+    let directory = TestDirectory::new();
+    let program = compile_c_program(&directory.0, "exec-commit", EXEC_COMMIT_PROGRAM);
+    let path = program.to_str().unwrap().to_owned();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_file_with_context(
+            std::fs::File::open(&program).unwrap(),
+            &[path.as_str()],
+            &[],
+            &directory.0,
+        )
+        .unwrap();
+    let result = futures::executor::block_on(backend.run_static_elf_with_tool::<T>((), true));
+    (result, path)
+}
+
+/// `Tool::handle_exec_commit` runs once for the guest's successful exec,
+/// never for its failed one and not for the initial image, between the
+/// initial image's `handle_post_exec` and the new image's. It sees the old
+/// image's memory, and it runs after the exec read its strings: the hook
+/// overwrites the path's first byte in the old image, yet the exec runs the
+/// program and the new image receives the path unchanged as argv[0].
+#[test]
+fn tool_exec_commit_runs_once_after_the_exec_read_its_strings() {
+    if !leader_self_exec_bounded("tool_exec_commit_runs_once_after_the_exec_read_its_strings") {
+        return;
+    }
+    let (result, path) = run_exec_commit_program::<ExecCommitTool>();
+    let (log, code, stdout, stderr) = result.unwrap();
+    assert_eq!(
+        code,
+        0,
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        format!("failed-exec errno=2\nafter-exec argv0={path}\n")
+    );
+    assert_eq!(
+        log.events(),
+        vec![
+            "post-exec".to_owned(),
+            format!("commit {path}"),
+            "post-exec".to_owned(),
+        ]
+    );
+}
+
+/// An exec-commit hook that injects a syscall fails the run, by name, and the
+/// injection does not return to it.
+#[test]
+fn tool_exec_commit_may_not_inject() {
+    if !leader_self_exec_bounded("tool_exec_commit_may_not_inject") {
+        return;
+    }
+    let (result, _) = run_exec_commit_program::<ExecCommitInjectingTool>();
+    let error = match result {
+        Ok((log, code, stdout, _)) => panic!(
+            "the run succeeded: code={code} events={:?} stdout={}",
+            log.events(),
+            String::from_utf8_lossy(&stdout)
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains(&format!(
+            "exec-commit hook injected syscall {}",
+            libc::SYS_getpid
+        )),
+        "{error}"
+    );
+}
+
 #[derive(Default)]
 struct LifecycleSignalLog {
     callbacks: Mutex<Vec<u8>>,

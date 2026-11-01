@@ -765,6 +765,14 @@ trait GuestSyscallExecutor<T: Tool>:
         None
     }
 
+    /// Whether the process action the last injection staged is an exec, which
+    /// can no longer fail: `KvmGuest::inject` then calls the Tool's
+    /// `handle_exec_commit` before [`Self::complete_injection`] replaces the
+    /// image. An adapter that stages no exec answers false.
+    fn staged_exec(&self) -> bool {
+        false
+    }
+
     fn complete_injection<'a>(
         &'a mut self,
         _context: ToolContext<'a, T>,
@@ -1810,6 +1818,10 @@ where
         Some(self.completion_without_action())
     }
 
+    fn staged_exec(&self) -> bool {
+        self.executor.has_staged_exec()
+    }
+
     fn complete_injection<'a>(
         &'a mut self,
         context: ToolContext<'a, T>,
@@ -2008,6 +2020,9 @@ struct KvmGuest<'a, T: Tool> {
     // Set once this timer callback had an injection refused; the refusal is
     // then its outcome (see `record_timer_refusal`).
     timer_refusal_recorded: bool,
+    // Set while the Tool's `handle_exec_commit` runs (`commit_exec`), which
+    // may not inject: `inject` fails the run instead.
+    committing_exec: bool,
 }
 
 impl<'a, T: Tool> KvmGuest<'a, T> {
@@ -2108,6 +2123,7 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
             injected_syscalls: 0,
             rpc_failure: None,
             timer_refusal_recorded: false,
+            committing_exec: false,
         }
     }
 
@@ -2118,6 +2134,21 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
     /// through a builder.
     fn set_rpc_failure(&mut self, failure: &'a dyn crate::failure::RpcFailure) {
         self.rpc_failure = Some(failure);
+    }
+
+    /// Run the Tool's `Tool::handle_exec_commit` for the exec the current
+    /// injection staged. The provider has finished every fallible step of
+    /// the exec (`prepare_exec_image` read the path, argv and envp and
+    /// validated the image before staging the action), and the old image is
+    /// still this guest's: the action that replaces it runs only after this
+    /// returns. The hook may not inject; `inject` fails the run while
+    /// `committing_exec` is set.
+    async fn commit_exec(&mut self) -> Result<()> {
+        let tool = self.process_state.clone();
+        self.committing_exec = true;
+        let committed = tool.handle_exec_commit(self).await;
+        self.committing_exec = false;
+        committed.map_err(Error::ExecCommit)
     }
 
     /// Preserve a previously selected nonlocal disposition. Its outer owner
@@ -2528,6 +2559,16 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
     }
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> std::result::Result<i64, Errno> {
+        if self.committing_exec {
+            // `Tool::handle_exec_commit` may not inject: its exec can no
+            // longer fail, and a call made now would run between the exec's
+            // last fallible step and the image's replacement.
+            let number = SyscallRequest::from_syscall(syscall).number();
+            self.signal_handler(HandlerSignal::RuntimeError(Error::ExecCommitInjection(
+                number,
+            )));
+            return std::future::pending().await;
+        }
         self.hold_timer_refusal().await;
         self.admit_ordinary_operation().await;
         self.executor.invalidate_polled_read_attempt();
@@ -2675,6 +2716,16 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
             let completion = match self.executor.complete_injection_now(plan.as_ref()) {
                 Some(completion) => Ok(completion),
                 None => {
+                    // An exec this call staged can no longer fail, and the
+                    // old image is still in place: the Tool's exec-commit
+                    // hook runs now, before the action replaces the image.
+                    if plan.is_some()
+                        && self.executor.staged_exec()
+                        && let Err(error) = self.commit_exec().await
+                    {
+                        self.signal_handler(HandlerSignal::RuntimeError(error));
+                        return std::future::pending().await;
+                    }
                     let context = ToolContext {
                         pid: self.pid,
                         tid: self.tid,

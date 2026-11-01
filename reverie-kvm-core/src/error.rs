@@ -286,6 +286,16 @@ pub enum Error {
     #[error("Reverie post-exec hook failed: {0}")]
     PostExec(reverie::syscalls::Errno),
 
+    /// A Tool's exec-commit hook (`Tool::handle_exec_commit`) failed.
+    #[error("Reverie exec-commit hook failed: {0}")]
+    ExecCommit(reverie::syscalls::Errno),
+
+    /// A Tool's exec-commit hook injected a syscall (this number), which it may
+    /// not do: the exec can no longer fail, and the call would run between its
+    /// last fallible step and the image's replacement.
+    #[error("Reverie exec-commit hook injected syscall {0}, which it may not do")]
+    ExecCommitInjection(u64),
+
     /// A shared Reverie tool callback failed.
     #[error("Reverie tool failed: {0}")]
     Reverie(#[source] reverie::Error),

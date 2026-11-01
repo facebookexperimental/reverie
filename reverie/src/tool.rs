@@ -936,6 +936,31 @@ pub trait Tool: Send + Sync + Default {
         Ok(())
     }
 
+    /// Called once an `execve` or `execveat` this Tool injected can no longer
+    /// fail, on a backend that carries the exec out itself rather than through
+    /// a host kernel exec (today the KVM backend). The backend has finished
+    /// every step that could fail: it has read the path, the argument strings
+    /// and the environment strings out of guest memory and validated the new
+    /// image. The old image's memory is still this guest's, and the image is
+    /// replaced only after this returns; `handle_post_exec` then follows in
+    /// the new image, and the injection does not return. This is the point
+    /// Linux's `begin_new_exec` reaches past `point_of_no_return`, where
+    /// `exec_mmap` runs `exec_mm_release` on the old address space
+    /// (`fs/exec.c`), after `do_execveat_common` has copied the strings. A
+    /// Tool that models what Linux does to the old image there, such as the
+    /// robust-futex walk `futex_exec_release` makes, does it here, where the
+    /// strings the new image receives can no longer change.
+    ///
+    /// The handler may read and write guest memory and its own state. It must
+    /// not inject a syscall: the backend refuses one and the run fails. Other
+    /// threads of the process have not been stopped yet; a Tool that runs one
+    /// thread at a time already holds them off. An exec that fails never
+    /// reaches this point, and a backend whose exec is the host kernel's
+    /// (ptrace, for one) does not call it. An error fails the run.
+    async fn handle_exec_commit<T: Guest<Self>>(&self, _guest: &mut T) -> Result<(), Errno> {
+        Ok(())
+    }
+
     /// The tool receives an event from the guest, via the Reverie program
     /// instrumentation. A Reverie syscall handler fires in the moment *before* a
     /// guest syscall executes (like a "prehook").
