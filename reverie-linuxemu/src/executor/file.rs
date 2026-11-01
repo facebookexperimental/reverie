@@ -263,29 +263,11 @@ pub(super) fn sync_file_range(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     }
 }
 
-pub(super) fn open(
-    memory: &GuestMemory,
-    state: &mut LoadedStaticElf,
-    args: &[u64; 6],
-    capture_output: bool,
-) -> i64 {
-    open_file(
-        memory,
-        state,
-        libc::AT_FDCWD,
-        args[0],
-        args[1],
-        args[2],
-        capture_output,
-    )
+pub(super) fn open(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    open_file(memory, state, libc::AT_FDCWD, args[0], args[1], args[2])
 }
 
-pub(super) fn openat(
-    memory: &GuestMemory,
-    state: &mut LoadedStaticElf,
-    args: &[u64; 6],
-    capture_output: bool,
-) -> i64 {
+pub(super) fn openat(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     open_file(
         memory,
         state,
@@ -293,7 +275,6 @@ pub(super) fn openat(
         args[1],
         args[2],
         args[3],
-        capture_output,
     )
 }
 
@@ -305,22 +286,9 @@ pub(super) fn openat(
 // previously fell through to `ENOSYS`. Delegating to `open_file` reuses the
 // existing create/procfs/umask handling so the behavior matches the equivalent
 // `open`/`openat` call exactly.
-pub(super) fn creat(
-    memory: &GuestMemory,
-    state: &mut LoadedStaticElf,
-    args: &[u64; 6],
-    capture_output: bool,
-) -> i64 {
+pub(super) fn creat(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let flags = (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as u64;
-    open_file(
-        memory,
-        state,
-        libc::AT_FDCWD,
-        args[0],
-        flags,
-        args[1],
-        capture_output,
-    )
+    open_file(memory, state, libc::AT_FDCWD, args[0], flags, args[1])
 }
 
 fn open_file(
@@ -330,7 +298,6 @@ fn open_file(
     path_address: u64,
     raw_flags: u64,
     raw_mode: u64,
-    capture_output: bool,
 ) -> i64 {
     let flags = u64::from(raw_flags as libc::c_int as u32) & LEGACY_OPEN_FLAGS;
     let path_only = flags & libc::O_PATH as u64 != 0;
@@ -356,33 +323,6 @@ fn open_file(
     }
     let path = path.as_slice();
     let close_on_exec = flags & libc::O_CLOEXEC as u64 != 0;
-    if let Some(target) = fdinfo_path_target(state, path) {
-        return match target {
-            FdinfoPathTarget::Target { tid, fd } => {
-                open_fdinfo(state, (tid, fd), flags, capture_output)
-            }
-            FdinfoPathTarget::EmptyFinal { tid } => {
-                if let Err(error) = fdinfo_task_generation(state, tid) {
-                    return error;
-                }
-                if !path_only
-                    && state.regular_create_directory_policy
-                        == RegularCreateDirectoryPolicy::LegacyLookup
-                    && flags & (libc::O_CREAT | libc::O_DIRECTORY) as u64
-                        == (libc::O_CREAT | libc::O_DIRECTORY) as u64
-                {
-                    // Linux v6.3 fs/namei.c:3460-3469 preserves the trailing
-                    // slash and rejects O_CREAT on the fdinfo directory itself.
-                    negative_errno(libc::EISDIR)
-                } else {
-                    negative_errno(libc::ENOENT)
-                }
-            }
-            FdinfoPathTarget::MissingFinal { tid } => fdinfo_task_generation(state, tid)
-                .map_or_else(|error| error, |_| negative_errno(libc::ENOENT)),
-            FdinfoPathTarget::InvalidTask => negative_errno(libc::ENOENT),
-        };
-    }
     // Serve the synthetic /proc surface before touching the host filesystem, so
     // deterministic content replaces the deliberately-refused real procfs.
     if let Some(content) = synthetic_proc_content(state, path) {

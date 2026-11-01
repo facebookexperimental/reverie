@@ -83,8 +83,8 @@ pub(super) fn syncfs_private_memfd_name(path: &[u8]) -> bool {
     else {
         return false;
     };
-    // Current creation sites: open_synthetic_proc (also process stat/status and
-    // fdinfo), and create_memory_backing.
+    // Current creation sites: open_synthetic_proc (also process status), and
+    // create_memory_backing.
     // Guest RAM is not exported, but must not become ordinary if imported.
     // The last two are reserved carrier shapes from the preserved PR610
     // implementation. Refusing them does not implement its EBADMSG/auth rules.

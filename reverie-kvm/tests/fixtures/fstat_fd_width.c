@@ -256,11 +256,8 @@ int main(int argc, char **argv) {
   // the backend refuses a guest's own open of procfs.
   int proc_root = dup(STDIN_FILENO);
   int proc_maps = open("/proc/self/maps", O_RDONLY);
-  char path[64];
-  CHECK(snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", file) > 0);
-  int fdinfo = open(path, O_RDONLY);
   int stdout_alias = dup(STDOUT_FILENO);
-  CHECK(directory >= 0 && proc_root >= 0 && proc_maps >= 0 && fdinfo >= 0);
+  CHECK(directory >= 0 && proc_root >= 0 && proc_maps >= 0);
   CHECK(stdout_alias >= 0);
   int closed = dup(file);
   CHECK(closed >= 0 && close(closed) == 0);
@@ -276,8 +273,7 @@ int main(int argc, char **argv) {
                  {"stderr", STDERR_FILENO, 1, 0, 0},
                  {"file", file, 0, 0, 0},
                  {"directory", directory, 0, 0, 1},
-                 {"proc-maps", proc_maps, 0, 1, 0},
-                 {"fdinfo", fdinfo, 0, 1, 0}};
+                 {"proc-maps", proc_maps, 0, 1, 0}};
   struct observation stdout_stat = {0};
   for (size_t object = 0; object < sizeof(objects) / sizeof(objects[0]); ++object) {
     struct observation plain = {0};
@@ -340,16 +336,13 @@ int main(int argc, char **argv) {
   // These are explicit backend policy controls, separate from native parity.
   // Neither a wide fd nor a bad output pointer may bypass a guest refusal.
   puts("proc-policy");
-  for (size_t object = 0; object < 2; ++object)
-    for (size_t upper = 0; upper < 4; ++upper)
-      for (int bad_pointer = 0; bad_pointer < 2; ++bad_pointer) {
-        int expected = guest ? (object == 0 ? EACCES : ENOSYS)
-                             : (bad_pointer ? EFAULT : 0);
-        observe(1, object == 0 ? "proc-root" : "fdinfo",
-                (uint32_t)(object == 0 ? proc_root : fdinfo),
-                upper_words[upper], bad_pointer, expected);
-      }
-  CHECK(close(stdout_alias) == 0 && close(fdinfo) == 0);
+  for (size_t upper = 0; upper < 4; ++upper)
+    for (int bad_pointer = 0; bad_pointer < 2; ++bad_pointer) {
+      int expected = guest ? EACCES : (bad_pointer ? EFAULT : 0);
+      observe(1, "proc-root", (uint32_t)proc_root, upper_words[upper],
+              bad_pointer, expected);
+    }
+  CHECK(close(stdout_alias) == 0);
   CHECK(close(proc_maps) == 0 && close(proc_root) == 0);
   CHECK(close(directory) == 0 && close(file) == 0);
   return 0;

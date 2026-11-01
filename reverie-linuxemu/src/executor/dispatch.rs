@@ -547,12 +547,12 @@ fn execute_basic_syscall_inner(
         // AUTONOMOUS-BOT-IMPLEMENTED
         fcntl(memory, state, args)
     } else if number == libc::SYS_open as u64 {
-        open(memory, state, args, capture_output)
+        open(memory, state, args)
     } else if number == libc::SYS_openat as u64 {
-        openat(memory, state, args, capture_output)
+        openat(memory, state, args)
     } else if number == libc::SYS_creat as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        creat(memory, state, args, capture_output)
+        creat(memory, state, args)
     } else if number == libc::SYS_memfd_create as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         memfd_create(memory, state, args)

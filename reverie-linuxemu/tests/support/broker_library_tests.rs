@@ -29,7 +29,6 @@ pub(crate) fn selected_child_without(test: &str, removed: &[&str]) -> Option<Bro
     assert!(matches!(
         test,
         "executor::tests::terminal_cleanup_preserves_live_shared_table_and_does_not_wait_for_its_lock"
-            | "executor::tests::terminal_cleanup_retires_socket_despite_fdinfo_observer_table_pin"
             | "terminal_cleanup::tests::dropped_waiter_keeps_native_wait_and_owned_service_alive"
             | "terminal_cleanup::tests::a_cancelled_waiters_waker_is_dropped_on_the_file_exit_thread_without_rust_min_stack"
             | "executor::tests::pdeath_abi_adoption_full_width_and_scalar_copyout_are_exact"

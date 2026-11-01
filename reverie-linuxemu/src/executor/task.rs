@@ -687,7 +687,6 @@ impl ElfExecutor {
         file_table = Arc::new(std::sync::Mutex::new(
             FileTableState::try_from_elf(&state).expect("clone initial KVM file table"),
         ));
-        state.fdinfo_table = Arc::downgrade(&file_table);
         let signal_registry = state.children.registry().unwrap_or_default();
         let signal_binding = signal_registry
             .register(&state, &file_table, process_generation, None)
@@ -1275,7 +1274,6 @@ impl ElfExecutor {
         }
         let address_space = None;
         file_table = Arc::new(std::sync::Mutex::new(FileTableState::try_from_elf(&state)?));
-        state.fdinfo_table = Arc::downgrade(&file_table);
         let task_generation = {
             let mut lifecycle = state
                 .task_lifecycle

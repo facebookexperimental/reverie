@@ -12,8 +12,8 @@ use super::*;
 
 /// The capacity of the guest descriptor table. A descriptor allocated
 /// while the limit was higher stays usable after the limit is lowered, so
-/// lookups that only test existence (fdinfo path parsing, `select`) bound
-/// by this capacity, never by the current allocation limit.
+/// lookups that only test existence (`select`) bound by this capacity,
+/// never by the current allocation limit.
 pub(super) const GUEST_FD_TABLE_CAPACITY: libc::c_int = 1 << 20;
 
 /// The bound on allocating a new guest descriptor, as Linux bounds it:

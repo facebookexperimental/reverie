@@ -27,7 +27,8 @@
 //! - [`elf`]: the ELF loader (`loader`) and the per-task state it creates.
 //! - [`signal`]: the signal ABI and per-thread and per-process signal state
 //!   (`arch/signal_amd64`, `kernel/task_signals`, `kernel/pending_signals`).
-//! - [`fdinfo`]: `/proc/<pid>/fdinfo` rendering (`fsimpl/proc`).
+//! - [`fdinfo`]: the single-record seq_file state that reads of the synthetic
+//!   `/proc/self/status` go through (`fsimpl/proc`).
 //! - [`provider`]: the `reverie::provider` interface as LinuxEmu answers it.
 //! - [`terminal_read`] and [`terminal_cleanup`]: reads from a host terminal and
 //!   their cleanup (`kernel/tty`, `fsimpl/devpts`).

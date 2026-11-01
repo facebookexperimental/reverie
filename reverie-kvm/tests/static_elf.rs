@@ -3333,13 +3333,6 @@ int main(int argc, char **argv) {
     EXPECT_ERROR(open("missing-open-precedence", O_ACCMODE | O_TMPFILE, 0600), ENOENT);
     EXPECT_ERROR(open("missing-open-precedence", O_PATH | O_TMPFILE, 0600), ENOENT);
     EXPECT_ERROR(open("missing-open-precedence", O_RDONLY | O_DIRECTORY, 0600), ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_RDONLY | O_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_WRONLY | O_TMPFILE, 0600), ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_ACCMODE | O_TMPFILE, 0600), ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_PATH | O_TMPFILE, 0600), ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999", O_RDONLY | O_DIRECTORY, 0600), ENOENT);
     EXPECT_ERROR(open("/proc/self/fd/999999", O_RDONLY | O_TMPFILE, 0600), EINVAL);
     EXPECT_ERROR(open("/proc/self/fd/999999", O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
     EXPECT_ERROR(open("/proc/self/fd/999999", O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
@@ -3358,9 +3351,6 @@ int main(int argc, char **argv) {
                         O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
                  early_create_directory ? EINVAL : EBADF);
     EXPECT_ERROR(open("missing-open-precedence",
-                      O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
-                 early_create_directory ? EINVAL : ENOENT);
-    EXPECT_ERROR(open("/proc/self/fdinfo/999999",
                       O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
                  early_create_directory ? EINVAL : ENOENT);
     EXPECT_ERROR(open("/proc/self/fd/999999",
@@ -3388,19 +3378,6 @@ int main(int argc, char **argv) {
 
     char procfd[64];
     CHECK(snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", descriptor) > 0);
-    char unsupported_fdinfo[64];
-    CHECK(snprintf(unsupported_fdinfo, sizeof(unsupported_fdinfo),
-                   "/proc/self/fdinfo/%d", descriptor) > 0);
-    CHECK(stat(unsupported_fdinfo, &metadata) == 0);
-    CHECK(S_ISREG(metadata.st_mode));
-    EXPECT_ERROR(open(unsupported_fdinfo, O_RDONLY), ENOSYS);
-    EXPECT_ERROR(open(unsupported_fdinfo, O_RDONLY | O_DIRECTORY), ENOTDIR);
-    EXPECT_ERROR(open(unsupported_fdinfo, O_WRONLY | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(unsupported_fdinfo, O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
-                 expected_create_directory);
-    EXPECT_ERROR(open(unsupported_fdinfo,
-                      O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY, 0600),
-                 expected_create_directory_exclusive);
     EXPECT_ERROR(open(procfd, O_WRONLY), EACCES);
     EXPECT_ERROR(open(procfd, O_RDWR), EACCES);
     EXPECT_ERROR(open(procfd, O_RDONLY | O_TRUNC), EACCES);
@@ -3438,81 +3415,6 @@ int main(int argc, char **argv) {
     CHECK((fcntl(reopened, F_GETFL) & (O_NONBLOCK | O_APPEND | O_SYNC)) ==
           (O_NONBLOCK | O_APPEND | O_SYNC));
     CHECK(close(reopened) == 0);
-
-    int ordinary = open("fdinfo-target", O_CREAT | O_RDWR | O_TRUNC, 0600);
-    CHECK(ordinary >= 0);
-    char fdinfo[64];
-    CHECK(snprintf(fdinfo, sizeof(fdinfo), "/proc/self/fdinfo/%d", ordinary) > 0);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_NOFOLLOW, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_TRUNC, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_DIRECT, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_EXCL, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_WRONLY | PRIVATE_TMPFILE, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_WRONLY | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_RDWR | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_ACCMODE | O_TMPFILE | O_CREAT, 0600), EINVAL);
-    EXPECT_ERROR(open(fdinfo, O_WRONLY | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_RDWR | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_ACCMODE | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_PATH | O_TMPFILE, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_PATH | O_TMPFILE | O_NOFOLLOW | O_TRUNC | O_DIRECT | O_EXCL, 0600), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_DIRECTORY), ENOTDIR);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_CREAT | O_DIRECTORY, 0600),
-                 expected_create_directory);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY, 0600),
-                 expected_create_directory_exclusive);
-    EXPECT_ERROR(open(fdinfo, O_RDONLY | O_CREAT | O_DIRECTORY | O_NOFOLLOW, 0600),
-                 expected_create_directory);
-    EXPECT_ERROR(open(fdinfo,
-                      O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY | O_NOFOLLOW,
-                      0600),
-                 expected_create_directory_exclusive);
-    int readable_fdinfo = open(fdinfo, O_RDONLY | O_CLOEXEC);
-    CHECK(readable_fdinfo >= 0);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo, "x", 1, 0), ESPIPE);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo, "x", 0, 0), ESPIPE);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo, "x", 1, (off_t)-1), EINVAL);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo, "x", 0, (off_t)-1), EINVAL);
-    EXPECT_ERROR(syscall(SYS_pwrite64, readable_fdinfo,
-                         (const char *)(uintptr_t)-1, 1, 0),
-                 ESPIPE);
-    CHECK(close(readable_fdinfo) == 0);
-
-    if (expected_create_directory == ENOTDIR) {
-        static const char *const missing_fdinfo_paths[] = {
-            "/proc/self/fdinfo/999999",
-            "/proc/self/fdinfo/not-a-fd",
-            "/proc/self/fdinfo/03",
-        };
-        static const int create_directory_flags[] = {
-            O_RDONLY | O_CREAT | O_DIRECTORY,
-            O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY,
-            O_RDONLY | O_CREAT | O_DIRECTORY | O_NOFOLLOW,
-            O_RDONLY | O_CREAT | O_EXCL | O_DIRECTORY | O_NOFOLLOW,
-        };
-        for (size_t path_index = 0;
-             path_index < sizeof(missing_fdinfo_paths) / sizeof(missing_fdinfo_paths[0]);
-             ++path_index) {
-            for (size_t flag_index = 0;
-                 flag_index < sizeof(create_directory_flags) / sizeof(create_directory_flags[0]);
-                 ++flag_index) {
-                EXPECT_ERROR(open(missing_fdinfo_paths[path_index],
-                                  create_directory_flags[flag_index], 0600),
-                             ENOENT);
-            }
-        }
-        for (size_t flag_index = 0;
-             flag_index < sizeof(create_directory_flags) / sizeof(create_directory_flags[0]);
-             ++flag_index) {
-            EXPECT_ERROR(open("/proc/self/fdinfo/",
-                              create_directory_flags[flag_index], 0600),
-                         EISDIR);
-        }
-    }
-    CHECK(close(ordinary) == 0);
-    CHECK(unlink("fdinfo-target") == 0);
 
     EXPECT_ERROR(open("/proc/self/maps", O_RDONLY | O_DIRECTORY), ENOTDIR);
     EXPECT_ERROR(open("/proc/self/maps", O_PATH | O_DIRECTORY), ENOTDIR);
@@ -21937,7 +21839,6 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
                     "file",
                     "directory",
                     "proc-maps",
-                    "fdinfo",
                 ][..],
             ),
             ("fstatfs", &["file", "directory"][..]),
@@ -21959,21 +21860,19 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
             }
         }
         expected.push_str("proc-policy\n");
-        for (object, refusal) in [("proc-root", libc::EACCES), ("fdinfo", libc::ENOSYS)] {
-            for upper in upper_words {
-                for badptr in [0, 1] {
-                    let error = if guest {
-                        refusal
-                    } else if badptr == 1 {
-                        libc::EFAULT
-                    } else {
-                        0
-                    };
-                    let result = if error == 0 { 0 } else { -1 };
-                    expected.push_str(&format!(
-                        "fstatfs object={object} upper={upper:016x} badptr={badptr} result={result} errno={error}\n"
-                    ));
-                }
+        for upper in upper_words {
+            for badptr in [0, 1] {
+                let error = if guest {
+                    libc::EACCES
+                } else if badptr == 1 {
+                    libc::EFAULT
+                } else {
+                    0
+                };
+                let result = if error == 0 { 0 } else { -1 };
+                expected.push_str(&format!(
+                    "fstatfs object=proc-root upper={upper:016x} badptr={badptr} result={result} errno={error}\n"
+                ));
             }
         }
         expected
@@ -22000,7 +21899,7 @@ fn fstat_and_fstatfs_consume_low_descriptor_words_on_kvm() {
         .unwrap();
     assert_eq!(native.status.code(), Some(0), "native fixture: {native:?}");
     let native_stdout = std::str::from_utf8(&native.stdout).unwrap();
-    assert_eq!(native_stdout.lines().count(), 153);
+    assert_eq!(native_stdout.lines().count(), 137);
     assert_eq!(native_stdout, expected_transcript(false));
     assert!(native.stderr.is_empty());
     let (native_common, _) = native_stdout.split_once("proc-policy\n").unwrap();

@@ -411,15 +411,6 @@ fn syncfs_known_private_descriptions_are_refused_without_host_call() {
             "fd={fd}"
         );
     }
-    // Fdinfo needs a live executor table; a standalone test_state deliberately
-    // cannot open one. Exercise the actual executor binding, not a forged map.
-    let mut fixture = FdinfoFixture::new(true);
-    let target = fixture.open("a", libc::O_RDONLY);
-    let info = fixture.info(target);
-    assert_eq!(
-        fixture.call(libc::SYS_syncfs, [info as u64, 0, 0, 0, 0, 0]),
-        negative_errno(libc::ENOSYS)
-    );
 }
 
 #[test]
