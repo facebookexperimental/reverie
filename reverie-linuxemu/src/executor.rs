@@ -19505,6 +19505,192 @@ mod tests {
                 [fd as u64, offset as u64, whence as u64, 0, 0, 0],
             )
         }
+        /// Up to `count` bytes read from `fd` into the second page.
+        fn read(&mut self, fd: i64, count: usize) -> Vec<u8> {
+            let result = self.call(
+                libc::SYS_read,
+                [fd as u64, PAGE_SIZE, count as u64, 0, 0, 0],
+            );
+            assert!(result >= 0, "read: {result}");
+            let mut bytes = vec![0; result as usize];
+            self.memory.read(PAGE_SIZE, &mut bytes).unwrap();
+            bytes
+        }
+        /// The process's name, which `/proc/self/status` renders at read
+        /// time, set with PR_SET_NAME.
+        fn set_name(&mut self, name: &str) {
+            self.memory
+                .write(0x180, &CString::new(name).unwrap().into_bytes_with_nul())
+                .unwrap();
+            assert_eq!(
+                self.call(
+                    libc::SYS_prctl,
+                    [libc::PR_SET_NAME as u64, 0x180, 0, 0, 0, 0]
+                ),
+                0
+            );
+        }
+    }
+
+    /// `/proc/self/status` is one seq_file description over the process's
+    /// live cells, as Linux's is: a positioned read moves the sequence's
+    /// position and not the file's, so the next plain read starts the
+    /// sequence again and renders the cells as they are then; and a negative
+    /// position is EINVAL.
+    #[test]
+    fn process_status_pread_moves_the_sequence_and_not_the_file_position() {
+        let mut f = FdinfoFixture::new(false);
+        f.set_name("first");
+        let status = f.open("/proc/self/status", libc::O_RDONLY);
+        assert!(status >= 0, "{status}");
+        assert_eq!(
+            f.call(libc::SYS_pread64, [status as u64, PAGE_SIZE, 7, 0, 0, 0]),
+            7
+        );
+        let mut prefix = [0; 7];
+        f.memory.read(PAGE_SIZE, &mut prefix).unwrap();
+        assert_eq!(&prefix, b"Name:\tf");
+        assert_eq!(f.seek(status, 0, libc::SEEK_CUR), 0);
+        f.set_name("second");
+        let fresh = f.read(status, 4096);
+        assert!(
+            fresh.starts_with(b"Name:\tsecond\n"),
+            "{}",
+            String::from_utf8_lossy(&fresh)
+        );
+        assert_eq!(f.seek(status, 0, libc::SEEK_CUR), fresh.len() as i64);
+        assert_eq!(
+            f.call(
+                libc::SYS_pread64,
+                [status as u64, PAGE_SIZE, 64, u64::MAX, 0, 0]
+            ),
+            negative_errno(libc::EINVAL)
+        );
+        assert_eq!(f.seek(status, 0, libc::SEEK_CUR), fresh.len() as i64);
+    }
+
+    /// A read of `/proc/self/status` whose copy to the caller faults part
+    /// way returns the bytes it copied and keeps the rest buffered for the
+    /// next read, which does not render the cells again, as Linux's
+    /// seq_read does. One that faults at its first byte is EFAULT and moves
+    /// nothing, a zero-length one moves nothing, and a count the architecture
+    /// cannot address is EFAULT before any copy, as vfs_read refuses it.
+    #[test]
+    fn process_status_keeps_what_a_faulting_read_did_not_copy() {
+        let mut f = FdinfoFixture::new(false);
+        f.set_name("first");
+        let status = f.open("/proc/self/status", libc::O_RDONLY);
+        assert!(status >= 0, "{status}");
+        f.memory
+            .map_user_permissions(0, 4 * PAGE_SIZE, true, true)
+            .unwrap();
+        f.memory
+            .map_user_permissions(2 * PAGE_SIZE, PAGE_SIZE, true, false)
+            .unwrap();
+        f.memory.enable_user_access();
+        assert_eq!(
+            f.call(libc::SYS_read, [status as u64, 2 * PAGE_SIZE, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(f.seek(status, 0, libc::SEEK_CUR), 0);
+        assert_eq!(
+            f.call(libc::SYS_read, [status as u64, 2 * PAGE_SIZE, 64, 0, 0, 0]),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(f.seek(status, 0, libc::SEEK_CUR), 0);
+        let original = f.read(status, 4096);
+        assert!(original.starts_with(b"Name:\tfirst\n"));
+        assert_eq!(f.seek(status, 0, libc::SEEK_SET), 0);
+        assert_eq!(
+            f.call(
+                libc::SYS_read,
+                [status as u64, 2 * PAGE_SIZE - 7, 64, 0, 0, 0]
+            ),
+            7
+        );
+        let mut prefix = [0; 7];
+        f.memory.read(2 * PAGE_SIZE - 7, &mut prefix).unwrap();
+        assert_eq!(prefix.as_slice(), &original[..7]);
+        assert_eq!(f.seek(status, 0, libc::SEEK_CUR), 7);
+        f.set_name("second");
+        assert_eq!(f.read(status, 4096), original[7..]);
+        assert_eq!(f.seek(status, 0, libc::SEEK_CUR), original.len() as i64);
+        let native = std::fs::File::open("/proc/self/status").unwrap();
+        let mut native_buffer = [0_u8; 256];
+        // SAFETY: the descriptor is live; the kernel refuses the count before
+        // it writes anything to the buffer.
+        let native_result = unsafe {
+            libc::syscall(
+                libc::SYS_read,
+                native.as_raw_fd(),
+                native_buffer.as_mut_ptr(),
+                usize::MAX,
+            )
+        };
+        assert_eq!(native_result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EFAULT)
+        );
+        assert_eq!(
+            f.call(
+                libc::SYS_read,
+                [status as u64, PAGE_SIZE, u64::MAX, 0, 0, 0]
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(
+            f.call(
+                libc::SYS_pread64,
+                [status as u64, PAGE_SIZE, u64::MAX, 0, 0, 0]
+            ),
+            negative_errno(libc::EFAULT)
+        );
+        assert_eq!(f.seek(status, 0, libc::SEEK_CUR), original.len() as i64);
+    }
+
+    /// Every descriptor of one `/proc/self/status` description shares its
+    /// position and what it buffered, as Linux's do: a duplicate goes on
+    /// where the other left off, from the same rendering; a seek through
+    /// either moves both; a seek to a position replays the sequence to it,
+    /// rendering the cells as they are at the seek; and SEEK_END is refused,
+    /// as seq_lseek refuses it.
+    #[test]
+    fn every_descriptor_of_process_status_shares_its_position_and_buffer() {
+        let mut f = FdinfoFixture::new(false);
+        f.set_name("first");
+        let status = f.open("/proc/self/status", libc::O_RDONLY);
+        assert!(status >= 0, "{status}");
+        let original = f.read(status, 4096);
+        assert_eq!(f.seek(status, 0, libc::SEEK_SET), 0);
+        assert_eq!(f.read(status, 7), original[..7]);
+        let alias = f.call(
+            libc::SYS_fcntl,
+            [status as u64, libc::F_DUPFD_CLOEXEC as u64, 20, 0, 0, 0],
+        );
+        assert_eq!(alias, 20);
+        f.set_name("second");
+        assert_eq!(f.read(alias, 4096), original[7..]);
+        assert_eq!(f.seek(status, 0, libc::SEEK_CUR), original.len() as i64);
+        assert_eq!(f.seek(alias, 0, libc::SEEK_SET), 0);
+        let fresh = f.read(status, 4096);
+        assert!(
+            fresh.starts_with(b"Name:\tsecond\n"),
+            "{}",
+            String::from_utf8_lossy(&fresh)
+        );
+        assert_eq!(f.seek(status, 3, libc::SEEK_SET), 3);
+        f.set_name("third");
+        let suffix = f.read(alias, 4096);
+        assert!(
+            suffix.starts_with(b"e:\tsecond\n"),
+            "{}",
+            String::from_utf8_lossy(&suffix)
+        );
+        assert_eq!(
+            f.seek(status, 0, libc::SEEK_END),
+            negative_errno(libc::EINVAL)
+        );
     }
 
     fn epoll_pwait2_test_interest(f: &mut FdinfoFixture, initial: u64) -> (i64, i64) {

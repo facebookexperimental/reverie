@@ -479,18 +479,18 @@ pub(super) const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 // (package K slice D4c-1). Its KVM copy (this table's entry, a 53-field line
 // of pid, the leader's name, state R and the parent followed by zeros, its
 // reopen refusal and its zero path size) carried no marker.
-// /proc/locks and every /proc/<pid>/fdinfo/<fd> followed, once Detcore
-// rendered both where the guest's procfs is not the kernel's (package K slice
-// K8-h), /proc/locks from its lock ledger and an fdinfo from the backend's
-// descriptor_status fact, and resolved their `..` spellings itself (package K
-// slice K8-d). Their KVM copies were this table's /proc/locks entry with its
-// /proc/self/../locks spelling and proc_locks_content, which rebuilt the rows
-// from the supervisor's own fdinfo of each guest file and carried
-// TODO-HUMAN-REVIEW(PR-211) (guest-owned /proc/locks filtering), a review that
-// now applies to Detcore's rendering; and the fdinfo opener (open_fdinfo, its
-// path classification and its stat answers), which read the supervisor's host
-// fdinfo of the guest's descriptor and rewrote its flags, and carried no
-// marker.
+// /proc/locks and every /proc/<pid>/fdinfo/<fd> are a Tool's to render: the
+// backend gives a Tool what both need (the guest's descriptors and the
+// descriptor_status fact), and a Tool that renders them answers every
+// spelling of either, `..` spellings included, before this executor sees it.
+// Without such a Tool, both are refused as any procfs object outside this
+// table is. The executor's own copies were this table's /proc/locks entry,
+// with its /proc/self/../locks spelling and proc_locks_content, which rebuilt
+// the rows from the supervisor's own fdinfo of each guest file and carried
+// TODO-HUMAN-REVIEW(PR-211) (guest-owned /proc/locks filtering); and the
+// fdinfo opener (open_fdinfo, its path classification and its stat
+// answers), which read the supervisor's fdinfo of the guest's descriptor and
+// rewrote its flags, and carried no marker.
 pub(super) const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] =
     &[b"/proc/self/status", b"/proc/self/maps"];
 
