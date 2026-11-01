@@ -173,6 +173,21 @@ enum Copyout {
     Whole,
 }
 
+/// The width of the user word a compare-and-exchange acts on.
+const USER_WORD_LENGTH: usize = std::mem::size_of::<u32>();
+
+/// What a compare-and-exchange of a user word found
+/// (`UserMemory::exchange_user_u32_admitted`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserWordExchange {
+    /// The word held this value; the new value was stored exactly when it
+    /// equals the expected one.
+    Held(u32),
+    /// The word lies on truncate-capable file backing, which has no proven
+    /// fault-contained atomic store; nothing was stored.
+    FileBacked,
+}
+
 #[derive(Debug)]
 struct Backing {
     fd: OwnedFd,
@@ -4248,75 +4263,109 @@ impl UserMemory {
         current: u32,
         new: u32,
     ) -> Result<u32> {
-        const LENGTH: usize = std::mem::size_of::<u32>();
-        let denied = Error::GuestMemoryAccessDenied {
-            address: guest_address,
-            length: LENGTH,
-        };
-        if !guest_address.is_multiple_of(LENGTH as u64) {
-            return Err(denied);
+        if !guest_address.is_multiple_of(USER_WORD_LENGTH as u64) {
+            return Err(Error::GuestMemoryAccessDenied {
+                address: guest_address,
+                length: USER_WORD_LENGTH,
+            });
         }
         self.memory.with_copy(|copy| {
-            self.translate_admitted(guest_address, LENGTH, copy)?;
-            let access = self
-                .memory
-                .mapping
-                .address_space
-                .lock()
-                .expect("guest memory access map lock poisoned");
-            let (start, _) = access.user_extent(guest_address, LENGTH)?;
-            if access.enabled
-                && !matches!(
-                    access.pages.get(&(start / PAGE_SIZE as u64)),
-                    Some(UserPageState::Accessible { writable: true, .. })
-                )
-            {
-                return Err(denied);
-            }
-            let physical = access.translate(guest_address, LENGTH)?;
-            let offset = self.memory.checked_offset(physical, LENGTH)?;
-            let chunks = self
-                .memory
-                .mapping
-                .host_chunks_from_state(&access, offset, LENGTH);
-            // An aligned word never crosses a page, so it is one chunk.
-            let [chunk] = &chunks[..] else {
-                return Err(denied);
-            };
-            if matches!(chunk.backing.kind, BackingKind::OrdinaryFile { .. }) {
-                return Err(Error::SharedFileCapability {
+            match self.exchange_user_u32_admitted(guest_address, current, new, copy)? {
+                UserWordExchange::Held(observed) => Ok(observed),
+                UserWordExchange::FileBacked => Err(Error::SharedFileCapability {
                     operation: "atomic compare-exchange",
                     reason: "truncate-capable file backing has no proven fault-contained atomic store",
-                });
+                }),
             }
-            let host_access = self
-                .memory
-                .mapping
-                .slice
-                .backing
-                .host_access
-                .lock()
-                .expect("guest memory lock poisoned");
-            // SAFETY: host_chunks_from_state returned the live mmap pointer
-            // for exactly these four bytes, which are four-byte aligned
-            // because the guest address and every chunk start are; the
-            // address-space lock keeps the mapping installed until the
-            // exchange completes. Guest vCPUs access the same bytes only
-            // through hardware atomics or plain stores, which an atomic RMW
-            // tolerates.
-            let word = unsafe { std::sync::atomic::AtomicU32::from_ptr(chunk.mapping.as_ptr().cast()) };
-            let observed = match word.compare_exchange(
-                current,
-                new,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            ) {
-                Ok(value) | Err(value) => value,
-            };
-            drop(host_access);
-            drop(access);
-            Ok(observed)
         })
+    }
+
+    /// [`Self::compare_exchange_u32`] for a Tool's
+    /// [`MemoryAccess::compare_exchange_u32`], which must be able to tell a
+    /// missing capability from a fault: a word on truncate-capable file
+    /// backing is reported as [`UserWordExchange::FileBacked`], with nothing
+    /// stored, rather than as the terminal shared-file failure the provider
+    /// path makes of it. The caller checks the alignment first.
+    fn exchange_user_u32(
+        &self,
+        guest_address: u64,
+        current: u32,
+        new: u32,
+    ) -> Result<UserWordExchange> {
+        self.memory
+            .with_copy(|copy| self.exchange_user_u32_admitted(guest_address, current, new, copy))
+    }
+
+    /// The exchange itself, under the caller's copy admission: the
+    /// translation, the writability check and the atomic exchange run under
+    /// one address-space lock. `guest_address` is four-byte aligned.
+    fn exchange_user_u32_admitted(
+        &self,
+        guest_address: u64,
+        current: u32,
+        new: u32,
+        copy: &CopyAccess,
+    ) -> Result<UserWordExchange> {
+        let denied = Error::GuestMemoryAccessDenied {
+            address: guest_address,
+            length: USER_WORD_LENGTH,
+        };
+        self.translate_admitted(guest_address, USER_WORD_LENGTH, copy)?;
+        let access = self
+            .memory
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        let (start, _) = access.user_extent(guest_address, USER_WORD_LENGTH)?;
+        if access.enabled
+            && !matches!(
+                access.pages.get(&(start / PAGE_SIZE as u64)),
+                Some(UserPageState::Accessible { writable: true, .. })
+            )
+        {
+            return Err(denied);
+        }
+        let physical = access.translate(guest_address, USER_WORD_LENGTH)?;
+        let offset = self.memory.checked_offset(physical, USER_WORD_LENGTH)?;
+        let chunks = self
+            .memory
+            .mapping
+            .host_chunks_from_state(&access, offset, USER_WORD_LENGTH);
+        // An aligned word never crosses a page, so it is one chunk.
+        let [chunk] = &chunks[..] else {
+            return Err(denied);
+        };
+        if matches!(chunk.backing.kind, BackingKind::OrdinaryFile { .. }) {
+            return Ok(UserWordExchange::FileBacked);
+        }
+        let host_access = self
+            .memory
+            .mapping
+            .slice
+            .backing
+            .host_access
+            .lock()
+            .expect("guest memory lock poisoned");
+        // SAFETY: host_chunks_from_state returned the live mmap pointer
+        // for exactly these four bytes, which are four-byte aligned
+        // because the guest address and every chunk start are; the
+        // address-space lock keeps the mapping installed until the
+        // exchange completes. Guest vCPUs access the same bytes only
+        // through hardware atomics or plain stores, which an atomic RMW
+        // tolerates.
+        let word = unsafe { std::sync::atomic::AtomicU32::from_ptr(chunk.mapping.as_ptr().cast()) };
+        let observed = match word.compare_exchange(
+            current,
+            new,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(value) | Err(value) => value,
+        };
+        drop(host_access);
+        drop(access);
+        Ok(UserWordExchange::Held(observed))
     }
 
     fn write_user(&self, guest_address: u64, source: &[u8], mode: Copyout) -> Result<()> {
@@ -5074,6 +5123,43 @@ mod user_copy_tests {
         }
     }
 
+    /// A Tool's compare-and-exchange (`MemoryAccess::compare_exchange_u32`)
+    /// stores only over the expected value and returns what the word held;
+    /// a misaligned word is `EINVAL`, and a read-only page, an inaccessible
+    /// page and an address outside user memory are `EFAULT`, each with
+    /// nothing stored and every guard released.
+    #[test]
+    fn user_compare_exchange_is_conditional_and_reports_faults_as_the_trait_states() {
+        let memory = fixture();
+        memory
+            .map_user_permissions(BASE + PAGE_SIZE as u64, PAGE_SIZE as u64, true, false)
+            .unwrap();
+        memory
+            .map_user_permissions(BASE + 2 * PAGE_SIZE as u64, PAGE_SIZE as u64, false, false)
+            .unwrap();
+        let mut user = memory.user();
+        let word = |address: u64| AddrMut::<u32>::from_raw(address as usize).unwrap();
+        let mut exchange = |address: u64, expected: u32, desired: u32| {
+            MemoryAccess::compare_exchange_u32(&mut user, word(address), expected, desired)
+        };
+        // The fixture fills every byte with 0xa5.
+        assert_eq!(exchange(BASE + 8, 0xa5a5_a5a5, 9), Ok(0xa5a5_a5a5));
+        assert_bytes(&memory, 8, &9_u32.to_ne_bytes());
+        assert_eq!(exchange(BASE + 8, 0xa5a5_a5a5, 11), Ok(9));
+        assert_eq!(exchange(BASE + 10, 9, 1), Err(Errno::EINVAL));
+        assert_eq!(
+            exchange(BASE + PAGE_SIZE as u64, 0xa5a5_a5a5, 1),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(
+            exchange(BASE + 2 * PAGE_SIZE as u64, 0xa5a5_a5a5, 1),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(exchange(memory.guest_end(), 0, 1), Err(Errno::EFAULT));
+        assert_bytes(&memory, 8, &9_u32.to_ne_bytes());
+        assert_released(&memory);
+    }
+
     #[test]
     fn user_copy_geometry_empty_and_disabled_access_contract() {
         for user in [false, true] {
@@ -5600,6 +5686,34 @@ impl MemoryAccess for UserMemory {
             Err(Errno::EIO)
         } else {
             ordinary
+        }
+    }
+
+    /// The exchange Linux's `futex_atomic_cmpxchg_inatomic` makes, atomic
+    /// with respect to every vCPU that can access the word: an aligned,
+    /// writable user word only. A misaligned address is `EINVAL` and a word
+    /// that is not writable user memory `EFAULT`, both with nothing stored.
+    /// A word on truncate-capable file backing, which this backend has no
+    /// proven fault-contained atomic store for, is `ENOSYS`, the missing
+    /// capability, with nothing stored and no failure recorded. An admission
+    /// or backend failure is `EIO`, never an ordinary fault.
+    fn compare_exchange_u32(
+        &mut self,
+        addr: reverie::syscalls::AddrMut<u32>,
+        expected: u32,
+        desired: u32,
+    ) -> std::result::Result<u32, Errno> {
+        let address = addr.as_raw() as u64;
+        if !address.is_multiple_of(USER_WORD_LENGTH as u64) {
+            return Err(Errno::EINVAL);
+        }
+        match self.exchange_user_u32(address, expected, desired) {
+            Ok(UserWordExchange::Held(observed)) => Ok(observed),
+            Ok(UserWordExchange::FileBacked) => Err(Errno::ENOSYS),
+            Err(Error::InvalidGuestAddress { .. } | Error::GuestMemoryAccessDenied { .. }) => {
+                Err(Errno::EFAULT)
+            }
+            Err(_) => Err(Errno::EIO),
         }
     }
 

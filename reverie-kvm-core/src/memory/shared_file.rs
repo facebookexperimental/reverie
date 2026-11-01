@@ -2178,6 +2178,47 @@ mod tests {
         assert_eq!(bytes(&file, 0, 4), [0x11; 4]);
     }
 
+    /// A Tool's compare-and-exchange of a word on a shared file page answers
+    /// the missing capability (`ENOSYS`) with nothing stored and records no
+    /// failure, so the mapping stays usable; the provider's exchange of the
+    /// same word keeps its terminal shared-file refusal.
+    #[test]
+    fn a_tool_exchange_on_file_backing_is_a_missing_capability_not_a_failure() {
+        let memory = fixture(2);
+        let file = file(1);
+        install(&memory, &file, BASE + P, 1, 0);
+        memory
+            .map_user_permissions(BASE + P, P, true, true)
+            .unwrap();
+        let mut user = memory.user();
+        let word = AddrMut::<u32>::from_raw((BASE + P) as usize).unwrap();
+        assert_eq!(
+            MemoryAccess::compare_exchange_u32(&mut user, word, 0x1111_1111, 7),
+            Err(Errno::ENOSYS)
+        );
+        assert_eq!(bytes(&file, 0, 4), [0x11; 4]);
+        assert!(memory.entry_gate().pending_failure().is_none());
+        // A private word next to it still exchanges.
+        let private = AddrMut::<u32>::from_raw(BASE as usize).unwrap();
+        assert_eq!(
+            MemoryAccess::compare_exchange_u32(&mut user, private, 0, 9),
+            Ok(0)
+        );
+        assert_eq!(read(&memory, BASE, 4), 9_u32.to_ne_bytes());
+        let error = memory
+            .user()
+            .compare_exchange_u32(BASE + P, 0x1111_1111, 7)
+            .unwrap_err();
+        assert!(matches!(
+            error.primary(),
+            Error::SharedFileCapability {
+                operation: "atomic compare-exchange",
+                ..
+            }
+        ));
+        assert_eq!(bytes(&file, 0, 4), [0x11; 4]);
+    }
+
     fn vector_transfer<M: MemoryAccess>(
         mut adapter: M,
         write: bool,

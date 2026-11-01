@@ -180,6 +180,27 @@ pub struct BackendCapabilities {
     /// the owner-word update to the kernel.
     pub runs_exit_robust_list: bool,
 
+    /// No Linux task exits for a guest thread, so Linux's exit-time walk of a
+    /// thread's robust-futex list (`exit_robust_list`, run by
+    /// `futex_exit_release` and `futex_exec_release`) never runs for one:
+    /// nothing marks an owner word `FUTEX_OWNER_DIED` or wakes its waiter. A
+    /// tool that models robust-futex owner death must make that transition
+    /// itself, with the guest compare-and-exchange
+    /// ([`MemoryAccess::compare_exchange_u32`](crate::syscalls::MemoryAccess::compare_exchange_u32)),
+    /// which such a backend implements. Such a backend also carries an exec
+    /// out itself, so it calls
+    /// [`Tool::handle_exec_commit`](crate::Tool::handle_exec_commit) at each
+    /// exec's point of no return, where the tool makes the walk Linux's
+    /// `futex_exec_release` makes. Never true together with
+    /// `runs_exit_robust_list`: a backend whose kernel walks the list must
+    /// leave the word to that walk, or the word would be marked twice.
+    /// - reverie-ptrace (and e9patch preprocessing, which runs on it),
+    ///   reverie-dbt, the in-guest backends (LiteInst) and SaBRe run every
+    ///   guest thread as a host task, whose exit runs Linux's walk;
+    /// - reverie-kvm runs guest threads on its own vCPUs: their exits are the
+    ///   backend's, and no Linux task exits with them.
+    pub kernel_never_walks_robust_lists: bool,
+
     /// The backend cannot execute a process-directed signal syscall with the
     /// tool's process identifier, so the tool must translate an unambiguous
     /// process target to a specific thread.
@@ -391,6 +412,7 @@ impl BackendCapabilities {
         process_exits_complete_asynchronously: false,
         tracks_process_children: true,
         runs_exit_robust_list: true,
+        kernel_never_walks_robust_lists: false,
         requires_thread_directed_process_signals: false,
         supports_parked_write_signal_interruption: true,
         reports_child_exit_publication: true,
@@ -503,6 +525,9 @@ impl BackendCapabilities {
     pub const KVM: Self = Self {
         needs_killed_thread_rpc_cancellation: true,
         runs_exit_robust_list: false,
+        // Guest threads run on the backend's vCPUs: no Linux task exits with
+        // one, so no kernel walk marks its robust-futex owner words.
+        kernel_never_walks_robust_lists: true,
         provides_process_signal_control: true,
         emulates_child_waits: true,
         reports_child_exit_publication: false,
@@ -543,6 +568,7 @@ mod tests {
             "process_exits_complete_asynchronously": false,
             "tracks_process_children": true,
             "runs_exit_robust_list": true,
+            "kernel_never_walks_robust_lists": false,
             "requires_thread_directed_process_signals": false,
             "supports_parked_write_signal_interruption": true,
             "reports_child_exit_publication": true,
@@ -689,6 +715,7 @@ mod tests {
             ptrace_with(serde_json::json!({
                 "needs_killed_thread_rpc_cancellation": true,
                 "runs_exit_robust_list": false,
+                "kernel_never_walks_robust_lists": true,
                 "provides_process_signal_control": true,
                 "emulates_child_waits": true,
                 "reports_child_exit_publication": false,
@@ -703,6 +730,26 @@ mod tests {
                 "provides_guest_backtraces": false,
             }))
         );
+    }
+
+    /// A kernel either walks a dying thread's robust list or never does: no
+    /// constant claims both, so a tool never marks a word that Linux's own
+    /// walk marks again.
+    #[test]
+    fn no_backend_both_runs_and_never_runs_the_kernel_robust_list_walk() {
+        for (name, caps) in [
+            ("PTRACE", BackendCapabilities::PTRACE),
+            ("E9PATCH", BackendCapabilities::E9PATCH),
+            ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
+            ("SABRE", BackendCapabilities::SABRE),
+            ("DBT", BackendCapabilities::DBT),
+            ("KVM", BackendCapabilities::KVM),
+        ] {
+            assert!(
+                !(caps.runs_exit_robust_list && caps.kernel_never_walks_robust_lists),
+                "{name}"
+            );
+        }
     }
 
     #[test]
