@@ -818,7 +818,7 @@ pub(super) fn munmap_shared_file(
 }
 
 // TODO-HUMAN-REVIEW(PR-132): Review KVM mprotect user-copy enforcement.
-pub(super) fn mprotect<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
+pub(super) fn mprotect(memory: &ProviderMemory<'_>, args: &[u64; 6]) -> i64 {
     let address = args[0];
     let requested_length = args[1];
     let grows_down = libc::PROT_GROWSDOWN as u64;
@@ -845,23 +845,19 @@ pub(super) fn mprotect<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
         return negative_errno(libc::EINVAL);
     }
     if grows != 0 {
-        // Linux applies one grows flag only to a mapping that grows that
-        // way, and no mapping here does: it answers ENOMEM when the range
-        // reaches no mapping (with PROT_GROWSUP, when its start is not
-        // mapped) and EINVAL otherwise.
-        let reaches_a_mapping = if grows == grows_down {
-            matches!(
-                memory.query(address, length),
-                RangeState::Mapped | RangeState::Mixed
-            )
+        // Linux takes the first mapping that ends above the start and begins
+        // below the end (vma_find): none is ENOMEM, and so, with
+        // PROT_GROWSUP, is one that begins above the start. Either flag then
+        // needs a mapping that grows that way, and no mapping here does
+        // (EINVAL). The range may leave the arena or a window, which `query`
+        // answers as a whole, so the search does not depend on it.
+        let searched = if grows == grows_down {
+            length
         } else {
-            matches!(memory.query(address, PAGE_SIZE), RangeState::Mapped)
+            PAGE_SIZE
         };
-        return negative_errno(if reaches_a_mapping {
-            libc::EINVAL
-        } else {
-            libc::ENOMEM
-        });
+        let found = memory.0.user_range_reaches_mapping(address, searched);
+        return negative_errno(if found { libc::EINVAL } else { libc::ENOMEM });
     }
     // PROT_SEM changes no mapping on x86-64: calc_vm_prot_bits drops it.
     let protection = protection & MMAP_PROT_BITS;

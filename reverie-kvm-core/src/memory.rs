@@ -650,6 +650,44 @@ impl AddressSpaceState {
         Err(self.invalid_address(address, length))
     }
 
+    /// Whether a page of user `[address, end)` is mapped. The range is taken
+    /// one region at a time, as [`Self::user_extent`] divides the user
+    /// addresses, so it may leave the identity addresses or a window; the
+    /// addresses between the regions are not user addresses, have no pages,
+    /// and are skipped.
+    fn user_range_reaches_mapping(&self, address: u64, end: u64) -> bool {
+        let page = PAGE_SIZE as u64;
+        let mut cursor = address;
+        while cursor < end {
+            let Ok((physical, limit)) = self.user_extent(cursor, 0) else {
+                let next_region = self
+                    .windows
+                    .iter()
+                    .map(|window| window.user_start)
+                    .chain(std::iter::once(self.coverage.start))
+                    .filter(|start| *start > cursor)
+                    .min();
+                match next_region {
+                    Some(start) => cursor = start,
+                    None => return false,
+                }
+                continue;
+            };
+            // The region holds `cursor`, so it ends above it.
+            let physical_end = limit.min(physical.saturating_add(end - cursor));
+            if self
+                .pages
+                .range(physical / page..=(physical_end - 1) / page)
+                .next()
+                .is_some()
+            {
+                return true;
+            }
+            cursor += physical_end - physical;
+        }
+        false
+    }
+
     /// The user address of physical address `physical`, if it has one.
     fn physical_to_user(&self, physical: u64) -> Option<u64> {
         if let Some(window) = self.windows.iter().find(|window| {
@@ -2962,6 +3000,21 @@ impl GuestMemory {
             .lock()
             .expect("guest memory access map lock poisoned");
         (first_page..=last_page).all(|page| access.pages.contains_key(&page))
+    }
+
+    /// Whether any page of user `[address, address + length)` is mapped,
+    /// wherever the range lies. Unlike [`Self::user_range_to_guest`], the
+    /// range need not lie in one region (the identity addresses, or a window):
+    /// it may span several and the addresses between them, which are not user
+    /// addresses and are never mapped. A range that would pass the end of the
+    /// address space stops there. The cost grows with the number of regions,
+    /// not with the length.
+    pub fn user_range_reaches_mapping(&self, address: u64, length: u64) -> bool {
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .user_range_reaches_mapping(address, address.saturating_add(length))
     }
 
     /// The highest page-aligned `length`-byte range of unmapped physical pages in
@@ -6465,6 +6518,48 @@ mod tests {
         let mut bytes = [0; 16];
         memory.read_raw(8 * MIB, &mut bytes).unwrap();
         assert_eq!(bytes, [[2; 8], [3; 8]].concat()[..]);
+    }
+
+    /// A mapped page is found anywhere in a range that leaves one region: from
+    /// an identity address or from an address between the regions, into the
+    /// stack window, and past the end of the user addresses, however long the
+    /// range. A physical page with no user address is never found, and the
+    /// identity addresses find a window's physical page once they reach it.
+    #[test]
+    fn user_range_reaches_mapping_across_regions() {
+        let page = PAGE_SIZE as u64;
+        let memory = GuestMemory::new(0, (16 * MIB) as usize).unwrap();
+        let window = memory.establish_user_stack_window(8 * MIB).unwrap();
+        // An identity page, the window's third page, and the window's last
+        // physical page, which has no user address.
+        for physical in [4 * page, 8 * MIB + 2 * page, 16 * MIB - page] {
+            memory
+                .map_user_permissions(physical, page, true, true)
+                .unwrap();
+        }
+        let reaches = |start: u64, end: u64| memory.user_range_reaches_mapping(start, end - start);
+        // Within one region.
+        assert!(reaches(4 * page, 5 * page));
+        assert!(!reaches(5 * page, 8 * MIB));
+        assert!(reaches(window, window + 3 * page));
+        assert!(!reaches(window, window + 2 * page));
+        assert!(!reaches(window + 3 * page, USER_STACK_TOP));
+        // From an identity address, or from between the regions, into the
+        // window.
+        assert!(reaches(5 * page, window + 3 * page));
+        assert!(!reaches(5 * page, window + 2 * page));
+        assert!(reaches(8 * MIB, window + 3 * page));
+        assert!(!reaches(8 * MIB, window + 2 * page));
+        // Past the end of the user addresses, however long the range.
+        assert!(!reaches(window + 3 * page, window + 3 * page + (1 << 46)));
+        assert!(!memory.user_range_reaches_mapping(USER_STACK_TOP, u64::MAX));
+        assert!(memory.user_range_reaches_mapping(5 * page, 1 << 47));
+        assert!(memory.user_range_reaches_mapping(0, u64::MAX));
+        // Identity addresses that end above the window's physical start reach
+        // its pages there.
+        memory.set_user_identity_end(9 * MIB);
+        assert!(reaches(8 * MIB, 8 * MIB + 3 * page));
+        assert!(!reaches(8 * MIB, 8 * MIB + 2 * page));
     }
 
     const MIB: u64 = 1024 * 1024;

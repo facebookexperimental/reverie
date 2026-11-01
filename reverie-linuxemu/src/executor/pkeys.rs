@@ -71,7 +71,7 @@ pub(super) fn pkey_free(_args: &[u64; 6]) -> i64 {
 }
 
 /// `pkey_mprotect(start, len, prot, pkey)` without protection keys.
-pub(super) fn pkey_mprotect<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
+pub(super) fn pkey_mprotect(memory: &ProviderMemory<'_>, args: &[u64; 6]) -> i64 {
     // TODO-HUMAN-REVIEW(PR-id): Review the answers of a CPU without protection keys.
     // The key is an `int`: Linux reads the register's low 32 bits.
     if args[3] as u32 as i32 == -1 {

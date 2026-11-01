@@ -157,11 +157,17 @@ fn pkey_mprotect_with_key_minus_one_is_mprotect() {
 /// do_mprotect_pkey's order: both grows flags, or a start that is not
 /// page-aligned (EINVAL); a zero length (0); a range that wraps (ENOMEM);
 /// the protection bits, of which PROT_SEM is valid (EINVAL); and only then
-/// the mappings: one grows flag where no mapping grows (EINVAL where the
-/// range reaches a mapping, ENOMEM where it does not), or a page that is
-/// not mapped (ENOMEM). Each expected answer is what Linux 6.19.2 gave on a
-/// vCPU without protection keys for the same call on the same layout: an
-/// unmapped page, a read-write page, then unmapped pages.
+/// the mappings: one grows flag where no mapping grows (EINVAL where Linux
+/// finds a mapping, anywhere in the range for PROT_GROWSDOWN and at its
+/// start for PROT_GROWSUP; ENOMEM where it finds none), also over a range
+/// that leaves the arena, or a page that is not mapped (ENOMEM). Each
+/// expected answer is what Linux 6.19.2 gave on a vCPU without protection
+/// keys for the same call on the same layout: an unmapped page, a read-write
+/// page, then unmapped pages through the 16th page from the first; here the
+/// arena ends among them. The answers to the longer ranges, of 2^46 bytes
+/// or above 2^47, depend on nothing mapped beyond: each is decided by the
+/// range's first page, by the read-write page, or by there being no mapping
+/// at or above 2^47.
 #[test]
 fn mprotect_and_key_minus_one_check_in_linux_order() {
     let root = TestDir::new();
@@ -187,9 +193,15 @@ fn mprotect_and_key_minus_one_check_in_linux_order() {
     );
     let (einval, enomem) = (negative_errno(libc::EINVAL), negative_errno(libc::ENOMEM));
     let wrap = mapped.wrapping_neg();
+    // Sixteen pages from each address of the layout leave the arena.
+    let past = 16 * PAGE_SIZE;
+    assert!(hole_below + past > memory.guest_end());
+    let (huge, above) = (1_u64 << 46, 1_u64 << 47);
     let cases = [
         // Both grows flags, before alignment and length.
         ([mapped + 1, 0, rw | down | up], einval),
+        ([mapped, 0, rw | down | up], einval),
+        ([hole_above, PAGE_SIZE, rw | down | up], einval),
         // Alignment, before the length.
         ([mapped + 1, 0, 0x10], einval),
         ([mapped + 1, PAGE_SIZE, rw], einval),
@@ -212,9 +224,23 @@ fn mprotect_and_key_minus_one_check_in_linux_order() {
         ([hole_above, PAGE_SIZE, read | up], enomem),
         ([hole_below, 2 * PAGE_SIZE, rw | down], einval),
         ([hole_below, 2 * PAGE_SIZE, read | up], enomem),
+        // ... over a range that leaves the arena: the mapping is found where
+        // the range is, not only where the arena is.
+        ([mapped, past, rw | down], einval),
+        ([mapped, past, read | up], einval),
+        ([hole_below, past, rw | down], einval),
+        ([hole_below, past, read | up], enomem),
+        ([hole_above, past, rw | down], enomem),
+        ([mapped, huge, rw | down], einval),
+        ([hole_below, huge, rw | down], einval),
+        ([hole_below, huge, read | up], enomem),
+        ([above, huge, rw | down], enomem),
         // A page that is not mapped.
         ([hole_above, PAGE_SIZE, rw], enomem),
         ([mapped, 2 * PAGE_SIZE, rw], enomem),
+        ([mapped, past, rw], enomem),
+        ([mapped, huge, rw], enomem),
+        ([above, huge, rw], enomem),
     ];
     for ([start, length, prot], result) in cases {
         assert_eq!(
