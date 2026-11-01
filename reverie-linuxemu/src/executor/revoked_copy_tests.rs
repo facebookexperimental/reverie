@@ -542,6 +542,14 @@ impl NofileLimit {
     }
 
     fn soft() -> libc::rlim_t {
+        Self::current().rlim_cur
+    }
+
+    fn hard() -> libc::rlim_t {
+        Self::current().rlim_max
+    }
+
+    fn current() -> libc::rlimit {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -551,7 +559,7 @@ impl NofileLimit {
             unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
             0
         );
-        limit.rlim_cur
+        limit
     }
 }
 
@@ -726,5 +734,119 @@ fn a_copy_whose_limit_falls_after_the_check_ends_the_run_and_stays_recorded() {
     for thread in [&mut first, &mut second] {
         assert!(call(thread, &memory, libc::SYS_getpid, [0; 6]) > 0);
     }
+    assert_eq!(read_byte(&reader).unwrap(), None);
+}
+
+/// A copy a call reached and whose entry another thread then retired is
+/// replaced when that call ends. If that replacement fails (here the hard
+/// limit falls below the copy after the retirement checked it, through a
+/// test hook inside the call), the call does not return to the guest: it ends
+/// the run with the named refusal, and the copy, which still holds the
+/// description, stays its thread's.
+#[test]
+fn a_deferred_replacement_that_fails_ends_the_call_by_name() {
+    if run_isolated("a_deferred_replacement_that_fails_ends_the_call_by_name") {
+        return;
+    }
+    let (reader, leader, mut first, second) = leader_and_parked_threads(|_| {});
+    let leader = Rc::new(RefCell::new(leader));
+    let lowest = lowest_copy([&first, &second]);
+    let copy = first.state.files.copies()[&3].as_raw_fd();
+    let mut memory = GuestMemory::new(0, 4096).unwrap();
+    memory.write(0x100, b"z").unwrap();
+    let close = closer(&leader, 3);
+    when_a_copy_is_reached(move || {
+        // The close runs with the limits as they were: it leaves the
+        // reached copy to the call. Then the hard limit falls below it.
+        close();
+        std::mem::forget(NofileLimit::set(
+            lowest as libc::rlim_t,
+            Some(lowest as libc::rlim_t),
+        ));
+    });
+    let error = first
+        .execute_checked(
+            &SyscallRequest::new(libc::SYS_write as u64, [3, 0x100, 1, 0, 0, 0]),
+            &memory,
+        )
+        .unwrap_err();
+    assert_descriptors_refusal(&error);
+    // The write itself completed on the original description.
+    assert_eq!(read_byte(&reader).unwrap(), Some(b'z'));
+    // SAFETY: F_GETFL reads only the descriptor's status flags.
+    let flags = unsafe { libc::fcntl(copy, libc::F_GETFL) };
+    assert!(
+        flags >= 0 && flags & libc::O_PATH == 0,
+        "the unreplaced copy keeps the description, and stays the thread's"
+    );
+    drop(second);
+    assert_write_end_open(&reader, "while the unreplaced copy holds it");
+}
+
+/// Another process can lower the hard limit while a replacement holds the
+/// soft limit raised (here through a test hook at that point). The soft
+/// limit is then put back under the hard limit as it is, not the one read
+/// before: the replacement succeeds and the soft limit is as it was.
+#[test]
+fn a_raised_soft_limit_is_put_back_under_a_lowered_hard_limit() {
+    if run_isolated("a_raised_soft_limit_is_put_back_under_a_lowered_hard_limit") {
+        return;
+    }
+    let (reader, mut leader, first, second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    let highest = [&first, &second]
+        .iter()
+        .map(|thread| thread.state.files.copies()[&3].as_raw_fd())
+        .max()
+        .unwrap();
+    let lowest = lowest_copy([&first, &second]);
+    // S <= lowest < N = highest + 1 <= H2 < H.
+    let soft = lowest as libc::rlim_t;
+    let _limit = NofileLimit::set(soft, None);
+    let lowered = highest as libc::rlim_t + 8;
+    assert!(lowered < NofileLimit::hard());
+    SOFT_LIMIT_RAISED_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // Keep the raised soft limit; lower only the hard one.
+            std::mem::forget(NofileLimit::set(NofileLimit::soft(), Some(lowered)));
+        }))
+    });
+    assert_eq!(
+        call(&mut leader, &memory, libc::SYS_close, [3, 0, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(read_byte(&reader).unwrap(), None);
+    assert_eq!(NofileLimit::soft(), soft, "the soft limit must be put back");
+    assert_eq!(NofileLimit::hard(), lowered);
+    drop((first, second));
+}
+
+/// A raised soft limit that cannot be put back (here a test hook makes the
+/// restoring setrlimit fail) ends the run with the named refusal: the copy
+/// was replaced and the close published, but no guest descriptor may be
+/// allocated under a limit the guest did not set.
+#[test]
+fn a_soft_limit_that_cannot_be_put_back_ends_the_run_by_name() {
+    if run_isolated("a_soft_limit_that_cannot_be_put_back_ends_the_run_by_name") {
+        return;
+    }
+    let (reader, mut leader, first, second) = leader_and_parked_threads(|_| {});
+    let memory = GuestMemory::new(0, 4096).unwrap();
+    let lowest = lowest_copy([&first, &second]);
+    let _limit = NofileLimit::set(lowest as libc::rlim_t, None);
+    RESTORE_FAILS_TEST_HOOK.with(|fails| fails.set(true));
+    let error = leader
+        .execute_checked(
+            &SyscallRequest::new(libc::SYS_close as u64, [3, 0, 0, 0, 0, 0]),
+            &memory,
+        )
+        .unwrap_err();
+    assert_descriptors_refusal(&error);
+    assert!(
+        format!("{error:?}").contains("could not be put back"),
+        "{error:?}"
+    );
+    assert!(!leader.file_table.lock().unwrap().files.contains_key(&3));
+    drop((first, second));
     assert_eq!(read_byte(&reader).unwrap(), None);
 }

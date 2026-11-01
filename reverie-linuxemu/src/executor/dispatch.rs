@@ -942,15 +942,19 @@ impl ElfExecutor {
         self.state.signal_refusal = None;
         // The copies this call reaches stay its own until it returns, and
         // any whose entries another thread retired meanwhile are replaced
-        // then (`PrivateCopies`).
-        let _call = self.state.private_copy_gate.call_scope();
+        // then, before the guest continues (`PrivateCopies`); a replacement
+        // that fails there ends the run by name (`CallScope::end`).
+        let call = self.state.private_copy_gate.call_scope();
         let result = self
             .execute_checked_dispatch(request, memory, terminal_read)
             .map_err(|error| memory.capture_shared_file_error(error));
+        let ended = call.end(self.state.tid);
         if let Some(failure) = memory.entry_gate().pending_failure() {
             return Err(failure.error());
         }
-        result
+        let value = result?;
+        ended?;
+        Ok(value)
     }
 
     fn execute_checked_dispatch(

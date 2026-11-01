@@ -599,8 +599,10 @@ enum UnreplacedCause {
     /// At or above this process's hard `RLIMIT_NOFILE`, where `dup3` cannot
     /// put the placeholder; found before anything was published.
     AboveHardLimit,
-    /// The replacement failed after the guest's change was published.
-    Failed(std::io::Error),
+    /// A replacement failed: the copy keeps its description
+    /// (`ReplaceFailure::NotReplaced`), or the soft limit raised for it
+    /// stays raised (`ReplaceFailure::LimitNotRestored`).
+    Replacement(ReplaceFailure),
 }
 
 impl UnreplacedCopy {
@@ -621,12 +623,12 @@ impl UnreplacedCopy {
                  published, with every copy as it was",
                 self.tid, self.host,
             ),
-            UnreplacedCause::Failed(error) => format!(
-                "KVM descriptor retirement: thread {}'s copy of {descriptor} (host descriptor {}) \
-                 could not be replaced after another thread closed or replaced it ({error}) under \
-                 this process's RLIMIT_NOFILE ({limits}); the copy still holds the closed \
-                 description, so the run ends here rather than leave a reader waiting for its EOF",
-                self.tid, self.host,
+            UnreplacedCause::Replacement(failure) => format!(
+                "KVM descriptor retirement: thread {}'s copy of {descriptor} (host descriptor {}), \
+                 which another thread closed or replaced: {}",
+                self.tid,
+                self.host,
+                failure.describe(&limits),
             ),
         };
         crate::Error::HostResources {
@@ -801,23 +803,35 @@ impl PrivateCopies {
                     Ok(()) => {
                         task.files.remove(&fd);
                     }
-                    Err(error) => unreplaced.push(UnreplacedCopy {
-                        tid,
-                        fd: Some(fd),
-                        host,
-                        cause: UnreplacedCause::Failed(error),
-                    }),
+                    Err(failure) => {
+                        // A copy that now holds the placeholder is no longer
+                        // a copy of the entry, whatever else failed.
+                        if failure.replaced() {
+                            task.files.remove(&fd);
+                        }
+                        unreplaced.push(UnreplacedCopy {
+                            tid,
+                            fd: Some(fd),
+                            host,
+                            cause: UnreplacedCause::Replacement(failure),
+                        });
+                    }
                 }
             }
             if let Some(host) = stdin {
                 match ledger.retire_copy(host) {
                     Ok(()) => task.stdin = None,
-                    Err(error) => unreplaced.push(UnreplacedCopy {
-                        tid,
-                        fd: None,
-                        host,
-                        cause: UnreplacedCause::Failed(error),
-                    }),
+                    Err(failure) => {
+                        if failure.replaced() {
+                            task.stdin = None;
+                        }
+                        unreplaced.push(UnreplacedCopy {
+                            tid,
+                            fd: None,
+                            host,
+                            cause: UnreplacedCause::Replacement(failure),
+                        });
+                    }
                 }
             }
         }
@@ -901,7 +915,7 @@ impl CopyLedger {
     /// A retirement's part for one copy: leaves a reached copy to its call,
     /// and otherwise replaces it now. A descriptor that is no longer the
     /// task's copy is left alone.
-    fn retire_copy(&mut self, host: RawFd) -> std::io::Result<()> {
+    fn retire_copy(&mut self, host: RawFd) -> Result<(), ReplaceFailure> {
         if self.foreign.contains(&host) {
             return Ok(());
         }
@@ -909,9 +923,14 @@ impl CopyLedger {
             self.deferred.insert(host);
             return Ok(());
         }
-        replace_copy(host)?;
-        self.revoked.insert(host);
-        Ok(())
+        let result = replace_copy(host);
+        if result
+            .as_ref()
+            .map_or_else(ReplaceFailure::replaced, |()| true)
+        {
+            self.revoked.insert(host);
+        }
+        result
     }
 }
 
@@ -975,12 +994,12 @@ impl PrivateCopyGate {
         ledger.foreign.clear();
     }
 
-    /// The scope of one call of this task: when it ends, the copies the call
-    /// reached become replaceable again, and those whose entries were retired
-    /// meanwhile are replaced.
+    /// The scope of one call of this task: when it ends
+    /// ([`CallScope::end`]), the copies the call reached become replaceable
+    /// again, and those whose entries were retired meanwhile are replaced.
     pub(crate) fn call_scope(&self) -> CallScope {
         self.ledger().in_call = true;
-        CallScope(self.0.clone())
+        CallScope(Some(self.0.clone()))
     }
 
     /// Closes the gate and, under it, makes each of `copies` drop its
@@ -991,10 +1010,14 @@ impl PrivateCopyGate {
         ledger.open = false;
         ledger.reached.clear();
         ledger.deferred.clear();
-        // A copy that cannot be replaced keeps its description until its
-        // owner closes it, later in this exit.
+        // A copy that cannot be replaced without raising the soft limit
+        // keeps its description until its owner closes it, later in this
+        // exit: the exit raises no limit.
+        let Ok(placeholder) = revoked_copy_placeholder() else {
+            return;
+        };
         for copy in copies {
-            let _ = replace_copy(copy.as_raw_fd());
+            let _ = dup3_retrying(placeholder, copy.as_raw_fd());
         }
     }
 }
@@ -1006,12 +1029,30 @@ impl Drop for PrivateCopyGate {
 }
 
 /// One call of a task, from its start to its end (`PrivateCopyGate::call_scope`).
-pub(crate) struct CallScope(Arc<Mutex<CopyLedger>>);
+/// The call's executor ends it explicitly ([`Self::end`]) before the guest
+/// continues; dropping it unended (an unwinding call) does the same and
+/// drops the result.
+pub(crate) struct CallScope(Option<Arc<Mutex<CopyLedger>>>);
 
-impl Drop for CallScope {
-    fn drop(&mut self) {
-        let mut ledger = self
-            .0
+impl CallScope {
+    /// Ends the call of task `tid`: the copies it reached become replaceable
+    /// again, and each whose entry another task retired meanwhile is
+    /// replaced now (`replace_copy`). A replacement that fails, which the
+    /// retirement's check rules out unless this process's hard limit fell
+    /// below the copy since, or whose raised soft limit cannot be put back,
+    /// ends the run here with the named refusal `HostResources`, before the
+    /// guest continues: an unreplaced copy keeps the closed description, so
+    /// a reader would otherwise wait for an EOF Linux gives it. The copy
+    /// stays the task's, recorded for its owner to close.
+    pub(crate) fn end(mut self, tid: i32) -> crate::Result<()> {
+        match self.0.take() {
+            Some(ledger) => Self::finish(&ledger, tid),
+            None => Ok(()),
+        }
+    }
+
+    fn finish(ledger: &Mutex<CopyLedger>, tid: i32) -> crate::Result<()> {
+        let mut ledger = ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         ledger.in_call = false;
@@ -1020,21 +1061,41 @@ impl Drop for CallScope {
             // The task's exit has given its copies up; one handed to a
             // cleanup service is no longer the task's to touch.
             ledger.deferred.clear();
-            return;
+            return Ok(());
         }
+        let mut first = None;
         for host in std::mem::take(&mut ledger.deferred) {
             match replace_copy(host) {
                 Ok(()) => {
                     ledger.revoked.insert(host);
                 }
-                // Not replaced, which the retirement's check rules out unless
-                // this process's hard limit fell below the copy since: the
-                // copy keeps its description, the original, until the owner's
-                // next install, at the start of its next call, retires it.
-                Err(_) => {
-                    ledger.deferred.insert(host);
+                Err(failure) => {
+                    if failure.replaced() {
+                        ledger.revoked.insert(host);
+                    } else {
+                        ledger.deferred.insert(host);
+                    }
+                    first.get_or_insert(UnreplacedCopy {
+                        tid,
+                        fd: None,
+                        host,
+                        cause: UnreplacedCause::Replacement(failure),
+                    });
                 }
             }
+        }
+        match first {
+            None => Ok(()),
+            Some(copy) => Err(copy.into_call_end_error()),
+        }
+    }
+}
+
+impl Drop for CallScope {
+    fn drop(&mut self) {
+        if let Some(ledger) = self.0.take() {
+            // Only an unwinding call ends here; its own error ends the run.
+            let _ = Self::finish(&ledger, 0);
         }
     }
 }
@@ -1060,6 +1121,15 @@ std::thread_local! {
     /// before it changes anything.
     pub(crate) static PUBLICATION_CHECKED_TEST_HOOK: OneShotTestHook =
         const { std::cell::RefCell::new(None) };
+    /// Runs once on the calling thread right after a replacement raised the
+    /// soft limit for a copy's `dup3`, before it puts the limit back
+    /// (`replace_copy`): where another process can change the limits.
+    pub(crate) static SOFT_LIMIT_RAISED_TEST_HOOK: OneShotTestHook =
+        const { std::cell::RefCell::new(None) };
+    /// When set, the next restoration of a raised soft limit on this thread
+    /// fails as a refused `setrlimit` would (`restore_soft_limit`).
+    pub(crate) static RESTORE_FAILS_TEST_HOOK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Runs `hook` once, if this thread installed it.
@@ -1202,55 +1272,169 @@ fn revoked_copy_placeholder() -> std::io::Result<RawFd> {
     Ok(PLACEHOLDER.get_or_init(|| file).as_raw_fd())
 }
 
+/// Why a copy's replacement failed (`replace_copy`).
+#[derive(Debug)]
+pub(super) enum ReplaceFailure {
+    /// The copy keeps its description: `dup3` refused it (or the
+    /// placeholder is gone).
+    NotReplaced(std::io::Error),
+    /// The soft limit raised for the copy's `dup3` could not be put back to
+    /// `saved`, so `raised` stays in force. `replaced` says whether the copy
+    /// holds the placeholder.
+    LimitNotRestored {
+        saved: libc::rlim_t,
+        raised: libc::rlim_t,
+        replaced: bool,
+        error: std::io::Error,
+    },
+}
+
+impl ReplaceFailure {
+    /// Whether the copy holds the placeholder anyway.
+    fn replaced(&self) -> bool {
+        matches!(self, Self::LimitNotRestored { replaced: true, .. })
+    }
+
+    /// What went wrong, for a refusal's diagnostic, under `limits`.
+    fn describe(&self, limits: &str) -> String {
+        match self {
+            Self::NotReplaced(error) => format!(
+                "it could not be replaced ({error}) under this process's RLIMIT_NOFILE \
+                 ({limits}); the copy still holds the closed description, so the run ends here \
+                 rather than leave a reader waiting for its EOF"
+            ),
+            Self::LimitNotRestored {
+                saved,
+                raised,
+                replaced,
+                error,
+            } => format!(
+                "the soft RLIMIT_NOFILE raised to {raised} for its replacement could not be put \
+                 back to {saved} ({error}; now {limits}); the copy {}, and the run ends here \
+                 rather than allocate guest descriptors under a limit the guest did not set",
+                if *replaced {
+                    "holds the placeholder"
+                } else {
+                    "still holds the closed description"
+                },
+            ),
+        }
+    }
+}
+
+impl UnreplacedCopy {
+    /// The run-ending refusal for a copy whose replacement failed at the end
+    /// of the call that held it (`CallScope::end`).
+    fn into_call_end_error(self) -> crate::Error {
+        let limits = reverie_kvm_core::host_limits::descriptor_limit_text();
+        let UnreplacedCause::Replacement(failure) = self.cause else {
+            unreachable!("a call's end fails only by a replacement");
+        };
+        crate::Error::HostResources {
+            resource: reverie_kvm_core::host_limits::HostResource::Descriptors,
+            diagnostic: format!(
+                "KVM descriptor retirement: thread {}'s copy (host descriptor {}) of a \
+                 descriptor another thread closed or replaced while this thread's call was \
+                 using it, at the end of that call: {}",
+                self.tid,
+                self.host,
+                failure.describe(&limits),
+            ),
+        }
+    }
+}
+
 /// Puts the placeholder's description on copy `host`, dropping `host`'s own.
 ///
 /// `dup3` refuses a target at or above this process's soft `RLIMIT_NOFILE`
 /// (EBADF), even an open one, while Linux closes such a descriptor at any
 /// limit. A copy above a lowered soft limit is replaced with the soft limit
-/// raised just past it for the one call, and restored, under
-/// [`NOFILE_LIMIT_ADJUSTMENT`], which every read of the guest's descriptor
-/// limit also takes (`guest_nofile_limit`), so no guest allocation sees the
-/// raised value. A copy at or above the hard limit (lowered after the copy
-/// was made) cannot be replaced; a retirement looks for one before it
-/// changes anything (`PrivateCopies::first_unreplaceable`). Closing the copy
-/// instead would leave its owner's `File` naming a number that is no longer
-/// its own.
-fn replace_copy(host: RawFd) -> std::io::Result<()> {
-    let placeholder = revoked_copy_placeholder()?;
-    match dup3_retrying(placeholder, host) {
-        Err(error) if error.raw_os_error() == Some(libc::EBADF) => {
-            let _adjustment = NOFILE_LIMIT_ADJUSTMENT
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut limit = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            // SAFETY: getrlimit writes only `limit`.
-            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-                return Err(error);
-            }
-            let needed = host as libc::rlim_t + 1;
-            if needed <= limit.rlim_cur || needed > limit.rlim_max {
-                return Err(error);
-            }
-            let raised = libc::rlimit {
-                rlim_cur: needed,
-                rlim_max: limit.rlim_max,
-            };
-            // SAFETY: setrlimit reads only `raised`, a soft limit within the
-            // hard one, which this process may always set.
-            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
-                return Err(error);
-            }
-            let replaced = dup3_retrying(placeholder, host);
-            // SAFETY: restores the soft limit read above; lowering a soft
-            // limit is always allowed.
-            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
-            replaced
-        }
-        other => other,
+/// raised just past it for the one call, under [`NOFILE_LIMIT_ADJUSTMENT`],
+/// which every read of the guest's descriptor limit also takes
+/// (`guest_nofile_limit`), so no guest allocation sees the raised value. The
+/// soft limit is then put back, under the hard limit as it is then (another
+/// process may have lowered it meanwhile): a restoration that fails is
+/// reported (`ReplaceFailure::LimitNotRestored`), and ends the run. A copy at
+/// or above the hard limit (lowered after the copy was made) cannot be
+/// replaced; a retirement looks for one before it changes anything
+/// (`PrivateCopies::first_unreplaceable`). Closing the copy instead would
+/// leave its owner's `File` naming a number that is no longer its own.
+fn replace_copy(host: RawFd) -> Result<(), ReplaceFailure> {
+    let placeholder = revoked_copy_placeholder().map_err(ReplaceFailure::NotReplaced)?;
+    let error = match dup3_retrying(placeholder, host) {
+        Err(error) if error.raw_os_error() == Some(libc::EBADF) => error,
+        other => return other.map_err(ReplaceFailure::NotReplaced),
+    };
+    let _adjustment = NOFILE_LIMIT_ADJUSTMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(limit) = nofile_limit() else {
+        return Err(ReplaceFailure::NotReplaced(error));
+    };
+    let needed = host as libc::rlim_t + 1;
+    if needed <= limit.rlim_cur || needed > limit.rlim_max {
+        return Err(ReplaceFailure::NotReplaced(error));
     }
+    let raised = libc::rlimit {
+        rlim_cur: needed,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: setrlimit reads only `raised`, a soft limit within the hard
+    // one, which this process may always set.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        return Err(ReplaceFailure::NotReplaced(error));
+    }
+    #[cfg(test)]
+    run_one_shot_test_hook(&SOFT_LIMIT_RAISED_TEST_HOOK);
+    let replaced = dup3_retrying(placeholder, host);
+    match (restore_soft_limit(limit.rlim_cur, needed), replaced) {
+        (Ok(()), replaced) => replaced.map_err(ReplaceFailure::NotReplaced),
+        (Err(error), replaced) => Err(ReplaceFailure::LimitNotRestored {
+            saved: limit.rlim_cur,
+            raised: needed,
+            replaced: replaced.is_ok(),
+            error,
+        }),
+    }
+}
+
+/// This process's `RLIMIT_NOFILE`, if it can be read.
+fn nofile_limit() -> Option<libc::rlimit> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only `limit`.
+    (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0).then_some(limit)
+}
+
+/// Puts this process's soft `RLIMIT_NOFILE` back to `saved` after a
+/// replacement raised it to `raised`, keeping the hard limit as it is now:
+/// another process may have lowered it meanwhile, and setting the old one
+/// again would need a privilege to raise it. A soft limit no longer at
+/// `raised` was set since by someone else, whose limit stands.
+fn restore_soft_limit(saved: libc::rlim_t, raised: libc::rlim_t) -> std::io::Result<()> {
+    let now = nofile_limit().ok_or_else(std::io::Error::last_os_error)?;
+    if now.rlim_cur != raised {
+        return Ok(());
+    }
+    if saved > now.rlim_max {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let restored = libc::rlimit {
+        rlim_cur: saved,
+        rlim_max: now.rlim_max,
+    };
+    #[cfg(test)]
+    if RESTORE_FAILS_TEST_HOOK.with(|fails| fails.replace(false)) {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    // SAFETY: setrlimit reads only `restored`: a lower soft limit under the
+    // current hard limit, which lowering always allows.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &restored) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn dup3_retrying(placeholder: RawFd, host: RawFd) -> std::io::Result<()> {
