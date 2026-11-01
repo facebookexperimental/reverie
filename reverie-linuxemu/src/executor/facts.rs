@@ -490,8 +490,8 @@ impl ElfExecutor {
     /// as it was where Linux shows it changed: `mlock(2)` and `mlock2(2)`,
     /// `madvise(2)` with `MADV_DONTFORK`, `MADV_DONTDUMP` or
     /// `MADV_WIPEONFORK`, `mseal(2)`, `mbind(2)` and
-    /// `prctl(PR_SET_VMA)` (ENOSYS); `mprotect(2)` with `PROT_GROWSDOWN` or
-    /// `PROT_SEM`, `mremap(2)` with `MREMAP_DONTUNMAP`, and a same-size
+    /// `prctl(PR_SET_VMA)` (ENOSYS); `mprotect(2)` with `PROT_GROWSDOWN`,
+    /// `mremap(2)` with `MREMAP_DONTUNMAP`, and a same-size
     /// `mremap(2)` move of a range with a hole after its start, which Linux
     /// moves, keeping the hole (EINVAL); a `MAP_FIXED` mapping or an
     /// `mremap(2)` destination in the window (ENOMEM and EINVAL); and a
@@ -2673,6 +2673,11 @@ mod memory_map_tests {
         type Calls = Vec<(libc::c_long, [u64; 3])>;
         let cases: Vec<(&str, Calls, reverie::MemoryMap)> = vec![
             ("read-only", vec![protect(libc::PROT_READ)], split(r)),
+            (
+                "read-only, PROT_SEM ignored",
+                vec![protect(libc::PROT_READ | PROT_SEM as i32)],
+                split(r),
+            ),
             ("inaccessible", vec![protect(libc::PROT_NONE)], split(0)),
             ("read-write-execute", vec![protect(RWX as i32)], split(RWX)),
             ("write-only", vec![protect(libc::PROT_WRITE)], split(w)),
@@ -3139,12 +3144,11 @@ mod memory_map_tests {
     /// Linux refuses; madvise and munlock over no page; a munlock that starts
     /// at no mapping, which Linux refuses first; mprotect and munlock of the
     /// heap; munlock and munlockall, since nothing is locked; mprotect to the
-    /// protection the stack has. So do the calls this
+    /// protection the stack has, with or without `PROT_SEM`, which changes
+    /// nothing on x86-64. So do the calls this
     /// executor refuses before anything changes, where Linux applies them:
-    /// mlock and mlock2 (ENOSYS), mprotect with `PROT_GROWSDOWN` or
-    /// `PROT_SEM` (EINVAL; Linux on x86-64 ignores `PROT_SEM` and applies the
-    /// rest), a fixed mapping in the window (ENOMEM) and an mremap there
-    /// (EINVAL).
+    /// mlock and mlock2 (ENOSYS), mprotect with `PROT_GROWSDOWN` (EINVAL), a
+    /// fixed mapping in the window (ENOMEM) and an mremap there (EINVAL).
     #[test]
     fn calls_that_keep_the_stacks_mapping_leave_it_listed() {
         let directory = Directory::new();
@@ -3172,7 +3176,7 @@ mod memory_map_tests {
                 "advice {advice}"
             );
         }
-        let refused: [(&str, libc::c_long, [u64; 3], i32); 10] = [
+        let refused: [(&str, libc::c_long, [u64; 3], i32); 9] = [
             (
                 "MADV_DONTFORK",
                 libc::SYS_madvise,
@@ -3220,12 +3224,6 @@ mod memory_map_tests {
                     page,
                     (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_GROWSDOWN) as u64,
                 ],
-                libc::EINVAL,
-            ),
-            (
-                "mprotect with PROT_SEM",
-                libc::SYS_mprotect,
-                [STACK_PAGE, page, (libc::PROT_READ | 0x8) as u64],
                 libc::EINVAL,
             ),
             (
@@ -3280,7 +3278,7 @@ mod memory_map_tests {
             0
         );
         // munlock and munlockall, since nothing is locked, and mprotect to the
-        // protection the stack has.
+        // protection the stack has, with or without PROT_SEM.
         assert_eq!(
             change(
                 &mut executor,
@@ -3300,6 +3298,15 @@ mod memory_map_tests {
                 &memory,
                 libc::SYS_mprotect,
                 [STACK_PAGE, 4 * page, u64::from(RW)]
+            ),
+            0
+        );
+        assert_eq!(
+            change(
+                &mut executor,
+                &memory,
+                libc::SYS_mprotect,
+                [STACK_PAGE, 4 * page, u64::from(RW) | PROT_SEM]
             ),
             0
         );

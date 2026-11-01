@@ -50,7 +50,9 @@ fn the_initial_fpu_image_covers_every_component_the_guest_enables() {
         crate::signal::FIXED_XFEATURES
     );
     // CR4.PKE is clear and XCR0 has no PKRU bit: the guest has no PKRU, so
-    // nothing stands for Linux's pkru_write_default.
+    // nothing stands for Linux's pkru_write_default. reverie-linuxemu's
+    // executor/pkeys.rs relies on this too: it answers the protection-key
+    // calls as Linux does on a CPU without OSPKE.
     assert_eq!(
         kvm_ioctls::VcpuFd::get_sregs(&backend.vcpu).unwrap().cr4 & (1 << 22),
         0

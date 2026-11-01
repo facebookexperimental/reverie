@@ -842,8 +842,8 @@ A new image, such as a `posix_spawn(3)` child's, starts it again and leaves its
 parent's list. A call the executor refuses where Linux applies it (`mlock(2)`
 and `mlock2(2)`, madvise with `MADV_DONTFORK`, `MADV_DONTDUMP` or
 `MADV_WIPEONFORK`, `mseal(2)`, `mbind(2)` and
-`prctl(PR_SET_VMA)`, `ENOSYS`; `mprotect(2)` with `PROT_GROWSDOWN` or
-`PROT_SEM`, `mremap(2)` with `MREMAP_DONTUNMAP`, and a same-size `mremap(2)`
+`prctl(PR_SET_VMA)`, `ENOSYS`; `mprotect(2)` with `PROT_GROWSDOWN`,
+`mremap(2)` with `MREMAP_DONTUNMAP`, and a same-size `mremap(2)`
 move of a range with a hole after its start, which Linux moves, keeping the
 hole, `EINVAL`; a `MAP_FIXED` mapping or an `mremap(2)` destination in the
 window, `ENOMEM` and `EINVAL`; a `munmap(2)` that crosses the window's start,

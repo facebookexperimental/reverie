@@ -27,13 +27,17 @@
 //!   finds every key taken (ENOSPC). Fork copies that state; exec starts
 //!   without it ([`crate::elf::LoadedStaticElf::pkey_zero_claimed`]).
 //! - `pkey_free` answers EINVAL for every key: none is allocated.
-//! - `pkey_mprotect` with key -1 is `mprotect(2)` (`do_mprotect_pkey(start,
-//!   len, prot, -1)`). With any other key it fails with EINVAL, after the
-//!   checks `do_mprotect_pkey` makes first: both `PROT_GROWSDOWN` and
-//!   `PROT_GROWSUP`, or a start that is not page-aligned (EINVAL); a zero
-//!   length (0); a range that wraps (ENOMEM); a `prot` bit
-//!   `arch_validate_prot` refuses (EINVAL); and only then the key, which no
-//!   address space here has allocated (EINVAL) (mm/mprotect.c).
+//! - `pkey_mprotect` with key -1 is `mprotect(2)`, as Linux's is
+//!   `do_mprotect_pkey(start, len, prot, -1)`: this executor's mprotect,
+//!   which makes Linux's checks in Linux's order and differs from Linux only
+//!   where reverie-kvm's README says (a `PROT_GROWSDOWN` change of the
+//!   stack, and a range with a hole, refused whole). With any other key it
+//!   fails with EINVAL, after the checks `do_mprotect_pkey` makes first:
+//!   both `PROT_GROWSDOWN` and `PROT_GROWSUP`, or a start that is not
+//!   page-aligned (EINVAL); a zero length (0); a range that wraps (ENOMEM);
+//!   a `prot` bit `arch_validate_prot` refuses (EINVAL); and only then the
+//!   key, which no address space here has allocated (EINVAL)
+//!   (mm/mprotect.c).
 //!
 //! No key ever exists, so no page here carries one, and nothing the guest
 //! can do makes a protection key withhold memory from it.

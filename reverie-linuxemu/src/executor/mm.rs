@@ -560,6 +560,11 @@ pub(super) fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
 pub(crate) const MMAP_PROT_BITS: u64 =
     (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
 
+/// `PROT_SEM` (include/uapi/asm-generic/mman-common.h), which the libc
+/// crate does not export for this target. mprotect accepts it, and on
+/// x86-64 it changes no mapping.
+pub(crate) const PROT_SEM: u64 = 0x8;
+
 /// Flags a host mmap probe clears from the guest's request: they choose where
 /// a mapping goes, or ask for work beyond creating it (population, locking).
 /// The probe maps at an address of the host's choosing and keeps nothing.
@@ -816,17 +821,50 @@ pub(super) fn munmap_shared_file(
 pub(super) fn mprotect<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
     let address = args[0];
     let requested_length = args[1];
-    let protection = args[2];
-    let allowed_protection = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-    if !address.is_multiple_of(PAGE_SIZE) || protection & !allowed_protection != 0 {
+    let grows_down = libc::PROT_GROWSDOWN as u64;
+    let grows_up = libc::PROT_GROWSUP as u64;
+    let grows = args[2] & (grows_down | grows_up);
+    let protection = args[2] & !(grows_down | grows_up);
+    // do_mprotect_pkey's checks, in its order (mm/mprotect.c): both grows
+    // flags, or a start that is not page-aligned (EINVAL); a zero length
+    // (0); a range that wraps, `PAGE_ALIGN(len)` and `start + len` both
+    // modulo 2^64 (ENOMEM); and only then the protection bits, of which
+    // arch_validate_prot accepts PROT_READ, PROT_WRITE, PROT_EXEC and
+    // PROT_SEM (include/linux/mman.h).
+    if grows == grows_down | grows_up || !address.is_multiple_of(PAGE_SIZE) {
         return negative_errno(libc::EINVAL);
     }
     if requested_length == 0 {
         return 0;
     }
-    let Some(length) = align_up(requested_length, PAGE_SIZE) else {
+    let length = requested_length.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if address.wrapping_add(length) <= address {
         return negative_errno(libc::ENOMEM);
-    };
+    }
+    if protection & !(MMAP_PROT_BITS | PROT_SEM) != 0 {
+        return negative_errno(libc::EINVAL);
+    }
+    if grows != 0 {
+        // Linux applies one grows flag only to a mapping that grows that
+        // way, and no mapping here does: it answers ENOMEM when the range
+        // reaches no mapping (with PROT_GROWSUP, when its start is not
+        // mapped) and EINVAL otherwise.
+        let reaches_a_mapping = if grows == grows_down {
+            matches!(
+                memory.query(address, length),
+                RangeState::Mapped | RangeState::Mixed
+            )
+        } else {
+            matches!(memory.query(address, PAGE_SIZE), RangeState::Mapped)
+        };
+        return negative_errno(if reaches_a_mapping {
+            libc::EINVAL
+        } else {
+            libc::ENOMEM
+        });
+    }
+    // PROT_SEM changes no mapping on x86-64: calc_vm_prot_bits drops it.
+    let protection = protection & MMAP_PROT_BITS;
     // The protection bits were validated above, so they fit a c_int.
     match memory.protect(address, length, protection as libc::c_int) {
         Ok(()) => 0,
