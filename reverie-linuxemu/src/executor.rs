@@ -14427,6 +14427,144 @@ mod tests {
         );
     }
 
+    /// socketpair(AF_UNIX, SOCK_SEQPACKET) makes a host pair, as a stream or
+    /// datagram pair does: each send is one record, a receive ends at a
+    /// record's end, a receive into a short buffer returns the buffer's worth
+    /// with MSG_TRUNC set, and recv with MSG_TRUNC returns the record's whole
+    /// length while copying no more than the buffer holds.
+    #[test]
+    fn seqpacket_socketpair_keeps_records_and_truncates_short_receives() {
+        const PAIR_FDS: u64 = 0x80;
+        const LONG: u64 = 0x100;
+        const SHORT: u64 = 0x140;
+        const RECEIVED: u64 = 0x200;
+        const MESSAGE: u64 = 0x300;
+        const IOV: u64 = 0x380;
+        const SMALL: u64 = 0x400;
+        const SENTINEL: u8 = 0xa5;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        memory.write(LONG, b"a twenty-byte record").unwrap();
+        memory.write(SHORT, b"short").unwrap();
+        memory.write(RECEIVED, &[SENTINEL; 32]).unwrap();
+        memory.write(SMALL, &[SENTINEL; 16]).unwrap();
+
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socketpair,
+                [
+                    libc::AF_UNIX as u64,
+                    (libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC) as u64,
+                    0,
+                    PAIR_FDS,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        let [first, second]: [libc::c_int; 2] = read_struct(&memory, PAIR_FDS);
+        assert!(
+            [first, second]
+                .iter()
+                .all(|fd| state.cloexec_fds.contains(fd))
+        );
+        for (address, length, flags) in [
+            (LONG, 20, libc::MSG_EOR),
+            (SHORT, 5, libc::MSG_EOR),
+            (LONG, 12, 0),
+        ] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sendto,
+                    [first as u64, address, length, flags as u64, 0, 0],
+                ),
+                length as i64
+            );
+        }
+
+        // The 20-byte record into 8 bytes: 8, with MSG_TRUNC, and nothing past
+        // the buffer written.
+        let iov = libc::iovec {
+            iov_base: RECEIVED as usize as *mut libc::c_void,
+            iov_len: 8,
+        };
+        assert_eq!(write_struct(&mut ProviderMemory(&memory), IOV, &iov), 0);
+        // SAFETY: an all-zero msghdr is valid; its pointers name guest addresses.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = IOV as usize as *mut libc::iovec;
+        message.msg_iovlen = 1;
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), MESSAGE, &message),
+            0
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_recvmsg,
+                [second as u64, MESSAGE, 0, 0, 0, 0],
+            ),
+            8
+        );
+        let received: libc::msghdr = read_struct(&memory, MESSAGE);
+        assert_ne!(received.msg_flags & libc::MSG_TRUNC, 0);
+        let mut bytes = [0u8; 9];
+        memory.read(RECEIVED, &mut bytes).unwrap();
+        assert_eq!(&bytes[..8], b"a twenty");
+        assert_eq!(bytes[8], SENTINEL);
+
+        // The 5-byte record with recv(MSG_TRUNC) into 4 bytes: its whole length,
+        // 5, and only 4 bytes copied.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_recvfrom,
+                [second as u64, SMALL, 4, libc::MSG_TRUNC as u64, 0, 0],
+            ),
+            5
+        );
+        let mut small = [0u8; 5];
+        memory.read(SMALL, &mut small).unwrap();
+        assert_eq!(&small, &[b's', b'h', b'o', b'r', SENTINEL]);
+
+        // The last record is not joined to anything: 12 bytes into 16.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_recvfrom,
+                [second as u64, RECEIVED, 16, 0, 0, 0],
+            ),
+            12
+        );
+
+        // An unsupported pair type is still refused before the host call.
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_socketpair,
+                [
+                    libc::AF_UNIX as u64,
+                    libc::SOCK_RAW as u64,
+                    0,
+                    PAIR_FDS,
+                    0,
+                    0
+                ],
+            ),
+            negative_errno(libc::EPROTONOSUPPORT)
+        );
+    }
+
     #[test]
     fn elf_executor_accepts_unix_listener_connection() {
         const ADDRESS: u64 = 0x100;

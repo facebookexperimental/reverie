@@ -12099,6 +12099,7 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner",
         "shared_file_vfork_and_posix_spawn_children_match_native",
         "shared_file_vfork_child_view_changes_and_threads_are_refused_by_name",
+        "seqpacket_socketpair_two_writers_match_native",
         "vfork_children_share_private_memory_with_their_parent_like_native",
         "a_vfork_child_cannot_leave_a_mapping_changed",
         "a_vfork_child_and_a_parent_thread_storing_one_byte_are_refused_by_name",
@@ -22235,6 +22236,70 @@ fn run_shared_file_vfork_on_kvm(
             let (code, stdout, stderr) = backend.run_static_elf_captured()?;
             Ok((None, code, stdout, stderr))
         }
+    }
+}
+
+/// Two threads of a child process send records of different sizes, with
+/// MSG_EOR, on one AF_UNIX SOCK_SEQPACKET socketpair at the same time, one of
+/// them also an SCM_RIGHTS message carrying a pipe's read end; the parent
+/// reads each record with a 4-byte recv(MSG_PEEK | MSG_TRUNC) and then a
+/// 16-byte recvmsg. Every record arrives whole and in its own writer's order,
+/// the peek returns its whole length, a longer record is cut to 16 bytes with
+/// MSG_TRUNC, and the passed descriptor reads what was written to the pipe:
+/// the same standard output as native Linux. Standard error holds the arrival
+/// order, which the two writers' timing decides.
+#[test]
+fn seqpacket_socketpair_two_writers_match_native() {
+    const TEST: &str = "seqpacket_socketpair_two_writers_match_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "seqpacket-two-writers",
+        include_str!("fixtures/seqpacket_two_writers.c"),
+    );
+    let expected = "A0: whole 2, returned 2, bytes ok\n\
+                    A1: whole 17, returned 16, MSG_TRUNC, bytes ok\n\
+                    A2: whole 64, returned 16, MSG_TRUNC, bytes ok\n\
+                    A3: whole 200, returned 16, MSG_TRUNC, bytes ok\n\
+                    B0: whole 9, returned 9, bytes ok\n\
+                    B1: whole 40, returned 16, MSG_TRUNC, bytes ok\n\
+                    B2: whole 300, returned 16, MSG_TRUNC, bytes ok\n\
+                    B3: whole 2, returned 2, bytes ok, passed descriptor reads \
+                    \"through the passed pipe\" (24 bytes)\n\
+                    each writer's records arrived in its own order: yes\n\
+                    after the writers: recv returns 0; writer process exited 0\n";
+    let arrival = |stderr: &[u8]| {
+        let stderr = String::from_utf8_lossy(stderr);
+        let words: Vec<&str> = stderr.split_whitespace().collect();
+        words.len() == 10 && words[..2] == ["arrival", "order:"]
+    };
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native", &[]);
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        expected,
+        "{native:?}"
+    );
+    assert!(arrival(&native.stderr), "{native:?}");
+    for mode in SHARED_FILE_VFORK_MODES {
+        let name = mode.0;
+        let (_, code, stdout, stderr) =
+            run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &[])
+                .unwrap_or_else(|error| panic!("{TEST} mode={name}: {error}"));
+        assert_eq!(
+            code, 0,
+            "{TEST} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            expected,
+            "{TEST} mode={name}"
+        );
+        assert!(arrival(&stderr), "{TEST} mode={name}: stderr={stderr:?}");
+        eprintln!("{TEST} completed {name}");
     }
 }
 

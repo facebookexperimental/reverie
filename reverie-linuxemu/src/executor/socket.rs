@@ -514,7 +514,18 @@ pub(super) fn socketpair(
         return negative_errno(libc::EPROTONOSUPPORT);
     }
     let base_type = socket_type & !(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK);
-    if !matches!(base_type, libc::SOCK_DGRAM | libc::SOCK_STREAM) {
+    // A SOCK_SEQPACKET pair is host mechanics exactly as a stream or datagram
+    // pair is: the host kernel holds the pair, and every later call on its ends
+    // is the host call on their host descriptors (`sendmsg`, `recvmsg` and the
+    // rest below), so the kernel keeps each record whole, ends a receive at a
+    // record's end, and decides MSG_TRUNC, MSG_EOR and the descriptors an
+    // SCM_RIGHTS message carries, as socket(AF_UNIX, SOCK_SEQPACKET) already
+    // does above. A receive copies at most the caller's buffer even where
+    // MSG_TRUNC returns a record's whole length.
+    if !matches!(
+        base_type,
+        libc::SOCK_DGRAM | libc::SOCK_STREAM | libc::SOCK_SEQPACKET
+    ) {
         return negative_errno(libc::EPROTONOSUPPORT);
     }
     let mut host_fds = [-1; 2];
