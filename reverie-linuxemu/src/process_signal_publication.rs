@@ -45,6 +45,9 @@ use crate::signal::ProcessSignalState;
 #[path = "parent_death_publication.rs"]
 mod parent_death_publication;
 
+#[path = "orphan_placement.rs"]
+mod orphan_placement;
+
 #[path = "child_wait.rs"]
 pub mod child_wait;
 use std::sync::Condvar;
@@ -123,7 +126,9 @@ struct CurrentImage {
 /// Threads share it, fork registers a fresh binding, and exec replaces `image`.
 pub(super) struct ProcessBinding {
     identity: SignalProcessId,
-    parent: Option<SignalProcessId>,
+    // The fork-time parent, until an orphan placement names a new one
+    // (`place_orphans`). Read without the family lock, so it is a leaf lock.
+    parent: Mutex<Option<SignalProcessId>>,
     transaction: Weak<Mutex<()>>,
     lifecycle: Weak<Mutex<TaskLifecycleTable>>,
     image: Mutex<CurrentImage>,
@@ -132,6 +137,16 @@ pub(super) struct ProcessBinding {
 }
 
 impl ProcessBinding {
+    /// This process's parent: the fork-time one, or the reaper an orphan
+    /// placement named.
+    pub(super) fn parent(&self) -> Option<SignalProcessId> {
+        *self.parent.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn set_parent(&self, parent: Option<SignalProcessId>) {
+        *self.parent.lock().unwrap_or_else(|p| p.into_inner()) = parent;
+    }
+
     pub(super) fn rebind(&self, state: &LoadedStaticElf, files: &Arc<Mutex<FileTableState>>) {
         // Caller holds the authoritative file table and process transaction.
         state
@@ -234,9 +249,11 @@ enum ProcessFamilyAncestryError {
     },
 }
 
-/// Linux `find_new_reaper` without a same-group survivor (family exits are
-/// whole-process) and without subreapers: `PR_SET_CHILD_SUBREAPER` is not
-/// modeled, so the orphan's PID-namespace init is always its new parent.
+/// The PID-namespace init that adopts an orphan no Tool places: Linux's
+/// `find_new_reaper` without a same-group survivor (family exits are
+/// whole-process). Child subreapers are a placing Tool's to model
+/// (`enable_orphan_placement`, `place_orphans`); without such a Tool the
+/// orphan's PID-namespace init is always its new parent.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum NamespaceReaper {
     /// No traced root has declared its namespace; orphaning fails closed.
@@ -271,9 +288,24 @@ pub struct ProcessFamilyState {
     // claim, so a parent exit that reparents first retires the claim instead.
     unclaimed_child_exits: BTreeMap<ProcessKey, BTreeSet<ProcessKey>>,
     // Exact generations whose exit transferred their children to an outside
-    // namespace init. Their executors hand live host children to the run's
-    // namespace orphanage instead of joining them.
+    // namespace init, or left them waiting for a placement. Their executors
+    // hand live host children to the run's namespace orphanage instead of
+    // joining them.
     reparented: BTreeSet<ProcessKey>,
+    // Whether a Tool opted into orphan placement
+    // (`ProcessSignalControl::enable_orphan_placement`), fixed at
+    // installation: each exit then leaves its children in
+    // `awaiting_placement` until the Tool places them (`place_orphans`).
+    orphan_placement: bool,
+    awaiting_placement: BTreeMap<ProcessKey, orphan_placement::AwaitingOrphans>,
+    // Each placement's request and retained result, by exited generation.
+    placement_results: BTreeMap<
+        ProcessKey,
+        (
+            Vec<reverie::OrphanPlacement>,
+            reverie::OrphanPlacementResult,
+        ),
+    >,
 }
 
 impl ProcessFamilyState {
@@ -380,6 +412,7 @@ pub struct ProcessSignalRegistry {
     failure: Mutex<Option<PublicationFailure>>,
     controlled: AtomicBool,
     parent_death_adopted: AtomicBool,
+    orphan_placement_adopted: AtomicBool,
     parent_death_installation_closed: AtomicBool,
     parent_death_results: Mutex<BTreeMap<u64, parent_death_publication::BatchResult>>,
     parent_death_error: Mutex<Option<Errno>>,
@@ -418,7 +451,7 @@ impl ProcessSignalRegistry {
         let parent = parent.filter(|candidate| *candidate != identity);
         let binding = Arc::new(ProcessBinding {
             identity,
-            parent,
+            parent: Mutex::new(parent),
             transaction: Arc::downgrade(&state.signal_transaction),
             lifecycle: Arc::downgrade(&state.task_lifecycle),
             image: Mutex::new(CurrentImage {
@@ -491,7 +524,7 @@ impl ProcessSignalRegistry {
     /// outside namespace init; children already adopted by an earlier
     /// successful exit of this generation stay adopted.
     pub(super) fn record_process_failure(&self, process: SignalProcessId) {
-        let parent = self.lookup(process).and_then(|binding| binding.parent);
+        let parent = self.lookup(process).and_then(|binding| binding.parent());
         let mut family = self.family.lock().unwrap_or_else(|p| p.into_inner());
         let process_family_key = process_key(process);
         let replace_success = matches!(
@@ -550,7 +583,7 @@ impl ProcessSignalRegistry {
         }
 
         let binding = self.lookup(process);
-        let parent_identity = binding.as_ref().and_then(|binding| binding.parent);
+        let parent_identity = binding.as_ref().and_then(|binding| binding.parent());
         let is_root = parent_identity.is_none();
         let parent_binding = parent_identity.and_then(|parent| self.lookup(parent));
         let parent_transaction = parent_binding
@@ -602,8 +635,12 @@ impl ProcessSignalRegistry {
             let exit = ProcessFamilyExit::ReapedByNamespaceInit { status };
             family.terminal.insert(process_key(process), exit);
             self.wait_changed.notify_all();
-            let adopted = family.reparent_children_to_outside_init(process_key(process));
-            self.label_orphans(&mut family, &adopted);
+            if family.orphan_placement {
+                family.await_placement(process_key(process));
+            } else {
+                let adopted = family.reparent_children_to_outside_init(process_key(process));
+                self.label_orphans(&mut family, &adopted);
+            }
             return exit;
         }
         let blocking_descendant = family
@@ -725,6 +762,11 @@ impl ProcessSignalRegistry {
         family.terminal.insert(process_key(process), exit);
         self.wait_changed.notify_all();
         if matches!(exit, ProcessFamilyExit::Root | ProcessFamilyExit::Child(_))
+            && family.orphan_placement
+        {
+            // The Tool names each child's new parent (`place_orphans`).
+            family.await_placement(process_key(process));
+        } else if matches!(exit, ProcessFamilyExit::Root | ProcessFamilyExit::Child(_))
             && matches!(family.reaper, NamespaceReaper::Outside { .. })
         {
             let adopted = family.reparent_children_to_outside_init(process_key(process));
@@ -995,6 +1037,39 @@ impl ProcessSignalControl {
         self.publish(target, event, None, true, None)
     }
 
+    /// A parent-death signal the Tool decided
+    /// ([`reverie::ProcessSignalControl::publish_parent_death_signal`]): a
+    /// process-directed signal of the set this backend declares
+    /// (`BackendCapabilities::KVM.publishable_parent_death_signals`: a
+    /// standard signal other than a stop signal and SIGCHLD), whose siginfo
+    /// has `SI_USER` (the sender's tgid and uid are the Tool's).
+    /// Everything after validation is the alarm's publication. SIGKILL is
+    /// one of them: its disposition cannot change, so its delivery at any
+    /// thread's next boundary ends the process (the delivery hook passes a
+    /// published SIGKILL, `validate_deferred_signal_event`).
+    fn publish_active_parent_death_signal(
+        &self,
+        target: SignalProcessId,
+        event: SignalEvent,
+    ) -> ProcessPublication {
+        let signal = event.signal();
+        let info = event.siginfo();
+        let field = |at: usize| i32::from_ne_bytes(info[at..at + 4].try_into().unwrap());
+        // The set this backend declares: no stop signal (no stopped state
+        // here) and no SIGCHLD, which its queues carry only for a child's
+        // exit.
+        let published = reverie::BackendCapabilities::KVM.publishable_parent_death_signals;
+        if !(1..=64).contains(&signal)
+            || published & (1 << (signal - 1)) == 0
+            || field(0) != signal
+            || field(8) != libc::SI_USER
+            || event.target() != (reverie::SignalTarget::Process { pid: target.tgid })
+        {
+            return ProcessPublication::Rejected(PublicationRejection::InvalidEvent);
+        }
+        self.publish(target, event, None, true, None)
+    }
+
     fn publish_child_completion(
         &self,
         completion: reverie::ChildExitCompletion,
@@ -1106,7 +1181,7 @@ impl ProcessSignalControl {
             let Some(child) = registry.lookup(completion.child) else {
                 return Rejected(InvalidCompletion);
             };
-            if child.parent != Some(target)
+            if child.parent() != Some(target)
                 || lifecycle.process_exit_status(
                     completion.child.tgid.as_raw(),
                     completion.child.generation,
@@ -1343,6 +1418,13 @@ impl ProcessSignalRegistry {
             mode == reverie::BackendSignalControlMode::ToolControlled,
             Ordering::Release,
         );
+        // Placement is the controlling Tool's: a run that kept the backend's
+        // own selection keeps its outside-init adoption.
+        self.family
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .orphan_placement =
+            self.controlled() && self.orphan_placement_adopted.load(Ordering::Acquire);
         let processes = self
             .processes
             .lock()
@@ -1592,6 +1674,32 @@ impl reverie::ProcessSignalControl for ProcessSignalControl {
         }
     }
 
+    fn enable_orphan_placement(&self) -> Result<(), Errno> {
+        self.0
+            .upgrade()
+            .ok_or(Errno::ESRCH)?
+            .enable_orphan_placement()
+    }
+
+    fn place_orphans(
+        &self,
+        exited: SignalProcessId,
+        placements: &[reverie::OrphanPlacement],
+    ) -> reverie::OrphanPlacementResult {
+        match self.0.upgrade() {
+            Some(registry) => registry.place_orphans(exited, placements),
+            None => reverie::OrphanPlacementResult::RejectedBeforeCommit(Errno::ESRCH),
+        }
+    }
+
+    fn publish_parent_death_signal(
+        &self,
+        process: SignalProcessId,
+        event: SignalEvent,
+    ) -> reverie::ProcessSignalPublicationResult {
+        public_process_outcome(self.publish_active_parent_death_signal(process, event))
+    }
+
     fn signal_recipients(
         &self,
         process: SignalProcessId,
@@ -1817,6 +1925,7 @@ mod tests {
     use crate::signal::KernelSigset;
 
     include!("../tests/support/process_signal_publication_fixtures.rs");
+    include!("orphan_placement_tests.rs");
 
     fn alarm(target: SignalProcessId) -> SignalEvent {
         let mut info = [0; reverie::SIGNAL_INFO_SIZE];
@@ -5792,6 +5901,9 @@ mod tests {
         assert!(family_snapshot(&root).1.is_empty());
     }
 
+    /// The backend never chooses a child subreaper: without a Tool's
+    /// placement (`place_orphans`) the namespace init is every orphan's
+    /// reaper, and the subreaper prctls are a Tool's to answer.
     #[test]
     fn child_subreapers_remain_unmodeled_so_namespace_init_is_the_reaper() {
         let mut root = outside_init_root();
@@ -5804,7 +5916,7 @@ mod tests {
                 [libc::PR_SET_CHILD_SUBREAPER as u64, 1, 0, 0, 0, 0],
             ),
             -i64::from(libc::ENOSYS),
-            "modeling subreapers requires find_new_reaper to consult them",
+            "a Tool that models subreapers names each reaper through place_orphans",
         );
     }
 

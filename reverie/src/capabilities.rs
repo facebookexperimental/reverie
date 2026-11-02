@@ -397,7 +397,48 @@ pub struct BackendCapabilities {
     /// - reverie-sabre returns one frame, the site of the trapped syscall;
     /// - reverie-kvm and reverie-liteinst's in-guest runtime never return one.
     pub provides_guest_backtraces: bool,
+
+    /// The backend's process signal control (see
+    /// [`provides_process_signal_control`](Self::provides_process_signal_control))
+    /// lets a tool name the new parent of each child of an exiting process:
+    /// after [`ProcessSignalControl::enable_orphan_placement`](crate::ProcessSignalControl::enable_orphan_placement),
+    /// a process's exit leaves its children waiting for
+    /// [`ProcessSignalControl::place_orphans`](crate::ProcessSignalControl::place_orphans),
+    /// which moves each one to a live process of the run (a child subreaper,
+    /// as Linux's `find_new_reaper` chooses one) or to the PID namespace's
+    /// init. A tool that models `PR_SET_CHILD_SUBREAPER` on a backend that
+    /// emulates child waits itself (`emulates_child_waits`) needs this, so
+    /// that the backend's waits, `SIGCHLD` and `getppid` follow the parent the
+    /// tool chose.
+    pub places_orphans: bool,
+
+    /// The parent-death signals the backend's process signal control
+    /// publishes for a tool that decided them
+    /// ([`ProcessSignalControl::publish_parent_death_signal`](crate::ProcessSignalControl::publish_parent_death_signal)),
+    /// as a kernel signal set (bit `n - 1` for signal `n`), each with Linux's
+    /// siginfo to an exact process lifetime; it rejects any other. 0: it
+    /// publishes none. A tool that holds `PR_SET_PDEATHSIG` values itself can
+    /// then send these on a backend whose guest threads no host signal
+    /// reaches, and leave any other to the backend's own `PR_SET_PDEATHSIG`.
+    pub publishable_parent_death_signals: u64,
 }
+
+/// Bit `signal - 1` of a kernel signal set.
+const fn signal_bit(signal: libc::c_int) -> u64 {
+    1 << (signal - 1)
+}
+
+/// The parent-death signals reverie-kvm's process signal control publishes
+/// (`BackendCapabilities::publishable_parent_death_signals`): every standard
+/// signal (1 to 31), `SIGKILL` included, but `SIGCHLD`, which its signal
+/// queues carry only for a child's exit, and the stop signals (`SIGSTOP`,
+/// `SIGTSTP`, `SIGTTIN`, `SIGTTOU`), as it has no stopped state.
+const KVM_PUBLISHABLE_PARENT_DEATH_SIGNALS: u64 = (signal_bit(32) - 1)
+    & !(signal_bit(libc::SIGCHLD)
+        | signal_bit(libc::SIGSTOP)
+        | signal_bit(libc::SIGTSTP)
+        | signal_bit(libc::SIGTTIN)
+        | signal_bit(libc::SIGTTOU));
 
 impl BackendCapabilities {
     /// `reverie-ptrace`: every guest thread is a host task stopped and resumed
@@ -433,6 +474,9 @@ impl BackendCapabilities {
         // DR0-DR3 on x86-64; arm64 watchpoints are not implemented yet.
         hardware_watchpoints: if cfg!(target_arch = "x86_64") { 4 } else { 0 },
         provides_guest_backtraces: true,
+        // The kernel re-parents orphans and sends parent-death signals itself.
+        places_orphans: false,
+        publishable_parent_death_signals: 0,
     };
 
     /// `reverie-e9patch`: the guest is rewritten ahead of time and then run
@@ -541,6 +585,8 @@ impl BackendCapabilities {
         reports_sigreturns: false,
         hardware_watchpoints: 0,
         provides_guest_backtraces: false,
+        places_orphans: true,
+        publishable_parent_death_signals: KVM_PUBLISHABLE_PARENT_DEATH_SIGNALS,
         ..Self::PTRACE
     };
 }
@@ -587,6 +633,8 @@ mod tests {
             "reports_sigreturns": cfg!(target_arch = "x86_64"),
             "hardware_watchpoints": if cfg!(target_arch = "x86_64") { 4 } else { 0 },
             "provides_guest_backtraces": true,
+            "places_orphans": false,
+            "publishable_parent_death_signals": 0,
         })
     }
 
@@ -728,6 +776,10 @@ mod tests {
                 "reports_sigreturns": false,
                 "hardware_watchpoints": 0,
                 "provides_guest_backtraces": false,
+                "places_orphans": true,
+                // Signals 1 to 31 but SIGCHLD (17) and SIGSTOP, SIGTSTP,
+                // SIGTTIN and SIGTTOU (19 to 22).
+                "publishable_parent_death_signals": 0x7fc2_ffff_u64,
             }))
         );
     }

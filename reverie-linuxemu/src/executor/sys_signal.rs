@@ -25,7 +25,7 @@ impl ElfExecutor {
         &mut self,
         event: reverie::SignalEvent,
     ) -> Result<(), reverie::syscalls::Errno> {
-        self.validate_deferred_signal_event(event)?;
+        self.validate_deferred_signal_event(event, false)?;
         // A Process target records provenance, while this API is called on the
         // concrete thread already selected by the scheduler. Keep it in that
         // thread's queue; direct guest kill(2) separately uses shared pending.
@@ -33,9 +33,13 @@ impl ElfExecutor {
             .map_err(|raw| reverie::syscalls::Errno::new(i32::try_from(-raw).unwrap_or(libc::EIO)))
     }
 
+    /// `delivery_hook`: the event is the one a Tool's signal hook returned
+    /// for a delivery boundary (`prepare_filtered_signal_delivery`), rather
+    /// than one a Tool asks to queue (`defer_signal_delivery`).
     fn validate_deferred_signal_event(
         &self,
         event: reverie::SignalEvent,
+        delivery_hook: bool,
     ) -> Result<(), reverie::syscalls::Errno> {
         let signal = event.signal();
         let info = event.siginfo();
@@ -54,8 +58,18 @@ impl ElfExecutor {
             (code, _) if code < 0 && !matches!(code, libc::SI_TKILL | libc::SI_TIMER) => true,
             _ => false,
         };
+        // A process-directed SIGKILL a Tool published with `SI_USER` (a
+        // parent-death signal, `publish_parent_death_signal`) reaches the
+        // delivery hook as itself, and is delivered by its default action,
+        // which no handler, mask or ignored disposition changes on Linux. A
+        // Tool still cannot queue a SIGKILL itself (`defer_signal_delivery`).
+        let published_sigkill = delivery_hook
+            && signal == libc::SIGKILL
+            && code == libc::SI_USER
+            && matches!(event.target(), reverie::SignalTarget::Process { .. });
         if signal > 31
-            || matches!(signal, libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD)
+            || (matches!(signal, libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD)
+                && !published_sigkill)
             || !supported_provenance
         {
             return Err(reverie::syscalls::Errno::ENOSYS);
@@ -462,7 +476,7 @@ impl ElfExecutor {
             self.validate_child_exit_signal_event(event)
                 .map_err(|(_, errno)| errno)?;
         } else {
-            self.validate_deferred_signal_event(event)?;
+            self.validate_deferred_signal_event(event, true)?;
         }
         if signal_is_blocked(&self.state, event.signal()) {
             queue_signal_event_locked(

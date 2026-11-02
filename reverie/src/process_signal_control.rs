@@ -223,6 +223,86 @@ pub enum ParentDeathPublicationResult {
     },
 }
 
+/// The new parent of one child of an exiting process
+/// ([`ProcessSignalControl::place_orphans`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OrphanReaper {
+    /// A live process of this run, by exact lifetime: the child becomes its
+    /// child, as when Linux's `find_new_reaper` picks a child subreaper.
+    Process(SignalProcessId),
+    /// The PID namespace's init, which the backend keeps outside the guest
+    /// process tree. No guest process can wait for the child.
+    NamespaceInit,
+}
+
+/// One placement in [`ProcessSignalControl::place_orphans`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OrphanPlacement {
+    /// Exact child lifetime of the exiting process.
+    pub child: SignalProcessId,
+    /// Its new parent.
+    pub reaper: OrphanReaper,
+}
+
+/// What a placement did to one child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PlacedOrphanEffect {
+    /// A live child: its parent is now the reaper, for its waits, its later
+    /// exit notification and `getppid`.
+    Live,
+    /// A child that had already exited (a zombie), now waitable by the reaper
+    /// process. Its exit was announced to the reaper again with `SIGCHLD`, as
+    /// Linux's `reparent_leader` does; the effect of that publication.
+    Zombie(ChildExitPublicationEffect),
+    /// A zombie the reaper process reaps at once: its `SIGCHLD` is ignored or
+    /// carries `SA_NOCLDWAIT`.
+    AutoReaped,
+    /// A zombie that moved to the reaper process, whose announcement the
+    /// backend could not publish. Only in
+    /// [`OrphanPlacementResult::FailedAfterCommit`], which names the error.
+    ZombieUnannounced,
+    /// Adopted by the namespace init, live or exited.
+    NamespaceInit,
+}
+
+/// One child in an [`OrphanPlacementReceipt`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlacedOrphan {
+    /// Exact child lifetime.
+    pub child: SignalProcessId,
+    /// Its new parent.
+    pub reaper: OrphanReaper,
+    /// What the placement did.
+    pub effect: PlacedOrphanEffect,
+}
+
+/// Receipt for the placement of every child of one exited process.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OrphanPlacementReceipt {
+    /// Exact process lifetime whose exit left the children.
+    pub exited: SignalProcessId,
+    /// Each child, in the order of the placements, then any child the caller
+    /// did not name (adopted by the namespace init), in ascending pid order.
+    pub placed: Vec<PlacedOrphan>,
+}
+
+/// Placement never converts a partial commit into a retry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OrphanPlacementResult {
+    /// No child moved and nothing was published.
+    RejectedBeforeCommit(Errno),
+    /// Every child moved, and every announcement committed.
+    Committed(OrphanPlacementReceipt),
+    /// Every child moved, but a reaper's `SIGCHLD` readiness failed after its
+    /// pending state committed. Never retry it.
+    FailedAfterCommit {
+        /// Committed effect.
+        receipt: OrphanPlacementReceipt,
+        /// Original readiness failure.
+        errno: Errno,
+    },
+}
+
 /// Immediate result of an original-callback parent-death preflight with no
 /// guest-visible effects (retained-image exec may stage private callback state).
 /// Neither result is a reusable permit for a later or rewritten syscall.
@@ -329,6 +409,73 @@ pub trait ProcessSignalControl: Debug + Send + Sync {
     /// progress before returning.
     fn publish_child_exit(&self, _completion: ChildExitCompletion) -> ChildExitPublicationResult {
         ChildExitPublicationResult::RejectedBeforeCommit(Errno::ENOSYS)
+    }
+
+    /// Opt into orphan placement before starting any guest task: from then
+    /// on, a process's exit leaves its children waiting for
+    /// [`Self::place_orphans`] rather than giving them to the namespace init
+    /// at once. A Tool that opts in promises to place the children of every
+    /// process exit it observes, before releasing the fence of that exit.
+    /// The backend keeps the new parents in its own records, which its waits,
+    /// child-exit notifications and `getppid` read; it never chooses one.
+    fn enable_orphan_placement(&self) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// Give each child of `exited` its new parent, as Linux's
+    /// `forget_original_parent` does in `exit_notify`, with the parents the
+    /// caller chose (for example, the nearest child subreaper).
+    ///
+    /// Every child named must be one the exit of `exited` left waiting for a
+    /// parent; a child the caller does not name goes to the namespace init.
+    /// A live child's waits, later exit notification and `getppid` then name
+    /// its reaper. A child that had already exited becomes the reaper's
+    /// zombie: the backend announces it with `SIGCHLD` (the child's siginfo),
+    /// or reaps it at once if the reaper's `SIGCHLD` is ignored or carries
+    /// `SA_NOCLDWAIT`, both decided from the reaper's disposition at this
+    /// call, as Linux's `do_notify_parent` decides them. A reaper must be a
+    /// live process of the run.
+    ///
+    /// The backend must already have recorded the exit (a backend records it
+    /// before it reports the exit's terminal boundary); before that the call
+    /// changes nothing and answers `EAGAIN`. Nothing moves unless every
+    /// placement is valid (`EINVAL` otherwise, and `ESRCH` for a reaper that
+    /// is gone). An exact duplicate returns the retained result. Like every
+    /// method here it is synchronous, takes the backend's locks after the
+    /// caller's, and calls no Tool code; the caller supplies the causal fence
+    /// (the exit's own).
+    fn place_orphans(
+        &self,
+        _exited: SignalProcessId,
+        _placements: &[OrphanPlacement],
+    ) -> OrphanPlacementResult {
+        OrphanPlacementResult::RejectedBeforeCommit(Errno::ENOSYS)
+    }
+
+    /// Publish one parent-death signal the Tool decided to an exact process
+    /// lifetime: a complete process-directed event for a signal the backend
+    /// declares it publishes
+    /// ([`BackendCapabilities::publishable_parent_death_signals`](crate::BackendCapabilities::publishable_parent_death_signals);
+    /// it rejects any other before commit, `EINVAL`), whose siginfo has
+    /// `si_code` `SI_USER`, as Linux's `group_send_sig_info` builds it for the
+    /// exiting parent thread (its tgid in `si_pid`, its real uid in
+    /// `si_uid`).
+    ///
+    /// The caller owns the parent-death registrations, decides when a parent
+    /// thread exits and orders the sends; the backend only publishes the
+    /// pending signal, with the same shared pending ownership,
+    /// standard-signal coalescing and disposition handling as
+    /// [`Self::publish_timer_expiry`]. `SIGKILL` is published the same way:
+    /// it cannot be caught, blocked or ignored, so it ends the process at the
+    /// first delivery boundary of any of its threads. No Tool hook, guest
+    /// instruction or wait completion is performed. Backends without a
+    /// controlled signal queue keep the default `ENOSYS`.
+    fn publish_parent_death_signal(
+        &self,
+        _process: SignalProcessId,
+        _event: SignalEvent,
+    ) -> ProcessSignalPublicationResult {
+        ProcessSignalPublicationResult::RejectedBeforeCommit(Errno::ENOSYS)
     }
 
     /// Eligible live recipients for one pending signal, in ascending numeric
