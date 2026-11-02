@@ -4190,7 +4190,10 @@ struct BranchRunPlan {
 /// it has one, retires branches until the timer's target, where a run
 /// without stops takes one attempt. A `decoded` sequence was found by
 /// [`decode_branch_run`]; otherwise the code at pc is read, and only a
-/// sequence that would run as a unit is reported. `REVERIE_BLOCK_STEP=0`,
+/// sequence that would run as a unit is reported. That costs every stepped
+/// instruction one register read and one 4-byte code read while branch runs
+/// are off and nothing is reported yet; the window is read and decoded only
+/// at a load-exclusive (`crate::branch_step::probe_exclusive_sequence`). `REVERIE_BLOCK_STEP=0`,
 /// which turns branch runs off on purpose, is not reported.
 #[cfg(target_arch = "aarch64")]
 fn report_stepped_exclusive_sequence(task: &Stopped, decoded: Option<u64>, reason: &str) {
@@ -4201,12 +4204,12 @@ fn report_stepped_exclusive_sequence(task: &Stopped, decoded: Option<u64>, reaso
     let Ok(regs) = task.getregs() else {
         return;
     };
-    if decoded.is_none() {
-        let mut code = [0u8; 4 * crate::branch_step::EXCLUSIVE_WINDOW];
-        let len = read_code(task, regs.pc, &mut code);
-        if crate::branch_step::exclusive_sequence(regs.pc, &code[..len]).is_none() {
-            return;
-        }
+    if decoded.is_none()
+        && !crate::branch_step::probe_exclusive_sequence(regs.pc, |addr, buf| {
+            read_code(task, addr, buf)
+        })
+    {
+        return;
     }
     if REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;

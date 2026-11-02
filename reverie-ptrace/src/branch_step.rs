@@ -286,6 +286,27 @@ pub(crate) fn exclusive_sequence(pc: u64, code: &[u8]) -> Option<ExclusiveSequen
     None
 }
 
+/// Whether the guest's code at `pc` holds a load-exclusive sequence that
+/// runs as one unit ([`exclusive_sequence`]). `read` fills a buffer with the
+/// code from an address and returns how many bytes it read. The first
+/// instruction is read alone, and the rest of the window only if that is a
+/// load-exclusive, which almost no stepped instruction is.
+pub(crate) fn probe_exclusive_sequence(
+    pc: u64,
+    mut read: impl FnMut(u64, &mut [u8]) -> usize,
+) -> bool {
+    if !pc.is_multiple_of(4) {
+        return false;
+    }
+    let mut code = [0u8; 4 * EXCLUSIVE_WINDOW];
+    let (first, rest) = code.split_first_chunk_mut::<4>().expect("a window");
+    if read(pc, first) < 4 || !is_exclusive(u32::from_le_bytes(*first), true) {
+        return false;
+    }
+    let len = 4 + read(pc.wrapping_add(4), rest);
+    exclusive_sequence(pc, &code[..len]).is_some()
+}
+
 /// The first two breakpoint registers that are not enabled, given whether
 /// each register the hardware has is (`enabled`); `None` with fewer than two
 /// free. An enabled register belongs to someone else (a debugger of the
@@ -436,6 +457,36 @@ mod tests {
         }
         assert_eq!(b_ne(12), 0x5400_0061);
         assert_eq!(cbnz_w17(-16), 0x35ff_ff91);
+    }
+
+    /// The probe of a stepped pc reads one instruction when that is not a
+    /// load-exclusive, and the rest of the window only after one that is.
+    #[test]
+    fn the_exclusive_probe_reads_one_word_unless_it_is_a_load_exclusive() {
+        let pc = 0x1000;
+        let probe = |code: &[u8]| {
+            let mut bytes_read = 0;
+            let found = probe_exclusive_sequence(pc, |addr, buf: &mut [u8]| {
+                let from = usize::try_from(addr - pc).unwrap().min(code.len());
+                let len = buf.len().min(code.len() - from);
+                buf[..len].copy_from_slice(&code[from..from + len]);
+                bytes_read += len;
+                len
+            });
+            (found, bytes_read)
+        };
+        let window = vec![NOP; EXCLUSIVE_WINDOW];
+        assert_eq!(probe(&bytes(&window)), (false, 4));
+        let mut ldadd = vec![LDXR_W, ADD_W, STXR_W, cbnz_w17(-12)];
+        ldadd.resize(EXCLUSIVE_WINDOW, NOP);
+        assert_eq!(probe(&bytes(&ldadd)), (true, 4 * EXCLUSIVE_WINDOW));
+        // A load-exclusive whose sequence does not run as a unit.
+        let mut svc = vec![LDXR_W, SVC, STXR_W];
+        svc.resize(EXCLUSIVE_WINDOW, NOP);
+        assert_eq!(probe(&bytes(&svc)), (false, 4 * EXCLUSIVE_WINDOW));
+        // Unreadable or misaligned code.
+        assert_eq!(probe(&[]), (false, 0));
+        assert!(!probe_exclusive_sequence(pc + 2, |_, buf: &mut [u8]| buf.len()));
     }
 
     #[test]
