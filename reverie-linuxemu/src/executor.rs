@@ -14934,6 +14934,201 @@ mod tests {
         }
     }
 
+    /// The header a receive leaves, made natively on a fresh datagram pair
+    /// holding "payload!", sent with a `sendmsg` whose `msg_name` is NULL and
+    /// `msg_namelen` 77: the receive's 8-byte payload buffer is the
+    /// `msg_name` field of its own header, which names no buffer (NULL) and
+    /// has a stale `msg_namelen` of 77. Returns the bytes then in `msg_name`,
+    /// `msg_namelen`, `msg_flags`, `msg_controllen`, and with `batch` (a
+    /// `recvmmsg` of one entry rather than a `recvmsg`) the entry's `msg_len`.
+    fn native_header_after_receive_over_name(
+        batch: bool,
+    ) -> ([u8; 8], libc::socklen_t, libc::c_int, usize, Option<u32>) {
+        let mut pair = [0; 2];
+        // SAFETY: pair is writable storage for two descriptors.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, pair.as_mut_ptr()) },
+            0
+        );
+        let mut sent_iov = libc::iovec {
+            iov_base: b"payload!".as_ptr().cast_mut().cast(),
+            iov_len: 8,
+        };
+        // SAFETY: an all-zero msghdr is valid.
+        let mut sent: libc::msghdr = unsafe { std::mem::zeroed() };
+        sent.msg_namelen = 77;
+        sent.msg_iov = std::ptr::from_mut(&mut sent_iov);
+        sent.msg_iovlen = 1;
+        // SAFETY: sent and its iovec, 8 readable bytes, are live for the call.
+        assert_eq!(unsafe { libc::sendmsg(pair[0], &sent, 0) }, 8);
+        // SAFETY: an all-zero mmsghdr is valid.
+        let mut entry: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        entry.msg_hdr.msg_namelen = 77;
+        let mut iov = libc::iovec {
+            iov_base: (&raw mut entry.msg_hdr.msg_name).cast(),
+            iov_len: 8,
+        };
+        entry.msg_hdr.msg_iov = std::ptr::from_mut(&mut iov);
+        entry.msg_hdr.msg_iovlen = 1;
+        // SAFETY: entry and iov are live for the call, and the payload buffer
+        // is entry's own msg_name field.
+        let result = unsafe {
+            if batch {
+                libc::recvmmsg(
+                    pair[1],
+                    &mut entry,
+                    1,
+                    libc::MSG_DONTWAIT,
+                    std::ptr::null_mut(),
+                ) as isize
+            } else {
+                libc::recvmsg(pair[1], &mut entry.msg_hdr, libc::MSG_DONTWAIT)
+            }
+        };
+        assert_eq!(result, if batch { 1 } else { 8 });
+        // SAFETY: both descriptors are owned here.
+        unsafe {
+            libc::close(pair[0]);
+            libc::close(pair[1]);
+        }
+        (
+            (entry.msg_hdr.msg_name as usize).to_ne_bytes(),
+            entry.msg_hdr.msg_namelen,
+            entry.msg_hdr.msg_flags,
+            entry.msg_hdr.msg_controllen,
+            batch.then_some(entry.msg_len),
+        )
+    }
+
+    /// After a receive, Linux writes back only some fields of the header:
+    /// `msg_namelen` where `msg_name` names a buffer, `msg_flags` and
+    /// `msg_controllen`, and for a `recvmmsg` entry its `msg_len`. The
+    /// provider wrote back the whole header as it read it before the call,
+    /// which replaced payload bytes a receive had put over its own header, and
+    /// a `msg_namelen` Linux leaves alone when `msg_name` is NULL. Linux also
+    /// takes a header whose `msg_name` is NULL as naming no address, whatever
+    /// its `msg_namelen` (`__copy_msghdr`), where the provider failed `sendmsg`,
+    /// `recvmsg` and `recvmmsg` with EFAULT. Each is compared with the same
+    /// call made natively.
+    #[test]
+    fn receives_write_back_only_the_header_fields_linux_writes() {
+        const PAIR_FDS: u64 = 0x80;
+        const BYTES: u64 = 0x100;
+        const MESSAGE: u64 = 0x300;
+        const IOV: u64 = 0x380;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        memory.write(BYTES, b"payload!").unwrap();
+        for batch in [false, true] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_socketpair,
+                    [
+                        libc::AF_UNIX as u64,
+                        libc::SOCK_DGRAM as u64,
+                        0,
+                        PAIR_FDS,
+                        0,
+                        0
+                    ],
+                ),
+                0
+            );
+            let [first, second]: [libc::c_int; 2] = read_struct(&memory, PAIR_FDS);
+            let sent_iov = libc::iovec {
+                iov_base: BYTES as usize as *mut libc::c_void,
+                iov_len: 8,
+            };
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), IOV, &sent_iov),
+                0
+            );
+            // SAFETY: an all-zero msghdr is valid; its pointers name guest
+            // addresses.
+            let mut sent: libc::msghdr = unsafe { std::mem::zeroed() };
+            sent.msg_namelen = 77;
+            sent.msg_iov = IOV as usize as *mut libc::iovec;
+            sent.msg_iovlen = 1;
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), MESSAGE, &sent),
+                0
+            );
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_sendmsg,
+                    [first as u64, MESSAGE, 0, 0, 0, 0],
+                ),
+                8,
+                "sendmsg with a NULL msg_name, batch {batch}"
+            );
+            let name_field = MESSAGE + std::mem::offset_of!(libc::msghdr, msg_name) as u64;
+            let iov = libc::iovec {
+                iov_base: name_field as usize as *mut libc::c_void,
+                iov_len: 8,
+            };
+            assert_eq!(write_struct(&mut ProviderMemory(&memory), IOV, &iov), 0);
+            // SAFETY: an all-zero mmsghdr is valid; its pointers name guest
+            // addresses.
+            let mut entry: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            entry.msg_hdr.msg_namelen = 77;
+            entry.msg_hdr.msg_iov = IOV as usize as *mut libc::iovec;
+            entry.msg_hdr.msg_iovlen = 1;
+            assert_eq!(
+                write_struct(&mut ProviderMemory(&memory), MESSAGE, &entry),
+                0
+            );
+            let result = if batch {
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_recvmmsg,
+                    [second as u64, MESSAGE, 1, libc::MSG_DONTWAIT as u64, 0, 0],
+                )
+            } else {
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_recvmsg,
+                    [second as u64, MESSAGE, libc::MSG_DONTWAIT as u64, 0, 0, 0],
+                )
+            };
+            assert_eq!(result, if batch { 1 } else { 8 }, "batch {batch}");
+            let after: libc::mmsghdr = read_struct(&memory, MESSAGE);
+            let guest = (
+                (after.msg_hdr.msg_name as usize).to_ne_bytes(),
+                after.msg_hdr.msg_namelen,
+                after.msg_hdr.msg_flags,
+                after.msg_hdr.msg_controllen,
+                batch.then_some(after.msg_len),
+            );
+            let native = native_header_after_receive_over_name(batch);
+            assert_eq!(guest, native, "batch {batch}");
+            assert_eq!(
+                native,
+                (*b"payload!", 77, 0, 0, batch.then_some(8)),
+                "batch {batch}"
+            );
+            assert_eq!(after.msg_hdr.msg_iov as usize as u64, IOV, "batch {batch}");
+            for fd in [first, second] {
+                assert_eq!(
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_close,
+                        [fd as u64, 0, 0, 0, 0, 0]
+                    ),
+                    0
+                );
+            }
+        }
+    }
+
     #[test]
     fn elf_executor_accepts_unix_listener_connection() {
         const ADDRESS: u64 = 0x100;

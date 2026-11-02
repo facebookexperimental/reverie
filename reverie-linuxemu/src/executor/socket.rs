@@ -1308,13 +1308,15 @@ pub(super) fn sendmsg(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64
         }
     }
 
-    let name_capacity = message.msg_namelen as usize;
+    // A header that names no buffer has no name length (__copy_msghdr).
+    let name_capacity = if message.msg_name.is_null() {
+        0
+    } else {
+        message.msg_namelen as usize
+    };
     let control_capacity = message.msg_controllen;
     if name_capacity > MAX_HOST_IO || control_capacity > MAX_HOST_IO {
         return negative_errno(libc::EINVAL);
-    }
-    if name_capacity != 0 && message.msg_name.is_null() {
-        return negative_errno(libc::EFAULT);
     }
     if control_capacity != 0 && message.msg_control.is_null() {
         return negative_errno(libc::EFAULT);
@@ -1409,11 +1411,10 @@ pub(super) fn recvmsg(
     if message_address == 0 {
         return negative_errno(libc::EFAULT);
     }
-    let mut message: libc::msghdr =
-        match read_guest_struct(&ProviderMemory(memory), message_address) {
-            Ok(message) => message,
-            Err(error) => return error,
-        };
+    let message: libc::msghdr = match read_guest_struct(&ProviderMemory(memory), message_address) {
+        Ok(message) => message,
+        Err(error) => return error,
+    };
     // Validate the final header copyout before consuming a datagram.
     if write_struct(&mut ProviderMemory(memory), message_address, &message) != 0 {
         return negative_errno(libc::EFAULT);
@@ -1455,13 +1456,15 @@ pub(super) fn recvmsg(
         guest_iovecs.push(iov);
     }
 
-    let name_capacity = message.msg_namelen as usize;
+    // A header that names no buffer has no name length (__copy_msghdr).
+    let name_capacity = if message.msg_name.is_null() {
+        0
+    } else {
+        message.msg_namelen as usize
+    };
     let control_capacity = message.msg_controllen;
     if name_capacity > MAX_HOST_IO || control_capacity > MAX_HOST_IO {
         return negative_errno(libc::EINVAL);
-    }
-    if name_capacity != 0 && message.msg_name.is_null() {
-        return negative_errno(libc::EFAULT);
     }
     if control_capacity != 0 && message.msg_control.is_null() {
         return negative_errno(libc::EFAULT);
@@ -1630,20 +1633,59 @@ pub(super) fn recvmsg(
             return negative_errno(libc::EFAULT);
         }
     }
-    message.msg_namelen = host_header.msg_namelen;
-    message.msg_controllen = control_bytes.len();
-    message.msg_flags = host_header.msg_flags;
+    let mut message_flags = host_header.msg_flags;
     if flags & libc::MSG_CMSG_CLOEXEC == 0 {
-        message.msg_flags &= !libc::MSG_CMSG_CLOEXEC;
+        message_flags &= !libc::MSG_CMSG_CLOEXEC;
     }
     if stripped_unsupported {
-        message.msg_flags |= libc::MSG_CTRUNC;
+        message_flags |= libc::MSG_CTRUNC;
     }
-    if write_struct(&mut ProviderMemory(memory), message_address, &message) != 0 {
+    if !write_back_received_header(
+        memory,
+        message_address,
+        &message,
+        host_header.msg_namelen,
+        message_flags,
+        control_bytes.len(),
+    ) {
         rollback_received_rights(state, &installed);
         return negative_errno(libc::EFAULT);
     }
     received as i64
+}
+
+/// Writes back, to the guest `msghdr` at `address` (`message`, as read
+/// before the call), the fields Linux writes after a receive, in its order:
+/// the name's length where the header names a buffer (`move_addr_to_user`),
+/// then `msg_flags` and `msg_controllen` (`____sys_recvmsg`). The rest of the
+/// header stays as the guest left it, which a receive may have overwritten
+/// with its own payload. False if a field cannot be written.
+fn write_back_received_header(
+    memory: &GuestMemory,
+    address: u64,
+    message: &libc::msghdr,
+    namelen: libc::socklen_t,
+    flags: libc::c_int,
+    controllen: usize,
+) -> bool {
+    let mut memory = ProviderMemory(memory);
+    let field = |offset: usize| address.checked_add(offset as u64);
+    if !message.msg_name.is_null() {
+        let Some(at) = field(std::mem::offset_of!(libc::msghdr, msg_namelen)) else {
+            return false;
+        };
+        if write_struct(&mut memory, at, &namelen) != 0 {
+            return false;
+        }
+    }
+    let (Some(flags_at), Some(controllen_at)) = (
+        field(std::mem::offset_of!(libc::msghdr, msg_flags)),
+        field(std::mem::offset_of!(libc::msghdr, msg_controllen)),
+    ) else {
+        return false;
+    };
+    write_struct(&mut memory, flags_at, &flags) == 0
+        && write_struct(&mut memory, controllen_at, &controllen) == 0
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1680,7 +1722,7 @@ pub(super) fn recvmmsg(
                 delivered as i64
             };
         };
-        let mut message: libc::mmsghdr =
+        let message: libc::mmsghdr =
             match read_guest_struct(&ProviderMemory(memory), message_address) {
                 Ok(message) => message,
                 Err(error) => {
@@ -1755,7 +1797,12 @@ pub(super) fn recvmmsg(
             guest_iovecs.push(iov);
         }
 
-        let name_capacity = message.msg_hdr.msg_namelen as usize;
+        // A header that names no buffer has no name length (__copy_msghdr).
+        let name_capacity = if message.msg_hdr.msg_name.is_null() {
+            0
+        } else {
+            message.msg_hdr.msg_namelen as usize
+        };
         let control_capacity = message.msg_hdr.msg_controllen;
         if name_capacity > MAX_HOST_IO || control_capacity > MAX_HOST_IO {
             return if delivered == 0 {
@@ -1920,17 +1967,27 @@ pub(super) fn recvmmsg(
                 };
             }
         }
-        message.msg_hdr.msg_namelen = host_header.msg_namelen;
-        message.msg_hdr.msg_controllen = control_bytes.len();
-        message.msg_hdr.msg_flags = host_header.msg_flags;
+        let mut message_flags = host_header.msg_flags;
         if flags & libc::MSG_CMSG_CLOEXEC == 0 {
-            message.msg_hdr.msg_flags &= !libc::MSG_CMSG_CLOEXEC;
+            message_flags &= !libc::MSG_CMSG_CLOEXEC;
         }
         if stripped_unsupported {
-            message.msg_hdr.msg_flags |= libc::MSG_CTRUNC;
+            message_flags |= libc::MSG_CTRUNC;
         }
-        message.msg_len = received as libc::c_uint;
-        if write_struct(&mut ProviderMemory(memory), message_address, &message) != 0 {
+        // The entry's header fields as for recvmsg, then its msg_len, as
+        // do_recvmmsg writes it after each message.
+        let length_at =
+            message_address.checked_add(std::mem::offset_of!(libc::mmsghdr, msg_len) as u64);
+        if !write_back_received_header(
+            memory,
+            message_address,
+            &message.msg_hdr,
+            host_header.msg_namelen,
+            message_flags,
+            control_bytes.len(),
+        ) || length_at.is_none_or(|at| {
+            write_struct(&mut ProviderMemory(memory), at, &(received as libc::c_uint)) != 0
+        }) {
             rollback_received_rights(state, &installed);
             return if delivered == 0 {
                 negative_errno(libc::EFAULT)
