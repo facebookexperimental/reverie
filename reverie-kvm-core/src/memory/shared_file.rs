@@ -242,7 +242,9 @@ impl GuestMemory {
         // path; preserve the caller's wrappers and cleanup evidence below.
         if !matches!(
             error.primary(),
-            Error::SharedFileCapability { .. } | Error::SharedFileCopy { .. }
+            Error::SharedFileCapability { .. }
+                | Error::UnsupportedSharedFile { .. }
+                | Error::SharedFileCopy { .. }
         ) {
             return error;
         }
@@ -1860,24 +1862,28 @@ mod tests {
         }
 
         for deferred in [false, true] {
-            for file_copy in [false, true] {
+            // A capability guard, a file copy, and a named refusal.
+            for kind in 0..3 {
                 for wrapper in 0..3 {
                     let memory = fixture(1);
                     let gate = memory.entry_gate();
-                    let cause = Arc::new(if file_copy {
-                        Error::SharedFileCopy {
+                    let cause = Arc::new(match kind {
+                        0 => Error::SharedFileCapability {
+                            operation: "atomic scalar store",
+                            reason: "capture identity control",
+                        },
+                        1 => Error::SharedFileCopy {
                             operation: "write",
                             address: BASE,
                             requested: 8,
                             transferred: 2,
                             prior_transferred: 4,
                             source: io::Error::from_raw_os_error(libc::EFAULT),
-                        }
-                    } else {
-                        Error::SharedFileCapability {
-                            operation: "atomic scalar store",
+                        },
+                        _ => Error::UnsupportedSharedFile {
+                            operation: "mmap",
                             reason: "capture identity control",
-                        }
+                        },
                     });
                     let cleanup = Arc::new(Error::GuestWorkerPanic);
                     let make_aggregate = || Error::WithCleanup {
@@ -1907,6 +1913,9 @@ mod tests {
                         .expect("file primary was not captured");
                     let terminal = pending.error();
                     assert!(terminal.retains_primary(&cause));
+                    // Only the named refusal reads as one, through every wrapper.
+                    assert_eq!(terminal.is_named_refusal(), kind == 2);
+                    assert_eq!(returned.is_named_refusal(), kind == 2);
                     if wrapper == 1 {
                         assert!(terminal.retains_primary(&shared_wrapper));
                     }

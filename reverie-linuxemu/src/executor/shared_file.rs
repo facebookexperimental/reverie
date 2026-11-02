@@ -20,6 +20,10 @@ fn unsupported_mmap(reason: &'static str) -> crate::Error {
     }
 }
 
+/// Why a shared view of a hugetlbfs file is refused.
+const HUGETLBFS_VIEW_REFUSAL: &str =
+    "hugetlbfs file views need huge page placement, length and reservation";
+
 /// Whether `file` lives on hugetlbfs (`fstatfs` `f_type`), whose shared
 /// views follow huge page placement, length and reservation rules.
 fn on_hugetlbfs(file: &std::fs::File) -> crate::Result<bool> {
@@ -189,9 +193,11 @@ pub(super) fn mmap_with_shared_files(
     // name below, with or without the flag: Linux places it at an address
     // aligned to the huge page, rounds its length up to whole huge pages and
     // reserves them unless MAP_NORESERVE is given, and the page-granular view
-    // made here does none of that. Other flags (locking, population, huge
-    // pages, grows-down, and so on) require their own faithful
-    // implementation before file-view replacement.
+    // made here does none of that. A private mapping of one still takes the
+    // plain path, page by page
+    // (https://github.com/rrnewton/reverie/issues/1234). Other flags (locking,
+    // population, huge pages, grows-down, and so on) require their own
+    // faithful implementation before file-view replacement.
     let supported_flags = (libc::MAP_PRIVATE
         | libc::MAP_SHARED
         | libc::MAP_FIXED
@@ -262,9 +268,12 @@ pub(super) fn mmap_with_shared_files(
             ));
         }
         if on_hugetlbfs(file)? {
-            return Err(unsupported_mmap(
-                "hugetlbfs file views need huge page placement, length and reservation",
-            ));
+            // A named refusal, not one of this path's internal guards: the
+            // run ends as one.
+            return Err(crate::Error::UnsupportedSharedFile {
+                operation: "mmap",
+                reason: HUGETLBFS_VIEW_REFUSAL,
+            });
         }
         if prot & libc::PROT_EXEC as u64 != 0 {
             return Err(unsupported_mmap(
@@ -741,7 +750,9 @@ mod tests {
     /// the page-granular view made without the flag would instead try to
     /// reserve the huge page, at a page-aligned address, for one page. Files
     /// outside hugetlbfs keep accepting MAP_NORESERVE
-    /// (`shared_mmap_noreserve_view_is_the_file_both_ways`).
+    /// (`shared_mmap_noreserve_view_is_the_file_both_ways`). The refusal is
+    /// the named one (`Error::UnsupportedSharedFile`), which a run ends with
+    /// as a refusal, not one of this path's internal guards.
     #[test]
     fn shared_mmap_of_hugetlbfs_file_is_refused_by_name() {
         // SAFETY: the name is terminated and the descriptor is owned below.
@@ -805,17 +816,19 @@ mod tests {
             );
             assert!(
                 matches!(
-                    result,
-                    Err(crate::Error::SharedFileCapability {
+                    &result,
+                    Err(error @ crate::Error::UnsupportedSharedFile {
                         operation: "mmap",
-                        reason,
-                    }) if reason.contains("hugetlbfs")
+                        reason: HUGETLBFS_VIEW_REFUSAL,
+                    }) if error.is_named_refusal()
                 ),
                 "flags {flags:#x}: {result:?}"
             );
             assert_eq!(memory.allocation_cursors(), before);
             assert!(!memory.contains_shared_file());
         }
+        // The internal guards of this path stay apart from the named refusal.
+        assert!(!unsupported_mmap("cannot identify the file's filesystem").is_named_refusal());
     }
 
     /// What the host kernel answers when `path`, opened with `open_flags`, is

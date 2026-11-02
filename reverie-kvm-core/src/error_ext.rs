@@ -290,6 +290,10 @@ mod tests {
         for refusal in [
             Error::PotentiallyBlockingZeroRead { fd: 3 },
             Error::BlockingInotifyRead { fd: 4 },
+            Error::UnsupportedSharedFile {
+                operation: "mmap",
+                reason: "hugetlbfs file views need huge page placement, length and reservation",
+            },
         ] {
             assert!(refusal.is_named_refusal(), "{refusal}");
             let refusal = wrapped(refusal);
@@ -299,6 +303,11 @@ mod tests {
             Error::UnexpectedVcpuExit("hlt".to_owned()),
             Error::RunAborted,
             Error::Reverie(reverie::syscalls::Errno::EIO.into()),
+            // The variant that also reports the backend's internal guards.
+            Error::SharedFileCapability {
+                operation: "atomic scalar store",
+                reason: "an internal guard",
+            },
         ] {
             assert!(!failure.is_named_refusal(), "{failure}");
             let failure = wrapped(failure);

@@ -367,6 +367,19 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// A shared-file operation Linux would perform that this backend does not
+    /// implement, refused by name before any effect. It is terminal like
+    /// [`Self::SharedFileCapability`], which also reports the backend's
+    /// internal guards; this one never does, so a run that ends with it ends
+    /// with a named refusal ([`Self::is_named_refusal`]).
+    #[error("unsupported KVM shared-file operation {operation}: {reason}")]
+    UnsupportedSharedFile {
+        /// Operation refused before its effect.
+        operation: &'static str,
+        /// What the backend does not implement.
+        reason: &'static str,
+    },
+
     /// A fault-contained copy involving mutable ordinary-file backing stopped.
     /// The recorded prefix is real and is never rolled back or reported as a
     /// complete copy; source preserves the actual host errno on a failed call.
@@ -599,11 +612,16 @@ impl Error {
     /// by name: the executor declined an operation it cannot perform
     /// faithfully, rather than failing at one. A consumer reports a run that
     /// ends this way as a refusal under its fail-closed policy, not as a
-    /// failure of its own. Every other variant is a failure.
+    /// failure of its own. The refusals are [`Self::PotentiallyBlockingZeroRead`],
+    /// [`Self::BlockingInotifyRead`] and [`Self::UnsupportedSharedFile`];
+    /// every other variant is a failure, [`Self::SharedFileCapability`]
+    /// among them, since it also reports the backend's internal guards.
     pub fn is_named_refusal(&self) -> bool {
         matches!(
             self.primary(),
-            Self::PotentiallyBlockingZeroRead { .. } | Self::BlockingInotifyRead { .. }
+            Self::PotentiallyBlockingZeroRead { .. }
+                | Self::BlockingInotifyRead { .. }
+                | Self::UnsupportedSharedFile { .. }
         )
     }
 }
