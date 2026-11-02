@@ -1046,6 +1046,7 @@ impl ElfExecutor {
             && (1..=64).contains(&request.args()[1])
             && self.terminal_cleanup.is_none()
         {
+            self.unsupported_refusal = Some(parent_death_signal_refusal(request.args()[1]));
             return Ok(negative_errno(libc::ENOSYS));
         }
         let _retirement = self.state.file_retirement.hold();

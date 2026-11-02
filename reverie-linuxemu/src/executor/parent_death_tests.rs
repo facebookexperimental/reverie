@@ -1175,3 +1175,79 @@ fn pdeath_adopted_control_without_terminal_cleanup_refuses_before_enrollment() {
     assert_eq!(&unchanged[4..], &[0xa5; 4]);
     assert!(executor.terminal_cleanup.is_none());
 }
+
+/// Without its parent-death protocol the executor holds no parent-death
+/// signal, so PR_SET_PDEATHSIG with any signal from 1 to 64 arms nothing and
+/// answers ENOSYS with the typed refusal `ParentDeathSignal`: a stop signal, a
+/// real-time signal and SIGCHLD by their own reasons, every other signal by the
+/// reason that no tool sends it. Linux accepts all of them, so the refusal must not
+/// read as a kernel answer. 0 is accepted and a value above 64 is EINVAL, as
+/// on Linux, and neither records a refusal.
+#[test]
+fn pdeath_refusals_without_the_protocol_are_typed_and_named() {
+    let root = TestDir::new();
+    let mut executor = ElfExecutor::new(test_state(&root.0), true);
+    let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+    let armed = |executor: &mut ElfExecutor, memory: &mut GuestMemory| {
+        memory.write(0x100, &[0xa5; 4]).unwrap();
+        assert_eq!(
+            executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_prctl as u64,
+                    [libc::PR_GET_PDEATHSIG as u64, 0x100, 0, 0, 0, 0]
+                ),
+                memory
+            ),
+            0
+        );
+        let mut bytes = [0; 4];
+        memory.read(0x100, &mut bytes).unwrap();
+        i32::from_ne_bytes(bytes)
+    };
+    let stop = [libc::SIGSTOP, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
+    for signal in 1..=64_u64 {
+        assert_eq!(
+            pdeath_set(&mut executor, &memory, signal),
+            -i64::from(libc::ENOSYS),
+            "signal {signal}"
+        );
+        let reason = if stop.iter().any(|stop| *stop as u64 == signal) {
+            ParentDeathSignalRefusal::STOP
+        } else if signal >= 32 {
+            ParentDeathSignalRefusal::REALTIME
+        } else if signal == libc::SIGCHLD as u64 {
+            ParentDeathSignalRefusal::SIGCHLD
+        } else {
+            ParentDeathSignalRefusal::UNSENT
+        };
+        assert_eq!(
+            executor.take_unsupported_refusal(),
+            Some(reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::ParentDeathSignal,
+                reverie::Errno::ENOSYS,
+                reason
+            )),
+            "signal {signal}"
+        );
+        assert_eq!(executor.take_unsupported_refusal(), None, "signal {signal}");
+        assert_eq!(
+            armed(&mut executor, &mut memory),
+            0,
+            "signal {signal} armed something"
+        );
+        assert_eq!(executor.take_unsupported_refusal(), None, "signal {signal}");
+    }
+    for (signal, answer) in [
+        (0, 0),
+        (65, -i64::from(libc::EINVAL)),
+        (u64::MAX, -i64::from(libc::EINVAL)),
+    ] {
+        assert_eq!(
+            pdeath_set(&mut executor, &memory, signal),
+            answer,
+            "signal {signal}"
+        );
+        assert_eq!(executor.take_unsupported_refusal(), None, "signal {signal}");
+    }
+    assert!(!executor.parent_death_enrolled());
+}

@@ -110,6 +110,14 @@ pub enum UnsupportedOperation {
     /// image, its threads and its address space in place. The refusal's
     /// diagnostic names the resource, the request and the limit.
     HostResources,
+    /// `prctl(PR_SET_PDEATHSIG)` arming a signal the backend cannot send when
+    /// the caller's parent thread exits, such as a stop signal on a backend
+    /// with no stopped state, a real-time signal on one whose signal queues
+    /// hold standard signals only, or `SIGCHLD` on one whose queues carry it
+    /// only for a child's exit. Linux accepts every signal from 1 to 64. A
+    /// backend that refuses it armed nothing and kept the caller's previous
+    /// parent-death signal; the refusal's diagnostic names the reason.
+    ParentDeathSignal,
 }
 
 /// A backend's refusal of an injected syscall, or of a `Guest` operation,

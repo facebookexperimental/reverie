@@ -360,6 +360,55 @@ pub(super) fn signal_refusal_record(
         })
 }
 
+/// Why this backend refused `prctl(PR_SET_PDEATHSIG)` with a nonzero signal.
+/// Each is the diagnostic of the typed refusal
+/// `UnsupportedOperation::ParentDeathSignal`; the refused call armed nothing.
+///
+/// Outside its own parent-death protocol (which a tool adopts with
+/// `ProcessSignalControl::enable_parent_death_control`) the executor holds no
+/// parent-death signal: a tool that sends them through
+/// `ProcessSignalControl::publish_parent_death_signal` keeps the signal itself
+/// and arms the executor with 0. A nonzero signal reaches the executor only
+/// when the tool cannot send it, so the refusal names why this backend could
+/// not send it either.
+pub(crate) struct ParentDeathSignalRefusal;
+
+impl ParentDeathSignalRefusal {
+    pub(crate) const STOP: &'static str = "KVM parent-death signal refused: KVM cannot send a \
+         stop signal (SIGSTOP, SIGTSTP, SIGTTIN or SIGTTOU), because it has no stopped state";
+    pub(crate) const REALTIME: &'static str = "KVM parent-death signal refused: KVM cannot \
+         send a real-time signal, because its signal queues hold standard signals only";
+    pub(crate) const SIGCHLD: &'static str = "KVM parent-death signal refused: KVM cannot \
+         send SIGCHLD, which its signal queues carry only for a child's exit";
+    pub(crate) const UNSENT: &'static str = "KVM parent-death signal refused: KVM sends a \
+         parent-death signal only for a tool that publishes it or that adopted KVM's \
+         parent-death protocol, and this run's tool did neither";
+}
+
+/// The typed refusal of `prctl(PR_SET_PDEATHSIG, signal)` with `signal` from 1
+/// to 64, which this executor answers with ENOSYS when no parent-death
+/// protocol is adopted (Linux refuses a larger value with EINVAL first, and
+/// accepts every one of these). Linux's prctl never answers a valid signal
+/// with ENOSYS, so the answer cannot be mistaken for a kernel one.
+pub(super) fn parent_death_signal_refusal(signal: u64) -> reverie::UnsupportedRefusal {
+    let reason = match signal {
+        stop if [libc::SIGSTOP, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU]
+            .iter()
+            .any(|candidate| *candidate as u64 == stop) =>
+        {
+            ParentDeathSignalRefusal::STOP
+        }
+        32..=64 => ParentDeathSignalRefusal::REALTIME,
+        sigchld if sigchld == libc::SIGCHLD as u64 => ParentDeathSignalRefusal::SIGCHLD,
+        _ => ParentDeathSignalRefusal::UNSENT,
+    };
+    reverie::UnsupportedRefusal::new(
+        reverie::UnsupportedOperation::ParentDeathSignal,
+        reverie::Errno::ENOSYS,
+        reason,
+    )
+}
+
 /// The calls whose answer Detcore decides on every backend, which this
 /// executor therefore leaves unimplemented: the CPU, affinity, scheduling
 /// policy and parameter, priority and I/O-priority calls; `membarrier`;
