@@ -3409,10 +3409,6 @@ impl TimerImpl {
     }
 }
 
-/// Whether a block step left the counter at `clock`, at or past the precise
-/// target `target_rcb`, which the decoded bound rules out. If it did, the
-/// delivery point may be passed, so this is recorded as a skid overshoot,
-/// with its marker, and the run fails closed as for a late notification.
 /// Whether an interrupted single step that moved neither rip nor the clock,
 /// and so is not counted, may make the event land one instruction late, if
 /// its instruction can run in place ([`instruction_may_run_in_place`]): it
@@ -3449,7 +3445,8 @@ fn instruction_may_run_in_place(task: &Stopped, ip: u64) -> bool {
 /// Whether the 64-bit instruction at the start of `code`, whose first byte
 /// is at `ip`, can run without moving rip: a `rep` or `repne` string
 /// instruction, which repeats in place until its count runs out, a direct
-/// branch to itself, or an indirect branch, whose target is not decoded.
+/// branch to itself, or an indirect branch or a return, whose target is not
+/// decoded (a return's comes from the stack, which can hold its own address).
 /// Bytes that do not decode count as able to.
 #[cfg(target_arch = "x86_64")]
 fn runs_in_place(ip: u64, code: &[u8]) -> bool {
@@ -3471,7 +3468,7 @@ fn runs_in_place(ip: u64, code: &[u8]) -> bool {
         FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::Call => {
             instruction.near_branch_target() == ip
         }
-        FlowControl::IndirectBranch | FlowControl::IndirectCall => true,
+        FlowControl::IndirectBranch | FlowControl::IndirectCall | FlowControl::Return => true,
         _ => {
             instruction.is_string_instruction()
                 && (instruction.has_rep_prefix() || instruction.has_repne_prefix())
@@ -3479,6 +3476,10 @@ fn runs_in_place(ip: u64, code: &[u8]) -> bool {
     }
 }
 
+/// Whether a block step left the counter at `clock`, at or past the precise
+/// target `target_rcb`, which the decoded bound rules out. If it did, the
+/// delivery point may be passed, so this is recorded as a skid overshoot,
+/// with its marker, and the run fails closed as for a late notification.
 fn block_step_reached_target(unit: StepUnit, clock: u64, target_rcb: u64) -> bool {
     if unit == StepUnit::Instruction || clock < target_rcb {
         return false;
@@ -6820,17 +6821,20 @@ mod tests {
         ));
     }
 
-    /// Only an instruction that can repeat without moving rip leaves an
-    /// unmoved interrupted step ambiguous.
+    /// Only an instruction that can repeat without moving rip, or a branch or
+    /// return whose target is not decoded, leaves an unmoved interrupted step
+    /// ambiguous.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn only_repeats_and_branches_to_themselves_run_in_place() {
         const IP: u64 = 0x40_1000;
-        let cases: [(&[u8], bool); 13] = [
+        let cases: [(&[u8], bool); 15] = [
             (&[0xf3, 0xa4], true),        // rep movsb
             (&[0xf2, 0xae], true),        // repne scasb
             (&[0xa4], false),             // movsb
-            (&[0xf3, 0xc3], false),       // rep ret: not a string instruction
+            (&[0xf3, 0xc3], true),        // rep ret: a return, not a string instruction
+            (&[0xc3], true),              // ret: target taken from the stack
+            (&[0xc2, 0x08, 0x00], true),  // ret 8: likewise
             (&[0xeb, 0xfe], true),        // jmp to itself
             (&[0x75, 0xfe], true),        // jne to itself
             (&[0xe2, 0xfe], true),        // loop to itself
