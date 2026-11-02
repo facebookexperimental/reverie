@@ -1,1 +1,0 @@
-./test -M 'random < 100000000' -P print

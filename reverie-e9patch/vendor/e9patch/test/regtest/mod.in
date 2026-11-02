@@ -1,1 +1,0 @@
-./test.pie -M 'addr % 13 == 4' -P 'format("addr=%p\n",(static)addr)@patch'

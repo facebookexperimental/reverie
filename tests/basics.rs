@@ -77,11 +77,10 @@ fn fn_test() {
 #[test]
 fn run_fn_test() {
     fn_test();
-    #[cfg(feature = "dbt")]
     rust_command_test();
 }
 
-#[cfg(all(feature = "dbt", not(sanitized)))]
+#[cfg(not(sanitized))]
 fn assert_rust_marker(stdout: &[u8]) {
     const MARKER: &[u8] = b"basics-rust-body-complete\n";
     assert_eq!(
@@ -93,7 +92,7 @@ fn assert_rust_marker(stdout: &[u8]) {
     );
 }
 
-#[cfg(all(feature = "dbt", not(sanitized)))]
+#[cfg(not(sanitized))]
 fn assert_rust_counter(output: &reverie::process::Output, state: &tools::CounterGlobal) {
     // The original fn_test predicates, applied to the actual returned state.
     assert_eq!(output.status, ExitStatus::Exited(0));
@@ -101,7 +100,7 @@ fn assert_rust_counter(output: &reverie::process::Output, state: &tools::Counter
     assert!(AtomicU64::load(&state.num_syscalls, Ordering::SeqCst) > 1);
 }
 
-#[cfg(all(feature = "dbt", not(sanitized)))]
+#[cfg(not(sanitized))]
 fn record_rust_command(
     label: &str,
     output: &reverie::process::Output,
@@ -131,20 +130,8 @@ fn record_rust_command(
     assert_rust_marker(&output.stdout);
 }
 
-#[cfg(all(feature = "dbt", not(sanitized)))]
+#[cfg(not(sanitized))]
 fn rust_command_test() {
-    let executable = std::env::current_exe().unwrap();
-    let callers = executable
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("reverie-dbt-callers");
-    let counter = callers.join("basics-counter/manifest.json");
-    let noop = callers.join("basics-noop/manifest.json");
-    for manifest in [&counter, &noop] {
-        reverie_dbt::CallerArtifact::load(manifest).unwrap();
-    }
     let program = env!("CARGO_BIN_EXE_basics-rust-command-guest");
     eprintln!("basics Rust command image={program}");
     let output = std::process::Command::new(program).output().unwrap();
@@ -160,20 +147,15 @@ fn rust_command_test() {
     record_rust_command("ptrace", &output, &state);
     assert_rust_counter(&output, &state);
 
-    let (output, state) =
-        reverie_test_support::test_dbt_cmd_with_config::<CounterLocal>(program, &[], (), &counter)
-            .unwrap();
-    record_rust_command("dbt", &output, &state);
-    assert_rust_counter(&output, &state);
-
-    // Actual Noop Tool, with the same unit Config and the real controller's
-    // CounterGlobal. Successful execution, not setup refusal, is the control.
-    let (output, state) =
-        reverie_test_support::test_dbt_cmd_with_config::<CounterLocal>(program, &[], (), &noop)
-            .unwrap();
-    record_rust_command("noop", &output, &state);
-    assert_eq!(state.num_syscalls.load(Ordering::SeqCst), 0);
-    assert!(std::panic::catch_unwind(|| assert_rust_counter(&output, &state)).is_err());
+    // The actual Noop Tool has no counter, so its real successful run is
+    // paired with an empty counter state. record_rust_command first requires
+    // that run's success and marker, so the rejection below can only come from
+    // the count predicate: it cannot pass a Tool that intercepts no syscall.
+    let (output, ()) = test_cmd::<NoopTool>(program, &[]).unwrap();
+    let noop = tools::CounterGlobal::default();
+    record_rust_command("noop", &output, &noop);
+    assert_eq!(noop.num_syscalls.load(Ordering::SeqCst), 0);
+    assert!(std::panic::catch_unwind(|| assert_rust_counter(&output, &noop)).is_err());
 }
 
 #[cfg(not(sanitized))]
@@ -195,7 +177,6 @@ fn run_guest_func_write_test() {
     let (output, _state) = test_fn::<CounterLocal, _>(move || rust_guest::write_body(msg)).unwrap();
     assert_eq!(output.status, ExitStatus::Exited(0));
     assert_eq!(output.stdout.as_slice(), msg.as_bytes());
-    #[cfg(feature = "dbt")]
     rust_output_command_test("write");
 }
 
@@ -207,11 +188,10 @@ fn run_guest_func_print_test() {
 
     assert_eq!(output.status, ExitStatus::Exited(0));
     assert_eq!(output.stdout.as_slice(), b"abcd\n");
-    #[cfg(feature = "dbt")]
     rust_output_command_test("print");
 }
 
-#[cfg(all(feature = "dbt", not(sanitized)))]
+#[cfg(not(sanitized))]
 fn rust_output_matches(mode: &str, exited_zero: bool, stdout: &[u8], stderr: &[u8]) -> bool {
     let expected: &[u8] = match mode {
         "write" => b"abcd",
@@ -221,7 +201,10 @@ fn rust_output_matches(mode: &str, exited_zero: bool, stdout: &[u8], stderr: &[u
     exited_zero && stdout == expected && stderr.is_empty()
 }
 
-#[cfg(all(feature = "dbt", not(sanitized)))]
+/// The shared write/print bodies as ordinary commands, natively and under
+/// ptrace. The opposite selector's real output must pass its own oracle and be
+/// rejected by this mode's, so the byte oracle cannot accept either output.
+#[cfg(not(sanitized))]
 fn rust_output_command_test(mode: &str) {
     let opposite = match mode {
         "write" => "print",
@@ -258,21 +241,9 @@ fn rust_output_command_test(mode: &str) {
         &output.stderr,
     ));
 
-    let (output, _state) = commands::counter_command(program, &[mode]).unwrap();
+    let (output, _state) = test_cmd::<CounterLocal>(program, &[opposite]).unwrap();
     eprintln!(
-        "basics Rust output mode={mode} role=dbt selector={mode}: status={:?} stdout={:02x?} stderr={:02x?}",
-        output.status, output.stdout, output.stderr,
-    );
-    assert!(rust_output_matches(
-        mode,
-        output.status == ExitStatus::Exited(0),
-        &output.stdout,
-        &output.stderr,
-    ));
-
-    let (output, _state) = commands::counter_command(program, &[opposite]).unwrap();
-    eprintln!(
-        "basics Rust output mode={mode} role=opposite-dbt selector={opposite}: status={:?} stdout={:02x?} stderr={:02x?}",
+        "basics Rust output mode={mode} role=opposite-ptrace selector={opposite}: status={:?} stdout={:02x?} stderr={:02x?}",
         output.status, output.stdout, output.stderr,
     );
     assert!(rust_output_matches(
@@ -389,34 +360,4 @@ fn child_should_inherit_fds() {
             }
         }
     });
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_noop_tool_test() {
-    commands::noop_tool_test(commands::noop_command);
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_counter_tool_test() {
-    commands::counter_tool_test(commands::counter_command);
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_error_exit_test() {
-    commands::error_exit_test(commands::counter_command);
-}
-
-#[cfg(all(feature = "dbt", not(sanitized)))]
-#[test]
-fn dbt_run_guest_command_test() {
-    commands::run_guest_command_test(commands::counter_command);
-}
-
-#[cfg(all(feature = "dbt", not(sanitized)))]
-#[test]
-fn dbt_run_guest_command_test_closure() {
-    commands::run_guest_command_test_closure(commands::counter_command);
 }

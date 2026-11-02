@@ -1,2 +1,0 @@
-imul $0x77, %r11, %r10
-PASSED

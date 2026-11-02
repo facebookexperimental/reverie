@@ -75,6 +75,7 @@ const TAIL_NONE: u8 = 0;
 const TAIL_RESULT: u8 = 1;
 const TAIL_EXIT: u8 = 2;
 const TAIL_FORK_CHILD: u8 = 3;
+const TAIL_DEFERRED_NATIVE: u8 = 4;
 
 /// Poll a `Future` to completion with a no-op waker.
 ///
@@ -103,6 +104,8 @@ where
 pub enum SyscallOutcome {
     /// The future resolved to a syscall result (`Ok`) or a Tool error (`Err`).
     Return(Result<i64, Error>),
+    /// Execute only after the Rust callback and all Guest borrows ended.
+    DeferredNative { number: i64, args: [u64; 6] },
     /// The Tool tail-injected a process/thread exit; the host must run the
     /// exit-lifecycle callbacks and perform `number(args)`.
     Exit { number: i64, args: [u64; 6] },
@@ -119,6 +122,10 @@ pub enum SyscallOutcome {
 /// A pending tail transition parked in a [`TailResult`].
 enum TailAction {
     Result(i64),
+    DeferredNative {
+        number: i64,
+        args: [u64; 6],
+    },
     Exit {
         number: i64,
         args: [u64; 6],
@@ -135,6 +142,7 @@ impl From<TailAction> for TailFact<(i64, [u64; 6])> {
     fn from(action: TailAction) -> Self {
         match action {
             TailAction::Result(value) => Self::Completed(value),
+            TailAction::DeferredNative { number, args } => Self::Deferred { number, args },
             TailAction::Exit { number, args } => Self::Established((number, args)),
             TailAction::ForkChild {
                 parent_tid,
@@ -192,10 +200,11 @@ where
                 };
             }
             CallbackDecision::Wait => core::hint::spin_loop(),
-            CallbackDecision::StartupCompleted(_)
-            | CallbackDecision::Deferred { .. }
-            | CallbackDecision::Refused(_) => {
-                unreachable!("trap syscall facts contain no deferred call or refusal")
+            CallbackDecision::Deferred { number, args } => {
+                return SyscallOutcome::DeferredNative { number, args };
+            }
+            CallbackDecision::StartupCompleted(_) | CallbackDecision::Refused(_) => {
+                unreachable!("trap syscall facts contain no startup completion or refusal")
             }
         }
     }
@@ -254,6 +263,81 @@ where
     }
 }
 
+/// Poll an instruction/finalization helper that uses the native owner's
+/// original no-op-waker/yield loop. This is distinct from its application
+/// syscall/lifecycle driver: it does not consume a tail rendezvous or add a
+/// syscall restart. A pending future retains the original yield behavior.
+pub fn drive_native_ready<F: Future>(future: F) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// The native owner's callback completion. Deferred operations remain with
+/// that owner until its real post-event path, after all Rust borrows end.
+/// Unlike the local driver, the native driver does not add a syscall-restart
+/// loop, and it retains the native owner's cross-thread wake/park behavior.
+pub enum NativeCallbackOutcome<V> {
+    /// The original handler returned its value (including any error).
+    Ready(V),
+    /// The original native continuation must apply this exact operation.
+    Deferred { number: i64, args: [u64; 6] },
+    /// A local-only transition cannot be applied by the native continuation.
+    Unsupported(&'static str),
+}
+
+/// Drive one native handler, preserving its original single-handler behavior.
+/// No registry, Tool-slot or state-owner lock may surround this call. Blocking
+/// RPC remains synchronous; genuinely pending futures use the original native
+/// thread wakeup and a 1 ms defensive park timeout. A ready handler wins over
+/// an abandoned tail future, as in the original native driver.
+pub fn drive_native_callback<F, V>(future: F, tail: &TailResult) -> NativeCallbackOutcome<V>
+where
+    F: Future<Output = V>,
+{
+    struct ThreadWake(std::thread::Thread);
+    impl std::task::Wake for ThreadWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let mut future = core::pin::pin!(future);
+    let waker = Waker::from(std::sync::Arc::new(ThreadWake(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return NativeCallbackOutcome::Ready(value),
+            Poll::Pending => match tail.take() {
+                Some(
+                    TailAction::DeferredNative { number, args } | TailAction::Exit { number, args },
+                ) => {
+                    return NativeCallbackOutcome::Deferred { number, args };
+                }
+                Some(TailAction::Result(_)) => {
+                    return NativeCallbackOutcome::Unsupported(
+                        "a local completed tail in a native callback",
+                    );
+                }
+                Some(TailAction::ForkChild { .. }) => {
+                    return NativeCallbackOutcome::Unsupported(
+                        "a local fork transition in a native callback",
+                    );
+                }
+                None => std::thread::park_timeout(std::time::Duration::from_millis(1)),
+            },
+        }
+    }
+}
+
 /// The resolved outcome of driving a subscribed syscall through the Tool,
 /// after the shared restart protocol has been applied.
 ///
@@ -271,6 +355,9 @@ pub enum DrivenSyscall {
     /// A final result to store into the syscall event (already negated for the
     /// errno case).
     Result(i64),
+    /// A native owner must apply this operation after the Rust borrow ends;
+    /// the callback scratch remains live until its real completion.
+    DeferredNative { number: i64, args: [u64; 6] },
     /// The Tool tail-injected a process/thread exit.
     Exit { number: i64, args: [u64; 6] },
     /// The Tool's injected plain fork returned in the child.
@@ -348,6 +435,9 @@ fn classify_outcome(outcome: SyscallOutcome) -> Option<DrivenSyscall> {
             SyscallResult::Restart => None,
             SyscallResult::Fatal(error) => Some(DrivenSyscall::Fatal(error)),
         },
+        SyscallOutcome::DeferredNative { number, args } => {
+            Some(DrivenSyscall::DeferredNative { number, args })
+        }
         SyscallOutcome::Exit { number, args } => Some(DrivenSyscall::Exit { number, args }),
         SyscallOutcome::ForkChild {
             parent_tid,
@@ -388,6 +478,16 @@ impl TailResult {
         self.action.store(TAIL_RESULT, Ordering::Release);
     }
 
+    /// Defer a native operation until the real callback releases its Rust
+    /// borrows. This rendezvous grants no lifecycle, image or clone authority.
+    pub fn set_deferred_native(&self, number: i64, args: [u64; 6]) {
+        self.number.store(number, Ordering::Relaxed);
+        for (destination, value) in self.args.iter().zip(args) {
+            destination.store(value, Ordering::Relaxed);
+        }
+        self.action.store(TAIL_DEFERRED_NATIVE, Ordering::Release);
+    }
+
     /// Stage a tail-injected process/thread exit (`number(args)`).
     pub fn set_exit(&self, number: i64, args: [u64; 6]) {
         self.ending.store(true, Ordering::Release);
@@ -421,6 +521,10 @@ impl TailResult {
         match self.action.swap(TAIL_NONE, Ordering::AcqRel) {
             TAIL_RESULT => Some(TailAction::Result(self.value.load(Ordering::Relaxed))),
             TAIL_EXIT => Some(TailAction::Exit {
+                number: self.number.load(Ordering::Relaxed),
+                args: core::array::from_fn(|index| self.args[index].load(Ordering::Relaxed)),
+            }),
+            TAIL_DEFERRED_NATIVE => Some(TailAction::DeferredNative {
                 number: self.number.load(Ordering::Relaxed),
                 args: core::array::from_fn(|index| self.args[index].load(Ordering::Relaxed)),
             }),

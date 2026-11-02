@@ -1,1 +1,0 @@
-./test -M true -P 'state_check(addr,state,rsp,rbx,r15)@patch'

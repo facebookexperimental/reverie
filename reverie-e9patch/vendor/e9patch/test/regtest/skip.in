@@ -1,1 +1,0 @@
-./test -M true -P 'if skip(state,0xa00025a,asm)@patch goto'

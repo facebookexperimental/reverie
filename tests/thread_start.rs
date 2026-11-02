@@ -28,7 +28,6 @@ fn thread_start_inject() {
     eprintln!("thread-start function: observed={observed}");
     assert!(observed);
 
-    #[cfg(feature = "dbt")]
     rust_command_test();
 }
 
@@ -39,20 +38,6 @@ fn thread_start_tail_inject() {
     reverie_ptrace::testing::check_fn::<TestTool, _>(|| {});
 }
 
-#[cfg(feature = "dbt")]
-fn caller_manifest() -> std::path::PathBuf {
-    let executable = std::env::current_exe().unwrap();
-    executable
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("reverie-dbt-callers")
-        .join("thread-start-inject")
-        .join("manifest.json")
-}
-
-#[cfg(feature = "dbt")]
 fn assert_command_output(
     label: &str,
     output: &reverie::process::Output,
@@ -69,10 +54,7 @@ fn assert_command_output(
     assert!(observed);
 }
 
-#[cfg(feature = "dbt")]
 fn rust_command_test() {
-    let manifest = caller_manifest();
-    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
     let program = env!("CARGO_BIN_EXE_thread-start-rust-command-guest");
     eprintln!("thread-start Rust command image={program}");
 
@@ -88,76 +70,23 @@ fn rust_command_test() {
     let (output, state) =
         reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], ()).unwrap();
     assert_command_output("ptrace", &output, &state);
-    let (output, state) =
-        reverie_test_support::test_dbt_cmd_with_config::<TestTool>(program, &[], (), &manifest)
-            .unwrap();
-    assert_command_output("dbt", &output, &state);
 }
 
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_thread_start_missing_artifact_refuses() {
-    let manifest = caller_manifest();
-    let _valid_default = reverie_dbt::CallerArtifact::load(&manifest).unwrap();
-    let missing = manifest.with_file_name("missing-thread-start-inject-manifest.json");
-    assert!(!missing.exists());
-    let error =
-        reverie_test_support::test_dbt_cmd_with_config::<TestTool>("/bin/true", &[], (), &missing)
-            .unwrap_err();
-    eprintln!(
-        "explicit missing thread-start artifact {}: {error}",
-        missing.display()
-    );
-    let reverie::Error::Io(error) = error else {
-        panic!("expected missing manifest I/O error: {error}");
-    };
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-}
-
-#[cfg(feature = "dbt")]
 #[test]
 fn rust_thread_start_tail_command() {
     use thread_start_tail_tool::TestTool;
 
-    let manifest = caller_manifest()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("thread-start-tail/manifest.json");
-    let _valid = reverie_dbt::CallerArtifact::load(&manifest).unwrap();
     let program = env!("CARGO_BIN_EXE_thread-start-rust-command-guest");
     eprintln!("thread-start tail Rust command image={program}");
-    let check = |label: &str, output: &reverie::process::Output| {
-        eprintln!(
-            "thread-start tail Rust command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
-            output.status, output.stdout, output.stderr,
-        );
-        assert_eq!(output.status, reverie::ExitStatus::Exited(0));
-        assert!(output.stdout.is_empty());
-        assert!(output.stderr.is_empty());
-    };
-    let (ptrace, ()) =
+    let (output, ()) =
         reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], ()).unwrap();
-    check("ptrace", &ptrace);
-    let (dbt, ()) =
-        reverie_test_support::test_dbt_cmd_with_config::<TestTool>(program, &[], (), &manifest)
-            .unwrap();
-    check("dbt", &dbt);
-
-    let missing = manifest.with_file_name("missing-thread-start-tail-manifest.json");
-    assert!(!missing.exists());
-    let error =
-        reverie_test_support::test_dbt_cmd_with_config::<TestTool>(program, &[], (), &missing)
-            .unwrap_err();
     eprintln!(
-        "explicit missing thread-start tail artifact {}: {error}",
-        missing.display()
+        "thread-start tail Rust command ptrace: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
     );
-    let reverie::Error::Io(error) = error else {
-        panic!("expected missing manifest I/O error: {error}");
-    };
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }
 
 struct ReturningRun {
@@ -211,26 +140,6 @@ fn ptrace_returning(mode: u8) -> ReturningRun {
     >("/bin/true", &[], (mode, 0, 0))
     .unwrap();
     returning_output("ptrace", mode, output, state)
-}
-
-#[cfg(feature = "dbt")]
-fn dbt_returning(mode: u8) -> ReturningRun {
-    let manifest = caller_manifest()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("thread-start-tail-witness/manifest.json");
-    let _valid = reverie_dbt::CallerArtifact::load(&manifest).unwrap();
-    eprintln!(
-        "returning-injection dbt image=/bin/true mode={mode} manifest={}",
-        manifest.display()
-    );
-    let (output, state) = reverie_test_support::test_dbt_cmd_with_config::<
-        thread_start_tail_witness::TestTool,
-    >("/bin/true", &[], (mode, 0, 0), &manifest)
-    .unwrap();
-    returning_output("dbt", mode, output, state)
 }
 
 fn returning_order(mode: u8) -> Vec<(u8, u8, Option<reverie::syscalls::Sysno>)> {
@@ -512,74 +421,33 @@ fn ptrace_returning_post_exec_preserves_frame_and_effect() {
     );
 }
 
-#[cfg(feature = "dbt")]
+/// The first post-exec call's register view before injection is a native ELF
+/// execve's: rax 0 and orig_rax 59.
 #[test]
-fn dbt_returning_startup_getpid_preserves_frame() {
-    returning_single(dbt_returning, thread_start_tail_witness::START_GETPID);
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_returning_startup_errno_preserves_frame() {
-    returning_single(dbt_returning, thread_start_tail_witness::START_ERRNO);
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_returning_startup_mutation_and_effect() {
-    returning_sequence(
-        dbt_returning,
-        thread_start_tail_witness::START_SEQUENCE,
-        thread_start_tail_witness::START_NO_EFFECT,
-    );
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_returning_post_exec_preserves_frame_and_effect() {
-    returning_sequence(
-        dbt_returning,
-        thread_start_tail_witness::POST_SEQUENCE,
-        thread_start_tail_witness::POST_NO_EFFECT,
-    );
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_and_ptrace_post_exec_orig_rax_before_injection() {
+fn ptrace_post_exec_orig_rax_before_injection() {
     use thread_start_tail_witness::*;
 
-    let before = |backend: &str, run: &ReturningRun| {
-        assert_returning_records(POST_SEQUENCE, run);
-        assert_returning_completion(run, &[BYTE]);
-        assert!(
-            full_returning_effect(run),
-            "returning-injection full effect predicate"
-        );
-        let mut first_calls = run
-            .rows
-            .iter()
-            .filter(|(_, row)| row.0 == POST_EXEC && row.1 == CALL && row.3 == Some(0));
-        let (_, record) = first_calls.next().expect("missing first post_exec call");
-        assert!(
-            first_calls.next().is_none(),
-            "duplicate first post_exec call"
-        );
-        let frame = record.7.expect("missing first post_exec call frames").0;
-        let values = (frame[10], frame[15]);
-        eprintln!(
-            "post-exec-orig-rax {backend} image=/bin/true mode={POST_SEQUENCE} callback={POST_EXEC} call_ordinal=0 frame=before rax={} orig_rax={}",
-            values.0, values.1,
-        );
-        assert_eq!(values, (0, 59), "native ELF post_exec register view");
-        values
-    };
-
-    let ptrace = before("ptrace", &ptrace_returning(POST_SEQUENCE));
-    let dbt = before("dbt", &dbt_returning(POST_SEQUENCE));
-    assert_eq!(dbt, ptrace, "post_exec BEFORE register views differ");
-    eprintln!(
-        "post-exec-orig-rax comparison accepted: ptrace_rax={} ptrace_orig_rax={} dbt_rax={} dbt_orig_rax={}",
-        ptrace.0, ptrace.1, dbt.0, dbt.1,
+    let run = ptrace_returning(POST_SEQUENCE);
+    assert_returning_records(POST_SEQUENCE, &run);
+    assert_returning_completion(&run, &[BYTE]);
+    assert!(
+        full_returning_effect(&run),
+        "returning-injection full effect predicate"
     );
+    let mut first_calls = run
+        .rows
+        .iter()
+        .filter(|(_, row)| row.0 == POST_EXEC && row.1 == CALL && row.3 == Some(0));
+    let (_, record) = first_calls.next().expect("missing first post_exec call");
+    assert!(
+        first_calls.next().is_none(),
+        "duplicate first post_exec call"
+    );
+    let frame = record.7.expect("missing first post_exec call frames").0;
+    let values = (frame[10], frame[15]);
+    eprintln!(
+        "post-exec-orig-rax ptrace image=/bin/true mode={POST_SEQUENCE} callback={POST_EXEC} call_ordinal=0 frame=before rax={} orig_rax={}",
+        values.0, values.1,
+    );
+    assert_eq!(values, (0, 59), "native ELF post_exec register view");
 }

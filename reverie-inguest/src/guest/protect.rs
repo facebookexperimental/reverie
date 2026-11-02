@@ -40,7 +40,11 @@ use crate::trap::raw_syscall6;
 
 static COORDINATOR_FD: AtomicI32 = AtomicI32::new(-1);
 
-#[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
+#[cfg(any(
+    feature = "exec-native-injection",
+    feature = "loader-private-runtime",
+    all(test, feature = "coordinator-rpc")
+))]
 pub(super) fn coordinator_fd() -> Option<libc::c_int> {
     let fd = COORDINATOR_FD.load(Ordering::Acquire);
     (fd >= 0).then_some(fd)

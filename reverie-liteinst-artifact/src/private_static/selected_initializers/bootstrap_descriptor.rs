@@ -370,7 +370,7 @@ impl VerifiedStaticSource {
         artifact: &FileIdentity,
         link_map: &FileIdentity,
         runner: &mut Runner,
-        callback: impl FnOnce(&BootstrapDescriptorLeafObservation, &mut Runner) -> Result<T>,
+        callback: impl FnOnce(&super::BootstrapDescriptorLeafObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
         self.with_leaf_objects(
             archive,

@@ -1,3 +1,0 @@
-jmpq *0x777f(%rsp,%rcx,1)
-movq %gs:-0x100(%rsp,%rsi,8), %rcx
-PASSED

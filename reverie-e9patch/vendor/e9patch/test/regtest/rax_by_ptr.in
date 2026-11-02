@@ -1,1 +1,0 @@
-./test -M 'rax in regs' -P 'rax_by_ptr(&rax,asm)@patch'

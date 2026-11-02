@@ -1,1 +1,0 @@
-./test -M true -P 'entry(addr,(static)addr,base,bytes,size,asm)@inst'

@@ -1,1 +1,0 @@
-./test -M 'BB.entry && BB.exit' -P print

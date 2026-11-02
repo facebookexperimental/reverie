@@ -44,6 +44,43 @@ fn inputs() -> &'static [(&'static str, &'static [u8])] {
             include_bytes!("guest/native_exec_mappings.rs"),
         ),
         ("rv/guest/host.rs", include_bytes!("guest/host.rs")),
+        ("rv/guest/mod.rs", include_bytes!("guest/mod.rs")),
+        (
+            "rv/guest/native_capture.rs",
+            include_bytes!("guest/native_capture.rs"),
+        ),
+        (
+            "rv/guest/native_copied.rs",
+            include_bytes!("guest/native_copied.rs"),
+        ),
+        (
+            "rv/guest/native_entry.rs",
+            include_bytes!("guest/native_entry.rs"),
+        ),
+        (
+            "rv/guest/native_exit.rs",
+            include_bytes!("guest/native_exit.rs"),
+        ),
+        (
+            "rv/guest/native_initialize.rs",
+            include_bytes!("guest/native_initialize.rs"),
+        ),
+        (
+            "rv/guest/native_linux.rs",
+            include_bytes!("guest/native_linux.rs"),
+        ),
+        (
+            "rv/guest/native_rpc.rs",
+            include_bytes!("guest/native_rpc.rs"),
+        ),
+        (
+            "rv/guest/native_services.rs",
+            include_bytes!("guest/native_services.rs"),
+        ),
+        (
+            "rv/guest/native_state.rs",
+            include_bytes!("guest/native_state.rs"),
+        ),
         (
             "rv/guest/tool_install.rs",
             include_bytes!("guest/tool_install.rs"),
@@ -232,6 +269,43 @@ mod tests {
                 include_bytes!("../../reverie/src/tool_outcome.rs").as_slice(),
             ),
             ("rv/tool_host.rs", include_bytes!("tool_host.rs").as_slice()),
+            ("rv/guest/mod.rs", include_bytes!("guest/mod.rs").as_slice()),
+            (
+                "rv/guest/native_capture.rs",
+                include_bytes!("guest/native_capture.rs").as_slice(),
+            ),
+            (
+                "rv/guest/native_copied.rs",
+                include_bytes!("guest/native_copied.rs").as_slice(),
+            ),
+            (
+                "rv/guest/native_entry.rs",
+                include_bytes!("guest/native_entry.rs").as_slice(),
+            ),
+            (
+                "rv/guest/native_exit.rs",
+                include_bytes!("guest/native_exit.rs").as_slice(),
+            ),
+            (
+                "rv/guest/native_initialize.rs",
+                include_bytes!("guest/native_initialize.rs").as_slice(),
+            ),
+            (
+                "rv/guest/native_linux.rs",
+                include_bytes!("guest/native_linux.rs").as_slice(),
+            ),
+            (
+                "rv/guest/native_rpc.rs",
+                include_bytes!("guest/native_rpc.rs").as_slice(),
+            ),
+            (
+                "rv/guest/native_services.rs",
+                include_bytes!("guest/native_services.rs").as_slice(),
+            ),
+            (
+                "rv/guest/native_state.rs",
+                include_bytes!("guest/native_state.rs").as_slice(),
+            ),
             (
                 "rv/transport/lib.rs",
                 include_bytes!("../../reverie-rpc-transport/src/lib.rs").as_slice(),

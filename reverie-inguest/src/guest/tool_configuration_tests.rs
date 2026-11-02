@@ -131,8 +131,20 @@ fn retained_configuration_is_shared_by_rpc_host_and_fork_constructor() {
     let selection = owner.subscriptions().iter_syscalls().collect();
     let host = ToolHost::with_configuration(tool, rpc, pid, owner, selection, Runtime);
     assert!(std::ptr::eq(host.rpc().config(), Arc::as_ptr(&original)));
-    assert!(host.tool.lock().selected_configuration().is_some());
-    let child = host.tool.lock().new_process(child_pid, host.rpc().config());
+    assert!(
+        host.tool
+            .lock()
+            .as_deref()
+            .unwrap()
+            .selected_configuration()
+            .is_some()
+    );
+    let child = host
+        .tool
+        .lock()
+        .as_deref()
+        .unwrap()
+        .new_process(child_pid, host.rpc().config());
     let state = child.init_thread_state(child_tid, Some((tid, &parent)));
     assert_eq!(parent, (31, 37, 71));
     assert_eq!(state, (41, 43, 72));
@@ -150,12 +162,24 @@ fn retained_configuration_is_shared_by_rpc_host_and_fork_constructor() {
     let address = rpc.config() as *const u64 as usize;
     EVENTS.lock().unwrap().clear();
     let host = ToolHost::new(Probe { pid: 97 }, rpc, pid, HashSet::new(), false, Runtime);
-    assert!(host.tool.lock().selected_configuration().is_none());
+    assert!(
+        host.tool
+            .lock()
+            .as_deref()
+            .unwrap()
+            .selected_configuration()
+            .is_none()
+    );
     assert!(EVENTS.lock().unwrap().is_empty());
-    assert_eq!(host.tool.lock().as_ref().unwrap().pid, 97);
+    assert_eq!(
+        host.tool.lock().as_deref().unwrap().as_ref().unwrap().pid,
+        97
+    );
     assert_eq!(
         host.tool
             .lock()
+            .as_deref()
+            .unwrap()
             .new_process(child_pid, host.rpc().config())
             .as_ref()
             .unwrap()
@@ -200,6 +224,8 @@ impl HostRuntime for Runtime {
 #[cfg(feature = "rcb-clock")]
 #[test]
 fn retained_configuration_preflight_failure_never_constructs_the_tool() {
+    use std::os::fd::AsRawFd;
+
     use super::super::tool_install::PatchHost;
     use super::super::tool_install::install_tool_with;
     use crate::guest::runtime_seam::PatcherRef;
@@ -233,11 +259,12 @@ fn retained_configuration_preflight_failure_never_constructs_the_tool() {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            let socket_path =
-                std::env::temp_dir().join(format!("reverie-config-preflight-{}.sock", child.id()));
+            let socket_directory =
+                std::env::temp_dir().join(format!("reverie-config-preflight-{}", child.id()));
             let output = child.wait_with_output().unwrap();
-            if socket_path.exists() {
-                std::fs::remove_file(socket_path).unwrap();
+            if socket_directory.exists() {
+                std::fs::remove_file(socket_directory.join("socket")).unwrap();
+                std::fs::remove_dir(socket_directory).unwrap();
             }
             let mut events = Vec::new();
             witness.read_to_end(&mut events).unwrap();
@@ -324,9 +351,14 @@ fn retained_configuration_preflight_failure_never_constructs_the_tool() {
         }
     }
     let early = phase == "before-selection";
-    let path = std::env::temp_dir().join(format!(
-        "reverie-config-preflight-{}.sock",
-        std::process::id()
+    let directory =
+        std::env::temp_dir().join(format!("reverie-config-preflight-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let directory_owner = std::fs::File::open(&directory).unwrap();
+    // Keep the socket inside the owned TMPDIR while using a bounded sun_path.
+    let path = std::path::PathBuf::from(format!(
+        "/proc/self/fd/{}/socket",
+        directory_owner.as_raw_fd()
     ));
     let server = if early {
         None
@@ -348,4 +380,6 @@ fn retained_configuration_preflight_failure_never_constructs_the_tool() {
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }
+    drop(directory_owner);
+    std::fs::remove_dir(directory).unwrap();
 }

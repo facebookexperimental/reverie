@@ -74,6 +74,33 @@ struct RpcConnection<G: GlobalTool> {
     client: BlockingRpcClient<G, GuestRpcStream>,
 }
 
+// Native application callbacks own their separate primary/contention routes.
+// They need the authenticated shared config, not an unused ordinary socket.
+// Keeping this owner explicit also prevents ordinary/private RPC APIs from
+// manufacturing a connection or selecting a fallback on a native config owner.
+enum ConnectionOwner<G: GlobalTool> {
+    Ordinary(SpinMutex<RpcConnection<G>>),
+    NativeConfiguration,
+}
+
+impl<G: GlobalTool> ConnectionOwner<G> {
+    fn try_lock(&self) -> Option<crate::sync::SpinGuard<'_, RpcConnection<G>>> {
+        match self {
+            Self::Ordinary(connection) => connection.try_lock(),
+            Self::NativeConfiguration => None,
+        }
+    }
+
+    fn lock(&self) -> crate::sync::SpinGuard<'_, RpcConnection<G>> {
+        match self {
+            Self::Ordinary(connection) => connection.lock(),
+            // An ordinary send on a native config owner is an owner mismatch,
+            // not permission to open another route or a fake successful reply.
+            Self::NativeConfiguration => rpc_fatal(123),
+        }
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-326): Review the common blocking
 // transport and fork-child reconnect used by LiteInst's synchronous Tool callback.
 /// Blocking guest-side RPC handle backed by the common Reverie RPC transport.
@@ -82,9 +109,9 @@ struct RpcConnection<G: GlobalTool> {
 /// clone remains rejected: [`BlockingRpcClient`] stamps its connect-time TID,
 /// and Detcore requires one independently blocking connection per guest thread.
 pub struct CoordinatorRpc<G: GlobalTool> {
-    connection: SpinMutex<RpcConnection<G>>,
+    connection: ConnectionOwner<G>,
     config: Arc<G::Config>,
-    path: PathBuf,
+    path: Option<PathBuf>,
     fd: AtomicI32,
     on_reconnect: ReconnectHook,
     #[cfg(feature = "exec-private-successor")]
@@ -98,6 +125,50 @@ pub struct CoordinatorRpc<G: GlobalTool> {
 pub type ReconnectHook = fn(old: libc::c_int, new: libc::c_int) -> io::Result<()>;
 
 impl<G: GlobalTool> CoordinatorRpc<G> {
+    /// Retain the exact configuration already received by a native image's
+    /// authenticated temporary-config owner. This opens or owns no socket.
+    ///
+    /// This is configuration storage only, not image/thread admission. Actual
+    /// native calls must use their NativeRpc/NativeBackgroundRpc owner and the
+    /// same Arc. Ordinary sends, descriptor relocation and private frame I/O
+    /// refuse on this owner; none may create an ambient or fallback connection.
+    /// The native initializer remains responsible for the fingerprint, complete
+    /// frame and closing its temporary connection before publishing readiness.
+    pub fn from_native_configuration(
+        path: impl AsRef<Path>,
+        config: Arc<G::Config>,
+    ) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if path.as_os_str().is_empty() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok(Self {
+            connection: ConnectionOwner::NativeConfiguration,
+            config,
+            path: Some(path),
+            fd: AtomicI32::new(-1),
+            on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
+            #[cfg(feature = "exec-private-successor")]
+            native_failed: AtomicBool::new(false),
+        })
+    }
+
+    /// Retain an explicitly selected in-process native GlobalTool's config.
+    /// No path, descriptor, ordinary connection or coordinator fallback exists.
+    /// This is config storage only; the real native entry owner still supplies
+    /// the separate NativeRpc::local route and actual callback authority.
+    pub fn from_native_local_configuration(config: Arc<G::Config>) -> Self {
+        Self {
+            connection: ConnectionOwner::NativeConfiguration,
+            config,
+            path: None,
+            fd: AtomicI32::new(-1),
+            on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
+            #[cfg(feature = "exec-private-successor")]
+            native_failed: AtomicBool::new(false),
+        }
+    }
+
     /// Share the launch configuration cached by this connection owner.
     pub fn shared_config(&self) -> Arc<G::Config> {
         Arc::clone(&self.config)
@@ -181,9 +252,9 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         }
         let config = Arc::new(client.config().clone());
         Ok(Self {
-            connection: SpinMutex::new(RpcConnection { pid, client }),
+            connection: ConnectionOwner::Ordinary(SpinMutex::new(RpcConnection { pid, client })),
             config,
-            path: path.as_ref().to_path_buf(),
+            path: Some(path.as_ref().to_path_buf()),
             fd: AtomicI32::new(fd),
             on_reconnect,
             #[cfg(feature = "exec-private-successor")]
@@ -203,9 +274,9 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         let config = Arc::new(client.config().clone());
         let fd = client.as_raw_fd();
         Ok(Self {
-            connection: SpinMutex::new(RpcConnection { pid, client }),
+            connection: ConnectionOwner::Ordinary(SpinMutex::new(RpcConnection { pid, client })),
             config,
-            path,
+            path: Some(path),
             fd: AtomicI32::new(fd),
             on_reconnect,
             #[cfg(feature = "exec-private-successor")]
@@ -262,7 +333,8 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
                 // The new connection is recorded as the coordinator's
                 // before the placement unblocks signals, so a guest handler
                 // run then already finds it protected.
-                let client = connect_ordinary::<G>(&self.path, tid, |new_fd| {
+                let path = self.path.as_deref().unwrap_or_else(|| rpc_fatal(123));
+                let client = connect_ordinary::<G>(path, tid, |new_fd| {
                     let old_fd = self.fd.swap(new_fd, Ordering::AcqRel);
                     (self.on_reconnect)(old_fd, new_fd)
                 })

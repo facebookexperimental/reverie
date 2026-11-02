@@ -1,1 +1,0 @@
-./test -M 'mnemonic = /cmp.*/ && op[0] == rax && op[1] == rbx' -P 'swap(&rax,&r15,asm)@patch'

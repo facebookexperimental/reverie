@@ -1,1 +1,0 @@
-./test -M sse -P 'entry(addr,op[0].size,op[1].size,bytes,size,asm)@inst'

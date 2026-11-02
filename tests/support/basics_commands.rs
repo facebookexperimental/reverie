@@ -51,39 +51,3 @@ pub(super) fn run_guest_command_test_closure(run: Command<CounterGlobal>) {
     assert_eq!(output.status, ExitStatus::Exited(0));
     assert_eq!(output.stdout.as_slice(), msg.as_bytes());
 }
-
-#[cfg(feature = "dbt")]
-fn manifest(label: &str) -> std::path::PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("reverie-dbt-callers")
-        .join(label)
-        .join("manifest.json")
-}
-
-#[cfg(feature = "dbt")]
-pub(super) fn noop_command(program: &str, args: &[&str]) -> Result<(Output, ()), Error> {
-    reverie_test_support::test_dbt_cmd_with_config::<super::tools::NoopTool>(
-        program,
-        args,
-        (),
-        &manifest("basics-noop"),
-    )
-}
-
-#[cfg(feature = "dbt")]
-pub(super) fn counter_command(
-    program: &str,
-    args: &[&str],
-) -> Result<(Output, CounterGlobal), Error> {
-    reverie_test_support::test_dbt_cmd_with_config::<super::tools::CounterLocal>(
-        program,
-        args,
-        (),
-        &manifest("basics-counter"),
-    )
-}

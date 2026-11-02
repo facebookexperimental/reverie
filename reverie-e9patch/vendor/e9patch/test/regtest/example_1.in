@@ -1,1 +1,0 @@
-./test -M 'asm == /jmp.*%r.*/' -P 'entry(addr,target,next,bytes,size,asm)@inst'

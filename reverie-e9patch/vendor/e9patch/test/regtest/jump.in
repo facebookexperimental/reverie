@@ -1,1 +1,0 @@
-./test -M 'addr == &"entry"' -P 'if "jump"(&data_END,asm)@patch goto'

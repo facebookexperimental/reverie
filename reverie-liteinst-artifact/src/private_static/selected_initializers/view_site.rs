@@ -635,7 +635,7 @@ impl VerifiedStaticSource {
         artifact: &FileIdentity,
         link_map: &FileIdentity,
         runner: &mut Runner,
-        body: impl FnOnce(&ViewSiteLeafObservation, &mut Runner) -> Result<T>,
+        body: impl FnOnce(&super::ViewSiteLeafObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
         self.with_site_leaf(
             SiteLeafKind::View,

@@ -117,6 +117,15 @@ pub use tool_host::blocking_global_rpc;
 pub use tool_host::initialize_initial_image_lifecycle;
 pub use tool_host::install_tool;
 pub use tool_host::install_tool_from_bootstrap;
+pub use tool_host::install_tool_from_bootstrap_with_runtime;
+
+/// Checks that this linked root's allocator uses the runtime's selected Tool
+/// backing. Call during installation, while a dispatch allocation scope is live,
+/// before connecting or publishing a Tool. This grants no installation or
+/// private-image authority.
+pub fn preflight_tool_allocator() -> std::io::Result<()> {
+    patch_alloc::preflight_allocator()
+}
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::install_tool_initial_image;
 #[cfg(feature = "exec-native-injection")]

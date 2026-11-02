@@ -1,1 +1,0 @@
-./test -M 'size == 2' -P 'entry(asm.size,asm.len,op[0].size,bytes,size,asm)@inst'

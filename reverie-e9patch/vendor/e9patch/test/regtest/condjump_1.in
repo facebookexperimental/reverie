@@ -1,3 +1,0 @@
-./test -M true -P 'if ret_1(asm)@patch goto'
-
-# This will jmp to address 0x1 after the first bytesuction, hence SEGV

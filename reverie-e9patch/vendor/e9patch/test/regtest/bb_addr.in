@@ -1,1 +1,0 @@
-./test -M 'BB == 0xa0001c2' -P print

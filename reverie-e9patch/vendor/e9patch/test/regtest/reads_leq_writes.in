@@ -1,1 +1,0 @@
-./test -M 'reads <= writes' -P print

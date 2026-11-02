@@ -1,1 +1,0 @@
-./test -M 'asm=/.*p.*/' -P 'naked<clean>(asm)@patch'

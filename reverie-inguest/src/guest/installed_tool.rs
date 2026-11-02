@@ -508,6 +508,10 @@ fn instruction_handler() -> &'static dyn ToolHandler {
 pub fn blocking_global_rpc<G: reverie::GlobalTool + 'static>(
     request: G::Request,
 ) -> io::Result<G::Response> {
+    let request = match super::native_rpc::dispatch_global::<G>(request) {
+        super::native_rpc::NativeGlobalDispatch::Handled(result) => return result,
+        super::native_rpc::NativeGlobalDispatch::Absent(request) => request,
+    };
     if super::host::callback_ending_staged() {
         return Err(io::Error::from_raw_os_error(libc::ESRCH));
     }

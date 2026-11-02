@@ -60,7 +60,7 @@
 //!     the guest's `syscall`: its address plus two, and the RFLAGS saved there.
 //!   - SaBRe's rewriter loads them before its handler runs: the trampoline of
 //!     each rewritten `syscall` sets `%r11` from RFLAGS and `%rcx` to the site's
-//!     next address (`experimental/reverie-sabre/vendor/sabre`, rewriter.c).
+//!     next address (SaBRe's rewriter.c, now in hermit-3rdparty-patching).
 //!
 //!   Two known exceptions remain:
 //!   - On reverie-kvm, a signal handler whose frame is set up at a syscall's

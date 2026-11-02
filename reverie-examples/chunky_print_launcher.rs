@@ -32,11 +32,6 @@ struct Args {
     #[clap(long)]
     preload: Option<std::path::PathBuf>,
 
-    /// Verified caller artifact manifest for DBT. Defaults to
-    /// reverie-dbt-callers/chunky-print/manifest.json beside this binary.
-    #[clap(long, env = "REVERIE_DBT_CALLER_ARTIFACT")]
-    dbt_artifact: Option<std::path::PathBuf>,
-
     #[clap(flatten)]
     common: CommonToolArguments,
 }
@@ -46,28 +41,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_main(args: Args) -> anyhow::Result<()> {
-    let caller = if args.backend == backend::BackendKind::Dbt {
-        let path = match &args.dbt_artifact {
-            Some(path) => path.clone(),
-            None => std::env::current_exe()?
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("chunky_print executable has no profile directory"))?
-                .join("reverie-dbt-callers/chunky-print/manifest.json"),
-        };
-        Some(reverie_dbt::CallerArtifact::load(&path).map_err(|error| {
-            anyhow::anyhow!("cannot load DBT caller artifact {}: {error}; run reverie-dbt/scripts/build-client.sh --caller-manifest reverie-examples/chunky-print-dbt-runtime/Cargo.toml --profile <this binary's Cargo profile>", path.display())
-        })?)
-    } else {
-        None
-    };
     let log_guard = args.common.init_tracing();
-    let run = backend::run_blocking_with_caller::<ChunkyPrintLocal>(
+    let run = backend::run_blocking::<ChunkyPrintLocal>(
         args.backend,
         &args.common,
         (),
         "chunky-print",
         args.preload.clone(),
-        caller,
     )?;
     let (status, global_state) = (run.status, run.global_state);
     trace!(" [chunky_print] global exit, flushing last messages.");

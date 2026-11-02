@@ -1,1 +1,0 @@
-./test -M sib -P 'format(".text=%p\n",&".text")@patch'

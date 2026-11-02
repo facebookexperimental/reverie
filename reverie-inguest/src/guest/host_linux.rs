@@ -563,6 +563,7 @@ mod tests {
             ppid: None,
             state: &mut state,
             rpc: &rpc,
+            native: None,
             tail: &tail,
             cpuid_interception: false,
             fork_parent_state: None,

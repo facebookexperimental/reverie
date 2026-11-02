@@ -1,1 +1,0 @@
-./test.pie -M '--offset > ---offset' -P 'write(".")@patch'

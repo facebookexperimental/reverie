@@ -1,5 +1,6 @@
 load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
 load("@fbsource//tools/build_defs:fb_native_wrapper.bzl", "fb_native")
+load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
 load("@fbsource//tools/build_defs:selects.bzl", "selects")
@@ -215,9 +216,6 @@ rust_library(
                 "description": "Command helpers for generic Reverie conformance tests.",
                 "publish": False,
             },
-            # DBT caller artifacts use the explicit OSS producer. Buck's
-            # generic conformance targets retain their ptrace selections.
-            "features": {"default": [], "dbt": ["dep:reverie-dbt"]},
             "test": [
                 {"name": "basics", "path": "../tests/basics.rs"},
                 {"name": "exit", "path": "../tests/exit.rs"},
@@ -229,63 +227,53 @@ rust_library(
                 {"name": "thread_start", "path": "../tests/thread_start.rs"},
                 {"name": "stack", "path": "../tests/stack.rs"},
                 {"name": "suppression", "path": "../tests/suppression.rs"},
-                {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
             ],
             "bin": [
-                {"name": "stat-rust-command-guest", "path": "../tests/fixtures/stat-rust-command.rs", "test": False, "bench": False, "required-features": ["dbt"]},
+                {"name": "stat-rust-command-guest", "path": "../tests/fixtures/stat-rust-command.rs", "test": False, "bench": False},
             {
                 "name": "exit-rust-command-guest",
                 "path": "../tests/fixtures/exit-rust-command.rs",
                 "test": False,
                 "bench": False,
-                "required-features": ["dbt"],
             }, {
                 "name": "basics-rust-command-guest",
                 "path": "../tests/fixtures/basics-rust-command.rs",
                 "test": False,
                 "bench": False,
-                "required-features": ["dbt"],
             }, {
                 "name": "vdso-rust-command-guest",
                 "path": "../tests/fixtures/vdso-rust-command.rs",
                 "test": False,
                 "bench": False,
-                "required-features": ["dbt"],
             }, {
                 "name": "inject-then-tail-rust-command-guest",
                 "path": "../tests/fixtures/inject-then-tail-rust-command.rs",
                 "test": False,
                 "bench": False,
-                "required-features": ["dbt"],
             }, {
                 "name": "at-random-rust-command-guest",
                 "path": "../tests/fixtures/at-random-rust-command.rs",
                 "test": False,
                 "bench": False,
-                "required-features": ["dbt"],
             }, {
                 "name": "thread-start-rust-command-guest",
                 "path": "../tests/fixtures/thread-start-rust-command.rs",
                 "test": False,
                 "bench": False,
-                "required-features": ["dbt"],
             }, {
                 "name": "stack-rust-command-guest",
                 "path": "../tests/fixtures/stack-rust-command.rs",
                 "test": False,
                 "bench": False,
-                "required-features": ["dbt"],
             }, {
                 "name": "suppression-rust-command-guest",
                 "path": "../tests/fixtures/suppression-rust-command.rs",
                 "test": False,
                 "bench": False,
-                "required-features": ["dbt"],
             }],
             "dependencies_override": {
                 "dependencies": {
                     "nix": {"features": ["fs", "process", "signal"]},
-                    "reverie-dbt": {"version": "0.5.4", "path": "../reverie-dbt", "default-features": False, "optional": True},
                 },
                 "dev-dependencies": {
                     "reverie-ptrace": {"features": ["nightly"]},
@@ -319,6 +307,130 @@ rust_library(
     ],
 )
 
+# First-party command guests: explicit native producers for the same Cargo bin entries.
+# env below is compile-time rustc input (env!), not a guessed runtime path.
+
+rust_binary(
+    name = "basics-rust-command-guest",
+    srcs = [
+        "tests/fixtures/basics-rust-command.rs",
+        "tests/support/basics_rust_guest.rs",
+    ],
+    crate_root = "tests/fixtures/basics-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+    ],
+)
+
+rust_binary(
+    name = "exit-rust-command-guest",
+    srcs = [
+        "tests/fixtures/exit-rust-command.rs",
+        "tests/support/exit_rust_guest.rs",
+    ],
+    crate_root = "tests/fixtures/exit-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "stat-rust-command-guest",
+    srcs = [
+        "tests/fixtures/stat-rust-command.rs",
+        "tests/support/stat_rust_guest.rs",
+    ],
+    crate_root = "tests/fixtures/stat-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "vdso-rust-command-guest",
+    srcs = [
+        "tests/fixtures/vdso-rust-command.rs",
+        "tests/support/vdso_rust_guest.rs",
+    ],
+    crate_root = "tests/fixtures/vdso-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "inject-then-tail-rust-command-guest",
+    srcs = [
+        "tests/fixtures/inject-then-tail-rust-command.rs",
+        "tests/support/inject_then_tail_rust_guest.rs",
+        "tests/tool_fixtures/inject_then_tail_constants.rs",
+    ],
+    crate_root = "tests/fixtures/inject-then-tail-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        ":reverie",
+    ],
+)
+
+rust_binary(
+    name = "at-random-rust-command-guest",
+    srcs = [
+        "tests/fixtures/at-random-rust-command.rs",
+        "tests/support/at_random_rust_guest.rs",
+        "tests/tool_fixtures/at_random_constants.rs",
+    ],
+    crate_root = "tests/fixtures/at-random-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "stack-rust-command-guest",
+    srcs = [
+        "tests/fixtures/stack-rust-command.rs",
+        "tests/support/stack_rust_guest.rs",
+    ],
+    crate_root = "tests/fixtures/stack-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "thread-start-rust-command-guest",
+    srcs = [
+        "tests/fixtures/thread-start-rust-command.rs",
+        "tests/support/thread_start_guest.rs",
+    ],
+    crate_root = "tests/fixtures/thread-start-rust-command.rs",
+    unittests = False,
+    deps = [],
+)
+
+rust_binary(
+    name = "suppression-rust-command-guest",
+    srcs = [
+        "tests/fixtures/suppression-rust-command.rs",
+        "tests/support/suppression_rust_guest.rs",
+    ],
+    crate_root = "tests/fixtures/suppression-rust-command.rs",
+    unittests = False,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:syscalls",
+    ],
+)
+
 rust_unittest(
     name = "generic-basics",
     srcs = [
@@ -329,6 +441,9 @@ rust_unittest(
     ],
     crate_root = "tests/basics.rs",
     rustc_flags = sanitized_feature,
+    env = {
+        "CARGO_BIN_EXE_basics-rust-command-guest": "$(location :basics-rust-command-guest)",
+    },
     deps = [
         "fbsource//third-party/rust:close-err",
         "fbsource//third-party/rust:libc",
@@ -351,6 +466,9 @@ rust_unittest(
     ],
     crate_root = "tests/exit.rs",
     rustc_flags = sanitized_feature,
+    env = {
+        "CARGO_BIN_EXE_exit-rust-command-guest": "$(location :exit-rust-command-guest)",
+    },
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:tempfile",
@@ -372,6 +490,9 @@ rust_unittest(
     ],
     crate_root = "tests/stat.rs",
     rustc_flags = sanitized_feature,
+    env = {
+        "CARGO_BIN_EXE_stat-rust-command-guest": "$(location :stat-rust-command-guest)",
+    },
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:tempfile",
@@ -392,6 +513,9 @@ rust_unittest(
     ],
     crate_root = "tests/vdso.rs",
     rustc_flags = sanitized_feature,
+    env = {
+        "CARGO_BIN_EXE_vdso-rust-command-guest": "$(location :vdso-rust-command-guest)",
+    },
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:tempfile",
@@ -408,9 +532,13 @@ rust_unittest(
         "tests/fixtures/inject-then-tail-command.c",
         "tests/support/inject_then_tail_command.rs",
         "tests/tool_fixtures/inject_then_tail.rs",
+        "tests/tool_fixtures/inject_then_tail_constants.rs",
     ],
     crate_root = "tests/inject_then_tail.rs",
     rustc_flags = sanitized_feature,
+    env = {
+        "CARGO_BIN_EXE_inject-then-tail-rust-command-guest": "$(location :inject-then-tail-rust-command-guest)",
+    },
     deps = [
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tracing",
@@ -430,6 +558,9 @@ rust_unittest(
     ],
     crate_root = "tests/thread_start.rs",
     rustc_flags = sanitized_feature,
+    env = {
+        "CARGO_BIN_EXE_thread-start-rust-command-guest": "$(location :thread-start-rust-command-guest)",
+    },
     deps = [
         ":reverie",
         ":reverie-ptrace",
@@ -459,9 +590,13 @@ rust_unittest(
         "tests/fixtures/at-random-command.c",
         "tests/support/at_random_command.rs",
         "tests/tool_fixtures/at_random.rs",
+        "tests/tool_fixtures/at_random_constants.rs",
     ],
     crate_root = "tests/at_random.rs",
     rustc_flags = sanitized_feature,
+    env = {
+        "CARGO_BIN_EXE_at-random-rust-command-guest": "$(location :at-random-rust-command-guest)",
+    },
     deps = [
         "fbsource//third-party/rust:tempfile",
         ":reverie",
@@ -478,6 +613,9 @@ rust_unittest(
     ],
     crate_root = "tests/stack.rs",
     rustc_flags = sanitized_feature,
+    env = {
+        "CARGO_BIN_EXE_stack-rust-command-guest": "$(location :stack-rust-command-guest)",
+    },
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
@@ -496,6 +634,9 @@ rust_unittest(
     ],
     crate_root = "tests/suppression.rs",
     rustc_flags = sanitized_feature,
+    env = {
+        "CARGO_BIN_EXE_suppression-rust-command-guest": "$(location :suppression-rust-command-guest)",
+    },
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:syscalls",
@@ -572,22 +713,6 @@ rust_library(
         "fbsource//third-party/rust:sha2",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
-        ":reverie",
-    ],
-)
-
-# Hermit's SaBRe supervisor reads the statistics page through this crate.
-rust_library(
-    name = "reverie-sabre-stats",
-    srcs = glob(["experimental/reverie-sabre-stats/src/**/*.rs"]),
-    autocargo = {
-        "cargo_toml_config": {
-            "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-sabre-stats"),
-        },
-        "cargo_toml_dir": "experimental/reverie-sabre-stats",
-    },
-    deps = [
-        "fbsource//third-party/rust:libc",
         ":reverie",
     ],
 )
@@ -826,6 +951,7 @@ rust_library(
     deps = [
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:goblin",
+        "fbsource//third-party/rust:iced-x86",
         "fbsource//third-party/rust:kvm-bindings",
         "fbsource//third-party/rust:kvm-ioctls",
         "fbsource//third-party/rust:libc",
@@ -881,3 +1007,4 @@ rust_library(
         ":reverie-process",
     ],
 )
+

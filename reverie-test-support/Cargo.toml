@@ -10,17 +10,12 @@ edition = "2024"
 license = "BSD-2-Clause"
 publish = false
 
-[features]
-default = []
-dbt = ["dep:reverie-dbt"]
-
 [dependencies]
 libc = "0.2.186"
 syscalls = "0.6.18"
 nix = { version = "0.30.1", features = ["fs", "process", "signal"] }
 reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
 reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace" }
-reverie-dbt = { version = "0.5.4", path = "../reverie-dbt", default-features = false, optional = true }
 
 [dev-dependencies]
 close-err = "1.0.2"
@@ -37,11 +32,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sanitized)"] }
 [[test]]
 name = "basics"
 path = "../tests/basics.rs"
-
-[[test]]
-name = "dbt_command"
-path = "tests/dbt_command.rs"
-required-features = ["dbt"]
 
 [[test]]
 name = "exit"
@@ -84,60 +74,51 @@ name = "stat-rust-command-guest"
 path = "../tests/fixtures/stat-rust-command.rs"
 test = false
 bench = false
-required-features = ["dbt"]
 
 [[bin]]
 name = "exit-rust-command-guest"
 path = "../tests/fixtures/exit-rust-command.rs"
 test = false
 bench = false
-required-features = ["dbt"]
 
 [[bin]]
 name = "basics-rust-command-guest"
 path = "../tests/fixtures/basics-rust-command.rs"
 test = false
 bench = false
-required-features = ["dbt"]
 
 [[bin]]
 name = "vdso-rust-command-guest"
 path = "../tests/fixtures/vdso-rust-command.rs"
 test = false
 bench = false
-required-features = ["dbt"]
 
 [[bin]]
 name = "inject-then-tail-rust-command-guest"
 path = "../tests/fixtures/inject-then-tail-rust-command.rs"
 test = false
 bench = false
-required-features = ["dbt"]
 
 [[bin]]
 name = "at-random-rust-command-guest"
 path = "../tests/fixtures/at-random-rust-command.rs"
 test = false
 bench = false
-required-features = ["dbt"]
 
 [[bin]]
 name = "thread-start-rust-command-guest"
 path = "../tests/fixtures/thread-start-rust-command.rs"
 test = false
 bench = false
-required-features = ["dbt"]
 
 [[bin]]
 name = "stack-rust-command-guest"
 path = "../tests/fixtures/stack-rust-command.rs"
 test = false
 bench = false
-required-features = ["dbt"]
 
 [[bin]]
 name = "suppression-rust-command-guest"
 path = "../tests/fixtures/suppression-rust-command.rs"
 test = false
 bench = false
-required-features = ["dbt"]

@@ -1,1 +1,0 @@
-./test -M true -P 'entry(F,F.len,F.size,bytes,size,asm)@inst'

@@ -1,2 +1,0 @@
-sqrtss %xmm0, %xmm1
-PASSED

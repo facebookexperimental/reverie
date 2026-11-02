@@ -58,9 +58,8 @@ a *swappable implementation* — anything playing the same role as
 `reverie-ptrace` — and it must be able to host an **arbitrary** tool, not a
 hard-coded one. See [The Backend Contract](#the-backend-contract) below.
 
-Reverie provides several backends: the production `ptrace` backend, the
-in-progress KVM and DBT (dynamic binary instrumentation) backends, and the
-experimental SaBRe, e9patch, and LiteInst rewriting backends. With the
+The core provides ptrace, KVM and LiteInst runtimes. Separate extensions own
+DynamoRIO, SaBRe and e9patch. With the
 *backend* role now in hand, see [Backend architecture](BACKENDS.md) for how each
 one hooks, traps, and routes a guest's events, and for the shared RPC, ptracer,
 and trapping components they build on.
@@ -92,19 +91,21 @@ cargo run --bin strace -- ls
 
 ## Backend Sources
 
-Large native sources for DynamoRIO, SaBRe, and e9patch are pinned as shallow
-submodules. `git submodule update --init --recursive` checks out every pinned
-source; `scripts/backend-submodule.sh` remains available for focused activation.
-See [Backend sources](docs/BACKEND_SOURCES.md) for revisions, build commands,
-and license notes.
+The core workspace contains the first-party runtimes and shared Tool, Guest,
+RPC and example APIs. DynamoRIO belongs to
+[hermit-dynamorio](https://github.com/rrnewton/hermit-dynamorio); SaBRe and
+e9patch belong to
+[hermit-3rdparty-patching](https://github.com/rrnewton/hermit-3rdparty-patching).
+Their source checkout and native producers belong to those repositories.
+See [Backend sources](docs/BACKEND_SOURCES.md) for ownership and license notes.
 
 ## Usage
 
-`reverie-ptrace` is the reference runtime. `reverie-e9patch` and
-`reverie-liteinst` also implement the generic `Backend` contract, with the
+`reverie-ptrace` is the reference runtime. `reverie-liteinst` also implements
+the generic `Backend` contract, with the
 current hybrid and in-guest boundaries documented in
-[Backend architecture](BACKENDS.md). KVM, DBT, and SaBRe currently expose
-specialized runners or adapters rather than that generic launch contract.
+[Backend architecture](BACKENDS.md). KVM exposes a specialized runner. The
+external backend repositories own their runners and adapters.
 
 Copy one of the example tools to a new Rust project (e.g. `cargo init`). You’ll
 see that it depends both on the general `reverie` crate for the API and on the

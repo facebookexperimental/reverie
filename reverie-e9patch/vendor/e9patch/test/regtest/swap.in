@@ -1,3 +1,0 @@
-./test -M 'mnemonic = /cmp.*/ && op[0] == rax && op[1] == rbx' -P 'swap(&rax,&rbx,asm)@patch'
-
-# This swap does not affect the program, since rax==rbx

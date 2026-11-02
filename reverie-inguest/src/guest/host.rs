@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
+use std::sync::Arc;
 
 use reverie::Error;
 use reverie::GlobalRPC;
@@ -44,6 +45,11 @@ use super::context::RegisterContext;
 use super::event::InstructionEventKind;
 use super::event::SyscallDispatch;
 use super::event::SyscallEvent;
+use super::native_rpc::NativeApplicationRpc;
+use super::native_rpc::NativeRpc;
+use super::native_services::NativeEntryObservation;
+use super::native_services::NativeEntryStage;
+use super::native_services::NativeServices;
 use super::rpc::CoordinatorRpc;
 use super::signal::core_dump_expected;
 use super::signal::current_pending_set;
@@ -61,6 +67,27 @@ use crate::trap::raw_syscall6;
 
 #[path = "host_linux.rs"]
 mod host_linux;
+
+#[path = "native_copied.rs"]
+mod native_copied;
+#[path = "native_entry.rs"]
+mod native_entry;
+#[path = "native_initialize.rs"]
+mod native_initialize;
+/// Exclusive state and scratch owners for live native callbacks.
+#[path = "native_state.rs"]
+pub mod native_state;
+pub use native_entry::NativeCallResult;
+pub use native_entry::NativeInstruction;
+pub use native_entry::NativeInstructionResult;
+pub use native_entry::NativeSignalResult;
+#[path = "native_exit.rs"]
+mod native_exit;
+pub use native_exit::NativeExitRpc;
+#[cfg(test)]
+#[path = "native_entry_tests.rs"]
+mod native_entry_tests;
+
 #[cfg(feature = "exec-private-init")]
 #[path = "image_guest.rs"]
 mod image_guest;
@@ -79,6 +106,14 @@ pub trait HostRuntime: Send + Sync + 'static {
     fn fork_child_rebind(&self);
     /// Reports a lifecycle stage on the backend's diagnostic stream, if any.
     fn emit_stage(&self, stage: &[u8]);
+    /// Optional read-only diagnostics at the actual native callback boundary.
+    /// The borrowed view cannot alter Tool state, registers, memory or admission.
+    fn observe_native_entry(
+        &self,
+        _stage: NativeEntryStage,
+        _observation: NativeEntryObservation<'_, '_>,
+    ) {
+    }
     /// In a forked child, after the Tool and thread state are replaced: reset
     /// the inherited observability and statistics, and account the child's
     /// first event (`event`) to the path that entered it.
@@ -247,12 +282,16 @@ impl Drop for DispatchScratchScope {
 /// owns the trap and hook paths supplies `R`, the runtime services the host
 /// calls back into.
 pub struct ToolHost<T: Tool, R: HostRuntime> {
-    tool: SpinMutex<ToolProcess<T>>,
+    tool: SpinMutex<Option<Arc<ToolProcess<T>>>>,
     rpc: CoordinatorRpc<T::GlobalState>,
     root_pid: Pid,
     subscriptions: HashSet<Sysno>,
     cpuid_interception: bool,
     states: SpinMutex<HashMap<i32, T::ThreadState>>,
+    native_threads: Option<native_state::NativeThreads<T::ThreadState>>,
+    // Prepared only by the ordinary installer, before publication. Keeping it
+    // outside `states` preserves the real first-event lifecycle callbacks.
+    ordinary_root_state: SpinMutex<Option<T::ThreadState>>,
     runtime: R,
     #[cfg(feature = "exec-private-successor")]
     prepared_exec: SpinMutex<Option<PreparedExecState<T>>>,
@@ -341,6 +380,120 @@ where
         )
     }
 
+    /// Construct a host whose callback state is owned by a native runtime.
+    ///
+    /// This selects storage/lifetimes only. The native owner must separately
+    /// provide the actual callback services before invoking a Tool. It cannot
+    /// use the local `dispatch`/`dispatch_instruction` path.
+    ///
+    /// # Safety
+    /// The caller owns the live native image, thread admission, allocator/TLS,
+    /// service table and lifecycle. No local dispatch may run in this process
+    /// concurrently. The coordinator configuration must be authentic. A
+    /// native initializer may use CoordinatorRpc::from_native_configuration
+    /// after closing its temporary config connection; callbacks use their
+    /// separately owned native RPC route, never an ordinary fallback. This
+    /// constructor grants no private-image authority.
+    pub unsafe fn new_native(
+        tool: T,
+        rpc: CoordinatorRpc<T::GlobalState>,
+        root_pid: Pid,
+        subscriptions: HashSet<Sysno>,
+        cpuid_interception: bool,
+        runtime: R,
+    ) -> Self {
+        let mut host = Self::from_parts(
+            ToolProcess::adopt_legacy(tool),
+            rpc,
+            root_pid,
+            subscriptions,
+            cpuid_interception,
+            runtime,
+        );
+        host.native_threads = Some(native_state::NativeThreads::new());
+        host
+    }
+
+    /// Retain the original state created at the actual native lifecycle
+    /// boundary; no default state or synthetic lifecycle event is substituted.
+    ///
+    /// # Safety
+    /// `identity` and `state` must belong to this Tool's admitted native task
+    /// and image, including its real parent snapshot where applicable. The
+    /// owner must have entered its actual allocation/callback context.
+    pub unsafe fn register_native_thread(
+        &self,
+        identity: native_state::NativeThreadIdentity,
+        state: T::ThreadState,
+    ) -> io::Result<native_state::NativeThreadHandle> {
+        self.native_threads
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?
+            .register(identity, state)
+    }
+
+    /// Register state for an actual newly admitted image. This retains the
+    /// same real thread-start then post-exec ordering; ordinary created child
+    /// tasks use register_native_thread and do not acquire a post-exec event.
+    ///
+    /// # Safety
+    /// The native image owner must have completed its real image/config/state
+    /// admission. Serialized flags or a child-registration request cannot
+    /// authorize this entry or restore initial/successor authority.
+    pub unsafe fn register_native_image_thread(
+        &self,
+        identity: native_state::NativeThreadIdentity,
+        state: T::ThreadState,
+    ) -> io::Result<native_state::NativeThreadHandle> {
+        self.native_threads
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?
+            .register_image(identity, state)
+    }
+
+    /// Pin this one Tool and take this thread's exclusive state. All process
+    /// owner guards are released before the returned value reaches callbacks.
+    ///
+    /// # Safety
+    /// The caller must validate current native service/task/image facts and
+    /// borrow the live callback context. The returned lease stays on this
+    /// thread and cannot outlive its actual native callback/continuation.
+    pub unsafe fn enter_native_callback(
+        &self,
+        handle: native_state::NativeThreadHandle,
+        identity: native_state::NativeThreadIdentity,
+    ) -> io::Result<native_state::NativeCallbackLease<'_, T>> {
+        let owner = self
+            .native_threads
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
+        let tool = self
+            .tool
+            .try_lock()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+        native_state::NativeCallbackLease::new(tool, owner, handle, identity)
+    }
+
+    /// Take the original state once, after actual native callback use ended,
+    /// so the owner can invoke the existing Tool thread-exit lifecycle.
+    ///
+    /// # Safety
+    /// The native task is genuinely retiring and its callbacks/continuations
+    /// are quiescent. This is not a request to create or resume a task.
+    pub unsafe fn retire_native_thread(
+        &self,
+        handle: native_state::NativeThreadHandle,
+        identity: native_state::NativeThreadIdentity,
+    ) -> io::Result<T::ThreadState> {
+        self.native_threads
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?
+            .retire(handle, identity)
+    }
+
     /// Retain the standard installer's selected configuration for later forks.
     /// The Tool has already been constructed after that installer's preflight.
     #[cfg(any(test, feature = "rcb-clock"))]
@@ -373,18 +526,56 @@ where
     ) -> Self {
         COMMITTED_STACKS.lock().clear();
         Self {
-            tool: SpinMutex::new(tool),
+            tool: SpinMutex::new(Some(Arc::new(tool))),
             rpc,
             root_pid,
             subscriptions,
             cpuid_interception,
             states: SpinMutex::new(HashMap::new()),
+            native_threads: None,
+            ordinary_root_state: SpinMutex::new(None),
             runtime,
             #[cfg(feature = "exec-private-successor")]
             prepared_exec: SpinMutex::new(None),
             #[cfg(feature = "exec-native-injection")]
             native_exec_driver: None,
         }
+    }
+
+    /// Prepare an ordinary root before this newly constructed host is published.
+    /// The initializer has config/state only, no RPC or lifecycle authority.
+    /// Errors return to installation; they cannot become a fresh default state.
+    pub(crate) fn prepare_ordinary_root_state<F>(&mut self, initialize: F) -> io::Result<()>
+    where
+        F: FnOnce(
+            &<T::GlobalState as GlobalTool>::Config,
+            Pid,
+            &mut T::ThreadState,
+        ) -> io::Result<()>,
+    {
+        if !self.states.lock().is_empty() || self.ordinary_root_state.lock().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "ordinary root preparation follows state creation",
+            ));
+        }
+        let tool_slot = self.tool.lock();
+        let tool = tool_slot
+            .as_deref()
+            .ok_or_else(|| io::Error::other("ordinary root Tool is absent"))?;
+        let mut state = tool.init_thread_state(self.root_pid, None);
+        initialize(self.rpc.config(), self.root_pid, &mut state)?;
+        *self.ordinary_root_state.lock() = Some(state);
+        Ok(())
+    }
+
+    fn new_thread_state(&self, tool: &ToolProcess<T>, tid: Pid) -> T::ThreadState {
+        if tid == self.root_pid
+            && let Some(state) = self.ordinary_root_state.lock().take()
+        {
+            return state;
+        }
+        tool.init_thread_state(tid, None)
     }
 
     /// Install the inactive native exec driver exactly once, before dispatch.
@@ -503,10 +694,9 @@ where
                 "successor Tool callback is active",
             )
         })?;
-        tool_slot
-            .as_ref()
+        let tool = tool_slot
+            .as_deref()
             .ok_or_else(|| io::Error::other("successor Tool is absent"))?;
-        let tool = &*tool_slot;
         let mut states = self.states.try_lock().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -601,10 +791,9 @@ where
                 "InitialImage Tool callback is active",
             )
         })?;
-        tool_slot
-            .as_ref()
+        let tool = tool_slot
+            .as_deref()
             .ok_or_else(|| io::Error::other("InitialImage Tool is absent"))?;
-        let tool = &*tool_slot;
         let mut states = self.states.try_lock().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -708,6 +897,9 @@ where
     /// its injections must not break Rust's memory invariants for any memory
     /// they touch.
     pub unsafe fn dispatch(&self, event: &mut SyscallEvent) {
+        if self.native_threads.is_some() {
+            fatal(126);
+        }
         #[cfg(feature = "exec-private-successor")]
         if self
             .prepared_exec
@@ -728,13 +920,12 @@ where
         // support requires per-thread RPC/state ownership before relaxing the
         // clone guard below.
         let mut tool_slot = self.tool.lock();
-        tool_slot.as_ref().unwrap_or_else(|| fatal(126));
-        let tool = &*tool_slot;
+        let tool = tool_slot.as_deref().unwrap_or_else(|| fatal(126));
         let mut states = self.states.lock();
         let is_new = !states.contains_key(&tid.as_raw());
         let state = states
             .entry(tid.as_raw())
-            .or_insert_with(|| tool.init_thread_state(tid, None));
+            .or_insert_with(|| self.new_thread_state(tool, tid));
         let tail = TailResult::default();
         let mut guest = InGuest::<T, R> {
             event,
@@ -743,6 +934,7 @@ where
             ppid,
             state,
             rpc: &self.rpc,
+            native: None,
             tail: &tail,
             cpuid_interception: self.cpuid_interception,
             fork_parent_state: None,
@@ -758,11 +950,12 @@ where
             injected_syscalls: 0,
         };
 
-        if is_new {
-            match callback_result(drive_callback(tool.handle_thread_start(&mut guest), &tail)) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tool_fatal(124, &error),
-                Err(ending) => {
+        let mut lifecycle =
+            CallbackLifecycle::new(is_new, is_new && tid.as_raw() == self.root_pid.as_raw());
+        if let Err(failure) = enter_tool_callbacks(tool, &mut guest, &mut lifecycle) {
+            match failure {
+                EntryFailure::Tool(error) => tool_fatal(124, &error),
+                EntryFailure::Ending(ending) => {
                     drop(guest);
                     finish_ending(
                         &mut tool_slot,
@@ -771,66 +964,9 @@ where
                         &self.runtime,
                         (tid, pid),
                         ending,
-                    )
+                    );
                 }
             }
-            // A signal the thread-start callback sent is delivered before the
-            // next callback runs, as a tracer delivers it when the thread
-            // resumes.
-            if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
-                drop(guest);
-                finish_ending(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    &self.runtime,
-                    (tid, pid),
-                    ending,
-                );
-            }
-        }
-
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-liteinst-post-exec): The kernel exec'd the guest
-        // image before this LD_PRELOAD backend attached, so — unlike the ptrace
-        // backend — the `Tool::handle_post_exec` lifecycle callback never fired.
-        // A Tool such as Detcore relies on it to determinize the auxv AT_RANDOM
-        // vector and to advance per-thread state (e.g. its seeded PRNG) exactly
-        // as the ptrace backend does; without it the guest-visible getrandom(2)
-        // stream is offset relative to ptrace and cross-backend parity fails.
-        // The guest genuinely did execve into this image, so emitting the event
-        // once for the root process's main thread restores contract parity. It
-        // is intentionally not emitted for child threads (there is none in the
-        // current single-process/thread tool mode) nor re-emitted per dispatch.
-        if is_new && tid.as_raw() == self.root_pid.as_raw() {
-            match callback_result(drive_callback(tool.handle_post_exec(&mut guest), &tail)) {
-                Ok(Ok(())) => {}
-                // handle_post_exec returns Errno; tool_fatal expects reverie::Error.
-                Ok(Err(error)) => tool_fatal(124, &Error::from(error)),
-                Err(ending) => {
-                    drop(guest);
-                    finish_ending(
-                        &mut tool_slot,
-                        &mut states,
-                        &self.rpc,
-                        &self.runtime,
-                        (tid, pid),
-                        ending,
-                    )
-                }
-            }
-        }
-        // A signal the post-exec callback sent.
-        if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
-            drop(guest);
-            finish_ending(
-                &mut tool_slot,
-                &mut states,
-                &self.rpc,
-                &self.runtime,
-                (tid, pid),
-                ending,
-            );
         }
 
         let Some(number) = usize::try_from(guest.event.number)
@@ -1065,6 +1201,13 @@ where
                     },
                 );
             }
+            DrivenSyscall::DeferredNative { .. } => tool_fatal(
+                125,
+                &Error::Tool(
+                    io::Error::other("local entry cannot complete a native deferred syscall")
+                        .into(),
+                ),
+            ),
             DrivenSyscall::Fatal(error) => tool_fatal(125, &error),
         }
     }
@@ -1087,6 +1230,9 @@ where
         kind: InstructionEventKind,
         context: &mut RegisterContext,
     ) {
+        if self.native_threads.is_some() {
+            fatal(126);
+        }
         #[cfg(feature = "exec-private-successor")]
         if self
             .prepared_exec
@@ -1100,13 +1246,12 @@ where
         let (tid, pid) = event_identity();
         let ppid = (pid != self.root_pid).then(|| raw_pid(libc::SYS_getppid));
         let mut tool_slot = self.tool.lock();
-        tool_slot.as_ref().unwrap_or_else(|| fatal(126));
-        let tool = &*tool_slot;
+        let tool = tool_slot.as_deref().unwrap_or_else(|| fatal(126));
         let mut states = self.states.lock();
         let is_new = !states.contains_key(&tid.as_raw());
         let state = states
             .entry(tid.as_raw())
-            .or_insert_with(|| tool.init_thread_state(tid, None));
+            .or_insert_with(|| self.new_thread_state(tool, tid));
         let tail = TailResult::default();
         let mut event = SyscallEvent {
             number: -1,
@@ -1124,6 +1269,7 @@ where
             ppid,
             state,
             rpc: &self.rpc,
+            native: None,
             tail: &tail,
             cpuid_interception: self.cpuid_interception,
             fork_parent_state: None,
@@ -1138,11 +1284,12 @@ where
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
-        if is_new {
-            match callback_result(drive_callback(tool.handle_thread_start(&mut guest), &tail)) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tool_fatal(124, &error),
-                Err(ending) => {
+        let mut lifecycle =
+            CallbackLifecycle::new(is_new, is_new && tid.as_raw() == self.root_pid.as_raw());
+        if let Err(failure) = enter_tool_callbacks(tool, &mut guest, &mut lifecycle) {
+            match failure {
+                EntryFailure::Tool(error) => tool_fatal(124, &error),
+                EntryFailure::Ending(ending) => {
                     drop(guest);
                     finish_ending(
                         &mut tool_slot,
@@ -1151,48 +1298,9 @@ where
                         &self.runtime,
                         (tid, pid),
                         ending,
-                    )
+                    );
                 }
             }
-            if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
-                drop(guest);
-                finish_ending(
-                    &mut tool_slot,
-                    &mut states,
-                    &self.rpc,
-                    &self.runtime,
-                    (tid, pid),
-                    ending,
-                );
-            }
-        }
-        if is_new && tid.as_raw() == self.root_pid.as_raw() {
-            match callback_result(drive_callback(tool.handle_post_exec(&mut guest), &tail)) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tool_fatal(124, &Error::from(error)),
-                Err(ending) => {
-                    drop(guest);
-                    finish_ending(
-                        &mut tool_slot,
-                        &mut states,
-                        &self.rpc,
-                        &self.runtime,
-                        (tid, pid),
-                        ending,
-                    )
-                }
-            }
-        }
-        if let Some(ending) = deliver_staged_signals(tool, &mut guest) {
-            drop(guest);
-            finish_ending(
-                &mut tool_slot,
-                &mut states,
-                &self.rpc,
-                &self.runtime,
-                (tid, pid),
-                ending,
-            );
         }
 
         match kind {
@@ -1276,7 +1384,7 @@ where
 }
 
 fn finish_fork_child<T: Tool, R: HostRuntime>(
-    tool_slot: &mut ToolProcess<T>,
+    tool_slot: &mut Option<Arc<ToolProcess<T>>>,
     states: &mut HashMap<i32, T::ThreadState>,
     rpc: &CoordinatorRpc<T::GlobalState>,
     runtime: &R,
@@ -1303,17 +1411,19 @@ fn finish_fork_child<T: Tool, R: HostRuntime>(
         .remove(&parent_tid.as_raw())
         .unwrap_or_else(|| fatal(126));
     drop(inherited_parent_state);
-    let child_tool = tool_slot.new_process(child_pid, rpc.config());
+    let child_tool = tool_slot
+        .as_deref()
+        .unwrap_or_else(|| fatal(126))
+        .new_process(child_pid, rpc.config());
     let child_state = child_tool.init_thread_state(child_tid, Some((parent_tid, &parent_snapshot)));
     states.clear();
     states.insert(child_tid.as_raw(), child_state);
-    *tool_slot = child_tool;
+    *tool_slot = Some(Arc::new(child_tool));
     // Both installed hooks and deferred fallback carry a register context.
     // Attribute the child's first event to the path that actually entered it.
     runtime.fork_child_reset(event);
 
-    tool_slot.as_ref().unwrap_or_else(|| fatal(126));
-    let tool = &*tool_slot;
+    let tool = tool_slot.as_deref().unwrap_or_else(|| fatal(126));
     let state = states
         .get_mut(&child_tid.as_raw())
         .unwrap_or_else(|| fatal(126));
@@ -1325,6 +1435,7 @@ fn finish_fork_child<T: Tool, R: HostRuntime>(
         ppid: Some(parent_pid),
         state,
         rpc,
+        native: None,
         tail: &child_tail,
         cpuid_interception: runtime.cpuid_interception_enabled(),
         fork_parent_state: None,
@@ -1381,7 +1492,7 @@ struct ForkChildContext {
 
 // TODO-HUMAN-REVIEW(PR-143): Review single-process Tool exit lifecycle.
 fn finish_tool_exit<T: Tool, R: HostRuntime>(
-    tool_slot: &mut ToolProcess<T>,
+    tool_slot: &mut Option<Arc<ToolProcess<T>>>,
     states: &mut HashMap<i32, T::ThreadState>,
     rpc: &CoordinatorRpc<T::GlobalState>,
     runtime: &R,
@@ -1399,12 +1510,14 @@ fn finish_tool_exit<T: Tool, R: HostRuntime>(
     let state = states
         .remove(&tid.as_raw())
         .expect("LiteInst thread state disappeared before exit");
-    tool_slot.as_ref().unwrap_or_else(|| fatal(126));
-    if let Err(error) = drive_ready(tool_slot.on_exit_thread(tid, rpc, state, status)) {
+    let tool = tool_slot.as_deref().unwrap_or_else(|| fatal(126));
+    if let Err(error) = drive_ready(tool.on_exit_thread(tid, rpc, state, status)) {
         tool_fatal(125, &error);
     }
     if process_exit {
-        if let Err(error) = drive_ready(tool_slot.on_exit_process(pid, rpc, status)) {
+        let tool = tool_slot.take().unwrap_or_else(|| fatal(126));
+        let mut tool = Arc::try_unwrap(tool).unwrap_or_else(|_| fatal(126));
+        if let Err(error) = drive_ready(tool.on_exit_process(pid, rpc, status)) {
             tool_fatal(125, &error);
         }
         if let Err(error) = runtime.exit_process_stats(tid) {
@@ -1503,7 +1616,7 @@ fn callback_result<V>(outcome: CallbackOutcome<V>) -> Result<V, Ending> {
 /// and ends the process: by its signal ([`die_by_pending_signal`]), or by
 /// the exit a callback injected.
 fn finish_ending<T: Tool, R: HostRuntime>(
-    tool_slot: &mut ToolProcess<T>,
+    tool_slot: &mut Option<Arc<ToolProcess<T>>>,
     states: &mut HashMap<i32, T::ThreadState>,
     rpc: &CoordinatorRpc<T::GlobalState>,
     runtime: &R,
@@ -1836,13 +1949,114 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
     }
 }
 
-struct InGuest<'a, T: Tool, R: HostRuntime> {
+/// Per-thread lifecycle advanced only by the real callbacks below. This is
+/// internal state, never serialized image or resumable/register authority.
+struct CallbackLifecycle {
+    start_pending: bool,
+    post_exec_pending: bool,
+}
+impl CallbackLifecycle {
+    fn new(start_pending: bool, post_exec_pending: bool) -> Self {
+        Self {
+            start_pending,
+            post_exec_pending,
+        }
+    }
+}
+
+enum EntryFailure {
+    Tool(Error),
+    Ending(Ending),
+}
+
+// Only the selected native mechanism uses the native wake/park driver.
+// Lifecycle tail injection remains refused there, as in the existing native
+// start/post-exec owners. Local endings retain their existing finalizer.
+fn drive_entry_callback<F, V>(future: F, tail: &TailResult, native: bool) -> Result<V, EntryFailure>
+where
+    F: core::future::Future<Output = V>,
+{
+    if native {
+        match crate::tool_host::drive_native_callback(future, tail) {
+            crate::tool_host::NativeCallbackOutcome::Ready(value) => Ok(value),
+            crate::tool_host::NativeCallbackOutcome::Deferred { .. } => Err(EntryFailure::Tool(
+                io::Error::other("native lifecycle handler unexpectedly tail-injected").into(),
+            )),
+            crate::tool_host::NativeCallbackOutcome::Unsupported(reason) => {
+                Err(EntryFailure::Tool(io::Error::other(reason).into()))
+            }
+        }
+    } else {
+        callback_result(drive_callback(future, tail)).map_err(EntryFailure::Ending)
+    }
+}
+
+/// Both entry mechanisms use this exact start -> signals -> post-exec ->
+/// signals order. Each mechanism still owns its existing ending/finalizer.
+fn enter_tool_callbacks<T: Tool, R: HostRuntime>(
+    tool: &ToolProcess<T>,
+    guest: &mut InGuest<'_, T, R>,
+    lifecycle: &mut CallbackLifecycle,
+) -> Result<(), EntryFailure> {
+    let tail = guest.tail;
+    let native = guest.native.is_some();
+    if lifecycle.start_pending {
+        #[cfg(feature = "native-entry-observer")]
+        guest.observe_native_entry(NativeEntryStage::StartEnter);
+        drive_entry_callback(tool.handle_thread_start(guest), tail, native)?
+            .map_err(EntryFailure::Tool)?;
+        #[cfg(feature = "native-entry-observer")]
+        guest.observe_native_entry(NativeEntryStage::StartComplete);
+        lifecycle.start_pending = false;
+        if let Some(native) = &guest.native {
+            native.services.acknowledge_tool_admission();
+        }
+        if let Some(ending) = deliver_staged_signals(tool, guest) {
+            return Err(EntryFailure::Ending(ending));
+        }
+    }
+    if lifecycle.post_exec_pending {
+        #[cfg(feature = "native-entry-observer")]
+        guest.observe_native_entry(NativeEntryStage::PostExecEnter);
+        drive_entry_callback(tool.handle_post_exec(guest), tail, native)?
+            .map_err(|e| EntryFailure::Tool(e.into()))?;
+        #[cfg(feature = "native-entry-observer")]
+        guest.observe_native_entry(NativeEntryStage::PostExecComplete);
+        lifecycle.post_exec_pending = false;
+    }
+    if let Some(ending) = deliver_staged_signals(tool, guest) {
+        return Err(EntryFailure::Ending(ending));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-entry-observer")]
+impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
+    fn observe_native_entry(&self, stage: NativeEntryStage) {
+        if let Some(native) = &self.native {
+            self.runtime
+                .observe_native_entry(stage, NativeEntryObservation::new(native.services));
+        }
+    }
+}
+
+struct NativeGuestView<'callback, G: GlobalTool> {
+    services: &'callback NativeServices<'callback>,
+    rpc: NativeApplicationRpc<'callback, G>,
+    scratch: native_state::CallbackScratch,
+    signal_info_replacement: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
+}
+
+/// The common Tool-facing Guest. Fields remain private: only the local host
+/// and an admitted native callback lease can construct a view.
+pub struct InGuest<'a, T: Tool, R: HostRuntime> {
     event: &'a mut SyscallEvent,
     tid: Pid,
     pid: Pid,
     ppid: Option<Pid>,
     state: &'a mut T::ThreadState,
     rpc: &'a CoordinatorRpc<T::GlobalState>,
+    native: Option<NativeGuestView<'a, T::GlobalState>>,
     tail: &'a TailResult,
     cpuid_interception: bool,
     fork_parent_state: Option<T::ThreadState>,
@@ -1898,6 +2112,48 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
         Ok(())
     }
 
+    fn inject_native<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: reverie::InjectionPurpose,
+    ) -> Result<i64, Errno> {
+        self.unsupported_refusal = None;
+        self.injected_syscalls += 1;
+        let native = self
+            .native
+            .as_ref()
+            .expect("native injection selected by the Guest");
+        native
+            .services
+            .invocation()
+            .ensure_current()
+            .map_err(|_| Errno::ESTALE)?;
+        let (number, args) = syscall.into_parts();
+        let args = [
+            args.arg0 as u64,
+            args.arg1 as u64,
+            args.arg2 as u64,
+            args.arg3 as u64,
+            args.arg4 as u64,
+            args.arg5 as u64,
+        ];
+        let number = number.id() as i64;
+        if let Some(result) =
+            native
+                .rpc
+                .owner()
+                .protect_operation(native.services.invocation(), number, &args, false)
+        {
+            return Errno::from_ret(result as usize).map(|value| value as i64);
+        }
+        let result = super::native_linux::forward(
+            native.services.invocation(),
+            purpose,
+            &reverie::provider::SyscallRequest::new(number as u64, args),
+        );
+        Errno::from_ret(result as usize).map(|value| value as i64)
+    }
+
     /// Materialize the parent view while every synchronization owner still
     /// exists. A raw process fork can otherwise copy a locked Tool-state mutex
     /// into the child after its owning thread disappeared. Round-tripping via
@@ -1950,11 +2206,32 @@ impl<T: Tool, R: HostRuntime> GlobalRPC<T::GlobalState> for InGuest<'_, T, R> {
             // they are passed, which this does not gate.
             return std::future::pending().await;
         }
-        self.rpc.send_rpc(message).await
+        match &self.native {
+            Some(native) => native.rpc.send_rpc(message).await,
+            None => self.rpc.send_rpc(message).await,
+        }
+    }
+
+    fn try_send_rpc_sync(
+        &self,
+        message: <T::GlobalState as GlobalTool>::Request,
+    ) -> Result<<T::GlobalState as GlobalTool>::Response, <T::GlobalState as GlobalTool>::Request>
+    {
+        if self.tail.ending() {
+            return Err(message);
+        }
+        match &self.native {
+            Some(native) => native.rpc.try_send_rpc_sync(message),
+            // Preserve the local Guest's former default unsupported hook.
+            None => Err(message),
+        }
     }
 
     fn config(&self) -> &<T::GlobalState as GlobalTool>::Config {
-        self.rpc.config()
+        match &self.native {
+            Some(native) => native.rpc.config(),
+            None => self.rpc.config(),
+        }
     }
 }
 
@@ -1973,7 +2250,8 @@ static ENDING_STAGED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// backend's blocking coordinator request, refuse to act while it is true;
 /// the exit callbacks run after it is cleared.
 pub fn callback_ending_staged() -> bool {
-    ENDING_STAGED.load(core::sync::atomic::Ordering::Acquire)
+    super::native_rpc::callback_ending_staged()
+        .unwrap_or_else(|| ENDING_STAGED.load(core::sync::atomic::Ordering::Acquire))
 }
 
 /// Set once a guest seccomp filter install passed the runtime's guard
@@ -3031,8 +3309,13 @@ fn stripped_signal_mask(
 /// Empty exact-copy helpers can return without invoking a primitive, as with
 /// the other [`MemoryAccess`] implementations.
 pub struct GuestMemory<'a> {
-    local: LocalMemory,
+    kind: GuestMemoryKind<'a>,
     tail: &'a TailResult,
+}
+
+enum GuestMemoryKind<'a> {
+    Local(LocalMemory),
+    Native(super::native_services::NativeMemory<'a>),
 }
 
 impl GuestMemory<'_> {
@@ -3040,8 +3323,23 @@ impl GuestMemory<'_> {
         GuestMemory {
             // SAFETY: the immutable executor below forwards one syscall with
             // unchanged arguments and result, synchronously on this thread.
-            local: unsafe { LocalMemory::with_syscall_executor(runtime_tool_syscall) },
+            kind: GuestMemoryKind::Local(unsafe {
+                LocalMemory::with_syscall_executor(runtime_tool_syscall)
+            }),
             tail,
+        }
+    }
+
+    fn with_services<'a>(
+        tail: &'a TailResult,
+        services: Option<&'a NativeServices<'a>>,
+    ) -> GuestMemory<'a> {
+        match services {
+            Some(native) => GuestMemory {
+                kind: GuestMemoryKind::Native(native.memory()),
+                tail,
+            },
+            None => GuestMemory::new(tail),
         }
     }
 
@@ -3078,7 +3376,10 @@ impl MemoryAccess for GuestMemory<'_> {
         write_to: &mut [io::IoSliceMut],
     ) -> Result<usize, Errno> {
         self.check()?;
-        self.local.read_vectored(read_from, write_to)
+        match &self.kind {
+            GuestMemoryKind::Local(memory) => memory.read_vectored(read_from, write_to),
+            GuestMemoryKind::Native(memory) => memory.read_vectored(read_from, write_to),
+        }
     }
 
     fn write_vectored(
@@ -3087,7 +3388,10 @@ impl MemoryAccess for GuestMemory<'_> {
         write_to: &mut [io::IoSliceMut],
     ) -> Result<usize, Errno> {
         self.check()?;
-        self.local.write_vectored(read_from, write_to)
+        match &mut self.kind {
+            GuestMemoryKind::Local(memory) => memory.write_vectored(read_from, write_to),
+            GuestMemoryKind::Native(memory) => memory.write_vectored(read_from, write_to),
+        }
     }
 
     fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
@@ -3098,17 +3402,39 @@ impl MemoryAccess for GuestMemory<'_> {
         // (abandon a SIGKILL injection, say), so it runs before the check.
         let addr: Addr<'a, u8> = addr.into();
         self.check()?;
-        self.local.read(addr, buf)
+        match &self.kind {
+            GuestMemoryKind::Local(memory) => memory.read(addr, buf),
+            GuestMemoryKind::Native(memory) => memory.read(addr, buf),
+        }
     }
 
     fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
         self.check()?;
-        self.local.write(addr, buf)
+        match &mut self.kind {
+            GuestMemoryKind::Local(memory) => memory.write(addr, buf),
+            GuestMemoryKind::Native(memory) => memory.write(addr, buf),
+        }
     }
 
     fn write_with_user_access(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
         self.check()?;
-        self.local.write_with_user_access(addr, buf)
+        match &mut self.kind {
+            GuestMemoryKind::Local(memory) => memory.write_with_user_access(addr, buf),
+            GuestMemoryKind::Native(memory) => memory.write_with_user_access(addr, buf),
+        }
+    }
+
+    fn compare_exchange_u32(
+        &mut self,
+        addr: AddrMut<u32>,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, Errno> {
+        self.check()?;
+        match &mut self.kind {
+            GuestMemoryKind::Local(memory) => memory.compare_exchange_u32(addr, expected, desired),
+            GuestMemoryKind::Native(memory) => memory.compare_exchange_u32(addr, expected, desired),
+        }
     }
 }
 
@@ -3147,17 +3473,94 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     /// connection, the Tool output socket, the performance counters and any
     /// native-exec lease ([`crate::guest::protect::is_runtime_owned_fd`]).
     fn is_runtime_owned_fd(&self, fd: i32) -> bool {
-        crate::guest::protect::is_runtime_owned_fd(fd)
+        match &self.native {
+            Some(native) => {
+                native
+                    .rpc
+                    .owner()
+                    .descriptor(native.services.invocation().identity().physical_pid())
+                    == Some(fd)
+            }
+            None => crate::guest::protect::is_runtime_owned_fd(fd),
+        }
+    }
+
+    fn controller_capture_fact(&self) -> Option<reverie::ControllerCaptureFact> {
+        self.native
+            .as_ref()
+            .and_then(|native| native.services.controller_fact())
+    }
+
+    fn runtime_private_memory_regions(&self) -> Option<reverie::RuntimePrivateMemory> {
+        self.native
+            .as_ref()
+            .map(|native| native.services.private_regions())
+    }
+
+    fn runtime_private_memory_is_current(
+        &self,
+        snapshot: &reverie::RuntimePrivateMemorySnapshot,
+    ) -> bool {
+        self.native
+            .as_ref()
+            .is_some_and(|native| native.services.private_is_current(snapshot))
+    }
+
+    fn try_mapping_capture(
+        &self,
+        prepared: reverie::PreparedMappingCapture<<T::GlobalState as GlobalTool>::Request>,
+    ) -> Result<<T::GlobalState as GlobalTool>::Response, reverie::MappingCaptureError> {
+        let native = self
+            .native
+            .as_ref()
+            .ok_or(reverie::MappingCaptureError::Unavailable)?;
+        super::native_capture::execute::<T>(
+            native.services,
+            native.rpc.owner(),
+            self.tid,
+            self.config(),
+            prepared,
+        )
+    }
+
+    fn initial_stack_pointer(&self) -> Option<u64> {
+        self.native
+            .as_ref()
+            .and_then(|native| native.services.facts().initial_stack)
+    }
+
+    fn auxv(&self) -> reverie::Auxv {
+        match &self.native {
+            Some(native) => {
+                reverie::Auxv::from_entries(native.services.facts().auxv.iter().copied())
+            }
+            None => reverie::Auxv::from_pid(self.pid()).expect("failed to read auxv table"),
+        }
     }
 
     fn memory(&self) -> Self::Memory {
-        GuestMemory::new(self.tail)
+        GuestMemory::with_services(
+            self.tail,
+            self.native.as_ref().map(|native| native.services),
+        )
     }
 
     unsafe fn tool_syscall(&self, number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
         // SAFETY: Guest::tool_syscall's caller vouches for these Tool-owned
         // operands; the adapter preserves them and grants no callback scope.
-        unsafe { runtime_tool_syscall(number, args) }
+        match &self.native {
+            Some(native) => {
+                let value = unsafe {
+                    native.services.invocation().invoke(
+                        number.id() as i64,
+                        args.map(|arg| arg as u64),
+                        reverie::InjectionPurpose::Application,
+                    )
+                };
+                Errno::from_ret(value as usize)
+            }
+            None => unsafe { runtime_tool_syscall(number, args) },
+        }
     }
 
     /// Qualified at the guest's trusted physical gate, where this backend's
@@ -3167,6 +3570,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     /// (which could fail or fake the gate's calls), nothing is executed and
     /// the spelling is unknown.
     fn pidfd_self_spelling(&self) -> reverie::PidfdSelfSpelling {
+        if let Some(native) = &self.native {
+            return native.services.facts().pidfd_self_spelling;
+        }
         // Read, never qualified, here: an image whose runtime installed its
         // trap qualified it before the filter
         // (`pidfd_self::initialize_before_runtime_filter`); any other image
@@ -3179,6 +3585,26 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         super::pidfd_self::spelling()
     }
 
+    fn signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
+        self.native.as_ref().and_then(|native| {
+            native
+                .signal_info_replacement
+                .or(native.services.facts().signal_info)
+        })
+    }
+
+    fn set_signal_info(&mut self, info: [u8; reverie::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
+        let Some(native) = &mut self.native else {
+            return Err(Errno::ENOSYS);
+        };
+        let original = native.services.facts().signal_info.ok_or(Errno::EINVAL)?;
+        if info[..4] != original[..4] {
+            return Err(Errno::EINVAL);
+        }
+        native.signal_info_replacement = Some(info);
+        Ok(())
+    }
+
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
         self.state
     }
@@ -3188,6 +3614,12 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     }
 
     async fn regs(&mut self) -> libc::user_regs_struct {
+        if let Some(native) = &self.native {
+            return native
+                .services
+                .regs()
+                .expect("native failed to translate the guest registers");
+        }
         let mut regs = unsafe { core::mem::zeroed::<libc::user_regs_struct>() };
         if self.event.context != 0 {
             let context = unsafe { &*(self.event.context as *const RegisterContext) };
@@ -3228,6 +3660,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             // The guest is ending: no further guest effect (see `inject`).
             return std::future::pending().await;
         }
+        if let Some(native) = &self.native {
+            return native.services.set_regs(&regs).map_err(Error::from);
+        }
         self.event.number = regs.rax as i64;
         self.event.args = [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9];
         if self.event.context != 0 {
@@ -3253,7 +3688,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         Ok(())
     }
     async fn stack(&mut self) -> Self::Stack {
-        LocalStack::new()
+        match &self.native {
+            Some(native) => native.scratch.stack(),
+            None => LocalStack::new(),
+        }
     }
 
     async fn daemonize(&mut self) {}
@@ -3264,6 +3702,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     /// the continuation saved and its completion installs. `None` with the
     /// gate off, where the kernel's mask is the guest's own.
     fn resume_signal_mask(&self) -> Option<u64> {
+        // The native owner, not the local SIGALRM continuation, restores it.
+        if self.native.is_some() {
+            return None;
+        }
         if !super::runtime_mask::delivers_signals() {
             return None;
         }
@@ -3283,6 +3725,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         syscall: S,
         purpose: reverie::InjectionPurpose,
     ) -> std::result::Result<i64, reverie::Error> {
+        if self.native.is_some() {
+            return self.inject_native(syscall, purpose).map_err(Error::from);
+        }
         // This route keeps its existing guarded injection behavior.
         match purpose {
             reverie::InjectionPurpose::Application
@@ -3293,6 +3738,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     }
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        if self.native.is_some() {
+            return self.inject_native(syscall, reverie::InjectionPurpose::Application);
+        }
         self.unsupported_refusal = None;
         self.injected_syscalls += 1;
         if self.tail.ending() {
@@ -3464,6 +3912,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         if self.tail.ending() {
             return std::future::pending().await;
         }
+        if self.native.is_some() {
+            return Err(Errno::ENOSYS.into());
+        }
         if !self.delivers_sigalrm(&event) {
             return Err(Errno::ENOSYS.into());
         }
@@ -3482,6 +3933,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         if self.tail.ending() {
             return std::future::pending().await;
         }
+        if self.native.is_some() {
+            return Err(Errno::ENOSYS.into());
+        }
         if !self.delivers_sigalrm(&event) {
             return Err(Errno::ENOSYS.into());
         }
@@ -3497,6 +3951,31 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     }
 
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
+        if let Some(native) = &self.native {
+            native
+                .services
+                .invocation()
+                .ensure_current()
+                .unwrap_or_else(|error| tool_fatal(125, &error.into()));
+            let (number, args) = syscall.into_parts();
+            let args = [
+                args.arg0 as u64,
+                args.arg1 as u64,
+                args.arg2 as u64,
+                args.arg3 as u64,
+                args.arg4 as u64,
+                args.arg5 as u64,
+            ];
+            let number = number.id() as i64;
+            if !self.in_syscall_handler && is_exit_syscall(number) {
+                self.tail.set_exit(number, args);
+            } else {
+                self.tail.set_deferred_native(number, args);
+            }
+            // The caller retains the callback lease and its committed storage
+            // through native completion, after this future and Guest end.
+            return std::future::pending().await;
+        }
         self.unsupported_refusal = None;
         if self.tail.ending() {
             // As in `inject`: the guest is ending, so nothing is made.
@@ -3627,7 +4106,45 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     }
 
     fn read_clock(&mut self) -> Result<u64, Error> {
-        self.runtime.read_clock().map_err(Error::from)
+        match &self.native {
+            Some(native) => Ok(native.services.facts().branches),
+            None => self.runtime.read_clock().map_err(Error::from),
+        }
+    }
+
+    fn backtrace(&mut self) -> Option<reverie::Backtrace> {
+        // Preserve the local default (no in-process unwind) and the native
+        // owner's bounded, fault-safe saved-frame-pointer walk.
+        let native = self.native.as_ref()?;
+        let regs = native.services.regs().ok()?;
+        let mut frames = vec![reverie::Frame {
+            ip: regs.rip,
+            is_signal: false,
+        }];
+        let mut fp = regs.rbp;
+        while frames.len() < 256 {
+            if fp == 0 || !fp.is_multiple_of(std::mem::align_of::<u64>() as u64) {
+                break;
+            }
+            let Some(saved_fp) = native.services.read_word(fp) else {
+                break;
+            };
+            let Some(return_addr) = native.services.read_word(fp.wrapping_add(8)) else {
+                break;
+            };
+            if return_addr == 0 {
+                break;
+            }
+            frames.push(reverie::Frame {
+                ip: return_addr,
+                is_signal: false,
+            });
+            if saved_fp <= fp {
+                break;
+            }
+            fp = saved_fp;
+        }
+        Some(reverie::Backtrace::new(self.tid, frames))
     }
 
     fn has_cpuid_interception(&self) -> bool {
@@ -3638,6 +4155,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
 pub struct LocalStack {
     arena: Box<[u8]>,
     offset: usize,
+    callback_scratch: Option<native_state::CallbackScratch>,
 }
 
 impl LocalStack {
@@ -3645,7 +4163,14 @@ impl LocalStack {
         Self {
             arena: vec![0; STACK_CAPACITY].into_boxed_slice(),
             offset: 0,
+            callback_scratch: None,
         }
+    }
+
+    fn with_callback_scratch(scratch: native_state::CallbackScratch) -> Self {
+        let mut stack = Self::new();
+        stack.callback_scratch = Some(scratch);
+        stack
     }
 
     /// Claims the next `size_of::<V>()` bytes aligned for `V` and returns
@@ -3671,12 +4196,17 @@ impl LocalStack {
 
 pub struct LocalStackGuard {
     arena: Option<Box<[u8]>>,
+    callback_scratch: Option<native_state::CallbackScratch>,
 }
 
 impl Drop for LocalStackGuard {
     fn drop(&mut self) {
         if let Some(arena) = self.arena.take() {
-            COMMITTED_STACKS.lock().push(arena);
+            if let Some(scratch) = &self.callback_scratch {
+                scratch.retain(arena);
+            } else {
+                COMMITTED_STACKS.lock().push(arena);
+            }
         }
     }
 }
@@ -3711,6 +4241,7 @@ impl Stack for LocalStack {
     fn commit(self) -> Result<Self::StackGuard, Errno> {
         Ok(LocalStackGuard {
             arena: Some(self.arena),
+            callback_scratch: self.callback_scratch,
         })
     }
 }
@@ -3769,6 +4300,14 @@ fn fatal(status: i32) -> ! {
 #[cfg(test)]
 #[path = "tool_configuration_tests.rs"]
 mod tool_configuration_tests;
+
+#[cfg(test)]
+#[path = "native_state_tests.rs"]
+mod native_state_tests;
+
+#[cfg(test)]
+#[path = "ordinary_root_tests.rs"]
+mod ordinary_root_tests;
 
 #[cfg(test)]
 mod process_owner_tests {
@@ -4056,6 +4595,8 @@ mod process_owner_tests {
                     .env(MODE, mode)
                     .env(PARENT, &identities)
                     .process_group(0)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4073,7 +4614,25 @@ mod process_owner_tests {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 };
-                assert!(status.success(), "{mode}: {status}");
+                let output = child.wait_with_output().unwrap();
+                assert!(status.success(), "{mode}: {status}; {output:?}");
+                assert_eq!(output.status, status);
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let summaries: Vec<_> = stdout
+                    .lines()
+                    .filter(|line| line.starts_with("test result: "))
+                    .collect();
+                assert!(
+                    matches!(summaries.as_slice(), [summary] if summary.starts_with(
+                        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                    )),
+                    "expected exactly one completed {mode} child test: {stdout}"
+                );
+                assert!(
+                    stdout
+                        .lines()
+                        .any(|line| line == format!("test {TEST} ... ok"))
+                );
             }
             return;
         };
@@ -4092,11 +4651,12 @@ mod process_owner_tests {
             pid: parent_pid,
             abandon: false,
         };
-        let mut owner = if mode == "selected" {
+        let owner = if mode == "selected" {
             ToolProcess::adopt_selected(inherited, ToolConfiguration::select(rpc.shared_config()))
         } else {
             ToolProcess::adopt_legacy(inherited)
         };
+        let mut owner = Some(Arc::new(owner));
         assert_eq!(
             EVENTS.lock().unwrap().len(),
             usize::from(mode == "selected")
@@ -4146,8 +4706,11 @@ mod process_owner_tests {
                 ("state-drop", parent_tid),
             ]
         );
-        assert_eq!(owner.as_ref().unwrap().pid, child_pid);
-        assert_eq!(owner.selected_configuration().is_some(), mode == "selected");
+        assert_eq!(owner.as_deref().unwrap().as_ref().unwrap().pid, child_pid);
+        assert_eq!(
+            owner.as_deref().unwrap().selected_configuration().is_some(),
+            mode == "selected"
+        );
         assert_eq!(states.len(), 1);
         assert_eq!(states.get(&child_tid).unwrap().pid, child_pid);
     }
@@ -4247,6 +4810,7 @@ mod tests {
             ppid: None,
             state: &mut state,
             rpc: &rpc,
+            native: None,
             tail: &tail,
             cpuid_interception: false,
             fork_parent_state: None,
@@ -4386,6 +4950,7 @@ mod tests {
             ppid: None,
             state: &mut state,
             rpc: &rpc,
+            native: None,
             tail: &tail,
             cpuid_interception: false,
             fork_parent_state: None,
@@ -4985,6 +5550,7 @@ mod tests {
                 ppid: None,
                 state: &mut state,
                 rpc: &rpc,
+                native: None,
                 tail: &tail,
                 cpuid_interception: false,
                 fork_parent_state: None,

@@ -1,1 +1,0 @@
-./test -M jmp -P 'if jump(next,asm)@patch goto'

@@ -1,1 +1,0 @@
-./test -M 'op[0].type == mem' -P 'entry(op[0].base,op[0].index,op[0].scale,bytes,size,asm)@inst'

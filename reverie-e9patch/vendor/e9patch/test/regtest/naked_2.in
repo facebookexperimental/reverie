@@ -1,1 +1,0 @@
-./test -M true -P 'naked<naked>(asm,state,rsp,rax,&rax,trampoline,target,next)@patch'

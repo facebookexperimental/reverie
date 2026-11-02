@@ -721,9 +721,9 @@ impl VerifiedStaticSource {
         &self,
         archive: &StaticArchive,
         definitions: &SelectedInitializerDefinitions,
-        inputs: ViewSiteInstallerInputs<'_>,
+        inputs: super::super::ViewSiteInstallerInputs<'_>,
         runner: &mut Runner,
-        body: impl FnOnce(&ViewSiteInstallerObservation, &mut Runner) -> Result<T>,
+        body: impl FnOnce(&super::super::ViewSiteInstallerObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
         let ViewSiteInstallerInputs {
             artifact,

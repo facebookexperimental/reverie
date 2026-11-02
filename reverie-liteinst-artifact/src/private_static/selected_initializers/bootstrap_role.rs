@@ -23,8 +23,8 @@
 //! allocator, panic, syscall or UD2. RET assumes the valid actual caller ABI.
 //! This conditional normal-return fact does not establish source-qualified
 //! role contents, descriptor/project/iterator closure, async safety or Ready.
+use super::ViewTableLeafObservation;
 use super::view_table::PlainLeafKind;
-use super::view_table::ViewTableLeafObservation;
 use super::*;
 
 pub(super) const SIZE: usize = 73;
@@ -89,7 +89,7 @@ impl VerifiedStaticSource {
         artifact: &FileIdentity,
         link_map: &FileIdentity,
         runner: &mut Runner,
-        body: impl FnOnce(&BootstrapRoleLeafObservation, &mut Runner) -> Result<T>,
+        body: impl FnOnce(&super::BootstrapRoleLeafObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
         self.with_plain_leaf(
             PlainLeafKind::BootstrapRole,

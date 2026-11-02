@@ -1,4 +1,0 @@
-call 0xa000168
-call 0xa0001b5
-call *%rdx
-PASSED

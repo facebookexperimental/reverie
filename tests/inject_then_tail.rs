@@ -35,66 +35,9 @@ fn ptrace_inject_then_tail_command() {
         reverie_test_support::test_cmd_with_config::<TestTool>(guest.program(), &[], NUM_REPS)
             .unwrap();
     assert_command_output("ptrace", &output);
+    rust_command_test();
 }
 
-#[cfg(feature = "dbt")]
-fn caller_manifest() -> std::path::PathBuf {
-    let executable = std::env::current_exe().unwrap();
-    executable
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("reverie-dbt-callers")
-        .join("inject-then-tail")
-        .join("manifest.json")
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_inject_then_tail_command() {
-    let manifest = caller_manifest();
-    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
-    let guest = command::GuestBinary::compile();
-    guest.assert_native();
-    guest.record_before_launch("dbt");
-    let (output, _state): (_, TestTool) =
-        reverie_test_support::test_dbt_cmd_with_config::<TestTool>(
-            guest.program(),
-            &[],
-            NUM_REPS,
-            &manifest,
-        )
-        .unwrap();
-    assert_command_output("dbt", &output);
-    rust_command_test(&manifest);
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_inject_then_tail_missing_artifact_refuses() {
-    let manifest = caller_manifest();
-    let _valid_default = reverie_dbt::CallerArtifact::load(&manifest).unwrap();
-    let missing = manifest.with_file_name("missing-inject-then-tail-manifest.json");
-    assert!(!missing.exists());
-    let error = reverie_test_support::test_dbt_cmd_with_config::<TestTool>(
-        "/bin/true",
-        &[],
-        NUM_REPS,
-        &missing,
-    )
-    .unwrap_err();
-    eprintln!(
-        "explicit missing inject-then-tail artifact {}: {error}",
-        missing.display()
-    );
-    let reverie::Error::Io(error) = error else {
-        panic!("expected missing manifest I/O error: {error}");
-    };
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-}
-
-#[cfg(feature = "dbt")]
 fn assert_rust_guest_records(stdout: &[u8]) {
     let text = std::str::from_utf8(stdout).unwrap();
     let lines: Vec<_> = text.split_terminator('\n').collect();
@@ -113,7 +56,6 @@ fn assert_rust_guest_records(stdout: &[u8]) {
         .unwrap();
 }
 
-#[cfg(feature = "dbt")]
 fn assert_rust_command_output(label: &str, output: &reverie::process::Output) {
     eprintln!(
         "inject-then-tail Rust command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
@@ -123,9 +65,7 @@ fn assert_rust_command_output(label: &str, output: &reverie::process::Output) {
     assert_rust_guest_records(&output.stdout);
 }
 
-#[cfg(feature = "dbt")]
-fn rust_command_test(manifest: &std::path::Path) {
-    reverie_dbt::CallerArtifact::load(manifest).unwrap();
+fn rust_command_test() {
     let program = env!("CARGO_BIN_EXE_inject-then-tail-rust-command-guest");
     eprintln!("inject-then-tail Rust guest: image={program}");
 
@@ -140,13 +80,4 @@ fn rust_command_test(manifest: &std::path::Path) {
     let (ptrace, _state): (_, TestTool) =
         reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], NUM_REPS).unwrap();
     assert_rust_command_output("ptrace", &ptrace);
-
-    let (dbt, _state): (_, TestTool) = reverie_test_support::test_dbt_cmd_with_config::<TestTool>(
-        program,
-        &[],
-        NUM_REPS,
-        manifest,
-    )
-    .unwrap();
-    assert_rust_command_output("dbt", &dbt);
 }

@@ -210,6 +210,41 @@ where
     }
 }
 
+/// Install an ordinary bootstrap Tool using a caller-owned concrete runtime.
+///
+/// The projection receives this mechanism's real services, allocated inside
+/// the shared installer's private allocation scope. The runtime and Tool stay
+/// in the same linked image; the boxed Rust trait is not an external ABI.
+/// Private initial/successor installation does not use this entry.
+///
+/// # Safety
+///
+/// All [`install_tool_from_bootstrap`] and
+/// [`reverie_inguest::guest::tool_install::install_tool_with_runtime`]
+/// preconditions apply. `project` must preserve every supplied service and
+/// retain it for the installed host's lifetime.
+pub unsafe fn install_tool_from_bootstrap_with_runtime<T, R>(
+    coordinator: impl AsRef<Path>,
+    project: impl FnOnce(Box<dyn HostRuntime>) -> R,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+    R: HostRuntime,
+{
+    // SAFETY: the caller retains the original installation and service
+    // projection obligations. No private image owner is created here.
+    unsafe {
+        reverie_inguest::guest::tool_install::install_tool_with_runtime::<T, _, R, _>(
+            coordinator.as_ref(),
+            false,
+            runtime::LiteinstPatchHost {
+                publication: runtime::PatchPublication::Concurrent,
+            },
+            |services| project(Box::new(services)),
+        )
+    }
+}
+
 #[cfg(feature = "exec-private-init")]
 #[derive(Clone, Copy)]
 pub(crate) enum PrivateImageControl<'a> {

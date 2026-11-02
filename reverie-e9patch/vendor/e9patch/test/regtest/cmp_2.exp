@@ -1,2 +1,0 @@
-cmp %rax, %rbx
-Illegal instruction

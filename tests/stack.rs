@@ -178,24 +178,9 @@ mod tests {
         eprintln!("stack good function: observed={observed}");
         assert!(observed);
 
-        #[cfg(feature = "dbt")]
         rust_command_test();
     }
 
-    #[cfg(feature = "dbt")]
-    fn caller_manifest() -> std::path::PathBuf {
-        let executable = std::env::current_exe().unwrap();
-        executable
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("reverie-dbt-callers")
-            .join("stack-two-allocs-good")
-            .join("manifest.json")
-    }
-
-    #[cfg(feature = "dbt")]
     fn assert_command_output(
         label: &str,
         output: &reverie::process::Output,
@@ -212,10 +197,7 @@ mod tests {
         assert!(observed);
     }
 
-    #[cfg(feature = "dbt")]
     fn rust_command_test() {
-        let manifest = caller_manifest();
-        reverie_dbt::CallerArtifact::load(&manifest).unwrap();
         let program = env!("CARGO_BIN_EXE_stack-rust-command-guest");
         eprintln!("stack good Rust command image={program}");
 
@@ -231,37 +213,5 @@ mod tests {
         let (output, state) =
             reverie_test_support::test_cmd_with_config::<LocalState3>(program, &[], ()).unwrap();
         assert_command_output("ptrace", &output, &state);
-        let (output, state) = reverie_test_support::test_dbt_cmd_with_config::<LocalState3>(
-            program,
-            &[],
-            (),
-            &manifest,
-        )
-        .unwrap();
-        assert_command_output("dbt", &output, &state);
-    }
-
-    #[cfg(feature = "dbt")]
-    #[test]
-    fn dbt_stack_missing_artifact_refuses() {
-        let manifest = caller_manifest();
-        let _valid_default = reverie_dbt::CallerArtifact::load(&manifest).unwrap();
-        let missing = manifest.with_file_name("missing-stack-two-allocs-good-manifest.json");
-        assert!(!missing.exists());
-        let error = reverie_test_support::test_dbt_cmd_with_config::<LocalState3>(
-            "/bin/true",
-            &[],
-            (),
-            &missing,
-        )
-        .unwrap_err();
-        eprintln!(
-            "explicit missing stack artifact {}: {error}",
-            missing.display()
-        );
-        let reverie::Error::Io(error) = error else {
-            panic!("expected missing manifest I/O error: {error}");
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 }

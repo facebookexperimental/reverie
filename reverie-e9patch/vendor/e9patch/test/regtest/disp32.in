@@ -1,1 +1,0 @@
-./test -M 'defined(disp32)' -P 'format("addr=0x%lx, disp32=%d\n",addr,disp32)@patch'

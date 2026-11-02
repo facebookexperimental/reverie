@@ -38,7 +38,9 @@ mod ordinary_gate;
 pub use ordinary_gate::OrdinaryGateObservations;
 #[cfg(test)]
 pub(crate) use ordinary_gate::composition_test_fixture;
-pub use ordinary_gate::ordinary_gate_implementation_sha256;
+pub fn ordinary_gate_implementation_sha256() -> String {
+    ordinary_gate::ordinary_gate_implementation_sha256()
+}
 
 mod package_roles;
 pub use package_roles::PackageRoleObservation;
@@ -4655,7 +4657,7 @@ mod optional_zero {
             &self,
             archive: &StaticArchive,
             definitions: &SelectedInitializerDefinitions,
-            input: &OptionalSourceInputs<'_>,
+            input: &super::OptionalSourceInputs<'_>,
             runner: &mut Runner,
         ) -> Result<OptionalZeroObservation> {
             // Wrong-owner refusal precedes even reads of the supplied files.

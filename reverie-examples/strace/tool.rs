@@ -6,9 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::Ordering;
 
 use reverie::Error;
@@ -25,9 +25,9 @@ use reverie::syscalls::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 
+use super::GlobalState;
+use super::OutputEvent;
 use crate::config::Config;
-use crate::global_state::GlobalState;
-use crate::global_state::OutputEvent;
 
 async fn send_output<G: GlobalRPC<GlobalState>>(
     global: &G,
@@ -38,11 +38,11 @@ async fn send_output<G: GlobalRPC<GlobalState>>(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static HANDLED_SYSCALLS: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
-pub(crate) fn take_handled_syscalls() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn take_handled_syscalls() -> usize {
     HANDLED_SYSCALLS.swap(0, Ordering::SeqCst)
 }
 
@@ -86,7 +86,7 @@ impl Tool for Strace {
         guest: &mut T,
         syscall: Syscall,
     ) -> Result<i64, Error> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         HANDLED_SYSCALLS.fetch_add(1, Ordering::SeqCst);
         match syscall {
             Syscall::Exit(_) | Syscall::ExitGroup(_) => {

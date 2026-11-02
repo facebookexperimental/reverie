@@ -1,1 +1,0 @@
-./test -M 'asm=/cmp.*/' -P trap

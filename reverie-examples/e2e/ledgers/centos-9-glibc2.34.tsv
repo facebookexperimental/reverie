@@ -35,13 +35,3 @@ sh-pipe	in-guest-trap	mismatch	getrandom=ok -> openat=ENOENT	https://github.com/
 awk	in-guest-trap	mismatch	fcntl=32769 -> fcntl=1	https://github.com/rrnewton/hermit/issues/4485
 dd-zero	in-guest-trap	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
 perl	in-guest-trap	mismatch	(no aligned start) -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
-# e9patch's direct path hosts a tool only in a program whose own executable makes syscalls; the
-# corpus's programs make theirs through libc.
-*	e9patch	no_result	recorder exit status: 1: Error: direct e9patch Tool hosting requires at least one recovered syscall site	https://github.com/rrnewton/hermit/issues/4485
-# DBT: DynamoRIO runs with -disable_rseq, so rseq answers ENOSYS. (The runtime's GlobalState connection
-# no longer takes the program's first descriptor: reverie-dbt reserves it before the program runs.)
-*	dbt	mismatch	rseq=ok -> rseq=ENOSYS	https://github.com/rrnewton/hermit/issues/4485
-# SaBRe: before the program's first call the tool sees a getrandom the program never makes (on this glibc,
-# which makes the call where a newer one reads the vDSO), so no start aligns: most likely the plugin's
-# own call through libc's rewritten site.
-*	sabre	mismatch	(no aligned start) -> getrandom=ok	https://github.com/rrnewton/hermit/issues/4485

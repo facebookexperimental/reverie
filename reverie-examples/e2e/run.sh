@@ -20,8 +20,8 @@ usage: reverie-examples/e2e/run.sh [--backends LIST] [--environment NAME]
                                    [--artifacts DIR] [--report-only]
                                    [--write-ledger FILE]
 
-  --backends LIST      comma-separated; default: every backend
-                       (ptrace,kvm,liteinst,in-guest-trap,e9patch,dbt,sabre)
+  --backends LIST      comma-separated; default: every first-party backend
+                       (ptrace,kvm,liteinst,in-guest-trap)
   --environment NAME   the ledger to judge against, ledgers/NAME.tsv; default:
                        this host's, <os id>-<os version>-glibc<version>
   --artifacts DIR      records and logs; default: target/e2e
@@ -37,7 +37,7 @@ EOF
 
 E2E_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$E2E_DIR/../.." && pwd)"
-ALL_BACKENDS=ptrace,kvm,liteinst,in-guest-trap,e9patch,dbt,sabre
+ALL_BACKENDS=ptrace,kvm,liteinst,in-guest-trap
 backends=$ALL_BACKENDS
 environment=
 artifacts=
@@ -78,7 +78,7 @@ say() { printf 'reverie e2e: %s\n' "$*"; }
 
 say "environment $environment; backends requested: $backends"
 if ! cargo build --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
-    -p reverie-examples -p reverie-sabre-strace --lib --bins; then
+    -p reverie-examples --lib --bins; then
     say "build failed"
     exit 2
 fi
@@ -91,7 +91,7 @@ refused=()
 IFS=, read -r -a requested <<<"$backends"
 for backend in "${requested[@]}"; do
     case $backend in
-        ptrace | liteinst | in-guest-trap | e9patch) run_backends+=("$backend") ;;
+        ptrace | liteinst | in-guest-trap) run_backends+=("$backend") ;;
         kvm)
             # `<>` would create a missing /dev/kvm as an ordinary file where
             # /dev is writable, so require the character device first.
@@ -101,27 +101,9 @@ for backend in "${requested[@]}"; do
                 refused+=("kvm: /dev/kvm is not a character device this user can open read-write")
             fi
             ;;
-        dbt)
-            if ! command -v cmake >/dev/null; then
-                refused+=("dbt: cmake, which builds DynamoRIO and the DBT client, is not on PATH")
-            elif [[ ! -f $ROOT_DIR/reverie-dbt/vendor/dynamorio/CMakeLists.txt ]]; then
-                refused+=("dbt: the vendored DynamoRIO source (reverie-dbt/vendor/dynamorio) is missing")
-            elif CARGO_TARGET_DIR=$target_dir bash "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
-                >"$artifacts/dbt-client-build.log" 2>&1; then
-                run_backends+=(dbt)
-            else
-                say "the DBT client failed to build ($artifacts/dbt-client-build.log)"
-                exit 2
-            fi
-            ;;
-        sabre)
-            loader=$("$binaries/reverie-sabre-strace" --print-sabre 2>/dev/null)
-            if [[ -n $loader && -x $loader ]]; then
-                export SABRE_BINARY=$loader
-                run_backends+=(sabre)
-            else
-                refused+=("sabre: the SaBRe loader reverie-sabre builds was not found")
-            fi
+        e9patch | dbt | dynamorio | sabre)
+            say "backend $backend is owned by its extension repository; use that extension's E2E entry with the explicit core comparator/data inputs"
+            exit 2
             ;;
         *) say "unknown backend $backend"; exit 2 ;;
     esac

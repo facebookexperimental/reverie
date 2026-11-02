@@ -1,1 +1,0 @@
-./test -M 'defined(mem[0])' -P 'entry(mem[0].disp,mem[0].base,&mem[0],bytes,size,asm)@inst'

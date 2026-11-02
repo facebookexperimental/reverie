@@ -1,1 +1,0 @@
-./test -M 'I.rex == 0x48' -P print

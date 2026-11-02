@@ -22,7 +22,9 @@ from pathlib import Path
 from typing import Any
 
 
-BACKENDS = ("ptrace", "kvm", "liteinst", "dbt", "sabre", "e9patch")
+BACKENDS = ("ptrace", "kvm", "liteinst")
+# Explicit physical-backend callback interface for separately owned frontends.
+EXTERNAL_BACKEND_API = 1
 COUNTER_PATTERNS = (
     re.compile(
         rb"Total system calls in process tree: (?P<total>[0-9]+), "
@@ -60,7 +62,9 @@ class Outcome:
     counter_threads: int | None
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, backend_names: tuple[str, ...] = BACKENDS
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Measure exact counter2 overhead only on the selected backends' "
@@ -69,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backends",
-        default=",".join(BACKENDS),
+        default=",".join(backend_names),
         help="comma-separated backend set (default: all)",
     )
     parser.add_argument(
@@ -83,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", choices=("debug", "release"), default="release")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--seed", type=int, default=1)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def fail(message: str) -> None:
@@ -193,30 +197,7 @@ def base_environment() -> dict[str, str]:
 def backend_environment(
     backend: str, env: dict[str, str], root: Path, target: Path
 ) -> dict[str, str]:
-    result = env.copy()
-    if backend == "dbt":
-        helper = require_file(
-            target / "reverie-dbt-dynamorio-path", "DBT DynamoRIO path helper"
-        )
-        if not result.get("DYNAMORIO_HOME"):
-            result["DYNAMORIO_HOME"] = subprocess.check_output(
-                [str(helper), "home"], cwd=root, text=True
-            ).strip()
-        result.setdefault(
-            "REVERIE_DBT_CLIENT",
-            str(target / "reverie-dbt-native" / "libreverie_dbt_client.so"),
-        )
-        require_file(Path(result["REVERIE_DBT_CLIENT"]), "DBT native client")
-    elif backend == "e9patch":
-        result.setdefault("REVERIE_E9TOOL", str(root / "third-party/e9patch/e9tool"))
-        result.setdefault(
-            "REVERIE_E9PATCH_BACKEND", str(root / "third-party/e9patch/e9patch")
-        )
-        require_file(Path(result["REVERIE_E9TOOL"]), "e9tool")
-        require_file(Path(result["REVERIE_E9PATCH_BACKEND"]), "e9patch backend")
-    elif backend == "sabre":
-        result["REVERIE_SABRE_STRACE_QUIET"] = "1"
-    return result
+    return env.copy()
 
 
 def backend_command(
@@ -251,43 +232,6 @@ def backend_command(
             str(artifact),
             *arguments,
         ]
-    if backend == "dbt":
-        return [
-            str(
-                require_file(
-                    target / "reverie-dbt-counter2-exact", "DBT exact counter2"
-                )
-            ),
-            "--",
-            str(artifact),
-            *arguments,
-        ]
-    if backend == "sabre":
-        return [
-            str(require_file(target / "reverie-sabre-strace", "SaBRe counter2 host")),
-            "--sabre",
-            str(require_file(root / "target/sabre/sabre", "SaBRe loader")),
-            "--plugin",
-            str(
-                require_file(
-                    target / "libreverie_sabre_strace_plugin.so", "SaBRe plugin"
-                )
-            ),
-            "--tool",
-            "counter2-exact",
-            "--",
-            str(artifact),
-            *arguments,
-        ]
-    if backend == "e9patch":
-        return [
-            str(require_file(target / "counter2", "counter2")),
-            "--backend",
-            "e9patch",
-            "--",
-            str(artifact),
-            *arguments,
-        ]
     fail(f"unknown backend {backend}")
 
 
@@ -296,6 +240,7 @@ def command_for(
     artifacts: dict[str, Path],
     root: Path,
     target: Path,
+    command_factory=backend_command,
 ) -> list[str]:
     artifact = artifacts[execution.variant]
     arguments = [
@@ -306,7 +251,7 @@ def command_for(
     ]
     if execution.backend == "native":
         return [str(artifact), *arguments]
-    return backend_command(execution.backend, artifact, arguments, root, target)
+    return command_factory(execution.backend, artifact, arguments, root, target)
 
 
 def check_outcome(
@@ -340,8 +285,20 @@ def git_output(root: Path, *arguments: str) -> str:
     return subprocess.check_output(["git", *arguments], cwd=root, text=True).strip()
 
 
-def main() -> None:
-    args = parse_args()
+def main(
+    *,
+    argv: list[str] | None = None,
+    backend_names: tuple[str, ...] = BACKENDS,
+    command_factory=backend_command,
+    environment_factory=backend_environment,
+    adapter_identity: dict[str, Any] | None = None,
+) -> None:
+    # The shared driver owns calibration, workload intersection, every probe
+    # and comparator, sampling, and reports. External callbacks supply only
+    # their physical command/environment, plus provenance stored in metadata.
+    args = parse_args(argv, backend_names)
+    if adapter_identity is not None:
+        json.dumps(adapter_identity, sort_keys=True)
     if not 3.0 <= args.target_seconds <= 10.0:
         fail("--target-seconds must be between 3 and 10")
     if args.repetitions < 1 or args.warmups < 0:
@@ -351,7 +308,7 @@ def main() -> None:
     target = root / "target" / args.profile
     selected = [item.strip() for item in args.backends.split(",") if item.strip()]
     if len(set(selected)) != len(selected) or any(
-        item not in BACKENDS for item in selected
+        item not in backend_names for item in selected
     ):
         fail(f"invalid --backends value: {args.backends}")
     if not selected:
@@ -448,8 +405,8 @@ def main() -> None:
     probes: list[dict[str, Any]] = []
     print("PROBE: validating every known-green cell before timing", flush=True)
     for execution in executions:
-        command = command_for(execution, artifacts, root, target)
-        run_env = backend_environment(execution.backend, env, root, target)
+        command = command_for(execution, artifacts, root, target, command_factory)
+        run_env = environment_factory(execution.backend, env, root, target)
         outcome = run_process(command, run_env, args.timeout_seconds, root)
         key = (execution.workload, execution.variant)
         if execution.backend == "native":
@@ -480,8 +437,8 @@ def main() -> None:
         print(f"WARMUP {warmup + 1}/{args.warmups}", flush=True)
         for execution in executions:
             outcome = run_process(
-                command_for(execution, artifacts, root, target),
-                backend_environment(execution.backend, env, root, target),
+                command_for(execution, artifacts, root, target, command_factory),
+                environment_factory(execution.backend, env, root, target),
                 args.timeout_seconds,
                 root,
             )
@@ -500,8 +457,8 @@ def main() -> None:
     with sample_path.open("w") as stream:
         for index, (repetition, execution) in enumerate(schedule, 1):
             outcome = run_process(
-                command_for(execution, artifacts, root, target),
-                backend_environment(execution.backend, env, root, target),
+                command_for(execution, artifacts, root, target, command_factory),
+                environment_factory(execution.backend, env, root, target),
                 args.timeout_seconds,
                 root,
             )
@@ -611,6 +568,8 @@ def main() -> None:
         "timeout_seconds": args.timeout_seconds,
         "seed": args.seed,
     }
+    if adapter_identity is not None:
+        metadata["external_adapter"] = adapter_identity
     (output / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n"
     )

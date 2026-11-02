@@ -1,2 +1,0 @@
-callq *-0x88(%rsp)
-PASSED

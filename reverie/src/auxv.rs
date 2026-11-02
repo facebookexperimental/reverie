@@ -89,6 +89,12 @@ impl Auxv {
         }
     }
 
+    /// Reads the process auxiliary vector through the normal launch-window
+    /// reader. Backends with a distinct application vector use from_entries.
+    pub fn from_pid(pid: Pid) -> io::Result<Self> {
+        Self::new(pid)
+    }
+
     /// Reads the auxiliary values from `/proc/{pid}/auxv`.
     pub(crate) fn new(pid: Pid) -> io::Result<Self> {
         let mut map = BTreeMap::new();

@@ -317,7 +317,7 @@ impl VerifiedStaticSource {
         definitions: &SelectedInitializerDefinitions,
         objdump: &FileIdentity,
         runner: &mut Runner,
-        callback: impl FnOnce(&MappedTerminalObservation, &mut Runner) -> Result<T>,
+        callback: impl FnOnce(&super::MappedTerminalObservation, &mut Runner) -> Result<T>,
     ) -> Result<T> {
         let admission = self.require_archive_owner(archive).and_then(|_| {
             require(

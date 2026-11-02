@@ -19,6 +19,8 @@ description = "Shared LD_PRELOAD + seccomp/SIGSYS instrumentation runtime for Re
 crate-type = ["cdylib", "rlib"]
 
 [features]
+# Read-only native callback observations; no constructor or entry authority.
+native-entry-observer = ["coordinator-rpc"]
 default = ["preload-constructor"]
 # Allocation diagnostics for the real-preload ownership regression. This does
 # not select or alter the allocator.

@@ -330,11 +330,11 @@ impl VerifiedStaticSource {
     pub fn with_native_leaf_definitions<T>(
         &self,
         archive: &StaticArchive,
-        native: &NativeLeafInputs<'_>,
+        native: &super::NativeLeafInputs<'_>,
         artifact: &FileIdentity,
         link_map: &FileIdentity,
         runner: &mut Runner,
-        body: impl FnOnce(&NativeLeafObservations) -> Result<T>,
+        body: impl FnOnce(&super::NativeLeafObservations) -> Result<T>,
     ) -> Result<T> {
         let mut source_files = Vec::new();
         let result = (|| {

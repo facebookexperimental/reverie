@@ -1,4 +1,0 @@
-preinit
-init argv = "./init_exe.exe" 
-postinit
-PASSED

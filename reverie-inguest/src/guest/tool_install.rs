@@ -26,6 +26,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use reverie::GlobalRPC;
+use reverie::GlobalTool;
 use reverie::Pid;
 use reverie::Tool;
 use reverie::ToolConfiguration;
@@ -147,6 +148,114 @@ where
     T: Tool + 'static,
     H: PatchHost,
 {
+    // SAFETY: identity preserves the caller's runtime and every installation
+    // precondition. Existing consumers retain their original concrete host.
+    unsafe {
+        install_tool_with_runtime::<T, H, H::Runtime, _>(
+            coordinator,
+            remove_coordinator_environment,
+            host,
+            core::convert::identity,
+        )
+    }
+}
+
+/// Install a Tool after projecting the mechanism's runtime services into one
+/// caller-owned concrete runtime type.
+///
+/// Different entry mechanisms can share the same `ToolHost<T, R>` and Guest
+/// instantiations in a single linked runtime. The projection runs once, inside
+/// the private allocation scope, before the host is published. It must preserve
+/// the mechanism's services; it grants no image or callback authority.
+///
+/// # Safety
+///
+/// All [`install_tool_with`] preconditions apply. `project` must retain the
+/// actual runtime services and their image lifetime, including fork rebinding,
+/// signal control, clock and statistics behavior. Rust objects supplied here
+/// remain within one linked build; this is not a dynamic-library ABI.
+pub unsafe fn install_tool_with_runtime<T, H, R, F>(
+    coordinator: &Path,
+    remove_coordinator_environment: bool,
+    host: H,
+    project: F,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+    H: PatchHost,
+    R: HostRuntime,
+    F: FnOnce(H::Runtime) -> R,
+{
+    // Existing callers keep lazy state construction and all original ordering.
+    unsafe {
+        install_tool_with_runtime_impl::<T, H, R, F>(
+            coordinator,
+            remove_coordinator_environment,
+            host,
+            project,
+            None,
+        )
+    }
+}
+
+/// A one-use ordinary root-state initializer. This is not an initial-image or
+/// successor permit: the consumer must authenticate any opaque handoff itself.
+/// The normal thread-start and post-exec callbacks still run on the first event.
+pub type OrdinaryRootInitializer<T> = fn(
+    &<<T as Tool>::GlobalState as GlobalTool>::Config,
+    Pid,
+    &mut <T as Tool>::ThreadState,
+) -> io::Result<()>;
+
+/// Install a projected runtime with an authenticated ordinary root-state handoff.
+///
+/// After the normal config handshake and Tool construction, `initialize` runs
+/// on the normally initialized root, before host publication or activation. It
+/// receives no RPC client and cannot manufacture coordinator readiness. Its
+/// error aborts installation; no freshly seeded replacement is published.
+/// Inherited fork state and all private installers retain their existing paths.
+///
+/// # Safety
+/// All [`install_tool_with_runtime`] preconditions apply. The caller owns the
+/// initializer's payload/schema/config/image checks and may change only its
+/// declared state fields. This does not authorize private phase callbacks.
+pub unsafe fn install_tool_with_runtime_and_root_initializer<T, H, R, F>(
+    coordinator: &Path,
+    remove_coordinator_environment: bool,
+    host: H,
+    project: F,
+    initialize: OrdinaryRootInitializer<T>,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+    H: PatchHost,
+    R: HostRuntime,
+    F: FnOnce(H::Runtime) -> R,
+{
+    unsafe {
+        install_tool_with_runtime_impl::<T, H, R, F>(
+            coordinator,
+            remove_coordinator_environment,
+            host,
+            project,
+            Some(initialize),
+        )
+    }
+}
+
+unsafe fn install_tool_with_runtime_impl<T, H, R, F>(
+    coordinator: &Path,
+    remove_coordinator_environment: bool,
+    host: H,
+    project: F,
+    initialize: Option<OrdinaryRootInitializer<T>>,
+) -> io::Result<()>
+where
+    T: Tool + 'static,
+    H: PatchHost,
+    R: HostRuntime,
+    F: FnOnce(H::Runtime) -> R,
+{
     // Everything installation allocates lives in the runtime's private Tool
     // heap, never in the guest's own malloc heap; see LiteInst's installer.
     let _private_allocations = crate::guest::alloc::enter_dispatch();
@@ -216,14 +325,17 @@ where
         unsafe { std::env::remove_var(crate::bootstrap::COORDINATOR_ENV) };
     }
     let tool = configuration.new_process(pid);
-    let tool_host = ToolHost::<T, H::Runtime>::with_configuration(
+    let mut tool_host = ToolHost::<T, R>::with_configuration(
         tool,
         rpc,
         pid,
         configuration,
         syscall_subscriptions,
-        host.runtime(stats),
+        project(host.runtime(stats)),
     );
+    if let Some(initialize) = initialize {
+        tool_host.prepare_ordinary_root_state(initialize)?;
+    }
     if delivers && site_patching {
         // A patched site reaches the Tool without the fallback continuation,
         // which keeps the guest's mask apart from the runtime's.

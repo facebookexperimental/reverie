@@ -1,1 +1,0 @@
-./test -M true -P 'entry(BB,BB.len,BB.size,bytes,size,asm)@inst'

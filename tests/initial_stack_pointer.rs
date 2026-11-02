@@ -60,46 +60,11 @@ fn ptrace_initial_stack_pointer_at_argc() {
     assert_initial_stack(&output, &observation);
 }
 
-#[cfg(feature = "dbt")]
-fn caller_manifest() -> std::path::PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("reverie-dbt-callers")
-        .join("initial-stack")
-        .join("manifest.json")
-}
-
-#[cfg(feature = "dbt")]
 #[test]
-fn dbt_initial_stack_pointer_at_argc() {
-    let args = ["first", "second"];
-    let (output, global) = reverie_test_support::test_dbt_cmd_with_config::<StackTool>(
-        "/bin/true",
-        &args,
-        (),
-        &caller_manifest(),
-    )
-    .unwrap();
-    let observation = observed("dbt", &args, &output, global);
-    assert_initial_stack(&output, &observation);
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_initial_stack_reversed_argv_is_rejected() {
+fn ptrace_initial_stack_reversed_argv_is_rejected() {
     let args = ["second", "first"];
-    let (output, global) = reverie_test_support::test_dbt_cmd_with_config::<StackTool>(
-        "/bin/true",
-        &args,
-        (),
-        &caller_manifest(),
-    )
-    .unwrap();
-    let observation = observed("dbt-reversed", &args, &output, global);
+    let (output, global) = reverie_test_support::test_cmd::<StackTool>("/bin/true", &args).unwrap();
+    let observation = observed("ptrace-reversed", &args, &output, global);
     // Qualify the real alternate route before catching only the positive
     // helper's argument-order failure. Setup/record failures cannot qualify.
     assert!(output.status.success(), "{output:?}");

@@ -1,1 +1,0 @@
-./test -M 'jmp or call or return' -P 'entry(addr,target,next,bytes,size,asm)@inst'

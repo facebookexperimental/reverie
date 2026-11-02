@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#[cfg(feature = "dbt")]
 pub const PRE_BODY_MARKER: &[u8] = b"inject-exit-rust-body\n";
 
 pub fn smoke() {

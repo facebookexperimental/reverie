@@ -1,1 +1,0 @@
-./test -M 'op[0] == rax' -P 'entry(addr,rax,op[0],bytes,size,asm)@inst'

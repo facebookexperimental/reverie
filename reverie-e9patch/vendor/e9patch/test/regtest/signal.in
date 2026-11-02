@@ -1,1 +1,0 @@
-./test -M 'mnemonic == "cvtsi2ss"' -P 'signal(10)'

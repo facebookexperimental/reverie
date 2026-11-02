@@ -1,1 +1,0 @@
-./test -M true -P 'after record(addr, rax)@patch'

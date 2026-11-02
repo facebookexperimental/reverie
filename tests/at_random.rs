@@ -35,22 +35,9 @@ fn ptrace_at_random_command() {
     let (output, _state): (_, ()) =
         reverie_test_support::test_cmd_with_config::<TestTool>(guest.program(), &[], ()).unwrap();
     assert_command_output("ptrace", &output);
+    rust_command_test();
 }
 
-#[cfg(feature = "dbt")]
-fn caller_manifest() -> std::path::PathBuf {
-    let executable = std::env::current_exe().unwrap();
-    executable
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("reverie-dbt-callers")
-        .join("at-random")
-        .join("manifest.json")
-}
-
-#[cfg(feature = "dbt")]
 fn assert_rust_command_output(label: &str, output: &reverie::process::Output) {
     eprintln!(
         "at-random Rust command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
@@ -64,54 +51,10 @@ fn assert_rust_command_output(label: &str, output: &reverie::process::Output) {
     assert!(output.stderr.is_empty());
 }
 
-#[cfg(feature = "dbt")]
-fn rust_command_test(manifest: &std::path::Path) {
+fn rust_command_test() {
     let program = env!("CARGO_BIN_EXE_at-random-rust-command-guest");
     eprintln!("at-random Rust guest: image={program}");
     let (output, ()): (_, ()) =
         reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], ()).unwrap();
     assert_rust_command_output("ptrace", &output);
-    let (output, ()): (_, ()) =
-        reverie_test_support::test_dbt_cmd_with_config::<TestTool>(program, &[], (), manifest)
-            .unwrap();
-    assert_rust_command_output("dbt", &output);
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_at_random_command() {
-    let manifest = caller_manifest();
-    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
-    let guest = command::GuestBinary::compile();
-    guest.assert_native();
-    guest.record_before_launch("dbt");
-    let (output, _state): (_, ()) = reverie_test_support::test_dbt_cmd_with_config::<TestTool>(
-        guest.program(),
-        &[],
-        (),
-        &manifest,
-    )
-    .unwrap();
-    assert_command_output("dbt", &output);
-    rust_command_test(&manifest);
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_at_random_missing_artifact_refuses() {
-    let manifest = caller_manifest();
-    let _valid_default = reverie_dbt::CallerArtifact::load(&manifest).unwrap();
-    let missing = manifest.with_file_name("missing-at-random-manifest.json");
-    assert!(!missing.exists());
-    let error =
-        reverie_test_support::test_dbt_cmd_with_config::<TestTool>("/bin/true", &[], (), &missing)
-            .unwrap_err();
-    eprintln!(
-        "explicit missing at-random artifact {}: {error}",
-        missing.display()
-    );
-    let reverie::Error::Io(error) = error else {
-        panic!("expected missing manifest I/O error: {error}");
-    };
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }

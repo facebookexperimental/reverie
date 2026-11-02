@@ -1,2 +1,0 @@
-lea 0x2(%rip), %rdx
-PASSED

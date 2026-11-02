@@ -1,1 +1,0 @@
-./test -M jmp -P 'if once(trampoline,addr,next,asm)@init goto'

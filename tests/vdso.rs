@@ -74,21 +74,18 @@ mod tests {
             rust_guest::getcpu(getcpu, vdso_base);
         });
         drop(handle);
-        #[cfg(feature = "dbt")]
         rust_getcpu_command();
     }
 
     #[test]
     fn run_guest_vdso_gettimeofday_test() {
         check_fn::<LocalState, _>(rust_guest::gettimeofday);
-        #[cfg(feature = "dbt")]
         rust_gettimeofday_command();
     }
 
     #[test]
     fn run_guest_vdso_clock_getres_test() {
         check_fn::<LocalState, _>(rust_guest::clock_getres);
-        #[cfg(feature = "dbt")]
         rust_clock_getres_command();
     }
 }
@@ -119,85 +116,37 @@ fn ptrace_vdso_command() {
     assert_command_output("ptrace", &output);
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
-fn caller_manifest() -> std::path::PathBuf {
-    let executable = std::env::current_exe().unwrap();
-    executable
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("reverie-dbt-callers")
-        .join("vdso")
-        .join("manifest.json")
-}
-
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
-#[test]
-fn dbt_vdso_command() {
-    let manifest = caller_manifest();
-    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
-    let guest = command::GuestBinary::compile();
-    guest.assert_native();
-    guest.record_before_launch("dbt");
-    let (output, ()) = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
-        guest.program(),
-        &["tool"],
-        (),
-        &manifest,
-    )
-    .unwrap();
-    assert_command_output("dbt", &output);
-}
-
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
-#[test]
-fn dbt_vdso_missing_artifact_refuses() {
-    let manifest = caller_manifest();
-    let _valid_default = reverie_dbt::CallerArtifact::load(&manifest).unwrap();
-    let missing = manifest.with_file_name("missing-vdso-manifest.json");
-    assert!(!missing.exists());
-    let error = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
-        "/bin/true",
-        &[],
-        (),
-        &missing,
-    )
-    .unwrap_err();
-    eprintln!(
-        "explicit missing vdso artifact {}: {error}",
-        missing.display()
-    );
-    let reverie::Error::Io(error) = error else {
-        panic!("expected missing manifest I/O error: {error}");
-    };
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-}
-
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[cfg(all(not(sanitized), test))]
 fn rust_clock_getres_command() {
-    let manifest = caller_manifest();
-    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
     let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
     eprintln!("vdso Rust clock_getres command: image={program}");
 
     let (output, ()) = reverie_test_support::test_cmd::<LocalState>(program, &[]).unwrap();
     assert_command_output("rust/clock_getres/ptrace", &output);
-
-    let (output, ()) =
-        reverie_test_support::test_dbt_cmd_with_config::<LocalState>(program, &[], (), &manifest)
-            .unwrap();
-    assert_command_output("rust/clock_getres/dbt", &output);
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+/// Run the command image with no selector (its clock_getres body) under
+/// ptrace: a real successful run whose output another selector's oracle must
+/// reject.
+#[cfg(all(not(sanitized), test))]
+fn clock_getres_control(label: &str) -> reverie::process::Output {
+    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    let (control, ()) = reverie_test_support::test_cmd::<LocalState>(program, &[]).unwrap();
+    assert_command_output(
+        &format!("rust/{label}/control-clock_getres/ptrace"),
+        &control,
+    );
+    control
+}
+
+#[cfg(all(not(sanitized), test))]
 fn gettimeofday_command_output_matches(output: &reverie::process::Output) -> bool {
     output.status == reverie::ExitStatus::Exited(0)
         && output.stdout.as_slice() == b"vdso-rust-gettimeofday-complete\n"
         && output.stderr.is_empty()
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[cfg(all(not(sanitized), test))]
 fn assert_gettimeofday_command_output(label: &str, output: &reverie::process::Output) {
     eprintln!(
         "vdso command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
@@ -206,42 +155,28 @@ fn assert_gettimeofday_command_output(label: &str, output: &reverie::process::Ou
     assert!(gettimeofday_command_output_matches(output));
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[cfg(all(not(sanitized), test))]
 fn rust_gettimeofday_command() {
-    let manifest = caller_manifest();
-    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
     let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
     eprintln!("vdso Rust gettimeofday command: image={program}");
 
-    let (control, ()) =
-        reverie_test_support::test_dbt_cmd_with_config::<LocalState>(program, &[], (), &manifest)
-            .unwrap();
-    assert_command_output("rust/gettimeofday/control-clock_getres/dbt", &control);
+    let control = clock_getres_control("gettimeofday");
     assert!(!gettimeofday_command_output_matches(&control));
     eprintln!("vdso Rust gettimeofday control: clock_getres rejected=true");
 
     let (output, ()) =
         reverie_test_support::test_cmd::<LocalState>(program, &["gettimeofday"]).unwrap();
     assert_gettimeofday_command_output("rust/gettimeofday/ptrace", &output);
-
-    let (output, ()) = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
-        program,
-        &["gettimeofday"],
-        (),
-        &manifest,
-    )
-    .unwrap();
-    assert_gettimeofday_command_output("rust/gettimeofday/dbt", &output);
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[cfg(all(not(sanitized), test))]
 fn getcpu_command_output_matches(output: &reverie::process::Output) -> bool {
     output.status == reverie::ExitStatus::Exited(0)
         && output.stdout == b"vdso-rust-getcpu-complete\n"
         && output.stderr.is_empty()
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[cfg(all(not(sanitized), test))]
 fn assert_getcpu_command_output(label: &str, output: &reverie::process::Output) {
     eprintln!(
         "vdso command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
@@ -250,34 +185,20 @@ fn assert_getcpu_command_output(label: &str, output: &reverie::process::Output) 
     assert!(getcpu_command_output_matches(output));
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[cfg(all(not(sanitized), test))]
 fn rust_getcpu_command() {
-    let manifest = caller_manifest();
-    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
     let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
     eprintln!("vdso Rust getcpu command: image={program}");
 
     let (output, ()) = reverie_test_support::test_cmd::<LocalState>(program, &["getcpu"]).unwrap();
     assert_getcpu_command_output("rust/getcpu/ptrace", &output);
 
-    let (output, ()) = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
-        program,
-        &["getcpu"],
-        (),
-        &manifest,
-    )
-    .unwrap();
-    assert_getcpu_command_output("rust/getcpu/dbt", &output);
-
-    let (output, ()) =
-        reverie_test_support::test_dbt_cmd_with_config::<LocalState>(program, &[], (), &manifest)
-            .unwrap();
-    assert_command_output("rust/getcpu/control-clock_getres/dbt", &output);
-    assert!(!getcpu_command_output_matches(&output));
+    let control = clock_getres_control("getcpu");
+    assert!(!getcpu_command_output_matches(&control));
     eprintln!("vdso Rust getcpu control: clock_getres rejected=true");
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[cfg(all(not(sanitized), test))]
 fn tod_command_output_matches(output: &reverie::process::Output) -> bool {
     output.status == reverie::ExitStatus::Exited(0)
         && output.stdout.as_slice()
@@ -289,7 +210,7 @@ fn tod_command_output_matches(output: &reverie::process::Output) -> bool {
         && output.stderr.is_empty()
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[cfg(all(not(sanitized), test))]
 fn assert_tod_command_output(label: &str, output: &reverie::process::Output) {
     eprintln!(
         "vdso command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
@@ -298,30 +219,16 @@ fn assert_tod_command_output(label: &str, output: &reverie::process::Output) {
     assert!(tod_command_output_matches(output));
 }
 
-#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[cfg(all(not(sanitized), test))]
 #[test]
 fn rust_vdso_tod_command() {
-    let manifest = caller_manifest();
-    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
     let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
     eprintln!("vdso Rust tod command: image={program}");
 
     let (output, ()) = reverie_test_support::test_cmd::<LocalState>(program, &["tod"]).unwrap();
     assert_tod_command_output("rust/tod/ptrace", &output);
 
-    let (output, ()) = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
-        program,
-        &["tod"],
-        (),
-        &manifest,
-    )
-    .unwrap();
-    assert_tod_command_output("rust/tod/dbt", &output);
-
-    let (output, ()) =
-        reverie_test_support::test_dbt_cmd_with_config::<LocalState>(program, &[], (), &manifest)
-            .unwrap();
-    assert_command_output("rust/tod/control-clock_getres/dbt", &output);
-    assert!(!tod_command_output_matches(&output));
+    let control = clock_getres_control("tod");
+    assert!(!tod_command_output_matches(&control));
     eprintln!("vdso Rust tod control: clock_getres rejected=true");
 }

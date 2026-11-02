@@ -1,1 +1,0 @@
-./test -M 'I[0].BB.addr == 0xa0001c2' -P print
