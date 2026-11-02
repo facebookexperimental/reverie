@@ -3238,9 +3238,11 @@ impl TimerImpl {
         let mut guest_trap_flag = regs.eflags & TRAP_FLAG != 0;
         // Steps of each unit this approach takes, for the log.
         let (mut instruction_steps, mut block_steps) = (0u64, 0u64);
-        // The hardware breakpoints branch runs use, once a run needs them.
+        // The hardware breakpoints branch runs use, once a run needs them,
+        // given back on every return (`crate::branch_step::Borrowed`).
         #[cfg(target_arch = "aarch64")]
-        let mut breakpoints: Option<BranchBreakpoints> = None;
+        let mut breakpoints =
+            crate::branch_step::Borrowed::<BranchBreakpoints>::new(task.generation());
         loop {
             if !current
                 .is_behind(target_rcb, target_instr)
@@ -3276,7 +3278,7 @@ impl TimerImpl {
                 target_rcb,
             );
             #[cfg(target_arch = "aarch64")]
-            let unit = self.branch_run(&task, &mut breakpoints, current.rcbs(), target_rcb)?;
+            let unit = self.branch_run(&task, breakpoints.regs(), current.rcbs(), target_rcb)?;
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let unit = StepUnit::Instruction;
             match unit {
@@ -3296,7 +3298,23 @@ impl TimerImpl {
                 }
             }
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let wait = step(task, unit)?.next_state_with_owner(waits).await?;
+            // A failed step made no resuming request that took effect, so the
+            // thread is still at its stop, where an early return gives the
+            // breakpoints back.
+            let running = step(task, unit)?;
+            #[cfg(target_arch = "aarch64")]
+            breakpoints.resumed();
+            let wait = running.next_state_with_owner(waits).await?;
+            #[cfg(target_arch = "aarch64")]
+            match &wait {
+                // A single-stepped execve: Linux flushed the old program's
+                // breakpoints, and writing the saved ones would register them
+                // in the new program.
+                Wait::Stopped(_, TraceEvent::Exec(_)) => breakpoints.forget(),
+                Wait::Stopped(new_task, _) => breakpoints.stopped(new_task.generation()),
+                // The thread is gone, and its breakpoints with it.
+                _ => breakpoints.forget(),
+            }
             observe(&wait)?;
             // A stop during a branch run that is not its breakpoint's ends
             // the stepping like any other stop, with the breakpoints gone.
@@ -3310,7 +3328,7 @@ impl TimerImpl {
                     Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)),
                 ) if !is_branch_run_report(&new_task, &stops[..count]) => {
                     self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, false);
-                    restore_breakpoints(&mut breakpoints, &new_task);
+                    restore_breakpoints(breakpoints.regs(), &new_task);
                     return Err(HandleFailure::Event(Wait::Stopped(
                         new_task,
                         TraceEvent::Signal(Signal::SIGTRAP),
@@ -3322,14 +3340,8 @@ impl TimerImpl {
                     // The check reads the clock, at a stop that may not have
                     // made a ptrace request yet (`read_clock_at`).
                     self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, false);
-                    if matches!(event, TraceEvent::Exec(_)) {
-                        // A single-stepped execve: Linux flushed the old
-                        // program's breakpoints, and writing the saved ones
-                        // would register them in the new program.
-                        breakpoints.take();
-                    } else {
-                        restore_breakpoints(&mut breakpoints, &new_task);
-                    }
+                    // Nothing to restore after an exec (forgotten above).
+                    restore_breakpoints(breakpoints.regs(), &new_task);
                     Wait::Stopped(new_task, event)
                 }
                 (_, wait) => wait,
@@ -3435,13 +3447,13 @@ impl TimerImpl {
                 // Delivered at the observed counter, as a late notification
                 // is; the marker makes the run fail closed.
                 #[cfg(target_arch = "aarch64")]
-                restore_breakpoints(&mut breakpoints, &task);
+                restore_breakpoints(breakpoints.regs(), &task);
                 return Ok(task);
             }
             current.single_step_with_clock(clock);
         }
         #[cfg(target_arch = "aarch64")]
-        restore_breakpoints(&mut breakpoints, &task);
+        restore_breakpoints(breakpoints.regs(), &task);
         debug!(
             "Timer reached its target {} with {} block steps or branch runs and {} single steps",
             current, block_steps, instruction_steps
@@ -3950,7 +3962,9 @@ fn is_branch_run_report(task: &Stopped, stops: &[u64]) -> bool {
 /// belong to someone else (a debugger of the guest, or the guest's own
 /// breakpoints) and are written back unchanged, as Linux writes registers
 /// from the first. Every return from the approach leaves the two as they
-/// were found ([`restore_breakpoints`]).
+/// were found: its ordinary returns through [`restore_breakpoints`], and
+/// every other return, an error's `?` included, through
+/// [`crate::branch_step::Borrowed`], at the last stop the approach saw.
 #[cfg(target_arch = "aarch64")]
 #[derive(Debug)]
 struct BranchBreakpoints {
@@ -4048,6 +4062,17 @@ fn restore_breakpoints(breakpoints: &mut Option<BranchBreakpoints>, task: &Stopp
         && let Err(error) = armed.arm(task, &[]).or_else(|_| armed.recover(task))
     {
         warn!("Could not restore hardware breakpoints after branch runs: {error:?}");
+    }
+}
+
+/// An early return from an approach gives its breakpoints back at the
+/// generation's stop, which the guard knows the thread to be in.
+#[cfg(target_arch = "aarch64")]
+impl crate::branch_step::GiveBack for BranchBreakpoints {
+    type Stop = safeptrace::TraceeGeneration;
+
+    fn give_back(self, stop: &Self::Stop) {
+        restore_breakpoints(&mut Some(self), &stop.assume_stopped());
     }
 }
 
@@ -4763,6 +4788,59 @@ mod tests {
         }
         SWITCH_OUT_FORCED_FOR_TEST.set(false);
         assert!(!inner.branch_runs_off);
+    }
+
+    /// A step that fails after a branch run armed its breakpoints, before
+    /// any resuming request took effect, leaves the thread's breakpoint
+    /// registers as the approach found them (`crate::branch_step::Borrowed`).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_failed_step_after_arming_gives_the_breakpoints_back() {
+        use super::ClockCounter;
+        use super::HandleFailure;
+        use super::StepUnit;
+        use super::TraceError;
+
+        let Some((mut timer, task, _reap)) = timer_on_a_stopped_child() else {
+            return;
+        };
+        let generation = task.generation();
+        let found = task.hw_breakpoints().expect("read the breakpoints");
+        let inner = timer.inner_mut_noinit().expect("a timer");
+        let from = inner.read_clock();
+        let mut armed = None;
+        let mut step = |task: super::Stopped, unit| -> Result<super::Running, TraceError> {
+            if matches!(unit, StepUnit::ToBranch { .. }) {
+                armed = Some(task.hw_breakpoints().expect("read the armed breakpoints"));
+            }
+            Err(TraceError::Errno(super::Errno::EIO))
+        };
+        let mut observe = |_: &super::Wait| Ok(());
+        let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
+        let result = futures::executor::block_on(inner.attempt_single_step(
+            task,
+            ClockCounter::new(from, 0, from + 50),
+            0,
+            &mut step,
+            &mut observe,
+            &waits,
+        ));
+        assert_eq!(
+            result,
+            Err(HandleFailure::TraceError(TraceError::Errno(
+                super::Errno::EIO
+            )))
+        );
+        let armed = armed.expect("the first step was a branch run");
+        assert_ne!(armed, found, "the branch run armed a breakpoint");
+        assert_eq!(
+            generation
+                .assume_stopped()
+                .hw_breakpoints()
+                .expect("read the breakpoints"),
+            found,
+            "the failed step left a breakpoint armed"
+        );
     }
 
     #[test]

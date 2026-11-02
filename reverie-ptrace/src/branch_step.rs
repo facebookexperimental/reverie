@@ -181,6 +181,75 @@ pub(crate) fn free_slots(enabled: impl IntoIterator<Item = bool>) -> Option<[usi
     Some([free.next()?, free.next()?])
 }
 
+/// Registers that can be given back to the thread they were borrowed from,
+/// at a ptrace stop of that thread.
+pub(crate) trait GiveBack {
+    /// A stop of the thread, where its registers can be written.
+    type Stop;
+
+    /// Writes the registers back as they were found, at `stop`.
+    fn give_back(self, stop: &Self::Stop);
+}
+
+/// Registers that branch runs borrow from a thread for one approach to a
+/// precise target (its hardware breakpoints on aarch64), and the stop where
+/// they can be given back.
+///
+/// The approach gives them back itself on its ordinary returns, taking them
+/// out of [`Borrowed::regs`]. Every other return, an error's `?` included,
+/// drops the guard, which gives back whatever is still borrowed at the stop
+/// the approach last knew the thread to be in: the one it started at, or the
+/// last one a wait returned ([`Borrowed::stopped`]). Between a resuming
+/// request and the wait that follows it ([`Borrowed::resumed`]) the thread
+/// may be running, and nothing can be written: a return there (a failed
+/// wait, or the approach's future dropped while it waits) leaves the
+/// registers as they are, since the thread is at no stop this approach can
+/// write at.
+pub(crate) struct Borrowed<R: GiveBack> {
+    regs: Option<R>,
+    stop: Option<R::Stop>,
+}
+
+impl<R: GiveBack> Borrowed<R> {
+    /// Nothing borrowed yet, from a thread at `stop`.
+    pub(crate) fn new(stop: R::Stop) -> Self {
+        Self {
+            regs: None,
+            stop: Some(stop),
+        }
+    }
+
+    /// The borrowed registers: `None` until borrowed, and once given back.
+    pub(crate) fn regs(&mut self) -> &mut Option<R> {
+        &mut self.regs
+    }
+
+    /// A resuming request took effect: until a wait returns the thread's
+    /// next stop, a return gives nothing back.
+    pub(crate) fn resumed(&mut self) {
+        self.stop = None;
+    }
+
+    /// A wait returned the thread at `stop`.
+    pub(crate) fn stopped(&mut self, stop: R::Stop) {
+        self.stop = Some(stop);
+    }
+
+    /// The thread no longer holds the registers (it execed, or exited), so
+    /// they are dropped without a write.
+    pub(crate) fn forget(&mut self) {
+        self.regs = None;
+    }
+}
+
+impl<R: GiveBack> Drop for Borrowed<R> {
+    fn drop(&mut self) {
+        if let (Some(regs), Some(stop)) = (self.regs.take(), self.stop.as_ref()) {
+            regs.give_back(stop);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +457,90 @@ mod tests {
             Some(([0x4444, 0x4444], 1))
         );
         assert_eq!(Stop::Other.successors(0x1000, &x), None);
+    }
+
+    /// Registers that log the stop where they are given back.
+    struct Logged(std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+
+    impl GiveBack for Logged {
+        type Stop = &'static str;
+
+        fn give_back(self, stop: &&'static str) {
+            self.0.borrow_mut().push(stop);
+        }
+    }
+
+    /// Where `approach` returns early, in the order an approach to a precise
+    /// target reaches each point.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Exit {
+        /// Before a resuming request took effect: the step's request, or a
+        /// register write, failed.
+        AtStart,
+        /// In the wait that follows a resuming request.
+        InWait,
+        /// At the stop that wait returned: observing it failed.
+        AtNextStop,
+        /// At an exec's stop, after which the thread holds no breakpoints.
+        AfterExec,
+        /// After the approach gave the registers back itself.
+        AfterGivingBack,
+    }
+
+    /// An approach that borrows registers at stop "start", resumes the thread
+    /// once, sees it stop at "next", gives the registers back itself at
+    /// "returned", and returns early with `?` at `exit`. Returns the stops
+    /// where the registers were given back.
+    fn approach(exit: Exit) -> Vec<&'static str> {
+        let log = std::rc::Rc::default();
+        let run = |log: &std::rc::Rc<_>| -> Result<(), Exit> {
+            let check = |at: Exit| if at == exit { Err(at) } else { Ok(()) };
+            let mut held = Borrowed::new("start");
+            *held.regs() = Some(Logged(std::rc::Rc::clone(log)));
+            check(Exit::AtStart)?;
+            held.resumed();
+            check(Exit::InWait)?;
+            if exit == Exit::AfterExec {
+                held.forget();
+            }
+            held.stopped("next");
+            check(Exit::AtNextStop)?;
+            check(Exit::AfterExec)?;
+            if let Some(regs) = held.regs().take() {
+                regs.give_back(&"returned");
+            }
+            check(Exit::AfterGivingBack)?;
+            Ok(())
+        };
+        assert_eq!(run(&log), Err(exit));
+        log.take()
+    }
+
+    /// An error before the resume, such as a failed step request, gives the
+    /// registers back at the stop the approach started at.
+    #[test]
+    fn an_error_before_the_resume_gives_the_registers_back() {
+        assert_eq!(approach(Exit::AtStart), ["start"]);
+    }
+
+    /// An error at a stop a wait returned, such as a failed observation of
+    /// it, gives the registers back at that stop.
+    #[test]
+    fn an_error_at_a_later_stop_gives_them_back_there() {
+        assert_eq!(approach(Exit::AtNextStop), ["next"]);
+    }
+
+    /// A failed wait leaves a thread that may be running: nothing is written.
+    #[test]
+    fn an_error_in_the_wait_writes_nothing() {
+        assert_eq!(approach(Exit::InWait), Vec::<&str>::new());
+    }
+
+    /// Registers the thread no longer holds, or that the approach gave back
+    /// itself, are not written again.
+    #[test]
+    fn forgotten_or_returned_registers_are_not_written_again() {
+        assert_eq!(approach(Exit::AfterExec), Vec::<&str>::new());
+        assert_eq!(approach(Exit::AfterGivingBack), ["returned"]);
     }
 }
