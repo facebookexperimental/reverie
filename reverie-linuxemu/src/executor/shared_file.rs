@@ -168,15 +168,23 @@ pub(super) fn mmap_with_shared_files(
 
     // These ignored compatibility flags require no extra VM semantics, and
     // MAP_FIXED_NOREPLACE's range is vacant by now, so it maps as MAP_FIXED.
-    // Other flags (locking, population, huge pages, grows-down, and so on)
-    // require their own faithful implementation before file-view replacement.
+    // Outside hugetlbfs, MAP_NORESERVE only exempts a mapping from the commit
+    // charge (do_mmap): Linux never charges a shared mapping of a file
+    // (accountable_mapping charges private writable ones alone), and this
+    // provider charges no private mapping, as its plain mmap path ignores the
+    // flag too. A hugetlbfs file's host view is made without the flag, so it
+    // reserves huge pages that Linux would not: at worst that view fails
+    // where Linux maps it, and what it holds is the same. Other flags
+    // (locking, population, huge pages, grows-down, and so on) require their
+    // own faithful implementation before file-view replacement.
     let supported_flags = (libc::MAP_PRIVATE
         | libc::MAP_SHARED
         | libc::MAP_FIXED
         | libc::MAP_FIXED_NOREPLACE
         | libc::MAP_ANONYMOUS
         | libc::MAP_DENYWRITE
-        | libc::MAP_EXECUTABLE) as u64;
+        | libc::MAP_EXECUTABLE
+        | libc::MAP_NORESERVE) as u64;
     let writable = prot & libc::PROT_WRITE as u64 != 0;
     let mut cursors = AllocationCursors::from_elf(state);
     if !fixed {
@@ -641,6 +649,69 @@ mod tests {
             Err(crate::Error::SharedFileCapability { .. })
         ));
         assert_eq!(bytes(&memory, address, 32), [0x5a; 32]);
+    }
+
+    /// A linker's output buffer is a writable MAP_SHARED | MAP_NORESERVE view
+    /// of a regular file. The flag changes nothing a view holds: stores reach
+    /// the file and file writes reach the view, as without it, and a private
+    /// MAP_NORESERVE replacement of part of the view leaves the file alone.
+    #[test]
+    fn shared_mmap_noreserve_view_is_the_file_both_ways() {
+        let (mut memory, mut state) = setup();
+        let file = backing(c"shared-map-noreserve");
+        file.write_all_at(b"before", 0).unwrap();
+        state.files.insert(3, file.try_clone().unwrap());
+        let address = call(
+            &mut memory,
+            &mut state,
+            [
+                0,
+                2 * PAGE_SIZE,
+                (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                (libc::MAP_SHARED | libc::MAP_NORESERVE) as u64,
+                3,
+                0,
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(address > 0, "{address}");
+        let address = address as u64;
+        assert!(memory.contains_shared_file());
+        assert_eq!(bytes(&memory, address, 6), b"before");
+        memory.write(address, b"output").unwrap();
+        let mut observed = [0; 6];
+        file.read_exact_at(&mut observed, 0).unwrap();
+        assert_eq!(&observed, b"output");
+        file.write_all_at(b"fdedit", PAGE_SIZE).unwrap();
+        assert_eq!(bytes(&memory, address + PAGE_SIZE, 6), b"fdedit");
+
+        let private = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED;
+        assert_eq!(
+            call(
+                &mut memory,
+                &mut state,
+                [
+                    address,
+                    PAGE_SIZE,
+                    (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                    (private | libc::MAP_NORESERVE) as u64,
+                    u64::MAX,
+                    0
+                ],
+                false,
+            )
+            .unwrap(),
+            address as i64
+        );
+        assert_eq!(
+            bytes(&memory, address, PAGE_SIZE as usize),
+            vec![0; PAGE_SIZE as usize]
+        );
+        memory.write(address, b"privat").unwrap();
+        file.read_exact_at(&mut observed, 0).unwrap();
+        assert_eq!(&observed, b"output", "the replacement wrote the file");
+        assert_eq!(bytes(&memory, address + PAGE_SIZE, 6), b"fdedit");
     }
 
     /// What the host kernel answers when `path`, opened with `open_flags`, is
