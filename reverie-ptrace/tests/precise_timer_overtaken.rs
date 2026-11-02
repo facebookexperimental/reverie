@@ -275,3 +275,140 @@ fn a_disregarded_trap_past_the_target_is_witnessed_once(after: AfterTrap, witnes
     );
 }
 
+/// [`PreciseTimerTool`] without `rt_sigprocmask` among its syscalls, so a
+/// guest can unblock the timer signal without a stop: the pending
+/// notification is then the first stop after the target, and it finds the
+/// guest wherever the guest has run to.
+#[derive(Debug, Default, Clone)]
+struct UnobservedUnblockTool;
+
+#[reverie::tool]
+impl Tool for UnobservedUnblockTool {
+    type GlobalState = Log;
+    type ThreadState = ();
+
+    fn subscriptions(_cfg: &u64) -> Subscription {
+        let mut s = Subscription::none();
+        s.syscalls([Sysno::clock_getres, Sysno::getpid, Sysno::exit]);
+        s
+    }
+
+    async fn handle_syscall_event<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        match syscall.number() {
+            Sysno::clock_getres => {
+                let schedule = match *guest.config() {
+                    0 => TimerSchedule::Rcbs(TIMEOUT_RCBS),
+                    offset => TimerSchedule::RcbsAndInstructions(TIMEOUT_RCBS, offset),
+                };
+                guest.set_timer_precise(schedule).unwrap();
+                Ok(0)
+            }
+            Sysno::getpid => {
+                guest.send_rpc(Report::OvertakingSyscall).await;
+                guest.tail_inject(syscall).await
+            }
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+
+    async fn handle_timer_event<T: Guest<Self>>(&self, guest: &mut T) {
+        guest.send_rpc(Report::TimerEvent).await;
+    }
+}
+
+/// Unblocks the timer signal with `rt_sigprocmask` and no conditional branch
+/// before the kernel entry, so the guest's branch count when the pending
+/// notification is handled, on the syscall's return, is exact. The result is
+/// checked only after that return.
+#[inline(always)]
+unsafe fn unblock_timer_signal_no_branches(set: *const libc::sigset_t) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") Sysno::rt_sigprocmask as usize => ret,
+            in("rdi") libc::SIG_UNBLOCK as usize,
+            in("rsi") set as usize,
+            in("rdx") 0usize,
+            in("r10") std::mem::size_of::<u64>(),
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+fn timer_signal_set() -> libc::sigset_t {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGSTKFLT);
+        set
+    }
+}
+
+// The guest blocks the timer signal, runs `branches` conditional branches
+// past the request and unblocks it with no stop in between, so the overflow
+// notification, held pending while the signal was blocked, is handled only
+// where the guest then is: the limiting case of a late notification. As in
+// `overtaken_precise_event_is_witnessed`, `TIMEOUT_RCBS - 1` branches leave the
+// guest exactly at the target when it unblocks the signal. Short of the target
+// no overflow is pending and the guest's syscall cancels the event. At or past
+// the target the notification delivers the event at the observed counter.
+// With an instruction offset it cannot count the offset from there, since the
+// guest may have run any number of instructions past the target branch, so it
+// is witnessed as a skid overshoot even exactly at the target. Without an
+// offset, an event found exactly at its target is delivered there unwitnessed
+// and one found past it is witnessed, as before.
+#[test_case(TIMEOUT_RCBS / 2, OFFSET_INSTRS, 0, 0; "short of the target with an offset")]
+#[test_case(TIMEOUT_RCBS - 1, 0, 1, 0; "exactly at the target without an offset")]
+#[test_case(TIMEOUT_RCBS - 1, OFFSET_INSTRS, 1, 1; "exactly at the target with an offset")]
+#[test_case(TIMEOUT_RCBS * 2, OFFSET_INSTRS, 1, 1; "past the target with an offset")]
+#[test_case(TIMEOUT_RCBS * 2, 0, 1, 1; "past the target without an offset")]
+fn a_late_notification_of_an_offset_event_is_witnessed(
+    branches: u64,
+    offset: u64,
+    timer_events: u64,
+    witnesses: u64,
+) {
+    ret_without_perf!();
+    let _owner = WITNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = reverie::take_skid_overshoot_count();
+
+    let log = check_fn_with_config::<UnobservedUnblockTool, _>(
+        move || {
+            let set = timer_signal_set();
+            block_timer_signal();
+            unsafe { syscall_no_branches(Sysno::clock_getres) };
+            do_branches(branches);
+            let unblocked = unsafe { unblock_timer_signal_no_branches(&set) };
+            unsafe { syscall_no_branches(Sysno::getpid) };
+            assert_eq!(unblocked, 0, "rt_sigprocmask(SIG_UNBLOCK) failed");
+        },
+        offset,
+        true,
+    );
+
+    assert_eq!(
+        log.overtaking_syscalls.load(Ordering::SeqCst),
+        1,
+        "the guest must reach the syscall stop exactly once"
+    );
+    assert_eq!(
+        log.timer_events.load(Ordering::SeqCst),
+        timer_events,
+        "only a notification at or past the target delivers the event"
+    );
+    assert_eq!(
+        reverie::take_skid_overshoot_count(),
+        witnesses,
+        "a notification that cannot place the event is witnessed exactly once"
+    );
+}
