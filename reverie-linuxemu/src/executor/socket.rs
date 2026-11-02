@@ -668,7 +668,9 @@ pub(super) fn sendto(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64;
 
     // SAFETY: the payload and optional address are readable host buffers and
     // host_fd belongs to the guest descriptor table. MSG_NOSIGNAL keeps a
-    // guest EPIPE from delivering SIGPIPE to the supervisor.
+    // guest EPIPE from delivering SIGPIPE to the supervisor; no guest SIGPIPE
+    // is raised in its place yet
+    // (https://github.com/rrnewton/reverie/issues/1089).
     let result = unsafe {
         libc::sendto(
             host_fd,
@@ -1370,7 +1372,8 @@ pub(super) fn sendmsg(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u64
     // header's declared lengths, and host_fd belongs to the guest descriptor
     // table. The supervisor cannot safely accept a guest SIGPIPE, so KVM's
     // explicit policy is to suppress the host signal and return EPIPE. Guest
-    // SIGPIPE synthesis remains a separate signal-delivery capability.
+    // SIGPIPE synthesis remains a separate signal-delivery capability
+    // (https://github.com/rrnewton/reverie/issues/1089).
     let result = unsafe {
         libc::sendmsg(
             host_fd,
@@ -1780,6 +1783,9 @@ pub(super) fn recvmmsg(
                 };
             }
             if iov.iov_len != 0 {
+                // Unlike recvmsg, this checks the buffer before receiving, so
+                // an inaccessible one leaves the record queued where Linux
+                // frees it (https://github.com/rrnewton/reverie/issues/1235).
                 let mut probe = vec![0; iov.iov_len];
                 if memory
                     .user()

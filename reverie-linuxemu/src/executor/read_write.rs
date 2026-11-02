@@ -783,6 +783,9 @@ fn prepare_host_read<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>(
     let Ok(writable) = memory.accessible_prefix(address, length, Access::Read) else {
         return Err(negative_errno(libc::EFAULT));
     };
+    // Checked before the host read, so a datagram or seqpacket record whose
+    // copy Linux would fault and free stays queued here
+    // (https://github.com/rrnewton/reverie/issues/1235).
     if writable == 0 && length != 0 {
         return Err(negative_errno(libc::EFAULT));
     }
