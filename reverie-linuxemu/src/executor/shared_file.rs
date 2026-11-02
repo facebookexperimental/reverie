@@ -20,6 +20,18 @@ fn unsupported_mmap(reason: &'static str) -> crate::Error {
     }
 }
 
+/// Whether `file` lives on hugetlbfs (`fstatfs` `f_type`), whose shared
+/// views follow huge page placement, length and reservation rules.
+fn on_hugetlbfs(file: &std::fs::File) -> crate::Result<bool> {
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: file is a live descriptor and filesystem is writable storage.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(unsupported_mmap("cannot identify the file's filesystem"));
+    }
+    // SAFETY: fstatfs initialized filesystem on success.
+    Ok(unsafe { filesystem.assume_init() }.f_type == libc::HUGETLBFS_MAGIC)
+}
+
 /// A reserved name only denies an unsupported private object; it never proves
 /// that an object is an authenticated carrier or an ordinary filesystem file.
 fn classify_shared_mmap_file(
@@ -168,15 +180,18 @@ pub(super) fn mmap_with_shared_files(
 
     // These ignored compatibility flags require no extra VM semantics, and
     // MAP_FIXED_NOREPLACE's range is vacant by now, so it maps as MAP_FIXED.
-    // Outside hugetlbfs, MAP_NORESERVE only exempts a mapping from the commit
-    // charge (do_mmap): Linux never charges a shared mapping of a file
-    // (accountable_mapping charges private writable ones alone), and this
-    // provider charges no private mapping, as its plain mmap path ignores the
-    // flag too. A hugetlbfs file's host view is made without the flag, so it
-    // reserves huge pages that Linux would not: at worst that view fails
-    // where Linux maps it, and what it holds is the same. Other flags
-    // (locking, population, huge pages, grows-down, and so on) require their
-    // own faithful implementation before file-view replacement.
+    // MAP_NORESERVE is ignored only where it changes nothing. On a shared view
+    // of a file outside hugetlbfs it would exempt the mapping from the commit
+    // charge (do_mmap), which Linux never makes for a shared mapping
+    // (accountable_mapping charges private writable ones alone); this
+    // provider charges no private mapping either, as its plain mmap path
+    // ignores the flag too. A shared view of a hugetlbfs file is refused by
+    // name below, with or without the flag: Linux places it at an address
+    // aligned to the huge page, rounds its length up to whole huge pages and
+    // reserves them unless MAP_NORESERVE is given, and the page-granular view
+    // made here does none of that. Other flags (locking, population, huge
+    // pages, grows-down, and so on) require their own faithful
+    // implementation before file-view replacement.
     let supported_flags = (libc::MAP_PRIVATE
         | libc::MAP_SHARED
         | libc::MAP_FIXED
@@ -244,6 +259,11 @@ pub(super) fn mmap_with_shared_files(
         if flags & !supported_flags != 0 {
             return Err(unsupported_mmap(
                 "mapping flags need unsupported file-view semantics",
+            ));
+        }
+        if on_hugetlbfs(file)? {
+            return Err(unsupported_mmap(
+                "hugetlbfs file views need huge page placement, length and reservation",
             ));
         }
         if prot & libc::PROT_EXEC as u64 != 0 {
@@ -712,6 +732,90 @@ mod tests {
         file.read_exact_at(&mut observed, 0).unwrap();
         assert_eq!(&observed, b"output", "the replacement wrote the file");
         assert_eq!(bytes(&memory, address + PAGE_SIZE, 6), b"fdedit");
+    }
+
+    /// A shared view of a hugetlbfs file is refused by name, with or without
+    /// MAP_NORESERVE, before anything is mapped. Natively, a one-page
+    /// MAP_NORESERVE view of such a file maps with no huge page reserved, at
+    /// an address aligned to the huge page, and occupies a whole huge page;
+    /// the page-granular view made without the flag would instead try to
+    /// reserve the huge page, at a page-aligned address, for one page. Files
+    /// outside hugetlbfs keep accepting MAP_NORESERVE
+    /// (`shared_mmap_noreserve_view_is_the_file_both_ways`).
+    #[test]
+    fn shared_mmap_of_hugetlbfs_file_is_refused_by_name() {
+        // SAFETY: the name is terminated and the descriptor is owned below.
+        let fd = unsafe {
+            libc::memfd_create(
+                c"shared-map-hugetlb".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_HUGETLB,
+            )
+        };
+        assert!(
+            fd >= 0,
+            "memfd_create(MFD_HUGETLB) failed ({}); this test needs hugetlbfs in the host kernel",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: memfd_create returned this newly owned descriptor.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        assert!(on_hugetlbfs(&file).unwrap());
+        let ordinary = backing(c"shared-map-not-hugetlb");
+        assert!(!on_hugetlbfs(&ordinary).unwrap());
+        let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: file is a live descriptor and filesystem is writable storage.
+        assert_eq!(
+            unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: fstatfs initialized filesystem on success.
+        let huge_page = unsafe { filesystem.assume_init() }.f_bsize as usize;
+        assert!(huge_page > PAGE_SIZE as usize, "{huge_page}");
+        file.set_len(huge_page as u64).unwrap();
+
+        // SAFETY: a kernel-placed mapping of a live descriptor, unmapped below.
+        let native = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE_SIZE as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_NORESERVE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(
+            native,
+            libc::MAP_FAILED,
+            "native MAP_NORESERVE view: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(native as usize % huge_page, 0, "{native:?}");
+        // SAFETY: the kernel's mapping above spans one whole huge page.
+        assert_eq!(unsafe { libc::munmap(native, huge_page) }, 0);
+
+        let (mut memory, mut state) = setup();
+        state.files.insert(3, file.try_clone().unwrap());
+        for flags in [libc::MAP_SHARED, libc::MAP_SHARED | libc::MAP_NORESERVE] {
+            let before = memory.allocation_cursors();
+            let result = call(
+                &mut memory,
+                &mut state,
+                [0, PAGE_SIZE, libc::PROT_READ as u64, flags as u64, 3, 0],
+                false,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::Error::SharedFileCapability {
+                        operation: "mmap",
+                        reason,
+                    }) if reason.contains("hugetlbfs")
+                ),
+                "flags {flags:#x}: {result:?}"
+            );
+            assert_eq!(memory.allocation_cursors(), before);
+            assert!(!memory.contains_shared_file());
+        }
     }
 
     /// What the host kernel answers when `path`, opened with `open_flags`, is
