@@ -413,6 +413,25 @@ pub(super) fn write(
         return error;
     }
     if length == 0 {
+        // A zero-length write to a datagram or seqpacket socket sends an empty
+        // record (unix_dgram_sendmsg queues an skb of no bytes), which the
+        // peer receives as a 0-byte message; one to a stream socket sends
+        // nothing. An owned socket therefore takes even a zero count to the
+        // host, which decides as it does for a nonzero one. Every other
+        // descriptor keeps the early zero.
+        if !standard
+            && (output_destination.is_none() || output.is_none())
+            && let Some(file) = state.files.get(&fd)
+            && file_mode(file).is_ok_and(|mode| mode & libc::S_IFMT == libc::S_IFSOCK)
+        {
+            let host_fd = file.as_raw_fd();
+            let (written, sigpipe) = suppress_host_sigpipe_reporting(None, || {
+                // SAFETY: a zero count reads no byte from the dangling,
+                // non-null pointer, and host_fd is a live backing descriptor.
+                unsafe { libc::write(host_fd, std::ptr::dangling::<libc::c_void>(), 0) as i64 }
+            });
+            return with_guest_sigpipe(state, written, sigpipe);
+        }
         return 0;
     }
 

@@ -14565,6 +14565,160 @@ mod tests {
         );
     }
 
+    /// The calls of [`zero_length_writes_reach_owned_sockets_as_linux_takes_them`],
+    /// made natively on a fresh pair of `kind`: each result, with the first
+    /// byte a receive returned.
+    fn native_zero_length_write_sequence(kind: libc::c_int) -> Vec<(i64, Option<u8>)> {
+        let mut pair = [0; 2];
+        // SAFETY: pair is writable storage for two descriptors.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, pair.as_mut_ptr()) },
+            0
+        );
+        let result = |value: isize| {
+            if value < 0 {
+                negative_errno(std::io::Error::last_os_error().raw_os_error().unwrap())
+            } else {
+                value as i64
+            }
+        };
+        let byte = b'X';
+        let byte = std::ptr::from_ref(&byte).cast::<libc::c_void>();
+        let mut results = Vec::new();
+        // SAFETY: a zero count reads no byte; the one-byte send reads `byte`.
+        unsafe {
+            results.push((result(libc::write(pair[0], byte, 0)), None));
+            let empty = libc::iovec {
+                iov_base: byte.cast_mut(),
+                iov_len: 0,
+            };
+            results.push((result(libc::writev(pair[0], &empty, 1)), None));
+            results.push((result(libc::send(pair[0], byte, 0, 0)), None));
+            results.push((result(libc::send(pair[0], byte, 1, 0)), None));
+        }
+        for _ in 0..4 {
+            let mut buffer = [0u8; 16];
+            // SAFETY: buffer is writable for 16 bytes.
+            let received = result(unsafe {
+                libc::recv(pair[1], buffer.as_mut_ptr().cast(), 16, libc::MSG_DONTWAIT)
+            });
+            results.push((received, (received > 0).then_some(buffer[0])));
+        }
+        // SAFETY: pair[0] is owned here; a SIGPIPE the write raises is ignored
+        // by the test process.
+        unsafe {
+            results.push((libc::shutdown(pair[0], libc::SHUT_WR) as i64, None));
+            results.push((result(libc::write(pair[0], byte, 0)), None));
+        }
+        // SAFETY: both descriptors are owned here.
+        unsafe {
+            libc::close(pair[0]);
+            libc::close(pair[1]);
+        }
+        results
+    }
+
+    /// A zero-length write to an owned socket reaches the host as Linux takes
+    /// it: on a seqpacket or datagram pair it sends an empty record, which
+    /// the peer receives as a 0-byte message before the next one; on a stream
+    /// pair it sends nothing; and after `shutdown(SHUT_WR)` it fails with
+    /// EPIPE on every pair. The provider used to return 0 without the host
+    /// call, so the empty record was lost. A zero-length `sendto` already
+    /// reached the host, and a `writev` of zero bytes sends nothing on any
+    /// pair, which Linux decides before the socket sees it. Each sequence is
+    /// compared with the same calls made natively.
+    #[test]
+    fn zero_length_writes_reach_owned_sockets_as_linux_takes_them() {
+        const PAIR_FDS: u64 = 0x80;
+        const BYTE: u64 = 0x100;
+        const RECEIVED: u64 = 0x200;
+        const EMPTY_IOV: u64 = 0x300;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        memory.write(BYTE, b"X").unwrap();
+        let empty = libc::iovec {
+            iov_base: BYTE as usize as *mut libc::c_void,
+            iov_len: 0,
+        };
+        assert_eq!(
+            write_struct(&mut ProviderMemory(&memory), EMPTY_IOV, &empty),
+            0
+        );
+        for kind in [libc::SOCK_SEQPACKET, libc::SOCK_DGRAM, libc::SOCK_STREAM] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_socketpair,
+                    [libc::AF_UNIX as u64, kind as u64, 0, PAIR_FDS, 0, 0],
+                ),
+                0
+            );
+            let [first, second]: [libc::c_int; 2] = read_struct(&memory, PAIR_FDS);
+            let first = first as u64;
+            let mut guest = Vec::new();
+            for (number, args) in [
+                (libc::SYS_write, [first, BYTE, 0, 0, 0, 0]),
+                (libc::SYS_writev, [first, EMPTY_IOV, 1, 0, 0, 0]),
+                (libc::SYS_sendto, [first, BYTE, 0, 0, 0, 0]),
+                (libc::SYS_sendto, [first, BYTE, 1, 0, 0, 0]),
+            ] {
+                guest.push((syscall_result(&mut memory, &mut state, number, args), None));
+            }
+            for _ in 0..4 {
+                memory.write(RECEIVED, &[0; 16]).unwrap();
+                let received = syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_recvfrom,
+                    [second as u64, RECEIVED, 16, libc::MSG_DONTWAIT as u64, 0, 0],
+                );
+                let mut byte = [0u8];
+                memory.read(RECEIVED, &mut byte).unwrap();
+                guest.push((received, (received > 0).then_some(byte[0])));
+            }
+            for (number, args) in [
+                (
+                    libc::SYS_shutdown,
+                    [first, libc::SHUT_WR as u64, 0, 0, 0, 0],
+                ),
+                (libc::SYS_write, [first, BYTE, 0, 0, 0, 0]),
+            ] {
+                guest.push((syscall_result(&mut memory, &mut state, number, args), None));
+            }
+            let native = native_zero_length_write_sequence(kind);
+            assert_eq!(guest, native, "socket type {kind}");
+            let received = &native[4..8];
+            assert_eq!(
+                native[9],
+                (negative_errno(libc::EPIPE), None),
+                "type {kind}"
+            );
+            if kind == libc::SOCK_STREAM {
+                assert_eq!(received[0], (1, Some(b'X')), "nothing before the byte");
+            } else {
+                assert_eq!(
+                    received[..3],
+                    [(0, None), (0, None), (1, Some(b'X'))],
+                    "two empty records (write, send; none from writev), then the byte, type {kind}"
+                );
+            }
+            for fd in [first, second as u64] {
+                assert_eq!(
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_close,
+                        [fd, 0, 0, 0, 0, 0]
+                    ),
+                    0
+                );
+            }
+        }
+    }
+
     #[test]
     fn elf_executor_accepts_unix_listener_connection() {
         const ADDRESS: u64 = 0x100;
