@@ -210,8 +210,8 @@ impl AddressSpace for ProviderMemory<'_> {
                 .range_contains_retained_shared(address, length as usize)
         {
             // On Linux a vfork child's mprotect changes its parent's view
-            // too; this copy cannot, so the change is refused whole, as a
-            // capability failure the allocation owner publishes on unlock.
+            // too; this copy cannot, so the change is refused whole, by
+            // name, a refusal the allocation owner publishes on unlock.
             let _ = self
                 .0
                 .capture_shared_file_error(GuestMemory::vfork_shared_view_change(

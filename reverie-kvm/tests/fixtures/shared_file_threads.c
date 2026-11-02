@@ -56,6 +56,18 @@
  *   mm_release stores zero there and wakes it only while another task uses
  *   the address space; the joined thread does not, so the marker stays. The
  *   parent prints the word once it has reaped the child.
+ * - "worker-cleartid": as "leader-cleartid", but the child's main thread
+ *   creates a worker and exits with pthread_exit; the worker joins it, waits
+ *   10 ms (so that natively the main thread has dropped its mm), points its
+ *   own clear_child_tid at the marker and exits with SYS_exit as the child's
+ *   last thread. mm_release's rule is the same for a worker: the marker
+ *   stays.
+ * - "group-cleartid": the child's main thread points its clear_child_tid at
+ *   the marker, creates a worker that spins in sched_yield, and once the
+ *   worker runs calls exit_group(0). With the worker alive when the exit
+ *   begins, Linux may store zero (when the main thread's mm_release comes
+ *   before the worker drops its mm, as it almost always does) or leave the
+ *   marker; the parent prints the word.
  * Every step prints one line.
  */
 #define _GNU_SOURCE
@@ -64,6 +76,7 @@
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -282,6 +295,66 @@ static int leader_cleartid(int fd) {
   return 0;
 }
 
+static void *last_worker_cleartid(void *argument) {
+  (void)argument;
+  REQUIRE(pthread_join(main_thread, NULL) == 0, "joining the child's main thread");
+  struct timespec delay = {0, 10 * 1000 * 1000};
+  while (nanosleep(&delay, &delay) != 0) {
+  }
+  syscall(SYS_set_tid_address, (unsigned int *)&word[16]);
+  syscall(SYS_exit, 0);
+  _exit(6);
+}
+
+static atomic_int spinner_runs;
+
+static void *spin_until_the_group_exits(void *argument) {
+  (void)argument;
+  atomic_store(&spinner_runs, 1);
+  for (;;) {
+    sched_yield();
+  }
+  return NULL;
+}
+
+/* Modes "worker-cleartid" and "group-cleartid". */
+static int child_cleartid(int fd, int group) {
+  view = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  REQUIRE(view != MAP_FAILED, "mmap");
+  view[0] = 'w';
+  word = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  REQUIRE(word != MAP_FAILED, "the marker's page");
+  word[16] = 0x5eedf00d;
+  pid_t child = fork();
+  REQUIRE(child >= 0, "fork");
+  if (child == 0) {
+    main_thread = pthread_self();
+    pthread_t thread;
+    if (group) {
+      syscall(SYS_set_tid_address, (unsigned int *)&word[16]);
+      if (pthread_create(&thread, NULL, spin_until_the_group_exits, NULL) != 0) {
+        _exit(5);
+      }
+      while (!atomic_load(&spinner_runs)) {
+        sched_yield();
+      }
+      syscall(SYS_exit_group, 0);
+      _exit(6);
+    }
+    if (pthread_create(&thread, NULL, last_worker_cleartid, NULL) != 0) {
+      _exit(5);
+    }
+    pthread_exit(NULL);
+  }
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0,
+          "the child");
+  printf("the child's %s; its clear_child_tid word holds %#x\n",
+         group ? "group exit ended it" : "last thread, a worker, exited", word[16]);
+  return 0;
+}
+
 static void *join_main_thread(void *argument) {
   (void)argument;
   REQUIRE(pthread_join(main_thread, NULL) == 0, "joining the child's main thread");
@@ -332,6 +405,12 @@ int main(int argc, char **argv) {
   }
   if (strcmp(mode, "leader-cleartid") == 0) {
     return leader_cleartid(fd);
+  }
+  if (strcmp(mode, "worker-cleartid") == 0) {
+    return child_cleartid(fd, 0);
+  }
+  if (strcmp(mode, "group-cleartid") == 0) {
+    return child_cleartid(fd, 1);
   }
   REQUIRE(pthread_barrier_init(&barrier, NULL, WORKERS + 1) == 0, "pthread_barrier_init");
   word = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

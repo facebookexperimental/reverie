@@ -1495,7 +1495,17 @@ mod shared_file_dispatch_tests {
             if label == "brk" {
                 vfork_child_refusal(&error, operation, super::dispatch::VFORK_CHILD_BREAK_REASON);
             } else {
-                capability(&error, operation, VFORK_VIEW_REASON);
+                // Refused by name, as the vfork child's other limits are.
+                match error.primary() {
+                    crate::Error::UnsupportedSharedFile {
+                        operation: actual,
+                        reason,
+                    } => {
+                        assert_eq!(*actual, operation, "{label}");
+                        assert_eq!(*reason, VFORK_VIEW_REASON, "{label}");
+                    }
+                    other => panic!("{label}: expected the vfork view refusal; got {other:?}"),
+                }
             }
             assert_eq!(layout(&child, &state), before, "{label}");
             assert!(

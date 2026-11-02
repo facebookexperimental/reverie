@@ -341,8 +341,10 @@ impl Control {
     /// `kicks` is what withdrawal reported. Every recorded send completed
     /// under the registry lock, so each successful one is pending for this
     /// thread or already delivered (the signal is real-time, so instances do
-    /// not merge). A send that failed after being counted has already failed
-    /// the gate. Returns whether the entry was kicked.
+    /// not merge). A send that failed was taken back before the registry
+    /// lock was released: its closer abandoned the close and undid that
+    /// member's count (`try_close_with`), so `kicks` counts only sends that
+    /// succeeded. Returns whether the entry was kicked.
     pub(super) fn finish(mut self, kicks: usize) -> Result<bool> {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(error) = fault::take(1) {

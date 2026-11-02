@@ -13669,7 +13669,8 @@ int main(void) {
 }
 
 /// Reserves a permit for the leader's own `SYS_exit` (the main thread's
-/// `pthread_exit`), as Detcore does for exit boundaries.
+/// `pthread_exit`), as a Tool that observes exits through signal-boundary
+/// receipts does.
 #[derive(Default)]
 struct LeaderTerminalReceiptTool;
 
@@ -22963,9 +22964,14 @@ fn shared_file_publications_kick_running_and_new_vcpus_as_natively() {
 /// "leader-exit-fork" forks from a child's last thread after its main thread
 /// exited; and in mode "leader-cleartid" a forked child's last thread exits
 /// with its clear_child_tid word in shared anonymous memory, which Linux
-/// leaves unwritten when no other task uses the address space. Each run
-/// matches native Linux on KVM, three times over, without a tool and with the
-/// strace tool owning threads on the host or through the tool.
+/// leaves unwritten when no other task uses the address space, and in mode
+/// "worker-cleartid" that last thread is a worker. Each run matches native
+/// Linux on KVM, three times over, without a tool and with the strace tool
+/// owning threads on the host or through the tool. In mode "group-cleartid"
+/// the child's main thread, whose word is the marker, ends the group while a
+/// worker runs: Linux stores zero or not depending on when the worker drops
+/// its mm, and KVM stores zero every time, which is one of those outcomes,
+/// the one the exit's start decides.
 #[test]
 fn shared_file_threads_that_exited_stop_counting_in_the_guests_order() {
     const TEST: &str = "shared_file_threads_that_exited_stop_counting_in_the_guests_order";
@@ -22991,6 +22997,14 @@ fn shared_file_threads_that_exited_stop_counting_in_the_guests_order() {
             "leader-cleartid",
             "the child's last thread exited; its clear_child_tid word holds 0x5eedf00d\n",
         ),
+        (
+            "worker-cleartid",
+            "the child's last thread, a worker, exited; its clear_child_tid word holds 0x5eedf00d\n",
+        ),
+        (
+            "group-cleartid",
+            "the child's group exit ended it; its clear_child_tid word holds 0\n",
+        ),
     ] {
         let native = run_shared_file_vfork_natively(
             &directory.0,
@@ -22999,7 +23013,18 @@ fn shared_file_threads_that_exited_stop_counting_in_the_guests_order() {
             &[mode],
         );
         assert_eq!(native.status.code(), Some(0), "{mode}: {native:?}");
-        assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "{mode}");
+        let native_stdout = String::from_utf8_lossy(&native.stdout);
+        if mode == "group-cleartid" {
+            // Natively either outcome, by when the worker drops its mm.
+            assert!(
+                native_stdout == expected
+                    || native_stdout
+                        == "the child's group exit ended it; its clear_child_tid word holds 0x5eedf00d\n",
+                "{mode}: {native_stdout:?}"
+            );
+        } else {
+            assert_eq!(native_stdout, expected, "{mode}");
+        }
         for round in 0..3 {
             for kvm_mode in SHARED_FILE_VFORK_MODES {
                 let name = kvm_mode.0;

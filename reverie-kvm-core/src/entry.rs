@@ -2015,7 +2015,8 @@ impl Closing {
     /// admitted copy is short. If they have not all stopped by the deadline,
     /// the close is abandoned: admission reopens, nothing is poisoned, and
     /// None is returned, so that a member that cannot stop costs the caller a
-    /// named refusal rather than a hang.
+    /// failure it reports as the backend's own defect (a publication ends
+    /// with `PUBLICATION_STOP_FAILURE`, exit 125) rather than a hang.
     pub(crate) fn finish_blocking(mut self, timeout: Duration) -> GateResult<Option<Closed>> {
         let deadline = Instant::now() + timeout;
         let mut state = self.gate.state.lock().unwrap();
@@ -3781,8 +3782,9 @@ mod tests {
     }
 
     /// A kick that lands after `KVM_RUN` returned, while the entry is still
-    /// published, goes through the real path, a closer's `pthread_kill` and
-    /// the reserved signal's handler on the vCPU thread, and stores nothing
+    /// published, goes through the real path, a closer's `tgkill` to the
+    /// thread's kernel ID and the reserved signal's handler on the vCPU
+    /// thread, and stores nothing
     /// into the `kvm_run` page: `RunEntry::run_vcpu` took the
     /// `immediate_exit` byte back from the handler before it decodes the exit
     /// through a `&mut kvm_run`. The kick is still counted, so the entry's

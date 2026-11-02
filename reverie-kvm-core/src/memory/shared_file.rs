@@ -96,8 +96,9 @@ fn publication_stop_timeout() -> std::time::Duration {
 /// held address-space lock, the region reservation and the allocation
 /// transaction. They are released in that order however the operation ends,
 /// run or dropped unrun: a reservation's rollback takes the address-space
-/// lock, and the allocation transaction's release delivers deferred
-/// notifications, whose wakers may read memory.
+/// lock. The allocation transaction's release delivers no notification
+/// here: the publication's fence holds them until admission has reopened
+/// (`publish_range_from`), because their wakers may read memory.
 struct PublicationHold<'a> {
     space: Option<MutexGuard<'a, AddressSpaceState>>,
     reservation: Option<PendingReservation>,
@@ -623,6 +624,14 @@ impl GuestMemory {
         source: InstallSource,
         provenance: Option<MappingProvenance>,
     ) -> Result<()> {
+        // Every notification queued from here on, those of copies that
+        // retired while the caller held the allocation transaction before
+        // this call included, is delivered when this fence drops: after the
+        // close below has reopened admission, never by the transaction's own
+        // release inside the publication. A subscriber's waker may read guest
+        // memory, which waits for admission to reopen, and this stack is the
+        // one that reopens it. Declared first, it outlives every guard here.
+        let _notifications = self.defer_notifications();
         self.check_copy_failure()?;
         // Only a guest's own mapping change is a Fresh publication; a fork's
         // inheritance and the sharing of anonymous memory before a fork change
@@ -1075,6 +1084,11 @@ impl GuestMemory {
         if !Arc::ptr_eq(&allocation.memory.mapping, &self.mapping) {
             return Err(Error::MappingPublicationGateMismatch);
         }
+        // As in a publication (`publish_range_from`): notifications queued
+        // while the allocation transaction is held are delivered only after
+        // admission has reopened, when this fence, declared before the
+        // close, drops.
+        let _notifications = self.defer_notifications();
         let gate = self.entry_gate();
         let closed = match gate
             .try_close_quiescent_single_counting()
@@ -3802,7 +3816,7 @@ mod tests {
 
     fn vfork_refusal(result: Result<()>) {
         match result {
-            Err(Error::SharedFileCapability { operation, reason }) => {
+            Err(Error::UnsupportedSharedFile { operation, reason }) => {
                 assert_eq!(operation, "mapping change in a vfork child");
                 assert!(reason.starts_with("a vfork child shares its parent's address space"));
             }
@@ -4230,13 +4244,22 @@ mod tests {
     /// its locks. The publication closes admission with the general close on
     /// the publishing thread, holding the allocation transaction; waking the
     /// subscriber there would run its read, which waits for admission to
-    /// reopen, on the one stack that reopens it.
+    /// reopen, on the one stack that reopens it. Two ways to be woken: the
+    /// publication's own change, and (`queued`) a copy that retired while the
+    /// caller held the allocation transaction before the publication, whose
+    /// notification waits in the transaction's queue.
     #[test]
     fn a_memory_reading_waker_runs_only_after_a_publication_reopens_admission() {
+        for queued in [false, true] {
+            publish_beside_a_memory_reading_waker(queued);
+        }
+    }
+
+    fn publish_beside_a_memory_reading_waker(queued: bool) {
         struct ReadingWake {
             memory: GuestMemory,
             /// Whether admission was open when the waker read, and whether
-            /// the read was admitted.
+            /// the read succeeded.
             reads: Mutex<Vec<(bool, bool)>>,
         }
         impl Wake for ReadingWake {
@@ -4244,12 +4267,12 @@ mod tests {
                 self.wake_by_ref();
             }
             fn wake_by_ref(self: &Arc<Self>) {
-                let gate = self.memory.entry_gate();
-                let open = gate.admission_open().unwrap();
-                // A copy admission waits while admission is closing or
-                // closed, as every guest-memory read does.
-                let admitted = gate.copy_blocking(None).is_ok();
-                self.reads.lock().unwrap().push((open, admitted));
+                let open = self.memory.entry_gate().admission_open().unwrap();
+                // A guest-memory read waits while admission is closing or
+                // closed.
+                let mut byte = [0; 1];
+                let read = self.memory.read_raw(BASE, &mut byte).is_ok();
+                self.reads.lock().unwrap().push((open, read));
             }
         }
 
@@ -4273,8 +4296,23 @@ mod tests {
         let (done, published) = std::sync::mpsc::channel();
         crate::supervisor_thread::builder()
             .spawn(move || {
+                let allocation = publisher.allocation_guard();
+                if queued {
+                    // The read retires while the transaction is held, so its
+                    // notification is queued, not delivered.
+                    assert_eq!(publisher.try_read_with(|_| Ok(())).unwrap(), Some(()));
+                    assert!(
+                        !publisher
+                            .mapping
+                            .deferred
+                            .lock()
+                            .unwrap()
+                            .notifications
+                            .is_empty()
+                    );
+                }
                 let result = publisher.publish_shared_file_range(
-                    publisher.allocation_guard(),
+                    allocation,
                     SharedFileRangePlan {
                         address: BASE,
                         length: PAGE_SIZE,
@@ -4295,11 +4333,15 @@ mod tests {
                 // The publisher is stuck in the waker and holds the change's
                 // waker list: dropping what it shares would wait for it.
                 std::mem::forget((change, waker, one, two, memory));
-                panic!("the publication deadlocked in a subscriber's waker");
+                panic!("the publication (queued: {queued}) deadlocked in a subscriber's waker");
             }
         };
-        assert!(published);
-        assert_eq!(*waker.reads.lock().unwrap(), vec![(true, true)]);
+        assert!(published, "queued: {queued}");
+        assert_eq!(
+            *waker.reads.lock().unwrap(),
+            vec![(true, true)],
+            "queued: {queued}"
+        );
         assert!(
             change
                 .as_mut()
@@ -4307,7 +4349,102 @@ mod tests {
                 .is_ready()
         );
         assert!(memory.contains_shared_file());
+        assert!(
+            memory
+                .mapping
+                .deferred
+                .lock()
+                .unwrap()
+                .notifications
+                .is_empty()
+        );
         drop((one, two));
+    }
+
+    /// The same for a fork's snapshot of an address space that holds a view:
+    /// a copy that retired while the forking thread held the allocation
+    /// transaction queues its notification, and the snapshot, which releases
+    /// the transaction before it reopens admission, delivers it only after
+    /// admission has reopened.
+    #[test]
+    fn a_memory_reading_waker_runs_only_after_a_fork_snapshot_reopens_admission() {
+        struct ReadingWake {
+            memory: GuestMemory,
+            reads: Mutex<Vec<(bool, bool)>>,
+        }
+        impl Wake for ReadingWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                let open = self.memory.entry_gate().admission_open().unwrap();
+                let mut byte = [0; 1];
+                let read = self.memory.read_raw(BASE, &mut byte).is_ok();
+                self.reads.lock().unwrap().push((open, read));
+            }
+        }
+
+        let memory = fixture(2);
+        memory.record_kvm_sync_mmu(true).unwrap();
+        let view = file(1);
+        install(&memory, &view, BASE, 1, 0);
+        // The forking thread, stopped.
+        let forker = memory.entry_gate().register().unwrap();
+        let waker = Arc::new(ReadingWake {
+            memory: memory.clone(),
+            reads: Mutex::new(Vec::new()),
+        });
+        let mut change = Box::pin(memory.entry_gate().subscribe());
+        assert!(
+            change
+                .as_mut()
+                .poll(&mut Context::from_waker(&Waker::from(waker.clone())))
+                .is_pending()
+        );
+        let parent = memory.clone();
+        let (done, snapshotted) = std::sync::mpsc::channel();
+        crate::supervisor_thread::builder()
+            .spawn(move || {
+                let allocation = parent.allocation_guard();
+                assert_eq!(parent.try_read_with(|_| Ok(())).unwrap(), Some(()));
+                assert!(
+                    !parent
+                        .mapping
+                        .deferred
+                        .lock()
+                        .unwrap()
+                        .notifications
+                        .is_empty()
+                );
+                let child = parent.snapshot_with_shared_files(allocation, false);
+                done.send(child.is_ok()).unwrap();
+            })
+            .unwrap();
+        let snapshotted = match snapshotted.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(snapshotted) => snapshotted,
+            Err(_) => {
+                std::mem::forget((change, waker, forker, memory));
+                panic!("the fork snapshot deadlocked in a subscriber's waker");
+            }
+        };
+        assert!(snapshotted);
+        assert_eq!(*waker.reads.lock().unwrap(), vec![(true, true)]);
+        assert!(
+            change
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        assert!(
+            memory
+                .mapping
+                .deferred
+                .lock()
+                .unwrap()
+                .notifications
+                .is_empty()
+        );
+        drop(forker);
     }
 
     /// The bytes the host has allocated for the base backing of `memory`.

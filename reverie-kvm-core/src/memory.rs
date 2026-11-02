@@ -1878,7 +1878,7 @@ impl GuestMemory {
     /// creation of a thread, at the call. As a backstop below the provider, a
     /// publication that would install, replace or withdraw a shared view,
     /// and a protection change over one, are refused at once with
-    /// [`Error::SharedFileCapability`], so that the parent's shared views,
+    /// [`Error::UnsupportedSharedFile`], so that the parent's shared views,
     /// which the copy's stores still reach, are exactly the child's when the
     /// parent resumes.
     pub fn shares_parent_address_space(&self) -> bool {
@@ -1888,9 +1888,14 @@ impl GuestMemory {
     }
 
     /// The refusal of a change to a shared view while
-    /// [`GuestMemory::shares_parent_address_space`] holds.
+    /// [`GuestMemory::shares_parent_address_space`] holds: a refusal by name
+    /// ([`Error::UnsupportedSharedFile`]), as is the other direction, a
+    /// change by another thread of the parent while the child's window is
+    /// open over the view (`publish_range_from`), and as are the vfork
+    /// child's other limits (`Error::VforkChildCapability`). The program
+    /// made the change; nothing failed in the backend.
     pub(crate) fn vfork_shared_view_change(operation: &'static str) -> Error {
-        Error::SharedFileCapability {
+        Error::UnsupportedSharedFile {
             operation,
             reason: "a vfork child shares its parent's address space until it execs or exits, \
                      and runs on a copy here, so it cannot change a shared view it inherited \

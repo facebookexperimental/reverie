@@ -624,6 +624,20 @@ pub(crate) struct GuestThreadGroup {
     // AUTONOMOUS-BOT-IMPLEMENTED: Propagate worker exit_group to the root vCPU.
     // TODO-HUMAN-REVIEW(PR-177): Review KVM thread-group exit ordering.
     exit_status: Mutex<Option<ExitStatus>>,
+    // Whether another thread of the group had not retired (in the guest's
+    // order) when its group exit was first published: what every thread that
+    // dies in that exit decides its clear_child_tid store by
+    // (`KvmBackend::clear_registered_worker_tid_before_exit`). Set with the
+    // exit status, under its lock, by the first publisher that knows it.
+    group_exit_others_live: std::sync::OnceLock<bool>,
+    // The process's certificate that every user of its guest mm is one of
+    // its own threads, each counted by the entry gate: a non-CLONE_VM
+    // process snapshot (`KvmBackend::prepare_forked_process`). Its
+    // CLONE_THREAD workers share it with it, as they share the mm; a
+    // CLONE_VM process that any of them prepares revokes it for all of them,
+    // for good, instead of guessing when that process stops using the mm.
+    // Initial roots and legacy vfork snapshots never have it.
+    independent_mm: AtomicBool,
     root: Mutex<Option<GuestThreadTarget>>,
     workers: Mutex<Vec<GuestThreadTarget>>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Join cancelled KVM workers before root teardown returns.
@@ -850,12 +864,36 @@ impl GuestThreadGroup {
             .expect("KVM exit-group lock poisoned")
     }
 
+    /// Whether another thread of the group was live when its group exit was
+    /// first published; None before a group exit, or for one published
+    /// without the answer (unit tests that publish on the group directly).
+    fn group_exit_others_live(&self) -> Option<bool> {
+        self.group_exit_others_live.get().copied()
+    }
+
+    /// A group exit published without the live-thread answer, as only unit
+    /// tests publish on the group directly.
+    #[cfg(test)]
     fn request_exit_group(&self, status: ExitStatus) {
-        let status = *self
-            .exit_status
-            .lock()
-            .expect("KVM exit-group lock poisoned")
-            .get_or_insert(status);
+        self.request_exit_group_from(status, None);
+    }
+
+    /// As [`Self::request_exit_group`]; `others_live` is whether the
+    /// publishing thread saw another live thread of the group. The first
+    /// publication's answer is kept for every thread that dies in the exit.
+    fn request_exit_group_from(&self, status: ExitStatus, others_live: Option<bool>) {
+        let status = {
+            let mut published = self
+                .exit_status
+                .lock()
+                .expect("KVM exit-group lock poisoned");
+            if published.is_none()
+                && let Some(others_live) = others_live
+            {
+                let _ = self.group_exit_others_live.set(others_live);
+            }
+            *published.get_or_insert(status)
+        };
         self.cancelled.store(true, Ordering::Release);
         self.terminal_reads.request_exit_group(status);
 
@@ -2019,15 +2057,6 @@ pub struct KvmBackend {
     completed_tool_panics: Mutex<Vec<CompletedToolPanic>>,
     thread_slot: Option<usize>,
     is_guest_thread: bool,
-    // Conservative certificate for a non-CLONE_VM process snapshot. Other
-    // users of the same mm are the threads of this process, which the entry
-    // gate counts: each thread's vCPU registers when the thread is created
-    // and stops counting at its retirement, in the guest's order
-    // (`clear_registered_worker_tid_before_exit`). Initial roots and legacy
-    // vfork snapshots have no certificate;
-    // a later CLONE_VM process preparation revokes it instead of guessing when
-    // the other process has stopped using the guest mm.
-    independent_process_mm: bool,
     // Who owns this backend's guest threads. The single value drives BOTH the
     // CLONE_THREAD worker dispatch path (`run_process_action_with_tool`) and
     // `futex`/CLEARTID ownership (`is_backend_owned_syscall`), so the two can
@@ -2418,7 +2447,6 @@ impl KvmBackend {
             completed_tool_panics: Mutex::new(Vec::new()),
             thread_slot: None,
             is_guest_thread: false,
-            independent_process_mm: false,
             // Effective ownership before any tool run resolves it. The direct
             // (non-tool) personality never dispatches threads through a Tool loop,
             // so Host is the correct effective value there; when a tool runs,
@@ -3704,9 +3732,15 @@ impl KvmBackend {
         // guest mm. The legacy vfork path also creates a backend snapshot, so
         // distinct host mappings alone cannot confer this certificate. Never
         // recover a revoked parent certificate from a guessed join condition.
-        child.independent_process_mm = !share_address_space;
+        child
+            .thread_group
+            .independent_mm
+            .store(!share_address_space, Ordering::Release);
         if share_address_space {
-            self.independent_process_mm = false;
+            // Whichever thread of the process prepared it.
+            self.thread_group
+                .independent_mm
+                .store(false, Ordering::Release);
         }
         if shared_file_snapshot {
             // Child TID may itself lie in a shared file, so neither TID store
@@ -6169,9 +6203,9 @@ impl KvmBackend {
     ///
     /// Linux clears and wakes this word in `mm_release`, called from `exit_mm`,
     /// before `exit_notify` makes the task's death observable, for a leader as
-    /// for any other thread. A receipt is how a Tool observes that death;
-    /// Detcore, for example, retires the task and wakes a `pthread_join`
-    /// waiter from it. If the clear waited for `finish_tool_process`, the
+    /// for any other thread. A receipt is how a Tool observes that death, and
+    /// a Tool that schedules the guest's threads may let a `pthread_join`
+    /// waiter run from it. If the clear waited for `finish_tool_process`, the
     /// woken joiner would read the stale TID and retry `FUTEX_WAIT` a
     /// host-timing-dependent number of times, or wait for a wake that comes
     /// only when the whole process finishes.
@@ -6208,24 +6242,39 @@ impl KvmBackend {
             return;
         };
         debug_assert!(self.thread_slot.is_none());
-        if self.independent_process_mm
-            && !self.is_guest_thread
+        #[cfg(test)]
+        clear_tid_last_user_hold::wait_for_peers(|| self.vcpu.is_sole_participant());
+        // Whether this thread is the address space's last user. A thread that
+        // dies in a group exit takes the answer recorded when the exit was
+        // first published (`publish_group_exit`): Linux runs every dying
+        // thread's mm_release in an order the program does not control, and
+        // with another thread live at the commit, every thread storing is
+        // one order Linux allows (each reaches mm_release before any drops
+        // its mm), where the answer at each thread's own retirement would
+        // depend on when the others' host threads tear down. A thread that
+        // exits by itself decides at its retirement above.
+        let sole = match self.thread_group.group_exit_others_live() {
+            Some(others_live) => !others_live,
+            None => self.vcpu.is_sole_participant(),
+        };
+        if self.thread_group.independent_mm.load(Ordering::Acquire)
             && self.memory.contains_shared_file()
-            && self.vcpu.is_sole_participant()
+            && sole
         {
             // Linux mm_release discards clear_child_tid in either case, but
-            // stores/wakes only for mm_users > 1; an exiting thread drops its
-            // mm reference in exit_mm right after its mm_release, before
-            // anything makes its exit observable. File pages shared with a
-            // different process do not share the guest mm. This certificate,
-            // with every other thread of the address space retired (each
-            // thread's vCPU registers when the thread is created and stops
-            // counting at the thread's retirement above, in the guest's
-            // order), proves the virtual last-user case; it is not a general
-            // model of host mm_users, which temporary /proc readers can also
-            // increment. No virtual observer owns such a reference here.
-            // Consume the registration without accessing its address;
-            // existing gate failures remain pending and unchanged.
+            // stores/wakes only for mm_users > 1, for any thread, a process
+            // leader or a worker; an exiting thread drops its mm reference in
+            // exit_mm right after its mm_release, before anything makes its
+            // exit observable. File pages shared with a different process do
+            // not share the guest mm. The process's certificate, which its
+            // workers share, with every other thread of the address space
+            // retired (each thread's vCPU registers when the thread is
+            // created and stops counting at the thread's retirement above, in
+            // the guest's order), proves the virtual last-user case; it is
+            // not a general model of host mm_users, which temporary /proc
+            // readers can also increment. No virtual observer owns such a
+            // reference here. Consume the registration without accessing its
+            // address; existing gate failures remain pending and unchanged.
             // https://github.com/gregkh/linux/blob/v7.1.3/kernel/fork.c#L1463
             #[cfg(test)]
             clear_tid_diagnostic::stopped("single-owner shared-file process mm");
@@ -6910,7 +6959,7 @@ impl KvmBackend {
     /// the next return to user mode. The status is the committed winner,
     /// which the exiting thread then publishes again.
     pub(crate) fn publish_committed_group_exit(&self, status: ExitStatus) {
-        self.thread_group.request_exit_group(status);
+        self.publish_group_exit(status);
     }
 
     pub(crate) fn request_guest_thread_group_exit(&self, status: ExitStatus) {
@@ -6918,7 +6967,19 @@ impl KvmBackend {
         group_exit_publication_gap::hold(self.is_guest_thread, || {
             self.thread_group.exit_status().is_some()
         });
-        self.thread_group.request_exit_group(status);
+        self.publish_group_exit(status);
+    }
+
+    /// Publishes the group's exit with whether another of its threads is
+    /// live now. The first publication follows the exit's commit in the
+    /// guest's order and precedes every thread's death in it: each dying
+    /// thread learns of the exit from a publication, and retires only after
+    /// that. So the answer the first publication records is the one at the
+    /// commit, and no dying thread's host teardown can change it.
+    fn publish_group_exit(&self, status: ExitStatus) {
+        let others_live = !self.vcpu.is_sole_participant();
+        self.thread_group
+            .request_exit_group_from(status, Some(others_live));
     }
 
     /// Linux makes a fatal signal's group exit visible to every sibling
@@ -9823,7 +9884,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_process_mm_certificate_excludes_vfork_and_stays_revoked() {
+    fn independent_mm_certificate_is_shared_by_workers_and_revoked_by_vfork_for_good() {
         let mut parent =
             KvmBackend::new(16 * 1024 * 1024).expect("independent mm control requires KVM");
         parent
@@ -9838,14 +9899,23 @@ mod tests {
             registers,
         )
         .unwrap();
-        assert!(!parent.independent_process_mm);
+        let independent =
+            |backend: &KvmBackend| backend.thread_group.independent_mm.load(Ordering::Acquire);
+        assert!(!independent(&parent));
         let mut child = parent
             .prepare_forked_process(
                 &executor, 2, None, None, None, None, false, false, false, None,
             )
             .unwrap();
-        assert!(child.backend.independent_process_mm);
-        assert!(!parent.independent_process_mm);
+        assert!(independent(&child.backend));
+        assert!(!independent(&parent));
+        // A CLONE_THREAD worker of the child shares its process's thread
+        // group, and with it the certificate.
+        let mut worker =
+            KvmBackend::new(16 * 1024 * 1024).expect("independent mm control requires KVM");
+        worker.thread_group = child.backend.thread_group.clone();
+        worker.is_guest_thread = true;
+        assert!(independent(&worker));
 
         let vfork_child = child
             .backend
@@ -9862,10 +9932,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(!vfork_child.backend.independent_process_mm);
-        assert!(!child.backend.independent_process_mm);
+        assert!(!independent(&vfork_child.backend));
+        assert!(!independent(&child.backend));
+        // Revoked for every thread of the process, the worker included.
+        assert!(!independent(&worker));
         drop(vfork_child);
-        assert!(!child.backend.independent_process_mm);
+        assert!(!independent(&child.backend));
 
         let independent_child = child
             .backend
@@ -9882,8 +9954,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(independent_child.backend.independent_process_mm);
-        assert!(!child.backend.independent_process_mm);
+        assert!(independent(&independent_child.backend));
+        assert!(!independent(&child.backend));
     }
 
     /// The stack window's pages as extents of equal declared mapping, `(user
@@ -13997,9 +14069,41 @@ mod exec_wait_tests;
 static DELAY_AFTER_CLEAR_TID_WAKE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// A test hold before a dying thread decides whether it is its address
+/// space's last user: with the hold armed, the thread first waits, bounded,
+/// until every other thread of the address space has retired, as when the
+/// others' host threads happen to tear down first.
+#[cfg(test)]
+pub(crate) mod clear_tid_last_user_hold {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn arm(armed: bool) {
+        ARMED.store(armed, Ordering::SeqCst);
+    }
+
+    pub(super) fn wait_for_peers(sole: impl Fn() -> bool) {
+        if !ARMED.load(Ordering::SeqCst) {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sole() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "vm/group_exit_order_tests.rs"]
 mod group_exit_order_tests;
+
+#[cfg(test)]
+#[path = "vm/clear_tid_last_user_tests.rs"]
+mod clear_tid_last_user_tests;
 
 /// A test hold in the gap between a worker's committed group exit and its
 /// publication (`KvmBackend::request_guest_thread_group_exit`), process-wide,
