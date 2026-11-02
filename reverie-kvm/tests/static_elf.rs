@@ -22965,7 +22965,10 @@ fn shared_file_publications_kick_running_and_new_vcpus_as_natively() {
 /// exited; and in mode "leader-cleartid" a forked child's last thread exits
 /// with its clear_child_tid word in shared anonymous memory, which Linux
 /// leaves unwritten when no other task uses the address space, and in mode
-/// "worker-cleartid" that last thread is a worker. Each run matches native
+/// "worker-cleartid" that last thread is a worker; so does a child whose only
+/// shared memory is the marker's shared anonymous page
+/// ("anon-worker-cleartid"), and one that first vforked a child that exited
+/// at once ("vfork-worker-cleartid"). Each run matches native
 /// Linux on KVM, three times over, without a tool and with the strace tool
 /// owning threads on the host or through the tool. In mode "group-cleartid"
 /// the child's main thread, whose word is the marker, ends the group while a
@@ -23004,6 +23007,14 @@ fn shared_file_threads_that_exited_stop_counting_in_the_guests_order() {
         (
             "group-cleartid",
             "the child's group exit ended it; its clear_child_tid word holds 0\n",
+        ),
+        (
+            "anon-worker-cleartid",
+            "the child's last thread, a worker, exited; its clear_child_tid word holds 0x5eedf00d\n",
+        ),
+        (
+            "vfork-worker-cleartid",
+            "the child's last thread, a worker, exited; its clear_child_tid word holds 0x5eedf00d\n",
         ),
     ] {
         let native = run_shared_file_vfork_natively(

@@ -471,6 +471,10 @@ pub struct Member {
     /// counts as a user of the address space, though its host thread may
     /// still be tearing down and stays registered until it drops.
     retired: bool,
+    /// Whether every other member had retired when this one retired, read
+    /// under the same hold of the registry lock that set `retired`
+    /// ([`Participant::retire_from_guest`]'s answer).
+    last_at_retirement: bool,
 }
 
 pub struct State {
@@ -966,6 +970,7 @@ impl EntryGate {
                             activity: Activity::Stopped,
                             kicks: 0,
                             retired: false,
+                            last_at_retirement: false,
                         },
                     );
                     Ok(Participant {
@@ -1438,15 +1443,30 @@ impl Participant {
     /// their live count), though it stays
     /// registered, and protected like every member, until it drops. Must be
     /// called with no entry outstanding; idempotent.
-    pub fn retire_from_guest(&mut self) {
+    ///
+    /// Returns whether every other member had already retired: whether this
+    /// thread was its address space's last user when it retired. The answer
+    /// is read under the same hold of the registry lock that retires it, so
+    /// of two threads that retire concurrently exactly one sees the other
+    /// still live, as of two tasks in exit_mm only the second can find
+    /// mm_users at 1. A later call returns the first call's answer.
+    pub fn retire_from_guest(&mut self) -> bool {
         assert!(
             !self.entry_outstanding,
             "participant retired from the guest with an entry outstanding"
         );
         let mut state = self.gate.state.lock().unwrap();
+        let last = state
+            .members
+            .iter()
+            .all(|(id, member)| *id == self.id || member.retired);
         let member = state.members.get_mut(&self.id).unwrap();
         assert_eq!(member.activity, Activity::Stopped);
-        member.retired = true;
+        if !member.retired {
+            member.retired = true;
+            member.last_at_retirement = last;
+        }
+        member.last_at_retirement
     }
 
     pub fn try_enter(&mut self) -> GateResult<Option<Entry<'_>>> {
@@ -2016,7 +2036,9 @@ impl Closing {
     /// the close is abandoned: admission reopens, nothing is poisoned, and
     /// None is returned, so that a member that cannot stop costs the caller a
     /// failure it reports as the backend's own defect (a publication ends
-    /// with `PUBLICATION_STOP_FAILURE`, exit 125) rather than a hang.
+    /// with the typed backend failure `Error::SharedFileCapability` and the
+    /// reason `PUBLICATION_STOP_FAILURE`, never a refusal by name) rather
+    /// than a hang.
     pub(crate) fn finish_blocking(mut self, timeout: Duration) -> GateResult<Option<Closed>> {
         let deadline = Instant::now() + timeout;
         let mut state = self.gate.state.lock().unwrap();
@@ -3366,6 +3388,44 @@ mod tests {
     /// ahead, and the live count leaves it out. It may not enter again: an
     /// entry after retirement is the backend's own defect, which fails the
     /// gate.
+    /// A retirement answers whether every other member had already retired,
+    /// read under the hold that retires it: of two members retiring in
+    /// either order the first is not the last user and the second is, from
+    /// two threads at once exactly one is, and a repeated call keeps the
+    /// first answer.
+    #[test]
+    fn retirement_answers_whether_the_member_was_the_last_user_atomically() {
+        let gate = EntryGate::new();
+        let mut first = gate.register().unwrap();
+        let mut second = gate.register().unwrap();
+        assert!(!first.retire_from_guest());
+        assert!(second.retire_from_guest());
+        assert!(!first.retire_from_guest());
+        drop((first, second));
+        for _ in 0..200 {
+            let gate = EntryGate::new();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let racers: Vec<_> = (0..2)
+                .map(|_| {
+                    let mut member = gate.register().unwrap();
+                    let barrier = barrier.clone();
+                    crate::supervisor_thread::builder()
+                        .spawn(move || {
+                            barrier.wait();
+                            let last = member.retire_from_guest();
+                            (last, member)
+                        })
+                        .unwrap()
+                })
+                .collect();
+            let answers: Vec<_> = racers
+                .into_iter()
+                .map(|racer| racer.join().unwrap())
+                .collect();
+            assert_eq!(answers.iter().filter(|(last, _)| *last).count(), 1);
+        }
+    }
+
     #[test]
     fn a_retired_participant_counts_as_no_user_of_the_address_space() {
         let gate = EntryGate::new();

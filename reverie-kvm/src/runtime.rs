@@ -5617,7 +5617,11 @@ impl KvmBackend {
             }
         }
         self.release_thread_slot();
-        self.clear_registered_worker_tid_before_exit(executor);
+        let dies_in_group = cancelled_exit.as_ref().map_or_else(
+            || outcome.as_ref().is_ok_and(|exit| exit.exit.group),
+            |exit| exit.exit.group,
+        );
+        self.clear_registered_worker_tid_before_exit(executor, dies_in_group);
         // A vfork child whose last thread has ended can change its copy no
         // more. Its window's end releases its address space now
         // (`release_vfork_mm`: its changes to private memory go back, with

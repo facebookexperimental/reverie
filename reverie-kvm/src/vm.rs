@@ -628,15 +628,18 @@ pub(crate) struct GuestThreadGroup {
     // order) when its group exit was first published: what every thread that
     // dies in that exit decides its clear_child_tid store by
     // (`KvmBackend::clear_registered_worker_tid_before_exit`). Set with the
-    // exit status, under its lock, by the first publisher that knows it.
-    group_exit_others_live: std::sync::OnceLock<bool>,
+    // exit status by the first publisher that knows it, and read and cleared
+    // only under `exit_status`'s lock, so it describes the published exit
+    // and no other: an exec's rearm clears both.
+    group_exit_others_live: Mutex<Option<bool>>,
     // The process's certificate that every user of its guest mm is one of
     // its own threads, each counted by the entry gate: a non-CLONE_VM
-    // process snapshot (`KvmBackend::prepare_forked_process`). Its
-    // CLONE_THREAD workers share it with it, as they share the mm; a
-    // CLONE_VM process that any of them prepares revokes it for all of them,
-    // for good, instead of guessing when that process stops using the mm.
-    // Initial roots and legacy vfork snapshots never have it.
+    // process snapshot (`KvmBackend::prepare_forked_process`), or a process
+    // that has exec'd, whose new mm only its own threads use. Its
+    // CLONE_THREAD workers share it with it, as they share the mm. A vfork
+    // child also uses the mm while its window is open; the decision checks
+    // that separately (`GuestMemory::vfork_window_open`). A vfork child
+    // itself and the initial root have it only once they exec.
     independent_mm: AtomicBool,
     root: Mutex<Option<GuestThreadTarget>>,
     workers: Mutex<Vec<GuestThreadTarget>>,
@@ -868,7 +871,16 @@ impl GuestThreadGroup {
     /// first published; None before a group exit, or for one published
     /// without the answer (unit tests that publish on the group directly).
     fn group_exit_others_live(&self) -> Option<bool> {
-        self.group_exit_others_live.get().copied()
+        let published = self
+            .exit_status
+            .lock()
+            .expect("KVM exit-group lock poisoned");
+        published.and(
+            *self
+                .group_exit_others_live
+                .lock()
+                .expect("KVM exit-group lock poisoned"),
+        )
     }
 
     /// A group exit published without the live-thread answer, as only unit
@@ -887,10 +899,11 @@ impl GuestThreadGroup {
                 .exit_status
                 .lock()
                 .expect("KVM exit-group lock poisoned");
-            if published.is_none()
-                && let Some(others_live) = others_live
-            {
-                let _ = self.group_exit_others_live.set(others_live);
+            if published.is_none() {
+                *self
+                    .group_exit_others_live
+                    .lock()
+                    .expect("KVM exit-group lock poisoned") = others_live;
             }
             *published.get_or_insert(status)
         };
@@ -1099,10 +1112,17 @@ impl GuestThreadGroup {
         // Exec reaches this boundary only after every old worker has joined.
         // The read registry must reject rearm with any old helper still owned.
         self.terminal_reads.rearm_after_exec();
-        *self
-            .exit_status
-            .lock()
-            .expect("KVM exit-group lock poisoned") = None;
+        {
+            let mut published = self
+                .exit_status
+                .lock()
+                .expect("KVM exit-group lock poisoned");
+            *published = None;
+            *self
+                .group_exit_others_live
+                .lock()
+                .expect("KVM exit-group lock poisoned") = None;
+        }
         *self
             .failure_state
             .lock()
@@ -3179,7 +3199,15 @@ impl KvmBackend {
         // a descriptor, the host's file table) ends the run with the named
         // refusal; any other failure ends it as a backend fault.
         self.replace_process_image(executor, executable, execfn, image, argv, envp)
-            .map_err(exec_after_point_of_no_return_error)
+            .map_err(exec_after_point_of_no_return_error)?;
+        // The new image's mm is used only by this process's threads (Linux's
+        // exec_mmap gives the process a new mm, and the other threads have
+        // exited): the process holds the certificate from here on, a vfork
+        // child and the initial root included.
+        self.thread_group
+            .independent_mm
+            .store(true, Ordering::Release);
+        Ok(())
     }
 
     /// [`Self::exec_process`] from its point of no return: discards the old
@@ -3732,16 +3760,14 @@ impl KvmBackend {
         // guest mm. The legacy vfork path also creates a backend snapshot, so
         // distinct host mappings alone cannot confer this certificate. Never
         // recover a revoked parent certificate from a guessed join condition.
+        // A CLONE_VM (vfork) child shares this mm until its window ends; the
+        // last-user decision refuses the certificate while the window is open
+        // (`GuestMemory::vfork_window_open`), and it holds again once the
+        // child has exec'd or exited, as Linux's mm_users falls back then.
         child
             .thread_group
             .independent_mm
             .store(!share_address_space, Ordering::Release);
-        if share_address_space {
-            // Whichever thread of the process prepared it.
-            self.thread_group
-                .independent_mm
-                .store(false, Ordering::Release);
-        }
         if shared_file_snapshot {
             // Child TID may itself lie in a shared file, so neither TID store
             // precedes fallible VM setup or descriptor/lifecycle preparation.
@@ -6215,19 +6241,36 @@ impl KvmBackend {
     /// non-group receipt: a process killed by a signal keeps its discard
     /// policy at the signal-return site.
     pub(crate) fn clear_thread_tid_before_terminal_receipt(&mut self, executor: &mut ElfExecutor) {
-        self.clear_registered_worker_tid_before_exit(executor);
+        self.clear_registered_worker_tid_before_exit(executor, false);
     }
 
-    pub(crate) fn clear_registered_worker_tid_before_exit(&mut self, executor: &mut ElfExecutor) {
+    /// `group` is whether the thread dies in its group's exit (exit_group, a
+    /// fatal signal, a peer's exit_group); otherwise it exits by itself (or
+    /// its run failed).
+    pub(crate) fn clear_registered_worker_tid_before_exit(
+        &mut self,
+        executor: &mut ElfExecutor,
+        group: bool,
+    ) {
         #[cfg(test)]
         clear_tid_diagnostic::begin();
         // The thread has made its last guest-visible change. Before anything
         // makes its exit observable (the store and wake below, a terminal
         // receipt, a Tool's deregistration), it stops counting as a user of
         // the address space, so a sibling that sees the exit sees that too:
-        // the sole-member decision below and a later fork's do not depend on
-        // when this host thread finishes tearing down.
-        self.vcpu.retire_participant_from_guest();
+        // the last-user decision below and a later fork's do not depend on
+        // when this host thread finishes tearing down. Whether it was the
+        // last user is answered under the same hold of the gate's lock that
+        // retires it, so of two threads exiting at once exactly one finds
+        // the other still live, as of two tasks only the second to reach
+        // exit_mm can find mm_users at 1.
+        let last_at_retirement = self.vcpu.retire_participant_from_guest();
+        #[cfg(test)]
+        clear_tid_last_user_hold::after_retirement(
+            group,
+            || self.vcpu.is_sole_participant(),
+            || self.thread_group.exit_status().is_some(),
+        );
         self.release_thread_slot();
         if executor.vfork_window_holds_clear_child_tid(&self.memory) {
             // A vfork child's word lies in memory its parent shares: the end
@@ -6242,32 +6285,41 @@ impl KvmBackend {
             return;
         };
         debug_assert!(self.thread_slot.is_none());
-        #[cfg(test)]
-        clear_tid_last_user_hold::wait_for_peers(|| self.vcpu.is_sole_participant());
         // Whether this thread is the address space's last user. A thread that
-        // dies in a group exit takes the answer recorded when the exit was
-        // first published (`publish_group_exit`): Linux runs every dying
+        // dies in its group's exit takes the answer recorded when that exit
+        // was first published (`publish_group_exit`): Linux runs every dying
         // thread's mm_release in an order the program does not control, and
         // with another thread live at the commit, every thread storing is
         // one order Linux allows (each reaches mm_release before any drops
         // its mm), where the answer at each thread's own retirement would
         // depend on when the others' host threads tear down. A thread that
-        // exits by itself decides at its retirement above.
-        let sole = match self.thread_group.group_exit_others_live() {
+        // exits by itself keeps the answer it got at its retirement, even if
+        // a group exit is published after it: that exit's answer counted it
+        // as already gone.
+        let sole = match group
+            .then(|| self.thread_group.group_exit_others_live())
+            .flatten()
+        {
             Some(others_live) => !others_live,
-            None => self.vcpu.is_sole_participant(),
+            None => last_at_retirement,
         };
         if self.thread_group.independent_mm.load(Ordering::Acquire)
-            && self.memory.contains_shared_file()
+            && !self.memory.vfork_window_open()
+            && self.memory.contains_retained_shared()
             && sole
         {
             // Linux mm_release discards clear_child_tid in either case, but
             // stores/wakes only for mm_users > 1, for any thread, a process
             // leader or a worker; an exiting thread drops its mm reference in
             // exit_mm right after its mm_release, before anything makes its
-            // exit observable. File pages shared with a different process do
-            // not share the guest mm. The process's certificate, which its
-            // workers share, with every other thread of the address space
+            // exit observable. File pages and fork-shared anonymous memory
+            // shared with a different process do not share the guest mm; only
+            // when the address space holds such a page can another process
+            // see the word, so only then is the store skipped (without one,
+            // storing into the dying mm and skipping look alike). The
+            // process's certificate, which its workers share, with no vfork
+            // window open over the mm and every other thread of the address
+            // space
             // retired (each thread's vCPU registers when the thread is
             // created and stops counting at the thread's retirement above, in
             // the guest's order), proves the virtual last-user case; it is
@@ -6277,7 +6329,7 @@ impl KvmBackend {
             // address; existing gate failures remain pending and unchanged.
             // https://github.com/gregkh/linux/blob/v7.1.3/kernel/fork.c#L1463
             #[cfg(test)]
-            clear_tid_diagnostic::stopped("single-owner shared-file process mm");
+            clear_tid_diagnostic::stopped("single-owner shared-memory process mm");
             return;
         }
         // Errors below are dropped on purpose. A bad guest address is Linux's
@@ -6623,7 +6675,8 @@ impl KvmBackend {
                         if executor.has_pending_exit() {
                             self.publish_pending_group_exit(executor);
                             self.discard_process_clear_tid_at_signal_return(executor);
-                            self.clear_registered_worker_tid_before_exit(executor);
+                            let group = executor.pending_group_exit_status().is_some();
+                            self.clear_registered_worker_tid_before_exit(executor, group);
                         }
                         (None, None, None)
                     } else {
@@ -6686,7 +6739,8 @@ impl KvmBackend {
                     if executor.has_pending_exit() {
                         self.publish_pending_group_exit(executor);
                         self.discard_process_clear_tid_at_signal_return(executor);
-                        self.clear_registered_worker_tid_before_exit(executor);
+                        let group = executor.pending_group_exit_status().is_some();
+                        self.clear_registered_worker_tid_before_exit(executor, group);
                     }
                     (None, None, None)
                 }
@@ -6772,7 +6826,7 @@ impl KvmBackend {
         if exit.group {
             self.request_guest_thread_group_exit(exit.status);
         }
-        self.clear_registered_worker_tid_before_exit(executor);
+        self.clear_registered_worker_tid_before_exit(executor, exit.group);
         executor.finish_terminal_cleanup().await?;
         self.release_stdin_on_exit();
         // Best-effort writes and Errno adapters can conceal a captured cause.
@@ -6977,6 +7031,8 @@ impl KvmBackend {
     /// that. So the answer the first publication records is the one at the
     /// commit, and no dying thread's host teardown can change it.
     fn publish_group_exit(&self, status: ExitStatus) {
+        #[cfg(test)]
+        clear_tid_last_user_hold::before_group_answer(|| self.vcpu.is_sole_participant());
         let others_live = !self.vcpu.is_sole_participant();
         self.thread_group
             .request_exit_group_from(status, Some(others_live));
@@ -7123,7 +7179,7 @@ impl KvmBackend {
             crate::runtime::finish_unstarted_tool_cleanups_with_panics(executor, &self.tool_panics),
         );
         executor.retire_failed_thread();
-        self.clear_registered_worker_tid_before_exit(executor);
+        self.clear_registered_worker_tid_before_exit(executor, false);
         executor.release_files_on_exit();
         self.release_stdin_on_exit();
         executor.transfer_child_processes_to_owner();
@@ -7173,7 +7229,7 @@ impl KvmBackend {
             crate::runtime::finish_unstarted_tool_cleanups_with_panics(executor, &self.tool_panics),
         );
         executor.retire_failed_thread();
-        self.clear_registered_worker_tid_before_exit(executor);
+        self.clear_registered_worker_tid_before_exit(executor, false);
         executor.release_files_on_exit();
         self.release_stdin_on_exit();
         let error = futures::executor::block_on(self.route_entry_outcome::<()>(Err(
@@ -8002,6 +8058,25 @@ mod tests {
             assert_eq!(next.now_or_never(), Some(Ok(())));
             assert_eq!(group.exit_status(), Some(ExitStatus::Exited(31)));
             assert!(group.subscribe_cancellation().now_or_never().is_none());
+        }
+
+        /// A group exit's last-user answer belongs to that exit: the first
+        /// publication sets it, a later one keeps it, and an exec's rearm
+        /// clears it with the exit status, so a later exit of the new image
+        /// does not read a stale answer.
+        #[test]
+        fn a_group_exits_last_user_answer_is_cleared_with_it_at_exec() {
+            let group = GuestThreadGroup::default();
+            assert_eq!(group.group_exit_others_live(), None);
+            group.request_exit_group_from(ExitStatus::Exited(1), Some(false));
+            group.request_exit_group_from(ExitStatus::Exited(2), Some(true));
+            assert_eq!(group.exit_status(), Some(ExitStatus::Exited(1)));
+            assert_eq!(group.group_exit_others_live(), Some(false));
+            group.rearm_after_exec();
+            assert_eq!(group.exit_status(), None);
+            assert_eq!(group.group_exit_others_live(), None);
+            group.request_exit_group_from(ExitStatus::Exited(3), Some(true));
+            assert_eq!(group.group_exit_others_live(), Some(true));
         }
 
         #[test]
@@ -9884,7 +9959,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_mm_certificate_is_shared_by_workers_and_revoked_by_vfork_for_good() {
+    fn independent_mm_certificate_is_shared_by_workers_and_held_off_by_an_open_vfork_window() {
         let mut parent =
             KvmBackend::new(16 * 1024 * 1024).expect("independent mm control requires KVM");
         parent
@@ -9932,12 +10007,16 @@ mod tests {
                 None,
             )
             .unwrap();
+        // The vfork child has no certificate of its own until it execs. The
+        // process keeps its certificate, but the vfork child's open window
+        // over its memory holds the last-user skip off for every thread of
+        // it, the worker included, until the window ends.
         assert!(!independent(&vfork_child.backend));
-        assert!(!independent(&child.backend));
-        // Revoked for every thread of the process, the worker included.
-        assert!(!independent(&worker));
+        assert!(independent(&child.backend) && independent(&worker));
+        assert!(child.backend.memory.vfork_window_open());
         drop(vfork_child);
-        assert!(!independent(&child.backend));
+        assert!(!child.backend.memory.vfork_window_open());
+        assert!(independent(&child.backend) && independent(&worker));
 
         let independent_child = child
             .backend
@@ -9955,7 +10034,7 @@ mod tests {
             )
             .unwrap();
         assert!(independent(&independent_child.backend));
-        assert!(!independent(&child.backend));
+        assert!(independent(&child.backend));
     }
 
     /// The stack window's pages as extents of equal declared mapping, `(user
@@ -13785,7 +13864,7 @@ mod tests {
                 // https://github.com/torvalds/linux/blob/v7.1/io_uring/futex.c
                 if registered_worker {
                     executor.set_clear_child_tid(Some(WORD));
-                    backend.clear_registered_worker_tid_before_exit(&mut executor);
+                    backend.clear_registered_worker_tid_before_exit(&mut executor, false);
                     assert_eq!(executor.take_clear_child_tid(), None);
                 } else {
                     clear_tid_and_wake(&mut backend.memory, Some(WORD));
@@ -13859,7 +13938,7 @@ mod tests {
             backend.memory.write_raw(address, &[0xa5; 4]).unwrap();
             if registered_worker {
                 executor.set_clear_child_tid(Some(address));
-                backend.clear_registered_worker_tid_before_exit(&mut executor);
+                backend.clear_registered_worker_tid_before_exit(&mut executor, false);
                 assert_eq!(executor.take_clear_child_tid(), None);
             } else {
                 clear_tid_and_wake(&mut backend.memory, Some(address));
@@ -14069,30 +14148,66 @@ mod exec_wait_tests;
 static DELAY_AFTER_CLEAR_TID_WAKE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// A test hold before a dying thread decides whether it is its address
-/// space's last user: with the hold armed, the thread first waits, bounded,
+/// Test holds around a dying thread's last-user decision, process-wide while
+/// armed. `Peers`: right after its retirement, a dying thread waits, bounded,
 /// until every other thread of the address space has retired, as when the
-/// others' host threads happen to tear down first.
+/// others' host threads happen to tear down first. `OrdinaryThenGroup`: a
+/// thread exiting by itself waits after its retirement until its group's
+/// exit has been published, and the first publisher of a group exit waits
+/// before it reads who is live until every other thread has retired, as
+/// when an exit_group lands just after another thread's own exit.
 #[cfg(test)]
 pub(crate) mod clear_tid_last_user_hold {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU8;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     use std::time::Instant;
 
-    static ARMED: AtomicBool = AtomicBool::new(false);
+    static MODE: AtomicU8 = AtomicU8::new(0);
 
-    pub(crate) fn arm(armed: bool) {
-        ARMED.store(armed, Ordering::SeqCst);
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    pub(crate) enum Hold {
+        Peers = 1,
+        OrdinaryThenGroup = 2,
     }
 
-    pub(super) fn wait_for_peers(sole: impl Fn() -> bool) {
-        if !ARMED.load(Ordering::SeqCst) {
-            return;
+    /// Disarms the hold when dropped, a panicking test's included.
+    pub(crate) struct Armed(());
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            MODE.store(0, Ordering::SeqCst);
         }
+    }
+
+    pub(crate) fn arm(hold: Hold) -> Armed {
+        MODE.store(hold as u8, Ordering::SeqCst);
+        Armed(())
+    }
+
+    fn wait_until(done: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !sole() && Instant::now() < deadline {
+        while !done() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub(super) fn after_retirement(
+        group: bool,
+        sole: impl Fn() -> bool,
+        published: impl Fn() -> bool,
+    ) {
+        match MODE.load(Ordering::SeqCst) {
+            1 => wait_until(sole),
+            2 if !group => wait_until(published),
+            _ => {}
+        }
+    }
+
+    pub(super) fn before_group_answer(sole: impl Fn() -> bool) {
+        if MODE.load(Ordering::SeqCst) == 2 {
+            wait_until(sole);
         }
     }
 }

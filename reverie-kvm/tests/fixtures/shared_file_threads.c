@@ -68,6 +68,13 @@
  *   begins, Linux may store zero (when the main thread's mm_release comes
  *   before the worker drops its mm, as it almost always does) or leave the
  *   marker; the parent prints the word.
+ * - "anon-worker-cleartid": as "worker-cleartid", without the file view: the
+ *   only memory the child shares with the parent is the marker's
+ *   MAP_SHARED | MAP_ANONYMOUS page. The marker stays.
+ * - "vfork-worker-cleartid": as "worker-cleartid", but the child's main
+ *   thread first vforks a child that exits at once, as posix_spawn and
+ *   system() do; once that child has exited it no longer uses the address
+ *   space, and the marker stays.
  * Every step prints one line.
  */
 #define _GNU_SOURCE
@@ -317,11 +324,14 @@ static void *spin_until_the_group_exits(void *argument) {
   return NULL;
 }
 
-/* Modes "worker-cleartid" and "group-cleartid". */
-static int child_cleartid(int fd, int group) {
-  view = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  REQUIRE(view != MAP_FAILED, "mmap");
-  view[0] = 'w';
+/* Modes "worker-cleartid", "group-cleartid", "anon-worker-cleartid" and
+   "vfork-worker-cleartid". */
+static int child_cleartid(int fd, int group, int with_view, int vfork_first) {
+  if (with_view) {
+    view = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    REQUIRE(view != MAP_FAILED, "mmap");
+    view[0] = 'w';
+  }
   word = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   REQUIRE(word != MAP_FAILED, "the marker's page");
   word[16] = 0x5eedf00d;
@@ -330,6 +340,16 @@ static int child_cleartid(int fd, int group) {
   if (child == 0) {
     main_thread = pthread_self();
     pthread_t thread;
+    if (vfork_first) {
+      pid_t spawned = vfork();
+      if (spawned == 0) {
+        _exit(0);
+      }
+      int status = 0;
+      if (spawned < 0 || waitpid(spawned, &status, 0) != spawned || status != 0) {
+        _exit(8);
+      }
+    }
     if (group) {
       syscall(SYS_set_tid_address, (unsigned int *)&word[16]);
       if (pthread_create(&thread, NULL, spin_until_the_group_exits, NULL) != 0) {
@@ -407,10 +427,16 @@ int main(int argc, char **argv) {
     return leader_cleartid(fd);
   }
   if (strcmp(mode, "worker-cleartid") == 0) {
-    return child_cleartid(fd, 0);
+    return child_cleartid(fd, 0, 1, 0);
   }
   if (strcmp(mode, "group-cleartid") == 0) {
-    return child_cleartid(fd, 1);
+    return child_cleartid(fd, 1, 1, 0);
+  }
+  if (strcmp(mode, "anon-worker-cleartid") == 0) {
+    return child_cleartid(fd, 0, 0, 0);
+  }
+  if (strcmp(mode, "vfork-worker-cleartid") == 0) {
+    return child_cleartid(fd, 0, 1, 1);
   }
   REQUIRE(pthread_barrier_init(&barrier, NULL, WORKERS + 1) == 0, "pthread_barrier_init");
   word = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

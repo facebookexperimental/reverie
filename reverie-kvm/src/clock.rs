@@ -412,8 +412,10 @@ impl CountedVcpu {
 
     /// This vCPU's guest thread has retired: it enters no more and no longer
     /// counts as a user of its address space (`Participant::retire_from_guest`).
-    pub(crate) fn retire_participant_from_guest(&mut self) {
-        self.participant.retire_from_guest();
+    /// Returns whether every other thread of the address space had already
+    /// retired, read atomically with this retirement.
+    pub(crate) fn retire_participant_from_guest(&mut self) -> bool {
+        self.participant.retire_from_guest()
     }
 
     /// The attribution this vCPU's own memory handle carries: none, since

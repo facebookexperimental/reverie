@@ -204,8 +204,9 @@ impl GuestMemory {
     }
 
     /// Whether a vfork window is open over this memory's current image
-    /// ([`OpenVforkWindow`]).
-    pub(super) fn vfork_window_open(&self) -> bool {
+    /// (`OpenVforkWindow`): a vfork child still uses the address space, as
+    /// on Linux it holds a reference to the mm until it execs or exits.
+    pub fn vfork_window_open(&self) -> bool {
         let windows = self.mapping.open_vfork_windows.lock().unwrap();
         let exec_count = self
             .mapping
