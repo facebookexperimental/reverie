@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
-*/
+ */
 
 #[test]
 fn explicit_ptracer_namespace_guard_requires_complete_original_self_field() {
@@ -1399,7 +1399,12 @@ async fn explicit_copied_owner_namespace_refuses_before_consuming_any_report() {
         return;
     }
     assert_eq!(nix::unistd::getpid().as_raw(), 1);
-    assert_eq!(nix::unistd::gettid().as_raw(), 2);
+    // The harness thread number is not fixed. The proof below constructs
+    // an actual equal-TID owner collision in its fresh descendant namespace.
+    assert_ne!(
+        nix::unistd::gettid().as_raw(),
+        nix::unistd::getpid().as_raw()
+    );
     for forced in [false, true] {
         for realign_proc in [false, true] {
             let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
@@ -1424,7 +1429,7 @@ async fn explicit_copied_owner_namespace_refuses_before_consuming_any_report() {
             running.interrupt().unwrap();
             let mut owned = running.wait_owned_on_ptracer_thread().into_driver();
             let owner = owned.affinity.owner.as_ref().unwrap().clone();
-            assert_eq!(owner.tid.as_raw(), 2);
+            assert_eq!(owner.tid.as_raw(), nix::unistd::gettid().as_raw());
             assert!(owner.is_current().unwrap());
             assert_eq!(original.identity().unwrap().pidfd_is_live(), Ok(true));
             let (resume, capture) = if native {
@@ -1483,7 +1488,7 @@ async fn explicit_copied_owner_namespace_refuses_before_consuming_any_report() {
                                     0
                                 );
                             }
-                            let proof = thread::spawn(move || {
+                            let proof = spawn_namespace_owner_collision(owner.tid, move || {
                                 let mut sync = sync;
                                 let mut exit = exit;
                                 let mut cleanup = cleanup;
@@ -1853,7 +1858,12 @@ async fn explicit_copied_stopped_namespace_refuses_numeric_ptrace() {
         return;
     }
     assert_eq!(nix::unistd::getpid().as_raw(), 1);
-    assert_eq!(nix::unistd::gettid().as_raw(), 2);
+    // The harness thread number is not fixed. The proof below constructs
+    // an actual equal-TID owner collision in its fresh descendant namespace.
+    assert_ne!(
+        nix::unistd::gettid().as_raw(),
+        nix::unistd::getpid().as_raw()
+    );
     for forced in [false, true] {
         for realign_proc in [false, true] {
             let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
@@ -1941,7 +1951,7 @@ async fn explicit_copied_stopped_namespace_refuses_numeric_ptrace() {
                                     0
                                 );
                             }
-                            let proof = thread::spawn(move || {
+                            let proof = spawn_namespace_owner_collision(owner.tid, move || {
                                 assert_eq!(nix::unistd::gettid().as_raw(), owner.tid.as_raw());
                                 assert_eq!(nix::unistd::getpid().as_raw(), owner.tgid.as_raw());
                                 assert!(owner.is_live().unwrap());
@@ -2167,7 +2177,12 @@ async fn explicit_first_binding_uses_original_native_event_mount() {
         return;
     }
     assert_eq!(nix::unistd::getpid().as_raw(), 1);
-    assert_eq!(nix::unistd::gettid().as_raw(), 2);
+    // The harness thread number is not fixed. The proof below constructs
+    // an actual equal-TID owner collision in its fresh descendant namespace.
+    assert_ne!(
+        nix::unistd::gettid().as_raw(),
+        nix::unistd::getpid().as_raw()
+    );
     for realign_proc in [false, true] {
         let (root, tid, release, mut root_cleanup) = legacy_owner_guest();
         match pidfd_open_with_flags(tid.into(), libc::O_EXCL) {
@@ -2274,7 +2289,7 @@ async fn explicit_first_binding_uses_original_native_event_mount() {
                                 0
                             );
                         }
-                        let proof = thread::spawn(move || {
+                        let proof = spawn_namespace_owner_collision(host.tid, move || {
                             assert_eq!(nix::unistd::gettid().as_raw(), host.tid.as_raw());
                             assert_eq!(nix::unistd::getpid().as_raw(), host.tgid.as_raw());
                             assert!(host.is_live().unwrap());
@@ -3032,4 +3047,48 @@ fn run_explicit_wait_role_outer(name: &str, marker: &str, cell_prefix: &str) -> 
     print!("{stdout}");
     eprint!("{}", String::from_utf8_lossy(&result.output.stderr));
     true
+}
+
+/// Construct the original owner's *actual* namespace-relative TID in this
+/// fresh descendant namespace. The caller already performed unshare + fork;
+/// it is the single-threaded namespace init, and the proof must remain a
+/// different kernel task even though the numeric TID is exactly equal.
+///
+/// This is fixed-count padding, not a search for a passing identity. Each
+/// joined padding thread must get its predetermined next TID; any unexpected
+/// allocation fails immediately. No numeric equality is conditional, and no
+/// arbitrary allocator cursor, new capability, or fallback is introduced.
+#[cfg(not(sanitized))]
+fn spawn_namespace_owner_collision<F, T>(owner_tid: super::Pid, proof: F) -> thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    assert_eq!(nix::unistd::getpid().as_raw(), 1);
+    assert_eq!(nix::unistd::gettid().as_raw(), 1);
+    let requested = owner_tid.as_raw();
+    assert!(requested > 1, "the original owner must be a nonleader");
+    // This only adds a stricter setup check. The existing parent tracee wait
+    // and the outer namespace subprocess deadline remain unchanged. A check
+    // before spawn does not itself preempt a blocked spawn or join.
+    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+    for expected in 2..requested {
+        assert!(Instant::now() < deadline, "owner-collision setup deadline");
+        let observed = thread::spawn(|| nix::unistd::gettid().as_raw())
+            .join()
+            .unwrap();
+        assert_eq!(
+            observed, expected,
+            "fresh namespace allocation did not match the fixed collision construction"
+        );
+    }
+    assert!(Instant::now() < deadline, "owner-collision setup deadline");
+    thread::spawn(move || {
+        assert_eq!(
+            nix::unistd::gettid().as_raw(),
+            requested,
+            "proof thread must collide with the actual original owner TID"
+        );
+        proof()
+    })
 }
