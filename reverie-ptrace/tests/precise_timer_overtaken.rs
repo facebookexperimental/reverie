@@ -161,14 +161,18 @@ static WITNESS: Mutex<()> = Mutex::new(());
 // kick, so no case can deliver the event.
 //
 // With an instruction offset, the event is due `OFFSET_INSTRS` instructions
-// after the target branch. One further branch leaves the guest well short of
-// that, while `OFFSET_INSTRS` further branches prove it got there.
+// after the target branch. A stop at or past the target branch is witnessed
+// whether or not the guest has covered the offset: the counter cannot show
+// how many of the offset's instructions the guest ran past that branch, so the
+// delivery point may already have passed. Reaching the target with the offset
+// outstanding, or one branch past it, is witnessed exactly as covering it is.
 #[test_case(TIMEOUT_RCBS / 2, 0, 0; "well before the target")]
 #[test_case(TIMEOUT_RCBS - 2, 0, 0; "one branch before the target")]
 #[test_case(TIMEOUT_RCBS - 1, 0, 1; "exactly at the target")]
 #[test_case(TIMEOUT_RCBS * 2, 0, 1; "well past the target")]
-#[test_case(TIMEOUT_RCBS - 1, OFFSET_INSTRS, 0; "at the target with the offset outstanding")]
-#[test_case(TIMEOUT_RCBS, OFFSET_INSTRS, 0; "one branch past the target with the offset outstanding")]
+#[test_case(TIMEOUT_RCBS - 2, OFFSET_INSTRS, 0; "one branch before the target with an offset")]
+#[test_case(TIMEOUT_RCBS - 1, OFFSET_INSTRS, 1; "at the target with the offset outstanding")]
+#[test_case(TIMEOUT_RCBS, OFFSET_INSTRS, 1; "one branch past the target with the offset outstanding")]
 #[test_case(TIMEOUT_RCBS - 1 + OFFSET_INSTRS, OFFSET_INSTRS, 1; "branches past the target cover the offset")]
 #[test_case(TIMEOUT_RCBS * 2, OFFSET_INSTRS, 1; "well past the target and the offset")]
 fn overtaken_precise_event_is_witnessed(branches: u64, offset: u64, witnesses: u64) {
@@ -270,3 +274,4 @@ fn a_disregarded_trap_past_the_target_is_witnessed_once(after: AfterTrap, witnes
         "only a stop that retires the event past its target may witness it"
     );
 }
+
