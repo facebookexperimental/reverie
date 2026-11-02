@@ -35,6 +35,27 @@
  *   and forks; the child creates a worker and its main thread exits with
  *   pthread_exit; the worker joins it, which again needs the exit to clear
  *   the TID word, prints a line and exits 0; the parent waits for the child.
+ * - "spin": worker 0 spins in user code, making no system call, until the
+ *   main thread has mapped the view and stored a flag; the mapping is made
+ *   while the worker spins.
+ * - "publish-vs-clone": with no workers, a publisher thread maps a view,
+ *   stores through it and unmaps it 200 times, while the main thread creates
+ *   and joins 200 short threads; the file then holds the publisher's count.
+ * - "join-fork": with no workers, the main thread maps the view, then five
+ *   times creates a thread, joins it and forks; each child reads the view
+ *   and exits 0. At each fork the process has one live thread, so Linux
+ *   always allows it.
+ * - "leader-exit-fork": with no workers, the main thread maps the view and
+ *   forks; the child creates a worker and its main thread exits with
+ *   pthread_exit; the worker joins it, so that it is the child's only live
+ *   thread, forks a grandchild that reads the view, and exits 0.
+ * - "leader-cleartid": with no workers, the main thread maps the view and a
+ *   MAP_SHARED | MAP_ANONYMOUS page holding a marker, and forks. The child
+ *   points its clear_child_tid at the marker (set_tid_address), creates a
+ *   thread, joins it, and exits its only thread with SYS_exit. Linux's
+ *   mm_release stores zero there and wakes it only while another task uses
+ *   the address space; the joined thread does not, so the marker stays. The
+ *   parent prints the word once it has reaped the child.
  * Every step prints one line.
  */
 #define _GNU_SOURCE
@@ -42,6 +63,7 @@
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +89,8 @@ static pthread_barrier_t barrier;
 static unsigned char *volatile view;
 static unsigned int *volatile word;
 static pthread_t main_thread;
+static int spinning;
+static int released;
 
 static unsigned char mark(int round, long worker) {
   return (unsigned char)('a' + round * WORKERS + worker);
@@ -79,6 +103,12 @@ static void wait_all(void) {
 
 static void *worker(void *argument) {
   long index = (long)argument;
+  if (strcmp(mode, "spin") == 0 && index == 0) {
+    __atomic_store_n(&spinning, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&released, __ATOMIC_ACQUIRE) == 0) {
+    }
+    REQUIRE(view != MAP_FAILED && view != NULL, "the view, after the spin");
+  }
   wait_all(); /* the first view is mapped */
   if (strcmp(mode, "use") == 0) {
     for (int round = 0; round < 2; round++) {
@@ -118,10 +148,138 @@ static void *worker(void *argument) {
       fflush(stdout);
       exit(0);
     }
+  } else if (strcmp(mode, "spin") == 0) {
+    wait_all(); /* the main thread saw the spin end */
   } else {
     wait_all(); /* the child was forked and reaped */
   }
   return NULL;
+}
+
+enum { CLONE_ROUNDS = 200 };
+
+static void *publisher(void *argument) {
+  int fd = (int)(long)argument;
+  for (int round = 0; round < CLONE_ROUNDS; round++) {
+    unsigned char *mapped = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    REQUIRE(mapped != MAP_FAILED, "the publisher's mmap");
+    mapped[0]++;
+    REQUIRE(munmap(mapped, PAGE) == 0, "the publisher's munmap");
+  }
+  return NULL;
+}
+
+static void *short_lived(void *argument) { return argument; }
+
+/* Mode "publish-vs-clone": publications while threads come and go. */
+static int publish_vs_clone(int fd) {
+  pthread_t thread;
+  REQUIRE(pthread_create(&thread, NULL, publisher, (void *)(long)fd) == 0,
+          "pthread_create of the publisher");
+  for (int round = 0; round < CLONE_ROUNDS; round++) {
+    pthread_t brief;
+    REQUIRE(pthread_create(&brief, NULL, short_lived, NULL) == 0,
+            "pthread_create of a short thread");
+    REQUIRE(pthread_join(brief, NULL) == 0, "pthread_join of a short thread");
+  }
+  REQUIRE(pthread_join(thread, NULL) == 0, "pthread_join of the publisher");
+  unsigned char count = 0;
+  REQUIRE(pread(fd, &count, 1, 0) == 1, "pread");
+  printf("%d threads came and went beside %d mappings; the file counts %d\n",
+         CLONE_ROUNDS, CLONE_ROUNDS, count);
+  return 0;
+}
+
+/* Mode "join-fork". */
+static int join_fork(int fd) {
+  view = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  REQUIRE(view != MAP_FAILED, "mmap");
+  view[0] = 'j';
+  for (int round = 0; round < 5; round++) {
+    pthread_t brief;
+    REQUIRE(pthread_create(&brief, NULL, short_lived, NULL) == 0, "pthread_create");
+    REQUIRE(pthread_join(brief, NULL) == 0, "pthread_join");
+    pid_t child = fork();
+    REQUIRE(child >= 0, "fork after a join");
+    if (child == 0) {
+      _exit(view[0] == 'j' ? 0 : 3);
+    }
+    int status = 0;
+    REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+                WEXITSTATUS(status) == 0,
+            "the child");
+  }
+  printf("forked five times, each after joining the only other thread\n");
+  return 0;
+}
+
+static void *fork_after_leader_exit(void *argument) {
+  (void)argument;
+  REQUIRE(pthread_join(main_thread, NULL) == 0, "joining the child's main thread");
+  pid_t grandchild = fork();
+  REQUIRE(grandchild >= 0, "fork by the last thread");
+  if (grandchild == 0) {
+    _exit(view[0] == 'l' ? 0 : 3);
+  }
+  int status = 0;
+  REQUIRE(waitpid(grandchild, &status, 0) == grandchild && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0,
+          "the grandchild");
+  printf("the child's last thread forked after its main thread exited\n");
+  fflush(stdout);
+  exit(0);
+}
+
+/* Mode "leader-exit-fork". */
+static int leader_exit_fork(int fd) {
+  view = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  REQUIRE(view != MAP_FAILED, "mmap");
+  view[0] = 'l';
+  pid_t child = fork();
+  REQUIRE(child >= 0, "fork");
+  if (child == 0) {
+    main_thread = pthread_self();
+    pthread_t thread;
+    REQUIRE(pthread_create(&thread, NULL, fork_after_leader_exit, NULL) == 0,
+            "pthread_create in the child");
+    pthread_exit(NULL);
+  }
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0,
+          "the child");
+  printf("the child exited 0\n");
+  return 0;
+}
+
+/* Mode "leader-cleartid". */
+static int leader_cleartid(int fd) {
+  view = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  REQUIRE(view != MAP_FAILED, "mmap");
+  view[0] = 'c';
+  volatile unsigned int *marker = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  REQUIRE(marker != MAP_FAILED, "the marker's page");
+  marker[16] = 0x5eedf00d;
+  pid_t child = fork();
+  REQUIRE(child >= 0, "fork");
+  if (child == 0) {
+    syscall(SYS_set_tid_address, (unsigned int *)&marker[16]);
+    pthread_t brief;
+    if (pthread_create(&brief, NULL, short_lived, NULL) != 0 ||
+        pthread_join(brief, NULL) != 0) {
+      _exit(5);
+    }
+    syscall(SYS_exit, 0);
+    _exit(6);
+  }
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0,
+          "the child");
+  printf("the child's last thread exited; its clear_child_tid word holds %#x\n",
+         marker[16]);
+  return 0;
 }
 
 static void *join_main_thread(void *argument) {
@@ -163,6 +321,18 @@ int main(int argc, char **argv) {
   if (strcmp(mode, "fork-leader-exit") == 0) {
     return fork_leader_exit(fd);
   }
+  if (strcmp(mode, "publish-vs-clone") == 0) {
+    return publish_vs_clone(fd);
+  }
+  if (strcmp(mode, "join-fork") == 0) {
+    return join_fork(fd);
+  }
+  if (strcmp(mode, "leader-exit-fork") == 0) {
+    return leader_exit_fork(fd);
+  }
+  if (strcmp(mode, "leader-cleartid") == 0) {
+    return leader_cleartid(fd);
+  }
   REQUIRE(pthread_barrier_init(&barrier, NULL, WORKERS + 1) == 0, "pthread_barrier_init");
   word = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   REQUIRE(word != MAP_FAILED, "the futex word's page");
@@ -172,10 +342,16 @@ int main(int argc, char **argv) {
     REQUIRE(pthread_create(&threads[index], NULL, worker, (void *)index) == 0,
             "pthread_create");
   }
+  if (strcmp(mode, "spin") == 0) {
+    while (__atomic_load_n(&spinning, __ATOMIC_ACQUIRE) == 0) {
+      sched_yield();
+    }
+  }
   view = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   REQUIRE(view != MAP_FAILED, "mmap with threads alive");
   printf("mapped a shared view with %d threads alive\n", WORKERS);
   fflush(stdout);
+  __atomic_store_n(&released, 1, __ATOMIC_RELEASE);
   wait_all();
   if (strcmp(mode, "use") == 0) {
     for (int round = 0; round < 2; round++) {
@@ -235,6 +411,9 @@ int main(int argc, char **argv) {
     /* With a worker alive, the exit stores zero to this thread's TID word
      * and wakes it, which ends the worker's join (Linux's mm_release). */
     pthread_exit(NULL);
+  } else if (strcmp(mode, "spin") == 0) {
+    wait_all();
+    printf("a thread spinning in user code through the mapping went on\n");
   } else {
     REQUIRE(0, "the mode");
   }

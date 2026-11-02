@@ -542,6 +542,18 @@ impl Drop for WorkerCompletionNotice {
     }
 }
 
+/// What one entry toward a process action's park did
+/// (`KvmBackend::try_park_process_action`).
+#[derive(Debug)]
+enum ParkAttempt {
+    /// The vCPU exited: at its park (`Ok`), or elsewhere (`Err`).
+    Parked(Result<()>),
+    /// Admission was closed, so no entry was made.
+    AdmissionClosed,
+    /// A signal interrupted the entry before the vCPU reached its park.
+    Interrupted,
+}
+
 /// How an inline (Direct) fork child's completion resolved for its caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ForkedProcessCompletion {
@@ -612,8 +624,8 @@ pub(crate) struct GuestThreadGroup {
     // AUTONOMOUS-BOT-IMPLEMENTED: Propagate worker exit_group to the root vCPU.
     // TODO-HUMAN-REVIEW(PR-177): Review KVM thread-group exit ordering.
     exit_status: Mutex<Option<ExitStatus>>,
-    root: Mutex<Option<libc::pthread_t>>,
-    workers: Mutex<Vec<libc::pthread_t>>,
+    root: Mutex<Option<GuestThreadTarget>>,
+    workers: Mutex<Vec<GuestThreadTarget>>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Join cancelled KVM workers before root teardown returns.
     // TODO-HUMAN-REVIEW(PR-178): Review KVM worker join ordering.
     worker_handles: Mutex<Vec<GuestWorkerHandle>>,
@@ -848,17 +860,13 @@ impl GuestThreadGroup {
         self.terminal_reads.request_exit_group(status);
 
         if let Some(root) = *self.root.lock().expect("KVM guest root lock poisoned") {
-            // SAFETY: root is registered for the lifetime of its run loop.
-            unsafe {
-                libc::pthread_kill(root, worker_interrupt_signal());
-            }
+            // Root is registered for the lifetime of its run loop.
+            let _ = root.interrupt();
         }
         let workers = self.workers.lock().expect("KVM guest worker lock poisoned");
-        for &worker in workers.iter() {
-            // SAFETY: the registry lock keeps each pthread ID live for this call.
-            unsafe {
-                libc::pthread_kill(worker, worker_interrupt_signal());
-            }
+        for worker in workers.iter() {
+            // The registry lock keeps each thread registered for this call.
+            let _ = worker.interrupt();
         }
         drop(workers);
         self.notify_cancellation();
@@ -1034,11 +1042,9 @@ impl GuestThreadGroup {
             .workers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for &worker in workers.iter() {
-            // SAFETY: the registry lock keeps each pthread ID live for this call.
-            unsafe {
-                libc::pthread_kill(worker, worker_interrupt_signal());
-            }
+        for worker in workers.iter() {
+            // The registry lock keeps each thread registered for this call.
+            let _ = worker.interrupt();
         }
         drop(workers);
         self.notify_cancellation();
@@ -1096,9 +1102,37 @@ impl GuestThreadGroup {
     }
 }
 
+/// A registered guest thread's host thread: its pthread identity, which the
+/// registry compares, and the kernel's process and thread IDs, to which the
+/// worker interrupt is sent (`tgkill(2)`). glibc's `pthread_kill` sends to
+/// the thread ID cached in the thread's descriptor, which the initial thread
+/// of a process created by a raw `clone(2)` holds from its parent, so a kick
+/// of that thread would fail with ESRCH (see `crate::entry::HostThread`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestThreadTarget {
+    pthread: libc::pthread_t,
+    host: crate::entry::HostThread,
+}
+
+impl GuestThreadTarget {
+    /// The calling thread.
+    fn current() -> Self {
+        Self {
+            // SAFETY: pthread_self identifies this live calling thread.
+            pthread: unsafe { libc::pthread_self() },
+            host: crate::entry::HostThread::current(),
+        }
+    }
+
+    /// Sends the worker interrupt to this thread.
+    fn interrupt(self) -> std::io::Result<()> {
+        self.host.signal(worker_interrupt_signal())
+    }
+}
+
 pub(crate) struct GuestThreadRegistration {
     group: Arc<GuestThreadGroup>,
-    pthread: libc::pthread_t,
+    target: GuestThreadTarget,
     root: bool,
     restore_blocked_signal: bool,
 }
@@ -1106,25 +1140,24 @@ pub(crate) struct GuestThreadRegistration {
 impl GuestThreadRegistration {
     fn register(group: Arc<GuestThreadGroup>, root: bool) -> Result<Self> {
         let restore_blocked_signal = set_guest_interrupt_signal_mask(libc::SIG_UNBLOCK)?;
-        // SAFETY: pthread_self identifies this live calling thread.
-        let pthread = unsafe { libc::pthread_self() };
+        let target = GuestThreadTarget::current();
         if root {
             let previous = group
                 .root
                 .lock()
                 .expect("KVM guest root lock poisoned")
-                .replace(pthread);
+                .replace(target);
             assert!(previous.is_none(), "KVM guest root already registered");
         } else {
             group
                 .workers
                 .lock()
                 .expect("KVM guest worker lock poisoned")
-                .push(pthread);
+                .push(target);
         }
         Ok(Self {
             group,
-            pthread,
+            target,
             root,
             restore_blocked_signal,
         })
@@ -1137,7 +1170,7 @@ impl GuestThreadRegistration {
         panics: Arc<crate::failure::tool_panics::ToolPanics>,
     ) -> Result<GuestInterruptSuspension<'_>> {
         // Only the private synchronous Direct driver supplies this owner.
-        if unsafe { libc::pthread_equal(libc::pthread_self(), self.pthread) } == 0 {
+        if unsafe { libc::pthread_equal(libc::pthread_self(), self.target.pthread) } == 0 {
             return Err(interrupt_ownership_error(
                 "Direct fork moved off its registered pthread",
             ));
@@ -1154,7 +1187,7 @@ impl GuestThreadRegistration {
         };
         let withdrawn = if self.root {
             match self.group.root.lock() {
-                Ok(mut root) if *root == Some(self.pthread) => {
+                Ok(mut root) if *root == Some(self.target) => {
                     *root = None;
                     suspended.detached = true;
                     Ok(())
@@ -1166,10 +1199,8 @@ impl GuestThreadRegistration {
             }
         } else {
             match self.group.workers.lock() {
-                Ok(mut workers)
-                    if workers.iter().filter(|&&id| id == self.pthread).count() == 1 =>
-                {
-                    workers.retain(|id| *id != self.pthread);
+                Ok(mut workers) if workers.iter().filter(|&&id| id == self.target).count() == 1 => {
+                    workers.retain(|id| *id != self.target);
                     suspended.detached = true;
                     Ok(())
                 }
@@ -1179,7 +1210,7 @@ impl GuestThreadRegistration {
                 Err(_) => Err(interrupt_ownership_error("Direct worker registry poisoned")),
             }
         };
-        // Senders hold these same locks through pthread_kill. No old-parent
+        // Senders hold these same locks through each send. No old-parent
         // send remains in flight, and no registry lock crosses the child await.
         if let Err(error) = withdrawn.and_then(|()| deliver_guest_interrupt_at_neutral_boundary()) {
             return suspended.finish(Err(error));
@@ -1237,7 +1268,7 @@ struct GuestInterruptSuspension<'a> {
 impl GuestInterruptSuspension<'_> {
     fn restore(&mut self) -> Result<()> {
         let registration = self.registration;
-        if unsafe { libc::pthread_equal(libc::pthread_self(), registration.pthread) } == 0 {
+        if unsafe { libc::pthread_equal(libc::pthread_self(), registration.target.pthread) } == 0 {
             return Err(interrupt_ownership_error(
                 "Direct restoration moved off its registered pthread",
             ));
@@ -1265,7 +1296,7 @@ impl GuestInterruptSuspension<'_> {
                     }
                 };
                 if root.is_none() {
-                    *root = Some(registration.pthread);
+                    *root = Some(registration.target);
                 } else {
                     errors.push(interrupt_ownership_error(
                         "Direct root was replaced while suspended",
@@ -1281,8 +1312,8 @@ impl GuestInterruptSuspension<'_> {
                         poisoned.into_inner()
                     }
                 };
-                if !workers.contains(&registration.pthread) {
-                    workers.push(registration.pthread);
+                if !workers.contains(&registration.target) {
+                    workers.push(registration.target);
                 } else {
                     errors.push(interrupt_ownership_error(
                         "Direct worker was replaced while suspended",
@@ -1334,7 +1365,7 @@ impl Drop for GuestThreadRegistration {
                 .root
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if *root == Some(self.pthread) {
+            if *root == Some(self.target) {
                 *root = None;
             }
         } else {
@@ -1342,7 +1373,7 @@ impl Drop for GuestThreadRegistration {
                 .workers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .retain(|worker| *worker != self.pthread);
+                .retain(|worker| *worker != self.target);
         }
         if self.restore_blocked_signal {
             let _ = set_guest_interrupt_signal_mask(libc::SIG_BLOCK);
@@ -1988,9 +2019,12 @@ pub struct KvmBackend {
     completed_tool_panics: Mutex<Vec<CompletedToolPanic>>,
     thread_slot: Option<usize>,
     is_guest_thread: bool,
-    // Conservative certificate for a non-CLONE_VM process snapshot. The
-    // ordinary shared-file domain separately excludes additional same-mm
-    // participants. Initial roots and legacy vfork snapshots have no certificate;
+    // Conservative certificate for a non-CLONE_VM process snapshot. Other
+    // users of the same mm are the threads of this process, which the entry
+    // gate counts: each thread's vCPU registers when the thread is created
+    // and stops counting at its retirement, in the guest's order
+    // (`clear_registered_worker_tid_before_exit`). Initial roots and legacy
+    // vfork snapshots have no certificate;
     // a later CLONE_VM process preparation revokes it instead of guessing when
     // the other process has stopped using the guest mm.
     independent_process_mm: bool,
@@ -3451,11 +3485,20 @@ impl KvmBackend {
                     }
                     Ok(None) => {}
                 }
-            } else if let Some(actual) = self.try_park_process_action(phase)? {
-                // This is an owned result, not a borrowed VcpuExit. Retain it
-                // across an unpark wait and never execute this entry twice.
-                parked = Some(actual);
-                continue;
+            } else {
+                match self.try_park_process_action(phase)? {
+                    // This is an owned result, not a borrowed VcpuExit. Retain
+                    // it across an unpark wait and never execute this entry
+                    // twice.
+                    ParkAttempt::Parked(actual) => {
+                        parked = Some(actual);
+                        continue;
+                    }
+                    // Enter again at once, as the run loop does, after the
+                    // checks above: a closing gate refuses the next entry.
+                    ParkAttempt::Interrupted => continue,
+                    ParkAttempt::AdmissionClosed => {}
+                }
             }
             match futures::future::select(
                 futures::future::select(changed, cancelled),
@@ -3473,12 +3516,23 @@ impl KvmBackend {
         }
     }
 
-    fn try_park_process_action(&mut self, phase: &'static str) -> Result<Option<Result<()>>> {
-        let Some(exit) = self.vcpu.run()? else {
-            return Ok(None);
+    fn try_park_process_action(&mut self, phase: &'static str) -> Result<ParkAttempt> {
+        let exit = match self.vcpu.run() {
+            Ok(Some(exit)) => exit,
+            Ok(None) => return Ok(ParkAttempt::AdmissionClosed),
+            // A signal ended KVM_RUN before the vCPU reached its park: the
+            // reserved signal of another thread's close of admission, which
+            // kicks every running vCPU, or another. The entry left the guest
+            // where a later one resumes it.
+            Err(Error::Kvm(error)) if error.errno() == libc::EINTR => {
+                #[cfg(test)]
+                tests::entry_action_tests::observe("park_interrupted");
+                return Ok(ParkAttempt::Interrupted);
+            }
+            Err(error) => return Err(error),
         };
         Self::record_exit(self.exit_collector.as_deref(), &exit);
-        Ok(Some(match exit {
+        Ok(ParkAttempt::Parked(match exit {
             VcpuExit::Hlt => {
                 #[cfg(test)]
                 tests::entry_action_tests::observe("park_hlt");
@@ -3539,10 +3593,12 @@ impl KvmBackend {
         // provider's vfork-style child (it admits CLONE_VM only with
         // CLONE_VFORK), whose parent waits for its exec or exit. Like a
         // fork's, its copy of shared-file views gets an arena and entry gate
-        // of its own (`GuestMemory::snapshot_sharing_address_space`), so this
-        // gate keeps its one participant, and the copy refuses changes to the
-        // views until the child execs. Thread creation is refused before any
-        // process action exists.
+        // of its own (`GuestMemory::snapshot_sharing_address_space`), so the
+        // child adds no participant to this gate; the copy refuses changes to
+        // the views until the child execs, and this memory refuses another
+        // thread's changes to its views while the child's window is open. A
+        // thread created by the child is refused before any process action
+        // exists.
         let shared_file_snapshot = self.memory.contains_shared_file();
         // Preserve the existing private-fork preparation order. For real file
         // views, duplication may fail after unmapping a child destination;
@@ -6106,28 +6162,38 @@ impl KvmBackend {
         }
     }
 
-    /// Clears a CLONE_THREAD worker's CLONE_CHILD_CLEARTID word before the
-    /// worker's non-group terminal signal-boundary receipt is published.
+    /// Clears a thread's CLONE_CHILD_CLEARTID word before its non-group
+    /// terminal signal-boundary receipt is published: a CLONE_THREAD worker's,
+    /// and a process leader's that exits by itself (`pthread_exit` of the main
+    /// thread) while other threads of its process may live.
     ///
     /// Linux clears and wakes this word in `mm_release`, called from `exit_mm`,
-    /// before `exit_notify` makes the task's death observable. A receipt is
-    /// how a Tool observes that death; Detcore, for example, retires the task
-    /// and wakes a `pthread_join` waiter from it. If the clear waited for
-    /// `finish_tool_process`, the woken joiner would read the stale TID and
-    /// retry `FUTEX_WAIT` a host-timing-dependent number of times.
+    /// before `exit_notify` makes the task's death observable, for a leader as
+    /// for any other thread. A receipt is how a Tool observes that death;
+    /// Detcore, for example, retires the task and wakes a `pthread_join`
+    /// waiter from it. If the clear waited for `finish_tool_process`, the
+    /// woken joiner would read the stale TID and retry `FUTEX_WAIT` a
+    /// host-timing-dependent number of times, or wait for a wake that comes
+    /// only when the whole process finishes.
     ///
     /// The clear consumes the registered address, so the later call in
-    /// `finish_tool_process` does nothing. A process leader keeps its existing
-    /// discard-or-clear policy at the signal-return and finish sites.
-    pub(crate) fn clear_worker_tid_before_terminal_receipt(&mut self, executor: &mut ElfExecutor) {
-        if self.is_guest_thread {
-            self.clear_registered_worker_tid_before_exit(executor);
-        }
+    /// `finish_tool_process` does nothing. Only a thread's own exit has a
+    /// non-group receipt: a process killed by a signal keeps its discard
+    /// policy at the signal-return site.
+    pub(crate) fn clear_thread_tid_before_terminal_receipt(&mut self, executor: &mut ElfExecutor) {
+        self.clear_registered_worker_tid_before_exit(executor);
     }
 
     pub(crate) fn clear_registered_worker_tid_before_exit(&mut self, executor: &mut ElfExecutor) {
         #[cfg(test)]
         clear_tid_diagnostic::begin();
+        // The thread has made its last guest-visible change. Before anything
+        // makes its exit observable (the store and wake below, a terminal
+        // receipt, a Tool's deregistration), it stops counting as a user of
+        // the address space, so a sibling that sees the exit sees that too:
+        // the sole-member decision below and a later fork's do not depend on
+        // when this host thread finishes tearing down.
+        self.vcpu.retire_participant_from_guest();
         self.release_thread_slot();
         if executor.vfork_window_holds_clear_child_tid(&self.memory) {
             // A vfork child's word lies in memory its parent shares: the end
@@ -6148,15 +6214,18 @@ impl KvmBackend {
             && self.vcpu.is_sole_participant()
         {
             // Linux mm_release discards clear_child_tid in either case, but
-            // stores/wakes only for mm_users > 1. File pages shared with a
+            // stores/wakes only for mm_users > 1; an exiting thread drops its
+            // mm reference in exit_mm right after its mm_release, before
+            // anything makes its exit observable. File pages shared with a
             // different process do not share the guest mm. This certificate,
-            // with this vCPU the only one registered in the address space now
-            // (each thread's vCPU registers when the thread is created and
-            // leaves when it is dropped), proves the virtual last-user case;
-            // it is not a general model of host mm_users, which temporary
-            // /proc readers can also increment. No virtual observer owns such
-            // a reference here. Consume the registration without accessing its
-            // address; existing gate failures remain pending and unchanged.
+            // with every other thread of the address space retired (each
+            // thread's vCPU registers when the thread is created and stops
+            // counting at the thread's retirement above, in the guest's
+            // order), proves the virtual last-user case; it is not a general
+            // model of host mm_users, which temporary /proc readers can also
+            // increment. No virtual observer owns such a reference here.
+            // Consume the registration without accessing its address;
+            // existing gate failures remain pending and unchanged.
             // https://github.com/gregkh/linux/blob/v7.1.3/kernel/fork.c#L1463
             #[cfg(test)]
             clear_tid_diagnostic::stopped("single-owner shared-file process mm");
@@ -7144,10 +7213,11 @@ impl KvmBackend {
 
     /// Runs until the guest halts, invoking `handler` for each syscall vmcall.
     ///
-    /// Actual KVM_RUN interruption remains an error on this raw interface.
-    /// A private close against a running vCPU can also cause EINTR; this loop
-    /// does not distinguish that kick from a foreign interrupt. A production
-    /// closer must not use this driver without defining that distinction.
+    /// Actual KVM_RUN interruption remains an error on this raw interface. It
+    /// runs one vCPU, and no other thread of its address space, so no close
+    /// of the entry gate by a publication kicks it; a caller that closes the
+    /// gate against it from another thread must not use this driver, which
+    /// does not tell such a kick from a foreign interrupt.
     pub fn run<F>(&mut self, handler: F) -> Result<()>
     where
         F: FnMut(Syscall, &GuestMemory) -> i64,

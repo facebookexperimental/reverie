@@ -246,21 +246,15 @@ fn assert_member(gate: &EntryGate, id: CleanupIdentity, activity: Activity) {
 /// sends. An entry refuses any instance beyond its recorded kicks.
 /// A thread-directed send to the calling thread is delivered before it
 /// returns, since every entry leaves signal 64 unblocked.
-fn send_one(thread: libc::pthread_t, sends: &AtomicUsize) -> std::io::Result<()> {
-    let result = unsafe { libc::pthread_kill(thread, 64) };
-    if result != 0 {
-        return Err(std::io::Error::from_raw_os_error(result));
-    }
+fn send_one(thread: HostThread, sends: &AtomicUsize) -> std::io::Result<()> {
+    thread.signal(64)?;
     sends.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }
 
-fn send_three(thread: libc::pthread_t, sends: &AtomicUsize) -> std::io::Result<()> {
+fn send_three(thread: HostThread, sends: &AtomicUsize) -> std::io::Result<()> {
     for _ in 0..3 {
-        let result = unsafe { libc::pthread_kill(thread, 64) };
-        if result != 0 {
-            return Err(std::io::Error::from_raw_os_error(result));
-        }
+        thread.signal(64)?;
         sends.fetch_add(1, Ordering::SeqCst);
     }
     Ok(())
@@ -297,7 +291,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
     // Instances this thread took before this case; each case adds its kick.
     let base = signal::delivered_for_test();
     let kicked = u64::from(kind != Race::Withdrawn);
-    let pthread = unsafe { libc::pthread_self() };
+    let pthread = HostThread::current();
     let (mut backend, gate, probe) = make_backend(tracked);
     let pending = Arc::new(PendingClose::default());
     let phases = Arc::new(Mutex::new(Vec::new()));
@@ -525,7 +519,7 @@ fn race_case(kind: Race, blocked: bool, tracked: bool) {
     // No signal-mask/entry guard crosses this transfer. The second host has
     // the opposite saved signal-64 state and must observe no stale kick.
     let other = std::thread::spawn(move || {
-        assert_ne!(unsafe { libc::pthread_self() }, pthread);
+        assert_ne!(HostThread::current(), pthread);
         let restore = RestoreMask::install(!blocked);
         let other_mask = mask_bits();
         assert_ne!(other_mask & (1_u64 << 63), original & (1_u64 << 63));
@@ -619,7 +613,7 @@ fn error_case(blocked: bool, tracked: bool, selected: [bool; 2]) {
                     .unwrap()
                     .kicks = 3;
                 let sends = AtomicUsize::new(0);
-                send_three(unsafe { libc::pthread_self() }, &sends).unwrap();
+                send_three(HostThread::current(), &sends).unwrap();
                 assert_eq!(sends.load(Ordering::SeqCst), 3);
                 assert_eq!(signal::delivered_for_test(), base + 3);
             }

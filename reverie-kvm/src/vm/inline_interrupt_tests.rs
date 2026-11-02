@@ -12,7 +12,7 @@ pub(crate) mod inline_interrupt_tests {
 
     use super::*;
 
-    // Only these four tests enroll fresh owned host threads. The signal hook
+    // Only these five tests enroll fresh owned host threads. The signal hook
     // does no allocation, locking, TLS initialization or disposition change.
     static TIDS: [AtomicI32; 8] = [const { AtomicI32::new(0) }; 8];
     static DELIVERIES: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
@@ -126,11 +126,11 @@ pub(crate) mod inline_interrupt_tests {
         }
     }
     fn registered(group: &GuestThreadGroup, root: bool) -> bool {
-        let pthread = unsafe { libc::pthread_self() };
+        let target = GuestThreadTarget::current();
         if root {
-            *group.root.lock().unwrap() == Some(pthread)
+            *group.root.lock().unwrap() == Some(target)
         } else {
-            group.workers.lock().unwrap().contains(&pthread)
+            group.workers.lock().unwrap().contains(&target)
         }
     }
     fn suspend(registration: &GuestThreadRegistration) -> GuestInterruptSuspension<'_> {
@@ -141,6 +141,85 @@ pub(crate) mod inline_interrupt_tests {
                 Arc::new(crate::failure::tool_panics::ToolPanics::default()),
             )
             .unwrap()
+    }
+
+    /// In a process created by a raw `clone(2)`, as reverie-process creates
+    /// its children, glibc's descriptor of the initial thread keeps its
+    /// parent's thread ID, so `pthread_kill` to that thread from another one
+    /// fails with ESRCH (the test checks that it does). A group exit still
+    /// interrupts a root registered on that thread: the interrupt is sent to
+    /// the kernel's thread ID, read on the thread when it registered.
+    #[test]
+    fn a_group_exit_interrupts_a_root_on_the_initial_thread_of_a_raw_clone_child() {
+        const CHILD: &str = "REVERIE_KVM_GROUP_RAW_CLONE_CHILD";
+        const NAME: &str = "vm::tests::inline_interrupt_tests::a_group_exit_interrupts_a_root_on_the_initial_thread_of_a_raw_clone_child";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("raw-clone child: the root was interrupted"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        extern "C" fn child(_: *mut libc::c_void) -> libc::c_int {
+            install_worker_interrupt_handler().unwrap();
+            let initial = unsafe { libc::pthread_self() };
+            let seen = Deliveries::new();
+            let group = Arc::new(GuestThreadGroup::default());
+            let registration = GuestThreadRegistration::register(group.clone(), true).unwrap();
+            let exiting = group.clone();
+            let peer = crate::supervisor_thread::builder()
+                .spawn(move || {
+                    // What the interrupt used to be sent with: glibc's cached
+                    // ID is stale here. Signal 0 checks and sends nothing.
+                    let cached = unsafe { libc::pthread_kill(initial, 0) };
+                    exiting.request_exit_group(ExitStatus::Exited(0));
+                    cached
+                })
+                .unwrap();
+            let cached = peer.join().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while seen.count() == 0 && Instant::now() < deadline {
+                // A real system call returns through the kernel, which runs
+                // the handler for a pending interrupt here.
+                unsafe { libc::syscall(libc::SYS_getppid) };
+            }
+            let delivered = seen.count();
+            drop(registration);
+            if cached != libc::ESRCH || delivered != 1 {
+                println!("raw-clone child: pthread_kill gave {cached}, interrupts delivered {delivered}");
+                return 1;
+            }
+            println!("raw-clone child: the root was interrupted");
+            0
+        }
+
+        let mut stack = vec![0_u8; 1 << 20];
+        // SAFETY: the child runs on its own copy of this process, without
+        // CLONE_VM, on the top of `stack`, which outlives the call.
+        let pid = unsafe {
+            libc::clone(
+                child,
+                stack.as_mut_ptr().add(stack.len()).cast(),
+                libc::SIGCHLD,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(pid > 0, "clone: {}", std::io::Error::last_os_error());
+        let mut status = 0;
+        // SAFETY: status is a valid out-parameter.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "raw-clone child status {status:#x}"
+        );
     }
 
     #[test]
@@ -287,7 +366,7 @@ pub(crate) mod inline_interrupt_tests {
             let suspended = suspend(&registration);
             // A real contradictory registry state must refuse restoration,
             // not erase the child error or silently bless ownership replacement.
-            *group.root.lock().unwrap() = Some(registration.pthread);
+            *group.root.lock().unwrap() = Some(registration.target);
             let original = Arc::new(Error::UnexpectedVcpuExit(
                 "original child failure".to_owned(),
             ));
@@ -301,7 +380,7 @@ pub(crate) mod inline_interrupt_tests {
             assert_eq!(cleanup.len(), 1);
             assert!(matches!(cleanup[0].primary(), Error::EntryControl { .. }));
             let suspended = suspend(&registration);
-            *group.root.lock().unwrap() = Some(registration.pthread);
+            *group.root.lock().unwrap() = Some(registration.target);
             let error = suspended.finish::<()>(Err(Error::RunAborted)).unwrap_err();
             assert!(matches!(error.primary(), Error::EntryControl { .. }));
             let Error::WithCleanup { cleanup, .. } = error else {
@@ -321,7 +400,7 @@ pub(crate) mod inline_interrupt_tests {
                     panics.clone(),
                 )
                 .unwrap();
-            *group.root.lock().unwrap() = Some(registration.pthread);
+            *group.root.lock().unwrap() = Some(registration.target);
             drop(suspended);
             let pending = gate
                 .pending_failure()

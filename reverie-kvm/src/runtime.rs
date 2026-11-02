@@ -5423,7 +5423,7 @@ impl KvmBackend {
             // a Tool may wake a joiner from it. Linux clears CLONE_CHILD_CLEARTID
             // before that death is observable, so the joiner must not see the
             // stale TID word.
-            self.clear_worker_tid_before_terminal_receipt(executor);
+            self.clear_thread_tid_before_terminal_receipt(executor);
         }
         if let reverie::SignalBoundaryOutcome::Terminated {
             group: true,

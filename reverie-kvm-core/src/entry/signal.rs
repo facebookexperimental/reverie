@@ -9,14 +9,19 @@
 //! The embedding process reserves Linux signal 64 for KVM entry control.
 //! SIGURG remains the independent worker-cancellation signal.
 //!
-//! A closer interrupts a running vCPU by sending signal 64 to its thread, and
-//! the thread's handler stops the vCPU as QEMU's and Firecracker's do. Signal
+//! A closer interrupts a running vCPU by sending signal 64 to its thread
+//! (`tgkill(2)` to the kernel's thread ID, which the entry read on the thread:
+//! see `HostThread`), and the thread's handler stops the vCPU as QEMU's and
+//! Firecracker's do. Signal
 //! 64 is unblocked on a vCPU thread from its first entry on. The handler
 //! counts the delivery and, while an entry is published on the thread, sets
 //! that vCPU's `kvm_run.immediate_exit` byte. An instance arriving inside
 //! `KVM_RUN` ends it with EINTR. One arriving after the entry's signal setup
 //! but before `KVM_RUN` runs the handler outside it, and `immediate_exit` then
-//! makes `KVM_RUN` return EINTR without entering the guest. Entry control
+//! makes `KVM_RUN` return EINTR without entering the guest. One arriving after
+//! `KVM_RUN` returned is counted and stores nothing: the entry takes the byte
+//! back from the handler before it decodes the exit through a reference to the
+//! `kvm_run` page (`RunEntry::run_vcpu`). Entry control
 //! therefore needs no KVM signal mask of its own: `KVM_RUN` runs under the
 //! thread's mask, or a vCPU mask composed from it that keeps signal 64's
 //! state, and entry control adds no host syscall to an entry besides
@@ -55,7 +60,7 @@ use crate::Result;
 #[cfg(any(test, feature = "test-support"))]
 use crate::error_ext::ErrorExt;
 
-const SIGNAL: libc::c_int = 64;
+pub(super) const SIGNAL: libc::c_int = 64;
 
 thread_local! {
     /// Instances of the reserved signal that this thread's handler has taken.
@@ -236,26 +241,20 @@ pub struct ImmediateExit(std::ptr::NonNull<u8>);
 
 // SAFETY: the byte is accessed only on the thread running an entry for its
 // vCPU: by that thread's signal handler while the entry is published, and by
-// the entry's cleanup after unpublishing. Both use single-byte atomics, and the
-// kernel reads the byte with READ_ONCE at each KVM_RUN. kvm-ioctls'
-// VcpuFd::run forms a `&mut kvm_run` over the mapped page after KVM_RUN
-// returns, and a late handler run can store this byte while it exists. That
-// is the store Firecracker makes through kvm-ioctls from the same handler
-// position, kvm-ioctls never touches immediate_exit through that reference,
-// and the kernel itself writes this page. Moving the value between threads
-// moves only the address.
+// the entry's cleanup after retracting it. Both use single-byte atomics, and
+// the kernel reads the byte with READ_ONCE at each KVM_RUN. No Rust reference
+// into the kvm_run page exists while the handler may store: the entry issues
+// KVM_RUN itself and retracts the byte from the handler (Control::retract)
+// before it decodes the exit through a `&mut kvm_run` (RunEntry::run_vcpu),
+// and the handler, which runs on this same thread, either finished before the
+// retraction or finds nothing published after it. A late kick, one a closer
+// sent after KVM_RUN returned, is still counted, and stores nothing. A closer
+// waits a bounded time for a kick to take effect
+// (EntryGate::close_blocking), so one that never does fails with a typed
+// error. Moving the value between threads moves only the address.
 //
-// That late store is reachable only through a kick sent after KVM_RUN
-// returned, and EntryGate::try_close, the only sender, has no production
-// caller; or through a foreign signal 64, which breaks the embedding contract
-// and makes the thread's next entry refuse. PRECONDITION for the first
-// production caller of try_close
-// (https://github.com/rrnewton/reverie/issues/1051): first remove this
-// aliasing, either with a raw-provenance kvm_run accessor (in kvm-ioctls or a
-// fork) so exit decoding never holds `&mut kvm_run` over this byte, or by
-// issuing KVM_RUN here and decoding the exits it uses from raw pointers; and
-// bound the closer's wait so a kick that never takes effect fails loudly with
-// a typed error.
+// A foreign signal 64 breaks the embedding contract and makes the thread's
+// next entry refuse.
 unsafe impl Send for ImmediateExit {}
 // SAFETY: as for Send; a shared reference permits only copying the address.
 unsafe impl Sync for ImmediateExit {}
@@ -316,7 +315,7 @@ impl Control {
         // counted before that entry acknowledged, and no closer can know this
         // entry before it is published. An extra instance has no sender.
         if delivered() != RECORDED.get() {
-            control.unpublish();
+            control.retract();
             return Err(protocol_failure(
                 "unexplained reserved host signal before entry",
             ));
@@ -327,8 +326,10 @@ impl Control {
     /// Stop the handler from touching this entry's vCPU, then clear any
     /// immediate_exit it set so the vCPU's next KVM_RUN enters the guest.
     /// The handler runs on this thread, so it either finished before the
-    /// unpublish or sees null after it; the fence keeps the clear after it.
-    fn unpublish(&mut self) {
+    /// retraction or sees null after it; the fence keeps the clear after it.
+    /// Idempotent: an entry retracts as soon as its KVM_RUN returns
+    /// (`RunEntry::run_vcpu`), and its cleanup retracts again.
+    pub(super) fn retract(&mut self) {
         PUBLISHED_EXIT.with(|published| published.store(std::ptr::null_mut(), Ordering::Relaxed));
         std::sync::atomic::compiler_fence(Ordering::SeqCst);
         if let Some(exit) = self.immediate_exit.take() {
@@ -362,7 +363,7 @@ impl Control {
             // which would otherwise land later in an unrelated host call.
             deliver_pending();
         }
-        self.unpublish();
+        self.retract();
         let (delivered, recorded) = (delivered(), RECORDED.get());
         if delivered > recorded {
             return Err(protocol_failure(
@@ -379,7 +380,7 @@ impl Control {
 impl Drop for Control {
     fn drop(&mut self) {
         // Idempotent; finish already did this on every ordinary path.
-        self.unpublish();
+        self.retract();
     }
 }
 

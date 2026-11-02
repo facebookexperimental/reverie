@@ -35,10 +35,18 @@
  * With "thread-then-map" a second thread is alive when the process maps the
  * file, and with "map-then-thread" the process creates a thread while it
  * holds the views.
+ *
+ * With "sibling-map", another thread of the parent maps a MAP_SHARED view of
+ * the file with MAP_FIXED over a private page while a vfork child runs. The
+ * page holds 'A' and the file 'B'. Pipes order the steps: the child starts,
+ * the other thread maps, then the child reads the page and exits with its
+ * byte (the child waits for the mapping at most two seconds). On Linux the
+ * child shares the address space, so it reads 'B'.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -214,6 +222,66 @@ static int threads(int map_first) {
   return 0;
 }
 
+/* Mode "sibling-map". */
+static int sibling_started[2];
+static int sibling_mapped[2];
+static int sibling_fd;
+static unsigned char *volatile sibling_page;
+
+static void *map_beside_vfork(void *argument) {
+  (void)argument;
+  char byte;
+  REQUIRE(read(sibling_started[0], &byte, 1) == 1, "the vfork child's start");
+  void *over = mmap((void *)sibling_page, PAGE, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_FIXED, sibling_fd, 0);
+  REQUIRE(over == (void *)sibling_page, "a view over the private page");
+  REQUIRE(write(sibling_mapped[1], "m", 1) == 1, "the mapping's notice");
+  return NULL;
+}
+
+static int sibling_map(void) {
+  sibling_fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  REQUIRE(sibling_fd >= 0, "create file");
+  unsigned char bytes[PAGE];
+  memset(bytes, 'B', sizeof(bytes));
+  REQUIRE(write(sibling_fd, bytes, sizeof(bytes)) == (ssize_t)sizeof(bytes),
+          "write file");
+  sibling_page = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  REQUIRE(sibling_page != MAP_FAILED, "the private page");
+  memset((void *)sibling_page, 'A', PAGE);
+  REQUIRE(pipe2(sibling_started, O_CLOEXEC) == 0 &&
+              pipe2(sibling_mapped, O_CLOEXEC) == 0,
+          "pipes");
+  pthread_t thread;
+  REQUIRE(pthread_create(&thread, NULL, map_beside_vfork, NULL) == 0,
+          "pthread_create");
+  pid_t child = vfork();
+  REQUIRE(child >= 0, "vfork");
+  if (child == 0) {
+    char byte;
+    struct pollfd notice = {sibling_mapped[0], POLLIN, 0};
+    if (syscall(SYS_write, sibling_started[1], "s", 1) != 1) {
+      _exit(2);
+    }
+    /* Bounded, so that a run that refuses the mapping leaves no process
+     * waiting for its notice. */
+    if (syscall(SYS_poll, &notice, 1, 2000) != 1 ||
+        syscall(SYS_read, sibling_mapped[0], &byte, 1) != 1) {
+      _exit(3);
+    }
+    _exit(sibling_page[0]);
+  }
+  int status = wait_status(child);
+  REQUIRE(WIFEXITED(status) &&
+              (WEXITSTATUS(status) == 'A' || WEXITSTATUS(status) == 'B'),
+          "the vfork child's read");
+  REQUIRE(pthread_join(thread, NULL) == 0, "pthread_join");
+  printf("shared-file vfork sibling-map child=%c parent=%c\n",
+         WEXITSTATUS(status), sibling_page[0]);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "helper") == 0) {
     return helper();
@@ -226,6 +294,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && strcmp(argv[1], "map-then-thread") == 0) {
     return threads(1);
+  }
+  if (argc == 2 && strcmp(argv[1], "sibling-map") == 0) {
+    return sibling_map();
   }
   /* "child-signal-only" leaves out the signal to the parent. */
   int parent_signal =

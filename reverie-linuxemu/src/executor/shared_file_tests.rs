@@ -499,6 +499,61 @@ mod shared_file_dispatch_tests {
         assert_eq!(&kept, b"private!");
     }
 
+    /// A mapping that a publication installs carries what it maps from the
+    /// moment the publication releases the allocation transaction: the
+    /// transaction's next holder (another thread's MADV_DONTNEED, which
+    /// drops a private file page to be read again but zeroes private
+    /// anonymous memory, or a fork's snapshot) sees the new mapping's file
+    /// offset. Here a private mapping of the file from its second page
+    /// replaces a shared view with MAP_FIXED, and a shared view from its
+    /// third page then replaces that.
+    #[test]
+    fn a_publication_records_what_it_maps_before_it_releases_the_transaction() {
+        let mut f = Fixture::new();
+        let fd = f.open(true);
+        let view = f.shared(fd, 0, 0, true);
+        assert_eq!(f.memory.file_offset(view), Some(0));
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let map_over = |f: &mut Fixture, flags: libc::c_int, offset: u64| {
+            let memory = f.memory.clone();
+            let seen = observed.clone();
+            let hook = crate::memory::after_allocation_release_for_test(move || {
+                seen.borrow_mut().push(memory.file_offset(view));
+            });
+            let result = syscall_result(
+                &mut f.memory,
+                &mut f.state,
+                libc::SYS_mmap,
+                [
+                    view,
+                    PAGE_SIZE,
+                    (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                    (flags | libc::MAP_FIXED) as u64,
+                    fd as u64,
+                    offset,
+                ],
+            );
+            drop(hook);
+            assert_eq!(result, view as i64);
+            let seen = std::mem::take(&mut *observed.borrow_mut());
+            assert!(!seen.is_empty(), "no allocation transaction was released");
+            assert!(
+                seen.iter().all(|offset_seen| *offset_seen == Some(offset)),
+                "a release saw another mapping's file offset: {seen:?}, expected {offset:#x}"
+            );
+            assert_eq!(f.memory.file_offset(view), Some(offset));
+        };
+        map_over(&mut f, libc::MAP_PRIVATE, PAGE_SIZE);
+        assert!(!f.memory.range_contains_shared_file(view, PAGE_SIZE as usize));
+        let mut bytes = vec![0; PAGE_SIZE as usize];
+        f.memory.user().read(view, &mut bytes).unwrap();
+        assert_eq!(bytes, f.expected[PAGE_SIZE as usize..2 * PAGE_SIZE as usize]);
+        map_over(&mut f, libc::MAP_SHARED, 2 * PAGE_SIZE);
+        assert!(f.memory.range_contains_shared_file(view, PAGE_SIZE as usize));
+        f.memory.user().read(view, &mut bytes).unwrap();
+        assert_eq!(bytes, f.expected[2 * PAGE_SIZE as usize..]);
+    }
+
     /// MAP_FIXED_NOREPLACE's refusals in Linux's order: an unaligned offset
     /// first (EINVAL), then a bad or O_PATH descriptor (EBADF), an overlap,
     /// a stack page above the mapping range included (EEXIST), and only

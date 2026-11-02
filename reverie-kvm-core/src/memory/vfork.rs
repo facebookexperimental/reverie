@@ -77,6 +77,16 @@
 //! was cannot be told from no store, so the child's change to that byte goes
 //! back over it.
 //!
+//! The same holds for another thread's mapping changes during the window. On
+//! Linux the child sees them at once; here its copy keeps the mappings it
+//! started with. A change to a shared view (a new view, or a private mapping
+//! or a hole in place of one) would show the child a page Linux would not, so
+//! it is refused by name before it takes effect: the window is open over the
+//! parent from before the copy reads its image until the child's changes go
+//! back (`GuestMemory::publish_range_from`). A new private mapping, in
+//! place of private memory or not, is a documented limit like a store: the
+//! child that reads it sees the memory from before the window.
+//!
 //! Comparing the end of the window with its start cannot see what happened in
 //! between, so three more cases are documented limits rather than refusals: a
 //! byte the child changed and changed back (or another thread did, an ABA),
@@ -111,6 +121,50 @@ pub(super) struct VforkParent {
     /// not reach on Linux either.
     exec_count: u64,
     baseline: Option<VforkBaseline>,
+    /// Keeps the window open over the parent until the link drops, at the
+    /// window's end ([`GuestMemory::return_vfork_changes`],
+    /// [`GuestMemory::abandon_vfork_changes`], an exec of the child) or with
+    /// the copy.
+    _window: OpenVforkWindow,
+}
+
+/// One vfork window open over a parent memory's image, listed in its
+/// `open_vfork_windows` from [`OpenVforkWindow::open`] to drop.
+#[derive(Debug)]
+pub(super) struct OpenVforkWindow {
+    mapping: Arc<Mapping>,
+    /// The exec count of the image the window is open over.
+    exec_count: u64,
+}
+
+impl OpenVforkWindow {
+    /// Opens a window over `parent`'s current image.
+    pub(super) fn open(parent: &GuestMemory) -> Self {
+        let mut windows = parent.mapping.open_vfork_windows.lock().unwrap();
+        let exec_count = parent
+            .mapping
+            .exec_count
+            .load(std::sync::atomic::Ordering::Acquire);
+        windows.push(exec_count);
+        drop(windows);
+        Self {
+            mapping: parent.mapping.clone(),
+            exec_count,
+        }
+    }
+}
+
+impl Drop for OpenVforkWindow {
+    fn drop(&mut self) {
+        let mut windows = self
+            .mapping
+            .open_vfork_windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = windows.iter().position(|&count| count == self.exec_count) {
+            windows.swap_remove(index);
+        }
+    }
 }
 
 /// The copy as it was when the child started, kept for a parent with another
@@ -137,17 +191,27 @@ const RUN_PAGES: u64 = 256;
 
 impl GuestMemory {
     /// Records `parent` as the parent whose address space this copy stands in
-    /// for, from the copy until the child's changes go back.
-    pub(super) fn link_vfork_parent(&self, parent: &GuestMemory) {
-        let exec_count = parent
+    /// for, from the copy until the child's changes go back, keeping
+    /// `window`, opened over the parent's image before the copy read it.
+    pub(super) fn link_vfork_parent(&self, parent: &GuestMemory, window: OpenVforkWindow) {
+        debug_assert!(Arc::ptr_eq(&window.mapping, &parent.mapping));
+        *self.mapping.vfork_parent.lock().unwrap() = Some(VforkParent {
+            memory: parent.clone(),
+            exec_count: window.exec_count,
+            baseline: None,
+            _window: window,
+        });
+    }
+
+    /// Whether a vfork window is open over this memory's current image
+    /// ([`OpenVforkWindow`]).
+    pub(super) fn vfork_window_open(&self) -> bool {
+        let windows = self.mapping.open_vfork_windows.lock().unwrap();
+        let exec_count = self
             .mapping
             .exec_count
             .load(std::sync::atomic::Ordering::Acquire);
-        *self.mapping.vfork_parent.lock().unwrap() = Some(VforkParent {
-            memory: parent.clone(),
-            exec_count,
-            baseline: None,
-        });
+        windows.contains(&exec_count)
     }
 
     /// Keeps this vfork child's copy as it is now, before the child runs, so

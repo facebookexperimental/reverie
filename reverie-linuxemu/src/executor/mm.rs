@@ -812,6 +812,7 @@ pub(super) fn munmap_shared_file(
             contents: None,
             permissions: None,
             cursors: None,
+            provenance: None,
         },
     )?;
     Ok(0)

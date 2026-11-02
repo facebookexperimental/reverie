@@ -13474,6 +13474,9 @@ int main(void) {
 
 const TERMINAL_RECEIPT_CHILD_TID: u64 = 0x0800_3000;
 static TERMINAL_RECEIPT_MEMORY: Mutex<Option<reverie_kvm::GuestMemory>> = Mutex::new(None);
+/// Held by each test that installs `TERMINAL_RECEIPT_MEMORY`, so tests in one
+/// process take turns with it.
+static TERMINAL_RECEIPT_EXCLUSIVE: Mutex<()> = Mutex::new(());
 
 /// Reserves a permit for a worker's `SYS_exit`, as Detcore does for exit
 /// boundaries, and records the worker's CLONE_CHILD_CLEARTID word at the
@@ -13582,6 +13585,9 @@ fn worker_exit_clears_child_tid_before_terminal_receipt() {
     if !kvm_available("worker exit CHILD_CLEARTID terminal receipt ordering test") {
         return;
     }
+    let _exclusive = TERMINAL_RECEIPT_EXCLUSIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let directory = TestDirectory::new();
     let executable = compile_c_program(
@@ -13639,6 +13645,127 @@ int main(void) {
 
     let completion = futures::executor::block_on(
         backend.run_static_elf_with_tool_completion::<TerminalReceiptTool>((), true),
+    );
+    *TERMINAL_RECEIPT_MEMORY
+        .lock()
+        .expect("terminal-receipt memory lock poisoned") = None;
+    let completion = completion.unwrap();
+    let global = completion.global_state;
+    let (status, stdout, stderr) = completion.result.unwrap();
+    assert_eq!(status, reverie::ExitStatus::Exited(0));
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert!(global.permit.into_inner().unwrap().is_none());
+    assert_eq!(
+        global.receipts.into_inner().unwrap(),
+        vec![(
+            reverie::SignalBoundaryOutcome::Terminated {
+                group: false,
+                wait_status: 0,
+            },
+            0,
+        )],
+    );
+}
+
+/// Reserves a permit for the leader's own `SYS_exit` (the main thread's
+/// `pthread_exit`), as Detcore does for exit boundaries.
+#[derive(Default)]
+struct LeaderTerminalReceiptTool;
+
+#[reverie::tool]
+impl Tool for LeaderTerminalReceiptTool {
+    type GlobalState = TerminalReceiptGlobal;
+    type ThreadState = ();
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        if call.number() == Sysno::exit && guest.tid() == guest.pid() {
+            let task = guest
+                .signal_task_identity()
+                .expect("a running leader has a task identity");
+            guest.send_rpc(task).await;
+        }
+        guest.tail_inject(call).await
+    }
+}
+
+/// A process leader that exits by itself while another of its threads lives
+/// (the main thread's `pthread_exit`) has its CLONE_CHILD_CLEARTID word
+/// cleared before its terminal receipt is published, as a worker's is: Linux
+/// runs `mm_release` at every thread's `exit_mm`, before the exit is
+/// observable, and a Tool may wake the leader's joiner from that receipt. The
+/// other thread waits for the word to become zero and then ends the group.
+#[test]
+fn leader_exit_clears_child_tid_before_terminal_receipt() {
+    if !kvm_available("leader exit CHILD_CLEARTID terminal receipt ordering test") {
+        return;
+    }
+    let _exclusive = TERMINAL_RECEIPT_EXCLUSIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "leader-exit-cleartid-receipt",
+        r#"
+#define _GNU_SOURCE
+#include <sched.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define TID_WORD ((volatile int *)UINT64_C(0x08003000))
+static _Alignas(16) unsigned char worker_stack[1 << 20];
+
+static int worker_main(void *unused) {
+  (void)unused;
+  // Bounded, so that a word nobody clears ends the run instead of hanging it.
+  for (long spins = 0; *TID_WORD != 0; spins++) {
+    if (spins == 1000000) syscall(SYS_exit_group, 3);
+    syscall(SYS_sched_yield);
+  }
+  syscall(SYS_exit_group, 0);
+  return 44;
+}
+
+int main(void) {
+  void *mapped = mmap((void *)TID_WORD, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  if (mapped != (void *)TID_WORD) return 20;
+  *TID_WORD = (int)syscall(SYS_gettid);
+  syscall(SYS_set_tid_address, (int *)TID_WORD);
+  int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+              CLONE_THREAD | CLONE_SYSVSEM;
+  if (clone(worker_main, worker_stack + sizeof(worker_stack), flags, 0) < 0)
+    return 22;
+  syscall(SYS_exit, 0);
+  return 23;
+}
+"#,
+    );
+    let executable = executable.to_str().unwrap();
+    let image = std::fs::read(executable).unwrap();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_with_context(
+            &image,
+            &[executable],
+            &["PATH=/usr/bin:/bin"],
+            &directory.0,
+        )
+        .unwrap();
+    *TERMINAL_RECEIPT_MEMORY
+        .lock()
+        .expect("terminal-receipt memory lock poisoned") = Some(backend.memory().unwrap().clone());
+
+    let completion = futures::executor::block_on(
+        backend.run_static_elf_with_tool_completion::<LeaderTerminalReceiptTool>((), true),
     );
     *TERMINAL_RECEIPT_MEMORY
         .lock()
@@ -22763,12 +22890,139 @@ fn shared_file_views_with_threads_match_native() {
         };
         assert!(
             error.contains(
-                "unsupported KVM shared-file operation shared-file fork snapshot: requires one \
-                 stopped vCPU"
+                "unsupported KVM shared-file operation shared-file fork snapshot: another thread \
+                 of the process is alive"
             ),
             "fork mode={name}: {error}"
         );
         eprintln!("shared-file-threads refused fork {name}");
+    }
+}
+
+/// A publication interrupts every vCPU that runs guest code
+/// (`fixtures/shared_file_threads.c`): in mode "spin" a worker spins in user
+/// code, making no system call, while the main thread maps a view, so the
+/// publication's close must kick that vCPU out of the guest by the reserved
+/// signal; in mode "publish-vs-clone" a publisher maps and unmaps a view 200
+/// times while the main thread creates and joins 200 short threads, so
+/// closes meet vCPUs that are starting, running and retiring. Each matches
+/// native Linux on KVM, without a tool and with the strace tool owning
+/// threads on the host or through the tool.
+#[test]
+fn shared_file_publications_kick_running_and_new_vcpus_as_natively() {
+    const TEST: &str = "shared_file_publications_kick_running_and_new_vcpus_as_natively";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-threads",
+        include_str!("fixtures/shared_file_threads.c"),
+    );
+    for (mode, expected) in [
+        (
+            "spin",
+            "mapped a shared view with 2 threads alive\na thread spinning in user code through \
+             the mapping went on\nthreads joined\n",
+        ),
+        (
+            "publish-vs-clone",
+            "200 threads came and went beside 200 mappings; the file counts 200\n",
+        ),
+    ] {
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{mode}"),
+            &[mode],
+        );
+        assert_eq!(native.status.code(), Some(0), "{mode}: {native:?}");
+        assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "{mode}");
+        for kvm_mode in SHARED_FILE_VFORK_MODES {
+            let name = kvm_mode.0;
+            let (_, code, stdout, stderr) =
+                run_shared_file_vfork_on_kvm(&directory.0, &program, kvm_mode, &[mode])
+                    .unwrap_or_else(|error| panic!("{mode} mode={name}: {error}"));
+            assert_eq!(
+                code, 0,
+                "{mode} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert_eq!(stdout, native.stdout, "{mode} mode={name}");
+            assert_eq!(stderr, native.stderr, "{mode} mode={name}");
+            eprintln!("shared-file-threads completed {mode} {name}");
+        }
+    }
+}
+
+/// What a process that holds shared views may do once its other threads
+/// have exited (`fixtures/shared_file_threads.c`) does not depend on when
+/// their host threads finish tearing down: a thread stops counting as a user
+/// of the address space at its exit, in the guest's order. Mode "join-fork"
+/// forks five times, each time after joining the only other thread; mode
+/// "leader-exit-fork" forks from a child's last thread after its main thread
+/// exited; and in mode "leader-cleartid" a forked child's last thread exits
+/// with its clear_child_tid word in shared anonymous memory, which Linux
+/// leaves unwritten when no other task uses the address space. Each run
+/// matches native Linux on KVM, three times over, without a tool and with the
+/// strace tool owning threads on the host or through the tool.
+#[test]
+fn shared_file_threads_that_exited_stop_counting_in_the_guests_order() {
+    const TEST: &str = "shared_file_threads_that_exited_stop_counting_in_the_guests_order";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-threads",
+        include_str!("fixtures/shared_file_threads.c"),
+    );
+    for (mode, expected) in [
+        (
+            "join-fork",
+            "forked five times, each after joining the only other thread\n",
+        ),
+        (
+            "leader-exit-fork",
+            "the child's last thread forked after its main thread exited\nthe child exited 0\n",
+        ),
+        (
+            "leader-cleartid",
+            "the child's last thread exited; its clear_child_tid word holds 0x5eedf00d\n",
+        ),
+    ] {
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{mode}"),
+            &[mode],
+        );
+        assert_eq!(native.status.code(), Some(0), "{mode}: {native:?}");
+        assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "{mode}");
+        for round in 0..3 {
+            for kvm_mode in SHARED_FILE_VFORK_MODES {
+                let name = kvm_mode.0;
+                let run_directory = directory.0.join(format!("{mode}-{round}"));
+                std::fs::create_dir_all(&run_directory).unwrap();
+                let (_, code, stdout, stderr) =
+                    run_shared_file_vfork_on_kvm(&run_directory, &program, kvm_mode, &[mode])
+                        .unwrap_or_else(|error| {
+                            panic!("{mode} round {round} mode={name}: {error}")
+                        });
+                assert_eq!(
+                    code, 0,
+                    "{mode} round {round} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&stdout),
+                    expected,
+                    "{mode} round {round} mode={name}"
+                );
+                assert_eq!(stderr, native.stderr, "{mode} round {round} mode={name}");
+            }
+        }
+        eprintln!("shared-file-threads completed {mode} 3 rounds x 3 modes");
     }
 }
 
@@ -22821,6 +23075,63 @@ fn shared_file_view_over_a_waiting_futex_word_is_refused_by_name() {
         ),
         "{error}"
     );
+}
+
+/// While a vfork child runs, another thread of its parent maps a shared view
+/// of a file with MAP_FIXED over a private page
+/// (`fixtures/shared_file_vfork.c`, mode "sibling-map"). On Linux the child
+/// shares the address space and reads the file's byte through the new view.
+/// On KVM the child runs on a copy, which the view would not reach, so the
+/// mapping is refused by name before it takes effect; the child never reads
+/// the page from before as if it were Linux's.
+#[test]
+fn shared_file_view_mapped_beside_a_vfork_child_is_refused_by_name() {
+    const TEST: &str = "shared_file_view_mapped_beside_a_vfork_child_is_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-vfork",
+        include_str!("fixtures/shared_file_vfork.c"),
+    );
+    let native = run_shared_file_vfork_natively(
+        &directory.0,
+        &program,
+        "native-sibling-map",
+        &["sibling-map"],
+    );
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "shared-file vfork sibling-map child=B parent=B\n"
+    );
+    for mode in SHARED_FILE_VFORK_MODES {
+        let name = mode.0;
+        let error =
+            match run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &["sibling-map"]) {
+                Ok((_, code, stdout, stderr)) => panic!(
+                    "mode={name}: expected the refusal, got code={code} stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                ),
+                // The program's doing (a mapping beside a vfork child), so a
+                // refusal by name rather than a failure of the backend.
+                Err(error) => {
+                    assert!(refused_by_name(&error), "mode={name}: {error:?}");
+                    error.to_string()
+                }
+            };
+        assert!(
+            error.contains(
+                "unsupported KVM shared-file operation mapping publication: a vfork child of \
+                 this process runs on a copy of its address space"
+            ),
+            "mode={name}: {error}"
+        );
+        eprintln!("shared-file-vfork refused sibling-map {name}");
+    }
 }
 
 /// A vfork child that changes a shared view it inherited is refused by name

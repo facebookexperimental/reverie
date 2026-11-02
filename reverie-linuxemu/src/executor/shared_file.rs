@@ -10,6 +10,7 @@ use std::os::fd::AsFd;
 
 use super::*;
 use crate::memory::AllocationGuard;
+use crate::memory::MappingProvenance;
 use crate::memory::PrivateRangePlan;
 use crate::memory::SharedFileRangePlan;
 
@@ -347,15 +348,19 @@ pub(super) fn mmap_with_shared_files(
                 contents: file_bytes.as_deref(),
                 permissions: Some((prot != libc::PROT_NONE as u64, writable)),
                 cursors: Some(cursors),
+                // Recorded with the installation, before the publication
+                // releases the allocation transaction: another thread's
+                // MADV_DONTNEED or fork would otherwise see the new mapping
+                // as private anonymous memory.
+                provenance: Some(MappingProvenance {
+                    file_offset: kind.file_offset(),
+                    shared_anonymous: is_anonymous && is_shared,
+                }),
             },
         )?;
     }
-    memory.record_page_backing(
-        address,
-        length as u64,
-        kind.file_offset(),
-        is_anonymous && is_shared,
-    );
+    // Either publication recorded the new mapping's provenance with it
+    // (a shared view's file offset by `publish_shared_file_range`).
     state.mmap_next = cursors.mmap_next;
     Ok(memory.physical_to_user(address).unwrap_or(address) as i64)
 }

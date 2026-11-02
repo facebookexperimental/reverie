@@ -99,6 +99,13 @@ impl RunProbe {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Runs `hook` once, after the next entry is prepared and activated and
+    /// before its `KVM_RUN`.
+    pub(crate) fn after_prepare(&self, hook: impl FnOnce() + Send + 'static) {
+        let previous = self.after_prepare.lock().unwrap().replace(Box::new(hook));
+        assert!(previous.is_none(), "entry control replaced an armed hook");
+    }
+
     fn run_hook(&self) {
         let hook = self.before_run.lock().unwrap().take();
         if let Some(hook) = hook {
@@ -397,10 +404,16 @@ impl CountedVcpu {
         self.participant.origin()
     }
 
-    /// Whether this vCPU is the only one registered in its address space now
-    /// (`Participant::is_sole_member`).
+    /// Whether this vCPU's thread is the only one using its address space
+    /// now: every other thread has retired (`Participant::is_sole_member`).
     pub(crate) fn is_sole_participant(&self) -> bool {
         self.participant.is_sole_member()
+    }
+
+    /// This vCPU's guest thread has retired: it enters no more and no longer
+    /// counts as a user of its address space (`Participant::retire_from_guest`).
+    pub(crate) fn retire_participant_from_guest(&mut self) {
+        self.participant.retire_from_guest();
     }
 
     /// The attribution this vCPU's own memory handle carries: none, since
@@ -616,7 +629,7 @@ impl CountedVcpu {
         self.clock.stepping_entry = self.stepped;
         // Declare entry first: unwinding must retire the clock and restore CPU
         // affinity before entry withdraws its target and checks its signals.
-        let Some(entry) = self
+        let Some(mut entry) = self
             .participant
             .prepare(Some(self.immediate_exit))
             .map_err(|failure| failure.error())?
@@ -637,7 +650,8 @@ impl CountedVcpu {
             if let Some(probe) = &self.run_probe {
                 probe.prepare.increment(&probe.untracked_runs);
             }
-            let exit = finish_entry(self.fd.run().map_err(Error::Kvm), entry);
+            let run = entry.run_vcpu(&mut self.fd).map_err(Error::Kvm);
+            let exit = finish_entry(run, entry);
             if exit.is_ok() && self.sync_regs {
                 self.synced_exit
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -656,7 +670,7 @@ impl CountedVcpu {
         if let Some(probe) = &self.run_probe {
             probe.prepare.increment(&probe.tracked_runs);
         }
-        let result = self.fd.run();
+        let result = entry.run_vcpu(&mut self.fd);
         // VcpuExit borrows only fd. Always finish the separate clock interval,
         // including EINTR and other KVM errors, before exposing that exit.
         let result = finish_run(result, interval);

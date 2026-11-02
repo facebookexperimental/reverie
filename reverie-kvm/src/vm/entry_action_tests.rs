@@ -29,7 +29,7 @@ pub(crate) mod entry_action_tests {
     const ORIGINAL_CHILD: i32 = -202;
     const STOP: i32 = 29;
     const EXEC_EXIT: i32 = 53;
-    const STAGES: [&str; 12] = [
+    const STAGES: [&str; 13] = [
         "snapshot",
         "fork_backend",
         "thread_backend",
@@ -38,6 +38,7 @@ pub(crate) mod entry_action_tests {
         "park_restore",
         "park_prepare",
         "park_hlt",
+        "park_interrupted",
         "fork_executor",
         "host_spawn",
         "tool_spawn",
@@ -699,5 +700,54 @@ pub(crate) mod entry_action_tests {
     #[test]
     fn prepared_tool_thread_parking_stops_before_child_state_and_start() {
         all_cases(Site::ToolThread);
+    }
+
+    /// A kick that lands on a process action's park entry (another thread's
+    /// close of admission, which kicks every running vCPU) ends its
+    /// `KVM_RUN` with EINTR before the vCPU reaches its park. The attempt
+    /// reports the interruption, not a failure of the action; while the close
+    /// holds, an attempt makes no entry, and once admission reopens the next
+    /// one parks.
+    #[test]
+    fn an_interrupted_park_entry_is_entered_again_not_failed() {
+        let mut backend =
+            KvmBackend::new(0x10000).expect("the interrupted park control requires /dev/kvm");
+        backend.install_real_mode_program(0x1000, &[0xf4]).unwrap();
+        let gate = backend.memory.entry_gate();
+        let closing = Arc::new(Mutex::new(None));
+        let hook_closing = closing.clone();
+        let hook_gate = gate.clone();
+        let probe = Arc::new(crate::clock::RunProbe::default());
+        probe.after_prepare(move || {
+            // The entry is published: the close kicks this very thread, whose
+            // handler stops the KVM_RUN below before it enters the guest.
+            let close = hook_gate.try_close().unwrap().unwrap();
+            assert!(hook_closing.lock().unwrap().replace(close).is_none());
+        });
+        backend.vcpu.set_run_probe(probe.clone());
+        probe.arm();
+        let stages = Arc::new(Stages::default());
+        let _observations = ObservationScope::new(stages.clone());
+        let attempt = backend.try_park_process_action("interrupted park control");
+        assert!(
+            matches!(attempt, Ok(ParkAttempt::Interrupted)),
+            "{attempt:?}"
+        );
+        assert!(gate.pending_failure().is_none());
+        let close = closing.lock().unwrap().take().unwrap();
+        let closed = futures::executor::block_on(close.finish()).unwrap();
+        let attempt = backend.try_park_process_action("interrupted park control");
+        assert!(
+            matches!(attempt, Ok(ParkAttempt::AdmissionClosed)),
+            "{attempt:?}"
+        );
+        drop(closed);
+        let attempt = backend.try_park_process_action("interrupted park control");
+        assert!(
+            matches!(attempt, Ok(ParkAttempt::Parked(Ok(())))),
+            "{attempt:?}"
+        );
+        stages.assert_exact(&[("park_interrupted", 1), ("park_hlt", 1)]);
+        assert!(gate.pending_failure().is_none());
     }
 }

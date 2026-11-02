@@ -34094,9 +34094,12 @@ mod tests {
         assert_eq!(&page_bytes(&memory, shared), b"reused!!");
     }
 
-    /// Sharing the object needs the forking address space quiescent. With
-    /// another live participant, the fork refuses by name instead of handing
-    /// the child a private copy, and the parent's memory is unchanged.
+    /// Sharing the object needs the forking thread to be the only live one.
+    /// With another live participant, the fork refuses by name instead of
+    /// handing the child a private copy, and the parent's memory is
+    /// unchanged. A participant whose thread has exited (retired, its host
+    /// side perhaps still tearing down) does not count: the fork then shares
+    /// the object.
     #[test]
     fn shared_anonymous_fork_refuses_with_another_live_participant() {
         let (_root, mut state, mut memory) = madvise_memory(4);
@@ -34109,16 +34112,23 @@ mod tests {
         );
         memory.write(shared, b"prefork!").unwrap();
         let _forking = memory.entry_gate().register().unwrap();
-        let _sibling = memory.entry_gate().register().unwrap();
+        let mut sibling = memory.entry_gate().register().unwrap();
         match memory.snapshot() {
-            Err(crate::Error::SharedFileCapability { operation, .. }) => {
-                assert_eq!(operation, "fork with shared anonymous memory");
-            }
+            Err(
+                error @ crate::Error::UnsupportedSharedFile {
+                    operation: "fork with shared anonymous memory",
+                    ..
+                },
+            ) => assert!(error.is_named_refusal(), "{error}"),
             Err(other) => panic!("expected the shared anonymous fork refusal, got {other}"),
             Ok(_) => panic!("fork with a live sibling copied shared anonymous memory"),
         }
         assert_eq!(memory.separately_backed_pages(), 0);
         assert_eq!(&page_bytes(&memory, shared), b"prefork!");
+        sibling.retire_from_guest();
+        let mut child = memory.snapshot().unwrap();
+        child.write(shared, b"shared!!").unwrap();
+        assert_eq!(&page_bytes(&memory, shared), b"shared!!");
     }
 
     #[test]
