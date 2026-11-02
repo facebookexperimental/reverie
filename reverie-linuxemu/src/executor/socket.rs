@@ -708,13 +708,34 @@ pub(super) fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace
         return negative_errno(libc::EFAULT);
     }
     let length = requested_length.min(MAX_HOST_IO);
-    let Ok(writable) = memory.accessible_prefix(args[1], length, Access::Read) else {
-        return negative_errno(libc::EFAULT);
+    // The host receives into staging whose inaccessible part is PROT_NONE
+    // where the guest's is (`StagedIoVector`), so its kernel makes Linux's
+    // decisions for the guest's buffer: a datagram or seqpacket record is
+    // taken off the queue before the copy that faults, and freed (EFAULT,
+    // unix_dgram_recvmsg); a stream returns what it copied before the fault;
+    // MSG_PEEK takes nothing.
+    let accessible = memory
+        .accessible_prefix(args[1], length, Access::Write)
+        .unwrap_or(0);
+    let mut staged = match StagedIoVector::new(
+        GuestIoVec {
+            base: args[1],
+            length,
+        },
+        accessible,
+        PAGE_SIZE as usize,
+    ) {
+        Ok(staged) => staged,
+        Err(error) => return error,
     };
-    if writable == 0 && requested_length != 0 {
+    if accessible != 0
+        && memory
+            .read_exact(args[1], staged.accessible_slice_mut(accessible))
+            .is_err()
+    {
         return negative_errno(libc::EFAULT);
     }
-    let mut bytes = vec![0; writable];
+    let host_iov = staged_host_iovecs(std::slice::from_mut(&mut staged))[0];
 
     // SAFETY: a zeroed sockaddr_storage is valid scratch space for recvfrom.
     let mut address =
@@ -744,23 +765,40 @@ pub(super) fn recvfrom<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace
         std::ptr::from_mut(&mut address_length)
     };
 
-    // SAFETY: bytes is writable for its full length, the optional peer address
-    // points to initialized host storage, and host_fd is guest-owned.
+    // SAFETY: host_iov is the staging for the guest's `length` bytes (its
+    // inaccessible suffix PROT_NONE), the optional peer address points to
+    // initialized host storage, and host_fd is guest-owned.
     let result = unsafe {
         libc::recvfrom(
             host_fd,
-            bytes.as_mut_ptr().cast::<libc::c_void>(),
-            bytes.len(),
+            host_iov.iov_base,
+            host_iov.iov_len,
             flags,
             address_pointer,
             length_pointer,
         )
     };
     if result < 0 {
-        return io_error(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        // Linux may have copied into the accessible prefix before the fault.
+        // The staging was filled from guest memory, so publishing all of it
+        // keeps both the changed and the untouched bytes.
+        if error.raw_os_error() == Some(libc::EFAULT)
+            && accessible != 0
+            && memory
+                .write_exact(args[1], staged.accessible_slice(accessible))
+                .is_err()
+        {
+            return negative_errno(libc::EFAULT);
+        }
+        return io_error(error);
     }
-    let copy_length = (result as usize).min(bytes.len());
-    if copy_length != 0 && memory.write_exact(args[1], &bytes[..copy_length]).is_err() {
+    let copy_length = (result as usize).min(length).min(accessible);
+    if copy_length != 0
+        && memory
+            .write_exact(args[1], staged.accessible_slice(copy_length))
+            .is_err()
+    {
         return negative_errno(libc::EFAULT);
     }
 
@@ -1407,15 +1445,11 @@ pub(super) fn recvmsg(
         if next_length > MAX_HOST_IO {
             return negative_errno(libc::EINVAL);
         }
-        if iov.iov_len != 0 {
-            let mut probe = vec![0; iov.iov_len];
-            if memory
-                .user()
-                .read(iov.iov_base as usize as u64, &mut probe)
-                .is_err()
-            {
-                return negative_errno(libc::EFAULT);
-            }
+        // import_iovec checks each segment's address range (access_ok)
+        // before anything is received; accessibility decides only the copy.
+        if let Err(error) = validate_guest_iovec_address(iov.iov_base as usize as u64, iov.iov_len)
+        {
+            return error;
         }
         payload_length = next_length;
         guest_iovecs.push(iov);
@@ -1432,7 +1466,6 @@ pub(super) fn recvmsg(
     if control_capacity != 0 && message.msg_control.is_null() {
         return negative_errno(libc::EFAULT);
     }
-    let mut payload = vec![0u8; payload_length];
     let mut name = vec![0u8; name_capacity];
     let mut control = vec![0u8; control_capacity];
     for (address, length) in [
@@ -1447,10 +1480,32 @@ pub(super) fn recvmsg(
         }
     }
 
-    let mut host_iov = libc::iovec {
-        iov_base: payload.as_mut_ptr().cast(),
-        iov_len: payload.len(),
-    };
+    // Each segment is received into staging whose inaccessible part is
+    // PROT_NONE where the guest's is, as `recvfrom` receives, so the host
+    // kernel takes and frees a record whose copy faults, as Linux does.
+    let mut staged_vectors = Vec::with_capacity(guest_iovecs.len());
+    for iov in &guest_iovecs {
+        let guest = GuestIoVec {
+            base: iov.iov_base as usize as u64,
+            length: iov.iov_len,
+        };
+        let accessible = ProviderMemory(memory)
+            .accessible_prefix(guest.base, guest.length, Access::Write)
+            .unwrap_or(0);
+        let mut staged = match StagedIoVector::new(guest, accessible, PAGE_SIZE as usize) {
+            Ok(staged) => staged,
+            Err(error) => return error,
+        };
+        if accessible != 0
+            && ProviderMemory(memory)
+                .read_exact(guest.base, staged.accessible_slice_mut(accessible))
+                .is_err()
+        {
+            return negative_errno(libc::EFAULT);
+        }
+        staged_vectors.push(staged);
+    }
+    let mut host_iovecs = staged_host_iovecs(&mut staged_vectors);
     let mut host_header = libc::msghdr {
         msg_name: if name.is_empty() {
             std::ptr::null_mut()
@@ -1458,8 +1513,8 @@ pub(super) fn recvmsg(
             name.as_mut_ptr().cast()
         },
         msg_namelen: name.len() as libc::socklen_t,
-        msg_iov: std::ptr::from_mut(&mut host_iov),
-        msg_iovlen: usize::from(!payload.is_empty()),
+        msg_iov: host_iovecs.as_mut_ptr(),
+        msg_iovlen: host_iovecs.len(),
         msg_control: if control.is_empty() {
             std::ptr::null_mut()
         } else {
@@ -1481,7 +1536,30 @@ pub(super) fn recvmsg(
         )
     };
     if received < 0 {
-        return io_error(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        // Linux may have copied into the segments' accessible prefixes, up to
+        // the first fault, before reporting EFAULT; the staging was filled
+        // from guest memory, so publishing those prefixes keeps both the
+        // changed and the untouched bytes. A faulting receive's descriptors
+        // were released by the host kernel, as by Linux.
+        if error.raw_os_error() == Some(libc::EFAULT) {
+            for vector in &staged_vectors {
+                if vector.accessible_length != 0
+                    && ProviderMemory(memory)
+                        .write_exact(
+                            vector.guest.base,
+                            vector.accessible_slice(vector.accessible_length),
+                        )
+                        .is_err()
+                {
+                    return negative_errno(libc::EFAULT);
+                }
+                if vector.accessible_length < vector.guest.length {
+                    break;
+                }
+            }
+        }
+        return io_error(error);
     }
 
     let used_control = host_header.msg_controllen.min(control.len());
@@ -1494,24 +1572,23 @@ pub(super) fn recvmsg(
         Err(error) => return error,
     };
 
-    let copied_length = (received as usize).min(payload.len());
-    let mut copied = 0usize;
-    for iov in &guest_iovecs {
-        let length = iov.iov_len.min(copied_length.saturating_sub(copied));
-        if length != 0
-            && memory
-                .user()
-                .write(
-                    iov.iov_base as usize as u64,
-                    &payload[copied..copied + length],
-                )
+    let mut remaining = (received as usize).min(payload_length);
+    for vector in &staged_vectors {
+        let transferred = remaining.min(vector.guest.length);
+        let copied = transferred.min(vector.accessible_length);
+        if copied != 0
+            && ProviderMemory(memory)
+                .write_exact(vector.guest.base, vector.accessible_slice(copied))
                 .is_err()
         {
             let dropped = rights.iter().map(|right| &right.file);
             release_dropped_proc_transfers(state, dropped, flags & libc::MSG_PEEK != 0);
             return negative_errno(libc::EFAULT);
         }
-        copied += length;
+        remaining -= transferred;
+        if remaining == 0 {
+            break;
+        }
     }
     if name_capacity != 0
         && memory

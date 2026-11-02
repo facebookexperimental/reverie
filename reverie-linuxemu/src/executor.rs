@@ -14719,6 +14719,221 @@ mod tests {
         }
     }
 
+    /// What a receive of up to 2 bytes into memory that is inaccessible from
+    /// its first byte (`straddle` false) or from its second (true), then one
+    /// into a good buffer, give natively on a fresh pair of `kind` holding the
+    /// records "AB" and "CD": the first receive's result (with `peek`,
+    /// MSG_PEEK) and the byte it left before the inaccessible page, then the
+    /// second's result and bytes. `vectored` receives with recvmsg, else
+    /// recvfrom.
+    fn native_receive_after_fault(
+        kind: libc::c_int,
+        vectored: bool,
+        peek: bool,
+        straddle: bool,
+    ) -> (i64, u8, i64, [u8; 2]) {
+        let mut pair = [0; 2];
+        // SAFETY: pair is writable storage for two descriptors.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, pair.as_mut_ptr()) },
+            0
+        );
+        for record in [b"AB", b"CD"] {
+            // SAFETY: record is two readable bytes.
+            assert_eq!(
+                unsafe { libc::send(pair[0], record.as_ptr().cast(), 2, 0) },
+                2
+            );
+        }
+        let page = PAGE_SIZE as usize;
+        // SAFETY: a fresh anonymous mapping of two pages, unmapped below; its
+        // second page is made inaccessible.
+        let area = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(area, libc::MAP_FAILED);
+        let inaccessible = area.cast::<u8>().wrapping_add(page);
+        // SAFETY: the second page lies within the mapping.
+        assert_eq!(
+            unsafe { libc::mprotect(inaccessible.cast(), page, libc::PROT_NONE) },
+            0
+        );
+        let receive = |buffer: *mut u8, flags: libc::c_int| -> i64 {
+            let result = if vectored {
+                let mut iov = libc::iovec {
+                    iov_base: buffer.cast(),
+                    iov_len: 2,
+                };
+                // SAFETY: an all-zero msghdr is valid; iov is live for the call.
+                let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+                message.msg_iov = std::ptr::from_mut(&mut iov);
+                message.msg_iovlen = 1;
+                // SAFETY: message and iov are live; the kernel checks buffer.
+                unsafe { libc::recvmsg(pair[1], &mut message, flags) }
+            } else {
+                // SAFETY: the kernel checks buffer.
+                unsafe { libc::recv(pair[1], buffer.cast(), 2, flags) }
+            };
+            if result < 0 {
+                negative_errno(std::io::Error::last_os_error().raw_os_error().unwrap())
+            } else {
+                result as i64
+            }
+        };
+        let flags = libc::MSG_DONTWAIT | if peek { libc::MSG_PEEK } else { 0 };
+        let buffer = if straddle {
+            inaccessible.wrapping_sub(1)
+        } else {
+            inaccessible
+        };
+        let faulted = receive(buffer, flags);
+        // SAFETY: the byte before the inaccessible page is readable.
+        let before = unsafe { *inaccessible.wrapping_sub(1) };
+        let mut next = [0u8; 2];
+        let next_result = receive(next.as_mut_ptr(), libc::MSG_DONTWAIT);
+        // SAFETY: the mapping and descriptors are owned here.
+        unsafe {
+            libc::munmap(area, 2 * page);
+            libc::close(pair[0]);
+            libc::close(pair[1]);
+        }
+        (faulted, before, next_result, next)
+    }
+
+    /// A receive into inaccessible memory makes Linux's decisions for the
+    /// guest's buffer: a seqpacket or datagram record is taken off the queue
+    /// before its copy faults, so the receive fails with EFAULT and the next
+    /// one gets the record after it; with MSG_PEEK the record stays queued.
+    /// Into a buffer whose first byte is accessible, the receive copies that
+    /// byte and still fails with EFAULT. The provider used to refuse a wholly
+    /// inaccessible buffer before receiving, leaving the record queued, and
+    /// to receive into the accessible prefix of a straddling one, returning a
+    /// truncated record where Linux fails. `recvfrom` and `recvmsg` are each
+    /// compared with the same calls made natively.
+    #[test]
+    fn receives_into_inaccessible_memory_consume_records_as_linux_does() {
+        const PAIR_FDS: u64 = 0x80;
+        const BYTES: u64 = 0x100;
+        const GOOD: u64 = 0x200;
+        const MESSAGE: u64 = 0x300;
+        const IOV: u64 = 0x380;
+        const INACCESSIBLE: u64 = 2 * PAGE_SIZE;
+
+        let root = TestDir::new();
+        let mut state = test_state(&root.0);
+        let mut memory = GuestMemory::new(0, 4 * PAGE_SIZE as usize).unwrap();
+        memory.write(BYTES, b"ABCD").unwrap();
+        memory.enable_user_access();
+        memory.map_user_range(0, 2 * PAGE_SIZE, false).unwrap();
+        memory
+            .map_user_range(INACCESSIBLE, PAGE_SIZE, true)
+            .unwrap();
+        for kind in [libc::SOCK_SEQPACKET, libc::SOCK_DGRAM] {
+            for vectored in [false, true] {
+                for peek in [false, true] {
+                    for straddle in [false, true] {
+                        assert_eq!(
+                            syscall_result(
+                                &mut memory,
+                                &mut state,
+                                libc::SYS_socketpair,
+                                [libc::AF_UNIX as u64, kind as u64, 0, PAIR_FDS, 0, 0],
+                            ),
+                            0
+                        );
+                        let [first, second]: [libc::c_int; 2] = read_struct(&memory, PAIR_FDS);
+                        for offset in [0, 2] {
+                            assert_eq!(
+                                syscall_result(
+                                    &mut memory,
+                                    &mut state,
+                                    libc::SYS_sendto,
+                                    [first as u64, BYTES + offset, 2, 0, 0, 0],
+                                ),
+                                2
+                            );
+                        }
+                        let mut receive =
+                            |memory: &mut GuestMemory, buffer: u64, flags: libc::c_int| {
+                                if !vectored {
+                                    return syscall_result(
+                                        memory,
+                                        &mut state,
+                                        libc::SYS_recvfrom,
+                                        [second as u64, buffer, 2, flags as u64, 0, 0],
+                                    );
+                                }
+                                let iov = libc::iovec {
+                                    iov_base: buffer as usize as *mut libc::c_void,
+                                    iov_len: 2,
+                                };
+                                assert_eq!(write_struct(&mut ProviderMemory(memory), IOV, &iov), 0);
+                                // SAFETY: an all-zero msghdr is valid; its
+                                // pointers name guest addresses.
+                                let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+                                message.msg_iov = IOV as usize as *mut libc::iovec;
+                                message.msg_iovlen = 1;
+                                assert_eq!(
+                                    write_struct(&mut ProviderMemory(memory), MESSAGE, &message),
+                                    0
+                                );
+                                syscall_result(
+                                    memory,
+                                    &mut state,
+                                    libc::SYS_recvmsg,
+                                    [second as u64, MESSAGE, flags as u64, 0, 0, 0],
+                                )
+                            };
+                        let flags = libc::MSG_DONTWAIT | if peek { libc::MSG_PEEK } else { 0 };
+                        memory.write(INACCESSIBLE - 1, &[0]).unwrap();
+                        let buffer = if straddle {
+                            INACCESSIBLE - 1
+                        } else {
+                            INACCESSIBLE
+                        };
+                        let faulted = receive(&mut memory, buffer, flags);
+                        let mut before = [0u8];
+                        memory.read(INACCESSIBLE - 1, &mut before).unwrap();
+                        memory.write(GOOD, &[0, 0]).unwrap();
+                        let next_result = receive(&mut memory, GOOD, libc::MSG_DONTWAIT);
+                        let mut next = [0u8; 2];
+                        memory.read(GOOD, &mut next).unwrap();
+                        let native = native_receive_after_fault(kind, vectored, peek, straddle);
+                        let case = format!(
+                            "type {kind} vectored {vectored} peek {peek} straddle {straddle}"
+                        );
+                        assert_eq!((faulted, before[0], next_result, next), native, "{case}");
+                        assert_eq!(native.0, negative_errno(libc::EFAULT), "{case}");
+                        assert_eq!(
+                            native.1,
+                            if straddle { b'A' } else { 0 },
+                            "{case}: the bytes copied before the fault stay"
+                        );
+                        assert_eq!(native.3, if peek { *b"AB" } else { *b"CD" }, "{case}");
+                        for fd in [first, second] {
+                            assert_eq!(
+                                syscall_result(
+                                    &mut memory,
+                                    &mut state,
+                                    libc::SYS_close,
+                                    [fd as u64, 0, 0, 0, 0, 0]
+                                ),
+                                0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn elf_executor_accepts_unix_listener_connection() {
         const ADDRESS: u64 = 0x100;
