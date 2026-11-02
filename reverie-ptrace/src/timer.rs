@@ -211,6 +211,15 @@ pub(crate) static BLOCK_BOUND_MISSES: std::sync::atomic::AtomicU64 =
 /// instruction step, as before block steps (x86_64) and branch runs
 /// (aarch64) existed. Any other value, or none,
 /// leaves block steps on. For measurement and as an escape hatch.
+///
+/// On aarch64, a thread's first branch run registers two of its hardware
+/// breakpoint slots, disabled between runs, and they stay registered until
+/// the thread execs or exits: ptrace has no request that unregisters one.
+/// A guest thread that arms breakpoints of its own through
+/// `perf_event_open` after that finds two fewer free slots than natively,
+/// and can get `ENOSPC` where a native run would not. Breakpoints it armed
+/// before are left alone: with fewer than two free slots the thread takes
+/// no branch runs. Setting this to `0` avoids the reservation entirely.
 pub const BLOCK_STEP_ENV: &str = "REVERIE_BLOCK_STEP";
 
 /// When set (to anything), every hit in the block bound cache re-reads the
