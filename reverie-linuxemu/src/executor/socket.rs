@@ -1617,21 +1617,9 @@ pub(super) fn recvmsg(
         Ok(installed) => installed,
         Err(error) => return error,
     };
-    if control_capacity != 0 {
-        // Detcore snapshots the caller's original capacity before injection and
-        // rereads that entire region to canonicalize timestamps. Zero the tail
-        // so stripped host metadata or stale guest bytes cannot be reparsed as
-        // a second control record.
-        let mut guest_control = vec![0; control_capacity];
-        guest_control[..control_bytes.len()].copy_from_slice(&control_bytes);
-        if memory
-            .user()
-            .write(message.msg_control as usize as u64, &guest_control)
-            .is_err()
-        {
-            rollback_received_rights(state, &installed);
-            return negative_errno(libc::EFAULT);
-        }
+    if !publish_received_control(memory, message.msg_control as usize as u64, &control_bytes) {
+        rollback_received_rights(state, &installed);
+        return negative_errno(libc::EFAULT);
     }
     let mut message_flags = host_header.msg_flags;
     if flags & libc::MSG_CMSG_CLOEXEC == 0 {
@@ -1652,6 +1640,18 @@ pub(super) fn recvmsg(
         return negative_errno(libc::EFAULT);
     }
     received as i64
+}
+
+/// Writes the control messages a receive returned, `control` (already
+/// sanitized, with the guest's descriptor numbers), to the guest's control
+/// buffer at `address`, and nothing past them: Linux writes each control
+/// message where the previous one ended (`put_cmsg`) and leaves the rest of
+/// the buffer as the caller left it, so a buffer that also covers the
+/// caller's own header or payload keeps those bytes. Its length goes back in
+/// `msg_controllen`, which is what a reader of the buffer after the call
+/// reads. False if the bytes cannot be written.
+fn publish_received_control(memory: &GuestMemory, address: u64, control: &[u8]) -> bool {
+    control.is_empty() || memory.user().write(address, control).is_ok()
 }
 
 /// Writes back, to the guest `msghdr` at `address` (`message`, as read
@@ -1951,21 +1951,17 @@ pub(super) fn recvmmsg(
                 };
             }
         };
-        if control_capacity != 0 {
-            let mut guest_control = vec![0; control_capacity];
-            guest_control[..control_bytes.len()].copy_from_slice(&control_bytes);
-            if memory
-                .user()
-                .write(message.msg_hdr.msg_control as usize as u64, &guest_control)
-                .is_err()
-            {
-                rollback_received_rights(state, &installed);
-                return if delivered == 0 {
-                    negative_errno(libc::EFAULT)
-                } else {
-                    delivered as i64
-                };
-            }
+        if !publish_received_control(
+            memory,
+            message.msg_hdr.msg_control as usize as u64,
+            &control_bytes,
+        ) {
+            rollback_received_rights(state, &installed);
+            return if delivered == 0 {
+                negative_errno(libc::EFAULT)
+            } else {
+                delivered as i64
+            };
         }
         let mut message_flags = host_header.msg_flags;
         if flags & libc::MSG_CMSG_CLOEXEC == 0 {
