@@ -11,11 +11,19 @@
 //! Closing admission accounts for vCPU setup, running vCPUs, return cleanup,
 //! and admitted host copies. It neither completes pending guest syscalls nor
 //! waits for host operations using an already retained pointer. Those retained
-//! operands are counted separately: an unchanged close may finish around them,
-//! but a mapping publication must refuse while any remains live.
+//! operands are recorded separately, each with the arena range it may touch:
+//! an unchanged close may finish around them, but a mapping publication must
+//! refuse while one overlaps the range it replaces.
+//!
+//! A mapping publication closes admission for every vCPU of the address
+//! space. Running vCPUs are interrupted with the reserved signal; the others
+//! are already outside the guest, so a close made while a tool holds every
+//! other vCPU outside the guest sends no signal and waits for no guest
+//! progress.
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::panic::resume_unwind;
@@ -24,6 +32,8 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::time::Duration;
+use std::time::Instant;
 
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -294,7 +304,6 @@ impl std::fmt::Debug for PendingFailure {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-// Not used outside tests yet: The private unchanged-mapping close protocol has no production closer yet.
 pub enum Admission {
     Open,
     Closing(u64),
@@ -323,15 +332,17 @@ pub struct Member {
 
 pub struct State {
     pub admission: Admission,
-    // An ordinary shared-file image is supported only by its existing vCPU.
-    // A quiescent close reserves this before any mapping can be installed.
-    single_member_domain: bool,
     generation: MappingGeneration,
     next_member: u64,
     next_close: u64,
     pub members: BTreeMap<u64, Member>,
     copies: usize,
-    retained_operands: usize,
+    /// The arena byte range each live retained operand may touch, by its
+    /// identity. An unchanged close finishes around them; a publication
+    /// refuses one that overlaps the range it replaces. Retaining one
+    /// requires an admitted copy, so none is added while admission is closed.
+    retained_operands: BTreeMap<u64, Range<usize>>,
+    next_operand: u64,
     failure: Option<Arc<PendingFailure>>,
     /// The change future. Its fields are private to [`change`], so every
     /// subscriber must go through [`change::ChangeFuture::subscribe`], which
@@ -347,6 +358,11 @@ pub struct State {
     /// always makes a FUTEX_WAKE syscall, and nearly every change (a copy's
     /// retirement, an entry's acknowledgement) happens with nobody waiting.
     blocked_copiers: usize,
+    /// Closers parked on `copy_changed` until every member stops
+    /// ([`Closing::finish_blocking`]) or an overlapping retained operand
+    /// retires ([`Closed::wait_for_operands_outside`]). As for copies, a
+    /// change wakes the condition variable only when one exists.
+    blocked_closers: usize,
     owner_notifications: Vec<owner::OwnerNotification>,
     retired_origins: Vec<EntryOrigin>,
     /// Set, under this lock, right after `failure` is first recorded; shared
@@ -477,9 +493,10 @@ impl State {
     /// subscriber taken before a recheck therefore cannot miss this change.
     ///
     /// Both wake paths are skipped when nobody can be waiting, which is the
-    /// common case. No wakeup is lost: a parked copy registers in
-    /// `blocked_copiers`, and a subscriber marks the change future taken, under
-    /// this same lock before it waits, so every later change sees it.
+    /// common case. No wakeup is lost: a parked copy or closer registers in
+    /// `blocked_copiers` or `blocked_closers`, and a subscriber marks the
+    /// change future taken, under this same lock before it waits, so every
+    /// later change sees it.
     fn changed(&mut self) -> ChangeSignal {
         let sender = self.change.rearm_if_taken();
         ChangeSignal {
@@ -489,7 +506,8 @@ impl State {
             } else {
                 None
             },
-            copies: (self.blocked_copiers != 0).then(|| self.copy_changed.clone()),
+            copies: (self.blocked_copiers != 0 || self.blocked_closers != 0)
+                .then(|| self.copy_changed.clone()),
             owners: std::mem::take(&mut self.owner_notifications),
             origins: std::mem::take(&mut self.retired_origins),
         }
@@ -508,6 +526,22 @@ impl State {
                 .values()
                 .all(|member| member.activity == Activity::Stopped)
     }
+
+    /// The first live retained operand whose range overlaps `range`.
+    fn overlapping_operand(&self, range: &Range<usize>) -> Option<Range<usize>> {
+        self.retained_operands
+            .values()
+            .find(|operand| ranges_overlap(operand, range))
+            .cloned()
+    }
+}
+
+/// Whether two arena byte ranges share a byte. An empty range shares none.
+fn ranges_overlap(first: &Range<usize>, second: &Range<usize>) -> bool {
+    first.start < first.end
+        && second.start < second.end
+        && first.start < second.end
+        && second.start < first.end
 }
 
 fn notify(change: ChangeSignal) {
@@ -591,7 +625,7 @@ impl EntryGate {
             closed: matches!(state.admission, Admission::Closed(_)),
             generation: state.generation,
             copies: state.copies,
-            retained_operands: state.retained_operands,
+            retained_operands: state.retained_operands.len(),
             copy_waits: state.copy_waits,
             copy_admissions: state.copy_admissions,
             copy_waiters: state.copy_waiters.clone(),
@@ -617,19 +651,20 @@ impl EntryGate {
             failure_recorded: failure_recorded.clone(),
             state: Mutex::new(State {
                 admission: Admission::Open,
-                single_member_domain: false,
                 generation: MappingGeneration::INITIAL,
                 next_member: 0,
                 next_close: 0,
                 members: BTreeMap::new(),
                 copies: 0,
-                retained_operands: 0,
+                retained_operands: BTreeMap::new(),
+                next_operand: 0,
                 failure: None,
                 change: change::ChangeFuture::new(),
                 failed_sender: Some(failed_sender),
                 failed: failed.shared(),
                 copy_changed: Arc::new(Condvar::new()),
                 blocked_copiers: 0,
+                blocked_closers: 0,
                 owner_notifications: Vec::new(),
                 retired_origins: Vec::new(),
                 failure_recorded: failure_recorded.clone(),
@@ -729,49 +764,36 @@ impl EntryGate {
         failure
     }
 
-    /// Registration while closed is allowed, but grants no entry or access.
-    /// The ordinary shared-file domain is the exception: its existing member
-    /// is exclusive, and bypassing the syscall-level refusal is terminal.
+    /// Registration while closed is allowed, but grants no entry or access:
+    /// the new member is stopped, so a close still holds, and it first enters
+    /// against whatever image is installed when admission reopens.
     pub fn register(self: &Arc<Self>) -> GateResult<Participant> {
         let result = {
             let mut state = self.state.lock().unwrap();
             state.check()?;
-            if state.single_member_domain
-                && (state.admission != Admission::Open || !state.members.is_empty())
-            {
-                Err(state.fail(
-                    None,
-                    protocol_failure(
-                        "ordinary shared-file domain permits only its existing stopped participant",
-                    ),
-                ))
-            } else {
-                match state.next_member.checked_add(1) {
-                    Some(id) => {
-                        state.next_member = id;
-                        state.members.insert(
-                            id,
-                            Member {
-                                run: 0,
-                                generation: None,
-                                activity: Activity::Stopped,
-                                kicks: 0,
-                            },
-                        );
-                        Ok(Participant {
-                            gate: self.clone(),
-                            id,
-                            key: signal::participant_key(),
-                            origin: EntryOrigin::default(),
-                            entry_outstanding: false,
-                            #[cfg(any(test, feature = "test-support"))]
-                            prepare_probe: None,
-                        })
-                    }
-                    None => {
-                        Err(state.fail(None, protocol_failure("participant identity exhausted")))
-                    }
+            match state.next_member.checked_add(1) {
+                Some(id) => {
+                    state.next_member = id;
+                    state.members.insert(
+                        id,
+                        Member {
+                            run: 0,
+                            generation: None,
+                            activity: Activity::Stopped,
+                            kicks: 0,
+                        },
+                    );
+                    Ok(Participant {
+                        gate: self.clone(),
+                        id,
+                        key: signal::participant_key(),
+                        origin: EntryOrigin::default(),
+                        entry_outstanding: false,
+                        #[cfg(any(test, feature = "test-support"))]
+                        prepare_probe: None,
+                    })
                 }
+                None => Err(state.fail(None, protocol_failure("participant identity exhausted"))),
             }
         };
         if result.is_err() {
@@ -781,10 +803,24 @@ impl EntryGate {
         result
     }
 
-    /// Quietly inspect the capability restriction before a fork or snapshot
-    /// can create a new participant or copy a shared-file image.
-    pub fn single_member_domain_active(&self) -> bool {
-        self.state.lock().unwrap().single_member_domain
+    /// Whether admission is open now: no close is in progress or held, so no
+    /// mapping publication is under way. A recorded failure is returned
+    /// instead. Every production closer holds its memory's allocation
+    /// transaction, so a caller holding that transaction can check here that
+    /// no closer bypassed it.
+    pub fn admission_open(&self) -> GateResult<bool> {
+        let state = self.state.lock().unwrap();
+        state.check()?;
+        Ok(state.admission == Admission::Open)
+    }
+
+    /// How many vCPUs are registered in this gate's address space now. A
+    /// vCPU registers when it is created and leaves when it is dropped. A
+    /// recorded failure is returned instead.
+    pub(crate) fn member_count(&self) -> GateResult<usize> {
+        let state = self.state.lock().unwrap();
+        state.check()?;
+        Ok(state.members.len())
     }
 
     /// Close synchronously only when the sole participant is already stopped
@@ -792,17 +828,14 @@ impl EntryGate {
     /// never interrupts, waits, or notifies: `None` changes no state. Callers
     /// can therefore retain their allocation transaction during admission and
     /// construct any capability failure after releasing that transaction.
-    ///
-    /// The domain reservation and member check occur under the same lock, so
-    /// registration cannot slip between the check and the first file mapping.
     pub(crate) fn try_close_quiescent_single(self: &Arc<Self>) -> GateResult<Option<Closed>> {
         self.try_close_quiescent_members(1)
     }
 
     /// Publish into an unexecuted arena without fabricating a stopped vCPU.
-    /// This has the same copy, retained-pointer and domain checks as the live
+    /// This has the same copy and retained-pointer checks as the live
     /// single-member path, but requires that no participant exists at all.
-    /// The first real participant can register only after this close reopens.
+    /// A participant registered while it is held enters only after it reopens.
     pub(crate) fn try_close_quiescent_unattached(self: &Arc<Self>) -> GateResult<Option<Closed>> {
         self.try_close_quiescent_members(0)
     }
@@ -813,7 +846,7 @@ impl EntryGate {
         if state.admission != Admission::Open
             || state.members.len() != members
             || !state.stopped()
-            || state.retained_operands != 0
+            || !state.retained_operands.is_empty()
             || state.generation.next().is_none()
         {
             return Ok(None);
@@ -821,17 +854,33 @@ impl EntryGate {
         let Some(id) = state.next_close.checked_add(1) else {
             return Ok(None);
         };
-        let previous_domain = state.single_member_domain;
         state.next_close = id;
         state.admission = Admission::Closed(id);
-        state.single_member_domain = true;
         Ok(Some(Closed {
             gate: self.clone(),
             id,
             published: false,
-            previous_domain: Some(previous_domain),
-            published_domain: true,
         }))
+    }
+
+    /// Close admission for every member, as [`Self::try_close`] does, and
+    /// wait on this thread, for at most `timeout`, until every member is
+    /// stopped and every admitted copy has retired
+    /// ([`Closing::finish_blocking`]). None changes no lasting state: either
+    /// a close was already in progress, or members or copies did not stop in
+    /// time, and the close was abandoned with admission reopened.
+    ///
+    /// The caller may hold its memory's allocation transaction: no admitted
+    /// copy acquires it, and a member stops without it. It must hold no
+    /// address-space or backing lock, which admitted copies take.
+    pub(crate) fn close_blocking(
+        self: &Arc<Self>,
+        timeout: Duration,
+    ) -> GateResult<Option<Closed>> {
+        match self.try_close()? {
+            Some(closing) => closing.finish_blocking(timeout),
+            None => Ok(None),
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -941,15 +990,17 @@ impl EntryGate {
 
     /// Retain a host pointer after its short-copy admission ends. Closing still
     /// waits only for short copies, so ordinary unchanged fences do not wait on
-    /// a blocking kernel operation. Mapping publication checks this count and
-    /// fails before changing the backing image.
+    /// a blocking kernel operation. `range` is the arena byte range the host
+    /// operation may touch; a mapping publication that would replace any of
+    /// it fails before changing the backing image.
     #[cfg(test)]
     pub(crate) fn retain_operand(
         self: &Arc<Self>,
         copy: &CopyAccess,
+        range: Range<usize>,
     ) -> GateResult<RetainedOperand> {
         assert!(!copy.lazy, "a lazily admitted copy must supply its origin");
-        self.retain_operand_with(copy, || copy.origin.clone())
+        self.retain_operand_with(copy, range, || copy.origin.clone())
     }
 
     /// As `retain_operand`, for a lazily admitted copy, whose origin
@@ -957,6 +1008,7 @@ impl EntryGate {
     pub(crate) fn retain_operand_with(
         self: &Arc<Self>,
         copy: &CopyAccess,
+        range: Range<usize>,
         origin: impl FnOnce() -> EntryOrigin,
     ) -> GateResult<RetainedOperand> {
         assert!(
@@ -964,12 +1016,16 @@ impl EntryGate {
                 .as_ref()
                 .is_some_and(|gate| Arc::ptr_eq(self, gate))
         );
+        assert!(
+            range.start <= range.end,
+            "retained operand range is reversed"
+        );
         let mut state = self.state.lock().unwrap();
         state.check()?;
         assert!(state.copies != 0, "retained operand requires a live copy");
         assert_eq!(state.generation, copy.generation);
         let origin = origin();
-        let Some(retained_operands) = state.retained_operands.checked_add(1) else {
+        let Some(id) = state.next_operand.checked_add(1) else {
             let failure = state.fail(
                 origin,
                 protocol_failure("retained host operand accounting exhausted"),
@@ -979,15 +1035,21 @@ impl EntryGate {
             notify(sender);
             return Err(failure);
         };
-        state.retained_operands = retained_operands;
+        state.next_operand = id;
+        state.retained_operands.insert(id, range.clone());
         Ok(RetainedOperand {
             gate: self.clone(),
             origin,
             generation: copy.generation,
+            id,
+            range,
         })
     }
 
-    // Not used outside tests yet: The private unchanged-mapping close protocol has no production closer yet.
+    /// Close admission, sending the reserved signal to every running member.
+    /// [`Closing::finish`], or the crate's bounded blocking form
+    /// (`Closing::finish_blocking`), then waits until every member is
+    /// stopped and every admitted copy has retired.
     pub fn try_close(self: &Arc<Self>) -> GateResult<Option<Closing>> {
         self.try_close_with(|thread| {
             // SAFETY: the registry mutex remains held through pthread_kill.
@@ -1002,7 +1064,7 @@ impl EntryGate {
         })
     }
 
-    // Not used outside tests yet: The private unchanged-mapping close protocol has no production closer yet.
+    /// As [`Self::try_close`], with `send` interrupting each running member.
     pub fn try_close_with(
         self: &Arc<Self>,
         mut send: impl FnMut(libc::pthread_t) -> std::io::Result<()>,
@@ -1125,6 +1187,14 @@ impl Participant {
             "participant origin set while an entry is outstanding"
         );
         update(&mut self.origin);
+    }
+
+    /// Whether this participant is the only member of its gate now, so that
+    /// no other vCPU is registered in its address space. A vCPU registers
+    /// when it is created and leaves when it is dropped.
+    pub fn is_sole_member(&self) -> bool {
+        let state = self.gate.state.lock().unwrap();
+        state.members.len() == 1 && state.members.contains_key(&self.id)
     }
 
     pub fn try_enter(&mut self) -> GateResult<Option<Entry<'_>>> {
@@ -1461,7 +1531,15 @@ impl CopyAccess {
         mut self,
         origin: impl FnOnce() -> EntryOrigin,
     ) -> CopyRetirement {
-        let change = self.retire(origin);
+        let mut change = self.retire(origin);
+        // A parked copy or closer only rechecks the gate under its registry
+        // lock, so waking it now runs no waker and takes none of the caller's
+        // locks. Without this, a close waiting for copies to drain, made by
+        // a publication that holds the allocation transaction under which
+        // this delivery is deferred, would wait out its bound.
+        if let Some(copies) = change.copies.take() {
+            copies.notify_all();
+        }
         CopyRetirement {
             change: Some(change),
             origin: Some(std::mem::take(&mut self.origin)),
@@ -1567,13 +1645,19 @@ impl Drop for CopyRetirement {
 pub(crate) struct RetainedOperand {
     gate: Arc<EntryGate>,
     origin: EntryOrigin,
+    /// The generation it was retained against. A publication outside its
+    /// range may advance the gate's generation before it retires; none can
+    /// change the mapping of its range (`Closed::publish`).
     generation: MappingGeneration,
+    id: u64,
+    range: Range<usize>,
 }
 
 impl std::fmt::Debug for RetainedOperand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RetainedOperand")
             .field("generation", &self.generation)
+            .field("range", &self.range)
             .finish_non_exhaustive()
     }
 }
@@ -1588,18 +1672,18 @@ impl Drop for RetainedOperand {
                     protocol_failure("retained host operand unwound"),
                 );
             }
-            assert_eq!(state.generation, self.generation);
-            state.retained_operands = state
+            assert!(state.generation.0 >= self.generation.0);
+            let range = state
                 .retained_operands
-                .checked_sub(1)
+                .remove(&self.id)
                 .expect("retained host operand retired twice");
+            assert_eq!(range, self.range);
             state.changed()
         };
         notify(sender);
     }
 }
 
-// Not used outside tests yet: The private unchanged-mapping close protocol has no production closer yet.
 pub struct Closing {
     gate: Arc<EntryGate>,
     id: u64,
@@ -1607,7 +1691,6 @@ pub struct Closing {
 }
 
 impl Closing {
-    // Not used outside tests yet: The private unchanged-mapping close protocol has no production closer yet.
     pub async fn finish(mut self) -> GateResult<Closed> {
         loop {
             let changed = {
@@ -1621,13 +1704,52 @@ impl Closing {
                         gate: self.gate.clone(),
                         id: self.id,
                         published: false,
-                        previous_domain: None,
-                        published_domain: false,
                     });
                 }
                 state.subscribe()
             };
             let _ = changed.await;
+        }
+    }
+
+    /// As [`Self::finish`], waiting on this thread for at most `timeout`.
+    /// A mapping publication closes from inside a guest's call, holding its
+    /// memory's allocation transaction, which no stopping member and no
+    /// admitted copy needs, so it waits here rather than on an executor. A
+    /// member stops on its own thread: an interrupted one leaves the guest at
+    /// the reserved signal, one in setup or cleanup finishes it, and an
+    /// admitted copy is short. If they have not all stopped by the deadline,
+    /// the close is abandoned: admission reopens, nothing is poisoned, and
+    /// None is returned, so that a member that cannot stop costs the caller a
+    /// named refusal rather than a hang.
+    pub(crate) fn finish_blocking(mut self, timeout: Duration) -> GateResult<Option<Closed>> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.gate.state.lock().unwrap();
+        loop {
+            state.check()?;
+            assert_eq!(state.admission, Admission::Closing(self.id));
+            if state.stopped() {
+                state.admission = Admission::Closed(self.id);
+                self.complete = true;
+                return Ok(Some(Closed {
+                    gate: self.gate.clone(),
+                    id: self.id,
+                    published: false,
+                }));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                state.admission = Admission::Open;
+                self.complete = true;
+                let sender = state.changed();
+                drop(state);
+                notify(sender);
+                return Ok(None);
+            }
+            let changed = state.copy_changed.clone();
+            state.blocked_closers += 1;
+            state = changed.wait_timeout(state, deadline - now).unwrap().0;
+            state.blocked_closers -= 1;
         }
     }
 }
@@ -1648,39 +1770,58 @@ pub struct Closed {
     gate: Arc<EntryGate>,
     pub id: u64,
     published: bool,
-    // Only a quiescent single-member close can change this capability. A
-    // clean abandoned plan restores the previous state; a poisoned one cannot
-    // reopen a usable mapping and keeps the conservative reservation.
-    previous_domain: Option<bool>,
-    published_domain: bool,
 }
 
 impl Closed {
-    /// Stage the known final image's shared-file domain before publication.
-    /// The reservation stays active until successful publication commits this
-    /// value. In particular, retiring the last file view cannot admit another
-    /// participant while the old image is still installed.
-    pub(crate) fn set_single_member_domain(&mut self, active: bool) -> GateResult<()> {
-        let state = self.gate.state.lock().unwrap();
-        state.check()?;
-        assert_eq!(state.admission, Admission::Closed(self.id));
-        assert!(
-            self.previous_domain.is_some(),
-            "domain requires a quiescent single-member close"
-        );
-        assert!(!self.published, "domain must be staged before publication");
-        self.published_domain = active;
-        Ok(())
-    }
-
     pub(crate) fn belongs_to(&self, gate: &Arc<EntryGate>) -> bool {
         Arc::ptr_eq(&self.gate, gate)
     }
 
-    /// Publish exactly one prepared mapping image while every participant is
-    /// stopped and short copies are drained. The operation runs without the
-    /// registry mutex; admission remains closed through this token. Any error
-    /// or unwind poisons the gate, so a partially changed external mapping can
+    /// The first live retained operand whose arena byte range overlaps
+    /// `range`. While this token exists no copy is admitted, and retaining an
+    /// operand requires one, so none is added: an answer can only change
+    /// from an overlap to none, as operands retire.
+    #[cfg(test)]
+    pub(crate) fn overlapping_operand(&self, range: &Range<usize>) -> Option<Range<usize>> {
+        self.gate.state.lock().unwrap().overlapping_operand(range)
+    }
+
+    /// Wait on this thread, for at most `timeout`, until no live retained
+    /// operand overlaps `range`; whether none does. An operand retires when
+    /// its host operation returns. One that waits for another guest thread,
+    /// such as a host futex wait, may not retire before the deadline; the
+    /// caller then refuses rather than wait for it, so no wakeup it needs can
+    /// be held up behind this close.
+    pub(crate) fn wait_for_operands_outside(
+        &self,
+        range: &Range<usize>,
+        timeout: Duration,
+    ) -> GateResult<bool> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.gate.state.lock().unwrap();
+        loop {
+            state.check()?;
+            assert_eq!(state.admission, Admission::Closed(self.id));
+            if state.overlapping_operand(range).is_none() {
+                return Ok(true);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let changed = state.copy_changed.clone();
+            state.blocked_closers += 1;
+            state = changed.wait_timeout(state, deadline - now).unwrap().0;
+            state.blocked_closers -= 1;
+        }
+    }
+
+    /// Publish exactly one prepared mapping image, replacing the arena byte
+    /// range `replaced`, while every participant is stopped and short copies
+    /// are drained. The operation runs without the registry mutex; admission
+    /// remains closed through this token. A live retained operand overlapping
+    /// `replaced`, which the caller must have refused first, and any error or
+    /// unwind poison the gate, so a partially changed external mapping can
     /// never be followed by guest re-entry.
     /// Success requires the memory owner's opaque installed-view receipt. Its
     /// private constructor binds generation advancement to retained backing and
@@ -1689,6 +1830,7 @@ impl Closed {
         &mut self,
         origin: impl Into<EntryOrigin>,
         expected: MappingGeneration,
+        replaced: Range<usize>,
         operation: impl FnOnce(MappingGeneration) -> crate::Result<crate::memory::InstalledMapping>,
     ) -> GateResult<MappingGeneration> {
         let origin = origin.into();
@@ -1718,10 +1860,10 @@ impl Closed {
                 notify(sender);
                 return Err(failure);
             }
-            if state.retained_operands != 0 {
+            if state.overlapping_operand(&replaced).is_some() {
                 let failure = state.fail(
                     origin.clone(),
-                    protocol_failure("mapping publication has retained host operands"),
+                    protocol_failure("mapping publication overlaps a retained host operand"),
                 );
                 let sender = state.changed();
                 drop(state);
@@ -1766,9 +1908,6 @@ impl Closed {
             assert_eq!(state.generation.next(), Some(next));
             state.generation = next;
             self.published = true;
-            if self.previous_domain.is_some() {
-                state.single_member_domain = self.published_domain;
-            }
             state.changed()
         };
         notify(sender);
@@ -1783,12 +1922,6 @@ impl Drop for Closed {
             assert_eq!(state.admission, Admission::Closed(self.id));
             if std::thread::panicking() {
                 state.fail(None, protocol_failure("closed operation unwound"));
-            }
-            if !self.published
-                && state.failure.is_none()
-                && let Some(previous) = self.previous_domain
-            {
-                state.single_member_domain = previous;
             }
             state.admission = Admission::Open;
             state.changed()
@@ -1818,22 +1951,14 @@ mod tests {
         let before = gate.test_state();
         let bookkeeping = {
             let state = gate.state.lock().unwrap();
-            (
-                state.single_member_domain,
-                state.next_close,
-                state.next_member,
-            )
+            (state.next_close, state.next_member, state.next_operand)
         };
         let changed = gate.subscribe();
         assert!(gate.try_close_quiescent_single().unwrap().is_none());
         assert_eq!(gate.test_state(), before);
         let state = gate.state.lock().unwrap();
         assert_eq!(
-            (
-                state.single_member_domain,
-                state.next_close,
-                state.next_member
-            ),
+            (state.next_close, state.next_member, state.next_operand),
             bookkeeping
         );
         assert!(state.failure.is_none());
@@ -1850,10 +1975,8 @@ mod tests {
         assert_quiescent_refusal_is_quiet(&gate);
         drop(second);
         let closed = gate.try_close_quiescent_single().unwrap().unwrap();
-        assert!(gate.single_member_domain_active());
         assert!(gate.test_state().closed);
         drop(closed);
-        assert!(!gate.single_member_domain_active());
         assert!(gate.test_state().open);
     }
 
@@ -1879,7 +2002,7 @@ mod tests {
         let _participant = gate.register().unwrap();
         let copy = gate.try_copy(None).unwrap().unwrap();
         assert_quiescent_refusal_is_quiet(&gate);
-        let retained = gate.retain_operand(&copy).unwrap();
+        let retained = gate.retain_operand(&copy, 0..8).unwrap();
         drop(copy);
         assert_quiescent_refusal_is_quiet(&gate);
         drop(retained);
@@ -1919,71 +2042,73 @@ mod tests {
         assert!(Arc::ptr_eq(&expected, &actual));
         assert_eq!(actual.causes().len(), 1);
         assert_eq!(gate.test_state(), before);
-        assert!(!gate.single_member_domain_active());
         assert!(changed.now_or_never().is_none());
     }
 
+    /// A published image restricts no later registration: a second vCPU
+    /// registers, enters against the published generation, and a later
+    /// publication closes around both.
     #[test]
-    fn quiescent_single_domain_commits_only_with_the_published_image() {
+    fn quiescent_publication_leaves_registration_open() {
         let gate = EntryGate::new();
         let _participant = gate.register().unwrap();
         let mut closed = gate.try_close_quiescent_single().unwrap().unwrap();
         let first = closed
-            .publish(None, MappingGeneration::INITIAL, |next| {
+            .publish(None, MappingGeneration::INITIAL, 0..4096, |next| {
                 Ok(crate::memory::InstalledMapping::gate_control(next))
             })
             .unwrap();
         drop(closed);
-        assert!(gate.single_member_domain_active());
-
-        let mut abandoned = gate.try_close_quiescent_single().unwrap().unwrap();
-        abandoned.set_single_member_domain(false).unwrap();
-        assert!(gate.single_member_domain_active());
-        drop(abandoned);
-        assert!(gate.single_member_domain_active());
-        assert_eq!(gate.generation().unwrap(), first);
-
-        let mut retirement = gate.try_close_quiescent_single().unwrap().unwrap();
-        retirement.set_single_member_domain(false).unwrap();
-        retirement
-            .publish(None, first, |next| {
-                assert!(gate.single_member_domain_active());
+        let mut second = gate.register().unwrap();
+        assert_eq!(gate.test_state().members.len(), 2);
+        let mut entry = second.try_enter().unwrap().unwrap();
+        assert_eq!(entry.generation, first);
+        entry.withdraw();
+        entry.acknowledge(Ok(())).unwrap();
+        assert!(gate.try_close_quiescent_single().unwrap().is_none());
+        let mut closed = gate
+            .close_blocking(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let next = closed
+            .publish(None, first, 0..4096, |next| {
                 Ok(crate::memory::InstalledMapping::gate_control(next))
             })
             .unwrap();
-        assert!(!gate.single_member_domain_active());
-        drop(retirement);
-        let _second = gate.register().unwrap();
-        assert_eq!(gate.test_state().members.len(), 2);
+        drop(closed);
+        assert_eq!(gate.generation().unwrap(), next);
+        assert!(gate.pending_failure().is_none());
     }
 
+    /// A participant registered while an unattached publication's close is
+    /// held enters only after it reopens, against the published generation;
+    /// so do participants registered later.
     #[test]
-    fn quiescent_unattached_publication_admits_only_its_first_real_participant() {
+    fn quiescent_unattached_publication_admits_participants_after_it_reopens() {
         let gate = EntryGate::new();
         let mut closed = gate.try_close_quiescent_unattached().unwrap().unwrap();
         assert!(gate.test_state().members.is_empty());
-        assert!(gate.single_member_domain_active());
+        let mut early = gate.register().unwrap();
+        assert!(early.try_enter().unwrap().is_none());
         closed
-            .publish(None, MappingGeneration::INITIAL, |next| {
+            .publish(None, MappingGeneration::INITIAL, 0..4096, |next| {
                 Ok(crate::memory::InstalledMapping::gate_control(next))
             })
             .unwrap();
         drop(closed);
-        let mut participant = gate.register().unwrap();
-        assert_eq!(gate.test_state().members.len(), 1);
-        let mut entry = participant.try_enter().unwrap().unwrap();
-        assert_eq!(entry.generation, MappingGeneration(1));
-        entry.withdraw();
-        entry.acknowledge(Ok(())).unwrap();
-        let Err(failure) = gate.register() else {
-            panic!("ordinary shared-file arena admitted a second participant");
-        };
-        assert_eq!(gate.test_state().members.len(), 1);
-        assert!(Arc::ptr_eq(&failure, &gate.pending_failure().unwrap()));
+        let mut late = gate.register().unwrap();
+        assert_eq!(gate.test_state().members.len(), 2);
+        for participant in [&mut early, &mut late] {
+            let mut entry = participant.try_enter().unwrap().unwrap();
+            assert_eq!(entry.generation, MappingGeneration(1));
+            entry.withdraw();
+            entry.acknowledge(Ok(())).unwrap();
+        }
+        assert!(gate.pending_failure().is_none());
     }
 
     #[test]
-    fn quiescent_unattached_requires_empty_quiet_arena_and_closed_registration_refuses() {
+    fn quiescent_unattached_requires_empty_quiet_arena_and_closed_registration_waits() {
         let gate = EntryGate::new();
         let first = gate.register().unwrap();
         let before = gate.test_state();
@@ -1999,7 +2124,7 @@ mod tests {
         assert!(gate.try_close_quiescent_unattached().unwrap().is_none());
         assert_eq!(gate.test_state(), before);
         assert!(changed.now_or_never().is_none());
-        let retained = gate.retain_operand(&copy).unwrap();
+        let retained = gate.retain_operand(&copy, 0..8).unwrap();
         drop(copy);
         let before = gate.test_state();
         let changed = gate.subscribe();
@@ -2009,26 +2134,27 @@ mod tests {
         drop(retained);
 
         let closed = gate.try_close_quiescent_unattached().unwrap().unwrap();
-        assert!(gate.register().is_err());
-        assert!(gate.test_state().members.is_empty());
+        let mut participant = gate.register().unwrap();
+        assert_eq!(gate.test_state().members.len(), 1);
+        assert!(participant.try_enter().unwrap().is_none());
         drop(closed);
-        assert!(gate.single_member_domain_active());
-        assert!(gate.pending_failure().is_some());
+        let mut entry = participant.try_enter().unwrap().unwrap();
+        entry.withdraw();
+        entry.acknowledge(Ok(())).unwrap();
+        assert!(gate.pending_failure().is_none());
     }
 
     #[test]
-    fn quiescent_single_failed_publication_keeps_terminal_domain() {
+    fn quiescent_single_failed_publication_is_terminal() {
         let gate = EntryGate::new();
         let _participant = gate.register().unwrap();
         let mut closed = gate.try_close_quiescent_single().unwrap().unwrap();
-        closed.set_single_member_domain(false).unwrap();
         let failure = closed
-            .publish(None, MappingGeneration::INITIAL, |_| {
+            .publish(None, MappingGeneration::INITIAL, 0..4096, |_| {
                 Err(protocol_failure("shared-file replacement failed"))
             })
             .unwrap_err();
         drop(closed);
-        assert!(gate.single_member_domain_active());
         assert_eq!(gate.test_state().generation, MappingGeneration::INITIAL);
         let Err(refused) = gate.try_close_quiescent_single() else {
             panic!("failed shared-file publication admitted another close");
@@ -2037,8 +2163,11 @@ mod tests {
         assert!(gate.try_copy(None).is_err());
     }
 
+    /// A registration racing a quiescent close either lands first, and the
+    /// close refuses (two members), or lands while the close is held, as a
+    /// stopped member that enters only after it reopens. Neither fails.
     #[test]
-    fn quiescent_single_registration_race_has_no_second_member_window() {
+    fn quiescent_single_registration_race_enters_only_after_reopening() {
         let gate = EntryGate::new();
         let _first = gate.register().unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -2050,27 +2179,222 @@ mod tests {
         });
         barrier.wait();
         let closed = gate.try_close_quiescent_single().unwrap();
-        let registered = registering.join().unwrap();
-        match closed {
-            Some(closed) => {
-                let Err(failure) = registered else {
-                    panic!("registration crossed the single-member reservation");
-                };
-                assert_eq!(gate.test_state().members.len(), 1);
-                assert!(Arc::ptr_eq(&gate.pending_failure().unwrap(), &failure));
-                assert!(failure.primary.to_string().contains(
-                    "ordinary shared-file domain permits only its existing stopped participant"
-                ));
-                drop(closed);
-                assert!(gate.single_member_domain_active());
-            }
-            None => {
-                let _second = registered.unwrap();
-                assert_eq!(gate.test_state().members.len(), 2);
-                assert!(!gate.single_member_domain_active());
-                assert!(gate.pending_failure().is_none());
-            }
+        let mut second = registering.join().unwrap().unwrap();
+        assert_eq!(gate.test_state().members.len(), 2);
+        if let Some(closed) = closed {
+            assert!(second.try_enter().unwrap().is_none());
+            drop(closed);
         }
+        let mut entry = second.try_enter().unwrap().unwrap();
+        entry.withdraw();
+        entry.acknowledge(Ok(())).unwrap();
+        assert!(gate.pending_failure().is_none());
+    }
+
+    /// The general close publishes with several stopped members, each of
+    /// which then enters against the new generation; `is_sole_member` names
+    /// a gate with one member only.
+    #[test]
+    fn blocking_close_publishes_with_several_stopped_members() {
+        let gate = EntryGate::new();
+        let mut members: Vec<_> = (0..3).map(|_| gate.register().unwrap()).collect();
+        assert!(members.iter().all(|member| !member.is_sole_member()));
+        let mut closed = gate
+            .close_blocking(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(gate.test_state().closed);
+        let next = closed
+            .publish(None, MappingGeneration::INITIAL, 0..4096, |next| {
+                Ok(crate::memory::InstalledMapping::gate_control(next))
+            })
+            .unwrap();
+        drop(closed);
+        for member in &mut members {
+            let mut entry = member.try_enter().unwrap().unwrap();
+            assert_eq!(entry.generation, next);
+            entry.withdraw();
+            entry.acknowledge(Ok(())).unwrap();
+        }
+        members.truncate(1);
+        assert!(members[0].is_sole_member());
+        assert!(gate.pending_failure().is_none());
+    }
+
+    /// A running member is interrupted once through the close's send hook,
+    /// and the blocking close completes only after that member's entry
+    /// withdraws and acknowledges, on its own thread.
+    #[test]
+    fn blocking_close_waits_for_an_interrupted_running_member() {
+        let gate = EntryGate::new();
+        let (running_sender, running) = std::sync::mpsc::channel();
+        let (kick_sender, kick) = std::sync::mpsc::channel::<()>();
+        let member_gate = gate.clone();
+        let member = std::thread::spawn(move || {
+            let mut participant = member_gate.register().unwrap();
+            let mut entry = participant.try_enter().unwrap().unwrap();
+            assert!(entry.activate().unwrap());
+            running_sender.send(()).unwrap();
+            kick.recv().unwrap();
+            assert_eq!(entry.withdraw(), 1);
+            entry.acknowledge(Ok(())).unwrap();
+        });
+        running.recv().unwrap();
+        let mut sent = 0;
+        let closing = gate
+            .try_close_with(|_| {
+                sent += 1;
+                kick_sender.send(()).unwrap();
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent, 1);
+        let closed = closing
+            .finish_blocking(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(
+            gate.test_state()
+                .members
+                .iter()
+                .all(|member| member.stopped)
+        );
+        drop(closed);
+        member.join().unwrap();
+        assert!(gate.pending_failure().is_none());
+    }
+
+    /// A copy whose retirement's delivery is deferred, as it is while another
+    /// thread holds its memory's allocation transaction, still wakes a
+    /// blocking close parked on it at once, well before the close's bound.
+    #[test]
+    fn deferred_copy_retirement_wakes_a_blocking_close_at_once() {
+        let gate = EntryGate::new();
+        let copy = gate.try_copy(None).unwrap().unwrap();
+        let closer_gate = gate.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let closed = closer_gate.close_blocking(Duration::from_secs(60)).unwrap();
+            sender.send(closed.is_some()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gate.state.lock().unwrap().blocked_closers == 0 {
+            assert!(Instant::now() < deadline, "the close never parked");
+            std::thread::yield_now();
+        }
+        let retirement = copy.retire_deferred();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(10)), Ok(true));
+        drop(retirement);
+        closer.join().unwrap();
+        assert!(gate.test_state().open);
+        assert!(gate.pending_failure().is_none());
+    }
+
+    /// A member that does not stop by the deadline makes the blocking close
+    /// abandon itself: admission reopens, nothing is poisoned, and the
+    /// member then enters as before.
+    #[test]
+    fn blocking_close_abandons_at_its_deadline_without_poisoning() {
+        let gate = EntryGate::new();
+        let mut participant = gate.register().unwrap();
+        let mut entry = participant.try_enter().unwrap().unwrap();
+        assert!(
+            gate.close_blocking(Duration::from_millis(50))
+                .unwrap()
+                .is_none()
+        );
+        assert!(gate.test_state().open);
+        assert!(gate.pending_failure().is_none());
+        assert!(entry.activate().unwrap());
+        entry.withdraw();
+        entry.acknowledge(Ok(())).unwrap();
+        assert!(gate.pending_failure().is_none());
+    }
+
+    /// A publication refuses only a retained operand whose range overlaps
+    /// the range it replaces: one ending where the replaced range starts, one
+    /// starting where it ends, and an empty one do not overlap it. Waiting
+    /// for an overlapping operand ends when it retires, or at the deadline
+    /// without poisoning; publishing over it anyway poisons the gate.
+    #[test]
+    fn publication_refuses_only_overlapping_retained_operands() {
+        let gate = EntryGate::new();
+        let copy = gate.try_copy(None).unwrap().unwrap();
+        let operands: Vec<_> = [4096..4100, 8188..8192, 12288..12288]
+            .into_iter()
+            .map(|range| gate.retain_operand(&copy, range).unwrap())
+            .collect();
+        drop(copy);
+        // Another thread's operand, which it retires once told to.
+        let (ready_sender, ready) = std::sync::mpsc::channel();
+        let (go_sender, go) = std::sync::mpsc::channel::<()>();
+        let retiring_gate = gate.clone();
+        let retiring = std::thread::spawn(move || {
+            let copy = retiring_gate.try_copy(None).unwrap().unwrap();
+            let operand = retiring_gate.retain_operand(&copy, 0..4).unwrap();
+            drop(copy);
+            ready_sender.send(()).unwrap();
+            go.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            drop(operand);
+        });
+        ready.recv().unwrap();
+        assert_eq!(gate.test_state().retained_operands, 4);
+        let mut closed = gate
+            .close_blocking(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        for range in [4..4096, 4100..8188, 8192..12288, 12288..16384] {
+            assert_eq!(closed.overlapping_operand(&range), None, "{range:?}");
+        }
+        assert_eq!(closed.overlapping_operand(&(0..8192)), Some(4096..4100));
+        assert_eq!(closed.overlapping_operand(&(3..4)), Some(0..4));
+        assert_eq!(closed.overlapping_operand(&(8191..8192)), Some(8188..8192));
+        assert!(
+            !closed
+                .wait_for_operands_outside(&(4096..8192), Duration::from_millis(20))
+                .unwrap()
+        );
+        assert!(gate.pending_failure().is_none());
+
+        // The other thread's operand retires while the close waits.
+        go_sender.send(()).unwrap();
+        assert!(
+            closed
+                .wait_for_operands_outside(&(0..4096), Duration::from_secs(10))
+                .unwrap()
+        );
+        retiring.join().unwrap();
+        assert_eq!(gate.test_state().retained_operands, 3);
+        let next = closed
+            .publish(None, MappingGeneration::INITIAL, 0..4096, |next| {
+                Ok(crate::memory::InstalledMapping::gate_control(next))
+            })
+            .unwrap();
+        assert_eq!(next, MappingGeneration(1));
+        drop(closed);
+
+        let mut closed = gate
+            .close_blocking(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let called = std::cell::Cell::new(false);
+        let failure = closed
+            .publish(None, next, 8188..8192, |next| {
+                called.set(true);
+                Ok(crate::memory::InstalledMapping::gate_control(next))
+            })
+            .unwrap_err();
+        assert!(!called.get());
+        assert!(
+            failure
+                .primary
+                .to_string()
+                .contains("mapping publication overlaps a retained host operand")
+        );
+        drop(closed);
+        drop(operands);
     }
 
     struct PublicationLockWake {
@@ -2284,7 +2608,7 @@ mod tests {
             let gate = EntryGate::new();
             let retained = if scenario == "retained" {
                 let copy = gate.try_copy(None).unwrap().unwrap();
-                let retained = gate.retain_operand(&copy).unwrap();
+                let retained = gate.retain_operand(&copy, 0..8).unwrap();
                 drop(copy);
                 Some(retained)
             } else {
@@ -2296,7 +2620,7 @@ mod tests {
             let mut closed = block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
             if scenario == "duplicate" {
                 closed
-                    .publish(None, MappingGeneration::INITIAL, |next| {
+                    .publish(None, MappingGeneration::INITIAL, 0..4096, |next| {
                         Ok(crate::memory::InstalledMapping::gate_control(next))
                     })
                     .unwrap();
@@ -2327,7 +2651,7 @@ mod tests {
             let called = std::cell::Cell::new(false);
             let called_ref = &called;
             let failure = closed
-                .publish(None, expected, move |next| {
+                .publish(None, expected, 0..4096, move |next| {
                     called_ref.set(true);
                     drop((address, allocation));
                     Ok(crate::memory::InstalledMapping::gate_control(next))
@@ -2385,7 +2709,7 @@ mod tests {
             );
             let allocation = observer.allocation.lock().unwrap();
             let address = observer.address.lock().unwrap();
-            let result = closed.publish(None, MappingGeneration::INITIAL, move |next| {
+            let result = closed.publish(None, MappingGeneration::INITIAL, 0..4096, move |next| {
                 drop((address, allocation));
                 if succeeds {
                     Ok(crate::memory::InstalledMapping::gate_control(next))
@@ -2428,7 +2752,7 @@ mod tests {
         let expected = gate.generation().unwrap();
         let mut closed = block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
         let generation = closed
-            .publish(None, expected, |next| {
+            .publish(None, expected, 0..4096, |next| {
                 assert_eq!(next.get(), expected.get() + 1);
                 Ok(crate::memory::InstalledMapping::gate_control(next))
             })
@@ -2468,7 +2792,7 @@ mod tests {
         // Published and reopened: the old generation is refused, the new
         // one admitted.
         let published = closed
-            .publish(None, seen, |next| {
+            .publish(None, seen, 0..4096, |next| {
                 Ok(crate::memory::InstalledMapping::gate_control(next))
             })
             .unwrap();
@@ -2501,7 +2825,7 @@ mod tests {
             let expected = gate.generation().unwrap();
             let mut closed = block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                closed.publish(None, expected, |next| {
+                closed.publish(None, expected, 0..4096, |next| {
                     if unwinds {
                         panic!("injected mapping publication unwind");
                     }
@@ -2528,7 +2852,7 @@ mod tests {
         let stale = gate.generation().unwrap();
         let mut closed = block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
         closed
-            .publish(None, stale, |next| {
+            .publish(None, stale, 0..4096, |next| {
                 Ok(crate::memory::InstalledMapping::gate_control(next))
             })
             .unwrap();
@@ -2536,7 +2860,7 @@ mod tests {
 
         let mut closed = block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
         let called = std::cell::Cell::new(false);
-        let result = closed.publish(None, stale, |next| {
+        let result = closed.publish(None, stale, 0..4096, |next| {
             called.set(true);
             Ok(crate::memory::InstalledMapping::gate_control(next))
         });

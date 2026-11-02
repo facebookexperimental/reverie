@@ -31,6 +31,62 @@ impl Drop for ClosedSnapshot<'_> {
     }
 }
 
+/// How long a mapping publication waits for the address space's other vCPUs
+/// and host copies to stop ([`PUBLICATION_STOP_FAILURE`] after it), and for
+/// a host operation using the memory it replaces to return (a refusal by
+/// name after it). A vCPU interrupted with the reserved signal stops within
+/// microseconds, and a copy is short; the bound is for a thread that never
+/// stops, which would otherwise hang the run.
+const PUBLICATION_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why a publication ends when the address space's other vCPUs or host
+/// copies did not stop within [`PUBLICATION_STOP_TIMEOUT`]. Nothing a
+/// program does keeps them running that long, so this is the backend's own
+/// failure ([`Error::SharedFileCapability`]), not a refusal by name.
+const PUBLICATION_STOP_FAILURE: &str = "the address space's other vCPUs or host copies did not \
+     stop within the publication's bound; this is a defect of the backend to report, not a \
+     refusal of the program";
+
+/// What a fork's snapshot of an address space that holds shared views needs.
+const FORK_SNAPSHOT_REQUIREMENT: &str =
+    "requires one stopped vCPU (or unattached memory), no copies and no retained operands";
+
+#[cfg(test)]
+thread_local! {
+    /// A unit test's bound in place of `PUBLICATION_STOP_TIMEOUT`, for the
+    /// publications its own thread makes.
+    static PUBLICATION_STOP_TIMEOUT_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn publication_stop_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(timeout) = PUBLICATION_STOP_TIMEOUT_FOR_TEST.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    PUBLICATION_STOP_TIMEOUT
+}
+
+/// What a publication's operation owns while it installs the new image: the
+/// held address-space lock, the region reservation and the allocation
+/// transaction. They are released in that order however the operation ends,
+/// run or dropped unrun: a reservation's rollback takes the address-space
+/// lock, and the allocation transaction's release delivers deferred
+/// notifications, whose wakers may read memory.
+struct PublicationHold<'a> {
+    space: Option<MutexGuard<'a, AddressSpaceState>>,
+    reservation: Option<PendingReservation>,
+    allocation: Option<AllocationGuard<'a>>,
+}
+
+impl Drop for PublicationHold<'_> {
+    fn drop(&mut self) {
+        drop(self.space.take());
+        drop(self.reservation.take());
+        drop(self.allocation.take());
+    }
+}
+
 #[derive(Default)]
 pub(super) struct DeferredFailures {
     next: u128,
@@ -522,10 +578,111 @@ impl GuestMemory {
         };
         let gate = self.entry_gate();
         let expected = gate.generation().map_err(|failure| failure.error())?;
-        // All BTreeMap nodes and terminal ownership storage are prepared before
+        let replaced = offset..offset + slice.length;
+        // A close with no participant serves an arena no vCPU has entered yet
+        // (a fork's child before it runs); every other has a vCPU to protect.
+        let (mut closed, attached) = match gate
+            .try_close_quiescent_single()
+            .map_err(|failure| failure.error())?
+        {
+            Some(closed) => (closed, true),
+            None => match gate
+                .try_close_quiescent_unattached()
+                .map_err(|failure| failure.error())?
+            {
+                Some(closed) => (closed, false),
+                // Other vCPUs share the address space, or a host copy or a
+                // retained operand is live: a guest's own mapping change
+                // closes admission for every vCPU, on this thread, holding
+                // its allocation transaction, which no stopping vCPU and no
+                // admitted copy needs.
+                None if matches!(source, InstallSource::Fresh) => {
+                    match gate
+                        .close_blocking(publication_stop_timeout())
+                        .map_err(|failure| failure.error())?
+                    {
+                        Some(closed) => (closed, true),
+                        // The backend's own vCPUs or copies failed to stop:
+                        // its failure, not a refusal of what the program did.
+                        None => {
+                            drop(reservation);
+                            drop(allocation);
+                            return Err(Error::SharedFileCapability {
+                                operation: "mapping publication",
+                                reason: PUBLICATION_STOP_FAILURE,
+                            });
+                        }
+                    }
+                }
+                None => {
+                    drop(reservation);
+                    drop(allocation);
+                    return Err(Error::SharedFileCapability {
+                        operation: "mapping publication",
+                        reason: "requires one stopped vCPU (or unattached memory), no host copies and no retained operands",
+                    });
+                }
+            },
+        };
+        if attached {
+            // Check the hardware requirement while no HVA has changed.
+            // Error paths explicitly release allocation before reopening.
+            let recorded = *self.mapping.sync_mmu.lock().unwrap();
+            let supported = match recorded {
+                Some(supported) => Ok(supported),
+                None => Kvm::new().map(|kvm| kvm.check_extension(Cap::SyncMmu)),
+            };
+            if !matches!(supported, Ok(true)) {
+                drop(reservation);
+                drop(allocation);
+                drop(closed);
+                return match supported {
+                    Ok(false) => Err(Error::SynchronousMmuUnsupported),
+                    Err(error) => Err(error.into()),
+                    Ok(true) => unreachable!(),
+                };
+            }
+        }
+        // A host operation still using memory the publication replaces would
+        // read or write the old mapping, or the new one, at a host-timed
+        // point: wait, bounded, for it to return, and refuse by name if it
+        // does not. One waiting on another guest thread (a host futex wait)
+        // may not return while this close holds every vCPU outside the guest.
+        // That is the program's doing (a mapping over memory another of its
+        // threads is blocked on), so the refusal is a named one.
+        let quiet = closed
+            .wait_for_operands_outside(&replaced, publication_stop_timeout())
+            .map_err(|failure| failure.error());
+        if !matches!(quiet, Ok(true)) {
+            drop(reservation);
+            drop(allocation);
+            drop(closed);
+            return match quiet {
+                Ok(_) => Err(Error::UnsupportedSharedFile {
+                    operation: "mapping publication",
+                    reason: "a host operation still uses memory in the replaced range",
+                }),
+                Err(error) => Err(error),
+            };
+        }
+        if matches!(source, InstallSource::CurrentContents)
+            && let Err(error) = self.copy_current_contents(&closed, address, &slice)
+        {
+            drop(reservation);
+            drop(allocation);
+            drop(closed);
+            return Err(error);
+        }
+        // The new image is prepared from the current one, under one hold of
+        // the address-space lock that lasts until it is installed: with
+        // several vCPUs, another thread's call (a Tool callback's scratch
+        // exposure, for one) may change the page map at any other time, and
+        // installing an image prepared earlier would undo that change. All
+        // BTreeMap nodes and terminal ownership storage are prepared before
         // the first destructive mmap. The publication closure only updates
         // existing nodes and swaps complete images.
-        let mut prepared = self.mapping.address_space.lock().unwrap().clone();
+        let space = self.mapping.address_space.lock().unwrap();
+        let mut prepared = space.clone();
         let first = address / PAGE_SIZE as u64;
         let pages = slice.length / PAGE_SIZE;
         for i in 0..pages {
@@ -566,65 +723,18 @@ impl GuestMemory {
         if let Some(cursors) = cursors {
             prepared.cursors = Some(cursors);
         }
-        let domain = prepared
-            .backing_pages
-            .values()
-            .any(|page| matches!(page._slice.backing.kind, BackingKind::OrdinaryFile { .. }));
-        let ledger = self.prepare_mapping_retirement(&prepared);
-        let mut closed = match gate
-            .try_close_quiescent_single()
-            .map_err(|failure| failure.error())?
-        {
-            Some(closed) => {
-                // Check the hardware requirement while no HVA has changed.
-                // Error paths explicitly release allocation before reopening.
-                let recorded = *self.mapping.sync_mmu.lock().unwrap();
-                let supported = match recorded {
-                    Some(supported) => Ok(supported),
-                    None => Kvm::new().map(|kvm| kvm.check_extension(Cap::SyncMmu)),
-                };
-                if !matches!(supported, Ok(true)) {
-                    drop(reservation);
-                    drop(allocation);
-                    drop(closed);
-                    return match supported {
-                        Ok(false) => Err(Error::SynchronousMmuUnsupported),
-                        Err(error) => Err(error.into()),
-                        Ok(true) => unreachable!(),
-                    };
-                }
-                closed
-            }
-            None => match gate
-                .try_close_quiescent_unattached()
-                .map_err(|failure| failure.error())?
-            {
-                Some(closed) => closed,
-                None => {
-                    return Err(Error::SharedFileCapability {
-                        operation: "mapping publication",
-                        reason: "requires one stopped vCPU (or unattached memory), no host copies and no retained operands",
-                    });
-                }
-            },
+        let ledger = self.prepare_mapping_retirement(&prepared, &space);
+        // The operation owns the held lock, the reservation and the
+        // allocation transaction, and releases them in that order however it
+        // ends, run or dropped unrun (`PublicationHold`).
+        let mut hold = PublicationHold {
+            space: Some(space),
+            reservation,
+            allocation: Some(allocation),
         };
-        if let Err(failure) = closed.set_single_member_domain(domain) {
-            drop(reservation);
-            drop(allocation);
-            drop(closed);
-            return Err(failure.error());
-        }
-        if matches!(source, InstallSource::CurrentContents)
-            && let Err(error) = self.copy_current_contents(&closed, address, &slice)
-        {
-            drop(reservation);
-            drop(allocation);
-            drop(closed);
-            return Err(error);
-        }
         let mapping = &self.mapping;
         let result = closed
-            .publish(self.entry_origin(), expected, move |generation| {
+            .publish(self.entry_origin(), expected, replaced, move |generation| {
                 let outcome = (|| {
                     // Keep the ledger before mmap; after failure it excludes the
                     // uncertain target even if a foreign allocator fills the gap.
@@ -690,13 +800,15 @@ impl GuestMemory {
                             NonNull::new_unchecked(installed.as_ptr().add(i * PAGE_SIZE))
                         };
                     }
-                    *mapping.address_space.lock().unwrap() = prepared;
-                    if let Some(reservation) = reservation {
+                    **hold.space.as_mut().expect("the address space is held") = prepared;
+                    if let Some(reservation) = hold.reservation.take() {
                         reservation.commit();
                     }
                     Ok(InstalledMapping::new(generation))
                 })();
-                drop(allocation);
+                // Nothing held may outlive the operation: the gate notifies
+                // its waiters after it returns.
+                drop(hold);
                 outcome
             })
             .map_err(|failure| failure.error());
@@ -838,11 +950,29 @@ impl GuestMemory {
         let gate = self.entry_gate();
         let closed = match gate.try_close_quiescent_single().map_err(|e| e.error())? {
             Some(closed) => closed,
-            None => gate.try_close_quiescent_unattached().map_err(|e| e.error())?
-                .ok_or(Error::SharedFileCapability {
-                    operation: "shared-file fork snapshot",
-                    reason: "requires one stopped vCPU (or unattached memory), no copies and no retained operands",
-                })?,
+            None => match gate
+                .try_close_quiescent_unattached()
+                .map_err(|e| e.error())?
+            {
+                Some(closed) => closed,
+                // Another vCPU of the address space lives: the program forked
+                // a process that holds views while another of its threads
+                // runs, which this backend does not implement, so the refusal
+                // is a named one. Anything else (a host copy or a retained
+                // operand beside the one vCPU) is the backend's own state.
+                None if gate.member_count().map_err(|e| e.error())? > 1 => {
+                    return Err(Error::UnsupportedSharedFile {
+                        operation: "shared-file fork snapshot",
+                        reason: FORK_SNAPSHOT_REQUIREMENT,
+                    });
+                }
+                None => {
+                    return Err(Error::SharedFileCapability {
+                        operation: "shared-file fork snapshot",
+                        reason: FORK_SNAPSHOT_REQUIREMENT,
+                    });
+                }
+            },
         };
         // Drop releases allocation BEFORE Closed, including during unwinding.
         // Opening admission may synchronously notify a caller-owned observer.
@@ -1133,9 +1263,13 @@ impl GuestMemory {
             return Ok(-(libc::ENOMEM as i64));
         };
         let copy = self.copy_access()?;
+        // The range the call names, within the arena: the host msync below
+        // touches file views inside it alone.
         let retained = self
             .entry_gate()
-            .retain_operand_with(&copy, || self.entry_origin())
+            .retain_operand_with(&copy, self.arena_range(address, rounded), || {
+                self.entry_origin()
+            })
             .map_err(|failure| failure.error())?;
         let (spans, hole) = {
             let state = self.mapping.address_space.lock().unwrap();
@@ -1356,18 +1490,20 @@ impl UserMemory {
 }
 
 impl GuestMemory {
+    /// The retirement ledger for installing `prepared` over `old`, the image
+    /// installed now, which the caller holds locked.
     pub(super) fn prepare_mapping_retirement(
         &self,
         prepared: &AddressSpaceState,
+        old: &AddressSpaceState,
     ) -> Box<WriteAliasMapping> {
-        let old = self.mapping.address_space.lock().unwrap();
         let mut extents =
             Vec::with_capacity(prepared.backing_pages.len() + old.backing_pages.len() + 1);
         extents.push(WriteAliasExtent {
             offset: 0,
             slice: self.mapping.slice.clone(),
         });
-        for image in [prepared, &*old] {
+        for image in [prepared, old] {
             for (&page, installed) in &image.backing_pages {
                 extents.push(WriteAliasExtent {
                     offset: (page * PAGE_SIZE as u64 - self.guest_base()) as usize,
@@ -1991,7 +2127,6 @@ mod tests {
         install(&memory, &original, BASE, 3, 0);
         replace(&memory, BASE + P, 1, None, false);
         assert!(memory.contains_shared_file());
-        assert!(memory.entry_gate().single_member_domain_active());
         assert!(!memory.user_range_is_mapped(BASE + P, P));
         assert_eq!(read(&memory, BASE, 8), [0x11; 8]);
         assert_eq!(read(&memory, BASE + 2 * P, 8), [0x33; 8]);
@@ -2005,7 +2140,6 @@ mod tests {
         assert!(memory.contains_shared_file());
         memory.retire_shared_files_for_exec().unwrap();
         assert!(!memory.contains_shared_file());
-        assert!(!memory.entry_gate().single_member_domain_active());
         assert_eq!(bytes(&original, 0, 3 * PAGE_SIZE), original_bytes);
         let child = memory.snapshot().unwrap();
         child.write_raw(BASE, b"child!!!").unwrap();
@@ -2296,8 +2430,6 @@ mod tests {
         assert!(!Arc::ptr_eq(&memory.mapping, &child.mapping));
         assert!(!Arc::ptr_eq(&memory.entry_gate(), &child.entry_gate()));
         assert_ne!(memory.host_address(), child.host_address());
-        assert!(memory.entry_gate().single_member_domain_active());
-        assert!(child.entry_gate().single_member_domain_active());
         assert_eq!(child.separately_backed_pages(), 3);
         child.write_raw(BASE, b"private-child!").unwrap();
         assert_eq!(read(&memory, BASE, 14), b"private-parent");
@@ -2643,7 +2775,7 @@ mod tests {
             memory.snapshot().unwrap_err(),
             Error::SharedFileCapability { .. }
         ));
-        let retained = gate.retain_operand(&copy).unwrap();
+        let retained = gate.retain_operand(&copy, 0..8).unwrap();
         drop(copy);
         assert!(matches!(
             memory.snapshot().unwrap_err(),
@@ -3365,6 +3497,10 @@ mod tests {
         assert!(rows.iter().all(|row| *row == (true, true, true, 0)));
     }
 
+    /// A host copy that does not retire within the publication's bound (here
+    /// the test's own, which it holds through the call) refuses the
+    /// publication by name, with no reservation or byte effect; the close is
+    /// abandoned, so admission reopens and nothing is poisoned.
     #[test]
     fn busy_copy_refuses_publication_without_reservation_or_byte_effect() {
         let memory = fixture(1);
@@ -3374,6 +3510,8 @@ mod tests {
         let generation = gate.generation().unwrap();
         let reservation = memory.reservation_kind(BASE);
         let copy = gate.copy_blocking(None).unwrap();
+        PUBLICATION_STOP_TIMEOUT_FOR_TEST
+            .with(|bound| bound.set(Some(std::time::Duration::from_millis(50))));
         let result = memory.publish_shared_file_range(
             memory.allocation_guard(),
             SharedFileRangePlan {
@@ -3387,20 +3525,87 @@ mod tests {
                 cursors: None,
             },
         );
-        assert!(matches!(
-            result,
-            Err(Error::SharedFileCapability {
-                operation: "mapping publication",
-                ..
-            })
-        ));
+        PUBLICATION_STOP_TIMEOUT_FOR_TEST.with(|bound| bound.set(None));
+        // The backend's own failure, which names itself a defect to report,
+        // not a refusal by name.
+        assert!(
+            matches!(
+                &result,
+                Err(error @ Error::SharedFileCapability {
+                    operation: "mapping publication",
+                    reason: PUBLICATION_STOP_FAILURE,
+                }) if !error.is_named_refusal()
+                    && error.to_string().contains("a defect of the backend to report")
+            ),
+            "{result:?}"
+        );
         assert_eq!(gate.generation().unwrap(), generation);
         assert_eq!(memory.reservation_kind(BASE), reservation);
-        assert!(!gate.single_member_domain_active());
+        assert!(gate.admission_open().unwrap());
+        assert!(gate.pending_failure().is_none());
         assert!(!memory.contains_shared_file());
         drop(copy);
         assert_eq!(read(&memory, BASE, 7), b"private");
         assert_eq!(bytes(&file, 0, 7), [0x11; 7]);
+    }
+
+    /// A publication over memory that a retained host operand (here a
+    /// futex-style operand of four bytes) still covers waits, bounded, for it
+    /// to retire, and refuses by name when it does not, with no reservation,
+    /// mapping or generation effect and no failure recorded. A publication
+    /// beside the operand goes on while it lives, and the operand retires
+    /// afterwards across the new generation.
+    #[test]
+    fn publication_over_a_retained_operand_waits_then_refuses_by_name() {
+        let memory = fixture(2);
+        memory.record_kvm_sync_mmu(true).unwrap();
+        memory.write_raw(BASE, b"operand!").unwrap();
+        let file = file(1);
+        let gate = memory.entry_gate();
+        let generation = gate.generation().unwrap();
+        let reservation = memory.reservation_kind(BASE);
+        let operand = memory.user().host_operand(BASE, 4).unwrap();
+        let plan = |address| SharedFileRangePlan {
+            address,
+            length: PAGE_SIZE,
+            file: file.try_clone().unwrap().into(),
+            offset: 0,
+            readable: true,
+            writable: true,
+            max_writable: true,
+            cursors: None,
+        };
+        PUBLICATION_STOP_TIMEOUT_FOR_TEST
+            .with(|bound| bound.set(Some(std::time::Duration::from_millis(50))));
+        let refused = memory.publish_shared_file_range(memory.allocation_guard(), plan(BASE));
+        PUBLICATION_STOP_TIMEOUT_FOR_TEST.with(|bound| bound.set(None));
+        assert!(
+            matches!(
+                &refused,
+                Err(error @ Error::UnsupportedSharedFile {
+                    operation: "mapping publication",
+                    reason: "a host operation still uses memory in the replaced range",
+                }) if error.is_named_refusal()
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(gate.generation().unwrap(), generation);
+        assert_eq!(memory.reservation_kind(BASE), reservation);
+        assert!(gate.admission_open().unwrap());
+        assert!(gate.pending_failure().is_none());
+        assert!(!memory.contains_shared_file());
+        assert_eq!(read(&memory, BASE, 8), b"operand!");
+
+        memory
+            .publish_shared_file_range(memory.allocation_guard(), plan(BASE + P))
+            .unwrap();
+        assert!(memory.contains_shared_file());
+        assert_eq!(gate.generation().unwrap().get(), generation.get() + 1);
+        assert_eq!(read(&memory, BASE + P, 4), [0x11; 4]);
+        assert_eq!(gate.test_state().retained_operands, 1);
+        drop(operand);
+        assert_eq!(gate.test_state().retained_operands, 0);
+        assert!(gate.pending_failure().is_none());
     }
 
     #[test]
@@ -3423,7 +3628,6 @@ mod tests {
         );
         assert!(matches!(result, Err(Error::SynchronousMmuUnsupported)));
         assert!(!memory.contains_shared_file());
-        assert!(!memory.entry_gate().single_member_domain_active());
         let memory = fixture(1);
         install(&memory, &file, BASE, 1, 0);
         assert!(matches!(
@@ -3436,7 +3640,6 @@ mod tests {
         // /dev/kvm in this native unit. It does not claim a VM execution result.
         replace(&memory, BASE, 1, None, false);
         assert!(!memory.contains_shared_file());
-        assert!(!memory.entry_gate().single_member_domain_active());
         drop(member);
     }
 
@@ -3470,8 +3673,6 @@ mod tests {
         assert!(!memory.shares_parent_address_space());
         assert!(!Arc::ptr_eq(&memory.mapping, &child.mapping));
         assert!(!Arc::ptr_eq(&memory.entry_gate(), &child.entry_gate()));
-        assert!(memory.entry_gate().single_member_domain_active());
-        assert!(child.entry_gate().single_member_domain_active());
         assert_eq!(memory.entry_gate().test_state().members.len(), 1);
         assert!(child.entry_gate().test_state().members.is_empty());
         assert_eq!(child.separately_backed_pages(), 2);
@@ -3594,10 +3795,11 @@ mod tests {
     }
 
     /// A vfork child's copy of shared views needs what a fork's does: the
-    /// source's one participant stopped and no host copy in flight. A second
-    /// participant cannot join a memory that holds a view, and a memory with
-    /// two participants cannot publish one, so the source of such a copy
-    /// never has a second vCPU running in its address space.
+    /// source's one participant stopped and no host copy in flight. A copy
+    /// in flight beside the one participant is the backend's own state, so
+    /// the snapshot fails (SharedFileCapability); a second participant is
+    /// another thread of the program, which a view's address space may now
+    /// hold, so the snapshot is refused by name (UnsupportedSharedFile).
     #[test]
     fn vfork_copy_needs_the_sources_one_participant_quiescent() {
         let memory = fixture(2);
@@ -3606,13 +3808,17 @@ mod tests {
         let participant = memory.entry_gate().register().unwrap();
         let gate = memory.entry_gate();
         let copy = gate.try_copy(None).unwrap().unwrap();
-        assert!(matches!(
-            memory.snapshot_sharing_address_space().unwrap_err(),
-            Error::SharedFileCapability {
-                operation: "shared-file fork snapshot",
-                ..
-            }
-        ));
+        let busy = memory.snapshot_sharing_address_space().unwrap_err();
+        assert!(
+            matches!(
+                &busy,
+                Error::SharedFileCapability {
+                    operation: "shared-file fork snapshot",
+                    ..
+                }
+            ) && !busy.is_named_refusal(),
+            "{busy}"
+        );
         drop(copy);
         assert!(
             memory
@@ -3621,18 +3827,33 @@ mod tests {
                 .shares_parent_address_space()
         );
         assert!(gate.pending_failure().is_none());
-        // A second vCPU cannot join the view's address space.
+        // A second vCPU joins the view's address space, but a vfork-style
+        // child of the two is refused by name, as a fork of them is.
         let joined = fixture(2);
         install(&joined, &original, BASE, 1, 0);
         let first = joined.entry_gate().register().unwrap();
-        assert!(joined.entry_gate().register().is_err());
-        drop(first);
-        // Two vCPUs cannot take a view.
+        let second = joined.entry_gate().register().unwrap();
+        let two_threads = joined.snapshot_sharing_address_space().unwrap_err();
+        assert!(
+            matches!(
+                &two_threads,
+                Error::UnsupportedSharedFile {
+                    operation: "shared-file fork snapshot",
+                    ..
+                }
+            ) && two_threads.is_named_refusal(),
+            "{two_threads}"
+        );
+        assert!(joined.entry_gate().pending_failure().is_none());
+        drop((first, second));
+        // Two stopped vCPUs take a view: the publication closes for both.
+        // The recorded capability spares this native unit /dev/kvm.
         let threaded = fixture(2);
+        threaded.record_kvm_sync_mmu(true).unwrap();
         let one = threaded.entry_gate().register().unwrap();
         let two = threaded.entry_gate().register().unwrap();
-        assert!(matches!(
-            threaded.publish_shared_file_range(
+        threaded
+            .publish_shared_file_range(
                 threaded.allocation_guard(),
                 SharedFileRangePlan {
                     address: BASE,
@@ -3644,13 +3865,11 @@ mod tests {
                     max_writable: true,
                     cursors: None,
                 },
-            ),
-            Err(Error::SharedFileCapability {
-                operation: "mapping publication",
-                ..
-            })
-        ));
-        assert!(!threaded.contains_shared_file());
+            )
+            .unwrap();
+        assert!(threaded.contains_shared_file());
+        assert_eq!(threaded.entry_gate().generation().unwrap().get(), 1);
+        assert!(threaded.entry_gate().admission_open().unwrap());
         drop((one, two, participant));
     }
 

@@ -99,17 +99,6 @@ pub(super) fn vfork_child_creates_thread(
     flags & libc::CLONE_THREAD as u64 != 0
 }
 
-/// Whether a `clone` or `clone3` with `flags` would run its child in the
-/// caller's address space beside the caller: a thread (`CLONE_THREAD`), or a
-/// `CLONE_VM` process that the caller does not wait for (no `CLONE_VFORK`).
-/// A vfork-style child (`CLONE_VM|CLONE_VFORK`) is not one: its caller waits
-/// until the child execs or exits, and the backend runs it on a copy of the
-/// arena (`GuestMemory::snapshot_sharing_address_space`).
-pub(super) fn clone_runs_beside_caller_in_its_arena(flags: u64) -> bool {
-    let shares = flags & (libc::CLONE_VM | libc::CLONE_VFORK) as u64;
-    flags & libc::CLONE_THREAD as u64 != 0 || shares == libc::CLONE_VM as u64
-}
-
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-216): Review direct-worker classification for CLONE_THREAD.
 // CLONE_THREAD is no longer treated as backend-owned (workers now run through
@@ -985,15 +974,8 @@ impl ElfExecutor {
         self.check_parent_death_failure()?;
         self.bind_address_space(memory);
         self.parent_death_injection_preflight(request)?;
-        // A fork gets a separate arena/gate and inherits the real shared VMAs.
-        // So does a vfork-style child (vfork, or a process clone with
-        // CLONE_VM|CLONE_VFORK): it runs on a copy of this arena with a gate
-        // of its own (`GuestMemory::snapshot_sharing_address_space`), which
-        // refuses changes to the inherited views until the child execs, and
-        // adds no participant to this gate. A thread, or a CLONE_VM process
-        // without CLONE_VFORK, would be another owner of this arena running
-        // beside the caller, and is refused before task-ID allocation, child
-        // copyout or ProcessAction.
+        // A vfork child's copy may not create a thread (see
+        // `vfork_child_creates_thread`).
         if vfork_child_creates_thread(memory, request.number(), request.args()) {
             return Err(crate::Error::VforkChildCapability {
                 operation: "thread creation in a vfork child",
@@ -1002,48 +984,18 @@ impl ElfExecutor {
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-919): Review shared-file fork admission.
-        if memory.entry_gate().single_member_domain_active() {
-            let number = request.number();
-            let args = request.args();
-            let refusal = || crate::Error::SharedFileCapability {
-                operation: "CLONE_VM/thread creation",
-                reason: "ordinary shared-file views require one vCPU per address space",
-            };
-            if number == libc::SYS_clone as u64 && clone_runs_beside_caller_in_its_arena(args[0]) {
-                return Err(refusal());
-            }
-            if number == libc::SYS_clone3 as u64 {
-                // Read once: the checked flags must be the flags actually used
-                // to create the ProcessAction, not a second mutable copyin.
-                let clone = match read_clone3(&ProviderMemory(memory), args[0], args[1]) {
-                    Ok(clone) => clone,
-                    Err(error) => return Ok(self.refuse_clone3_fields(error)),
-                };
-                if clone_runs_beside_caller_in_its_arena(clone.flags) {
-                    return Err(refusal());
-                }
-                if let Err(refused) = validate_process_clone_flags(clone.flags) {
-                    return Ok(self.refuse_clone_flags(refused));
-                }
-                if clone.flags & PROCESS_CLONE_TID_FLAGS != 0
-                    || clone.parent_tid.is_some()
-                    || clone.child_tid.is_some()
-                {
-                    return Ok(self.refuse_clone_flags(CloneFlagsRefused::unsupported(
-                        libc::ENOTSUP,
-                        CLONE_FLAGS_REFUSAL,
-                    )));
-                }
-                return Ok(self.prepare_fork(
-                    clone.child_stack,
-                    None,
-                    None,
-                    None,
-                    clone.flags & CLONE_CLEAR_SIGHAND != 0,
-                    clone.flags & libc::CLONE_VM as u64 != 0,
-                ));
-            }
-        }
+        // Ordinary shared-file views restrict no clone here. A thread runs in
+        // this arena beside the caller, and a later publication closes
+        // admission for every vCPU of the arena before it changes a view
+        // (`EntryGate::close_blocking`). A fork gets a separate arena and gate
+        // and inherits the real shared VMAs, which its snapshot refuses by
+        // name while another vCPU of this arena runs. So does a vfork-style
+        // child (vfork, or a process clone with CLONE_VM|CLONE_VFORK): it runs
+        // on a copy of this arena with a gate of its own
+        // (`GuestMemory::snapshot_sharing_address_space`), which refuses
+        // changes to the inherited views until the child execs. A CLONE_VM
+        // process without CLONE_VFORK is refused like any other process clone
+        // (`validate_process_clone_flags`).
         if request.number() == libc::SYS_prctl as u64
             && request.args()[0] as i32 == libc::PR_SET_PDEATHSIG
             && (1..=64).contains(&request.args()[1])

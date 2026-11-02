@@ -198,7 +198,6 @@ mod shared_file_dispatch_tests {
         elf_cursors: AllocationCursors,
         pages: Vec<(Option<RegionKind>, bool)>,
         backed: usize,
-        shared_domain: bool,
     }
 
     fn layout(memory: &GuestMemory, state: &LoadedStaticElf) -> Layout {
@@ -217,7 +216,6 @@ mod shared_file_dispatch_tests {
                 })
                 .collect(),
             backed: memory.separately_backed_pages(),
-            shared_domain: memory.entry_gate().single_member_domain_active(),
         }
     }
 
@@ -392,7 +390,6 @@ mod shared_file_dispatch_tests {
         assert_eq!(AllocationCursors::from_elf(&executor.state), elf_cursors);
         assert_eq!(f.memory.separately_backed_pages(), backed);
         assert!(f.memory.user_range_is_mapped(address, 2 * PAGE_SIZE));
-        assert!(gate.single_member_domain_active());
         assert!(executor.take_process_action().is_none());
         assert!(executor.pending_processes.is_empty());
         assert!(executor.state.consumed_child_wait.is_none());
@@ -759,7 +756,6 @@ mod shared_file_dispatch_tests {
         );
         assert_eq!(layout(&f.memory, &f.state), before);
         assert!(f.memory.contains_shared_file());
-        assert!(f.memory.entry_gate().single_member_domain_active());
         assert_eq!(std::fs::read(&f.path).unwrap(), f.expected);
     }
 
@@ -992,68 +988,81 @@ mod shared_file_dispatch_tests {
         }
     }
 
-    /// A thread, or a CLONE_VM process its caller does not wait for, would run
-    /// beside the caller in the arena that holds the views; both stay refused,
-    /// a thread asking for CLONE_VFORK too.
+    /// An ordinary shared-file view changes no clone's outcome: a thread, a
+    /// CLONE_VM process without CLONE_VFORK, a thread request with
+    /// CLONE_VFORK, and the same with TID flags, by clone and by clone3, each
+    /// get what they get in an address space without a view (the result, the
+    /// task IDs taken and the process action), where the views used to refuse
+    /// every clone that would run beside the caller by name. Thread creation
+    /// is admitted; the CLONE_VM process is refused as it is without a view.
     #[test]
-    fn shared_file_vm_and_thread_clone_refuse_before_ids_copyout_or_process_action() {
-        for (number, flags) in [
-            (libc::SYS_clone, libc::CLONE_VM),
-            (libc::SYS_clone, libc::CLONE_VM | libc::CLONE_THREAD | libc::CLONE_SIGHAND),
-            (
-                libc::SYS_clone,
-                libc::CLONE_VM | libc::CLONE_VFORK | libc::CLONE_THREAD | libc::CLONE_SIGHAND,
-            ),
-            (libc::SYS_clone3, libc::CLONE_VM),
-            (libc::SYS_clone3, libc::CLONE_VM | libc::CLONE_THREAD | libc::CLONE_SIGHAND),
-            (
-                libc::SYS_clone3,
-                libc::CLONE_VM | libc::CLONE_VFORK | libc::CLONE_THREAD | libc::CLONE_SIGHAND,
-            ),
-        ] {
-            let mut f = Fixture::new();
-            let fd = f.open(true);
-            f.shared(fd, 0, 0, true);
-            let args = if number == libc::SYS_clone {
-                [(flags | libc::CLONE_PARENT_SETTID | libc::CLONE_CHILD_SETTID) as u64,
-                    0, 0x100, 0x108, 0, 0]
-            } else if number == libc::SYS_clone3 {
-                let mut raw = [0_u8; 88];
-                raw[..8].copy_from_slice(&(flags as u64).to_ne_bytes());
-                f.memory.write_raw(0x100, &raw).unwrap();
-                [0x100, 88, 0, 0, 0, 0]
-            } else { [0; 6] };
-            let mut executor = f.take_executor();
-            let before = layout(&f.memory, &executor.state);
-            let next = executor.next_pid.load(Ordering::SeqCst);
-            assert!(executor.state.task_lifecycle.lock().unwrap().get(next).is_none());
-            let error = executor.execute_checked(&SyscallRequest::new(number as u64, args), &f.memory).unwrap_err();
-            capability(&error, "CLONE_VM/thread creation",
-                "ordinary shared-file views require one vCPU per address space");
-            assert_eq!(executor.next_pid.load(Ordering::SeqCst), next);
-            assert!(executor.take_process_action().is_none());
-            assert!(executor.pending_processes.is_empty());
-            assert!(executor.state.task_lifecycle.lock().unwrap().get(next).is_none());
-            assert_eq!(layout(&f.memory, &executor.state), before);
-            assert_eq!(std::fs::read(&f.path).unwrap(), f.expected);
-        }
-    }
-
-    #[test]
-    fn clone_runs_beside_caller_in_its_arena_names_threads_and_unwaited_clone_vm() {
+    fn shared_file_views_change_no_clone_outcome() {
+        let thread = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM) as u64;
+        let tids = (libc::CLONE_PARENT_SETTID | libc::CLONE_CHILD_SETTID) as u64;
         let vm = libc::CLONE_VM as u64;
         let vfork = libc::CLONE_VFORK as u64;
-        let thread = (libc::CLONE_THREAD | libc::CLONE_SIGHAND) as u64;
-        let signal = libc::SIGCHLD as u64;
-        assert!(!clone_runs_beside_caller_in_its_arena(signal));
-        assert!(!clone_runs_beside_caller_in_its_arena(vfork | signal));
-        assert!(!clone_runs_beside_caller_in_its_arena(vm | vfork | signal));
-        assert!(!clone_runs_beside_caller_in_its_arena(
-            vm | vfork | CLONE_CLEAR_SIGHAND
-        ));
-        assert!(clone_runs_beside_caller_in_its_arena(vm | signal));
-        assert!(clone_runs_beside_caller_in_its_arena(vm | thread));
-        assert!(clone_runs_beside_caller_in_its_arena(vm | vfork | thread));
+        let outcome = |with_view: bool, number: libc::c_long, flags: u64| {
+            let mut f = Fixture::new();
+            if with_view {
+                let fd = f.open(true);
+                f.shared(fd, 0, 0, true);
+            }
+            let args = if number == libc::SYS_clone {
+                [flags, 0x3000, 0x100, 0x108, 0, 0]
+            } else {
+                // clone_args: flags, pidfd, child_tid, parent_tid,
+                // exit_signal, then a stack's lowest address and its size.
+                let mut raw = [0_u8; 88];
+                raw[..8].copy_from_slice(&(flags & !0xff).to_ne_bytes());
+                raw[16..24].copy_from_slice(&0x108_u64.to_ne_bytes());
+                raw[24..32].copy_from_slice(&0x100_u64.to_ne_bytes());
+                raw[32..40].copy_from_slice(&(flags & 0xff).to_ne_bytes());
+                raw[40..48].copy_from_slice(&0x2000_u64.to_ne_bytes());
+                raw[48..56].copy_from_slice(&0x1000_u64.to_ne_bytes());
+                f.memory.write_raw(0x200, &raw).unwrap();
+                [0x200, 88, 0, 0, 0, 0]
+            };
+            let mut executor = f.take_executor();
+            let next = executor.next_pid.load(Ordering::SeqCst);
+            let result = executor
+                .execute_checked(&SyscallRequest::new(number as u64, args), &f.memory)
+                .map_err(|error| error.primary().to_string());
+            let action = match executor.take_process_action() {
+                None => "none".to_owned(),
+                Some(ProcessAction::Fork {
+                    share_address_space,
+                    ..
+                }) => format!("fork share_address_space={share_address_space}"),
+                Some(ProcessAction::Thread { .. }) => "thread".to_owned(),
+                Some(_) => "other".to_owned(),
+            };
+            let taken = executor.next_pid.load(Ordering::SeqCst) - next;
+            (result, taken, action)
+        };
+        for number in [libc::SYS_clone, libc::SYS_clone3] {
+            for (flags, admitted) in [
+                (thread, true),
+                (thread | tids, true),
+                (vm | libc::SIGCHLD as u64, false),
+                (vm | tids | libc::SIGCHLD as u64, false),
+                (thread | vfork, false),
+            ] {
+                let label = format!("syscall={number} flags={flags:#x}");
+                let without = outcome(false, number, flags);
+                let with = outcome(true, number, flags);
+                assert_eq!(with, without, "{label}");
+                if admitted {
+                    assert_eq!((with.1, with.2.as_str()), (1, "thread"), "{label}: {with:?}");
+                } else {
+                    assert_eq!((with.1, with.2.as_str()), (0, "none"), "{label}: {with:?}");
+                }
+            }
+        }
     }
 
     /// A vfork-style child (vfork, and clone or clone3 with
@@ -1604,7 +1613,6 @@ mod shared_file_dispatch_tests {
             0
         );
         assert!(!f.memory.contains_shared_file());
-        assert!(!f.memory.entry_gate().single_member_domain_active());
         let snapshot = f.memory.snapshot().unwrap();
         assert_eq!(hva_bytes(&snapshot), hva_bytes(&f.memory));
         let mut executor = f.take_executor();

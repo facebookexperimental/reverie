@@ -258,7 +258,7 @@ pub(crate) mod exit_read_reuse_tests {
         let mut closed =
             futures::executor::block_on(gate.try_close().unwrap().unwrap().finish()).unwrap();
         closed
-            .publish(None, exit.generation, |next| {
+            .publish(None, exit.generation, 0..4096, |next| {
                 Ok(crate::memory::InstalledMapping::gate_control(next))
             })
             .unwrap();

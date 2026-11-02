@@ -6145,13 +6145,15 @@ impl KvmBackend {
         if self.independent_process_mm
             && !self.is_guest_thread
             && self.memory.contains_shared_file()
-            && self.memory.entry_gate().single_member_domain_active()
+            && self.vcpu.is_sole_participant()
         {
             // Linux mm_release discards clear_child_tid in either case, but
             // stores/wakes only for mm_users > 1. File pages shared with a
-            // different process do not share the guest mm. This certificate
-            // plus the exclusive file domain proves the virtual last-user
-            // case; it is not a general model of host mm_users, which temporary
+            // different process do not share the guest mm. This certificate,
+            // with this vCPU the only one registered in the address space now
+            // (each thread's vCPU registers when the thread is created and
+            // leaves when it is dropped), proves the virtual last-user case;
+            // it is not a general model of host mm_users, which temporary
             // /proc readers can also increment. No virtual observer owns such
             // a reference here. Consume the registration without accessing its
             // address; existing gate failures remain pending and unchanged.

@@ -397,6 +397,12 @@ impl CountedVcpu {
         self.participant.origin()
     }
 
+    /// Whether this vCPU is the only one registered in its address space now
+    /// (`Participant::is_sole_member`).
+    pub(crate) fn is_sole_participant(&self) -> bool {
+        self.participant.is_sole_member()
+    }
+
     /// The attribution this vCPU's own memory handle carries: none, since
     /// construction moved it aside for the participant.
     #[cfg(test)]

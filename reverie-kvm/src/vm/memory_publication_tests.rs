@@ -148,7 +148,7 @@ pub(crate) mod memory_publication_tests {
         assert!(
             error
                 .to_string()
-                .contains("mapping publication has retained host operands"),
+                .contains("mapping publication overlaps a retained host operand"),
             "unexpected error: {error}"
         );
         let refused = gate.test_state();
@@ -163,6 +163,39 @@ pub(crate) mod memory_publication_tests {
         assert_eq!(gate.test_state().retained_operands, 0);
         drop(closed);
         assert!(memory.read_raw(0, &mut [0]).is_err());
+    }
+
+    /// A retained host operand on another page does not hold up a page
+    /// publication: only an operand overlapping the replaced range refuses
+    /// it. The operand retires afterwards, across the new generation.
+    #[test]
+    fn retained_host_operand_on_another_page_allows_publication() {
+        let memory = GuestMemory::new(0, 2 * HOST_PAGE_SIZE).unwrap();
+        memory
+            .map_user_range(0, 2 * HOST_PAGE_SIZE as u64, false)
+            .unwrap();
+        memory.enable_user_access();
+        memory.write_raw(HOST_PAGE_SIZE as u64, &[0x42]).unwrap();
+        let operand = memory.user().host_operand(HOST_PAGE_SIZE as u64, 1).unwrap();
+        let gate = memory.entry_gate();
+        assert_eq!(gate.test_state().retained_operands, 1);
+
+        let mut replacement = vec![0; HOST_PAGE_SIZE];
+        replacement[0] = 0x99;
+        let pending = memory.stage_backing_page(0, &replacement).unwrap();
+        let mut closed = close_mapping(&gate);
+        let generation = pending.publish(&mut closed).unwrap();
+        assert_eq!(generation.get(), 1);
+        drop(closed);
+        let mut byte = [0];
+        memory.read_raw(0, &mut byte).unwrap();
+        assert_eq!(byte, [0x99]);
+        // SAFETY: no VM or other host thread can write this control byte, and
+        // the publication replaced only the other page.
+        assert_eq!(unsafe { operand.read_volatile::<u8>() }, 0x42);
+        drop(operand);
+        assert_eq!(gate.test_state().retained_operands, 0);
+        assert!(gate.pending_failure().is_none());
     }
 
     #[test]

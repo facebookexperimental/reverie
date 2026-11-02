@@ -12317,7 +12317,10 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "shared_file_fork_settled_visibility_close_reuse_and_private_cow_match_native",
         "shared_file_fork_clear_tid_records_native_and_checks_kvm_last_owner",
         "shared_file_vfork_and_posix_spawn_children_match_native",
-        "shared_file_vfork_child_view_changes_and_threads_are_refused_by_name",
+        "shared_file_vfork_child_view_changes_are_refused_by_name",
+        "shared_file_views_and_threads_coexist_as_natively",
+        "shared_file_views_with_threads_match_native",
+        "shared_file_view_over_a_waiting_futex_word_is_refused_by_name",
         "seqpacket_socketpair_two_writers_match_native",
         "vfork_children_share_private_memory_with_their_parent_like_native",
         "a_vfork_child_cannot_leave_a_mapping_changed",
@@ -22404,6 +22407,23 @@ const SHARED_FILE_VFORK_MODES: [(&str, Option<ThreadOwnership>); 3] = [
     ("tool", Some(ThreadOwnership::Tool)),
 ];
 
+/// Whether `error`, or a KVM backend error among its sources, is a refusal
+/// by name (`reverie_kvm::Error::is_named_refusal`), as a consumer that walks
+/// the chain of a run's failure finds it.
+fn refused_by_name(error: &reverie_kvm::Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if current
+            .downcast_ref::<reverie_kvm::Error>()
+            .is_some_and(reverie_kvm::Error::is_named_refusal)
+        {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
 /// Runs the shared-file vfork fixture with `args` natively, in a directory
 /// of its own under `directory`, and returns its status and output.
 fn run_shared_file_vfork_natively(
@@ -22583,15 +22603,233 @@ fn shared_file_vfork_and_posix_spawn_children_match_native() {
     }
 }
 
+/// A thread created while the process holds shared-file views, and views
+/// mapped while a second thread is alive, behave on KVM as natively: the
+/// guest's output and exit status are Linux's. A publication closes
+/// admission for every vCPU of the address space; these used to be refused
+/// by name (https://github.com/rrnewton/reverie/issues/1108).
+#[test]
+fn shared_file_views_and_threads_coexist_as_natively() {
+    const TEST: &str = "shared_file_views_and_threads_coexist_as_natively";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-vfork",
+        include_str!("fixtures/shared_file_vfork.c"),
+    );
+    for (args, native_stdout) in [
+        (
+            vec!["map-then-thread"],
+            "shared-file vfork threads=map-then-thread ok\n",
+        ),
+        (
+            vec!["thread-then-map"],
+            "shared-file vfork threads=thread-then-map ok\n",
+        ),
+    ] {
+        let label = args.join("-");
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{label}"),
+            &args,
+        );
+        assert_eq!(native.status.code(), Some(0), "{label}: {native:?}");
+        assert_eq!(
+            native.stdout,
+            native_stdout.as_bytes(),
+            "{label}: {native:?}"
+        );
+        for mode in SHARED_FILE_VFORK_MODES {
+            let name = mode.0;
+            let (_, code, stdout, stderr) =
+                run_shared_file_vfork_on_kvm(&directory.0, &program, mode, &args)
+                    .unwrap_or_else(|error| panic!("{label} mode={name}: {error}"));
+            assert_eq!(
+                code, 0,
+                "{label} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert_eq!(stdout, native.stdout, "{label} mode={name}");
+            assert_eq!(stderr, native.stderr, "{label} mode={name}");
+            eprintln!("shared-file-vfork completed {label} {name}");
+        }
+    }
+}
+
+/// Shared file views in an address space with two worker threads alive
+/// (`fixtures/shared_file_threads.c`): a view mapped after the threads start,
+/// which every thread stores through and reads; the view unmapped and mapped
+/// again while they live; a worker's gettimeofday(2) into the view after the
+/// main thread made it read-only, which fails with EFAULT and stores nothing;
+/// and the main thread's pthread_exit while it holds the view, which, with
+/// workers alive, clears its TID word and wakes the worker joining it, in
+/// the first process and in a forked child, whose leader alone may skip that
+/// store as the last user of its address space. Each
+/// matches native Linux on KVM, without a tool and with the strace tool
+/// owning threads on the host or through the tool. A fork of the process
+/// while its workers live is refused by name: its snapshot would copy the
+/// views' address space while another vCPU runs in it. The fork waits for
+/// the workers to block first: a refusal's teardown while a worker enters a
+/// host futex wait can miss that worker
+/// (https://github.com/rrnewton/reverie/issues/1238).
+#[test]
+fn shared_file_views_with_threads_match_native() {
+    const TEST: &str = "shared_file_views_with_threads_match_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-threads",
+        include_str!("fixtures/shared_file_threads.c"),
+    );
+    let mapped = "mapped a shared view with 2 threads alive\n";
+    for (mode, expected) in [
+        (
+            "use",
+            format!(
+                "{mapped}round 0: the file holds every thread's store, and every thread read \
+                 them all\nunmapped the view and mapped it again with threads alive\nround 1: \
+                 the file holds every thread's store, and every thread read them all\nthreads \
+                 joined\n"
+            ),
+        ),
+        (
+            "mprotect",
+            format!(
+                "{mapped}a thread's gettimeofday into the read-only view failed with \
+                 EFAULT\nthreads joined\n"
+            ),
+        ),
+        (
+            "leader-exit",
+            format!("{mapped}a worker joined the main thread after it exited\n"),
+        ),
+        (
+            "fork-leader-exit",
+            "mapped a shared view, then forked\nthe child's worker joined the child's main \
+             thread after it exited\nthe child exited 0\n"
+                .to_owned(),
+        ),
+    ] {
+        let native = run_shared_file_vfork_natively(
+            &directory.0,
+            &program,
+            &format!("native-{mode}"),
+            &[mode],
+        );
+        assert_eq!(native.status.code(), Some(0), "{mode}: {native:?}");
+        assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "{mode}");
+        for kvm_mode in SHARED_FILE_VFORK_MODES {
+            let name = kvm_mode.0;
+            let (_, code, stdout, stderr) =
+                run_shared_file_vfork_on_kvm(&directory.0, &program, kvm_mode, &[mode])
+                    .unwrap_or_else(|error| panic!("{mode} mode={name}: {error}"));
+            assert_eq!(
+                code, 0,
+                "{mode} mode={name}: stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert_eq!(stdout, native.stdout, "{mode} mode={name}");
+            assert_eq!(stderr, native.stderr, "{mode} mode={name}");
+            eprintln!("shared-file-threads completed {mode} {name}");
+        }
+    }
+
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native-fork", &["fork"]);
+    assert_eq!(native.status.code(), Some(0), "fork: {native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        format!("{mapped}the forked child read the view\nthreads joined\n"),
+        "fork"
+    );
+    for kvm_mode in SHARED_FILE_VFORK_MODES {
+        let name = kvm_mode.0;
+        let error = match run_shared_file_vfork_on_kvm(&directory.0, &program, kvm_mode, &["fork"])
+        {
+            Ok((_, code, stdout, stderr)) => panic!(
+                "fork mode={name}: expected the refusal, got code={code} stdout={stdout:?} \
+                 stderr={stderr:?}"
+            ),
+            // The program's doing (a fork beside a live thread), so a refusal
+            // by name rather than a failure of the backend.
+            Err(error) => {
+                assert!(refused_by_name(&error), "fork mode={name}: {error:?}");
+                error.to_string()
+            }
+        };
+        assert!(
+            error.contains(
+                "unsupported KVM shared-file operation shared-file fork snapshot: requires one \
+                 stopped vCPU"
+            ),
+            "fork mode={name}: {error}"
+        );
+        eprintln!("shared-file-threads refused fork {name}");
+    }
+}
+
+/// A view mapped with MAP_FIXED over the page of another thread's host
+/// FUTEX_WAIT (`fixtures/shared_file_threads.c`, mode "futex") is refused by
+/// name on KVM after the publication's bound: the wait holds a host pointer
+/// into the replaced page, which the publication cannot move, and waiting for
+/// it longer could wait for a wake that only the publishing thread would
+/// make. Linux replaces the page and the later wake still reaches the waiter.
+/// Without a tool only: each run waits out the ten-second bound.
+#[test]
+fn shared_file_view_over_a_waiting_futex_word_is_refused_by_name() {
+    const TEST: &str = "shared_file_view_over_a_waiting_futex_word_is_refused_by_name";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "shared-file-threads",
+        include_str!("fixtures/shared_file_threads.c"),
+    );
+    let native = run_shared_file_vfork_natively(&directory.0, &program, "native-futex", &["futex"]);
+    assert_eq!(native.status.code(), Some(0), "futex: {native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "mapped a shared view with 2 threads alive\nmapped a view over a waiting thread's futex \
+         word\nthe waiter woke and read 1 through the view\nthreads joined\n",
+    );
+    let error = match run_shared_file_vfork_on_kvm(
+        &directory.0,
+        &program,
+        SHARED_FILE_VFORK_MODES[0],
+        &["futex"],
+    ) {
+        Ok((_, code, stdout, stderr)) => {
+            panic!("expected the refusal, got code={code} stdout={stdout:?} stderr={stderr:?}")
+        }
+        // The program's doing (a mapping over memory another of its threads
+        // waits on), so a refusal by name rather than a failure.
+        Err(error) => {
+            assert!(refused_by_name(&error), "{error:?}");
+            error.to_string()
+        }
+    };
+    assert!(
+        error.contains(
+            "unsupported KVM shared-file operation mapping publication: a host operation still \
+             uses memory in the replaced range"
+        ),
+        "{error}"
+    );
+}
+
 /// A vfork child that changes a shared view it inherited is refused by name
 /// on KVM before the change: Linux would apply an unmapping, a protection
 /// change, a private mapping over the view or a new shared view to the
-/// parent's address space too, and the child here runs on a copy of it. A
-/// thread is refused while the process holds a view, and a view while a
-/// second thread is alive, as before.
+/// parent's address space too, and the child here runs on a copy of it.
 #[test]
-fn shared_file_vfork_child_view_changes_and_threads_are_refused_by_name() {
-    const TEST: &str = "shared_file_vfork_child_view_changes_and_threads_are_refused_by_name";
+fn shared_file_vfork_child_view_changes_are_refused_by_name() {
+    const TEST: &str = "shared_file_vfork_child_view_changes_are_refused_by_name";
     if !leader_self_exec_bounded(TEST) {
         return;
     }
@@ -22627,20 +22865,6 @@ fn shared_file_vfork_child_view_changes_and_threads_are_refused_by_name() {
             vec!["change", "mprotect"],
             "shared-file vfork change=mprotect child=ok\n",
             vfork_refusal("mprotect in a vfork child"),
-        ),
-        (
-            vec!["map-then-thread"],
-            "shared-file vfork threads=map-then-thread ok\n",
-            "unsupported KVM shared-file operation CLONE_VM/thread creation: ordinary shared-file \
-             views require one vCPU per address space"
-                .to_owned(),
-        ),
-        (
-            vec!["thread-then-map"],
-            "shared-file vfork threads=thread-then-map ok\n",
-            "unsupported KVM shared-file operation mapping publication: requires one stopped \
-             vCPU"
-                .to_owned(),
         ),
     ];
     for (args, native_stdout, refusal) in cases {
