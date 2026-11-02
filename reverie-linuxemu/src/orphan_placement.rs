@@ -60,6 +60,44 @@ impl ProcessFamilyState {
     }
 }
 
+impl ProcessFamilyState {
+    /// The exit of a traced root that is itself its PID namespace's init
+    /// (`NamespaceReaper::TracedRoot`), with orphan placement enabled: the
+    /// namespace ends with it. Linux's `find_child_reaper` (kernel/exit.c)
+    /// then kills every member (`zap_pid_ns_processes`) and the dying init
+    /// reaps each one, so no process adopts an orphan of this exit and none is
+    /// announced to a new parent. Its children therefore stay as they were
+    /// without placement: each keeps its edge to the exited root, whose
+    /// terminal state makes its own exit a `RunTeardownChild`, and the root's
+    /// executors join its host children themselves (it is not `reparented`).
+    ///
+    /// The same holds for each later exit inside the ended namespace (a
+    /// `RunTeardownChild`, called before that exit retires its edges as it
+    /// does without placement): Linux's `find_child_reaper` still returns the
+    /// dying init, which is not the exiting member, and its `kernel_wait4`
+    /// loop reaps the member's children (kernel/exit.c, kernel/pid_namespace.c).
+    ///
+    /// The children are only listed here, so that the Tool's placement can be
+    /// checked: each must go to the namespace init, the only placement Linux's
+    /// rule leaves (`place_orphans`).
+    pub(super) fn await_namespace_end(&mut self, process: ProcessKey) {
+        let awaiting: AwaitingOrphans = self
+            .direct_children
+            .get(&process)
+            .into_iter()
+            .flatten()
+            .filter(|(child, state)| match state {
+                DirectChildState::Live => !self.terminal.contains_key(child),
+                DirectChildState::WaitableZombie => true,
+            })
+            .map(|(child, state)| (*child, *state))
+            .collect();
+        let previous = self.awaiting_placement.insert(process, awaiting);
+        debug_assert!(previous.is_none(), "KVM exit awaited placement twice");
+        self.namespace_ended.insert(process);
+    }
+}
+
 /// The publication effect of a zombie's announcement, as a child-exit effect.
 fn announcement_effect(change: PendingChange) -> ChildExitPublicationEffect {
     match change {
@@ -152,6 +190,9 @@ impl ProcessSignalRegistry {
             // The exit has not been recorded: nothing waits for a parent yet.
             return RejectedBeforeCommit(Errno::EAGAIN);
         }
+        if family.namespace_ended.contains(&key) {
+            return Self::place_at_namespace_end(family, exited, placements);
+        }
         if family
             .unclaimed_child_exits
             .get(&key)
@@ -223,6 +264,57 @@ impl ProcessSignalRegistry {
             None => None,
         };
         self.commit_placement(family, exited, placements, &awaiting, reaper, init_pid)
+    }
+
+    /// The placement of the orphans of a namespace init's exit, or of a
+    /// member's exit after it (`ProcessFamilyState::await_namespace_end`):
+    /// every child goes to the
+    /// namespace init, which here is the namespace's teardown, and nothing
+    /// moves; a process reaper is refused (`EINVAL`), as no process survives
+    /// the namespace to adopt one. No announcement follows, so a child exit
+    /// the exit's fence has not claimed yet does not stand in the way.
+    fn place_at_namespace_end(
+        mut family: std::sync::MutexGuard<'_, ProcessFamilyState>,
+        exited: SignalProcessId,
+        placements: &[OrphanPlacement],
+    ) -> OrphanPlacementResult {
+        let key = process_key(exited);
+        let awaiting = family
+            .awaiting_placement
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let mut named = BTreeSet::new();
+        for placement in placements {
+            let child = process_key(placement.child);
+            if placement.reaper != OrphanReaper::NamespaceInit
+                || !awaiting.contains_key(&child)
+                || !named.insert(child)
+            {
+                return OrphanPlacementResult::RejectedBeforeCommit(Errno::EINVAL);
+            }
+        }
+        family.awaiting_placement.remove(&key);
+        let placed = placements
+            .iter()
+            .map(|placement| process_key(placement.child))
+            .chain(
+                awaiting
+                    .keys()
+                    .copied()
+                    .filter(|child| !named.contains(child)),
+            )
+            .map(|child| PlacedOrphan {
+                child: process_identity(child),
+                reaper: OrphanReaper::NamespaceInit,
+                effect: PlacedOrphanEffect::NamespaceInit,
+            })
+            .collect();
+        let result = OrphanPlacementResult::Committed(OrphanPlacementReceipt { exited, placed });
+        family
+            .placement_results
+            .insert(key, (placements.to_vec(), result.clone()));
+        result
     }
 
     /// Moves the validated children of `exited` under the family lock

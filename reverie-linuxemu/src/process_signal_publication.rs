@@ -298,6 +298,10 @@ pub struct ProcessFamilyState {
     // `awaiting_placement` until the Tool places them (`place_orphans`).
     orphan_placement: bool,
     awaiting_placement: BTreeMap<ProcessKey, orphan_placement::AwaitingOrphans>,
+    // Exits that ended, or happened inside, a namespace whose traced-root
+    // init has exited: the root's own, then each member's
+    // (`await_namespace_end`). Nonempty exactly once the namespace ended.
+    namespace_ended: BTreeSet<ProcessKey>,
     // Each placement's request and retained result, by exited generation.
     placement_results: BTreeMap<
         ProcessKey,
@@ -698,7 +702,16 @@ impl ProcessSignalRegistry {
             // already-published zombie or a still-running direct child. Retire
             // those exact edges as part of this consuming teardown transition;
             // each later child still recognizes the terminal direct parent by
-            // generation and takes this same branch.
+            // generation and takes this same branch. Inside a namespace that
+            // ended with its traced-root init, list those children first, so
+            // that the Tool's placement of them can be checked
+            // (`await_namespace_end`).
+            if family.orphan_placement
+                && family.reaper == NamespaceReaper::TracedRoot
+                && !family.namespace_ended.is_empty()
+            {
+                family.await_namespace_end(process_key(process));
+            }
             family.direct_children.remove(&process_key(process));
             ProcessFamilyExit::RunTeardownChild { status }
         } else if let (Some(child), NamespaceReaper::Unknown | NamespaceReaper::TracedRoot) =
@@ -761,7 +774,13 @@ impl ProcessSignalRegistry {
         };
         family.terminal.insert(process_key(process), exit);
         self.wait_changed.notify_all();
-        if matches!(exit, ProcessFamilyExit::Root | ProcessFamilyExit::Child(_))
+        if matches!(exit, ProcessFamilyExit::Root)
+            && family.orphan_placement
+            && family.reaper == NamespaceReaper::TracedRoot
+        {
+            // The namespace ends with its init (`await_namespace_end`).
+            family.await_namespace_end(process_key(process));
+        } else if matches!(exit, ProcessFamilyExit::Root | ProcessFamilyExit::Child(_))
             && family.orphan_placement
         {
             // The Tool names each child's new parent (`place_orphans`).

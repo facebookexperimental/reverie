@@ -231,7 +231,10 @@ pub enum OrphanReaper {
     /// child, as when Linux's `find_new_reaper` picks a child subreaper.
     Process(SignalProcessId),
     /// The PID namespace's init, which the backend keeps outside the guest
-    /// process tree. No guest process can wait for the child.
+    /// process tree. No guest process can wait for the child. Where the
+    /// namespace init is the exited process itself, or the exit happens in a
+    /// namespace whose init has exited, this is the only reaper accepted: the
+    /// namespace is being torn down ([`ProcessSignalControl::place_orphans`]).
     NamespaceInit,
 }
 
@@ -261,7 +264,10 @@ pub enum PlacedOrphanEffect {
     /// backend could not publish. Only in
     /// [`OrphanPlacementResult::FailedAfterCommit`], which names the error.
     ZombieUnannounced,
-    /// Adopted by the namespace init, live or exited.
+    /// Adopted by the namespace init, live or exited. Where the namespace is
+    /// being torn down (the exited process is its init, or exited after it),
+    /// nothing moved: the child keeps its parent and goes with the teardown,
+    /// and no guest process waits for it.
     NamespaceInit,
 }
 
@@ -435,6 +441,14 @@ pub trait ProcessSignalControl: Debug + Send + Sync {
     /// `SA_NOCLDWAIT`, both decided from the reaper's disposition at this
     /// call, as Linux's `do_notify_parent` decides them. A reaper must be a
     /// live process of the run.
+    ///
+    /// Where the exited process is itself its PID namespace's init, or exits
+    /// in a namespace whose init has already exited, Linux tears the
+    /// namespace down (`zap_pid_ns_processes`) and the dying init reaps every
+    /// orphan: any [`OrphanReaper::Process`] is refused (`EINVAL`), and each
+    /// child, named or not, is placed with [`OrphanReaper::NamespaceInit`] as
+    /// a no-op ([`PlacedOrphanEffect::NamespaceInit`]: nothing moves, nothing
+    /// is announced, and no child exit needs to have been claimed first).
     ///
     /// The backend must already have recorded the exit (a backend records it
     /// before it reports the exit's terminal boundary); before that the call
