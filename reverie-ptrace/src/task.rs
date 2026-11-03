@@ -621,20 +621,25 @@ fn preparation_word(
 }
 
 /// Whether an injected syscall `nr` with `args` may swap the signal mask for
-/// its duration, as `swaps_signal_mask` names the calls that can: one whose
-/// registers name no temporary mask (`may_name_temporary_signal_mask`)
-/// swaps nothing. The kernel installs a temporary mask only from a non-NULL
-/// mask argument of `sizeof(sigset_t)` (`set_user_sigmask`, which returns
-/// at once for a NULL mask and fails with `EINVAL` on another size before
-/// it changes anything), and so sets no restore to take at the return
-/// either. Such a call's step is taken as any call that keeps the mask:
-/// bionic's and glibc's `poll()` call `ppoll` with a NULL mask, and a Tool
-/// polling one would otherwise pay for a mask swap that cannot happen at
-/// every injection. io_pgetevents and io_uring_enter, whose masks are not
-/// read, are taken as swapping.
+/// its duration, as `swaps_signal_mask` names the calls that can: a poll or
+/// wait whose registers name no temporary mask
+/// (`may_name_temporary_signal_mask`) swaps nothing. Those calls install a
+/// temporary mask only from a non-NULL mask argument of `sizeof(sigset_t)`
+/// (`set_user_sigmask`, kernel/signal.c:3272-3288 at v6.16, which returns at
+/// once for a NULL mask and fails with `EINVAL` on another size before it
+/// changes anything), and so set no restore to take at the return either.
+/// Such a call's step is taken as any call that keeps the mask: bionic's
+/// and glibc's `poll()` call `ppoll` with a NULL mask, and a Tool polling one
+/// would otherwise pay for a mask swap that cannot happen at every
+/// injection. `rt_sigsuspend` has no such case: with the valid size it
+/// copies its mask from the address given, address 0 included, which a
+/// process may map (`rt_sigsuspend`, kernel/signal.c:4848-4859 at v6.16), so
+/// it is taken as swapping whatever the address. io_pgetevents and
+/// io_uring_enter, whose masks are not read, are taken as swapping.
 fn injection_swaps_signal_mask(nr: Sysno, args: &SyscallArgs) -> bool {
     match nr {
         Sysno::io_pgetevents | Sysno::io_uring_enter => true,
+        Sysno::rt_sigsuspend => args.arg1 == std::mem::size_of::<u64>(),
         _ => swaps_signal_mask(nr) && may_name_temporary_signal_mask(nr, args),
     }
 }
@@ -17556,6 +17561,44 @@ mod tests {
         assert_eq!(state.blocked, blocked);
         assert_eq!(state_reads(), states_before, "the kept mask was used");
         assert_eq!(pending_reads(), pendings_before + 1);
+    }
+
+    /// A poll or wait whose registers name no temporary mask is taken as a
+    /// call that keeps the mask, but `rt_sigsuspend` with the valid size is
+    /// taken as swapping whatever its mask's address, 0 included: Linux reads
+    /// its mask from the address given, which a process may map. With another
+    /// size it fails before it changes anything.
+    #[test]
+    fn only_a_poll_or_wait_without_a_mask_keeps_the_mask() {
+        let args = |values: [usize; 6]| {
+            SyscallArgs::new(
+                values[0], values[1], values[2], values[3], values[4], values[5],
+            )
+        };
+        // ppoll(fds, n, timeout, NULL, 8) and epoll_pwait(.., NULL, 8).
+        assert!(!injection_swaps_signal_mask(
+            Sysno::ppoll,
+            &args([0x1000, 1, 0, 0, 8, 0])
+        ));
+        assert!(!injection_swaps_signal_mask(
+            Sysno::epoll_pwait,
+            &args([3, 0x1000, 1, 0, 0, 8])
+        ));
+        assert!(injection_swaps_signal_mask(
+            Sysno::ppoll,
+            &args([0x1000, 1, 0, 0x2000, 8, 0])
+        ));
+        // rt_sigsuspend(mask, 8), at address 0 as anywhere else.
+        for mask in [0, 0x2000] {
+            assert!(injection_swaps_signal_mask(
+                Sysno::rt_sigsuspend,
+                &args([mask, 8, 0, 0, 0, 0])
+            ));
+        }
+        assert!(!injection_swaps_signal_mask(
+            Sysno::rt_sigsuspend,
+            &args([0x2000, 4, 0, 0, 0, 0])
+        ));
     }
 
     /// Kills and reaps a test's tracee on every exit from the test.
