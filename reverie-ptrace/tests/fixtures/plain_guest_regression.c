@@ -2211,6 +2211,32 @@ static void mode_guest_trace_unknown(void) {
   say("unknown ret=%ld\n", syscall(500, 0, 0, 0, 0, 0, 0));
 }
 
+/* The guest's own SECCOMP_RET_TRACE for getppid; everything else allowed. */
+static struct sock_filter trace_getppid_code[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+};
+static struct sock_fprog trace_getppid_filter = {
+    sizeof trace_getppid_code / sizeof trace_getppid_code[0],
+    trace_getppid_code,
+};
+
+/* A guest trace stop for a call the Tool injects on the private page
+ * (SHAPE_PRIVATE_CALL): the guest's filter traces getppid wherever it runs,
+ * so the injected getppid stops at PTRACE_EVENT_SECCOMP too. */
+static void mode_guest_trace_private_call(void) {
+  long expected = syscall(SYS_getppid);
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+    die("no_new_privs");
+  long r =
+      prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &trace_getppid_filter, 0, 0);
+  say("trace-private install ret=%ld\n", r);
+  long got = SITEM(SYS_getppid, 0, 0, 0, 0, 0, SHAPE_PRIVATE_CALL);
+  say("trace-private getppid same=%d\n", got == expected);
+}
+
 static int tsync_pipe[2];
 static long tsync_thread_getppid;
 
@@ -5334,6 +5360,8 @@ int main(int argc, char** argv) {
     guest_seccomp("prctl");
   else if (!strcmp(m, "guest_trace_unknown"))
     mode_guest_trace_unknown();
+  else if (!strcmp(m, "guest_trace_private_call"))
+    mode_guest_trace_private_call();
   else if (!strcmp(m, "sud"))
     mode_sud();
   else if (!strcmp(m, "untraced_thread"))

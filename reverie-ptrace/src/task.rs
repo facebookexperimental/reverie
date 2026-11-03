@@ -3817,6 +3817,12 @@ thread_local! {
     /// the delivered signal's action and SIGSEGV's. Per thread, as above.
     pub(crate) static SEGV_TRAP_QUERIES_FOR_TEST: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+
+    /// The guest trace stops (`SECCOMP_RET_TRACE`) that a private-page
+    /// step resumed past (`step_private_syscall_unshielded`). Per thread, as
+    /// above.
+    pub(crate) static PRIVATE_STEP_TRACE_STOPS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Test-only: counts every tracer single-step request per tid, so a test
@@ -11333,6 +11339,25 @@ impl<L: Tool + 'static> TracedTask<L> {
                         ));
                     }
                     (stopped, sig)
+                }
+                // A seccomp filter the guest installed returned
+                // `SECCOMP_RET_TRACE` for the private `syscall`: Reverie's
+                // own filter allows the private page, and the guest's
+                // action takes precedence. Reverie runs a call at a guest's
+                // trace stop (`handle_unsubscribed_mapping_syscall`), so the
+                // step goes on unchanged: the kernel checks the filters
+                // again, a trace action now lets the call run, and the step
+                // ends as for any other syscall.
+                Wait::Stopped(stopped, Event::Seccomp) => {
+                    tracing::debug!(
+                        "[scheduler/tool] (pid = {}) resuming injected {} past the guest's own seccomp trace stop",
+                        stopped.pid(),
+                        nr
+                    );
+                    #[cfg(test)]
+                    PRIVATE_STEP_TRACE_STOPS_FOR_TEST.with(|count| count.set(count.get() + 1));
+                    running = self.step_stopped_input(stopped, None, input)?;
+                    continue;
                 }
                 Wait::Stopped(stopped, event) => {
                     lift_requeued(&stopped, requeued)?;

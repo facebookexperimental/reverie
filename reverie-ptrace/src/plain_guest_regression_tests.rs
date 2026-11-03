@@ -1905,6 +1905,40 @@ async fn guest_trace_of_an_unknown_number_ends_the_run() {
     assert!(text.contains("ENOSYS"), "{text}");
 }
 
+/// The guest's own seccomp filter returns `SECCOMP_RET_TRACE` for `getppid`,
+/// and the Tool injects the guest's `getppid` on the private page
+/// (`SHAPE_PRIVATE_CALL`). The guest's filter applies there too, so the
+/// injection's step stops at `PTRACE_EVENT_SECCOMP`. Reverie runs a call at a
+/// guest's trace stop (`handle_unsubscribed_mapping_syscall`), so the step
+/// goes on and the call runs once: the guest gets its parent's PID. (Natively,
+/// with no tracer, the call would fail with ENOSYS; this keeps Reverie's
+/// existing policy.) Each configuration's injection meets exactly one such
+/// stop (`PRIVATE_STEP_TRACE_STOPS_FOR_TEST`), so the call did take the
+/// private-page step. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_private_injection_at_a_guest_trace_stop_runs_the_call() {
+    let before = crate::task::PRIVATE_STEP_TRACE_STOPS_FOR_TEST.with(|count| count.get());
+    let runs = run_both_configurations("guest_trace_private_call").await;
+    let stops = crate::task::PRIVATE_STEP_TRACE_STOPS_FOR_TEST.with(|count| count.get()) - before;
+    assert_eq!(stops, 2, "one private-page trace stop per configuration");
+    for run in runs {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("trace-private "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "trace-private install ret=0",
+                "trace-private getppid same=1",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
 /// A parent stops its child (SIGSTOP) while the child's write at the shared
 /// site is parked at its seccomp stop, then continues it (SIGCONT)
 /// immediately before the write runs. The SIGCONT discards the pending
