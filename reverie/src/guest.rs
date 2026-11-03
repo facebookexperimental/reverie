@@ -738,6 +738,16 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// adopts the final process status, including a peer's later group exit.
     /// Unlike explicit cancellation, retirement does not discard their work.
     /// Restricted signal callbacks do not gain arbitrary syscall injection.
+    ///
+    /// A retirement before any group exit of the thread's process is
+    /// published is taken as the start of that thread's death with its
+    /// group (a peer's exit_group, a fatal signal, an exec): a backend that
+    /// decides whether a dying thread is its address space's last user (KVM,
+    /// for CLONE_CHILD_CLEARTID) counts the retired thread as live for the
+    /// group's decision if another thread was live when it retired. A Tool
+    /// that retires a thread for any other reason, and then lets a lone
+    /// thread call exit_group, gets a store where Linux, with mm_users at 1,
+    /// would skip it.
     async fn retire_current_thread(&mut self) -> Never {
         self.tail_inject(reverie_syscalls::Exit::default()).await
     }

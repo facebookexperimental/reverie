@@ -632,6 +632,18 @@ pub(crate) struct GuestThreadGroup {
     // only under `exit_status`'s lock, so it describes the published exit
     // and no other: an exec's rearm clears both.
     group_exit_others_live: Mutex<Option<bool>>,
+    // Whether the Tool retired a thread of the group
+    // (`Guest::retire_current_thread`) while another thread was live, before
+    // any group exit was published (`KvmBackend::note_tool_retirement`).
+    // Before a group exit is published, a Tool retirement is the start of
+    // that thread's death with its group, as `Guest::retire_current_thread`
+    // documents (a sibling's exit_group, a fatal signal, an exec the Tool
+    // has already ordered), at whose commit that thread was live; its host
+    // side may retire before the exit's first publication, so the
+    // publication counts it as live through this, not through whether it
+    // has retired yet. Read and set only under `exit_status`'s lock; an
+    // exec's rearm clears it.
+    retired_by_tool_beside_live: Mutex<bool>,
     // The process's certificate that every user of its guest mm is one of
     // its own threads, each counted by the entry gate: a non-CLONE_VM
     // process snapshot (`KvmBackend::prepare_forked_process`), or a process
@@ -883,6 +895,39 @@ impl GuestThreadGroup {
         )
     }
 
+    #[cfg(test)]
+    fn retired_by_tool_beside_live(&self) -> bool {
+        let _published = self
+            .exit_status
+            .lock()
+            .expect("KVM exit-group lock poisoned");
+        *self
+            .retired_by_tool_beside_live
+            .lock()
+            .expect("KVM exit-group lock poisoned")
+    }
+
+    /// Records that the Tool is retiring a thread of the group while
+    /// `others_live` says another thread is live, unless a group exit has
+    /// been published, whose recorded answer the retiring thread then takes.
+    /// Called before the thread retires from the entry gate and under
+    /// `exit_status`'s lock, so the exit's first publication either precedes
+    /// it or reads it; and no publisher has retired while no exit is
+    /// published (a publisher publishes before it retires), so a publishing
+    /// thread is among those `others_live` counts.
+    fn note_tool_retirement(&self, others_live: impl FnOnce() -> bool) {
+        let published = self
+            .exit_status
+            .lock()
+            .expect("KVM exit-group lock poisoned");
+        if published.is_none() && others_live() {
+            *self
+                .retired_by_tool_beside_live
+                .lock()
+                .expect("KVM exit-group lock poisoned") = true;
+        }
+    }
+
     /// A group exit published without the live-thread answer, as only unit
     /// tests publish on the group directly.
     #[cfg(test)]
@@ -892,7 +937,9 @@ impl GuestThreadGroup {
 
     /// As [`Self::request_exit_group`]; `others_live` is whether the
     /// publishing thread saw another live thread of the group. The first
-    /// publication's answer is kept for every thread that dies in the exit.
+    /// publication's answer is kept for every thread that dies in the exit;
+    /// a thread the Tool retired beside a live one before it counts as live
+    /// (`retired_by_tool_beside_live`).
     fn request_exit_group_from(&self, status: ExitStatus, others_live: Option<bool>) {
         let status = {
             let mut published = self
@@ -900,10 +947,15 @@ impl GuestThreadGroup {
                 .lock()
                 .expect("KVM exit-group lock poisoned");
             if published.is_none() {
+                let retired_beside_live = *self
+                    .retired_by_tool_beside_live
+                    .lock()
+                    .expect("KVM exit-group lock poisoned");
                 *self
                     .group_exit_others_live
                     .lock()
-                    .expect("KVM exit-group lock poisoned") = others_live;
+                    .expect("KVM exit-group lock poisoned") =
+                    others_live.map(|live| live || retired_beside_live);
             }
             *published.get_or_insert(status)
         };
@@ -1122,6 +1174,10 @@ impl GuestThreadGroup {
                 .group_exit_others_live
                 .lock()
                 .expect("KVM exit-group lock poisoned") = None;
+            *self
+                .retired_by_tool_beside_live
+                .lock()
+                .expect("KVM exit-group lock poisoned") = false;
         }
         *self
             .failure_state
@@ -6245,8 +6301,8 @@ impl KvmBackend {
     }
 
     /// `group` is whether the thread dies in its group's exit (exit_group, a
-    /// fatal signal, a peer's exit_group); otherwise it exits by itself (or
-    /// its run failed).
+    /// fatal signal, a peer's exit_group, or its Tool's retirement of it);
+    /// otherwise it exits by itself (or its run failed).
     pub(crate) fn clear_registered_worker_tid_before_exit(
         &mut self,
         executor: &mut ElfExecutor,
@@ -6264,6 +6320,12 @@ impl KvmBackend {
         // retires it, so of two threads exiting at once exactly one finds
         // the other still live, as of two tasks only the second to reach
         // exit_mm can find mm_users at 1.
+        #[cfg(test)]
+        clear_tid_last_user_hold::before_retirement(
+            self.is_guest_thread,
+            || self.thread_group.retired_by_tool_beside_live(),
+            || self.vcpu.is_sole_participant(),
+        );
         let last_at_retirement = self.vcpu.retire_participant_from_guest();
         #[cfg(test)]
         clear_tid_last_user_hold::after_retirement(
@@ -6295,7 +6357,11 @@ impl KvmBackend {
         // depend on when the others' host threads tear down. A thread that
         // exits by itself keeps the answer it got at its retirement, even if
         // a group exit is published after it: that exit's answer counted it
-        // as already gone.
+        // as already gone. A thread its Tool retired dies in its group's
+        // death too (`KvmBackend::note_tool_retirement`): after the exit is
+        // published it takes its answer, which counts it; before, its
+        // retirement found the publisher, which publishes before it retires,
+        // still live.
         let sole = match group
             .then(|| self.thread_group.group_exit_others_live())
             .flatten()
@@ -7032,7 +7098,10 @@ impl KvmBackend {
     /// commit, and no dying thread's host teardown can change it.
     fn publish_group_exit(&self, status: ExitStatus) {
         #[cfg(test)]
-        clear_tid_last_user_hold::before_group_answer(|| self.vcpu.is_sole_participant());
+        clear_tid_last_user_hold::before_group_answer(
+            || self.vcpu.is_sole_participant(),
+            || self.thread_group.retired_by_tool_beside_live(),
+        );
         let others_live = !self.vcpu.is_sole_participant();
         self.thread_group
             .request_exit_group_from(status, Some(others_live));
@@ -7047,6 +7116,31 @@ impl KvmBackend {
         if let Some(status) = executor.pending_group_exit_status() {
             self.request_guest_thread_group_exit(status);
         }
+    }
+
+    /// The Tool is retiring this thread (`Guest::retire_current_thread`)
+    /// with no group exit published, before the thread retires from the
+    /// entry gate. Before a group exit is published, a Tool retirement is
+    /// the start of this thread's death with its group
+    /// (`Guest::retire_current_thread` documents the contract): a Tool may
+    /// retire a sibling of an exit_group as soon as it has ordered that exit,
+    /// before the issuing thread's exit_group reaches this backend, so this
+    /// retirement can come before that exit's first publication, which then
+    /// would find this thread gone and record that no other thread was live.
+    /// A Tool that retires a thread for another reason and then lets a lone
+    /// thread call exit_group gets a store where Linux would skip it (see
+    /// that contract). So whether another thread
+    /// is live now is recorded here, under the lock that orders it with the
+    /// publication (`GuestThreadGroup::note_tool_retirement`): the issuer has
+    /// not published, so has not retired, and counts. That exit's answer,
+    /// and this thread's own (it dies in the group's death and takes that
+    /// answer once published; before, its retirement finds the publisher
+    /// still live), is then the one at the death's commit, not the one at
+    /// whichever comes first on the host.
+    /// https://github.com/rrnewton/reverie/issues/1108
+    pub(crate) fn note_tool_retirement(&self) {
+        self.thread_group
+            .note_tool_retirement(|| !self.vcpu.is_sole_participant());
     }
 
     // TODO-HUMAN-REVIEW(PR-172): Review signal-driven KVM worker cancellation.
@@ -8077,6 +8171,35 @@ mod tests {
             assert_eq!(group.group_exit_others_live(), None);
             group.request_exit_group_from(ExitStatus::Exited(3), Some(true));
             assert_eq!(group.group_exit_others_live(), Some(true));
+        }
+
+        /// A thread the Tool retires beside a live one before a group exit is
+        /// published counts as live in that exit's answer, even when the
+        /// publisher finds it already retired. One retired with no other live
+        /// thread, or after the publication, changes nothing, and an exec's
+        /// rearm forgets it.
+        #[test]
+        fn a_thread_the_tool_retired_before_the_publication_counts_as_live() {
+            let group = GuestThreadGroup::default();
+            group.note_tool_retirement(|| false);
+            assert!(!group.retired_by_tool_beside_live());
+            group.request_exit_group_from(ExitStatus::Exited(1), Some(false));
+            assert_eq!(group.group_exit_others_live(), Some(false));
+            group.note_tool_retirement(|| panic!("asked after the publication"));
+            assert!(!group.retired_by_tool_beside_live());
+            assert_eq!(group.group_exit_others_live(), Some(false));
+
+            group.rearm_after_exec();
+            group.note_tool_retirement(|| true);
+            assert!(group.retired_by_tool_beside_live());
+            assert_eq!(group.group_exit_others_live(), None);
+            group.request_exit_group_from(ExitStatus::Exited(2), Some(false));
+            assert_eq!(group.group_exit_others_live(), Some(true));
+
+            group.rearm_after_exec();
+            assert_eq!(group.group_exit_others_live(), None);
+            group.request_exit_group_from(ExitStatus::Exited(3), Some(false));
+            assert_eq!(group.group_exit_others_live(), Some(false));
         }
 
         #[test]
@@ -14170,6 +14293,12 @@ pub(crate) mod clear_tid_last_user_hold {
     pub(crate) enum Hold {
         Peers = 1,
         OrdinaryThenGroup = 2,
+        /// A group exit's publisher, with another thread live, publishes only
+        /// once the Tool has retired a thread beside a live one; a worker
+        /// whose retirement the Tool asked for beside a live thread retires
+        /// from the entry gate only once every other thread has (the
+        /// publisher included).
+        ToolRetiredThenPublisher = 3,
     }
 
     /// Disarms the hold when dropped, a panicking test's included.
@@ -14205,8 +14334,20 @@ pub(crate) mod clear_tid_last_user_hold {
         }
     }
 
-    pub(super) fn before_group_answer(sole: impl Fn() -> bool) {
-        if MODE.load(Ordering::SeqCst) == 2 {
+    pub(super) fn before_group_answer(sole: impl Fn() -> bool, noted: impl Fn() -> bool) {
+        match MODE.load(Ordering::SeqCst) {
+            2 => wait_until(sole),
+            3 if !sole() => wait_until(noted),
+            _ => {}
+        }
+    }
+
+    pub(super) fn before_retirement(
+        worker: bool,
+        noted: impl Fn() -> bool,
+        sole: impl Fn() -> bool,
+    ) {
+        if MODE.load(Ordering::SeqCst) == 3 && worker && noted() {
             wait_until(sole);
         }
     }

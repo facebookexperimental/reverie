@@ -327,3 +327,105 @@ fn two_exits_never_both_leave_their_clear_child_tid_words() {
         }
     }
 }
+
+/// Per process (each forked child gets its own): when the main thread of a
+/// process with a worker calls exit_group, the Tool retires the worker at its
+/// next sched_yield, as a Tool may retire an exit_group's siblings once it
+/// has ordered the exit, and lets the exit_group run once the worker has
+/// begun to retire.
+#[derive(Default)]
+struct RetireWorkerAtGroupExit {
+    worker: std::sync::atomic::AtomicI32,
+    retire: std::sync::atomic::AtomicBool,
+    retiring: std::sync::atomic::AtomicBool,
+}
+
+#[reverie::tool]
+impl reverie::Tool for RetireWorkerAtGroupExit {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_thread_start<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> std::result::Result<(), reverie::Error> {
+        if guest.pid() != guest.tid() {
+            self.worker.store(guest.tid().as_raw(), Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    async fn handle_syscall_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: reverie::syscalls::Syscall,
+    ) -> std::result::Result<i64, reverie::Error> {
+        use reverie::syscalls::SyscallInfo;
+        use reverie::syscalls::Sysno;
+        if guest.pid() != guest.tid()
+            && call.number() == Sysno::sched_yield
+            && self.retire.load(Ordering::SeqCst)
+        {
+            self.retiring.store(true, Ordering::SeqCst);
+            guest.retire_current_thread().await;
+        }
+        if guest.pid() == guest.tid()
+            && call.number() == Sysno::exit_group
+            && self.worker.load(Ordering::SeqCst) != 0
+        {
+            self.retire.store(true, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !self.retiring.load(Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the worker never began to retire"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        guest.tail_inject(call).await
+    }
+}
+
+/// The two words the program prints for `mode` on KVM under
+/// `RetireWorkerAtGroupExit`.
+fn kvm_with_retiring_tool(executable: &Path, directory: &Path, mode: &str) -> (u32, u32) {
+    let image = std::fs::read(executable).unwrap();
+    let program = executable.to_str().unwrap();
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).expect("this test requires /dev/kvm");
+    backend
+        .install_static_elf_with_context(&image, &[program, mode], &[], directory)
+        .unwrap();
+    let (_, code, stdout, stderr) = futures::executor::block_on(
+        backend.run_static_elf_with_tool::<RetireWorkerAtGroupExit>((), true),
+    )
+    .unwrap();
+    assert_eq!(
+        code,
+        0,
+        "{mode}: stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    words(&String::from_utf8(stdout).unwrap())
+}
+
+/// A thread its Tool retires dies in its group's death and decides with
+/// that exit's answer, as the main thread does. "group": the main thread
+/// calls exit_group while the worker, whose word is the second marker,
+/// spins; the Tool retires the worker for that exit. The hold makes the
+/// main thread publish the exit only once the worker's retirement has been
+/// noted, and the worker retire from the entry gate only once the main
+/// thread has retired, so the worker's own retirement would find it the
+/// last user and leave its marker. With the worker live at the exit's
+/// commit, both store zero, one of the outcomes Linux allows.
+#[test]
+fn a_thread_its_tool_retired_takes_its_group_exits_answer() {
+    let directory = TestDir::new("clear-tid-tool-retired");
+    let executable = compile(&directory.0);
+    let _hold =
+        clear_tid_last_user_hold::arm(clear_tid_last_user_hold::Hold::ToolRetiredThenPublisher);
+    assert_eq!(
+        kvm_with_retiring_tool(&executable, &directory.0, "group"),
+        (0, 0)
+    );
+}

@@ -22453,6 +22453,9 @@ fn fchdir_consumes_low_descriptor_words_on_kvm() {
 #[path = "support/natural_retirement.rs"]
 mod natural_retirement;
 
+#[path = "support/tool_retired_group_exit.rs"]
+mod tool_retired_group_exit;
+
 #[path = "support/exit_descriptor_ordering.rs"]
 mod exit_descriptor_ordering;
 

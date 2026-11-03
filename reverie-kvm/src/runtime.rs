@@ -5517,6 +5517,9 @@ impl KvmBackend {
         let exit = if let Some(status) = self.guest_thread_group_exit_status() {
             executor.retire_current_thread(status, true)
         } else {
+            // A group exit the Tool ordered may be published only after this
+            // thread retires; its answer must still count this thread.
+            self.note_tool_retirement();
             executor.cancel_current_thread()
         };
         if exit.group {
@@ -5617,8 +5620,14 @@ impl KvmBackend {
             }
         }
         self.release_thread_slot();
+        // A thread its Tool retired dies in its group's death, whose answer
+        // it takes (`KvmBackend::note_tool_retirement`).
         let dies_in_group = cancelled_exit.as_ref().map_or_else(
-            || outcome.as_ref().is_ok_and(|exit| exit.exit.group),
+            || {
+                outcome.as_ref().is_ok_and(|exit| {
+                    exit.exit.group || exit.disposition == ToolExitDisposition::Retirement
+                })
+            },
             |exit| exit.exit.group,
         );
         self.clear_registered_worker_tid_before_exit(executor, dies_in_group);
