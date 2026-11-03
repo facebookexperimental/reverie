@@ -6215,7 +6215,7 @@ fn trap_before_getppid_on_an_unfiltered_tracer(
 /// trap is discarded, and the step runs the `getppid`, which the guest's
 /// filter traps as without the SIGTRAP.
 #[cfg(target_arch = "x86_64")]
-fn sigtrap_before_an_injected_syscall_is_discarded(probe: &str) {
+fn a_trap_coded_sigtrap_before_an_injected_syscall_is_discarded(probe: &str) {
     let (output, log) = trap_before_getppid_on_an_unfiltered_tracer(false, false);
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!(
@@ -6255,10 +6255,11 @@ fn sigtrap_before_an_injected_syscall_is_discarded(probe: &str) {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs() {
-    const NAME: &str = "sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs";
+fn a_trap_coded_sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs() {
+    const NAME: &str =
+        "a_trap_coded_sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs";
     in_child_process(NAME, || {
-        sigtrap_before_an_injected_syscall_is_discarded("trap-before-getppid")
+        a_trap_coded_sigtrap_before_an_injected_syscall_is_discarded("trap-before-getppid")
     });
 }
 
@@ -6320,7 +6321,7 @@ fn a_sent_sigtrap_that_stops_an_injection_reaches_the_guest() {
     });
 }
 
-/// As `sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs`,
+/// As `a_trap_coded_sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs`,
 /// but no descriptor can be opened during the injection, so procfs cannot
 /// report the tracer thread's seccomp mode at the decision (EMFILE). The
 /// thread is taken as filtered, and the trap for the step's report, as on
@@ -6372,7 +6373,7 @@ fn sigtrap_before_an_injected_syscall_is_taken_as_on_main_with_no_descriptor_fro
     });
 }
 
-/// `sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs`
+/// `a_trap_coded_sigtrap_before_an_injected_syscall_is_discarded_and_the_syscall_runs`
 /// under a tracer filter that returns `action` for a `ptrace` of `request`,
 /// with SIGTSTP pending after the SIGTRAP when `tstp` is set. Retried, the
 /// step would stop at requests main does not make for this guest: at the

@@ -5737,6 +5737,33 @@ async fn a_stashed_sigtrap_refuses_a_step_over_a_sigreturn_that_unblocks_it() {
     );
 }
 
+/// A SIGTRAP still queued after a precise timer took the guest's pending
+/// one out of the queue, here one sent to the thread right after the take,
+/// ends the run with the named `PendingSigtrapAtStep` and its site, as
+/// every other refusal of the stash does, rather than with a bare `EPROTO`
+/// (`TracedTask::stash_pending_sigtrap`). The taken SIGTRAP cannot be put
+/// back ahead of the new one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sigtrap_queued_after_the_stash_ends_the_run_by_name() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    crate::task::SIGTRAP_SENT_AFTER_STASH_FOR_TEST.with(|sent| sent.set(true));
+    let result = run_guest_options("sigtrap_guest_pending_kept", GuestOptions::default()).await;
+    let armed = crate::task::SIGTRAP_SENT_AFTER_STASH_FOR_TEST.with(|sent| sent.replace(false));
+    assert!(!armed, "no SIGTRAP was taken for the timer's steps");
+    let error = match result {
+        Ok(run) => panic!("the run was not refused: {:?}\n{}", run.status, run.report),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("SIGTRAP blocked with one pending")
+            && error.contains("another SIGTRAP queued after the pending one was taken"),
+        "{error}"
+    );
+}
+
 /// A SIGTRAP the guest queued itself while blocking it, with a negative
 /// code, absorbed by a private-page injection that queues the thread a
 /// blocked SIGUSR2, is queued again behind it, where it keeps its place:
