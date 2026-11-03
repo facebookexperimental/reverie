@@ -565,6 +565,34 @@ pub struct PendingSigtrapAtStep {
     pub site: &'static str,
 }
 
+/// An injected syscall that Reverie ran between syscall stops, without a
+/// single-step, reached its exit stop with its return register equal to its
+/// own number and SIGSYS pending for the thread (or that state unreadable).
+///
+/// That is what a guest seccomp filter's `SECCOMP_RET_TRAP` leaves: Linux
+/// puts the number back in the return register, skips the call and forces
+/// SIGSYS, whose siginfo can be lost to an older pending SIGSYS. A call that
+/// ran and returned its own number while another SIGSYS was pending looks
+/// the same. Reverie cannot tell which, so it ends the run rather than report
+/// a result for a call that may not have run. Threads with a guest seccomp
+/// filter of their own are never run this way, so reaching this takes a
+/// filter installed by another thread after that check, or that coincidence
+/// (named limits L9, and L8 for a SIGSYS another thread ignored meanwhile, of
+/// <https://github.com/rrnewton/reverie/issues/1262>).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "injected syscall {nr} in thread {tid} returned its own number with \
+     SIGSYS pending, which a guest seccomp trap also leaves; Reverie cannot \
+     tell whether it ran, so the run is ended (limit L9 of \
+     https://github.com/rrnewton/reverie/issues/1262)"
+)]
+pub struct UnprovenPrivateSyscallCompletion {
+    /// The thread that made the injection.
+    pub tid: i32,
+    /// The injected syscall's number.
+    pub nr: i64,
+}
+
 /// A guest made a syscall through the untraced `syscall` of Reverie's private
 /// page, outside any injection, and took the SIGILL of the `ud2` after it.
 ///

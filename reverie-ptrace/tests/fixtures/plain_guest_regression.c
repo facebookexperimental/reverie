@@ -65,6 +65,8 @@
 #define SHAPE_BLOCK_ALL 6
 #define SHAPE_PRIVATE_CALL 7
 #define SHAPE_PPOLL_THEN_CALL 8
+#define SHAPE_HELD_THEN_CALL 9
+#define SHAPE_PPOLL_OF_ARGS 10
 #define SEND_SIGUSR1 0x100
 #define SEND_SIGWINCH 0x200
 #define SEND_QUEUE 0x400
@@ -3341,6 +3343,433 @@ static void mode_sigtrap_int3_after_sibling_syscall(void) {
   }
 }
 
+/* The window of a mask-swapping wait injected from a Tool's signal callback
+ * (limit L1 of https://github.com/rrnewton/reverie/issues/1262): SIGUSR1
+ * blocked and pending, then a POSIX-timer SIGVTALRM whose Tool callback
+ * injects a ppoll whose temporary mask blocks a caught SIGTRAP and admits
+ * SIGUSR1, so the wait is interrupted with its restore pending; the guest's
+ * SIGVTALRM handler executes int3 before any syscall. A callback's
+ * injection is single-stepped. Natively there is no injection and the child
+ * exits 0. */
+static void mode_sigtrap_int3_after_callback_wait(void) {
+  warm();
+  pid_t pid = fork();
+  if (pid < 0)
+    die("fork");
+  if (pid == 0) {
+    struct rlimit core = {1, 1};
+    if (setrlimit(RLIMIT_CORE, &core) != 0)
+      die("RLIMIT_CORE");
+    struct sigaction usr1;
+    memset(&usr1, 0, sizeof usr1);
+    usr1.sa_handler = quiet_usr1;
+    if (sigaction(SIGUSR1, &usr1, NULL) != 0)
+      die("install SIGUSR1");
+    sigtrap_set(trap_handler, 0);
+    sigset_t usr1_set;
+    sigemptyset(&usr1_set);
+    sigaddset(&usr1_set, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &usr1_set, NULL) != 0)
+      die("block SIGUSR1");
+    raise(SIGUSR1);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = window_int3_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGVTALRM, &sa, NULL) != 0)
+      die("install SIGVTALRM");
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGVTALRM;
+    timer_t timer;
+    if (timer_create(CLOCK_MONOTONIC, &sev, &timer) != 0)
+      die("timer_create");
+    struct itimerspec spec = {{0, 0}, {0, 2000000}};
+    if (timer_settime(timer, 0, &spec, NULL) != 0)
+      die("timer_settime");
+    __asm__ volatile("1: pause\n\tcmpl $0, %0\n\tje 1b" : : "m"(window_callback_done) : "memory", "cc");
+    _exit(0);
+  }
+  window_report("callback-wait ppoll", pid);
+}
+
+/* The sibling window (tmask=1, the sibling making no syscall) in a process
+ * with a seccomp filter of its own (limit L6 of
+ * https://github.com/rrnewton/reverie/issues/1262): allow everything but
+ * getppid, which fails with EPERM. Its injections are single-stepped. */
+static void mode_sigtrap_int3_in_a_guest_filtered_window(void) {
+  warm();
+  for (int op = 0; op < 2; op++) {
+    pid_t pid = fork();
+    if (pid < 0)
+      die("fork");
+    if (pid == 0) {
+      if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+        die("no_new_privs");
+      if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &guest_filter, 0, 0) != 0)
+        die("install guest filter");
+      window_sibling_child(op, 1, 0);
+    }
+    char tag[64];
+    snprintf(tag, sizeof tag, "filtered-window %s", op == 0 ? "sigsuspend" : "ppoll");
+    window_report(tag, pid);
+  }
+}
+
+static volatile int held_code, held_value, held_pid, held_hits;
+
+static void held_usr2(int sig, siginfo_t* si, void* uc) {
+  (void)sig;
+  (void)uc;
+  held_code = si->si_code;
+  held_value = si->si_value.sival_int;
+  held_pid = si->si_pid;
+  held_hits++;
+}
+
+/* A ppoll the Tool injects while Reverie holds a queued SIGUSR2 for the
+ * thread (SHAPE_HELD_THEN_CALL): the signal reaches the guest's handler with
+ * the siginfo it was queued with. */
+static void mode_held_siginfo_then_ppoll(void) {
+  warm();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = held_usr2;
+  sa.sa_flags = SA_SIGINFO;
+  sigemptyset(&sa.sa_mask);
+  if (sigaction(SIGUSR2, &sa, NULL) != 0)
+    die("install SIGUSR2");
+  unsigned long temporary = 0;
+  struct timespec ts = {0, 0};
+  long r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&temporary, 8, SHAPE_HELD_THEN_CALL);
+  say("held ppoll ret=%ld hits=%d code=%d value=%d pid-is-parent=%d\n",
+      r,
+      held_hits,
+      held_code,
+      held_value,
+      held_pid == getppid());
+}
+
+/* The guest's own SECCOMP_RET_TRAP for ppoll; everything else allowed. */
+static struct sock_filter trap_ppoll_code[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_ppoll, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+};
+static struct sock_fprog trap_ppoll_filter = {
+    sizeof trap_ppoll_code / sizeof trap_ppoll_code[0],
+    trap_ppoll_code,
+};
+
+/* The guest's own SECCOMP_RET_TRACE for ppoll; everything else allowed. */
+static struct sock_filter trace_ppoll_code[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_ppoll, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+};
+static struct sock_fprog trace_ppoll_filter = {
+    sizeof trace_ppoll_code / sizeof trace_ppoll_code[0],
+    trace_ppoll_code,
+};
+
+static void install_filter(struct sock_fprog* filter) {
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+    die("no_new_privs");
+  if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, filter, 0, 0) != 0)
+    die("install filter");
+}
+
+static void quiet_sigsys(int sig) {
+  (void)sig;
+}
+
+/* A ppoll the Tool injects on the private page (SHAPE_PPOLL_OF_ARGS) that
+ * the guest's own filter traps (SECCOMP_RET_TRAP). With `prequeued`, an
+ * older SIGSYS (SI_TKILL) is blocked and pending first, so the trap's SIGSYS
+ * coalesces with it and its SYS_SECCOMP siginfo is lost. */
+static void trap_ppoll(int prequeued) {
+  warm();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = quiet_sigsys;
+  if (sigaction(SIGSYS, &sa, NULL) != 0)
+    die("install SIGSYS");
+  if (prequeued) {
+    sigset_t sys_set;
+    sigemptyset(&sys_set);
+    sigaddset(&sys_set, SIGSYS);
+    if (sigprocmask(SIG_BLOCK, &sys_set, NULL) != 0)
+      die("block SIGSYS");
+    if (syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGSYS) != 0)
+      die("tgkill SIGSYS");
+  }
+  install_filter(&trap_ppoll_filter);
+  unsigned long temporary = 0;
+  struct timespec ts = {0, 0};
+  long r = SITEM(SYS_getpid, 0, 0, (long)&ts, (long)&temporary, 0, SHAPE_PPOLL_OF_ARGS);
+  say("trap-ppoll prequeued=%d ret=%ld\n", prequeued, r);
+}
+
+static void mode_trap_ppoll(void) {
+  trap_ppoll(0);
+}
+
+static void mode_trap_ppoll_prequeued(void) {
+  trap_ppoll(1);
+}
+
+/* A ppoll the Tool injects on the private page that returns 271, ppoll's own
+ * number on x86_64: 271 entries for one pipe's write end, each ready for
+ * POLLOUT. With no SIGSYS pending, that is the call's result. */
+static void mode_ppoll_returns_its_number(void) {
+  warm();
+  int fds[2];
+  if (pipe(fds) != 0)
+    die("pipe");
+  static struct pollfd entries[271];
+  for (int i = 0; i < 271; i++) {
+    entries[i].fd = fds[1];
+    entries[i].events = POLLOUT;
+    entries[i].revents = 0;
+  }
+  unsigned long temporary = 0;
+  struct timespec ts = {0, 0};
+  long r = SITEM(SYS_getpid, (long)entries, 271, (long)&ts, (long)&temporary, 0, SHAPE_PPOLL_OF_ARGS);
+  int ready = 0;
+  for (int i = 0; i < 271; i++)
+    ready += entries[i].revents == POLLOUT;
+  say("ppoll-nr ret=%ld ready=%d\n", r, ready);
+}
+
+/* A ppoll the Tool injects on the private page that the guest's own filter
+ * traces (SECCOMP_RET_TRACE): it runs once, as Reverie runs a call at a
+ * guest's trace stop. A 1 ms timeout is written back as what remains of it,
+ * 0. Then the same ppoll interrupted by a SIGUSR1 the guest left pending,
+ * which its temporary mask admits. */
+static void mode_trace_ppoll(void) {
+  warm();
+  struct sigaction usr1;
+  memset(&usr1, 0, sizeof usr1);
+  usr1.sa_handler = quiet_usr1;
+  if (sigaction(SIGUSR1, &usr1, NULL) != 0)
+    die("install SIGUSR1");
+  install_filter(&trace_ppoll_filter);
+  unsigned long temporary = 0;
+  struct timespec ts = {0, 1000000};
+  long r = SITEM(SYS_getpid, 0, 0, (long)&ts, (long)&temporary, 0, SHAPE_PPOLL_OF_ARGS);
+  say("trace-ppoll ret=%ld remaining=%ld.%09ld\n", r, (long)ts.tv_sec, (long)ts.tv_nsec);
+  sigset_t usr1_set;
+  sigemptyset(&usr1_set);
+  sigaddset(&usr1_set, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &usr1_set, NULL) != 0)
+    die("block SIGUSR1");
+  raise(SIGUSR1);
+  struct timespec wait = {5, 0};
+  r = SITEM(SYS_getpid, 0, 0, (long)&wait, (long)&temporary, 0, SHAPE_PPOLL_OF_ARGS);
+  say("trace-ppoll interrupted ret=%ld\n", r);
+  if (sigprocmask(SIG_UNBLOCK, &usr1_set, NULL) != 0)
+    die("unblock SIGUSR1");
+}
+
+static volatile int matrix_hits;
+
+static void matrix_usr1(int sig) {
+  (void)sig;
+  matrix_hits++;
+}
+
+/* The pselect6 sixth argument. */
+struct pselect6_sigset {
+  const unsigned long* ss;
+  size_t ss_len;
+};
+
+/* io_pgetevents' sixth argument. */
+struct aio_sigset_arg {
+  const unsigned long* sigmask;
+  size_t sigsetsize;
+};
+
+/* Each mask-swapping syscall, which the Tool runs on the private page
+ * (`GuestConfig::private_mask_swaps`), with an empty temporary mask: once
+ * with nothing pending and a zero timeout (rt_sigsuspend has no such case),
+ * once with a SIGUSR1 the guest blocks pending, which the temporary mask
+ * admits, and a 5 s timeout, so the call is interrupted. Prints each result
+ * (-1 with errno on failure) and the handler's hits; natively the same.
+ * io_uring_enter waits for one completion in the interrupted case; a kernel
+ * that refuses io_uring_setup reports that instead. */
+static void mode_swapsmask_matrix(void) {
+  warm();
+  struct sigaction usr1;
+  memset(&usr1, 0, sizeof usr1);
+  usr1.sa_handler = matrix_usr1;
+  if (sigaction(SIGUSR1, &usr1, NULL) != 0)
+    die("install SIGUSR1");
+  sigset_t usr1_set;
+  sigemptyset(&usr1_set);
+  sigaddset(&usr1_set, SIGUSR1);
+  unsigned long temporary = 0;
+  struct pselect6_sigset pss = {&temporary, 8};
+  struct aio_sigset_arg ass = {&temporary, 8};
+  int epfd = epoll_create1(0);
+  if (epfd < 0)
+    die("epoll_create1");
+  struct epoll_event events[1];
+  unsigned long ctx = 0;
+  if (syscall(SYS_io_setup, 1, &ctx) != 0)
+    die("io_setup");
+  struct {
+    unsigned long data, obj;
+    long res, res2;
+  } aio_events[1];
+  unsigned char params[120];
+  memset(params, 0, sizeof params);
+  long ring = syscall(425 /* io_uring_setup */, 1, params);
+  if (ring < 0)
+    say("matrix io_uring_setup errno=%d\n", errno);
+  static const char* const names[] = {"rt_sigsuspend", "ppoll", "pselect6", "epoll_pwait",
+                                      "epoll_pwait2", "io_pgetevents", "io_uring_enter"};
+  for (int intr = 0; intr < 2; intr++) {
+    for (int c = 0; c < 7; c++) {
+      if (c == 0 && !intr)
+        continue;
+      if (c == 6 && ring < 0)
+        continue;
+      struct timespec ts = {intr ? 5 : 0, 0};
+      matrix_hits = 0;
+      if (intr) {
+        if (sigprocmask(SIG_BLOCK, &usr1_set, NULL) != 0)
+          die("block SIGUSR1");
+        raise(SIGUSR1);
+      }
+      long r = 0;
+      errno = 0;
+      switch (c) {
+        case 0:
+          r = syscall(SYS_rt_sigsuspend, &temporary, 8);
+          break;
+        case 1:
+          r = syscall(SYS_ppoll, NULL, 0, &ts, &temporary, 8);
+          break;
+        case 2:
+          r = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &ts, &pss);
+          break;
+        case 3:
+          r = syscall(SYS_epoll_pwait, epfd, events, 1, intr ? 5000 : 0, &temporary, 8);
+          break;
+        case 4:
+          r = syscall(441 /* epoll_pwait2 */, epfd, events, 1, &ts, &temporary, 8);
+          break;
+        case 5:
+          r = syscall(SYS_io_pgetevents, ctx, intr ? 1 : 0, 1, aio_events, &ts, &ass);
+          break;
+        case 6:
+          r = syscall(426 /* io_uring_enter */, ring, 0, intr ? 1 : 0,
+                      intr ? 1 /* IORING_ENTER_GETEVENTS */ : 0, &temporary, 8);
+          break;
+      }
+      int err = r < 0 ? errno : 0;
+      if (intr && sigprocmask(SIG_UNBLOCK, &usr1_set, NULL) != 0)
+        die("unblock SIGUSR1");
+      say("matrix %s %s ret=%ld errno=%d hits=%d\n", names[c], intr ? "intr" : "normal", r, err, matrix_hits);
+    }
+  }
+}
+
+static volatile unsigned long masks_live, masks_frame;
+static volatile int masks_hits;
+
+static void masks_usr1(int sig, siginfo_t* si, void* uc_) {
+  (void)sig;
+  (void)si;
+  ucontext_t* uc = uc_;
+  sigset_t live;
+  sigprocmask(SIG_SETMASK, NULL, &live);
+  unsigned long l = 0, f = 0;
+  for (int s = 1; s < 32; s++) {
+    if (sigismember(&live, s))
+      l |= 1UL << (s - 1);
+    if (sigismember(&uc->uc_sigmask, s))
+      f |= 1UL << (s - 1);
+  }
+  masks_live = l;
+  masks_frame = f;
+  masks_hits++;
+}
+
+static void masks_int3_usr1(int sig) {
+  (void)sig;
+  __asm__ volatile("int3");
+}
+
+/* The masks of a SIGUSR1 handler that interrupts an injected ppoll (on the
+ * private page, SHAPE_PRIVATE_CALL) whose temporary mask is {SIGTRAP}, with
+ * SIGUSR1 blocked and pending before it and SIGUSR2 in the handler's
+ * sa_mask: the handler's live mask (temporary | sa_mask | SIGUSR1), its
+ * frame's uc_sigmask (the mask before the wait, {SIGUSR1}), and the mask
+ * after the handler returns (that same mask). Printed as which of SIGTRAP,
+ * SIGUSR1 and SIGUSR2 each has. Then, in a child, an int3 in such a handler,
+ * which natively meets SIGTRAP blocked and dies of it. */
+static void mode_swapsmask_handler_masks(void) {
+  warm();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = masks_usr1;
+  sa.sa_flags = SA_SIGINFO;
+  sigemptyset(&sa.sa_mask);
+  sigaddset(&sa.sa_mask, SIGUSR2);
+  if (sigaction(SIGUSR1, &sa, NULL) != 0)
+    die("install SIGUSR1");
+  sigtrap_set(trap_handler, 0);
+  sigset_t usr1_set;
+  sigemptyset(&usr1_set);
+  sigaddset(&usr1_set, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &usr1_set, NULL) != 0)
+    die("block SIGUSR1");
+  raise(SIGUSR1);
+  unsigned long temporary = 1UL << (SIGTRAP - 1);
+  struct timespec ts = {5, 0};
+  long r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&temporary, 8, SHAPE_PRIVATE_CALL);
+  sigset_t after;
+  sigprocmask(SIG_SETMASK, NULL, &after);
+#define BITS(m) ((m) >> (SIGTRAP - 1) & 1), ((m) >> (SIGUSR1 - 1) & 1), ((m) >> (SIGUSR2 - 1) & 1)
+  say("masks ret=%ld hits=%d live trap=%lu usr1=%lu usr2=%lu frame trap=%lu usr1=%lu usr2=%lu after trap=%d usr1=%d usr2=%d\n",
+      r,
+      masks_hits,
+      BITS(masks_live),
+      BITS(masks_frame),
+      sigismember(&after, SIGTRAP),
+      sigismember(&after, SIGUSR1),
+      sigismember(&after, SIGUSR2));
+#undef BITS
+  if (sigprocmask(SIG_UNBLOCK, &usr1_set, NULL) != 0)
+    die("unblock SIGUSR1");
+  pid_t pid = fork();
+  if (pid < 0)
+    die("fork");
+  if (pid == 0) {
+    struct rlimit core = {1, 1};
+    if (setrlimit(RLIMIT_CORE, &core) != 0)
+      die("RLIMIT_CORE");
+    struct sigaction int3;
+    memset(&int3, 0, sizeof int3);
+    int3.sa_handler = masks_int3_usr1;
+    if (sigaction(SIGUSR1, &int3, NULL) != 0)
+      die("install SIGUSR1");
+    sigtrap_set(trap_handler, 0);
+    if (sigprocmask(SIG_BLOCK, &usr1_set, NULL) != 0)
+      die("block SIGUSR1");
+    raise(SIGUSR1);
+    struct timespec ts5 = {5, 0};
+    SITEM(SYS_ppoll, 0, 0, (long)&ts5, (long)&temporary, 8, SHAPE_PRIVATE_CALL);
+    _exit(0);
+  }
+  window_report("masks handler-int3", pid);
+}
+
 /* A sibling that maps pages while another thread's private injections
  * reset an ignored SIGTRAP, so that each one repairs. Thread A makes 4000
  * private injections and reads SIGTRAP's action after each. Thread B loops:
@@ -5407,6 +5836,24 @@ int main(int argc, char** argv) {
     mode_sigtrap_int3_in_the_other_windows();
   else if (!strcmp(m, "sigtrap_int3_after_sibling_syscall"))
     mode_sigtrap_int3_after_sibling_syscall();
+  else if (!strcmp(m, "sigtrap_int3_after_callback_wait"))
+    mode_sigtrap_int3_after_callback_wait();
+  else if (!strcmp(m, "sigtrap_int3_in_a_guest_filtered_window"))
+    mode_sigtrap_int3_in_a_guest_filtered_window();
+  else if (!strcmp(m, "held_siginfo_then_ppoll"))
+    mode_held_siginfo_then_ppoll();
+  else if (!strcmp(m, "trap_ppoll"))
+    mode_trap_ppoll();
+  else if (!strcmp(m, "trap_ppoll_prequeued"))
+    mode_trap_ppoll_prequeued();
+  else if (!strcmp(m, "ppoll_returns_its_number"))
+    mode_ppoll_returns_its_number();
+  else if (!strcmp(m, "trace_ppoll"))
+    mode_trace_ppoll();
+  else if (!strcmp(m, "swapsmask_matrix"))
+    mode_swapsmask_matrix();
+  else if (!strcmp(m, "swapsmask_handler_masks"))
+    mode_swapsmask_handler_masks();
   else if (!strcmp(m, "sigtrap_scratch_overlay"))
     mode_sigtrap_scratch_overlay();
   else if (!strcmp(m, "sigtrap_mmap_race"))

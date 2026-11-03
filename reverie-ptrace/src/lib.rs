@@ -99,6 +99,7 @@ pub use failure::PtraceCallbackStop;
 pub use failure::PtraceCleanupFailure;
 pub use failure::PtraceRunFailure;
 pub use failure::ToolRunCompletion;
+pub use failure::UnprovenPrivateSyscallCompletion;
 pub use failure::UntracedStubSyscall;
 pub use injected_syscall::InjectedSyscallFrame;
 pub use perf::is_perf_supported;

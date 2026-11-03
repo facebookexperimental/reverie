@@ -37,6 +37,7 @@ use std::sync::Mutex;
 use reverie::Guest;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -549,6 +550,18 @@ const SHAPE_PRIVATE_CALL: u64 = 7;
 /// on the private page, through the held-signal retry
 /// (`Guest::inject_with_retry`).
 const SHAPE_PPOLL_THEN_CALL: u64 = 8;
+/// Queues a SIGUSR2 with value 4242 (`SI_QUEUE`) for the calling thread,
+/// which the guest leaves unblocked, so that the getpid injected next is
+/// stopped before its instruction and Reverie holds the signal
+/// (`pending_signal`); then injects the call itself on the private page with
+/// that signal held, through the held-signal retry.
+const SHAPE_HELD_THEN_CALL: u64 = 9;
+/// Injects a getpid, which takes the pending syscall's place, then, on the
+/// private page, a `ppoll` whose `fds`, `nfds`, `tsp` and `sigmask` are the
+/// tagged call's first four arguments (sigsetsize 8), and returns its result.
+/// The tagged call is not `ppoll`, so a guest filter on `ppoll` meets only
+/// the injection.
+const SHAPE_PPOLL_OF_ARGS: u64 = 10;
 const SEND_SIGUSR1: u64 = 0x100;
 const SEND_SIGWINCH: u64 = 0x200;
 const SEND_QUEUE: u64 = 0x400;
@@ -606,6 +619,11 @@ struct GuestConfig {
     /// (`a_timer_step_at_a_pending_restore_keeps_a_blocked_sigtrap`). Every
     /// other run delivers SIGURG.
     urg_arms_timer: bool,
+    /// Runs each untagged mask-swapping syscall on the private page: a
+    /// getpid injected first takes the pending syscall's place, then the call
+    /// itself, as `SHAPE_PRIVATE_CALL` does for a tagged one. Lets a guest
+    /// make such calls with all six arguments (the tag takes r9).
+    private_mask_swaps: bool,
 }
 
 /// The `rt_sigreturn` reports the regression Tool was given, as (thread,
@@ -721,6 +739,21 @@ fn tgkill(pid: Pid, tid: Pid, signal: i32) {
 }
 
 /// Sends the signals a tagged call asks for, while it is parked at its stop.
+/// Whether `call` swaps in a temporary signal mask (the seven syscalls of
+/// `task::swaps_signal_mask`).
+fn swaps_signal_mask_for_test(call: &Syscall) -> bool {
+    matches!(
+        call.number(),
+        Sysno::rt_sigsuspend
+            | Sysno::ppoll
+            | Sysno::pselect6
+            | Sysno::epoll_pwait
+            | Sysno::epoll_pwait2
+            | Sysno::io_pgetevents
+            | Sysno::io_uring_enter
+    )
+}
+
 fn send_signals(pid: Pid, tid: Pid, action: u64) {
     if action & SEND_SIGUSR1 != 0 {
         tgkill(pid, tid, libc::SIGUSR1);
@@ -1040,6 +1073,8 @@ impl Tool for GuestTool {
             SHAPE_TAIL
         } else if tagged {
             regs.r9 & 0xff
+        } else if guest.config().private_mask_swaps && swaps_signal_mask_for_test(&call) {
+            SHAPE_PRIVATE_CALL
         } else if guest.config().tail {
             SHAPE_TAIL
         } else {
@@ -1173,6 +1208,36 @@ impl Tool for GuestTool {
                     .await;
                 Ok(result?)
             }
+            SHAPE_HELD_THEN_CALL => {
+                send_queued(pid, tid, libc::SIGUSR2, 4242, true);
+                let first = guest.inject(reverie::syscalls::Getpid::new()).await;
+                let result = guest.inject_with_retry(call).await;
+                guest
+                    .send_rpc(format!(
+                        "syscall {name} = {} after getpid {}",
+                        errno_value(&result),
+                        errno_value(&first)
+                    ))
+                    .await;
+                Ok(result?)
+            }
+            SHAPE_PPOLL_OF_ARGS => {
+                guest.inject(reverie::syscalls::Getpid::new()).await?;
+                let ppoll = reverie::syscalls::Ppoll::new()
+                    .with_fds(reverie::syscalls::AddrMut::from_raw(regs.rdi as usize))
+                    .with_nfds(regs.rsi as _)
+                    .with_timeout(reverie::syscalls::AddrMut::from_raw(regs.rdx as usize))
+                    .with_sigmask(reverie::syscalls::Addr::from_raw(regs.r10 as usize))
+                    .with_sigsetsize(8);
+                let result = guest.inject(ppoll).await;
+                guest
+                    .send_rpc(format!(
+                        "syscall ppoll = {} privately",
+                        errno_value(&result)
+                    ))
+                    .await;
+                Ok(result?)
+            }
             SHAPE_TWO_PRIVATE => {
                 let first = guest.inject(reverie::syscalls::Getpid::new()).await;
                 let second = guest.inject(reverie::syscalls::Getpid::new()).await;
@@ -1265,6 +1330,28 @@ impl Tool for GuestTool {
         match signal {
             reverie::Signal::SIGPROF => {
                 let _ = guest.inject(reverie::syscalls::Getpid::new()).await;
+            }
+            // `sigtrap_int3_after_callback_wait`: a mask-swapping wait from
+            // the callback, whose temporary mask blocks SIGTRAP and admits
+            // the SIGUSR1 the guest left pending, so the wait is
+            // interrupted with its restore pending. A callback's injection
+            // is single-stepped (`syscall_stops_admitted`).
+            reverie::Signal::SIGVTALRM => {
+                use reverie::Stack;
+                let mut stack = guest.stack().await;
+                let timeout = stack.push([5u64, 0u64]);
+                let temporary = stack.push(1u64 << (libc::SIGTRAP - 1));
+                let _guard = stack.commit()?;
+                let ppoll = reverie::syscalls::Ppoll::new()
+                    .with_fds(None)
+                    .with_nfds(0)
+                    .with_timeout(reverie::syscalls::AddrMut::from_raw(timeout.as_raw()))
+                    .with_sigmask(Some(temporary.cast()))
+                    .with_sigsetsize(8);
+                let result = guest.inject(ppoll).await;
+                guest
+                    .send_rpc(format!("callback ppoll = {}", errno_value(&result)))
+                    .await;
             }
             reverie::Signal::SIGXCPU => {
                 use reverie::Stack;
@@ -1429,6 +1516,8 @@ struct GuestOptions {
     no_serialization_contract: bool,
     /// `GuestConfig::urg_arms_timer`.
     urg_arms_timer: bool,
+    /// `GuestConfig::private_mask_swaps`.
+    private_mask_swaps: bool,
 }
 
 /// Installs a seccomp filter on the calling thread that returns `action` for
@@ -1501,6 +1590,7 @@ async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun
             sigreturns: options.sigreturns,
             serialized: !options.no_serialization_contract,
             urg_arms_timer: options.urg_arms_timer,
+            private_mask_swaps: options.private_mask_swaps,
         })
         .backend_stats(BackendStatsRequest::ENABLED)
         .final_resume_signal_for_test(resume_recorder(resumes.clone()))
@@ -3891,16 +3981,18 @@ async fn an_untraced_sharer_keeps_the_step_shield_as_before() {
 /// signal, and the mask's restore is left pending), then the guest's status
 /// read through the held-signal retry, whose path restores the saved mask
 /// before the read's step. The shield is decided at that step, from the mask
-/// then (`step_private_syscall`), as on Reverie 63934937, whose own lines
-/// these are: each blocked SIGTRAP reads unblocked. (An ignored SIGTRAP reads
-/// `SIG_DFL` during the read: the ppoll step's reset is owed until the
-/// restore, as before; it is `SIG_IGN` again afterwards.) Deciding before the
-/// held-signal path changed the mask let the read run unshielded. Both
-/// configurations.
+/// then (`step_private_syscall`), as on Reverie 63934937: each blocked
+/// SIGTRAP reads unblocked. Deciding before the held-signal path changed the
+/// mask let the read run unshielded. The ppoll runs between syscall stops
+/// (<https://github.com/rrnewton/reverie/issues/1262>), so an ignored SIGTRAP
+/// now reads `SIG_IGN` during the read too; before, the ppoll's step reset it
+/// to `SIG_DFL`, owed until the restore. The read, a call that keeps the mask,
+/// is still stepped at the pending restore (limit L3 of that issue); two
+/// repairs are noted per configuration. Both configurations.
 #[tokio::test(flavor = "current_thread")]
 async fn a_held_signal_mask_transition_decides_the_shield_as_before() {
     let expected = [
-        "hold ign-blocked SigBlk=0 SigIgn=0 SigCgt=0 blocked=1 hits=1",
+        "hold ign-blocked SigBlk=0 SigIgn=1 SigCgt=0 blocked=1 hits=1",
         "hold ign-blocked after sigtrap=ign flags=0x50000000 usr2-in-mask=1 blocked=1",
         "hold handler-blocked SigBlk=0 SigIgn=0 SigCgt=1 blocked=1 hits=1",
         "hold handler-blocked after sigtrap=trap_handler flags=0x50000000 usr2-in-mask=1 blocked=1",
@@ -3909,7 +4001,16 @@ async fn a_held_signal_mask_transition_decides_the_shield_as_before() {
         "hold dfl SigBlk=0 SigIgn=0 SigCgt=0 blocked=0 hits=1",
         "hold dfl after sigtrap=dfl flags=0x50000000 usr2-in-mask=1 blocked=0",
     ];
-    for run in run_both_configurations("sigtrap_ppoll_hold_then_read").await {
+    let before = TransportCounts::now();
+    let runs = run_both_configurations("sigtrap_ppoll_hold_then_read").await;
+    let after = TransportCounts::now();
+    assert_eq!(
+        after.delta(&before, Sysno::ppoll),
+        (8, 0),
+        "each state's ppoll, per configuration"
+    );
+    assert_eq!(after.repairs - before.repairs, 4, "two per configuration");
+    for run in runs {
         let lines: Vec<&str> = run
             .report
             .lines()
@@ -4610,32 +4711,48 @@ async fn a_caught_unblocked_sigtrap_takes_no_repair_injection() {
     assert_eq!(made, 0, "unstepped injections");
 }
 
-/// A phase-0 limit, pinned: a guest `int3` right after a wait that a handled
-/// signal interrupted, with a caught, unblocked SIGTRAP in the wait's
-/// temporary mask, meets the reset `SIG_DFL` and kills the child. The repair
-/// is owed while the wait's mask restore is pending, and is written at the
-/// thread's next syscall or timer event, which the `int3` precedes. Natively
-/// the handler runs and the child exits 0, so this test must change when the
-/// window closes (<https://github.com/rrnewton/hermit/issues/4409>).
+/// A guest `int3` right after a wait that a handled signal interrupted, with
+/// a caught, unblocked SIGTRAP in the wait's temporary mask, runs the guest's
+/// handler and the child exits 0, as natively
+/// (<https://github.com/rrnewton/reverie/issues/1262>). The injected wait
+/// runs between syscall stops (`syscall_stops_admitted`), whose exit stop
+/// raises no trap, so nothing resets SIGTRAP and no repair is owed. Before,
+/// the wait's single-step trap met the temporary mask, reset the action to
+/// `SIG_DFL`, and the repair could not run before the `int3`. The lines are
+/// a native run's, and each wait took the syscall-stop transport with no
+/// step and no repair noted. Both configurations.
 #[tokio::test(flavor = "current_thread")]
-async fn an_int3_right_after_an_interrupted_wait_still_meets_the_reset_action() {
+async fn an_int3_right_after_an_interrupted_wait_runs_the_guest_handler() {
     require_capped_crash_dumps();
-    for run in run_both_configurations("sigtrap_int3_after_interrupted_wait").await {
-        let lines: Vec<&str> = run
-            .report
-            .lines()
-            .filter(|line| line.starts_with("after-wait "))
-            .collect();
+    let expected = [
+        "after-wait sigsuspend signaled=0 sig=0 exited=0",
+        "after-wait ppoll signaled=0 sig=0 exited=0",
+    ];
+    let native = native_report("sigtrap_int3_after_interrupted_wait");
+    assert_eq!(
+        prefixed_lines(&native, &["after-wait "]),
+        expected,
+        "{native}"
+    );
+    let before = TransportCounts::now();
+    let runs = run_both_configurations("sigtrap_int3_after_interrupted_wait").await;
+    let after = TransportCounts::now();
+    for run in runs {
         assert_eq!(
-            lines,
-            [
-                "after-wait sigsuspend signaled=1 sig=5 exited=-1",
-                "after-wait ppoll signaled=1 sig=5 exited=-1",
-            ],
+            prefixed_lines(&run.report, &["after-wait "]),
+            expected,
             "{}",
             run.report
         );
     }
+    for nr in [Sysno::rt_sigsuspend, Sysno::ppoll] {
+        assert_eq!(
+            after.delta(&before, nr),
+            (2, 0),
+            "{nr}: one wait per configuration"
+        );
+    }
+    assert_eq!(after.repairs - before.repairs, 0);
 }
 
 /// A Tool that injects from its signal callback, then resumes the signal,
@@ -4678,44 +4795,53 @@ async fn a_signal_callback_injection_delivers_the_signal_once_and_keeps_sigtrap(
     }
 }
 
-/// Phase-0 limits, pinned: the reset `SIG_DFL` is also met by another thread
-/// and by a guest handler after a signal-callback injection, not only by the
-/// interrupted thread itself
-/// (`an_int3_right_after_an_interrupted_wait_still_meets_the_reset_action`).
-/// The repair is owed to the signal-action table, and a thread's read of the
-/// action takes a syscall stop that writes it first; a delivery takes no
-/// stop. So, with a caught, unblocked SIGTRAP:
-/// - a sibling's `int3` while the interrupted thread's handler runs without a
-///   syscall kills the child when SIGTRAP was in the wait's temporary mask,
-///   and not otherwise. The scenario pinned is a sibling that is already in
-///   its own function and makes no syscall between the reset and its `int3`
-///   (the fixture waits for it to start); a sibling syscall in that window
-///   pays the repair first
-///   (`an_int3_after_a_sibling_syscall_meets_the_repaired_handler`);
-/// - an `int3` in the guest's handler of a POSIX-timer signal whose Tool
-///   callback injected block-all `rt_sigprocmask` calls (SIGXCPU) kills the
-///   child, since the repair waits for a stop outside the callback; with only
-///   a shielded `getpid` (SIGPROF) it does not.
+/// The same window met by another thread, and one met after a signal
+/// callback's injection (<https://github.com/rrnewton/reverie/issues/1262>):
+/// - a sibling's `int3` while the interrupted thread's handler runs without
+///   a syscall runs the guest's handler, with SIGTRAP in the wait's temporary
+///   mask or not: the wait runs between syscall stops, so nothing resets
+///   SIGTRAP and nothing is owed. The fixture waits for the sibling to be in
+///   its own function, so it makes no syscall between the wait and its
+///   `int3`; the order with one is
+///   `an_int3_after_a_sibling_syscall_runs_the_guest_handler`;
+/// - limit L1, pinned: an `int3` in the guest's handler of a POSIX-timer
+///   signal whose Tool callback injected block-all `rt_sigprocmask` calls
+///   (SIGXCPU) still kills the child. A callback's injections are
+///   single-stepped, and their repair waits for a stop outside the callback;
+///   with only a shielded `getpid` (SIGPROF) it does not.
 ///
-/// Natively every child exits 0, so this test must change when the windows
-/// close (<https://github.com/rrnewton/hermit/issues/4409>). Both
+/// Natively every child exits 0. Each wait took the syscall-stop transport;
+/// the one repair noted per configuration is the SIGXCPU callback's. Both
 /// configurations.
 #[tokio::test(flavor = "current_thread")]
-async fn an_int3_in_another_thread_or_after_a_callback_injection_still_meets_the_reset_action() {
+async fn an_int3_in_another_thread_runs_the_guest_handler_and_one_after_a_callback_injection_still_meets_the_reset_action()
+ {
     require_capped_crash_dumps();
-    for run in run_both_configurations("sigtrap_int3_in_the_other_windows").await {
-        let lines: Vec<&str> = run
-            .report
-            .lines()
-            .filter(|line| line.starts_with("sibling ") || line.starts_with("callback "))
-            .collect();
+    let native_expected = [
+        "sibling sigsuspend tmask=0 signaled=0 sig=0 exited=0",
+        "sibling sigsuspend tmask=1 signaled=0 sig=0 exited=0",
+        "sibling ppoll tmask=0 signaled=0 sig=0 exited=0",
+        "sibling ppoll tmask=1 signaled=0 sig=0 exited=0",
+        "callback prof signaled=0 sig=0 exited=0",
+        "callback xcpu signaled=0 sig=0 exited=0",
+    ];
+    let native = native_report("sigtrap_int3_in_the_other_windows");
+    assert_eq!(
+        prefixed_lines(&native, &["sibling ", "callback "]),
+        native_expected,
+        "{native}"
+    );
+    let before = TransportCounts::now();
+    let runs = run_both_configurations("sigtrap_int3_in_the_other_windows").await;
+    let after = TransportCounts::now();
+    for run in runs {
         assert_eq!(
-            lines,
+            prefixed_lines(&run.report, &["sibling ", "callback "]),
             [
                 "sibling sigsuspend tmask=0 signaled=0 sig=0 exited=0",
-                "sibling sigsuspend tmask=1 signaled=1 sig=5 exited=-1",
+                "sibling sigsuspend tmask=1 signaled=0 sig=0 exited=0",
                 "sibling ppoll tmask=0 signaled=0 sig=0 exited=0",
-                "sibling ppoll tmask=1 signaled=1 sig=5 exited=-1",
+                "sibling ppoll tmask=1 signaled=0 sig=0 exited=0",
                 "callback prof signaled=0 sig=0 exited=0",
                 "callback xcpu signaled=1 sig=5 exited=-1",
             ],
@@ -4723,41 +4849,62 @@ async fn an_int3_in_another_thread_or_after_a_callback_injection_still_meets_the
             run.report
         );
     }
+    for nr in [Sysno::rt_sigsuspend, Sysno::ppoll] {
+        assert_eq!(
+            after.delta(&before, nr),
+            (4, 0),
+            "{nr}: two waits per configuration"
+        );
+    }
+    assert_eq!(
+        after.repairs - before.repairs,
+        2,
+        "the SIGXCPU callback's, once per configuration"
+    );
 }
 
 /// The other ordering of the sibling window above (tmask=1): the sibling
-/// makes one `getppid` after the interrupted thread is in its handler, so
-/// after the step that reset SIGTRAP, and before its `int3`. Reverie owes the
-/// repair of SIGTRAP's action to the process's action table, and the first of
-/// its threads to stop pays it: here the sibling's seccomp stop
-/// (`repair_sigtrap_at_seccomp_stop`). The `int3` then meets the guest's
-/// handler and the child exits 0, as natively.
-///
-/// This documents current behaviour, in which the order the threads stop in
-/// decides the `int3`'s outcome
-/// (<https://github.com/rrnewton/reverie/issues/1262>).
-/// The change that fixes that must revisit this test and the tmask=1 lines
-/// above together.
+/// makes one `getppid` after the interrupted thread is in its handler and
+/// before its `int3`. The `int3` runs the guest's handler and the child exits
+/// 0, as natively, as it does in the order without that syscall
+/// (`an_int3_in_another_thread_runs_the_guest_handler_and_one_after_a_callback_injection_still_meets_the_reset_action`):
+/// the wait ran between syscall stops, so nothing was reset and the order
+/// the threads stop in decides nothing
+/// (<https://github.com/rrnewton/reverie/issues/1262>). Before, the wait's
+/// step reset SIGTRAP, and the sibling's syscall paid the table's repair.
 /// Both configurations.
 #[tokio::test(flavor = "current_thread")]
-async fn an_int3_after_a_sibling_syscall_meets_the_repaired_handler() {
+async fn an_int3_after_a_sibling_syscall_runs_the_guest_handler() {
     require_capped_crash_dumps();
-    for run in run_both_configurations("sigtrap_int3_after_sibling_syscall").await {
-        let lines: Vec<&str> = run
-            .report
-            .lines()
-            .filter(|line| line.starts_with("sibling-syscall "))
-            .collect();
+    let expected = [
+        "sibling-syscall sigsuspend signaled=0 sig=0 exited=0",
+        "sibling-syscall ppoll signaled=0 sig=0 exited=0",
+    ];
+    let native = native_report("sigtrap_int3_after_sibling_syscall");
+    assert_eq!(
+        prefixed_lines(&native, &["sibling-syscall "]),
+        expected,
+        "{native}"
+    );
+    let before = TransportCounts::now();
+    let runs = run_both_configurations("sigtrap_int3_after_sibling_syscall").await;
+    let after = TransportCounts::now();
+    for run in runs {
         assert_eq!(
-            lines,
-            [
-                "sibling-syscall sigsuspend signaled=0 sig=0 exited=0",
-                "sibling-syscall ppoll signaled=0 sig=0 exited=0",
-            ],
+            prefixed_lines(&run.report, &["sibling-syscall "]),
+            expected,
             "{}",
             run.report
         );
     }
+    for nr in [Sysno::rt_sigsuspend, Sysno::ppoll] {
+        assert_eq!(
+            after.delta(&before, nr),
+            (2, 0),
+            "{nr}: one wait per configuration"
+        );
+    }
+    assert_eq!(after.repairs - before.repairs, 0);
 }
 
 /// Reverie's SIGTRAP repair page is the page after the trampoline
@@ -4850,6 +4997,7 @@ async fn a_guest_elf_segment_at_the_repair_page_address_keeps_every_byte() {
                 sigreturns: false,
                 serialized: true,
                 urg_arms_timer: false,
+                private_mask_swaps: false,
             })
             .spawn()
             .await
@@ -5905,4 +6053,529 @@ async fn a_guest_seccomp_filter_against_rt_sigaction_never_meets_a_repair() {
             );
         }
     }
+}
+
+/// Private-page injection counts of this thread (`PRIVATE_TRANSPORTS_FOR_TEST`)
+/// and the SIGTRAP repairs it noted (`SIGTRAP_REPAIRS_NOTED_FOR_TEST`), for
+/// the tests of which transport an injection took
+/// (<https://github.com/rrnewton/reverie/issues/1262>). A test's tracer runs
+/// on its own `current_thread` runtime, so these are its own.
+struct TransportCounts {
+    by_call: Vec<(Sysno, u64, u64)>,
+    repairs: u64,
+}
+
+impl TransportCounts {
+    fn now() -> Self {
+        let calls = [
+            Sysno::rt_sigsuspend,
+            Sysno::ppoll,
+            Sysno::pselect6,
+            Sysno::epoll_pwait,
+            Sysno::epoll_pwait2,
+            Sysno::io_pgetevents,
+            Sysno::io_uring_enter,
+        ];
+        Self {
+            by_call: calls
+                .iter()
+                .map(|&nr| {
+                    (
+                        nr,
+                        crate::task::private_transports_for_test(nr, true),
+                        crate::task::private_transports_for_test(nr, false),
+                    )
+                })
+                .collect(),
+            repairs: crate::task::SIGTRAP_REPAIRS_NOTED_FOR_TEST.with(|count| count.get()),
+        }
+    }
+
+    /// The injections of `nr` since `before`: (between syscall stops,
+    /// single-stepped).
+    fn delta(&self, before: &Self, nr: Sysno) -> (u64, u64) {
+        let get = |counts: &Self| {
+            counts
+                .by_call
+                .iter()
+                .find(|(call, _, _)| *call == nr)
+                .map(|&(_, stops, steps)| (stops, steps))
+                .expect("a counted call")
+        };
+        let (stops, steps) = get(self);
+        let (stops_before, steps_before) = get(before);
+        (stops - stops_before, steps - steps_before)
+    }
+}
+
+/// The lines of `report` that start with one of `prefixes`.
+fn prefixed_lines<'a>(report: &'a str, prefixes: &[&str]) -> Vec<&'a str> {
+    report
+        .lines()
+        .filter(|line| prefixes.iter().any(|prefix| line.starts_with(prefix)))
+        .collect()
+}
+
+/// The whole report of `mode` run natively, untraced.
+fn native_report(mode: &str) -> String {
+    let report = tempfile_path(&format!("plain-guest-native-{mode}"));
+    let status = std::process::Command::new(regression_guest())
+        .arg(mode)
+        .arg(&report)
+        .status()
+        .expect("run the regression fixture natively");
+    assert!(status.success(), "native {mode}: {status}");
+    let text = std::fs::read_to_string(&report).expect("read the native report");
+    assert!(text.ends_with("done\n"), "{text}");
+    text
+}
+
+/// Limit L1 of <https://github.com/rrnewton/reverie/issues/1262>, pinned: a
+/// mask-swapping wait that a Tool's signal callback injects (SIGVTALRM's
+/// `ppoll`, whose temporary mask blocks a caught SIGTRAP and admits a pending
+/// SIGUSR1) is still single-stepped, since a callback's resume needs its
+/// injection to end at a signal-delivery stop. Its trap resets SIGTRAP, the
+/// repair (one per configuration) waits for a stop outside the callback, and
+/// the guest's SIGVTALRM handler's `int3` kills the child. Natively there is
+/// no injection and the child exits 0. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_mask_swapping_wait_injected_from_a_callback_still_meets_the_reset_action() {
+    require_capped_crash_dumps();
+    let native = native_report("sigtrap_int3_after_callback_wait");
+    assert_eq!(
+        prefixed_lines(&native, &["callback-wait "]),
+        ["callback-wait ppoll signaled=0 sig=0 exited=0"],
+        "{native}"
+    );
+    let before = TransportCounts::now();
+    let runs = run_both_configurations("sigtrap_int3_after_callback_wait").await;
+    let after = TransportCounts::now();
+    for run in runs {
+        assert_eq!(
+            prefixed_lines(&run.report, &["callback-wait "]),
+            ["callback-wait ppoll signaled=1 sig=5 exited=-1"],
+            "{}",
+            run.report
+        );
+    }
+    assert_eq!(
+        after.delta(&before, Sysno::ppoll),
+        (0, 2),
+        "stepped, once per configuration"
+    );
+    assert_eq!(after.repairs - before.repairs, 2);
+}
+
+/// Limit L6 of <https://github.com/rrnewton/reverie/issues/1262>, pinned: in
+/// a process with a seccomp filter of its own (all but `getppid` allowed),
+/// the sibling window's waits are still single-stepped, since an exit stop
+/// could not tell that filter's `SECCOMP_RET_TRAP` from a result. The trap
+/// resets SIGTRAP and the sibling's `int3` kills the child. No repair is
+/// noted: Reverie neither reads nor writes SIGTRAP's action through its
+/// repair page under a guest filter (`sigtrap_scratch`), so the reset stays.
+/// Natively the child exits 0. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_filtered_thread_keeps_the_stepped_window() {
+    require_capped_crash_dumps();
+    let before = TransportCounts::now();
+    let runs = run_both_configurations("sigtrap_int3_in_a_guest_filtered_window").await;
+    let after = TransportCounts::now();
+    for run in runs {
+        assert_eq!(
+            prefixed_lines(&run.report, &["filtered-window "]),
+            [
+                "filtered-window sigsuspend signaled=1 sig=5 exited=-1",
+                "filtered-window ppoll signaled=1 sig=5 exited=-1",
+            ],
+            "{}",
+            run.report
+        );
+    }
+    for nr in [Sysno::rt_sigsuspend, Sysno::ppoll] {
+        assert_eq!(
+            after.delta(&before, nr),
+            (0, 2),
+            "{nr}: stepped, once per configuration"
+        );
+    }
+    assert_eq!(after.repairs - before.repairs, 0);
+}
+
+/// Limit L5 of <https://github.com/rrnewton/reverie/issues/1262>, pinned: on
+/// a tracer thread under a seccomp filter of its own, installed before the
+/// trace starts (an allow-all filter, so procfs reports `Seccomp: 2`),
+/// Reverie keeps no SIGTRAP state (`keeps_sigtrap_state`), and the sibling
+/// window's waits are still single-stepped. Every sibling `int3` then meets
+/// the reset action, with SIGTRAP in the temporary mask or not, as does the
+/// SIGXCPU callback's, and no repair is noted. Natively every child exits 0
+/// (`an_int3_in_another_thread_runs_the_guest_handler_and_one_after_a_callback_injection_still_meets_the_reset_action`).
+/// The guest inherits the filter, which counts as one it got from outside,
+/// not as its own. The tracer runs on a thread of its own so that no other
+/// test's thread is filtered. Both configurations.
+#[test]
+fn a_filtered_tracer_keeps_the_stepped_window() {
+    require_capped_crash_dumps();
+    let outcome = std::thread::spawn(|| {
+        let allow = [libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        }];
+        let program = libc::sock_fprog {
+            len: allow.len() as u16,
+            filter: allow.as_ptr().cast_mut(),
+        };
+        // SAFETY: prctl with a valid filter program that outlives the call.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &program as *const libc::sock_fprog,
+                ),
+                0
+            );
+        }
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        assert!(status.lines().any(|line| line == "Seccomp:\t2"), "{status}");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let before = TransportCounts::now();
+                let runs = run_both_configurations("sigtrap_int3_in_the_other_windows").await;
+                let after = TransportCounts::now();
+                (runs, before, after)
+            })
+    })
+    .join()
+    .unwrap();
+    let (runs, before, after) = outcome;
+    for run in &runs {
+        assert_eq!(
+            prefixed_lines(&run.report, &["sibling ", "callback "]),
+            [
+                "sibling sigsuspend tmask=0 signaled=1 sig=5 exited=-1",
+                "sibling sigsuspend tmask=1 signaled=1 sig=5 exited=-1",
+                "sibling ppoll tmask=0 signaled=1 sig=5 exited=-1",
+                "sibling ppoll tmask=1 signaled=1 sig=5 exited=-1",
+                "callback prof signaled=0 sig=0 exited=0",
+                "callback xcpu signaled=1 sig=5 exited=-1",
+            ],
+            "{}",
+            run.report
+        );
+    }
+    for nr in [Sysno::rt_sigsuspend, Sysno::ppoll] {
+        assert_eq!(
+            after.delta(&before, nr),
+            (0, 4),
+            "{nr}: stepped, two waits per configuration"
+        );
+    }
+    assert_eq!(after.repairs - before.repairs, 0);
+}
+
+/// Limit L7 of <https://github.com/rrnewton/reverie/issues/1262>: a
+/// mask-swapping wait injected while Reverie holds a signal for the resume
+/// (`pending_signal`) is still single-stepped, so that the held signal's
+/// siginfo is written back at the signal-delivery stop it needs
+/// (`report_held_signal`). The Tool queues SIGUSR2 with value 4242, a getpid
+/// injected next is stopped by it before its instruction (so it is held), and
+/// the guest's `ppoll` is then injected: the guest's handler receives
+/// `SI_QUEUE`, 4242 and the tracer's PID. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_held_signal_keeps_its_siginfo_across_an_injected_wait() {
+    let before = TransportCounts::now();
+    let runs = run_both_configurations("held_siginfo_then_ppoll").await;
+    let after = TransportCounts::now();
+    for run in runs {
+        assert_eq!(
+            prefixed_lines(&run.report, &["held "]),
+            ["held ppoll ret=0 hits=1 code=-1 value=4242 pid-is-parent=1"],
+            "{}",
+            run.report
+        );
+    }
+    assert_eq!(
+        after.delta(&before, Sysno::ppoll),
+        (0, 2),
+        "stepped, once per configuration"
+    );
+}
+
+/// An injected `ppoll` run between syscall stops whose result is 271, its
+/// own number on x86_64 (271 entries for one pipe's write end, each ready),
+/// with no SIGSYS pending: the exit stop reports it as the call's result
+/// (`classify_syscall_stop_exit`). Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wait_run_between_syscall_stops_can_return_its_own_number() {
+    let before = TransportCounts::now();
+    let runs = run_both_configurations("ppoll_returns_its_number").await;
+    let after = TransportCounts::now();
+    for run in runs {
+        assert_eq!(
+            prefixed_lines(&run.report, &["ppoll-nr "]),
+            ["ppoll-nr ret=271 ready=271"],
+            "{}",
+            run.report
+        );
+    }
+    assert_eq!(after.delta(&before, Sysno::ppoll), (2, 0));
+}
+
+/// The exit-stop rule of an injection run between syscall stops
+/// (<https://github.com/rrnewton/reverie/issues/1262>): only a return
+/// register equal to the call's number with SIGSYS pending for the thread,
+/// or that state unreadable, fails to show a completed instruction, since a
+/// `SECCOMP_RET_TRAP` leaves exactly that. And the pending state read is the
+/// thread's own (`SigPnd`), not the thread group's (`ShdPnd`).
+#[test]
+fn an_exit_stop_is_unproven_only_for_its_own_number_with_sigsys_pending() {
+    use crate::task::SyscallStopOutcome::*;
+    use crate::task::classify_syscall_stop_exit as classify;
+    let nr = Sysno::ppoll;
+    assert_eq!(classify(0, nr, Some(true)), Ran);
+    assert_eq!(classify(-4i64 as u64, nr, None), Ran);
+    assert_eq!(classify(271, nr, Some(false)), Ran);
+    assert_eq!(classify(271, nr, Some(true)), Unproven);
+    assert_eq!(classify(271, nr, None), Unproven);
+    let sigsys = 1u64 << (libc::SIGSYS - 1);
+    let status = |own: u64, shared: u64| {
+        format!("SigQ:\t0/1\nSigPnd:\t{own:016x}\nShdPnd:\t{shared:016x}\n")
+    };
+    assert_eq!(
+        crate::task::parse_thread_sigsys_pending(&status(sigsys, 0)),
+        Some(true)
+    );
+    assert_eq!(
+        crate::task::parse_thread_sigsys_pending(&status(0, sigsys)),
+        Some(false)
+    );
+    assert_eq!(
+        crate::task::parse_thread_sigsys_pending("ShdPnd:\t0\n"),
+        None
+    );
+    assert_eq!(
+        crate::task::parse_thread_sigsys_pending("SigPnd:\tzz\n"),
+        None
+    );
+}
+
+/// Sets `FORCE_SYSCALL_STOPS_FOR_TEST` for this thread until dropped.
+struct ForceSyscallStops;
+
+impl ForceSyscallStops {
+    fn new() -> Self {
+        crate::task::FORCE_SYSCALL_STOPS_FOR_TEST.with(|force| force.set(true));
+        Self
+    }
+}
+
+impl Drop for ForceSyscallStops {
+    fn drop(&mut self) {
+        crate::task::FORCE_SYSCALL_STOPS_FOR_TEST.with(|force| force.set(false));
+    }
+}
+
+/// The boundary of an injection run between syscall stops that a guest
+/// filter's `SECCOMP_RET_TRAP` skipped (limit L9 of
+/// <https://github.com/rrnewton/reverie/issues/1262>). Such a thread is
+/// never admitted (`syscall_stops_admitted`); the test override admits it.
+/// The exit stop shows the call's own number with SIGSYS pending, so the run
+/// ends with `UnprovenPrivateSyscallCompletion` and no result reaches the
+/// Tool or the guest: plainly, and when an older `SI_TKILL` SIGSYS was
+/// already pending, so the trap's siginfo is lost. Without the override the
+/// same guests take the stepped path: the plain one gets `ENOSYS`, and the
+/// one with SIGSYS blocked is killed by the trap's SIGSYS, as before.
+#[tokio::test(flavor = "current_thread")]
+async fn a_seccomp_trap_of_a_wait_run_between_syscall_stops_ends_the_run() {
+    for mode in ["trap_ppoll", "trap_ppoll_prequeued"] {
+        let before = TransportCounts::now();
+        let error = {
+            let _force = ForceSyscallStops::new();
+            run_guest_with(mode, false)
+                .await
+                .expect_err("an unproven completion must end the run")
+        };
+        let after = TransportCounts::now();
+        let text = format!("{error:#} {error:?}");
+        assert!(
+            text.contains("returned its own number with SIGSYS pending"),
+            "{mode}: {text}"
+        );
+        assert_eq!(after.delta(&before, Sysno::ppoll), (1, 0), "{mode}");
+    }
+    let before = TransportCounts::now();
+    let plain = run_guest("trap_ppoll", false).await;
+    let prequeued = run_guest("trap_ppoll_prequeued", false).await;
+    let after = TransportCounts::now();
+    assert_eq!(plain.status, ExitStatus::Exited(0), "{}", plain.report);
+    assert_eq!(
+        prefixed_lines(&plain.report, &["trap-ppoll "]),
+        ["trap-ppoll prequeued=0 ret=-38"],
+        "{}",
+        plain.report
+    );
+    assert_eq!(
+        prequeued.status,
+        ExitStatus::Signaled(Signal::SIGSYS, true),
+        "{}",
+        prequeued.report
+    );
+    assert_eq!(after.delta(&before, Sysno::ppoll), (0, 2));
+}
+
+/// A guest filter's `SECCOMP_RET_TRACE` for a `ppoll` the Tool injects on the
+/// private page: the call runs once, as Reverie runs a call at a guest's
+/// trace stop, completing with its 1 ms timeout written back as 0 left, and
+/// interrupted by a pending SIGUSR1 its temporary mask admits (`-EINTR`).
+/// Such a thread is single-stepped (`PRIVATE_STEP_TRACE_STOPS_FOR_TEST`); the
+/// test override admits it to run between syscall stops instead, where the
+/// trace stop comes between the entry and exit stops
+/// (`SYSCALL_STOP_TRACE_STOPS_FOR_TEST`), with the same results. (Natively,
+/// with no tracer, a traced call fails with ENOSYS; this keeps Reverie's
+/// existing policy.)
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_trace_stop_runs_an_injected_wait_on_either_transport() {
+    let expected = [
+        "trace-ppoll ret=0 remaining=0.000000000",
+        "trace-ppoll interrupted ret=-4",
+    ];
+    for force in [false, true] {
+        let before = TransportCounts::now();
+        let step_stops = crate::task::PRIVATE_STEP_TRACE_STOPS_FOR_TEST.with(|count| count.get());
+        let syscall_stops =
+            crate::task::SYSCALL_STOP_TRACE_STOPS_FOR_TEST.with(|count| count.get());
+        let run = {
+            let _force = force.then(ForceSyscallStops::new);
+            run_guest("trace_ppoll", false).await
+        };
+        let after = TransportCounts::now();
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        assert_eq!(
+            prefixed_lines(&run.report, &["trace-ppoll "]),
+            expected,
+            "{}",
+            run.report
+        );
+        let step_stops =
+            crate::task::PRIVATE_STEP_TRACE_STOPS_FOR_TEST.with(|count| count.get()) - step_stops;
+        let syscall_stops = crate::task::SYSCALL_STOP_TRACE_STOPS_FOR_TEST
+            .with(|count| count.get())
+            - syscall_stops;
+        if force {
+            assert_eq!(after.delta(&before, Sysno::ppoll), (2, 0));
+            assert_eq!((step_stops, syscall_stops), (0, 2));
+        } else {
+            assert_eq!(after.delta(&before, Sysno::ppoll), (0, 2));
+            assert_eq!((step_stops, syscall_stops), (2, 0));
+        }
+    }
+}
+
+/// Each of the seven mask-swapping syscalls, which the Tool runs on the
+/// private page (`GuestConfig::private_mask_swaps`), with an empty temporary
+/// mask: with nothing pending and a zero timeout (not `rt_sigsuspend`), and
+/// interrupted by a pending SIGUSR1 the temporary mask admits. Every result
+/// and handler count is a native run's, and every call ran between syscall
+/// stops, with no step and no repair
+/// (<https://github.com/rrnewton/reverie/issues/1262>). Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn each_mask_swapping_wait_runs_between_syscall_stops_as_natively() {
+    let native = native_report("swapsmask_matrix");
+    let native_lines = prefixed_lines(&native, &["matrix "]);
+    // io_uring_enter is left out only where the kernel refuses io_uring,
+    // which the native run reports; otherwise all 13 rows run.
+    let refused = native_lines
+        .iter()
+        .any(|line| line.starts_with("matrix io_uring_setup"));
+    assert_eq!(
+        native_lines.len(),
+        if refused { 12 } else { 13 },
+        "{native}"
+    );
+    let before = TransportCounts::now();
+    let mut runs = Vec::new();
+    for tail in [false, true] {
+        let options = GuestOptions {
+            tail,
+            private_mask_swaps: true,
+            ..Default::default()
+        };
+        let run = run_guest_options("swapsmask_matrix", options)
+            .await
+            .expect("run swapsmask_matrix");
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        runs.push(run);
+    }
+    let after = TransportCounts::now();
+    for run in &runs {
+        assert_eq!(
+            prefixed_lines(&run.report, &["matrix "]),
+            native_lines,
+            "{}",
+            run.report
+        );
+    }
+    for nr in [
+        Sysno::ppoll,
+        Sysno::pselect6,
+        Sysno::epoll_pwait,
+        Sysno::epoll_pwait2,
+        Sysno::io_pgetevents,
+    ] {
+        assert_eq!(
+            after.delta(&before, nr),
+            (4, 0),
+            "{nr}: two calls per configuration"
+        );
+    }
+    assert_eq!(after.delta(&before, Sysno::rt_sigsuspend), (2, 0));
+    let uring = if refused { 0 } else { 4 };
+    assert_eq!(after.delta(&before, Sysno::io_uring_enter), (uring, 0));
+    assert_eq!(after.repairs - before.repairs, 0);
+}
+
+/// The masks of a SIGUSR1 handler that interrupts an injected `ppoll` whose
+/// temporary mask is {SIGTRAP}, with SIGUSR1 pending before the wait and
+/// SIGUSR2 in the handler's `sa_mask`: its live mask has SIGTRAP, SIGUSR1 and
+/// SIGUSR2 (the temporary mask, `sa_mask` and the signal), its frame's
+/// `uc_sigmask` and the mask after it returns are the mask before the wait
+/// ({SIGUSR1}), and an `int3` in such a handler meets SIGTRAP blocked and
+/// kills the child, all as natively. Before, the wait's step trap unblocked
+/// SIGTRAP in the live mask (<https://github.com/rrnewton/reverie/issues/1262>).
+/// The waits ran between syscall stops; the one repair noted per
+/// configuration is that of the handler's own `rt_sigprocmask`, which is
+/// single-stepped with the caught SIGTRAP blocked and repaired at its own
+/// stop. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_handler_that_interrupts_an_injected_wait_has_the_native_masks() {
+    require_capped_crash_dumps();
+    let expected = [
+        "masks ret=-4 hits=1 live trap=1 usr1=1 usr2=1 frame trap=0 usr1=1 usr2=0 after trap=0 usr1=1 usr2=0",
+        "masks handler-int3 signaled=1 sig=5 exited=-1",
+    ];
+    let native = native_report("swapsmask_handler_masks");
+    assert_eq!(prefixed_lines(&native, &["masks "]), expected, "{native}");
+    let before = TransportCounts::now();
+    let runs = run_both_configurations("swapsmask_handler_masks").await;
+    let after = TransportCounts::now();
+    for run in runs {
+        assert_eq!(
+            prefixed_lines(&run.report, &["masks "]),
+            expected,
+            "{}",
+            run.report
+        );
+    }
+    assert_eq!(
+        after.delta(&before, Sysno::ppoll),
+        (4, 0),
+        "two waits per configuration"
+    );
+    assert_eq!(after.repairs - before.repairs, 2);
 }

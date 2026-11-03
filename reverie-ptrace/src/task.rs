@@ -2111,6 +2111,59 @@ fn guest_seccomp_filters(tid: Pid) -> Option<u64> {
         .and_then(|count| count.trim().parse().ok())
 }
 
+/// Whether SIGSYS is pending in thread `tid`'s own queue (procfs `SigPnd`,
+/// without the thread group's `ShdPnd`), or `None` if that cannot be read.
+/// A seccomp `SECCOMP_RET_TRAP` forces its SIGSYS on the thread itself, and
+/// the bit stays set even when the signal coalesces with an older pending
+/// SIGSYS or its siginfo cannot be allocated.
+fn thread_sigsys_pending(tid: Pid) -> Option<bool> {
+    let status = read_status(format!("/proc/{tid}/status")).ok()?;
+    parse_thread_sigsys_pending(&status)
+}
+
+/// `thread_sigsys_pending` for a procfs `status` text.
+pub(crate) fn parse_thread_sigsys_pending(status: &str) -> Option<bool> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigPnd:"))
+        .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        .map(|pending| pending & (1u64 << (libc::SIGSYS as u64 - 1)) != 0)
+}
+
+/// How an injected syscall run between syscall stops ended, read at its exit
+/// stop (`classify_syscall_stop_exit`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SyscallStopOutcome {
+    /// The syscall instruction completed: the return register holds the
+    /// kernel's result (which a seccomp `SECCOMP_RET_ERRNO` or a user
+    /// notification may also have made without running the call's body).
+    Ran,
+    /// The return register holds the syscall's own number with SIGSYS
+    /// pending for the thread, or that pending state could not be read: a
+    /// `SECCOMP_RET_TRAP` leaves this, and no result can be reported.
+    Unproven,
+}
+
+/// Classifies an exit stop from the raw return register `ret`, the injected
+/// syscall's number `nr`, and whether SIGSYS is pending in the thread's own
+/// queue (`None`: unreadable). A `SECCOMP_RET_TRAP` sets the return register
+/// to the number (`syscall_rollback`) and forces SIGSYS on the thread before
+/// any signal work, which comes only after the exit stop; so any other return
+/// value, or no SIGSYS pending, means the instruction did not end in a trap.
+pub(crate) fn classify_syscall_stop_exit(
+    ret: u64,
+    nr: Sysno,
+    sigsys_pending: Option<bool>,
+) -> SyscallStopOutcome {
+    if ret as i64 != nr.id() as i64 {
+        return SyscallStopOutcome::Ran;
+    }
+    match sigsys_pending {
+        Some(false) => SyscallStopOutcome::Ran,
+        Some(true) | None => SyscallStopOutcome::Unproven,
+    }
+}
+
 /// The states of an address space's SIGTRAP repair page
 /// (`TracedTask::sigtrap_scratch_state`): not set up yet (a new image before
 /// pre-init), sealed, unsealed (`mseal` unavailable; checked by its canary
@@ -4184,6 +4237,53 @@ thread_local! {
     /// above.
     pub(crate) static PRIVATE_STEP_TRACE_STOPS_FOR_TEST: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+
+    /// Private-page injections by syscall number and transport: `true` for
+    /// one run between syscall stops (`syscall_stops_admitted`), `false` for
+    /// one single-stepped. Per thread, as above.
+    pub(crate) static PRIVATE_TRANSPORTS_FOR_TEST:
+        std::cell::RefCell<HashMap<(i64, bool), u64>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// SIGTRAP repairs noted for a table that owed none
+    /// (`note_sigtrap_repair`). Per thread, as above.
+    pub(crate) static SIGTRAP_REPAIRS_NOTED_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Guest trace stops (`SECCOMP_RET_TRACE`) that an injection run between
+    /// syscall stops resumed past (`syscall_private_syscall`). Per thread, as
+    /// above.
+    pub(crate) static SYSCALL_STOP_TRACE_STOPS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Admits an injection to run between syscall stops even though its
+    /// thread has a seccomp filter of the guest's (`syscall_stops_admitted`),
+    /// for the tests of what such a filter does there. Per thread, as above.
+    pub(crate) static FORCE_SYSCALL_STOPS_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: the private-page injections of `nr` made by `syscall_stops`
+/// transport on this thread (`PRIVATE_TRANSPORTS_FOR_TEST`).
+#[cfg(test)]
+pub(crate) fn private_transports_for_test(nr: Sysno, syscall_stops: bool) -> u64 {
+    PRIVATE_TRANSPORTS_FOR_TEST.with(|counts| {
+        counts
+            .borrow()
+            .get(&(nr.id() as i64, syscall_stops))
+            .copied()
+            .unwrap_or(0)
+    })
+}
+
+#[cfg(test)]
+fn record_private_transport_for_test(nr: Sysno, syscall_stops: bool) {
+    PRIVATE_TRANSPORTS_FOR_TEST.with(|counts| {
+        *counts
+            .borrow_mut()
+            .entry((nr.id() as i64, syscall_stops))
+            .or_default() += 1;
+    });
 }
 
 /// Test-only: counts every tracer single-step request per tid, so a test
@@ -4531,6 +4631,10 @@ pub struct TracedTask<L: Tool> {
     /// stop, and after a mask-swapping syscall runs, until the next seccomp
     /// stop (`read_sigtrap_before_injection`).
     restore_maybe_pending: bool,
+    /// The injected syscall being run between syscall stops instead of
+    /// single-stepped (`syscall_stops_admitted`), from its admission until
+    /// `status_to_result` takes its outcome; `None` for a stepped one.
+    syscall_stop_injection: Option<Sysno>,
     /// Set at an exec stop when SIGTRAP is neither ignored nor blocked and no
     /// repair is owed: then no step through pre-init and the new image's
     /// first instruction can reset it, and those steps skip the SIGTRAP work
@@ -4986,6 +5090,7 @@ impl<L: Tool> TracedTask<L> {
             tracer_unfiltered: StdMutex::new(None),
             injection_proc_state: None,
             restore_maybe_pending: true,
+            syscall_stop_injection: None,
             sigtrap_table,
             sigtrap_scratch_state: Arc::new(AtomicU8::new(SCRATCH_PENDING)),
             segv_run: StdMutex::new(SignalRun::Unknown),
@@ -5108,6 +5213,7 @@ impl<L: Tool> TracedTask<L> {
             tracer_unfiltered: StdMutex::new(None),
             injection_proc_state: None,
             restore_maybe_pending: true,
+            syscall_stop_injection: None,
             sigtrap_table: self.sigtrap_table,
             sigtrap_scratch_state: self.sigtrap_scratch_state.clone(),
             segv_run: StdMutex::new(SignalRun::Unknown),
@@ -5250,6 +5356,7 @@ impl<L: Tool> TracedTask<L> {
             tracer_unfiltered: StdMutex::new(None),
             injection_proc_state: None,
             restore_maybe_pending: true,
+            syscall_stop_injection: None,
             sigtrap_table,
             sigtrap_scratch_state,
             segv_run: StdMutex::new(SignalRun::Unknown),
@@ -11305,6 +11412,13 @@ impl<L: Tool + 'static> TracedTask<L> {
             task.pid(),
             nr
         );
+        // Whether this injection runs between syscall stops instead of a
+        // single step (`syscall_stops_admitted`), decided afresh for each
+        // injection: an earlier one that did not run may have left a signal
+        // held. Decided before the step-only reads below, which such an
+        // injection has no trap for.
+        self.syscall_stop_injection = None;
+        let syscall_stops = self.syscall_stops_admitted(nr);
         // What the step's trap can reset of SIGTRAP's state, read before the
         // registers change (`sigtrap_state`). The reads and the repair make
         // requests main does not, which a tracer filter may refuse
@@ -11312,8 +11426,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         // main.
         // An exec never returns to this injection's repair; the exec stop and
         // pre-init keep SIGTRAP across it (`handle_exec_event`).
+        // An injection run between syscall stops raises no trap, so it reads
+        // nothing for a repair and owes none; a repair owed from before is
+        // still written first.
         let (mut task, sigtrap) =
             if !self.keeps_sigtrap_state() || matches!(nr, Sysno::execve | Sysno::execveat) {
+                (task, None)
+            } else if syscall_stops {
+                let task = self.apply_sigtrap_repair(task).await?;
+                let task = self.learn_segv_action(task).await?;
                 (task, None)
             } else {
                 let task = self.apply_sigtrap_repair(task).await?;
@@ -11398,6 +11519,11 @@ impl<L: Tool + 'static> TracedTask<L> {
             return Err(self.recover_input_not_run(&task, oldregs, input, error));
         }
         self.issue_input(input)?;
+        // From here every private-page run of this injection
+        // (`step_private_syscall`) uses the transport decided above.
+        if syscall_stops {
+            self.syscall_stop_injection = Some(nr);
+        }
         if shield != 0 {
             // The shielded injection runs the thread to the syscall's entry
             // first, so the state read before is not reused for its step.
@@ -11875,6 +12001,25 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    /// Records `UnprovenPrivateSyscallCompletion` with the session, which
+    /// ends the run, and returns the error that unwinds the handler: no
+    /// result of the call reaches the Tool.
+    fn fail_unproven_completion(&self, tid: Pid, nr: Sysno) -> TraceError {
+        self.fatal_session().fail_at(
+            BackendFailure {
+                pid: self.pid(),
+                tid: self.tid(),
+                phase: "injected syscall's exit stop looks like a seccomp trap",
+            },
+            anyhow::Error::new(crate::UnprovenPrivateSyscallCompletion {
+                tid: tid.as_raw(),
+                nr: nr.id() as i64,
+            })
+            .into(),
+        );
+        Errno::ECANCELED.into()
+    }
+
     /// Records `PendingSigtrapAtStep` with the session, which ends the run,
     /// and returns the error that unwinds the handler.
     fn fail_pending_sigtrap(&self, tid: Pid, site: &'static str) -> TraceError {
@@ -11912,6 +12057,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         input: Option<&NativeCallContext>,
     ) -> Result<(Wait, bool), TraceError> {
+        // An injection admitted to run between syscall stops is never
+        // stepped, retries and the entry-stop callers included.
+        if self.syscall_stop_injection == Some(nr) {
+            return self.syscall_private_syscall(task, nr, input).await;
+        }
+        #[cfg(test)]
+        record_private_transport_for_test(nr, false);
         // The shield makes requests main does not, which a tracer filter may
         // refuse (`thread_may_be_seccomp_filtered`).
         let known = self.injection_proc_state.take();
@@ -11958,6 +12110,133 @@ impl<L: Tool + 'static> TracedTask<L> {
             reblock_sigtrap_after_step(&wait)?;
         }
         Ok((wait, seccomp_trapped))
+    }
+
+    /// Runs the private-page `syscall` of an injection admitted by
+    /// `syscall_stops_admitted` between its syscall-entry and syscall-exit
+    /// stops, with `PTRACE_SYSCALL` and never a single step, so that no
+    /// `force_sig(SIGTRAP)` meets its temporary mask
+    /// (<https://github.com/rrnewton/reverie/issues/1262>). Writes no signal
+    /// mask: a mask write would discard a pending temporary-mask restore.
+    ///
+    /// `task` is either before the instruction (rip at the private page), as
+    /// for a step, or already at the syscall's entry stop (rip just past the
+    /// instruction), where `requeue_signals_until_syscall_entry` hands it
+    /// over. Before the instruction it ends as a step would for a stale step
+    /// SIGTRAP (discarded), a group stop (resumed) or another signal (its stop
+    /// returned, for `status_to_result` to report that the call did not run).
+    /// Between the entry and exit stops only a seccomp event or the thread's
+    /// exit can come: a guest filter's `SECCOMP_RET_TRACE` is resumed so the
+    /// call runs, as Reverie runs a call at a guest's trace stop
+    /// (`handle_unsubscribed_mapping_syscall`), and any other stop fails
+    /// closed. The exit stop is returned as `Event::Syscall`, before any
+    /// signal work: a signal that arrived during the call stays queued in the
+    /// kernel, and none is held. Never reports a seccomp trap: its thread has
+    /// no guest filter, and `classify_syscall_stop_exit` refuses what one would
+    /// leave.
+    async fn syscall_private_syscall(
+        &mut self,
+        task: Stopped,
+        nr: Sysno,
+        input: Option<&NativeCallContext>,
+    ) -> Result<(Wait, bool), TraceError> {
+        #[cfg(test)]
+        record_private_transport_for_test(nr, true);
+        let after_syscall = (cp::PRIVATE_PAGE_OFFSET + cp::SYSCALL_INSTR_SIZE) as u64;
+        let ip = task.getregs()?.ip();
+        let mut at_entry = if ip == cp::PRIVATE_PAGE_OFFSET as u64 {
+            false
+        } else if ip == after_syscall {
+            true
+        } else {
+            tracing::error!(
+                "[scheduler/tool] (pid = {}) injected {} to run between syscall stops is at {:#x}, neither before nor just past the private syscall",
+                task.pid(),
+                nr,
+                ip
+            );
+            return Err(Errno::EPROTO.into());
+        };
+        tracing::debug!(
+            "[scheduler/tool] (pid = {}) running injected {} between syscall stops{}",
+            task.pid(),
+            nr,
+            if at_entry { " from its entry stop" } else { "" }
+        );
+        let mut running = self.syscall_stopped_any_input(task, None, input)?;
+        loop {
+            let wait = running.next_state_with_owner(&self.ptracer_waits).await?;
+            self.arm_liteinst_wait(&wait);
+            match wait {
+                Wait::Stopped(stopped, Event::Syscall) if !at_entry => {
+                    at_entry = true;
+                    running = self.syscall_stopped_any_input(stopped, None, input)?;
+                }
+                Wait::Stopped(stopped, Event::Syscall) => {
+                    if stopped.getregs()?.ip() != after_syscall {
+                        tracing::error!(
+                            "[scheduler/tool] (pid = {}) injected {} reached its exit stop away from the private syscall",
+                            stopped.pid(),
+                            nr
+                        );
+                        return Err(Errno::EPROTO.into());
+                    }
+                    return Ok((Wait::Stopped(stopped, Event::Syscall), false));
+                }
+                Wait::Stopped(stopped, Event::Seccomp) if at_entry => {
+                    tracing::debug!(
+                        "[scheduler/tool] (pid = {}) resuming injected {} past the guest's own seccomp trace stop",
+                        stopped.pid(),
+                        nr
+                    );
+                    #[cfg(test)]
+                    SYSCALL_STOP_TRACE_STOPS_FOR_TEST.with(|count| count.set(count.get() + 1));
+                    running = self.syscall_stopped_any_input(stopped, None, input)?;
+                }
+                Wait::Stopped(stopped, event) if !at_entry && let Some(sig) = event.signal() => {
+                    if sig == Signal::SIGTRAP
+                        && std::mem::take(&mut self.stale_private_step_trap)
+                        && is_private_step_trap(&stopped, after_syscall)?
+                    {
+                        tracing::debug!(
+                            "[scheduler/tool] (pid = {}) discarding a stale step SIGTRAP before injected {}",
+                            stopped.pid(),
+                            nr
+                        );
+                        running = self.syscall_stopped_any_input(stopped, None, input)?;
+                    } else if is_group_stop(&stopped, sig)? {
+                        tracing::debug!(
+                            "[scheduler/tool] (pid = {}) resuming injected {} past {} group stop",
+                            stopped.pid(),
+                            nr,
+                            sig
+                        );
+                        running = self.syscall_stopped_any_input(stopped, None, input)?;
+                    } else {
+                        // Stopped before the instruction ran.
+                        return Ok((Wait::Stopped(stopped, event), false));
+                    }
+                }
+                Wait::Stopped(stopped, Event::Exit) => {
+                    return Ok((Wait::Stopped(stopped, Event::Exit), false));
+                }
+                Wait::Stopped(stopped, event) => {
+                    tracing::error!(
+                        "[scheduler/tool] (pid = {}) injected {} run between syscall stops stopped at {:?} ({})",
+                        stopped.pid(),
+                        nr,
+                        event,
+                        if at_entry {
+                            "after its entry stop"
+                        } else {
+                            "before its entry stop"
+                        }
+                    );
+                    return Err(Errno::EPROTO.into());
+                }
+                wait @ Wait::Exited(..) => return Ok((wait, false)),
+            }
+        }
     }
 
     /// Runs `nr` with `args` on the private page without single-stepping it,
@@ -12670,6 +12949,48 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    /// Whether the injection of `nr` that is starting runs between a
+    /// syscall-entry and a syscall-exit stop (`PTRACE_SYSCALL`) instead of
+    /// single-stepping its private `syscall`
+    /// (<https://github.com/rrnewton/reverie/issues/1262>). A single step is
+    /// reported with `force_sig(SIGTRAP)`, and after a mask-swapping call
+    /// that a signal interrupted, the trap meets the call's temporary mask:
+    /// a caught SIGTRAP it blocks is reset to `SIG_DFL` for every thread of
+    /// the table and unblocked, and the repair cannot run while the
+    /// temporary mask's restore is pending, so whichever thread stops first
+    /// pays it. A syscall-exit stop is a ptrace notification, which resets
+    /// nothing. Admitted, decided afresh for each injection:
+    /// 1. on x86_64 (aarch64's restart and syscall-stop registers differ);
+    /// 2. a mask-swapping syscall (`StepKind::SwapsMask`);
+    /// 3. outside a signal callback, held or not, whose resume needs the
+    ///    injection to end at a signal-delivery stop;
+    /// 4. with SIGTRAP's state kept (`keeps_sigtrap_state`): an unfiltered
+    ///    tracer and a Tool that honours the serialized-execution contract;
+    /// 5. in a thread with no seccomp filter of the guest's
+    ///    (`guest_has_own_seccomp_filter`), whose `SECCOMP_RET_TRAP` the exit
+    ///    stop could not tell from a result (`classify_syscall_stop_exit`);
+    /// 6. with no signal held for the resume (`pending_signal`), whose
+    ///    siginfo is written back only at a signal-delivery stop
+    ///    (`report_held_signal`).
+    ///
+    /// Every other injection is single-stepped as before.
+    fn syscall_stops_admitted(&self, nr: Sysno) -> bool {
+        if !cfg!(target_arch = "x86_64")
+            || step_kind(nr, swaps_signal_mask(nr)) != StepKind::SwapsMask
+            || self.in_signal_callback
+            || self.in_held_signal_callback
+            || !self.keeps_sigtrap_state()
+            || self.pending_signal.is_some()
+        {
+            return false;
+        }
+        #[cfg(test)]
+        if FORCE_SYSCALL_STOPS_FOR_TEST.with(|force| force.get()) {
+            return true;
+        }
+        !self.guest_has_own_seccomp_filter(self.tid())
+    }
+
     /// Maps Reverie's sealed SIGTRAP repair page after the trampoline
     /// (`cp::SCRATCH_BASE`): an unstepped `mmap(..., MAP_FIXED_NOREPLACE)`,
     /// read-write, then `mseal`. Pre-init runs at an exec stop, where the new
@@ -13323,13 +13644,14 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// reads as the reset left it, so no later read can know more.
     fn note_sigtrap_repair(&mut self, repair: SigtrapRepair) {
         if self.keeps_sigtrap_state() {
-            self.global_state
-                .sigtrap_tables
-                .lock()
-                .unwrap()
-                .repairs
-                .entry(self.sigtrap_table)
-                .or_insert(repair);
+            let mut tables = self.global_state.sigtrap_tables.lock().unwrap();
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                tables.repairs.entry(self.sigtrap_table)
+            {
+                entry.insert(repair);
+                #[cfg(test)]
+                SIGTRAP_REPAIRS_NOTED_FOR_TEST.with(|count| count.set(count.get() + 1));
+            }
         }
     }
 
@@ -14389,6 +14711,73 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.pending_signal_reported = self.take_reported_requeue(sig);
     }
 
+    /// The end of `status_to_result` for a private-page injection whose stop
+    /// shows its outcome in `regs` (the instruction completed, or a step was
+    /// stopped before it and `regs` already reports `-ERESTARTSYS`): records
+    /// the result with the observers, then restores the registers for its
+    /// kind of injection, an injected frame's controller registers
+    /// (`child_context`), a public-returning frame, or the guest's own.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_private_completion(
+        &mut self,
+        stopped: &Stopped,
+        regs: libc::user_regs_struct,
+        context: Option<libc::user_regs_struct>,
+        child_context: Option<libc::user_regs_struct>,
+        input: Option<&NativeCallContext>,
+        seccomp_trapped: bool,
+        restoration: InjectionRestoration,
+    ) -> Result<Result<i64, Errno>, TraceError> {
+        let result = Errno::from_ret(regs.ret() as usize).map(|x| x as i64);
+        self.native_result_at_stop(
+            stopped,
+            input,
+            result,
+            self.last_injection_ran,
+            seccomp_trapped,
+        )?;
+        self.input_result(input, &result, self.last_injection_ran, seccomp_trapped)?;
+        if let Some(context) = context {
+            if child_context.is_some() {
+                // An injected-frame event temporarily replaces the
+                // controller's live trap registers with the logical
+                // guest frame. Restore every controller register;
+                // leaving even a callee-saved register would
+                // corrupt the code that resumes after injection.
+                stopped.setregs(&context)?;
+            } else if restoration == InjectionRestoration::PublicReturning {
+                // `result` above is the actual classified kernel
+                // outcome, including errno. Restore at this real
+                // Wait::Stopped, before releasing the invocation;
+                // neither its saved frame nor its policy is a
+                // substitute stop owner.
+                stopped.setregs(&public_returning_regs(regs, &context))?;
+            } else {
+                // Restore syscall args to original values. This is
+                // needed when we convert syscalls like SYS_open ->
+                // SYS_openat, syscall args are modified need to restore
+                // it back. A held-signal callback's injection keeps
+                // the guest's return register too
+                // (`in_held_signal_callback`). An interrupted
+                // `restart_syscall` resumed the thread's restart
+                // block rather than replacing it.
+                let retval = self.in_held_signal_callback.then(|| context.ret());
+                if retval.is_some() {
+                    let injection = stopped.getregs()?;
+                    if Errno::from_ret(injection.ret() as usize)
+                        == Err(Errno::ERESTART_RESTARTBLOCK)
+                        && injection.orig_syscall() as i64 != Sysno::restart_syscall.id() as i64
+                    {
+                        self.signal_callback_replaced_restart_block = true;
+                    }
+                }
+                let retval = retval.and_then(|ret| self.signal_callback_guest_ret(&context, ret));
+                restore_context(stopped, context, retval, false)?;
+            }
+        }
+        Ok(result)
+    }
+
     async fn status_to_result(
         &mut self,
         wait_status: Wait,
@@ -14398,6 +14787,45 @@ impl<L: Tool + 'static> TracedTask<L> {
         seccomp_trapped: bool,
         restoration: InjectionRestoration,
     ) -> Result<Result<i64, Errno>, TraceError> {
+        // A private-page injection run between syscall stops
+        // (`syscall_private_syscall`) that reached its exit stop: its raw
+        // return register is classified before any observer or restoration
+        // reads it (`classify_syscall_stop_exit`). Its other outcomes, a stop
+        // before the instruction or the thread's exit, take the arms below as
+        // a step's do.
+        if let Some(nr) = self.syscall_stop_injection.take()
+            && context.is_some()
+            && let Wait::Stopped(stopped, Event::Syscall) = &wait_status
+        {
+            let regs = stopped.getregs()?;
+            let sigsys_pending = if regs.ret() as i64 == nr.id() as i64 {
+                thread_sigsys_pending(stopped.pid())
+            } else {
+                None
+            };
+            if classify_syscall_stop_exit(regs.ret(), nr, sigsys_pending)
+                == SyscallStopOutcome::Unproven
+            {
+                return Err(self.fail_unproven_completion(stopped.pid(), nr));
+            }
+            self.note_injection_stop(&wait_status)?;
+            self.last_injection_ran = true;
+            // A mask-swapping call can leave its temporary mask's restore
+            // pending whatever it returned (a positive count included).
+            self.restore_maybe_pending = true;
+            let Wait::Stopped(stopped, _) = wait_status else {
+                unreachable!("matched a stopped task")
+            };
+            return self.finish_private_completion(
+                &stopped,
+                regs,
+                context,
+                child_context,
+                input,
+                seccomp_trapped,
+                restoration,
+            );
+        }
         self.note_injection_stop(&wait_status)?;
         self.last_injection_ran = true;
         match wait_status {
@@ -14496,56 +14924,15 @@ impl<L: Tool + 'static> TracedTask<L> {
                         *regs.ret_mut() = (-(Errno::ERESTARTSYS.into_raw()) as i64) as u64;
                         self.last_injection_ran = false;
                     }
-                    let result = Errno::from_ret(regs.ret() as usize).map(|x| x as i64);
-                    self.native_result_at_stop(
+                    self.finish_private_completion(
                         &stopped,
+                        regs,
+                        context,
+                        child_context,
                         input,
-                        result,
-                        self.last_injection_ran,
                         seccomp_trapped,
-                    )?;
-                    self.input_result(input, &result, self.last_injection_ran, seccomp_trapped)?;
-                    if let Some(context) = context {
-                        if child_context.is_some() {
-                            // An injected-frame event temporarily replaces the
-                            // controller's live trap registers with the logical
-                            // guest frame. Restore every controller register;
-                            // leaving even a callee-saved register would
-                            // corrupt the code that resumes after injection.
-                            stopped.setregs(&context)?;
-                        } else if restoration == InjectionRestoration::PublicReturning {
-                            // `result` above is the actual classified kernel
-                            // outcome, including errno. Restore at this real
-                            // Wait::Stopped, before releasing the invocation;
-                            // neither its saved frame nor its policy is a
-                            // substitute stop owner.
-                            stopped.setregs(&public_returning_regs(regs, &context))?;
-                        } else {
-                            // Restore syscall args to original values. This is
-                            // needed when we convert syscalls like SYS_open ->
-                            // SYS_openat, syscall args are modified need to restore
-                            // it back. A held-signal callback's injection keeps
-                            // the guest's return register too
-                            // (`in_held_signal_callback`). An interrupted
-                            // `restart_syscall` resumed the thread's restart
-                            // block rather than replacing it.
-                            let retval = self.in_held_signal_callback.then(|| context.ret());
-                            if retval.is_some() {
-                                let injection = stopped.getregs()?;
-                                if Errno::from_ret(injection.ret() as usize)
-                                    == Err(Errno::ERESTART_RESTARTBLOCK)
-                                    && injection.orig_syscall() as i64
-                                        != Sysno::restart_syscall.id() as i64
-                                {
-                                    self.signal_callback_replaced_restart_block = true;
-                                }
-                            }
-                            let retval = retval
-                                .and_then(|ret| self.signal_callback_guest_ret(&context, ret));
-                            restore_context(&stopped, context, retval, false)?;
-                        }
-                    }
-                    Ok(result)
+                        restoration,
+                    )
                 }
                 Event::NewChild(op, child) => {
                     let ret = child.pid().as_raw() as i64;
