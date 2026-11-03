@@ -359,6 +359,11 @@ impl<'a> SysvAdoption<'a> {
     }
 }
 
+pub(super) struct AdoptionContext<'a> {
+    pub(super) sources: Option<&'a VerifiedCompiledSources>,
+    pub(super) route: &'a NativeDispatchRoute,
+}
+
 pub(super) fn qualify_transfers(
     elf: &Elf<'_>,
     bytes: &[u8],
@@ -366,8 +371,7 @@ pub(super) fn qualify_transfers(
     instructions: &[EncodedConstructorInstruction],
     got: &BTreeMap<u64, u64>,
     known: &BTreeSet<u64>,
-    sources: Option<&VerifiedCompiledSources>,
-    route: &NativeDispatchRoute,
+    context: AdoptionContext<'_>,
 ) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>, ProvenIdentities)> {
     let entries = executable_entries(elf);
     let candidates = calls(instructions, got, &entries)?;
@@ -381,7 +385,11 @@ pub(super) fn qualify_transfers(
         None
     } else {
         let (owner, _) = preparation_instruction_boundaries(instructions)?;
-        Some(SysvAdoption::resolve(sources, owner, route)?)
+        Some(SysvAdoption::resolve(
+            context.sources,
+            owner,
+            context.route,
+        )?)
     };
     let code = if ranges.is_empty() {
         BTreeMap::new()
@@ -1050,8 +1058,10 @@ mod tests {
                 &instructions,
                 &got,
                 &known,
-                Some(sources),
-                &route,
+                AdoptionContext {
+                    sources: Some(sources),
+                    route: &route,
+                },
             )?;
             let edge = GotEdge {
                 source_function: 0x1300,
@@ -1096,8 +1106,10 @@ mod tests {
                 &instructions,
                 &got,
                 &known,
-                Some(sources),
-                &route,
+                AdoptionContext {
+                    sources: Some(sources),
+                    route: &route,
+                },
             );
             let message = match result {
                 Ok(_) => return Err("nonidentity target unexpectedly qualified".to_owned()),
@@ -1115,8 +1127,10 @@ mod tests {
                 &instructions,
                 &got,
                 &known,
-                None,
-                &route,
+                AdoptionContext {
+                    sources: None,
+                    route: &route,
+                },
             );
             let message = match result {
                 Ok(_) => return Err("source-less identity unexpectedly qualified".to_owned()),
@@ -1136,8 +1150,10 @@ mod tests {
                 &instructions,
                 &got,
                 &known,
-                Some(sources),
-                &wrong_route,
+                AdoptionContext {
+                    sources: Some(sources),
+                    route: &wrong_route,
+                },
             );
             let message = match result {
                 Ok(_) => return Err("wrong owned entry unexpectedly qualified".to_owned()),

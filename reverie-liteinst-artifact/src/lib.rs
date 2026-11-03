@@ -745,8 +745,8 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     (
         "reverie-liteinst-artifact/src/preparation_identity.rs",
-        44688,
-        "687e52d6d066c555d3e3785f4d06be35e18d4caca4168ecb0529ed3c847a564e",
+        45164,
+        "49b1c39cf79a5523850cfb8f1b8e8c023a5516c861c01d661841fd245a463ac7",
     ),
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
@@ -30963,8 +30963,10 @@ fn qualify_standalone_constructor(
             &prepare_instructions,
             got,
             &preparation_helpers.values().map(|s| s.st_value).collect(),
-            sources,
-            &route,
+            preparation_identity::AdoptionContext {
+                sources,
+                route: &route,
+            },
         )?;
     let mut preparation_helpers = preparation_helpers
         .iter()
@@ -31084,8 +31086,10 @@ fn qualify_detcore_constructor_route(
             &prepare_instructions,
             got,
             &preparation_helpers.values().map(|s| s.st_value).collect(),
-            sources,
-            &route,
+            preparation_identity::AdoptionContext {
+                sources,
+                route: &route,
+            },
         )?;
     let mut preparation_helpers = preparation_helpers
         .iter()
@@ -31254,8 +31258,10 @@ fn qualify_generic_bootstrap(
             &prepare_instructions,
             got,
             &preparation_helpers.values().map(|s| s.st_value).collect(),
-            sources,
-            &route,
+            preparation_identity::AdoptionContext {
+                sources,
+                route: &route,
+            },
         )?;
     let mut preparation_helpers = preparation_helpers
         .iter()
