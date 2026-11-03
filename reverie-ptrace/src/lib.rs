@@ -54,6 +54,8 @@ mod gdbstub;
 mod injected_syscall;
 mod link_path;
 mod memory_map;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod offset_step_interruption_tests;
 mod perf;
 mod pidfd_self;
 mod poll_on_wake;
