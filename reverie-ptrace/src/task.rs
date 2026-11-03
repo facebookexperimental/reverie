@@ -1384,29 +1384,24 @@ impl TimerStepShield {
             return Ok(());
         }
         // procfs is read only while SIGTRAP is blocked
-        // (`unblock_sigtrap_for_step_known`), and once a sequence. Its
-        // pending sets do not hold from one step to the next (`known_mask`),
-        // so a kept state takes SIGTRAP's pending bit from the queues now.
-        // `PTRACE_PEEKSIGINFO` on both queues shows every SIGTRAP that can be
-        // queued during a sequence: a POSIX timer's comes with the siginfo
-        // the timer owns, allocated when the timer was created, and a trap
-        // the kernel forces is queued past `RLIMIT_SIGPENDING`
-        // (`override_rlimit`). A sent SIGTRAP can be pending without siginfo,
-        // where the guest's user is at that limit, but no guest thread can
-        // send one during a sequence, and one sent from outside the guest
-        // between this read and the resume is not seen in any case, as for
-        // the procfs read. The kept state's other pending bits are not read:
-        // it was kept only with `SigBlk` equal to the mask, so
-        // `unblock_sigtrap_for_timer_step` reads only SIGTRAP's.
+        // (`unblock_sigtrap_for_step_known`). Its masks and SIGTRAP's
+        // disposition hold from one step to the next, but its pending sets do
+        // not (`known_mask`), so a kept state takes SIGTRAP's pending bits
+        // from procfs again now. `PTRACE_PEEKSIGINFO` would not do: it shows
+        // the queued siginfo, and a SIGTRAP sent with a negative code (as by
+        // `sigqueue`) to a thread whose user is at `RLIMIT_SIGPENDING` is
+        // pending with none, its information lost (`__send_signal_locked`,
+        // kernel/signal.c:1082-1137 at v6.16). Such a signal sent before this
+        // read is refused like any other; one sent from outside the guest
+        // between this read and the resume is not seen in any case. The kept
+        // state's other pending bits are not used: it was kept only with
+        // `SigBlk` equal to the mask, so `unblock_sigtrap_for_timer_step`
+        // reads only SIGTRAP's.
         let state = match known_state {
             Some(state) => {
                 #[cfg(test)]
                 TIMER_STEP_PENDING_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
-                let pending = if sigtrap_queued(task)? {
-                    SIGTRAP_BIT
-                } else {
-                    0
-                };
+                let pending = ProcSignalState::read(task)?.pending & SIGTRAP_BIT;
                 Some(ProcSignalState { pending, ..state })
             }
             None if mask & SIGTRAP_BIT != 0 => {
@@ -1434,7 +1429,17 @@ impl TimerStepShield {
     /// At the step's stop: put back what `prepare` changed. After a frame
     /// shield, the restored mask lacks SIGTRAP only if the `rt_sigreturn` ran
     /// (rip moved, and the stop is not its seccomp stop).
-    fn settle(&mut self, task: &Stopped) -> Result<(), TraceError> {
+    ///
+    /// Only SIGTRAP is blocked again, in the mask the thread has now. A step
+    /// whose instruction faults makes the kernel force the fault's signal,
+    /// and a forced signal that the thread blocks is unblocked (and its
+    /// action reset to the default) before the signal stop
+    /// (`force_sig_info_to_task`, kernel/signal.c:1294-1312 at v6.16). So
+    /// where the step stopped for a signal other than SIGTRAP
+    /// (`other_signal`), the mask is read again, and the kept one forgotten.
+    /// A SIGTRAP stop is the step's own trap, forced with SIGTRAP unblocked
+    /// for it, which changes no mask.
+    fn settle(&mut self, task: &Stopped, other_signal: bool) -> Result<(), TraceError> {
         let mut reblock = std::mem::take(&mut self.reblock);
         if let Some((address, mask, rip)) = self.frame_mask.take() {
             let frame = AddrMut::<u64>::from_raw(address).ok_or(Errno::EFAULT)?;
@@ -1444,8 +1449,12 @@ impl TimerStepShield {
             reblock = task.getregs()?.ip() != rip;
         }
         if reblock {
+            if other_signal {
+                self.known_mask = None;
+            }
             // The step changed no mask but the shield's own (`mask_stable`),
-            // unless it ran an `rt_sigreturn`, which forgot the known mask.
+            // unless it ran an `rt_sigreturn`, which forgot the known mask,
+            // or forced a signal, which forgot it above.
             let mask = match self.known_mask {
                 Some((mask, _)) => mask,
                 None => {
@@ -1458,6 +1467,12 @@ impl TimerStepShield {
         }
         Ok(())
     }
+}
+
+/// Whether a step's stop by `event` is a signal stop for a signal other than
+/// SIGTRAP, one the kernel may have forced (`TimerStepShield::settle`).
+fn stopped_for_another_signal(event: &Event) -> bool {
+    matches!(event, Event::Signal(signal) if *signal != Signal::SIGTRAP)
 }
 
 /// If the task's next instruction is a guest `rt_sigreturn` (a `syscall`
@@ -6659,8 +6674,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         let watch_global = Arc::clone(&self.global_state.gs_ref);
         let tid = self.tid();
         let mut observe = |wait: &Wait| {
-            if let Wait::Stopped(task, _) = wait {
-                observe_shield.lock().unwrap().settle(task)?;
+            if let Wait::Stopped(task, event) = wait {
+                observe_shield
+                    .lock()
+                    .unwrap()
+                    .settle(task, stopped_for_another_signal(event))?;
             }
             // The step's own trap, which the shield accounts for, carried
             // the hit: the hit adds nothing to SIGTRAP's state.
@@ -17477,7 +17495,7 @@ mod tests {
         );
         assert!(shield.known_mask.is_some(), "the first step kept its reads");
         assert_eq!(task.getsigmask().expect("mask"), blocked & !SIGTRAP_BIT);
-        shield.settle(&task).expect("the first step's stop");
+        shield.settle(&task, false).expect("the first step's stop");
         assert_eq!(task.getsigmask().expect("mask"), blocked);
 
         // The timer queues SIGTRAP while the tracee is stopped.
@@ -17501,6 +17519,207 @@ mod tests {
         assert_eq!(state.blocked, blocked);
         assert_eq!(state_reads(), states_before, "the kept mask was used");
         assert_eq!(pending_reads(), pendings_before + 1);
+    }
+
+    /// Kills and reaps a test's tracee on every exit from the test.
+    struct ReapTracee(Pid);
+    impl Drop for ReapTracee {
+        fn drop(&mut self) {
+            let pid = self.0.as_raw();
+            // SAFETY: kill and waitpid take plain values and a local status.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                let mut status = 0;
+                while libc::waitpid(pid, &mut status, libc::__WALL) < 0
+                    && *libc::__errno_location() == libc::EINTR
+                {}
+            }
+        }
+    }
+
+    /// A step whose instruction faults keeps the kernel's unblock of the
+    /// forced signal: with SIGTRAP and SIGILL blocked, the shield unblocks
+    /// SIGTRAP for the step, and the step over an undefined instruction
+    /// makes Linux force SIGILL, unblocking it (`force_sig_info_to_task`).
+    /// At that stop the shield blocks SIGTRAP again in the mask the thread
+    /// has, so SIGILL stays unblocked, as natively; restoring the mask it
+    /// kept from before the step blocked SIGILL again. The tracee stops for
+    /// SIGSTOP right before the instruction. Drives a real stopped tracee.
+    #[test]
+    fn a_forced_signals_unblock_survives_the_steps_settlement() {
+        use nix::unistd::ForkResult;
+
+        let sigill_bit = 1u64 << (libc::SIGILL - 1);
+        // SAFETY: the child makes only raw syscalls before the undefined
+        // instruction, which never returns.
+        let pid = match unsafe { nix::unistd::fork() }.expect("fork the tracee") {
+            ForkResult::Child => unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGTRAP);
+                libc::sigaddset(&mut set, libc::SIGILL);
+                if libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0
+                    || libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != 0
+                {
+                    libc::_exit(2);
+                }
+                let (pid, tid) = (libc::getpid(), libc::syscall(libc::SYS_gettid));
+                // SIGSTOP, then the undefined instruction right after the
+                // call, where the stop leaves the thread.
+                #[cfg(target_arch = "x86_64")]
+                std::arch::asm!(
+                    "syscall",
+                    "ud2",
+                    in("rax") libc::SYS_tgkill,
+                    in("rdi") pid,
+                    in("rsi") tid,
+                    in("rdx") libc::SIGSTOP,
+                    options(noreturn),
+                );
+                #[cfg(target_arch = "aarch64")]
+                std::arch::asm!(
+                    "svc #0",
+                    "udf #0",
+                    in("x8") libc::SYS_tgkill,
+                    in("x0") pid,
+                    in("x1") tid,
+                    in("x2") libc::SIGSTOP,
+                    options(noreturn),
+                );
+            },
+            ForkResult::Parent { child } => Pid::from(child),
+        };
+        let _reap = ReapTracee(pid);
+        let (task, event) = Running::new(pid).wait().expect("wait").assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGSTOP));
+        let blocked = task.getsigmask().expect("mask");
+        assert_eq!(
+            blocked & (SIGTRAP_BIT | sigill_bit),
+            SIGTRAP_BIT | sigill_bit
+        );
+        let mut shield = TimerStepShield {
+            mask_stable: true,
+            ..TimerStepShield::default()
+        };
+        shield.prepare(&task).expect("the step's shield");
+        assert!(shield.known_mask.is_some(), "the step kept its reads");
+        assert_eq!(task.getsigmask().expect("mask"), blocked & !SIGTRAP_BIT);
+        let (task, event) = task
+            .step(None)
+            .expect("step")
+            .wait()
+            .expect("wait")
+            .assume_stopped();
+        assert_eq!(
+            event,
+            Event::Signal(Signal::SIGILL),
+            "the instruction faults"
+        );
+        assert_eq!(
+            task.getsigmask().expect("mask"),
+            blocked & !SIGTRAP_BIT & !sigill_bit,
+            "Linux unblocked the forced SIGILL"
+        );
+        shield
+            .settle(&task, stopped_for_another_signal(&event))
+            .expect("the step's stop");
+        assert_eq!(
+            task.getsigmask().expect("mask"),
+            blocked & !sigill_bit,
+            "SIGTRAP is blocked again and SIGILL stays unblocked"
+        );
+        assert!(
+            shield.known_mask.is_none(),
+            "the forced signal changed the mask"
+        );
+    }
+
+    /// A SIGTRAP pending with no siginfo still refuses a later step: the
+    /// tracee blocks SIGTRAP with `RLIMIT_SIGPENDING` at 0, and after an
+    /// earlier step's shield kept its reads, the tracer sends it SIGTRAP with
+    /// `SI_QUEUE`, which the kernel then leaves pending without a queued
+    /// siginfo (`__send_signal_locked`), so `PTRACE_PEEKSIGINFO` shows none.
+    /// The later step reads SIGTRAP's pending bits from procfs and refuses
+    /// (`PendingTrap`). Drives a real stopped tracee.
+    #[test]
+    fn a_timer_step_refuses_a_sigtrap_pending_without_siginfo() {
+        use std::time::Duration;
+        use std::time::Instant;
+
+        use nix::unistd::ForkResult;
+
+        // SAFETY: the child makes only raw syscalls, `traceme_and_stop` and
+        // `_exit`, each async-signal-safe.
+        let pid = match unsafe { nix::unistd::fork() }.expect("fork the tracee") {
+            ForkResult::Child => unsafe {
+                let mut trap: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut trap);
+                libc::sigaddset(&mut trap, libc::SIGTRAP);
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_SIGPENDING, &mut limit) != 0 {
+                    libc::_exit(2);
+                }
+                limit.rlim_cur = 0;
+                if libc::setrlimit(libc::RLIMIT_SIGPENDING, &limit) != 0
+                    || libc::sigprocmask(libc::SIG_BLOCK, &trap, std::ptr::null_mut()) != 0
+                {
+                    libc::_exit(2);
+                }
+                safeptrace::traceme_and_stop().expect("TRACEME");
+                libc::_exit(0)
+            },
+            ForkResult::Parent { child } => Pid::from(child),
+        };
+        let _reap = ReapTracee(pid);
+        let (task, event) = Running::new(pid).wait().expect("wait").assume_stopped();
+        assert_eq!(event, Event::Signal(Signal::SIGSTOP));
+        let blocked = task.getsigmask().expect("mask");
+        assert_ne!(blocked & SIGTRAP_BIT, 0, "the tracee blocked SIGTRAP");
+        let mut shield = TimerStepShield {
+            mask_stable: true,
+            ..TimerStepShield::default()
+        };
+        // The first step reads the mask and procfs and keeps them.
+        shield.prepare(&task).expect("the first step's shield");
+        assert!(!shield.pending_trap);
+        assert!(shield.known_mask.is_some(), "the first step kept its reads");
+        shield.settle(&task, false).expect("the first step's stop");
+        assert_eq!(task.getsigmask().expect("mask"), blocked);
+
+        // SIGTRAP with a negative code, past the tracee's limit.
+        // SAFETY: an all-zero siginfo is valid, and rt_sigqueueinfo reads it.
+        let sent = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            info.si_signo = libc::SIGTRAP;
+            info.si_code = libc::SI_QUEUE;
+            libc::syscall(
+                libc::SYS_rt_sigqueueinfo,
+                pid.as_raw(),
+                libc::SIGTRAP,
+                &raw const info,
+            )
+        };
+        assert_eq!(sent, 0, "send SIGTRAP");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ProcSignalState::read(&task).expect("procfs").pending & SIGTRAP_BIT == 0 {
+            assert!(Instant::now() < deadline, "SIGTRAP never became pending");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !sigtrap_queued(&task).expect("peek"),
+            "the kernel kept no siginfo for it"
+        );
+
+        assert!(shield.prepare(&task).is_err(), "the later step must refuse");
+        assert!(shield.pending_trap, "refused for the pending SIGTRAP");
+        assert_eq!(
+            task.getsigmask().expect("mask"),
+            blocked,
+            "SIGTRAP stays blocked"
+        );
     }
 
     /// A thread offered after the run has failed carries the failed run's
