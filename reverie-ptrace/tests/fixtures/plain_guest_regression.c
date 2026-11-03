@@ -3628,8 +3628,13 @@ static void mode_swapsmask_matrix(void) {
   unsigned char params[120];
   memset(params, 0, sizeof params);
   long ring = syscall(425 /* io_uring_setup */, 1, params);
+  /* Only a kernel that refuses io_uring (ENOSYS: not built; EPERM:
+   * io_uring_disabled or a filter) leaves its two rows out. Any other
+   * setup error is a fixture or resource failure, not a refusal. */
+  if (ring < 0 && errno != ENOSYS && errno != EPERM)
+    die("io_uring_setup");
   if (ring < 0)
-    say("matrix io_uring_setup errno=%d\n", errno);
+    say("matrix io_uring_setup refused errno=%d\n", errno);
   static const char* const names[] = {"rt_sigsuspend", "ppoll", "pselect6", "epoll_pwait",
                                       "epoll_pwait2", "io_pgetevents", "io_uring_enter"};
   for (int intr = 0; intr < 2; intr++) {

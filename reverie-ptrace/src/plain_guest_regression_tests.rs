@@ -6325,6 +6325,7 @@ async fn a_wait_run_between_syscall_stops_can_return_its_own_number() {
         );
     }
     assert_eq!(after.delta(&before, Sysno::ppoll), (2, 0));
+    assert_eq!(after.repairs - before.repairs, 0);
 }
 
 /// The exit-stop rule of an injection run between syscall stops
@@ -6408,6 +6409,7 @@ async fn a_seccomp_trap_of_a_wait_run_between_syscall_stops_ends_the_run() {
             "{mode}: {text}"
         );
         assert_eq!(after.delta(&before, Sysno::ppoll), (1, 0), "{mode}");
+        assert_eq!(after.repairs - before.repairs, 0, "{mode}");
     }
     let before = TransportCounts::now();
     let plain = run_guest("trap_ppoll", false).await;
@@ -6470,6 +6472,7 @@ async fn a_guest_trace_stop_runs_an_injected_wait_on_either_transport() {
         if force {
             assert_eq!(after.delta(&before, Sysno::ppoll), (2, 0));
             assert_eq!((step_stops, syscall_stops), (0, 2));
+            assert_eq!(after.repairs - before.repairs, 0);
         } else {
             assert_eq!(after.delta(&before, Sysno::ppoll), (0, 2));
             assert_eq!((step_stops, syscall_stops), (2, 0));
@@ -6488,11 +6491,16 @@ async fn a_guest_trace_stop_runs_an_injected_wait_on_either_transport() {
 async fn each_mask_swapping_wait_runs_between_syscall_stops_as_natively() {
     let native = native_report("swapsmask_matrix");
     let native_lines = prefixed_lines(&native, &["matrix "]);
-    // io_uring_enter is left out only where the kernel refuses io_uring,
-    // which the native run reports; otherwise all 13 rows run.
-    let refused = native_lines
-        .iter()
-        .any(|line| line.starts_with("matrix io_uring_setup"));
+    // io_uring_enter is left out only where the kernel refuses io_uring
+    // (ENOSYS or EPERM), which the native run reports; any other setup
+    // error ends the fixture, so the run fails. Otherwise all 13 rows run.
+    let refused = native_lines.iter().any(|line| {
+        [
+            format!("matrix io_uring_setup refused errno={}", libc::ENOSYS),
+            format!("matrix io_uring_setup refused errno={}", libc::EPERM),
+        ]
+        .contains(&line.to_string())
+    });
     assert_eq!(
         native_lines.len(),
         if refused { 12 } else { 13 },
