@@ -2911,10 +2911,20 @@ static void mode_sigtrap_guest_pending_kept(void) {
   say("kept clone child saw SigPnd=%d\n",
       atomic_load_explicit(&gk_child_saw, memory_order_relaxed));
   gk_state("after-clone");
+  /* A maskless ppoll keeps the guest's mask, so the SIGTRAP stays blocked
+   * and queued while it waits: it times out, as natively, injected and on
+   * the private page. */
+  struct timespec brief = {0, 1000000};
+  long r = SITEM(SYS_ppoll, 0, 0, (long)&brief, 0, 8, SHAPE_INJECT);
+  say("kept maskless ppoll r=%ld handled=%d\n", r, gk_n);
+  gk_state("after-maskless-ppoll");
+  r = SITEM(SYS_ppoll, 0, 0, (long)&brief, 0, 8, SHAPE_PRIVATE_CALL);
+  say("kept private maskless ppoll r=%ld handled=%d\n", r, gk_n);
+  gk_state("after-private-maskless-ppoll");
   sigset_t none;
   sigemptyset(&none);
   struct timespec ts = {1, 0};
-  long r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&none, 8, SHAPE_INJECT);
+  r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&none, 8, SHAPE_INJECT);
   say("kept ppoll r=%ld handled=%d code=%d pid=%d\n", r, gk_n, gk_code, gk_pid);
   gk_state("after-ppoll");
   /* The same ppoll on the private page: run between syscall stops where

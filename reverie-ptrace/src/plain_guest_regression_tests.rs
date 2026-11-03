@@ -5588,12 +5588,16 @@ async fn a_last_step_over_a_sigreturn_that_unblocks_a_signal_is_single_stepped()
 
 /// The lines of `sigtrap_guest_pending_kept`, single-stepped or not, the
 /// native ones.
-const KEPT_ACROSS_STEPS_LINES: [&str; 12] = [
+const KEPT_ACROSS_STEPS_LINES: [&str; 16] = [
     "kept queued SigPnd=1 ShdPnd=0 handled=0",
     "kept after-injection SigPnd=1 ShdPnd=0 handled=0",
     "kept after-timer SigPnd=1 ShdPnd=0 handled=0",
     "kept clone child saw SigPnd=1",
     "kept after-clone SigPnd=1 ShdPnd=0 handled=0",
+    "kept maskless ppoll r=0 handled=0",
+    "kept after-maskless-ppoll SigPnd=1 ShdPnd=0 handled=0",
+    "kept private maskless ppoll r=0 handled=0",
+    "kept after-private-maskless-ppoll SigPnd=1 ShdPnd=0 handled=0",
     "kept ppoll r=-4 handled=1 code=-7 pid=4242",
     "kept after-ppoll SigPnd=0 ShdPnd=0 handled=1",
     "kept queued-again SigPnd=1 ShdPnd=0 handled=1",
@@ -5648,7 +5652,9 @@ async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_stepped_injections
 /// of the thread's status see it pending, before and after a private
 /// injection, a precise timer's steps and a thread's creation, and so does
 /// the new thread, which reads the parent's status while the parent, back
-/// from the bare clone, runs no syscall; a ppoll
+/// from the bare clone, runs no syscall; a maskless ppoll, which keeps the
+/// mask, times out with it still pending, both run in place and
+/// single-stepped on the private page; a ppoll
 /// whose temporary mask unblocks it returns EINTR with the handler run
 /// once, with the queued code and pid, and is not restarted, both run in
 /// place and on the private page, where this thread, with no seccomp filter
@@ -5716,12 +5722,13 @@ async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_steps() {
             .filter(|line| line.starts_with("kept "))
             .collect();
         assert_eq!(lines, expected, "{}", run.report);
-        // Each ppoll is interrupted and returns EINTR once, as natively:
-        // after the private one the SIGTRAP is held for the resume rather
-        // than queued again, which would leave the guest's call to restart.
+        // Each ppoll enters once, as natively: the maskless ones time out,
+        // and the others are interrupted and return EINTR once. After the
+        // private one the SIGTRAP is held for the resume rather than queued
+        // again, which would leave the guest's call to restart.
         assert_eq!(
             run.count_events("entry ppoll "),
-            2,
+            4,
             "{:#?}",
             run.all_events()
         );
