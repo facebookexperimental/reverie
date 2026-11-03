@@ -200,6 +200,11 @@ pub(crate) static BLOCK_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 pub(crate) static BRANCH_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Branch runs whose counter moved by more branches than their decode
 /// allows, for tests (see [`TimerImpl::check_branch_run`]).
+/// Notifications of a timer's own that arrived during its single steps and
+/// were consumed there (see [`TimerImpl::own_notification_during_steps`]),
+/// for tests.
+pub(crate) static OWN_NOTIFICATIONS_DURING_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static BRANCH_RUN_MISMATCHES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static BLOCK_BOUND_HITS: std::sync::atomic::AtomicU64 =
@@ -3325,6 +3330,38 @@ impl TimerImpl {
                 _ => breakpoints.forget(),
             }
             observe(&wait)?;
+            // A notification of this timer's own that reaches the thread
+            // during its steps is consumed, and the stepping goes on from
+            // where the stop found it (`own_notification_during_steps`).
+            // Handed on, it would reach the run loop as the event's
+            // notification after the stop had already decided the event,
+            // which then fires nowhere.
+            if let Wait::Stopped(stopped, TraceEvent::Signal(signal)) = &wait
+                && *signal == MARKER_SIGNAL
+                && self.own_notification_during_steps(stopped)?
+            {
+                let Wait::Stopped(stopped, _) = wait else {
+                    unreachable!("matched a stop");
+                };
+                #[cfg(target_arch = "x86_64")]
+                let mut stopped = stopped;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    (guest_trap_flag, regs) =
+                        remove_stepping_trap_flag(&mut stopped, &start, guest_trap_flag)?;
+                }
+                // A branch run, which lets the guest run, may have come part
+                // of its way; its counter is checked as at any other stop.
+                #[cfg(target_arch = "aarch64")]
+                self.check_branch_run(&stopped, unit, current.rcbs(), target_rcb, false);
+                #[cfg(target_arch = "aarch64")]
+                let clock = self.read_clock_at(&stopped);
+                #[cfg(not(target_arch = "aarch64"))]
+                let clock = self.read_clock();
+                current.catch_up(clock);
+                task = stopped;
+                continue;
+            }
             // A stop during a branch run that is not its breakpoint's ends
             // the stepping like any other stop, with the breakpoints gone.
             // Any stop of a branch run checks its counter first, so a run
@@ -3578,6 +3615,38 @@ impl TimerImpl {
             count,
             branches,
         })
+    }
+
+    /// Whether the signal stop `task`, which a step toward the active event
+    /// reached, is a notification of this timer's own: an overflow signal of
+    /// its counter, or the controller's artificial kick
+    /// ([`TimerImpl::generated_signal`]); if so, it is consumed. The event is
+    /// being delivered, and the steps disabled the counter before they began
+    /// ([`TimerImpl::disable_timer_before_stepping`]), so the notification
+    /// was raised before that and announces the event the steps deliver. On
+    /// an NVIDIA Grace host a staged event's last programming can overflow a
+    /// second time before the steps disable it; that notification is
+    /// delivered as a step resumes the thread, before the step's instruction
+    /// runs, or part of the way through a branch run, which lets the guest
+    /// run.
+    fn own_notification_during_steps(&mut self, task: &Stopped) -> Result<bool, TraceError> {
+        let signal = task.getsiginfo()?;
+        let controller = self.controller_artificial_signal(&signal)?;
+        if !self.generated_signal(&signal, controller) {
+            return Ok(false);
+        }
+        if controller {
+            self.artificial_signal_sent = false;
+        }
+        if self.owns_overflow_signal(&signal) {
+            self.mark_overflows_consumed();
+        }
+        debug!(
+            si_code = signal.si_code,
+            "A notification of this timer arrived during its steps; consuming it"
+        );
+        OWN_NOTIFICATIONS_DURING_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
     }
 
     /// Records a precise event whose notification found the thread at
@@ -4875,6 +4944,169 @@ mod tests {
                 assert_eq!(now.regs[slot], found.regs[slot], "slot {slot}");
             }
         }
+    }
+
+    /// A notification of the timer's own that reaches the thread during the
+    /// steps toward its event is consumed there, and the steps go on to the
+    /// target. Handed on, it ended the steps with `HandleFailure::Event`, and
+    /// the run loop then found the event already decided by that stop, so it
+    /// fired nowhere. The child queues itself the notification, the timer's
+    /// signal with its counter's descriptor and `POLL_IN`, as a counter
+    /// overflow raises it; the steps start at that call's exit stop, so the
+    /// first step's resume delivers it, before any instruction runs.
+    #[test]
+    fn a_notification_of_the_timer_during_its_steps_is_consumed() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        use nix::unistd::ForkResult;
+        use reverie::Pid;
+        use reverie::Tid;
+        use reverie::syscalls::AddrMut;
+        use reverie::syscalls::MemoryAccess;
+
+        use super::ClockCounter;
+        use super::HandleFailure;
+        use super::MARKER_SIGNAL;
+        use super::OWN_NOTIFICATIONS_DURING_STEPS;
+        use super::Running;
+        use super::StepUnit;
+        use super::Stopped;
+        use super::TraceError;
+        use super::TraceEvent;
+        use super::Wait;
+        use crate::regs::RegAccess;
+
+        if !crate::perf::is_perf_supported() || super::try_get_pmu_config().is_none() {
+            eprintln!("skipping: perf counters are not supported here");
+            return;
+        }
+        struct Reap(i32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: kill and waitpid take plain values and a local status.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    let mut status = 0;
+                    while libc::waitpid(self.0, &mut status, libc::__WALL) < 0
+                        && *libc::__errno_location() == libc::EINTR
+                    {}
+                }
+            }
+        }
+        let signo = MARKER_SIGNAL as i32;
+        // The notification's siginfo, at the same address in the forked
+        // child; the tracer fills in the counter's descriptor (si_fd, 24
+        // bytes in) at the call's entry stop.
+        // SAFETY: an all-zero siginfo is valid.
+        let info: &'static mut libc::siginfo_t = Box::leak(Box::new(unsafe { std::mem::zeroed() }));
+        info.si_signo = signo;
+        info.si_code = i32::from(libc::POLLIN);
+        let info = std::ptr::from_mut(info) as usize;
+        // SAFETY: the child makes only raw calls before it spins.
+        let raw = match unsafe { nix::unistd::fork() }.expect("fork the tracee") {
+            ForkResult::Child => unsafe {
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != 0 {
+                    libc::_exit(1);
+                }
+                libc::raise(libc::SIGSTOP);
+                libc::syscall(
+                    libc::SYS_rt_tgsigqueueinfo,
+                    libc::getpid(),
+                    libc::syscall(libc::SYS_gettid),
+                    signo,
+                    info as *const libc::siginfo_t,
+                );
+                let mut count = 0u64;
+                loop {
+                    count = std::hint::black_box(count.wrapping_add(1));
+                    if std::hint::black_box(count) == 0 {
+                        libc::_exit(0);
+                    }
+                }
+            },
+            ForkResult::Parent { child } => child.as_raw(),
+        };
+        let _reap = Reap(raw);
+        let pid = Pid::from_raw(raw);
+        let (mut task, event) = Running::new_on_ptracer_thread(pid)
+            .expect("capture the tracee")
+            .wait()
+            .expect("wait")
+            .assume_stopped();
+        assert_eq!(event, TraceEvent::Signal(reverie::Signal::SIGSTOP));
+        task.setoptions(nix::sys::ptrace::Options::PTRACE_O_TRACESYSGOOD)
+            .expect("set options");
+        let mut timer = super::Timer::new(pid, Tid::from_raw(raw));
+        let fd = timer.inner().timer.raw_fd();
+        // Syscall stops alternate between entry and exit, from an entry.
+        let mut entry = true;
+        loop {
+            let (stopped, event) = task
+                .syscall(None)
+                .expect("resume")
+                .wait()
+                .expect("wait")
+                .assume_stopped();
+            task = stopped;
+            assert_eq!(event, TraceEvent::Syscall, "only syscall stops come first");
+            let regs = task.getregs().expect("read the registers");
+            let queues = entry
+                && regs.orig_syscall() == libc::SYS_rt_tgsigqueueinfo as u64
+                && regs.args().2 == signo as u64;
+            entry = !entry;
+            if queues {
+                let si_fd = AddrMut::<i32>::from_raw(info + 24).expect("an address");
+                task.write_value(si_fd, &fd).expect("fill in si_fd");
+                break;
+            }
+        }
+        let (task, event) = task
+            .syscall(None)
+            .expect("resume")
+            .wait()
+            .expect("wait")
+            .assume_stopped();
+        assert_eq!(event, TraceEvent::Syscall, "the call's exit stop");
+
+        let inner = timer.inner_mut_noinit().expect("a timer");
+        let from = inner.read_clock();
+        let mut step = |task: Stopped, unit| -> Result<Running, TraceError> {
+            match unit {
+                #[cfg(target_arch = "x86_64")]
+                StepUnit::Block => task.block_step(),
+                #[cfg(target_arch = "aarch64")]
+                StepUnit::ToBranch { .. } => task.resume(None),
+                _ => task.step(None),
+            }
+        };
+        let mut observe = |_: &Wait| Ok(());
+        let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
+        waits.bind_stopped(&task);
+        let consumed = OWN_NOTIFICATIONS_DURING_STEPS.load(Relaxed);
+        let result = futures::executor::block_on(inner.attempt_single_step(
+            task,
+            ClockCounter::new(from, 0, from + 2),
+            0,
+            &mut step,
+            &mut observe,
+            &waits,
+        ));
+        let stopped = match result {
+            Ok(stopped) => stopped,
+            Err(HandleFailure::Event(Wait::Stopped(stopped, event))) => panic!(
+                "the steps ended at {event:?}, siginfo {:?}",
+                stopped
+                    .getsiginfo()
+                    .map(|info| (info.si_signo, info.si_code))
+            ),
+            Err(error) => panic!("the steps failed: {error:?}"),
+        };
+        assert_eq!(OWN_NOTIFICATIONS_DURING_STEPS.load(Relaxed), consumed + 1);
+        assert!(
+            inner.read_clock() >= from + 2,
+            "the steps reached the target"
+        );
+        drop(stopped);
     }
 
     #[test]
