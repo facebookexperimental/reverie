@@ -20285,9 +20285,38 @@ int main(int argc, char **argv) {
   errno = 0;
   if (!failed_with(syscall(SYS_fallocate, HIGH_WORD | (uint32_t)fd,
                            0, 0, 0), EINVAL)) return 8;
+  // Linux's generic file advice refuses a negative offset only since commit
+  // 0fd66c343ce7, so the result and errno are printed for the emulated runs
+  // to match, and the high-word alias must observe what the plain fd does.
   errno = 0;
-  if (!failed_with(syscall(SYS_readahead, HIGH_WORD | (uint32_t)fd,
-                           (int64_t)-1, 1), EINVAL)) return 9;
+  long plain = syscall(SYS_readahead, (uint64_t)(uint32_t)fd, (int64_t)-1,
+                       (size_t)1);
+  int plain_errno = plain == 0 ? 0 : errno;
+  errno = 0;
+  long negative = syscall(SYS_readahead, HIGH_WORD | (uint32_t)fd,
+                          (int64_t)-1, (size_t)1);
+  int negative_errno = negative == 0 ? 0 : errno;
+  if ((negative != 0 && negative != -1) || (negative == -1 && negative_errno == 0) ||
+      negative != plain || negative_errno != plain_errno) {
+    fprintf(stderr,
+            "readahead offset -1: high-word result %ld errno %d, plain fd "
+            "result %ld errno %d\n",
+            negative, negative_errno, plain, plain_errno);
+    return 9;
+  }
+  // The access mode is checked before the offset on every version.
+  int write_only = open(argv[1], O_WRONLY);
+  if (write_only < 0) return 17;
+  errno = 0;
+  long refused = syscall(SYS_readahead, HIGH_WORD | (uint32_t)write_only,
+                         (int64_t)-1, (size_t)1);
+  int refused_errno = errno;
+  if (!(refused == -1 && refused_errno == EBADF)) {
+    fprintf(stderr, "write-only readahead offset -1: result %ld errno %d\n",
+            refused, refused_errno);
+    return 18;
+  }
+  if (close(write_only) != 0) return 19;
   errno = 0;
   if (!failed_with(syscall(SYS_sync_file_range,
                            HIGH_WORD | (uint32_t)fd, 0, 1,
@@ -20309,7 +20338,8 @@ int main(int argc, char **argv) {
   if (!failed_with(syscall(SYS_fallocate, invalid, 0, 0, 1), EBADF)) return 15;
 
   if (close(fd) != 0) return 16;
-  printf("storage-low-word-ok fallocate=%s\n", allocation_result);
+  printf("storage-low-word-ok fallocate=%s readahead-negative=%ld,%d\n",
+         allocation_result, negative, negative_errno);
   return 0;
 }
 "#,
@@ -20326,12 +20356,23 @@ int main(int argc, char **argv) {
         String::from_utf8_lossy(&native.stdout),
         String::from_utf8_lossy(&native.stderr)
     );
+    // A readable regular file's generic file advice gives 0 before Linux
+    // commit 0fd66c343ce7 and EINVAL after it; each emulated run must then
+    // print the same readahead result and errno as this native one.
+    let native_line = String::from_utf8_lossy(&native.stdout);
+    let readahead_negative = ["ok", "unsupported"].iter().find_map(|allocation| {
+        native_line
+            .strip_prefix(&format!(
+                "storage-low-word-ok fallocate={allocation} readahead-negative="
+            ))?
+            .strip_suffix('\n')
+    });
+    let einval = format!("-1,{}", libc::EINVAL);
     assert!(
-        native.stdout == b"storage-low-word-ok fallocate=ok\n"
-            || native.stdout == b"storage-low-word-ok fallocate=unsupported\n",
-        "unexpected native oracle: {:?}",
-        String::from_utf8_lossy(&native.stdout)
+        matches!(readahead_negative, Some(pair) if pair == "0,0" || pair == einval),
+        "unexpected native oracle: {native_line:?}"
     );
+    eprintln!("native readahead(fd, -1, 1): {native_line:?}");
     assert!(native.stderr.is_empty());
 
     let image = std::fs::read(&executable).unwrap();

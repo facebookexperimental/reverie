@@ -33025,15 +33025,75 @@ mod tests {
             ),
             0
         );
+        // Linux's generic file advice refuses a negative offset only since
+        // commit 0fd66c343ce7, so the emulated answer must be the host's own
+        // for the same file, through the plain and the high-word fd.
+        let native_readahead = |file: &std::fs::File, offset: i64| {
+            use std::os::fd::AsRawFd;
+            // SAFETY: a live descriptor and no pointers.
+            let result =
+                unsafe { libc::syscall(libc::SYS_readahead, file.as_raw_fd(), offset, 1usize) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            match (result, errno) {
+                (0, _) => 0,
+                (-1, Some(errno)) if errno > 0 => negative_errno(errno),
+                _ => panic!("native readahead({offset}) returned {result} with errno {errno:?}"),
+            }
+        };
+        let path = root.0.join("positioned");
+        let readable = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let native = native_readahead(&readable, -1);
+        assert!(
+            native == 0 || native == negative_errno(libc::EINVAL),
+            "native readahead of a regular file at offset -1 returned {native}"
+        );
+        for guest_fd in [fd as u64, HIGH_WORD | fd as u64] {
+            assert_eq!(
+                syscall_result(
+                    &mut memory,
+                    &mut state,
+                    libc::SYS_readahead,
+                    [guest_fd, u64::MAX, 1, 0, 0, 0],
+                ),
+                native,
+                "a negative offset reaches the low-word descriptor's host file ({guest_fd:#x})"
+            );
+        }
+        // The access-mode check precedes the offset on every Linux version.
+        let write_only_fd = syscall_result(
+            &mut memory,
+            &mut state,
+            libc::SYS_open,
+            [PATH_ADDRESS, libc::O_WRONLY as u64, 0, 0, 0, 0],
+        );
+        assert!(write_only_fd >= 0, "{write_only_fd}");
+        let write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert_eq!(
+            native_readahead(&write_only, -1),
+            negative_errno(libc::EBADF)
+        );
         assert_eq!(
             syscall_result(
                 &mut memory,
                 &mut state,
                 libc::SYS_readahead,
-                [HIGH_WORD | fd as u64, u64::MAX, 1, 0, 0, 0],
+                [HIGH_WORD | write_only_fd as u64, u64::MAX, 1, 0, 0, 0],
             ),
-            negative_errno(libc::EINVAL),
-            "offset validation follows low-word descriptor decoding"
+            negative_errno(libc::EBADF),
+            "a write-only descriptor is refused before its offset"
+        );
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_close,
+                [write_only_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            0
         );
         assert_eq!(
             syscall_result(

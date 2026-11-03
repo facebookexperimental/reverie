@@ -219,9 +219,10 @@ pub(super) fn readahead(state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let Ok(count) = usize::try_from(args[2]) else {
         return negative_errno(libc::EINVAL);
     };
-    if offset < 0 {
-        return negative_errno(libc::EINVAL);
-    }
+    // The host kernel checks the access mode, then the file type, then the
+    // offset in its file advice, whose generic version refuses a negative one
+    // only since Linux commit 0fd66c343ce7, so every offset goes to the
+    // translated descriptor.
     // SAFETY: host_fd names the guest's live translated descriptor; the call
     // has no guest pointers, and the host kernel validates the descriptor type.
     let result = unsafe { libc::syscall(libc::SYS_readahead, host_fd, offset, count) };
