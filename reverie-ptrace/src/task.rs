@@ -118,6 +118,9 @@ use crate::sigtrap_state::KernelSigaction;
 use crate::sigtrap_state::SIGTRAP_BIT;
 use crate::sigtrap_state::SigtrapAction;
 use crate::sigtrap_state::StepKind;
+#[cfg(target_arch = "aarch64")]
+use crate::sigtrap_state::instruction_raises_sigtrap;
+#[cfg(target_arch = "x86_64")]
 use crate::sigtrap_state::instruction_raises_sigtrap_with_words;
 use crate::sigtrap_state::mask_after_sigprocmask;
 use crate::sigtrap_state::parse_sigtrap_disposition;
@@ -1942,14 +1945,15 @@ fn shares_signal_actions(parent: &Stopped) -> bool {
     clone_flags(parent).is_some_and(|flags| flags & libc::CLONE_SIGHAND as u64 != 0)
 }
 
-/// Whether the instruction at `rip` raises a SIGTRAP of its own (`int3`,
+/// Whether the x86-64 instruction at `rip` raises a SIGTRAP of its own (`int3`,
 /// `int 3` or `int1`, behind any prefixes: `instruction_raises_sigtrap`). Its
 /// `force_sig` resets a blocked or ignored SIGTRAP natively too, so a step
 /// over it is neither shielded nor repaired. The decoder reads its 15-byte
 /// window as demand-driven aligned `PTRACE_PEEKDATA` words (8-byte reads),
-/// preserving its original overflow-edge collection. Forced reads support
-/// execute-only pages, where `process_vm_readv` fails; a needed unreadable
-/// word ends decoding.
+/// checking address arithmetic only when a word is needed. Forced reads
+/// support execute-only pages, where `process_vm_readv` fails; a needed
+/// unreadable or unrepresentable word ends decoding.
+#[cfg(target_arch = "x86_64")]
 fn instruction_at_raises_sigtrap(task: &Stopped, rip: u64) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1978,6 +1982,27 @@ fn instruction_at_raises_sigtrap(task: &Stopped, rip: u64) -> bool {
         let skip = rip - start;
         instruction_raises_sigtrap(bytes.get(skip..len).unwrap_or(&[]))
     }
+}
+
+/// The existing aligned-word collector for the AArch64 BRK decoder. Keep
+/// that architecture's instruction grammar and read behavior unchanged.
+#[cfg(target_arch = "aarch64")]
+fn instruction_at_raises_sigtrap(task: &Stopped, rip: u64) -> bool {
+    let rip = rip as usize;
+    let start = rip & !7;
+    let mut bytes = [0u8; 24];
+    let mut len = 0;
+    while len < bytes.len() && start + len < rip + 15 {
+        let word =
+            Addr::<u64>::from_raw(start + len).and_then(|address| task.read_value(address).ok());
+        let Some(word) = word else {
+            break;
+        };
+        bytes[len..len + 8].copy_from_slice(&word.to_ne_bytes());
+        len += 8;
+    }
+    let skip = rip - start;
+    instruction_raises_sigtrap(bytes.get(skip..len).unwrap_or(&[]))
 }
 
 /// `instruction_at_raises_sigtrap` at the task's current rip.
@@ -8939,13 +8964,22 @@ impl<L: Tool + 'static> TracedTask<L> {
                 }
                 None => None,
             };
-            // This step runs the new image's first instruction; its trap must
-            // not reset SIGTRAP either (`sigtrap_state`).
-            // An instruction that raises its own SIGTRAP resets it natively too,
-            // so its step is neither shielded nor repaired.
+            // On x86-64, decode independently of SIGTRAP shielding: a native
+            // trap needs CONT even for a plain Tool or a default, unblocked
+            // SIGTRAP. STEP can otherwise disguise ICEBP as the controller's
+            // own trap. A native trap resets SIGTRAP itself, so neither shield
+            // nor repair its state (`sigtrap_state`).
+            #[cfg(target_arch = "x86_64")]
+            let native_trap = next_instruction_raises_sigtrap(&task)?;
+            #[cfg(target_arch = "aarch64")]
             let mut native_trap = false;
             let (shielded, ignored) = if exec_sigtrap_quiet || !self.keeps_sigtrap_state() || {
-                native_trap = next_instruction_raises_sigtrap(&task)?;
+                // Preserve AArch64's existing short-circuit decode and BRK
+                // shield bypass; its first instruction still uses STEP.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    native_trap = next_instruction_raises_sigtrap(&task)?;
+                }
                 native_trap
             } {
                 (false, false)
@@ -8958,7 +8992,12 @@ impl<L: Tool + 'static> TracedTask<L> {
             };
             // Never lend CONT origin to a controller trap already queued by
             // an earlier operation. A failed full-pending read keeps STEP.
-            let continue_native_trap = native_trap
+            // This preserves the existing STEP fallback for pending or stale
+            // traps; it does not establish native-trap fidelity in those cases.
+            // In particular, a blocked, pending SIGTRAP may absorb the native
+            // trap and its stop may still be suppressed as a controller STEP.
+            let continue_native_trap = cfg!(target_arch = "x86_64")
+                && native_trap
                 && !self.stale_private_step_trap
                 && ProcSignalState::read(&task).is_ok_and(|state| state.pending & SIGTRAP_BIT == 0);
             #[cfg(all(test, target_arch = "x86_64"))]

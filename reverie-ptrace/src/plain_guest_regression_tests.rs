@@ -3748,15 +3748,21 @@ async fn sigtrap_state_survives_reverie_preinit_at_exec() {
 async fn a_guest_trap_at_elf_entry_takes_sigtraps_default_action() {
     let targets = first_exec_guests();
     let expected = [
+        "first-exec cc dfl-unblocked signaled=1 sig=5 exited=0 rc=-1",
         "first-exec cc dfl-blocked signaled=1 sig=5 exited=0 rc=-1",
         "first-exec cc ign-unblocked signaled=1 sig=5 exited=0 rc=-1",
         "first-exec cc ign-blocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec f1 dfl-unblocked signaled=1 sig=5 exited=0 rc=-1",
         "first-exec f1 dfl-blocked signaled=1 sig=5 exited=0 rc=-1",
         "first-exec f1 ign-unblocked signaled=1 sig=5 exited=0 rc=-1",
         "first-exec f1 ign-blocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec cd03 dfl-unblocked signaled=1 sig=5 exited=0 rc=-1",
         "first-exec cd03 dfl-blocked signaled=1 sig=5 exited=0 rc=-1",
         "first-exec cd03 ign-unblocked signaled=1 sig=5 exited=0 rc=-1",
         "first-exec cd03 ign-blocked signaled=1 sig=5 exited=0 rc=-1",
+        "first-exec nop dfl-unblocked signaled=0 sig=0 exited=1 rc=99",
+        "first-exec nop dfl-blocked signaled=0 sig=0 exited=1 rc=99",
+        "first-exec nop ign-unblocked signaled=0 sig=0 exited=1 rc=99",
         "first-exec nop ign-blocked signaled=0 sig=0 exited=1 rc=99",
         "done",
     ];
@@ -3779,63 +3785,70 @@ async fn a_guest_trap_at_elf_entry_takes_sigtraps_default_action() {
     // A native mismatch fails this prerequisite; it is never a skip.
     check_report("native", &native_first_exec_report());
     let _observations = FirstExecObservations::begin();
-    let [inject, tail] = run_both_configurations("sigtrap_first_exec").await;
-    for (phase, run) in [("inject", inject), ("tail", tail)] {
-        check_report(phase, &run.report);
-        assert_eq!(
-            run.count_events("post-exec"),
-            11,
-            "{phase}: launcher plus ten target execs"
-        );
-        let mut actual = Vec::new();
-        for events in run.tool_events.values() {
-            let entries: Vec<_> = events
-                .iter()
-                .filter(|event| event.starts_with("elf-entry "))
-                .collect();
-            if !entries.is_empty() {
-                assert_eq!(
-                    entries.len(),
-                    1,
-                    "{phase}: one entry observation per child: {events:?}"
-                );
-                assert_eq!(
-                    events
-                        .iter()
-                        .filter(|event| event.as_str() == "post-exec")
-                        .count(),
-                    1,
-                    "{phase}: one post-exec per target entry: {events:?}"
-                );
-                actual.push(entries[0].to_owned());
+    for no_serialization_contract in [false, true] {
+        let options = GuestOptions {
+            no_serialization_contract,
+            ..Default::default()
+        };
+        let [inject, tail] = run_both_configurations_with("sigtrap_first_exec", options).await;
+        for (phase, run) in [("inject", inject), ("tail", tail)] {
+            let phase = format!("{phase} serialized={}", !no_serialization_contract);
+            check_report(&phase, &run.report);
+            assert_eq!(
+                run.count_events("post-exec"),
+                17,
+                "{phase}: launcher plus sixteen target execs"
+            );
+            let mut actual = Vec::new();
+            for events in run.tool_events.values() {
+                let entries: Vec<_> = events
+                    .iter()
+                    .filter(|event| event.starts_with("elf-entry "))
+                    .collect();
+                if !entries.is_empty() {
+                    assert_eq!(
+                        entries.len(),
+                        1,
+                        "{phase}: one entry observation per child: {events:?}"
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event.as_str() == "post-exec")
+                            .count(),
+                        1,
+                        "{phase}: one post-exec per target entry: {events:?}"
+                    );
+                    actual.push(entries[0].to_owned());
+                }
             }
-        }
-        assert_eq!(
-            actual.len(),
-            10,
-            "{phase}: exactly ten authenticated target-entry observations"
-        );
-        let mut expected_entries = Vec::new();
-        for target in targets {
-            let hex = target
-                .opcode
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .concat();
-            for _ in 0..if target.name == "nop" { 1 } else { 3 } {
-                expected_entries.push(format!(
-                    "elf-entry {} rip={:#x} bytes={hex}",
-                    target.name, target.entry
-                ));
+            assert_eq!(
+                actual.len(),
+                16,
+                "{phase}: exactly sixteen authenticated target-entry observations"
+            );
+            let mut expected_entries = Vec::new();
+            for target in targets {
+                let hex = target
+                    .opcode
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .concat();
+                for _ in 0..4 {
+                    expected_entries.push(format!(
+                        "elf-entry {} rip={:#x} bytes={hex}",
+                        target.name, target.entry
+                    ));
+                }
             }
+            actual.sort_unstable();
+            expected_entries.sort_unstable();
+            assert_eq!(
+                actual, expected_entries,
+                "{phase}: actual stopped RIP/bytes, not callback count alone"
+            );
         }
-        actual.sort_unstable();
-        expected_entries.sort_unstable();
-        assert_eq!(
-            actual, expected_entries,
-            "{phase}: actual stopped RIP/bytes, not callback count alone"
-        );
     }
 }
 

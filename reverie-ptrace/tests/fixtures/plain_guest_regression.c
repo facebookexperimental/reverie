@@ -1604,14 +1604,13 @@ static void mode_sigtrap_first_exec(void) {
     void (*action)(int);
     int block;
   } states[] = {
+      {"dfl-unblocked", SIG_DFL, 0},
       {"dfl-blocked", SIG_DFL, 1},
       {"ign-unblocked", SIG_IGN, 0},
       {"ign-blocked", SIG_IGN, 1},
   };
   for (unsigned e = 0; e < 4; e++) {
-    unsigned count = e == 3 ? 1 : 3;
-    for (unsigned c = 0; c < count; c++) {
-      unsigned s = e == 3 ? 2 : c;
+    for (unsigned s = 0; s < sizeof states / sizeof states[0]; s++) {
       pid_t pid = fork();
       if (pid < 0)
         die("fork first-exec child");
