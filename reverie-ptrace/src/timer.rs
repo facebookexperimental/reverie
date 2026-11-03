@@ -206,10 +206,25 @@ pub(crate) enum StepUnit {
     /// synchronous-class signal, its `SI_USER` report stays queued, as it
     /// did before syscall steps existed.
     LastInstruction,
+    /// One `syscall` instruction that can queue the thread a SIGTRAP with a
+    /// code the guest chooses ([`queues_the_thread_a_sigtrap`]), run with
+    /// `PTRACE_SYSCALL` to its entry stop and then to its exit stop
+    /// ([`StepUnit::SyscallExit`]) rather than single-stepped. Single-stepped,
+    /// such a SIGTRAP would be delivered at the step's own stop, in place of
+    /// the step's report, which Linux drops while a SIGTRAP is queued
+    /// (`legacy_queue`), and could not be told from it. At the exit stop the
+    /// thread's queue is read before anything is delivered
+    /// ([`TimerImpl::attempt_single_step`]). Chosen by the timer on x86_64,
+    /// which reads the registers for every step; on aarch64 the caller's step
+    /// function runs such an `svc` this way from the registers its shield
+    /// reads.
+    #[cfg(target_arch = "x86_64")]
+    Syscall,
     /// From the entry stop of a syscall that a step resumed with
     /// `PTRACE_SYSCALL` to its exit stop (see [`TimerImpl::attempt_single_step`]).
     /// The caller's step function chooses `PTRACE_SYSCALL` for a step over a
-    /// guest `rt_sigreturn` that no seccomp stop reports.
+    /// guest `rt_sigreturn` that no seccomp stop reports, and for a
+    /// [`StepUnit::Syscall`].
     SyscallExit,
     /// From the stop of a signal the kernel took ahead of the step's report,
     /// back to that report: the signal is resumed while blocked, so the
@@ -603,14 +618,15 @@ pub enum HandleFailure {
     #[error("Pending signal was not for this timer")]
     ImproperSignal(Stopped),
 
-    /// A step stopped at a synchronous-class signal that the kernel took
-    /// ahead of a queued SIGTRAP shaped like the step's report, but a SIGTRAP
-    /// was already queued for the thread before the step, so the queued one
-    /// is the guest's ([`dequeued_ahead_of_step_report`]). The caller ends the
-    /// run with `PendingSigtrapAtStep`, as for a pending SIGTRAP the shield
-    /// finds before a step.
-    #[error("A SIGTRAP queued before a timer step is not the step's report")]
-    PendingSigtrap(Stopped),
+    /// A SIGTRAP of the guest's own was queued for the thread before a step,
+    /// with a code that Reverie's own traps use, so the step's report could
+    /// not be queued and the guest's SIGTRAP could not be told from it: the
+    /// step stopped at it, or at a synchronous-class signal the kernel took
+    /// ahead of it ([`dequeued_ahead_of_step_report`]), or the step that
+    /// reaches the target would queue one ([`queues_the_thread_a_sigtrap`]).
+    /// The caller ends the run with `QueuedSigtrapAtStep` and the site.
+    #[error("A SIGTRAP of the guest's own is queued at a timer step ({1})")]
+    GuestSigtrap(Stopped, &'static str),
 }
 
 #[cfg(test)]
@@ -3349,17 +3365,22 @@ impl TimerImpl {
             current, target_rcb
         );
         // Whether a SIGTRAP is in the thread's own queue before the next
-        // step, which decides whether a SIGTRAP queued behind a signal the
-        // kernel took first can be the step's report
-        // (`dequeued_ahead_of_step_report`). It is read once, here, and then
-        // kept without a read per step. Linux keeps at most one standard
-        // signal of a number in a queue (`legacy_queue`), so the stop at a
-        // step's report, which dequeues that queue's SIGTRAP, leaves none; a
-        // step run as a syscall dequeues nothing, and changes nothing here.
-        // A SIGTRAP that a stepped instruction itself queues is taken at that
-        // step's own stops, since every step runs with SIGTRAP deliverable.
-        // As for the shield's pending-state reads, no other guest thread
-        // queues one during a sequence.
+        // step. Linux keeps at most one standard signal of a number in a
+        // queue (`legacy_queue`), so a step taken with one queued gets no
+        // report of its own, and any SIGTRAP it stops at, or finds queued
+        // behind a signal the kernel took first, is the guest's
+        // (`dequeued_ahead_of_step_report`). It is read here, and again only
+        // after a step that ran a syscall to its exit stop, never per step:
+        // - the stop at a step's report dequeues the queue's one SIGTRAP;
+        // - only a syscall can queue a SIGTRAP with a code the guest chooses,
+        //   and a step over one that can (`queues_the_thread_a_sigtrap`) runs
+        //   it to its exit stop (`StepUnit::Syscall`), before anything it
+        //   queued is delivered, so the read there sees it; a step run as a
+        //   syscall otherwise only runs a guest `rt_sigreturn`, which queues
+        //   nothing but may unblock one already queued, which the read also
+        //   sees;
+        // - as for the shield's pending-state reads, no other guest thread
+        //   queues one during a sequence.
         let mut sigtrap_queued = sigtrap_in_own_queue(&task)?;
         let mut task = task;
         // The registers before each step. A step's cleanup reads them back
@@ -3425,12 +3446,35 @@ impl TimerImpl {
             } else {
                 unit
             };
+            // A `syscall` that can queue the thread a SIGTRAP of the guest's
+            // choosing runs to its exit stop, where the queue is read. The
+            // step that reaches the target cannot (`StepUnit::LastInstruction`)
+            // and would leave such a SIGTRAP to be taken for its report, so
+            // the run ends there instead.
+            #[cfg(target_arch = "x86_64")]
+            let unit = match unit {
+                StepUnit::Instruction | StepUnit::LastInstruction
+                    if matches!(start.instruction, FlagsInstruction::Syscall { .. })
+                        && queues_the_thread_a_sigtrap(regs.rax, regs.rsi, regs.rdx) =>
+                {
+                    if unit == StepUnit::LastInstruction {
+                        return Err(HandleFailure::GuestSigtrap(task, LAST_STEP_QUEUES_SIGTRAP));
+                    }
+                    StepUnit::Syscall
+                }
+                unit => unit,
+            };
             match unit {
                 // The loop chooses neither of the last two.
                 StepUnit::Instruction
                 | StepUnit::LastInstruction
                 | StepUnit::SyscallExit
                 | StepUnit::Requeue(_) => {
+                    instruction_steps += 1;
+                    &INSTRUCTION_STEPS
+                }
+                #[cfg(target_arch = "x86_64")]
+                StepUnit::Syscall => {
                     instruction_steps += 1;
                     &INSTRUCTION_STEPS
                 }
@@ -3473,8 +3517,9 @@ impl TimerImpl {
             let mut wait = running.next_state_with_owner(waits).await?;
             #[cfg(target_arch = "aarch64")]
             note_stop(&mut breakpoints, &wait);
-            // A step the caller ran as a syscall (`StepUnit::SyscallExit`)
-            // stops at the syscall's entry first; it ends at its exit stop.
+            // A step run as a syscall (`StepUnit::Syscall`, or one the caller
+            // chose, `StepUnit::SyscallExit`) stops at the syscall's entry
+            // first; it ends at its exit stop.
             let mut ran_syscall = false;
             if let Wait::Stopped(_, event) = &wait
                 && is_syscall_stop(event)
@@ -3518,7 +3563,7 @@ impl TimerImpl {
                     let Wait::Stopped(stopped, _) = wait else {
                         unreachable!("matched a stop");
                     };
-                    return Err(HandleFailure::PendingSigtrap(stopped));
+                    return Err(HandleFailure::GuestSigtrap(stopped, "precise timer"));
                 }
                 let sig = *sig;
                 observe(&wait, StepStop::Passing)?;
@@ -3613,6 +3658,16 @@ impl TimerImpl {
                 (_, wait) => wait,
             };
             task = match wait {
+                // A SIGTRAP stop while one was queued before the step is that
+                // SIGTRAP, the guest's: the step got no report. One a process
+                // sent is passed on below, and the run loop delivers it
+                // (`handle_sigtrap`); one with a trap's code would be taken
+                // for a trap of Reverie's there, so the run ends instead.
+                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP))
+                    if sigtrap_queued && !crate::task::is_sigtrap_sent_by_a_process(&new_task) =>
+                {
+                    return Err(HandleFailure::GuestSigtrap(new_task, "precise timer"));
+                }
                 // A syscall run to its exit stop completes its step; the
                 // stop sends no signal.
                 Wait::Stopped(new_task, event) if ran_syscall && is_syscall_stop(&event) => {
@@ -3621,12 +3676,12 @@ impl TimerImpl {
                 // a successful single step results in SIGTRAP stop
                 #[cfg(target_arch = "x86_64")]
                 Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP))
-                    if matches!(is_step_report(&new_task, &start), Ok(true)) =>
+                    if !sigtrap_queued && matches!(is_step_report(&new_task, &start), Ok(true)) =>
                 {
                     new_task
                 }
                 #[cfg(not(target_arch = "x86_64"))]
-                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) => {
+                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) if !sigtrap_queued => {
                     // The clock is read below, and nothing at a single step's
                     // stop has made a ptrace request yet (x86 reads the
                     // registers here). A branch run's stop has.
@@ -3706,8 +3761,10 @@ impl TimerImpl {
                 }
                 wait => return Err(HandleFailure::Event(wait)),
             };
-            // The step's report stop dequeued the thread's one SIGTRAP.
-            sigtrap_queued &= ran_syscall;
+            // The step's report stop dequeued the thread's one SIGTRAP; a
+            // syscall's exit stop dequeued nothing, and the syscall may have
+            // queued one, delivered at the next resume.
+            sigtrap_queued = ran_syscall && sigtrap_in_own_queue(&task)?;
             #[cfg(target_arch = "x86_64")]
             {
                 (guest_trap_flag, regs) =
@@ -4099,12 +4156,27 @@ fn runs_in_place(ip: u64, code: &[u8]) -> bool {
     }
 }
 
+/// Whether `unit` is a block step or a branch run, which may retire branches
+/// as far as their decode allows. A single instruction, however the step
+/// runs it (`Instruction`, `LastInstruction`, and on x86 `Syscall`), and the
+/// halves of a step that go on from its own stops (`SyscallExit`, `Requeue`)
+/// are not.
+fn block_step(unit: StepUnit) -> bool {
+    match unit {
+        #[cfg(target_arch = "x86_64")]
+        StepUnit::Block => true,
+        #[cfg(target_arch = "aarch64")]
+        StepUnit::ToBranch { .. } => true,
+        _ => false,
+    }
+}
+
 /// Whether a block step left the counter at `clock`, at or past the precise
 /// target `target_rcb`, which the decoded bound rules out. If it did, the
 /// delivery point may be passed, so this is recorded as a skid overshoot,
 /// with its marker, and the run fails closed as for a late notification.
 fn block_step_reached_target(unit: StepUnit, clock: u64, target_rcb: u64) -> bool {
-    if matches!(unit, StepUnit::Instruction | StepUnit::LastInstruction) || clock < target_rcb {
+    if !block_step(unit) || clock < target_rcb {
         return false;
     }
     warn!(
@@ -5069,19 +5141,18 @@ fn signal_bit(sig: Signal) -> u64 {
 /// guest's trap ahead of its signal, and the step could take it for its
 /// report. A SIGTRAP the guest queued itself with those very fields
 /// (`rt_tgsigqueueinfo` allows any positive code for the caller) cannot be
-/// told from the report by its siginfo. One queued before the step is told
-/// by when it was queued: the caller reads the thread's own queue before
-/// the step, and with a SIGTRAP there the report cannot be queued (a queue
-/// holds one SIGTRAP, `legacy_queue`), nor does the instruction run: the
-/// pending signals are taken on the way out of the stop the step resumes,
-/// before it.
-/// The caller then ends the run (`HandleFailure::PendingSigtrap`) instead of
-/// requeueing, which would hand the guest's SIGTRAP to the step as its
-/// report and put the other signal behind it. One that the stepped
-/// instruction itself queues, an untraced `rt_tgsigqueueinfo` with the
-/// report's code and the next pc, still passes, as it passes at the step's
-/// own stop (`is_step_report`); the shield refuses any SIGTRAP pending
-/// while SIGTRAP is blocked before a step (`PendingSigtrapAtStep`). Each
+/// told from the report by its siginfo; it is told by when it was queued.
+/// The caller knows whether a SIGTRAP was in the thread's own queue before
+/// the step: it reads the queue before the steps and at the exit stop of
+/// every step that ran a syscall, and a `syscall` that can queue one
+/// (`queues_the_thread_a_sigtrap`) is always run to its exit stop
+/// (`StepUnit::Syscall`). With a SIGTRAP queued, the report cannot be
+/// queued too (a queue holds one SIGTRAP, `legacy_queue`), nor does the
+/// instruction run: the pending signals are taken on the way out of the stop
+/// the step resumes, before it. The caller then ends the run
+/// (`HandleFailure::GuestSigtrap`) instead of requeueing, which would hand
+/// the guest's SIGTRAP to the step as its report and put the other signal
+/// behind it. Each
 /// signal is requeued once per step (`returned`): a second stop at it means
 /// the kernel did not take the report next, and it is handed on.
 /// The report must be deliverable, so that resuming takes it next and runs
@@ -5124,8 +5195,33 @@ fn dequeued_ahead_of_step_report(
 
 /// Whether a SIGTRAP is queued for the stopped `task` in its own queue
 /// (`PTRACE_PEEKSIGINFO`), the one a step's report goes to.
+///
+/// A SIGTRAP in the thread group's queue does not stop the report: Linux
+/// queues the report in the thread's own queue and delivers that first.
 fn sigtrap_in_own_queue(task: &Stopped) -> Result<bool, TraceError> {
     task.peeksiginfo_any(None, |info| info.si_signo == libc::SIGTRAP)
+}
+
+/// The site `HandleFailure::GuestSigtrap` names for a step that would reach
+/// the target over a syscall that can queue the thread a SIGTRAP.
+pub(crate) const LAST_STEP_QUEUES_SIGTRAP: &str =
+    "precise timer's last step, over a call that can queue the thread a SIGTRAP";
+
+/// Whether the syscall `nr`, with its second and third arguments `arg1` and
+/// `arg2`, can queue the calling thread a SIGTRAP with a code the caller
+/// chooses: `rt_tgsigqueueinfo` naming SIGTRAP (third argument), which Linux
+/// lets a thread send itself with any code, and `pidfd_send_signal` naming
+/// SIGTRAP (second argument), which can target the thread's own queue
+/// (`PIDFD_SIGNAL_THREAD`). Other ways to queue the thread a SIGTRAP give it
+/// a code a process cannot choose and that no step report has (`tgkill`,
+/// `tkill`: `SI_TKILL`; POSIX timers: `SI_TIMER`), or queue it for the
+/// thread group (`rt_sigqueueinfo`, `kill`), whose queue a step's report does
+/// not share. A queueing call whose target is another thread, or whose code
+/// turns out to be a sender's, is caught too; that costs it two stops.
+pub(crate) fn queues_the_thread_a_sigtrap(nr: u64, arg1: u64, arg2: u64) -> bool {
+    let sigtrap = libc::SIGTRAP as u64;
+    (nr == libc::SYS_rt_tgsigqueueinfo as u64 && arg2 == sigtrap)
+        || (nr == libc::SYS_pidfd_send_signal as u64 && arg1 == sigtrap)
 }
 
 /// Whether `event` is a syscall stop (`PTRACE_SYSCALL`). Reverie's launch
@@ -5303,23 +5399,44 @@ mod tests {
         ));
     }
 
-    /// A SIGTRAP the guest queued for itself before a timer step, shaped like
-    /// the step's report (`TRAP_TRACE` at the pc the thread stands at), is not
-    /// taken for the report when the kernel takes a blocked synchronous-class
-    /// signal queued before it first. The step's report cannot be queued
-    /// behind a queued SIGTRAP (`legacy_queue`), so requeueing the signal
-    /// would hand the guest's SIGTRAP to the step as its report and put the
-    /// signal behind it. The sequence ends instead
-    /// (`HandleFailure::PendingSigtrap`), with both signals still queued.
-    #[test]
-    fn a_sigtrap_queued_before_a_step_is_not_taken_for_its_report() {
+    /// How a guest SIGTRAP gets queued for the tests below, and what else
+    /// is queued with it.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum QueuedTrap {
+        /// Queued by the guest before the steps; the steps start at that
+        /// call's exit stop, with nothing delivered.
+        Before,
+        /// Queued by an untraced `rt_tgsigqueueinfo` that the first step
+        /// runs (x86_64 only: the steps start at a stop just before the
+        /// `syscall`).
+        Stepped,
+    }
+
+    /// `FPE_INTDIV` (include/uapi/asm-generic/siginfo.h), a positive code.
+    const FPE_INTDIV: i32 = 1;
+    /// `SI_QUEUE` (include/uapi/asm-generic/siginfo.h), `sigqueue`'s code.
+    const SI_QUEUE: i32 = -1;
+
+    /// Runs a precise timer's steps on a traced child that queues itself a
+    /// SIGTRAP with `code` and `si_addr` at the instruction after the queueing
+    /// call, as `how` says, after queueing itself a blocked SIGFPE first when
+    /// `fpe_first` is set. The steps aim `rcbs` branches past the clock at
+    /// the first step, at instruction offset `instr`. Returns the steps'
+    /// result, the si_addr the SIGTRAP carries, and the guard that kills the
+    /// child; `None` where perf counters are missing.
+    fn steps_with_a_guest_sigtrap(
+        how: QueuedTrap,
+        code: i32,
+        fpe_first: bool,
+        rcbs: u64,
+        instr: u64,
+    ) -> Option<(Result<super::Stopped, super::HandleFailure>, u64, impl Drop)> {
         use nix::unistd::ForkResult;
         use reverie::Pid;
         use reverie::Tid;
         use reverie::syscalls::AddrMut;
         use reverie::syscalls::MemoryAccess;
 
-        use super::HandleFailure;
         use super::Running;
         use super::StepStop;
         use super::StepUnit;
@@ -5331,10 +5448,8 @@ mod tests {
 
         if !crate::perf::is_perf_supported() || super::try_get_pmu_config().is_none() {
             eprintln!("skipping: perf counters are not supported here");
-            return;
+            return None;
         }
-        /// `FPE_INTDIV` (include/uapi/asm-generic/siginfo.h), a positive code.
-        const FPE_INTDIV: i32 = 1;
         struct Reap(i32);
         impl Drop for Reap {
             fn drop(&mut self) {
@@ -5348,8 +5463,7 @@ mod tests {
                 }
             }
         }
-        // The SIGTRAP's siginfo, at the same address in the forked child; the
-        // tracer fills in its `si_addr` at the call's entry stop.
+        // The SIGTRAP's siginfo, at the same address in the forked child.
         // SAFETY: an all-zero siginfo is valid.
         let trap: &'static mut libc::siginfo_t = Box::leak(Box::new(unsafe { std::mem::zeroed() }));
         let trap = std::ptr::from_mut(trap) as usize;
@@ -5360,25 +5474,53 @@ mod tests {
                     libc::_exit(1);
                 }
                 libc::raise(libc::SIGSTOP);
-                let mut set: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut set);
-                libc::sigaddset(&mut set, libc::SIGFPE);
-                libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
                 let (pid, tid) = (libc::getpid(), libc::syscall(libc::SYS_gettid));
-                let mut fpe: libc::siginfo_t = std::mem::zeroed();
-                fpe.si_signo = libc::SIGFPE;
-                fpe.si_code = FPE_INTDIV;
-                libc::syscall(
-                    libc::SYS_rt_tgsigqueueinfo,
-                    pid,
-                    tid,
-                    libc::SIGFPE,
-                    &raw const fpe,
-                );
+                if fpe_first {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGFPE);
+                    libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                    let mut fpe: libc::siginfo_t = std::mem::zeroed();
+                    fpe.si_signo = libc::SIGFPE;
+                    fpe.si_code = FPE_INTDIV;
+                    libc::syscall(
+                        libc::SYS_rt_tgsigqueueinfo,
+                        pid,
+                        tid,
+                        libc::SIGFPE,
+                        &raw const fpe,
+                    );
+                }
                 let info = trap as *mut libc::siginfo_t;
                 (*info).si_signo = libc::SIGTRAP;
-                (*info).si_code = libc::TRAP_TRACE;
-                libc::syscall(libc::SYS_rt_tgsigqueueinfo, pid, tid, libc::SIGTRAP, info);
+                (*info).si_code = code;
+                match how {
+                    // The tracer fills in si_addr at the call's entry stop.
+                    QueuedTrap::Before => {
+                        libc::syscall(libc::SYS_rt_tgsigqueueinfo, pid, tid, libc::SIGTRAP, info);
+                    }
+                    // si_addr is the instruction after the `syscall`; the
+                    // `int3` stops the child just before it.
+                    #[cfg(target_arch = "x86_64")]
+                    QueuedTrap::Stepped => core::arch::asm!(
+                        "lea {next}, [rip + 2f]",
+                        "mov qword ptr [{info} + 16], {next}",
+                        "int3",
+                        "syscall",
+                        "2:",
+                        next = out(reg) _,
+                        info = in(reg) info,
+                        inlateout("rax") libc::SYS_rt_tgsigqueueinfo => _,
+                        in("rdi") pid,
+                        in("rsi") tid,
+                        in("rdx") libc::SIGTRAP,
+                        in("r10") info,
+                        lateout("rcx") _,
+                        lateout("r11") _,
+                    ),
+                    #[cfg(not(target_arch = "x86_64"))]
+                    QueuedTrap::Stepped => libc::_exit(2),
+                }
                 let mut count = 0u64;
                 loop {
                     count = std::hint::black_box(count.wrapping_add(1));
@@ -5399,44 +5541,73 @@ mod tests {
         assert_eq!(event, TraceEvent::Signal(reverie::Signal::SIGSTOP));
         task.setoptions(nix::sys::ptrace::Options::PTRACE_O_TRACESYSGOOD)
             .expect("set options");
-        // Syscall stops alternate between entry and exit, from an entry.
-        let mut entry = true;
-        loop {
-            let (stopped, event) = task
-                .syscall(None)
-                .expect("resume")
-                .wait()
-                .expect("wait")
-                .assume_stopped();
-            task = stopped;
-            assert_eq!(event, TraceEvent::Syscall, "only syscall stops come first");
-            let regs = task.getregs().expect("read the registers");
-            let queues_trap = entry
-                && regs.orig_syscall() == libc::SYS_rt_tgsigqueueinfo as u64
-                && regs.args().2 == libc::SIGTRAP as u64;
-            entry = !entry;
-            if queues_trap {
-                // The report's pc: the instruction after the call's.
-                let si_addr = AddrMut::<u64>::from_raw(trap + 16).expect("an address");
-                task.write_value(si_addr, &regs.ip())
-                    .expect("fill in si_addr");
-                break;
+        let si_addr = AddrMut::<u64>::from_raw(trap + 16).expect("an address");
+        let task = match how {
+            QueuedTrap::Before => {
+                // Syscall stops alternate between entry and exit, from an
+                // entry.
+                let mut entry = true;
+                loop {
+                    let (stopped, event) = task
+                        .syscall(None)
+                        .expect("resume")
+                        .wait()
+                        .expect("wait")
+                        .assume_stopped();
+                    task = stopped;
+                    assert_eq!(event, TraceEvent::Syscall, "only syscall stops come first");
+                    let regs = task.getregs().expect("read the registers");
+                    let queues_trap = entry
+                        && regs.orig_syscall() == libc::SYS_rt_tgsigqueueinfo as u64
+                        && regs.args().2 == libc::SIGTRAP as u64;
+                    entry = !entry;
+                    if queues_trap {
+                        // The report's pc: the instruction after the call's.
+                        task.write_value(si_addr, &regs.ip())
+                            .expect("fill in si_addr");
+                        break;
+                    }
+                }
+                // At the call's exit stop the SIGTRAP is queued, and the
+                // kernel has taken nothing.
+                let (task, event) = task
+                    .syscall(None)
+                    .expect("resume")
+                    .wait()
+                    .expect("wait")
+                    .assume_stopped();
+                assert_eq!(event, TraceEvent::Syscall);
+                task
             }
-        }
-        // At the call's exit stop both signals are queued, and the kernel has
-        // taken neither.
-        let (task, event) = task
-            .syscall(None)
-            .expect("resume")
-            .wait()
-            .expect("wait")
-            .assume_stopped();
-        assert_eq!(event, TraceEvent::Syscall);
-        let queued = |task: &Stopped, signo: i32| {
-            task.peeksiginfo_any(None, |info| info.si_signo == signo)
-                .expect("read the queue")
+            QueuedTrap::Stepped => {
+                let (mut task, mut event) = task
+                    .resume(None)
+                    .expect("resume")
+                    .wait()
+                    .expect("wait")
+                    .assume_stopped();
+                if event == TraceEvent::Signal(reverie::Signal::SIGFPE) {
+                    // The kernel takes the queued SIGFPE ahead of the int3's
+                    // trap (`dequeue_synchronous_signal`); resumed while
+                    // blocked, it is queued again.
+                    (task, event) = task
+                        .resume(Some(reverie::Signal::SIGFPE))
+                        .expect("resume")
+                        .wait()
+                        .expect("wait")
+                        .assume_stopped();
+                }
+                assert_eq!(
+                    event,
+                    TraceEvent::Signal(reverie::Signal::SIGTRAP),
+                    "the int3"
+                );
+                task
+            }
         };
-        assert!(queued(&task, libc::SIGFPE) && queued(&task, libc::SIGTRAP));
+        let queued = sigtrap_queued_for_test(&task);
+        assert_eq!(queued, how == QueuedTrap::Before, "queued before the steps");
+        let trap_addr: u64 = task.read_value(si_addr).expect("read si_addr");
 
         let mut timer = super::Timer::new(pid, Tid::from_raw(raw));
         let inner = timer.inner_mut_noinit().expect("a timer");
@@ -5445,6 +5616,8 @@ mod tests {
             match unit {
                 StepUnit::Requeue(sig) => task.step(Some(sig)),
                 StepUnit::SyscallExit => task.syscall(None),
+                #[cfg(target_arch = "x86_64")]
+                StepUnit::Syscall => task.syscall(None),
                 #[cfg(target_arch = "x86_64")]
                 StepUnit::Block => task.block_step(),
                 _ => task.step(None),
@@ -5455,25 +5628,223 @@ mod tests {
         waits.bind_stopped(&task);
         let result = futures::executor::block_on(inner.attempt_single_step(
             task,
-            super::ClockCounter::new(from, 0, from + 2),
-            0,
+            super::ClockCounter::new(from, 0, from + rcbs),
+            instr,
             &mut step,
             &mut observe,
             &waits,
         ));
-        let Err(HandleFailure::PendingSigtrap(stopped)) = result else {
-            panic!("the guest's SIGTRAP was taken for the step's report: {result:?}");
+        Some((result, trap_addr, reap))
+    }
+
+    /// Whether a SIGTRAP is in `task`'s own queue.
+    fn sigtrap_queued_for_test(task: &super::Stopped) -> bool {
+        task.peeksiginfo_any(None, |info| info.si_signo == libc::SIGTRAP)
+            .expect("read the queue")
+    }
+
+    /// Checks that the steps ended with `HandleFailure::GuestSigtrap` at a
+    /// stop for `signal`, and, where that is SIGFPE, that the guest's SIGTRAP
+    /// is still queued; where it is SIGTRAP, that the stop is the guest's
+    /// (its code and si_addr).
+    fn ended_at_the_guests_sigtrap(
+        result: Result<super::Stopped, super::HandleFailure>,
+        signal: i32,
+        trap_addr: u64,
+    ) {
+        let Err(super::HandleFailure::GuestSigtrap(stopped, site)) = result else {
+            panic!("the guest's SIGTRAP was taken for a step's report: {result:?}");
         };
+        assert_eq!(site, "precise timer");
+        let info = stopped.getsiginfo().expect("read the siginfo");
+        assert_eq!(info.si_signo, signal, "the stop the sequence ended at");
+        if signal == libc::SIGTRAP {
+            assert_eq!(info.si_code, libc::TRAP_TRACE);
+            // SAFETY: si_addr reads the member the guest filled in.
+            assert_eq!(unsafe { info.si_addr() } as u64, trap_addr);
+        } else {
+            assert!(
+                sigtrap_queued_for_test(&stopped),
+                "the guest's SIGTRAP stays queued"
+            );
+        }
+    }
+
+    /// A SIGTRAP the guest queued for itself before a timer step, shaped like
+    /// the step's report (`TRAP_TRACE` at the pc the thread stands at), is not
+    /// taken for the report when the kernel takes a blocked synchronous-class
+    /// signal queued before it first. The step's report cannot be queued
+    /// behind a queued SIGTRAP (`legacy_queue`), so requeueing the signal
+    /// would hand the guest's SIGTRAP to the step as its report and put the
+    /// signal behind it. The sequence ends instead
+    /// (`HandleFailure::GuestSigtrap`), with both signals still queued.
+    #[test]
+    fn a_sigtrap_queued_before_a_step_is_not_taken_for_its_report() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Before, libc::TRAP_TRACE, true, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGFPE, addr);
+    }
+
+    /// As `a_sigtrap_queued_before_a_step_is_not_taken_for_its_report`, with
+    /// nothing queued ahead of the guest's SIGTRAP: the step stops at it, before
+    /// its instruction runs, and it is not taken for the step's report.
+    #[test]
+    fn a_sigtrap_queued_before_a_step_is_not_taken_for_its_report_at_its_stop() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Before, libc::TRAP_TRACE, false, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGTRAP, addr);
+    }
+
+    /// A step over an untraced `rt_tgsigqueueinfo` that queues the thread a
+    /// SIGTRAP shaped like the step's report runs to the syscall's exit stop
+    /// (`StepUnit::Syscall`), where the queue is read, so the SIGTRAP, which
+    /// the next resume delivers, is not taken for a report when the kernel
+    /// takes a blocked SIGFPE queued before it first (the requeue form).
+    /// Single-stepped, the call's SIGTRAP would take the place of the step's
+    /// report, which Linux then drops, and be handed to the step behind the
+    /// requeued SIGFPE.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_sigtrap_a_stepped_call_queues_is_not_taken_for_a_report_behind_a_signal() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Stepped, libc::TRAP_TRACE, true, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGFPE, addr);
+    }
+
+    /// As `a_sigtrap_a_stepped_call_queues_is_not_taken_for_a_report_behind_a_signal`,
+    /// with nothing queued ahead of the call's SIGTRAP: the next step stops at
+    /// it, and it is not taken for that step's report.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_sigtrap_a_stepped_call_queues_is_not_taken_for_a_report_at_its_stop() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Stepped, libc::TRAP_TRACE, false, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGTRAP, addr);
+    }
+
+    /// A SIGTRAP a stepped call queues with a sender's code (`SI_QUEUE`) is
+    /// the guest's too, but the run loop tells it from Reverie's traps
+    /// (`handle_sigtrap`): the steps hand its stop on, unchanged, for the run
+    /// loop to deliver.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_sent_sigtrap_a_stepped_call_queues_is_handed_on() {
+        let Some((result, _, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Stepped, SI_QUEUE, false, 2, 0)
+        else {
+            return;
+        };
+        let Err(super::HandleFailure::Event(super::Wait::Stopped(stopped, event))) = result else {
+            panic!("the guest's SIGTRAP was not handed on: {result:?}");
+        };
+        assert_eq!(event, super::TraceEvent::Signal(reverie::Signal::SIGTRAP));
         assert_eq!(
-            stopped.getsiginfo().expect("read the siginfo").si_signo,
-            libc::SIGFPE,
-            "the sequence ends at the signal the kernel took first"
+            stopped.getsiginfo().expect("read the siginfo").si_code,
+            SI_QUEUE
         );
+    }
+
+    /// The step that reaches an instruction-precise target cannot run a
+    /// syscall to its exit stop (`StepUnit::LastInstruction`), so where that
+    /// step is over a call that can queue the thread a SIGTRAP, the run ends
+    /// before the call runs, rather than let its SIGTRAP be taken for the
+    /// step's report.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_last_step_over_a_call_that_can_queue_a_sigtrap_is_refused() {
+        let Some((result, _, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::Stepped, libc::TRAP_TRACE, false, 0, 1)
+        else {
+            return;
+        };
+        let Err(super::HandleFailure::GuestSigtrap(stopped, site)) = result else {
+            panic!("the last step ran the call: {result:?}");
+        };
+        assert_eq!(site, super::LAST_STEP_QUEUES_SIGTRAP);
+        assert!(!sigtrap_queued_for_test(&stopped), "the call did not run");
+    }
+
+    /// A block step or branch run whose counter reaches its precise target,
+    /// which its decode rules out, is recorded as a skid overshoot; one short
+    /// of the target is not, and no single-instruction unit ever is
+    /// (`block_step_reached_target`). The past-target case is a run from RCB
+    /// 10 toward target 12, decoded to retire at most one branch, that stopped
+    /// at 13.
+    #[test]
+    fn a_block_step_or_branch_run_at_or_past_its_target_is_an_overshoot() {
+        use super::StepUnit;
+        use super::block_step;
+        use super::block_step_reached_target;
+        use super::try_get_pmu_config;
+        #[cfg(target_arch = "x86_64")]
+        let unit = StepUnit::Block;
+        #[cfg(target_arch = "aarch64")]
+        let unit = StepUnit::ToBranch {
+            stops: [0x1010, 0],
+            count: 1,
+            branches: [1, 0],
+        };
+        assert!(block_step(unit), "{unit:?}");
+        for single in [
+            StepUnit::Instruction,
+            StepUnit::LastInstruction,
+            StepUnit::SyscallExit,
+            StepUnit::Requeue(reverie::Signal::SIGFPE),
+        ] {
+            assert!(!block_step(single), "{single:?}");
+            assert!(
+                !block_step_reached_target(single, 13, 12),
+                "{single:?} past its target"
+            );
+        }
         assert!(
-            queued(&stopped, libc::SIGTRAP),
-            "the guest's SIGTRAP stays queued"
+            !block_step_reached_target(unit, 11, 12),
+            "short of the target"
         );
-        drop(reap);
+        // Recording an overshoot emits the marker, which reads the PMU
+        // configuration.
+        if try_get_pmu_config().is_none() {
+            eprintln!("skipping the at- and past-target cases: no PMU configuration");
+            return;
+        }
+        assert!(block_step_reached_target(unit, 12, 12), "at the target");
+        assert!(block_step_reached_target(unit, 13, 12), "past the target");
+    }
+
+    /// The calls that can queue the calling thread a SIGTRAP with a code it
+    /// chooses, from the registers at their `syscall` or `svc`.
+    #[test]
+    fn calls_that_can_queue_the_thread_a_sigtrap() {
+        use super::queues_the_thread_a_sigtrap as queues;
+        let (tgsigqueueinfo, pidfd) = (
+            libc::SYS_rt_tgsigqueueinfo as u64,
+            libc::SYS_pidfd_send_signal as u64,
+        );
+        let sigtrap = libc::SIGTRAP as u64;
+        assert!(queues(tgsigqueueinfo, 7, sigtrap));
+        assert!(!queues(tgsigqueueinfo, 7, libc::SIGFPE as u64));
+        assert!(queues(pidfd, sigtrap, 0));
+        assert!(!queues(pidfd, libc::SIGUSR1 as u64, sigtrap));
+        for nr in [
+            libc::SYS_rt_sigqueueinfo,
+            libc::SYS_tgkill,
+            libc::SYS_tkill,
+            libc::SYS_kill,
+        ] {
+            assert!(!queues(nr as u64, sigtrap, sigtrap), "{nr}");
+        }
     }
 
     /// The controller's marker reads as its own PID in a shared PID

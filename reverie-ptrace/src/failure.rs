@@ -593,6 +593,29 @@ pub struct UnprovenPrivateSyscallCompletion {
     pub nr: i64,
 }
 
+/// A guest thread had a SIGTRAP of its own queued, with a code that Reverie's
+/// own traps also use, when Reverie had to single-step it.
+///
+/// Linux queues at most one SIGTRAP per thread, so the step's own trap was
+/// dropped, and the guest's SIGTRAP took its place at the step's stop, or
+/// would have, for a call that can queue one at the step that reaches a
+/// precise timer's target. Nothing tells the two apart afterwards: taken
+/// for the step's trap, the guest's signal would be lost. Reverie ends the
+/// run rather than continue without it. A SIGTRAP a process sent (a code of
+/// zero or below) is not this: it is delivered.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "thread {tid} has a SIGTRAP of its own queued with a trap's code, which \
+     Reverie's single-step at the {site} cannot tell from its own trap; the \
+     run is ended instead of losing it"
+)]
+pub struct QueuedSigtrapAtStep {
+    /// The thread that was stepped.
+    pub tid: i32,
+    /// The step at which it was found.
+    pub site: &'static str,
+}
+
 /// A guest made a syscall through the untraced `syscall` of Reverie's private
 /// page, outside any injection, and took the SIGILL of the `ud2` after it.
 ///

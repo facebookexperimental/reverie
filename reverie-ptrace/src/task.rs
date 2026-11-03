@@ -1344,6 +1344,18 @@ struct TimerStepShield {
     /// Whether a step met a pending, blocked SIGTRAP, which no step can keep
     /// (`PendingSigtrapAtStep`); the step was not made.
     pending_trap: bool,
+    /// Whether the next step is over an aarch64 `svc` that can queue the
+    /// thread a SIGTRAP with a code the guest chooses
+    /// (`timer::queues_the_thread_a_sigtrap`), read from the registers the
+    /// shield reads anyway. Such a step runs to the syscall's exit stop, as
+    /// `syscall_step`, so that the timer reads the queue before anything is
+    /// delivered (on x86_64 the timer chooses that itself,
+    /// `StepUnit::Syscall`). Not read under a tracer filter, where no shield
+    /// runs.
+    queues_sigtrap: bool,
+    /// The site of a step refused because it would reach the target over
+    /// such an `svc` (`QueuedSigtrapAtStep`); the step was not made.
+    queued_sigtrap_refused: Option<&'static str>,
     /// Whether SIGTRAP is to be blocked again at the step's stop.
     reblock: bool,
     /// Whether the next step is over a guest `rt_sigreturn`, which no
@@ -1376,6 +1388,10 @@ impl TimerStepShield {
         }
         if self.quiet_unless_sigreturn {
             let regs = task.getregs()?;
+            #[cfg(target_arch = "aarch64")]
+            {
+                self.queues_sigtrap = svc_queues_the_thread_a_sigtrap(task, &regs);
+            }
             if sigreturn_frame_mask_address(task, &regs)?.is_none() {
                 self.stepped = true;
                 return Ok(());
@@ -1385,6 +1401,10 @@ impl TimerStepShield {
         #[cfg(test)]
         TIMER_STEP_SHIELD_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
         let regs = task.getregs()?;
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.queues_sigtrap = svc_queues_the_thread_a_sigtrap(task, &regs);
+        }
         // A guest `int3` (or `int 3`, `int1`, behind any prefixes) resets a
         // blocked or ignored SIGTRAP natively, and natively the process then
         // takes SIGTRAP's default action; neither the shield nor a repair may
@@ -1564,6 +1584,22 @@ fn sigreturn_frame_mask_address(
         regs.sp as usize + crate::sigtrap_state::SIGRETURN_UC_SIGMASK_OFFSET,
         regs.pc,
     )))
+}
+
+/// Whether the task's next instruction is an `svc` whose call can queue the
+/// thread a SIGTRAP with a code the guest chooses
+/// (`timer::queues_the_thread_a_sigtrap`, from x8 and the arguments). The
+/// instruction is read only when the registers name such a call.
+#[cfg(target_arch = "aarch64")]
+fn svc_queues_the_thread_a_sigtrap(task: &Stopped, regs: &libc::user_regs_struct) -> bool {
+    if !crate::timer::queues_the_thread_a_sigtrap(regs.regs[8], regs.regs[1], regs.regs[2]) {
+        return false;
+    }
+    Addr::<[u8; 4]>::from_raw(regs.pc as usize).is_some_and(|pc| {
+        // `svc #imm16`: 0xd4000001 | imm16 << 5, little-endian.
+        task.read_value(pc)
+            .is_ok_and(|insn| u32::from_le_bytes(insn) & 0xffe0_001f == 0xd400_0001)
+    })
 }
 
 /// What a private-page step decided about SIGTRAP, at the step itself
@@ -2446,7 +2482,7 @@ thread_local! {
 /// `kill`, `tgkill`, `raise`, `sigqueue`, or a POSIX timer or `F_SETSIG` file
 /// that names SIGTRAP (`is_sender_coded_sigtrap`). A siginfo that cannot be
 /// read is not evidence, and the stop keeps its other handling.
-fn is_sigtrap_sent_by_a_process(task: &Stopped) -> bool {
+pub(crate) fn is_sigtrap_sent_by_a_process(task: &Stopped) -> bool {
     task.getsiginfo()
         .is_ok_and(|info| is_sender_coded_sigtrap(&info))
 }
@@ -6807,7 +6843,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 StepUnit::SyscallExit => true,
                 StepUnit::Requeue(_) => false,
                 _ => {
-                    !filtered && {
+                    let wanted = !filtered && {
                         let mut shield = step_shield.lock().unwrap();
                         shield.prepare(&task)?;
                         let wanted = std::mem::take(&mut shield.syscall_step);
@@ -6816,8 +6852,23 @@ impl<L: Tool + 'static> TracedTask<L> {
                             TIMER_LAST_SIGRETURN_STEPS_FOR_TEST
                                 .with(|count| count.set(count.get() + 1));
                         }
-                        wanted && unit != StepUnit::LastInstruction
-                    }
+                        // An `svc` that can queue the thread a SIGTRAP runs
+                        // to its exit stop too, where the timer reads the
+                        // queue; the step that reaches the target cannot, so
+                        // the run ends there (as `StepUnit::Syscall` on
+                        // x86_64).
+                        let queues = std::mem::take(&mut shield.queues_sigtrap);
+                        if queues && unit == StepUnit::LastInstruction {
+                            shield.queued_sigtrap_refused =
+                                Some(crate::timer::LAST_STEP_QUEUES_SIGTRAP);
+                            return Err(Errno::ECANCELED.into());
+                        }
+                        (wanted || queues) && unit != StepUnit::LastInstruction
+                    };
+                    // The timer chose a syscall step itself.
+                    #[cfg(target_arch = "x86_64")]
+                    let wanted = wanted || unit == StepUnit::Syscall;
+                    wanted
                 }
             };
             #[cfg(test)]
@@ -6856,6 +6907,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                 StepUnit::Instruction | StepUnit::LastInstruction | StepUnit::SyscallExit => {
                     lease.step(None)
                 }
+                #[cfg(target_arch = "x86_64")]
+                StepUnit::Syscall => lease.syscall(None),
                 #[cfg(target_arch = "x86_64")]
                 StepUnit::Block => lease.block_step(),
                 // The hardware breakpoints at the run's stop points are armed.
@@ -6942,12 +6995,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         // An ignored SIGTRAP that a step reset is put back before the Tool's
         // callback. A stop that is passed on or kept for later cannot take an
         // injection here, so the next injection or syscall skip puts it back.
-        let (stepped, native_trap, pending_trap) = {
+        let (stepped, native_trap, pending_trap, queued_sigtrap_refused) = {
             let mut shield = shield.lock().unwrap();
             (
                 std::mem::take(&mut shield.stepped),
                 std::mem::take(&mut shield.native_trap),
                 std::mem::take(&mut shield.pending_trap),
+                shield.queued_sigtrap_refused.take(),
             )
         };
         // A guest instruction's own trap may have reset SIGTRAP natively.
@@ -6956,6 +7010,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
         if pending_trap {
             return Err(self.fail_pending_sigtrap(self.tid(), "precise timer"));
+        }
+        if let Some(site) = queued_sigtrap_refused {
+            return Err(self.fail_queued_sigtrap(self.tid(), site));
         }
         #[cfg(test)]
         if stepped {
@@ -6981,8 +7038,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                 }
                 return Err(e);
             }
-            Err(HandleFailure::PendingSigtrap(_)) => {
-                return Err(self.fail_pending_sigtrap(self.tid(), "precise timer"));
+            Err(HandleFailure::GuestSigtrap(_, site)) => {
+                return Err(self.fail_queued_sigtrap(self.tid(), site));
             }
             Err(HandleFailure::Event(wait)) => self.abort(Ok(wait)).await,
             Err(HandleFailure::SeccompStop(task)) => {
@@ -12093,6 +12150,24 @@ impl<L: Tool + 'static> TracedTask<L> {
             anyhow::Error::new(crate::UnprovenPrivateSyscallCompletion {
                 tid: tid.as_raw(),
                 nr: nr.id() as i64,
+            })
+            .into(),
+        );
+        Errno::ECANCELED.into()
+    }
+
+    /// Records `QueuedSigtrapAtStep` with the session, which ends the run,
+    /// and returns the error that unwinds the handler.
+    fn fail_queued_sigtrap(&self, tid: Pid, site: &'static str) -> TraceError {
+        self.fatal_session().fail_at(
+            BackendFailure {
+                pid: self.pid(),
+                tid: self.tid(),
+                phase: "guest SIGTRAP queued at a Reverie single-step",
+            },
+            anyhow::Error::new(crate::QueuedSigtrapAtStep {
+                tid: tid.as_raw(),
+                site,
             })
             .into(),
         );
