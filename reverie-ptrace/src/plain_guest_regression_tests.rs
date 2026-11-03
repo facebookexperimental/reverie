@@ -629,6 +629,9 @@ struct GuestConfig {
     /// Leaves clone and clone3 unsubscribed, so a thread's creation stops
     /// the run loop at its clone event rather than at a seccomp stop.
     clone_unsubscribed: bool,
+    /// Leaves rt_sigtimedwait unsubscribed, so a step can reach one without
+    /// a seccomp stop.
+    sigwait_unsubscribed: bool,
 }
 
 /// The `rt_sigreturn` reports the regression Tool was given, as (thread,
@@ -990,6 +993,9 @@ impl Tool for GuestTool {
         if config.clone_unsubscribed {
             subscription.disable_syscall(reverie::syscalls::Sysno::clone);
             subscription.disable_syscall(reverie::syscalls::Sysno::clone3);
+        }
+        if config.sigwait_unsubscribed {
+            subscription.disable_syscall(reverie::syscalls::Sysno::rt_sigtimedwait);
         }
         if config.partial {
             subscription.disable_syscall(reverie::syscalls::Sysno::getuid);
@@ -1761,6 +1767,8 @@ struct GuestOptions {
     private_mask_swaps: bool,
     /// `GuestConfig::clone_unsubscribed`.
     clone_unsubscribed: bool,
+    /// `GuestConfig::sigwait_unsubscribed`.
+    sigwait_unsubscribed: bool,
 }
 
 /// Installs a seccomp filter on the calling thread that returns `action` for
@@ -1841,6 +1849,7 @@ async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun
             urg_arms_timer: options.urg_arms_timer,
             private_mask_swaps: options.private_mask_swaps,
             clone_unsubscribed: options.clone_unsubscribed,
+            sigwait_unsubscribed: options.sigwait_unsubscribed,
         })
         .backend_stats(BackendStatsRequest::ENABLED)
         .final_resume_signal_for_test(resume_recorder(resumes.clone()))
@@ -5372,6 +5381,7 @@ async fn a_guest_elf_segment_at_the_repair_page_address_keeps_every_byte() {
                 urg_arms_timer: false,
                 private_mask_swaps: false,
                 clone_unsubscribed: false,
+                sigwait_unsubscribed: false,
             })
             .spawn()
             .await
@@ -5762,6 +5772,36 @@ async fn a_sigtrap_queued_after_the_stash_ends_the_run_by_name() {
             && error.contains("another SIGTRAP queued after the pending one was taken"),
         "{error}"
     );
+}
+
+/// A precise timer takes a guest's pending, blocked SIGTRAP out of the queue
+/// for its steps only where the Tool stops every syscall that reads or
+/// takes a pending signal (`GlobalState::traces_signal_reading_syscalls`).
+/// With `rt_sigtimedwait` unsubscribed, a step could run a guest
+/// `sigwaitinfo({SIGTRAP})` while the SIGTRAP is out of the queue, which
+/// would find nothing and wait, or return `EAGAIN`. So nothing is taken,
+/// and the timer's step ends the run with `PendingSigtrapAtStep`, as before
+/// the SIGTRAP was kept. In the injecting configuration.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tool_that_lets_sigtimedwait_run_unstopped_keeps_no_sigtrap_out_of_the_queue() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    // Consumed only where a SIGTRAP is taken for the timer's steps.
+    crate::task::SIGTRAP_SENT_AFTER_STASH_FOR_TEST.with(|sent| sent.set(true));
+    let options = GuestOptions {
+        sigwait_unsubscribed: true,
+        ..GuestOptions::default()
+    };
+    let result = run_guest_options("sigtrap_guest_pending_kept", options).await;
+    let armed = crate::task::SIGTRAP_SENT_AFTER_STASH_FOR_TEST.with(|sent| sent.replace(false));
+    assert!(armed, "a SIGTRAP was taken out of the queue for the timer's steps");
+    let error = match result {
+        Ok(run) => panic!("the run was not refused: {:?}\n{}", run.status, run.report),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("SIGTRAP blocked with one pending"), "{error}");
 }
 
 /// A SIGTRAP the guest queued itself while blocking it, with a negative

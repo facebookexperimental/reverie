@@ -2762,6 +2762,17 @@ fn swaps_signal_mask(nr: Sysno) -> bool {
     )
 }
 
+/// The syscalls that read or take a pending signal, which a guest SIGTRAP
+/// held out of the queue would be missing from
+/// (`GlobalState::traces_signal_reading_syscalls`). aarch64 has no
+/// `signalfd`, only `signalfd4`.
+fn signal_reading_syscalls() -> Vec<Sysno> {
+    let mut syscalls = vec![Sysno::rt_sigtimedwait, Sysno::rt_sigpending, Sysno::signalfd4];
+    #[cfg(target_arch = "x86_64")]
+    syscalls.push(Sysno::signalfd);
+    syscalls
+}
+
 // The trap's ABI is x86_64's (see `TracerBuilder::injected_syscall_trap`).
 #[cfg_attr(
     not(target_arch = "x86_64"),
@@ -4283,6 +4294,15 @@ struct GlobalState<G: GlobalTool> {
     /// sequence (`drive_timer`).
     traces_signal_state_syscalls: bool,
 
+    /// Whether the Tool also subscribes to every syscall that reads or takes
+    /// a pending signal (`rt_sigtimedwait`, `rt_sigpending`, `signalfd` and
+    /// `signalfd4`), so that while a precise timer holds a guest SIGTRAP out
+    /// of the queue (`stash_pending_sigtrap`) a step reaching one stops at
+    /// its seccomp stop, where the SIGTRAP is queued again before it runs.
+    /// A `read` of an existing signalfd and a procfs status read are not
+    /// covered: they would see the SIGTRAP missing for the steps.
+    traces_signal_reading_syscalls: bool,
+
     /// Whether every change of the guest's mask or of a signal's action is
     /// one Reverie sees, so that it can keep a signal's mask bit across the
     /// resumes of a thread (`SignalRun`) and know which signal-action tables
@@ -4679,6 +4699,7 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
             caches_sigtrap_disposition: self.caches_sigtrap_disposition,
             sees_every_sighand_clone: self.sees_every_sighand_clone,
             traces_signal_state_syscalls: self.traces_signal_state_syscalls,
+            traces_signal_reading_syscalls: self.traces_signal_reading_syscalls,
             keeps_signal_records: self.keeps_signal_records,
             keeps_segv_state: self.keeps_segv_state,
             sequentialized_guest: self.sequentialized_guest.clone(),
@@ -5232,6 +5253,12 @@ impl<L: Tool> TracedTask<L> {
             .chain(Sysno::iter().filter(|&nr| swaps_signal_mask(nr)))
             .all(|nr| traced.contains(&nr))
         };
+        let traces_signal_reading_syscalls = {
+            let traced: HashSet<Sysno> = options.events.iter_syscalls().collect();
+            signal_reading_syscalls()
+                .into_iter()
+                .all(|nr| traced.contains(&nr))
+        };
         let keeps_signal_records = keeps_sigtrap_state
             && traces_signal_state_syscalls
             && reports_sigreturns
@@ -5245,6 +5272,7 @@ impl<L: Tool> TracedTask<L> {
             caches_sigtrap_disposition,
             sees_every_sighand_clone,
             traces_signal_state_syscalls,
+            traces_signal_reading_syscalls,
             keeps_signal_records,
             keeps_segv_state: keeps_signal_records
                 && (options.events.has_rdtsc() || options.events.has_cpuid()),
@@ -12679,9 +12707,11 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// cannot allocate one); a temporary mask's restore is pending, which an
     /// unstepped call would discard; the address space has no repair page
     /// for the calls' arguments; or the Tool does not stop every syscall
-    /// that reads or changes signal state
-    /// (`GlobalState::traces_signal_state_syscalls`), one of which could
-    /// then run before it is queued again.
+    /// that changes signal state (`GlobalState::traces_signal_state_syscalls`)
+    /// or reads or takes a pending signal
+    /// (`GlobalState::traces_signal_reading_syscalls`), one of which could
+    /// then run before it is queued again: a stepped `rt_sigtimedwait` for
+    /// SIGTRAP would find nothing, and wait or return `EAGAIN`.
     async fn stash_pending_sigtrap(
         &mut self,
         mut task: Stopped,
@@ -12689,6 +12719,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         if self.stashed_sigtrap.is_some()
             || !self.keeps_sigtrap_state()
             || !self.global_state.traces_signal_state_syscalls
+            || !self.global_state.traces_signal_reading_syscalls
         {
             return Ok((task, false));
         }
