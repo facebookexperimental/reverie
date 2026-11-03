@@ -2520,10 +2520,13 @@ pub(crate) type FirstExecMutationForTest =
 pub(crate) type FirstExecWaitForTest = Box<dyn FnOnce(&Wait) -> Result<(), TraceError> + Send>;
 
 #[cfg(all(test, target_arch = "x86_64"))]
+type FirstExecDecisionForTest =
+    Box<dyn FnOnce(&mut Stopped, bool) -> Result<FirstExecWaitForTest, TraceError> + Send>;
+
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) struct FirstExecTransitionForTest {
     pub(crate) before_decode: FirstExecMutationForTest,
-    pub(crate) after_decision:
-        Box<dyn FnOnce(&mut Stopped, bool) -> Result<FirstExecWaitForTest, TraceError> + Send>,
+    pub(crate) after_decision: FirstExecDecisionForTest,
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]

@@ -453,7 +453,7 @@ mod tests {
     fn word_reader_needs_each_prefix_word_and_never_a_fourth() {
         for alignment in 0..8 {
             let rip = 0x2000 + alignment;
-            let words = (alignment + 15 + 7) / 8;
+            let words = (alignment + 15).div_ceil(8);
             let expected_reads: Vec<_> = (0..words).map(|i| 0x2000 + 8 * i).collect();
             let mut int3 = vec![0x66; 14];
             int3.push(0xcc);
@@ -505,7 +505,7 @@ mod tests {
                 let (result, reads) = decode_words(rip, bytes, &[0x2018]);
                 assert!(!result);
                 assert_eq!(result, instruction_raises_sigtrap(bytes));
-                assert_eq!(reads.len(), (alignment + 15 + 7) / 8);
+                assert_eq!(reads.len(), (alignment + 15).div_ceil(8));
             }
         }
         let mut requested = Vec::new();
