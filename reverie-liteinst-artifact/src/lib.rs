@@ -46366,6 +46366,7 @@ mod tests {
 
     // These complete miniature ELFs exercise caller-bound selection, not whole
     // artifact admission. Original dev-heap body/data/census controls also run.
+    #[test]
     fn fixed_heap_equal_cohort_controls() {
         fn put(bytes: &mut [u8], offset: usize, width: usize, value: u64) {
             bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
@@ -46687,12 +46688,36 @@ mod tests {
                 "heap equality wrong-method provider {symbol_index} refusal passed: {message}"
             );
         }
+        for (symbol_index, expected) in [
+            (6, "deallocate lacks one exact typed equality cohort"),
+            (7, "heap equality scalar provider absent"),
+        ] {
+            let row = 0x6000 + symbol_index * 24;
+            let name =
+                u32::from_le_bytes(bytes[row..row + 4].try_into().unwrap()) as usize + 0x5000;
+            let length = bytes[name..].iter().position(|byte| *byte == 0).unwrap();
+            let spelling = std::str::from_utf8(&bytes[name..name + length]).unwrap();
+            let crate_start = spelling.find("reverie_inguest").unwrap();
+            let mut wrong_crate = bytes.clone();
+            wrong_crate[name + crate_start] = b'z';
+            let changed = std::str::from_utf8(&wrong_crate[name..name + length]).unwrap();
+            assert_eq!(&changed[..crate_start], &spelling[..crate_start]);
+            assert_eq!(&changed[crate_start..], "zeverie_inguest");
+            assert!(changed.contains("9PartialEq2eqCs1_15"));
+            assert!(changed.contains(if symbol_index == 6 {
+                "6Optionj"
+            } else {
+                "implsj"
+            }));
+            let message = select(&wrong_crate, false).unwrap_err();
+            assert_eq!(message, expected);
+            println!("heap equality wrong-crate provider {symbol_index} refusal passed: {message}");
+        }
     }
 
     // These miniature ELF symbol tables exercise the production role census.
     // They grant no source, machine-code or runtime qualification by themselves.
     fn fixed_dev_helper_emission_controls() {
-        fixed_heap_equal_cohort_controls();
         const OLD: &str =
             "_RNvMs8_NtCsayI02cGi06u_4core4cellINtB5_4CelljE3getCsdiSZO7VNmEz_12thread_local";
         const NEW: &str =
