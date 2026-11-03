@@ -30395,8 +30395,9 @@ fn constructor_instructions(
 
 /// Census every actual instruction in the complete prepare function. Only
 /// direct private helper transfers and independently resolved local RELATIVE
-/// GOT transfers to those same exact roles are admitted. A register-indirect
-/// supplied-body transfer is never a preparation helper, at any position.
+/// GOT transfers to those same exact roles are admitted. CALL RAX additionally
+/// needs its exact nearby defining GOT load and a closed argument/entry window.
+/// A supplied-body register transfer is never a preparation helper.
 fn preparation_transfers(
     instructions: &[EncodedConstructorInstruction],
     got: &BTreeMap<u64, u64>,
@@ -30593,9 +30594,27 @@ fn preparation_transfers_with_static_tail(
     static_tail: bool,
 ) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
     let (first, boundaries) = preparation_instruction_boundaries(instructions)?;
+    // The static-image diagnostic has no independently authenticated dynamic
+    // RELATIVE slots. It retains the original single-instruction policy.
+    let register_context = !static_tail
+        && instructions
+            .iter()
+            .any(|instruction| instruction.bytes == [0xff, 0xd0]);
+    let entries = if register_context {
+        preparation_register_entry_targets(instructions, helpers)?
+    } else {
+        BTreeSet::new()
+    };
     let mut transfers = Vec::new();
     let mut edges = Vec::new();
-    for instruction in instructions {
+    for (index, instruction) in instructions.iter().enumerate() {
+        if register_context && instruction.bytes == [0xff, 0xd0] {
+            let (transfer, edge) =
+                preparation_register_got_call(instructions, index, first, &entries, got, helpers)?;
+            transfers.push(transfer);
+            edges.push(edge);
+            continue;
+        }
         let (next, got_edges) = preparation_instruction_transfer(
             instruction,
             first,
@@ -30608,6 +30627,161 @@ fn preparation_transfers_with_static_tail(
         edges.extend(got_edges);
     }
     Ok((transfers, edges))
+}
+
+// Newly eligible register-call functions have a finite ordinary-instruction
+// vocabulary as well as the unchanged per-instruction transfer checks. Merely
+// copying the old branch list would miss XBEGIN's abort edge (C7/F8, including
+// 66 rel16), or other unmodeled system/far transfers. Unknown families refuse.
+fn preparation_register_entry_targets(
+    instructions: &[EncodedConstructorInstruction],
+    helpers: &BTreeSet<u64>,
+) -> Result<BTreeSet<u64>> {
+    let mut entries = helpers.clone();
+    for instruction in instructions {
+        let bytes = &instruction.bytes;
+        let prefix = usize::from(bytes.first() == Some(&0x48));
+        let opcode = *bytes
+            .get(prefix)
+            .ok_or("truncated contextual prepare instruction")?;
+        let relative = match opcode {
+            0xe8 | 0xe9 => Some((1, 4)),
+            0xeb | 0x70..=0x7f | 0xe0..=0xe3 => Some((1, 1)),
+            0x0f if bytes
+                .get(prefix + 1)
+                .is_some_and(|second| (0x80..=0x8f).contains(second)) =>
+            {
+                Some((2, 4))
+            }
+            _ => None,
+        };
+        if let Some((offset, width)) = relative {
+            require(
+                prefix == 0 && bytes.len() == offset + width,
+                "prefixed/truncated contextual prepare branch",
+            )?;
+            let displacement = if width == 1 {
+                i64::from(bytes[offset] as i8)
+            } else {
+                i64::from(i32::from_le_bytes(
+                    bytes[offset..offset + 4].try_into().unwrap(),
+                ))
+            };
+            let target = instruction
+                .address
+                .checked_add(bytes.len() as u64)
+                .and_then(|next| next.checked_add_signed(displacement))
+                .ok_or("contextual prepare branch target overflows")?;
+            entries.insert(target);
+            continue;
+        }
+        let ordinary = match opcode {
+            // Architectural data operations only: no control-transfer group.
+            0x24
+            | 0x31
+            | 0x34
+            | 0x80
+            | 0x81
+            | 0x83
+            | 0x88..=0x8b
+            | 0x8d
+            | 0xa8
+            | 0xa9
+            | 0xb9
+            | 0xba
+            | 0xbe
+            | 0xbf => true,
+            0xc6 | 0xc7 => bytes
+                .get(prefix + 1)
+                .is_some_and(|modrm| ((modrm >> 3) & 7) == 0),
+            0x0f => bytes
+                .get(prefix + 1)
+                .is_some_and(|second| matches!(*second, 0x10 | 0x28 | 0x29 | 0x44 | 0x94)),
+            0xc3 => prefix == 0 && bytes.len() == 1,
+            0xff => {
+                prefix == 0
+                    && (bytes == &[0xff, 0xd0]
+                        || (bytes.len() == 6 && bytes.starts_with(&[0xff, 0x15])))
+            }
+            _ => false,
+        };
+        require(
+            ordinary,
+            "unmodeled instruction/flow in contextual prepare function",
+        )?;
+    }
+    Ok(entries)
+}
+
+// Prove one local RAX definition from a unique authenticated GOT load, with
+// at most two exact argument moves and no alternate entry after the definition.
+// This does not admit supplied-body dispatch or arbitrary register calls.
+fn preparation_register_got_call(
+    instructions: &[EncodedConstructorInstruction],
+    call_index: usize,
+    first: u64,
+    entries: &BTreeSet<u64>,
+    got: &BTreeMap<u64, u64>,
+    helpers: &BTreeSet<u64>,
+) -> Result<(ConstructorTransfer, GotEdge)> {
+    let call = &instructions[call_index];
+    require(
+        call.bytes == [0xff, 0xd0],
+        "not the exact contextual CALL RAX",
+    )?;
+    let mut load_index = call_index;
+    let load = loop {
+        load_index = load_index
+            .checked_sub(1)
+            .ok_or("contextual CALL RAX has no defining GOT load")?;
+        let instruction = &instructions[load_index];
+        let bytes = &instruction.bytes;
+        if bytes.len() == 7 && bytes.starts_with(&[0x48, 0x8b, 0x05]) {
+            break instruction;
+        }
+        let argument = (bytes.len() == 5 && matches!(bytes[0], 0xbf | 0xba))
+            || (bytes.len() == 8 && bytes.starts_with(&[0x48, 0x8d, 0xbc, 0x24]));
+        require(
+            call_index - load_index <= 2 && argument,
+            "contextual CALL RAX has an unproved/clobbered argument window",
+        )?;
+    };
+    require(
+        entries
+            .range((
+                std::ops::Bound::Excluded(load.address),
+                std::ops::Bound::Included(call.address),
+            ))
+            .next()
+            .is_none(),
+        "contextual CALL RAX has an entry after its defining load",
+    )?;
+    let displacement = i64::from(i32::from_le_bytes(load.bytes[3..7].try_into().unwrap()));
+    let slot = load
+        .address
+        .checked_add(7)
+        .and_then(|next| next.checked_add_signed(displacement))
+        .ok_or("contextual prepare GOT load address overflows")?;
+    let target = *got
+        .get(&slot)
+        .ok_or("contextual prepare GOT load is unresolved/preemptible")?;
+    require(
+        helpers.contains(&target),
+        "contextual prepare GOT target lacks an exact private helper role",
+    )?;
+    Ok((
+        ConstructorTransfer {
+            instruction: call.address,
+            target,
+            local_got_slot: Some(slot),
+        },
+        GotEdge {
+            source_function: first,
+            instruction: call.address,
+            slot,
+            target_function: target,
+        },
+    ))
 }
 
 fn qualify_prefix_data(
@@ -32482,6 +32656,228 @@ pub fn verify_runtime_receipt(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preparation_register_got_context_requires_definition_and_no_alternate_entry() {
+        fn encode(parts: &[Vec<u8>]) -> Vec<EncodedConstructorInstruction> {
+            let mut address = 0x1000;
+            parts
+                .iter()
+                .map(|bytes| {
+                    let instruction = EncodedConstructorInstruction {
+                        address,
+                        bytes: bytes.clone(),
+                    };
+                    address += bytes.len() as u64;
+                    instruction
+                })
+                .collect()
+        }
+        fn load(address: u64, slot: u64) -> Vec<u8> {
+            let mut bytes = vec![0x48, 0x8b, 0x05];
+            bytes.extend(
+                i32::try_from(slot as i64 - address as i64 - 7)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+            bytes
+        }
+        fn parts(arguments: &[Vec<u8>]) -> Vec<Vec<u8>> {
+            let mut result = vec![load(0x1000, 0x4000)];
+            result.extend_from_slice(arguments);
+            result.extend([vec![0xff, 0xd0], vec![0xc3]]);
+            result
+        }
+        let helpers = BTreeSet::from([0x7000]);
+        let got = BTreeMap::from([(0x4000, 0x7000)]);
+        let edi = fixed_hex("bf01000000");
+        let edx = fixed_hex("ba0b000000");
+        let rdi = fixed_hex("488dbc2498000000");
+        for arguments in [
+            vec![],
+            vec![edi.clone()],
+            vec![fixed_hex("bf02000000")],
+            vec![fixed_hex("488dbc2418010000")],
+            vec![rdi.clone()],
+            vec![rdi.clone(), edx.clone()],
+        ] {
+            let instructions = encode(&parts(&arguments));
+            let call = instructions[instructions.len() - 2].address;
+            let (transfers, edges) = preparation_transfers(&instructions, &got, &helpers).unwrap();
+            assert_eq!(
+                transfers,
+                [ConstructorTransfer {
+                    instruction: call,
+                    target: 0x7000,
+                    local_got_slot: Some(0x4000),
+                }]
+            );
+            assert_eq!(
+                edges,
+                [GotEdge {
+                    source_function: 0x1000,
+                    instruction: call,
+                    slot: 0x4000,
+                    target_function: 0x7000,
+                }]
+            );
+            assert!(
+                preparation_transfers_with_static_tail(&instructions, &got, &helpers, true)
+                    .is_err()
+            );
+            assert!(preparation_transfers(&instructions, &BTreeMap::new(), &helpers).is_err());
+            assert!(preparation_transfers(&instructions, &got, &BTreeSet::new()).is_err());
+            assert!(preparation_transfers(
+                &instructions,
+                &BTreeMap::from([(0x4000, 0x7001)]),
+                &helpers,
+            )
+            .is_err());
+            for entry in (instructions[0].address + 1)..=call {
+                let mut with_entry = helpers.clone();
+                with_entry.insert(entry);
+                assert!(
+                    preparation_transfers(&instructions, &got, &with_entry).is_err(),
+                    "entry {entry:#x}"
+                );
+            }
+        }
+        // Negative signed displacement still uses the defining LOAD's next PC,
+        // not the later CALL (including a nonempty argument window).
+        let mut negative = parts(&[rdi.clone(), edx.clone()]);
+        negative[0] = load(0x1000, 0x800);
+        assert_eq!(
+            preparation_transfers(
+                &encode(&negative),
+                &BTreeMap::from([(0x800, 0x7000)]),
+                &helpers
+            )
+            .unwrap()
+            .1[0]
+                .slot,
+            0x800,
+        );
+        for clobber in [
+            fixed_hex("4831c0"),
+            fixed_hex("31c0"),
+            fixed_hex("6631c0"),
+            fixed_hex("b000"),
+            fixed_hex("b400"),
+            fixed_hex("4889c8"),
+            fixed_hex("e800000000"),
+            fixed_hex("eb00"),
+            fixed_hex("0f1f00"),
+        ] {
+            assert!(preparation_transfers(&encode(&parts(&[clobber])), &got, &helpers).is_err());
+        }
+        assert!(
+            preparation_transfers(
+                &encode(&parts(&[edi.clone(), edx.clone(), edi.clone()])),
+                &got,
+                &helpers,
+            )
+            .is_err()
+        );
+        for bad_call in [
+            fixed_hex("ffd1"),
+            fixed_hex("48ffd0"),
+            fixed_hex("66ffd0"),
+            fixed_hex("ff10"),
+            fixed_hex("ff1424"),
+            fixed_hex("ffe0"),
+            fixed_hex("ffd090"),
+        ] {
+            let mut changed = parts(&[]);
+            changed[1] = bad_call;
+            assert!(preparation_transfers(&encode(&changed), &got, &helpers).is_err());
+        }
+        for bad_load in [
+            fixed_hex("488b0d00000000"),
+            fixed_hex("488b05000000"),
+            fixed_hex("488b050000000090"),
+            fixed_hex("8b0500000000"),
+        ] {
+            let mut changed = parts(&[]);
+            changed[0] = bad_load;
+            assert!(preparation_transfers(&encode(&changed), &got, &helpers).is_err());
+        }
+        // Complete-function entry accounting includes backwards Jcc/LOOP/JMP
+        // edges and even an independently named direct helper entry at CALL.
+        let base = parts(&[rdi, edx]);
+        let instructions = encode(&base);
+        for target in instructions
+            .iter()
+            .skip(1)
+            .take(3)
+            .map(|instruction| instruction.address)
+        {
+            for opcode in [0x75, 0xe3, 0xeb] {
+                let mut changed = base.clone();
+                let branch_address = encode(&changed).last().unwrap().address + 1;
+                let displacement = i8::try_from(target as i64 - branch_address as i64 - 2).unwrap();
+                changed.push(vec![opcode, displacement as u8]);
+                assert!(preparation_transfers(&encode(&changed), &got, &helpers).is_err());
+            }
+            let mut changed = base.clone();
+            let branch_address = encode(&changed).last().unwrap().address + 1;
+            let displacement = i32::try_from(target as i64 - branch_address as i64 - 5).unwrap();
+            let mut branch = vec![0xe8];
+            branch.extend(displacement.to_le_bytes());
+            changed.push(branch);
+            let mut named = helpers.clone();
+            named.insert(target);
+            assert!(preparation_transfers(&encode(&changed), &got, &named).is_err());
+        }
+        // Jumping to the definition itself preserves the proof.
+        let positive = encode(&[
+            vec![0xeb, 0],
+            load(0x1002, 0x4000),
+            vec![0xff, 0xd0],
+            vec![0xc3],
+        ]);
+        preparation_transfers(&positive, &got, &helpers).unwrap();
+        for target_offset in [7, 8] {
+            let bypass = encode(&[
+                vec![0xeb, target_offset],
+                load(0x1002, 0x4000),
+                vec![0xff, 0xd0],
+                vec![0xc3],
+            ]);
+            assert!(preparation_transfers(&bypass, &got, &helpers).is_err());
+        }
+        // An unmodeled flow anywhere in the eligible function refuses, even
+        // when an old direct-branch-only collector would miss its abort edge.
+        for unmodeled in [
+            fixed_hex("c7f800000000"),
+            fixed_hex("66c7f80000"),
+            fixed_hex("c6f800"),
+            fixed_hex("667500"),
+            fixed_hex("660f8400000000"),
+            fixed_hex("67e300"),
+            fixed_hex("0f01d5"),
+            fixed_hex("0f01ec"),
+            fixed_hex("9a"),
+            fixed_hex("ea"),
+        ] {
+            let mut changed = parts(&[]);
+            changed.push(unmodeled);
+            assert!(preparation_transfers(&encode(&changed), &got, &helpers).is_err());
+        }
+        let mut discontinuous = encode(&parts(&[]));
+        discontinuous[1].address += 1;
+        assert!(preparation_transfers(&discontinuous, &got, &helpers).is_err());
+        let overflow = [
+            EncodedConstructorInstruction {
+                address: u64::MAX - 5,
+                bytes: load(0x1000, 0x4000),
+            },
+            EncodedConstructorInstruction {
+                address: u64::MAX,
+                bytes: vec![0xff, 0xd0],
+            },
+        ];
+        assert!(preparation_transfers(&overflow, &got, &helpers).is_err());
+    }
+
     use super::*;
 
     /// A child stream scripted read by read. `on_read` runs before the
