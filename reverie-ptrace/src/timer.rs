@@ -4800,8 +4800,10 @@ mod tests {
     }
 
     /// A step that fails after a branch run armed its breakpoints, before
-    /// any resuming request took effect, leaves the thread's breakpoint
-    /// registers as the approach found them (`crate::branch_step::Borrowed`).
+    /// any resuming request took effect, gives them back
+    /// (`crate::branch_step::Borrowed`): the thread's registers are enabled
+    /// exactly as the approach found them, and those enabled then are
+    /// unchanged.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn a_failed_step_after_arming_gives_the_breakpoints_back() {
@@ -4840,16 +4842,39 @@ mod tests {
                 super::Errno::EIO
             )))
         );
+        // Which registers are enabled. A register that has held a ptrace
+        // breakpoint keeps its other control bits once disabled: a write
+        // that disables it only marks the registered breakpoint disabled
+        // (`ptrace_hbp_fill_attr_ctrl`, arch/arm64/kernel/ptrace.c:326-334 at
+        // v6.16), and a read encodes the control bits the breakpoint kept
+        // (`ptrace_hbp_get_ctrl`, :384-396), so a given-back register reads
+        // as disabled, not as zero.
+        let enabled = |regs: &safeptrace::HwBreakpoints| -> Vec<bool> {
+            regs.regs[..regs.slots()]
+                .iter()
+                .map(|reg| reg.enabled())
+                .collect()
+        };
         let armed = armed.expect("the first step was a branch run");
-        assert_ne!(armed, found, "the branch run armed a breakpoint");
+        assert_ne!(
+            enabled(&armed),
+            enabled(&found),
+            "the branch run armed a breakpoint"
+        );
+        let now = generation
+            .assume_stopped()
+            .hw_breakpoints()
+            .expect("read the breakpoints");
         assert_eq!(
-            generation
-                .assume_stopped()
-                .hw_breakpoints()
-                .expect("read the breakpoints"),
-            found,
+            enabled(&now),
+            enabled(&found),
             "the failed step left a breakpoint armed"
         );
+        for slot in 0..found.slots() {
+            if found.regs[slot].enabled() {
+                assert_eq!(now.regs[slot], found.regs[slot], "slot {slot}");
+            }
+        }
     }
 
     #[test]
