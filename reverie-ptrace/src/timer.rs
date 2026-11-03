@@ -5218,10 +5218,15 @@ pub(crate) const LAST_STEP_QUEUES_SIGTRAP: &str =
 /// thread group (`rt_sigqueueinfo`, `kill`), whose queue a step's report does
 /// not share. A queueing call whose target is another thread, or whose code
 /// turns out to be a sender's, is caught too; that costs it two stops.
+///
+/// Linux declares both calls' signal argument `int` (`pidfd_send_signal`,
+/// kernel/signal.c:4065, and `rt_tgsigqueueinfo`, kernel/signal.c:4247, at
+/// v6.16), so only the low 32 bits of its register name the signal: a
+/// register holding `0x1_0000_0005` sends SIGTRAP.
 pub(crate) fn queues_the_thread_a_sigtrap(nr: u64, arg1: u64, arg2: u64) -> bool {
-    let sigtrap = libc::SIGTRAP as u64;
-    (nr == libc::SYS_rt_tgsigqueueinfo as u64 && arg2 == sigtrap)
-        || (nr == libc::SYS_pidfd_send_signal as u64 && arg1 == sigtrap)
+    let names_sigtrap = |arg: u64| arg as u32 as i32 == libc::SIGTRAP;
+    (nr == libc::SYS_rt_tgsigqueueinfo as u64 && names_sigtrap(arg2))
+        || (nr == libc::SYS_pidfd_send_signal as u64 && names_sigtrap(arg1))
 }
 
 /// Whether `event` is a syscall stop (`PTRACE_SYSCALL`). Reverie's launch
@@ -5410,6 +5415,9 @@ mod tests {
         /// runs (x86_64 only: the steps start at a stop just before the
         /// `syscall`).
         Stepped,
+        /// As `Stepped`, with bits above 31 set in the signal register,
+        /// which Linux ignores (`queues_the_thread_a_sigtrap`).
+        SteppedPadded,
     }
 
     /// `FPE_INTDIV` (include/uapi/asm-generic/siginfo.h), a positive code.
@@ -5502,7 +5510,7 @@ mod tests {
                     // si_addr is the instruction after the `syscall`; the
                     // `int3` stops the child just before it.
                     #[cfg(target_arch = "x86_64")]
-                    QueuedTrap::Stepped => core::arch::asm!(
+                    QueuedTrap::Stepped | QueuedTrap::SteppedPadded => core::arch::asm!(
                         "lea {next}, [rip + 2f]",
                         "mov qword ptr [{info} + 16], {next}",
                         "int3",
@@ -5513,13 +5521,17 @@ mod tests {
                         inlateout("rax") libc::SYS_rt_tgsigqueueinfo => _,
                         in("rdi") pid,
                         in("rsi") tid,
-                        in("rdx") libc::SIGTRAP,
+                        in("rdx") if how == QueuedTrap::SteppedPadded {
+                            1u64 << 32 | libc::SIGTRAP as u64
+                        } else {
+                            libc::SIGTRAP as u64
+                        },
                         in("r10") info,
                         lateout("rcx") _,
                         lateout("r11") _,
                     ),
                     #[cfg(not(target_arch = "x86_64"))]
-                    QueuedTrap::Stepped => libc::_exit(2),
+                    QueuedTrap::Stepped | QueuedTrap::SteppedPadded => libc::_exit(2),
                 }
                 let mut count = 0u64;
                 loop {
@@ -5579,7 +5591,7 @@ mod tests {
                 assert_eq!(event, TraceEvent::Syscall);
                 task
             }
-            QueuedTrap::Stepped => {
+            QueuedTrap::Stepped | QueuedTrap::SteppedPadded => {
                 let (mut task, mut event) = task
                     .resume(None)
                     .expect("resume")
@@ -5721,6 +5733,21 @@ mod tests {
     }
 
     /// As `a_sigtrap_a_stepped_call_queues_is_not_taken_for_a_report_behind_a_signal`,
+    /// with bits above 31 set in the call's signal register. Linux reads the
+    /// signal as an `int`, so the call queues SIGTRAP all the same, and the
+    /// step over it must run to the syscall's exit stop as well.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_sigtrap_a_stepped_call_queues_with_a_padded_signal_is_not_taken_for_a_report() {
+        let Some((result, addr, _reap)) =
+            steps_with_a_guest_sigtrap(QueuedTrap::SteppedPadded, libc::TRAP_TRACE, true, 2, 0)
+        else {
+            return;
+        };
+        ended_at_the_guests_sigtrap(result, libc::SIGFPE, addr);
+    }
+
+    /// As `a_sigtrap_a_stepped_call_queues_is_not_taken_for_a_report_behind_a_signal`,
     /// with nothing queued ahead of the call's SIGTRAP: the next step stops at
     /// it, and it is not taken for that step's report.
     #[cfg(target_arch = "x86_64")]
@@ -5837,6 +5864,12 @@ mod tests {
         assert!(!queues(tgsigqueueinfo, 7, libc::SIGFPE as u64));
         assert!(queues(pidfd, sigtrap, 0));
         assert!(!queues(pidfd, libc::SIGUSR1 as u64, sigtrap));
+        // The kernel reads the signal as an `int`: bits above 31 are ignored.
+        let padded = 1 << 32 | sigtrap;
+        assert!(queues(tgsigqueueinfo, 7, padded));
+        assert!(queues(pidfd, padded, 0));
+        assert!(!queues(tgsigqueueinfo, 7, 1 << 32 | libc::SIGFPE as u64));
+        assert!(!queues(pidfd, 1 << 32 | libc::SIGUSR1 as u64, 0));
         for nr in [
             libc::SYS_rt_sigqueueinfo,
             libc::SYS_tgkill,
