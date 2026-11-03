@@ -36,6 +36,9 @@ use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 
+#[path = "preparation_identity.rs"]
+mod preparation_identity;
+
 pub type Result<T> = std::result::Result<T, String>;
 pub const SCHEMA: u32 = 2;
 /// Explicit constructor contract for the genuine standalone preload. Generic
@@ -739,7 +742,12 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 }
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 82] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
+    (
+        "reverie-liteinst-artifact/src/preparation_identity.rs",
+        32635,
+        "6c5fee4ab00fd16e483baed4fecd7d389c592c3c17173f7b9b679bd6518bb956",
+    ),
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
@@ -1223,6 +1231,12 @@ fn content_reverie_inventory_for_image(
             require(
                 entry.sha256 == qualifier_source_sha256(),
                 "declared qualifier source differs from compiled host qualifier",
+            )?;
+        } else if entry.relative == "reverie-liteinst-artifact/src/preparation_identity.rs" {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256 == sha256(include_bytes!("preparation_identity.rs")),
+                "declared preparation identity source differs from compiled host module",
             )?;
         } else if entry.relative == "reverie-liteinst-artifact/src/private_static/tls_sources.rs" {
             content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
@@ -30593,6 +30607,16 @@ fn preparation_transfers_with_static_tail(
     helpers: &BTreeSet<u64>,
     static_tail: bool,
 ) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
+    preparation_transfers_with_identity_proofs(instructions, got, helpers, static_tail, None)
+}
+
+fn preparation_transfers_with_identity_proofs(
+    instructions: &[EncodedConstructorInstruction],
+    got: &BTreeMap<u64, u64>,
+    helpers: &BTreeSet<u64>,
+    static_tail: bool,
+    identities: Option<&preparation_identity::ProvenIdentities>,
+) -> Result<(Vec<ConstructorTransfer>, Vec<GotEdge>)> {
     let (first, boundaries) = preparation_instruction_boundaries(instructions)?;
     // The static-image diagnostic has no independently authenticated dynamic
     // RELATIVE slots. It retains the original single-instruction policy.
@@ -30601,7 +30625,11 @@ fn preparation_transfers_with_static_tail(
             .iter()
             .any(|instruction| instruction.bytes == [0xff, 0xd0]);
     let entries = if register_context {
-        preparation_register_entry_targets(instructions, helpers)?
+        let mut entry_points = helpers.clone();
+        if let Some(proofs) = identities {
+            entry_points.extend(proofs.entries());
+        }
+        preparation_register_entry_targets(instructions, &entry_points)?
     } else {
         BTreeSet::new()
     };
@@ -30609,8 +30637,17 @@ fn preparation_transfers_with_static_tail(
     let mut edges = Vec::new();
     for (index, instruction) in instructions.iter().enumerate() {
         if register_context && instruction.bytes == [0xff, 0xd0] {
-            let (transfer, edge) =
-                preparation_register_got_call(instructions, index, first, &entries, got, helpers)?;
+            let (transfer, edge) = if let Some(proofs) = identities {
+                let (transfer, edge) =
+                    preparation_register_got_target(instructions, index, first, &entries, got)?;
+                require(
+                    helpers.contains(&transfer.target) || proofs.proves(&edge),
+                    "contextual prepare GOT target lacks a canonical role or proved identity",
+                )?;
+                (transfer, edge)
+            } else {
+                preparation_register_got_call(instructions, index, first, &entries, got, helpers)?
+            };
             transfers.push(transfer);
             edges.push(edge);
             continue;
@@ -30724,6 +30761,24 @@ fn preparation_register_got_call(
     got: &BTreeMap<u64, u64>,
     helpers: &BTreeSet<u64>,
 ) -> Result<(ConstructorTransfer, GotEdge)> {
+    let (transfer, edge) =
+        preparation_register_got_target(instructions, call_index, first, entries, got)?;
+    require(
+        helpers.contains(&transfer.target),
+        "contextual prepare GOT target lacks an exact private helper role",
+    )?;
+    Ok((transfer, edge))
+}
+
+// Candidate discovery establishes the exact machine relation without granting
+// helper authority. Only the role/proof callers above may admit that relation.
+fn preparation_register_got_target(
+    instructions: &[EncodedConstructorInstruction],
+    call_index: usize,
+    first: u64,
+    entries: &BTreeSet<u64>,
+    got: &BTreeMap<u64, u64>,
+) -> Result<(ConstructorTransfer, GotEdge)> {
     let call = &instructions[call_index];
     require(
         call.bytes == [0xff, 0xd0],
@@ -30765,10 +30820,6 @@ fn preparation_register_got_call(
     let target = *got
         .get(&slot)
         .ok_or("contextual prepare GOT load is unresolved/preemptible")?;
-    require(
-        helpers.contains(&target),
-        "contextual prepare GOT target lacks an exact private helper role",
-    )?;
     Ok((
         ConstructorTransfer {
             instruction: call.address,
@@ -30830,6 +30881,7 @@ fn qualify_standalone_constructor(
     code: &BTreeMap<u64, Vec<u8>>,
     disassembly: &str,
     got: &BTreeMap<u64, u64>,
+    sources: Option<&VerifiedCompiledSources>,
 ) -> Result<StandaloneConstructorEvidence> {
     let symbols = standalone_symbols(elf)?;
     let symbol = |name| symbol_evidence(name, &symbols[name]);
@@ -30903,12 +30955,18 @@ fn qualify_standalone_constructor(
     )?;
     let prepare_instructions =
         constructor_instructions(disassembly, address(CONSTRUCTOR_ADOPTION))?;
-    let (prepare_helper_transfers, prepare_helper_edges) = preparation_transfers(
-        &prepare_instructions,
-        got,
-        &preparation_helpers.values().map(|s| s.st_value).collect(),
-    )?;
-    let preparation_helpers = preparation_helpers
+    let (prepare_helper_transfers, prepare_helper_edges, identity_proofs) =
+        preparation_identity::qualify_transfers(
+            elf,
+            bytes,
+            disassembly,
+            &prepare_instructions,
+            got,
+            &preparation_helpers.values().map(|s| s.st_value).collect(),
+            sources,
+            &route,
+        )?;
+    let mut preparation_helpers = preparation_helpers
         .iter()
         .map(|(name, s)| {
             (
@@ -30917,10 +30975,11 @@ fn qualify_standalone_constructor(
             )
         })
         .collect();
-    let function_sha256 = symbols
+    let mut function_sha256 = symbols
         .iter()
         .map(|(name, s)| (name.clone(), sha256(&code[&s.st_value])))
         .collect();
+    identity_proofs.append_records(&mut preparation_helpers, &mut function_sha256)?;
     Ok(StandaloneConstructorEvidence {
         generic_initializer: symbol(GENERIC_INITIALIZER), body: symbol(STANDALONE_BODY),
         selected_initializer: symbol(STANDALONE_INITIALIZER), resolver: symbol(STANDALONE_RESOLVER),
@@ -30950,6 +31009,7 @@ fn qualify_detcore_constructor_route(
     code: &BTreeMap<u64, Vec<u8>>,
     disassembly: &str,
     got: &BTreeMap<u64, u64>,
+    sources: Option<&VerifiedCompiledSources>,
 ) -> Result<DetcoreConstructorEvidence> {
     let symbols = detcore_symbols(elf)?;
     let symbol = |name| symbol_evidence(name, &symbols[name]);
@@ -31016,12 +31076,18 @@ fn qualify_detcore_constructor_route(
     )?;
     let prepare_instructions =
         constructor_instructions(disassembly, address(CONSTRUCTOR_ADOPTION))?;
-    let (prepare_helper_transfers, prepare_helper_edges) = preparation_transfers(
-        &prepare_instructions,
-        got,
-        &preparation_helpers.values().map(|s| s.st_value).collect(),
-    )?;
-    let preparation_helpers = preparation_helpers
+    let (prepare_helper_transfers, prepare_helper_edges, identity_proofs) =
+        preparation_identity::qualify_transfers(
+            elf,
+            bytes,
+            disassembly,
+            &prepare_instructions,
+            got,
+            &preparation_helpers.values().map(|s| s.st_value).collect(),
+            sources,
+            &route,
+        )?;
+    let mut preparation_helpers = preparation_helpers
         .iter()
         .map(|(name, s)| {
             (
@@ -31030,10 +31096,11 @@ fn qualify_detcore_constructor_route(
             )
         })
         .collect();
-    let function_sha256 = symbols
+    let mut function_sha256 = symbols
         .iter()
         .map(|(name, s)| (name.clone(), sha256(&code[&s.st_value])))
         .collect();
+    identity_proofs.append_records(&mut preparation_helpers, &mut function_sha256)?;
     Ok(DetcoreConstructorEvidence {
         protected_initializer: symbol(DETCORE_ROOT),
         body: symbol(DETCORE_BODY),
@@ -31080,6 +31147,7 @@ fn qualify_generic_bootstrap(
     code: &BTreeMap<u64, Vec<u8>>,
     disassembly: &str,
     got: &BTreeMap<u64, u64>,
+    sources: Option<&VerifiedCompiledSources>,
 ) -> Result<GenericBootstrapEvidence> {
     let symbols = generic_symbols(elf)?;
     let symbol = |name| symbol_evidence(name, &symbols[name]);
@@ -31178,12 +31246,18 @@ fn qualify_generic_bootstrap(
         address(GENERIC_ADOPTION),
     )?;
     let prepare_instructions = constructor_instructions(disassembly, address(GENERIC_ADOPTION))?;
-    let (prepare_helper_transfers, prepare_helper_edges) = preparation_transfers(
-        &prepare_instructions,
-        got,
-        &preparation_helpers.values().map(|s| s.st_value).collect(),
-    )?;
-    let preparation_helpers = preparation_helpers
+    let (prepare_helper_transfers, prepare_helper_edges, identity_proofs) =
+        preparation_identity::qualify_transfers(
+            elf,
+            bytes,
+            disassembly,
+            &prepare_instructions,
+            got,
+            &preparation_helpers.values().map(|s| s.st_value).collect(),
+            sources,
+            &route,
+        )?;
+    let mut preparation_helpers = preparation_helpers
         .iter()
         .map(|(name, s)| {
             (
@@ -31192,10 +31266,11 @@ fn qualify_generic_bootstrap(
             )
         })
         .collect();
-    let function_sha256 = symbols
+    let mut function_sha256 = symbols
         .iter()
         .map(|(name, s)| (name.clone(), sha256(&code[&s.st_value])))
         .collect();
+    identity_proofs.append_records(&mut preparation_helpers, &mut function_sha256)?;
     Ok(GenericBootstrapEvidence {
         public_initializer: symbol(GENERIC_INITIALIZER),
         body: symbol(GENERIC_BODY),
@@ -31366,45 +31441,60 @@ fn collect_proof_evidence(
     let mut disassembly = Vec::new();
     let mut emitted = 0usize;
     let limit = MAX_OBJDUMP_BYTES.min(runner.max_stream_bytes);
-    for (&address, &size) in scope {
-        // One aggregate budget covers all stdout/stderr from all intervals.
-        // Reserve the separator before spawning; neither a per-range nor a
-        // concatenated-output cap can silently grow with the function count.
-        let remaining = limit
-            .checked_sub(emitted)
-            .and_then(|remaining| remaining.checked_sub(1))
-            .filter(|remaining| *remaining > 0)
-            .ok_or("objdump aggregate byte limit exhausted")?;
-        let end = address.checked_add(size).ok_or("function range overflow")?;
-        let arguments = vec![
-            "--disassemble".to_owned(),
-            "--show-raw-insn".to_owned(),
-            "--disassemble-zeroes".to_owned(),
-            "--insn-width=16".to_owned(),
-            "--wide".to_owned(),
-            format!("--start-address={address:#x}"),
-            format!("--stop-address={end:#x}"),
-            path_string.to_owned(),
-        ];
-        let stdout = runner.run_with_combined_limit("objdump", &arguments, cwd, Some(remaining))?;
-        let stderr_bytes = fs::metadata(&runner.commands.last().unwrap().stderr.path)
-            .map_err(|e| e.to_string())?
-            .len();
-        emitted = emitted
-            .checked_add(stdout.len())
-            .and_then(|n| n.checked_add(usize::try_from(stderr_bytes).ok()?))
-            .and_then(|n| n.checked_add(1))
-            .ok_or("objdump aggregate byte count overflow")?;
-        require(
-            emitted <= limit,
-            "objdump aggregate output exceeds unchanged byte cap",
-        )?;
-        disassembly.extend_from_slice(&stdout);
-        disassembly.push(b'\n');
+    let mut pending = scope.clone();
+    for phase in 0..2 {
+        for (&address, &size) in &pending {
+            // One aggregate budget covers all stdout/stderr from all intervals.
+            // Reserve the separator before spawning; neither a per-range nor a
+            // concatenated-output cap can silently grow with the function count.
+            let remaining = limit
+                .checked_sub(emitted)
+                .and_then(|remaining| remaining.checked_sub(1))
+                .filter(|remaining| *remaining > 0)
+                .ok_or("objdump aggregate byte limit exhausted")?;
+            let end = address.checked_add(size).ok_or("function range overflow")?;
+            let arguments = vec![
+                "--disassemble".to_owned(),
+                "--show-raw-insn".to_owned(),
+                "--disassemble-zeroes".to_owned(),
+                "--insn-width=16".to_owned(),
+                "--wide".to_owned(),
+                format!("--start-address={address:#x}"),
+                format!("--stop-address={end:#x}"),
+                path_string.to_owned(),
+            ];
+            let stdout =
+                runner.run_with_combined_limit("objdump", &arguments, cwd, Some(remaining))?;
+            let stderr_bytes = fs::metadata(&runner.commands.last().unwrap().stderr.path)
+                .map_err(|e| e.to_string())?
+                .len();
+            emitted = emitted
+                .checked_add(stdout.len())
+                .and_then(|n| n.checked_add(usize::try_from(stderr_bytes).ok()?))
+                .and_then(|n| n.checked_add(1))
+                .ok_or("objdump aggregate byte count overflow")?;
+            require(
+                emitted <= limit,
+                "objdump aggregate output exceeds unchanged byte cap",
+            )?;
+            disassembly.extend_from_slice(&stdout);
+            disassembly.push(b'\n');
+        }
+        if phase == 0 {
+            let text = std::str::from_utf8(&disassembly)
+                .map_err(|e| format!("objdump output is not UTF-8: {e}"))?;
+            verify_constructor_complete_bytes(elf, initializer_name, text, &expected_bytes)?;
+            let got = local_got_targets(elf, bytes)?;
+            pending = preparation_identity::candidate_scope(elf, text, &got, scope)?;
+            pending.retain(|address, _| !scope.contains_key(address));
+            if pending.is_empty() {
+                break;
+            }
+        }
     }
     let text = std::str::from_utf8(&disassembly)
         .map_err(|e| format!("objdump output is not UTF-8: {e}"))?;
-    verify_constructor_complete_bytes(elf, initializer_name, text, &expected_bytes)?;
+    preparation_identity::complete_bytes(elf, bytes, initializer_name, text, scope)?;
     let disassembly_path = runner
         .logs
         .join(format!("objdump-scope-{:04}.stdout", runner.serial));
@@ -31606,8 +31696,8 @@ fn qualify_detcore_constructor_from_evidence_in_source_context(
     let (init_array_slot, init_array_resolution) =
         detcore_init_slot(&elf, &bytes, &detcore_symbols(&elf)?)?;
     let scope = detcore_proof_functions(&elf)?;
-    let expected_bytes = proof_function_bytes(&elf, &bytes, &scope)?;
-    verify_constructor_complete_bytes(&elf, DETCORE_ROOT, &disassembly, &expected_bytes)?;
+    let expected_bytes =
+        preparation_identity::complete_bytes(&elf, &bytes, DETCORE_ROOT, &disassembly, &scope)?;
     let got_targets = local_got_targets(&elf, &bytes)?;
     let detcore_constructor = qualify_detcore_constructor_route(
         &elf,
@@ -31615,9 +31705,16 @@ fn qualify_detcore_constructor_from_evidence_in_source_context(
         &expected_bytes,
         &disassembly,
         &got_targets,
+        sources,
     )?;
-    let generic_bootstrap =
-        qualify_generic_bootstrap(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
+    let generic_bootstrap = qualify_generic_bootstrap(
+        &elf,
+        &bytes,
+        &expected_bytes,
+        &disassembly,
+        &got_targets,
+        sources,
+    )?;
     let allocator_backing = qualify_fixed_allocator_in_source_context(
         &elf,
         &bytes,
@@ -31861,11 +31958,22 @@ pub fn qualify_detcore_native_entry_with_sources(
         &evidence.objdump_disassembly,
     )?;
     let required_versions = qualify_portability(&elf, &version_text)?;
-    let expected_bytes = proof_function_bytes(&elf, &bytes, &scope)?;
-    verify_constructor_complete_bytes(&elf, DETCORE_NATIVE_ENTRY, &disassembly, &expected_bytes)?;
+    let expected_bytes = preparation_identity::complete_bytes(
+        &elf,
+        &bytes,
+        DETCORE_NATIVE_ENTRY,
+        &disassembly,
+        &scope,
+    )?;
     let got_targets = local_got_targets(&elf, &bytes)?;
-    let generic_bootstrap =
-        qualify_generic_bootstrap(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
+    let generic_bootstrap = qualify_generic_bootstrap(
+        &elf,
+        &bytes,
+        &expected_bytes,
+        &disassembly,
+        &got_targets,
+        Some(sources),
+    )?;
     require(
         generic_bootstrap.fixed_native_gate.is_some(),
         "explicit native entry lacks its qualified fixed selector route",
@@ -32017,13 +32125,25 @@ fn qualify_constructor_from_evidence_in_source_context(
     let (init_array_slot, init_array_resolution) =
         standalone_init_slot(&elf, &bytes, &initializer)?;
     let scope = constructor_proof_functions(&elf)?;
-    let expected_bytes = proof_function_bytes(&elf, &bytes, &scope)?;
-    verify_constructor_complete_bytes(&elf, STANDALONE_ROOT, &disassembly, &expected_bytes)?;
+    let expected_bytes =
+        preparation_identity::complete_bytes(&elf, &bytes, STANDALONE_ROOT, &disassembly, &scope)?;
     let got_targets = local_got_targets(&elf, &bytes)?;
-    let standalone_constructor =
-        qualify_standalone_constructor(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
-    let generic_bootstrap =
-        qualify_generic_bootstrap(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
+    let standalone_constructor = qualify_standalone_constructor(
+        &elf,
+        &bytes,
+        &expected_bytes,
+        &disassembly,
+        &got_targets,
+        sources,
+    )?;
+    let generic_bootstrap = qualify_generic_bootstrap(
+        &elf,
+        &bytes,
+        &expected_bytes,
+        &disassembly,
+        &got_targets,
+        sources,
+    )?;
     let allocator_backing = qualify_fixed_allocator_in_source_context(
         &elf,
         &bytes,
@@ -32181,8 +32301,8 @@ fn qualify_elf_from_evidence_in_source_context(
     )?;
     let required_versions = qualify_portability(&elf, &version_text)?;
     let scope = proof_functions(&elf, initializer_name)?;
-    let expected_bytes = proof_function_bytes(&elf, &bytes, &scope)?;
-    verify_constructor_complete_bytes(&elf, initializer_name, &disassembly, &expected_bytes)?;
+    let expected_bytes =
+        preparation_identity::complete_bytes(&elf, &bytes, initializer_name, &disassembly, &scope)?;
     let functions = elf
         .syms
         .iter()
@@ -32198,6 +32318,7 @@ fn qualify_elf_from_evidence_in_source_context(
             &expected_bytes,
             &disassembly,
             &got_targets,
+            sources,
         )?)
     } else {
         None
@@ -32209,12 +32330,19 @@ fn qualify_elf_from_evidence_in_source_context(
             &expected_bytes,
             &disassembly,
             &got_targets,
+            sources,
         )?)
     } else {
         None
     };
-    let generic_bootstrap =
-        qualify_generic_bootstrap(&elf, &bytes, &expected_bytes, &disassembly, &got_targets)?;
+    let generic_bootstrap = qualify_generic_bootstrap(
+        &elf,
+        &bytes,
+        &expected_bytes,
+        &disassembly,
+        &got_targets,
+        sources,
+    )?;
     let mut call_paths = BTreeMap::new();
     let mut inline_routes = BTreeMap::new();
     for (entry, shim) in [
@@ -33316,13 +33444,17 @@ mod tests {
                 include_bytes!("../../reverie/src/tool.rs"),
             ),
             (
+                "reverie-liteinst-artifact/src/preparation_identity.rs",
+                include_bytes!("preparation_identity.rs"),
+            ),
+            (
                 "reverie-liteinst-artifact/src/lib.rs",
                 include_bytes!("lib.rs"),
             ),
         ];
         // These reviewed sources changed for startup or returning-injection contracts.
         // Keep the fixed catalog authoritative and reject their prior tuples.
-        assert_eq!(CONTENT_REVERIE_CATALOG.len(), 82);
+        assert_eq!(CONTENT_REVERIE_CATALOG.len(), 83);
         for (relative, old_size, old_digest) in [
             (
                 "Cargo.toml",
