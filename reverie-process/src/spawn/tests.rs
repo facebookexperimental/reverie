@@ -86,7 +86,10 @@ async fn check_routes(stdout: Mode, stderr: Mode, entry: Entry) {
     stderr_file.write_all(STDERR_PREFIX).unwrap();
     let out_meta = stdout_file.metadata().unwrap();
     let err_meta = stderr_file.metadata().unwrap();
-    assert_ne!((out_meta.dev(), out_meta.ino()), (err_meta.dev(), err_meta.ino()));
+    assert_ne!(
+        (out_meta.dev(), out_meta.ino()),
+        (err_meta.dev(), err_meta.ino())
+    );
 
     let mut command = Command::new("/bin/sh");
     command
@@ -135,7 +138,10 @@ async fn check_routes(stdout: Mode, stderr: Mode, entry: Entry) {
         stdout_file: expected_stdout,
         stderr_file: expected_stderr,
     };
-    assert_eq!(actual, expected, "entry={entry:?}, stdout={stdout:?}, stderr={stderr:?}");
+    assert_eq!(
+        actual, expected,
+        "entry={entry:?}, stdout={stdout:?}, stderr={stderr:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
