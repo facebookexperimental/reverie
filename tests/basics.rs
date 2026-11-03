@@ -300,25 +300,57 @@ fn rust_execve_noexist_test() {
     });
 }
 
+/// Runs `body` natively in a forked child (no tracer) and returns the
+/// kernel-reported status. The child inherits this process's limits
+/// (including RLIMIT_CORE) unchanged, so its core-dump bit is the native
+/// oracle for the same body under the same inherited limits: with a pipe
+/// core_pattern and RLIMIT_CORE == 1 the kernel skips the core helper and
+/// the bit is false, which a hard-coded `true` cannot express in every
+/// environment. A control that cannot run, or whose body does not die by
+/// a signal, panics: the control failing IS the test failing.
+#[cfg(not(sanitized))]
+fn native_signal_status(body: &dyn Fn()) -> ExitStatus {
+    use nix::sys::wait::WaitStatus;
+    use nix::unistd::ForkResult;
+    match unsafe { nix::unistd::fork() } {
+        Ok(ForkResult::Child) => {
+            body();
+            // The body must die by signal; reaching here is a control failure.
+            unsafe { libc::_exit(86) }
+        }
+        Ok(ForkResult::Parent { child }) => loop {
+            match nix::sys::wait::waitpid(child, None) {
+                Ok(WaitStatus::Signaled(_, signal, core_dumped)) => {
+                    return ExitStatus::Signaled(signal, core_dumped);
+                }
+                Ok(other) => {
+                    panic!("native segfault control did not die by signal: {other:?}")
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => panic!("native segfault control waitpid failed: {e}"),
+            }
+        },
+        Err(e) => panic!("native segfault control fork failed: {e}"),
+    }
+}
+
 #[cfg(not(sanitized))]
 #[test]
 fn i_should_segfault() {
-    use nix::sys::signal::Signal::SIGSEGV;
     use reverie_ptrace::testing::test_fn;
-    let (output, _) = test_fn::<NoopTool, _>(|| {
+    let body = || {
         unsafe {
             let invalid_ptr = std::ptr::dangling_mut::<u64>();
             invalid_ptr.write_volatile(0xdeadbeefu64);
         };
-    })
-    .unwrap();
-    assert_eq!(output.status, ExitStatus::Signaled(SIGSEGV, true),);
+    };
+    let (output, _) = test_fn::<NoopTool, _>(body).unwrap();
+    assert_eq!(output.status, native_signal_status(&body));
 }
 
 #[cfg(not(sanitized))]
 #[test]
 fn i_should_segfault_2() {
-    use nix::sys::signal::Signal::SIGSEGV;
     use reverie_ptrace::testing::test_fn;
 
     pub fn do_segfault() {
@@ -330,7 +362,7 @@ fn i_should_segfault_2() {
     }
 
     let (output, _) = test_fn::<NoopTool, _>(do_segfault).unwrap();
-    assert_eq!(output.status, ExitStatus::Signaled(SIGSEGV, true),);
+    assert_eq!(output.status, native_signal_status(&do_segfault));
 }
 
 #[cfg(not(sanitized))]
