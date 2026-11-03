@@ -1291,6 +1291,7 @@ dependencies = [
  "reverie-util",
  "serde",
  "serde_json",
+ "syscalls",
  "tempfile",
  "tokio",
  "tracing",

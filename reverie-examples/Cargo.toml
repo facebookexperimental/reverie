@@ -27,6 +27,8 @@ default = ["runtime"]
 host = []
 # Explicit instrumentation for real Tool consumer tests; absent from production defaults.
 test-support = []
+# Generic conformance Tools and guest bodies, without a backend or preload selection.
+conformance-tools = ["dep:syscalls"]
 runtime = [
     "host",
     "dep:reverie-kvm",
@@ -118,6 +120,7 @@ reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace", optional = tru
 reverie-util = { version = "0.5.4", path = "../reverie-util" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+syscalls = { version = "0.6.18", optional = true }
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
@@ -126,3 +129,7 @@ tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 # Keep the internal strace test dependency synchronized before the next export.
 reverie-rpc-transport = { version = "0.5.4", path = "../reverie-rpc-transport" }
 tempfile = "3.27.0"
+
+# Shared guests use cfg(sanitized); keep the internal target synchronized.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sanitized)"] }

@@ -91,6 +91,105 @@ pub mod tools {
     pub use super::strace_minimal;
 }
 
+// The conformance callers and core tests compile these same source bodies.
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/basics.rs"]
+pub mod conformance_basics;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/exit.rs"]
+pub mod conformance_exit;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/inject_then_tail.rs"]
+pub mod conformance_inject_then_tail;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/stat.rs"]
+pub mod conformance_stat;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/vdso.rs"]
+pub mod conformance_vdso;
+
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/at_random.rs"]
+pub mod conformance_at_random;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/initial_stack_pointer.rs"]
+pub mod conformance_initial_stack_pointer;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/stack.rs"]
+pub mod conformance_stack;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/suppression.rs"]
+pub mod conformance_suppression;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/thread_start.rs"]
+pub mod conformance_thread_start;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/thread_start_tail.rs"]
+pub mod conformance_thread_start_tail;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/tool_fixtures/thread_start_tail_witness.rs"]
+pub mod conformance_thread_start_tail_witness;
+
+/// Backend-independent Tools used by generic conformance callers.
+#[cfg(feature = "conformance-tools")]
+pub mod conformance_tools {
+    pub use super::conformance_at_random as at_random;
+    pub use super::conformance_basics as basics;
+    pub use super::conformance_exit as exit;
+    pub use super::conformance_initial_stack_pointer as initial_stack_pointer;
+    pub use super::conformance_inject_then_tail as inject_then_tail;
+    pub use super::conformance_stack as stack;
+    pub use super::conformance_stat as stat;
+    pub use super::conformance_suppression as suppression;
+    pub use super::conformance_thread_start as thread_start;
+    pub use super::conformance_thread_start_tail as thread_start_tail;
+    pub use super::conformance_thread_start_tail_witness as thread_start_tail_witness;
+    pub use super::conformance_vdso as vdso;
+}
+
+// The same guest bodies are used by the generic tests and command images.
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/support/at_random_rust_guest.rs"]
+pub mod conformance_guest_at_random;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/support/basics_rust_guest.rs"]
+pub mod conformance_guest_basics;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/support/exit_rust_guest.rs"]
+pub mod conformance_guest_exit;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/support/inject_then_tail_rust_guest.rs"]
+pub mod conformance_guest_inject_then_tail;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/support/stack_rust_guest.rs"]
+pub mod conformance_guest_stack;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/support/stat_rust_guest.rs"]
+pub mod conformance_guest_stat;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/support/suppression_rust_guest.rs"]
+pub mod conformance_guest_suppression;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/support/thread_start_guest.rs"]
+pub mod conformance_guest_thread_start;
+#[cfg(feature = "conformance-tools")]
+#[path = "../../tests/support/vdso_rust_guest.rs"]
+pub mod conformance_guest_vdso;
+
+/// Backend-independent guest bodies used by generic conformance commands.
+#[cfg(feature = "conformance-tools")]
+pub mod conformance_guests {
+    pub use super::conformance_guest_at_random as at_random;
+    pub use super::conformance_guest_basics as basics;
+    pub use super::conformance_guest_exit as exit;
+    pub use super::conformance_guest_inject_then_tail as inject_then_tail;
+    pub use super::conformance_guest_stack as stack;
+    pub use super::conformance_guest_stat as stat;
+    pub use super::conformance_guest_suppression as suppression;
+    pub use super::conformance_guest_thread_start as thread_start;
+    pub use super::conformance_guest_vdso as vdso;
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-139): Review the example-tool preload constructor and selector boundary.
 #[cfg(feature = "runtime")]
