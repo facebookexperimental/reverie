@@ -3173,12 +3173,12 @@ static void window_sibling_child(int op, int tmask, int sibling_syscall) {
  * threads to stop, so a sibling syscall in that window would pay it
  * (`mode_sigtrap_int3_after_sibling_syscall`). With tmask=1 the int3 meets
  * SIG_DFL and kills the child; natively, and with tmask=0, the handler runs
- * and it exits 0. Then a
- * POSIX-timer signal whose Tool callback injects (SIGXCPU: between block-all
- * rt_sigprocmask injections, whose trap resets SIGTRAP; SIGPROF: getpid,
- * which the shield covers), and whose guest handler executes int3 before any
- * syscall: the repair waits for a stop outside the callback, so with SIGXCPU
- * the int3 meets SIG_DFL. Phase-0 limits, pinned here. */
+ * and it exits 0. Then a POSIX-timer signal whose Tool callback injects
+ * (SIGXCPU: between block-all rt_sigprocmask injections, whose trap resets
+ * SIGTRAP; SIGPROF: getpid, which the shield covers), and whose guest handler
+ * executes int3 before any syscall: the repair waits for a stop outside the
+ * callback, so with SIGXCPU the int3 meets SIG_DFL. Phase-0 limits, pinned
+ * here. */
 static void mode_sigtrap_int3_in_the_other_windows(void) {
   warm();
   for (int op = 0; op < 2; op++) {

@@ -4581,7 +4581,7 @@ async fn an_int3_in_another_thread_or_after_a_callback_injection_still_meets_the
 ///
 /// This documents current behaviour, in which the order the threads stop in
 /// decides the `int3`'s outcome
-/// (<https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-bx337.md>).
+/// (<https://github.com/rrnewton/reverie/issues/1262>).
 /// The change that fixes that must revisit this test and the tmask=1 lines
 /// above together.
 /// Both configurations.
