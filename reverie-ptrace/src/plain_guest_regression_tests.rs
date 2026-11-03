@@ -5774,6 +5774,78 @@ async fn a_sigtrap_queued_after_the_stash_ends_the_run_by_name() {
     );
 }
 
+/// A SIGTRAP the guest queued itself while blocking it, taken out of the
+/// queue for a precise timer's steps that reach a traced syscall before the
+/// timer's target, is queued again at that syscall's seccomp stop
+/// (`TracedTask::repair_sigtrap_at_seccomp_stop`), before the Tool or the
+/// syscall can read the thread's signals: it is pending after the syscall
+/// and delivered once at the unblock, with its code and pid, as natively.
+/// In the injecting configuration.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stashed_sigtrap_is_queued_again_at_a_stepped_syscall() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let stashes = crate::task::SIGTRAP_STASHES_FOR_TEST.with(|count| count.get());
+    let run = run_guest("sigtrap_stash_steps_onto_syscall", false).await;
+    assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+    let lines: Vec<&str> = run
+        .report
+        .lines()
+        .filter(|line| line.starts_with("kept "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "kept after-stepped-getpid SigPnd=1 ShdPnd=0 handled=0",
+            "kept unblocked handled=1 code=-7 pid=4242",
+        ],
+        "{}",
+        run.report
+    );
+    assert_eq!(
+        stepped_entries(&run, "getpid"),
+        1,
+        "the timer's steps did not reach the getpid: {:#?}",
+        run.stepped_entries
+    );
+    assert!(
+        crate::task::SIGTRAP_STASHES_FOR_TEST.with(|count| count.get()) > stashes,
+        "no timer sequence took the SIGTRAP out of the queue: {}",
+        run.report
+    );
+}
+
+/// As `a_stashed_sigtrap_is_queued_again_at_a_stepped_syscall`, but the
+/// tracer's signal state cannot be read at the seccomp stop that owes the
+/// SIGTRAP its requeue (`keeps_sigtrap_state` false, as after an unreadable
+/// procfs status): the stop does not return silently and let the syscall
+/// and the Tool run without the SIGTRAP, but ends the run with the named
+/// `PendingSigtrapAtStep`. In the injecting configuration.
+#[tokio::test(flavor = "current_thread")]
+async fn a_requeue_owed_where_the_sigtrap_state_is_unknown_ends_the_run() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    crate::task::SIGTRAP_STATE_UNKNOWN_AT_REQUEUE_FOR_TEST.with(|unknown| unknown.set(true));
+    let result =
+        run_guest_options("sigtrap_stash_steps_onto_syscall", GuestOptions::default()).await;
+    let armed = crate::task::SIGTRAP_STATE_UNKNOWN_AT_REQUEUE_FOR_TEST
+        .with(|unknown| unknown.replace(false));
+    assert!(!armed, "no seccomp stop owed a taken SIGTRAP its requeue");
+    let error = match result {
+        Ok(run) => panic!("the run was not refused: {:?}\n{}", run.status, run.report),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("SIGTRAP blocked with one pending")
+            && error.contains("seccomp stop, with SIGTRAP state unknown"),
+        "{error}"
+    );
+}
+
 /// A precise timer takes a guest's pending, blocked SIGTRAP out of the queue
 /// for its steps only where the Tool stops every syscall that reads or
 /// takes a pending signal (`GlobalState::traces_signal_reading_syscalls`).
@@ -5796,12 +5868,18 @@ async fn a_tool_that_lets_sigtimedwait_run_unstopped_keeps_no_sigtrap_out_of_the
     };
     let result = run_guest_options("sigtrap_guest_pending_kept", options).await;
     let armed = crate::task::SIGTRAP_SENT_AFTER_STASH_FOR_TEST.with(|sent| sent.replace(false));
-    assert!(armed, "a SIGTRAP was taken out of the queue for the timer's steps");
+    assert!(
+        armed,
+        "a SIGTRAP was taken out of the queue for the timer's steps"
+    );
     let error = match result {
         Ok(run) => panic!("the run was not refused: {:?}\n{}", run.status, run.report),
         Err(error) => format!("{error:#}"),
     };
-    assert!(error.contains("SIGTRAP blocked with one pending"), "{error}");
+    assert!(
+        error.contains("SIGTRAP blocked with one pending"),
+        "{error}"
+    );
 }
 
 /// A SIGTRAP the guest queued itself while blocking it, with a negative

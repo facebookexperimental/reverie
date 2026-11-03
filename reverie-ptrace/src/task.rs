@@ -4402,6 +4402,12 @@ thread_local! {
     /// that takes a SIGTRAP sends the thread another one right after.
     pub(crate) static SIGTRAP_SENT_AFTER_STASH_FOR_TEST: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Set by a test so that the next seccomp stop that owes a taken SIGTRAP
+    /// its requeue finds the tracer's signal state unknown
+    /// (`TracedTask::keeps_sigtrap_state` false, as after an unreadable
+    /// procfs status).
+    pub(crate) static SIGTRAP_STATE_UNKNOWN_AT_REQUEUE_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// Guest SIGTRAPs taken out of the queue for a Reverie step
     /// (`TracedTask::stash_pending_sigtrap`). Per thread, as below.
     pub(crate) static SIGTRAP_STASHES_FOR_TEST: std::cell::Cell<u64> =
@@ -14765,9 +14771,25 @@ impl<L: Tool + 'static> TracedTask<L> {
     ) -> Result<Stopped, TraceError> {
         let owes_sigtrap = self.sigtrap_repair().is_some();
         let owes_requeue = self.stashed_sigtrap.is_some();
-        if !(owes_sigtrap || owes_requeue || self.segv_action_to_learn())
-            || !self.keeps_sigtrap_state()
-        {
+        if !(owes_sigtrap || owes_requeue || self.segv_action_to_learn()) {
+            return Ok(task);
+        }
+        let keeps = self.keeps_sigtrap_state();
+        #[cfg(test)]
+        let keeps = keeps
+            && !(owes_requeue
+                && SIGTRAP_STATE_UNKNOWN_AT_REQUEUE_FOR_TEST.with(|unknown| unknown.replace(false)));
+        if !keeps {
+            // A taken SIGTRAP must be queued again before this syscall or the
+            // Tool reads the thread's signals. Where the state that keeps it
+            // cannot be read now (an unreadable procfs status), the syscall
+            // would run without it, so the run ends instead.
+            if owes_requeue {
+                return Err(self.fail_pending_sigtrap(
+                    task.pid(),
+                    "seccomp stop, with SIGTRAP state unknown",
+                ));
+            }
             return Ok(task);
         }
         let regs = task.getregs()?;

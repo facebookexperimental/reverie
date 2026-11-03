@@ -2932,6 +2932,37 @@ static void mode_sigtrap_guest_pending_kept(void) {
 }
 
 /* A SIGTRAP the guest queued itself while blocking it, out of the queue for
+ * a precise timer's steps, which reach the traced getpid before the timer's
+ * target (as in timer_loop for k >= 3): the getpid's seccomp stop queues it
+ * again before the Tool or the syscall can read the thread's signals. The
+ * lines are the native ones: pending after the getpid, and delivered once,
+ * with its code and pid, at the unblock. */
+static void mode_sigtrap_stash_steps_onto_syscall(void) {
+  warm();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = gk_handler;
+  sa.sa_flags = SA_SIGINFO;
+  if (sigaction(SIGTRAP, &sa, NULL) != 0)
+    die("sigaction SIGTRAP");
+  sigset_t trap;
+  sigemptyset(&trap);
+  sigaddset(&trap, SIGTRAP);
+  if (sigprocmask(SIG_BLOCK, &trap, NULL) != 0)
+    die("block SIGTRAP");
+  gk_queue();
+  SITEM(SYS_getppid, 0, 0, 0, 0, TL_K, ARM_TIMER);
+  if (tl_a)
+    tl_sum++;
+  if (SITE(SYS_getpid, 0, 0, 0, 0, 0) <= 0)
+    die("getpid");
+  gk_state("after-stepped-getpid");
+  if (sigprocmask(SIG_UNBLOCK, &trap, NULL) != 0)
+    die("unblock SIGTRAP");
+  say("kept unblocked handled=%d code=%d pid=%d\n", gk_n, gk_code, gk_pid);
+}
+
+/* A SIGTRAP the guest queued itself while blocking it, out of the queue for
  * a precise timer's steps, which run through a SIGUSR1 handler's return as
  * in sync_signal_behind_sigreturn. The handler's frame keeps SIGTRAP
  * blocked (sigtrap_stash_sigreturn_keeps), or unblocks it
@@ -6665,6 +6696,8 @@ int main(int argc, char** argv) {
     mode_sigtrap_stash_sigreturn_unblocks();
   else if (!strcmp(m, "sigtrap_guest_pending_kept"))
     mode_sigtrap_guest_pending_kept();
+  else if (!strcmp(m, "sigtrap_stash_steps_onto_syscall"))
+    mode_sigtrap_stash_steps_onto_syscall();
   else if (!strcmp(m, "perf_marker"))
     mode_perf_marker();
   else if (!strcmp(m, "timer_allow"))
