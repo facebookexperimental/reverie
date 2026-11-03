@@ -1955,44 +1955,23 @@ fn shares_signal_actions(parent: &Stopped) -> bool {
 /// unreadable or unrepresentable word ends decoding.
 #[cfg(target_arch = "x86_64")]
 fn instruction_at_raises_sigtrap(task: &Stopped, rip: u64) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        instruction_raises_sigtrap_with_words(rip as usize, |address| {
-            Addr::<u64>::from_raw(address).and_then(|address| task.read_value(address).ok())
-        })
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        // aarch64's instructions are 4 bytes, aligned, so one word holds the
-        // whole of one.
-        const MAX_INSTRUCTION_LEN: usize = 4;
-        let rip = rip as usize;
-        let start = rip & !7;
-        let mut bytes = [0u8; 24];
-        let mut len = 0;
-        while len < bytes.len() && start + len < rip + MAX_INSTRUCTION_LEN {
-            let word = Addr::<u64>::from_raw(start + len)
-                .and_then(|address| task.read_value(address).ok());
-            let Some(word) = word else {
-                break;
-            };
-            bytes[len..len + 8].copy_from_slice(&word.to_ne_bytes());
-            len += 8;
-        }
-        let skip = rip - start;
-        instruction_raises_sigtrap(bytes.get(skip..len).unwrap_or(&[]))
-    }
+    instruction_raises_sigtrap_with_words(rip as usize, |address| {
+        Addr::<u64>::from_raw(address).and_then(|address| task.read_value(address).ok())
+    })
 }
 
-/// The existing aligned-word collector for the AArch64 BRK decoder. Keep
-/// that architecture's instruction grammar and read behavior unchanged.
+/// Whether the aarch64 instruction at `rip` raises a SIGTRAP of its own
+/// (`brk`: `instruction_raises_sigtrap`). aarch64's instructions are 4 bytes,
+/// aligned, so the one word that holds it is the only one read
+/// (`PTRACE_PEEKDATA`, which reads an execute-only page).
 #[cfg(target_arch = "aarch64")]
 fn instruction_at_raises_sigtrap(task: &Stopped, rip: u64) -> bool {
+    const MAX_INSTRUCTION_LEN: usize = 4;
     let rip = rip as usize;
     let start = rip & !7;
     let mut bytes = [0u8; 24];
     let mut len = 0;
-    while len < bytes.len() && start + len < rip + 15 {
+    while len < bytes.len() && start + len < rip + MAX_INSTRUCTION_LEN {
         let word =
             Addr::<u64>::from_raw(start + len).and_then(|address| task.read_value(address).ok());
         let Some(word) = word else {
