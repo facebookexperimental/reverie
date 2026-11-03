@@ -30,6 +30,9 @@ use super::stdio::ChildStdout;
 use super::util::CStringArray;
 use super::util::SharedValue;
 
+#[cfg(test)]
+mod tests;
+
 /// The allocated parts of a launch, made before its lock (`Command::prepare`).
 struct Prepared {
     env: CStringArray,
@@ -132,7 +135,7 @@ impl Command {
             let (stdout, child_stdout) =
                 launch.allocate(|| self.container.stdout.pipes(false), Errno::into_raw)?;
             let (stderr, child_stderr) =
-                launch.allocate(|| self.container.stdout.pipes(false), Errno::into_raw)?;
+                launch.allocate(|| self.container.stderr.pipes(false), Errno::into_raw)?;
 
             let seccomp_fd = if self.container.seccomp_notify {
                 Some(SharedValue::new(core::sync::atomic::AtomicI32::new(0))?)
