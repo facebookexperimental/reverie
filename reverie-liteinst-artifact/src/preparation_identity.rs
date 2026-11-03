@@ -865,4 +865,255 @@ mod tests {
             "unselected disassembly function 0x3000"
         );
     }
+
+    // Derive only the tested code/symbols from the existing complete loader
+    // fixture. Dynamic/hash/relocation construction remains shared verbatim.
+    fn transfers_fixture() -> Vec<u8> {
+        fn put(b: &mut [u8], at: usize, width: usize, value: u64) {
+            b[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        let mut bytes = super::super::tests::loader_writer_fixture::fixture();
+        bytes[0x1200..0x1200 + SPILLED_RDI_IDENTITY.len()].copy_from_slice(SPILLED_RDI_IDENTITY);
+        bytes[0x1300..0x130a]
+            .copy_from_slice(&[0x48, 0x8b, 0x05, 0xf9, 0x1c, 0, 0, 0xff, 0xd0, 0xc3]);
+        bytes[0x1400..0x1400 + CONSTRUCTOR_GATE_OWNER_BYTES.len()]
+            .copy_from_slice(CONSTRUCTOR_GATE_OWNER_BYTES);
+        let symbols = [
+            ("identity", 0x1200, 21, sym::STT_FUNC),
+            (CONSTRUCTOR_ADOPTION, 0x1300, 10, sym::STT_FUNC),
+            (CONSTRUCTOR_GATE_OWNER, 0x1400, 44, sym::STT_FUNC),
+            (CONSTRUCTOR_GATE, 0x1420, 0, sym::STT_NOTYPE),
+            (CONSTRUCTOR_GATE_RETURN, 0x1422, 0, sym::STT_NOTYPE),
+        ];
+        let mut names = vec![0];
+        bytes[0x4100..0x4200].fill(0);
+        for (index, (name, address, size, kind)) in symbols.iter().enumerate() {
+            let at = 0x4100 + (index + 1) * 24;
+            put(&mut bytes, at, 4, names.len() as u64);
+            names.extend_from_slice(name.as_bytes());
+            names.push(0);
+            bytes[at + 4] = *kind;
+            bytes[at + 5] = sym::STV_HIDDEN;
+            put(&mut bytes, at + 6, 2, 1);
+            put(&mut bytes, at + 8, 8, *address);
+            put(&mut bytes, at + 16, 8, *size);
+        }
+        assert!(names.len() <= 0x100);
+        bytes[0x4200..0x4300].fill(0);
+        bytes[0x4200..0x4200 + names.len()].copy_from_slice(&names);
+        put(&mut bytes, 0x5000 + 64 + 32, 8, 0x300);
+        put(
+            &mut bytes,
+            0x5000 + 4 * 64 + 32,
+            8,
+            (symbols.len() as u64 + 1) * 24,
+        );
+        put(&mut bytes, 0x5000 + 5 * 64 + 32, 8, names.len() as u64);
+        bytes
+    }
+
+    fn transfers_text(bytes: &[u8]) -> String {
+        let owner = body_text(0x1300, &bytes[0x1300..0x130a], &[7, 2, 1]);
+        let gate = body_text(
+            0x1400,
+            &bytes[0x1400..0x142c],
+            &[2, 7, 3, 3, 3, 3, 3, 3, 5, 2, 3, 4, 2, 1],
+        )
+        .replace("1420:", &format!("1420 <{CONSTRUCTOR_GATE}>:\n1420:"))
+        .replace(
+            "1422:",
+            &format!("1422 <{CONSTRUCTOR_GATE_RETURN}>:\n1422:"),
+        );
+        let identity = body_text(0x1200, &bytes[0x1200..0x1215], &[5, 5, 5, 5, 1]);
+        format!("{owner}{gate}{identity}")
+    }
+
+    fn transfers_route(owner: u64) -> NativeDispatchRoute {
+        let address = 0x1000;
+        let initializing = 0x100000;
+        let gate = 0x200000;
+        let mut bytes = native_template(NativeDispatchOrigin::Constructor);
+        for (offset, target, end) in [
+            (0x34, initializing, 0x38),
+            (0x71, gate, 0x75),
+            (0xab, gate, 0xaf),
+            (0xd9, gate, 0xdd),
+            (0x186, gate, 0x18a),
+            (0x1bc, gate, 0x1c0),
+            (0x1e0, owner, 0x1e4),
+            (0x219, initializing, 0x21e),
+            (0x29f, gate, 0x2a3),
+            (0x2b9, gate, 0x2bd),
+        ] {
+            let displacement = (target as i64 - (address + end) as i64) as i32;
+            bytes[offset..offset + 4].copy_from_slice(&displacement.to_le_bytes());
+        }
+        constructor_native_bridge(&bytes, address, initializing, gate, owner).unwrap()
+    }
+
+    #[test]
+    fn qualify_transfers_refuses_nonidentity_missing_sources_and_wrong_owned_entry() {
+        // This is a real factory transaction over the independently current,
+        // clean workspace. The fixture never constructs opaque source authority.
+        let workspace =
+            fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()).unwrap();
+        let scratch = std::env::temp_dir().join(format!(
+            "preparation-identity-entry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scratch).unwrap();
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch = Scratch(scratch);
+        let mut runner = Runner::new(
+            scratch.0.join("source-factory"),
+            Duration::from_secs(30),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        let pin = runner
+            .text(
+                "git",
+                &["--no-replace-objects", "rev-parse", "HEAD"],
+                &workspace,
+            )
+            .unwrap();
+        let manifest = workspace.join("Cargo.toml");
+        let expected = CompiledSourceExpectation {
+            layout: CompiledSourceLayout::ReverieWorkspace,
+            image_kind: FixedImageKind::Standalone,
+            workspace_root: &workspace,
+            manifest: &manifest,
+            reverie_pin: pin.trim(),
+        };
+        VerifiedCompiledSources::with_resolved(&expected, &mut runner, |sources| {
+            let bytes = transfers_fixture();
+            let elf = Elf::parse(&bytes).map_err(|error| error.to_string())?;
+            let text = transfers_text(&bytes);
+            let instructions = constructor_instructions(&text, 0x1300)?;
+            let got = local_got_targets(&elf, &bytes)?;
+            let primary = BTreeMap::from([(0x1300, 10), (0x1400, 44)]);
+            let known = BTreeSet::new();
+            let route = transfers_route(0x1300);
+            require(
+                candidate_scope(&elf, &text, &got, &primary)? == BTreeMap::from([(0x1200, 21)]),
+                "entry fixture did not discover the unknown complete identity scope",
+            )?;
+            let complete = complete_bytes(&elf, &bytes, GENERIC_INITIALIZER, &text, &primary)?;
+            require(
+                complete.len() == 3 && complete[&0x1200] == SPILLED_RDI_IDENTITY,
+                "entry fixture did not authenticate the complete identity union",
+            )?;
+            let (transfers, edges, proof) = qualify_transfers(
+                &elf,
+                &bytes,
+                &text,
+                &instructions,
+                &got,
+                &known,
+                Some(sources),
+                &route,
+            )?;
+            let edge = GotEdge {
+                source_function: 0x1300,
+                instruction: 0x1307,
+                slot: 0x3000,
+                target_function: 0x1200,
+            };
+            require(
+                transfers
+                    == [ConstructorTransfer {
+                        instruction: edge.instruction,
+                        target: edge.target_function,
+                        local_got_slot: Some(edge.slot),
+                    }]
+                    && edges == [edge.clone()]
+                    && proof.proves(&edge),
+                "entry fixture did not earn exactly its actual load/GOT/CALL identity proof",
+            )?;
+            // Every negative is paired with the accepting fixture above. The
+            // changed body and text agree physically, so only the ABI class can
+            // reject it; the two context controls retain the valid body verbatim.
+            let mut changed = bytes.clone();
+            changed[0x1207] = 0x74; // Return the RSI spill at [RSP-16], not the incoming RDI.
+            let changed_elf = Elf::parse(&changed).map_err(|error| error.to_string())?;
+            let changed_text = transfers_text(&changed);
+            let changed_complete = complete_bytes(
+                &changed_elf,
+                &changed,
+                GENERIC_INITIALIZER,
+                &changed_text,
+                &primary,
+            )?;
+            require(
+                changed_complete[&0x1200] == changed[0x1200..0x1215],
+                "nonidentity mutation did not reach complete physical byte proof",
+            )?;
+            let result = qualify_transfers(
+                &changed_elf,
+                &changed,
+                &changed_text,
+                &instructions,
+                &got,
+                &known,
+                Some(sources),
+                &route,
+            );
+            let message = match result {
+                Ok(_) => return Err("nonidentity target unexpectedly qualified".to_owned()),
+                Err(message) => message,
+            };
+            require(
+                message == "unrecognized complete preparation identity ABI body",
+                format!("nonidentity refusal reached the wrong guard: {message}"),
+            )?;
+            let result = qualify_transfers(
+                &elf,
+                &bytes,
+                &text,
+                &instructions,
+                &got,
+                &known,
+                None,
+                &route,
+            );
+            let message = match result {
+                Ok(_) => return Err("source-less identity unexpectedly qualified".to_owned()),
+                Err(message) => message,
+            };
+            require(
+                message == "preparation identity requires independent current compiled sources",
+                format!("missing-source refusal reached the wrong guard: {message}"),
+            )?;
+            let wrong_route = transfers_route(0x1301);
+            let result = qualify_transfers(
+                &elf,
+                &bytes,
+                &text,
+                &instructions,
+                &got,
+                &known,
+                Some(sources),
+                &wrong_route,
+            );
+            let message = match result {
+                Ok(_) => return Err("wrong owned entry unexpectedly qualified".to_owned()),
+                Err(message) => message,
+            };
+            require(
+                message == "preparation identity lacks its actual owned SysV adoption entry",
+                format!("owned-entry refusal reached the wrong guard: {message}"),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
 }
