@@ -1724,6 +1724,24 @@ fn resume_recorder(
     })
 }
 
+/// Fails unless the fixture's crashing children can set their core limit to
+/// 1, the only value that stops a piped `core_pattern` from receiving their
+/// dumps. A hard limit of 0 cannot be raised without `CAP_SYS_RESOURCE`, so
+/// each child would fail its `setrlimit` and exit 99 before reaching the
+/// behaviour under test.
+fn require_capped_crash_dumps() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `rlimit`.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) }, 0);
+    assert!(
+        limit.rlim_max >= 1,
+        "hard RLIMIT_CORE is 0: fixture cannot cap crash dumps; raise it to >= 1"
+    );
+}
+
 /// Runs `mode` in both Tool configurations, and requires each run to exit 0
 /// with a complete report. Returns the two runs as (inject, tail).
 async fn run_both_configurations(mode: &str) -> [GuestRun; 2] {
@@ -3525,6 +3543,7 @@ async fn a_guest_int3_in_a_timer_window_takes_sigtraps_default_action() {
         eprintln!("skipping: perf counters are not supported here");
         return;
     }
+    require_capped_crash_dumps();
     let mut expected = Vec::new();
     for encoding in ["cc", "66cc", "4848cc", "4866cc", "xo-cc"] {
         for case in [
@@ -4446,6 +4465,7 @@ async fn a_caught_unblocked_sigtrap_takes_no_repair_injection() {
 /// window closes (<https://github.com/rrnewton/hermit/issues/4409>).
 #[tokio::test(flavor = "current_thread")]
 async fn an_int3_right_after_an_interrupted_wait_still_meets_the_reset_action() {
+    require_capped_crash_dumps();
     for run in run_both_configurations("sigtrap_int3_after_interrupted_wait").await {
         let lines: Vec<&str> = run
             .report
@@ -4524,6 +4544,7 @@ async fn a_signal_callback_injection_delivers_the_signal_once_and_keeps_sigtrap(
 /// configurations.
 #[tokio::test(flavor = "current_thread")]
 async fn an_int3_in_another_thread_or_after_a_callback_injection_still_meets_the_reset_action() {
+    require_capped_crash_dumps();
     for run in run_both_configurations("sigtrap_int3_in_the_other_windows").await {
         let lines: Vec<&str> = run
             .report
@@ -5414,6 +5435,7 @@ async fn a_sibling_sig_dfl_during_a_repair_is_lost_a_pinned_limit() {
 /// configurations.
 #[tokio::test(flavor = "current_thread")]
 async fn a_sibling_tsync_filter_kills_no_guest_unless_the_contract_is_broken() {
+    require_capped_crash_dumps();
     for no_serialization_contract in [true, false] {
         for (mode, action) in [
             ("sigtrap_tsync_filter_kill", "0x80000000"),
