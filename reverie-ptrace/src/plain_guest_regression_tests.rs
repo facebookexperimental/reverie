@@ -4587,6 +4587,7 @@ async fn an_int3_in_another_thread_or_after_a_callback_injection_still_meets_the
 /// Both configurations.
 #[tokio::test(flavor = "current_thread")]
 async fn an_int3_after_a_sibling_syscall_meets_the_repaired_handler() {
+    require_capped_crash_dumps();
     for run in run_both_configurations("sigtrap_int3_after_sibling_syscall").await {
         let lines: Vec<&str> = run
             .report
