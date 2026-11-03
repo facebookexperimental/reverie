@@ -176,3 +176,83 @@ fn the_repair_page_is_sealed_by_default() {
     .join()
     .expect("the guest found the repair page sealed exactly where mseal works");
 }
+
+/// A guest that replaces the unsealed repair page with a shared mapping of a
+/// file of its own (a memfd), holding a copy of Reverie's page, canary
+/// included, as a guest that read the page can make: the canary matches, but
+/// Reverie must still never write into the mapping, since a write there
+/// would reach the file. The page and the file must come back exactly as the
+/// guest left them, and SIGTRAP's action as the reset left it (the repair is
+/// lost, and reported).
+#[test]
+fn a_shared_page_with_a_copied_canary_is_never_written() {
+    unsealed();
+    if !reverie_ptrace::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    reverie_ptrace::testing::check_fn::<sigtrap_steps::SyscallSteppingTool, _>(|| {
+        // SAFETY: plain libc calls; the mapping is the guest's own, made over
+        // Reverie's unsealed page on purpose, and only this thread runs.
+        unsafe {
+            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            let repair_page = reverie_ptrace::testing::sigtrap_repair_page();
+            // Reverie's page, canary included, with its start, where a repair
+            // writes, filled with a pattern no action matches.
+            let mut copy = std::slice::from_raw_parts(repair_page as *const u8, page).to_vec();
+            copy[..page / 2].fill(0x5a);
+            let fd = libc::memfd_create(c"repair-page".as_ptr(), 0);
+            assert!(fd >= 0, "memfd_create");
+            assert_eq!(
+                libc::pwrite(fd, copy.as_ptr().cast(), page, 0),
+                page as isize,
+                "fill the file"
+            );
+            let mapped = libc::mmap(
+                repair_page as *mut libc::c_void,
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd,
+                0,
+            );
+            assert_eq!(mapped as usize, repair_page, "map over the repair page");
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ignore.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGTRAP, &ignore, std::ptr::null_mut()),
+                0
+            );
+            for _ in 0..4 {
+                // The Tool arms a timer 40 branches out; its steps reach the
+                // next syscall, where a repair would run.
+                libc::getpid();
+                libc::getppid();
+            }
+            let page_untouched = std::slice::from_raw_parts(mapped.cast::<u8>(), page) == copy;
+            let mut file = vec![0u8; page];
+            assert_eq!(
+                libc::pread(fd, file.as_mut_ptr().cast(), page, 0),
+                page as isize,
+                "read the file back"
+            );
+            let file_untouched = file == copy;
+            // The steps did reset the ignored SIGTRAP, so a repair was owed,
+            // and it was lost rather than written through the guest's file.
+            let mut now: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGTRAP, std::ptr::null(), &mut now),
+                0
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "guest page untouched: {page_untouched}, file untouched: {file_untouched}, action {:#x}",
+                now.sa_sigaction
+            );
+            assert!(page_untouched, "Reverie wrote into the guest's shared page");
+            assert!(file_untouched, "Reverie wrote into the guest's file");
+            assert_eq!(now.sa_sigaction, libc::SIG_DFL, "no repair was owed");
+        }
+    });
+}

@@ -1975,8 +1975,13 @@ const SYS_MSEAL: Reg = 462;
 
 /// The bytes Reverie writes at the end of an unsealed repair page
 /// ([`SCRATCH_CANARY_OFFSET`]) and checks before every use: a page the guest
-/// unmapped, replaced or overwrote no longer holds them, and then no repair is
-/// written there (a guest page is never written).
+/// unmapped, replaced with a fresh one, or overwrote no longer holds them,
+/// and then no repair is written there. The canary is fixed and readable, so
+/// it proves nothing about who owns the page: a guest can copy it into a page
+/// of its own. Before any write the page's mapping is checked as well
+/// (`scratch_mapping_owned`). The bytes are fixed on purpose: random ones
+/// would be guest-readable memory that differs from run to run, and would
+/// stop no guest that reads its own page first.
 const SCRATCH_CANARY: [u8; 16] = *b"reverie-sigtrap\0";
 
 /// Where in the repair page the canary sits: its last 16 bytes, past every
@@ -2035,6 +2040,81 @@ fn scratch_canary_intact(tid: Pid) -> bool {
     // side is only read.
     let read = unsafe { libc::process_vm_readv(tid.as_raw(), &local, 1, &remote, 1, 0) };
     read == found.len() as isize && found == SCRATCH_CANARY
+}
+
+/// Whether the mapping that holds the repair page in thread `tid`'s address
+/// space is of the kind pre-init maps there (`seal_sigtrap_scratch`):
+/// private, anonymous (no file, no device, no inode and no name), readable
+/// and writable, and covering the page's whole `cp::SCRATCH_SIZE`, by procfs
+/// `maps`, read only as far as that mapping. A write into such a mapping
+/// changes no file, no memory that another process shares, and nothing
+/// read-only. Its exact extent is not compared: the kernel can merge it with
+/// an adjacent private anonymous mapping of the same protection. Unreadable
+/// is false.
+///
+/// This and the canary (`scratch_canary_intact`) still pass for a private
+/// anonymous page that the guest mapped there in place of Reverie's and into
+/// which it copied the canary; a repair is then written into that page. That
+/// is the accepted limit of an unsealed page: the page is the guest's own
+/// private memory, at the address Reverie reserves, made to receive the
+/// write.
+///
+/// The check and the write that follows are not atomic either. Only the
+/// Tool's serialized-execution contract, which every repair requires, keeps
+/// the guest's other threads stopped between them. Under a Tool that breaks
+/// the contract, another guest thread can remap the page in between, and
+/// the write then lands in whatever that thread mapped there: a mapping the
+/// guest itself made at the address Reverie reserves.
+fn scratch_mapping_owned(tid: Pid) -> bool {
+    use std::io::BufRead;
+    // One transient descriptor, which a concurrent launch must not take.
+    let _open = crate::launch_window::TransientOpen::begin();
+    let Ok(maps) = std::fs::File::open(format!("/proc/{tid}/maps")) else {
+        return false;
+    };
+    let mut maps = std::io::BufReader::new(maps);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match maps.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        // A path may be any bytes; every field read here is ASCII.
+        let line = String::from_utf8_lossy(&line);
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(range), Some(perms), Some(offset), Some(device), Some(inode)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return false;
+        };
+        let Some((Ok(low), Ok(high))) = range.split_once('-').map(|(low, high)| {
+            (
+                usize::from_str_radix(low, 16),
+                usize::from_str_radix(high, 16),
+            )
+        }) else {
+            return false;
+        };
+        // The lines are in address order.
+        if high <= cp::SCRATCH_BASE {
+            continue;
+        }
+        let perms = perms.as_bytes();
+        return low <= cp::SCRATCH_BASE
+            && cp::SCRATCH_BASE + cp::SCRATCH_SIZE <= high
+            && perms.len() == 4
+            && perms[..2] == *b"rw"
+            && perms[3] == b'p'
+            && u64::from_str_radix(offset, 16) == Ok(0)
+            && device == "00:00"
+            && inode == "0"
+            && fields.next().is_none();
+    }
 }
 
 /// The `si_code` of a SIGILL for an illegal operand (`ud2`), which `libc`
@@ -12264,7 +12344,9 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     /// Reverie's SIGTRAP repair page (`cp::SCRATCH_BASE`) for the address
-    /// space of thread `tid`: `Ok(Some(_))` if it is sealed there, `Ok(None)` if
+    /// space of thread `tid`: `Ok(Some(_))` if it is sealed there, or unsealed
+    /// with its canary intact in a mapping of the kind pre-init made
+    /// (`scratch_canary_intact`, `scratch_mapping_owned`), `Ok(None)` if
     /// pre-init has not set it up yet (a repair stays owed until it has),
     /// `Err(())` if the address space has none (`seal_sigtrap_scratch`), or the
     /// thread has seccomp filters of the guest's own, which a repair's
@@ -12286,17 +12368,20 @@ impl<L: Tool + 'static> TracedTask<L> {
                 Err(())
             }
             SCRATCH_SEALED => Ok(Some(cp::SCRATCH_BASE)),
-            // An unsealed page is used only while its canary is intact: one
-            // the guest unmapped, replaced or overwrote is not written to,
-            // and repairs end in this address space.
-            SCRATCH_UNSEALED if scratch_canary_intact(tid) => Ok(Some(cp::SCRATCH_BASE)),
+            // An unsealed page is used only while its canary is intact and
+            // its mapping is still private, anonymous and read-write: one the
+            // guest unmapped, replaced, reprotected or overwrote is not
+            // written to, and repairs end in this address space.
+            SCRATCH_UNSEALED if scratch_canary_intact(tid) && scratch_mapping_owned(tid) => {
+                Ok(Some(cp::SCRATCH_BASE))
+            }
             SCRATCH_UNSEALED => {
                 self.sigtrap_scratch_state
                     .store(SCRATCH_UNAVAILABLE, Ordering::SeqCst);
                 static WARNED: AtomicBool = AtomicBool::new(false);
                 if !WARNED.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
-                        "[scheduler/tool] (pid = {}) the unsealed SIGTRAP repair page was unmapped or replaced; a SIGTRAP repair is lost and repairs are off in this address space",
+                        "[scheduler/tool] (pid = {}) the unsealed SIGTRAP repair page was unmapped, replaced, reprotected or overwritten; a SIGTRAP repair is lost and repairs are off in this address space",
                         tid
                     );
                 }
@@ -12440,11 +12525,22 @@ impl<L: Tool + 'static> TracedTask<L> {
             match result {
                 // Without `mseal` (before Linux 6.10, or filtered by a
                 // container) the page is used unsealed. The guest could then
-                // unmap, replace or rewrite it; the canary written here is
-                // checked before every use (`sigtrap_scratch`), so a repair
-                // is never written into a page that is not Reverie's. That is
-                // detection, not prevention: such a page ends repairs in this
-                // address space.
+                // unmap, replace, reprotect or rewrite it. Before every use
+                // (`sigtrap_scratch`) the canary written here is checked, and
+                // so is the page's mapping: a repair is written only into a
+                // private, anonymous, read-write mapping that holds the
+                // canary, so never into a file, shared memory or a read-only
+                // page while the Tool keeps its serialized-execution
+                // contract, and a page that fails either check ends repairs
+                // in this address space. That is detection, not prevention, and
+                // it has two limits (`scratch_mapping_owned`): a guest that
+                // copies the canary into a private anonymous page of its
+                // own, mapped here in place of Reverie's, receives the
+                // repair's writes in that page; and the check and the write
+                // are not atomic, so under a Tool that breaks its
+                // serialized-execution contract another guest thread can
+                // remap the page between them, and the write lands in a
+                // mapping the guest itself made here.
                 Err(Errno::ENOSYS | Errno::EPERM) => {
                     let canary = AddrMut::<[u8; SCRATCH_CANARY.len()]>::from_raw(
                         cp::SCRATCH_BASE + SCRATCH_CANARY_OFFSET,
