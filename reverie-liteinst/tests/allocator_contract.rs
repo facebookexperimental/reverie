@@ -9,6 +9,9 @@ use std::process::Command;
 #[path = "support/liteinst_runtime.rs"]
 mod liteinst_runtime;
 
+#[path = "support/runtime_receipt_controls.rs"]
+mod runtime_receipt_controls;
+
 use liteinst_runtime::artifact;
 use liteinst_runtime::contract;
 

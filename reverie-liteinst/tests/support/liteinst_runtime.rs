@@ -2,8 +2,8 @@
 //!
 //! Expected package/profile/source/oracle identities come from this consumer and
 //! current Git worktree, never from the receipt being accepted. Verification is
-//! cached once per test process; it performs bounded Git reads and no Cargo, cc,
-//! dlopen or guest launch. There is no target/deps artifact fallback.
+//! cached once per test process; it performs bounded Git reads and offline Cargo
+//! metadata, with no compilation, dlopen or guest launch. No artifact fallback exists.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -13,6 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 // Each consumer uses a subset of the shared producer/consumer APIs. Their unit
 // tests remain enrolled in every test binary that includes this module.
@@ -319,19 +320,39 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
             ("rust_exports".to_owned(), RUST_ORACLE_SHA256.to_owned()),
             ("c_workload".to_owned(), C_ORACLE_SHA256.to_owned()),
         ]);
-        let expectation = artifact::ConsumerExpectation {
-            compiled_sources: None,
-            package: &package,
-            features: &features,
-            profile_name: "dev",
-            profile: &profile,
-            initializer: artifact::STANDALONE_ROOT,
-            source_head: &source.head,
-            source_tree: &source.tree,
-            source_lock_sha256: &source.lock.sha256,
-            oracle_sha256: &oracle_sha256,
-        };
-        let receipt = artifact::verify_runtime_receipt(&receipt_path, &path, &expectation)?;
+        let manifest = source.root.join("Cargo.toml");
+        let mut source_runner = artifact::Runner::new(
+            evidence.join("compiled-sources"),
+            Duration::from_secs(60),
+            16 << 20,
+        )?;
+        // Resolve from this consumer's current worktree, never from the receipt.
+        // The receipt-only transaction closes on success and ordinary error.
+        let (receipt, _) = artifact::VerifiedCompiledSources::with_resolved(
+            &artifact::CompiledSourceExpectation {
+                layout: artifact::CompiledSourceLayout::ReverieWorkspace,
+                image_kind: artifact::FixedImageKind::Standalone,
+                workspace_root: &source.root,
+                manifest: &manifest,
+                reverie_pin: &source.head,
+            },
+            &mut source_runner,
+            |compiled_sources| {
+                let expectation = artifact::ConsumerExpectation {
+                    compiled_sources: Some(compiled_sources),
+                    package: &package,
+                    features: &features,
+                    profile_name: "dev",
+                    profile: &profile,
+                    initializer: artifact::STANDALONE_ROOT,
+                    source_head: &source.head,
+                    source_tree: &source.tree,
+                    source_lock_sha256: &source.lock.sha256,
+                    oracle_sha256: &oracle_sha256,
+                };
+                artifact::verify_runtime_receipt(&receipt_path, &path, &expectation)
+            },
+        )?;
         if receipt.source_before != source || receipt.source_after != source {
             return Err("receipt source root/lock/oracle paths differ from the exact current source snapshot".into());
         }
