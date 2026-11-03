@@ -1211,7 +1211,8 @@ impl ProcSignalState {
 /// `ENOSYS`, as one built without `CONFIG_X86_X32_ABI` does. Reverie's
 /// filter traces syscalls by their x86-64 numbers; an x32 syscall has the
 /// same audit architecture and another number, so where the kernel accepts
-/// one, an x32 `rt_sigprocmask`, `rt_sigaction` or `rt_sigreturn` runs
+/// one, an x32 `rt_sigprocmask`, `rt_sigaction` or `rt_sigreturn`, or an x32
+/// `rt_sigtimedwait` or `rt_sigpending` (`stash_pending_sigtrap`), runs
 /// without a stop. Probed once, with an x32 `getpid`, by a tracer thread
 /// that has no seccomp filter of its own (`keeps_sigtrap_state`): a filter
 /// written for x86-64 numbers could kill the thread for an x32 one.

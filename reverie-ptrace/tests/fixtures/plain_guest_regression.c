@@ -2932,12 +2932,14 @@ static void mode_sigtrap_guest_pending_kept(void) {
 }
 
 /* A SIGTRAP the guest queued itself while blocking it, out of the queue for
- * a precise timer's steps, which reach the traced getpid before the timer's
- * target (as in timer_loop for k >= 3): the getpid's seccomp stop queues it
+ * a precise timer's steps, which reach a traced syscall before the timer's
+ * target (as in timer_loop for k >= 3): the syscall's seccomp stop queues it
  * again before the Tool or the syscall can read the thread's signals. The
- * lines are the native ones: pending after the getpid, and delivered once,
- * with its code and pid, at the unblock. */
-static void mode_sigtrap_stash_steps_onto_syscall(void) {
+ * syscall is a getpid, or an rt_sigpending run as the stop's own syscall
+ * (SHAPE_TAIL), which reads the pending set itself. The lines are the
+ * native ones: pending at and after the syscall, and delivered once, with
+ * its code and pid, at the unblock. */
+static void sigtrap_stash_steps_onto(int sigpending) {
   warm();
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
@@ -2954,12 +2956,27 @@ static void mode_sigtrap_stash_steps_onto_syscall(void) {
   SITEM(SYS_getppid, 0, 0, 0, 0, TL_K, ARM_TIMER);
   if (tl_a)
     tl_sum++;
-  if (SITE(SYS_getpid, 0, 0, 0, 0, 0) <= 0)
-    die("getpid");
-  gk_state("after-stepped-getpid");
+  if (sigpending) {
+    sigset_t pending;
+    sigemptyset(&pending);
+    if (SITEM(SYS_rt_sigpending, &pending, 8, 0, 0, 0, SHAPE_TAIL) != 0)
+      die("rt_sigpending");
+    say("kept stepped sigpending SIGTRAP=%d\n", sigismember(&pending, SIGTRAP));
+    gk_state("after-stepped-sigpending");
+  } else {
+    if (SITE(SYS_getpid, 0, 0, 0, 0, 0) <= 0)
+      die("getpid");
+    gk_state("after-stepped-getpid");
+  }
   if (sigprocmask(SIG_UNBLOCK, &trap, NULL) != 0)
     die("unblock SIGTRAP");
   say("kept unblocked handled=%d code=%d pid=%d\n", gk_n, gk_code, gk_pid);
+}
+static void mode_sigtrap_stash_steps_onto_syscall(void) {
+  sigtrap_stash_steps_onto(0);
+}
+static void mode_sigtrap_stash_steps_onto_sigpending(void) {
+  sigtrap_stash_steps_onto(1);
 }
 
 /* A SIGTRAP the guest queued itself while blocking it, out of the queue for
@@ -6698,6 +6715,8 @@ int main(int argc, char** argv) {
     mode_sigtrap_guest_pending_kept();
   else if (!strcmp(m, "sigtrap_stash_steps_onto_syscall"))
     mode_sigtrap_stash_steps_onto_syscall();
+  else if (!strcmp(m, "sigtrap_stash_steps_onto_sigpending"))
+    mode_sigtrap_stash_steps_onto_sigpending();
   else if (!strcmp(m, "perf_marker"))
     mode_perf_marker();
   else if (!strcmp(m, "timer_allow"))

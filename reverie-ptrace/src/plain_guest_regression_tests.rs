@@ -5780,7 +5780,9 @@ async fn a_sigtrap_queued_after_the_stash_ends_the_run_by_name() {
 /// (`TracedTask::repair_sigtrap_at_seccomp_stop`), before the Tool or the
 /// syscall can read the thread's signals: it is pending after the syscall
 /// and delivered once at the unblock, with its code and pid, as natively.
-/// In the injecting configuration.
+/// In the injecting configuration. Here the Tool's injection of the getpid
+/// would queue it too; `a_stashed_sigtrap_is_pending_for_a_stepped_sigpending`
+/// has none, and fails without the stop's own requeue.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stashed_sigtrap_is_queued_again_at_a_stepped_syscall() {
     if !crate::perf::is_perf_supported() {
@@ -5808,6 +5810,49 @@ async fn a_stashed_sigtrap_is_queued_again_at_a_stepped_syscall() {
         stepped_entries(&run, "getpid"),
         1,
         "the timer's steps did not reach the getpid: {:#?}",
+        run.stepped_entries
+    );
+    assert!(
+        crate::task::SIGTRAP_STASHES_FOR_TEST.with(|count| count.get()) > stashes,
+        "no timer sequence took the SIGTRAP out of the queue: {}",
+        run.report
+    );
+}
+
+/// As `a_stashed_sigtrap_is_queued_again_at_a_stepped_syscall`, but the
+/// syscall the timer's steps reach is an `rt_sigpending` that runs as its
+/// seccomp stop's own syscall (`tail_inject`), with no injection before it
+/// that could queue the SIGTRAP instead: it reads SIGTRAP pending only if
+/// the stop queued it again (`TracedTask::repair_sigtrap_at_seccomp_stop`),
+/// as natively. In the injecting configuration.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stashed_sigtrap_is_pending_for_a_stepped_sigpending() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let stashes = crate::task::SIGTRAP_STASHES_FOR_TEST.with(|count| count.get());
+    let run = run_guest("sigtrap_stash_steps_onto_sigpending", false).await;
+    assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+    let lines: Vec<&str> = run
+        .report
+        .lines()
+        .filter(|line| line.starts_with("kept "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "kept stepped sigpending SIGTRAP=1",
+            "kept after-stepped-sigpending SigPnd=1 ShdPnd=0 handled=0",
+            "kept unblocked handled=1 code=-7 pid=4242",
+        ],
+        "{}",
+        run.report
+    );
+    assert_eq!(
+        stepped_entries(&run, "rt_sigpending"),
+        1,
+        "the timer's steps did not reach the rt_sigpending: {:#?}",
         run.stepped_entries
     );
     assert!(
