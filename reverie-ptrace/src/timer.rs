@@ -200,12 +200,12 @@ pub(crate) static BLOCK_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 pub(crate) static BRANCH_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Branch runs whose counter moved by more branches than their decode
 /// allows, for tests (see [`TimerImpl::check_branch_run`]).
+pub(crate) static BRANCH_RUN_MISMATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Notifications of a timer's own that arrived during its single steps and
 /// were consumed there (see [`TimerImpl::own_notification_during_steps`]),
 /// for tests.
 pub(crate) static OWN_NOTIFICATIONS_DURING_STEPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub(crate) static BRANCH_RUN_MISMATCHES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static BLOCK_BOUND_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
