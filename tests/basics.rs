@@ -321,6 +321,11 @@ fn native_signal_status(body: &dyn Fn()) -> ExitStatus {
         Ok(ForkResult::Parent { child }) => loop {
             match nix::sys::wait::waitpid(child, None) {
                 Ok(WaitStatus::Signaled(_, signal, core_dumped)) => {
+                    assert_eq!(
+                        signal,
+                        nix::sys::signal::Signal::SIGSEGV,
+                        "native segfault control died by the wrong signal"
+                    );
                     return ExitStatus::Signaled(signal, core_dumped);
                 }
                 Ok(other) => {

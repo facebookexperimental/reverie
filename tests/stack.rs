@@ -131,6 +131,12 @@ impl Tool for LocalState2 {
                 let v2 = guest.memory().read_value(ptr2).unwrap();
                 assert_eq!(v2, 4444);
 
+                // The nested frame must not disturb the still-live first
+                // frame: it lies strictly below it and leaves its value.
+                assert!(ptr2.as_raw() + 8 <= ptr1.as_raw());
+                let v1_again = guest.memory().read_value(ptr1).unwrap();
+                assert_eq!(v1_again, 3333);
+
                 guest.tail_inject(exit_success).await
             }
             _ => guest.tail_inject(syscall).await,
@@ -159,9 +165,12 @@ impl Tool for LocalStateUncommitted {
                 let mut stack = guest.stack().await;
                 let _ptr: AddrMut<u64> = stack.reserve();
                 // No commit: `stack` is a live uncommitted builder. A second
-                // checkout while it is alive must panic.
+                // checkout while it is alive must panic in the allocator. If
+                // it ever succeeds, exit 0 instead of panicking, so the
+                // should_panic test goes red.
                 let _second = guest.stack().await;
-                unreachable!("second uncommitted stack checkout must panic");
+                drop(_second);
+                guest.tail_inject(ExitGroup::new().with_status(0)).await
             }
             _ => guest.tail_inject(syscall).await,
         }
@@ -209,7 +218,9 @@ mod tests {
     /// the first builder is still uncommitted. Pending builders are
     /// exclusive, so retrieving another guest stack panics.
     #[test]
-    #[should_panic]
+    #[should_panic(
+        expected = "cannot retrieve guest Stack while an uncommitted stack builder is still alive"
+    )]
     fn stack_two_allocs_uncommitted_bad() {
         check_fn::<LocalStateUncommitted, _>(|| {
             unsafe { libc::syscall(libc::SYS_exit_group, 0) };

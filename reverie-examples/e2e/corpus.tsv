@@ -6,7 +6,9 @@
 # them back (openat=3), so the two native runs differ run-to-run. A per-run
 # PYTHONPYCACHEPREFIX would need comparator-supplied per-run state, which the
 # static corpus cannot express; disabling the write makes both runs take the
-# same no-cache path.
+# same no-cache path. A fixed, never-created PYTHONPYCACHEPREFIX alongside it
+# also stops either run from reading a shared __pycache__ another process
+# filled between the two runs.
 true	/bin/true
 echo	/bin/echo	hello
 cat-hostname	/bin/cat	/etc/hostname
@@ -28,5 +30,5 @@ tar-hostname	/bin/tar	-cf	/dev/null	/etc/hostname
 gzip-hostname	/bin/gzip	-c	/etc/hostname
 awk	/bin/awk	BEGIN{print 1}
 perl	/bin/perl	-e	print 1
-python3	/bin/env	PYTHONHASHSEED=0	PYTHONDONTWRITEBYTECODE=1	/bin/python3	-c	pass
+python3	/bin/env	PYTHONHASHSEED=0	PYTHONDONTWRITEBYTECODE=1	PYTHONPYCACHEPREFIX=/nonexistent/reverie-e2e-pycache	/bin/python3	-c	pass
 sh-pipe	/bin/sh	-c	/bin/seq 1 100 | /bin/wc -l
