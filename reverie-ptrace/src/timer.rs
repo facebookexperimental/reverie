@@ -194,6 +194,40 @@ pub(crate) enum StepUnit {
     },
 }
 
+/// Whether a branch run's counter, `moved` branches on from where it
+/// started, agrees with its decode ([`StepUnit::ToBranch`]'s `stops[..count]`
+/// and `branches`), as [`TimerImpl::check_branch_run`] requires:
+/// - at the run's own breakpoint (`at_breakpoint`, which reads the stop's pc),
+///   exactly the count of the end it stopped at. Where the two ends differ in
+///   count, the pc picks the end, and a pc that cannot be read or is at
+///   neither end fails closed. Otherwise every end has the first end's count,
+///   and the pc is not read;
+/// - at any other stop, no more than the most at any end.
+///
+/// Kept apart from the check, which only aarch64 builds, so that its
+/// arithmetic is tested on every architecture.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn branch_run_consistent(
+    stops: [u64; 2],
+    count: usize,
+    branches: [u64; 2],
+    moved: u64,
+    at_breakpoint: Option<impl FnOnce() -> Option<u64>>,
+) -> bool {
+    match at_breakpoint {
+        Some(pc) => {
+            let expected = if count == 2 && branches[0] != branches[1] {
+                pc().and_then(|pc| stops[..count].iter().position(|&stop| stop == pc))
+                    .map(|end| branches[end])
+            } else {
+                Some(branches[0])
+            };
+            expected == Some(moved)
+        }
+        None => moved <= branches[..count].iter().copied().max().unwrap_or(0),
+    }
+}
+
 /// Steps of each unit taken toward precise event targets, and lookups in the
 /// block bound cache, for tests and measurement.
 pub(crate) static INSTRUCTION_STEPS: std::sync::atomic::AtomicU64 =
@@ -3568,21 +3602,8 @@ impl TimerImpl {
         };
         let clock = self.read_clock_at(task);
         let moved = clock.wrapping_sub(from);
-        let most = branches[..count].iter().copied().max().unwrap_or(0);
-        let expected = at_breakpoint.and_then(|task| {
-            if count == 2 && branches[0] != branches[1] {
-                let pc = task.getregs().ok()?.pc;
-                let end = stops[..count].iter().position(|&stop| stop == pc)?;
-                Some(branches[end])
-            } else {
-                Some(branches[0])
-            }
-        });
-        let consistent = match at_breakpoint {
-            Some(_) => expected == Some(moved),
-            None => moved <= most,
-        };
-        if consistent {
+        let at = at_breakpoint.map(|task| move || task.getregs().ok().map(|regs| regs.pc));
+        if branch_run_consistent(stops, count, branches, moved, at) {
             return;
         }
         warn!(
@@ -4914,10 +4935,104 @@ mod tests {
     use super::ClockCounter;
     #[cfg(target_arch = "x86_64")]
     use super::PmuConfig;
+    use super::branch_run_consistent;
     #[cfg(target_arch = "x86_64")]
     use super::runs_in_place;
     #[cfg(target_arch = "x86_64")]
     use super::uncounted_step_may_miscount;
+
+    /// A load-exclusive unit whose two ends differ in count, as
+    /// [`crate::branch_step::exclusive_sequence`] decodes a compare-and-swap:
+    /// 2 branches to the address after its store-exclusive, 1 to its exit.
+    const UNIT_STOPS: [u64; 2] = [0x1010, 0x2000];
+    const UNIT_BRANCHES: [u64; 2] = [2, 1];
+
+    /// At the run's breakpoint, a unit whose ends differ in count is checked
+    /// against the end the stop's pc is at: each end's own count agrees, and
+    /// the other end's count is a mismatch, which ends branch runs
+    /// (`check_branch_run`).
+    #[test]
+    fn a_branch_run_at_its_breakpoint_is_checked_against_that_ends_count() {
+        for (end, &pc) in UNIT_STOPS.iter().enumerate() {
+            let other = UNIT_BRANCHES[1 - end];
+            assert!(
+                branch_run_consistent(
+                    UNIT_STOPS,
+                    2,
+                    UNIT_BRANCHES,
+                    UNIT_BRANCHES[end],
+                    Some(|| Some(pc))
+                ),
+                "end {end}: its own count"
+            );
+            assert!(
+                !branch_run_consistent(UNIT_STOPS, 2, UNIT_BRANCHES, other, Some(|| Some(pc))),
+                "end {end}: the other end's count {other} is a mismatch"
+            );
+        }
+    }
+
+    /// At the run's breakpoint, a unit whose ends differ in count fails
+    /// closed where the end cannot be known: a pc that cannot be read, or one
+    /// at neither end, agrees with no count, either end's included.
+    #[test]
+    fn a_branch_run_at_its_breakpoint_with_an_unknown_end_fails_closed() {
+        for moved in [0, 1, 2, 3] {
+            assert!(
+                !branch_run_consistent(UNIT_STOPS, 2, UNIT_BRANCHES, moved, Some(|| None)),
+                "unreadable pc, moved {moved}"
+            );
+            assert!(
+                !branch_run_consistent(UNIT_STOPS, 2, UNIT_BRANCHES, moved, Some(|| Some(0x1004))),
+                "pc at neither end, moved {moved}"
+            );
+        }
+    }
+
+    /// At a stop other than the run's breakpoint (an interrupting signal),
+    /// the counter may have moved by any count up to the most at any end;
+    /// more fails closed. A unit whose ends have one count is checked at its
+    /// breakpoint against that count exactly, without reading the pc.
+    #[test]
+    fn a_branch_run_elsewhere_may_not_pass_its_most_branches() {
+        let none = None::<fn() -> Option<u64>>;
+        for moved in [0, 1, 2] {
+            assert!(
+                branch_run_consistent(UNIT_STOPS, 2, UNIT_BRANCHES, moved, none),
+                "{moved}"
+            );
+        }
+        assert!(!branch_run_consistent(
+            UNIT_STOPS,
+            2,
+            UNIT_BRANCHES,
+            3,
+            none
+        ));
+        assert!(!branch_run_consistent([0x1010, 0], 1, [1, 0], 2, none));
+        let unread = || -> Option<u64> { panic!("the pc is read only where the ends differ") };
+        assert!(branch_run_consistent(
+            [0x1010, 0x2000],
+            2,
+            [1, 1],
+            1,
+            Some(unread)
+        ));
+        assert!(!branch_run_consistent(
+            [0x1010, 0],
+            1,
+            [1, 0],
+            0,
+            Some(unread)
+        ));
+        assert!(!branch_run_consistent(
+            [0x1010, 0],
+            1,
+            [1, 0],
+            2,
+            Some(unread)
+        ));
+    }
 
     /// The controller's marker reads as its own PID in a shared PID
     /// namespace, as 0 from a descendant one, and as its own PID on a kernel
@@ -5069,6 +5184,32 @@ mod tests {
         }
         SWITCH_OUT_FORCED_FOR_TEST.set(false);
         assert!(!inner.branch_runs_off);
+    }
+
+    /// A branch run whose counter disagrees with its decode at its own
+    /// breakpoint (no branch retired where the unit decoded 5) ends branch
+    /// runs for the thread and is counted (`check_branch_run`), as any
+    /// inconsistency `branch_run_consistent` finds.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn a_branch_run_mismatch_ends_branch_runs() {
+        use super::BRANCH_RUN_MISMATCHES;
+        use super::StepUnit;
+
+        let Some((mut timer, task, _reap)) = timer_on_a_stopped_child() else {
+            return;
+        };
+        let inner = timer.inner_mut_noinit().expect("a timer");
+        let from = inner.read_clock();
+        let unit = StepUnit::ToBranch {
+            stops: [0, 0],
+            count: 1,
+            branches: [5, 5],
+        };
+        let before = BRANCH_RUN_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed);
+        inner.check_branch_run(&task, unit, from, from + 1_000, Some(&task));
+        assert!(inner.branch_runs_off);
+        assert!(BRANCH_RUN_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) > before);
     }
 
     /// A step that fails after a branch run armed its breakpoints, before
