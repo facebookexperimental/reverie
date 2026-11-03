@@ -13,26 +13,45 @@
 //! This verifies that timer events, if requested, are delivered during busywaits and are not delivered
 //! if not requested.
 
+#[cfg(all(not(sanitized), test))]
 use std::sync::atomic::AtomicBool;
+#[cfg(all(not(sanitized), test))]
 use std::sync::atomic::AtomicU64;
+#[cfg(all(not(sanitized), test))]
 use std::sync::atomic::Ordering;
 
+#[cfg(all(not(sanitized), test))]
 use reverie::CpuIdResult;
+#[cfg(all(not(sanitized), test))]
 use reverie::Errno;
+#[cfg(all(not(sanitized), test))]
 use reverie::Error;
+#[cfg(all(not(sanitized), test))]
 use reverie::ExitStatus;
+#[cfg(all(not(sanitized), test))]
 use reverie::GlobalRPC;
+#[cfg(all(not(sanitized), test))]
 use reverie::GlobalTool;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Pid;
+#[cfg(all(not(sanitized), test))]
 use reverie::Signal;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tid;
+#[cfg(all(not(sanitized), test))]
 use reverie::TimerSchedule;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Syscall;
+#[cfg(all(not(sanitized), test))]
 use serde::Deserialize;
+#[cfg(all(not(sanitized), test))]
 use serde::Serialize;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct GlobalState {
     num_evts: AtomicU64,
@@ -40,14 +59,17 @@ struct GlobalState {
     collect: AtomicBool,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct Config {
     set_timer: bool,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum IncrMsg {
     Increment,
@@ -55,6 +77,7 @@ pub enum IncrMsg {
     TimerEvent,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::global_tool]
 impl GlobalTool for GlobalState {
     type Request = IncrMsg;
@@ -87,8 +110,10 @@ impl GlobalTool for GlobalState {
 
 // Use RCBs directly to ensure determinism tests are robust to changes in
 // conversion from realtime to RCBs.
+#[cfg(all(not(sanitized), test))]
 const TIMEOUT: TimerSchedule = TimerSchedule::Rcbs(120_000_000);
 
+#[cfg(all(not(sanitized), test))]
 /// Should implement _all_ reverie callbacks.
 #[reverie::tool]
 impl Tool for LocalState {
