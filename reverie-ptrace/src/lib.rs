@@ -38,6 +38,12 @@
 #![cfg(target_os = "linux")]
 #![cfg_attr(feature = "nightly", feature(internal_output_capture))]
 
+// The crate's own unit tests share test modules with its integration tests
+// (`task::sigtrap_repair_page_tests` includes `tests/sigtrap_steps`), which
+// name the crate as `reverie_ptrace`.
+#[cfg(test)]
+extern crate self as reverie_ptrace;
+
 mod backend;
 #[cfg(any(test, target_arch = "aarch64"))]
 mod branch_step;

@@ -174,6 +174,9 @@ use native_syscall::NativeCallContext;
 #[cfg(test)]
 mod thread_state_ready_tests;
 
+#[cfg(test)]
+mod sigtrap_repair_page_tests;
+
 #[cfg(target_arch = "x86_64")]
 fn is_legacy_vsyscall_ip(ip: Reg) -> bool {
     const VSYSCALL_START: Reg = 0xffff_ffff_ff60_0000;
@@ -1980,14 +1983,40 @@ const SCRATCH_CANARY: [u8; 16] = *b"reverie-sigtrap\0";
 /// action a repair writes or reads at its start.
 const SCRATCH_CANARY_OFFSET: usize = cp::SCRATCH_SIZE - SCRATCH_CANARY.len();
 
-/// When set (to anything), the repair page is used unsealed as if `mseal`
-/// were unavailable, as on kernels before Linux 6.10: for testing that path
-/// on a kernel that has `mseal`.
-pub const SIGTRAP_REPAIR_NO_MSEAL_ENV: &str = "REVERIE_SIGTRAP_REPAIR_NO_MSEAL";
+/// The SIGTRAP repair page's test switches, which exist only in this crate's
+/// own unit tests (`cfg(test)`): no other build, and no user of the crate,
+/// can leave the page unsealed where `mseal` works. A tracer takes them from
+/// the thread that starts it (`SigtrapRepairTestSwitches::of_this_thread`)
+/// and keeps them for its whole run (`GlobalState::sigtrap_repair_test_switches`);
+/// a test sets them on its own thread, never through the environment.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct SigtrapRepairTestSwitches {
+    /// The repair page is used unsealed even where `mseal` works, as on a
+    /// kernel before Linux 6.10, so that a test can run that path.
+    pub(crate) unsealed: bool,
+}
 
-fn mseal_disabled_for_testing() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os(SIGTRAP_REPAIR_NO_MSEAL_ENV).is_some())
+#[cfg(test)]
+thread_local! {
+    /// The switches the tracers this thread starts take.
+    static SIGTRAP_REPAIR_TEST_SWITCHES: std::cell::RefCell<SigtrapRepairTestSwitches> =
+        std::cell::RefCell::new(SigtrapRepairTestSwitches::default());
+}
+
+#[cfg(test)]
+impl SigtrapRepairTestSwitches {
+    /// The switches set on the calling thread, for a tracer it starts.
+    pub(crate) fn of_this_thread() -> Self {
+        SIGTRAP_REPAIR_TEST_SWITCHES.with(|switches| switches.borrow().clone())
+    }
+
+    /// Makes every tracer that the calling thread starts from now on leave
+    /// its repair pages unsealed; each such address space logs an INFO line.
+    /// libtest runs each test on a thread of its own.
+    pub(crate) fn unseal_on_this_thread() {
+        SIGTRAP_REPAIR_TEST_SWITCHES.with(|switches| switches.borrow_mut().unsealed = true);
+    }
 }
 
 /// Whether thread `tid`'s address space still holds the canary at the end of
@@ -3798,6 +3827,10 @@ struct GlobalState<G: GlobalTool> {
 
     #[cfg(test)]
     preinit_point_for_test: Option<PreinitPointForTest>,
+
+    /// The repair page's test switches, taken when the tracer started.
+    #[cfg(test)]
+    sigtrap_repair_test_switches: SigtrapRepairTestSwitches,
 }
 
 /// Test-only: sees the registers at the final resume of every Tool-visible
@@ -4041,6 +4074,8 @@ impl<G: GlobalTool> Clone for GlobalState<G> {
             pre_syscall_for_test: self.pre_syscall_for_test.clone(),
             #[cfg(test)]
             preinit_point_for_test: self.preinit_point_for_test.clone(),
+            #[cfg(test)]
+            sigtrap_repair_test_switches: self.sigtrap_repair_test_switches.clone(),
         }
     }
 }
@@ -4599,6 +4634,10 @@ impl<L: Tool> TracedTask<L> {
             pre_syscall_for_test: options.pre_syscall_for_test,
             #[cfg(test)]
             preinit_point_for_test: options.preinit_point_for_test,
+            // The root's task is made while the tracer starts, on the thread
+            // that starts it (`TracerBuilder::spawn`, `spawn_fn_with_config`).
+            #[cfg(test)]
+            sigtrap_repair_test_switches: SigtrapRepairTestSwitches::of_this_thread(),
         };
         let thread_state = process_state.init_thread_state(tid, None);
         let (next_state, next_state_rx) = mpsc::channel(1);
@@ -12281,6 +12320,21 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    /// Whether this tracer leaves every repair page unsealed, as if `mseal`
+    /// failed with `ENOSYS`, by its test switch
+    /// (`SigtrapRepairTestSwitches::unsealed`). Never outside this crate's
+    /// own unit tests.
+    fn sigtrap_repair_page_forced_unsealed(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.global_state.sigtrap_repair_test_switches.unsealed
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     /// Maps Reverie's sealed SIGTRAP repair page after the trampoline
     /// (`cp::SCRATCH_BASE`): an unstepped `mmap(..., MAP_FIXED_NOREPLACE)`,
     /// read-write, then `mseal`. Pre-init runs at an exec stop, where the new
@@ -12373,7 +12427,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         };
         let (task, sealed) = if mapped == cp::SCRATCH_BASE {
             let args = SyscallArgs::new(cp::SCRATCH_BASE, cp::SCRATCH_SIZE, 0, 0, 0, 0);
-            let (task, result) = if mseal_disabled_for_testing() {
+            let (task, result) = if self.sigtrap_repair_page_forced_unsealed() {
+                tracing::info!(
+                    "[scheduler/tool] (pid = {}) SIGTRAP repair page left unsealed by the test switch",
+                    task.pid()
+                );
                 (task, Err(Errno::ENOSYS))
             } else {
                 self.untraced_syscall_number_unstepped(task, SYS_MSEAL, args)

@@ -7,23 +7,29 @@
  */
 
 //! The SIGTRAP repair without `mseal` (Linux before 6.10): the repair page is
-//! used unsealed, as `REVERIE_SIGTRAP_REPAIR_NO_MSEAL` forces on a kernel
+//! used unsealed, as this crate's test switch
+//! (`SigtrapRepairTestSwitches::unseal_on_this_thread`) forces on a kernel
 //! that has `mseal`. Every state of `sigtrap_steps` must survive as it does
 //! with the page sealed, and a page the guest replaced must never be written:
-//! its canary is gone, so the repair is reported lost instead.
+//! the repair is reported lost instead. Without the switch the page is sealed
+//! wherever `mseal` works.
+//!
+//! The switch exists only under `cfg(test)`, so these are the crate's own unit
+//! tests rather than integration tests. They run the guests of
+//! `tests/sigtrap_steps`, which `tests/sigtrap_state_timer_steps.rs` runs
+//! with the page sealed.
 
+#[path = "../../tests/sigtrap_steps/mod.rs"]
 mod sigtrap_steps;
 
 use std::io::Write;
 
-/// Sets `REVERIE_SIGTRAP_REPAIR_NO_MSEAL` once, before any tracer in this
-/// test binary maps a repair page. Every test here sets the same value.
+use super::SigtrapRepairTestSwitches;
+
+/// Makes the tracers this test starts, on its own thread, leave their repair
+/// pages unsealed.
 fn unsealed() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: every test in this binary sets the same variable to the same
-    // value through this `Once`, before it starts a tracer; nothing reads the
-    // environment concurrently with a different expectation.
-    ONCE.call_once(|| unsafe { std::env::set_var("REVERIE_SIGTRAP_REPAIR_NO_MSEAL", "1") });
+    SigtrapRepairTestSwitches::unseal_on_this_thread();
 }
 
 #[test]
@@ -107,4 +113,66 @@ fn a_replaced_unsealed_repair_page_is_never_written() {
             assert_eq!(now.sa_sigaction, libc::SIG_DFL, "no repair was owed");
         }
     });
+}
+
+/// `mseal(2)`'s number on x86-64 and aarch64, which `libc` does not name.
+const SYS_MSEAL: libc::c_long = 462;
+
+/// Whether `mseal` works on this kernel, tried on a page of this process,
+/// which stays mapped and sealed.
+fn mseal_works() -> bool {
+    // SAFETY: a fresh private anonymous page of this process, which nothing
+    // else uses, is mapped and sealed.
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let mapped = libc::mmap(
+            std::ptr::null_mut(),
+            page,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        assert_ne!(mapped, libc::MAP_FAILED, "map a page to seal");
+        libc::syscall(SYS_MSEAL, mapped, page, 0) == 0
+    }
+}
+
+/// Without the test switch the repair page is sealed wherever `mseal` works:
+/// a guest's `mmap` over it fails with EPERM exactly there. The tracer starts
+/// on a thread of its own, on which no switch was ever set, so the switch's
+/// default decides.
+#[test]
+fn the_repair_page_is_sealed_by_default() {
+    let sealed = mseal_works();
+    std::thread::spawn(move || {
+        reverie_ptrace::testing::check_fn::<sigtrap_steps::SyscallSteppingTool, _>(move || {
+            // SAFETY: plain libc calls; a mapping that succeeds replaces only
+            // Reverie's repair page, which this guest does not use
+            // afterwards, and only this thread runs.
+            unsafe {
+                let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                let mapped = libc::mmap(
+                    reverie_ptrace::testing::sigtrap_repair_page() as *mut libc::c_void,
+                    page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                    -1,
+                    0,
+                );
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                let refused = mapped == libc::MAP_FAILED && errno == Some(libc::EPERM);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "mseal works: {sealed}; mapping over the repair page refused with EPERM: {refused}"
+                );
+                assert_eq!(
+                    refused, sealed,
+                    "the repair page must be sealed exactly where mseal works"
+                );
+            }
+        });
+    })
+    .join()
+    .expect("the guest found the repair page sealed exactly where mseal works");
 }
