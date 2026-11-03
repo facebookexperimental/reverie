@@ -1232,6 +1232,17 @@ struct TimerImpl {
     /// programmed. Consuming notifications does not clear it.
     programming_overflowed: bool,
 
+    /// Overflows of the current programming that the kernel has recorded and
+    /// whose notification no stop has yet taken. The kernel writes an
+    /// overflow's record before it queues the notification, so a notification
+    /// of this counter's own is one of these; one beyond them is not the
+    /// kernel's (see [`TimerImpl::own_notification_during_steps`]). Collecting
+    /// records adds to it, each notification of the timer's own that a stop
+    /// takes uses one up, and it starts again from zero at every programming
+    /// and once an event's steps reach their target, so that what one
+    /// programming recorded cannot account for a signal after it.
+    unnotified_overflows: u64,
+
     /// The clock at which the programming of the active event's latest
     /// successful request (or second stage) overflows `timer`, or `None` if
     /// it programmed no overflow, as for an artificial notification or a
@@ -1775,6 +1786,7 @@ impl TimerImpl {
             overflow_period: None,
             overflow_recorded: false,
             programming_overflowed: false,
+            unnotified_overflows: 0,
             overflow_point: None,
             event_margin: get_pmu_config().skid_margin(),
             first_stage: None,
@@ -2095,6 +2107,7 @@ impl TimerImpl {
         // overflows is still to be handled.
         self.collect_overflow_records();
         self.programming_overflowed = false;
+        self.unnotified_overflows = 0;
         self.send_artificial_signal = if notification <= SINGLESTEP_TIMEOUT_RCBS {
             // If there's an existing event making use of the timer counter,
             // we need to "overwrite" it the same way setting an actual RCB
@@ -2155,6 +2168,7 @@ impl TimerImpl {
                 if samples > 0 {
                     self.overflow_recorded = true;
                     self.programming_overflowed = true;
+                    self.unnotified_overflows = self.unnotified_overflows.saturating_add(samples);
                 }
                 true
             }
@@ -2193,6 +2207,13 @@ impl TimerImpl {
     fn mark_overflows_consumed(&mut self) {
         self.collect_overflow_records();
         self.overflow_recorded = false;
+    }
+
+    /// Records that a stop took a notification of this counter's own, which
+    /// accounts for one recorded overflow (`unnotified_overflows`).
+    fn note_overflow_notification(&mut self) {
+        self.collect_overflow_records();
+        self.unnotified_overflows = self.unnotified_overflows.saturating_sub(1);
     }
 
     /// Whether the kernel has recorded an overflow whose notification has not
@@ -2786,6 +2807,7 @@ impl TimerImpl {
         }
         self.collect_overflow_records();
         if self.live_notification()? {
+            self.note_overflow_notification();
             self.mark_overflows_consumed();
             self.notification_taken = true;
             return Ok(Some(OwnNotification::Live));
@@ -3024,6 +3046,7 @@ impl TimerImpl {
             self.timer.disable()?;
             self.overflow_period = None;
         }
+        self.note_overflow_notification();
         self.mark_overflows_consumed();
         Ok(true)
     }
@@ -3095,6 +3118,7 @@ impl TimerImpl {
                 return Err(HandleFailure::ImproperSignal(task));
             }
             if self.owns_overflow_signal(&signal) {
+                self.note_overflow_notification();
                 // Otherwise a later injected syscall could mistake a guest signal
                 // for this notification.
                 self.mark_overflows_consumed();
@@ -3504,6 +3528,9 @@ impl TimerImpl {
             "Timer reached its target {} with {} block steps or branch runs and {} single steps",
             current, block_steps, instruction_steps
         );
+        // A notification still outstanding was merged into one already taken,
+        // as standard signals coalesce; none can come for this event now.
+        self.unnotified_overflows = 0;
         Ok(task)
     }
 
@@ -3618,28 +3645,47 @@ impl TimerImpl {
     }
 
     /// Whether the signal stop `task`, which a step toward the active event
-    /// reached, is a notification of this timer's own: an overflow signal of
-    /// its counter, or the controller's artificial kick
-    /// ([`TimerImpl::generated_signal`]); if so, it is consumed. The event is
-    /// being delivered, and the steps disabled the counter before they began
-    /// ([`TimerImpl::disable_timer_before_stepping`]), so the notification
-    /// was raised before that and announces the event the steps deliver. On
-    /// an NVIDIA Grace host a staged event's last programming can overflow a
-    /// second time before the steps disable it; that notification is
-    /// delivered as a step resumes the thread, before the step's instruction
-    /// runs, or part of the way through a branch run, which lets the guest
-    /// run.
+    /// reached, is a notification of this timer's own; if so, it is consumed.
+    /// The event is being delivered, and the steps disabled the counter
+    /// before they began ([`TimerImpl::disable_timer_before_stepping`]), so
+    /// such a notification was raised before that and announces the event
+    /// the steps deliver. On an NVIDIA Grace host a staged event's last
+    /// programming can overflow a second time before the steps disable it;
+    /// that notification is delivered as a step resumes the thread, before
+    /// the step's instruction runs, or part of the way through a branch run,
+    /// which lets the guest run.
+    ///
+    /// A guest can produce the same siginfo: it may queue itself the timer's
+    /// signal with `POLL_IN` and the counter's descriptor number, or have an
+    /// `F_SETSIG` descriptor of its own with that number. So an overflow's
+    /// notification is taken as the timer's only while the kernel has
+    /// recorded an overflow of the current programming that no stop has yet
+    /// taken a notification for (`unnotified_overflows`), counted after the
+    /// records written so far are collected. Otherwise, or where no records
+    /// are mapped, the stop is handed on as any other stop is. The
+    /// controller's artificial kick is taken as the run loop takes it
+    /// ([`TimerImpl::controller_artificial_signal`]). The siginfo cannot tell
+    /// a forged signal from a genuine notification while one is outstanding,
+    /// and such a signal then uses that notification's count.
     fn own_notification_during_steps(&mut self, task: &Stopped) -> Result<bool, TraceError> {
         let signal = task.getsiginfo()?;
         let controller = self.controller_artificial_signal(&signal)?;
         if !self.generated_signal(&signal, controller) {
             return Ok(false);
         }
-        if controller {
-            self.artificial_signal_sent = false;
-        }
-        if self.owns_overflow_signal(&signal) {
+        if !controller {
+            self.collect_overflow_records();
+            debug!(
+                unnotified_overflows = self.unnotified_overflows,
+                "A notification of this timer's counter arrived during its steps"
+            );
+            if self.unnotified_overflows == 0 {
+                return Ok(false);
+            }
+            self.note_overflow_notification();
             self.mark_overflows_consumed();
+        } else {
+            self.artificial_signal_sent = false;
         }
         debug!(
             si_code = signal.si_code,
@@ -4946,18 +4992,45 @@ mod tests {
         }
     }
 
-    /// A notification of the timer's own that reaches the thread during the
-    /// steps toward its event is consumed there, and the steps go on to the
-    /// target. Handed on, it ended the steps with `HandleFailure::Event`, and
-    /// the run loop then found the event already decided by that stop, so it
-    /// fired nowhere. The child queues itself the notification, the timer's
-    /// signal with its counter's descriptor and `POLL_IN`, as a counter
-    /// overflow raises it; the steps start at that call's exit stop, so the
-    /// first step's resume delivers it, before any instruction runs.
-    #[test]
-    fn a_notification_of_the_timer_during_its_steps_is_consumed() {
-        use std::sync::atomic::Ordering::Relaxed;
+    /// What a traced child queues itself before the steps toward an event
+    /// start (see `steps_over_a_queued_signal`).
+    #[derive(Debug, Clone, Copy)]
+    enum Queued {
+        /// The timer's signal with `POLL_IN` and the counter's descriptor, as
+        /// a counter overflow raises it.
+        PerfShaped,
+        /// The same with another descriptor number, as another counter's.
+        OtherDescriptor,
+        /// The timer's signal by `rt_tgsigqueueinfo` with `SI_QUEUE`, as
+        /// `sigqueue` sends it.
+        Sigqueued,
+        /// The timer's signal by `tgkill`, as `raise` sends it.
+        Raised,
+    }
 
+    /// How the steps over a queued signal ended.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Steps {
+        /// They reached the target.
+        Reached,
+        /// They handed on the stop of a signal, with this number and code.
+        HandedOn(i32, i32),
+    }
+
+    /// A traced child queues itself the timer's signal as `queued` says, and
+    /// the steps toward a target two branches out start at that call's exit
+    /// stop, so the first step's resume delivers the signal, before any
+    /// instruction runs. `prepare` sets up the timer first. If
+    /// `end_an_event_first`, steps toward a target already reached run
+    /// first, as an event's last steps end. Returns how the steps ended and
+    /// the recorded overflows left outstanding (`unnotified_overflows`).
+    /// Each test reads its own timer, not the process-wide count that
+    /// concurrent tests share.
+    fn steps_over_a_queued_signal(
+        queued: Queued,
+        end_an_event_first: bool,
+        prepare: impl FnOnce(&mut super::TimerImpl),
+    ) -> Option<(Steps, u64)> {
         use nix::unistd::ForkResult;
         use reverie::Pid;
         use reverie::Tid;
@@ -4967,7 +5040,6 @@ mod tests {
         use super::ClockCounter;
         use super::HandleFailure;
         use super::MARKER_SIGNAL;
-        use super::OWN_NOTIFICATIONS_DURING_STEPS;
         use super::Running;
         use super::StepUnit;
         use super::Stopped;
@@ -4978,7 +5050,7 @@ mod tests {
 
         if !crate::perf::is_perf_supported() || super::try_get_pmu_config().is_none() {
             eprintln!("skipping: perf counters are not supported here");
-            return;
+            return None;
         }
         struct Reap(i32);
         impl Drop for Reap {
@@ -4994,13 +5066,20 @@ mod tests {
             }
         }
         let signo = MARKER_SIGNAL as i32;
-        // The notification's siginfo, at the same address in the forked
-        // child; the tracer fills in the counter's descriptor (si_fd, 24
-        // bytes in) at the call's entry stop.
+        let call = match queued {
+            Queued::Raised => libc::SYS_tgkill,
+            _ => libc::SYS_rt_tgsigqueueinfo,
+        };
+        // The siginfo the child queues, at the same address in the forked
+        // child; the tracer fills in a descriptor (si_fd, 24 bytes in) at the
+        // call's entry stop.
         // SAFETY: an all-zero siginfo is valid.
         let info: &'static mut libc::siginfo_t = Box::leak(Box::new(unsafe { std::mem::zeroed() }));
         info.si_signo = signo;
-        info.si_code = i32::from(libc::POLLIN);
+        info.si_code = match queued {
+            Queued::PerfShaped | Queued::OtherDescriptor => i32::from(libc::POLLIN),
+            _ => libc::SI_QUEUE,
+        };
         let info = std::ptr::from_mut(info) as usize;
         // SAFETY: the child makes only raw calls before it spins.
         let raw = match unsafe { nix::unistd::fork() }.expect("fork the tracee") {
@@ -5009,13 +5088,17 @@ mod tests {
                     libc::_exit(1);
                 }
                 libc::raise(libc::SIGSTOP);
-                libc::syscall(
-                    libc::SYS_rt_tgsigqueueinfo,
-                    libc::getpid(),
-                    libc::syscall(libc::SYS_gettid),
-                    signo,
-                    info as *const libc::siginfo_t,
-                );
+                if call == libc::SYS_tgkill {
+                    libc::syscall(call, libc::getpid(), libc::syscall(libc::SYS_gettid), signo);
+                } else {
+                    libc::syscall(
+                        call,
+                        libc::getpid(),
+                        libc::syscall(libc::SYS_gettid),
+                        signo,
+                        info as *const libc::siginfo_t,
+                    );
+                }
                 let mut count = 0u64;
                 loop {
                     count = std::hint::black_box(count.wrapping_add(1));
@@ -5050,17 +5133,20 @@ mod tests {
             task = stopped;
             assert_eq!(event, TraceEvent::Syscall, "only syscall stops come first");
             let regs = task.getregs().expect("read the registers");
-            let queues = entry
-                && regs.orig_syscall() == libc::SYS_rt_tgsigqueueinfo as u64
-                && regs.args().2 == signo as u64;
+            let queues =
+                entry && regs.orig_syscall() == call as u64 && regs.args().2 == signo as u64;
             entry = !entry;
             if queues {
                 let si_fd = AddrMut::<i32>::from_raw(info + 24).expect("an address");
-                task.write_value(si_fd, &fd).expect("fill in si_fd");
+                let number = match queued {
+                    Queued::OtherDescriptor => fd + 100,
+                    _ => fd,
+                };
+                task.write_value(si_fd, &number).expect("fill in si_fd");
                 break;
             }
         }
-        let (task, event) = task
+        let (mut task, event) = task
             .syscall(None)
             .expect("resume")
             .wait()
@@ -5069,7 +5155,7 @@ mod tests {
         assert_eq!(event, TraceEvent::Syscall, "the call's exit stop");
 
         let inner = timer.inner_mut_noinit().expect("a timer");
-        let from = inner.read_clock();
+        prepare(inner);
         let mut step = |task: Stopped, unit| -> Result<Running, TraceError> {
             match unit {
                 #[cfg(target_arch = "x86_64")]
@@ -5082,7 +5168,19 @@ mod tests {
         let mut observe = |_: &Wait| Ok(());
         let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
         waits.bind_stopped(&task);
-        let consumed = OWN_NOTIFICATIONS_DURING_STEPS.load(Relaxed);
+        if end_an_event_first {
+            let clock = inner.read_clock();
+            task = futures::executor::block_on(inner.attempt_single_step(
+                task,
+                ClockCounter::new(clock, 0, clock),
+                0,
+                &mut step,
+                &mut observe,
+                &waits,
+            ))
+            .expect("steps toward a target already reached");
+        }
+        let from = inner.read_clock();
         let result = futures::executor::block_on(inner.attempt_single_step(
             task,
             ClockCounter::new(from, 0, from + 2),
@@ -5091,24 +5189,111 @@ mod tests {
             &mut observe,
             &waits,
         ));
-        let stopped = match result {
-            Ok(stopped) => stopped,
-            Err(HandleFailure::Event(Wait::Stopped(stopped, event))) => panic!(
-                "the steps ended at {event:?}, siginfo {:?}",
-                stopped
-                    .getsiginfo()
-                    .map(|info| (info.si_signo, info.si_code))
-            ),
+        let steps = match result {
+            Ok(_) => {
+                assert!(
+                    inner.read_clock() >= from + 2,
+                    "the steps reached the target"
+                );
+                Steps::Reached
+            }
+            Err(HandleFailure::Event(Wait::Stopped(stopped, TraceEvent::Signal(_)))) => {
+                let info = stopped.getsiginfo().expect("the stop's siginfo");
+                Steps::HandedOn(info.si_signo, info.si_code)
+            }
             Err(error) => panic!("the steps failed: {error:?}"),
         };
-        assert_eq!(OWN_NOTIFICATIONS_DURING_STEPS.load(Relaxed), consumed + 1);
-        assert!(
-            inner.read_clock() >= from + 2,
-            "the steps reached the target"
-        );
-        drop(stopped);
+        Some((steps, inner.unnotified_overflows))
     }
 
+    /// A signal that only looks like the timer's notification, which the
+    /// steps toward an event meet, is handed on, as every stop the steps do
+    /// not own is: the timer's signal with `POLL_IN` and the counter's
+    /// descriptor that the guest queued itself, with no overflow recorded
+    /// (the counter never ran past a period); the same with another
+    /// descriptor number; and the timer's signal by `sigqueue` or `raise`.
+    #[test]
+    fn a_signal_shaped_like_the_timers_during_its_steps_is_handed_on() {
+        let poll_in = i32::from(libc::POLLIN);
+        let signo = super::MARKER_SIGNAL as i32;
+        for (queued, code) in [
+            (Queued::PerfShaped, poll_in),
+            (Queued::OtherDescriptor, poll_in),
+            (Queued::Sigqueued, libc::SI_QUEUE),
+            (Queued::Raised, libc::SI_TKILL),
+        ] {
+            let Some(outcome) = steps_over_a_queued_signal(queued, false, |_| {}) else {
+                return;
+            };
+            assert_eq!(outcome, (Steps::HandedOn(signo, code), 0), "{queued:?}");
+        }
+    }
+
+    /// A notification of the counter's own that reaches the thread during
+    /// the steps toward its event, while the kernel has recorded an overflow
+    /// of the current programming that no stop took a notification for, is
+    /// consumed, and the steps go on to the target. Handed on, it reached the
+    /// run loop after the stop had decided the event, which then fired
+    /// nowhere. The recorded overflow is set up as collecting its record
+    /// leaves it (`unnotified_overflows`); the child queues the notification
+    /// itself, which the siginfo cannot tell from the kernel's.
+    #[test]
+    fn a_notification_of_a_recorded_overflow_during_the_steps_is_consumed() {
+        let Some(outcome) = steps_over_a_queued_signal(Queued::PerfShaped, false, |timer| {
+            timer.unnotified_overflows = 1;
+        }) else {
+            return;
+        };
+        // Handed on, it would have ended the steps; consumed, it used up
+        // the overflow.
+        assert_eq!(outcome, (Steps::Reached, 0));
+    }
+
+    /// What an earlier programming recorded does not account for a
+    /// notification during the steps: a programming made after the overflow
+    /// was recorded starts the count again, and the notification is handed
+    /// on.
+    #[test]
+    fn an_earlier_programmings_overflow_does_not_account_for_a_notification() {
+        let Some(outcome) = steps_over_a_queued_signal(Queued::PerfShaped, false, |timer| {
+            timer.unnotified_overflows = 1;
+            timer
+                .prepare_notification(1 << 40)
+                .expect("program the counter");
+            timer.timer.disable().expect("disable the counter");
+            timer.overflow_period = None;
+        }) else {
+            return;
+        };
+        assert_eq!(
+            outcome,
+            (
+                Steps::HandedOn(super::MARKER_SIGNAL as i32, i32::from(libc::POLLIN)),
+                0
+            )
+        );
+    }
+
+    /// Two overflows recorded and one notification taken, as when standard
+    /// signals coalesce, leave one counted; it ends with the event's steps,
+    /// so a later signal shaped like the notification is handed on.
+    #[test]
+    fn a_coalesced_notifications_count_ends_with_its_event() {
+        let Some(outcome) = steps_over_a_queued_signal(Queued::PerfShaped, true, |timer| {
+            timer.unnotified_overflows = 2;
+            timer.note_overflow_notification();
+            assert_eq!(timer.unnotified_overflows, 1);
+        }) else {
+            return;
+        };
+        assert_eq!(
+            outcome,
+            (
+                Steps::HandedOn(super::MARKER_SIGNAL as i32, i32::from(libc::POLLIN)),
+                0
+            )
+        );
+    }
     #[test]
     fn terminal_close_attempts_both_counters_after_cancellation_error() {
         use super::*;
@@ -5140,6 +5325,7 @@ mod tests {
                 overflow_period: None,
                 overflow_recorded: false,
                 programming_overflowed: false,
+                unnotified_overflows: 0,
                 overflow_point: None,
                 event_margin: get_pmu_config().skid_margin(),
                 first_stage: None,
