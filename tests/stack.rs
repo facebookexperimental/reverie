@@ -138,6 +138,36 @@ impl Tool for LocalState2 {
     }
 }
 
+/// Tool for the uncommitted-overlap negative: it holds a stack builder
+/// without committing, then asks for a second guest stack, which the
+/// allocator refuses with a panic (pending builders are exclusive).
+#[derive(Debug, Default, Clone)]
+struct LocalStateUncommitted;
+
+#[reverie::tool]
+impl Tool for LocalStateUncommitted {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        match syscall.number() {
+            Sysno::exit_group => {
+                let mut stack = guest.stack().await;
+                let _ptr: AddrMut<u64> = stack.reserve();
+                // No commit: `stack` is a live uncommitted builder. A second
+                // checkout while it is alive must panic.
+                let _second = guest.stack().await;
+                unreachable!("second uncommitted stack checkout must panic");
+            }
+            _ => guest.tail_inject(syscall).await,
+        }
+    }
+}
+
 #[cfg(all(not(sanitized), test))]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -160,12 +190,28 @@ mod tests {
         });
     }
 
-    /// A test that allocates on the stack TWICE.
-    /// Currently failing because we attempt to grab a second stack while the guard is still alive.
+    /// The original two-allocs scenario: two nested stack commits with both
+    /// guards still alive. Nested scratch frames are now a supported,
+    /// bounded feature (commit ee4fb6e043: committed frames stay disjoint
+    /// below live ones), so this is a positive test: both values must be
+    /// written and read back by the Tool, and the guest must exit 0.
+    #[test]
+    fn stack_two_allocs_nested_good() {
+        use reverie_ptrace::testing::test_fn;
+        let (output, _) = test_fn::<LocalState2, _>(|| {
+            unsafe { libc::syscall(libc::SYS_exit_group, 0) };
+        })
+        .unwrap();
+        assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+    }
+
+    /// The negative that must still panic: a second stack checkout while
+    /// the first builder is still uncommitted. Pending builders are
+    /// exclusive, so retrieving another guest stack panics.
     #[test]
     #[should_panic]
-    fn stack_two_allocs_bad() {
-        check_fn::<LocalState2, _>(|| {
+    fn stack_two_allocs_uncommitted_bad() {
+        check_fn::<LocalStateUncommitted, _>(|| {
             unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         });
     }
