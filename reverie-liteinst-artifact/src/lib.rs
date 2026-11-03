@@ -745,8 +745,8 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     (
         "reverie-liteinst-artifact/src/preparation_identity.rs",
-        42968,
-        "ee5da17a3b6395e2b25ff0d7b4d887165535e77bf0ee0c3b73f93da7fd46a8c3",
+        44688,
+        "687e52d6d066c555d3e3785f4d06be35e18d4caca4168ecb0529ed3c847a564e",
     ),
     // Bind the signal-mask gate and every changed native-source premise of it.
     (

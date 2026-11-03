@@ -878,17 +878,38 @@ mod tests {
             .copy_from_slice(&[0x48, 0x8b, 0x05, 0xf9, 0x1c, 0, 0, 0xff, 0xd0, 0xc3]);
         bytes[0x1400..0x1400 + CONSTRUCTOR_GATE_OWNER_BYTES.len()]
             .copy_from_slice(CONSTRUCTOR_GATE_OWNER_BYTES);
-        let symbols = [
+        let required: Vec<_> = FIXED_REQUIRED_ROLES
+            .iter()
+            .map(|role| {
+                FIXED_EMITTED_ROLE_SYMBOLS
+                    .iter()
+                    .find(|(name, _)| name == role)
+                    .unwrap()
+                    .1
+                    .replace("Cs_", "Cs1_")
+            })
+            .collect();
+        let mut symbols = vec![
             ("identity", 0x1200, 21, sym::STT_FUNC),
             (CONSTRUCTOR_ADOPTION, 0x1300, 10, sym::STT_FUNC),
             (CONSTRUCTOR_GATE_OWNER, 0x1400, 44, sym::STT_FUNC),
             (CONSTRUCTOR_GATE, 0x1420, 0, sym::STT_NOTYPE),
             (CONSTRUCTOR_GATE_RETURN, 0x1422, 0, sym::STT_NOTYPE),
         ];
+        for (index, name) in required.iter().enumerate() {
+            let address = 0x1500 + index * 0x10;
+            bytes[address] = 0xc3;
+            symbols.push((name.as_str(), address as u64, 1, sym::STT_FUNC));
+        }
+        // Keep both larger tables beyond the section headers and inside the
+        // existing read-only LOAD; no dynamic/hash/relocation table is moved.
+        let symtab = 0x5400;
+        let strtab = 0x5600;
+        assert!((symbols.len() + 1) * 24 <= strtab - symtab);
         let mut names = vec![0];
-        bytes[0x4100..0x4200].fill(0);
+        bytes[symtab..strtab].fill(0);
         for (index, (name, address, size, kind)) in symbols.iter().enumerate() {
-            let at = 0x4100 + (index + 1) * 24;
+            let at = symtab + (index + 1) * 24;
             put(&mut bytes, at, 4, names.len() as u64);
             names.extend_from_slice(name.as_bytes());
             names.push(0);
@@ -898,17 +919,25 @@ mod tests {
             put(&mut bytes, at + 8, 8, *address);
             put(&mut bytes, at + 16, 8, *size);
         }
-        assert!(names.len() <= 0x100);
-        bytes[0x4200..0x4300].fill(0);
-        bytes[0x4200..0x4200 + names.len()].copy_from_slice(&names);
-        put(&mut bytes, 0x5000 + 64 + 32, 8, 0x300);
+        assert!(names.len() <= bytes.len() - strtab);
+        bytes[strtab..].fill(0);
+        bytes[strtab..strtab + names.len()].copy_from_slice(&names);
+        put(&mut bytes, 0x5000 + 64 + 32, 8, 0x400);
+        for (section, address, size) in [
+            (4, symtab, (symbols.len() + 1) * 24),
+            (5, strtab, names.len()),
+        ] {
+            let header = 0x5000 + section * 64;
+            put(&mut bytes, header + 16, 8, address as u64);
+            put(&mut bytes, header + 24, 8, address as u64);
+            put(&mut bytes, header + 32, 8, size as u64);
+        }
         put(
             &mut bytes,
-            0x5000 + 4 * 64 + 32,
-            8,
-            (symbols.len() as u64 + 1) * 24,
+            0x5000 + 4 * 64 + 44,
+            4,
+            symbols.len() as u64 + 1,
         );
-        put(&mut bytes, 0x5000 + 5 * 64 + 32, 8, names.len() as u64);
         bytes
     }
 
@@ -955,6 +984,8 @@ mod tests {
     fn qualify_transfers_refuses_nonidentity_missing_sources_and_wrong_owned_entry() {
         // This is a real factory transaction over the independently current,
         // clean workspace. The fixture never constructs opaque source authority.
+        // Requires a clean Git checkout, Git and Cargo, and an offline Cargo
+        // cache for locked workspace metadata. Missing prerequisites fail; no skip.
         let workspace =
             fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()).unwrap();
         let scratch = std::env::temp_dir().join(format!(
@@ -1039,6 +1070,7 @@ mod tests {
                     && proof.proves(&edge),
                 "entry fixture did not earn exactly its actual load/GOT/CALL identity proof",
             )?;
+            println!("qualify_transfers accepting proof passed");
             // Every negative is paired with the accepting fixture above. The
             // changed body and text agree physically, so only the ABI class can
             // reject it; the two context controls retain the valid body verbatim.
@@ -1075,6 +1107,7 @@ mod tests {
                 message == "unrecognized complete preparation identity ABI body",
                 format!("nonidentity refusal reached the wrong guard: {message}"),
             )?;
+            println!("qualify_transfers nonidentity refusal passed: {message}");
             let result = qualify_transfers(
                 &elf,
                 &bytes,
@@ -1093,7 +1126,9 @@ mod tests {
                 message == "preparation identity requires independent current compiled sources",
                 format!("missing-source refusal reached the wrong guard: {message}"),
             )?;
+            println!("qualify_transfers missing-sources refusal passed: {message}");
             let wrong_route = transfers_route(0x1301);
+            assert_eq!(wrong_route.prepare.target, 0x1301);
             let result = qualify_transfers(
                 &elf,
                 &bytes,
@@ -1112,6 +1147,7 @@ mod tests {
                 message == "preparation identity lacks its actual owned SysV adoption entry",
                 format!("owned-entry refusal reached the wrong guard: {message}"),
             )?;
+            println!("qualify_transfers owner-route refusal passed: {message}");
             Ok(())
         })
         .unwrap();
