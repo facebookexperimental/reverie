@@ -33113,7 +33113,7 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 84] = [
+        let compiled_files: [(&str, &[u8]); 85] = [
             (
                 "reverie/src/tool_process.rs",
                 include_bytes!("../../reverie/src/tool_process.rs"),
@@ -33513,11 +33513,11 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        // 82 reviewed sources plus the independently checked qualifier.
-        assert_eq!(rv_inventory.len(), 83);
+        // 83 reviewed sources plus the independently checked qualifier.
+        assert_eq!(rv_inventory.len(), 84);
         let (detcore_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
-        assert_eq!(detcore_inventory.len(), 84);
+        assert_eq!(detcore_inventory.len(), 85);
         assert_eq!(
             content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
                 .unwrap()
