@@ -245,6 +245,17 @@ pub(crate) enum StepStop {
     Passing,
 }
 
+/// The next step and, on x86, its registers at the same owned stop.
+/// Consumed synchronously by the step callback before resuming the task.
+pub(crate) struct StepRequest {
+    pub(crate) unit: StepUnit,
+    /// The registers at the stop the step starts from, for the step's shield;
+    /// `None` for a step that goes on from a step's own stop
+    /// (`StepUnit::SyscallExit`, `StepUnit::Requeue`), which has no shield.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) regs: Option<Regs>,
+}
+
 /// Whether a branch run's counter, `moved` branches on from where it
 /// started, agrees with its decode ([`StepUnit::ToBranch`]'s `stops[..count]`
 /// and `branches`), as [`TimerImpl::check_branch_run`] requires:
@@ -1186,7 +1197,7 @@ impl Timer {
     pub(crate) async fn handle_signal(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -1206,7 +1217,7 @@ impl Timer {
         &mut self,
         task: Stopped,
         unfinished: Unfinished,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -2986,7 +2997,7 @@ impl TimerImpl {
         &mut self,
         task: Stopped,
         unfinished: Unfinished,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -3182,7 +3193,7 @@ impl TimerImpl {
     async fn handle_signal(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -3262,7 +3273,7 @@ impl TimerImpl {
     async fn deliver(
         &mut self,
         task: Stopped,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -3334,7 +3345,7 @@ impl TimerImpl {
         task: Stopped,
         mut current: ClockCounter,
         target_instr: u64,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
+        step: &mut (dyn FnMut(Stopped, StepRequest) -> Result<Running, TraceError> + Send),
         observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
         waits: &std::sync::Arc<PtracerWaitOwner>,
     ) -> Result<Stopped, HandleFailure> {
@@ -3511,7 +3522,14 @@ impl TimerImpl {
             // A failed step made no resuming request that took effect, so the
             // thread is still at its stop, where an early return gives the
             // breakpoints back.
-            let running = step(task, unit)?;
+            let running = step(
+                task,
+                StepRequest {
+                    unit,
+                    #[cfg(target_arch = "x86_64")]
+                    regs: Some(regs),
+                },
+            )?;
             #[cfg(target_arch = "aarch64")]
             breakpoints.resumed();
             let mut wait = running.next_state_with_owner(waits).await?;
@@ -3528,7 +3546,14 @@ impl TimerImpl {
                 let Wait::Stopped(entered, _) = wait else {
                     unreachable!("matched a stop");
                 };
-                let running = step(entered, StepUnit::SyscallExit)?;
+                let running = step(
+                    entered,
+                    StepRequest {
+                        unit: StepUnit::SyscallExit,
+                        #[cfg(target_arch = "x86_64")]
+                        regs: None,
+                    },
+                )?;
                 #[cfg(target_arch = "aarch64")]
                 breakpoints.resumed();
                 wait = running.next_state_with_owner(waits).await?;
@@ -3581,7 +3606,14 @@ impl TimerImpl {
                     "Requeueing {} that a timer step stopped at, behind the step's report",
                     sig
                 );
-                let running = step(stopped, StepUnit::Requeue(sig))?;
+                let running = step(
+                    stopped,
+                    StepRequest {
+                        unit: StepUnit::Requeue(sig),
+                        #[cfg(target_arch = "x86_64")]
+                        regs: None,
+                    },
+                )?;
                 #[cfg(target_arch = "aarch64")]
                 breakpoints.resumed();
                 wait = running.next_state_with_owner(waits).await?;
@@ -5624,17 +5656,18 @@ mod tests {
         let mut timer = super::Timer::new(pid, Tid::from_raw(raw));
         let inner = timer.inner_mut_noinit().expect("a timer");
         let from = inner.read_clock();
-        let mut step = |task: Stopped, unit| -> Result<Running, TraceError> {
-            match unit {
-                StepUnit::Requeue(sig) => task.step(Some(sig)),
-                StepUnit::SyscallExit => task.syscall(None),
-                #[cfg(target_arch = "x86_64")]
-                StepUnit::Syscall => task.syscall(None),
-                #[cfg(target_arch = "x86_64")]
-                StepUnit::Block => task.block_step(),
-                _ => task.step(None),
-            }
-        };
+        let mut step =
+            |task: Stopped, request: super::StepRequest| -> Result<Running, TraceError> {
+                match request.unit {
+                    StepUnit::Requeue(sig) => task.step(Some(sig)),
+                    StepUnit::SyscallExit => task.syscall(None),
+                    #[cfg(target_arch = "x86_64")]
+                    StepUnit::Syscall => task.syscall(None),
+                    #[cfg(target_arch = "x86_64")]
+                    StepUnit::Block => task.block_step(),
+                    _ => task.step(None),
+                }
+            };
         let mut observe = |_: &Wait, _: StepStop| Ok(());
         let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
         waits.bind_stopped(&task);
@@ -6079,8 +6112,10 @@ mod tests {
         let inner = timer.inner_mut_noinit().expect("a timer");
         let from = inner.read_clock();
         let mut armed = None;
-        let mut step = |task: super::Stopped, unit| -> Result<super::Running, TraceError> {
-            if matches!(unit, StepUnit::ToBranch { .. }) {
+        let mut step = |task: super::Stopped,
+                        request: super::StepRequest|
+         -> Result<super::Running, TraceError> {
+            if matches!(request.unit, StepUnit::ToBranch { .. }) {
                 armed = Some(task.hw_breakpoints().expect("read the armed breakpoints"));
             }
             Err(TraceError::Errno(super::Errno::EIO))
@@ -6300,15 +6335,16 @@ mod tests {
 
         let inner = timer.inner_mut_noinit().expect("a timer");
         prepare(inner);
-        let mut step = |task: Stopped, unit| -> Result<Running, TraceError> {
-            match unit {
-                #[cfg(target_arch = "x86_64")]
-                StepUnit::Block => task.block_step(),
-                #[cfg(target_arch = "aarch64")]
-                StepUnit::ToBranch { .. } => task.resume(None),
-                _ => task.step(None),
-            }
-        };
+        let mut step =
+            |task: Stopped, request: super::StepRequest| -> Result<Running, TraceError> {
+                match request.unit {
+                    #[cfg(target_arch = "x86_64")]
+                    StepUnit::Block => task.block_step(),
+                    #[cfg(target_arch = "aarch64")]
+                    StepUnit::ToBranch { .. } => task.resume(None),
+                    _ => task.step(None),
+                }
+            };
         let mut observe = |_: &Wait, _: super::StepStop| Ok(());
         let waits = std::sync::Arc::new(super::PtracerWaitOwner::default());
         waits.bind_stopped(&task);

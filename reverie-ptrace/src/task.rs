@@ -126,6 +126,7 @@ use crate::stack::GuestStack;
 use crate::stack::StackArena;
 use crate::timer::HandleFailure;
 use crate::timer::OwnNotification;
+use crate::timer::StepRequest;
 use crate::timer::StepStop;
 use crate::timer::StepUnit;
 use crate::timer::Timer;
@@ -1381,13 +1382,28 @@ struct TimerStepShield {
 impl TimerStepShield {
     /// Before a step: shield SIGTRAP as `unblock_sigtrap_for_timer_step` does,
     /// or, for a guest `rt_sigreturn`, in the frame it restores.
-    fn prepare(&mut self, task: &Stopped) -> Result<(), TraceError> {
+    fn prepare(
+        &mut self,
+        task: &Stopped,
+        #[cfg(target_arch = "x86_64")] regs: Option<&safeptrace::Regs>,
+    ) -> Result<(), TraceError> {
         if self.quiet {
             self.stepped = true;
             return Ok(());
         }
+        // On x86 the timer hands over the registers it already holds for
+        // this stop (`StepRequest::regs`), so no second read is made.
+        #[cfg(target_arch = "x86_64")]
+        let given = regs;
+        let read_regs = || -> Result<_, TraceError> {
+            #[cfg(target_arch = "x86_64")]
+            if let Some(regs) = given {
+                return Ok(*regs);
+            }
+            task.getregs()
+        };
         if self.quiet_unless_sigreturn {
-            let regs = task.getregs()?;
+            let regs = read_regs()?;
             #[cfg(target_arch = "aarch64")]
             {
                 self.queues_sigtrap = svc_queues_the_thread_a_sigtrap(task, &regs);
@@ -1400,7 +1416,7 @@ impl TimerStepShield {
         }
         #[cfg(test)]
         TIMER_STEP_SHIELD_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
-        let regs = task.getregs()?;
+        let regs = read_regs()?;
         #[cfg(target_arch = "aarch64")]
         {
             self.queues_sigtrap = svc_queues_the_thread_a_sigtrap(task, &regs);
@@ -6821,7 +6837,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         let input_task = self.reserved_input_task;
         let input_session = self.fatal_session();
         let input_pid = self.pid();
-        let mut step = move |task: Stopped, unit| {
+        let mut step = move |task: Stopped, request: StepRequest| {
+            let unit = request.unit;
             if let (Some(control), Some(identity)) = (&input_control, input_task)
                 && let Err(error) = control.backend_continuation(identity, None)
             {
@@ -6845,7 +6862,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                 _ => {
                     let wanted = !filtered && {
                         let mut shield = step_shield.lock().unwrap();
-                        shield.prepare(&task)?;
+                        shield.prepare(
+                            &task,
+                            #[cfg(target_arch = "x86_64")]
+                            request.regs.as_ref(),
+                        )?;
                         let wanted = std::mem::take(&mut shield.syscall_step);
                         #[cfg(test)]
                         if wanted && unit == StepUnit::LastInstruction {
@@ -18071,7 +18092,13 @@ mod tests {
 
         // The first step reads the mask and procfs, keeps them, and unblocks
         // SIGTRAP for the step's trap; its stop blocks SIGTRAP again.
-        shield.prepare(&task).expect("the first step's shield");
+        shield
+            .prepare(
+                &task,
+                #[cfg(target_arch = "x86_64")]
+                None,
+            )
+            .expect("the first step's shield");
         assert!(
             !shield.pending_trap,
             "the timer expired before the first step; EXPIRY is too short for this host"
@@ -18089,7 +18116,16 @@ mod tests {
         }
 
         let (states_before, pendings_before) = (state_reads(), pending_reads());
-        assert!(shield.prepare(&task).is_err(), "the later step must refuse");
+        assert!(
+            shield
+                .prepare(
+                    &task,
+                    #[cfg(target_arch = "x86_64")]
+                    None,
+                )
+                .is_err(),
+            "the later step must refuse"
+        );
         assert!(shield.pending_trap, "refused for the pending SIGTRAP");
         assert!(!shield.reblock, "nothing to block again");
         assert_eq!(
@@ -18222,7 +18258,13 @@ mod tests {
             mask_stable: true,
             ..TimerStepShield::default()
         };
-        shield.prepare(&task).expect("the step's shield");
+        shield
+            .prepare(
+                &task,
+                #[cfg(target_arch = "x86_64")]
+                None,
+            )
+            .expect("the step's shield");
         assert!(shield.known_mask.is_some(), "the step kept its reads");
         assert_eq!(task.getsigmask().expect("mask"), blocked & !SIGTRAP_BIT);
         let (task, event) = task
@@ -18304,7 +18346,13 @@ mod tests {
             ..TimerStepShield::default()
         };
         // The first step reads the mask and procfs and keeps them.
-        shield.prepare(&task).expect("the first step's shield");
+        shield
+            .prepare(
+                &task,
+                #[cfg(target_arch = "x86_64")]
+                None,
+            )
+            .expect("the first step's shield");
         assert!(!shield.pending_trap);
         assert!(shield.known_mask.is_some(), "the first step kept its reads");
         shield.settle(&task, false).expect("the first step's stop");
@@ -18334,7 +18382,16 @@ mod tests {
             "the kernel kept no siginfo for it"
         );
 
-        assert!(shield.prepare(&task).is_err(), "the later step must refuse");
+        assert!(
+            shield
+                .prepare(
+                    &task,
+                    #[cfg(target_arch = "x86_64")]
+                    None,
+                )
+                .is_err(),
+            "the later step must refuse"
+        );
         assert!(shield.pending_trap, "refused for the pending SIGTRAP");
         assert_eq!(
             task.getsigmask().expect("mask"),
