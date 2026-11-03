@@ -44,13 +44,6 @@ fn unsealed_a_repair_at_a_seccomp_stop_runs_the_syscall_once() {
     sigtrap_steps::a_repair_at_a_seccomp_stop_runs_the_syscall_once();
 }
 
-/// Reverie's repair page: right after the trampoline's page on x86_64, and at
-/// the next 64 KiB boundary on aarch64 (reverie-ptrace `cp::SCRATCH_BASE`).
-#[cfg(target_arch = "x86_64")]
-const REPAIR_PAGE: usize = 0x7100_1000;
-#[cfg(target_arch = "aarch64")]
-const REPAIR_PAGE: usize = 0x7101_0000;
-
 /// A guest that maps its own page over the unsealed repair page: Reverie must
 /// never write into it. The guest fills the page, ignores SIGTRAP, and lets a
 /// timer's steps reset it, which would owe a repair through the page; the
@@ -69,14 +62,18 @@ fn a_replaced_unsealed_repair_page_is_never_written() {
         unsafe {
             let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let mapped = libc::mmap(
-                REPAIR_PAGE as *mut libc::c_void,
+                reverie_ptrace::testing::sigtrap_repair_page() as *mut libc::c_void,
                 page,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
                 -1,
                 0,
             );
-            assert_eq!(mapped as usize, REPAIR_PAGE, "map over the repair page");
+            assert_eq!(
+                mapped as usize,
+                reverie_ptrace::testing::sigtrap_repair_page(),
+                "map over the repair page"
+            );
             std::ptr::write_bytes(mapped.cast::<u8>(), 0x5a, page);
             let mut ignore: libc::sigaction = std::mem::zeroed();
             ignore.sa_sigaction = libc::SIG_IGN;

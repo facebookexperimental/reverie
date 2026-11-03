@@ -22,6 +22,12 @@ use crate::TracerBuilder;
 pub use crate::perf::do_branches;
 use crate::spawn_fn_with_config;
 
+/// The address of Reverie's SIGTRAP repair page, which pre-init maps in
+/// every guest image that leaves the address free (`cp::SCRATCH_BASE`).
+pub fn sigtrap_repair_page() -> usize {
+    crate::cp::SCRATCH_BASE
+}
+
 /// The number of late timer overflow signals this process has discarded at
 /// injected syscalls. Concurrent tests in one process share the count.
 pub fn late_timer_signals_discarded() -> u64 {
