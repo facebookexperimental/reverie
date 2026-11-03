@@ -4533,7 +4533,11 @@ async fn a_signal_callback_injection_delivers_the_signal_once_and_keeps_sigtrap(
 /// stop. So, with a caught, unblocked SIGTRAP:
 /// - a sibling's `int3` while the interrupted thread's handler runs without a
 ///   syscall kills the child when SIGTRAP was in the wait's temporary mask,
-///   and not otherwise;
+///   and not otherwise. The scenario pinned is a sibling that is already in
+///   its own function and makes no syscall between the reset and its `int3`
+///   (the fixture waits for it to start); a sibling syscall in that window
+///   pays the repair first
+///   (`an_int3_after_a_sibling_syscall_meets_the_repaired_handler`);
 /// - an `int3` in the guest's handler of a POSIX-timer signal whose Tool
 ///   callback injected block-all `rt_sigprocmask` calls (SIGXCPU) kills the
 ///   child, since the repair waits for a stop outside the callback; with only
@@ -4560,6 +4564,40 @@ async fn an_int3_in_another_thread_or_after_a_callback_injection_still_meets_the
                 "sibling ppoll tmask=1 signaled=1 sig=5 exited=-1",
                 "callback prof signaled=0 sig=0 exited=0",
                 "callback xcpu signaled=1 sig=5 exited=-1",
+            ],
+            "{}",
+            run.report
+        );
+    }
+}
+
+/// The other ordering of the sibling window above (tmask=1): the sibling
+/// makes one `getppid` after the interrupted thread is in its handler, so
+/// after the step that reset SIGTRAP, and before its `int3`. Reverie owes the
+/// repair of SIGTRAP's action to the process's action table, and the first of
+/// its threads to stop pays it: here the sibling's seccomp stop
+/// (`repair_sigtrap_at_seccomp_stop`). The `int3` then meets the guest's
+/// handler and the child exits 0, as natively.
+///
+/// This documents current behaviour, in which the order the threads stop in
+/// decides the `int3`'s outcome
+/// (<https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-bx337.md>).
+/// The change that fixes that must revisit this test and the tmask=1 lines
+/// above together.
+/// Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn an_int3_after_a_sibling_syscall_meets_the_repaired_handler() {
+    for run in run_both_configurations("sigtrap_int3_after_sibling_syscall").await {
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("sibling-syscall "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "sibling-syscall sigsuspend signaled=0 sig=0 exited=0",
+                "sibling-syscall ppoll signaled=0 sig=0 exited=0",
             ],
             "{}",
             run.report

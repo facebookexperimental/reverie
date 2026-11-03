@@ -3079,7 +3079,10 @@ static void mode_sigtrap_int3_after_interrupted_wait(void) {
   }
 }
 
-static _Atomic int window_in_handler, window_sibling_done;
+static _Atomic int window_in_handler, window_sibling_done, window_sibling_started;
+/* Whether the sibling makes one syscall after the main thread is in its
+ * handler, before its int3 (`mode_sigtrap_int3_after_sibling_syscall`). */
+static int window_sibling_syscall;
 
 static void window_spinning_usr1(int sig) {
   (void)sig;
@@ -3090,8 +3093,12 @@ static void window_spinning_usr1(int sig) {
 
 static void* window_sibling_int3(void* arg) {
   (void)arg;
+  /* glibc's thread start-up syscalls have all run by now. */
+  atomic_store(&window_sibling_started, 1);
   while (!atomic_load(&window_in_handler))
     __asm__ volatile("pause");
+  if (window_sibling_syscall)
+    syscall(SYS_getppid);
   __asm__ volatile("int3");
   atomic_store(&window_sibling_done, 1);
   return NULL;
@@ -3117,11 +3124,56 @@ static void window_report(const char* tag, pid_t pid) {
       WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 }
 
+/* One child of the sibling window (below): the sibling starts, then the main
+ * thread's injected wait, interrupted by a handled SIGUSR1, runs with a
+ * caught, unblocked SIGTRAP in its temporary mask (tmask=1) or not
+ * (tmask=0), and the handler spins without a syscall while the sibling
+ * executes int3. The main thread waits until the sibling is in its own
+ * function, so the sibling's thread start-up syscalls cannot run after the
+ * step that resets SIGTRAP. */
+static void window_sibling_child(int op, int tmask, int sibling_syscall) {
+  struct rlimit core = {1, 1};
+  if (setrlimit(RLIMIT_CORE, &core) != 0)
+    die("RLIMIT_CORE");
+  window_sibling_syscall = sibling_syscall;
+  struct sigaction usr1;
+  memset(&usr1, 0, sizeof usr1);
+  usr1.sa_handler = window_spinning_usr1;
+  if (sigaction(SIGUSR1, &usr1, NULL) != 0)
+    die("install SIGUSR1");
+  sigtrap_set(trap_handler, 0);
+  pthread_t sibling;
+  if (pthread_create(&sibling, NULL, window_sibling_int3, NULL) != 0)
+    die("pthread_create");
+  while (!atomic_load(&window_sibling_started))
+    __asm__ volatile("pause");
+  sigset_t usr1_set;
+  sigemptyset(&usr1_set);
+  sigaddset(&usr1_set, SIGUSR1);
+  if (pthread_sigmask(SIG_BLOCK, &usr1_set, NULL) != 0)
+    die("block SIGUSR1");
+  if (syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR1) != 0)
+    die("tgkill SIGUSR1");
+  unsigned long temporary = tmask ? 1UL << (SIGTRAP - 1) : 0;
+  struct timespec ts = {5, 0};
+  if (op == 0)
+    SITEM(SYS_rt_sigsuspend, (long)&temporary, 8, 0, 0, 0, SHAPE_PRIVATE_CALL);
+  else
+    SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&temporary, 8, SHAPE_PRIVATE_CALL);
+  pthread_join(sibling, NULL);
+  _exit(0);
+}
+
 /* The same window, met by another thread: a wait that a handled SIGUSR1
  * interrupted, with a caught, unblocked SIGTRAP in the wait's temporary mask
  * (tmask=1) or not (tmask=0), whose handler spins without a syscall while a
- * sibling executes int3. With tmask=1 the int3 meets SIG_DFL and kills the
- * child; natively, and with tmask=0, the handler runs and it exits 0. Then a
+ * sibling executes int3. The scenario pinned is that the sibling makes no
+ * syscall between the main thread's reset and its int3: Reverie's repair of
+ * SIGTRAP is owed by the process's action table and paid by the first of its
+ * threads to stop, so a sibling syscall in that window would pay it
+ * (`mode_sigtrap_int3_after_sibling_syscall`). With tmask=1 the int3 meets
+ * SIG_DFL and kills the child; natively, and with tmask=0, the handler runs
+ * and it exits 0. Then a
  * POSIX-timer signal whose Tool callback injects (SIGXCPU: between block-all
  * rt_sigprocmask injections, whose trap resets SIGTRAP; SIGPROF: getpid,
  * which the shield covers), and whose guest handler executes int3 before any
@@ -3134,35 +3186,8 @@ static void mode_sigtrap_int3_in_the_other_windows(void) {
       pid_t pid = fork();
       if (pid < 0)
         die("fork");
-      if (pid == 0) {
-        struct rlimit core = {1, 1};
-        if (setrlimit(RLIMIT_CORE, &core) != 0)
-          die("RLIMIT_CORE");
-        struct sigaction usr1;
-        memset(&usr1, 0, sizeof usr1);
-        usr1.sa_handler = window_spinning_usr1;
-        if (sigaction(SIGUSR1, &usr1, NULL) != 0)
-          die("install SIGUSR1");
-        sigtrap_set(trap_handler, 0);
-        pthread_t sibling;
-        if (pthread_create(&sibling, NULL, window_sibling_int3, NULL) != 0)
-          die("pthread_create");
-        sigset_t usr1_set;
-        sigemptyset(&usr1_set);
-        sigaddset(&usr1_set, SIGUSR1);
-        if (pthread_sigmask(SIG_BLOCK, &usr1_set, NULL) != 0)
-          die("block SIGUSR1");
-        if (syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR1) != 0)
-          die("tgkill SIGUSR1");
-        unsigned long temporary = tmask ? 1UL << (SIGTRAP - 1) : 0;
-        struct timespec ts = {5, 0};
-        if (op == 0)
-          SITEM(SYS_rt_sigsuspend, (long)&temporary, 8, 0, 0, 0, SHAPE_PRIVATE_CALL);
-        else
-          SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&temporary, 8, SHAPE_PRIVATE_CALL);
-        pthread_join(sibling, NULL);
-        _exit(0);
-      }
+      if (pid == 0)
+        window_sibling_child(op, tmask, 0);
       char tag[64];
       snprintf(tag, sizeof tag, "sibling %s tmask=%d", op == 0 ? "sigsuspend" : "ppoll", tmask);
       window_report(tag, pid);
@@ -3207,6 +3232,27 @@ static void mode_sigtrap_int3_in_the_other_windows(void) {
     }
     char tag[32];
     snprintf(tag, sizeof tag, "callback %s", signals[s].name);
+    window_report(tag, pid);
+  }
+}
+
+/* The sibling window with tmask=1, but the sibling makes one getppid after
+ * the main thread is in its SIGUSR1 handler, so after the step that reset
+ * SIGTRAP, and before its int3. That syscall's seccomp stop pays the repair
+ * the action table owes, so the int3 meets the guest's handler and the child
+ * exits 0, as natively. This documents current behaviour: which thread stops
+ * first decides the int3's outcome
+ * (an_int3_after_a_sibling_syscall_meets_the_repaired_handler). */
+static void mode_sigtrap_int3_after_sibling_syscall(void) {
+  warm();
+  for (int op = 0; op < 2; op++) {
+    pid_t pid = fork();
+    if (pid < 0)
+      die("fork");
+    if (pid == 0)
+      window_sibling_child(op, 1, 1);
+    char tag[64];
+    snprintf(tag, sizeof tag, "sibling-syscall %s", op == 0 ? "sigsuspend" : "ppoll");
     window_report(tag, pid);
   }
 }
@@ -5188,6 +5234,8 @@ int main(int argc, char** argv) {
     mode_sigtrap_int3_timer();
   else if (!strcmp(m, "sigtrap_int3_in_the_other_windows"))
     mode_sigtrap_int3_in_the_other_windows();
+  else if (!strcmp(m, "sigtrap_int3_after_sibling_syscall"))
+    mode_sigtrap_int3_after_sibling_syscall();
   else if (!strcmp(m, "sigtrap_scratch_overlay"))
     mode_sigtrap_scratch_overlay();
   else if (!strcmp(m, "sigtrap_mmap_race"))
