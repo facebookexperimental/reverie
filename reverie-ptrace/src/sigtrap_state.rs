@@ -155,7 +155,7 @@ pub(crate) const SIGRETURN_UC_SIGMASK_OFFSET: usize = 128 + 8 + 8 + 24;
 /// instruction. A prefix does not change what these instructions do, so
 /// `66 cc` is an `int3` too; and the CPU ignores a REX prefix that does not
 /// directly precede the opcode, so `48 48 cc` and `48 66 cc` are as well.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn instruction_raises_sigtrap(bytes: &[u8]) -> bool {
     instruction_raises_sigtrap_from(|offset| bytes.get(offset).copied())
 }
