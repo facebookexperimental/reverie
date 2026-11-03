@@ -833,8 +833,21 @@ where
 
     /// Admits every later connection through `admission` before serving it;
     /// see [`ConnectionAdmission`].
-    pub fn set_connection_admission(&mut self, admission: Arc<dyn ConnectionAdmission>) {
+    ///
+    /// Fails when per-connection identity is already required
+    /// ([`RpcServer::require_connection_identity`]): the two cannot be
+    /// combined, in either setter order.
+    pub fn set_connection_admission(
+        &mut self,
+        admission: Arc<dyn ConnectionAdmission>,
+    ) -> Result<(), RpcError> {
+        if self.identify_connections {
+            return Err(RpcError::Io(std::io::Error::other(
+                "per-connection identity cannot be combined with connection or image admission",
+            )));
+        }
         self.admission = Some(admission);
+        Ok(())
     }
 
     /// Identifies the process that opened each later connection and hands it
@@ -2752,7 +2765,7 @@ mod owned_request_cancellation_tests {
         let path = directory.0.join("rpc.sock");
         let global = Arc::new(WaitingGlobal::default());
         let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
-        server.set_connection_admission(Arc::new(SelfPeer));
+        server.set_connection_admission(Arc::new(SelfPeer)).unwrap();
         let issues = server.retain_connection_issues();
         let connections = server.connection_monitor();
         let cancellation = RequestCancellation::default();
@@ -2815,7 +2828,7 @@ mod owned_request_cancellation_tests {
         let path = directory.0.join("rpc.sock");
         let global = Arc::new(WaitingGlobal::default());
         let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
-        server.set_connection_admission(Arc::new(SelfPeer));
+        server.set_connection_admission(Arc::new(SelfPeer)).unwrap();
         let issues = server.retain_connection_issues();
         let cancellation = RequestCancellation::default();
         let task_cancel = cancellation.clone();
@@ -2861,7 +2874,7 @@ mod owned_request_cancellation_tests {
         let path = directory.0.join("rpc.sock");
         let global = Arc::new(WaitingGlobal::default());
         let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
-        server.set_connection_admission(Arc::new(SelfPeer));
+        server.set_connection_admission(Arc::new(SelfPeer)).unwrap();
         let issues = server.retain_connection_issues();
         let connections = server.connection_monitor();
         let cancellation = RequestCancellation::default();
@@ -2942,7 +2955,7 @@ mod owned_request_cancellation_tests {
         let path = directory.0.join("rpc.sock");
         let mut server =
             RpcServer::bind_exclusive(&path, Arc::new(WaitingGlobal::default()), ()).unwrap();
-        server.set_connection_admission(Arc::new(Replay));
+        server.set_connection_admission(Arc::new(Replay)).unwrap();
         let issues = server.retain_connection_issues();
         let connections = server.connection_monitor();
         let cancellation = RequestCancellation::default();
@@ -2984,7 +2997,7 @@ mod owned_request_cancellation_tests {
         let path = directory.0.join("rpc.sock");
         let global = Arc::new(WaitingGlobal::default());
         let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
-        server.set_connection_admission(Arc::new(SelfPeer));
+        server.set_connection_admission(Arc::new(SelfPeer)).unwrap();
         let issues = server.retain_connection_issues();
         let cancellation = RequestCancellation::default();
         let task_cancel = cancellation.clone();
@@ -3030,7 +3043,7 @@ mod owned_request_cancellation_tests {
             let path = directory.0.join("rpc.sock");
             let global = Arc::new(WaitingGlobal::default());
             let mut server = RpcServer::bind_exclusive(&path, global.clone(), ()).unwrap();
-            server.set_connection_admission(Arc::new(SelfPeer));
+            server.set_connection_admission(Arc::new(SelfPeer)).unwrap();
             let issues = server.retain_connection_issues();
             let connections = server.connection_monitor();
             let cancellation = RequestCancellation::default();

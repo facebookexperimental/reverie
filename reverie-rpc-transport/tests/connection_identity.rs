@@ -265,9 +265,37 @@ fn identity_cannot_be_combined_with_connection_admission() {
         "cfg".to_string(),
     )
     .unwrap();
-    server.set_connection_admission(Arc::new(Admit));
+    server.set_connection_admission(Arc::new(Admit)).unwrap();
     let error = server
         .require_connection_identity()
         .expect_err("identity and admission are exclusive");
+    assert!(error.to_string().contains("cannot be combined"), "{error}");
+}
+
+#[test]
+fn connection_admission_cannot_be_combined_with_identity_in_reverse_order() {
+    struct Admit;
+    impl reverie_rpc_transport::ConnectionAdmission for Admit {
+        fn admit(
+            &self,
+            _peer: std::os::fd::OwnedFd,
+        ) -> std::io::Result<reverie_rpc_transport::Admitted> {
+            Ok(reverie_rpc_transport::Admitted { process_id: 1 })
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let mut server = RpcServer::bind(
+        unique_sock_path("combined-reverse"),
+        Arc::new(Plain),
+        "cfg".to_string(),
+    )
+    .unwrap();
+    server
+        .require_connection_identity()
+        .expect("identity alone is supported on this kernel");
+    let error = server
+        .set_connection_admission(Arc::new(Admit))
+        .expect_err("admission after identity is exclusive in either order");
     assert!(error.to_string().contains("cannot be combined"), "{error}");
 }

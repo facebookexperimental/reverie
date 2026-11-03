@@ -96,7 +96,7 @@ impl InitialImageStatsServer {
         )?;
         let global = Arc::new(crate::stats::LiteinstStatsGlobal::default());
         let mut server = RpcServer::bind_exclusive(&endpoint, global.clone(), ())?;
-        server.set_connection_admission(admission);
+        server.set_connection_admission(admission)?;
         let issues = server.retain_connection_issues();
         Ok((
             Self { server, issues },
@@ -128,7 +128,7 @@ impl InitialImageStatsServer {
         }
         let global = Arc::new(crate::stats::LiteinstStatsGlobal::default());
         let mut server = RpcServer::from_prebound(listener, global.clone(), ())?;
-        server.set_connection_admission(admission);
+        server.set_connection_admission(admission)?;
         let issues = server.retain_connection_issues();
         Ok((
             Self { server, issues },
@@ -1015,7 +1015,9 @@ where
         // global state alive past the run (launch reclaims it by value); a
         // report arriving after the run finds no global and is dropped.
         admission.attach_exit_reporter(Arc::new(GlobalExitReporter(Arc::downgrade(&global))));
-        server.set_connection_admission(admission);
+        server
+            .set_connection_admission(admission)
+            .map_err(|error| io::Error::other(error.to_string()))?;
     }
     #[cfg(feature = "rpc-io-fixture")]
     let _ = RPC_ISSUES_FOR_TEST.try_with(|captures| {
