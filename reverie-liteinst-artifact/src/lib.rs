@@ -17521,9 +17521,9 @@ fn fixed_role_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
     Ok(result)
 }
 
-// Both observed equality cohorts can coexist in one DSO. This finite census
+// Observed equality cohorts can coexist in one DSO. This finite census
 // grants byte coverage only; admission chooses one pair from complete callers.
-const FIXED_HEAP_EQUAL_COHORTS: [(&str, &str); 2] = [
+const FIXED_HEAP_EQUAL_COHORTS: [(&str, &str); 3] = [
     (
         "_RNvXsf_NtCs_4core6optionINtB5_6OptionjENtNtB7_3cmp9PartialEq2eqCs_12regex_syntax",
         "_RNvXsj_NtNtCs_4core3cmp5implsjNtB7_9PartialEq2eqCs_12regex_syntax",
@@ -17531,6 +17531,10 @@ const FIXED_HEAP_EQUAL_COHORTS: [(&str, &str); 2] = [
     (
         "_RNvXsf_NtCs_4core6optionINtB5_6OptionjENtNtB7_3cmp9PartialEq2eqCs_10safeptrace",
         "_RNvXsj_NtNtCs_4core3cmp5implsjNtB7_9PartialEq2eqCs_10safeptrace",
+    ),
+    (
+        "_RNvXsf_NtCs_4core6optionINtB5_6OptionjENtNtB7_3cmp9PartialEq2eqCs_15reverie_inguest",
+        "_RNvXsj_NtNtCs_4core3cmp5implsjNtB7_9PartialEq2eqCs_15reverie_inguest",
     ),
 ];
 
@@ -46431,9 +46435,11 @@ mod tests {
                 FIXED_HEAP_EQUAL_COHORTS[0].1.replace("Cs_", "Cs1_"),
                 FIXED_HEAP_EQUAL_COHORTS[1].0.replace("Cs_", "Cs1_"),
                 FIXED_HEAP_EQUAL_COHORTS[1].1.replace("Cs_", "Cs1_"),
+                FIXED_HEAP_EQUAL_COHORTS[2].0.replace("Cs_", "Cs1_"),
+                FIXED_HEAP_EQUAL_COHORTS[2].1.replace("Cs_", "Cs1_"),
             ];
-            let addresses = [0x1000, 0x2000, 0x2100, 0x2200, 0x2300];
-            let sizes = [2690, 124, 22, 124, 22];
+            let addresses = [0x1000, 0x2000, 0x2100, 0x2200, 0x2300, 0x2400, 0x2500];
+            let sizes = [2690, 124, 22, 124, 22, 124, 22];
             let mut strings = vec![0];
             for (index, name) in names.iter().enumerate() {
                 let row = 0x6000 + (index + 1) * 24;
@@ -46445,8 +46451,10 @@ mod tests {
                 strings.extend_from_slice(name.as_bytes());
                 strings.push(0);
             }
+            assert!(0x5000 + strings.len() <= 0x6000);
+            assert!(0x6000 + (names.len() + 1) * 24 <= 0x6500);
             bytes[0x5000..0x5000 + strings.len()].copy_from_slice(&strings);
-            for (option, scalar) in [(0x2000, 0x2100), (0x2200, 0x2300)] {
+            for (option, scalar) in [(0x2000, 0x2100), (0x2200, 0x2300), (0x2400, 0x2500)] {
                 let mut body = fixed_hex(DEV_FIXED_HEAP_HEX_23);
                 relative(&mut body, option, 105, 109, scalar);
                 bytes[option as usize..option as usize + body.len()].copy_from_slice(&body);
@@ -46457,7 +46465,7 @@ mod tests {
                 let row = 0x6500 + index * 24;
                 put(&mut bytes, row, 8, slot);
                 put(&mut bytes, row + 8, 8, 8);
-                put(&mut bytes, row + 16, 8, [0x2000, 0x2200][cohort]);
+                put(&mut bytes, row + 16, 8, [0x2000, 0x2200, 0x2400][cohort]);
             }
             // One null dynamic symbol. Mutation controls expose a real provider.
             for (index, word) in [1, 1, 0, 0, 0].into_iter().enumerate() {
@@ -46484,7 +46492,7 @@ mod tests {
                 (1, 1, 6, 0x1000, 0x3000, 0, 0),
                 (2, 1, 3, 0x4000, 0x1000, 0, 0),
                 (3, 3, 0, 0x5000, strings.len() as u64, 0, 0),
-                (4, 2, 0, 0x6000, 24 * 6, 3, 24),
+                (4, 2, 0, 0x6000, 24 * 8, 3, 24),
                 (5, 4, 2, 0x6500, 48, 7, 24),
                 (6, 6, 3, 0x4200, 16 * 9, 3, 16),
                 (7, 11, 2, 0x6800, 48, 3, 24),
@@ -46516,9 +46524,9 @@ mod tests {
                 ),
                 ("fixed_heap_usize_equal".into(), elf.syms.get(3).unwrap()),
             ]);
-            let code = [0x1000, 0x2000, 0x2100, 0x2200, 0x2300]
+            let code = [0x1000, 0x2000, 0x2100, 0x2200, 0x2300, 0x2400, 0x2500]
                 .into_iter()
-                .zip([2690, 124, 22, 124, 22])
+                .zip([2690, 124, 22, 124, 22, 124, 22])
                 .map(|(address, size)| {
                     (
                         address,
@@ -46635,6 +46643,49 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert!(fixed_whole_recipe(0x1000, body, DEV_FIXED_HEAP_HEX_1, &fields).is_err());
+        }
+        // The third pair is exercised separately: the original two-cohort
+        // primitive/method/crate and metadata controls above remain intact.
+        let bytes = fixture(2);
+        let selected = select(&bytes, false).unwrap();
+        assert_eq!(selected["fixed_heap_option_usize_equal"].st_value, 0x2400);
+        assert_eq!(selected["fixed_heap_usize_equal"].st_value, 0x2500);
+        println!("heap equality reverie_inguest accepting cohort passed");
+
+        let mut ambiguous = bytes.clone();
+        // Two DISTINCT exact canonical Option names share the selected target.
+        // Duplicating one spelling would stop at a different census guard.
+        put(&mut ambiguous, 0x6000 + 2 * 24 + 8, 8, 0x2400);
+        let elf = Elf::parse(&ambiguous).unwrap();
+        let candidates = fixed_heap_equal_candidates(&elf).unwrap();
+        assert_eq!(
+            FIXED_HEAP_EQUAL_COHORTS
+                .iter()
+                .filter(|(option, _)| candidates[option].st_value == 0x2400)
+                .count(),
+            2
+        );
+        let message = select(&ambiguous, false).unwrap_err();
+        assert_eq!(message, "deallocate lacks one exact typed equality cohort");
+        println!("heap equality ambiguity refusal passed: {message}");
+
+        for (symbol_index, expected) in [
+            (6, "deallocate lacks one exact typed equality cohort"),
+            (7, "heap equality scalar provider absent"),
+        ] {
+            let row = 0x6000 + symbol_index * 24;
+            let name =
+                u32::from_le_bytes(bytes[row..row + 4].try_into().unwrap()) as usize + 0x5000;
+            let length = bytes[name..].iter().position(|byte| *byte == 0).unwrap();
+            let spelling = std::str::from_utf8(&bytes[name..name + length]).unwrap();
+            assert!(spelling.ends_with("15reverie_inguest"));
+            let mut wrong_method = bytes.clone();
+            wrong_method[name + spelling.find("2eq").unwrap() + 2] = b'z';
+            let message = select(&wrong_method, false).unwrap_err();
+            assert_eq!(message, expected);
+            println!(
+                "heap equality wrong-method provider {symbol_index} refusal passed: {message}"
+            );
         }
     }
 
