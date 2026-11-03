@@ -191,7 +191,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+// Its one caller, a_kick_after_kvm_run_returned_stores_nothing_into_the_decoded_page,
+// needs native-test-support; without it the setter is dead code.
+#[cfg(all(test, feature = "native-test-support"))]
 pub(super) fn set_after_run_for_test(hook: impl FnOnce() + 'static) {
     AFTER_RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
