@@ -39631,11 +39631,21 @@ mod tests {
         assert!(loader_meta_version_rows(&definition, 1, false).is_err());
     }
 
-    fn loader_writer_controls() {
-        fn put(b: &mut [u8], offset: usize, width: usize, value: u64) {
+    // Shared only by crate unit tests; production loader authentication is unchanged.
+    pub(crate) mod loader_writer_fixture {
+        use super::*;
+
+        pub(super) fn put(b: &mut [u8], offset: usize, width: usize, value: u64) {
             b[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
         }
-        fn ph(b: &mut [u8], index: usize, kind: u32, flags: u32, address: u64, size: u64) {
+        pub(super) fn ph(
+            b: &mut [u8],
+            index: usize,
+            kind: u32,
+            flags: u32,
+            address: u64,
+            size: u64,
+        ) {
             let at = 64 + index * 56;
             for (offset, width, value) in [
                 (0, 4, u64::from(kind)),
@@ -39650,7 +39660,7 @@ mod tests {
                 put(b, at + offset, width, value);
             }
         }
-        fn malformed_fixture() -> Vec<u8> {
+        pub(super) fn malformed_fixture() -> Vec<u8> {
             let mut b = vec![0; 0x6000];
             b[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
             for (at, width, value) in [
@@ -39808,7 +39818,7 @@ mod tests {
         // Retain the old malformed input above verbatim. The positive fixture
         // now gives the loader and parser the same complete physical tables:
         // added section views bind existing bytes, not invented route evidence.
-        fn fixture() -> Vec<u8> {
+        pub(crate) fn fixture() -> Vec<u8> {
             let mut b = malformed_fixture();
             put(&mut b, 60, 2, 14);
             // ELF/PHDR bytes are actual read-only LOAD input too. PH6 remains
@@ -39864,6 +39874,14 @@ mod tests {
             b[0x4300..0x4300 + names.len()].copy_from_slice(&names);
             b
         }
+    }
+
+    fn loader_writer_controls() {
+        use loader_writer_fixture::fixture;
+        use loader_writer_fixture::malformed_fixture;
+        use loader_writer_fixture::ph;
+        use loader_writer_fixture::put;
+
         fn writer(b: &mut [u8], stream: usize, address: u64, kind: u32, symbol: u64) {
             let at = match stream {
                 0 => {
