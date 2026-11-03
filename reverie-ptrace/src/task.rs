@@ -2762,15 +2762,24 @@ fn swaps_signal_mask(nr: Sysno) -> bool {
     )
 }
 
-/// The syscalls that read or take a pending signal, which a guest SIGTRAP
-/// held out of the queue would be missing from
+/// The syscalls that read or take a pending signal, or make a signalfd that
+/// can, which a guest SIGTRAP held out of the queue would be missing from
 /// (`GlobalState::traces_signal_reading_syscalls`). aarch64 has no
 /// `signalfd`, only `signalfd4`.
 fn signal_reading_syscalls() -> Vec<Sysno> {
-    let mut syscalls = vec![Sysno::rt_sigtimedwait, Sysno::rt_sigpending, Sysno::signalfd4];
     #[cfg(target_arch = "x86_64")]
-    syscalls.push(Sysno::signalfd);
-    syscalls
+    let only_x86_64: &[Sysno] = &[Sysno::signalfd];
+    #[cfg(not(target_arch = "x86_64"))]
+    let only_x86_64: &[Sysno] = &[];
+    [
+        Sysno::rt_sigtimedwait,
+        Sysno::rt_sigpending,
+        Sysno::signalfd4,
+    ]
+    .iter()
+    .chain(only_x86_64)
+    .copied()
+    .collect()
 }
 
 // The trap's ABI is x86_64's (see `TracerBuilder::injected_syscall_trap`).
@@ -4299,8 +4308,11 @@ struct GlobalState<G: GlobalTool> {
     /// `signalfd4`), so that while a precise timer holds a guest SIGTRAP out
     /// of the queue (`stash_pending_sigtrap`) a step reaching one stops at
     /// its seccomp stop, where the SIGTRAP is queued again before it runs.
-    /// A `read` of an existing signalfd and a procfs status read are not
-    /// covered: they would see the SIGTRAP missing for the steps.
+    /// Not covered: a `read` of a signalfd made before the steps, which
+    /// would find nothing and block or return `EAGAIN`; a `poll`, `select`
+    /// or `epoll_wait` on one, which would not see it ready; and a procfs
+    /// status read, which would show the SIGTRAP missing. A Tool that stops
+    /// every syscall stops all of these first.
     traces_signal_reading_syscalls: bool,
 
     /// Whether every change of the guest's mask or of a signal's action is
@@ -12717,7 +12729,9 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// or reads or takes a pending signal
     /// (`GlobalState::traces_signal_reading_syscalls`), one of which could
     /// then run before it is queued again: a stepped `rt_sigtimedwait` for
-    /// SIGTRAP would find nothing, and wait or return `EAGAIN`.
+    /// SIGTRAP would find nothing, and wait or return `EAGAIN`; or the kernel
+    /// accepts x32 syscalls, which run without a stop
+    /// (`x32_syscalls_refused`).
     async fn stash_pending_sigtrap(
         &mut self,
         mut task: Stopped,
@@ -12726,6 +12740,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             || !self.keeps_sigtrap_state()
             || !self.global_state.traces_signal_state_syscalls
             || !self.global_state.traces_signal_reading_syscalls
+            || (cfg!(target_arch = "x86_64") && !x32_syscalls_refused())
         {
             return Ok((task, false));
         }
@@ -12865,9 +12880,11 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// whose temporary mask unblocks SIGTRAP; another signal pending too; a
     /// SIGTRAP queued in both queues or neither; a temporary mask's restore
     /// pending; no repair page for the arguments that queue it again; or the
-    /// Tool not stopping every syscall that reads or changes signal state
-    /// (`GlobalState::traces_signal_state_syscalls`). One in the thread
-    /// group's queue never leaves it (`absorb_sigtrap_at_stop`).
+    /// Tool not stopping every syscall that changes signal state
+    /// (`GlobalState::traces_signal_state_syscalls`). No guest code runs
+    /// before it is queued again, so the syscalls that only read signal
+    /// state need no stop here. One in the thread group's queue never leaves
+    /// it (`absorb_sigtrap_at_stop`).
     fn sigtrap_to_absorb(
         &self,
         task: &Stopped,
@@ -14778,17 +14795,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         #[cfg(test)]
         let keeps = keeps
             && !(owes_requeue
-                && SIGTRAP_STATE_UNKNOWN_AT_REQUEUE_FOR_TEST.with(|unknown| unknown.replace(false)));
+                && SIGTRAP_STATE_UNKNOWN_AT_REQUEUE_FOR_TEST
+                    .with(|unknown| unknown.replace(false)));
         if !keeps {
             // A taken SIGTRAP must be queued again before this syscall or the
             // Tool reads the thread's signals. Where the state that keeps it
             // cannot be read now (an unreadable procfs status), the syscall
             // would run without it, so the run ends instead.
             if owes_requeue {
-                return Err(self.fail_pending_sigtrap(
-                    task.pid(),
-                    "seccomp stop, with SIGTRAP state unknown",
-                ));
+                return Err(self
+                    .fail_pending_sigtrap(task.pid(), "seccomp stop, with SIGTRAP state unknown"));
             }
             return Ok(task);
         }
