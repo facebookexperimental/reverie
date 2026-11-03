@@ -26,3 +26,8 @@ fn sigtrap_state_survives_a_timer_step_over_sigreturn() {
 fn a_repair_at_a_seccomp_stop_runs_the_syscall_once() {
     sigtrap_steps::a_repair_at_a_seccomp_stop_runs_the_syscall_once();
 }
+
+#[test]
+fn a_pending_blocked_sigtrap_is_kept_across_timer_steps() {
+    sigtrap_steps::a_pending_blocked_sigtrap_is_kept_across_timer_steps();
+}

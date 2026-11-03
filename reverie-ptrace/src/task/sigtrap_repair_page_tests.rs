@@ -50,6 +50,12 @@ fn unsealed_a_repair_at_a_seccomp_stop_runs_the_syscall_once() {
     sigtrap_steps::a_repair_at_a_seccomp_stop_runs_the_syscall_once();
 }
 
+#[test]
+fn unsealed_a_pending_blocked_sigtrap_is_kept_across_timer_steps() {
+    unsealed();
+    sigtrap_steps::a_pending_blocked_sigtrap_is_kept_across_timer_steps();
+}
+
 /// A guest that maps its own page over the unsealed repair page: Reverie must
 /// never write into it. The guest fills the page, ignores SIGTRAP, and lets a
 /// timer's steps reset it, which would owe a repair through the page; the
