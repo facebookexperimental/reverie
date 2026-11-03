@@ -4234,6 +4234,23 @@ async fn sigsegv_state_survives_rdtsc_and_cpuid_traps() {
     assert!(made > 0, "no query at a trap");
 }
 
+/// `sigsegv_state_survives_rdtsc_and_cpuid_traps` with the repair page left
+/// unsealed, as on a kernel without `mseal` (before Linux 6.10), by the test
+/// switch: signal records are kept wherever pre-init set up a repair page,
+/// sealed or not (`TracedTask::keeps_signal_records`), so every row reads as
+/// natively, and the repairs write through the unsealed page.
+#[tokio::test(flavor = "current_thread")]
+async fn sigsegv_state_survives_rdtsc_and_cpuid_traps_with_an_unsealed_repair_page() {
+    crate::task::SigtrapRepairTestSwitches::unseal_on_this_thread();
+    let unsealed = crate::task::UNSEALED_REPAIR_PAGES_FOR_TEST.with(|count| count.get());
+    let before = crate::task::SEGV_REPAIRS_FOR_TEST.with(|count| count.get());
+    assert_segv_lines("segv_states", &kept_segv_states()).await;
+    let pages = crate::task::UNSEALED_REPAIR_PAGES_FOR_TEST.with(|count| count.get()) - unsealed;
+    assert!(pages > 0, "no repair page was left unsealed");
+    let made = crate::task::SEGV_REPAIRS_FOR_TEST.with(|count| count.get()) - before;
+    assert!(made > 0, "no repair ran");
+}
+
 /// The negative control of `sigsegv_state_survives_rdtsc_and_cpuid_traps`:
 /// without a serialized-execution contract, or with sigreturns not traced
 /// (so a guest `rt_sigreturn` can change the mask unseen), Reverie keeps

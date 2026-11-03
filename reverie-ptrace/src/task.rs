@@ -2024,6 +2024,15 @@ impl SigtrapRepairTestSwitches {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Repair pages that pre-init left unsealed (`seal_sigtrap_scratch`),
+    /// counted for the tests that must know the unsealed path ran. Per
+    /// thread, as `UNSTEPPED_INJECTIONS_FOR_TEST`.
+    pub(crate) static UNSEALED_REPAIR_PAGES_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Whether thread `tid`'s address space still holds the canary at the end of
 /// its unsealed repair page, read with `process_vm_readv`.
 fn scratch_canary_intact(tid: Pid) -> bool {
@@ -11857,7 +11866,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// of higher precedence than Reverie's can let a guest syscall run
     /// without a stop, as for a quiet timer sequence (`drive_timer`): the
     /// tracer has none of its own (`GlobalState::seccomp_filter_baseline` is
-    /// 1), the address space had none when pre-init sealed its repair page
+    /// 1), the address space had none when pre-init set up its repair page
     /// (`seal_sigtrap_scratch`), and the guest installs none later under the
     /// contract (`Tool::enforces_serialized_execution`).
     ///
@@ -11874,9 +11883,24 @@ impl<L: Tool + 'static> TracedTask<L> {
 
     /// Whether Reverie keeps signal records for this thread
     /// (`GlobalState::keeps_signal_records`) now: also, the guest has no
-    /// seccomp filter of its own, Reverie's repair page is sealed, the tracer
-    /// thread has no filter (`keeps_sigtrap_state`), and the kernel refuses
-    /// x32 syscalls. `keeps_segv_state` gives the conditions' reasons.
+    /// seccomp filter of its own, pre-init set up a repair page in this
+    /// address space, sealed or unsealed, and no repair through it has been
+    /// lost since (`scratch_usable`), the tracer thread has no filter
+    /// (`keeps_sigtrap_state`), and the kernel refuses x32 syscalls.
+    /// `keeps_segv_state` gives the conditions' reasons.
+    ///
+    /// The page counts here as the record that pre-init found no seccomp
+    /// filter of the guest's (`seal_sigtrap_scratch` sets up none otherwise),
+    /// not as a page to write through: the records themselves write nothing
+    /// there. An unsealed page's canary and mapping are checked where a
+    /// repair uses the page (`sigtrap_scratch`), and a page that fails that
+    /// check ends repairs and records in the address space, as a failed
+    /// repair call does with a sealed page (`lose_sigtrap_scratch`). They are
+    /// not read here, at every resume: the traps the records serve (an rdtsc
+    /// or cpuid trap's SIGSEGV, a watchpoint hit's SIGTRAP) are forced by the
+    /// kernel and cannot be shielded, so reading ahead would choose nothing,
+    /// and would drop the mask's repair, which needs no page, one trap
+    /// earlier.
     fn keeps_signal_records(&self) -> bool {
         self.global_state.keeps_signal_records
             && self.global_state.seccomp_filter_baseline == Some(1)
@@ -12563,6 +12587,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                             }
                             self.sigtrap_scratch_state
                                 .store(SCRATCH_UNSEALED, Ordering::SeqCst);
+                            #[cfg(test)]
+                            UNSEALED_REPAIR_PAGES_FOR_TEST.with(|count| count.set(count.get() + 1));
                             return Ok(task);
                         }
                         Err(errno) => {
