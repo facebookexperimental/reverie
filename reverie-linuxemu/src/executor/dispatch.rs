@@ -841,6 +841,9 @@ fn execute_basic_syscall_inner(
     } else if number == libc::SYS_sched_get_priority_max as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         sched_priority_bound(libc::SYS_sched_get_priority_max, args[0])
+    } else if number == libc::SYS_getrandom as u64 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        getrandom(&mut ProviderMemory(memory), args[0], args[1], args[2])
     } else if number == libc::SYS_clock_gettime as u64 {
         clock_gettime(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_nanosleep as u64 {

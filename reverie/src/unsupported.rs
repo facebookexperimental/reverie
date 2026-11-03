@@ -68,10 +68,10 @@ pub enum UnsupportedOperation {
     SignalDelivery,
     /// A call whose answer the tool decides on every backend, on a backend
     /// that therefore keeps no copy of that answer: for example the CPU,
-    /// scheduling and priority queries and changes, `getrandom`,
-    /// `prlimit64`, the user and group id calls, `seccomp` or `getpgrp`. A
-    /// backend that refuses one performed none of the call's own effects. A
-    /// tool that answers the call itself never sees this refusal.
+    /// scheduling and priority queries and changes, `prlimit64`, the user
+    /// and group id calls, `seccomp` or `getpgrp`. A backend that refuses one
+    /// performed none of the call's own effects. A tool that answers the call
+    /// itself never sees this refusal.
     ToolDecided,
     /// `madvise(2)` advice whose effect a program can observe, such as what a
     /// fork copies or a core dump holds, on a backend that does not implement

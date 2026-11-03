@@ -144,6 +144,8 @@ mod mm;
 pub(crate) use mm::*;
 mod pkeys;
 use pkeys::*;
+mod random;
+use random::*;
 mod time;
 use time::*;
 mod sys_signal;

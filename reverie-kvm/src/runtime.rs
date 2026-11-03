@@ -1219,7 +1219,8 @@ fn provider_disposition(error: Error) -> Result<ProviderOutcome> {
 ///   commands and `prctl` options, among others) answer a bare `-ENOSYS`
 ///   without a refusal, as do the admission checks above. An absent refusal
 ///   therefore does not establish that a request was supported.
-/// - The clock reads, `uname` and the random devices go to the host. The
+/// - The clock reads, `uname`, `getrandom` and the random devices go to the
+///   host. The
 ///   executor still makes up some values a guest sees: the synthetic `/proc`
 ///   files, and its signal model's decisions, which
 ///   Detcore owns too and which are scheduled for deletion; and a fixed

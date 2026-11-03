@@ -412,8 +412,8 @@ pub(super) fn parent_death_signal_refusal(signal: u64) -> reverie::UnsupportedRe
 /// The calls whose answer Detcore decides on every backend, which this
 /// executor therefore leaves unimplemented: the CPU, affinity, scheduling
 /// policy and parameter, priority and I/O-priority calls; `membarrier`;
-/// `getrandom`; `prlimit64`; the user and group id queries and setters;
-/// `seccomp`; and `getpgrp`. Detcore answers each of them itself; no Detcore
+/// `prlimit64`; the user and group id queries and setters; `seccomp`; and
+/// `getpgrp`. Detcore answers each of them itself; no Detcore
 /// path injects one on this backend, except getpgrp after a clone3 argument
 /// rewrite races Detcore under --no-sequentialize-threads
 /// (https://github.com/rrnewton/hermit/issues/4531), which Detcore then
@@ -421,8 +421,11 @@ pub(super) fn parent_death_signal_refusal(signal: u64) -> reverie::UnsupportedRe
 /// typed refusal `ToolDecided` (see `tool_decided_refusal`); so does a guest
 /// of a run without a Tool. `sched_get_priority_min` and
 /// `sched_get_priority_max` are not here, because Detcore passes them
-/// through to the host.
-pub(crate) const TOOL_DECIDED_SYSCALLS: [libc::c_long; 32] = [
+/// through to the host. Nor is `getrandom`: a backend only intercepts, and an
+/// injected call runs on the host on every backend, so this executor forwards
+/// it (see `getrandom`) and a program run without a Tool sees the host's
+/// answer, as under ptrace.
+pub(crate) const TOOL_DECIDED_SYSCALLS: [libc::c_long; 31] = [
     libc::SYS_getcpu,
     libc::SYS_sched_getaffinity,
     libc::SYS_sched_getscheduler,
@@ -436,7 +439,6 @@ pub(crate) const TOOL_DECIDED_SYSCALLS: [libc::c_long; 32] = [
     libc::SYS_ioprio_get,
     libc::SYS_ioprio_set,
     libc::SYS_membarrier,
-    libc::SYS_getrandom,
     libc::SYS_prlimit64,
     libc::SYS_getuid,
     libc::SYS_geteuid,

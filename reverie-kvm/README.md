@@ -261,7 +261,7 @@ instruction-fetch faults in virtual page zero produce `SIGSEGV` with
 `Error::GuestException`, reporting the vector, saved guest instruction pointer
 and `CR2`; this is not general synchronous-fault delivery.
 
-`run_static_elf` supplies a deliberately small Linux personality. It handles process exit, host-backed filesystem descriptors, stdout/stderr writes, host clock reads, FS/GS bases, `brk`, anonymous and file-backed `mmap`, and common startup no-ops. Unsupported syscalls return `ENOSYS`. The calls whose answers the Tool (Detcore) decides on every backend (the CPU, scheduling and priority calls, `membarrier`, `getrandom`, `prlimit64`, the user and group id calls, `seccomp` and `getpgrp`) also return `ENOSYS`, with the typed refusal `UnsupportedOperation::ToolDecided`.
+`run_static_elf` supplies a deliberately small Linux personality. It handles process exit, host-backed filesystem descriptors, stdout/stderr writes, host clock reads and `getrandom`, FS/GS bases, `brk`, anonymous and file-backed `mmap`, and common startup no-ops. Unsupported syscalls return `ENOSYS`. The calls whose answers the Tool (Detcore) decides on every backend (the CPU, scheduling and priority calls, `membarrier`, `prlimit64`, the user and group id calls, `seccomp` and `getpgrp`) also return `ENOSYS`, with the typed refusal `UnsupportedOperation::ToolDecided`.
 
 The host-backed filesystem layer includes descriptor duplication, file and
 filesystem metadata, permission and timestamp updates, and bounded

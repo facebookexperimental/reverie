@@ -808,6 +808,9 @@ int main(int argc, char **argv) {
 #[path = "support/random_device_stream.rs"]
 mod random_device_stream;
 
+#[path = "support/getrandom_forward.rs"]
+mod getrandom_forward;
+
 #[path = "support/poll_descriptor_abi.rs"]
 mod poll_descriptor_abi;
 
