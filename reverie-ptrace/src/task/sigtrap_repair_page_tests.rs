@@ -256,3 +256,91 @@ fn a_shared_page_with_a_copied_canary_is_never_written() {
         }
     });
 }
+
+/// Ignores SIGTRAP, lets `SyscallSteppingTool`'s timers step to the next
+/// syscalls, where a repair of the steps' reset is owed, and returns
+/// SIGTRAP's handler read back after them.
+fn ignore_sigtrap_then_step() -> libc::sighandler_t {
+    // SAFETY: plain libc signal calls on this thread's own state.
+    unsafe {
+        let mut ignore: libc::sigaction = std::mem::zeroed();
+        ignore.sa_sigaction = libc::SIG_IGN;
+        libc::sigemptyset(&mut ignore.sa_mask);
+        assert_eq!(
+            libc::sigaction(libc::SIGTRAP, &ignore, std::ptr::null_mut()),
+            0
+        );
+        for _ in 0..4 {
+            libc::getpid();
+            libc::getppid();
+        }
+        let mut now: libc::sigaction = std::mem::zeroed();
+        assert_eq!(
+            libc::sigaction(libc::SIGTRAP, std::ptr::null(), &mut now),
+            0
+        );
+        now.sa_sigaction
+    }
+}
+
+/// A SIGTRAP repair through an unsealed page that does not take is lost by
+/// name: the address space is marked as having no repair page
+/// (`TracedTask::lose_untaken_sigtrap_repair`), so no later repair goes
+/// through it. The first repair here has the reset put back into its page
+/// between its write and its call (`CHANGED_REPAIR_PAGES_FOR_TEST`), as a page
+/// changed in between would, so it does not take: SIGTRAP reads `SIG_DFL`
+/// after the first round, and the address space must be marked as having no
+/// repair page. The second round's steps reset SIGTRAP again, and no repair
+/// may be made through the page that did not carry the first: SIGTRAP reads
+/// `SIG_DFL` again. Unmarked, the second round's repair took, and SIGTRAP
+/// read `SIG_IGN`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unsealed_repair_that_does_not_take_is_lost() {
+    if !crate::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    unsealed();
+    super::CHANGED_REPAIR_PAGES_FOR_TEST.with(|count| count.set(1));
+    let pages = super::UNSEALED_REPAIR_PAGES_FOR_TEST.with(|count| count.get());
+    let untaken = super::UNTAKEN_REPAIRS_FOR_TEST.with(|count| count.get());
+    let tracer = crate::spawn_fn_with_config::<sigtrap_steps::SyscallSteppingTool, _>(
+        || {
+            let first = ignore_sigtrap_then_step();
+            let second = ignore_sigtrap_then_step();
+            // The guest's panic message is not shown; this line is.
+            let _ = writeln!(
+                std::io::stderr(),
+                "after the untaken repair: {first:#x}; after the next steps: {second:#x}"
+            );
+            assert_eq!(first, libc::SIG_DFL, "the changed repair took");
+            assert_eq!(second, libc::SIG_DFL, "a repair went through the page");
+        },
+        (),
+        true,
+    )
+    .await
+    .expect("start the tracer");
+    let (output, ()) = tracer.wait_with_output().await.expect("run the guest");
+    assert_eq!(
+        output.status,
+        reverie::ExitStatus::Exited(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        super::UNSEALED_REPAIR_PAGES_FOR_TEST.with(|count| count.get()) - pages,
+        1,
+        "the guest's page was left unsealed"
+    );
+    assert_eq!(
+        super::CHANGED_REPAIR_PAGES_FOR_TEST.with(|count| count.get()),
+        0,
+        "the first repair's page was changed"
+    );
+    assert_eq!(
+        super::UNTAKEN_REPAIRS_FOR_TEST.with(|count| count.get()) - untaken,
+        1,
+        "the untaken repair marked its address space"
+    );
+}

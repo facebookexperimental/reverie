@@ -2031,6 +2031,18 @@ thread_local! {
     /// thread, as `UNSTEPPED_INJECTIONS_FOR_TEST`.
     pub(crate) static UNSEALED_REPAIR_PAGES_FOR_TEST: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+
+    /// How many more SIGTRAP repairs through an unsealed page get the reset
+    /// put back into their page before their call
+    /// (`TracedTask::change_repair_page_for_test`). Per thread, as above.
+    pub(crate) static CHANGED_REPAIR_PAGES_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Repairs through an unsealed page that did not take, each of which
+    /// marked its address space (`TracedTask::lose_untaken_sigtrap_repair`).
+    /// Per thread, as above.
+    pub(crate) static UNTAKEN_REPAIRS_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Whether thread `tid`'s address space still holds the canary at the end of
@@ -13357,23 +13369,94 @@ impl<L: Tool + 'static> TracedTask<L> {
         let (task, written) = self
             .write_signal_action_at(task, scratch, libc::SIGTRAP, action)
             .await?;
-        // Through an unsealed page the action is read back, and a repair
-        // whose handler did not take is reported as lost. Only the handler is
-        // compared: a trap resets nothing else, and the kernel normalises the
-        // flags and mask a guest passed (`do_sigaction`).
+        // Through an unsealed page the action is read back. A repair whose
+        // handler did not take, or that cannot be read back, is lost
+        // (`lose_untaken_sigtrap_repair`): no later repair goes through a page
+        // that did not carry this one. Only the handler is compared: a trap
+        // resets nothing else, and the kernel normalises the flags and mask a
+        // guest passed (`do_sigaction`).
         if written && self.sigtrap_scratch_state.load(Ordering::SeqCst) == SCRATCH_UNSEALED {
             let (task, back) = self.query_sigtrap_action_at(task, scratch).await?;
-            if back.is_some_and(|back| back.handler != action.handler) {
-                tracing::warn!(
-                    "[scheduler/tool] (pid = {}) a SIGTRAP repair did not take (read back {:?}, wrote {:?})",
-                    task.pid(),
-                    back,
-                    action
-                );
+            if !back.is_some_and(|back| back.handler == action.handler) {
+                self.lose_untaken_sigtrap_repair(&task, back, action);
             }
             return Ok(task);
         }
         Ok(task)
+    }
+
+    /// Marks this address space as having no SIGTRAP repair page after a
+    /// repair through its unsealed page did not take (`back`, the action read
+    /// back, has another handler than `wrote`) or could not be read back
+    /// (`None`), and names the lost repair in a warning: the reset it was to
+    /// undo stays, and no later repair uses the page. A read back that failed
+    /// has already marked the address space (`lose_sigtrap_scratch`), and is
+    /// not reported again.
+    fn lose_untaken_sigtrap_repair(
+        &self,
+        task: &Stopped,
+        back: Option<KernelSigaction>,
+        wrote: KernelSigaction,
+    ) {
+        if self
+            .sigtrap_scratch_state
+            .compare_exchange(
+                SCRATCH_UNSEALED,
+                SCRATCH_UNAVAILABLE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+        #[cfg(test)]
+        UNTAKEN_REPAIRS_FOR_TEST.with(|count| count.set(count.get() + 1));
+        tracing::warn!(
+            "[scheduler/tool] (pid = {}) a SIGTRAP repair through the unsealed page did not take (read back {:?}, wrote {:?}); the repair is lost and SIGTRAP repairs are off in this address space",
+            task.pid(),
+            back,
+            wrote
+        );
+    }
+
+    /// Test-only: where `CHANGED_REPAIR_PAGES_FOR_TEST` asks for it, puts the
+    /// reset (`SIG_DFL`) back into an unsealed repair page between a SIGTRAP
+    /// repair's write there and its `rt_sigaction`, as a page changed in
+    /// between would, so that the repair does not take.
+    #[cfg(test)]
+    fn change_repair_page_for_test(
+        &self,
+        task: &Stopped,
+        scratch: usize,
+        signal: i32,
+        action: KernelSigaction,
+    ) {
+        if signal != libc::SIGTRAP
+            || self.sigtrap_scratch_state.load(Ordering::SeqCst) != SCRATCH_UNSEALED
+        {
+            return;
+        }
+        let armed = CHANGED_REPAIR_PAGES_FOR_TEST.with(|count| {
+            let left = count.get();
+            count.set(left.saturating_sub(1));
+            left > 0
+        });
+        if !armed {
+            return;
+        }
+        let reset = KernelSigaction {
+            handler: libc::SIG_DFL as u64,
+            ..action
+        };
+        let changed = AddrMut::from_raw(scratch)
+            .ok_or(Errno::EFAULT)
+            .and_then(|address| {
+                task.generation()
+                    .assume_stopped()
+                    .write_value(address, &reset)
+            });
+        assert_eq!(changed, Ok(()), "change the repair page");
     }
 
     /// `write_sigtrap_action_at` for `signal`, without its bookkeeping;
@@ -13398,6 +13481,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.lose_sigtrap_scratch(&task, errno);
             return Ok((task, false));
         }
+        #[cfg(test)]
+        self.change_repair_page_for_test(&task, scratch, signal, action);
         let args = SyscallArgs::new(
             signal as usize,
             scratch,
