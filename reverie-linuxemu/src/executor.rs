@@ -123,7 +123,10 @@ pub use task::*;
 mod poll;
 pub(crate) use poll::*;
 mod fd_table;
+mod vfs_file;
 pub use fd_table::*;
+#[allow(dead_code)]
+use vfs_file::FileDescription as _FileDescriptionUnused;
 mod proc;
 use proc::*;
 mod read_write;
