@@ -41,7 +41,6 @@ pub struct FileTableState {
     pub(super) cloexec_fds: std::collections::BTreeSet<i32>,
     pub(super) closed_standard_fds: std::collections::BTreeSet<i32>,
     pub(super) synthetic_proc_nofollow_fds: std::collections::BTreeSet<i32>,
-    pub(super) fdinfo_files: std::collections::BTreeMap<i32, Arc<FdinfoDescription>>,
     pub(super) signalfd_fds: std::collections::BTreeSet<i32>,
     /// Shared open descriptions per entry (R2): derived at publication from
     /// the published clones, best-effort (a failed dup leaves no entry; the
@@ -109,7 +108,9 @@ impl FileTableState {
                     proc_inode: state
                         .and_then(|state| state.proc_files.get(&fd).copied())
                         .or_else(|| self.slots.get(&fd).and_then(|slot| slot.proc_inode)),
-                    fdinfo: self.fdinfo_files.get(&fd).cloned(),
+                    fdinfo: state
+                        .and_then(|state| state.fdinfo_files.get(&fd).cloned())
+                        .or_else(|| self.slots.get(&fd).and_then(|slot| slot.fdinfo.clone())),
                     object_inode: state
                         .and_then(|state| state.fd_object_inodes.get(&fd).cloned())
                         .or_else(|| {
@@ -284,7 +285,6 @@ impl FileTableState {
             cloexec_fds: state.cloexec_fds.clone(),
             closed_standard_fds: state.closed_standard_fds.clone(),
             synthetic_proc_nofollow_fds: state.synthetic_proc_nofollow_fds.clone(),
-            fdinfo_files: state.fdinfo_files.clone(),
             signalfd_fds: state
                 .process_signals
                 .lock()
@@ -330,7 +330,6 @@ impl FileTableState {
             cloexec_fds,
             closed_standard_fds,
             synthetic_proc_nofollow_fds,
-            fdinfo_files,
             // install never writes the task's signalfd set.
             signalfd_fds: _,
             // Derived at publication, never installed into the task.
@@ -369,7 +368,18 @@ impl FileTableState {
                         .all(|((fa, va), (fb, vb))| fa == *fb && va == *vb)
             }
             && *synthetic_proc_nofollow_fds == state.synthetic_proc_nofollow_fds
-            && same_arcs(fdinfo_files, &state.fdinfo_files)
+            && {
+                let slot_fdinfo: Vec<_> = self
+                    .slots
+                    .iter()
+                    .filter_map(|(&fd, slot)| slot.fdinfo.as_ref().map(|d| (fd, d)))
+                    .collect();
+                slot_fdinfo.len() == state.fdinfo_files.len()
+                    && slot_fdinfo
+                        .into_iter()
+                        .zip(&state.fdinfo_files)
+                        .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
+            }
             && {
                 let slot_inodes: Vec<_> = self
                     .slots
@@ -481,7 +491,11 @@ impl FileTableState {
         state
             .synthetic_proc_nofollow_fds
             .clone_from(&self.synthetic_proc_nofollow_fds);
-        state.fdinfo_files.clone_from(&self.fdinfo_files);
+        state.fdinfo_files = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.fdinfo.clone().map(|d| (fd, d)))
+            .collect();
         state.fd_object_inodes = self
             .slots
             .iter()
@@ -508,6 +522,11 @@ impl FileTableState {
         &self,
         retirement: &crate::elf::FileRetirement,
     ) -> std::io::Result<ForkDescriptors> {
+        let fdinfo_files: std::collections::BTreeMap<_, _> = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.fdinfo.clone().map(|d| (fd, d)))
+            .collect();
         let proc_files: std::collections::BTreeMap<_, _> = self
             .slots
             .iter()
@@ -535,7 +554,7 @@ impl FileTableState {
                 closed_standard_fds: &self.closed_standard_fds,
                 proc_files: &proc_files,
                 synthetic_proc_nofollow_fds: &self.synthetic_proc_nofollow_fds,
-                fdinfo_files: &self.fdinfo_files,
+                fdinfo_files: &fdinfo_files,
                 fd_object_inodes: &fd_object_inodes,
             },
         )
