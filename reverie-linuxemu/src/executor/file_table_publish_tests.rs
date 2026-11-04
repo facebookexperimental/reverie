@@ -159,3 +159,22 @@ mod file_table_publish_tests {
     }
 
 }
+
+    /// R2 slice 9: derived slots mirror the side maps after publication.
+    #[test]
+    fn slots_mirror_side_maps_after_publishing() {
+        let root = TestDir::new();
+        std::fs::write(root.0.join("kept"), "kept").unwrap();
+        let mut state = test_state(&root.0);
+        assert!(state
+            .insert_file(3, std::fs::File::open(root.0.join("kept")).unwrap())
+            .is_empty());
+        let table = FileTableState::try_from_elf(&state).unwrap();
+        let slot = table.slot(3).expect("slot derived at publication");
+        assert!(std::sync::Arc::ptr_eq(
+            slot.entry_id.as_ref().expect("entry identity in slot"),
+            &table.fd_entry_ids[&3]
+        ));
+        assert!(slot.description.is_some());
+        assert!(table.slot(99).is_none());
+    }

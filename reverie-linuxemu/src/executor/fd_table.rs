@@ -10,6 +10,22 @@
 
 use super::*;
 
+/// One published entry's side facts, consolidated (R2): everything the
+/// table knows about a descriptor except its host file itself (still in
+/// `files`, whose host-fd identity facts readers depend on) and its
+/// per-slot flags (still the alias/cloexec sets). Derived from the side
+/// maps at every mutation point until a later slice flips authority.
+#[derive(Debug, Default)]
+pub(super) struct FdSlot {
+    pub(super) entry_id: Option<Arc<crate::elf::FdEntry>>,
+    pub(super) native_poll: Option<Arc<NativePollBinding>>,
+    pub(super) pipe_owner: Option<Arc<pipe_owner::PipeOwner>>,
+    pub(super) proc_inode: Option<u64>,
+    pub(super) fdinfo: Option<Arc<FdinfoDescription>>,
+    pub(super) object_inode: Option<Arc<GuestFileIdentity>>,
+    pub(super) description: Option<std::sync::Arc<dyn super::vfs_file::FileDescription>>,
+}
+
 #[derive(Debug, Default)]
 pub struct FileTableState {
     pub(super) stdin: Option<std::fs::File>,
@@ -35,6 +51,8 @@ pub struct FileTableState {
     /// into task state.
     pub(super) descriptions:
         std::collections::BTreeMap<i32, std::sync::Arc<dyn super::vfs_file::FileDescription>>,
+    /// Derived consolidation of the side maps above (see FdSlot).
+    pub(super) slots: std::collections::BTreeMap<i32, FdSlot>,
     /// The private copies of this table's entries that its tasks hold.
     pub(super) private_copies: PrivateCopies,
 }
@@ -74,6 +92,30 @@ impl FileTableState {
         fd: i32,
     ) -> Option<std::sync::Arc<dyn super::vfs_file::FileDescription>> {
         self.descriptions.get(&fd).cloned()
+    }
+
+    /// The consolidated slot for `fd`, as derived at the last mutation.
+    pub(super) fn slot(&self, fd: i32) -> Option<&FdSlot> {
+        self.slots.get(&fd)
+    }
+
+    fn rebuild_slots(&mut self) {
+        let mut slots: std::collections::BTreeMap<i32, FdSlot> = Default::default();
+        for &fd in self.files.keys() {
+            slots.insert(
+                fd,
+                FdSlot {
+                    entry_id: self.fd_entry_ids.get(&fd).cloned(),
+                    native_poll: self.native_poll_fds.get(&fd).cloned(),
+                    pipe_owner: self.pipe_owners.get(&fd).cloned(),
+                    proc_inode: self.proc_files.get(&fd).copied(),
+                    fdinfo: self.fdinfo_files.get(&fd).cloned(),
+                    object_inode: self.fd_object_inodes.get(&fd).cloned(),
+                    description: self.descriptions.get(&fd).cloned(),
+                },
+            );
+        }
+        self.slots = slots;
     }
 
     pub(super) fn try_from_elf(state: &LoadedStaticElf) -> std::io::Result<Self> {
@@ -148,6 +190,7 @@ impl FileTableState {
         // could not be replaced (the limits fell after the check) stays in its
         // task's record, and ends the run.
         let retired = std::mem::replace(self, next);
+        self.rebuild_slots();
         retired.retire(&state.file_retirement);
         match unreplaced.into_iter().next() {
             None => Ok(()),
@@ -220,7 +263,7 @@ impl FileTableState {
                 Some((fd, describe(file)))
             })
             .collect();
-        Ok(Self {
+        let mut table = Self {
             stdin: stdin.map(crate::elf::StagedFile::into_file),
             stdin_entry_id: state.stdin_entry_id.clone(),
             files,
@@ -246,8 +289,11 @@ impl FileTableState {
                 .copied()
                 .collect(),
             fd_object_inodes: state.fd_object_inodes.clone(),
+            slots: Default::default(),
             private_copies: PrivateCopies::default(),
-        })
+        };
+        table.rebuild_slots();
+        Ok(table)
     }
 
     /// Whether `install` would leave `state`'s descriptor fields exactly as
@@ -287,6 +333,8 @@ impl FileTableState {
             fd_object_inodes,
             // Derived at publication, never installed into the task.
             descriptions: _,
+            // Derived from the side maps at every mutation (rebuild_slots).
+            slots: _,
             // A record of the task's copies, not a descriptor fact; install
             // keeps it current either way.
             private_copies: _,
