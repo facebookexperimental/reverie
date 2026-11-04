@@ -551,9 +551,6 @@ mod tests {
                 let moved = rpc.relocate(from).unwrap();
                 assert_ne!(moved, from);
                 assert_eq!(rpc.raw_fd(), moved);
-                // `protect::coordinator_fd` exists only in the builds whose
-                // runtime reads it back.
-                #[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
                 assert_eq!(crate::guest::protect::coordinator_fd(), Some(moved));
                 // The caller closes the old number, as relocate_runtime_fd does.
                 // SAFETY: `from` is owned by no one after the relocation.
