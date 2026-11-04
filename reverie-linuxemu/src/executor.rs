@@ -22762,7 +22762,10 @@ mod tests {
             ));
             assert!(!Arc::ptr_eq(
                 &old_objects[&fd],
-                &authoritative.fd_object_inodes[&fd]
+                authoritative
+                    .slot(fd)
+                    .and_then(|slot| slot.object_inode.as_ref())
+                    .expect("object identity in slot")
             ));
         }
         // An owned duplicate of stdin's description: install below takes the

@@ -44,7 +44,6 @@ pub struct FileTableState {
     pub(super) synthetic_proc_nofollow_fds: std::collections::BTreeSet<i32>,
     pub(super) fdinfo_files: std::collections::BTreeMap<i32, Arc<FdinfoDescription>>,
     pub(super) signalfd_fds: std::collections::BTreeSet<i32>,
-    pub(super) fd_object_inodes: std::collections::BTreeMap<i32, Arc<GuestFileIdentity>>,
     /// Shared open descriptions per entry (R2): derived at publication from
     /// the published clones, best-effort (a failed dup leaves no entry; the
     /// accessor then falls back to the raw host-fd paths). Never installed
@@ -99,7 +98,7 @@ impl FileTableState {
         self.slots.get(&fd)
     }
 
-    fn rebuild_slots(&mut self) {
+    fn rebuild_slots(&mut self, state: Option<&LoadedStaticElf>) {
         let mut slots: std::collections::BTreeMap<i32, FdSlot> = Default::default();
         for &fd in self.files.keys() {
             slots.insert(
@@ -110,7 +109,13 @@ impl FileTableState {
                     pipe_owner: self.pipe_owners.get(&fd).cloned(),
                     proc_inode: self.proc_files.get(&fd).copied(),
                     fdinfo: self.fdinfo_files.get(&fd).cloned(),
-                    object_inode: self.fd_object_inodes.get(&fd).cloned(),
+                    object_inode: state
+                        .and_then(|state| state.fd_object_inodes.get(&fd).cloned())
+                        .or_else(|| {
+                            self.slots
+                                .get(&fd)
+                                .and_then(|slot| slot.object_inode.clone())
+                        }),
                     description: self.descriptions.get(&fd).cloned(),
                 },
             );
@@ -190,7 +195,7 @@ impl FileTableState {
         // could not be replaced (the limits fell after the check) stays in its
         // task's record, and ends the run.
         let retired = std::mem::replace(self, next);
-        self.rebuild_slots();
+        self.rebuild_slots(Some(state));
         retired.retire(&state.file_retirement);
         match unreplaced.into_iter().next() {
             None => Ok(()),
@@ -288,11 +293,10 @@ impl FileTableState {
                 .keys()
                 .copied()
                 .collect(),
-            fd_object_inodes: state.fd_object_inodes.clone(),
             slots: Default::default(),
             private_copies: PrivateCopies::default(),
         };
-        table.rebuild_slots();
+        table.rebuild_slots(Some(state));
         Ok(table)
     }
 
@@ -330,7 +334,6 @@ impl FileTableState {
             fdinfo_files,
             // install never writes the task's signalfd set.
             signalfd_fds: _,
-            fd_object_inodes,
             // Derived at publication, never installed into the task.
             descriptions: _,
             // Derived from the side maps at every mutation (rebuild_slots).
@@ -357,7 +360,18 @@ impl FileTableState {
             && *proc_files == state.proc_files
             && *synthetic_proc_nofollow_fds == state.synthetic_proc_nofollow_fds
             && same_arcs(fdinfo_files, &state.fdinfo_files)
-            && same_arcs(fd_object_inodes, &state.fd_object_inodes)
+            && {
+                let slot_inodes: Vec<_> = self
+                    .slots
+                    .iter()
+                    .filter_map(|(&fd, slot)| slot.object_inode.as_ref().map(|id| (fd, id)))
+                    .collect();
+                slot_inodes.len() == state.fd_object_inodes.len()
+                    && slot_inodes
+                        .into_iter()
+                        .zip(&state.fd_object_inodes)
+                        .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
+            }
     }
 
     // TODO-HUMAN-REVIEW(PR-235): Review stable host-fd preservation during table sync.
@@ -454,7 +468,11 @@ impl FileTableState {
             .synthetic_proc_nofollow_fds
             .clone_from(&self.synthetic_proc_nofollow_fds);
         state.fdinfo_files.clone_from(&self.fdinfo_files);
-        state.fd_object_inodes.clone_from(&self.fd_object_inodes);
+        state.fd_object_inodes = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.object_inode.clone().map(|id| (fd, id)))
+            .collect();
         self.private_copies.register(state);
         state.private_copy_gate.installed(&revoked);
         Ok(())
@@ -476,6 +494,11 @@ impl FileTableState {
         &self,
         retirement: &crate::elf::FileRetirement,
     ) -> std::io::Result<ForkDescriptors> {
+        let fd_object_inodes: std::collections::BTreeMap<_, _> = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.object_inode.clone().map(|id| (fd, id)))
+            .collect();
         ForkDescriptors::new(
             &self.files,
             self.stdin.as_ref(),
@@ -494,7 +517,7 @@ impl FileTableState {
                 proc_files: &self.proc_files,
                 synthetic_proc_nofollow_fds: &self.synthetic_proc_nofollow_fds,
                 fdinfo_files: &self.fdinfo_files,
-                fd_object_inodes: &self.fd_object_inodes,
+                fd_object_inodes: &fd_object_inodes,
             },
         )
     }
