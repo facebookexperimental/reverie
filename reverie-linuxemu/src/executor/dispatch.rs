@@ -339,264 +339,304 @@ fn execute_basic_syscall_inner(
         return continue_with(error);
     }
 
-    let result = if number == libc::SYS_write as u64 {
-        write(memory, state, args, output)
-    } else if number == libc::SYS_read as u64 {
-        match read(memory, state, request, terminal_read) {
+    let result = match number {
+        _ if number == libc::SYS_write as u64 => write(memory, state, args, output),
+        _ if number == libc::SYS_read as u64 => match read(memory, state, request, terminal_read) {
             Ok(result) => result,
             Err(error) => return SyscallAction::Failure(error),
+        },
+        _ if number == libc::SYS_writev as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            vectored_io(memory, state, args, libc::SYS_writev, output)
         }
-    } else if number == libc::SYS_writev as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        vectored_io(memory, state, args, libc::SYS_writev, output)
-    } else if number == libc::SYS_readv as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // A blocking inotify instance is refused before any host call: its
-        // read would wait in the host (inotify.rs).
-        if let Some(error) = blocking_inotify_vectored_read(state, number, args) {
-            return SyscallAction::Failure(error);
+        _ if number == libc::SYS_readv as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // A blocking inotify instance is refused before any host call: its
+            // read would wait in the host (inotify.rs).
+            if let Some(error) = blocking_inotify_vectored_read(state, number, args) {
+                return SyscallAction::Failure(error);
+            }
+            vectored_io(memory, state, args, libc::SYS_readv, output)
         }
-        vectored_io(memory, state, args, libc::SYS_readv, output)
-    } else if number == libc::SYS_preadv as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        vectored_io(memory, state, args, libc::SYS_preadv, output)
-    } else if number == libc::SYS_preadv2 as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        if let Some(error) = blocking_inotify_vectored_read(state, number, args) {
-            return SyscallAction::Failure(error);
+        _ if number == libc::SYS_preadv as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            vectored_io(memory, state, args, libc::SYS_preadv, output)
         }
-        vectored_io(memory, state, args, libc::SYS_preadv2, output)
-    } else if number == libc::SYS_pwritev as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        vectored_io(memory, state, args, libc::SYS_pwritev, output)
-    } else if number == libc::SYS_pwritev2 as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        vectored_io(memory, state, args, libc::SYS_pwritev2, output)
-    } else if number == libc::SYS_pread64 as u64 {
-        pread64(&mut ProviderMemory(memory), state, args)
-    } else if number == libc::SYS_pwrite64 as u64 {
-        pwrite64(memory, state, args)
-    } else if number == libc::SYS_sendfile as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        sendfile(memory, state, args, output)
-    } else if number == libc::SYS_lseek as u64 {
-        lseek(state, args, capture_output)
-    } else if number == libc::SYS_ftruncate as u64 {
-        ftruncate(state, args)
-    } else if number == libc::SYS_truncate as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        truncate(memory, state, args)
-    } else if number == libc::SYS_fallocate as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        fallocate(state, args)
-    } else if number == libc::SYS_fsync as u64 {
-        sync_file(state, args[0], false)
-    } else if number == libc::SYS_fdatasync as u64 {
-        sync_file(state, args[0], true)
-    } else if number == libc::SYS_syncfs as u64 {
-        sync_filesystem(state, args[0], capture_output)
-    } else if number == libc::SYS_readahead as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-227): Review translated host readahead semantics.
-        readahead(state, args)
-    } else if number == libc::SYS_sync_file_range as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-227): Review translated host range-sync semantics.
-        sync_file_range(state, args)
-    } else if number == libc::SYS_pipe as u64 {
-        pipe2(memory, state, args[0], 0)
-    } else if number == libc::SYS_pipe2 as u64 {
-        pipe2(memory, state, args[0], args[1])
-    } else if number == libc::SYS_select as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        select(memory, state, args)
-    } else if number == libc::SYS_pselect6 as u64 {
-        pselect6(memory, state, args, capture_output)
-    } else if number == libc::SYS_poll as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        poll(memory, state, args)
-    } else if number == libc::SYS_ppoll as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        ppoll(memory, state, args)
-    } else if number == libc::SYS_epoll_create1 as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        epoll_create1(state, args[0])
-    } else if number == libc::SYS_epoll_ctl as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        epoll_ctl(memory, state, args)
-    } else if number == libc::SYS_epoll_wait as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        epoll_wait(memory, state, args, false)
-    } else if number == libc::SYS_epoll_pwait as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        epoll_wait(memory, state, args, true)
-    } else if number == libc::SYS_epoll_pwait2 as u64 {
-        let result = epoll_pwait2(&ProviderMemory(memory), state, args);
-        // Alias infrastructure failure is terminal, even after successful
-        // kernel I/O. Forward the already-published cause without poisoning a
-        // second time or presenting its transport errno as a guest result.
-        if let Some(failure) = memory.entry_gate().pending_failure() {
-            return SyscallAction::Failure(failure.error());
+        _ if number == libc::SYS_preadv2 as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            if let Some(error) = blocking_inotify_vectored_read(state, number, args) {
+                return SyscallAction::Failure(error);
+            }
+            vectored_io(memory, state, args, libc::SYS_preadv2, output)
         }
-        result
-    } else if number == libc::SYS_eventfd as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        eventfd2(state, args[0], 0)
-    } else if number == libc::SYS_eventfd2 as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        eventfd2(state, args[0], args[1])
-    } else if number == libc::SYS_signalfd as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        signalfd(memory, state, args, 0)
-    } else if number == libc::SYS_signalfd4 as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        signalfd(memory, state, args, args[3])
-    } else if number == libc::SYS_timerfd_create as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        timerfd_create(state, args[0], args[1])
-    } else if number == libc::SYS_timerfd_settime as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        timerfd_settime(memory, state, args)
-    } else if number == libc::SYS_timerfd_gettime as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        timerfd_gettime(memory, state, args)
-    } else if number == libc::SYS_inotify_init as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        inotify_init1(state, 0)
-    } else if number == libc::SYS_inotify_init1 as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        inotify_init1(state, args[0])
-    } else if number == libc::SYS_inotify_add_watch as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        inotify_add_watch(memory, state, args)
-    } else if number == libc::SYS_inotify_rm_watch as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        inotify_rm_watch(state, args)
-    } else if number == libc::SYS_pidfd_open as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-235): Review self-only virtual pidfd translation.
-        pidfd_open(state, args)
-    } else if number == libc::SYS_socket as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        socket(state, args)
-    } else if number == libc::SYS_setsockopt as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        setsockopt(memory, state, args)
-    } else if number == libc::SYS_getsockopt as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-230): Review bounded SO_TYPE copy-out semantics.
-        getsockopt(memory, state, args)
-    } else if number == libc::SYS_bind as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        bind(memory, state, args)
-    } else if number == libc::SYS_listen as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        listen(state, args)
-    } else if number == libc::SYS_getsockname as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        getsockname(memory, state, args)
-    } else if number == libc::SYS_getpeername as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(kvm-socket-parity): Review bounded socket-name copyout.
-        getpeername(memory, state, args)
-    } else if number == libc::SYS_socketpair as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        socketpair(memory, state, args)
-    } else if number == libc::SYS_connect as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        connect(memory, state, args)
-    } else if number == libc::SYS_shutdown as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        shutdown(state, args)
-    } else if number == libc::SYS_sendto as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        sendto(memory, state, args)
-    } else if number == libc::SYS_recvfrom as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        recvfrom(&mut ProviderMemory(memory), state, args)
-    } else if number == libc::SYS_sendmsg as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        sendmsg(memory, state, args)
-    } else if number == libc::SYS_recvmsg as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        recvmsg(memory, state, args)
-    } else if number == libc::SYS_recvmmsg as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        recvmmsg(memory, state, args)
-    } else if number == libc::SYS_ioctl as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        ioctl(memory, state, args, capture_output)
-    } else if number == libc::SYS_dup as u64 {
-        duplicate_fd(state, args[0], None, 0, false)
-    } else if number == libc::SYS_dup2 as u64 {
-        duplicate_fd(state, args[0], Some(args[1]), 0, false)
-    } else if number == libc::SYS_dup3 as u64 {
-        duplicate_fd(state, args[0], Some(args[1]), args[2], true)
-    } else if number == libc::SYS_fcntl as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        fcntl(memory, state, args)
-    } else if number == libc::SYS_open as u64 {
-        open(memory, state, args)
-    } else if number == libc::SYS_openat as u64 {
-        openat(memory, state, args)
-    } else if number == libc::SYS_creat as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        creat(memory, state, args)
-    } else if number == libc::SYS_memfd_create as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        memfd_create(memory, state, args)
-    } else if number == libc::SYS_fstat as u64 {
-        fstat(memory, state, args, capture_metadata)
-    } else if number == libc::SYS_stat as u64 {
-        path_stat(memory, state, args, 0, capture_metadata)
-    } else if number == libc::SYS_lstat as u64 {
-        path_stat(
+        _ if number == libc::SYS_pwritev as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            vectored_io(memory, state, args, libc::SYS_pwritev, output)
+        }
+        _ if number == libc::SYS_pwritev2 as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            vectored_io(memory, state, args, libc::SYS_pwritev2, output)
+        }
+        _ if number == libc::SYS_pread64 as u64 => {
+            pread64(&mut ProviderMemory(memory), state, args)
+        }
+        _ if number == libc::SYS_pwrite64 as u64 => pwrite64(memory, state, args),
+        _ if number == libc::SYS_sendfile as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            sendfile(memory, state, args, output)
+        }
+        _ if number == libc::SYS_lseek as u64 => lseek(state, args, capture_output),
+        _ if number == libc::SYS_ftruncate as u64 => ftruncate(state, args),
+        _ if number == libc::SYS_truncate as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            truncate(memory, state, args)
+        }
+        _ if number == libc::SYS_fallocate as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            fallocate(state, args)
+        }
+        _ if number == libc::SYS_fsync as u64 => sync_file(state, args[0], false),
+        _ if number == libc::SYS_fdatasync as u64 => sync_file(state, args[0], true),
+        _ if number == libc::SYS_syncfs as u64 => sync_filesystem(state, args[0], capture_output),
+        _ if number == libc::SYS_readahead as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-227): Review translated host readahead semantics.
+            readahead(state, args)
+        }
+        _ if number == libc::SYS_sync_file_range as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-227): Review translated host range-sync semantics.
+            sync_file_range(state, args)
+        }
+        _ if number == libc::SYS_pipe as u64 => pipe2(memory, state, args[0], 0),
+        _ if number == libc::SYS_pipe2 as u64 => pipe2(memory, state, args[0], args[1]),
+        _ if number == libc::SYS_select as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            select(memory, state, args)
+        }
+        _ if number == libc::SYS_pselect6 as u64 => pselect6(memory, state, args, capture_output),
+        _ if number == libc::SYS_poll as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            poll(memory, state, args)
+        }
+        _ if number == libc::SYS_ppoll as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            ppoll(memory, state, args)
+        }
+        _ if number == libc::SYS_epoll_create1 as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            epoll_create1(state, args[0])
+        }
+        _ if number == libc::SYS_epoll_ctl as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            epoll_ctl(memory, state, args)
+        }
+        _ if number == libc::SYS_epoll_wait as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            epoll_wait(memory, state, args, false)
+        }
+        _ if number == libc::SYS_epoll_pwait as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            epoll_wait(memory, state, args, true)
+        }
+        _ if number == libc::SYS_epoll_pwait2 as u64 => {
+            let result = epoll_pwait2(&ProviderMemory(memory), state, args);
+            // Alias infrastructure failure is terminal, even after successful
+            // kernel I/O. Forward the already-published cause without poisoning a
+            // second time or presenting its transport errno as a guest result.
+            if let Some(failure) = memory.entry_gate().pending_failure() {
+                return SyscallAction::Failure(failure.error());
+            }
+            result
+        }
+        _ if number == libc::SYS_eventfd as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            eventfd2(state, args[0], 0)
+        }
+        _ if number == libc::SYS_eventfd2 as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            eventfd2(state, args[0], args[1])
+        }
+        _ if number == libc::SYS_signalfd as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            signalfd(memory, state, args, 0)
+        }
+        _ if number == libc::SYS_signalfd4 as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            signalfd(memory, state, args, args[3])
+        }
+        _ if number == libc::SYS_timerfd_create as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            timerfd_create(state, args[0], args[1])
+        }
+        _ if number == libc::SYS_timerfd_settime as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            timerfd_settime(memory, state, args)
+        }
+        _ if number == libc::SYS_timerfd_gettime as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            timerfd_gettime(memory, state, args)
+        }
+        _ if number == libc::SYS_inotify_init as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            inotify_init1(state, 0)
+        }
+        _ if number == libc::SYS_inotify_init1 as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            inotify_init1(state, args[0])
+        }
+        _ if number == libc::SYS_inotify_add_watch as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            inotify_add_watch(memory, state, args)
+        }
+        _ if number == libc::SYS_inotify_rm_watch as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            inotify_rm_watch(state, args)
+        }
+        _ if number == libc::SYS_pidfd_open as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-235): Review self-only virtual pidfd translation.
+            pidfd_open(state, args)
+        }
+        _ if number == libc::SYS_socket as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            socket(state, args)
+        }
+        _ if number == libc::SYS_setsockopt as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            setsockopt(memory, state, args)
+        }
+        _ if number == libc::SYS_getsockopt as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-230): Review bounded SO_TYPE copy-out semantics.
+            getsockopt(memory, state, args)
+        }
+        _ if number == libc::SYS_bind as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            bind(memory, state, args)
+        }
+        _ if number == libc::SYS_listen as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            listen(state, args)
+        }
+        _ if number == libc::SYS_getsockname as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            getsockname(memory, state, args)
+        }
+        _ if number == libc::SYS_getpeername as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(kvm-socket-parity): Review bounded socket-name copyout.
+            getpeername(memory, state, args)
+        }
+        _ if number == libc::SYS_socketpair as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            socketpair(memory, state, args)
+        }
+        _ if number == libc::SYS_connect as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            connect(memory, state, args)
+        }
+        _ if number == libc::SYS_shutdown as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            shutdown(state, args)
+        }
+        _ if number == libc::SYS_sendto as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            sendto(memory, state, args)
+        }
+        _ if number == libc::SYS_recvfrom as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            recvfrom(&mut ProviderMemory(memory), state, args)
+        }
+        _ if number == libc::SYS_sendmsg as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            sendmsg(memory, state, args)
+        }
+        _ if number == libc::SYS_recvmsg as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            recvmsg(memory, state, args)
+        }
+        _ if number == libc::SYS_recvmmsg as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            recvmmsg(memory, state, args)
+        }
+        _ if number == libc::SYS_ioctl as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            ioctl(memory, state, args, capture_output)
+        }
+        _ if number == libc::SYS_dup as u64 => duplicate_fd(state, args[0], None, 0, false),
+        _ if number == libc::SYS_dup2 as u64 => {
+            duplicate_fd(state, args[0], Some(args[1]), 0, false)
+        }
+        _ if number == libc::SYS_dup3 as u64 => {
+            duplicate_fd(state, args[0], Some(args[1]), args[2], true)
+        }
+        _ if number == libc::SYS_fcntl as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            fcntl(memory, state, args)
+        }
+        _ if number == libc::SYS_open as u64 => open(memory, state, args),
+        _ if number == libc::SYS_openat as u64 => openat(memory, state, args),
+        _ if number == libc::SYS_creat as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            creat(memory, state, args)
+        }
+        _ if number == libc::SYS_memfd_create as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            memfd_create(memory, state, args)
+        }
+        _ if number == libc::SYS_fstat as u64 => fstat(memory, state, args, capture_metadata),
+        _ if number == libc::SYS_stat as u64 => path_stat(memory, state, args, 0, capture_metadata),
+        _ if number == libc::SYS_lstat as u64 => path_stat(
             memory,
             state,
             args,
             libc::AT_SYMLINK_NOFOLLOW,
             capture_metadata,
-        )
-    } else if number == libc::SYS_newfstatat as u64 {
-        newfstatat(memory, state, args, capture_metadata)
-    } else if number == libc::SYS_statx as u64 {
-        statx(memory, state, args, capture_metadata)
-    } else if number == libc::SYS_statfs as u64 {
-        statfs(memory, state, args)
-    } else if number == libc::SYS_fstatfs as u64 {
-        fstatfs(memory, state, args)
-    } else if number == libc::SYS_access as u64 {
-        access(memory, state, args)
-    } else if number == libc::SYS_faccessat as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        faccessat(memory, state, args)
-    } else if number == libc::SYS_faccessat2 as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        faccessat2(memory, state, args)
-    } else if number == libc::SYS_mkdir as u64 {
-        mkdir_at(memory, state, libc::AT_FDCWD, args[0], args[1])
-    } else if number == libc::SYS_mkdirat as u64 {
-        mkdir_at(memory, state, args[0] as libc::c_int, args[1], args[2])
-    } else if number == libc::SYS_unlink as u64 {
-        unlink_at(memory, state, libc::AT_FDCWD, args[0], 0)
-    } else if number == libc::SYS_rmdir as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-111): Review rmdir->unlinkat(AT_REMOVEDIR) mapping.
-        // rmdir(path) is unlinkat(AT_FDCWD, path, AT_REMOVEDIR). Without this
-        // arm the guest's bare rmdir(2) fell through to ENOSYS, so coreutils
-        // `rmdir` (and `mktemp -d` cleanup) failed under the KVM backend even
-        // though `rm -rf`, which uses unlinkat(AT_REMOVEDIR), worked.
-        unlink_at(
-            memory,
-            state,
-            libc::AT_FDCWD,
-            args[0],
-            libc::AT_REMOVEDIR as u64,
-        )
-    } else if number == libc::SYS_unlinkat as u64 {
-        unlink_at(memory, state, args[0] as libc::c_int, args[1], args[2])
-    } else if number == libc::SYS_rename as u64 {
-        rename_at(
+        ),
+        _ if number == libc::SYS_newfstatat as u64 => {
+            newfstatat(memory, state, args, capture_metadata)
+        }
+        _ if number == libc::SYS_statx as u64 => statx(memory, state, args, capture_metadata),
+        _ if number == libc::SYS_statfs as u64 => statfs(memory, state, args),
+        _ if number == libc::SYS_fstatfs as u64 => fstatfs(memory, state, args),
+        _ if number == libc::SYS_access as u64 => access(memory, state, args),
+        _ if number == libc::SYS_faccessat as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            faccessat(memory, state, args)
+        }
+        _ if number == libc::SYS_faccessat2 as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            faccessat2(memory, state, args)
+        }
+        _ if number == libc::SYS_mkdir as u64 => {
+            mkdir_at(memory, state, libc::AT_FDCWD, args[0], args[1])
+        }
+        _ if number == libc::SYS_mkdirat as u64 => {
+            mkdir_at(memory, state, args[0] as libc::c_int, args[1], args[2])
+        }
+        _ if number == libc::SYS_unlink as u64 => {
+            unlink_at(memory, state, libc::AT_FDCWD, args[0], 0)
+        }
+        _ if number == libc::SYS_rmdir as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-111): Review rmdir->unlinkat(AT_REMOVEDIR) mapping.
+            // rmdir(path) is unlinkat(AT_FDCWD, path, AT_REMOVEDIR). Without this
+            // arm the guest's bare rmdir(2) fell through to ENOSYS, so coreutils
+            // `rmdir` (and `mktemp -d` cleanup) failed under the KVM backend even
+            // though `rm -rf`, which uses unlinkat(AT_REMOVEDIR), worked.
+            unlink_at(
+                memory,
+                state,
+                libc::AT_FDCWD,
+                args[0],
+                libc::AT_REMOVEDIR as u64,
+            )
+        }
+        _ if number == libc::SYS_unlinkat as u64 => {
+            unlink_at(memory, state, args[0] as libc::c_int, args[1], args[2])
+        }
+        _ if number == libc::SYS_rename as u64 => rename_at(
             memory,
             state,
             libc::AT_FDCWD,
@@ -604,9 +644,8 @@ fn execute_basic_syscall_inner(
             libc::AT_FDCWD,
             args[1],
             0,
-        )
-    } else if number == libc::SYS_renameat as u64 {
-        rename_at(
+        ),
+        _ if number == libc::SYS_renameat as u64 => rename_at(
             memory,
             state,
             args[0] as libc::c_int,
@@ -614,29 +653,8 @@ fn execute_basic_syscall_inner(
             args[2] as libc::c_int,
             args[3],
             0,
-        )
-    } else if number == libc::SYS_renameat2 as u64 {
-        rename_at(
-            memory,
-            state,
-            args[0] as libc::c_int,
-            args[1],
-            args[2] as libc::c_int,
-            args[3],
-            args[4],
-        )
-    } else if number == libc::SYS_link as u64 {
-        link_at(
-            memory,
-            state,
-            libc::AT_FDCWD,
-            args[0],
-            libc::AT_FDCWD,
-            args[1],
-            0,
-        )
-    } else if number == libc::SYS_linkat as u64 {
-        link_at(
+        ),
+        _ if number == libc::SYS_renameat2 as u64 => rename_at(
             memory,
             state,
             args[0] as libc::c_int,
@@ -644,265 +662,320 @@ fn execute_basic_syscall_inner(
             args[2] as libc::c_int,
             args[3],
             args[4],
-        )
-    } else if number == libc::SYS_symlink as u64 {
-        symlink_at(memory, state, args[0], libc::AT_FDCWD, args[1])
-    } else if number == libc::SYS_symlinkat as u64 {
-        symlink_at(memory, state, args[0], args[1] as libc::c_int, args[2])
-    } else if number == libc::SYS_getcwd as u64 {
-        getcwd(memory, state, args)
-    } else if number == libc::SYS_chdir as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        chdir(memory, state, args)
-    } else if number == libc::SYS_fchdir as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        fchdir(state, args)
-    } else if number == libc::SYS_getdents64 as u64 {
-        getdents64(&mut ProviderMemory(memory), state, args)
-    } else if number == libc::SYS_getpid as u64 {
-        i64::from(state.pid)
-    } else if number == libc::SYS_gettid as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-132): Review distinct KVM thread IDs.
-        i64::from(state.tid)
-    } else if number == libc::SYS_getppid as u64 {
-        i64::from(state.guest_parent_pid())
-    } else if number == libc::SYS_wait4 as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        return match wait4_result(memory, state, args) {
-            Ok(result) => continue_with(result),
-            Err(error) => SyscallAction::Failure(error),
-        };
-    } else if number == libc::SYS_waitid as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-227): Review serialized-child waitid emulation.
-        return match waitid_result(memory, state, args) {
-            Ok(result) => continue_with(result),
-            Err(error) => SyscallAction::Failure(error),
-        };
-    } else if number == libc::SYS_getgroups as u64 {
-        getgroups(&mut ProviderMemory(memory), args)
-    } else if number == libc::SYS_capget as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        capget(&mut ProviderMemory(memory), state, args)
-    } else if number == libc::SYS_capset as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        capset(&ProviderMemory(memory), state, args)
-    } else if number == libc::SYS_flock as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        flock(state, args)
-    } else if number == libc::SYS_fchown as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        fchown(state, args[0])
-    } else if number == libc::SYS_chown as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        fchownat(memory, state, libc::AT_FDCWD, args[0], 0)
-    } else if number == libc::SYS_lchown as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        fchownat(
+        ),
+        _ if number == libc::SYS_link as u64 => link_at(
             memory,
             state,
             libc::AT_FDCWD,
             args[0],
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } else if number == libc::SYS_fchownat as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        fchownat(
+            libc::AT_FDCWD,
+            args[1],
+            0,
+        ),
+        _ if number == libc::SYS_linkat as u64 => link_at(
             memory,
             state,
             args[0] as libc::c_int,
             args[1],
-            args[4] as libc::c_int,
-        )
-    } else if number == libc::SYS_listxattr as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        path_xattr_list(state, memory, args, false)
-    } else if number == libc::SYS_llistxattr as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        path_xattr_list(state, memory, args, true)
-    } else if number == libc::SYS_flistxattr as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        fd_xattr_list(memory, state, args)
-    } else if number == libc::SYS_umask as u64 {
-        let previous = state.umask;
-        state.umask = args[0] as libc::mode_t & 0o777;
-        i64::from(previous)
-    } else if number == libc::SYS_fchmod as u64 {
-        fchmod(state, args)
-    } else if number == libc::SYS_chmod as u64 {
-        fchmodat(memory, state, libc::AT_FDCWD, args[0], args[1], 0)
-    } else if number == libc::SYS_fchmodat as u64 {
-        // SYS_fchmodat has three arguments; r10 is unspecified guest state.
-        fchmodat(memory, state, args[0] as libc::c_int, args[1], args[2], 0)
-    } else if number == libc::SYS_fchmodat2 as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        fchmodat(
+            args[2] as libc::c_int,
+            args[3],
+            args[4],
+        ),
+        _ if number == libc::SYS_symlink as u64 => {
+            symlink_at(memory, state, args[0], libc::AT_FDCWD, args[1])
+        }
+        _ if number == libc::SYS_symlinkat as u64 => {
+            symlink_at(memory, state, args[0], args[1] as libc::c_int, args[2])
+        }
+        _ if number == libc::SYS_getcwd as u64 => getcwd(memory, state, args),
+        _ if number == libc::SYS_chdir as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            chdir(memory, state, args)
+        }
+        _ if number == libc::SYS_fchdir as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            fchdir(state, args)
+        }
+        _ if number == libc::SYS_getdents64 as u64 => {
+            getdents64(&mut ProviderMemory(memory), state, args)
+        }
+        _ if number == libc::SYS_getpid as u64 => i64::from(state.pid),
+        _ if number == libc::SYS_gettid as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-132): Review distinct KVM thread IDs.
+            i64::from(state.tid)
+        }
+        _ if number == libc::SYS_getppid as u64 => i64::from(state.guest_parent_pid()),
+        _ if number == libc::SYS_wait4 as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            return match wait4_result(memory, state, args) {
+                Ok(result) => continue_with(result),
+                Err(error) => SyscallAction::Failure(error),
+            };
+        }
+        _ if number == libc::SYS_waitid as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-227): Review serialized-child waitid emulation.
+            return match waitid_result(memory, state, args) {
+                Ok(result) => continue_with(result),
+                Err(error) => SyscallAction::Failure(error),
+            };
+        }
+        _ if number == libc::SYS_getgroups as u64 => getgroups(&mut ProviderMemory(memory), args),
+        _ if number == libc::SYS_capget as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            capget(&mut ProviderMemory(memory), state, args)
+        }
+        _ if number == libc::SYS_capset as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            capset(&ProviderMemory(memory), state, args)
+        }
+        _ if number == libc::SYS_flock as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            flock(state, args)
+        }
+        _ if number == libc::SYS_fchown as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            fchown(state, args[0])
+        }
+        _ if number == libc::SYS_chown as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            fchownat(memory, state, libc::AT_FDCWD, args[0], 0)
+        }
+        _ if number == libc::SYS_lchown as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            fchownat(
+                memory,
+                state,
+                libc::AT_FDCWD,
+                args[0],
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        }
+        _ if number == libc::SYS_fchownat as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            fchownat(
+                memory,
+                state,
+                args[0] as libc::c_int,
+                args[1],
+                args[4] as libc::c_int,
+            )
+        }
+        _ if number == libc::SYS_listxattr as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            path_xattr_list(state, memory, args, false)
+        }
+        _ if number == libc::SYS_llistxattr as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            path_xattr_list(state, memory, args, true)
+        }
+        _ if number == libc::SYS_flistxattr as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            fd_xattr_list(memory, state, args)
+        }
+        _ if number == libc::SYS_umask as u64 => {
+            let previous = state.umask;
+            state.umask = args[0] as libc::mode_t & 0o777;
+            i64::from(previous)
+        }
+        _ if number == libc::SYS_fchmod as u64 => fchmod(state, args),
+        _ if number == libc::SYS_chmod as u64 => {
+            fchmodat(memory, state, libc::AT_FDCWD, args[0], args[1], 0)
+        }
+        _ if number == libc::SYS_fchmodat as u64 => {
+            // SYS_fchmodat has three arguments; r10 is unspecified guest state.
+            fchmodat(memory, state, args[0] as libc::c_int, args[1], args[2], 0)
+        }
+        _ if number == libc::SYS_fchmodat2 as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            fchmodat(
+                memory,
+                state,
+                args[0] as libc::c_int,
+                args[1],
+                args[2],
+                args[3],
+            )
+        }
+        _ if number == libc::SYS_mknod as u64 => {
+            mknod_at(memory, state, libc::AT_FDCWD, args[0], args[1], args[2])
+        }
+        _ if number == libc::SYS_mknodat as u64 => mknod_at(
             memory,
             state,
             args[0] as libc::c_int,
             args[1],
             args[2],
             args[3],
-        )
-    } else if number == libc::SYS_mknod as u64 {
-        mknod_at(memory, state, libc::AT_FDCWD, args[0], args[1], args[2])
-    } else if number == libc::SYS_mknodat as u64 {
-        mknod_at(
-            memory,
-            state,
-            args[0] as libc::c_int,
-            args[1],
-            args[2],
-            args[3],
-        )
-    } else if number == libc::SYS_utimensat as u64 {
-        utimensat(memory, state, args)
-    } else if number == libc::SYS_arch_prctl as u64 {
-        return arch_prctl(memory, state, args);
-    } else if number == libc::SYS_prctl as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        prctl(&mut ProviderMemory(memory), state, args)
-    } else if number == libc::SYS_getxattr as u64
-        || number == libc::SYS_lgetxattr as u64
-        || number == libc::SYS_fgetxattr as u64
-    {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        getxattr(memory, state, number, args)
-    } else if number == libc::SYS_setxattr as u64
-        || number == libc::SYS_lsetxattr as u64
-        || number == libc::SYS_fsetxattr as u64
-    {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-227): Review deterministic xattr mutation refusal.
-        setxattr(memory, state, number, args)
-    } else if number == libc::SYS_removexattr as u64
-        || number == libc::SYS_lremovexattr as u64
-        || number == libc::SYS_fremovexattr as u64
-    {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-227): Review deterministic xattr removal result.
-        removexattr(memory, state, number, args)
-    } else if number == libc::SYS_brk as u64 {
-        brk(memory, state, args[0])
-    } else if number == libc::SYS_mmap as u64 {
-        mmap(memory, state, args)
-    } else if number == libc::SYS_munmap as u64 {
-        munmap(&mut ProviderMemory(memory), args[0], args[1])
-    } else if number == libc::SYS_msync as u64 {
-        match msync(memory, args) {
+        ),
+        _ if number == libc::SYS_utimensat as u64 => utimensat(memory, state, args),
+        _ if number == libc::SYS_arch_prctl as u64 => {
+            return arch_prctl(memory, state, args);
+        }
+        _ if number == libc::SYS_prctl as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            prctl(&mut ProviderMemory(memory), state, args)
+        }
+        _ if number == libc::SYS_getxattr as u64
+            || number == libc::SYS_lgetxattr as u64
+            || number == libc::SYS_fgetxattr as u64 =>
+        {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            getxattr(memory, state, number, args)
+        }
+        _ if number == libc::SYS_setxattr as u64
+            || number == libc::SYS_lsetxattr as u64
+            || number == libc::SYS_fsetxattr as u64 =>
+        {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-227): Review deterministic xattr mutation refusal.
+            setxattr(memory, state, number, args)
+        }
+        _ if number == libc::SYS_removexattr as u64
+            || number == libc::SYS_lremovexattr as u64
+            || number == libc::SYS_fremovexattr as u64 =>
+        {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-227): Review deterministic xattr removal result.
+            removexattr(memory, state, number, args)
+        }
+        _ if number == libc::SYS_brk as u64 => brk(memory, state, args[0]),
+        _ if number == libc::SYS_mmap as u64 => mmap(memory, state, args),
+        _ if number == libc::SYS_munmap as u64 => {
+            munmap(&mut ProviderMemory(memory), args[0], args[1])
+        }
+        _ if number == libc::SYS_msync as u64 => match msync(memory, args) {
             Ok(result) => result,
             Err(error) => return SyscallAction::Failure(error),
+        },
+        _ if number == libc::SYS_mremap as u64 => mremap(memory, state, args),
+        _ if number == libc::SYS_mprotect as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            mprotect(&ProviderMemory(memory), args)
         }
-    } else if number == libc::SYS_mremap as u64 {
-        mremap(memory, state, args)
-    } else if number == libc::SYS_mprotect as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        mprotect(&ProviderMemory(memory), args)
-    } else if number == libc::SYS_pkey_mprotect as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        pkey_mprotect(&ProviderMemory(memory), args)
-    } else if number == libc::SYS_pkey_alloc as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        pkey_alloc(state, args)
-    } else if number == libc::SYS_pkey_free as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        pkey_free(args)
-    } else if number == libc::SYS_madvise as u64 {
-        // Advice answered as a hint that changes the flags Linux keeps on the
-        // mappings it covers: the pages keep them (`DeclaredMapping::flags`).
-        if let Some((start, length, set, clear)) = madvise_flag_change(args) {
-            memory.flag_user_range(start, length, set, clear);
+        _ if number == libc::SYS_pkey_mprotect as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            pkey_mprotect(&ProviderMemory(memory), args)
         }
-        madvise(&ProviderMemory(memory), args)
-    } else if number == libc::SYS_munlock as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        munlock_guest_range(&ProviderMemory(memory), args[0], args[1])
-    } else if number == libc::SYS_munlockall as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-145): Review the deterministic no-op unlock-all model.
-        0
-    } else if number == libc::SYS_mincore as u64 {
-        mincore(&mut ProviderMemory(memory), args)
-    } else if number == libc::SYS_sched_get_priority_min as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        sched_priority_bound(libc::SYS_sched_get_priority_min, args[0])
-    } else if number == libc::SYS_sched_get_priority_max as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        sched_priority_bound(libc::SYS_sched_get_priority_max, args[0])
-    } else if number == libc::SYS_getrandom as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        getrandom(&mut ProviderMemory(memory), args[0], args[1], args[2])
-    } else if number == libc::SYS_clock_gettime as u64 {
-        clock_gettime(&mut ProviderMemory(memory), args)
-    } else if number == libc::SYS_nanosleep as u64 {
-        nanosleep(&mut ProviderMemory(memory), args)
-    } else if number == libc::SYS_clock_nanosleep as u64 {
-        clock_nanosleep(&mut ProviderMemory(memory), args)
-    } else if number == libc::SYS_gettimeofday as u64 {
-        gettimeofday(&mut ProviderMemory(memory), args)
-    } else if number == libc::SYS_time as u64 {
-        time(&mut ProviderMemory(memory), args)
-    } else if number == libc::SYS_readlink as u64 {
-        readlink(memory, state, args)
-    } else if number == libc::SYS_readlinkat as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        readlinkat(memory, state, args)
-    } else if number == libc::SYS_personality as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        personality(state, args[0])
-    } else if number == libc::SYS_uname as u64 {
-        uname(&mut ProviderMemory(memory), args[0])
-    } else if number == libc::SYS_rt_sigaction as u64 {
-        rt_sigaction(memory, state, args)
-    } else if number == libc::SYS_rt_sigprocmask as u64 {
-        rt_sigprocmask(memory, state, args)
-    } else if number == libc::SYS_rt_sigpending as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        rt_sigpending(memory, state, args)
-    } else if number == libc::SYS_sigaltstack as u64 {
-        sigaltstack(memory, state, current_user_stack_pointer, args)
-    } else if number == libc::SYS_rt_sigtimedwait as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        rt_sigtimedwait(memory, state, args)
-    } else if number == libc::SYS_rt_sigsuspend as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        rt_sigsuspend(memory, state, args)
-    } else if number == libc::SYS_kill as u64
-        || number == libc::SYS_tkill as u64
-        || number == libc::SYS_tgkill as u64
-    {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        return kill_signal(state, number, args);
-    } else if number == libc::SYS_rt_sigqueueinfo as u64
-        || number == libc::SYS_rt_tgsigqueueinfo as u64
-    {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        return sigqueueinfo(memory, state, number, args);
-    } else if number == libc::SYS_close as u64 {
-        close(state, args[0])
-    } else if number == libc::SYS_close_range as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        close_range(state, args)
-    } else if number == libc::SYS_futex as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        futex(&ProviderMemory(memory), args)
-    } else if number == libc::SYS_rseq as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-172): Review deterministic rseq feature refusal.
-        negative_errno(libc::ENOSYS)
-    } else if number == libc::SYS_get_robust_list as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list queries.
-        get_robust_list(memory, state, args)
-    } else if number == libc::SYS_set_robust_list as u64 {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list registration.
-        set_robust_list(state, args)
-    } else {
-        // Includes every call in `TOOL_DECIDED_SYSCALLS`, whose ENOSYS the
-        // checked dispatch reports as the typed refusal `ToolDecided`.
-        negative_errno(libc::ENOSYS)
+        _ if number == libc::SYS_pkey_alloc as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            pkey_alloc(state, args)
+        }
+        _ if number == libc::SYS_pkey_free as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            pkey_free(args)
+        }
+        _ if number == libc::SYS_madvise as u64 => {
+            // Advice answered as a hint that changes the flags Linux keeps on the
+            // mappings it covers: the pages keep them (`DeclaredMapping::flags`).
+            if let Some((start, length, set, clear)) = madvise_flag_change(args) {
+                memory.flag_user_range(start, length, set, clear);
+            }
+            madvise(&ProviderMemory(memory), args)
+        }
+        _ if number == libc::SYS_munlock as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            munlock_guest_range(&ProviderMemory(memory), args[0], args[1])
+        }
+        _ if number == libc::SYS_munlockall as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-145): Review the deterministic no-op unlock-all model.
+            0
+        }
+        _ if number == libc::SYS_mincore as u64 => mincore(&mut ProviderMemory(memory), args),
+        _ if number == libc::SYS_sched_get_priority_min as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            sched_priority_bound(libc::SYS_sched_get_priority_min, args[0])
+        }
+        _ if number == libc::SYS_sched_get_priority_max as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            sched_priority_bound(libc::SYS_sched_get_priority_max, args[0])
+        }
+        _ if number == libc::SYS_getrandom as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            getrandom(&mut ProviderMemory(memory), args[0], args[1], args[2])
+        }
+        _ if number == libc::SYS_clock_gettime as u64 => {
+            clock_gettime(&mut ProviderMemory(memory), args)
+        }
+        _ if number == libc::SYS_nanosleep as u64 => nanosleep(&mut ProviderMemory(memory), args),
+        _ if number == libc::SYS_clock_nanosleep as u64 => {
+            clock_nanosleep(&mut ProviderMemory(memory), args)
+        }
+        _ if number == libc::SYS_gettimeofday as u64 => {
+            gettimeofday(&mut ProviderMemory(memory), args)
+        }
+        _ if number == libc::SYS_time as u64 => time(&mut ProviderMemory(memory), args),
+        _ if number == libc::SYS_readlink as u64 => readlink(memory, state, args),
+        _ if number == libc::SYS_readlinkat as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            readlinkat(memory, state, args)
+        }
+        _ if number == libc::SYS_personality as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            personality(state, args[0])
+        }
+        _ if number == libc::SYS_uname as u64 => uname(&mut ProviderMemory(memory), args[0]),
+        _ if number == libc::SYS_rt_sigaction as u64 => rt_sigaction(memory, state, args),
+        _ if number == libc::SYS_rt_sigprocmask as u64 => rt_sigprocmask(memory, state, args),
+        _ if number == libc::SYS_rt_sigpending as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            rt_sigpending(memory, state, args)
+        }
+        _ if number == libc::SYS_sigaltstack as u64 => {
+            sigaltstack(memory, state, current_user_stack_pointer, args)
+        }
+        _ if number == libc::SYS_rt_sigtimedwait as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            rt_sigtimedwait(memory, state, args)
+        }
+        _ if number == libc::SYS_rt_sigsuspend as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            rt_sigsuspend(memory, state, args)
+        }
+        _ if number == libc::SYS_kill as u64
+            || number == libc::SYS_tkill as u64
+            || number == libc::SYS_tgkill as u64 =>
+        {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            return kill_signal(state, number, args);
+        }
+        _ if number == libc::SYS_rt_sigqueueinfo as u64
+            || number == libc::SYS_rt_tgsigqueueinfo as u64 =>
+        {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            return sigqueueinfo(memory, state, number, args);
+        }
+        _ if number == libc::SYS_close as u64 => close(state, args[0]),
+        _ if number == libc::SYS_close_range as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            close_range(state, args)
+        }
+        _ if number == libc::SYS_futex as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            futex(&ProviderMemory(memory), args)
+        }
+        _ if number == libc::SYS_rseq as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-172): Review deterministic rseq feature refusal.
+            negative_errno(libc::ENOSYS)
+        }
+        _ if number == libc::SYS_get_robust_list as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list queries.
+            get_robust_list(memory, state, args)
+        }
+        _ if number == libc::SYS_set_robust_list as u64 => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-232): Review task-local robust-list registration.
+            set_robust_list(state, args)
+        }
+        _ => {
+            // Includes every call in `TOOL_DECIDED_SYSCALLS`, whose ENOSYS the
+            // checked dispatch reports as the typed refusal `ToolDecided`.
+            negative_errno(libc::ENOSYS)
+        }
     };
 
     continue_with(result)
@@ -1132,5 +1205,76 @@ impl ElfExecutor {
     pub fn execute(&mut self, request: &SyscallRequest, memory: &GuestMemory) -> i64 {
         self.execute_checked(request, memory)
             .expect("unit-test syscall dispatch returned a backend failure")
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn probe(number: u64, args: [u64; 6]) -> SyscallAction {
+        let dir = std::env::temp_dir().join(format!("r3-routing-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut memory = GuestMemory::new(0, PAGE_SIZE as usize).unwrap();
+        let mut state = test_state(&dir);
+        execute_basic_syscall(&mut memory, &mut state, &SyscallRequest::new(number, args))
+    }
+
+    fn continued(action: SyscallAction) -> i64 {
+        match action {
+            SyscallAction::Continue { result, .. } => result,
+            _other => panic!("expected Continue, got a different action"),
+        }
+    }
+
+    // Routing semantics, not membership: each probe distinguishes its arm
+    // from the ENOSYS fallback and from neighbouring arms.
+    #[test]
+    fn exit_arms_return_exit_action_before_fallback() {
+        assert!(matches!(
+            probe(libc::SYS_exit as u64, [7, 0, 0, 0, 0, 0]),
+            SyscallAction::Exit(ExitStatus::Exited(7))
+        ));
+        assert!(matches!(
+            probe(libc::SYS_exit_group as u64, [3, 0, 0, 0, 0, 0]),
+            SyscallAction::Exit(ExitStatus::Exited(3))
+        ));
+    }
+
+    #[test]
+    fn fallback_and_refusal_arms_keep_existing_pairs() {
+        // Unknown number: fallback ENOSYS.
+        assert_eq!(continued(probe(9999, [0; 6])), negative_errno(libc::ENOSYS));
+        // rseq: explicit arm, still ENOSYS (refusal pair preserved, R7 separate).
+        assert_eq!(
+            continued(probe(libc::SYS_rseq as u64, [0; 6])),
+            negative_errno(libc::ENOSYS)
+        );
+        // ToolDecided sample: no arm, ENOSYS via fallback.
+        assert_eq!(
+            continued(probe(libc::SYS_getuid as u64, [0; 6])),
+            negative_errno(libc::ENOSYS)
+        );
+    }
+
+    #[test]
+    fn handler_arms_route_to_their_handlers() {
+        // getpid answers from task state, never ENOSYS.
+        assert!(continued(probe(libc::SYS_getpid as u64, [0; 6])) > 0);
+        // close of an unopened fd: EBADF from the close handler.
+        assert_eq!(
+            continued(probe(libc::SYS_close as u64, [99, 0, 0, 0, 0, 0])),
+            negative_errno(libc::EBADF)
+        );
+        // kill of a nonexistent pid: ESRCH from the signal handler arm.
+        assert_eq!(
+            continued(probe(libc::SYS_kill as u64, [999_999, 0, 0, 0, 0, 0])),
+            negative_errno(libc::ESRCH)
+        );
+        // futex at an unmapped address: EFAULT, not the fallback ENOSYS.
+        assert_eq!(
+            continued(probe(libc::SYS_futex as u64, [0x1_0000, 0, 0, 0, 0, 0])),
+            negative_errno(libc::EFAULT)
+        );
     }
 }
