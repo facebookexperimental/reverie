@@ -34,7 +34,6 @@ pub struct FileTableState {
     pub(super) fd_entry_ids: std::collections::BTreeMap<i32, Arc<crate::elf::FdEntry>>,
     pub(super) epoll_domain: Arc<Mutex<EpollDomain>>,
     pub(super) poll_table_id: Arc<NativePollTable>,
-    pub(super) pipe_owners: std::collections::BTreeMap<i32, Arc<pipe_owner::PipeOwner>>,
     pub(super) stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub(super) stderr_alias_fds: std::collections::BTreeSet<i32>,
     pub(super) cloexec_fds: std::collections::BTreeSet<i32>,
@@ -109,7 +108,9 @@ impl FileTableState {
                                 .get(&fd)
                                 .and_then(|slot| slot.native_poll.clone())
                         }),
-                    pipe_owner: self.pipe_owners.get(&fd).cloned(),
+                    pipe_owner: state
+                        .and_then(|state| state.pipe_owners.get(&fd).cloned())
+                        .or_else(|| self.slots.get(&fd).and_then(|slot| slot.pipe_owner.clone())),
                     proc_inode: state
                         .and_then(|state| state.proc_files.get(&fd).copied())
                         .or_else(|| self.slots.get(&fd).and_then(|slot| slot.proc_inode)),
@@ -283,7 +284,6 @@ impl FileTableState {
             fd_entry_ids: state.fd_entry_ids.clone(),
             epoll_domain: state.epoll_domain.clone(),
             poll_table_id: state.poll_table_id.clone(),
-            pipe_owners: state.pipe_owners.clone(),
             stdout_alias_fds: state.stdout_alias_fds.clone(),
             stderr_alias_fds: state.stderr_alias_fds.clone(),
             cloexec_fds: state.cloexec_fds.clone(),
@@ -327,7 +327,6 @@ impl FileTableState {
             fd_entry_ids,
             epoll_domain,
             poll_table_id,
-            pipe_owners,
             stdout_alias_fds,
             stderr_alias_fds,
             cloexec_fds,
@@ -364,7 +363,18 @@ impl FileTableState {
                         .zip(&state.native_poll_fds)
                         .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
             }
-            && same_arcs(pipe_owners, &state.pipe_owners)
+            && {
+                let slot_owners: Vec<_> = self
+                    .slots
+                    .iter()
+                    .filter_map(|(&fd, slot)| slot.pipe_owner.as_ref().map(|o| (fd, o)))
+                    .collect();
+                slot_owners.len() == state.pipe_owners.len()
+                    && slot_owners
+                        .into_iter()
+                        .zip(&state.pipe_owners)
+                        .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
+            }
             && *stdout_alias_fds == state.stdout_alias_fds
             && *stderr_alias_fds == state.stderr_alias_fds
             && *cloexec_fds == state.cloexec_fds
@@ -494,7 +504,11 @@ impl FileTableState {
             .iter()
             .filter_map(|(&fd, slot)| slot.native_poll.clone().map(|b| (fd, b)))
             .collect();
-        state.pipe_owners.clone_from(&self.pipe_owners);
+        state.pipe_owners = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.pipe_owner.clone().map(|o| (fd, o)))
+            .collect();
         state.stdout_alias_fds.clone_from(&self.stdout_alias_fds);
         state.stderr_alias_fds.clone_from(&self.stderr_alias_fds);
         state.cloexec_fds.clone_from(&self.cloexec_fds);
@@ -540,6 +554,11 @@ impl FileTableState {
         &self,
         retirement: &crate::elf::FileRetirement,
     ) -> std::io::Result<ForkDescriptors> {
+        let pipe_owners: std::collections::BTreeMap<_, _> = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.pipe_owner.clone().map(|o| (fd, o)))
+            .collect();
         let native_poll_fds: std::collections::BTreeMap<_, _> = self
             .slots
             .iter()
@@ -570,7 +589,7 @@ impl FileTableState {
                 epoll_domain: &self.epoll_domain,
                 poll_table_id: &self.poll_table_id,
                 native_poll_fds: &native_poll_fds,
-                pipe_owners: &self.pipe_owners,
+                pipe_owners: &pipe_owners,
                 stdout_alias_fds: &self.stdout_alias_fds,
                 stderr_alias_fds: &self.stderr_alias_fds,
                 cloexec_fds: &self.cloexec_fds,
