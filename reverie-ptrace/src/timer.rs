@@ -291,6 +291,29 @@ fn branch_run_consistent(
     }
 }
 
+/// Whether a branch run's SIGTRAP stop ends the stepping as a stop that is
+/// not its breakpoint's report, handed on after the counter check
+/// ([`TimerImpl::check_branch_run`]), rather than going on to the rules every
+/// step's SIGTRAP stop follows. `at_report` says whether the stop is the
+/// run's report (`is_branch_run_report`, which reads the stop); it is not
+/// called for a SIGTRAP that was queued before the run (`sigtrap_queued`).
+///
+/// Such a SIGTRAP is the guest's, whatever its siginfo says. The
+/// breakpoint's trap is forced while it is pending, and Linux drops the trap,
+/// so the stop shows the guest's siginfo at the breakpoint's pc. A thread may
+/// queue itself one with any code, a breakpoint's or a single step's
+/// included. Taken for an interruption, it would reach a guest that blocks
+/// it, and the run's report would be lost. The queued-SIGTRAP rule refuses
+/// one that no process sent by name (`HandleFailure::GuestSigtrap`), as at a
+/// single step.
+///
+/// Kept apart from the match, which only aarch64 builds, so that the
+/// decision is tested on every architecture.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn branch_run_stop_ends_stepping(sigtrap_queued: bool, at_report: impl FnOnce() -> bool) -> bool {
+    !sigtrap_queued && !at_report()
+}
+
 /// Steps of each unit taken toward precise event targets, and lookups in the
 /// block bound cache, for tests and measurement.
 pub(crate) static INSTRUCTION_STEPS: std::sync::atomic::AtomicU64 =
@@ -3544,7 +3567,8 @@ impl TimerImpl {
             note_stop(&mut breakpoints, &wait);
             // A step run as a syscall (`StepUnit::Syscall`, or one the caller
             // chose, `StepUnit::SyscallExit`) stops at the syscall's entry
-            // first; it ends at its exit stop.
+            // first; it ends at its exit stop. A branch run is resumed with
+            // `PTRACE_CONT` and makes no syscall stop.
             let mut ran_syscall = false;
             if let Wait::Stopped(_, event) = &wait
                 && is_syscall_stop(event)
@@ -3670,13 +3694,18 @@ impl TimerImpl {
             // the stepping like any other stop, with the breakpoints gone.
             // Any stop of a branch run checks its counter first, so a run
             // that escaped its breakpoints is reported, not passed on as if
-            // stepping had kept short of the target.
+            // stepping had kept short of the target. A SIGTRAP stop while one
+            // was queued before the run is the guest's, which the match below
+            // takes as at a single step's (`branch_run_stop_ends_stepping`).
             #[cfg(target_arch = "aarch64")]
             let wait = match (unit, wait) {
                 (
                     StepUnit::ToBranch { stops, count, .. },
                     Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)),
-                ) if !is_branch_run_report(&new_task, &stops[..count]) => {
+                ) if branch_run_stop_ends_stepping(sigtrap_queued, || {
+                    is_branch_run_report(&new_task, &stops[..count])
+                }) =>
+                {
                     self.check_branch_run(&new_task, unit, current.rcbs(), target_rcb, None);
                     restore_breakpoints(breakpoints.regs(), &new_task);
                     return Err(HandleFailure::Event(Wait::Stopped(
@@ -5345,6 +5374,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use super::PmuConfig;
     use super::branch_run_consistent;
+    use super::branch_run_stop_ends_stepping;
     #[cfg(target_arch = "x86_64")]
     use super::runs_in_place;
     #[cfg(target_arch = "x86_64")]
@@ -5441,6 +5471,21 @@ mod tests {
             2,
             Some(unread)
         ));
+    }
+
+    /// A SIGTRAP queued before a branch run goes on to the queued-SIGTRAP
+    /// rule, whatever its siginfo, without the report check reading the stop.
+    /// So a guest's self-queued `TRAP_BRKPT` or `TRAP_TRACE` SIGTRAP at the
+    /// breakpoint's pc, which the report check would not take for the
+    /// breakpoint's (its code is not `TRAP_HWBKPT`), is not handed on as an
+    /// interruption. With none queued, a stop that is not the report ends the
+    /// stepping, and the report does not.
+    #[test]
+    fn a_sigtrap_queued_before_a_branch_run_goes_to_the_queued_rule() {
+        let unread = || -> bool { panic!("a queued SIGTRAP's stop is not checked for the report") };
+        assert!(!branch_run_stop_ends_stepping(true, unread));
+        assert!(branch_run_stop_ends_stepping(false, || false));
+        assert!(!branch_run_stop_ends_stepping(false, || true));
     }
 
     /// How a guest SIGTRAP gets queued for the tests below, and what else
