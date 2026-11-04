@@ -40,12 +40,6 @@ pub struct FileTableState {
     pub(super) closed_standard_fds: std::collections::BTreeSet<i32>,
     pub(super) synthetic_proc_nofollow_fds: std::collections::BTreeSet<i32>,
     pub(super) signalfd_fds: std::collections::BTreeSet<i32>,
-    /// Shared open descriptions per entry (R2): derived at publication from
-    /// the published clones, best-effort (a failed dup leaves no entry; the
-    /// accessor then falls back to the raw host-fd paths). Never installed
-    /// into task state.
-    pub(super) descriptions:
-        std::collections::BTreeMap<i32, std::sync::Arc<dyn super::vfs_file::FileDescription>>,
     /// Derived consolidation of the side maps above (see FdSlot).
     pub(super) slots: std::collections::BTreeMap<i32, FdSlot>,
     /// The private copies of this table's entries that its tasks hold.
@@ -86,7 +80,9 @@ impl FileTableState {
         &self,
         fd: i32,
     ) -> Option<std::sync::Arc<dyn super::vfs_file::FileDescription>> {
-        self.descriptions.get(&fd).cloned()
+        self.slots
+            .get(&fd)
+            .and_then(|slot| slot.description.clone())
     }
 
     /// The consolidated slot for `fd`, as derived at the last mutation.
@@ -124,7 +120,10 @@ impl FileTableState {
                                 .get(&fd)
                                 .and_then(|slot| slot.object_inode.clone())
                         }),
-                    description: self.descriptions.get(&fd).cloned(),
+                    description: self
+                        .slots
+                        .get(&fd)
+                        .and_then(|slot| slot.description.clone()),
                 },
             );
         }
@@ -202,8 +201,20 @@ impl FileTableState {
         // copies' fate: it has happened, as it has on Linux. A copy that still
         // could not be replaced (the limits fell after the check) stays in its
         // task's record, and ends the run.
+        let prior_descriptions: Vec<_> = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.description.clone().map(|d| (fd, d)))
+            .collect();
         let retired = std::mem::replace(self, next);
         self.rebuild_slots(Some(state));
+        for (fd, description) in prior_descriptions {
+            if let Some(slot) = self.slots.get_mut(&fd) {
+                if slot.description.is_none() {
+                    slot.description = Some(description);
+                }
+            }
+        }
         retired.retire(&state.file_retirement);
         match unreplaced.into_iter().next() {
             None => Ok(()),
@@ -252,7 +263,10 @@ impl FileTableState {
         // changed entry describes its freshly published clone. Best-effort:
         // a failed dup or fstat leaves no description, never a failed
         // publication.
-        let descriptions = state
+        let descriptions: std::collections::BTreeMap<
+            i32,
+            std::sync::Arc<dyn super::vfs_file::FileDescription>,
+        > = state
             .files
             .copies()
             .keys()
@@ -267,9 +281,9 @@ impl FileTableState {
                 });
                 if unchanged {
                     if let Some(description) =
-                        published.and_then(|published| published.descriptions.get(&fd))
+                        published.and_then(|published| published.description(fd))
                     {
-                        return Some((fd, description.clone()));
+                        return Some((fd, description));
                     }
                 }
                 let file = files.get(&fd)?.try_clone().ok()?;
@@ -280,7 +294,6 @@ impl FileTableState {
             stdin: stdin.map(crate::elf::StagedFile::into_file),
             stdin_entry_id: state.stdin_entry_id.clone(),
             files,
-            descriptions,
             fd_entry_ids: state.fd_entry_ids.clone(),
             epoll_domain: state.epoll_domain.clone(),
             poll_table_id: state.poll_table_id.clone(),
@@ -301,6 +314,11 @@ impl FileTableState {
             private_copies: PrivateCopies::default(),
         };
         table.rebuild_slots(Some(state));
+        for (fd, description) in descriptions {
+            if let Some(slot) = table.slots.get_mut(&fd) {
+                slot.description = Some(description);
+            }
+        }
         Ok(table)
     }
 
@@ -334,8 +352,6 @@ impl FileTableState {
             synthetic_proc_nofollow_fds,
             // install never writes the task's signalfd set.
             signalfd_fds: _,
-            // Derived at publication, never installed into the task.
-            descriptions: _,
             // Derived from the side maps at every mutation (rebuild_slots).
             slots: _,
             // A record of the task's copies, not a descriptor fact; install
