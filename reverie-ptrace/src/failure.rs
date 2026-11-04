@@ -616,6 +616,35 @@ pub struct QueuedSigtrapAtStep {
     pub site: &'static str,
 }
 
+/// A guest thread took a SIGTRAP that no process sent and that no trap at
+/// its stop explains (<https://github.com/rrnewton/reverie/issues/1268>).
+///
+/// A thread may queue itself a SIGTRAP with any code, a trap's included
+/// (`rt_tgsigqueueinfo` and `rt_sigqueueinfo` check the code only for another
+/// target). At its delivery, nothing claims it: it is not sender-coded, and
+/// it is no breakpoint, step or injected-syscall trap of Reverie's or the
+/// guest's. The step and debug traps the kernel reports name the stop's own
+/// address, and an `int3`'s, which names none, is claimed as the guest's
+/// breakpoint or Reverie's; this one is neither, so it is the guest's own
+/// signal, which Reverie cannot deliver as Linux would. Before, it was taken for one
+/// of Reverie's traps and dropped, so the guest's handler never ran or its
+/// default action never killed it. Reverie ends the run rather than continue
+/// without it. One the guest ignores is dropped as Linux drops it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "thread {tid} took a SIGTRAP with code {code} at address {addr:#x}, \
+     which no process sent and no trap at its stop explains; Reverie cannot \
+     deliver it as Linux would, so the run is ended instead of dropping it"
+)]
+pub struct UnattributedSigtrap {
+    /// The thread that took it.
+    pub tid: i32,
+    /// Its `si_code`.
+    pub code: i32,
+    /// The address its siginfo names (`si_addr`).
+    pub addr: u64,
+}
+
 /// A guest made a syscall through the untraced `syscall` of Reverie's private
 /// page, outside any injection, and took the SIGILL of the `ud2` after it.
 ///

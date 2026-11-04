@@ -2550,10 +2550,11 @@ pub(crate) fn is_sigtrap_sent_by_a_process(task: &Stopped) -> bool {
 /// also carries pid 0 and is taken for a trap. x86_64 reports a stepped
 /// syscall with `TRAP_BRKPT`, so there every `SI_USER` is a sender's. The
 /// kernel's other sender-coded SIGTRAP, the legacy exec report, never comes:
-/// Reverie sets `PTRACE_O_TRACEEXEC`. Not covered: a thread that queues
-/// itself a SIGTRAP with a positive code (`rt_sigqueueinfo` and
-/// `rt_tgsigqueueinfo` allow that only to the calling thread itself) is not
-/// told apart from a kernel trap.
+/// Reverie sets `PTRACE_O_TRACEEXEC`. A thread that queues itself a SIGTRAP
+/// with a positive code (`rt_sigqueueinfo` and `rt_tgsigqueueinfo` allow
+/// that only to the calling thread itself) is not sender-coded either; where
+/// nothing else claims it, it ends the run if its siginfo names an address
+/// other than its stop's (`TracedTask::unattributed_sigtrap`).
 fn is_sender_coded_sigtrap(info: &libc::siginfo_t) -> bool {
     sender_coded_sigtrap(info, !cfg!(target_arch = "x86_64"))
 }
@@ -2568,6 +2569,17 @@ fn sender_coded_sigtrap(info: &libc::siginfo_t, step_report_is_si_user: bool) ->
                 // SAFETY: `si_pid` reads the sender member, which `SI_USER`
                 // fills in.
                 && (!step_report_is_si_user || unsafe { info.si_pid() } != 0)))
+}
+
+/// Whether `info`, a SIGTRAP taken at a stop at `ip`, is a trap there: its
+/// siginfo names `ip`, or, where `step_report_is_si_user` (as on aarch64), it
+/// is the `SI_USER` report with pid 0 of a stepped syscall
+/// (`TracedTask::unattributed_sigtrap`).
+fn trap_siginfo_names_stop(info: &libc::siginfo_t, ip: u64, step_report_is_si_user: bool) -> bool {
+    // SAFETY: `si_pid` reads the sender member, which `SI_USER` fills in;
+    // `si_addr` reads the fault member, which a trap's code fills in.
+    (step_report_is_si_user && info.si_code == libc::SI_USER && unsafe { info.si_pid() } == 0)
+        || unsafe { info.si_addr() } as u64 == ip
 }
 
 /// SIGTRAP stops that `handle_sigtrap` took as watch hits only.
@@ -7650,6 +7662,11 @@ impl<L: Tool + 'static> TracedTask<L> {
             // breakpoint (https://github.com/rrnewton/hermit/issues/1715).
             self.deliver_guest_sigtrap(task, regs).await?
         } else {
+            // A SIGTRAP the guest queued itself with a trap's code: dropped,
+            // it would be lost (`unattributed_sigtrap`).
+            if let Some((code, addr)) = self.unattributed_sigtrap(&task, regs.ip())? {
+                return Err(self.fail_unattributed_sigtrap(task.pid(), code, addr));
+            }
             UNCLAIMED_SIGTRAPS_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
             // The trap is not delivered and makes no Tool callback.
             let task = self.disregard_stop_for_timer(task).await?;
@@ -12267,6 +12284,56 @@ impl<L: Tool + 'static> TracedTask<L> {
             anyhow::Error::new(crate::UnprovenPrivateSyscallCompletion {
                 tid: tid.as_raw(),
                 nr: nr.id() as i64,
+            })
+            .into(),
+        );
+        Errno::ECANCELED.into()
+    }
+
+    /// The code and address of the SIGTRAP `task` stopped to take at `ip`,
+    /// which nothing in `handle_sigtrap` claimed, if it is not a trap at this
+    /// stop. The step and debug traps the kernel reports name the stop's
+    /// address: x86_64's (`send_sigtrap`, with `regs->ip`) and aarch64's
+    /// breakpoint and step traps (the pc). aarch64's report of a stepped
+    /// syscall is `SI_USER` with pid 0 instead (`is_sender_coded_sigtrap`).
+    /// An `int3`'s trap is `SI_KERNEL` with no address (x86_64's `do_trap`
+    /// with no code, `force_sig`), and reaches here only when it is no guest
+    /// `int3` (`is_guest_int3_trap`) and no breakpoint of Reverie's, so it
+    /// is unexplained too. A SIGTRAP whose siginfo names another address is
+    /// one a thread queued itself with a trap's code
+    /// (<https://github.com/rrnewton/reverie/issues/1268>). `None` for one
+    /// the guest ignores, which Linux drops at delivery too. Not covered: a
+    /// thread that queues itself a trap's code with the very address its
+    /// delivery stop will have is still taken for a trap.
+    fn unattributed_sigtrap(
+        &self,
+        task: &Stopped,
+        ip: u64,
+    ) -> Result<Option<(i32, u64)>, TraceError> {
+        let info = task.getsiginfo()?;
+        if trap_siginfo_names_stop(&info, ip, !cfg!(target_arch = "x86_64"))
+            || self.sigtrap_ignored(task)?
+        {
+            return Ok(None);
+        }
+        // SAFETY: `si_addr` reads the fault member, as a trap's code fills
+        // it; for another code it reads the same bytes.
+        Ok(Some((info.si_code, unsafe { info.si_addr() } as u64)))
+    }
+
+    /// Records `UnattributedSigtrap` with the session, which ends the run,
+    /// and returns the error that unwinds the handler.
+    fn fail_unattributed_sigtrap(&self, tid: Pid, code: i32, addr: u64) -> TraceError {
+        self.fatal_session().fail_at(
+            BackendFailure {
+                pid: self.pid(),
+                tid: self.tid(),
+                phase: "guest SIGTRAP that no trap explains",
+            },
+            anyhow::Error::new(crate::UnattributedSigtrap {
+                tid: tid.as_raw(),
+                code,
+                addr,
             })
             .into(),
         );

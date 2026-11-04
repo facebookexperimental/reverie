@@ -6967,7 +6967,11 @@ mod tests {
     /// take a guest's own SIGTRAP for the exit stop. A thread may queue
     /// itself a SIGTRAP whose si_code is the exit signature (0x605); only
     /// PF_SIGNALED tells the real exit stop apart. Refusing this resume would
-    /// leave a live, stopped leader that nothing resumes.
+    /// leave a live, stopped leader that nothing resumes. The guest ignores
+    /// SIGTRAP, so Linux drops the signal and the guest exits 0, and Reverie
+    /// drops it and resumes the stop too; a SIGTRAP of this kind that the
+    /// guest does not ignore ends the run (`UnattributedSigtrap`,
+    /// https://github.com/rrnewton/reverie/issues/1268).
     #[tokio::test(flavor = "current_thread")]
     async fn a_forged_exit_siginfo_does_not_refuse_the_resume() {
         let refusals_before = crate::task::EXIT_STOP_RESUME_REFUSALS.with(std::cell::Cell::get);
@@ -6988,6 +6992,7 @@ mod tests {
                 while !running.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                unsafe { libc::signal(libc::SIGTRAP, libc::SIG_IGN) };
                 let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
                 info.si_signo = libc::SIGTRAP;
                 info.si_code = libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8);

@@ -6593,6 +6593,71 @@ fn native_report(mode: &str) -> String {
     text
 }
 
+/// A SIGTRAP a thread queued itself with a trap's code (`TRAP_BRKPT`,
+/// through `rt_tgsigqueueinfo`, which checks the code only for another
+/// target), unblocked by a Tool-injected call run in place, a ppoll with an
+/// empty temporary mask or an `rt_sigprocmask`, so that no Reverie step meets
+/// it first (<https://github.com/rrnewton/reverie/issues/1268>). Natively the
+/// handler runs once, with code 1. Nothing in `handle_sigtrap` claims it, and
+/// its siginfo names an address other than its stop's, so it is no trap
+/// there (`TracedTask::unattributed_sigtrap`): the run ends with the named
+/// `UnattributedSigtrap`. Before, it was dropped as one of Reverie's traps:
+/// the ppoll timed out (`r=0`) with the handler never run, and the guest
+/// exited 0. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_self_queued_sigtrap_with_a_trap_code_ends_the_run_at_its_delivery() {
+    for (mode, line) in [
+        (
+            "sigtrap_self_queued_ppoll",
+            "selfq ppoll r=-4 handled=1 code=1",
+        ),
+        (
+            "sigtrap_self_queued_unblock",
+            "selfq unblock r=0 handled=1 code=1",
+        ),
+    ] {
+        let native = native_report(mode);
+        assert_eq!(prefixed_lines(&native, &["selfq "]), [line], "{native}");
+        for tail in [false, true] {
+            let options = GuestOptions {
+                tail,
+                ..GuestOptions::default()
+            };
+            let error = match run_guest_options(mode, options).await {
+                Ok(run) => panic!(
+                    "{mode} tail={tail}: the run was not refused: {:?}\n{}",
+                    run.status, run.report
+                ),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("took a SIGTRAP with code 1 at address 0x1092")
+                    && error.contains("no trap at its stop explains"),
+                "{mode} tail={tail}: {error}"
+            );
+        }
+    }
+}
+
+/// As `a_self_queued_sigtrap_with_a_trap_code_ends_the_run_at_its_delivery`,
+/// with SIGTRAP ignored: Linux drops it at its delivery, so dropping it is
+/// what Linux does, and the run goes on, as natively. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_self_queued_sigtrap_the_guest_ignores_is_dropped_as_natively() {
+    let expected = ["selfq unblock r=0 handled=0 code=0"];
+    let native = native_report("sigtrap_self_queued_ignored");
+    assert_eq!(prefixed_lines(&native, &["selfq "]), expected, "{native}");
+    for run in run_both_configurations("sigtrap_self_queued_ignored").await {
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        assert_eq!(
+            prefixed_lines(&run.report, &["selfq "]),
+            expected,
+            "{}",
+            run.report
+        );
+    }
+}
+
 /// Limit L1 of <https://github.com/rrnewton/reverie/issues/1262>, pinned: a
 /// mask-swapping wait that a Tool's signal callback injects (SIGVTALRM's
 /// `ppoll`, whose temporary mask blocks a caught SIGTRAP and admits a pending

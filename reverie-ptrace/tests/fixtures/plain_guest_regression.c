@@ -5914,6 +5914,64 @@ static void mode_text_residual(void) {
   say("getpid after mprotect pid=%d\n", r == getpid());
 }
 
+/* A SIGTRAP the thread queues itself with TRAP_BRKPT (si_pid 4242, which
+ * fills the bytes of si_addr), blocked, then a Tool-injected call run in
+ * place that unblocks it: a ppoll with an empty temporary mask, or an
+ * rt_sigprocmask(SIG_UNBLOCK). No Reverie step meets it first. Natively the
+ * handler runs once with code 1 (TRAP_BRKPT); with SIGTRAP ignored, Linux
+ * drops it. https://github.com/rrnewton/reverie/issues/1268 */
+static volatile int sq_n, sq_code;
+static void sq_handler(int sig, siginfo_t* si, void* uc) {
+  (void)sig;
+  (void)uc;
+  sq_n++;
+  sq_code = si->si_code;
+}
+static void sigtrap_self_queued(int unblock, int ignore) {
+  warm();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  if (ignore) {
+    sa.sa_handler = SIG_IGN;
+  } else {
+    sa.sa_sigaction = sq_handler;
+    sa.sa_flags = SA_SIGINFO;
+  }
+  if (sigaction(SIGTRAP, &sa, NULL) != 0)
+    die("sigaction SIGTRAP");
+  sigset_t trap;
+  sigemptyset(&trap);
+  sigaddset(&trap, SIGTRAP);
+  if (sigprocmask(SIG_BLOCK, &trap, NULL) != 0)
+    die("block SIGTRAP");
+  siginfo_t si;
+  memset(&si, 0, sizeof si);
+  si.si_signo = SIGTRAP;
+  si.si_code = TRAP_BRKPT;
+  si.si_pid = 4242;
+  if (syscall(SYS_rt_tgsigqueueinfo, getpid(), syscall(SYS_gettid), SIGTRAP, &si) != 0)
+    die("queue SIGTRAP");
+  if (unblock) {
+    long r = SITEM(SYS_rt_sigprocmask, SIG_UNBLOCK, (long)&trap, 0, 8, 0, SHAPE_INJECT);
+    say("selfq unblock r=%ld handled=%d code=%d\n", r, sq_n, sq_code);
+    return;
+  }
+  sigset_t none;
+  sigemptyset(&none);
+  struct timespec ts = {1, 0};
+  long r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&none, 8, SHAPE_INJECT);
+  say("selfq ppoll r=%ld handled=%d code=%d\n", r, sq_n, sq_code);
+}
+static void mode_sigtrap_self_queued_ppoll(void) {
+  sigtrap_self_queued(0, 0);
+}
+static void mode_sigtrap_self_queued_unblock(void) {
+  sigtrap_self_queued(1, 0);
+}
+static void mode_sigtrap_self_queued_ignored(void) {
+  sigtrap_self_queued(1, 1);
+}
+
 int main(int argc, char** argv) {
   if (argc != 3) {
     fprintf(stderr, "usage: %s <mode> <report>\n", argv[0]);
@@ -5927,6 +5985,12 @@ int main(int argc, char** argv) {
   const char* m = argv[1];
   if (!strcmp(m, "sig_pending"))
     mode_sig_pending();
+  else if (!strcmp(m, "sigtrap_self_queued_ppoll"))
+    mode_sigtrap_self_queued_ppoll();
+  else if (!strcmp(m, "sigtrap_self_queued_unblock"))
+    mode_sigtrap_self_queued_unblock();
+  else if (!strcmp(m, "sigtrap_self_queued_ignored"))
+    mode_sigtrap_self_queued_ignored();
   else if (!strcmp(m, "rt_queue"))
     mode_rt_queue();
   else if (!strcmp(m, "self_raise"))
