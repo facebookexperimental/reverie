@@ -545,6 +545,8 @@ where
     /// Prepare an ordinary root before this newly constructed host is published.
     /// The initializer has config/state only, no RPC or lifecycle authority.
     /// Errors return to installation; they cannot become a fresh default state.
+    /// Present where its installer (`tool_install`) is, and for its tests.
+    #[cfg(any(test, all(feature = "coordinator-rpc", feature = "rcb-clock")))]
     pub(crate) fn prepare_ordinary_root_state<F>(&mut self, initialize: F) -> io::Result<()>
     where
         F: FnOnce(
