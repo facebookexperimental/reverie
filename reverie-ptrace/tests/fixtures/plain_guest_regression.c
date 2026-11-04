@@ -47,6 +47,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/shm.h>
+#include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -3013,6 +3014,43 @@ static void mode_sigtrap_stash_brkpt(void) {
   if (sigprocmask(SIG_UNBLOCK, &trap, NULL) != 0)
     die("unblock SIGTRAP");
   say("brkpt stash unblocked handled=%d code=%d\n", gk_n, gk_code);
+}
+
+/* A sender-coded SIGTRAP (SI_QUEUE, pid 4242) the thread queues itself
+ * while blocking it, with a nonblocking signalfd for SIGTRAP made first,
+ * then a precise timer whose steps reach a read of the signalfd at the site
+ * before the timer's target (as in timer_loop for k >= 3, and
+ * sigtrap_stash_steps_onto). Natively the read returns the SIGTRAP's
+ * 128-byte record. Where the Tool stops
+ * every syscall, the read's seccomp stop queues the SIGTRAP again before
+ * the read runs, as natively. Where read is unsubscribed, the read would
+ * run while the SIGTRAP is out of the queue and fail with EAGAIN, so
+ * Reverie does not take it out for the steps (stash_pending_sigtrap), and
+ * the steps end the run (PendingSigtrapAtStep). */
+static void mode_sigtrap_stash_signalfd_read(void) {
+  warm();
+  sigset_t trap;
+  sigemptyset(&trap);
+  sigaddset(&trap, SIGTRAP);
+  if (sigprocmask(SIG_BLOCK, &trap, NULL) != 0)
+    die("block SIGTRAP");
+  int sfd = signalfd(-1, &trap, SFD_NONBLOCK);
+  if (sfd < 0)
+    die("signalfd");
+  gk_queue_code = SI_QUEUE;
+  gk_queue();
+  struct signalfd_siginfo info;
+  memset(&info, 0, sizeof info);
+  SITEM(SYS_getppid, 0, 0, 0, 0, TL_K, ARM_TIMER);
+  if (tl_a)
+    tl_sum++;
+  long n = SITE(SYS_read, sfd, &info, sizeof info, 0, 0);
+  close(sfd);
+  say("sfd read r=%ld signo=%u code=%d pid=%u\n",
+      n,
+      info.ssi_signo,
+      info.ssi_code,
+      info.ssi_pid);
 }
 
 /* A SIGTRAP the guest queued itself while blocking it, out of the queue for
@@ -6808,6 +6846,8 @@ int main(int argc, char** argv) {
     mode_sigtrap_thread_brkpt_private_ppoll();
   else if (!strcmp(m, "sigtrap_stash_brkpt"))
     mode_sigtrap_stash_brkpt();
+  else if (!strcmp(m, "sigtrap_stash_signalfd_read"))
+    mode_sigtrap_stash_signalfd_read();
   else if (!strcmp(m, "sigtrap_stash_steps_onto_syscall"))
     mode_sigtrap_stash_steps_onto_syscall();
   else if (!strcmp(m, "sigtrap_stash_steps_onto_sigpending"))

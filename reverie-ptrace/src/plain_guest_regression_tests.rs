@@ -632,6 +632,9 @@ struct GuestConfig {
     /// Leaves rt_sigtimedwait unsubscribed, so a step can reach one without
     /// a seccomp stop.
     sigwait_unsubscribed: bool,
+    /// Leaves read unsubscribed, so a step can reach one, of a signalfd for
+    /// example, without a seccomp stop.
+    read_unsubscribed: bool,
 }
 
 /// The `rt_sigreturn` reports the regression Tool was given, as (thread,
@@ -996,6 +999,9 @@ impl Tool for GuestTool {
         }
         if config.sigwait_unsubscribed {
             subscription.disable_syscall(reverie::syscalls::Sysno::rt_sigtimedwait);
+        }
+        if config.read_unsubscribed {
+            subscription.disable_syscall(reverie::syscalls::Sysno::read);
         }
         if config.partial {
             subscription.disable_syscall(reverie::syscalls::Sysno::getuid);
@@ -1769,6 +1775,8 @@ struct GuestOptions {
     clone_unsubscribed: bool,
     /// `GuestConfig::sigwait_unsubscribed`.
     sigwait_unsubscribed: bool,
+    /// `GuestConfig::read_unsubscribed`.
+    read_unsubscribed: bool,
 }
 
 /// Installs a seccomp filter on the calling thread that returns `action` for
@@ -1850,6 +1858,7 @@ async fn run_guest_options(mode: &str, options: GuestOptions) -> Result<GuestRun
             private_mask_swaps: options.private_mask_swaps,
             clone_unsubscribed: options.clone_unsubscribed,
             sigwait_unsubscribed: options.sigwait_unsubscribed,
+            read_unsubscribed: options.read_unsubscribed,
         })
         .backend_stats(BackendStatsRequest::ENABLED)
         .final_resume_signal_for_test(resume_recorder(resumes.clone()))
@@ -5382,6 +5391,7 @@ async fn a_guest_elf_segment_at_the_repair_page_address_keeps_every_byte() {
                 private_mask_swaps: false,
                 clone_unsubscribed: false,
                 sigwait_unsubscribed: false,
+                read_unsubscribed: false,
             })
             .spawn()
             .await
@@ -5666,7 +5676,10 @@ async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_stepped_injections
 /// step's trap be absorbed and keep the SIGTRAP the kernel then delivers
 /// (`TracedTask::absorb_sigtrap_at_step_end`); the timer takes it out of
 /// the queue for its steps (`TracedTask::stash_pending_sigtrap`). Both
-/// configurations.
+/// configurations. With clone unsubscribed the Tool no longer stops every
+/// syscall, so the timer takes nothing out of the queue
+/// (`GlobalState::traces_every_syscall`), and its step ends the run with the
+/// named `PendingSigtrapAtStep`.
 #[tokio::test(flavor = "current_thread")]
 async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_steps() {
     if !crate::perf::is_perf_supported() {
@@ -5680,23 +5693,28 @@ async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_steps() {
     let left_for_injection =
         || crate::task::STASHES_LEFT_FOR_INJECTION_FOR_TEST.with(|count| count.get());
     let left_before = left_for_injection();
-    let mut runs = run_both_configurations("sigtrap_guest_pending_kept")
-        .await
-        .into_iter()
-        .collect::<Vec<_>>();
-    // With clone unsubscribed, the thread's creation stops the run loop at
-    // its clone event, and the parent's step hands the stop that delivered
-    // the SIGTRAP to the run loop, which queues it again before resuming:
-    // the new thread sees it pending before the parent's next syscall.
+    let runs = run_both_configurations("sigtrap_guest_pending_kept").await;
+    // With clone unsubscribed, a clone could run while the SIGTRAP is out of
+    // the queue, so the timer does not take it out, and its step ends the
+    // run.
     let options = GuestOptions {
         clone_unsubscribed: true,
         ..GuestOptions::default()
     };
-    runs.push(
-        run_guest_options("sigtrap_guest_pending_kept", options)
-            .await
-            .expect("run with clone unsubscribed"),
-    );
+    match run_guest_options("sigtrap_guest_pending_kept", options).await {
+        Ok(run) => panic!(
+            "clone unsubscribed: the run was not refused: {:?}\n{}",
+            run.status, run.report
+        ),
+        Err(error) => {
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("SIGTRAP blocked with one pending")
+                    && error.contains("single-step at the precise timer cannot keep"),
+                "clone unsubscribed: {error}"
+            );
+        }
+    }
     // No SIGTRAP is left out of the queue for an injection to find: each
     // path queues it again before the guest or the Tool can run.
     assert_eq!(left_for_injection(), left_before);
@@ -5704,8 +5722,8 @@ async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_steps() {
         ppolls_between_stops() > between_stops_before,
         "no private ppoll ran between syscall stops"
     );
-    // The Tool sees the same SIGTRAPs however the thread is created: none
-    // for a stop whose SIGTRAP Reverie queued again.
+    // The Tool sees the same SIGTRAPs in both configurations: none for a
+    // stop whose SIGTRAP Reverie queued again.
     let tool_sigtraps: Vec<usize> = runs
         .iter()
         .map(|run| run.count_events("signal SIGTRAP "))
@@ -5952,8 +5970,8 @@ async fn a_requeue_owed_where_the_sigtrap_state_is_unknown_ends_the_run() {
 }
 
 /// A precise timer takes a guest's pending, blocked SIGTRAP out of the queue
-/// for its steps only where the Tool stops every syscall that reads or
-/// takes a pending signal (`GlobalState::traces_signal_reading_syscalls`).
+/// for its steps only where the Tool stops every syscall
+/// (`GlobalState::traces_every_syscall`).
 /// With `rt_sigtimedwait` unsubscribed, a step could run a guest
 /// `sigwaitinfo({SIGTRAP})` while the SIGTRAP is out of the queue, which
 /// would find nothing and wait, or return `EAGAIN`. So nothing is taken,
@@ -6211,6 +6229,64 @@ async fn a_thread_sigtrap_with_a_trap_code_is_not_stashed_for_a_timer() {
     let stashes = || crate::task::SIGTRAP_STASHES_FOR_TEST.with(|count| count.get());
     let before = stashes();
     for (tail, error) in refusals_in_both_configurations("sigtrap_stash_brkpt").await {
+        assert!(
+            error.contains("SIGTRAP blocked with one pending")
+                && error.contains("single-step at the precise timer cannot keep"),
+            "tail={tail}: {error}"
+        );
+    }
+    assert_eq!(stashes() - before, 0, "SIGTRAPs taken out of the queue");
+}
+
+/// A guest can see a SIGTRAP missing from the queue through syscalls besides
+/// those that take a pending signal: here a `read` of a signalfd made before
+/// a precise timer's steps. So the timer takes a pending, blocked SIGTRAP out
+/// of the queue only where the Tool stops every syscall
+/// (`GlobalState::traces_every_syscall`), whose seccomp stop queues it again
+/// first (`TracedTask::stash_pending_sigtrap`). Where it does, the read
+/// returns the SIGTRAP's record, as natively. With read unsubscribed, the
+/// read would run while the SIGTRAP is out of the queue and fail with
+/// `EAGAIN`; nothing is taken, and the timer's step ends the run with the
+/// named `PendingSigtrapAtStep`. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sigtrap_is_stashed_only_where_every_syscall_stops() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let expected = ["sfd read r=128 signo=5 code=-1 pid=4242"];
+    let native = native_report("sigtrap_stash_signalfd_read");
+    assert_eq!(prefixed_lines(&native, &["sfd "]), expected, "{native}");
+    let stashes = || crate::task::SIGTRAP_STASHES_FOR_TEST.with(|count| count.get());
+    let before = stashes();
+    for run in run_both_configurations("sigtrap_stash_signalfd_read").await {
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        assert_eq!(
+            prefixed_lines(&run.report, &["sfd "]),
+            expected,
+            "{}",
+            run.report
+        );
+    }
+    assert_eq!(
+        stashes() - before,
+        2,
+        "one SIGTRAP stashed per configuration"
+    );
+    let before = stashes();
+    for tail in [false, true] {
+        let options = GuestOptions {
+            tail,
+            read_unsubscribed: true,
+            ..GuestOptions::default()
+        };
+        let error = match run_guest_options("sigtrap_stash_signalfd_read", options).await {
+            Ok(run) => panic!(
+                "tail={tail}: the run was not refused: {:?}\n{}",
+                run.status, run.report
+            ),
+            Err(error) => format!("{error:#}"),
+        };
         assert!(
             error.contains("SIGTRAP blocked with one pending")
                 && error.contains("single-step at the precise timer cannot keep"),
