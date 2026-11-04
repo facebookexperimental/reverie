@@ -29,6 +29,12 @@ pub struct FileTableState {
     pub(super) fdinfo_files: std::collections::BTreeMap<i32, Arc<FdinfoDescription>>,
     pub(super) signalfd_fds: std::collections::BTreeSet<i32>,
     pub(super) fd_object_inodes: std::collections::BTreeMap<i32, Arc<GuestFileIdentity>>,
+    /// Shared open descriptions per entry (R2): derived at publication from
+    /// the published clones, best-effort (a failed dup leaves no entry; the
+    /// accessor then falls back to the raw host-fd paths). Never installed
+    /// into task state.
+    pub(super) descriptions:
+        std::collections::BTreeMap<i32, std::sync::Arc<dyn super::vfs_file::FileDescription>>,
     /// The private copies of this table's entries that its tasks hold.
     pub(super) private_copies: PrivateCopies,
 }
@@ -60,6 +66,14 @@ pub struct ProcTransfer {
 impl FileTableState {
     fn retire(self, retirement: &crate::elf::FileRetirement) {
         retirement.retire(self.stdin.into_iter().chain(self.files.into_values()));
+    }
+
+    /// The shared open description published for `fd`, if one was derived.
+    pub(super) fn description(
+        &self,
+        fd: i32,
+    ) -> Option<std::sync::Arc<dyn super::vfs_file::FileDescription>> {
+        self.descriptions.get(&fd).cloned()
     }
 
     pub(super) fn try_from_elf(state: &LoadedStaticElf) -> std::io::Result<Self> {
@@ -173,13 +187,44 @@ impl FileTableState {
             })
             .map(|(&fd, file)| Ok((fd, state.file_retirement.stage_clone(file)?)))
             .collect::<std::io::Result<std::collections::BTreeMap<_, _>>>()?;
+        let files: std::collections::BTreeMap<_, _> = files
+            .into_iter()
+            .map(|(fd, file)| (fd, file.into_file()))
+            .collect();
+        // Derived descriptions: an unchanged entry keeps the published
+        // description (same entry identity, as for its host fd); a new or
+        // changed entry describes its freshly published clone. Best-effort:
+        // a failed dup or fstat leaves no description, never a failed
+        // publication.
+        let descriptions = state
+            .files
+            .copies()
+            .keys()
+            .filter_map(|&fd| {
+                let unchanged = published.is_some_and(|published| {
+                    published.files.contains_key(&fd)
+                        && state
+                            .fd_entry_ids
+                            .get(&fd)
+                            .zip(published.fd_entry_ids.get(&fd))
+                            .is_some_and(|(current, previous)| Arc::ptr_eq(current, previous))
+                });
+                if unchanged {
+                    if let Some(description) =
+                        published.and_then(|published| published.descriptions.get(&fd))
+                    {
+                        return Some((fd, description.clone()));
+                    }
+                }
+                let file = files.get(&fd)?.try_clone().ok()?;
+                Some((fd, describe(file)))
+            })
+            .collect();
         Ok(Self {
             stdin: stdin.map(crate::elf::StagedFile::into_file),
             stdin_entry_id: state.stdin_entry_id.clone(),
-            files: files
-                .into_iter()
-                .map(|(fd, file)| (fd, file.into_file()))
-                .collect(),
+            files,
+            descriptions,
             fd_entry_ids: state.fd_entry_ids.clone(),
             epoll_domain: state.epoll_domain.clone(),
             poll_table_id: state.poll_table_id.clone(),
@@ -240,6 +285,8 @@ impl FileTableState {
             // install never writes the task's signalfd set.
             signalfd_fds: _,
             fd_object_inodes,
+            // Derived at publication, never installed into the task.
+            descriptions: _,
             // A record of the task's copies, not a descriptor fact; install
             // keeps it current either way.
             private_copies: _,
@@ -2140,4 +2187,18 @@ fn remove_inserted_file(state: &mut LoadedStaticElf, fd: libc::c_int) {
     state.fd_object_inodes.remove(&fd);
     state.cloexec_fds.remove(&fd);
     cleanup_fd_object_inodes(state);
+}
+
+/// The description kind for a published clone, by its file type.
+fn describe(file: std::fs::File) -> std::sync::Arc<dyn super::vfs_file::FileDescription> {
+    use std::os::unix::fs::FileTypeExt;
+    match file.metadata() {
+        Ok(metadata) if metadata.file_type().is_fifo() => {
+            std::sync::Arc::new(super::vfs_file::PipeDescription::new(file))
+        }
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            std::sync::Arc::new(super::vfs_file::SocketDescription::new(file))
+        }
+        _ => std::sync::Arc::new(super::vfs_file::HostDescription::new(file)),
+    }
 }

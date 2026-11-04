@@ -136,4 +136,26 @@ mod file_table_publish_tests {
             vec![3, 4, 5, 6]
         );
     }
+    /// R2: publication derives a shared description per entry (same open
+    /// description as the published clone), and an unchanged entry keeps
+    /// the very same Arc across a republication.
+    #[test]
+    fn publishing_derives_shared_descriptions() {
+        let root = TestDir::new();
+        std::fs::write(root.0.join("kept"), "kept").unwrap();
+        let mut state = test_state(&root.0);
+        assert!(state
+            .insert_file(3, std::fs::File::open(root.0.join("kept")).unwrap())
+            .is_empty());
+        let mut table = FileTableState::try_from_elf(&state).unwrap();
+        let first = table.description(3).expect("description derived");
+        assert!(same_description(
+            super::super::vfs_file::FileDescription::raw_fd(&*first).unwrap(),
+            table.files[&3].as_raw_fd()
+        ));
+        table.update_from_elf(&state).unwrap();
+        let second = table.description(3).expect("description retained");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
 }
