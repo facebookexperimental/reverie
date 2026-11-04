@@ -182,6 +182,41 @@ mod tests {
             Some(libc::EINVAL)
         );
     }
+
+    #[test]
+    fn eventfd_description_counts_and_reads() {
+        // SAFETY: eventfd takes an initial count and flags.
+        let fd = unsafe { libc::eventfd(2, 0) };
+        assert!(fd >= 0);
+        // SAFETY: fresh eventfd owned here.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let desc = EventFdDescription::new(file);
+        // Linux eventfd has no FIONREAD; available() stays ENOTTY.
+        assert_eq!(
+            desc.available().unwrap_err().raw_os_error(),
+            Some(libc::ENOTTY)
+        );
+        let mut buf = [0u8; 8];
+        assert_eq!(desc.read(&mut buf).unwrap(), 8);
+        assert_eq!(u64::from_ne_bytes(buf), 2);
+    }
+
+    #[test]
+    fn inotify_description_refuses_seek() {
+        // SAFETY: inotify_init1 takes only flags.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK) };
+        assert!(fd >= 0);
+        // SAFETY: fresh inotify descriptor owned here.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let desc = InotifyDescription::new(file);
+        // available() wiring for inotify arrives with its table migration;
+        // the kind's seek refusal is what this slice pins.
+        let _ = &desc;
+        assert_eq!(
+            desc.seek(SeekFrom::Start(0)).unwrap_err().raw_os_error(),
+            Some(libc::ESPIPE)
+        );
+    }
 }
 
 /// A pipe end (gVisor: kernel/pipe). Seeking is ESPIPE, as on Linux.
@@ -282,3 +317,39 @@ impl FileDescription for EpollDescription {
         Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
     }
 }
+macro_rules! event_kind {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug)]
+        pub struct $name {
+            file: std::fs::File,
+        }
+        impl $name {
+            pub fn new(file: std::fs::File) -> Self {
+                Self { file }
+            }
+        }
+        impl FileDescription for $name {
+            fn raw_fd(&self) -> Option<i32> {
+                Some(self.file.as_raw_fd())
+            }
+            fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+                (&self.file).read(buf)
+            }
+            fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+                (&self.file).write(buf)
+            }
+            fn seek(&self, _pos: SeekFrom) -> std::io::Result<u64> {
+                Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
+            }
+        }
+    };
+}
+
+event_kind!(EventFdDescription, "An eventfd (gVisor: fsimpl/eventfd).");
+event_kind!(TimerFdDescription, "A timerfd (gVisor: fsimpl/timerfd).");
+event_kind!(
+    InotifyDescription,
+    "An inotify instance (gVisor: vfs/inotify)."
+);
+event_kind!(SignalFdDescription, "A signalfd (gVisor: fsimpl/signalfd).");

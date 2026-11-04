@@ -2192,12 +2192,34 @@ fn remove_inserted_file(state: &mut LoadedStaticElf, fd: libc::c_int) {
 /// The description kind for a published clone, by its file type.
 fn describe(file: std::fs::File) -> std::sync::Arc<dyn super::vfs_file::FileDescription> {
     use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
     match file.metadata() {
         Ok(metadata) if metadata.file_type().is_fifo() => {
             std::sync::Arc::new(super::vfs_file::PipeDescription::new(file))
         }
         Ok(metadata) if metadata.file_type().is_socket() => {
             std::sync::Arc::new(super::vfs_file::SocketDescription::new(file))
+        }
+        // Anonymous inodes have no file-type bits; the fd link name is the
+        // kind (anon_inode:[eventfd] and friends), as in inotify detection.
+        Ok(metadata) if metadata.mode() & libc::S_IFMT == 0 => {
+            let link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if link.contains("[eventfd]") {
+                std::sync::Arc::new(super::vfs_file::EventFdDescription::new(file))
+            } else if link.contains("[timerfd]") {
+                std::sync::Arc::new(super::vfs_file::TimerFdDescription::new(file))
+            } else if link.contains("anon_inode:inotify") {
+                std::sync::Arc::new(super::vfs_file::InotifyDescription::new(file))
+            } else if link.contains("[signalfd]") {
+                std::sync::Arc::new(super::vfs_file::SignalFdDescription::new(file))
+            } else if link.contains("[eventpoll]") {
+                std::sync::Arc::new(super::vfs_file::EpollDescription::new(file))
+            } else {
+                std::sync::Arc::new(super::vfs_file::HostDescription::new(file))
+            }
         }
         _ => std::sync::Arc::new(super::vfs_file::HostDescription::new(file)),
     }
