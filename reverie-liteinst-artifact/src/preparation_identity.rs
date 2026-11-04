@@ -994,8 +994,38 @@ mod tests {
         // clean workspace. The fixture never constructs opaque source authority.
         // Requires a clean Git checkout, Git and Cargo, and an offline Cargo
         // cache for locked workspace metadata. Missing prerequisites fail; no skip.
-        let workspace =
-            fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()).unwrap();
+        // Cargo uses a workspace-relative source path; path-included scripts
+        // use an absolute one, independent of their temporary Cargo package.
+        let source = Path::new(file!());
+        let source = if source.is_absolute() {
+            source.to_path_buf()
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                source
+                    .strip_prefix("reverie-liteinst-artifact")
+                    .expect("preparation identity test source path is not package-relative"),
+            )
+        };
+        // Resolve lexical parents before touching the filesystem: a generated
+        // package directory in the source spelling may already be gone.
+        let mut source_path = PathBuf::new();
+        for component in source.components() {
+            match component {
+                std::path::Component::ParentDir => assert!(
+                    source_path.pop(),
+                    "preparation identity test source path escapes its root"
+                ),
+                std::path::Component::CurDir => {}
+                component => source_path.push(component.as_os_str()),
+            }
+        }
+        let workspace = fs::canonicalize(
+            source_path
+                .ancestors()
+                .nth(3)
+                .expect("preparation identity test source path has no workspace ancestor"),
+        )
+        .expect("preparation identity test workspace source path cannot be resolved");
         let scratch = std::env::temp_dir().join(format!(
             "preparation-identity-entry-{}-{}",
             std::process::id(),
