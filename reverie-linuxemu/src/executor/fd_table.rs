@@ -34,7 +34,6 @@ pub struct FileTableState {
     pub(super) fd_entry_ids: std::collections::BTreeMap<i32, Arc<crate::elf::FdEntry>>,
     pub(super) epoll_domain: Arc<Mutex<EpollDomain>>,
     pub(super) poll_table_id: Arc<NativePollTable>,
-    pub(super) native_poll_fds: std::collections::BTreeMap<i32, Arc<NativePollBinding>>,
     pub(super) pipe_owners: std::collections::BTreeMap<i32, Arc<pipe_owner::PipeOwner>>,
     pub(super) stdout_alias_fds: std::collections::BTreeSet<i32>,
     pub(super) stderr_alias_fds: std::collections::BTreeSet<i32>,
@@ -103,7 +102,13 @@ impl FileTableState {
                 fd,
                 FdSlot {
                     entry_id: self.fd_entry_ids.get(&fd).cloned(),
-                    native_poll: self.native_poll_fds.get(&fd).cloned(),
+                    native_poll: state
+                        .and_then(|state| state.native_poll_fds.get(&fd).cloned())
+                        .or_else(|| {
+                            self.slots
+                                .get(&fd)
+                                .and_then(|slot| slot.native_poll.clone())
+                        }),
                     pipe_owner: self.pipe_owners.get(&fd).cloned(),
                     proc_inode: state
                         .and_then(|state| state.proc_files.get(&fd).copied())
@@ -278,7 +283,6 @@ impl FileTableState {
             fd_entry_ids: state.fd_entry_ids.clone(),
             epoll_domain: state.epoll_domain.clone(),
             poll_table_id: state.poll_table_id.clone(),
-            native_poll_fds: state.native_poll_fds.clone(),
             pipe_owners: state.pipe_owners.clone(),
             stdout_alias_fds: state.stdout_alias_fds.clone(),
             stderr_alias_fds: state.stderr_alias_fds.clone(),
@@ -323,7 +327,6 @@ impl FileTableState {
             fd_entry_ids,
             epoll_domain,
             poll_table_id,
-            native_poll_fds,
             pipe_owners,
             stdout_alias_fds,
             stderr_alias_fds,
@@ -349,7 +352,18 @@ impl FileTableState {
             && files.keys().all(|fd| fd_entry_ids.contains_key(fd))
             && Arc::ptr_eq(epoll_domain, &state.epoll_domain)
             && Arc::ptr_eq(poll_table_id, &state.poll_table_id)
-            && same_arcs(native_poll_fds, &state.native_poll_fds)
+            && {
+                let slot_poll: Vec<_> = self
+                    .slots
+                    .iter()
+                    .filter_map(|(&fd, slot)| slot.native_poll.as_ref().map(|b| (fd, b)))
+                    .collect();
+                slot_poll.len() == state.native_poll_fds.len()
+                    && slot_poll
+                        .into_iter()
+                        .zip(&state.native_poll_fds)
+                        .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
+            }
             && same_arcs(pipe_owners, &state.pipe_owners)
             && *stdout_alias_fds == state.stdout_alias_fds
             && *stderr_alias_fds == state.stderr_alias_fds
@@ -475,7 +489,11 @@ impl FileTableState {
         state.fd_entry_ids.clone_from(&self.fd_entry_ids);
         state.epoll_domain.clone_from(&self.epoll_domain);
         state.poll_table_id.clone_from(&self.poll_table_id);
-        state.native_poll_fds.clone_from(&self.native_poll_fds);
+        state.native_poll_fds = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.native_poll.clone().map(|b| (fd, b)))
+            .collect();
         state.pipe_owners.clone_from(&self.pipe_owners);
         state.stdout_alias_fds.clone_from(&self.stdout_alias_fds);
         state.stderr_alias_fds.clone_from(&self.stderr_alias_fds);
@@ -522,6 +540,11 @@ impl FileTableState {
         &self,
         retirement: &crate::elf::FileRetirement,
     ) -> std::io::Result<ForkDescriptors> {
+        let native_poll_fds: std::collections::BTreeMap<_, _> = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.native_poll.clone().map(|b| (fd, b)))
+            .collect();
         let fdinfo_files: std::collections::BTreeMap<_, _> = self
             .slots
             .iter()
@@ -546,7 +569,7 @@ impl FileTableState {
                 fd_entry_ids: &self.fd_entry_ids,
                 epoll_domain: &self.epoll_domain,
                 poll_table_id: &self.poll_table_id,
-                native_poll_fds: &self.native_poll_fds,
+                native_poll_fds: &native_poll_fds,
                 pipe_owners: &self.pipe_owners,
                 stdout_alias_fds: &self.stdout_alias_fds,
                 stderr_alias_fds: &self.stderr_alias_fds,
