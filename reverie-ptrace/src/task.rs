@@ -12737,7 +12737,11 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// the same siginfo again.
     ///
     /// Returns whether it was taken. It is not, and nothing changes, where
-    /// it could not be put back exactly: another signal is pending too; the
+    /// once put back it would not be delivered as the guest's: no sender's
+    /// code attributes it to a process (`is_sender_coded_sigtrap`), so its
+    /// delivery would be taken for a trap and suppressed, as
+    /// `sigtrap_to_absorb` explains. Nor where it could not be put back
+    /// exactly: another signal is pending too; the
     /// SIGTRAP is not in the thread's own queue alone (one in the thread
     /// group's queue would be held by this thread only, and lost if it
     /// exited first; the kernel queues one without a siginfo only when it
@@ -12775,6 +12779,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             (Some(info), None) => info,
             _ => return Ok((task, false)),
         };
+        if !sender_coded_sigtrap_bytes(&info) {
+            return Ok((task, false));
+        }
         let _repairs = self.lock_sigtrap_repairs().await;
         // The set and a zero timeout, at the start of the page, which no
         // repair uses while the lock is held.
@@ -12833,7 +12840,10 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// and another synchronous-class signal is pending: then the run ends.
     /// That is deliberately broader than the hazard, which needs another
     /// synchronous-class signal with a positive code in the thread's own
-    /// queue (`dequeue_synchronous_signal` scans no other).
+    /// queue (`dequeue_synchronous_signal` scans no other). A SIGTRAP with a
+    /// positive code is not kept in the first place (`sigtrap_to_absorb`,
+    /// `stash_pending_sigtrap`), so this check is a fail-closed backstop
+    /// that no kept SIGTRAP reaches.
     async fn requeue_stashed_sigtrap(&mut self, mut task: Stopped) -> Result<Stopped, TraceError> {
         let Some(stashed) = self.stashed_sigtrap.take() else {
             return Ok(task);
@@ -12897,9 +12907,9 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// call that sets the mask to one not known, or a mask-swapping call
     /// whose temporary mask is not known; on aarch64, a mask-swapping call
     /// whose temporary mask unblocks SIGTRAP; another signal pending too; a
-    /// SIGTRAP queued in both queues or neither; one in the thread group's
-    /// queue that no sender's code attributes to a process
-    /// (`is_sender_coded_sigtrap`); a temporary mask's restore
+    /// SIGTRAP queued in both queues or neither; one that no sender's code
+    /// attributes to a process (`is_sender_coded_sigtrap`), in either
+    /// queue; a temporary mask's restore
     /// pending; no repair page for the arguments that queue it again; or the
     /// Tool not stopping every syscall that changes signal state
     /// (`GlobalState::traces_signal_state_syscalls`). No guest code runs
@@ -12945,15 +12955,17 @@ impl<L: Tool + 'static> TracedTask<L> {
             (None, Some(info)) => (info, true),
             _ => return Ok(None),
         };
-        // One in the thread group's queue stays there, and is delivered later
-        // at a stop that keeps no record of it, where `handle_sigtrap` delivers
-        // a SIGTRAP only if a sender's code shows a process sent it
+        // A kept SIGTRAP, queued again in the thread's own queue or left in
+        // the thread group's, is delivered later at a stop that keeps no
+        // record of it, where `handle_sigtrap` delivers a SIGTRAP only if a
+        // sender's code shows a process sent it
         // (`is_sigtrap_sent_by_a_process`). One it cannot attribute, such as
-        // a `TRAP_BRKPT` the process queued itself with `rt_sigqueueinfo`,
-        // would then be taken for a trap and suppressed, and the guest's
-        // handler would never run. It is refused, so the step ends the run
-        // with `PendingSigtrapAtStep`, as before it was kept.
-        if shared && !sender_coded_sigtrap_bytes(&info) {
+        // a `TRAP_BRKPT` a thread queued itself with `rt_tgsigqueueinfo` or
+        // `rt_sigqueueinfo`, would then be taken for a trap and suppressed,
+        // and the guest's handler would never run. It is refused, so the
+        // step ends the run with `PendingSigtrapAtStep`, as before it was
+        // kept.
+        if !sender_coded_sigtrap_bytes(&info) {
             return Ok(None);
         }
         Ok(Some(StashedSigtrap { info, shared }))

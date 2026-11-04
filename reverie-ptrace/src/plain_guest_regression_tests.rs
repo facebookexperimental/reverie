@@ -6005,7 +6005,12 @@ async fn a_sigtrap_queued_again_behind_a_later_signal_keeps_its_place() {
 /// positive code: Linux takes the first such synchronous-class signal in
 /// queue order (`dequeue_synchronous_signal`), natively the SIGTRAP, which
 /// queued again behind the SIGSEGV would come second, so the run ends with
-/// `PendingSigtrapAtStep`.
+/// `PendingSigtrapAtStep`. A SIGTRAP with a positive code is no longer kept
+/// at all, since no sender's code attributes it to a process
+/// (`TracedTask::sigtrap_to_absorb`), so the run now ends earlier, at the
+/// first step taken while it is pending, before the SIGSEGV is queued, and
+/// `TracedTask::requeue_stashed_sigtrap`'s check for this order is not
+/// reached.
 #[tokio::test(flavor = "current_thread")]
 async fn a_requeue_that_would_reorder_synchronous_signals_ends_the_run() {
     let error =
@@ -6015,7 +6020,7 @@ async fn a_requeue_that_would_reorder_synchronous_signals_ends_the_run() {
         };
     assert!(
         error.contains("SIGTRAP blocked with one pending")
-            && error.contains("behind another synchronous signal"),
+            && error.contains("single-step at the syscall skip cannot keep"),
         "{error}"
     );
 }
@@ -6110,6 +6115,109 @@ async fn a_group_sigtrap_with_the_step_trap_bytes_is_not_taken_for_it() {
             "tail={tail}: {error}"
         );
     }
+}
+
+/// The refusal of a run of `mode` in each configuration, which must be
+/// refused.
+async fn refusals_in_both_configurations(mode: &str) -> Vec<(bool, String)> {
+    let mut refusals = Vec::new();
+    for tail in [false, true] {
+        let options = GuestOptions {
+            tail,
+            ..GuestOptions::default()
+        };
+        match run_guest_options(mode, options).await {
+            Ok(run) => panic!(
+                "{mode} tail={tail}: the run was not refused: {:?}\n{}",
+                run.status, run.report
+            ),
+            Err(error) => refusals.push((tail, format!("{error:#}"))),
+        }
+    }
+    refusals
+}
+
+/// A SIGTRAP a thread queued itself with a positive code (`TRAP_BRKPT`,
+/// through `rt_tgsigqueueinfo`, which checks the code only for another
+/// target) cannot be told from a trap when it is delivered, as in
+/// `a_group_sigtrap_with_the_step_trap_bytes_is_not_taken_for_it`, though
+/// it is in the thread's own queue. Kept, it would be suppressed where a
+/// private-page ppoll's temporary mask unblocks it: the ppoll would time
+/// out with the handler never run, where natively it is interrupted and
+/// the handler runs once. So it is not kept
+/// (`TracedTask::sigtrap_to_absorb`): the first step Reverie takes while it
+/// is pending ends the run with the named `PendingSigtrapAtStep`. Both
+/// configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_thread_sigtrap_with_a_trap_code_is_not_kept_for_a_private_ppoll() {
+    let native = native_report("sigtrap_thread_brkpt_private_ppoll");
+    assert_eq!(
+        prefixed_lines(&native, &["brkpt "]),
+        ["brkpt private ppoll r=-4 handled=1 code=1"],
+        "{native}"
+    );
+    for (tail, error) in refusals_in_both_configurations("sigtrap_thread_brkpt_private_ppoll").await
+    {
+        assert!(
+            error.contains("SIGTRAP blocked with one pending")
+                && error.contains("single-step at the syscall skip cannot keep"),
+            "tail={tail}: {error}"
+        );
+    }
+}
+
+/// `a_guest_sigtrap_pending_while_blocked_is_kept_across_steps` with the
+/// SIGTRAP queued with `TRAP_BRKPT`: natively the lines are the same, with
+/// code 1, and the handler runs at each of the three unblocks. Reverie
+/// cannot attribute the SIGTRAP to a process, so it is not kept
+/// (`TracedTask::sigtrap_to_absorb`), and the run ends with the named
+/// `PendingSigtrapAtStep` at the first step taken while it is pending,
+/// rather than losing deliveries. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_sigtrap_with_a_trap_code_is_not_kept_across_steps() {
+    let native = native_report("sigtrap_guest_pending_kept_brkpt");
+    let expected: Vec<String> = KEPT_ACROSS_STEPS_LINES
+        .iter()
+        .map(|line| line.replace("code=-7", "code=1"))
+        .collect();
+    assert_eq!(prefixed_lines(&native, &["kept "]), expected, "{native}");
+    for (tail, error) in refusals_in_both_configurations("sigtrap_guest_pending_kept_brkpt").await {
+        assert!(
+            error.contains("SIGTRAP blocked with one pending")
+                && error.contains("single-step at the syscall skip cannot keep"),
+            "tail={tail}: {error}"
+        );
+    }
+}
+
+/// A SIGTRAP a thread queued itself with `TRAP_BRKPT`, first met pending by
+/// a precise timer's steps, is not taken out of the queue for them
+/// (`TracedTask::stash_pending_sigtrap`): queued again for the steps, its
+/// later delivery would be suppressed as a trap's, where natively the
+/// unblock runs the handler once. The steps end the run with the named
+/// `PendingSigtrapAtStep` instead. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_thread_sigtrap_with_a_trap_code_is_not_stashed_for_a_timer() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let native = native_report("sigtrap_stash_brkpt");
+    assert_eq!(
+        prefixed_lines(&native, &["brkpt "]),
+        ["brkpt stash unblocked handled=1 code=1"],
+        "{native}"
+    );
+    let stashes = || crate::task::SIGTRAP_STASHES_FOR_TEST.with(|count| count.get());
+    let before = stashes();
+    for (tail, error) in refusals_in_both_configurations("sigtrap_stash_brkpt").await {
+        assert!(
+            error.contains("SIGTRAP blocked with one pending")
+                && error.contains("single-step at the precise timer cannot keep"),
+            "tail={tail}: {error}"
+        );
+    }
+    assert_eq!(stashes() - before, 0, "SIGTRAPs taken out of the queue");
 }
 
 /// A SIGTRAP queued for the thread group while blocked is not taken out of

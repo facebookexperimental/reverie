@@ -2821,6 +2821,9 @@ static void mode_sync_signal_at_last_sigreturn(void) {
  * each step, and is delivered exactly when it would be, with its code and
  * pid. */
 static volatile int gk_n, gk_code, gk_pid;
+/* The code gk_queue queues the SIGTRAP with: a sender's (-7) unless a mode
+ * sets a positive one. */
+static int gk_queue_code = -7;
 static void gk_handler(int sig, siginfo_t* si, void* uc) {
   (void)sig;
   (void)uc;
@@ -2832,7 +2835,7 @@ static void gk_queue(void) {
   siginfo_t si;
   memset(&si, 0, sizeof si);
   si.si_signo = SIGTRAP;
-  si.si_code = -7;
+  si.si_code = gk_queue_code;
   si.si_pid = 4242;
   long pid = getpid(), tid = syscall(SYS_gettid);
   if (SITEM(SYS_rt_tgsigqueueinfo, pid, tid, SIGTRAP, (long)&si, 0, SHAPE_TAIL) != 0)
@@ -2940,6 +2943,76 @@ static void mode_sigtrap_guest_pending_kept(void) {
   if (SITEM(SYS_rt_sigprocmask, SIG_UNBLOCK, (long)&trap, 0, 8, 0, SHAPE_PRIVATE_CALL) != 0)
     die("unblock SIGTRAP");
   say("kept unblocked handled=%d code=%d pid=%d\n", gk_n, gk_code, gk_pid);
+}
+
+/* As sigtrap_guest_pending_kept, but the thread queues itself the SIGTRAP
+ * with TRAP_BRKPT, which Linux allows a thread to send itself
+ * (rt_tgsigqueueinfo checks the code only for another target). Natively the
+ * handler runs at each of the three unblocks with code 1 (TRAP_BRKPT). No
+ * sender's code attributes it to a process, so Reverie refuses to keep it,
+ * and the run ends at the first step taken while it is pending
+ * (PendingSigtrapAtStep). */
+static void mode_sigtrap_guest_pending_kept_brkpt(void) {
+  gk_queue_code = TRAP_BRKPT;
+  mode_sigtrap_guest_pending_kept();
+}
+
+/* A SIGTRAP the thread queues itself with TRAP_BRKPT while blocking it, then
+ * a private-page ppoll whose empty temporary mask unblocks it: natively the
+ * ppoll is interrupted (-EINTR) and the handler runs once. No sender's code
+ * attributes the SIGTRAP to a process, so Reverie refuses to keep it at the
+ * first step taken while it is pending (PendingSigtrapAtStep). */
+static void mode_sigtrap_thread_brkpt_private_ppoll(void) {
+  warm();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = gk_handler;
+  sa.sa_flags = SA_SIGINFO;
+  if (sigaction(SIGTRAP, &sa, NULL) != 0)
+    die("sigaction SIGTRAP");
+  sigset_t trap;
+  sigemptyset(&trap);
+  sigaddset(&trap, SIGTRAP);
+  if (sigprocmask(SIG_BLOCK, &trap, NULL) != 0)
+    die("block SIGTRAP");
+  gk_queue_code = TRAP_BRKPT;
+  gk_queue();
+  sigset_t none;
+  sigemptyset(&none);
+  struct timespec ts = {1, 0};
+  long r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&none, 8, SHAPE_PRIVATE_CALL);
+  say("brkpt private ppoll r=%ld handled=%d code=%d\n", r, gk_n, gk_code);
+}
+
+/* A SIGTRAP the thread queues itself with TRAP_BRKPT while blocking it, as
+ * the stop's own syscall (SHAPE_TAIL), right before a precise timer's
+ * arming, also the stop's own syscall, and its branch loop: the timer's
+ * steps are the first of Reverie's to meet the SIGTRAP pending. Natively
+ * the unblock runs the handler once, with code 1. No sender's code
+ * attributes the SIGTRAP to a process, so Reverie does not take it out of
+ * the queue for the steps (stash_pending_sigtrap), and the steps end the run
+ * (PendingSigtrapAtStep). */
+static void mode_sigtrap_stash_brkpt(void) {
+  warm();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = gk_handler;
+  sa.sa_flags = SA_SIGINFO;
+  if (sigaction(SIGTRAP, &sa, NULL) != 0)
+    die("sigaction SIGTRAP");
+  sigset_t trap;
+  sigemptyset(&trap);
+  sigaddset(&trap, SIGTRAP);
+  if (sigprocmask(SIG_BLOCK, &trap, NULL) != 0)
+    die("block SIGTRAP");
+  gk_queue_code = TRAP_BRKPT;
+  gk_queue();
+  SITEM(SYS_getppid, 0, 0, 0, 0, PM_BRANCHES + 1 + 3, ARM_TIMER | SHAPE_TAIL);
+  for (volatile int j = 0; j < PM_BRANCHES; j++)
+    ;
+  if (sigprocmask(SIG_UNBLOCK, &trap, NULL) != 0)
+    die("unblock SIGTRAP");
+  say("brkpt stash unblocked handled=%d code=%d\n", gk_n, gk_code);
 }
 
 /* A SIGTRAP the guest queued itself while blocking it, out of the queue for
@@ -6729,6 +6802,12 @@ int main(int argc, char** argv) {
     mode_sigtrap_stash_sigreturn_unblocks();
   else if (!strcmp(m, "sigtrap_guest_pending_kept"))
     mode_sigtrap_guest_pending_kept();
+  else if (!strcmp(m, "sigtrap_guest_pending_kept_brkpt"))
+    mode_sigtrap_guest_pending_kept_brkpt();
+  else if (!strcmp(m, "sigtrap_thread_brkpt_private_ppoll"))
+    mode_sigtrap_thread_brkpt_private_ppoll();
+  else if (!strcmp(m, "sigtrap_stash_brkpt"))
+    mode_sigtrap_stash_brkpt();
   else if (!strcmp(m, "sigtrap_stash_steps_onto_syscall"))
     mode_sigtrap_stash_steps_onto_syscall();
   else if (!strcmp(m, "sigtrap_stash_steps_onto_sigpending"))
