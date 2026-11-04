@@ -4510,7 +4510,10 @@ async fn a_caught_unblocked_sigtrap_costs_its_injections_no_reads() {
 /// polls. Before, each unblocked poll made one unstepped `rt_sigaction` (the
 /// handler's read) and one read; each blocked one three unstepped calls (the
 /// handler's read, and the repair's read-back and write) and two reads, of
-/// which the shield's two reads remain.
+/// which the shield's two reads remain. Each poll is single-stepped: one
+/// that swaps no mask is not run between syscall stops
+/// (`syscall_stops_admitted`), which decided from the syscall number alone
+/// ran all 200 there.
 #[tokio::test(flavor = "current_thread")]
 async fn a_caught_sigtrap_costs_a_maskless_poll_no_repair() {
     let reads = || crate::task::SIGTRAP_INJECTION_READS_FOR_TEST.with(|count| count.get());
@@ -4524,9 +4527,16 @@ async fn a_caught_sigtrap_costs_a_maskless_poll_no_repair() {
                 format!("sigtrap_caught_{blocked}_polls")
             };
             let (reads_before, repairs_before) = (reads(), repairs());
+            let transports_before = TransportCounts::now();
             let run = run_guest(&mode, false).await;
+            let transports = TransportCounts::now().delta(&transports_before, Sysno::ppoll);
             costs.push((reads() - reads_before, repairs() - repairs_before));
             assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+            assert_eq!(
+                transports,
+                (0, count),
+                "{blocked}: polls (between syscall stops, single-stepped)"
+            );
             let lines: Vec<&str> = run
                 .report
                 .lines()

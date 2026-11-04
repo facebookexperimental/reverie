@@ -11671,7 +11671,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         // held. Decided before the step-only reads below, which such an
         // injection has no trap for.
         self.syscall_stop_injection = None;
-        let syscall_stops = self.syscall_stops_admitted(nr);
+        let syscall_stops = self.syscall_stops_admitted(nr, &args);
         // What the step's trap can reset of SIGTRAP's state, read before the
         // registers change (`sigtrap_state`). The reads and the repair make
         // requests main does not, which a tracer filter may refuse
@@ -13232,7 +13232,10 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// pays it. A syscall-exit stop is a ptrace notification, which resets
     /// nothing. Admitted, decided afresh for each injection:
     /// 1. on x86_64 (aarch64's restart and syscall-stop registers differ);
-    /// 2. a mask-swapping syscall (`StepKind::SwapsMask`);
+    /// 2. a syscall that swaps the mask with these arguments
+    ///    (`StepKind::SwapsMask` of `injection_swaps_signal_mask`): a poll
+    ///    or wait that names no temporary mask swaps nothing, and its step
+    ///    is taken as any call's that keeps the mask;
     /// 3. outside a signal callback, held or not, whose resume needs the
     ///    injection to end at a signal-delivery stop;
     /// 4. with SIGTRAP's state kept (`keeps_sigtrap_state`): an unfiltered
@@ -13245,9 +13248,9 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///    (`report_held_signal`).
     ///
     /// Every other injection is single-stepped as before.
-    fn syscall_stops_admitted(&self, nr: Sysno) -> bool {
+    fn syscall_stops_admitted(&self, nr: Sysno, args: &SyscallArgs) -> bool {
         if !cfg!(target_arch = "x86_64")
-            || step_kind(nr, swaps_signal_mask(nr)) != StepKind::SwapsMask
+            || step_kind(nr, injection_swaps_signal_mask(nr, args)) != StepKind::SwapsMask
             || self.in_signal_callback
             || self.in_held_signal_callback
             || !self.keeps_sigtrap_state()
