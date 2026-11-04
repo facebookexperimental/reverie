@@ -40,7 +40,6 @@ pub struct FileTableState {
     pub(super) stderr_alias_fds: std::collections::BTreeSet<i32>,
     pub(super) cloexec_fds: std::collections::BTreeSet<i32>,
     pub(super) closed_standard_fds: std::collections::BTreeSet<i32>,
-    pub(super) proc_files: std::collections::BTreeMap<i32, u64>,
     pub(super) synthetic_proc_nofollow_fds: std::collections::BTreeSet<i32>,
     pub(super) fdinfo_files: std::collections::BTreeMap<i32, Arc<FdinfoDescription>>,
     pub(super) signalfd_fds: std::collections::BTreeSet<i32>,
@@ -107,7 +106,9 @@ impl FileTableState {
                     entry_id: self.fd_entry_ids.get(&fd).cloned(),
                     native_poll: self.native_poll_fds.get(&fd).cloned(),
                     pipe_owner: self.pipe_owners.get(&fd).cloned(),
-                    proc_inode: self.proc_files.get(&fd).copied(),
+                    proc_inode: state
+                        .and_then(|state| state.proc_files.get(&fd).copied())
+                        .or_else(|| self.slots.get(&fd).and_then(|slot| slot.proc_inode)),
                     fdinfo: self.fdinfo_files.get(&fd).cloned(),
                     object_inode: state
                         .and_then(|state| state.fd_object_inodes.get(&fd).cloned())
@@ -282,7 +283,6 @@ impl FileTableState {
             stderr_alias_fds: state.stderr_alias_fds.clone(),
             cloexec_fds: state.cloexec_fds.clone(),
             closed_standard_fds: state.closed_standard_fds.clone(),
-            proc_files: state.proc_files.clone(),
             synthetic_proc_nofollow_fds: state.synthetic_proc_nofollow_fds.clone(),
             fdinfo_files: state.fdinfo_files.clone(),
             signalfd_fds: state
@@ -329,7 +329,6 @@ impl FileTableState {
             stderr_alias_fds,
             cloexec_fds,
             closed_standard_fds,
-            proc_files,
             synthetic_proc_nofollow_fds,
             fdinfo_files,
             // install never writes the task's signalfd set.
@@ -357,7 +356,18 @@ impl FileTableState {
             && *stderr_alias_fds == state.stderr_alias_fds
             && *cloexec_fds == state.cloexec_fds
             && *closed_standard_fds == state.closed_standard_fds
-            && *proc_files == state.proc_files
+            && {
+                let slot_inodes: Vec<_> = self
+                    .slots
+                    .iter()
+                    .filter_map(|(&fd, slot)| slot.proc_inode.map(|ino| (fd, ino)))
+                    .collect();
+                slot_inodes.len() == state.proc_files.len()
+                    && slot_inodes
+                        .into_iter()
+                        .zip(&state.proc_files)
+                        .all(|((fa, va), (fb, vb))| fa == *fb && va == *vb)
+            }
             && *synthetic_proc_nofollow_fds == state.synthetic_proc_nofollow_fds
             && same_arcs(fdinfo_files, &state.fdinfo_files)
             && {
@@ -463,7 +473,11 @@ impl FileTableState {
         state
             .closed_standard_fds
             .clone_from(&self.closed_standard_fds);
-        state.proc_files.clone_from(&self.proc_files);
+        state.proc_files = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.proc_inode.map(|ino| (fd, ino)))
+            .collect();
         state
             .synthetic_proc_nofollow_fds
             .clone_from(&self.synthetic_proc_nofollow_fds);
@@ -494,6 +508,11 @@ impl FileTableState {
         &self,
         retirement: &crate::elf::FileRetirement,
     ) -> std::io::Result<ForkDescriptors> {
+        let proc_files: std::collections::BTreeMap<_, _> = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.proc_inode.map(|ino| (fd, ino)))
+            .collect();
         let fd_object_inodes: std::collections::BTreeMap<_, _> = self
             .slots
             .iter()
@@ -514,7 +533,7 @@ impl FileTableState {
                 stderr_alias_fds: &self.stderr_alias_fds,
                 cloexec_fds: &self.cloexec_fds,
                 closed_standard_fds: &self.closed_standard_fds,
-                proc_files: &self.proc_files,
+                proc_files: &proc_files,
                 synthetic_proc_nofollow_fds: &self.synthetic_proc_nofollow_fds,
                 fdinfo_files: &self.fdinfo_files,
                 fd_object_inodes: &fd_object_inodes,
