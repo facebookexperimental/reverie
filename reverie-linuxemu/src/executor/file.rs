@@ -1889,8 +1889,7 @@ pub(super) fn host_description(
     guest_fd: libc::c_int,
 ) -> Option<super::vfs_file::HostDescription> {
     state
-        .files
-        .get(&guest_fd)?
+        .guest_file(guest_fd)?
         .try_clone()
         .ok()
         .map(super::vfs_file::HostDescription::new)
@@ -1898,8 +1897,7 @@ pub(super) fn host_description(
 
 pub(super) fn host_fd(state: &LoadedStaticElf, guest_fd: libc::c_int) -> Option<RawFd> {
     state
-        .files
-        .get(&guest_fd)
+        .guest_file(guest_fd)
         .map(AsRawFd::as_raw_fd)
         .or_else(|| {
             if !is_open_standard(state, guest_fd) {

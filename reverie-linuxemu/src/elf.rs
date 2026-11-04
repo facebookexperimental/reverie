@@ -1329,6 +1329,35 @@ pub struct LoadedStaticElf {
 }
 
 impl LoadedStaticElf {
+    // R2 compatibility accessors: the single read path for descriptor facts
+    // while entry consolidation proceeds. Frozen consumers (signal, proc)
+    // may keep field access; migrated callers use these so the storage can
+    // change underneath without touching them again. guest_file reaches the
+    // copy through the ledger exactly as PrivateFiles::get does today.
+    pub(crate) fn guest_file(&self, fd: i32) -> Option<&std::fs::File> {
+        self.files.get(&fd)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn fd_entry(&self, fd: i32) -> Option<&std::sync::Arc<FdEntry>> {
+        self.fd_entry_ids.get(&fd)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_cloexec(&self, fd: i32) -> bool {
+        self.cloexec_fds.contains(&fd)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_stdout_alias(&self, fd: i32) -> bool {
+        self.stdout_alias_fds.contains(&fd)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_stderr_alias(&self, fd: i32) -> bool {
+        self.stderr_alias_fds.contains(&fd)
+    }
+
     /// The value reported by `getppid(2)` and procfs for this process.
     pub(crate) fn guest_parent_pid(&self) -> i32 {
         match self.orphan_reaper_pid.load(Ordering::SeqCst) {
