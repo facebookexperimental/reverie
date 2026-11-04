@@ -4388,8 +4388,8 @@ mod tests {
             memory
                 .write(0x100, format!("/proc/self/fd/{fd}\0").as_bytes())
                 .unwrap();
-            // Its link is the Tool's (Hermit's Detcore names it from its
-            // record of the open): the executor answers it as it answers any
+            // Its link is a Tool's to answer, from the Tool's own record of the
+            // open: with no Tool, the executor answers it as it answers any
             // procfs link of the supervisor.
             let length = call(
                 &mut child,
@@ -4698,8 +4698,10 @@ mod tests {
                 format!("/proc/self/fd/{received_status}\0").as_bytes(),
             )
             .unwrap();
-        // Its link is the Tool's, as for every descriptor (Hermit's Detcore
-        // refuses a received one by name, having no record of its open).
+        // Its link is a Tool's to answer, as for every descriptor. A Tool
+        // with no record of a received descriptor's open must answer it
+        // itself, for example by refusing it by name. With no Tool, the
+        // executor refuses it as any procfs link of the supervisor.
         let length = call(
             &mut child,
             &memory,

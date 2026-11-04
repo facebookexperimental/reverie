@@ -2339,10 +2339,12 @@ pub(super) fn readlinkat(
 // The guest's own descriptor, working-directory and root links
 // (`/proc/self/fd/<n>` and its `/dev/fd/<n>`, `/proc/thread-self/fd/<n>` and
 // `/proc/<pid>/fd/<n>` spellings, `/proc/self/cwd`, `/proc/self/root`) are a
-// Tool's to answer: the backend gives a Tool what they need
-// (`reverie::Guest::link_path`), and Hermit's Detcore answers every spelling
-// of them before this executor sees it. Without such a Tool they are refused
-// as any procfs link of the supervisor is (EACCES, below). The executor's own
+// Tool's to answer: the backend reports what a Tool needs through the
+// `reverie::Guest::link_path` fact, and a Tool that answers these links does
+// so before the call reaches this executor, for whichever spellings that Tool
+// recognises. Any call that still reaches the executor, whether no Tool
+// answers it or the Tool forwards a spelling it does not handle, is refused as
+// any procfs link of the supervisor is (EACCES, below). The executor's own
 // copies were the descriptor arm, through `guest_fd_link_target`, which named
 // a descriptor's file from the supervisor's own `/proc/self/fd/<host fd>` and
 // rewrote its pipe and socket inodes, and carried TODO-HUMAN-REVIEW(PR-136)

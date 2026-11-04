@@ -19649,10 +19649,10 @@ mod tests {
             .insert(9, std::fs::File::open(&payload).unwrap());
         let mut memory = GuestMemory::new(0, 0x2000).unwrap();
 
-        // The guest's own descriptor, working-directory and root links, by
-        // every spelling, are a Tool's to answer from `link_path` (whose
-        // answers facts.rs's `link_path` tests check): the executor answers
-        // none of them.
+        // The guest's own descriptor, working-directory and root links are a
+        // Tool's to answer from the `link_path` fact (facts.rs's `link_path`
+        // tests check the fact's answers). The executor answers none of the
+        // spellings below; this test covers only these spellings.
         for path in [
             "/proc/1/fd/9",
             "/proc/self/fd/9",
@@ -19721,9 +19721,9 @@ mod tests {
             0
         );
 
-        // A synthetic proc descriptor's link is the Tool's too (Hermit's
-        // Detcore names it from its record of the open), never the
-        // implementation's memfd backing file.
+        // A synthetic proc descriptor's link is a Tool's to answer too, from
+        // the Tool's own record of the open. The executor never answers it
+        // with the implementation's memfd backing file.
         let proc_fd = open_readonly(&mut memory, &mut state, "/proc/self/status");
         assert_eq!(proc_fd, 3);
         assert_proc_link_left_to_the_tool(&mut memory, &mut state, "/proc/self/fd/3");
