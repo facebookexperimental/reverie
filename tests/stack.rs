@@ -8,24 +8,40 @@
 
 //! Tests for process and thread state.
 
+#[cfg(all(not(sanitized), test))]
 use reverie::Error;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Stack;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Addr;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::AddrMut;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::ExitGroup;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::MemoryAccess;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Nanosleep;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Syscall;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::SyscallInfo;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Sysno;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Timespec;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Uname;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = ();
@@ -94,9 +110,11 @@ impl Tool for LocalState {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState2;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState2 {
     type GlobalState = ();
@@ -131,9 +149,11 @@ impl Tool for LocalState2 {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState3;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState3 {
     type GlobalState = ();

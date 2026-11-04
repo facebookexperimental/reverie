@@ -10,11 +10,13 @@
 // procfs error as an error, never as a lifecycle verdict
 // (https://github.com/rrnewton/reverie/issues/1091).
 
+#[cfg(not(sanitized))]
 fn set_bound_stat_flags_error(error: Option<ProcStatError>) {
     BOUND_STAT_FLAGS_ERROR_FOR_TEST.with(|slot| *slot.borrow_mut() = error);
 }
 
 /// The guest thread's state letter from its stat record.
+#[cfg(not(sanitized))]
 fn proc_state(pid: Pid) -> Option<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.rsplit_once(')')?.1;
