@@ -69,6 +69,25 @@ pub(super) fn lseek(state: &LoadedStaticElf, args: &[u64; 6], capture_output: bo
     let Ok(whence) = i32::try_from(args[2]) else {
         return negative_errno(libc::EINVAL);
     };
+    // R2 slice 2: seek through the FileDescription for table-backed host
+    // files. The clone shares the open description's offset, so this is the
+    // same lseek; SEEK_DATA/SEEK_HOLE and non-table descriptors keep the raw
+    // path below (the kernel answers their whence validation).
+    if let Some(mut description) = host_description(state, fd) {
+        let offset = args[1] as i64;
+        let pos = match whence {
+            libc::SEEK_SET if offset >= 0 => Some(std::io::SeekFrom::Start(offset as u64)),
+            libc::SEEK_CUR => Some(std::io::SeekFrom::Current(offset)),
+            libc::SEEK_END => Some(std::io::SeekFrom::End(offset)),
+            _ => None,
+        };
+        if let Some(pos) = pos {
+            return match description.seek(pos) {
+                Ok(at) => at as i64,
+                Err(error) => io_error(error),
+            };
+        }
+    }
     // SAFETY: host_fd names a live descriptor. Linux validates offset and whence.
     let result = unsafe { libc::lseek(host_fd, args[1] as libc::off_t, whence) };
     if result < 0 {
@@ -1858,6 +1877,23 @@ pub(super) fn is_open_standard(state: &LoadedStaticElf, guest_fd: libc::c_int) -
         && (guest_fd != libc::STDIN_FILENO || state.stdin_copy().is_some())
         && !state.closed_standard_fds.contains(&guest_fd)
         && !state.files.contains_key(&guest_fd)
+}
+
+/// The open description behind a table-backed guest descriptor, as a
+/// `FileDescription` (R2). `None` for descriptors with no table entry
+/// (stdin and the inherited standard descriptors), whose callers keep the
+/// raw host-fd path. The returned description holds a dup of the entry's
+/// host file: same open description, same shared offset.
+pub(super) fn host_description(
+    state: &LoadedStaticElf,
+    guest_fd: libc::c_int,
+) -> Option<super::vfs_file::HostDescription> {
+    state
+        .files
+        .get(&guest_fd)?
+        .try_clone()
+        .ok()
+        .map(super::vfs_file::HostDescription::new)
 }
 
 pub(super) fn host_fd(state: &LoadedStaticElf, guest_fd: libc::c_int) -> Option<RawFd> {
