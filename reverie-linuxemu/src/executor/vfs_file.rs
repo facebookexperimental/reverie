@@ -31,6 +31,16 @@ pub trait FileDescription: std::fmt::Debug + Send + Sync {
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize>;
     fn write(&self, buf: &[u8]) -> std::io::Result<usize>;
     fn seek(&self, pos: SeekFrom) -> std::io::Result<u64>;
+    /// Positioned read (pread): never moves the shared offset.
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let _ = (buf, offset);
+        Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
+    }
+    /// Positioned write (pwrite): never moves the shared offset.
+    fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        let _ = (buf, offset);
+        Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
+    }
     /// Bytes readable without blocking (FIONREAD), where the kind has them.
     fn available(&self) -> std::io::Result<i32> {
         Err(std::io::Error::from_raw_os_error(libc::ENOTTY))
@@ -66,6 +76,12 @@ impl FileDescription for HostDescription {
     fn seek(&self, pos: SeekFrom) -> std::io::Result<u64> {
         (&self.file).seek(pos)
     }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(&self.file, buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        std::os::unix::fs::FileExt::write_at(&self.file, buf, offset)
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +107,29 @@ mod tests {
         let mut buf = [0u8; 5];
         assert_eq!(desc.read(&mut buf).unwrap(), 5);
         assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn host_positioned_io_keeps_the_shared_offset() {
+        let dir = std::env::temp_dir().join(format!("r2-vfs-at-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(dir.join("f"))
+            .unwrap();
+        let desc = HostDescription::new(file);
+        assert_eq!(desc.write_at(b"world", 6).unwrap(), 5);
+        assert_eq!(desc.write_at(b"hello ", 0).unwrap(), 6);
+        // Offset untouched by positioned I/O: a plain read starts at 0.
+        let mut buf = [0u8; 5];
+        assert_eq!(desc.read(&mut buf).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
+        let mut at = [0u8; 5];
+        assert_eq!(desc.read_at(&mut at, 6).unwrap(), 5);
+        assert_eq!(&at, b"world");
     }
     #[test]
     fn pipe_description_reports_available_and_refuses_seek() {

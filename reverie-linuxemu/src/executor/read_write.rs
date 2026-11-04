@@ -1203,7 +1203,16 @@ pub(super) fn pread64<M: GuestMemoryAccess<Error = crate::Error> + AddressSpace>
         return negative_errno(libc::EFAULT);
     }
     let mut bytes = vec![0; writable];
-    match file.read_at(&mut bytes, args[3]) {
+    // R2 slice 6: positioned read through the description when the entry
+    // has one (a dup sharing the open description; read_at moves no
+    // offset). The direct file path remains the fallback.
+    let read = match host_description(state, fd) {
+        Some(description) => {
+            super::vfs_file::FileDescription::read_at(&description, &mut bytes, args[3])
+        }
+        None => file.read_at(&mut bytes, args[3]),
+    };
+    match read {
         Ok(count) => match memory.write_exact(args[1], &bytes[..count]) {
             Ok(()) => count as i64,
             Err(_) => negative_errno(libc::EFAULT),
