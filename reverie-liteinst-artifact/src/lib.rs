@@ -1051,8 +1051,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie/src/lib.rs",
-        7132,
-        "2a10fcc829d2ef3027ace66c46cc488c4acd8f933f80b5245c1700843656f9da",
+        7206,
+        "8856e2b563ca1610c6b2f12c8ea3e7b2f88382bd163847b63db1778e31252e8a",
     ),
     (
         "reverie/src/perf.rs",
@@ -1117,13 +1117,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-rpc-transport/src/lib.rs",
-        4843,
-        "f85ee8b473b9c072de1268a806e036665b3df94d021a26601876a6e0cb2c5adc",
+        4862,
+        "f0dec89933ddc8d520f0d7fbe634bbb5866826f4360b1a35d8a3fdedc4b36fbd",
     ),
     (
         "reverie-rpc-transport/src/server.rs",
-        118074,
-        "c1f4c4e013db4dbe1677b715ea215612cf15c9c1a8054cab4d42086c5dc07629",
+        121451,
+        "fdd1dd8a2d635426bab2bcd17867b70447cbffa52440bf08930432e904008ad2",
     ),
     (
         "reverie-rpc-transport/src/blocking_client.rs",
@@ -1138,8 +1138,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     // Bind the added input-ownership and facility-admission source premises.
     (
         "reverie-inguest/src/launcher/mod.rs",
-        90473,
-        "339116b362c7d4ffe92921d6b4660788f86d8f297431aa6939d44c15c25174bb",
+        90555,
+        "6f03c009d55a607cac79bdf230259ea2ebd39e590510afc84abd8361a5420326",
     ),
     (
         "reverie/src/native_syscall.rs",
@@ -1158,8 +1158,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie/src/tool.rs",
-        78009,
-        "bcb07a6c408dd2b768b7aaaaaffad013a6782027b78df7cb04d0aafecc2e3774",
+        78807,
+        "6bc09671bc1960d3c1029bc0901047307ac29a7e1fbc1cbc915bec296bb2cc4d",
     ),
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared
