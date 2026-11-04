@@ -5586,6 +5586,63 @@ async fn a_last_step_over_a_sigreturn_that_unblocks_a_signal_is_single_stepped()
     );
 }
 
+/// The lines of `sigtrap_guest_pending_kept`, single-stepped or not, the
+/// native ones.
+const KEPT_ACROSS_STEPS_LINES: [&str; 12] = [
+    "kept queued SigPnd=1 ShdPnd=0 handled=0",
+    "kept after-injection SigPnd=1 ShdPnd=0 handled=0",
+    "kept after-timer SigPnd=1 ShdPnd=0 handled=0",
+    "kept clone child saw SigPnd=1",
+    "kept after-clone SigPnd=1 ShdPnd=0 handled=0",
+    "kept ppoll r=-4 handled=1 code=-7 pid=4242",
+    "kept after-ppoll SigPnd=0 ShdPnd=0 handled=1",
+    "kept queued-again SigPnd=1 ShdPnd=0 handled=1",
+    "kept private ppoll r=-4 handled=2 code=-7 pid=4242",
+    "kept after-private-ppoll SigPnd=0 ShdPnd=0 handled=2",
+    "kept queued-third SigPnd=1 ShdPnd=0 handled=2",
+    "kept unblocked handled=3 code=-7 pid=4242",
+];
+
+/// As `a_guest_sigtrap_pending_while_blocked_is_kept_across_steps`, with no
+/// injection run between syscall stops (`NO_SYSCALL_STOPS_FOR_TEST`), as in
+/// a signal callback or with a signal held, where `syscall_stops_admitted`
+/// refuses that transport: the mask-swapping private ppoll is single-stepped,
+/// its trap is absorbed into the pending SIGTRAP
+/// (`TracedTask::absorb_sigtrap_at_step_end`), and the lines are the same
+/// native ones. Both configurations.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_stepped_injections() {
+    if !crate::perf::is_perf_supported() {
+        eprintln!("skipping: perf counters are not supported here");
+        return;
+    }
+    let ppolls = |between_stops| {
+        crate::task::private_transports_for_test(reverie::syscalls::Sysno::ppoll, between_stops)
+    };
+    let (stepped_before, between_before) = (ppolls(false), ppolls(true));
+    crate::task::NO_SYSCALL_STOPS_FOR_TEST.with(|none| none.set(true));
+    let runs = run_both_configurations("sigtrap_guest_pending_kept").await;
+    crate::task::NO_SYSCALL_STOPS_FOR_TEST.with(|none| none.set(false));
+    for run in runs {
+        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
+        let lines: Vec<&str> = run
+            .report
+            .lines()
+            .filter(|line| line.starts_with("kept "))
+            .collect();
+        assert_eq!(lines, KEPT_ACROSS_STEPS_LINES, "{}", run.report);
+    }
+    assert!(
+        ppolls(false) > stepped_before,
+        "no private ppoll was single-stepped"
+    );
+    assert_eq!(
+        ppolls(true),
+        between_before,
+        "a private ppoll ran between syscall stops"
+    );
+}
+
 /// A SIGTRAP the guest queued itself while blocking it, with its own code
 /// and pid, is kept across Reverie's steps, as natively: the injected reads
 /// of the thread's status see it pending, before and after a private
@@ -5594,9 +5651,11 @@ async fn a_last_step_over_a_sigreturn_that_unblocks_a_signal_is_single_stepped()
 /// from the bare clone, runs no syscall; a ppoll
 /// whose temporary mask unblocks it returns EINTR with the handler run
 /// once, with the queued code and pid, and is not restarted, both run in
-/// place and single-stepped on the private page; and an unblock on the
-/// private page delivers a
-/// third one.
+/// place and on the private page, where this thread, with no seccomp filter
+/// of the guest's, runs it between syscall stops
+/// (`syscall_stops_admitted`); and an unblock on the private page delivers
+/// a third one. `a_guest_sigtrap_pending_while_blocked_is_kept_across_stepped_injections`
+/// runs the same with every injection single-stepped.
 /// Before, each step refused it (`PendingSigtrapAtStep`). Injections let the
 /// step's trap be absorbed and keep the SIGTRAP the kernel then delivers
 /// (`TracedTask::absorb_sigtrap_at_step_end`); the timer takes it out of
@@ -5608,20 +5667,10 @@ async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_steps() {
         eprintln!("skipping: perf counters are not supported here");
         return;
     }
-    let expected = [
-        "kept queued SigPnd=1 ShdPnd=0 handled=0",
-        "kept after-injection SigPnd=1 ShdPnd=0 handled=0",
-        "kept after-timer SigPnd=1 ShdPnd=0 handled=0",
-        "kept clone child saw SigPnd=1",
-        "kept after-clone SigPnd=1 ShdPnd=0 handled=0",
-        "kept ppoll r=-4 handled=1 code=-7 pid=4242",
-        "kept after-ppoll SigPnd=0 ShdPnd=0 handled=1",
-        "kept queued-again SigPnd=1 ShdPnd=0 handled=1",
-        "kept private ppoll r=-4 handled=2 code=-7 pid=4242",
-        "kept after-private-ppoll SigPnd=0 ShdPnd=0 handled=2",
-        "kept queued-third SigPnd=1 ShdPnd=0 handled=2",
-        "kept unblocked handled=3 code=-7 pid=4242",
-    ];
+    let expected = KEPT_ACROSS_STEPS_LINES;
+    let ppolls_between_stops =
+        || crate::task::private_transports_for_test(reverie::syscalls::Sysno::ppoll, true);
+    let between_stops_before = ppolls_between_stops();
     let left_for_injection =
         || crate::task::STASHES_LEFT_FOR_INJECTION_FOR_TEST.with(|count| count.get());
     let left_before = left_for_injection();
@@ -5645,6 +5694,10 @@ async fn a_guest_sigtrap_pending_while_blocked_is_kept_across_steps() {
     // No SIGTRAP is left out of the queue for an injection to find: each
     // path queues it again before the guest or the Tool can run.
     assert_eq!(left_for_injection(), left_before);
+    assert!(
+        ppolls_between_stops() > between_stops_before,
+        "no private ppoll ran between syscall stops"
+    );
     // The Tool sees the same SIGTRAPs however the thread is created: none
     // for a stop whose SIGTRAP Reverie queued again.
     let tool_sigtraps: Vec<usize> = runs

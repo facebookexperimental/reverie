@@ -2917,7 +2917,8 @@ static void mode_sigtrap_guest_pending_kept(void) {
   long r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&none, 8, SHAPE_INJECT);
   say("kept ppoll r=%ld handled=%d code=%d pid=%d\n", r, gk_n, gk_code, gk_pid);
   gk_state("after-ppoll");
-  /* The same ppoll on the private page, which Reverie single-steps. */
+  /* The same ppoll on the private page: run between syscall stops where
+   * that is admitted, single-stepped otherwise. */
   gk_queue();
   gk_state("queued-again");
   r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&none, 8, SHAPE_PRIVATE_CALL);

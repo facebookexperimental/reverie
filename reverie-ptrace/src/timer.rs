@@ -3080,7 +3080,7 @@ impl TimerImpl {
         if sender != 0 && sender != controller {
             return Ok(false);
         }
-        // This runs while handle_signal owns the tracee's actual stop, before
+        // This runs while accept_signal owns the tracee's actual stop, before
         // any resumption. A task visible to this ptracer is in the same PID
         // namespace or a descendant. Linux translates an ancestor's tgkill
         // sender to zero; a positive numerical match alone is insufficient
@@ -3204,8 +3204,9 @@ impl TimerImpl {
     /// See [`Timer::accept_signal`].
     fn accept_signal(&mut self, task: Stopped) -> Result<Stopped, HandleFailure> {
         self.recheck_kept_programming();
-        // From libc 0.2.190 `siginfo_t` is not `Send`, so it must not be
-        // alive at the `.await` below; this block owns it.
+        // From libc 0.2.190 `siginfo_t` is not `Send`; this block owns it, so
+        // that it is gone before the caller awaits the delivery's steps
+        // (`deliver_accepted`).
         let controller = {
             let signal = task.getsiginfo()?;
             #[cfg(test)]
@@ -8552,7 +8553,7 @@ mod tests {
                 "{detail}"
             );
         };
-        // A late notification: consumed as `handle_signal` does, then the
+        // A late notification: consumed as `accept_signal` does, then the
         // counter disabled for stepping as `deliver` does.
         let (point, target) = overflow(&mut timer);
         let notification = take_timer_signal().expect("the counter overflowed");

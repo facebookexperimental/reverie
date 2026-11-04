@@ -4540,6 +4540,13 @@ thread_local! {
     /// for the tests of what such a filter does there. Per thread, as above.
     pub(crate) static FORCE_SYSCALL_STOPS_FOR_TEST: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+
+    /// Admits no injection to run between syscall stops
+    /// (`syscall_stops_admitted`), so that every private-page injection is
+    /// single-stepped, as one in a signal callback or with a signal held is,
+    /// for the tests of the stepped path. Per thread, as above.
+    pub(crate) static NO_SYSCALL_STOPS_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Test-only: the private-page injections of `nr` made by `syscall_stops`
@@ -11996,6 +12003,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         // held. Decided before the step-only reads below, which such an
         // injection has no trap for.
         self.syscall_stop_injection = None;
+        // An absorb is decided for this injection's step alone
+        // (`read_sigtrap_before_injection`); none is left over from an
+        // earlier injection that ended before its step did.
+        self.absorbing_sigtrap = None;
         let syscall_stops = self.syscall_stops_admitted(nr, &args);
         // What the step's trap can reset of SIGTRAP's state, read before the
         // registers change (`sigtrap_state`). The reads and the repair make
@@ -13986,6 +13997,10 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///
     /// Every other injection is single-stepped as before.
     fn syscall_stops_admitted(&self, nr: Sysno, args: &SyscallArgs) -> bool {
+        #[cfg(test)]
+        if NO_SYSCALL_STOPS_FOR_TEST.with(|none| none.get()) {
+            return false;
+        }
         if !cfg!(target_arch = "x86_64")
             || step_kind(nr, injection_swaps_signal_mask(nr, args)) != StepKind::SwapsMask
             || self.in_signal_callback
