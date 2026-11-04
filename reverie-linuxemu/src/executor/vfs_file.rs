@@ -28,11 +28,11 @@ use std::os::unix::io::FromRawFd;
 pub trait FileDescription: std::fmt::Debug + Send + Sync {
     /// Host descriptor backing this description, if it has one.
     fn raw_fd(&self) -> Option<i32>;
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize>;
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64>;
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+    fn write(&self, buf: &[u8]) -> std::io::Result<usize>;
+    fn seek(&self, pos: SeekFrom) -> std::io::Result<u64>;
     /// Bytes readable without blocking (FIONREAD), where the kind has them.
-    fn available(&mut self) -> std::io::Result<i32> {
+    fn available(&self) -> std::io::Result<i32> {
         Err(std::io::Error::from_raw_os_error(libc::ENOTTY))
     }
 }
@@ -57,14 +57,14 @@ impl FileDescription for HostDescription {
     fn raw_fd(&self) -> Option<i32> {
         Some(self.file.as_raw_fd())
     }
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.file.read(buf)
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.file).read(buf)
     }
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file.write(buf)
+    fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.file).write(buf)
     }
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.file.seek(pos)
+    fn seek(&self, pos: SeekFrom) -> std::io::Result<u64> {
+        (&self.file).seek(pos)
     }
 }
 
@@ -84,7 +84,7 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let mut desc: Box<dyn FileDescription> = Box::new(HostDescription::new(file));
+        let desc: Box<dyn FileDescription> = Box::new(HostDescription::new(file));
         assert!(desc.raw_fd().is_some_and(|fd| fd >= 0));
         assert_eq!(desc.write(b"hello").unwrap(), 5);
         assert_eq!(desc.seek(SeekFrom::Start(0)).unwrap(), 0);
@@ -97,7 +97,7 @@ mod tests {
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer.write_all(b"abc").unwrap();
         let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
-        let mut desc = PipeDescription::new(file);
+        let desc = PipeDescription::new(file);
         assert_eq!(desc.available().unwrap(), 3);
         assert_eq!(
             desc.seek(SeekFrom::Start(0)).unwrap_err().raw_os_error(),
@@ -114,7 +114,7 @@ mod tests {
         let mut writer = b;
         writer.write_all(b"xy").unwrap();
         let file = std::fs::File::from(std::os::fd::OwnedFd::from(a));
-        let mut desc = SocketDescription::new(file);
+        let desc = SocketDescription::new(file);
         assert_eq!(desc.available().unwrap(), 2);
         assert_eq!(
             desc.seek(SeekFrom::Start(0)).unwrap_err().raw_os_error(),
@@ -132,7 +132,7 @@ mod tests {
         assert!(fd >= 0);
         // SAFETY: fd is a fresh epoll descriptor owned here.
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let mut desc = EpollDescription::new(file);
+        let desc = EpollDescription::new(file);
         let mut buf = [0u8; 1];
         assert_eq!(
             desc.read(&mut buf).unwrap_err().raw_os_error(),
@@ -161,16 +161,16 @@ impl FileDescription for PipeDescription {
     fn raw_fd(&self) -> Option<i32> {
         Some(self.file.as_raw_fd())
     }
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.file.read(buf)
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.file).read(buf)
     }
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file.write(buf)
+    fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.file).write(buf)
     }
-    fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+    fn seek(&self, _pos: SeekFrom) -> std::io::Result<u64> {
         Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
     }
-    fn available(&mut self) -> std::io::Result<i32> {
+    fn available(&self) -> std::io::Result<i32> {
         let mut count: libc::c_int = 0;
         // SAFETY: count is supervisor storage for one int; the descriptor is live.
         if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::FIONREAD, &mut count) } != 0 {
@@ -196,16 +196,16 @@ impl FileDescription for SocketDescription {
     fn raw_fd(&self) -> Option<i32> {
         Some(self.file.as_raw_fd())
     }
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.file.read(buf)
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.file).read(buf)
     }
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file.write(buf)
+    fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.file).write(buf)
     }
-    fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+    fn seek(&self, _pos: SeekFrom) -> std::io::Result<u64> {
         Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
     }
-    fn available(&mut self) -> std::io::Result<i32> {
+    fn available(&self) -> std::io::Result<i32> {
         let mut count: libc::c_int = 0;
         // SAFETY: count is supervisor storage for one int; the descriptor is live.
         if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::FIONREAD, &mut count) } != 0 {
@@ -233,13 +233,13 @@ impl FileDescription for EpollDescription {
     fn raw_fd(&self) -> Option<i32> {
         Some(self.file.as_raw_fd())
     }
-    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
         Err(std::io::Error::from_raw_os_error(libc::EINVAL))
     }
-    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&self, _buf: &[u8]) -> std::io::Result<usize> {
         Err(std::io::Error::from_raw_os_error(libc::EINVAL))
     }
-    fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+    fn seek(&self, _pos: SeekFrom) -> std::io::Result<u64> {
         Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
     }
 }

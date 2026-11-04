@@ -2051,8 +2051,8 @@ pub(super) fn pipe_fionread<M: GuestMemoryAccess<Error = crate::Error>>(
     // (a dup sharing the pipe; FIONREAD consumes nothing).
     let count = match host_description(state, guest_fd) {
         Some(host) => {
-            let mut pipe = super::vfs_file::PipeDescription::new(host.into_file());
-            match super::vfs_file::FileDescription::available(&mut pipe) {
+            let pipe = super::vfs_file::PipeDescription::new(host.into_file());
+            match super::vfs_file::FileDescription::available(&pipe) {
                 Ok(count) => count,
                 Err(error) => return io_error(error),
             }
