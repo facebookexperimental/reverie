@@ -2047,12 +2047,27 @@ pub(super) fn pipe_fionread<M: GuestMemoryAccess<Error = crate::Error>>(
             }
         }
     }
-    let mut count: libc::c_int = 0;
-    // SAFETY: count is supervisor storage for one int. The kernel observes the
-    // actual pipe under its own mutex without consuming any queued bytes.
-    if unsafe { libc::ioctl(host_fd, libc::FIONREAD, &mut count) } != 0 {
-        return io_error(std::io::Error::last_os_error());
-    }
+    // R2 slice 3: the readable count comes through the pipe description
+    // (a dup sharing the pipe; FIONREAD consumes nothing).
+    let count = match host_description(state, guest_fd) {
+        Some(host) => {
+            let mut pipe = super::vfs_file::PipeDescription::new(host.into_file());
+            match super::vfs_file::FileDescription::available(&mut pipe) {
+                Ok(count) => count,
+                Err(error) => return io_error(error),
+            }
+        }
+        None => {
+            let mut count: libc::c_int = 0;
+            // SAFETY: count is supervisor storage for one int. The kernel
+            // observes the actual pipe under its own mutex without
+            // consuming any queued bytes.
+            if unsafe { libc::ioctl(host_fd, libc::FIONREAD, &mut count) } != 0 {
+                return io_error(std::io::Error::last_os_error());
+            }
+            count
+        }
+    };
     if memory.put_user_i32(address, count).is_err() {
         return negative_errno(libc::EFAULT);
     }
