@@ -5366,11 +5366,6 @@ mod tests {
                 synthetic_proc_content(&state, path.as_bytes()).is_none(),
                 "{path}"
             );
-            assert_eq!(
-                synthetic_proc_path_for_inode(synthetic_proc_inode(path.as_bytes())),
-                None,
-                "{path}"
-            );
             // The real-procfs backstop refuses it, as it refuses every other
             // unlisted /proc path.
             assert_eq!(
@@ -19606,8 +19601,39 @@ mod tests {
         assert_eq!(guest_fd_path(&state, b"/dev/fd/not-a-fd"), None);
     }
 
+    /// readlink of `path`, a procfs link of the guest's own that a Tool
+    /// answers (`reverie::Guest::link_path`), is refused as any procfs link
+    /// of the supervisor is: EACCES where the supervisor's own procfs has
+    /// the name, ENOENT where it does not, and nothing written.
+    fn assert_proc_link_left_to_the_tool(
+        memory: &mut GuestMemory,
+        state: &mut LoadedStaticElf,
+        path: &str,
+    ) {
+        const PATH: u64 = 0x100;
+        const OUTPUT: u64 = 0x400;
+        write_c_string(memory, PATH, path);
+        memory.write(OUTPUT, &[0xa5; 64]).unwrap();
+        for (number, args) in [
+            (libc::SYS_readlink, [PATH, OUTPUT, 64, 0, 0, 0]),
+            (
+                libc::SYS_readlinkat,
+                [libc::AT_FDCWD as u64, PATH, OUTPUT, 64, 0, 0],
+            ),
+        ] {
+            let result = syscall_result(memory, state, number, args);
+            assert!(
+                result == negative_errno(libc::EACCES) || result == negative_errno(libc::ENOENT),
+                "{path}: {result}"
+            );
+        }
+        let mut output = [0; 64];
+        memory.read(OUTPUT, &mut output).unwrap();
+        assert_eq!(output, [0xa5; 64], "{path}");
+    }
+
     #[test]
-    fn guest_proc_fd_links_and_readlinkat_are_guest_owned() {
+    fn guest_readlinkat_is_guest_owned_and_its_proc_links_are_the_tools() {
         const PATH: u64 = 0x100;
         const OUTPUT: u64 = 0x400;
         const PIPE_FDS: u64 = 0x800;
@@ -19623,46 +19649,22 @@ mod tests {
             .insert(9, std::fs::File::open(&payload).unwrap());
         let mut memory = GuestMemory::new(0, 0x2000).unwrap();
 
-        write_c_string(&mut memory, PATH, "/proc/1/fd/9");
-        let expected = payload.as_os_str().as_bytes();
-        let count = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_readlink,
-            [PATH, OUTPUT, 4096, 0, 0, 0],
-        );
-        assert_eq!(count, expected.len() as i64);
-        let mut actual = vec![0; count as usize];
-        memory.read(OUTPUT, &mut actual).unwrap();
-        assert_eq!(actual, expected);
-
-        // readlinkat returns a truncated byte count and never appends a NUL.
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_readlinkat,
-                [libc::AT_FDCWD as u64, PATH, OUTPUT, 4, 0, 0],
-            ),
-            4
-        );
-        let mut prefix = [0; 4];
-        memory.read(OUTPUT, &mut prefix).unwrap();
-        assert_eq!(&prefix, &expected[..4]);
-
-        // Numeric guest-pid links normalize to the same synthetic process.
-        write_c_string(&mut memory, PATH, "/proc/1/cwd");
-        let count = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_readlinkat,
-            [libc::AT_FDCWD as u64, PATH, OUTPUT, 4096, 0, 0],
-        );
-        let expected_cwd = root.0.as_os_str().as_bytes();
-        assert_eq!(count, expected_cwd.len() as i64);
-        let mut actual = vec![0; count as usize];
-        memory.read(OUTPUT, &mut actual).unwrap();
-        assert_eq!(actual, expected_cwd);
+        // The guest's own descriptor, working-directory and root links, by
+        // every spelling, are a Tool's to answer from `link_path` (whose
+        // answers facts.rs's `link_path` tests check): the executor answers
+        // none of them.
+        for path in [
+            "/proc/1/fd/9",
+            "/proc/self/fd/9",
+            "/proc/thread-self/fd/9",
+            "/dev/fd/9",
+            "/proc/self/cwd",
+            "/proc/1/cwd",
+            "/proc/self/root",
+            "/proc/1/root",
+        ] {
+            assert_proc_link_left_to_the_tool(&mut memory, &mut state, path);
+        }
 
         // Relative readlinkat resolves against the guest cwd descriptor.
         write_c_string(&mut memory, PATH, "link");
@@ -19719,21 +19721,12 @@ mod tests {
             0
         );
 
-        // A synthetic proc descriptor links back to its guest-visible proc
-        // path, never to the implementation's memfd backing file.
+        // A synthetic proc descriptor's link is the Tool's too (Hermit's
+        // Detcore names it from its record of the open), never the
+        // implementation's memfd backing file.
         let proc_fd = open_readonly(&mut memory, &mut state, "/proc/self/status");
         assert_eq!(proc_fd, 3);
-        write_c_string(&mut memory, PATH, "/proc/self/fd/3");
-        let count = syscall_result(
-            &mut memory,
-            &mut state,
-            libc::SYS_readlink,
-            [PATH, OUTPUT, 4096, 0, 0, 0],
-        );
-        assert_eq!(count, b"/proc/1/status".len() as i64);
-        let mut actual = vec![0; count as usize];
-        memory.read(OUTPUT, &mut actual).unwrap();
-        assert_eq!(actual, b"/proc/1/status");
+        assert_proc_link_left_to_the_tool(&mut memory, &mut state, "/proc/self/fd/3");
         assert_eq!(close(&mut state, proc_fd as u64), 0);
 
         // Independent opens of one file must report one target inode, just as
@@ -19765,16 +19758,7 @@ mod tests {
         assert_eq!(close(&mut state, first as u64), 0);
         assert_eq!(close(&mut state, second as u64), 0);
 
-        write_c_string(&mut memory, PATH, "/proc/self/fd/99");
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_readlink,
-                [PATH, OUTPUT, 4096, 0, 0, 0],
-            ),
-            negative_errno(libc::ENOENT)
-        );
+        assert_proc_link_left_to_the_tool(&mut memory, &mut state, "/proc/self/fd/99");
 
         // Ordinary pipe links report the owned kernel object, matching direct
         // fstat. Keep private object bookkeeping separate from visible inodes.
@@ -19840,20 +19824,9 @@ mod tests {
             );
         }
 
-        let mut targets = Vec::new();
         let mut inodes = Vec::new();
         for fd in [pipe_fds[0], pipe_fds[1], duplicate as libc::c_int] {
             write_c_string(&mut memory, PATH, &format!("/proc/self/fd/{fd}"));
-            let count = syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_readlink,
-                [PATH, OUTPUT, 4096, 0, 0, 0],
-            );
-            let mut target = vec![0; count as usize];
-            memory.read(OUTPUT, &mut target).unwrap();
-            targets.push(target);
-
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -19868,28 +19841,12 @@ mod tests {
             inodes.push(stat.st_ino);
         }
 
-        let stable_pipe = format!("pipe:[{}]", inodes[0]);
-        assert!(
-            targets
-                .iter()
-                .all(|target| target == stable_pipe.as_bytes())
-        );
         assert!(inodes.iter().all(|inode| *inode == inodes[0]));
 
         let stable_inode = inodes[0];
         assert_eq!(close(&mut state, pipe_fds[0] as u64), 0);
         for fd in [pipe_fds[1], duplicate as libc::c_int] {
             write_c_string(&mut memory, PATH, &format!("/proc/self/fd/{fd}"));
-            let count = syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_readlink,
-                [PATH, OUTPUT, 4096, 0, 0, 0],
-            );
-            let mut target = vec![0; count as usize];
-            memory.read(OUTPUT, &mut target).unwrap();
-            assert_eq!(target, stable_pipe.as_bytes());
-
             assert_eq!(
                 syscall_result(
                     &mut memory,
@@ -19957,16 +19914,6 @@ mod tests {
             let stat: libc::stat = read_struct(&memory, STAT);
             assert_pipe_stat_identity(&mut memory, &mut state, fd, &stat);
             assert_eq!(stat.st_ino, stable_inode);
-            let count = syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_readlink,
-                [PATH, OUTPUT, 4096, 0, 0, 0],
-            );
-            assert_eq!(count, stable_pipe.len() as i64);
-            let mut target = vec![0; count as usize];
-            memory.read(OUTPUT, &mut target).unwrap();
-            assert_eq!(target, stable_pipe.as_bytes());
         }
         let mut new_inodes = Vec::new();
         for fd in second_pipe_fds {
@@ -19987,17 +19934,6 @@ mod tests {
                 "descriptor reuse must expose a distinct live pipe object"
             );
             new_inodes.push(stat.st_ino);
-            let count = syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_readlink,
-                [PATH, OUTPUT, 4096, 0, 0, 0],
-            );
-            let expected = format!("pipe:[{}]", stat.st_ino);
-            assert_eq!(count, expected.len() as i64);
-            let mut target = vec![0; count as usize];
-            memory.read(OUTPUT, &mut target).unwrap();
-            assert_eq!(target, expected.as_bytes());
         }
         assert_eq!(new_inodes[0], new_inodes[1]);
     }
@@ -23063,8 +22999,11 @@ mod tests {
         );
     }
 
+    // The links of these descriptors are the Tool's: facts.rs's
+    // `each_kind_of_descriptor_is_named_as_linux_names_it` checks that
+    // `link_path` names them by the inode their `fstat` gives.
     #[test]
-    fn anonymous_proc_fd_links_match_direct_owned_object_stat() {
+    fn anonymous_proc_fd_stats_match_direct_owned_object_stat() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 0x4000).unwrap();
@@ -23088,25 +23027,18 @@ mod tests {
             for fd in fds {
                 let stat = assert_descriptor_stat_routes(&mut memory, &mut state, fd, None);
                 let native = file_identity_stat(state.files.get(&fd).unwrap()).unwrap();
-                assert_eq!((stat.st_dev, stat.st_ino), (native.st_dev, native.st_ino));
-                let expected = format!("{kind}:[{}]", native.st_ino).into_bytes();
-                write_c_string(&mut memory, 0x100, &format!("/proc/self/fd/{fd}"));
-                for capacity in [3, 256] {
-                    let count = syscall_result(
-                        &mut memory,
-                        &mut state,
-                        libc::SYS_readlink,
-                        [0x100, 0x2000, capacity, 0, 0, 0],
-                    );
-                    assert_eq!(count as usize, expected.len().min(capacity as usize));
-                    let mut bytes = vec![0; count as usize];
-                    memory.read(0x2000, &mut bytes).unwrap();
-                    assert_eq!(bytes, expected[..count as usize]);
-                }
+                assert_eq!(
+                    (stat.st_dev, stat.st_ino),
+                    (native.st_dev, native.st_ino),
+                    "{kind}"
+                );
             }
         }
     }
 
+    // The link of a captured stream is the Tool's: facts.rs's
+    // `captured_output_is_its_own_pipe_and_the_supervisors_is_not_provided`
+    // checks that `link_path` names it as the pipe its `fstat` describes.
     #[test]
     fn captured_output_stat_and_link_routes_preserve_the_capture_sink() {
         let mut output = CapturedOutput::default();
@@ -23137,18 +23069,6 @@ mod tests {
                 (identity.device, identity.inode)
             );
             write_c_string(&mut memory, 0x100, &format!("/proc/self/fd/{fd}"));
-            let expected = format!("pipe:[{}]", captured.st_ino).into_bytes();
-            let count = metadata_call(
-                &mut memory,
-                &mut state,
-                Some(&mut output),
-                libc::SYS_readlinkat,
-                [libc::AT_FDCWD as u64, 0x100, 0x2000, 256, 0, 0],
-            );
-            assert_eq!(count as usize, expected.len());
-            let mut target = vec![0; count as usize];
-            memory.read(0x2000, &mut target).unwrap();
-            assert_eq!(target, expected);
             assert_eq!(
                 metadata_call(
                     &mut memory,
@@ -31326,7 +31246,6 @@ mod tests {
         const TIMEVAL: u64 = 0x380;
         const TIMESPEC: u64 = 0x400;
         const PATH: u64 = 0x480;
-        const LINK: u64 = 0x580;
         const INFO: u64 = 0x680;
 
         let root = TestDir::new();
@@ -31656,21 +31575,11 @@ mod tests {
         );
         assert_eq!(state.mmap_next, mmap_next);
 
+        // Its link is the Tool's (`link_path` names it
+        // `anon_inode:[signalfd]`: facts.rs's
+        // `each_kind_of_descriptor_is_named_as_linux_names_it`).
         let path = format!("/proc/self/fd/{alias}\0");
         memory.write(PATH, path.as_bytes()).unwrap();
-        let target = b"anon_inode:[signalfd]";
-        assert_eq!(
-            syscall_result(
-                &mut memory,
-                &mut state,
-                libc::SYS_readlink,
-                [PATH, LINK, 64, 0, 0, 0],
-            ),
-            target.len() as i64,
-        );
-        let mut observed_target = vec![0; target.len()];
-        memory.read(LINK, &mut observed_target).unwrap();
-        assert_eq!(observed_target, target);
         let file_count = state.files.len();
         assert_eq!(
             syscall_result(
@@ -43351,7 +43260,7 @@ mod tests {
             write_c_string(&mut memory, 0x100, &path);
             memory.write(0x1000, &[0xa5; 64]).unwrap();
             assert_eq!(
-                readlink_at_impl(&mut memory, &state, libc::AT_FDCWD, 0x100, 0x1000, 64, None),
+                readlink_at_impl(&mut memory, &state, libc::AT_FDCWD, 0x100, 0x1000, 64),
                 negative_errno(libc::EACCES),
                 "{path}"
             );
@@ -43367,15 +43276,7 @@ mod tests {
             let mut memory = GuestMemory::new(0, 8192).unwrap();
             memory.write(0x100, b"/proc/self/exe\0").unwrap();
             memory.write(0x1000, &[0xa5; 4096]).unwrap();
-            let count = readlink_at_impl(
-                &mut memory,
-                state,
-                libc::AT_FDCWD,
-                0x100,
-                0x1000,
-                4096,
-                None,
-            );
+            let count = readlink_at_impl(&mut memory, state, libc::AT_FDCWD, 0x100, 0x1000, 4096);
             assert!((0..4096).contains(&count));
             let mut output = [0; 4096];
             memory.read(0x1000, &mut output).unwrap();

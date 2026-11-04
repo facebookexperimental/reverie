@@ -4388,16 +4388,19 @@ mod tests {
             memory
                 .write(0x100, format!("/proc/self/fd/{fd}\0").as_bytes())
                 .unwrap();
+            // Its link is the Tool's (Hermit's Detcore names it from its
+            // record of the open): the executor answers it as it answers any
+            // procfs link of the supervisor.
             let length = call(
                 &mut child,
                 &memory,
                 libc::SYS_readlink,
                 [0x100, 0x400, 64, 0, 0, 0],
             );
-            assert!(length > 0);
-            let mut target = vec![0; length as usize];
-            memory.read(0x400, &mut target).unwrap();
-            assert_eq!(target, b"/proc/6/status", "{name}");
+            assert!(
+                length == -i64::from(libc::EACCES) || length == -i64::from(libc::ENOENT),
+                "{name}: {length}"
+            );
             // The empty backing memfd is never content: kernel transfers and
             // mappings are refused, and an invalid output keeps its EBADF.
             assert_eq!(
@@ -4695,16 +4698,18 @@ mod tests {
                 format!("/proc/self/fd/{received_status}\0").as_bytes(),
             )
             .unwrap();
+        // Its link is the Tool's, as for every descriptor (Hermit's Detcore
+        // refuses a received one by name, having no record of its open).
         let length = call(
             &mut child,
             &memory,
             libc::SYS_readlink,
             [0x100, 0x400, 64, 0, 0, 0],
         );
-        assert!(length > 0);
-        let mut target = vec![0; length as usize];
-        memory.read(0x400, &mut target).unwrap();
-        assert_eq!(target, b"/proc/7/status");
+        assert!(
+            length == -i64::from(libc::EACCES) || length == -i64::from(libc::ENOENT),
+            "{length}"
+        );
         assert_eq!(
             call(
                 &mut child,

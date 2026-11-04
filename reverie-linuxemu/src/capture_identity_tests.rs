@@ -89,18 +89,9 @@ fn captured_output_identity_matches_pipefs_and_preserves_proc_symlinks() {
             )
         );
         assert_eq!(linkx.stx_mode & libc::S_IFMT as u16, libc::S_IFLNK as u16);
-        let expected = format!("pipe:[{}]", captured.st_ino);
-        let count = metadata_call(
-            &mut memory,
-            &mut state,
-            Some(&mut output),
-            libc::SYS_readlink,
-            [0x100, 0x2000, 256, 0, 0, 0],
-        );
-        assert_eq!(count as usize, expected.len());
-        let mut bytes = vec![0; count as usize];
-        memory.read(0x2000, &mut bytes).unwrap();
-        assert_eq!(bytes, expected.as_bytes());
+        // The link's target is the Tool's: `link_path` names it as the pipe
+        // its `fstat` describes (facts.rs's
+        // `captured_output_is_its_own_pipe_and_the_supervisors_is_not_provided`).
     }
     assert_ne!(captured_inodes[0], captured_inodes[1]);
 }

@@ -844,10 +844,10 @@ fn execute_basic_syscall_inner(
     } else if number == libc::SYS_time as u64 {
         time(&mut ProviderMemory(memory), args)
     } else if number == libc::SYS_readlink as u64 {
-        readlink(memory, state, args, capture_metadata)
+        readlink(memory, state, args)
     } else if number == libc::SYS_readlinkat as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        readlinkat(memory, state, args, capture_metadata)
+        readlinkat(memory, state, args)
     } else if number == libc::SYS_personality as u64 {
         // AUTONOMOUS-BOT-IMPLEMENTED
         personality(state, args[0])

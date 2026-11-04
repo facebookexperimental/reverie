@@ -39,7 +39,6 @@ pub struct FileTableState {
 #[derive(Debug)]
 pub struct FdinfoDescription {
     pub(super) source: SeqProcSource,
-    pub(super) path: Vec<u8>,
     pub(super) nofollow_status: bool,
     pub(super) sequence: Mutex<crate::fdinfo::FdinfoSequence>,
 }

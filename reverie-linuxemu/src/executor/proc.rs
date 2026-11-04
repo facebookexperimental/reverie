@@ -176,12 +176,6 @@ impl ProcessProcFile {
             _ => None,
         }
     }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Status => "status",
-        }
-    }
 }
 
 /// The process cells rendered into `/proc/<pid>/status`. The parent
@@ -356,7 +350,6 @@ pub(super) fn open_process_proc(
             file,
             view: ProcessProcView::of(state),
         },
-        path: format!("/proc/{}/{}", state.pid, file.name()).into_bytes(),
         // open_synthetic_proc records guest O_NOFOLLOW for this descriptor.
         nofollow_status: false,
         sequence: Mutex::default(),
@@ -491,6 +484,9 @@ pub(super) const SYNTHETIC_GUEST_FD_DEV_MINOR: u32 = 0xff02;
 // fdinfo opener (open_fdinfo, its path classification and its stat
 // answers), which read the supervisor's fdinfo of the guest's descriptor and
 // rewrote its flags, and carried no marker.
+// Only tests read this table since the descriptor link arm of readlink went
+// (file.rs `readlink_at_impl`): the paths `synthetic_proc_content` serves.
+#[cfg(test)]
 pub(super) const SYNTHETIC_REGULAR_PROC_PATHS: &[&[u8]] =
     &[b"/proc/self/status", b"/proc/self/maps"];
 
@@ -508,14 +504,6 @@ pub(super) fn synthetic_proc_inode(path: &[u8]) -> u64 {
     }
     // Keep clear of low, conventionally-reserved inode numbers.
     hash | 0x1000
-}
-
-// TODO-HUMAN-REVIEW(PR-136): Review synthetic procfd link reconstruction.
-pub(super) fn synthetic_proc_path_for_inode(inode: u64) -> Option<&'static [u8]> {
-    SYNTHETIC_REGULAR_PROC_PATHS
-        .iter()
-        .copied()
-        .find(|path| synthetic_proc_inode(path) == inode)
 }
 
 fn parse_proc_id(component: &[u8]) -> Option<i32> {

@@ -588,52 +588,6 @@ pub(super) fn guest_fd_metadata(
     }))
 }
 
-// TODO-HUMAN-REVIEW(PR-136): Review guest descriptor link-target sanitization.
-fn guest_fd_link_target(
-    state: &LoadedStaticElf,
-    guest_fd: libc::c_int,
-    capture: Option<CaptureMetadata>,
-) -> Result<Vec<u8>, i64> {
-    if let (Some(capture), Some(alias)) = (capture, output_alias(state, guest_fd)) {
-        return Ok(format!("pipe:[{}]", capture.identity(alias).inode).into_bytes());
-    }
-    let Some(host_fd) = host_fd(state, guest_fd) else {
-        return Err(negative_errno(libc::ENOENT));
-    };
-    if let Some(description) = state.fdinfo_files.get(&guest_fd) {
-        return Ok(description.path.clone());
-    }
-    if signalfd_mask(state, guest_fd).is_some() {
-        return Ok(b"anon_inode:[signalfd]".to_vec());
-    }
-    if let Some(&inode) = state.proc_files.get(&guest_fd)
-        && let Some(path) = synthetic_proc_path_for_inode(inode)
-    {
-        if let Some(suffix) = path.strip_prefix(b"/proc/self/") {
-            let mut numeric = format!("/proc/{}/", state.pid).into_bytes();
-            numeric.extend_from_slice(suffix);
-            return Ok(numeric);
-        }
-        return Ok(path.to_vec());
-    }
-    let target = canonical_fd_path(host_fd)?;
-    let target = target.as_os_str().as_bytes();
-
-    // A followed proc-fd path names the same object as fstat. Keep anonymous
-    // link targets consistent with that object's identity as well.
-    for kind in ["pipe", "socket"] {
-        let prefix = format!("{kind}:[");
-        if target.starts_with(prefix.as_bytes()) && target.ends_with(b"]") {
-            return Ok(format!(
-                "{kind}:[{}]",
-                guest_object_stat(state, guest_fd, capture)?.st_ino
-            )
-            .into_bytes());
-        }
-    }
-    Ok(target.to_vec())
-}
-
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-92): Review guest /dev/fd duplication without supervisor procfs exposure.
 // TODO-HUMAN-REVIEW(PR-114): Review fresh open-file-description semantics.
@@ -2360,21 +2314,8 @@ pub(super) fn arch_prctl(
 }
 
 // TODO-HUMAN-REVIEW(PR-136): Review shared readlink guest path handling.
-pub(super) fn readlink(
-    memory: &mut GuestMemory,
-    state: &LoadedStaticElf,
-    args: &[u64; 6],
-    capture: Option<CaptureMetadata>,
-) -> i64 {
-    readlink_at_impl(
-        memory,
-        state,
-        libc::AT_FDCWD,
-        args[0],
-        args[1],
-        args[2],
-        capture,
-    )
+pub(super) fn readlink(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
+    readlink_at_impl(memory, state, libc::AT_FDCWD, args[0], args[1], args[2])
 }
 
 // TODO-HUMAN-REVIEW(PR-136): Review readlinkat guest-dirfd and procfd semantics.
@@ -2382,7 +2323,6 @@ pub(super) fn readlinkat(
     memory: &mut GuestMemory,
     state: &LoadedStaticElf,
     args: &[u64; 6],
-    capture: Option<CaptureMetadata>,
 ) -> i64 {
     readlink_at_impl(
         memory,
@@ -2391,11 +2331,28 @@ pub(super) fn readlinkat(
         args[1],
         args[2],
         args[3],
-        capture,
     )
 }
 
 // TODO-HUMAN-REVIEW(PR-136): Review shared readlinkat implementation semantics.
+//
+// The guest's own descriptor, working-directory and root links
+// (`/proc/self/fd/<n>` and its `/dev/fd/<n>`, `/proc/thread-self/fd/<n>` and
+// `/proc/<pid>/fd/<n>` spellings, `/proc/self/cwd`, `/proc/self/root`) are a
+// Tool's to answer: the backend gives a Tool what they need
+// (`reverie::Guest::link_path`), and Hermit's Detcore answers every spelling
+// of them before this executor sees it. Without such a Tool they are refused
+// as any procfs link of the supervisor is (EACCES, below). The executor's own
+// copies were the descriptor arm, through `guest_fd_link_target`, which named
+// a descriptor's file from the supervisor's own `/proc/self/fd/<host fd>` and
+// rewrote its pipe and socket inodes, and carried TODO-HUMAN-REVIEW(PR-136)
+// (guest descriptor link-target sanitization), with
+// `synthetic_proc_path_for_inode` (proc.rs), which named this executor's own
+// synthetic `/proc` files for it and carried TODO-HUMAN-REVIEW(PR-136)
+// (synthetic procfd link reconstruction); and the `/proc/self/cwd` arm, which
+// answered the path the last chdir set, and the `/proc/self/root` arm, which
+// answered `/`. The `exe` arm stays: another process's `exe`
+// (https://github.com/rrnewton/hermit/issues/4564).
 pub(super) fn readlink_at_impl(
     memory: &mut GuestMemory,
     state: &LoadedStaticElf,
@@ -2403,7 +2360,6 @@ pub(super) fn readlink_at_impl(
     path_address: u64,
     output_address: u64,
     raw_capacity: u64,
-    capture: Option<CaptureMetadata>,
 ) -> i64 {
     let path = match read_c_string(&ProviderMemory(memory), path_address, 4096) {
         Ok(path) => path,
@@ -2417,19 +2373,6 @@ pub(super) fn readlink_at_impl(
     }
     let capacity = requested_capacity.min(MAX_HOST_IO);
 
-    if let Some(guest_fd) = guest_fd_path(state, &path) {
-        let target = match guest_fd_link_target(state, guest_fd, capture) {
-            Ok(target) => target,
-            Err(error) => return error,
-        };
-        let count = capacity.min(target.len());
-        return match memory.user().write(output_address, &target[..count]) {
-            Ok(()) => count as i64,
-            Err(_) => negative_errno(libc::EFAULT),
-        };
-    }
-
-    let normalized = normalize_proc_path(state, &path);
     let executable_target = match guest_proc_exe_path(state, &path) {
         Some(true) => match state.executable_file.as_ref() {
             Some(file) => match canonical_fd_path(file.as_raw_fd()) {
@@ -2441,28 +2384,15 @@ pub(super) fn readlink_at_impl(
         Some(false) => return negative_errno(libc::ENOENT),
         None => None,
     };
-    let proc_link_target: Option<&[u8]> = if let Some(target) = executable_target.as_deref() {
-        Some(target)
-    } else {
-        match normalized.as_deref() {
-            Some(b"/proc/self/cwd") => Some(state.cwd.as_os_str().as_bytes()),
-            Some(b"/proc/self/root") => Some(b"/"),
-            _ => None,
-        }
-    };
-    if let Some(target) = proc_link_target {
+    if let Some(target) = executable_target {
         let count = capacity.min(target.len());
-        let copied = if executable_target.is_some() {
-            memory.user().copy_to_user(output_address, &target[..count])
-        } else {
-            memory.user().write(output_address, &target[..count])
-        };
-        return match copied {
+        return match memory.user().copy_to_user(output_address, &target[..count]) {
             Ok(()) => count as i64,
             Err(_) => negative_errno(libc::EFAULT),
         };
     }
-    // Any other procfs link, `/proc/self` included, is the supervisor's, not
+    // Any other procfs link, `/proc/self` and the guest's own descriptor,
+    // working-directory and root links included, is the supervisor's, not
     // the guest's: open_metadata_path refuses it with EACCES. The Tool
     // decides the guest's links (Detcore renders `/proc/self` itself).
     let opened_file;
