@@ -268,6 +268,10 @@ pub struct Runner {
     wall_budget: Duration,
     #[cfg(test)]
     cgroup_parent: Option<PathBuf>,
+    /// Every command cgroup this Runner created, so a test can check its own
+    /// were removed without seeing a concurrent test's.
+    #[cfg(test)]
+    created_cgroups: Vec<PathBuf>,
 }
 
 impl Runner {
@@ -287,6 +291,8 @@ impl Runner {
             wall_budget: budget,
             #[cfg(test)]
             cgroup_parent: None,
+            #[cfg(test)]
+            created_cgroups: Vec::new(),
         })
     }
 
@@ -356,6 +362,10 @@ impl Runner {
             ),
             None => None,
         };
+        #[cfg(test)]
+        if let Some(cgroup) = &cgroup {
+            self.created_cgroups.push(cgroup.path.clone());
+        }
         self.serial += 1;
         let prefix = self.logs.join(format!("{:04}", self.serial));
         let mut command = Command::new(program);
@@ -390,18 +400,18 @@ impl Runner {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
-                let enrolled = cgroup.is_some();
-                if let Some(cgroup) = cgroup {
-                    cgroup.remove()?;
-                }
-                return Err(if enrolled {
-                    format!(
-                        "{program} not started: producer CPU accounting unavailable: \
-                         enrollment or spawn failed: {e}"
-                    )
-                } else {
-                    format!("spawn {program}: {e}")
-                });
+                let Some(cgroup) = cgroup else {
+                    return Err(format!("spawn {program}: {e}"));
+                };
+                let cleanup = cgroup
+                    .remove()
+                    .err()
+                    .map(|failure| format!("; {failure}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "{program} not started: spawn failed, or the command cgroup refused \
+                     enrollment: {e}{cleanup}"
+                ));
             }
         };
         let overflow = Arc::new(AtomicBool::new(false));
@@ -477,30 +487,23 @@ impl Runner {
                     || cpu_exceeded
                     || Instant::now() >= self.deadline)
             {
-                let wall = start.elapsed().as_secs_f64();
+                let wall = start.elapsed();
                 bounds_failure = Some(if overflow.load(Ordering::Acquire) {
-                    byte_limit_description.to_owned()
+                    format!("exceeded {byte_limit_description}")
                 } else if let Some(e) = accounting_failure {
-                    format!("producer CPU accounting failed ({e}); killed")
+                    format!("killed: producer CPU accounting failed ({e})")
                 } else if let Some((used, budget)) = cpu_used.filter(|_| cpu_exceeded) {
-                    format!(
-                        "producer CPU budget (used {:.2} of {:.2} CPU-s, wall {wall:.2} s)",
-                        used.as_secs_f64(),
-                        budget.as_secs_f64()
-                    )
+                    cpu_budget_failure(used, budget, wall)
                 } else {
-                    match cpu_used {
-                        Some((used, _)) => format!(
-                            "producer wall deadline ({} s wall backstop for this producer run; \
-                             CPU used {:.2} CPU-s)",
-                            self.wall_budget.as_secs(),
-                            used.as_secs_f64()
-                        ),
-                        None => format!(
-                            "producer wall deadline ({} s wall backstop for this producer run)",
-                            self.wall_budget.as_secs()
-                        ),
-                    }
+                    let cpu = cpu_used
+                        .map(|(used, _)| format!(", CPU used {:.2} CPU-s", used.as_secs_f64()))
+                        .unwrap_or_default();
+                    format!(
+                        "exceeded the producer wall deadline ({} s wall backstop for this \
+                         producer run; command wall {:.2} s{cpu})",
+                        self.wall_budget.as_secs(),
+                        wall.as_secs_f64()
+                    )
                 });
                 if let Some(e) = kill_command(&cgroup) {
                     bounds_failure = Some(format!(
@@ -560,7 +563,7 @@ impl Runner {
             .join()
             .map_err(|_| "stderr reader panicked")??;
         if overflow.load(Ordering::Acquire) {
-            bounds_failure = Some(byte_limit_description.to_owned());
+            bounds_failure = Some(format!("exceeded {byte_limit_description}"));
         }
         let measured_cpu = match cgroup {
             Some(cgroup) => match cgroup.finish() {
@@ -573,6 +576,16 @@ impl Runner {
             },
             None => None,
         };
+        // A command that passed its budget and finished within one poll still
+        // exceeded it.
+        // (A guard rather than a nested `if`: this file is also built as
+        // edition 2024, where clippy asks for a let chain edition 2021 lacks.)
+        match (&bounds_failure, measured_cpu, cpu_budget) {
+            (None, Some(used), Some(budget)) if used > budget => {
+                bounds_failure = Some(cpu_budget_failure(used, budget, start.elapsed()));
+            }
+            _ => {}
+        }
         let stdout_path = prefix.with_extension("stdout");
         let stderr_path = prefix.with_extension("stderr");
         write_new(&stdout_path, &stdout)?;
@@ -595,7 +608,7 @@ impl Runner {
         require(
             bounds_failure.is_none(),
             format!(
-                "{program} exceeded {}; logs {}",
+                "{program} stopped: {}; logs {}",
                 bounds_failure.unwrap_or_default(),
                 prefix.display()
             ),
@@ -659,14 +672,25 @@ fn enroll_in_cgroup(procs: libc::c_int) -> std::io::Result<()> {
 /// command and every process it starts. `cpu.stat` `usage_usec` is the CPU of
 /// the whole tree, including children already reaped and processes that left
 /// the command's process group or session; `cgroup.kill` kills all of them.
-/// The same per-attempt shape as Hermit's nextest CPU wrapper and dagrun's
-/// per-step cgroups.
+/// The same per-attempt shape as a per-test CPU wrapper or a DAG runner's
+/// per-step cgroups. Dropping one that was not finished kills what is left in
+/// it, waits briefly for it to empty and removes it.
 struct CommandCgroup {
     path: PathBuf,
     cpu_stat: fs::File,
     procs: fs::File,
     kill: fs::File,
     events: fs::File,
+    removed: bool,
+}
+
+fn cpu_budget_failure(used: Duration, budget: Duration, wall: Duration) -> String {
+    format!(
+        "exceeded the producer CPU budget (used {:.2} of {:.2} CPU-s, command wall {:.2} s)",
+        used.as_secs_f64(),
+        budget.as_secs_f64(),
+        wall.as_secs_f64()
+    )
 }
 
 impl CommandCgroup {
@@ -710,6 +734,7 @@ impl CommandCgroup {
                 procs: open("cgroup.procs", true)?,
                 kill: open("cgroup.kill", true)?,
                 events: open("cgroup.events", false)?,
+                removed: false,
             };
             require(
                 cgroup.usage()?.is_zero() && !cgroup.populated()?,
@@ -752,8 +777,19 @@ impl CommandCgroup {
 
     /// Kill what is left, wait (bounded) for the cgroup to empty, read the
     /// final CPU and remove the directory.
-    fn finish(self) -> Result<Duration> {
+    fn finish(mut self) -> Result<Duration> {
         self.kill()?;
+        self.wait_empty()?;
+        let used = self.usage()?;
+        self.remove_dir()?;
+        Ok(used)
+    }
+
+    fn remove(mut self) -> Result<()> {
+        self.remove_dir()
+    }
+
+    fn wait_empty(&self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(1);
         while self.populated()? {
             require(
@@ -762,14 +798,25 @@ impl CommandCgroup {
             )?;
             thread::sleep(Duration::from_millis(10));
         }
-        let used = self.usage()?;
-        self.remove()?;
-        Ok(used)
+        Ok(())
     }
 
-    fn remove(self) -> Result<()> {
+    fn remove_dir(&mut self) -> Result<()> {
         fs::remove_dir(&self.path)
-            .map_err(|e| format!("cannot remove command cgroup {}: {e}", self.path.display()))
+            .map_err(|e| format!("cannot remove command cgroup {}: {e}", self.path.display()))?;
+        self.removed = true;
+        Ok(())
+    }
+}
+
+impl Drop for CommandCgroup {
+    fn drop(&mut self) {
+        if !self.removed {
+            // An early return or a panic skipped finish(). Whatever fails
+            // here is left to the enclosing cgroup.
+            let _ = self.kill().and_then(|()| self.wait_empty());
+            let _ = fs::remove_dir(&self.path);
+        }
     }
 }
 
@@ -63177,14 +63224,13 @@ mod runner_cpu_budget_tests {
     /// Short busy work for a child shell: a few tens of milliseconds of CPU.
     const BUSY_CHILD: &str = "i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done";
 
-    fn command_cgroups_left() -> Vec<String> {
-        let parent = current_cgroup_directory().unwrap();
-        let prefix = format!("reverie-producer-{}-", std::process::id());
-        fs::read_dir(parent)
-            .unwrap()
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .filter(|name| name.starts_with(&prefix))
-            .collect()
+    /// This Runner's command cgroups are all gone. Only its own: concurrent
+    /// tests in the same process create theirs beside them.
+    fn assert_own_cgroups_removed(runner: &Runner, expected: usize) {
+        assert_eq!(runner.created_cgroups.len(), expected);
+        for path in &runner.created_cgroups {
+            assert!(!path.exists(), "command cgroup {} was left", path.display());
+        }
     }
 
     fn process_is_gone(pid: u32) -> bool {
@@ -63207,8 +63253,8 @@ mod runner_cpu_budget_tests {
         }
     }
 
-    /// Every shape revopus1 measured escaping /proc accounting must be killed
-    /// by the CPU budget, near the budget, long before the wall backstop.
+    /// Every shape that escapes per-process /proc accounting must be killed by
+    /// the CPU budget, near the budget, long before the wall backstop.
     #[test]
     fn cpu_budget_kills_the_whole_command_tree_near_its_budget() {
         let scratch = Scratch::new("tree");
@@ -63221,7 +63267,9 @@ mod runner_cpu_budget_tests {
             ),
             (
                 "busy grandchildren reaped by an intermediate",
-                format!("sh -c \"while :; do sh -c '{BUSY_CHILD}'; done\""),
+                // `; true` keeps the outer shell from exec'ing the inner one,
+                // so the inner shell is a real intermediate.
+                format!("sh -c \"while :; do sh -c '{BUSY_CHILD}'; done\"; true"),
             ),
             (
                 "a busy setsid escapee",
@@ -63245,7 +63293,7 @@ mod runner_cpu_budget_tests {
                 .expect_err(shape);
             let wall = started.elapsed();
             assert!(
-                error.contains("producer CPU budget (used "),
+                error.contains("stopped: exceeded the producer CPU budget (used "),
                 "{shape}: {error}"
             );
             let used = runner.command_cpu.last().copied().flatten().unwrap();
@@ -63258,6 +63306,7 @@ mod runner_cpu_budget_tests {
                 "{shape}: took {wall:?} of wall"
             );
             assert_eq!(runner.commands.len(), runner.command_cpu.len());
+            assert_own_cgroups_removed(&runner, 1);
         }
         let escapee: u32 = fs::read_to_string(&escapee_pid)
             .unwrap()
@@ -63268,7 +63317,6 @@ mod runner_cpu_budget_tests {
             process_is_gone(escapee),
             "setsid escapee {escapee} survived"
         );
-        assert_eq!(command_cgroups_left(), Vec::<String>::new());
     }
 
     #[test]
@@ -63287,8 +63335,9 @@ mod runner_cpu_budget_tests {
             .unwrap_err();
         assert!(
             error.contains(
-                "producer wall deadline (1 s wall backstop for this producer run; CPU used "
-            ),
+                "stopped: exceeded the producer wall deadline (1 s wall backstop for this \
+                 producer run; command wall "
+            ) && error.contains(", CPU used "),
             "{error}"
         );
         assert!(started.elapsed() < Duration::from_secs(5), "{error}");
@@ -63304,7 +63353,7 @@ mod runner_cpu_budget_tests {
             exhausted.contains("producer wall deadline exhausted (1 s wall backstop"),
             "{exhausted}"
         );
-        assert_eq!(command_cgroups_left(), Vec::<String>::new());
+        assert_own_cgroups_removed(&runner, 1);
     }
 
     #[test]
@@ -63335,11 +63384,16 @@ mod runner_cpu_budget_tests {
         assert_eq!(runner.command_cpu, vec![None]);
     }
 
+    /// CPU of the calling thread, which runs the Runner's poll loop and is
+    /// not shared with concurrent tests.
     fn own_cpu() -> Duration {
         // SAFETY: an all-zero rusage is a valid output buffer for getrusage.
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        // SAFETY: RUSAGE_SELF with a writable buffer.
-        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        // SAFETY: RUSAGE_THREAD with a writable buffer.
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) },
+            0
+        );
         let micros = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
         Duration::from_micros(micros(usage.ru_utime) + micros(usage.ru_stime))
     }
@@ -63387,6 +63441,6 @@ mod runner_cpu_budget_tests {
             !busy_cpu.is_zero() && busy_cpu < Duration::from_secs(30),
             "{busy_cpu:?}"
         );
-        assert_eq!(command_cgroups_left(), Vec::<String>::new());
+        assert_own_cgroups_removed(&runner, 2);
     }
 }
