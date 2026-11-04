@@ -21,6 +21,8 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
+#[cfg(test)]
+use std::os::unix::io::FromRawFd;
 
 /// One open file description: the object shared by dup/fork aliases.
 pub trait FileDescription: std::fmt::Debug + Send + Sync {
@@ -105,6 +107,42 @@ mod tests {
         assert_eq!(desc.read(&mut buf).unwrap(), 3);
         assert_eq!(&buf, b"abc");
     }
+
+    #[test]
+    fn socket_description_reports_available_and_refuses_seek() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut writer = b;
+        writer.write_all(b"xy").unwrap();
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(a));
+        let mut desc = SocketDescription::new(file);
+        assert_eq!(desc.available().unwrap(), 2);
+        assert_eq!(
+            desc.seek(SeekFrom::Start(0)).unwrap_err().raw_os_error(),
+            Some(libc::ESPIPE)
+        );
+        let mut buf = [0u8; 2];
+        assert_eq!(desc.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"xy");
+    }
+
+    #[test]
+    fn epoll_description_refuses_io() {
+        // SAFETY: epoll_create1 takes only flags.
+        let fd = unsafe { libc::epoll_create1(0) };
+        assert!(fd >= 0);
+        // SAFETY: fd is a fresh epoll descriptor owned here.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut desc = EpollDescription::new(file);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            desc.read(&mut buf).unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            desc.write(b"x").unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+    }
 }
 
 /// A pipe end (gVisor: kernel/pipe). Seeking is ESPIPE, as on Linux.
@@ -139,5 +177,69 @@ impl FileDescription for PipeDescription {
             return Err(std::io::Error::last_os_error());
         }
         Ok(count)
+    }
+}
+
+/// A socket end (gVisor: socket). Seeking is ESPIPE, as on Linux.
+#[derive(Debug)]
+pub struct SocketDescription {
+    file: std::fs::File,
+}
+
+impl SocketDescription {
+    pub fn new(file: std::fs::File) -> Self {
+        Self { file }
+    }
+}
+
+impl FileDescription for SocketDescription {
+    fn raw_fd(&self) -> Option<i32> {
+        Some(self.file.as_raw_fd())
+    }
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+    fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
+    }
+    fn available(&mut self) -> std::io::Result<i32> {
+        let mut count: libc::c_int = 0;
+        // SAFETY: count is supervisor storage for one int; the descriptor is live.
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::FIONREAD, &mut count) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(count)
+    }
+}
+
+/// An epoll instance (gVisor: vfs/epoll). Read/write/seek are refused as on
+/// Linux (EINVAL/ESPIPE-class answers stay with the epoll handlers today;
+/// this kind exists so table entries can name the kind in later slices).
+#[derive(Debug)]
+pub struct EpollDescription {
+    file: std::fs::File,
+}
+
+impl EpollDescription {
+    pub fn new(file: std::fs::File) -> Self {
+        Self { file }
+    }
+}
+
+impl FileDescription for EpollDescription {
+    fn raw_fd(&self) -> Option<i32> {
+        Some(self.file.as_raw_fd())
+    }
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+    }
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+    }
+    fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
     }
 }
