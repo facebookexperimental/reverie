@@ -1462,10 +1462,17 @@ mod routing_tests {
         let inner = src
             .split("fn execute_basic_syscall_inner")
             .nth(1)
-            .expect("dispatch function present");
+            .expect("dispatch function present")
+            .split("mod routing_tests")
+            .next()
+            .expect("dispatch function precedes the tests");
         for name in FROZEN_DISPATCHED {
             let guard = format!("number == libc::{name} as u64");
-            assert!(inner.contains(&guard), "dispatch guard lost for {name}");
+            let found = inner.contains(&format!("{guard} =>"))
+                || inner.contains(&format!("{guard} ||"))
+                || inner.contains(&format!("{guard} {{"))
+                || inner.contains(&format!("{guard}\n"));
+            assert!(found, "dispatch guard lost for {name}");
         }
     }
 }
