@@ -6071,17 +6071,19 @@ async fn a_group_queued_sigtrap_stays_queued_across_injections_in_any_thread() {
     }
 }
 
-/// A SIGTRAP the leader queued for the thread group, with the very bytes of
-/// the trap Reverie's step over the private page's syscall reports, stays
-/// in the group's queue across a private injection: the trap goes to the
-/// thread's own queue and is taken first, so the stop is never taken for
-/// the guest's SIGTRAP (`TracedTask::absorb_sigtrap_at_stop`), and no copy
-/// lands in the thread's queue. A private unblock's step trap is not taken
-/// for it either: held, it would run the handler while the group's SIGTRAP
-/// is still queued (`dup`). The group's SIGTRAP is then delivered, and, a
-/// positive-code SIGTRAP that cannot be told from a trap, suppressed
-/// (`handle_sigtrap`, the gap in `is_sigtrap_sent_by_a_process`); natively its handler
-/// runs once, with `dup=0`. Both configurations.
+/// A SIGTRAP the leader queued for the thread group with a positive code
+/// (`TRAP_BRKPT`, here even with the very bytes of the trap Reverie's step
+/// over the private page's syscall reports) cannot be told from a trap when
+/// it is later delivered: `handle_sigtrap` delivers a SIGTRAP only if a
+/// sender's code shows a process sent it (`is_sigtrap_sent_by_a_process`),
+/// and the group's queue keeps no record of it. Kept across a private
+/// injection, it would be suppressed at the unblock, and the guest's handler
+/// would never run, where natively it runs once
+/// (`kept report-unblocked handled=1 dup=0`). So it is not kept
+/// (`TracedTask::sigtrap_to_absorb`): the first step Reverie takes while it
+/// is pending, the syscall skip at the next patched syscall, ends the run
+/// with the named `PendingSigtrapAtStep`, as before SIGTRAPs were kept.
+/// Both configurations.
 #[tokio::test(flavor = "current_thread")]
 async fn a_group_sigtrap_with_the_step_trap_bytes_is_not_taken_for_it() {
     // The fixture writes the address of the instruction after the private
@@ -6090,23 +6092,22 @@ async fn a_group_sigtrap_with_the_step_trap_bytes_is_not_taken_for_it() {
         crate::cp::PRIVATE_PAGE_OFFSET + crate::cp::SYSCALL_INSTR_SIZE,
         0x7100_0002
     );
-    for run in run_both_configurations("sigtrap_shared_report_bytes").await {
-        assert_eq!(run.status, ExitStatus::Exited(0), "{}", run.report);
-        let lines: Vec<&str> = run
-            .report
-            .lines()
-            .filter(|line| line.starts_with("kept "))
-            .collect();
-        assert_eq!(
-            lines,
-            [
-                "kept report-queued SigPnd=0 ShdPnd=1 handled=0",
-                "kept report-after-injection SigPnd=0 ShdPnd=1 handled=0",
-                "kept report-unblocked handled=0 dup=0",
-                "kept report-after-unblock SigPnd=0 ShdPnd=0 handled=0",
-            ],
-            "{}",
-            run.report
+    for tail in [false, true] {
+        let options = GuestOptions {
+            tail,
+            ..GuestOptions::default()
+        };
+        let error = match run_guest_options("sigtrap_shared_report_bytes", options).await {
+            Ok(run) => panic!(
+                "tail={tail}: the run was not refused: {:?}\n{}",
+                run.status, run.report
+            ),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("SIGTRAP blocked with one pending")
+                && error.contains("single-step at the syscall skip cannot keep"),
+            "tail={tail}: {error}"
         );
     }
 }

@@ -3199,9 +3199,14 @@ static void mode_sigtrap_shared_pending_kept(void) {
  * bytes the same as those of the trap Reverie's single-step over the
  * private page's syscall reports (TRAP_BRKPT at 0x71000002, the
  * instruction after it). The step's trap is queued in the thread's own
- * queue and taken first, so the group's SIGTRAP stays where it is: after a
- * private injection the thread's status still shows it in ShdPnd only, as
- * natively. A private unblock then delivers it. */
+ * queue and taken first, so the group's SIGTRAP would stay where it is.
+ * Natively, after a private injection the thread's status still shows it in
+ * ShdPnd only, and a private unblock delivers it to the handler once
+ * ("kept report-unblocked handled=1 dup=0"). A positive-code SIGTRAP the
+ * process queued itself cannot be told from a trap when it is delivered,
+ * so Reverie refuses to keep it at the first step it takes while it is
+ * pending, the syscall skip at the next patched syscall, and the run ends
+ * there (PendingSigtrapAtStep). */
 static volatile sig_atomic_t rb_n, rb_dup;
 static void rb_handler(int sig, siginfo_t* si, void* uc) {
   (void)sig;
