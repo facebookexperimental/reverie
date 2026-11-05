@@ -820,6 +820,25 @@ pub trait Tool: Send + Sync + Default {
         Subscription::all_syscalls()
     }
 
+    /// What this tool needs from whichever cell runs it: unmonitored
+    /// window tolerance, instruction classes beyond
+    /// [`Tool::subscriptions`], lifecycle guarantees, placement, debugger
+    /// coexistence, and density. See [`crate::selection`].
+    ///
+    /// This is only called once for the entire tree, next to
+    /// `subscriptions`, and is pure like it. The default is the strictest
+    /// reading, so a tool that says nothing gets reference semantics or a
+    /// typed refusal — never a window or weaker lifecycle it did not
+    /// declare. Relaxation is explicit and appears in run reports.
+    ///
+    /// These are guest-behaviour requirements, not event interests: they
+    /// are never inferred from (or relaxed by) syscall subscriptions.
+    fn requirements(
+        _cfg: &<Self::GlobalState as GlobalTool>::Config,
+    ) -> crate::selection::ToolRequirements {
+        crate::selection::ToolRequirements::default()
+    }
+
     /// Declare native executor ownership for Tool code running in the observed
     /// address space. See [`NativeMmOwnership`] for the complete obligation.
     ///

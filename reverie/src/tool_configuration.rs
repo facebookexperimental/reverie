@@ -11,6 +11,8 @@ use crate::GlobalTool;
 use crate::Pid;
 use crate::Subscription;
 use crate::Tool;
+use crate::selection::EffectiveRequirements;
+use crate::selection::ToolQueries;
 
 /// Retained launch configuration and the Tool's already selected events.
 ///
@@ -22,17 +24,36 @@ use crate::Tool;
 pub struct ToolConfiguration<T: Tool> {
     config: Arc<<T::GlobalState as GlobalTool>::Config>,
     subscriptions: Subscription,
+    requirements: EffectiveRequirements,
     tool: PhantomData<fn() -> T>,
 }
 
 impl<T: Tool> ToolConfiguration<T> {
     /// Select events from this exact shared configuration allocation.
     /// This is the only operation on this type that calls `T::subscriptions`.
+    ///
+    /// [`Tool::requirements`] and the config-static query methods are read
+    /// here too, once, merged into [`EffectiveRequirements`], and retained
+    /// beside the subscriptions under the same once-per-tree guarantee.
     pub fn select(config: Arc<<T::GlobalState as GlobalTool>::Config>) -> Self {
         let subscriptions = T::subscriptions(&config);
+        let requirements = EffectiveRequirements::compute(
+            T::requirements(&config),
+            subscriptions.clone(),
+            ToolQueries {
+                requires_signal_control: T::requires_signal_control(&config),
+                observes_sigreturns: T::observes_sigreturns(&config),
+                may_observe_signal_dequeues: T::may_observe_signal_dequeues(&config),
+                in_guest_signal_delivery: T::in_guest_signal_delivery(&config),
+                enforces_serialized_execution: T::enforces_serialized_execution(&config),
+                reserved_input: T::reserved_input_requirement(&config).is_some(),
+                thread_ownership: T::thread_ownership(&config),
+            },
+        );
         Self {
             config,
             subscriptions,
+            requirements,
             tool: PhantomData,
         }
     }
@@ -52,6 +73,13 @@ impl<T: Tool> ToolConfiguration<T> {
         &self.subscriptions
     }
 
+    /// The merged requirements computed at construction: the tool's
+    /// stated [`Tool::requirements`], its subscriptions, and its
+    /// query-method answers, as admission consumes them.
+    pub fn requirements(&self) -> &EffectiveRequirements {
+        &self.requirements
+    }
+
     /// Construct the Tool for an actual application process, without selecting
     /// events again or creating its thread state.
     pub fn new_process(&self, actual_pid: Pid) -> T {
@@ -64,6 +92,7 @@ impl<T: Tool> Clone for ToolConfiguration<T> {
         Self {
             config: Arc::clone(&self.config),
             subscriptions: self.subscriptions.clone(),
+            requirements: self.requirements.clone(),
             tool: PhantomData,
         }
     }

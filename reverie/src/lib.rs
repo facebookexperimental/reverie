@@ -94,6 +94,7 @@ mod rdtsc;
 mod regs;
 /// Nonserialized ownership for private input and physical native attempts.
 pub mod reserved_input;
+pub mod selection;
 mod signal;
 mod signal_delivery;
 mod signal_observation;
@@ -129,6 +130,7 @@ pub use rdtsc::*;
 pub use regs::RegDisplay;
 pub use regs::RegDisplayOptions;
 pub use reverie_process as process;
+pub use selection::*;
 pub use signal::*;
 pub use signal_delivery::*;
 pub use signal_observation::*;
