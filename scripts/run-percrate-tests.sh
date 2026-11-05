@@ -35,6 +35,7 @@
 
 set -uo pipefail
 
+STARTUP_PWD=$PWD
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
 
@@ -79,6 +80,19 @@ while (($#)); do
         *) echo "run-percrate-tests.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+# The counted runner hands libtest a FIFO path derived from each counts
+# file, and cargo runs each test binary from its own package directory. A
+# relative $RESULTS would be resolved there and fail ENOENT, so make it
+# absolute before any path under it is created or handed out.
+if [[ -z $RESULTS ]]; then
+    echo "run-percrate-tests.sh: --results needs a non-empty directory" >&2
+    exit 2
+fi
+case $RESULTS in
+    /*) ;;
+    *) RESULTS="$STARTUP_PWD/$RESULTS" ;;
+esac
 
 # The same 17 skips as validate.sh REGULAR_TEST_SKIP_ARGS.
 SKIP_ARGS=()

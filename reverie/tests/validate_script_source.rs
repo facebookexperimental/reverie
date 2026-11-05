@@ -7,6 +7,39 @@
  */
 
 const VALIDATE_SCRIPT: &str = include_str!("../../validate.sh");
+const PERCRATE_SCRIPT: &str = include_str!("../../scripts/run-percrate-tests.sh");
+
+#[test]
+fn percrate_results_are_absolute_before_counted_tests() {
+    // The counted runner hands libtest a FIFO path derived from the counts
+    // file, and cargo runs each test binary from its own package directory.
+    // A relative --results therefore makes libtest look for that FIFO
+    // under the package directory and fail with ENOENT. The script must
+    // make RESULTS absolute before it creates or hands out any path under
+    // it.
+    const ABSOLUTIZE: &str = r#"case $RESULTS in
+    /*) ;;
+    *) RESULTS="$STARTUP_PWD/$RESULTS" ;;
+esac"#;
+    let startup = PERCRATE_SCRIPT
+        .find("STARTUP_PWD=$PWD\nROOT_DIR=")
+        .expect("startup directory must be captured before the script changes directory");
+    assert!(startup < PERCRATE_SCRIPT.find("cd \"$ROOT_DIR\"").unwrap());
+    assert!(
+        PERCRATE_SCRIPT.contains("--results needs a non-empty directory"),
+        "an empty --results must be rejected, not resolved to the startup directory"
+    );
+    let absolutize = PERCRATE_SCRIPT.find(ABSOLUTIZE).unwrap_or_else(|| {
+        panic!("run-percrate-tests.sh must resolve --results to an absolute path at startup")
+    });
+    let create = PERCRATE_SCRIPT
+        .find("mkdir -p \"$RESULTS/logs\" \"$RESULTS/counts\"")
+        .unwrap();
+    let counts = PERCRATE_SCRIPT
+        .find("counts=\"$RESULTS/counts/$pkg.json\"")
+        .unwrap();
+    assert!(absolutize < create && create < counts);
+}
 
 #[test]
 fn validation_ledger_writer_follows_the_discovered_parent() {
