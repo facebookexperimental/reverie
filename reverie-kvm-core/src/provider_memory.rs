@@ -160,6 +160,11 @@ impl GuestMemoryAccess for ProviderMemory<'_> {
 ///   contents.
 /// - [`AddressSpace::discard`] zeroes one run of contiguous pages at a time,
 ///   so a failure part way leaves earlier runs discarded.
+///
+/// Known deviation of the guard-region edits: a guard page faults every copy
+/// through [`GuestMemoryAccess`], but not a direct guest access, since the
+/// vCPU's page tables enforce no protection
+/// (<https://github.com/rrnewton/hermit/issues/5177>).
 impl AddressSpace for ProviderMemory<'_> {
     fn layout(&self) -> UserLayout {
         UserLayout {
@@ -269,13 +274,41 @@ impl AddressSpace for ProviderMemory<'_> {
         if plan.private_file {
             return Err(MapError::Unsupported);
         }
-        // Zero each run of physically contiguous pages with zero_lazily, so a
-        // large run (node drops its whole 512 MiB V8 reservation) is discarded
-        // rather than written and made resident
-        // (https://github.com/rrnewton/reverie/issues/1058).
+        self.zero_private_pages(plan.private_anonymous)?;
+        Ok(Discarded {
+            had_holes: plan.unmapped,
+        })
+    }
+
+    /// `Unsupported`, before any page changes, for a range holding a private
+    /// file mapping's page, as [`AddressSpace::discard`] is, and in a vfork
+    /// child, which shares its parent's address space on Linux but runs on a
+    /// copy here, as `protect` refuses a shared view's change there. The
+    /// guard is kept in the page's state, which every copy through
+    /// [`GuestMemoryAccess`] consults. The vCPU's page tables do not enforce
+    /// it, as they enforce no protection: a direct guest access to a guard
+    /// page does not fault (<https://github.com/rrnewton/hermit/issues/5177>).
+    fn guard_install(&self, address: u64, length: u64) -> std::result::Result<Discarded, MapError> {
+        self.change_guards(address, length, true)
+    }
+
+    /// `Unsupported` in a vfork child, as [`AddressSpace::guard_install`] is.
+    /// A private file mapping's page is never a guard page here, so a removal
+    /// over one leaves it as it is.
+    fn guard_remove(&self, address: u64, length: u64) -> std::result::Result<Discarded, MapError> {
+        self.change_guards(address, length, false)
+    }
+}
+
+impl ProviderMemory<'_> {
+    /// Zero each run of physically contiguous pages of `pages` (ascending
+    /// physical addresses) with zero_lazily, so a large run (node drops its
+    /// whole 512 MiB V8 reservation) is discarded rather than written and
+    /// made resident (<https://github.com/rrnewton/reverie/issues/1058>).
+    fn zero_private_pages(&self, pages: Vec<u64>) -> std::result::Result<(), MapError> {
         let page_size = PAGE_SIZE;
         let mut run: Option<(u64, u64)> = None;
-        for page in plan.private_anonymous {
+        for page in pages {
             match run {
                 Some((start, length)) if start + length == page => {
                     run = Some((start, length + page_size));
@@ -294,8 +327,27 @@ impl AddressSpace for ProviderMemory<'_> {
                 .zero_lazily(start, length as usize)
                 .map_err(|_| MapError::Failed)?;
         }
+        Ok(())
+    }
+
+    /// [`AddressSpace::guard_install`] with `guard`, otherwise
+    /// [`AddressSpace::guard_remove`].
+    fn change_guards(
+        &self,
+        address: u64,
+        length: u64,
+        guard: bool,
+    ) -> std::result::Result<Discarded, MapError> {
+        if self.0.shares_parent_address_space() {
+            return Err(MapError::Unsupported);
+        }
+        let change = self.0.set_user_guards(address, length, guard);
+        if change.private_file {
+            return Err(MapError::Unsupported);
+        }
+        self.zero_private_pages(change.private_anonymous)?;
         Ok(Discarded {
-            had_holes: plan.unmapped,
+            had_holes: change.unmapped,
         })
     }
 }
@@ -537,5 +589,244 @@ mod tests {
             ProviderMemory(&memory).unmap(u64::MAX - PAGE_SIZE, PAGE_SIZE),
             Err(MapError::Unaddressable)
         ));
+    }
+
+    /// Four declared read-write private anonymous pages from `RW`, filled
+    /// with 0xa5, and nothing mapped after them.
+    fn guard_memory() -> GuestMemory {
+        let memory = GuestMemory::new(RW, 5 * PAGE).unwrap();
+        memory.write_raw(RW, &vec![0xa5; 5 * PAGE]).unwrap();
+        memory
+            .map_user_protection(
+                RW,
+                4 * PAGE_SIZE,
+                (libc::PROT_READ | libc::PROT_WRITE) as u8,
+            )
+            .unwrap();
+        memory.enable_user_access();
+        memory
+    }
+
+    fn readable(memory: &GuestMemory, address: u64) -> bool {
+        let mut byte = [0];
+        GuestMemoryAccess::read_exact(&ProviderMemory(memory), address, &mut byte).is_ok()
+    }
+
+    fn writable(memory: &GuestMemory, address: u64) -> bool {
+        GuestMemoryAccess::accessible_prefix(&ProviderMemory(memory), address, 1, Access::Write)
+            .unwrap()
+            == 1
+    }
+
+    /// A guard page's contents go, every copy to or from it faults, and its
+    /// mapping (protection, extent) is unchanged, as with Linux's guard
+    /// markers (`madvise_guard_install`, mm/madvise.c in v6.17).
+    #[test]
+    fn a_guard_discards_the_page_and_faults_every_copy_but_keeps_the_mapping() {
+        let memory = guard_memory();
+        let declared = memory.declared_mapping(RW + PAGE_SIZE);
+        let view = ProviderMemory(&memory);
+        assert_eq!(
+            view.guard_install(RW + PAGE_SIZE, PAGE_SIZE).unwrap(),
+            Discarded { had_holes: false }
+        );
+        assert!(memory.is_guard_page(RW + PAGE_SIZE));
+        assert_eq!(bytes(&memory, RW + PAGE_SIZE, 8), [0; 8]);
+        assert!(!readable(&memory, RW + PAGE_SIZE));
+        assert!(!writable(&memory, RW + PAGE_SIZE));
+        assert!(GuestMemoryAccess::write_exact(&view, RW + PAGE_SIZE, b"x").is_err());
+        assert!(GuestMemoryAccess::put_user_i32(&view, RW + PAGE_SIZE, 1).is_err());
+        assert!(GuestMemoryAccess::lend(&view, RW + PAGE_SIZE, 4).is_err());
+        // A copy that runs into the guard stops at it.
+        assert_eq!(
+            GuestMemoryAccess::accessible_prefix(&view, RW, 2 * PAGE, Access::Read).unwrap(),
+            PAGE
+        );
+        // The neighbours keep their contents and access.
+        assert_eq!(bytes(&memory, RW, 4), [0xa5; 4]);
+        assert!(writable(&memory, RW) && writable(&memory, RW + 2 * PAGE_SIZE));
+        // The mapping is the same mapping: no split, no protection change.
+        assert_eq!(memory.declared_mapping(RW + PAGE_SIZE), declared);
+        assert_eq!(view.query(RW, 4 * PAGE_SIZE), RangeState::Mapped);
+        // A second install changes nothing.
+        view.guard_install(RW + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert!(memory.is_guard_page(RW + PAGE_SIZE));
+    }
+
+    /// Install and remove apply to the mapped part of a range with holes and
+    /// report the hole, as `madvise_walk_vmas` does (ENOMEM).
+    #[test]
+    fn a_guard_over_a_hole_applies_to_the_mapped_pages_and_reports_it() {
+        let memory = guard_memory();
+        let view = ProviderMemory(&memory);
+        assert_eq!(
+            view.guard_install(RW + 3 * PAGE_SIZE, 2 * PAGE_SIZE)
+                .unwrap(),
+            Discarded { had_holes: true }
+        );
+        assert!(memory.is_guard_page(RW + 3 * PAGE_SIZE));
+        assert_eq!(
+            view.guard_remove(RW + 3 * PAGE_SIZE, 2 * PAGE_SIZE)
+                .unwrap(),
+            Discarded { had_holes: true }
+        );
+        assert!(!memory.is_guard_page(RW + 3 * PAGE_SIZE));
+        assert!(writable(&memory, RW + 3 * PAGE_SIZE));
+    }
+
+    /// A guard stays through `MADV_DONTNEED` and through a protection change,
+    /// which sets the access the page gets back when the guard goes
+    /// (`change_pte_range` in mm/mprotect.c skips guard markers; a zap without
+    /// `ZAP_FLAG_DROP_MARKER` keeps them).
+    #[test]
+    fn a_guard_survives_discard_and_protect() {
+        let memory = guard_memory();
+        let view = ProviderMemory(&memory);
+        view.guard_install(RW, PAGE_SIZE).unwrap();
+        view.discard(RW, 2 * PAGE_SIZE).unwrap();
+        assert!(memory.is_guard_page(RW));
+        view.protect(RW, 2 * PAGE_SIZE, libc::PROT_READ).unwrap();
+        assert!(memory.is_guard_page(RW));
+        assert!(!readable(&memory, RW));
+        assert_eq!(
+            memory.declared_mapping(RW).map(|declared| declared.prot),
+            Some(libc::PROT_READ as u8)
+        );
+        view.guard_remove(RW, PAGE_SIZE).unwrap();
+        assert!(readable(&memory, RW));
+        assert!(!writable(&memory, RW));
+        view.protect(RW, PAGE_SIZE, libc::PROT_NONE).unwrap();
+        view.guard_install(RW, PAGE_SIZE).unwrap();
+        view.guard_remove(RW, PAGE_SIZE).unwrap();
+        assert!(!readable(&memory, RW));
+    }
+
+    /// Removing a guard gives a private anonymous page back empty: no access
+    /// could fill it on Linux, so whatever reached it here (a direct store,
+    /// which this backend's page tables do not stop) is gone.
+    #[test]
+    fn a_removed_guard_leaves_a_private_page_empty() {
+        let memory = guard_memory();
+        let view = ProviderMemory(&memory);
+        view.guard_install(RW, PAGE_SIZE).unwrap();
+        memory.write_raw(RW, b"stray").unwrap();
+        view.guard_remove(RW, PAGE_SIZE).unwrap();
+        assert_eq!(bytes(&memory, RW, 5), [0; 5]);
+        // Removing where there is no guard changes no contents.
+        memory.write_raw(RW + PAGE_SIZE, b"kept").unwrap();
+        view.guard_remove(RW + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(bytes(&memory, RW + PAGE_SIZE, 4), b"kept");
+    }
+
+    /// A shared page keeps its object's contents under a guard and after it,
+    /// as Linux zaps only the page-table entry.
+    #[test]
+    fn a_guard_keeps_shared_contents() {
+        let memory = guard_memory();
+        memory.record_page_backing(RW, PAGE_SIZE, None, true);
+        let view = ProviderMemory(&memory);
+        view.guard_install(RW, PAGE_SIZE).unwrap();
+        assert_eq!(bytes(&memory, RW, 4), [0xa5; 4]);
+        assert!(!readable(&memory, RW));
+        view.guard_remove(RW, PAGE_SIZE).unwrap();
+        assert_eq!(bytes(&memory, RW, 4), [0xa5; 4]);
+        assert!(writable(&memory, RW));
+    }
+
+    /// Unmapping a guard page, or mapping over it, ends the guard
+    /// (`unmap_vmas` drops markers with `ZAP_FLAG_DROP_MARKER`).
+    #[test]
+    fn unmap_and_a_new_mapping_end_a_guard() {
+        let memory = guard_memory();
+        let view = ProviderMemory(&memory);
+        view.guard_install(RW, 2 * PAGE_SIZE).unwrap();
+        view.unmap(RW, PAGE_SIZE).unwrap();
+        assert!(!memory.is_guard_page(RW));
+        memory
+            .map_user_protection(RW, 2 * PAGE_SIZE, libc::PROT_READ as u8)
+            .unwrap();
+        assert!(!memory.is_guard_page(RW + PAGE_SIZE));
+        assert!(readable(&memory, RW) && readable(&memory, RW + PAGE_SIZE));
+    }
+
+    /// A move keeps the guard on the pages it moves, and the pages a grow
+    /// adds are new pages without one (`move_ptes` moves markers).
+    #[test]
+    fn a_remap_moves_the_guard_and_grows_without_it() {
+        let memory = guard_memory();
+        ProviderMemory(&memory)
+            .guard_install(RW + PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        memory
+            .remap_user_range(RW, 2 * PAGE_SIZE, RW + 2 * PAGE_SIZE, 3 * PAGE_SIZE)
+            .unwrap();
+        assert!(!memory.is_guard_page(RW + PAGE_SIZE));
+        assert!(memory.is_guard_page(RW + 3 * PAGE_SIZE));
+        assert!(!memory.is_guard_page(RW + 4 * PAGE_SIZE));
+        assert!(readable(&memory, RW + 4 * PAGE_SIZE));
+    }
+
+    /// A fork's copy keeps the guards, on private and on shared pages, as
+    /// Linux copies guard markers into the child (`copy_nonpresent_pte`).
+    #[test]
+    fn a_fork_copies_the_guards() {
+        let memory = guard_memory();
+        memory.record_page_backing(RW + 2 * PAGE_SIZE, PAGE_SIZE, None, true);
+        let view = ProviderMemory(&memory);
+        view.guard_install(RW, PAGE_SIZE).unwrap();
+        view.guard_install(RW + 2 * PAGE_SIZE, PAGE_SIZE).unwrap();
+        let child = memory.snapshot().unwrap();
+        for copy in [&memory, &child] {
+            assert!(copy.is_guard_page(RW));
+            assert!(!copy.is_guard_page(RW + PAGE_SIZE));
+            assert!(copy.is_guard_page(RW + 2 * PAGE_SIZE));
+            assert!(!readable(copy, RW) && !readable(copy, RW + 2 * PAGE_SIZE));
+        }
+        ProviderMemory(&child).guard_remove(RW, PAGE_SIZE).unwrap();
+        assert!(memory.is_guard_page(RW));
+        assert!(!child.is_guard_page(RW));
+    }
+
+    /// A vfork child runs on a copy of an address space it shares with its
+    /// parent on Linux, so its guard changes are refused before anything
+    /// changes, as its changes to a shared view are.
+    #[test]
+    fn a_vfork_child_cannot_change_guards() {
+        let memory = guard_memory();
+        let child = memory.snapshot_sharing_address_space().unwrap();
+        assert!(matches!(
+            ProviderMemory(&child).guard_install(RW, PAGE_SIZE),
+            Err(MapError::Unsupported)
+        ));
+        assert!(matches!(
+            ProviderMemory(&child).guard_remove(RW, PAGE_SIZE),
+            Err(MapError::Unsupported)
+        ));
+        assert!(!child.is_guard_page(RW) && !memory.is_guard_page(RW));
+        assert_eq!(bytes(&child, RW, 4), [0xa5; 4]);
+    }
+
+    /// A private file page cannot be read from its file again when the guard
+    /// goes, so an install over a range holding one is refused before
+    /// anything changes; such a page is then never a guard page, and a
+    /// removal over it leaves it alone.
+    #[test]
+    fn a_guard_over_a_private_file_page_is_refused_whole() {
+        let memory = guard_memory();
+        memory.record_file_pages(RW + PAGE_SIZE, PAGE_SIZE, Some(0));
+        let view = ProviderMemory(&memory);
+        assert!(matches!(
+            view.guard_install(RW, 2 * PAGE_SIZE),
+            Err(MapError::Unsupported)
+        ));
+        assert!(!memory.is_guard_page(RW));
+        assert_eq!(bytes(&memory, RW, 4), [0xa5; 4]);
+        view.guard_install(RW, PAGE_SIZE).unwrap();
+        assert_eq!(
+            view.guard_remove(RW, 2 * PAGE_SIZE).unwrap(),
+            Discarded { had_holes: false }
+        );
+        assert!(!memory.is_guard_page(RW));
+        assert!(readable(&memory, RW + PAGE_SIZE));
     }
 }

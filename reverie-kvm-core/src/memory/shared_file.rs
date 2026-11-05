@@ -1051,9 +1051,11 @@ impl GuestMemory {
             let backing =
                 Arc::new(Backing::new_shared_anonymous(length).map_err(Error::MemoryMapping)?);
             let slice = BackingSlice::new(backing, 0, length).map_err(Error::MemoryMapping)?;
-            let permissions = match permission {
+            // A guard page keeps its access under the guard, and then its
+            // guard: the publication maps the object with plain permissions.
+            let permissions = match permission.unguarded() {
                 UserPageState::Accessible { writable, .. } => (true, writable),
-                UserPageState::NoAccess { .. } => (false, false),
+                _ => (false, false),
             };
             // A failure ends the fork: copying the object instead would
             // silently give the child private memory where Linux shares it.
@@ -1066,6 +1068,9 @@ impl GuestMemory {
                 InstallSource::CurrentContents,
                 None,
             )?;
+            if permission.is_guarded() {
+                self.guard_physical_pages(first..first + count);
+            }
         }
     }
 
@@ -1191,11 +1196,25 @@ impl GuestMemory {
         // installed pointers are recreated only from actual child syscall results.
         child_state.backing_pages.clear();
         *child.mapping.address_space.lock().unwrap() = child_state;
-        let permissions = |page: u64| match parent_state.pages.get(&page) {
-            Some(UserPageState::Accessible { writable, .. }) => Some((true, *writable)),
-            Some(UserPageState::NoAccess { .. }) => Some((false, false)),
-            None => None,
-        };
+        // A guard page publishes with its access under the guard, and takes
+        // its guard back below: Linux copies guard markers into a fork's
+        // child (`copy_nonpresent_pte`, mm/memory.c).
+        let permissions =
+            |page: u64| match parent_state.pages.get(&page).map(|state| state.unguarded()) {
+                Some(UserPageState::Accessible { writable, .. }) => Some((true, writable)),
+                Some(_) => Some((false, false)),
+                None => None,
+            };
+        let guarded: Vec<u64> = inherited
+            .iter()
+            .map(|(page, _)| *page)
+            .filter(|page| {
+                parent_state
+                    .pages
+                    .get(page)
+                    .is_some_and(|state| state.is_guarded())
+            })
+            .collect();
         let mut inherited = inherited.into_iter().peekable();
         while let Some((page, installed)) = inherited.next() {
             if installed._slice.backing.kind == BackingKind::SharedAnonymous {
@@ -1237,6 +1256,7 @@ impl GuestMemory {
                 None,
             )?;
         }
+        child.guard_physical_pages(guarded);
         self.check_copy_failure()?;
         child.check_copy_failure()?;
         drop(authority);

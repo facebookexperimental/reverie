@@ -12389,6 +12389,7 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name",
         "a_fork_copies_every_page_its_parent_can_read_like_native",
         "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native",
+        "guard_regions_fault_kernel_copies_like_native",
         "pdeathsig::unchanged_six_check_state_matches_native_controlled",
         "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
         "pdeathsig::creator_thread_death_and_clear_match_native_shared_pending",
@@ -23886,6 +23887,76 @@ fn shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_nativ
         assert_eq!(stderr, native.stderr, "mode={name}");
         assert_eq!(stdout, native.stdout, "mode={name}");
         eprintln!("shared-anonymous-fork completed {name}: forks=3");
+    }
+}
+
+/// madvise(MADV_GUARD_INSTALL) and madvise(MADV_GUARD_REMOVE) answer as on
+/// native Linux 6.13+, observed through kernel copies: a guard page faults a
+/// copy (EFAULT) through MADV_DONTNEED, mprotect and a fork, until it is
+/// removed or unmapped or mapped over, and moves with mremap. The guest
+/// never touches a guard page itself: KVM keeps the guard in its page state,
+/// which every copy consults, while the vCPU's page tables enforce no
+/// protection (<https://github.com/rrnewton/hermit/issues/5177>). A host
+/// kernel without guard regions answers EINVAL, and the test is skipped.
+#[test]
+fn guard_regions_fault_kernel_copies_like_native() {
+    const TEST: &str = "guard_regions_fault_kernel_copies_like_native";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "guard-regions",
+        include_str!("fixtures/guard_regions.c"),
+    );
+    let image = std::fs::read(&program).unwrap();
+    let native = std::process::Command::new(&program)
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(0), "{native:?}");
+    assert!(native.stderr.is_empty(), "{native:?}");
+    if native.stdout == b"guard: unsupported\n" {
+        eprintln!("skipping {TEST}: the host kernel has no guard regions");
+        return;
+    }
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains("moved guard: Bad address\n"),
+        "{native:?}"
+    );
+    for (name, ownership) in [
+        ("direct", None),
+        ("host", Some(ThreadOwnership::Host)),
+        ("tool", Some(ThreadOwnership::Tool)),
+    ] {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[program.to_str().unwrap()],
+                &[],
+                &directory.0,
+            )
+            .unwrap();
+        let (code, stdout, stderr) = if let Some(ownership) = ownership {
+            backend.set_thread_ownership(ownership);
+            let (_trace, code, stdout, stderr) = futures::executor::block_on(
+                backend.run_static_elf_with_tool::<StraceTool>((), true),
+            )
+            .unwrap();
+            (code, stdout, stderr)
+        } else {
+            backend.run_static_elf_captured().unwrap()
+        };
+        assert_eq!(code, 0, "mode={name}: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stderr, native.stderr, "mode={name}");
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&native.stdout),
+            "mode={name}"
+        );
+        eprintln!("guard-regions completed {name}");
     }
 }
 

@@ -531,8 +531,15 @@ pub(super) fn madvise_refusal_diagnostic(advice: libc::c_int) -> &'static str {
         25 => "KVM does not implement madvise MADV_COLLAPSE",
         libc::MADV_HWPOISON => "KVM does not implement madvise MADV_HWPOISON",
         libc::MADV_SOFT_OFFLINE => "KVM does not implement madvise MADV_SOFT_OFFLINE",
-        102 => "KVM does not implement madvise MADV_GUARD_INSTALL",
-        103 => "KVM does not implement madvise MADV_GUARD_REMOVE",
+        102 => {
+            "KVM does not implement madvise MADV_GUARD_INSTALL on a private file mapping \
+             or in a vfork child: it cannot read the file again, and a vfork child runs \
+             on a copy of its parent's address space"
+        }
+        103 => {
+            "KVM does not implement madvise MADV_GUARD_REMOVE in a vfork child: \
+             it runs on a copy of its parent's address space"
+        }
         _ => "KVM does not implement this madvise advice",
     }
 }

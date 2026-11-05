@@ -1107,12 +1107,17 @@ pub(super) fn mremap(
     memory.physical_to_user(destination).unwrap_or(destination) as i64
 }
 
+/// `MADV_GUARD_INSTALL` (Linux 6.13, include/uapi/asm-generic/mman-common.h),
+/// which the libc crate does not export for this target.
+pub(super) const MADV_GUARD_INSTALL: libc::c_int = 102;
+/// `MADV_GUARD_REMOVE` (Linux 6.13).
+pub(super) const MADV_GUARD_REMOVE: libc::c_int = 103;
+
 /// Advice whose effect, or whose possible failure, a program can observe and
 /// this backend does not implement: what a fork copies or wipes, what a core
 /// dump holds, locked-page discards, hole punching, page population and
-/// collapse, injected memory failures, and guard regions. madvise(2) answers
-/// it with ENOSYS.
-pub(super) const MADVISE_UNIMPLEMENTED: [libc::c_int; 15] = [
+/// collapse, and injected memory failures. madvise(2) answers it with ENOSYS.
+pub(super) const MADVISE_UNIMPLEMENTED: [libc::c_int; 13] = [
     libc::MADV_DONTFORK,
     libc::MADV_DOFORK,
     libc::MADV_DONTDUMP,
@@ -1126,8 +1131,6 @@ pub(super) const MADVISE_UNIMPLEMENTED: [libc::c_int; 15] = [
     25, // MADV_COLLAPSE
     libc::MADV_HWPOISON,
     libc::MADV_SOFT_OFFLINE,
-    102, // MADV_GUARD_INSTALL
-    103, // MADV_GUARD_REMOVE
 ];
 
 /// Every advice Linux accepts (`madvise_behavior_valid`, mm/madvise.c, v6.9,
@@ -1159,8 +1162,8 @@ pub(super) const MADVISE_KNOWN: [libc::c_int; 27] = [
     25, // MADV_COLLAPSE
     libc::MADV_HWPOISON,
     libc::MADV_SOFT_OFFLINE,
-    102, // MADV_GUARD_INSTALL
-    103, // MADV_GUARD_REMOVE
+    MADV_GUARD_INSTALL,
+    MADV_GUARD_REMOVE,
 ];
 
 /// Linux's argument checks for madvise(2) (mm/madvise.c): an advice outside
@@ -1229,7 +1232,18 @@ pub(super) fn madvise_flag_change(args: &[u64; 6]) -> Option<(u64, u64, u8, u8)>
 /// and shared file views) as they are, as Linux keeps their contents. A private
 /// copy of a regular file would have to read the file again, which this backend
 /// cannot do, so a range holding one is refused with ENOSYS before any page
-/// changes. Advice in [`MADVISE_UNIMPLEMENTED`] is refused with ENOSYS. Other
+/// changes. `MADV_GUARD_INSTALL` makes the mapped pages of the range guard
+/// pages, whose contents go and which no copy may then access (EFAULT), and
+/// `MADV_GUARD_REMOVE` makes them ordinary pages again
+/// ([`AddressSpace::guard_install`], [`AddressSpace::guard_remove`]); both
+/// apply to the mapped parts of a range with holes and then report ENOMEM, as
+/// Linux does. Both are refused with ENOSYS, before any page changes, in a vfork
+/// child, and an install also over a private file mapping. Linux also refuses a guard over
+/// a locked, huge-page or special mapping (EINVAL, `is_valid_guard_vma`); no
+/// mapping here is huge-page or special, and this backend keeps no locked
+/// state, so a `MAP_LOCKED` mapping takes a guard where Linux would refuse it
+/// (minibeads dh-te1lj). Advice in [`MADVISE_UNIMPLEMENTED`] is refused with
+/// ENOSYS. Other
 /// advice (the access-pattern hints, `MADV_FREE`, `MADV_COLD`, `MADV_PAGEOUT`,
 /// the KSM and huge-page advice) is answered as a hint, which this backend does
 /// not act on: success for a mapped range and ENOMEM for one with holes,
@@ -1248,6 +1262,21 @@ pub(super) fn madvise<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
     };
     if MADVISE_UNIMPLEMENTED.contains(&advice) {
         return negative_errno(libc::ENOSYS);
+    }
+    if advice == MADV_GUARD_INSTALL || advice == MADV_GUARD_REMOVE {
+        let result = if advice == MADV_GUARD_INSTALL {
+            memory.guard_install(start, length)
+        } else {
+            memory.guard_remove(start, length)
+        };
+        return match result {
+            Ok(Discarded { had_holes: true }) => negative_errno(libc::ENOMEM),
+            Ok(Discarded { had_holes: false }) => 0,
+            // A vfork child, or an install over a private file mapping:
+            // refused by name.
+            Err(MapError::Unsupported) => negative_errno(libc::ENOSYS),
+            Err(_) => negative_errno(libc::EFAULT),
+        };
     }
     if advice != libc::MADV_DONTNEED {
         // A hint: Linux applies it to the mapped parts and reports a hole.

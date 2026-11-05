@@ -714,7 +714,18 @@ and not every existing copy path enforces all Linux permission/fault semantics.
 The identity-mapped vCPU page tables remain permissive for direct guest accesses
 except virtual page zero, whose 4-KiB leaf is nonpresent. That exception does not
 enforce ELF/mprotect permissions on other pages or restrict privileged raw host
-access to guest backing. Filesystem access forwards into the host namespace with bounded
+access to guest backing, so a guest load or store to a `PROT_NONE`, read-only or
+unmapped page completes where Linux raises `SIGSEGV`
+(https://github.com/rrnewton/hermit/issues/5177). Guard regions
+(`madvise(MADV_GUARD_INSTALL)` and `MADV_GUARD_REMOVE`, Linux 6.13) are kept
+the same way: the guard is part of the page's software state, so a copy to or
+from a guard page faults (`EFAULT`), the guard survives `MADV_DONTNEED`,
+`mprotect(2)` and a fork, moves with `mremap(2)`, and ends at `munmap(2)` or a
+new mapping over it, and the mapping is not split; but a direct guest access to
+a guard page does not fault. A guard installed over a private file mapping,
+which this backend cannot read from the file again, and a guard change in a
+vfork child are refused by name (`ENOSYS`). No locked state is kept, so a `MAP_LOCKED` mapping
+takes a guard where Linux answers `EINVAL`. Filesystem access forwards into the host namespace with bounded
 memory copies and a guest-owned descriptor table; it does not isolate or
 snapshot host filesystem changes. The current hypercall transport also reuses
 standardized KVM hypercall 12 because it is the only hypercall KVM exposes to

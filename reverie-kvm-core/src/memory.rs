@@ -136,6 +136,31 @@ pub(crate) struct DontneedPlan {
     pub(crate) unmapped: bool,
 }
 
+/// What `GuestMemory::set_user_guards` did to a user range.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct GuardChange {
+    /// Physical addresses of the private anonymous pages whose contents go,
+    /// which then read as zeros: every one of the range when a guard is
+    /// installed, the guard pages when it is removed.
+    pub(crate) private_anonymous: Vec<u64>,
+    /// Whether a guard was to be installed and a mapped page of the range is
+    /// a private copy of a regular file, in which case nothing changed.
+    pub(crate) private_file: bool,
+    /// Whether part of the range is not mapped.
+    pub(crate) unmapped: bool,
+}
+
+/// Whose contents a mapped page shows (`AddressSpaceState::page_contents`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageContents {
+    /// A shared object's: a shared file view or shared anonymous memory.
+    Shared,
+    /// A private copy of a regular file's.
+    PrivateFile,
+    /// Its own: private anonymous memory.
+    PrivateAnonymous,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackingKind {
     /// Memory private to one address space: the arena itself, or a separately
@@ -793,6 +818,52 @@ impl AddressSpaceState {
     }
 
     /// The user address of physical address `physical`, if it has one.
+    /// The mapped physical pages of the user range `[user_start, user_start +
+    /// length)`, `length` whole pages, and whether part of the range is not
+    /// mapped. It walks the range's pages or the mapped pages, whichever are
+    /// fewer.
+    fn mapped_pages_in(&self, user_start: u64, length: u64) -> (Vec<u64>, bool) {
+        let page_size = PAGE_SIZE as u64;
+        let range_pages = length / page_size;
+        let mut pages = Vec::new();
+        if range_pages <= self.pages.len() as u64 {
+            for index in 0..range_pages {
+                if let Ok(physical) = self.translate(user_start + index * page_size, PAGE_SIZE)
+                    && self.pages.contains_key(&(physical / page_size))
+                {
+                    pages.push(physical / page_size);
+                }
+            }
+        } else {
+            let user_end = user_start + length;
+            for &physical_page in self.pages.keys() {
+                if self
+                    .physical_to_user(physical_page * page_size)
+                    .is_some_and(|user| (user_start..user_end).contains(&user))
+                {
+                    pages.push(physical_page);
+                }
+            }
+            pages.sort_unstable();
+        }
+        let unmapped = (pages.len() as u64) < range_pages;
+        (pages, unmapped)
+    }
+
+    /// Whose contents the mapped physical page `physical_page` shows.
+    fn page_contents(&self, physical_page: u64) -> PageContents {
+        let shared_file = self.backing_pages.get(&physical_page).is_some_and(|page| {
+            matches!(page._slice.backing.kind, BackingKind::OrdinaryFile { .. })
+        });
+        if shared_file || self.shared_anonymous_pages.contains(&physical_page) {
+            PageContents::Shared
+        } else if self.file_pages.contains_key(&physical_page) {
+            PageContents::PrivateFile
+        } else {
+            PageContents::PrivateAnonymous
+        }
+    }
+
     fn physical_to_user(&self, physical: u64) -> Option<u64> {
         if let Some(window) = self.windows.iter().find(|window| {
             (window.physical_start..window.physical(window.user_end)).contains(&physical)
@@ -1403,6 +1474,19 @@ enum UserPageState {
     NoAccess {
         declared: Option<DeclaredMapping>,
     },
+    /// A guard page (`MADV_GUARD_INSTALL`, [`GuestMemory::set_user_guards`]):
+    /// no user access at all, whatever its mapping allows, until the guard is
+    /// removed or the page is unmapped or mapped again. `accessible` and
+    /// `writable` are the access the page has under the guard, which a
+    /// protection change updates and which it gets back when the guard goes
+    /// ([`UserPageState::unguarded`]). The mapping is unchanged: `declared`
+    /// stays as it was, so the guard splits no mapping, as on Linux, where a
+    /// guard is a page-table marker and not a mapping of its own.
+    Guarded {
+        accessible: bool,
+        writable: bool,
+        declared: Option<DeclaredMapping>,
+    },
 }
 
 impl UserPageState {
@@ -1436,7 +1520,60 @@ impl UserPageState {
 
     fn declared(self) -> Option<DeclaredMapping> {
         match self {
-            Self::Accessible { declared, .. } | Self::NoAccess { declared } => declared,
+            Self::Accessible { declared, .. }
+            | Self::NoAccess { declared }
+            | Self::Guarded { declared, .. } => declared,
+        }
+    }
+
+    /// Whether this is a guard page.
+    fn is_guarded(self) -> bool {
+        matches!(self, Self::Guarded { .. })
+    }
+
+    /// This page as a guard page, keeping its access under the guard and its
+    /// mapping. A guard page stays as it is.
+    fn guarded(self) -> Self {
+        match self {
+            Self::Accessible { writable, declared } => Self::Guarded {
+                accessible: true,
+                writable,
+                declared,
+            },
+            Self::NoAccess { declared } => Self::Guarded {
+                accessible: false,
+                writable: false,
+                declared,
+            },
+            guarded @ Self::Guarded { .. } => guarded,
+        }
+    }
+
+    /// This page without its guard: the access it has under the guard. A page
+    /// that is not a guard page stays as it is.
+    fn unguarded(self) -> Self {
+        match self {
+            Self::Guarded {
+                accessible: true,
+                writable,
+                declared,
+            } => Self::Accessible { writable, declared },
+            Self::Guarded {
+                accessible: false,
+                declared,
+                ..
+            } => Self::NoAccess { declared },
+            unguarded => unguarded,
+        }
+    }
+
+    /// `new`, a state this page's mapping now gives it (a protection or flag
+    /// change), kept a guard page if this page is one.
+    fn keeping_guard(self, new: Self) -> Self {
+        if self.is_guarded() {
+            new.unguarded().guarded()
+        } else {
+            new
         }
     }
 }
@@ -2712,9 +2849,15 @@ impl GuestMemory {
     pub fn protect_user_range(&self, guest_address: u64, length: u64, prot: u8) -> Result<()> {
         let writable = libc::c_int::from(prot) & libc::PROT_WRITE != 0;
         self.set_user_pages(guest_address, length, writable, |old| {
-            match old.and_then(UserPageState::declared) {
+            let new = match old.and_then(UserPageState::declared) {
                 Some(declared) => UserPageState::of(DeclaredMapping { prot, ..declared }),
                 None => UserPageState::undeclared(prot != 0, writable),
+            };
+            // A guard stays through a protection change (`change_pte_range`,
+            // mm/mprotect.c, skips guard markers).
+            match old {
+                Some(old) => old.keeping_guard(new),
+                None => new,
             }
         })
     }
@@ -2764,14 +2907,13 @@ impl GuestMemory {
         let end = user_address.saturating_add(length).min(window.user_end);
         for user in (start..end).step_by(PAGE_SIZE) {
             let physical_page = window.physical(user & !(page - 1)) / page;
-            if let Some(declared) = access
-                .pages
-                .get(&physical_page)
-                .and_then(|state| state.declared())
+            if let Some(old) = access.pages.get(&physical_page).copied()
+                && let Some(declared) = old.declared()
             {
-                access
-                    .pages
-                    .insert(physical_page, UserPageState::of(edit(declared)));
+                access.pages.insert(
+                    physical_page,
+                    old.keeping_guard(UserPageState::of(edit(declared))),
+                );
             }
         }
     }
@@ -3026,58 +3168,113 @@ impl GuestMemory {
     /// mapped pages.
     pub(crate) fn dontneed_plan(&self, user_start: u64, length: u64) -> DontneedPlan {
         let page_size = PAGE_SIZE as u64;
-        let range_pages = length / page_size;
         let access = self
             .mapping
             .address_space
             .lock()
             .expect("guest memory access map lock poisoned");
+        let (pages, unmapped) = access.mapped_pages_in(user_start, length);
         let mut plan = DontneedPlan {
             private_anonymous: Vec::new(),
             private_file: false,
-            unmapped: false,
+            unmapped,
         };
-        let mut mapped = 0_u64;
-        let mut classify = |physical_page: u64, plan: &mut DontneedPlan| {
-            if !access.pages.contains_key(&physical_page) {
-                return;
-            }
-            mapped += 1;
-            let shared_file = access
-                .backing_pages
-                .get(&physical_page)
-                .is_some_and(|page| {
-                    matches!(page._slice.backing.kind, BackingKind::OrdinaryFile { .. })
-                });
-            if shared_file || access.shared_anonymous_pages.contains(&physical_page) {
+        for physical_page in pages {
+            match access.page_contents(physical_page) {
                 // Shared contents survive: nothing to do.
-            } else if access.file_pages.contains_key(&physical_page) {
-                plan.private_file = true;
-            } else {
-                plan.private_anonymous.push(physical_page * page_size);
-            }
-        };
-        if range_pages <= access.pages.len() as u64 {
-            for index in 0..range_pages {
-                if let Ok(physical) = access.translate(user_start + index * page_size, PAGE_SIZE) {
-                    classify(physical / page_size, &mut plan);
+                PageContents::Shared => {}
+                PageContents::PrivateFile => plan.private_file = true,
+                PageContents::PrivateAnonymous => {
+                    plan.private_anonymous.push(physical_page * page_size)
                 }
             }
-        } else {
-            let user_end = user_start + length;
-            let pages: Vec<u64> = access.pages.keys().copied().collect();
-            for physical_page in pages {
-                if access
-                    .physical_to_user(physical_page * page_size)
-                    .is_some_and(|user| (user_start..user_end).contains(&user))
-                {
-                    classify(physical_page, &mut plan);
-                }
-            }
-            plan.private_anonymous.sort_unstable();
         }
-        plan.unmapped = mapped < range_pages;
         plan
+    }
+
+    /// Makes every mapped page of the user range `[user_start, user_start +
+    /// length)` a guard page ([`UserPageState::Guarded`]), with `guard`, or,
+    /// without, makes every guard page of it an ordinary page of its mapping
+    /// again. A guard is installed only if no mapped page of the range is a
+    /// private copy of a regular file, whose contents this memory cannot read
+    /// from the file again when the guard goes; otherwise nothing changes and
+    /// the result says so. Such a page is therefore never a guard page, and a
+    /// removal skips it. The caller discards the pages' contents
+    /// ([`GuardChange::private_anonymous`]).
+    pub(crate) fn set_user_guards(&self, user_start: u64, length: u64, guard: bool) -> GuardChange {
+        let page_size = PAGE_SIZE as u64;
+        let mut access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        let (mut pages, unmapped) = access.mapped_pages_in(user_start, length);
+        let mut change = GuardChange {
+            private_anonymous: Vec::new(),
+            private_file: false,
+            unmapped,
+        };
+        if guard
+            && pages
+                .iter()
+                .any(|&page| access.page_contents(page) == PageContents::PrivateFile)
+        {
+            change.private_file = true;
+            return change;
+        }
+        pages.sort_unstable();
+        for physical_page in pages {
+            let Some(old) = access.pages.get(&physical_page).copied() else {
+                continue;
+            };
+            let new = if guard {
+                old.guarded()
+            } else {
+                old.unguarded()
+            };
+            // Install discards every page's contents; remove discards those of
+            // the guard pages, which no access could have filled.
+            if (guard || old.is_guarded())
+                && access.page_contents(physical_page) == PageContents::PrivateAnonymous
+            {
+                change.private_anonymous.push(physical_page * page_size);
+            }
+            if new != old {
+                access.pages.insert(physical_page, new);
+            }
+        }
+        change
+    }
+
+    /// Makes each mapped physical page of `pages` a guard page again, after a
+    /// publication that maps it anew with its access under the guard (a
+    /// fork's shared views).
+    pub(crate) fn guard_physical_pages(&self, pages: impl IntoIterator<Item = u64>) {
+        let mut access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        for page in pages {
+            if let Some(state) = access.pages.get(&page).copied() {
+                access.pages.insert(page, state.guarded());
+            }
+        }
+    }
+
+    /// Whether the page at physical `guest_address` is a guard page: one that
+    /// `madvise(MADV_GUARD_INSTALL)` covered
+    /// ([`reverie::provider::AddressSpace::guard_install`]).
+    pub fn is_guard_page(&self, guest_address: u64) -> bool {
+        let access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        access
+            .pages
+            .get(&(guest_address / PAGE_SIZE as u64))
+            .is_some_and(|state| state.is_guarded())
     }
 
     /// The file offset of the regular-file page at physical `guest_address`.
@@ -3268,11 +3465,14 @@ impl GuestMemory {
                     .unwrap_or(RegionKind::User)
             })
             .collect::<Vec<_>>();
+        // The pages a grow adds are fresh pages of the mapping: a guard on the
+        // last page does not extend to them.
         let extension_state = old_states
             .last()
             .copied()
             .flatten()
-            .expect("nonempty mapped range has a last page");
+            .expect("nonempty mapped range has a last page")
+            .unguarded();
         // A file mapping's offsets move with it, and a grown one continues its
         // file past the last page, as Linux grows the file mapping.
         let old_offsets = (old_first..=old_last)
