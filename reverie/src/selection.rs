@@ -343,6 +343,11 @@ pub struct SeccompState {
     pub filters: u64,
     /// Whether `no_new_privs` is set.
     pub no_new_privs: bool,
+    /// Whether a throwaway-child trial actually installed a filter (via
+    /// setting `no_new_privs` on itself first, as a guest runtime does).
+    /// Mode/capability metadata alone does not prove installation or
+    /// nesting is permitted; strict mode (`mode == 1`) forbids it.
+    pub install_proved: bool,
 }
 
 /// W^X / mapping-policy facts relevant to in-guest arenas and gates.
@@ -483,8 +488,11 @@ pub struct ToolQueries {
     /// returned `Some`: the cell's tested envelope must include reserved
     /// input.
     pub reserved_input: bool,
-    /// [`Tool::thread_ownership`](crate::Tool::thread_ownership): recorded;
-    /// only backends that run child threads consult it, as before.
+    /// The *effective* thread ownership for the run (the tool's
+    /// [`Tool::thread_ownership`](crate::Tool::thread_ownership) answer
+    /// after any caller override). Admission gates it only for cells
+    /// whose envelope honors the setting; backends keep resolving it at
+    /// their documented points.
     pub thread_ownership: ThreadOwnership,
 }
 
@@ -936,6 +944,12 @@ pub struct TestedEnvelope {
     /// rather than at admission (guest dispositions are not observable
     /// before the guest runs).
     pub signal_ownership_at_handoff: bool,
+    /// Whether this backend acts on [`ThreadOwnership`]: under
+    /// `ThreadOwnership::Host` its child threads run *unmonitored*, so a
+    /// monitored-threads requirement cannot be met in that configuration.
+    /// Backends that route every thread through the tool ignore the
+    /// setting and answer `false`.
+    pub honors_thread_ownership: bool,
     /// One line naming the envelope's evidence/boundary, for logs.
     pub notes: &'static str,
 }
@@ -1107,6 +1121,7 @@ pub fn implemented_cells() -> &'static [ImplementedCell] {
                 exec: ExecBound::RearmedSameCell,
                 reserved_input: true,
                 signal_ownership_at_handoff: false,
+                honors_thread_ownership: false,
                 notes: "reference backend; kernel follows fork/exec; CPUID/RDTSC via faulting prerequisites P5/P6",
             },
             capabilities: BackendCapabilities::PTRACE,
@@ -1142,6 +1157,7 @@ pub fn implemented_cells() -> &'static [ImplementedCell] {
                 exec: ExecBound::Refused,
                 reserved_input: false,
                 signal_ownership_at_handoff: true,
+                honors_thread_ownership: false,
                 notes: "preload in-guest trap; dynamic non-AT_SECURE single-thread envelope; thread creation and exec refuse by name",
             },
             capabilities: BackendCapabilities::LITEINST_IN_GUEST,
@@ -1177,6 +1193,7 @@ pub fn implemented_cells() -> &'static [ImplementedCell] {
                 exec: ExecBound::Refused,
                 reserved_input: false,
                 signal_ownership_at_handoff: true,
+                honors_thread_ownership: false,
                 notes: "preload site patching over the in-guest completeness trap; same envelope as V4-preload-trap",
             },
             capabilities: BackendCapabilities::LITEINST_IN_GUEST,
@@ -1195,8 +1212,12 @@ pub fn implemented_cells() -> &'static [ImplementedCell] {
                 threads: L::Emulated,
                 fork: L::Emulated,
                 vfork: L::Emulated,
-                exec_successor: L::Emulated,
-                signals: L::Emulated,
+                // Leader exec is emulated; non-leader exec refuses by name
+                // at runtime, so strict successor coverage is not met.
+                exec_successor: L::DeclaredWeaker,
+                // Stop-signal delivery refuses by name at runtime, so
+                // reference signal fidelity is not met.
+                signals: L::DeclaredWeaker,
             },
             code: CodeCoverage::Emulated,
             instructions: InstructionGuarantees {
@@ -1212,7 +1233,8 @@ pub fn implemented_cells() -> &'static [ImplementedCell] {
                 exec: ExecBound::Emulated,
                 reserved_input: false,
                 signal_ownership_at_handoff: false,
-                notes: "VM substrate with backend-emulated Linux lifecycle; static ELF images; registered for admission/explainability, invoked via its own entry points",
+                honors_thread_ownership: true,
+                notes: "VM substrate with backend-emulated Linux lifecycle; static ELF images; non-leader exec and stop signals refuse by name; registered for admission/explainability, invoked via its own entry points",
             },
             capabilities: BackendCapabilities::KVM,
             backend: BackendId("reverie-kvm"),
@@ -1517,6 +1539,16 @@ fn requirement_reasons(
     if life.threads && !cell.lifecycle.threads.satisfies() {
         out.push(R::LifecycleUnproven("threads"));
     }
+    // Host-owned threads run unmonitored on backends that honor the
+    // setting: demanding monitored threads in that configuration is a
+    // contradiction, not a satisfiable requirement.
+    if life.threads
+        && cell.envelope.honors_thread_ownership
+        && req.queries.thread_ownership == ThreadOwnership::Host
+        && !out.contains(&R::LifecycleUnproven("threads"))
+    {
+        out.push(R::LifecycleUnproven("threads"));
+    }
     if life.fork && !cell.lifecycle.fork.satisfies() {
         out.push(R::LifecycleUnproven("fork"));
     }
@@ -1598,10 +1630,11 @@ fn environment_reasons(
             }
         }
         Activation::PreloadLate => match &env.p3_seccomp {
-            Knowledge::Proved(state) if state.mode == 2 || state.no_new_privs => {}
-            // Filter mode already on, or installation permitted via
-            // no_new_privs: a further filter can be installed. Any other
-            // proved state is not a proof installation will succeed.
+            // Strict mode forbids installing another filter outright.
+            Knowledge::Proved(state) if state.mode == 1 => out.push(R::EnvDisproved("P3")),
+            // Only an actual install trial proves installation/nesting;
+            // mode and no_new_privs metadata do not.
+            Knowledge::Proved(state) if state.install_proved => {}
             Knowledge::Proved(_) => out.push(R::EnvUnknown("P3")),
             Knowledge::Disproved => out.push(R::EnvDisproved("P3")),
             Knowledge::Unknown { .. } => out.push(R::EnvUnknown("P3")),
@@ -1993,8 +2026,10 @@ pub struct HandoffFacts {
     /// guest reports `Proved(0)`; a backend that did not, reports what
     /// it observed — and `Unknown` when it did not observe.
     pub tracer_pid: Knowledge<i32>,
-    /// Seccomp filters already installed on the guest (lineage check).
-    pub seccomp_filters: Knowledge<u64>,
+    /// Whose seccomp filter lineage the guest carries at handoff. A
+    /// filter *count* cannot establish compatibility, so the backend
+    /// reports installation provenance instead.
+    pub seccomp_lineage: Knowledge<SeccompLineage>,
     /// Whether the guest runs in secure-execution mode (`AT_SECURE`).
     pub at_secure: Knowledge<bool>,
     /// Threads in the guest at handoff.
@@ -2011,13 +2046,26 @@ impl Default for HandoffFacts {
     fn default() -> Self {
         Self {
             tracer_pid: Knowledge::default(),
-            seccomp_filters: Knowledge::default(),
+            seccomp_lineage: Knowledge::default(),
             at_secure: Knowledge::default(),
             threads_at_handoff: Knowledge::default(),
             signal_ownership: Knowledge::default(),
             first_instruction_pending: Knowledge::default(),
         }
     }
+}
+
+/// Provenance of the seccomp filters on the actual guest at handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SeccompLineage {
+    /// The admitting backend installed its filter on this guest (and
+    /// accounts for every filter present).
+    BackendInstalled,
+    /// Filters predate the backend (inherited lineage); their
+    /// compatibility with the cell's trap is not established by a count.
+    Preexisting,
+    /// No seccomp filter is installed on the guest.
+    NoneInstalled,
 }
 
 /// Which succession a retained plan is re-admitted across.
@@ -2153,6 +2201,29 @@ impl ExecutionPlan {
                 }
             }
         }
+        // Host-process cells trap through a backend-installed seccomp
+        // filter: the actual guest must carry *that* lineage. Inherited
+        // filters of unknown compatibility, or an unproved lineage, fail
+        // closed here — admission-time metadata proved nothing about
+        // this guest.
+        if cell.mechanism != Mechanism::VmExits {
+            match &facts.seccomp_lineage {
+                Knowledge::Proved(SeccompLineage::BackendInstalled) => {}
+                Knowledge::Proved(_) | Knowledge::Disproved => {
+                    return Err(Self::terminal(
+                        RefusalCode::RLifecycle,
+                        "handoff: guest seccomp lineage is not the backend's own installation"
+                            .to_string(),
+                    ));
+                }
+                Knowledge::Unknown { .. } => {
+                    return Err(Self::terminal(
+                        RefusalCode::REnvUnknown,
+                        "handoff: guest seccomp lineage is unproved".to_string(),
+                    ));
+                }
+            }
+        }
         if cell.envelope.guest == GuestShape::DynamicPreloadableOnly {
             match &facts.at_secure {
                 Knowledge::Proved(false) => {}
@@ -2268,6 +2339,7 @@ mod tests {
                 mode: 2,
                 filters: 1,
                 no_new_privs: true,
+                install_proved: true,
             }),
             p4_sud: Knowledge::Proved(false),
             p5_cpuid_faulting: Knowledge::Proved(true),
@@ -2499,12 +2571,23 @@ mod tests {
         // requires_signal_control: only the capabilities constant that
         // provides process signal control satisfies it (the VM cell);
         // ptrace, which never offered the control, does not qualify.
-        let mut req = request(ToolRequirements::default(), GuestProfile::HostProcessAny);
+        // Isolate that axis: with every other axis relaxed, signal
+        // control is the only reason every host-process cell is removed.
+        let mut req = request(
+            relaxed_preload_tool(),
+            GuestProfile::HostProcessDynamicPreloadable,
+        );
         req.requirements.queries.requires_signal_control = true;
         let refusal = admit(&req).expect_err("host-process cells offer no signal control");
         assert_eq!(refusal.code, RefusalCode::RSignal);
 
-        let mut req = request(ToolRequirements::default(), GuestProfile::StaticElfVm);
+        // The VM cell's exec/signal guarantees are partial (see the
+        // strict-VM regression below), so isolate the signal-control axis
+        // by relaxing exactly those two.
+        let mut vm_stated = ToolRequirements::default();
+        vm_stated.lifecycle.exec_successor = false;
+        vm_stated.lifecycle.signal_fidelity = false;
+        let mut req = request(vm_stated, GuestProfile::StaticElfVm);
         req.requirements.queries.requires_signal_control = true;
         assert_eq!(admit(&req).expect("VM cell").chosen, CellId("V11-kvm"));
 
@@ -2784,7 +2867,7 @@ mod tests {
     fn good_handoff() -> HandoffFacts {
         HandoffFacts {
             tracer_pid: Knowledge::Proved(0),
-            seccomp_filters: Knowledge::Proved(1),
+            seccomp_lineage: Knowledge::Proved(SeccompLineage::BackendInstalled),
             at_secure: Knowledge::Proved(false),
             threads_at_handoff: Knowledge::Proved(1),
             signal_ownership: Knowledge::Proved(true),
@@ -2910,6 +2993,137 @@ mod tests {
         let mut scrubbed = succ(SuccessionKind::Fork);
         scrubbed.preload_present = Knowledge::Proved(false);
         assert!(plan.readmit_on_fork(&scrubbed).is_err());
+    }
+
+    /// Review regression (F1): the VM cell's emulated exec/signal paths
+    /// refuse known cases by name at runtime (non-leader exec, stop
+    /// signals), so strict requirements must not admit it. Failed on
+    /// 640a0add, where `Emulated` satisfied every lifecycle axis.
+    #[test]
+    fn strict_vm_lifecycle_cannot_include_known_runtime_refusals() {
+        let req = request(ToolRequirements::default(), GuestProfile::StaticElfVm);
+        let refusal = admit(&req).expect_err("strict exec/signal demands exceed the VM envelope");
+        let reasons = refusal.trace.reasons_for(CellId("V11-kvm"));
+        assert!(
+            reasons.contains(&RemovalReason::ExecUnproven),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.contains(&RemovalReason::LifecycleUnproven("signals")),
+            "{reasons:?}"
+        );
+        // Explicit relaxation of exactly those axes admits it again.
+        let mut stated = ToolRequirements::default();
+        stated.lifecycle.exec_successor = false;
+        stated.lifecycle.signal_fidelity = false;
+        assert_eq!(
+            admit(&request(stated, GuestProfile::StaticElfVm))
+                .expect("relaxed VM request")
+                .chosen,
+            CellId("V11-kvm")
+        );
+    }
+
+    /// Review regression (F2): Host-owned threads are unmonitored on a
+    /// backend that honors thread ownership, so they cannot satisfy a
+    /// monitored-threads requirement there. Failed on 640a0add, which
+    /// recorded ownership without gating it.
+    #[test]
+    fn host_owned_threads_cannot_satisfy_monitored_threads() {
+        let mut stated = ToolRequirements::default();
+        stated.lifecycle.exec_successor = false;
+        stated.lifecycle.signal_fidelity = false;
+        let mut req = request(stated.clone(), GuestProfile::StaticElfVm);
+        req.requirements.queries.thread_ownership = ThreadOwnership::Host;
+        let refusal = admit(&req).expect_err("Host ownership contradicts monitored threads");
+        assert!(
+            refusal
+                .trace
+                .reasons_for(CellId("V11-kvm"))
+                .contains(&RemovalReason::LifecycleUnproven("threads"))
+        );
+        // Same request with Tool ownership admits.
+        req.requirements.queries.thread_ownership = ThreadOwnership::Tool;
+        assert_eq!(
+            admit(&req).expect("tool-owned threads").chosen,
+            CellId("V11-kvm")
+        );
+        // And Host ownership does not disturb a backend that routes every
+        // thread through the tool anyway.
+        let mut req = request(ToolRequirements::default(), GuestProfile::HostProcessAny);
+        req.requirements.queries.thread_ownership = ThreadOwnership::Host;
+        assert_eq!(
+            admit(&req).expect("ptrace ignores ownership").chosen,
+            CellId("V1-ptrace")
+        );
+    }
+
+    /// Review regression (F3a): seccomp metadata is not install proof.
+    /// Strict mode forbids installing a filter even with no_new_privs;
+    /// filter mode without a proved install trial is unproved, not
+    /// permission. Both admitted V4 on 640a0add.
+    #[test]
+    fn strict_seccomp_metadata_is_not_install_permission() {
+        let mut req = request(
+            relaxed_preload_tool(),
+            GuestProfile::HostProcessDynamicPreloadable,
+        );
+        req.explicit = ExplicitSelection::Cell(CellId("V4-preload-trap"));
+        req.env.p3_seccomp = Knowledge::Proved(SeccompState {
+            mode: 1,
+            filters: 0,
+            no_new_privs: true,
+            install_proved: false,
+        });
+        assert!(
+            admit(&req).is_err(),
+            "strict mode must refuse the trap cell"
+        );
+        req.env.p3_seccomp = Knowledge::Proved(SeccompState {
+            mode: 2,
+            filters: 1,
+            no_new_privs: true,
+            install_proved: false,
+        });
+        let refusal = admit(&req).expect_err("metadata without an install trial is unproved");
+        assert_eq!(refusal.code, RefusalCode::REnvUnknown);
+        // The proved install trial admits.
+        req.env.p3_seccomp = Knowledge::Proved(SeccompState {
+            mode: 0,
+            filters: 0,
+            no_new_privs: false,
+            install_proved: true,
+        });
+        assert_eq!(
+            admit(&req).expect("proved install").chosen,
+            CellId("V4-preload-trap")
+        );
+    }
+
+    /// Review regression (F3b): handoff must consume the actual guest's
+    /// seccomp lineage. On 640a0add the field existed but was never
+    /// checked, so otherwise-good facts with unknown lineage passed.
+    #[test]
+    fn handoff_must_not_ignore_unknown_seccomp_lineage() {
+        let report = admit(&request(
+            relaxed_preload_tool(),
+            GuestProfile::HostProcessDynamicPreloadable,
+        ))
+        .unwrap();
+        let plan = ExecutionPlan::from_admission(&report).unwrap();
+        let mut facts = good_handoff();
+        facts.seccomp_lineage = Knowledge::Unknown {
+            why: "not observed",
+        };
+        let refusal = plan.validate_handoff(&facts).unwrap_err();
+        assert_eq!(refusal.code, RefusalCode::REnvUnknown);
+        assert!(refusal.terminal);
+        facts.seccomp_lineage = Knowledge::Proved(SeccompLineage::Preexisting);
+        let refusal = plan.validate_handoff(&facts).unwrap_err();
+        assert_eq!(refusal.code, RefusalCode::RLifecycle);
+        assert!(refusal.terminal);
+        facts.seccomp_lineage = Knowledge::Proved(SeccompLineage::BackendInstalled);
+        plan.validate_handoff(&facts).unwrap();
     }
 
     #[test]

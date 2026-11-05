@@ -32,9 +32,20 @@ impl<T: Tool> ToolConfiguration<T> {
     /// Select events from this exact shared configuration allocation.
     /// This is the only operation on this type that calls `T::subscriptions`.
     ///
-    /// [`Tool::requirements`] and the config-static query methods are read
-    /// here too, once, merged into [`EffectiveRequirements`], and retained
-    /// beside the subscriptions under the same once-per-tree guarantee.
+    /// [`Tool::requirements`] is read here too, once, and merged into
+    /// [`EffectiveRequirements`] beside the subscriptions. Only
+    /// query methods with no once-only contract are collected here
+    /// (`requires_signal_control`, `observes_sigreturns`,
+    /// `may_observe_signal_dequeues`, `reserved_input_requirement`, and
+    /// `in_guest_signal_delivery`, whose consumers must read the value
+    /// retained here instead of asking again).
+    /// `enforces_serialized_execution` is deliberately not collected: a
+    /// real tool's implementation of it calls `subscriptions`, whose
+    /// contract is once per tree. `thread_ownership` is likewise left to
+    /// the backends that resolve it (including caller overrides) at
+    /// their documented points. For those two, the retained
+    /// [`ToolQueries`] fields keep their defaults; a host running
+    /// admission fills the effective values at its own boundary.
     pub fn select(config: Arc<<T::GlobalState as GlobalTool>::Config>) -> Self {
         let subscriptions = T::subscriptions(&config);
         let requirements = EffectiveRequirements::compute(
@@ -45,9 +56,9 @@ impl<T: Tool> ToolConfiguration<T> {
                 observes_sigreturns: T::observes_sigreturns(&config),
                 may_observe_signal_dequeues: T::may_observe_signal_dequeues(&config),
                 in_guest_signal_delivery: T::in_guest_signal_delivery(&config),
-                enforces_serialized_execution: T::enforces_serialized_execution(&config),
+                enforces_serialized_execution: false,
                 reserved_input: T::reserved_input_requirement(&config).is_some(),
-                thread_ownership: T::thread_ownership(&config),
+                thread_ownership: crate::ThreadOwnership::Tool,
             },
         );
         Self {
@@ -194,6 +205,91 @@ mod tests {
         assert_eq!(
             *EVENTS.lock().unwrap(),
             [(-1, address), (31, address), (41, address)]
+        );
+    }
+
+    /// Review regression (F4): `select` must evaluate a once-contracted
+    /// query at most once — and must not evaluate the two queries whose
+    /// contracts belong to their backends at all (one real
+    /// `enforces_serialized_execution` implementation re-enters
+    /// `subscriptions`, so collecting it here would select twice).
+    /// Failed on 640a0add, which called all three.
+    #[test]
+    fn select_evaluates_once_contracted_queries_at_most_once() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        static SUBS: AtomicUsize = AtomicUsize::new(0);
+        static REQS: AtomicUsize = AtomicUsize::new(0);
+        static IN_GUEST: AtomicUsize = AtomicUsize::new(0);
+        static SERIALIZED: AtomicUsize = AtomicUsize::new(0);
+        static OWNERSHIP: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Default)]
+        struct Counting;
+        #[crate::global_tool]
+        impl GlobalTool for Counting {
+            type Config = ();
+            type Request = ();
+            type Response = ();
+            async fn receive_rpc(&self, _: Pid, _: ()) {}
+        }
+        #[derive(Default)]
+        struct CountingTool;
+        #[crate::tool]
+        impl Tool for CountingTool {
+            type GlobalState = Counting;
+            type ThreadState = ();
+            fn subscriptions(_: &()) -> Subscription {
+                SUBS.fetch_add(1, Ordering::SeqCst);
+                Subscription::none()
+            }
+            fn requirements(_: &()) -> crate::selection::ToolRequirements {
+                REQS.fetch_add(1, Ordering::SeqCst);
+                crate::selection::ToolRequirements::default()
+            }
+            fn in_guest_signal_delivery(_: &()) -> bool {
+                IN_GUEST.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            fn enforces_serialized_execution(config: &()) -> bool {
+                SERIALIZED.fetch_add(1, Ordering::SeqCst);
+                // The downstream shape that makes collecting this here a
+                // second selection:
+                let _ = Self::subscriptions(config);
+                true
+            }
+            fn thread_ownership(_: &()) -> crate::ThreadOwnership {
+                OWNERSHIP.fetch_add(1, Ordering::SeqCst);
+                crate::ThreadOwnership::Host
+            }
+        }
+
+        for counter in [&SUBS, &REQS, &IN_GUEST, &SERIALIZED, &OWNERSHIP] {
+            counter.store(0, Ordering::SeqCst);
+        }
+        let owner = ToolConfiguration::<CountingTool>::select(Arc::new(()));
+        assert_eq!(
+            SUBS.load(Ordering::SeqCst),
+            1,
+            "subscriptions once per tree"
+        );
+        assert_eq!(REQS.load(Ordering::SeqCst), 1, "requirements once per tree");
+        assert_eq!(
+            IN_GUEST.load(Ordering::SeqCst),
+            1,
+            "in-guest delivery read once, here; consumers use the retained value"
+        );
+        assert!(owner.requirements().queries.in_guest_signal_delivery);
+        assert_eq!(
+            SERIALIZED.load(Ordering::SeqCst),
+            0,
+            "serialized-execution belongs to its backend (it may re-enter subscriptions)"
+        );
+        assert_eq!(
+            OWNERSHIP.load(Ordering::SeqCst),
+            0,
+            "thread ownership belongs to the resolving backend (once per tree)"
         );
     }
 }

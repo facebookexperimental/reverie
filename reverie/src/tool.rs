@@ -827,9 +827,12 @@ pub trait Tool: Send + Sync + Default {
     ///
     /// This is only called once for the entire tree, next to
     /// `subscriptions`, and is pure like it. The default is the strictest
-    /// reading, so a tool that says nothing gets reference semantics or a
-    /// typed refusal — never a window or weaker lifecycle it did not
-    /// declare. Relaxation is explicit and appears in run reports.
+    /// reading: where a host runs selection admission, a tool that says
+    /// nothing gets reference semantics or a typed refusal — never a
+    /// window or weaker lifecycle it did not declare. Collecting the
+    /// value alone enforces nothing; enforcement happens in
+    /// [`selection::admit`](crate::selection::admit). Relaxation is
+    /// explicit and appears in run reports.
     ///
     /// These are guest-behaviour requirements, not event interests: they
     /// are never inferred from (or relaxed by) syscall subscriptions.

@@ -304,7 +304,13 @@ where
     let pid = Pid::from_raw(unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) } as i32);
     let configuration = ToolConfiguration::<T>::select(rpc.shared_config());
     let subscriptions = configuration.subscriptions();
-    let delivers = T::in_guest_signal_delivery(rpc.config());
+    // Read once, inside select() above: this query's contract is one
+    // evaluation when the runtime starts in a process, so consume the
+    // retained answer instead of asking the tool again.
+    let delivers = configuration
+        .requirements()
+        .queries
+        .in_guest_signal_delivery;
     let instruction_subscriptions = InstructionSubscriptions {
         cpuid: subscriptions.has_cpuid(),
         rdtsc: subscriptions.has_rdtsc(),
