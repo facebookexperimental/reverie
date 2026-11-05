@@ -73,7 +73,11 @@ fn tool_command(binary: &str) -> Command {
 /// descriptor directly; `scripts/run-percrate-tests.sh` counts these
 /// lines in its `skipped` column instead of counting the leg as passed.
 fn report_skip(reason: &str) {
-    let line = format!("REVERIE_SKIP: {reason}\n");
+    // The leading newline matters: libtest has already printed
+    // `test NAME ... ` with no newline when this runs, so without it the
+    // marker lands mid-line in the log. The scorecard matcher is
+    // unanchored as well, so either side alone would still count it.
+    let line = format!("\nREVERIE_SKIP: {reason}\n");
     let mut rest = line.as_bytes();
     while !rest.is_empty() {
         // SAFETY: writing a borrowed byte slice to the stderr descriptor.

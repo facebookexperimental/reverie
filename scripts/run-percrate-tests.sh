@@ -148,9 +148,11 @@ for pkg in "${PACKAGE_LIST[@]}"; do
     rc=$?
     wall=$((SECONDS - start))
     # Tests report a skipped leg with a REVERIE_SKIP line written past
-    # libtest's capture, so it lands in the log. Libtest still counts such
-    # a leg as passed; the scorecard moves it to skipped instead.
-    skipped=$(grep -c '^REVERIE_SKIP: ' "$log" || true)
+    # libtest's capture, so it lands in the log. The match is deliberately
+    # unanchored: libtest prints `test NAME ... ` with no newline before
+    # the test body runs, so the marker can land mid-line. Libtest still
+    # counts such a leg as passed; the scorecard moves it to skipped.
+    skipped=$(grep -c 'REVERIE_SKIP: ' "$log" || true)
     if read -r executed passed filtered counts_extra < <("$ROOT_DIR/scripts/libtest-counts.rs" read "$counts") &&
         [[ -z ${counts_extra:-} && $skipped -le $passed ]]; then
         failed=$((executed - passed))
