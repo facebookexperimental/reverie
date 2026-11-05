@@ -775,8 +775,8 @@ fn execute_basic_syscall_inner(
             fd_xattr_list(memory, state, args)
         }
         _ if number == libc::SYS_umask as u64 => {
-            let previous = state.umask;
-            state.umask = args[0] as libc::mode_t & 0o777;
+            let previous = state.fs_context.umask;
+            state.fs_context.umask = args[0] as libc::mode_t & 0o777;
             i64::from(previous)
         }
         _ if number == libc::SYS_fchmod as u64 => fchmod(state, args),

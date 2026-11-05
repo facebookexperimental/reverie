@@ -1179,7 +1179,7 @@ impl ElfExecutor {
             Some(&execfn),
             &argv_refs,
             &envp_refs,
-            &self.state.cwd,
+            &self.state.fs_context.cwd,
         ) {
             // A host resource this process ran out of while loading (memory
             // for the image's copy or its PT_INTERP image, a descriptor to
@@ -2550,7 +2550,7 @@ impl ElfExecutor {
     }
 
     pub fn cwd(&self) -> &std::path::Path {
-        &self.state.cwd
+        &self.state.fs_context.cwd
     }
 
     pub fn auxv(&self) -> &[(libc::c_ulong, libc::c_ulong)] {

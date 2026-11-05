@@ -421,7 +421,7 @@ fn open_file(
     let named_create = host_flags & libc::O_CREAT as u64 != 0 && !tmpfile;
     let uses_mode = named_create || tmpfile;
     let mode = if uses_mode {
-        u64::from(raw_mode as libc::mode_t & 0o7777 & !state.umask)
+        u64::from(raw_mode as libc::mode_t & 0o7777 & !state.fs_context.umask)
     } else {
         0
     };
@@ -1122,7 +1122,7 @@ pub(super) fn mkdir_at(
         Ok(path) => path,
         Err(error) => return error,
     };
-    let mode = raw_mode as libc::mode_t & 0o7777 & !state.umask;
+    let mode = raw_mode as libc::mode_t & 0o7777 & !state.fs_context.umask;
     // SAFETY: path is NUL-terminated and host_dirfd was translated from guest state.
     if unsafe { libc::mkdirat(host_dirfd, path.as_ptr(), mode) } != 0 {
         return io_error(std::io::Error::last_os_error());
@@ -1494,7 +1494,7 @@ pub(super) fn mknod_at(
         Ok(path) => path,
         Err(error) => return error,
     };
-    let mode = (mode & (libc::S_IFMT | 0o7777)) & !(state.umask as libc::mode_t);
+    let mode = (mode & (libc::S_IFMT | 0o7777)) & !(state.fs_context.umask as libc::mode_t);
     // SAFETY: path is NUL-terminated; device nodes are rejected above.
     if unsafe { libc::mknodat(host_dirfd, path.as_ptr(), mode, 0) } != 0 {
         return io_error(std::io::Error::last_os_error());
@@ -1639,7 +1639,7 @@ pub(super) fn utimensat(memory: &GuestMemory, state: &LoadedStaticElf, args: &[u
 /// " (deleted)" suffix, and a zero link count tells that from a directory
 /// really named that way.
 pub(super) fn getcwd(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[u64; 6]) -> i64 {
-    let fd = state.cwd_fd.as_raw_fd();
+    let fd = state.fs_context.cwd_fd.as_raw_fd();
     let path = canonical_fd_path(fd);
     let maybe_removed = match &path {
         Ok(path) => path.as_os_str().as_bytes().ends_with(b" (deleted)"),
@@ -1680,9 +1680,9 @@ pub(super) fn getcwd(memory: &mut GuestMemory, state: &LoadedStaticElf, args: &[
 //
 // `chdir`/`fchdir` update the emulated working directory that `getcwd` reports
 // and that relative-path resolution (`host_dirfd_and_path`) resolves against.
-// Both replace `state.cwd_fd` with a fresh `O_PATH|O_DIRECTORY` handle so cwd
+// Both replace `state.fs_context.cwd_fd` with a fresh `O_PATH|O_DIRECTORY` handle so cwd
 // identity survives host renames (the same invariant `cwd_fd` had at load).
-// `getcwd` walks that handle at each call; `state.cwd` keeps the path at the
+// `getcwd` walks that handle at each call; `state.fs_context.cwd` keeps the path at the
 // last change for exec's relative paths and the synthetic /proc/self/cwd.
 pub(super) fn chdir(memory: &GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
     let path = match read_c_string(&ProviderMemory(memory), args[0], 4096) {
@@ -1728,7 +1728,7 @@ pub(super) fn fchdir(state: &mut LoadedStaticElf, args: &[u64; 6]) -> i64 {
 }
 
 /// Open `path` (relative to `host_dirfd`) as an `O_PATH|O_DIRECTORY` handle
-/// suitable for use as `state.cwd_fd`. `O_DIRECTORY` yields `ENOTDIR` for a
+/// suitable for use as `state.fs_context.cwd_fd`. `O_DIRECTORY` yields `ENOTDIR` for a
 /// non-directory, and procfs (`EACCES`) and the Tool's reserved directory
 /// (`ENOENT`) are refused, keeping cwd within the same isolation boundary as
 /// [`open_file`].
@@ -1762,12 +1762,12 @@ fn open_cwd_directory(
 }
 
 /// Commit `directory` as the new working directory, recording its canonical
-/// path in `state.cwd` for the callers that still read the string.
+/// path in `state.fs_context.cwd` for the callers that still read the string.
 fn set_cwd(state: &mut LoadedStaticElf, directory: std::fs::File) -> i64 {
     match canonical_fd_path(directory.as_raw_fd()) {
         Ok(path) => {
-            state.cwd = path;
-            state.cwd_fd = directory;
+            state.fs_context.cwd = path;
+            state.fs_context.cwd_fd = directory;
             0
         }
         Err(error) => error,
@@ -2184,7 +2184,7 @@ pub(super) fn host_dirfd_and_path(
     }
     if guest_dirfd == libc::AT_FDCWD {
         return CString::new(path)
-            .map(|path| (state.cwd_fd.as_raw_fd(), path))
+            .map(|path| (state.fs_context.cwd_fd.as_raw_fd(), path))
             .map_err(|_| negative_errno(libc::EINVAL));
     }
     let Some(host_fd) = host_fd(state, guest_dirfd) else {

@@ -258,11 +258,11 @@ pub(super) fn resolve_guest_exec_image(
         if path.is_absolute() {
             path
         } else {
-            state.cwd.join(path)
+            state.fs_context.cwd.join(path)
         }
     } else {
         let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
-        match resolve_executable_path(&path.to_string_lossy(), &envp_refs, &state.cwd) {
+        match resolve_executable_path(&path.to_string_lossy(), &envp_refs, &state.fs_context.cwd) {
             Ok(resolved) => resolved,
             Err(_) => return Err(negative_errno(libc::ENOENT)),
         }

@@ -199,7 +199,7 @@ impl ProcessProcView {
             ppid: state.ppid,
             orphan_reaper_pid: state.orphan_reaper_pid.clone(),
             leader_name: state.thread_group_leader_name.clone(),
-            umask: state.umask,
+            umask: state.fs_context.umask,
         }
     }
 

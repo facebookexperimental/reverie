@@ -1106,6 +1106,14 @@ fn file_system_is_read_only(file: &std::fs::File) -> std::io::Result<bool> {
     })
 }
 
+/// A task's filesystem context (gVisor: kernel/fs_context.go).
+#[derive(Debug)]
+pub struct FsContext {
+    pub cwd: PathBuf,
+    pub cwd_fd: std::fs::File,
+    pub umask: libc::mode_t,
+}
+
 #[derive(Debug)]
 pub struct LoadedStaticElf {
     pub entry_point: u64,
@@ -1136,8 +1144,9 @@ pub struct LoadedStaticElf {
     /// large as the file it came from (`copy_image`).
     pub executable_image: std::sync::Arc<Vec<u8>>,
     pub argv0: Vec<u8>,
-    pub cwd: PathBuf,
-    pub cwd_fd: std::fs::File,
+    /// Filesystem context (R1): cwd path + handle and the umask. Per-task
+    /// value; fork clones the handle, exec keeps it, as the flat fields did.
+    pub fs_context: FsContext,
     /// Whether another task's retirement of a shared entry may still replace
     /// this task's copy of it ([`crate::executor::PrivateCopyGate`]).
     /// Declared before `stdin` and `files`, so dropping the state closes it
@@ -1185,7 +1194,6 @@ pub struct LoadedStaticElf {
     /// the traced process tree", and `Guest::is_root_process` is derived from it,
     /// so conflating the two makes the root guest invisible to the tool.
     pub is_traced_tree_root: bool,
-    pub umask: libc::mode_t,
     /// Per-task ELF64 Linux personality. It starts as the launcher's plus
     /// ADDR_NO_RANDOMIZE, and only UNAME26 can change within that base.
     /// Fork and clone copy it by value; ordinary
@@ -1462,7 +1470,7 @@ impl LoadedStaticElf {
             fdinfo_files,
             fd_object_inodes,
         } = descriptors;
-        let cwd_fd = self.file_retirement.stage_clone(&self.cwd_fd)?;
+        let cwd_fd = self.file_retirement.stage_clone(&self.fs_context.cwd_fd)?;
         let private_copy_gate = crate::executor::PrivateCopyGate::default();
         let process_signals = self
             .process_signals
@@ -1484,8 +1492,11 @@ impl LoadedStaticElf {
             executable_file: self.executable_file.clone(),
             executable_image: self.executable_image.clone(),
             argv0: self.argv0.clone(),
-            cwd: self.cwd.clone(),
-            cwd_fd: cwd_fd.into_file(),
+            fs_context: FsContext {
+                cwd: self.fs_context.cwd.clone(),
+                cwd_fd: cwd_fd.into_file(),
+                umask: self.fs_context.umask,
+            },
             files: private_copy_gate.bind(
                 files
                     .into_iter()
@@ -1506,7 +1517,6 @@ impl LoadedStaticElf {
             orphan_reaper_pid: std::sync::Arc::new(AtomicI32::new(0)),
             // A guest-created child always has a traced parent: this process.
             is_traced_tree_root: false,
-            umask: self.umask,
             linux_personality: self.linux_personality,
             ids_per_task: self.ids_per_task,
             host_metadata_timestamps: self.host_metadata_timestamps,
@@ -1722,8 +1732,11 @@ impl LoadedStaticElf {
             (process_signals, thread_signals)
         };
 
-        self.cwd = previous.cwd;
-        retired.push(std::mem::replace(&mut self.cwd_fd, previous.cwd_fd));
+        self.fs_context.cwd = previous.fs_context.cwd;
+        retired.push(std::mem::replace(
+            &mut self.fs_context.cwd_fd,
+            previous.fs_context.cwd_fd,
+        ));
         retired.extend(std::mem::replace(&mut self.stdin, stdin));
         self.stdin_entry_id = stdin_entry_id;
         self.pid = previous.pid;
@@ -1734,7 +1747,7 @@ impl LoadedStaticElf {
         // `execve` replaces the image, never the position in the process tree.
         self.is_traced_tree_root = previous.is_traced_tree_root;
         self.signal_dequeue_failure = previous.signal_dequeue_failure;
-        self.umask = previous.umask;
+        self.fs_context.umask = previous.fs_context.umask;
         self.linux_personality = previous.linux_personality;
         self.ids_per_task = previous.ids_per_task;
         self.host_metadata_timestamps = previous.host_metadata_timestamps;
@@ -2317,8 +2330,11 @@ fn load_executable(
         executable_file,
         executable_image,
         argv0,
-        cwd: cwd.to_owned(),
-        cwd_fd,
+        fs_context: FsContext {
+            cwd: cwd.to_owned(),
+            cwd_fd,
+            umask: launcher.umask,
+        },
         files: private_copy_gate.bind(std::collections::BTreeMap::new()),
         private_copy_gate,
         stdin: None,
@@ -2336,7 +2352,6 @@ fn load_executable(
         // `KvmBackend::set_root_pid` may later renumber `pid`/`tid`/`ppid`; it
         // must not change this.
         is_traced_tree_root: true,
-        umask: launcher.umask,
         linux_personality: crate::credentials::guest_personality(launcher.personality),
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
         host_metadata_timestamps: false,
@@ -3631,7 +3646,7 @@ mod tests {
             ]
         );
         assert_eq!(loaded.credential_root, launcher.root);
-        assert_eq!(loaded.umask, launcher.umask);
+        assert_eq!(loaded.fs_context.umask, launcher.umask);
         assert_eq!(
             loaded.linux_personality,
             crate::credentials::guest_personality(launcher.personality)

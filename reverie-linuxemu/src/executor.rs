@@ -497,8 +497,11 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         executable_file: None,
         executable_image: Arc::default(),
         argv0: b"test".to_vec(),
-        cwd: cwd.to_owned(),
-        cwd_fd: std::fs::File::open(cwd).unwrap(),
+        fs_context: crate::elf::FsContext {
+            cwd: cwd.to_owned(),
+            cwd_fd: std::fs::File::open(cwd).unwrap(),
+            umask: 0o022,
+        },
         files: private_copy_gate.bind(std::collections::BTreeMap::new()),
         private_copy_gate,
         stdin: Some(std::fs::File::open("/dev/null").unwrap()),
@@ -513,7 +516,6 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         ppid: 0,
         orphan_reaper_pid: Arc::new(AtomicI32::new(0)),
         is_traced_tree_root: true,
-        umask: 0o022,
         linux_personality: libc::ADDR_NO_RANDOMIZE as u32,
         ids_per_task: reverie::task_ids::LINUX_IDS_PER_TASK,
         host_metadata_timestamps: false,
@@ -1960,7 +1962,7 @@ mod tests {
     ) {
         assert_eq!(current_directory(memory, state), path);
         let expected = std::fs::metadata(path).unwrap();
-        let actual = state.cwd_fd.metadata().unwrap();
+        let actual = state.fs_context.cwd_fd.metadata().unwrap();
         assert_eq!(
             (actual.dev(), actual.ino()),
             (expected.dev(), expected.ino())
@@ -2086,7 +2088,7 @@ mod tests {
             syscall_result(&mut memory, &mut state, libc::SYS_close, [5, 0, 0, 0, 0, 0]),
             0
         );
-        let cwd_fd = state.cwd_fd.as_raw_fd();
+        let cwd_fd = state.fs_context.cwd_fd.as_raw_fd();
         let keys = state.files.keys().copied().collect::<Vec<_>>();
         for upper in [0, 1_u64 << 32, 1_u64 << 63, 0xffff_ffff_0000_0000] {
             for (low, error) in [
@@ -2121,7 +2123,7 @@ mod tests {
                     let mut actual = [0; 0x2000];
                     memory.read(0, &mut actual).unwrap();
                     assert_eq!(actual, sentinel);
-                    assert_eq!(state.cwd_fd.as_raw_fd(), cwd_fd);
+                    assert_eq!(state.fs_context.cwd_fd.as_raw_fd(), cwd_fd);
                     assert_eq!(state.files.keys().copied().collect::<Vec<_>>(), keys);
                     assert_fchdir_location(&mut memory, &mut state, &root.0, b"base");
                 }
@@ -22157,7 +22159,7 @@ mod tests {
                 f.executor.file_table.lock().unwrap().files[&(target as i32)].as_raw_fd();
             let old_stdin = f.executor.state.stdin.as_ref().unwrap().as_raw_fd();
             let replacement = test_state(&f.root.0);
-            let replacement_cwd = replacement.cwd_fd.as_raw_fd();
+            let replacement_cwd = replacement.fs_context.cwd_fd.as_raw_fd();
             let replacement_stdin = replacement.stdin.as_ref().unwrap().as_raw_fd();
             let observed = observe_unlocked_retirement(&f.executor);
             f.executor.replace_after_exec(replacement).unwrap();
@@ -27704,7 +27706,7 @@ mod tests {
             ),
             0
         );
-        assert_eq!(state.cwd, child);
+        assert_eq!(state.fs_context.cwd, child);
 
         assert_eq!(
             syscall_result(
@@ -27715,7 +27717,7 @@ mod tests {
             ),
             0
         );
-        assert_eq!(state.cwd, root.0);
+        assert_eq!(state.fs_context.cwd, root.0);
 
         let expected_len = root.0.as_os_str().as_bytes().len() + 1;
         assert_eq!(
@@ -36069,7 +36071,7 @@ mod tests {
         );
 
         write_c_string(&mut memory, CREATED, "created");
-        state.umask = 0;
+        state.fs_context.umask = 0;
         let created_fd = syscall_result(
             &mut memory,
             &mut state,

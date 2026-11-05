@@ -236,7 +236,7 @@ fn tool_directory_is_hidden_from_every_other_path_route() {
         return;
     };
     let mut f = ToolDirectoryFixture::new(root);
-    let cwd = f.state.cwd.clone();
+    let cwd = f.state.fs_context.cwd.clone();
     let root_path = f.root.to_str().unwrap().to_owned();
     let root_path = f.path(TOOL_DIRECTORY_PATH, &root_path);
     let root = f.call(
@@ -474,7 +474,7 @@ fn tool_directory_is_hidden_from_every_other_path_route() {
         );
     }
     // The working directory never moved into it.
-    assert_eq!(f.state.cwd, cwd);
+    assert_eq!(f.state.fs_context.cwd, cwd);
     // The directory itself is neither removed, renamed nor replaced.
     let reserved = f.path(TOOL_DIRECTORY_PATH, "reserved");
     let elsewhere = f.path(TOOL_DIRECTORY_OTHER, "elsewhere");

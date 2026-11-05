@@ -403,7 +403,7 @@ impl ElfExecutor {
                 handle_link(file.as_raw_fd())
             }
             reverie::PathLink::WorkingDirectory => match self.link_owner(tid)? {
-                LinkOwner::Caller => handle_link(self.state.cwd_fd.as_raw_fd()),
+                LinkOwner::Caller => handle_link(self.state.fs_context.cwd_fd.as_raw_fd()),
                 LinkOwner::Sibling => Err(reverie::FactError::NotProvided),
             },
             _ => Err(reverie::FactError::NotProvided),
