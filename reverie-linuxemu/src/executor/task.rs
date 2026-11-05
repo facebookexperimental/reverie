@@ -647,8 +647,8 @@ impl ElfExecutor {
             .address_space
             .as_ref()
             .and_then(GuestMemory::allocation_cursors)
-            .map_or(self.state.program_break, |cursors| cursors.program_break);
-        (self.state.heap_base, program_break)
+            .map_or(self.state.mm.program_break, |cursors| cursors.program_break);
+        (self.state.mm.heap_base, program_break)
     }
 
     #[cfg(any(test, feature = "test-support"))]

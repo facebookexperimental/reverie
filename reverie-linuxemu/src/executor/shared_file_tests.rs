@@ -22,11 +22,11 @@ mod shared_file_dispatch_tests {
         fn with_stack_window(stack_pages: u64) -> Self {
             let root = TestDir::new();
             let mut state = test_state(&root.0);
-            state.brk_limit = BOOT_RESERVED_END + 4 * PAGE_SIZE;
-            state.mmap_base = state.brk_limit;
-            state.mmap_next = state.mmap_base;
-            state.mmap_limit = state.mmap_base + 16 * PAGE_SIZE;
-            let size = state.mmap_limit + stack_pages * PAGE_SIZE;
+            state.mm.brk_limit = BOOT_RESERVED_END + 4 * PAGE_SIZE;
+            state.mm.mmap_base = state.mm.brk_limit;
+            state.mm.mmap_next = state.mm.mmap_base;
+            state.mm.mmap_limit = state.mm.mmap_base + 16 * PAGE_SIZE;
+            let size = state.mm.mmap_limit + stack_pages * PAGE_SIZE;
             let memory = GuestMemory::new(0, size as usize).unwrap();
             memory.write_raw(0, &vec![0xa5; size as usize]).unwrap();
             memory
@@ -37,7 +37,7 @@ mod shared_file_dispatch_tests {
                     .establish_user_stack_window(stack_pages * PAGE_SIZE)
                     .unwrap();
                 memory
-                    .map_user_permissions(state.mmap_limit, stack_pages * PAGE_SIZE, true, true)
+                    .map_user_permissions(state.mm.mmap_limit, stack_pages * PAGE_SIZE, true, true)
                     .unwrap();
             }
             memory.enable_user_access();
@@ -71,10 +71,10 @@ mod shared_file_dispatch_tests {
             )
             .unwrap()
             .unwrap();
-            state.brk_limit = layout.identity_end;
-            state.mmap_base = layout.identity_end;
-            state.mmap_next = layout.identity_end;
-            state.mmap_limit = layout.mmap_end;
+            state.mm.brk_limit = layout.identity_end;
+            state.mm.mmap_base = layout.identity_end;
+            state.mm.mmap_next = layout.identity_end;
+            state.mm.mmap_limit = layout.mmap_end;
             memory.write_raw(0, &vec![0xa5; SIZE as usize]).unwrap();
             memory
                 .map_user_permissions(0, BOOT_RESERVED_END, true, true)
@@ -108,7 +108,7 @@ mod shared_file_dispatch_tests {
 
         fn shared(&mut self, fd: i64, address: u64, offset: u64, writable: bool) -> u64 {
             let expected = if address == 0 {
-                self.state.mmap_next
+                self.state.mm.mmap_next
             } else {
                 address
             };
@@ -136,7 +136,7 @@ mod shared_file_dispatch_tests {
         }
 
         fn private(&mut self) -> u64 {
-            let address = self.state.mmap_next;
+            let address = self.state.mm.mmap_next;
             assert_eq!(
                 syscall_result(
                     &mut self.memory,
@@ -279,7 +279,7 @@ mod shared_file_dispatch_tests {
 
         let mut f = Fixture::new();
         let fd = f.open(true);
-        let address = f.state.mmap_next;
+        let address = f.state.mm.mmap_next;
         assert_eq!(
             syscall_result(
                 &mut f.memory,
@@ -480,7 +480,7 @@ mod shared_file_dispatch_tests {
                 ],
             )
         };
-        let vacant = f.state.mmap_base + 8 * PAGE_SIZE;
+        let vacant = f.state.mm.mmap_base + 8 * PAGE_SIZE;
         assert_eq!(noreplace(&mut f, vacant), vacant as i64);
         assert!(
             f.memory
@@ -595,7 +595,7 @@ mod shared_file_dispatch_tests {
         );
         // A page of the stack window, above the mapping range (at the top of
         // the user address space).
-        let stack_page = f.memory.physical_to_user(f.state.mmap_limit).unwrap();
+        let stack_page = f.memory.physical_to_user(f.state.mm.mmap_limit).unwrap();
         assert_eq!(
             call(&mut f, stack_page, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0),
             negative_errno(libc::EEXIST)
@@ -605,7 +605,7 @@ mod shared_file_dispatch_tests {
             call(&mut f, private, validate, fd, 0),
             negative_errno(libc::EEXIST)
         );
-        let vacant = f.state.mmap_base + 10 * PAGE_SIZE;
+        let vacant = f.state.mm.mmap_base + 10 * PAGE_SIZE;
         assert_eq!(
             call(&mut f, vacant, validate, fd, 0),
             negative_errno(libc::EOPNOTSUPP)
@@ -899,10 +899,10 @@ mod shared_file_dispatch_tests {
     fn heap_growth_over_shared_file_returns_the_old_break_unchanged() {
         let mut f = Fixture::new();
         let fd = f.open(true);
-        let address = f.state.heap_base + PAGE_SIZE;
+        let address = f.state.mm.heap_base + PAGE_SIZE;
         f.shared(fd, address, PAGE_SIZE, true);
         let before = layout(&f.memory, &f.state);
-        let old_break = f.state.program_break;
+        let old_break = f.state.mm.program_break;
         for requested in [address + PAGE_SIZE, address + 17] {
             assert_eq!(
                 syscall_result(
@@ -922,7 +922,7 @@ mod shared_file_dispatch_tests {
     #[test]
     fn heap_shrink_over_replaced_shared_page_is_typed_and_pre_effect() {
         let mut f = Fixture::new();
-        let original_break = f.state.heap_base + 3 * PAGE_SIZE;
+        let original_break = f.state.mm.heap_base + 3 * PAGE_SIZE;
         assert_eq!(
             syscall_result(
                 &mut f.memory,
@@ -933,10 +933,10 @@ mod shared_file_dispatch_tests {
             original_break as i64
         );
         let fd = f.open(true);
-        let address = f.state.heap_base + PAGE_SIZE;
+        let address = f.state.mm.heap_base + PAGE_SIZE;
         assert_eq!(f.shared(fd, address, PAGE_SIZE, true), address);
         let before = layout(&f.memory, &f.state);
-        let requested = f.state.heap_base + 17;
+        let requested = f.state.mm.heap_base + 17;
         let error = failure(execute_basic_syscall(
             &mut f.memory,
             &mut f.state,
@@ -948,7 +948,7 @@ mod shared_file_dispatch_tests {
             "this layout operation intersects an ordinary shared-file view",
         );
         assert_eq!(layout(&f.memory, &f.state), before);
-        assert_eq!(f.state.program_break, original_break);
+        assert_eq!(f.state.mm.program_break, original_break);
         assert!(
             f.memory
                 .range_contains_shared_file(address, PAGE_SIZE as usize)
@@ -1428,10 +1428,10 @@ mod shared_file_dispatch_tests {
         let child_state = |f: &Fixture, child: &GuestMemory| {
             let mut state = test_state(&f.root.0);
             let cursors = child.allocation_cursors().unwrap();
-            state.program_break = cursors.program_break;
-            state.mmap_base = cursors.mmap_base;
-            state.mmap_next = cursors.mmap_next;
-            state.mmap_limit = cursors.mmap_limit;
+            state.mm.program_break = cursors.program_break;
+            state.mm.mmap_base = cursors.mmap_base;
+            state.mm.mmap_next = cursors.mmap_next;
+            state.mm.mmap_limit = cursors.mmap_limit;
             let file = std::fs::File::open(&f.path).unwrap();
             let fd = insert_file_with_flags(&mut state, file, false, None);
             (state, fd as u64)
@@ -1484,7 +1484,7 @@ mod shared_file_dispatch_tests {
                 args[4] = fd;
             }
             if label == "brk" {
-                args[0] = state.program_break + PAGE_SIZE;
+                args[0] = state.mm.program_break + PAGE_SIZE;
             }
             let before = layout(&child, &state);
             let error = failure(execute_basic_syscall(
@@ -1584,12 +1584,12 @@ mod shared_file_dispatch_tests {
                 0
             );
         }
-        let program_break = state.program_break;
+        let program_break = state.mm.program_break;
         assert_eq!(
             syscall_result(&mut child, &mut state, libc::SYS_brk, [0, 0, 0, 0, 0, 0]),
             program_break as i64
         );
-        let hole = state.mmap_next;
+        let hole = state.mm.mmap_next;
         assert_eq!(
             syscall_result(
                 &mut child,
@@ -1870,7 +1870,7 @@ mod shared_file_dispatch_tests {
                 // Register a real logical child before creating the file view.
                 // No child host thread, exit status or completion is fabricated.
                 let _child = live_child.then(|| executor.fork_child(7, false, false).unwrap());
-                let address = executor.state.mmap_next;
+                let address = executor.state.mm.mmap_next;
                 assert_eq!(
                     syscall_result(
                         &mut f.memory,

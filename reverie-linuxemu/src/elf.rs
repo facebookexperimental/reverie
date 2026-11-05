@@ -1106,6 +1106,23 @@ fn file_system_is_read_only(file: &std::fs::File) -> std::io::Result<bool> {
     })
 }
 
+/// A task's address-space allocation state (gVisor: mm::MemoryManager
+/// bookkeeping half; the physical arena stays in reverie-kvm-core).
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryManager {
+    /// Initial program break set at load time (`align_up(main_end)`); the base
+    /// of the brk-managed heap. The live heap spans `[heap_base, program_break)`.
+    pub heap_base: u64,
+    /// The lowest break brk accepts: Linux's `mm->end_data`, its minimum
+    /// under CONFIG_COMPAT_BRK without brk randomization.
+    pub min_break: u64,
+    pub program_break: u64,
+    pub brk_limit: u64,
+    pub mmap_base: u64,
+    pub mmap_next: u64,
+    pub mmap_limit: u64,
+}
+
 /// A task's filesystem context (gVisor: kernel/fs_context.go).
 #[derive(Debug)]
 pub struct FsContext {
@@ -1124,19 +1141,8 @@ pub struct LoadedStaticElf {
     /// (`setup_arg_pages` in `fs/exec.c`). The stack window is mapped the same
     /// either way.
     pub stack_executable: bool,
-    /// Initial program break set at load time (`align_up(main_end)`); the base
-    /// of the brk-managed heap. The live heap spans `[heap_base, program_break)`.
-    pub heap_base: u64,
-    /// The lowest break brk accepts: Linux's `mm->end_data` (the end of the
-    /// main image's file-backed segment contents), its minimum under
-    /// CONFIG_COMPAT_BRK without brk randomization. Shrinking below it
-    /// would unmap the image's data.
-    pub min_break: u64,
-    pub program_break: u64,
-    pub brk_limit: u64,
-    pub mmap_base: u64,
-    pub mmap_next: u64,
-    pub mmap_limit: u64,
+    /// Address-space allocation state (R1 MemoryManager group).
+    pub mm: MemoryManager,
     pub executable_path: PathBuf,
     pub executable_file: Option<std::sync::Arc<std::fs::File>>,
     /// The image this process was loaded from, which an exec of its
@@ -1481,13 +1487,7 @@ impl LoadedStaticElf {
             entry_point: self.entry_point,
             stack_pointer: self.stack_pointer,
             stack_executable: self.stack_executable,
-            heap_base: self.heap_base,
-            min_break: self.min_break,
-            program_break: self.program_break,
-            brk_limit: self.brk_limit,
-            mmap_base: self.mmap_base,
-            mmap_next: self.mmap_next,
-            mmap_limit: self.mmap_limit,
+            mm: self.mm,
             executable_path: self.executable_path.clone(),
             executable_file: self.executable_file.clone(),
             executable_image: self.executable_image.clone(),
@@ -2319,13 +2319,15 @@ fn load_executable(
         entry_point,
         stack_pointer,
         stack_executable,
-        heap_base: program_break,
-        min_break,
-        program_break,
-        brk_limit,
-        mmap_base: mmap_next,
-        mmap_next,
-        mmap_limit,
+        mm: MemoryManager {
+            heap_base: program_break,
+            min_break,
+            program_break,
+            brk_limit,
+            mmap_base: mmap_next,
+            mmap_next,
+            mmap_limit,
+        },
         executable_path,
         executable_file,
         executable_image,
@@ -3455,7 +3457,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.entry_point, TEST_LOAD_ADDRESS);
-        assert_eq!(loaded.program_break, TEST_LOAD_ADDRESS + 0x2000);
+        assert_eq!(loaded.mm.program_break, TEST_LOAD_ADDRESS + 0x2000);
         assert_eq!(loaded.stack_pointer & 15, 0);
         assert_eq!(
             memory.reservation_kind(TEST_LOAD_ADDRESS),
@@ -3479,7 +3481,7 @@ mod tests {
         );
         assert_eq!(
             memory.allocation_cursors().unwrap().mmap_next,
-            loaded.mmap_next
+            loaded.mm.mmap_next
         );
         let mut code = [0; 2];
         memory.read_raw(TEST_LOAD_ADDRESS, &mut code).unwrap();
@@ -3984,10 +3986,10 @@ mod tests {
             &std::env::current_dir().unwrap(),
         )
         .unwrap();
-        assert_eq!(loaded.brk_limit, TEST_LOAD_ADDRESS + 0x2000 + MIB);
-        assert_eq!(loaded.mmap_limit, 4 * MIB - PAGE_SIZE);
+        assert_eq!(loaded.mm.brk_limit, TEST_LOAD_ADDRESS + 0x2000 + MIB);
+        assert_eq!(loaded.mm.mmap_limit, 4 * MIB - PAGE_SIZE);
         assert_eq!(
-            memory.physical_to_user(loaded.mmap_limit - PAGE_SIZE),
+            memory.physical_to_user(loaded.mm.mmap_limit - PAGE_SIZE),
             Some(MMAP_BASE - PAGE_SIZE)
         );
     }
@@ -4097,8 +4099,8 @@ mod tests {
         let physical = memory
             .user_range_to_guest(loaded.entry_point, 70 * MIB)
             .unwrap();
-        assert!(physical >= loaded.brk_limit);
-        assert!(loaded.brk_limit >= TEST_LOAD_ADDRESS + 0x2000 + INTERPRETED_BRK_HEADROOM);
+        assert!(physical >= loaded.mm.brk_limit);
+        assert!(loaded.mm.brk_limit >= TEST_LOAD_ADDRESS + 0x2000 + INTERPRETED_BRK_HEADROOM);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4141,9 +4143,9 @@ mod tests {
             &std::env::current_dir().unwrap(),
         )
         .unwrap();
-        assert_eq!(loaded.brk_limit, 0x30_2000);
-        assert_eq!(loaded.mmap_base, 0x30_2000);
-        assert_eq!(loaded.mmap_limit, 0x30_3000);
+        assert_eq!(loaded.mm.brk_limit, 0x30_2000);
+        assert_eq!(loaded.mm.mmap_base, 0x30_2000);
+        assert_eq!(loaded.mm.mmap_limit, 0x30_3000);
         assert!(!memory.has_mmap_window());
         assert_eq!(memory.user_layout().0.len(), 1, "the stack window only");
     }
@@ -4165,18 +4167,18 @@ mod tests {
             &std::env::current_dir().unwrap(),
         )
         .unwrap();
-        assert_eq!(loaded.mmap_limit, 0x31_0000);
+        assert_eq!(loaded.mm.mmap_limit, 0x31_0000);
         let user_end = memory
-            .physical_to_user(loaded.mmap_limit - PAGE_SIZE)
+            .physical_to_user(loaded.mm.mmap_limit - PAGE_SIZE)
             .unwrap()
             + PAGE_SIZE;
         assert_eq!(user_end, MMAP_BASE - 0xef000);
         assert_eq!(
             user_end % LARGE_PAGE_SIZE,
-            loaded.mmap_limit % LARGE_PAGE_SIZE
+            loaded.mm.mmap_limit % LARGE_PAGE_SIZE
         );
         assert_eq!(
-            memory.reservation_kind(loaded.mmap_limit - VDSO_GAP),
+            memory.reservation_kind(loaded.mm.mmap_limit - VDSO_GAP),
             Some(RegionKind::Mmap)
         );
         // An interpreter that needs the whole stretch up to the stack fits too.
@@ -4241,18 +4243,18 @@ mod tests {
         let auxv = &loaded.auxv;
         let aux = |key: u64| auxv.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
         assert_eq!(aux(libc::AT_ENTRY), Some(PIE_BASE));
-        assert_eq!(loaded.program_break, PIE_BASE + 0x3000);
-        assert_eq!(loaded.heap_base, PIE_BASE + 0x3000);
+        assert_eq!(loaded.mm.program_break, PIE_BASE + 0x3000);
+        assert_eq!(loaded.mm.heap_base, PIE_BASE + 0x3000);
         let physical = memory.user_range_to_guest(PIE_BASE, 0x3000).unwrap();
         let (windows, identity_end) = memory.user_layout();
         assert_eq!(windows.len(), 3, "PIE, mmap and stack windows");
-        assert!(physical >= identity_end && physical < loaded.mmap_base);
+        assert!(physical >= identity_end && physical < loaded.mm.mmap_base);
         assert_eq!(physical % LARGE_PAGE_SIZE, PIE_BASE % LARGE_PAGE_SIZE);
         assert_eq!(memory.user_range_to_guest(physical, 1), None);
-        assert!(loaded.brk_limit > loaded.program_break);
+        assert!(loaded.mm.brk_limit > loaded.mm.program_break);
         assert_eq!(
-            memory.user_range_to_guest(loaded.brk_limit - PAGE_SIZE, PAGE_SIZE),
-            Some(loaded.mmap_base - PAGE_SIZE)
+            memory.user_range_to_guest(loaded.mm.brk_limit - PAGE_SIZE, PAGE_SIZE),
+            Some(loaded.mm.mmap_base - PAGE_SIZE)
         );
         memory.enable_user_access();
         let low = crate::executor::place_mapping(
@@ -4277,7 +4279,7 @@ mod tests {
             shrunk as i64
         );
         assert!(memory.user().read(grown - 1, &mut [0]).is_err());
-        let limit = loaded.brk_limit;
+        let limit = loaded.mm.brk_limit;
         assert_eq!(
             crate::executor::test_brk(&mut memory, &mut loaded, limit),
             shrunk as i64
@@ -4314,7 +4316,7 @@ mod tests {
                 .find(|(key, _)| *key == libc::AT_ENTRY)
                 .map(|(_, value)| *value);
             assert_eq!(entry, Some(start), "{name}");
-            assert_eq!(loaded.program_break, start + 0x3000, "{name}");
+            assert_eq!(loaded.mm.program_break, start + 0x3000, "{name}");
             assert!(
                 memory.user_range_to_guest(start, 0x3000).is_some(),
                 "{name}"
@@ -4379,8 +4381,8 @@ mod tests {
             )
             .unwrap();
             memory.enable_user_access();
-            assert_eq!(loaded.min_break, min_break);
-            assert_eq!(loaded.program_break, 0x20_2000);
+            assert_eq!(loaded.mm.min_break, min_break);
+            assert_eq!(loaded.mm.program_break, 0x20_2000);
             let below = min_break - 1;
             assert_eq!(
                 crate::executor::test_brk(&mut memory, &mut loaded, below),
@@ -4416,8 +4418,8 @@ mod tests {
             &std::env::current_dir().unwrap(),
         )
         .unwrap();
-        assert_eq!(loaded.program_break, 48 * MIB);
-        assert_eq!(loaded.brk_limit, 49 * MIB);
+        assert_eq!(loaded.mm.program_break, 48 * MIB);
+        assert_eq!(loaded.mm.brk_limit, 49 * MIB);
         assert_eq!(
             memory.user_range_to_guest(49 * MIB - 1, 1),
             Some(49 * MIB - 1)
@@ -4456,7 +4458,11 @@ mod tests {
         let fresh = |image: &[u8]| {
             let mut memory = GuestMemory::new(0, (64 * MIB) as usize).unwrap();
             let loaded = load(&mut memory, image);
-            (memory.user_layout(), loaded.brk_limit, loaded.mmap_limit)
+            (
+                memory.user_layout(),
+                loaded.mm.brk_limit,
+                loaded.mm.mmap_limit,
+            )
         };
         let small_layout = fresh(&small);
         let large_layout = fresh(&large);
@@ -4470,7 +4476,11 @@ mod tests {
         ] {
             let loaded = load(&mut memory, image);
             assert_eq!(
-                (memory.user_layout(), loaded.brk_limit, loaded.mmap_limit),
+                (
+                    memory.user_layout(),
+                    loaded.mm.brk_limit,
+                    loaded.mm.mmap_limit
+                ),
                 *expected
             );
         }
@@ -4495,14 +4505,14 @@ mod tests {
         let gap = memory
             .user_range_to_guest(MMAP_BASE - VDSO_GAP, VDSO_GAP)
             .unwrap();
-        assert_eq!(gap + VDSO_GAP, loaded.mmap_limit);
+        assert_eq!(gap + VDSO_GAP, loaded.mm.mmap_limit);
         assert_eq!(memory.reservation_kind(gap), Some(RegionKind::Mmap));
         memory.enable_user_access();
         assert!(memory.user().read(MMAP_BASE - VDSO_GAP, &mut [0]).is_err());
-        assert_eq!(loaded.brk_limit, loaded.mmap_base);
+        assert_eq!(loaded.mm.brk_limit, loaded.mm.mmap_base);
         assert_eq!(
-            memory.physical_to_user(loaded.mmap_base),
-            Some(MMAP_BASE - (loaded.mmap_limit - loaded.mmap_base))
+            memory.physical_to_user(loaded.mm.mmap_base),
+            Some(MMAP_BASE - (loaded.mm.mmap_limit - loaded.mm.mmap_base))
         );
     }
 

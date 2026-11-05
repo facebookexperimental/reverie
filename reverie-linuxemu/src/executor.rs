@@ -443,10 +443,10 @@ trait AllocationCursorsFromElf {
 impl AllocationCursorsFromElf for AllocationCursors {
     fn from_elf(state: &LoadedStaticElf) -> Self {
         Self {
-            program_break: state.program_break,
-            mmap_base: state.mmap_base,
-            mmap_next: state.mmap_next,
-            mmap_limit: state.mmap_limit,
+            program_break: state.mm.program_break,
+            mmap_base: state.mm.mmap_base,
+            mmap_next: state.mm.mmap_next,
+            mmap_limit: state.mm.mmap_limit,
         }
     }
 }
@@ -486,13 +486,15 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         entry_point: 0,
         stack_pointer: 0,
         stack_executable: false,
-        heap_base: BOOT_RESERVED_END,
-        min_break: BOOT_RESERVED_END,
-        program_break: BOOT_RESERVED_END,
-        brk_limit: BOOT_RESERVED_END + PAGE_SIZE,
-        mmap_base: BOOT_RESERVED_END + PAGE_SIZE,
-        mmap_next: BOOT_RESERVED_END + PAGE_SIZE,
-        mmap_limit: BOOT_RESERVED_END + 2 * PAGE_SIZE,
+        mm: crate::elf::MemoryManager {
+            heap_base: BOOT_RESERVED_END,
+            min_break: BOOT_RESERVED_END,
+            program_break: BOOT_RESERVED_END,
+            brk_limit: BOOT_RESERVED_END + PAGE_SIZE,
+            mmap_base: BOOT_RESERVED_END + PAGE_SIZE,
+            mmap_next: BOOT_RESERVED_END + PAGE_SIZE,
+            mmap_limit: BOOT_RESERVED_END + 2 * PAGE_SIZE,
+        },
         executable_path: std::path::PathBuf::from("test"),
         executable_file: None,
         executable_image: Arc::default(),
@@ -768,14 +770,14 @@ mod tests {
     fn brk_shrink_releases_pages_only_when_a_mapping_intersects_them() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        state.heap_base = BOOT_RESERVED_END;
-        state.program_break = state.heap_base;
-        state.brk_limit = state.heap_base + 8 * PAGE_SIZE;
-        state.mmap_base = state.brk_limit;
-        state.mmap_next = state.mmap_base;
-        state.mmap_limit = state.mmap_base + 4 * PAGE_SIZE;
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
-        let base = state.heap_base;
+        state.mm.heap_base = BOOT_RESERVED_END;
+        state.mm.program_break = state.mm.heap_base;
+        state.mm.brk_limit = state.mm.heap_base + 8 * PAGE_SIZE;
+        state.mm.mmap_base = state.mm.brk_limit;
+        state.mm.mmap_next = state.mm.mmap_base;
+        state.mm.mmap_limit = state.mm.mmap_base + 4 * PAGE_SIZE;
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
+        let base = state.mm.heap_base;
         let brk = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, requested: u64| {
             syscall_result(memory, state, libc::SYS_brk, [requested, 0, 0, 0, 0, 0])
         };
@@ -799,7 +801,7 @@ mod tests {
             brk(&mut memory, &mut state, base),
             (base + 3 * PAGE_SIZE) as i64
         );
-        assert_eq!(state.program_break, base + 3 * PAGE_SIZE);
+        assert_eq!(state.mm.program_break, base + 3 * PAGE_SIZE);
 
         // With one page still mapped, the shrink releases it and succeeds.
         assert_eq!(
@@ -821,14 +823,14 @@ mod tests {
     fn fixed_mapping_in_brk_gap_blocks_heap_growth_until_unmapped() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        state.heap_base = BOOT_RESERVED_END;
-        state.program_break = state.heap_base;
-        state.brk_limit = state.heap_base + 4 * PAGE_SIZE;
-        state.mmap_base = state.brk_limit;
-        state.mmap_next = state.mmap_base;
-        state.mmap_limit = state.mmap_base + 4 * PAGE_SIZE;
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
-        let address = state.heap_base + PAGE_SIZE;
+        state.mm.heap_base = BOOT_RESERVED_END;
+        state.mm.program_break = state.mm.heap_base;
+        state.mm.brk_limit = state.mm.heap_base + 4 * PAGE_SIZE;
+        state.mm.mmap_base = state.mm.brk_limit;
+        state.mm.mmap_next = state.mm.mmap_base;
+        state.mm.mmap_limit = state.mm.mmap_base + 4 * PAGE_SIZE;
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
+        let address = state.mm.heap_base + PAGE_SIZE;
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -859,7 +861,7 @@ mod tests {
                 libc::SYS_brk,
                 [new_break, 0, 0, 0, 0, 0]
             ),
-            state.heap_base as i64
+            state.mm.heap_base as i64
         );
         assert_eq!(memory.reservation_kind(address), Some(RegionKind::Mmap));
         assert_eq!(memory.user().user_writable_prefix(address, 16).unwrap(), 0);
@@ -891,7 +893,7 @@ mod tests {
         let mut bytes = [0xa5; 16];
         memory.read_raw(address, &mut bytes).unwrap();
         assert_eq!(bytes, [0; 16]);
-        let heap_base = state.heap_base;
+        let heap_base = state.mm.heap_base;
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -2515,7 +2517,7 @@ mod tests {
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         write_c_string(&mut memory, PATH, "/proc/self/maps");
         let fd = syscall_result(
             &mut memory,
@@ -2716,7 +2718,7 @@ mod tests {
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         write_c_string(&mut memory, PATH, "/proc/self/maps");
         let fd = syscall_result(
             &mut memory,
@@ -2801,7 +2803,7 @@ mod tests {
     fn synthetic_proc_direct_open_flags_and_nofollow_lifecycle_match_linux() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
 
         for flags in [
             libc::O_RDONLY | libc::O_DIRECTORY,
@@ -3078,7 +3080,7 @@ mod tests {
         let root = TestDir::new();
         std::fs::write(root.0.join("ordinary"), b"x").unwrap();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         let ordinary = open_with_flags(&mut memory, &mut state, "ordinary", libc::O_RDONLY);
         let proc_file = open_readonly(&mut memory, &mut state, "/proc/self/maps");
         assert_eq!((ordinary, proc_file), (3, 4));
@@ -3100,7 +3102,7 @@ mod tests {
             libc::O_RDONLY | libc::O_DIRECTORY,
         ];
 
-        let bad_address = state.mmap_limit + PAGE_SIZE;
+        let bad_address = state.mm.mmap_limit + PAGE_SIZE;
         for flags in invalid {
             assert_eq!(
                 call_openat(&mut memory, &mut state, libc::AT_FDCWD, bad_address, flags,),
@@ -3167,7 +3169,7 @@ mod tests {
         let missing = root.0.join("missing");
         let missing = missing.to_str().unwrap();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         let private_tmpfile = libc::O_TMPFILE & !libc::O_DIRECTORY;
         let extras = [
             libc::O_WRONLY,
@@ -3184,7 +3186,7 @@ mod tests {
             private_tmpfile,
         ];
 
-        let bad_address = state.mmap_limit + PAGE_SIZE;
+        let bad_address = state.mm.mmap_limit + PAGE_SIZE;
         for extra in extras {
             let flags = libc::O_PATH | extra;
             // SAFETY: the intentionally invalid pointer is passed unchanged to
@@ -3492,7 +3494,7 @@ mod tests {
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         for &path in SYNTHETIC_REGULAR_PROC_PATHS {
             let path = std::str::from_utf8(path).unwrap();
             for &(label, flags, expected) in CASES {
@@ -3653,7 +3655,7 @@ mod tests {
             let root = TestDir::new();
             let mut state = test_state(&root.0);
             state.regular_create_directory_policy = policy;
-            let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+            let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
             assert_eq!(
                 open_with_flags(&mut memory, &mut state, path, flags),
                 negative_errno(expected),
@@ -3699,7 +3701,7 @@ mod tests {
         std::fs::write(root.0.join("ordinary"), b"x").unwrap();
         let mut state = test_state(&root.0);
         state.regular_create_directory_policy = RegularCreateDirectoryPolicy::EarlyEinval;
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         let ordinary = open_with_flags(&mut memory, &mut state, "ordinary", libc::O_RDONLY);
         let proc_file = open_readonly(&mut memory, &mut state, "/proc/self/maps");
         assert_eq!((ordinary, proc_file), (3, 4));
@@ -3712,7 +3714,7 @@ mod tests {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_DIRECTORY,
         ];
         let path_control = libc::O_PATH | libc::O_CREAT | libc::O_DIRECTORY;
-        let bad_address = state.mmap_limit + PAGE_SIZE;
+        let bad_address = state.mm.mmap_limit + PAGE_SIZE;
         for flags in early {
             assert_eq!(
                 call_openat(&mut memory, &mut state, libc::AT_FDCWD, bad_address, flags,),
@@ -3800,7 +3802,7 @@ mod tests {
     fn an_unchanged_file_table_install_keeps_state_and_a_changed_one_restores_it() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         let fd = open_with_flags(&mut memory, &mut state, "/proc/self/maps", libc::O_PATH);
         let mut shared = FileTableState::try_from_elf(&state).unwrap();
         assert!(shared.installed_matches(&state));
@@ -3867,7 +3869,7 @@ mod tests {
     fn synthetic_proc_nofollow_metadata_tracks_replacement_and_shared_tables() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         let marked = open_with_flags(
             &mut memory,
             &mut state,
@@ -3961,7 +3963,7 @@ mod tests {
     fn synthetic_proc_open_clears_stale_nofollow_metadata_on_fd_reuse() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         let next_fd = 3;
         assert!(!state.files.contains_key(&next_fd));
         state.synthetic_proc_nofollow_fds.insert(next_fd);
@@ -3991,7 +3993,7 @@ mod tests {
 
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         write_c_string(&mut memory, PATH, "/proc/self/maps");
         let fd = syscall_result(
             &mut memory,
@@ -4450,7 +4452,7 @@ mod tests {
         let path = root.0.join("mmap-access");
         std::fs::write(&path, vec![0xa5; PAGE_SIZE as usize]).unwrap();
         let mut state = test_state(&root.0);
-        let mut memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        let mut memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
 
         state.files.insert(3, std::fs::File::open(&path).unwrap());
         state.files.insert(
@@ -4630,7 +4632,7 @@ mod tests {
             ),
             negative_errno(libc::EPERM)
         );
-        let expected_address = state.mmap_next;
+        let expected_address = state.mm.mmap_next;
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -7185,9 +7187,9 @@ mod tests {
         let mut state = test_state(&root.0);
         let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
         let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
-        state.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_next = state.mmap_base;
-        state.mmap_limit = state.mmap_base + 4 * PAGE_SIZE;
+        state.mm.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_next = state.mm.mmap_base;
+        state.mm.mmap_limit = state.mm.mmap_base + 4 * PAGE_SIZE;
 
         const NAME: u64 = 0x100;
         memory.write(NAME, b"guest-remap\0").unwrap();
@@ -31593,7 +31595,7 @@ mod tests {
         let observed: libc::pollfd = read_struct(&memory, POLL_FD);
         assert_ne!(observed.revents & libc::POLLOUT, 0);
 
-        let mmap_next = state.mmap_next;
+        let mmap_next = state.mm.mmap_next;
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -31610,7 +31612,7 @@ mod tests {
             ),
             negative_errno(libc::ENODEV),
         );
-        assert_eq!(state.mmap_next, mmap_next);
+        assert_eq!(state.mm.mmap_next, mmap_next);
 
         // Its link is the Tool's (`link_path` names it
         // `anon_inode:[signalfd]`: facts.rs's
@@ -33298,8 +33300,8 @@ mod tests {
         let mut state = test_state(&root.0);
         let memory_size = BOOT_RESERVED_END + 16 * PAGE_SIZE;
         let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
-        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_limit = memory_size;
+        state.mm.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_limit = memory_size;
         let mmap_args = [
             0,
             PAGE_SIZE,
@@ -33371,9 +33373,9 @@ mod tests {
         let mut state = test_state(&root.0);
         let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
         let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
-        state.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_next = state.mmap_base;
-        state.mmap_limit = state.mmap_base + 3 * PAGE_SIZE;
+        state.mm.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_next = state.mm.mmap_base;
+        state.mm.mmap_limit = state.mm.mmap_base + 3 * PAGE_SIZE;
         let mmap_args = [
             0,
             PAGE_SIZE,
@@ -33388,7 +33390,7 @@ mod tests {
         let third = syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args) as u64;
         assert_eq!(second, first + PAGE_SIZE);
         assert_eq!(third, second + PAGE_SIZE);
-        assert_eq!(state.mmap_next, state.mmap_limit);
+        assert_eq!(state.mm.mmap_next, state.mm.mmap_limit);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -33401,7 +33403,7 @@ mod tests {
 
         let reused = syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args) as u64;
         assert_eq!(reused, first);
-        assert_eq!(state.mmap_next, state.mmap_limit);
+        assert_eq!(state.mm.mmap_next, state.mm.mmap_limit);
         assert_eq!(
             syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args),
             negative_errno(libc::ENOMEM)
@@ -33414,9 +33416,9 @@ mod tests {
         let mut state = test_state(&root.0);
         let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
         let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
-        state.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_next = state.mmap_base;
-        state.mmap_limit = state.mmap_base + 4 * PAGE_SIZE;
+        state.mm.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_next = state.mm.mmap_base;
+        state.mm.mmap_limit = state.mm.mmap_base + 4 * PAGE_SIZE;
         let mmap_args = [
             0,
             PAGE_SIZE,
@@ -33429,7 +33431,7 @@ mod tests {
         let first = syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args) as u64;
         let second = syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args) as u64;
         assert_eq!(second, first + PAGE_SIZE);
-        assert_eq!(state.mmap_next, first + 2 * PAGE_SIZE);
+        assert_eq!(state.mm.mmap_next, first + 2 * PAGE_SIZE);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -33444,7 +33446,7 @@ mod tests {
             syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args),
             first as i64
         );
-        assert_eq!(state.mmap_next, first + 2 * PAGE_SIZE);
+        assert_eq!(state.mm.mmap_next, first + 2 * PAGE_SIZE);
     }
 
     fn madvise_memory(pages: u64) -> (TestDir, LoadedStaticElf, GuestMemory) {
@@ -33452,8 +33454,8 @@ mod tests {
         let mut state = test_state(&root.0);
         let memory_size = BOOT_RESERVED_END + (pages + 1) * PAGE_SIZE;
         let memory = GuestMemory::new(0, memory_size as usize).unwrap();
-        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_limit = memory_size;
+        state.mm.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_limit = memory_size;
         (root, state, memory)
     }
 
@@ -33517,7 +33519,7 @@ mod tests {
         memory.write(private, b"guarded!").unwrap();
         let mut worker_memory = memory.clone();
         let mut worker_state = test_state(&root.0);
-        worker_state.mmap_limit = state.mmap_limit;
+        worker_state.mm.mmap_limit = state.mm.mmap_limit;
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             let guard = memory.allocation_guard();
@@ -34143,8 +34145,8 @@ mod tests {
         let mut state = test_state(&root.0);
         let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
         let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
-        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_limit = memory_size;
+        state.mm.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_limit = memory_size;
         let mapping = syscall_result(
             &mut memory,
             &mut state,
@@ -34280,9 +34282,9 @@ mod tests {
         let mut state = test_state(&root.0);
         let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
         let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
-        state.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_next = state.mmap_base;
-        state.mmap_limit = state.mmap_base + 3 * PAGE_SIZE;
+        state.mm.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_next = state.mm.mmap_base;
+        state.mm.mmap_limit = state.mm.mmap_base + 3 * PAGE_SIZE;
         let mmap_args = [
             0,
             PAGE_SIZE,
@@ -34301,7 +34303,7 @@ mod tests {
             syscall_result(&mut memory, &mut state, libc::SYS_mmap, mmap_args),
             (first + 2 * PAGE_SIZE) as i64
         );
-        assert_eq!(state.mmap_next, state.mmap_limit);
+        assert_eq!(state.mm.mmap_next, state.mm.mmap_limit);
         assert_eq!(
             syscall_result(
                 &mut memory,
@@ -34332,7 +34334,7 @@ mod tests {
             ),
             first as i64
         );
-        assert_eq!(state.mmap_next, state.mmap_limit);
+        assert_eq!(state.mm.mmap_next, state.mm.mmap_limit);
         assert!(memory.user_range_is_mapped(first, 2 * PAGE_SIZE));
     }
 
@@ -34381,8 +34383,8 @@ mod tests {
         let root = TestDir::new();
         let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
         let mut state = test_state(&root.0);
-        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_limit = memory_size;
+        state.mm.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_limit = memory_size;
         let memory = GuestMemory::new(0, memory_size as usize).unwrap();
         let mut parent = ElfExecutor::new(state, false);
         let mut child = parent.thread_child(2).unwrap();
@@ -34457,8 +34459,8 @@ mod tests {
         let mut state = test_state(&root.0);
         let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
         let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
-        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_limit = memory_size;
+        state.mm.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_limit = memory_size;
         let mapping = syscall_result(
             &mut memory,
             &mut state,
@@ -34545,8 +34547,8 @@ mod tests {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, (16 * MIB) as usize).unwrap();
-        state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
-        state.mmap_limit = 8 * MIB;
+        state.mm.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+        state.mm.mmap_limit = 8 * MIB;
         memory
             .reserve_region(8 * MIB, 8 * MIB, crate::memory::RegionKind::Stack)
             .unwrap()
@@ -34678,10 +34680,10 @@ mod tests {
         .unwrap();
         assert_eq!(layout.identity_end, 86 * MIB);
         crate::elf::reserve_vdso_gap(&mut memory, layout.mmap_end).unwrap();
-        state.mmap_base = layout.identity_end;
-        state.mmap_next = layout.identity_end;
-        state.mmap_limit = layout.mmap_end;
-        state.brk_limit = layout.identity_end;
+        state.mm.mmap_base = layout.identity_end;
+        state.mm.mmap_next = layout.identity_end;
+        state.mm.mmap_limit = layout.mmap_end;
+        state.mm.brk_limit = layout.identity_end;
         memory.enable_user_access();
         let large = root.0.join("three-mib.bin");
         std::fs::write(&large, vec![0; 0x30_0000]).unwrap();
@@ -34803,10 +34805,10 @@ mod tests {
         .unwrap()
         .unwrap();
         crate::elf::reserve_vdso_gap(&mut memory, layout.mmap_end).unwrap();
-        state.mmap_base = layout.identity_end;
-        state.mmap_next = layout.identity_end;
-        state.mmap_limit = layout.mmap_end;
-        state.brk_limit = layout.identity_end;
+        state.mm.mmap_base = layout.identity_end;
+        state.mm.mmap_next = layout.identity_end;
+        state.mm.mmap_limit = layout.mmap_end;
+        state.mm.brk_limit = layout.identity_end;
         memory.enable_user_access();
         (memory, state, layout)
     }
@@ -35100,9 +35102,9 @@ mod tests {
         let map = |memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: [u64; 6]| {
             syscall_result(memory, state, libc::SYS_mmap, args)
         };
-        state.mmap_base = 0xbf7f_f000;
-        state.mmap_next = 0xbf7f_f000;
-        state.mmap_limit = 0xbf80_0000;
+        state.mm.mmap_base = 0xbf7f_f000;
+        state.mm.mmap_next = 0xbf7f_f000;
+        state.mm.mmap_limit = 0xbf80_0000;
         memory.set_allocation_cursors(AllocationCursors::from_elf(&state));
         assert_eq!(
             map(
@@ -35120,8 +35122,8 @@ mod tests {
             ),
             (MAP_32BIT_END - PAGE_SIZE) as i64
         );
-        state.mmap_base = 0x7fff_c000;
-        state.mmap_next = 0x7fff_c000;
+        state.mm.mmap_base = 0x7fff_c000;
+        state.mm.mmap_next = 0x7fff_c000;
         memory.set_allocation_cursors(AllocationCursors::from_elf(&state));
         assert_eq!(
             map(
@@ -35159,17 +35161,17 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, (11 * MIB + 0x3000) as usize).unwrap();
         memory.enable_user_access();
-        state.heap_base = 0x20_2000;
-        state.program_break = 0x20_2000;
-        state.brk_limit = 0x30_2000;
-        state.mmap_base = 0x30_2000;
-        state.mmap_next = 0x30_2000;
-        state.mmap_limit = 0x30_3000;
+        state.mm.heap_base = 0x20_2000;
+        state.mm.program_break = 0x20_2000;
+        state.mm.brk_limit = 0x30_2000;
+        state.mm.mmap_base = 0x30_2000;
+        state.mm.mmap_next = 0x30_2000;
+        state.mm.mmap_limit = 0x30_3000;
         memory.set_allocation_cursors(AllocationCursors::from_elf(&state));
         // With a window: a 20 MiB mapping the 18 MiB window cannot hold.
         let (mut windowed, mut windowed_state, layout) = linux_layout_fixture(&root, 64 * MIB);
-        windowed_state.heap_base = 0x30_0000;
-        windowed_state.program_break = 0x30_0000;
+        windowed_state.mm.heap_base = 0x30_0000;
+        windowed_state.mm.program_break = 0x30_0000;
         windowed.set_allocation_cursors(AllocationCursors::from_elf(&windowed_state));
         for (memory, state, flags, length, expected) in [
             (&mut memory, &mut state, low, 2 * PAGE_SIZE, 0x30_0000),
@@ -35191,7 +35193,7 @@ mod tests {
                 expected as i64
             );
             memory.user().write(expected, &[0x5a]).unwrap();
-            let before = state.program_break;
+            let before = state.mm.program_break;
             assert_eq!(
                 syscall_result(
                     memory,
@@ -35235,8 +35237,8 @@ mod tests {
         let root = TestDir::new();
         let (mut memory, mut state, _layout) = linux_layout_fixture(&root, 64 * MIB);
         let base = 0x30_0000;
-        state.heap_base = base;
-        state.program_break = base;
+        state.mm.heap_base = base;
+        state.mm.program_break = base;
         memory.set_allocation_cursors(AllocationCursors::from_elf(&state));
         let path = root.0.join("file.bin");
         std::fs::write(&path, vec![7; 2 * PAGE_SIZE as usize]).unwrap();
@@ -35343,9 +35345,9 @@ mod tests {
         let mut state = test_state(&root.0);
         let mut memory = GuestMemory::new(0, 16 * 1024 * 1024).unwrap();
         memory.enable_user_access();
-        state.mmap_base = 0x30_2000;
-        state.mmap_next = 0x30_2000;
-        state.mmap_limit = 0x30_5000;
+        state.mm.mmap_base = 0x30_2000;
+        state.mm.mmap_next = 0x30_2000;
+        state.mm.mmap_limit = 0x30_5000;
         memory.set_allocation_cursors(AllocationCursors::from_elf(&state));
         let read_write = (libc::PROT_READ | libc::PROT_WRITE) as u64;
         let anonymous = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
@@ -35463,10 +35465,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        state.mmap_base = layout.identity_end;
-        state.mmap_next = layout.identity_end;
-        state.mmap_limit = layout.mmap_end;
-        state.brk_limit = layout.identity_end;
+        state.mm.mmap_base = layout.identity_end;
+        state.mm.mmap_next = layout.identity_end;
+        state.mm.mmap_limit = layout.mmap_end;
+        state.mm.brk_limit = layout.identity_end;
         memory.enable_user_access();
         let read_write = (libc::PROT_READ | libc::PROT_WRITE) as u64;
         let fixed = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED) as u64;

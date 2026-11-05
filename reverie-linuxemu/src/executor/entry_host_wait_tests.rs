@@ -646,8 +646,8 @@ impl Drop for MmapReader {
 #[test]
 fn allocation_held_mmap_file_read_does_not_hold_unchanged_mapping_fence() {
     let mut state = native_loaded_state(std::path::Path::new("/"));
-    let expected_address = state.mmap_base;
-    let memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+    let expected_address = state.mm.mmap_base;
+    let memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
     memory.enable_user_access();
     let expected: Vec<u8> = (0..PAGE_SIZE).map(|i| (i * 17 + 3) as u8).collect();
     // SAFETY: the fixed name is nul-terminated. A successful returned fd is
@@ -753,9 +753,9 @@ fn allocation_held_mmap_file_read_does_not_hold_unchanged_mapping_fence() {
 fn streamed_mmap_file_reads_do_not_hold_unchanged_mapping_fence() {
     const CHUNK: usize = 64 * 1024;
     let mut state = native_loaded_state(std::path::Path::new("/"));
-    state.mmap_limit = state.mmap_base + 4 * CHUNK as u64;
-    let expected_address = state.mmap_base;
-    let memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+    state.mm.mmap_limit = state.mm.mmap_base + 4 * CHUNK as u64;
+    let expected_address = state.mm.mmap_base;
+    let memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
     memory.enable_user_access();
     let len = 3 * CHUNK + 100;
     let expected: Vec<u8> = (0..len).map(|i| (i * 17 + 3) as u8).collect();

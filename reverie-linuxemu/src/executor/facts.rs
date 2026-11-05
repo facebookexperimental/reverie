@@ -2599,7 +2599,7 @@ mod memory_map_tests {
                 WINDOW.0, WINDOW.1
             )
         );
-        let base = executor.state.heap_base;
+        let base = executor.state.mm.heap_base;
         assert_eq!(
             change(
                 &mut executor,
@@ -3094,7 +3094,7 @@ mod memory_map_tests {
                 lineage: 0,
             })
         };
-        let base = executor.state.heap_base;
+        let base = executor.state.mm.heap_base;
         assert_eq!(
             change(
                 &mut executor,
@@ -3259,7 +3259,7 @@ mod memory_map_tests {
             ),
             0
         );
-        let base = executor.state.heap_base;
+        let base = executor.state.mm.heap_base;
         assert_eq!(
             change(&mut executor, &memory, libc::SYS_brk, [base + page, 0, 0]),
             (base + page) as i64

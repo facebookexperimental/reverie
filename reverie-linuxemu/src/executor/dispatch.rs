@@ -53,8 +53,8 @@ pub(super) fn vfork_child_moves_break(
 ) -> bool {
     owner.shares_parent_address_space()
         && number == libc::SYS_brk as u64
-        && args[0] >= state.min_break
-        && args[0] != state.program_break
+        && args[0] >= state.mm.min_break
+        && args[0] != state.mm.program_break
 }
 
 /// Why a vfork child may not create a thread before it execs
@@ -216,10 +216,10 @@ fn execute_basic_syscall_dispatch(
     let cursors = owner
         .allocation_cursors()
         .unwrap_or_else(|| AllocationCursors::from_elf(state));
-    state.program_break = cursors.program_break;
-    state.mmap_base = cursors.mmap_base;
-    state.mmap_next = cursors.mmap_next;
-    state.mmap_limit = cursors.mmap_limit;
+    state.mm.program_break = cursors.program_break;
+    state.mm.mmap_base = cursors.mmap_base;
+    state.mm.mmap_next = cursors.mmap_next;
+    state.mm.mmap_limit = cursors.mmap_limit;
     let number = request.number();
     let args = request.args();
     if vfork_child_moves_break(&owner, state, number, args) {
@@ -259,15 +259,15 @@ fn execute_basic_syscall_dispatch(
     // returns the old break as Linux does.
     let touches_brk = |contains: fn(&GuestMemory, u64, usize) -> bool| {
         number == libc::SYS_brk as u64
-            && args[0] >= BOOT_RESERVED_END.max(state.min_break)
-            && args[0] < state.program_break
+            && args[0] >= BOOT_RESERVED_END.max(state.mm.min_break)
+            && args[0] < state.mm.program_break
             && {
                 // Shrinking retires mappings. Check the exact page-rounded
                 // interval used by brk, before its legacy errno adapter could
                 // hide a shared-file capability refusal as the old break value.
                 match (
                     align_up(args[0], PAGE_SIZE),
-                    align_up(state.program_break, PAGE_SIZE),
+                    align_up(state.mm.program_break, PAGE_SIZE),
                 ) {
                     (Some(start), Some(end)) if end > start => owner
                         .user_range_to_guest(start, end - start)

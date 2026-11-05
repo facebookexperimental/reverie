@@ -33,8 +33,8 @@ fn pkey_test_mapping(root: &TestDir) -> (GuestMemory, LoadedStaticElf, u64) {
     let mut state = test_state(&root.0);
     let memory_size = BOOT_RESERVED_END + 8 * PAGE_SIZE;
     let mut memory = GuestMemory::new(0, memory_size as usize).unwrap();
-    state.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
-    state.mmap_limit = memory_size;
+    state.mm.mmap_next = BOOT_RESERVED_END + PAGE_SIZE;
+    state.mm.mmap_limit = memory_size;
     let mapping = pkey_test_call(
         &mut memory,
         &mut state,

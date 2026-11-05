@@ -12,13 +12,13 @@ use super::*;
 
 pub(super) fn brk(memory: &mut GuestMemory, state: &mut LoadedStaticElf, requested: u64) -> i64 {
     if requested == 0 {
-        return state.program_break as i64;
+        return state.mm.program_break as i64;
     }
     // Linux refuses a break below the image's data (end_data).
-    if requested < BOOT_RESERVED_END.max(state.min_break) || requested >= state.brk_limit {
-        return state.program_break as i64;
+    if requested < BOOT_RESERVED_END.max(state.mm.min_break) || requested >= state.mm.brk_limit {
+        return state.mm.program_break as i64;
     }
-    let previous = state.program_break;
+    let previous = state.mm.program_break;
     if requested > previous {
         // As on Linux, growth adds only the whole pages from the old break's
         // page end to the new break's; the page holding the old break stays
@@ -27,7 +27,7 @@ pub(super) fn brk(memory: &mut GuestMemory, state: &mut LoadedStaticElf, request
             align_up(previous, PAGE_SIZE),
             align_up(requested, PAGE_SIZE),
         ) else {
-            return state.program_break as i64;
+            return state.mm.program_break as i64;
         };
         if end > first {
             // Like Linux, refuse growth that reaches a mapping or the page
@@ -36,15 +36,15 @@ pub(super) fn brk(memory: &mut GuestMemory, state: &mut LoadedStaticElf, request
             // identity addresses above the break end: at the window, or at
             // the end of the mapping range without one.
             let identity_top = if memory.has_mmap_window() {
-                state.brk_limit
+                state.mm.brk_limit
             } else {
-                state.mmap_limit
+                state.mm.mmap_limit
             };
             let guarded = end.saturating_add(PAGE_SIZE).min(identity_top.max(end));
             // The break is a user address (in a PIE window, not physical);
             // the bookkeeping below is by physical address.
             let Some(physical) = memory.user_range_to_guest(first, guarded - first) else {
-                return state.program_break as i64;
+                return state.mm.program_break as i64;
             };
             if memory.find_unmapped_user_range(
                 physical,
@@ -52,14 +52,14 @@ pub(super) fn brk(memory: &mut GuestMemory, state: &mut LoadedStaticElf, request
                 guarded - first,
             ) != Some(physical)
             {
-                return state.program_break as i64;
+                return state.mm.program_break as i64;
             }
             let Ok(length) = usize::try_from(end - first) else {
-                return state.program_break as i64;
+                return state.mm.program_break as i64;
             };
             let Ok(reservation) = memory.reserve_region(physical, end - first, RegionKind::Heap)
             else {
-                return state.program_break as i64;
+                return state.mm.program_break as i64;
             };
             let prot = (libc::PROT_READ | libc::PROT_WRITE) as u8;
             if memory.zero_raw(physical, length).is_err()
@@ -67,22 +67,22 @@ pub(super) fn brk(memory: &mut GuestMemory, state: &mut LoadedStaticElf, request
                     .map_user_protection(physical, end - first, prot)
                     .is_err()
             {
-                return state.program_break as i64;
+                return state.mm.program_break as i64;
             }
             reservation.commit();
             memory.record_file_pages(physical, end - first, None);
         }
     } else if requested < previous {
         let Some(unmap_start) = align_up(requested, PAGE_SIZE) else {
-            return state.program_break as i64;
+            return state.mm.program_break as i64;
         };
         let Some(unmap_end) = align_up(previous, PAGE_SIZE) else {
-            return state.program_break as i64;
+            return state.mm.program_break as i64;
         };
         if unmap_end > unmap_start {
             let Some(physical) = memory.user_range_to_guest(unmap_start, unmap_end - unmap_start)
             else {
-                return state.program_break as i64;
+                return state.mm.program_break as i64;
             };
             // Linux (mm/mmap.c, brk) releases the pages only when a mapping
             // intersects them; with none (the program unmapped its heap) it
@@ -92,11 +92,11 @@ pub(super) fn brk(memory: &mut GuestMemory, state: &mut LoadedStaticElf, request
                     .unmap_user_range(physical, unmap_end - unmap_start)
                     .is_err()
             {
-                return state.program_break as i64;
+                return state.mm.program_break as i64;
             }
         }
     }
-    state.program_break = requested;
+    state.mm.program_break = requested;
     requested as i64
 }
 
@@ -120,12 +120,13 @@ fn legacy_placement(
     limit: u64,
 ) -> Option<u64> {
     let next = state
+        .mm
         .mmap_next
-        .clamp(state.mmap_base, limit.max(state.mmap_base));
+        .clamp(state.mm.mmap_base, limit.max(state.mm.mmap_base));
     memory
-        .find_unmapped_user_range(state.mmap_base, next, length)
+        .find_unmapped_user_range(state.mm.mmap_base, next, length)
         .or_else(|| memory.find_unmapped_user_range(next, limit, length))
-        .or_else(|| memory.find_unmapped_user_range(state.mmap_base, limit, length))
+        .or_else(|| memory.find_unmapped_user_range(state.mm.mmap_base, limit, length))
 }
 
 /// Where mremap moves the mapping at physical `old_address`: as Linux does,
@@ -192,7 +193,7 @@ pub(crate) fn place_mapping(
     let free_hint = |hint: u64| {
         let physical = memory.user_range_to_guest(hint, length)?;
         (physical >= BOOT_RESERVED_END
-            && physical.checked_add(length)? <= state.mmap_limit
+            && physical.checked_add(length)? <= state.mm.mmap_limit
             && memory.find_unmapped_user_range(physical, physical + length, length)
                 == Some(physical))
         .then_some(physical)
@@ -204,7 +205,7 @@ pub(crate) fn place_mapping(
     let identity_top = if window {
         memory.user_layout().1
     } else {
-        state.mmap_base
+        state.mm.mmap_base
     };
     if map_32bit {
         // Linux takes a free hint that ends below 2 GiB, else the lowest free
@@ -220,9 +221,9 @@ pub(crate) fn place_mapping(
         {
             return Some(physical);
         }
-        let low_limit = state.mmap_limit.min(MAP_32BIT_END);
+        let low_limit = state.mm.mmap_limit.min(MAP_32BIT_END);
         if !window
-            && state.mmap_base < low_limit
+            && state.mm.mmap_base < low_limit
             && let Some(found) = legacy_placement(memory, state, length, low_limit)
         {
             return Some(found);
@@ -234,7 +235,7 @@ pub(crate) fn place_mapping(
         );
     }
     if !window {
-        return legacy_placement(memory, state, length, state.mmap_limit);
+        return legacy_placement(memory, state, length, state.mm.mmap_limit);
     }
     if hint != 0
         && let Some(physical) = free_hint(hint)
@@ -257,8 +258,9 @@ pub(crate) fn place_mapping(
     {
         return Some(found);
     }
-    let top_down =
-        |length| memory.find_unmapped_user_range_topdown(state.mmap_base, state.mmap_limit, length);
+    let top_down = |length| {
+        memory.find_unmapped_user_range_topdown(state.mm.mmap_base, state.mm.mmap_limit, length)
+    };
     let offset = match kind {
         // Linux aligns an anonymous mapping only when it has no hint.
         MappingKind::Anonymous if hint == 0 && length.is_multiple_of(LARGE_PAGE) => Some(0),
@@ -399,7 +401,7 @@ pub(super) fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
     if noreplace && let Some(errno) = noreplace_error(memory, state, args, address, end) {
         return negative_errno(errno);
     }
-    if address < BOOT_RESERVED_END || end > state.mmap_limit {
+    if address < BOOT_RESERVED_END || end > state.mm.mmap_limit {
         return negative_errno(libc::ENOMEM);
     }
     // do_mmap refuses an unknown mapping type only after placement. For an
@@ -549,7 +551,7 @@ pub(super) fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
         is_anonymous && is_shared,
     );
     if !fixed {
-        state.mmap_next = state.mmap_next.max(end);
+        state.mm.mmap_next = state.mm.mmap_next.max(end);
     }
     memory.physical_to_user(address).unwrap_or(address) as i64
 }
@@ -935,7 +937,7 @@ pub(super) fn mremap(
         // The grown range must stay one run of user addresses: growing across
         // the identity end or a window's end would reach pages with no user
         // address.
-        if new_end <= state.mmap_limit
+        if new_end <= state.mm.mmap_limit
             && memory.user_range_to_guest(user_address, new_length) == Some(old_address)
             && memory.find_unmapped_user_range(old_end, new_end, extension_length) == Some(old_end)
         {
@@ -955,7 +957,7 @@ pub(super) fn mremap(
                 return negative_errno(libc::ENOMEM);
             }
             reservation.commit();
-            state.mmap_next = state.mmap_next.max(new_end);
+            state.mm.mmap_next = state.mm.mmap_next.max(new_end);
             return user_address as i64;
         }
     }
@@ -980,7 +982,7 @@ pub(super) fn mremap(
     };
     if destination < BOOT_RESERVED_END
         || !destination.is_multiple_of(PAGE_SIZE)
-        || destination_end > state.mmap_limit
+        || destination_end > state.mm.mmap_limit
         || destination < old_end && old_address < destination_end
     {
         return negative_errno(libc::EINVAL);
@@ -1017,7 +1019,7 @@ pub(super) fn mremap(
     }
     reservation.commit();
     if flags & libc::MREMAP_FIXED as u64 == 0 {
-        state.mmap_next = state.mmap_next.max(destination_end);
+        state.mm.mmap_next = state.mm.mmap_next.max(destination_end);
     }
     memory.physical_to_user(destination).unwrap_or(destination) as i64
 }

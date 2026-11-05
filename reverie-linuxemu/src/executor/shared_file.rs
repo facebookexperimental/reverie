@@ -149,7 +149,7 @@ pub(super) fn mmap_with_shared_files(
     if noreplace && let Some(errno) = super::noreplace_error(memory, state, args, address, end) {
         return Ok(negative_errno(errno));
     }
-    if address < BOOT_RESERVED_END || end > state.mmap_limit {
+    if address < BOOT_RESERVED_END || end > state.mm.mmap_limit {
         return Ok(negative_errno(libc::ENOMEM));
     }
     // An unknown mapping type is refused only after placement, as in do_mmap;
@@ -361,7 +361,7 @@ pub(super) fn mmap_with_shared_files(
     }
     // Either publication recorded the new mapping's provenance with it
     // (a shared view's file offset by `publish_shared_file_range`).
-    state.mmap_next = cursors.mmap_next;
+    state.mm.mmap_next = cursors.mmap_next;
     Ok(memory.physical_to_user(address).unwrap_or(address) as i64)
 }
 
@@ -409,7 +409,7 @@ pub(super) fn remap_requires_shared_capability(
         };
         let end = start + new_length;
         if start < BOOT_RESERVED_END
-            || end > state.mmap_limit
+            || end > state.mm.mmap_limit
             || (start < source + old_length && source < end)
         {
             return false;
@@ -442,8 +442,8 @@ mod tests {
 
     fn setup() -> (GuestMemory, LoadedStaticElf) {
         let mut state = native_loaded_state(std::path::Path::new("/"));
-        state.mmap_limit = BOOT_RESERVED_END + 8 * PAGE_SIZE;
-        let memory = GuestMemory::new(0, state.mmap_limit as usize).unwrap();
+        state.mm.mmap_limit = BOOT_RESERVED_END + 8 * PAGE_SIZE;
+        let memory = GuestMemory::new(0, state.mm.mmap_limit as usize).unwrap();
         (memory, state)
     }
 
@@ -583,7 +583,7 @@ mod tests {
             assert_eq!(native, libc::MAP_FAILED);
             assert_eq!(native_errno, Some(libc::EPERM));
             state.files.insert(3, file);
-            let address = state.mmap_base;
+            let address = state.mm.mmap_base;
             memory.write(address, &[0xa5; 16]).unwrap();
             let before = memory.allocation_cursors();
             assert_eq!(
@@ -633,7 +633,7 @@ mod tests {
         let (mut memory, mut state) = setup();
         state.files.insert(3, backing(c"reverie-kvm-proc"));
         state.files.insert(4, backing(c"shared-map-ordinary"));
-        let address = state.mmap_base;
+        let address = state.mm.mmap_base;
         memory.write(address, &[0x5a; 32]).unwrap();
         let base = [
             address,
@@ -921,9 +921,9 @@ mod tests {
                 state
                     .files
                     .insert(3, unsafe { std::fs::File::from_raw_fd(fd) });
-                let address = state.mmap_base;
+                let address = state.mm.mmap_base;
                 memory.write(address, &[0x5a; 32]).unwrap();
-                let before = state.mmap_next;
+                let before = state.mm.mmap_next;
                 let args = [0, length, libc::PROT_READ as u64, flags as u64, 3, 0];
                 let result = call(&mut memory, &mut state, args, false);
                 let native = native_mmap_result(path, open_flags, length, flags);
@@ -931,7 +931,7 @@ mod tests {
                 if native < 0 {
                     assert_eq!(result.unwrap(), native, "{label}");
                     assert_eq!(bytes(&memory, address, 32), [0x5a; 32], "{label}");
-                    assert_eq!(state.mmap_next, before, "{label}");
+                    assert_eq!(state.mm.mmap_next, before, "{label}");
                 } else if flags & libc::MAP_TYPE == libc::MAP_PRIVATE {
                     let mapped = result.unwrap();
                     assert!(mapped > 0, "{label}: {mapped}");
@@ -954,7 +954,7 @@ mod tests {
             state
                 .files
                 .insert(3, std::fs::File::open("/dev/urandom").unwrap());
-            let address = state.mmap_base;
+            let address = state.mm.mmap_base;
             memory.write(address, &[0x5a; 32]).unwrap();
             let args = [
                 address,

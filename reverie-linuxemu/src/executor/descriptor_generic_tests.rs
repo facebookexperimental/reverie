@@ -425,9 +425,9 @@ fn descriptor_mmap_cases(cases: &[(u64, u64, u64, u64, i32)]) {
     let root = TestDir::new();
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, (BOOT_RESERVED_END + 4 * PAGE_SIZE) as usize).unwrap();
-    state.mmap_base = BOOT_RESERVED_END;
-    state.mmap_next = BOOT_RESERVED_END;
-    state.mmap_limit = BOOT_RESERVED_END + 4 * PAGE_SIZE;
+    state.mm.mmap_base = BOOT_RESERVED_END;
+    state.mm.mmap_next = BOOT_RESERVED_END;
+    state.mm.mmap_limit = BOOT_RESERVED_END + 4 * PAGE_SIZE;
     memory
         .map_user_permissions(BOOT_RESERVED_END, PAGE_SIZE, true, true)
         .unwrap();
@@ -477,7 +477,7 @@ fn descriptor_mmap_cases(cases: &[(u64, u64, u64, u64, i32)]) {
                     negative_errno(error),
                     "{path} mode={mode:#x} address={address:#x} length={length:#x} flags={flags:#x} offset={offset:#x}"
                 );
-                assert_eq!(state.mmap_next, BOOT_RESERVED_END);
+                assert_eq!(state.mm.mmap_next, BOOT_RESERVED_END);
                 let mut page = vec![0; PAGE_SIZE as usize];
                 memory.read(BOOT_RESERVED_END, &mut page).unwrap();
                 assert_eq!(page, [0xa5; PAGE_SIZE as usize]);
@@ -934,9 +934,9 @@ fn descriptor_mmap_ignores_unknown_protection_bits() {
     let root = TestDir::new();
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, (BOOT_RESERVED_END + 8 * PAGE_SIZE) as usize).unwrap();
-    state.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
-    state.mmap_next = state.mmap_base;
-    state.mmap_limit = BOOT_RESERVED_END + 8 * PAGE_SIZE;
+    state.mm.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
+    state.mm.mmap_next = state.mm.mmap_base;
+    state.mm.mmap_limit = BOOT_RESERVED_END + 8 * PAGE_SIZE;
     let regular = descriptor_regular_file(&root, "regular");
     for (path, native_path) in [
         ("/dev/urandom", std::path::PathBuf::from("/dev/urandom")),
@@ -1186,9 +1186,9 @@ fn descriptor_mmap_object_probe_errors_are_final() {
     let root = TestDir::new();
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, (BOOT_RESERVED_END + 4 * PAGE_SIZE) as usize).unwrap();
-    state.mmap_base = BOOT_RESERVED_END;
-    state.mmap_next = BOOT_RESERVED_END;
-    state.mmap_limit = BOOT_RESERVED_END + 4 * PAGE_SIZE;
+    state.mm.mmap_base = BOOT_RESERVED_END;
+    state.mm.mmap_next = BOOT_RESERVED_END;
+    state.mm.mmap_limit = BOOT_RESERVED_END + 4 * PAGE_SIZE;
     memory
         .map_user_permissions(BOOT_RESERVED_END, PAGE_SIZE, true, true)
         .unwrap();
@@ -1223,7 +1223,7 @@ fn descriptor_mmap_object_probe_errors_are_final() {
         let mut page = vec![0; PAGE_SIZE as usize];
         memory.read(BOOT_RESERVED_END, &mut page).unwrap();
         assert_eq!(page, [0xa5; PAGE_SIZE as usize], "kind={kind:#x}");
-        assert_eq!(state.mmap_next, BOOT_RESERVED_END);
+        assert_eq!(state.mm.mmap_next, BOOT_RESERVED_END);
         assert_eq!(status(&mut memory, &mut state), before);
     }
     // Control: the host maps /dev/zero privately, and the copy runs.
@@ -1257,9 +1257,9 @@ fn descriptor_anonymous_mmap_checks_the_offset_first() {
     let root = TestDir::new();
     let mut state = test_state(&root.0);
     let mut memory = GuestMemory::new(0, (BOOT_RESERVED_END + 4 * PAGE_SIZE) as usize).unwrap();
-    state.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
-    state.mmap_next = state.mmap_base;
-    state.mmap_limit = BOOT_RESERVED_END + 4 * PAGE_SIZE;
+    state.mm.mmap_base = BOOT_RESERVED_END + PAGE_SIZE;
+    state.mm.mmap_next = state.mm.mmap_base;
+    state.mm.mmap_limit = BOOT_RESERVED_END + 4 * PAGE_SIZE;
     memory
         .map_user_permissions(BOOT_RESERVED_END, PAGE_SIZE, true, true)
         .unwrap();
