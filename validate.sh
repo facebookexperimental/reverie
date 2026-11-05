@@ -847,6 +847,15 @@ if ((failures == 0)) && ! aggregate_test_counts_are_passing; then
 fi
 
 passed=$((checks - failures))
+# Named host-capability refusals are libtest passes in the raw counts;
+# report them separately so they are never read as passes.
+named_refusals=$(grep -c '^REVERIE_SKIP:' "$LOG_FILE" || true)
+if ((named_refusals > 0)); then
+    read -r agg_executed agg_passed agg_filtered < <(aggregate_test_counts)
+    printf "Named refusals: %s REVERIE_SKIP (refused/skipped, not passes; raw libtest passes %s of %s include them)\n" \
+        "$named_refusals" "$agg_passed" "$agg_executed"
+    grep '^REVERIE_SKIP:' "$LOG_FILE" | sort | uniq -c | sed 's/^/  /'
+fi
 if ((failures == 0)); then
     printf "Validation summary: %s passed, 0 failed (log: %s)\n" "$passed" "$LOG_FILE"
     if ((LABEL_PR == 1)); then
