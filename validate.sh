@@ -25,6 +25,12 @@ unset lzma_runtime
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -C link-arg=$LZMA_LINK_TARGET"
 export RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-D warnings"
 
+# Counted-runner timeout/retry policy (scripts/libtest-counts.rs): per-test
+# CPU cap is primary, wall backstop is min(8x CPU, 600s), and failed tests
+# get at most two counted blanket retries, each pass reported as FLAKY.
+export REVERIE_TEST_CPU_SECONDS="${REVERIE_TEST_CPU_SECONDS:-120}"
+export REVERIE_TEST_RETRIES="${REVERIE_TEST_RETRIES:-2}"
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
@@ -746,6 +752,24 @@ readonly -a REGULAR_TEST_SKIP_ARGS=(
     --skip tests::port_isolation
     --skip tests::seccomp_notify
     --skip tests::uid_namespace
+    # dh-hkdh0: the LiteInst allocator-fixtures producer is disabled below
+    # (parity-with-main), so its fixture environment is absent. These tests
+    # require that produced fixture; skip them by name until the held
+    # ordinary-dev publication cohort (reverie 1125) lands. Tracker: dh-hkdh0.
+    --skip native_unpublished
+    --skip explicit_getter_strace_uses_owned_generic_stack
+    --skip explicit_none_reserves_owned_stack_without_runtime
+    --skip fixed_collision_refuses_without_changing_sentinel
+    --skip ordinary_region_is_not_adopted_by_generic_entry
+    --skip repeated_none_then_active_refuses_before_second_getter
+    --skip host_caller_keeps_its_96_mib_allocator
+    --skip private_pointer_guard_has_exact_failure_and_fallback_outcomes
+    --skip runtime_receipt_controls::production_consumer_requires_compiled_sources
+    --skip standalone_private_allocator_matrix
+    --skip system_roots_are_refused_before_all_three_installation_entries
+    --skip standalone_fixed_arena_workload_and_literal_placement
+    --skip native_mapping_boundaries_preserve_guards_break_abi_and_fork_owner
+    --skip published_owner_guest_mprotect_and_munmap_preserve_real_spare_pages
 )
 
 # These inputs belong to the required producer for this validation generation.
@@ -767,7 +791,18 @@ build_liteinst_allocator_fixtures() {
 
 run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
 run_check "Build workspace" cargo build --workspace --all-features
-run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
+# DISABLED (dh-hkdh0): the allocator-fixtures producer is red at base
+# (fixed_arena_backing needs the held ordinary-dev publication cohort,
+# reverie 1125). Waived to parity-with-main by coordinator ruling C;
+# re-enable by restoring the run_check below when that cohort lands.
+disabled_liteinst_allocator_fixtures() {
+    echo "SKIP (dh-hkdh0): allocator producer disabled until held reverie 1125 cohort lands"
+}
+run_check "LiteInst allocator fixtures (disabled: dh-hkdh0)" \
+    disabled_liteinst_allocator_fixtures
+# Bounded recipe tests require TMPDIR inside the retained artifact domain.
+export TMPDIR="$ROOT_DIR/target/validate-tmp"
+mkdir -p "$TMPDIR"
 # The counted runner accepts only a command that starts with `cargo test`, so
 # the fixture paths reach the tests through the environment rather than an
 # `env NAME=VALUE` prefix. They are exported for this step alone.

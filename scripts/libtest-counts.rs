@@ -26,12 +26,15 @@ use std::io;
 use std::io::BufRead;
 use std::io::Read;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -151,6 +154,158 @@ struct DiscoverySuite {
     ignored: u64,
 }
 
+/// One completed libtest execution record with attributed cost. CPU is the
+/// process-group CPU delta since the previous record (serial harness), so
+/// it includes descendants that stayed in the group; wall is the elapsed
+/// time until the record arrived. Attempt 0 is the counted run itself.
+#[derive(Clone, Debug, Serialize)]
+struct ExecutionRecord {
+    name: String,
+    outcome: String,
+    cpu_usec: u64,
+    wall_usec: u64,
+    attempt: u32,
+}
+
+/// Per-test timeout budgets. The CPU cap is the primary limit; the wall
+/// backstop is eight times the CPU cap, capped at 600 seconds (Hermit
+/// policy), unless explicitly overridden by environment.
+#[derive(Clone, Debug)]
+struct TestBudgets {
+    default_cpu_seconds: u64,
+    wall_seconds_override: Option<u64>,
+    per_test_cpu_seconds: std::collections::BTreeMap<String, u64>,
+}
+
+impl TestBudgets {
+    fn from_env() -> Result<Self, String> {
+        let mut budgets = Self {
+            default_cpu_seconds: 120,
+            wall_seconds_override: None,
+            per_test_cpu_seconds: Default::default(),
+        };
+        if let Some(path) = env::var_os("REVERIE_TEST_BUDGETS") {
+            let text = fs::read_to_string(&path).map_err(|error| {
+                format!(
+                    "cannot read REVERIE_TEST_BUDGETS {}: {error}",
+                    Path::new(&path).display()
+                )
+            })?;
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|error| format!("REVERIE_TEST_BUDGETS is not JSON: {error}"))?;
+            if let Some(default) = value.get("default_cpu_seconds") {
+                budgets.default_cpu_seconds = default
+                    .as_u64()
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| "default_cpu_seconds must be a positive integer".to_string())?;
+            }
+            if let Some(tests) = value.get("tests") {
+                let tests = tests
+                    .as_object()
+                    .ok_or_else(|| "tests in REVERIE_TEST_BUDGETS must be an object".to_string())?;
+                for (name, seconds) in tests {
+                    let seconds = seconds.as_u64().filter(|v| *v > 0).ok_or_else(|| {
+                        format!("CPU budget for {name} must be a positive integer")
+                    })?;
+                    budgets.per_test_cpu_seconds.insert(name.clone(), seconds);
+                }
+            }
+        }
+        budgets.default_cpu_seconds =
+            parse_positive_env_u64("REVERIE_TEST_CPU_SECONDS", budgets.default_cpu_seconds)?;
+        if env::var_os("REVERIE_TEST_WALL_SECONDS").is_some() {
+            budgets.wall_seconds_override =
+                Some(parse_positive_env_u64("REVERIE_TEST_WALL_SECONDS", 600)?);
+        }
+        Ok(budgets)
+    }
+
+    fn cpu_seconds(&self, test: &str) -> u64 {
+        self.per_test_cpu_seconds
+            .get(test)
+            .copied()
+            .unwrap_or(self.default_cpu_seconds)
+    }
+
+    fn wall_seconds(&self, test: &str) -> u64 {
+        self.wall_seconds_override
+            .unwrap_or_else(|| (8 * self.cpu_seconds(test)).min(600))
+    }
+}
+
+fn parse_positive_env_u64(name: &str, default: u64) -> Result<u64, String> {
+    match env::var(name) {
+        Ok(text) => text
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v > 0)
+            .ok_or_else(|| format!("{name} must be a positive integer, got {text:?}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("{name} must be valid UTF-8: {error}")),
+    }
+}
+
+fn retries_from_env() -> Result<u32, String> {
+    let retries = parse_positive_env_u64("REVERIE_TEST_RETRIES", 2).or_else(|_| {
+        // Zero is a valid explicit choice even though it is not positive.
+        match env::var("REVERIE_TEST_RETRIES").as_deref() {
+            Ok("0") => Ok(0),
+            _ => Err("REVERIE_TEST_RETRIES must be an integer in 0..=2".to_string()),
+        }
+    })?;
+    if retries > 2 {
+        return Err(format!(
+            "REVERIE_TEST_RETRIES={retries} exceeds the maximum of 2 counted retries"
+        ));
+    }
+    Ok(retries as u32)
+}
+
+/// Sum utime+stime+cutime+cstime (clock ticks) over one process group.
+/// USER_HZ is 100 on Linux x86_64/aarch64 userspace.
+fn process_group_cpu_usec(pgid: u32) -> u64 {
+    const TICKS_PER_SECOND: u64 = 100;
+    let mut total_ticks = 0_u64;
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some(ticks) = proc_stat_cpu_ticks_for_group(&stat, pgid) {
+            total_ticks = total_ticks.saturating_add(ticks);
+        }
+    }
+    total_ticks.saturating_mul(1_000_000 / TICKS_PER_SECOND)
+}
+
+fn proc_stat_cpu_ticks_for_group(stat: &str, pgid: u32) -> Option<u64> {
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
+    // After comm: state ppid pgrp session tty tpgid flags minflt cminflt
+    // majflt cmajflt utime stime cutime cstime ...
+    if fields.get(2).and_then(|v| v.parse::<u32>().ok()) != Some(pgid) {
+        return None;
+    }
+    let mut total = 0_u64;
+    for index in [11_usize, 12, 13, 14] {
+        total = total.saturating_add(fields.get(index).and_then(|v| v.parse::<u64>().ok())?);
+    }
+    Some(total)
+}
+
+fn kill_process_group(pgid: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{pgid}")])
+        .status();
+}
+
 fn increment(value: &mut u64, label: &str) -> Result<(), String> {
     *value = value
         .checked_add(1)
@@ -158,37 +313,56 @@ fn increment(value: &mut u64, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_execution_record_line(line: &str) -> Result<(&str, &str), String> {
+    let (outcome, name) = line
+        .split_once(' ')
+        .ok_or_else(|| format!("malformed libtest execution record: {line:?}"))?;
+    if name.is_empty() {
+        return Err("libtest execution record has an empty test name".to_string());
+    }
+    Ok((outcome, name))
+}
+
+fn count_execution_record(
+    counts: &mut ExecutionCounts,
+    outcome: &str,
+    line: &str,
+) -> Result<(), String> {
+    match outcome {
+        "ok" => {
+            increment(&mut counts.executed, "executed test count")?;
+            increment(&mut counts.passed, "passed test count")
+        }
+        "failed" => {
+            increment(&mut counts.executed, "executed test count")?;
+            increment(&mut counts.failed, "failed test count")
+        }
+        "ignored" | "ignored:" => increment(&mut counts.ignored, "ignored test count"),
+        _ => Err(format!(
+            "unknown libtest execution outcome {outcome:?} in record {line:?}"
+        )),
+    }
+}
+
 fn parse_execution_records<R: BufRead>(reader: R) -> Result<ExecutionCounts, String> {
     let mut counts = ExecutionCounts::default();
     for line in reader.lines() {
         let line = line.map_err(|error| format!("cannot read libtest execution log: {error}"))?;
-        let (outcome, name) = line
-            .split_once(' ')
-            .ok_or_else(|| format!("malformed libtest execution record: {line:?}"))?;
-        if name.is_empty() {
-            return Err("libtest execution record has an empty test name".to_string());
-        }
-        match outcome {
-            "ok" => {
-                increment(&mut counts.executed, "executed test count")?;
-                increment(&mut counts.passed, "passed test count")?;
-            }
-            "failed" => {
-                increment(&mut counts.executed, "executed test count")?;
-                increment(&mut counts.failed, "failed test count")?;
-            }
-            "ignored" | "ignored:" => increment(&mut counts.ignored, "ignored test count")?,
-            _ => {
-                return Err(format!(
-                    "unknown libtest execution outcome {outcome:?} in record {line:?}"
-                ));
-            }
-        }
+        let (outcome, _name) = parse_execution_record_line(&line)?;
+        count_execution_record(&mut counts, outcome, &line)?;
     }
     Ok(counts)
 }
 
-fn parse_discovery<R: BufRead>(reader: R, mut echo: impl Write) -> Result<DiscoveryCounts, String> {
+fn parse_discovery<R: BufRead>(reader: R, echo: impl Write) -> Result<DiscoveryCounts, String> {
+    parse_discovery_names(reader, echo).map(|(counts, _names)| counts)
+}
+
+fn parse_discovery_names<R: BufRead>(
+    reader: R,
+    mut echo: impl Write,
+) -> Result<(DiscoveryCounts, Vec<String>), String> {
+    let mut names = Vec::new();
     let mut counts = DiscoveryCounts::default();
     let mut suite = None;
     let mut completed = 0_u64;
@@ -221,6 +395,10 @@ fn parse_discovery<R: BufRead>(reader: R, mut echo: impl Write) -> Result<Discov
                     .as_mut()
                     .ok_or_else(|| "a test was discovered outside a discovery suite".to_string())?;
                 increment(&mut current.discovered, "discovered test count")?;
+                match value.get("name").and_then(serde_json::Value::as_str) {
+                    Some(name) if !name.is_empty() => names.push(name.to_string()),
+                    _ => return Err("discovered test lacks a nonempty name".to_string()),
+                }
                 match value.get("ignore").and_then(serde_json::Value::as_bool) {
                     Some(true) => increment(&mut current.ignored, "discovered ignored count")?,
                     Some(false) => {}
@@ -282,7 +460,7 @@ fn parse_discovery<R: BufRead>(reader: R, mut echo: impl Write) -> Result<Discov
     if completed == 0 {
         return Err("libtest emitted no completed discovery suite".to_string());
     }
-    Ok(counts)
+    Ok((counts, names))
 }
 
 fn write_counts(path: &Path, counts: TestCounts) -> Result<(), String> {
@@ -362,6 +540,7 @@ fn read_counts(path: &Path) -> Result<TestCounts, String> {
 #[derive(Debug)]
 struct CargoTestCommands {
     execution: Vec<String>,
+    retry_base: Vec<String>,
     selected_discovery: Vec<String>,
     unfiltered_discovery: Vec<String>,
 }
@@ -515,10 +694,12 @@ fn cargo_test_commands(
     if separator.is_none() {
         execution.push("--".to_string());
     }
+    let retry_base = execution.clone();
     execution.extend(["--logfile".to_string(), execution_log.display().to_string()]);
 
     Ok(CargoTestCommands {
         execution,
+        retry_base,
         selected_discovery: append_discovery_args(cargo_args.clone(), &selected_args),
         unfiltered_discovery: append_discovery_args(cargo_args, &unfiltered_args),
     })
@@ -597,6 +778,218 @@ fn read_execution_channel(mut reader: fs::File) -> Result<ExecutionCounts, Strin
     parse_execution_records(io::Cursor::new(bytes))
 }
 
+fn discover_names(args: &[String]) -> Result<(DiscoveryCounts, Vec<String>), String> {
+    let mut child = Command::new(&args[0])
+        .args(&args[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("cannot start cargo test discovery: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "cargo test discovery stdout was not piped".to_string())?;
+    let parsed = parse_discovery_names(io::BufReader::new(stdout), io::stdout().lock());
+    let status = child
+        .wait()
+        .map_err(|error| format!("cannot wait for cargo test discovery: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "cargo test discovery exited with {}",
+            status_code(status)
+        ));
+    }
+    parsed
+}
+
+struct SupervisedExecution {
+    counts: ExecutionCounts,
+    failed: Vec<String>,
+    records: Vec<ExecutionRecord>,
+    code: i32,
+    timeout: Option<String>,
+}
+
+fn run_supervised(
+    command: &[String],
+    reader: fs::File,
+    mut anchor: Option<fs::File>,
+    selected_names: &[String],
+    budgets: &TestBudgets,
+) -> Result<SupervisedExecution, String> {
+    let (sender, receiver) = std::sync::mpsc::channel::<io::Result<String>>();
+    let reader_thread = std::thread::spawn(move || {
+        let mut lines = io::BufReader::new(reader).lines();
+        loop {
+            match lines.next() {
+                Some(result) => {
+                    if sender.send(result).is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+    });
+    let mut child = Command::new(&command[0])
+        .args(&command[1..])
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("cannot start cargo test execution: {error}"))?;
+    let pgid = child.id();
+    let mut counts = ExecutionCounts::default();
+    let mut failed = Vec::new();
+    let mut records = Vec::new();
+    let mut timeout = None;
+    let mut status = None;
+    let mut segment_start = Instant::now();
+    let mut segment_cpu_start = process_group_cpu_usec(pgid);
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(line)) => {
+                let (outcome, name) = parse_execution_record_line(&line)?;
+                count_execution_record(&mut counts, outcome, &line)?;
+                let cpu_now = process_group_cpu_usec(pgid);
+                records.push(ExecutionRecord {
+                    name: name.to_string(),
+                    outcome: outcome.to_string(),
+                    cpu_usec: cpu_now.saturating_sub(segment_cpu_start),
+                    wall_usec: segment_start.elapsed().as_micros() as u64,
+                    attempt: 0,
+                });
+                if outcome == "failed" {
+                    failed.push(name.to_string());
+                }
+                segment_start = Instant::now();
+                segment_cpu_start = cpu_now;
+            }
+            Ok(Err(error)) => {
+                return Err(format!("cannot read libtest execution log: {error}"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if status.is_none() {
+            if let Some(done) = child
+                .try_wait()
+                .map_err(|error| format!("cannot wait for cargo test execution: {error}"))?
+            {
+                status = Some(done);
+                drop(anchor.take());
+                continue;
+            }
+            let recorded = counts.executed.saturating_add(counts.ignored) as usize;
+            let in_flight = selected_names
+                .get(recorded)
+                .map(String::as_str)
+                .unwrap_or("<unknown in-flight test>");
+            let cpu_used = process_group_cpu_usec(pgid).saturating_sub(segment_cpu_start);
+            let wall_used = segment_start.elapsed();
+            let cpu_cap = budgets.cpu_seconds(in_flight).saturating_mul(1_000_000);
+            let wall_cap = Duration::from_secs(budgets.wall_seconds(in_flight));
+            if cpu_used > cpu_cap || wall_used > wall_cap {
+                timeout = Some(format!(
+                    "test {in_flight} exceeded timeout budget: used {:.1}s CPU (cap {}s) and {:.1}s wall (backstop {}s)",
+                    cpu_used as f64 / 1e6,
+                    budgets.cpu_seconds(in_flight),
+                    wall_used.as_secs_f64(),
+                    budgets.wall_seconds(in_flight),
+                ));
+                kill_process_group(pgid);
+                status = Some(
+                    child
+                        .wait()
+                        .map_err(|error| format!("cannot wait for timed-out test: {error}"))?,
+                );
+                drop(anchor.take());
+            }
+        }
+    }
+    let status = match status {
+        Some(status) => status,
+        None => child
+            .wait()
+            .map_err(|error| format!("cannot wait for cargo test execution: {error}"))?,
+    };
+    let _ = reader_thread.join();
+    Ok(SupervisedExecution {
+        counts,
+        failed,
+        records,
+        code: status_code(status),
+        timeout,
+    })
+}
+
+/// One bounded batch rerun of the named failed tests. Returns the names
+/// that passed. Output is echoed so the validate log keeps full evidence.
+fn run_retry_batch(retry_base: &[String], names: &[String]) -> Result<Vec<String>, String> {
+    let retryable: Vec<&String> = names.iter().filter(|n| !n.contains(' ')).collect();
+    if retryable.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<String> = retry_base.to_vec();
+    args.push("--exact".to_string());
+    args.extend(retryable.iter().map(|n| n.to_string()));
+    let mut child = Command::new(&args[0])
+        .args(&args[1..])
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot start cargo test retry: {error}"))?;
+    let pgid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_group(pgid);
+                    break child.wait_with_output();
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("cannot wait for cargo test retry: {error}")),
+        }
+    }
+    .map_err(|error| format!("cannot collect cargo test retry output: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    let mut passed = Vec::new();
+    for line in stdout.lines().chain(stderr.lines()) {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("test ") {
+            if let Some(name) = rest.strip_suffix(" ... ok") {
+                if retryable.iter().any(|n| n.as_str() == name)
+                    && !passed.contains(&name.to_string())
+                {
+                    passed.push(name.to_string());
+                }
+            }
+        }
+    }
+    Ok(passed)
+}
+
+fn write_cpu_report(path: &Path, records: &[ExecutionRecord]) -> Result<(), String> {
+    let report = env::var_os("REVERIE_TEST_CPU_REPORT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.with_extension("cpu.jsonl"));
+    let mut text = String::new();
+    for record in records {
+        text.push_str(
+            &serde_json::to_string(record)
+                .map_err(|error| format!("cannot serialize CPU report record: {error}"))?,
+        );
+        text.push('\n');
+    }
+    fs::write(&report, text)
+        .map_err(|error| format!("cannot write CPU report {}: {error}", report.display()))
+}
+
 fn run(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
     if path.exists() {
         fs::remove_file(&path)
@@ -616,23 +1009,63 @@ fn run(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     let commands = cargo_test_commands(args, &execution_channel)?;
-    let selected = discover(&commands.selected_discovery)?;
+    let budgets = TestBudgets::from_env()?;
+    let max_retries = retries_from_env()?;
+    let (selected, selected_names) = discover_names(&commands.selected_discovery)?;
     let unfiltered = discover(&commands.unfiltered_discovery)?;
 
     let (anchor, reader) = create_execution_channel(&execution_channel)?;
-    let reader_thread = std::thread::spawn(move || read_execution_channel(reader));
-    let status = Command::new(&commands.execution[0])
-        .args(&commands.execution[1..])
-        .status()
-        .map_err(|error| format!("cannot start cargo test execution: {error}"));
-    drop(anchor);
-    let execution = reader_thread.join();
+    let outcome = run_supervised(
+        &commands.execution,
+        reader,
+        Some(anchor),
+        &selected_names,
+        &budgets,
+    );
     fs::remove_file(&execution_channel)
         .map_err(|error| format!("cannot remove {}: {error}", execution_channel.display()))?;
-    let execution =
-        execution.map_err(|_| "libtest execution-channel reader panicked".to_string())??;
-    let status = status?;
-    let code = status_code(status);
+    let mut outcome = outcome?;
+    if let Some(timeout) = &outcome.timeout {
+        write_cpu_report(&path, &outcome.records)?;
+        return Err(timeout.clone());
+    }
+    let mut code = outcome.code;
+    // Blanket counted retries (owner policy): every failed test gets up to
+    // REVERIE_TEST_RETRIES (default/max 2) batch reruns. A pass on retry is
+    // recorded as FLAKY in the output and CPU report, never silent.
+    let mut flaky_total = 0_usize;
+    for attempt in 1..=max_retries {
+        if outcome.failed.is_empty() {
+            break;
+        }
+        let passed = run_retry_batch(&commands.retry_base, &outcome.failed)?;
+        if passed.is_empty() {
+            break;
+        }
+        flaky_total += passed.len();
+        for name in &passed {
+            eprintln!("REVERIE_FLAKY: {name} passed on retry attempt {attempt}");
+            outcome.records.push(ExecutionRecord {
+                name: name.clone(),
+                outcome: "ok".to_string(),
+                cpu_usec: 0,
+                wall_usec: 0,
+                attempt,
+            });
+            outcome.counts.failed = outcome.counts.failed.saturating_sub(1);
+            outcome.counts.passed = outcome.counts.passed.saturating_add(1);
+        }
+        outcome.failed.retain(|name| !passed.contains(name));
+        if outcome.failed.is_empty() {
+            eprintln!(
+                "REVERIE_FLAKY_SUMMARY: {} test(s) passed only on retry",
+                flaky_total
+            );
+            code = 0;
+        }
+    }
+    write_cpu_report(&path, &outcome.records)?;
+    let execution = outcome.counts;
     if code == 0 && execution.failed != 0 {
         return Err(format!(
             "cargo test exited successfully but its execution log recorded {} failures",
@@ -645,6 +1078,25 @@ fn run(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
 }
 
 fn self_test() -> Result<(), String> {
+    // Timeout budget and process-group CPU accounting primitives.
+    let budgets = TestBudgets {
+        default_cpu_seconds: 120,
+        wall_seconds_override: None,
+        per_test_cpu_seconds: [("slow".to_string(), 90)].into_iter().collect(),
+    };
+    if budgets.cpu_seconds("slow") != 90
+        || budgets.cpu_seconds("other") != 120
+        || budgets.wall_seconds("slow") != 600
+        || budgets.wall_seconds("other") != 600
+    {
+        return Err("timeout budget resolution differs".to_string());
+    }
+    let stat = "123 (a b) S 1 4242 4242 0 -1 0 0 0 0 0 100 50 20 10 0 0 1 0 0";
+    if proc_stat_cpu_ticks_for_group(stat, 4242) != Some(180)
+        || proc_stat_cpu_ticks_for_group(stat, 7).is_some()
+    {
+        return Err("process-group CPU tick parsing differs".to_string());
+    }
     let selected = concat!(
         "{\"type\":\"suite\",\"event\":\"discovery\"}\n",
         "{\"type\":\"test\",\"event\":\"discovered\",\"name\":\"a\",\"ignore\":false}\n",
@@ -887,6 +1339,13 @@ const RUN_HELP: &str = "Usage: libtest-counts.rs run OUTPUT -- cargo test [ARGS.
 \n\
 Run one Cargo test command, derive authoritative counts from libtest's private\n\
 execution records, and atomically write schema-2 JSON to OUTPUT.\n\
+\n\
+Environment:\n\
+  REVERIE_TEST_CPU_SECONDS   Per-test CPU cap in seconds (default 120)\n\
+  REVERIE_TEST_WALL_SECONDS  Wall backstop override (default min(8x CPU, 600))\n\
+  REVERIE_TEST_BUDGETS       JSON {default_cpu_seconds, tests:{name:seconds}}\n\
+  REVERIE_TEST_RETRIES       Blanket counted retries 0..=2 (default 2)\n\
+  REVERIE_TEST_CPU_REPORT    Per-test CPU report JSONL (default OUTPUT.cpu.jsonl)\n\
 \n\
 Options:\n\
   -h, --help  Show this help";

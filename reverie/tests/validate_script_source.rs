@@ -51,7 +51,7 @@ required-features = ["allocator-fixture"]"#;
         .find("run_check \"Build workspace\" cargo build --workspace --all-features")
         .unwrap();
     let producer = VALIDATE_SCRIPT
-        .find("run_check \"LiteInst allocator fixtures\" build_liteinst_allocator_fixtures")
+        .find("run_check \"LiteInst allocator fixtures (disabled: dh-hkdh0)\"")
         .unwrap();
     // The counted runner accepts only a command that starts with `cargo
     // test`, so the fixture paths reach this step through the environment:
