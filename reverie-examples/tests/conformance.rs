@@ -18,8 +18,12 @@
 //!
 //! * `counter1` counts every syscall event its tool handler receives. The
 //!   recorder's comparable record omits the vDSO calls (`VDSO` in
-//!   `recorder_tool.rs`), so the counter total is the record's call count
-//!   plus the vDSO calls `strace_minimal` saw.
+//!   `recorder_tool.rs`), so in a separate execution of the same program
+//!   on the same backend the counter total is the record's call count plus
+//!   the vDSO calls `strace_minimal` saw in its own execution. These
+//!   programs make the same calls every run; a vDSO call no tool was
+//!   delivered would not be caught by this arithmetic, so the judged
+//!   native comparison remains the e2e comparator's job.
 //! * `strace_minimal` prints each syscall it intercepts. With the vDSO
 //!   calls removed, its call-name sequence is the recorder's. One named
 //!   exception: an in-guest tool prints through the guest's own stderr, so
@@ -64,9 +68,28 @@ fn tool_command(binary: &str) -> Command {
     command
 }
 
+/// Report a skipped backend leg where a scorecard can see it. Libtest
+/// captures this test's standard error, so the line is written to the
+/// descriptor directly; `scripts/run-percrate-tests.sh` counts these
+/// lines in its `skipped` column instead of counting the leg as passed.
+fn report_skip(reason: &str) {
+    let line = format!("REVERIE_SKIP: {reason}\n");
+    let mut rest = line.as_bytes();
+    while !rest.is_empty() {
+        // SAFETY: writing a borrowed byte slice to the stderr descriptor.
+        let written = unsafe { libc::write(2, rest.as_ptr().cast(), rest.len()) };
+        if written <= 0 {
+            eprint!("{line}");
+            return;
+        }
+        rest = &rest[written as usize..];
+    }
+}
+
 /// Whether this host can run the KVM backend. KVM needs a usable
 /// `/dev/kvm`; when `REVERIE_REQUIRE_KVM` is set its absence is a failure,
-/// as in `tests/kvm_cli.rs`.
+/// as in `tests/kvm_cli.rs`. Otherwise the leg is reported as a skip
+/// through [`report_skip`], never silently counted as a pass.
 fn kvm_available() -> bool {
     match std::fs::OpenOptions::new()
         .read(true)
@@ -78,7 +101,9 @@ fn kvm_available() -> bool {
             panic!("conformance tests require usable /dev/kvm: {error}")
         }
         Err(error) => {
-            eprintln!("skipping kvm conformance backend: cannot open /dev/kvm: {error}");
+            report_skip(&format!(
+                "kvm conformance backend: cannot open /dev/kvm: {error}"
+            ));
             false
         }
     }
@@ -192,6 +217,14 @@ fn assert_landmarks(program: &[&str], backend: &str, recorded: &[String]) {
     }
 }
 
+/// Whether every call in `needle` appears in `haystack`, in order.
+fn is_subsequence(needle: &[String], haystack: &[String]) -> bool {
+    let mut rest = haystack.iter();
+    needle
+        .iter()
+        .all(|call| rest.any(|candidate| candidate == call))
+}
+
 fn tools_agree_with_the_recorder(backend: &str) {
     let directory = tempfile::tempdir().unwrap();
     for (index, program) in PROGRAMS.iter().enumerate() {
@@ -212,17 +245,18 @@ fn tools_agree_with_the_recorder(backend: &str) {
         assert_eq!(exit, native_exit, "{backend} {program:?}");
         assert_landmarks(program, backend, &recorded);
         match backend {
-            // The recorder test already proves the full record here;
-            // the name sequence is this test's anchor.
-            "ptrace" => assert_eq!(recorded, native, "{backend} {program:?}"),
-            // Results may differ from native (for example `rseq`
-            // answering ENOSYS); the call count may not.
-            "kvm" => assert_eq!(recorded.len(), native.len(), "{backend} {program:?}"),
-            // In-guest tools start late and legitimately miss calls;
-            // the judged native comparison is the e2e ledger's job.
+            // Call names must match native exactly. Results may still
+            // differ (for example KVM answering `rseq` with ENOSYS);
+            // only the recorder's record, judged in the e2e run, compares
+            // those.
+            "ptrace" | "kvm" => assert_eq!(recorded, native, "{backend} {program:?}"),
+            // In-guest tools start late and legitimately miss calls, so
+            // their names must appear in native order with none the
+            // program never made. The judged native comparison, with its
+            // ledger of known missing calls, is the e2e comparator's job.
             _ => assert!(
-                recorded.len() <= native.len(),
-                "{backend} {program:?}: in-guest record longer than native"
+                is_subsequence(&recorded, &native),
+                "{backend} {program:?}: in-guest calls are not a native subsequence:\n{recorded:?}\nnative:\n{native:?}"
             ),
         }
         let direct = run_direct(program);

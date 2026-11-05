@@ -52,9 +52,13 @@ which a backend may turn into syscalls a tool can see.
   thread's syscalls with their results match a native baseline run twice,
   exactly, or after the late-start alignment for in-guest backends. Known
   mismatches are ledger rows; a stale row fails.
-- **counter1** (enforced in `cargo test`): the reported total equals the
-  recorder's call count for the same run plus the vDSO calls the record
-  omits. The program's stdout and exit status are its own.
+- **counter1** (enforced in `cargo test`): across separate executions of
+  the same program on the same backend, the reported total equals the
+  recorder's call count plus the vDSO calls `strace_minimal` saw in its
+  own execution. That transfer assumes the program makes the same calls
+  every run, as the corpus requires natively; a vDSO call delivered to no
+  tool is outside this arithmetic. The program's stdout and exit status
+  are its own.
 - **counter2** (designed, not yet enforced): the same counting oracle,
   plus its process and thread totals matching the record's thread
   structure.
@@ -75,6 +79,16 @@ which a backend may turn into syscalls a tool can see.
   their outputs need normalization first (decoded arguments and addresses,
   output ordering under concurrency, trace timestamps), so no oracle is
   enforced for them yet.
+
+At the `cargo test` layer the native anchoring is by call name only:
+ptrace and KVM records must equal the native name sequence exactly, and
+in-guest records must be a native subsequence containing the run's
+landmark calls (a `write` before a final `exit_group` for programs that
+print). Syscall arguments and results are compared only by the recorder
+row in the judged e2e run. A backend leg a host cannot run is reported
+with a `REVERIE_SKIP:` line that the per-crate scorecard counts as
+skipped, never as passed (and fails outright when `REVERIE_REQUIRE_KVM`
+is set).
 
 A backend that cannot host a tool or a program must refuse by name
 (`REFUSED:`), never fail silently or pass vacuously. A refusal is its own

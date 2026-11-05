@@ -101,8 +101,14 @@ if ((SKIP_LIST)); then
 fi
 
 mkdir -p "$RESULTS/logs" "$RESULTS/counts" || exit 2
-export TMPDIR="${TMPDIR:-$RESULTS/tmp}"
-mkdir -p "$TMPDIR" || exit 2
+if [[ -z ${TMPDIR:-} ]]; then
+    # Unique per run, so concurrent runs never share fixture scratch. It
+    # stays under the results dir because tests name it as evidence.
+    TMPDIR=$(mktemp -d "$RESULTS/tmp.XXXXXXXX") || exit 2
+    export TMPDIR
+else
+    mkdir -p "$TMPDIR" || exit 2
+fi
 
 if [[ -z $PACKAGES ]]; then
     PACKAGES=$(cargo metadata --no-deps --format-version 1 |
@@ -113,9 +119,19 @@ if ((${#PACKAGE_LIST[@]} == 0)); then
     echo "run-percrate-tests.sh: --packages names no packages" >&2
     exit 2
 fi
+# One row per package: drop repeats, keeping first-seen order.
+declare -A SEEN_PACKAGE=()
+DEDUPED_PACKAGES=()
+for pkg in "${PACKAGE_LIST[@]}"; do
+    if [[ -z ${SEEN_PACKAGE[$pkg]:-} ]]; then
+        SEEN_PACKAGE[$pkg]=1
+        DEDUPED_PACKAGES+=("$pkg")
+    fi
+done
+PACKAGE_LIST=("${DEDUPED_PACKAGES[@]}")
 
 SCORECARD="$RESULTS/scorecard.tsv"
-printf 'package\texit\texecuted\tpassed\tfailed\tfiltered\twall_s\tuser_s\tsys_s\n' >"$SCORECARD"
+printf 'package\texit\texecuted\tpassed\tfailed\tskipped\tfiltered\twall_s\tuser_s\tsys_s\n' >"$SCORECARD"
 failures=0
 for pkg in "${PACKAGE_LIST[@]}"; do
     log="$RESULTS/logs/$pkg.log"
@@ -131,25 +147,30 @@ for pkg in "${PACKAGE_LIST[@]}"; do
         -- --test-threads=1 "${SKIP_ARGS[@]}" >"$log" 2>&1
     rc=$?
     wall=$((SECONDS - start))
+    # Tests report a skipped leg with a REVERIE_SKIP line written past
+    # libtest's capture, so it lands in the log. Libtest still counts such
+    # a leg as passed; the scorecard moves it to skipped instead.
+    skipped=$(grep -c '^REVERIE_SKIP: ' "$log" || true)
     if read -r executed passed filtered counts_extra < <("$ROOT_DIR/scripts/libtest-counts.rs" read "$counts") &&
-        [[ -z ${counts_extra:-} ]]; then
+        [[ -z ${counts_extra:-} && $skipped -le $passed ]]; then
         failed=$((executed - passed))
+        passed=$((passed - skipped))
     else
         # Attributable counts are this script's purpose, so a package whose
-        # counts cannot be read fails even when cargo passed, as in
-        # validate.sh's counted gates.
-        executed='?'; passed='?'; failed='?'; filtered='?'
+        # counts cannot be read (or whose skip lines outnumber its passes)
+        # fails even when cargo passed, as in validate.sh's counted gates.
+        executed='?'; passed='?'; failed='?'; skipped='?'; filtered='?'
         if ((rc == 0)); then
             rc=2
         fi
-        echo "$pkg: counts unreadable ($counts); see $log" >&2
+        echo "$pkg: counts unreadable or inconsistent ($counts); see $log" >&2
     fi
     user=$(awk '/User time \(seconds\)/{value = $NF} END {print value}' "$log")
     sys=$(awk '/System time \(seconds\)/{value = $NF} END {print value}' "$log")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$pkg" "$rc" "$executed" "$passed" "$failed" "$filtered" "$wall" "${user:-?}" "${sys:-?}" >>"$SCORECARD"
-    printf '%s: exit %s, executed %s passed %s failed %s filtered %s (%ss)\n' \
-        "$pkg" "$rc" "$executed" "$passed" "$failed" "$filtered" "$wall"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$pkg" "$rc" "$executed" "$passed" "$failed" "$skipped" "$filtered" "$wall" "${user:-?}" "${sys:-?}" >>"$SCORECARD"
+    printf '%s: exit %s, executed %s passed %s failed %s skipped %s filtered %s (%ss)\n' \
+        "$pkg" "$rc" "$executed" "$passed" "$failed" "$skipped" "$filtered" "$wall"
     ((rc == 0)) || failures=$((failures + 1))
 done
 
