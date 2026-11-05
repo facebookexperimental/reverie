@@ -354,7 +354,10 @@ enum Custody {
 }
 
 /// Production [`TrialChild`]: a pid plus the pidfd created atomically
-/// with it (`CLONE_PIDFD`), plus the monotonic start instant.
+/// with it (`CLONE_PIDFD`), plus the monotonic start instant. `pidfd`
+/// is -1 only for a child retained without pidfd authority (see
+/// [`CloneOutcome::RetainedWithoutPidfd`]): it can be waited on, never
+/// signalled.
 struct PidChild {
     pid: libc::pid_t,
     pidfd: libc::c_int,
@@ -372,6 +375,36 @@ impl Drop for PidChild {
 
 impl TrialChild for PidChild {
     fn poll(&mut self) -> WaitReply {
+        if self.pidfd < 0 {
+            // Retained without pidfd authority (kernel contract
+            // violation after the facilities probe passed): waiting by
+            // pid can only ever reap *our* child, so polling remains
+            // safe; signalling it would not be (see kill).
+            let mut status: libc::c_int = 0;
+            // SAFETY: non-blocking wait on our own child by pid.
+            let waited =
+                unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            if waited == self.pid {
+                if libc::WIFEXITED(status) {
+                    return WaitReply::Exited(libc::WEXITSTATUS(status));
+                }
+                if libc::WIFSIGNALED(status) {
+                    return WaitReply::Signaled;
+                }
+                if libc::WIFSTOPPED(status) {
+                    return WaitReply::Stopped;
+                }
+                return WaitReply::Running;
+            }
+            if waited == 0 {
+                return WaitReply::Running;
+            }
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => WaitReply::Interrupted,
+                Some(libc::ECHILD) => WaitReply::NoChild,
+                _ => WaitReply::Failed,
+            };
+        }
         // si_code values (kernel siginfo): a stopped/traced child is
         // reported with WSTOPPED and is live, not terminal.
         const CLD_EXITED: libc::c_int = 1;
@@ -412,6 +445,11 @@ impl TrialChild for PidChild {
     }
 
     fn kill(&mut self) -> KillReply {
+        if self.pidfd < 0 {
+            // No identity-pinned handle: never signal a numeric pid.
+            // Custody stays unresolved and is retained by the caller.
+            return KillReply::Failed;
+        }
         // SAFETY: signalling through the pidfd created with this child:
         // it names exactly this process, or fails ESRCH — it can never
         // address a reused numeric pid. SIGCONT follows so a stopped
@@ -476,10 +514,16 @@ fn reap_trial(child: &mut dyn TrialChild) -> (Trial, Custody) {
             WaitReply::Exited(_) | WaitReply::Signaled => {
                 return (Trial::Inconclusive, Custody::Done);
             }
-            WaitReply::NoChild | WaitReply::Failed => {
-                // Custody lost/unverified: no child remains ours to reap
-                // (auto-reap) or we cannot prove otherwise; never signal.
+            WaitReply::NoChild => {
+                // Established no-child outcome (auto-reaped): nothing
+                // remains ours, and nothing may be signalled.
                 return (Trial::Inconclusive, Custody::Done);
+            }
+            WaitReply::Failed => {
+                // A generic wait error (EPERM/ENOSYS/EINVAL of the wait
+                // itself) does not prove the child exited: custody is
+                // unverified and must be retained, never declared done.
+                return (Trial::Inconclusive, Custody::Unresolved);
             }
             WaitReply::Running | WaitReply::Stopped | WaitReply::Interrupted => {}
         }
@@ -498,8 +542,11 @@ fn reap_trial(child: &mut dyn TrialChild) -> (Trial, Custody) {
             WaitReply::Exited(_) | WaitReply::Signaled => {
                 return (Trial::Inconclusive, Custody::Done);
             }
-            WaitReply::NoChild | WaitReply::Failed => {
+            WaitReply::NoChild => {
                 return (Trial::Inconclusive, Custody::Done);
+            }
+            WaitReply::Failed => {
+                return (Trial::Inconclusive, Custody::Unresolved);
             }
             WaitReply::Running | WaitReply::Stopped | WaitReply::Interrupted => {}
         }
@@ -525,29 +572,110 @@ pub fn pending_trial_children() -> usize {
         .len()
 }
 
-/// Non-blockingly retry reaping retained children; keep the rest.
+/// Whether one poll reply resolves custody (terminal status reaped by
+/// us, or an established no-child outcome). Generic wait failures do
+/// not resolve anything.
+fn poll_resolves_custody(reply: WaitReply) -> bool {
+    matches!(
+        reply,
+        WaitReply::Exited(_) | WaitReply::Signaled | WaitReply::NoChild
+    )
+}
+
+/// Retry retained children: re-attempt the identity-pinned kill for
+/// live ones (a transient signal failure must not strand a paused
+/// child forever), then drop only those whose custody resolved.
 fn drain_pending_custody() {
     let mut pending = PENDING_CUSTODY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     pending.retain_mut(|child| {
-        matches!(
-            child.poll(),
-            WaitReply::Running | WaitReply::Stopped | WaitReply::Interrupted
-        )
+        let reply = child.poll();
+        if matches!(reply, WaitReply::Running | WaitReply::Stopped) {
+            let _ = child.kill();
+            return true;
+        }
+        !poll_resolves_custody(reply)
     });
 }
 
-/// Whether inherited SIGCHLD handling auto-reaps children
-/// (`SIG_IGN` or `SA_NOCLDWAIT`), which would destroy trial custody and
-/// exit-code evidence. Read-only query; on any doubt, assume yes.
-fn sigchld_auto_reaps() -> bool {
+/// Exclusive-reaping discipline for trial custody: only the default
+/// SIGCHLD disposition (no handler, no `SA_NOCLDWAIT`) guarantees this
+/// process is the only reaper. `SIG_IGN`/`SA_NOCLDWAIT` auto-reap, and a
+/// custom handler may reap at any signal point — either can destroy
+/// custody (and, for the numeric-pid `PTRACE_SEIZE`, lose the pid to
+/// reuse between creation and seizure). Pure classification of a
+/// disposition (`sa_sigaction`, `sa_flags`); on any doubt, incompatible.
+fn sigchld_compatible(handler: usize, flags: libc::c_int) -> bool {
+    handler == libc::SIG_DFL && flags & libc::SA_NOCLDWAIT == 0
+}
+
+/// Whether the inherited SIGCHLD disposition preserves exclusive
+/// reaping for trial children. Read-only query.
+fn sigchld_custody_compatible() -> bool {
     // SAFETY: querying the current disposition without changing it.
     let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
     if unsafe { libc::sigaction(libc::SIGCHLD, core::ptr::null(), &mut old) } != 0 {
-        return true;
+        return false;
     }
-    old.sa_sigaction == libc::SIG_IGN || old.sa_flags & libc::SA_NOCLDWAIT != 0
+    sigchld_compatible(old.sa_sigaction, old.sa_flags)
+}
+
+/// What a clone attempt produced. A successful clone with no pidfd
+/// written (older kernels ignore the reused `CLONE_PIDFD` bit) still
+/// created a real child: it is retained under wait-only custody, never
+/// mistaken for no child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloneOutcome {
+    /// No child was created.
+    NoChild,
+    /// Child created with its atomic pidfd.
+    WithPidfd,
+    /// Child created; no pidfd was written. Retain wait ownership,
+    /// manufacture no signalling authority.
+    RetainedWithoutPidfd,
+}
+
+fn classify_clone_result(pid: libc::pid_t, pidfd: libc::c_int) -> CloneOutcome {
+    if pid < 0 {
+        CloneOutcome::NoChild
+    } else if pidfd >= 0 {
+        CloneOutcome::WithPidfd
+    } else {
+        CloneOutcome::RetainedWithoutPidfd
+    }
+}
+
+/// Establish, *before* spawning, that the facilities custody needs all
+/// exist on this kernel: `pidfd_open` and `waitid(P_PIDFD)` on our own
+/// pidfd (mirrors the same-tree owned-clone contract in
+/// reverie-process). Any failure means no trial child is created.
+fn trial_facilities_proved() -> bool {
+    const SYS_PIDFD_OPEN: libc::c_long = 434;
+    // SAFETY: opening a pidfd for our own process, closed below.
+    let fd = unsafe { libc::syscall(SYS_PIDFD_OPEN, libc::getpid(), 0usize) };
+    if fd < 0 {
+        return false;
+    }
+    let fd = fd as libc::c_int;
+    // SAFETY: zeroed siginfo input; non-blocking wait on our own pidfd.
+    // We are not our own child, so a supporting kernel answers ECHILD;
+    // a kernel without P_PIDFD (added in 5.4, after pidfd_open in 5.3)
+    // answers EINVAL for the unknown selector. Either distinguishable
+    // answer proves which side of that line we are on.
+    let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PIDFD,
+            fd as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG,
+        )
+    };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    // SAFETY: closing the pidfd just opened.
+    unsafe { libc::close(fd) };
+    waited == 0 || errno == Some(libc::ECHILD)
 }
 
 /// Child entry for `clone`: runs the trial, then `_exit`. Only
@@ -562,12 +690,13 @@ extern "C" fn trial_child_entry(arg: *mut libc::c_void) -> libc::c_int {
 
 /// Create a throwaway child running `trial`, with its pidfd obtained
 /// atomically at creation (`CLONE_PIDFD`) so no numeric-pid race exists
-/// at any point. Returns `None` when custody cannot be established
-/// (auto-reaping SIGCHLD inheritance, or clone/pidfd unavailable) — no
-/// child is left running in that case beyond the failed creation itself.
+/// at any point. Facilities and exclusive-reaping discipline are
+/// established *before* spawning; when they cannot be, `None` is
+/// returned and no child exists. A successful clone whose pidfd was not
+/// written is still returned, retained under wait-only custody.
 fn fork_trial(trial: fn() -> i32) -> Option<PidChild> {
     drain_pending_custody();
-    if sigchld_auto_reaps() {
+    if !sigchld_custody_compatible() || !trial_facilities_proved() {
         return None;
     }
     const STACK_SIZE: usize = 1 << 20;
@@ -605,18 +734,18 @@ fn fork_trial(trial: fn() -> i32) -> Option<PidChild> {
     };
     // SAFETY: the child (if any) runs on its own copy of the stack.
     unsafe { libc::munmap(stack, STACK_SIZE) };
-    if pid < 0 || pidfd < 0 {
-        if pidfd >= 0 {
-            // SAFETY: closing a pidfd we just received.
-            unsafe { libc::close(pidfd) };
-        }
-        return None;
+    match classify_clone_result(pid, pidfd) {
+        CloneOutcome::NoChild => None,
+        // WithPidfd: full custody. RetainedWithoutPidfd: a real child
+        // exists despite the facilities probe — retain wait ownership
+        // (poll falls back to waitpid, kill manufactures no authority);
+        // never mistake it for no child.
+        CloneOutcome::WithPidfd | CloneOutcome::RetainedWithoutPidfd => Some(PidChild {
+            pid,
+            pidfd,
+            started,
+        }),
     }
-    Some(PidChild {
-        pid,
-        pidfd,
-        started,
-    })
 }
 
 /// Run `trial` in a throwaway child and reap it under the custody
@@ -1091,10 +1220,36 @@ mod tests {
         assert_eq!(reap_trial(&mut child), (Trial::Inconclusive, Custody::Done));
         assert_eq!(child.kills, 0, "kill after ECHILD is a PID-reuse hazard");
 
-        // Other wait failures likewise never signal.
+        // A generic wait failure proves nothing about the child:
+        // custody is retained (Unresolved), never declared done, and
+        // nothing is signalled. (This expectation was Done on 83d55f46.)
         let mut child = Scripted::new(&[WaitReply::Failed]);
-        assert_eq!(reap_trial(&mut child), (Trial::Inconclusive, Custody::Done));
+        assert_eq!(
+            reap_trial(&mut child),
+            (Trial::Inconclusive, Custody::Unresolved)
+        );
         assert_eq!(child.kills, 0);
+
+        // Same after a sent kill: a generic cleanup-phase failure still
+        // retains custody.
+        let mut replies = vec![WaitReply::Running; 250];
+        replies.push(WaitReply::Failed);
+        let mut child = Scripted::new(&replies);
+        assert_eq!(
+            reap_trial(&mut child),
+            (Trial::Inconclusive, Custody::Unresolved)
+        );
+        assert_eq!(child.kills, 1);
+
+        // Deferred cleanup likewise: only terminal/no-child replies
+        // resolve custody; Failed is retained.
+        assert!(poll_resolves_custody(WaitReply::Exited(0)));
+        assert!(poll_resolves_custody(WaitReply::Signaled));
+        assert!(poll_resolves_custody(WaitReply::NoChild));
+        assert!(!poll_resolves_custody(WaitReply::Failed));
+        assert!(!poll_resolves_custody(WaitReply::Running));
+        assert!(!poll_resolves_custody(WaitReply::Stopped));
+        assert!(!poll_resolves_custody(WaitReply::Interrupted));
 
         // Deadline with a verified-live child: kill once, reap in the
         // bounded cleanup phase.
@@ -1126,6 +1281,36 @@ mod tests {
         assert_eq!(reap_trial(&mut child), (Trial::Refused, Custody::Done));
         let mut child = Scripted::new(&[WaitReply::Exited(TRIAL_INCONCLUSIVE)]);
         assert_eq!(reap_trial(&mut child), (Trial::Inconclusive, Custody::Done));
+    }
+
+    /// Clone-outcome regression (70041f4a finding 2): a successful clone
+    /// whose pidfd was not written is a real, retained child — the old
+    /// code returned None and dropped it.
+    #[test]
+    fn successful_clone_without_pidfd_is_retained_not_dropped() {
+        assert_eq!(classify_clone_result(-1, -1), CloneOutcome::NoChild);
+        assert_eq!(classify_clone_result(4242, 7), CloneOutcome::WithPidfd);
+        assert_eq!(
+            classify_clone_result(4242, -1),
+            CloneOutcome::RetainedWithoutPidfd
+        );
+        // The facilities probe passes on this host (pidfd trials run),
+        // so creation is never attempted blind.
+        assert!(trial_facilities_proved());
+    }
+
+    /// Exclusive-reaping regression (70041f4a finding 3): only the
+    /// default disposition preserves custody for numeric-pid seizure;
+    /// a custom handler (which may reap at any signal point) is as
+    /// incompatible as auto-reaping. The old check allowed handlers.
+    #[test]
+    fn sigchld_custom_handler_is_custody_incompatible() {
+        assert!(sigchld_compatible(libc::SIG_DFL, 0));
+        assert!(!sigchld_compatible(libc::SIG_IGN, 0));
+        assert!(!sigchld_compatible(libc::SIG_DFL, libc::SA_NOCLDWAIT));
+        assert!(!sigchld_compatible(0x401000, 0), "custom handler may reap");
+        // This test process itself must be compatible (trials run here).
+        assert!(sigchld_custody_compatible());
     }
 
     /// SUD regression (1285 finding 4): OFF must pass zero
