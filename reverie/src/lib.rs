@@ -82,6 +82,7 @@ pub mod pidfd_self;
 pub mod pmu;
 /// Process-wide PMU configuration shared by counters and precise timers.
 pub mod pmu_config;
+pub mod probes;
 pub use in_guest_rcb::InGuestRcbCounter;
 pub use perf::is_perf_supported;
 pub use pidfd_self::PidfdSelfSpelling;
