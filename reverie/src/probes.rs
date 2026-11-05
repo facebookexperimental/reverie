@@ -31,6 +31,7 @@
 use crate::selection::ArchFloor;
 use crate::selection::CodeShape;
 use crate::selection::EnvironmentSnapshot;
+use crate::selection::InstallEvidence;
 use crate::selection::Knowledge;
 use crate::selection::SeccompState;
 use crate::selection::WxPolicy;
@@ -130,35 +131,49 @@ pub fn probe_existing_tracer() -> Knowledge<bool> {
     }
 }
 
-/// P3: seccomp mode/filter count/`no_new_privs` of the probing context.
-/// All three facts or `Unknown` — a partial reading proves nothing about
-/// whether one more filter can be installed.
+/// Combine P3 metadata readings with the install trial. Any missing
+/// metadata is `Unknown` (a partial reading proves nothing); the trial
+/// outcome is preserved three-way so metadata can never override a
+/// failed or inconclusive installation attempt.
+fn seccomp_knowledge(
+    mode: Option<u64>,
+    no_new_privs: Option<bool>,
+    filters: Option<u64>,
+    install_trial: Trial,
+) -> Knowledge<SeccompState> {
+    match (mode, no_new_privs, filters) {
+        (Some(mode), Some(no_new_privs), Some(filters)) => Knowledge::Proved(SeccompState {
+            mode,
+            filters,
+            no_new_privs,
+            install: match install_trial {
+                Trial::Ok => InstallEvidence::Proved,
+                Trial::Refused => InstallEvidence::Refused,
+                Trial::Inconclusive => InstallEvidence::Unknown,
+            },
+        }),
+        _ => Knowledge::Unknown {
+            why: "seccomp metadata incomplete",
+        },
+    }
+}
+
+/// P3: seccomp state of the probing context plus a real install trial.
 pub fn probe_seccomp() -> Knowledge<SeccompState> {
     // SAFETY: prctl queries on the calling thread; arguments per prctl(2).
     let mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
-    if mode < 0 {
-        return Knowledge::Unknown {
-            why: "PR_GET_SECCOMP failed",
-        };
-    }
     // SAFETY: as above.
     let no_new_privs = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
-    if no_new_privs < 0 {
-        return Knowledge::Unknown {
-            why: "PR_GET_NO_NEW_PRIVS failed",
-        };
+    let filters = read_proc("/proc/self/status").and_then(|s| parse_seccomp_filters(&s));
+    if mode < 0 || no_new_privs < 0 || filters.is_none() {
+        return seccomp_knowledge(None, None, None, Trial::Inconclusive);
     }
-    match read_proc("/proc/self/status").and_then(|s| parse_seccomp_filters(&s)) {
-        Some(filters) => Knowledge::Proved(SeccompState {
-            mode: mode as u64,
-            filters,
-            no_new_privs: no_new_privs != 0,
-            install_proved: run_trial(seccomp_install_child) == Trial::Ok,
-        }),
-        None => Knowledge::Unknown {
-            why: "Seccomp_filters unreadable",
-        },
-    }
+    seccomp_knowledge(
+        Some(mode as u64),
+        Some(no_new_privs != 0),
+        filters,
+        run_trial(seccomp_install_child),
+    )
 }
 
 /// P3 trial child: set `no_new_privs` (as a guest runtime does), then
@@ -259,6 +274,10 @@ pub fn probe_code_shape_file(path: &std::path::Path) -> Knowledge<CodeShape> {
 const TRIAL_OK: i32 = 42;
 /// Exit code a trial child uses for "the trial was refused".
 const TRIAL_REFUSED: i32 = 43;
+/// Exit code a trial child uses for "the trial itself could not be
+/// performed" (for example a failed state query before any arming
+/// attempt): unproved, never a proved-negative capability.
+const TRIAL_INCONCLUSIVE: i32 = 44;
 
 /// What a throwaway-child trial concluded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,48 +287,141 @@ enum Trial {
     Inconclusive,
 }
 
-/// Run `trial` (returning an exit code) in a throwaway child and reap it,
-/// bounded by a 2s deadline after which the child is killed. The child
-/// must use only async-signal-safe operations: it inherits a possibly
-/// multi-threaded parent's locks and must not touch Rust runtime state.
-fn run_trial(trial: fn() -> i32) -> Trial {
-    // SAFETY: fork in the probing process per the module contract; the
-    // child below calls only `trial` (async-signal-safe by construction:
-    // raw syscalls via libc) and `_exit`.
+/// One non-blocking wait observation of a trial child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitReply {
+    /// Still running; custody verified (it is our unreaped child).
+    Running,
+    /// Exited with this status code.
+    Exited(i32),
+    /// Terminated by a signal.
+    Signaled,
+    /// Interrupted before any state change; poll again.
+    Interrupted,
+    /// No such child (ECHILD): custody is lost (auto-reaped or reaped
+    /// elsewhere) and the numeric pid must never be signalled again.
+    NoChild,
+    /// Any other wait failure; custody unverified.
+    Failed,
+}
+
+/// Custody operations over one trial child. The production
+/// implementation wraps a pid; tests script replies to pin the custody
+/// discipline without forking.
+trait TrialChild {
+    /// One non-blocking wait poll.
+    fn poll(&mut self) -> WaitReply;
+    /// Send SIGKILL. Only ever called while custody is verified
+    /// (the immediately preceding poll said `Running`).
+    fn kill(&mut self);
+    /// Pause between polls (production: a short sleep; tests: no-op).
+    fn pause(&mut self);
+}
+
+/// Production [`TrialChild`] over a forked pid.
+struct PidChild(libc::pid_t);
+
+impl TrialChild for PidChild {
+    fn poll(&mut self) -> WaitReply {
+        let mut status: libc::c_int = 0;
+        // SAFETY: non-blocking wait on our own child by pid.
+        let waited = unsafe { libc::waitpid(self.0, &mut status, libc::WNOHANG) };
+        if waited == self.0 {
+            if libc::WIFEXITED(status) {
+                WaitReply::Exited(libc::WEXITSTATUS(status))
+            } else {
+                WaitReply::Signaled
+            }
+        } else if waited == 0 {
+            WaitReply::Running
+        } else {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => WaitReply::Interrupted,
+                Some(libc::ECHILD) => WaitReply::NoChild,
+                _ => WaitReply::Failed,
+            }
+        }
+    }
+
+    fn kill(&mut self) {
+        // SAFETY: killing our own verified-running child (see trait).
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+
+    fn pause(&mut self) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Polls before the deadline kill (~2s at the production pause), and
+/// polls to reap after it (~500ms). Both bounds are poll counts so the
+/// discipline is testable without wall-clock sleeps.
+const TRIAL_POLLS: u32 = 400;
+const REAP_POLLS: u32 = 100;
+
+/// Reap one trial child under the custody discipline: retry interrupted
+/// polls, kill only a child the previous poll verified as running, and
+/// never signal after custody is lost (ECHILD/other errors). Every loop
+/// is bounded; a child that cannot be reaped within the reap bound is
+/// reported `Inconclusive` with custody retained by the caller of last
+/// resort (init reaps it) — never claimed cleaned up.
+fn reap_trial(child: &mut dyn TrialChild) -> Trial {
+    let mut polls = 0;
+    loop {
+        match child.poll() {
+            WaitReply::Exited(TRIAL_OK) => return Trial::Ok,
+            WaitReply::Exited(TRIAL_REFUSED) => return Trial::Refused,
+            WaitReply::Exited(_) | WaitReply::Signaled => return Trial::Inconclusive,
+            WaitReply::Interrupted => {}
+            WaitReply::Running => {
+                polls += 1;
+                if polls > TRIAL_POLLS {
+                    break;
+                }
+            }
+            // Custody lost or unverified: never signal the numeric pid.
+            WaitReply::NoChild | WaitReply::Failed => return Trial::Inconclusive,
+        }
+        child.pause();
+    }
+    // The immediately preceding poll verified the child is ours and
+    // running: this is the only kill site.
+    child.kill();
+    for _ in 0..REAP_POLLS {
+        match child.poll() {
+            WaitReply::Exited(_) | WaitReply::Signaled => break,
+            WaitReply::Interrupted | WaitReply::Running => child.pause(),
+            WaitReply::NoChild | WaitReply::Failed => break,
+        }
+    }
+    Trial::Inconclusive
+}
+
+/// Fork a throwaway child running `trial`, returning its pid wrapper.
+/// The child must use only async-signal-safe operations: it inherits a
+/// possibly multi-threaded parent's locks and must not touch Rust
+/// runtime state.
+fn fork_trial(trial: fn() -> i32) -> Option<PidChild> {
+    // SAFETY: fork per the module contract; the child calls only
+    // `trial` (raw syscalls via libc) and `_exit`.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Trial::Inconclusive;
+        return None;
     }
     if pid == 0 {
         let code = trial();
         // SAFETY: terminating the forked child without unwinding.
         unsafe { libc::_exit(code) };
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let mut status: libc::c_int = 0;
-        // SAFETY: reaping our own child by pid.
-        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if waited == pid {
-            return if libc::WIFEXITED(status) {
-                match libc::WEXITSTATUS(status) {
-                    TRIAL_OK => Trial::Ok,
-                    TRIAL_REFUSED => Trial::Refused,
-                    _ => Trial::Inconclusive,
-                }
-            } else {
-                Trial::Inconclusive
-            };
-        }
-        if waited < 0 || std::time::Instant::now() >= deadline {
-            // SAFETY: killing and reaping our own child.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, &mut status, 0);
-            }
-            return Trial::Inconclusive;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    Some(PidChild(pid))
+}
+
+/// Run `trial` in a throwaway child and reap it under the custody
+/// discipline in [`reap_trial`].
+fn run_trial(trial: fn() -> i32) -> Trial {
+    match fork_trial(trial) {
+        Some(mut child) => reap_trial(&mut child),
+        None => Trial::Inconclusive,
     }
 }
 
@@ -336,78 +448,63 @@ fn seize_target_child() -> i32 {
 /// this proves the *probing* context can seize its own child; the actual
 /// guest's seizure is re-validated at handoff.
 pub fn probe_ptrace_usable() -> Knowledge<bool> {
-    // SAFETY: fork as in run_trial; child only pauses.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
+    let Some(mut child) = fork_trial(seize_target_child) else {
         return Knowledge::Unknown {
             why: "fork for ptrace trial failed",
         };
-    }
-    if pid == 0 {
-        // SAFETY: terminating the forked child without unwinding.
-        unsafe { libc::_exit(seize_target_child()) };
-    }
+    };
     const PTRACE_SEIZE: libc::c_uint = 0x4206;
     // SAFETY: seizing our own child by pid; no data pointer used.
-    let seized = unsafe { libc::ptrace(PTRACE_SEIZE, pid, 0usize, 0usize) };
+    let seized = unsafe { libc::ptrace(PTRACE_SEIZE, child.0, 0usize, 0usize) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
     let result = if seized == 0 {
         Knowledge::Proved(true)
-    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
-    {
+    } else if errno == Some(libc::EPERM) || errno == Some(libc::EACCES) {
         Knowledge::Proved(false)
     } else {
         Knowledge::Unknown {
             why: "PTRACE_SEIZE trial failed inconclusively",
         }
     };
-    // SAFETY: killing and reaping our own child.
-    unsafe {
-        let mut status: libc::c_int = 0;
-        libc::kill(pid, libc::SIGKILL);
-        libc::waitpid(pid, &mut status, 0);
-    }
+    // Bounded, custody-checked cleanup (the child pauses, so this takes
+    // the deadline-kill path by design).
+    let _ = reap_trial(&mut child);
     result
 }
 
-/// P4 child body: arm Syscall User Dispatch with an allow-all selector.
-fn sud_trial_child() -> i32 {
-    const PR_SET_SYSCALL_USER_DISPATCH: libc::c_int = 59;
+/// P4 arming sequence, over an injected `prctl` so tests can pin the
+/// exact arguments (Linux requires offset, length AND selector to be
+/// zero when disabling; passing the selector with OFF is EINVAL, which
+/// previously misreported a working SUD facility as unavailable).
+fn sud_on_off(
+    mut prctl: impl FnMut(libc::c_ulong, usize, usize, *const u8) -> libc::c_int,
+    selector: *const u8,
+) -> i32 {
     const PR_SYS_DISPATCH_ON: libc::c_ulong = 1;
     const PR_SYS_DISPATCH_OFF: libc::c_ulong = 0;
-    // Selector byte: 0 = allow. It must outlive the prctl calls below;
-    // a static keeps its address valid without allocation.
-    static SELECTOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    let selector = SELECTOR.as_ptr();
-    // SAFETY: arming SUD on this throwaway child only. The full-range
-    // dispatch window with an allow selector means arming itself (kernel
-    // support + permission) is what is tested; then disarm before exiting.
-    let armed = unsafe {
-        libc::prctl(
-            PR_SET_SYSCALL_USER_DISPATCH,
-            PR_SYS_DISPATCH_ON,
-            0usize,
-            usize::MAX,
-            selector,
-        )
-    };
-    if armed != 0 {
+    if prctl(PR_SYS_DISPATCH_ON, 0, usize::MAX, selector) != 0 {
         return TRIAL_REFUSED;
     }
-    // SAFETY: disarming on this child only.
-    let disarmed = unsafe {
-        libc::prctl(
-            PR_SET_SYSCALL_USER_DISPATCH,
-            PR_SYS_DISPATCH_OFF,
-            0usize,
-            0usize,
-            selector,
-        )
-    };
-    if disarmed != 0 {
+    if prctl(PR_SYS_DISPATCH_OFF, 0, 0, core::ptr::null()) != 0 {
         return TRIAL_REFUSED;
     }
     TRIAL_OK
+}
+
+/// P4 child body: arm Syscall User Dispatch with an allow-all selector,
+/// then disarm. Arming itself (kernel support + permission) is the test.
+fn sud_trial_child() -> i32 {
+    const PR_SET_SYSCALL_USER_DISPATCH: libc::c_int = 59;
+    // Selector byte: 0 = allow. A static keeps its address valid without
+    // allocation in the forked child.
+    static SELECTOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    sud_on_off(
+        |action, offset, len, selector| {
+            // SAFETY: prctl on this throwaway child only.
+            unsafe { libc::prctl(PR_SET_SYSCALL_USER_DISPATCH, action, offset, len, selector) }
+        },
+        SELECTOR.as_ptr(),
+    )
 }
 
 /// P4: Syscall User Dispatch is available and permitted here. Optional
@@ -416,28 +513,34 @@ pub fn probe_sud() -> Knowledge<bool> {
     trial_knowledge(run_trial(sud_trial_child), "SUD trial inconclusive")
 }
 
+/// GET→SET→restore sequencing shared by the faulting trials. A failed
+/// GET performed no arming trial, so it is inconclusive — never a
+/// proved-negative capability; only a refused SET is a denial. Restore
+/// is best-effort: the throwaway child exits either way, and arming was
+/// already proved by the successful SET.
+fn arm_sequence(get: impl Fn() -> i64, set: impl Fn(i64) -> i64) -> i32 {
+    let previous = get();
+    if previous < 0 {
+        return TRIAL_INCONCLUSIVE;
+    }
+    if set(0) != 0 {
+        return TRIAL_REFUSED;
+    }
+    let _ = set(previous);
+    TRIAL_OK
+}
+
 /// P5 child body: read, disable (fault), and restore CPUID faulting.
 #[cfg(target_arch = "x86_64")]
 fn cpuid_trial_child() -> i32 {
     const ARCH_GET_CPUID: libc::c_ulong = 0x1011;
     const ARCH_SET_CPUID: libc::c_ulong = 0x1012;
-    // SAFETY: arch_prctl on this throwaway child only.
-    let previous = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0usize) };
-    if previous < 0 {
-        return TRIAL_REFUSED;
-    }
-    // SAFETY: as above; 0 disables CPUID (faulting on).
-    let armed = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0usize) };
-    if armed != 0 {
-        return TRIAL_REFUSED;
-    }
-    // SAFETY: restoring this child's previous state before it exits.
-    let restored =
-        unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, previous as usize) };
-    if restored != 0 {
-        return TRIAL_REFUSED;
-    }
-    TRIAL_OK
+    arm_sequence(
+        // SAFETY: arch_prctl on this throwaway child only.
+        || unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0usize) },
+        // SAFETY: as above; 0 disables CPUID (faulting on).
+        |value| unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, value as usize) },
+    )
 }
 
 /// P5: CPUID faulting can be armed. A cell may name this as a
@@ -459,23 +562,27 @@ pub fn probe_cpuid_faulting() -> Knowledge<bool> {
 /// P6 child body: read, arm `PR_TSC_SIGSEGV`, and restore TSC access.
 #[cfg(target_arch = "x86_64")]
 fn tsc_trial_child() -> i32 {
-    let mut previous: libc::c_int = 0;
-    // SAFETY: prctl on this throwaway child; `previous` outlives the call.
-    let got = unsafe { libc::prctl(libc::PR_GET_TSC, &mut previous as *mut libc::c_int, 0, 0, 0) };
-    if got != 0 {
-        return TRIAL_REFUSED;
-    }
-    // SAFETY: as above.
-    let armed = unsafe { libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0) };
-    if armed != 0 {
-        return TRIAL_REFUSED;
-    }
-    // SAFETY: restoring this child's previous state before it exits.
-    let restored = unsafe { libc::prctl(libc::PR_SET_TSC, previous, 0, 0, 0) };
-    if restored != 0 {
-        return TRIAL_REFUSED;
-    }
-    TRIAL_OK
+    arm_sequence(
+        || {
+            let mut previous: libc::c_int = 0;
+            // SAFETY: prctl on this throwaway child; out-param lives here.
+            let got = unsafe {
+                libc::prctl(libc::PR_GET_TSC, &mut previous as *mut libc::c_int, 0, 0, 0)
+            };
+            if got != 0 { -1 } else { previous as i64 }
+        },
+        |value| {
+            // arm_sequence arms with 0; for TSC the arming value is
+            // PR_TSC_SIGSEGV, and restore passes the previous mode.
+            let mode = if value == 0 {
+                libc::PR_TSC_SIGSEGV
+            } else {
+                value as libc::c_int
+            };
+            // SAFETY: prctl on this throwaway child only.
+            unsafe { libc::prctl(libc::PR_SET_TSC, mode, 0, 0, 0) as i64 }
+        },
+    )
 }
 
 /// P6: `PR_SET_TSC` can be armed (see P5 for the refusal semantics).
@@ -490,26 +597,19 @@ pub fn probe_pr_set_tsc() -> Knowledge<bool> {
     }
 }
 
-/// P7: whether this host context permits the dual-mapped RW/RX arena
-/// shape in-guest patching uses. Trialled on the probing process's own
-/// mappings (created and removed here); a guest's stricter policy is a
-/// handoff fact, so `DualMapAllowed` is a host fact, not a guest promise.
-pub fn probe_wx_policy() -> Knowledge<WxPolicy> {
+/// P7 dual-map trial: RW and RX views of one memfd (the arena shape).
+fn dual_map_trial() -> Trial {
     const PAGE: usize = 4096;
     // SAFETY: anonymous memfd owned by this call.
     let fd = unsafe { libc::memfd_create(c"reverie-wx-probe".as_ptr(), 0) };
     if fd < 0 {
-        return Knowledge::Unknown {
-            why: "memfd_create for W^X trial failed",
-        };
+        return Trial::Inconclusive;
     }
     // SAFETY: sizing the memfd just created.
     if unsafe { libc::ftruncate(fd, PAGE as libc::off_t) } != 0 {
         // SAFETY: closing our own descriptor.
         unsafe { libc::close(fd) };
-        return Knowledge::Unknown {
-            why: "W^X trial memfd could not be sized",
-        };
+        return Trial::Inconclusive;
     }
     // SAFETY: mapping our own memfd twice (RW and RX views).
     let rw = unsafe {
@@ -525,9 +625,7 @@ pub fn probe_wx_policy() -> Knowledge<WxPolicy> {
     if rw == libc::MAP_FAILED {
         // SAFETY: closing our own descriptor.
         unsafe { libc::close(fd) };
-        return Knowledge::Unknown {
-            why: "W^X trial RW mapping failed",
-        };
+        return Trial::Inconclusive;
     }
     // SAFETY: second, executable view of the same memfd.
     let rx = unsafe {
@@ -554,13 +652,75 @@ pub fn probe_wx_policy() -> Knowledge<WxPolicy> {
         libc::close(fd);
     }
     match rx_errno {
-        None => Knowledge::Proved(WxPolicy::DualMapAllowed),
-        Some(libc::EPERM) | Some(libc::EACCES) => Knowledge::Proved(WxPolicy::StrictWx),
-        Some(_) => Knowledge::Unknown {
-            why: "W^X trial RX mapping failed inconclusively",
+        None => Trial::Ok,
+        Some(libc::EPERM) | Some(libc::EACCES) => Trial::Refused,
+        Some(_) => Trial::Inconclusive,
+    }
+}
+
+/// P7 transition trial: `mprotect` an owned RW page to RWX — the exact
+/// text transition the patching backend performs. A policy can permit
+/// dual mappings yet deny this, so it is trialled separately.
+fn mprotect_rwx_trial() -> Trial {
+    const PAGE: usize = 4096;
+    // SAFETY: anonymous private page owned by this call.
+    let page = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if page == libc::MAP_FAILED {
+        return Trial::Inconclusive;
+    }
+    // SAFETY: reprotecting our own page, then unmapping it.
+    let (ret, errno) = unsafe {
+        let ret = libc::mprotect(
+            page,
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        );
+        let errno = if ret != 0 {
+            std::io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        libc::munmap(page, PAGE);
+        (ret, errno)
+    };
+    match (ret, errno) {
+        (0, _) => Trial::Ok,
+        (_, Some(libc::EPERM)) | (_, Some(libc::EACCES)) => Trial::Refused,
+        _ => Trial::Inconclusive,
+    }
+}
+
+/// Combine the P7 trials: `DualMapAllowed` promises both shapes, so
+/// both must be proved; a refusal of either is strict W^X for the
+/// patching cell's purposes; anything else is unproved.
+fn wx_from_trials(dual_map: Trial, mprotect_rwx: Trial) -> Knowledge<WxPolicy> {
+    match (dual_map, mprotect_rwx) {
+        (Trial::Ok, Trial::Ok) => Knowledge::Proved(WxPolicy::DualMapAllowed),
+        (Trial::Refused, _) | (_, Trial::Refused) => Knowledge::Proved(WxPolicy::StrictWx),
+        _ => Knowledge::Unknown {
+            why: "W^X trial inconclusive",
         },
     }
 }
+
+/// P7: whether this host context permits what in-guest patching needs:
+/// dual-mapped RW/RX arenas *and* the RW→RWX `mprotect` text transition.
+/// Trialled on the probing process's own mappings (created and removed
+/// here); a guest's stricter policy is a handoff fact, so this remains a
+/// host fact, not a guest promise.
+pub fn probe_wx_policy() -> Knowledge<WxPolicy> {
+    wx_from_trials(dual_map_trial(), mprotect_rwx_trial())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,16 +762,179 @@ mod tests {
         );
     }
 
+    /// Positive ELF coverage over a deterministic fixture that always
+    /// exists in a test run: this very test binary. An always-Unknown
+    /// `probe_code_shape_file` mutant fails here (it survived the old
+    /// /bin/true test, which returned successfully on Unknown).
     #[test]
-    fn code_shape_reads_a_real_dynamic_image() {
-        let shape = probe_code_shape_file(std::path::Path::new("/bin/true"));
-        let Knowledge::Proved(shape) = shape else {
-            // Restricted test roots may not expose /bin/true; Unknown is
-            // the fail-closed answer, not a probe failure.
-            return;
+    fn code_shape_proves_a_real_dynamic_image() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let Knowledge::Proved(shape) = probe_code_shape_file(&exe) else {
+            panic!("own test binary must parse as a proved ELF shape");
         };
-        assert!(shape.dynamic, "/bin/true is dynamically linked: {shape:?}");
+        assert!(
+            shape.dynamic,
+            "test binary is dynamically linked: {shape:?}"
+        );
+        assert!(shape.pie, "test binary is PIE: {shape:?}");
         assert!(!shape.jit_indicators, "{shape:?}");
+    }
+
+    /// Scripted [`TrialChild`] for custody tests: replays wait replies
+    /// (repeating the last), records kills.
+    struct Scripted {
+        replies: std::collections::VecDeque<WaitReply>,
+        last: WaitReply,
+        kills: usize,
+    }
+
+    impl Scripted {
+        fn new(replies: &[WaitReply]) -> Self {
+            Self {
+                last: *replies.last().expect("non-empty script"),
+                replies: replies.iter().copied().collect(),
+                kills: 0,
+            }
+        }
+    }
+
+    impl TrialChild for Scripted {
+        fn poll(&mut self) -> WaitReply {
+            self.replies.pop_front().unwrap_or(self.last)
+        }
+        fn kill(&mut self) {
+            self.kills += 1;
+        }
+        fn pause(&mut self) {}
+    }
+
+    /// Custody regressions (1285 findings 2–3): EINTR retries, ECHILD
+    /// never signals a possibly-reused pid, deadline kill happens only
+    /// with verified custody and is itself reaped boundedly.
+    #[test]
+    fn reap_trial_custody_discipline() {
+        // Interrupted polls retry and reach the verdict, no kill.
+        let mut child = Scripted::new(&[
+            WaitReply::Interrupted,
+            WaitReply::Running,
+            WaitReply::Interrupted,
+            WaitReply::Exited(TRIAL_OK),
+        ]);
+        assert_eq!(reap_trial(&mut child), Trial::Ok);
+        assert_eq!(child.kills, 0);
+
+        // ECHILD: custody already lost — never kill a numeric pid that
+        // may have been reused.
+        let mut child = Scripted::new(&[WaitReply::NoChild]);
+        assert_eq!(reap_trial(&mut child), Trial::Inconclusive);
+        assert_eq!(child.kills, 0, "kill after ECHILD is a PID-reuse hazard");
+
+        // Other wait failures likewise never signal.
+        let mut child = Scripted::new(&[WaitReply::Failed]);
+        assert_eq!(reap_trial(&mut child), Trial::Inconclusive);
+        assert_eq!(child.kills, 0);
+
+        // Deadline: kill exactly once (custody verified Running), then
+        // reap within the bounded second phase.
+        let mut replies = vec![WaitReply::Running; (TRIAL_POLLS + 2) as usize];
+        replies.push(WaitReply::Signaled);
+        let mut child = Scripted::new(&replies);
+        assert_eq!(reap_trial(&mut child), Trial::Inconclusive);
+        assert_eq!(child.kills, 1);
+
+        // Refused verdict passes through.
+        let mut child = Scripted::new(&[WaitReply::Exited(TRIAL_REFUSED)]);
+        assert_eq!(reap_trial(&mut child), Trial::Refused);
+        // Inconclusive exit code stays inconclusive.
+        let mut child = Scripted::new(&[WaitReply::Exited(TRIAL_INCONCLUSIVE)]);
+        assert_eq!(reap_trial(&mut child), Trial::Inconclusive);
+    }
+
+    /// SUD regression (1285 finding 4): OFF must pass zero
+    /// offset/length/selector. The old code passed the selector again,
+    /// EINVAL turned a working facility into Proved(false).
+    #[test]
+    fn sud_off_passes_null_selector() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let code = sud_on_off(
+            |action, offset, len, selector| {
+                calls
+                    .borrow_mut()
+                    .push((action, offset, len, selector.is_null()));
+                0
+            },
+            0x1234 as *const u8,
+        );
+        assert_eq!(code, TRIAL_OK);
+        assert_eq!(
+            *calls.borrow(),
+            vec![(1, 0, usize::MAX, false), (0, 0, 0, true)]
+        );
+        // ON refused → refused, no OFF attempted.
+        let code = sud_on_off(|_, _, _, _| -1, core::ptr::null());
+        assert_eq!(code, TRIAL_REFUSED);
+    }
+
+    /// GET-polarity regression (1285 finding 6): a failed state query
+    /// performed no arming trial and must be inconclusive, while a
+    /// refused SET is the proved denial.
+    #[test]
+    fn arm_sequence_get_failure_is_inconclusive_set_failure_refused() {
+        assert_eq!(arm_sequence(|| -1, |_| 0), TRIAL_INCONCLUSIVE);
+        assert_eq!(arm_sequence(|| 1, |_| -1), TRIAL_REFUSED);
+        assert_eq!(arm_sequence(|| 1, |_| 0), TRIAL_OK);
+        // Restore failure after a proved arm stays proved (the child is
+        // throwaway); only the arming SET is load-bearing.
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            arm_sequence(
+                || 7,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 1 { 0 } else { -1 }
+                }
+            ),
+            TRIAL_OK
+        );
+    }
+
+    /// W^X combination regression (1285 finding 5): dual mappings alone
+    /// do not prove the RW→RWX text transition the backend performs.
+    #[test]
+    fn wx_requires_both_dual_map_and_mprotect_transition() {
+        use Trial::*;
+        assert_eq!(
+            wx_from_trials(Ok, Ok),
+            Knowledge::Proved(WxPolicy::DualMapAllowed)
+        );
+        assert_eq!(
+            wx_from_trials(Ok, Refused),
+            Knowledge::Proved(WxPolicy::StrictWx)
+        );
+        assert_eq!(
+            wx_from_trials(Refused, Ok),
+            Knowledge::Proved(WxPolicy::StrictWx)
+        );
+        assert!(wx_from_trials(Ok, Inconclusive).is_unknown());
+        assert!(wx_from_trials(Inconclusive, Inconclusive).is_unknown());
+    }
+
+    /// Seccomp evidence regression (1285 finding 1): a refused or
+    /// inconclusive install trial survives combination with permissive
+    /// metadata — it is never collapsed into a boolean metadata can
+    /// override — and incomplete metadata is Unknown outright.
+    #[test]
+    fn seccomp_knowledge_preserves_trial_outcome() {
+        let state = |trial| match seccomp_knowledge(Some(2), Some(true), Some(1), trial) {
+            Knowledge::Proved(state) => state,
+            other => panic!("expected proved state, got {other:?}"),
+        };
+        assert_eq!(state(Trial::Ok).install, InstallEvidence::Proved);
+        assert_eq!(state(Trial::Refused).install, InstallEvidence::Refused);
+        assert_eq!(state(Trial::Inconclusive).install, InstallEvidence::Unknown);
+        assert!(seccomp_knowledge(None, Some(true), Some(1), Trial::Ok).is_unknown());
+        assert!(seccomp_knowledge(Some(2), None, Some(1), Trial::Ok).is_unknown());
+        assert!(seccomp_knowledge(Some(2), Some(true), None, Trial::Ok).is_unknown());
     }
 
     #[test]

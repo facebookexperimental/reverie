@@ -343,11 +343,24 @@ pub struct SeccompState {
     pub filters: u64,
     /// Whether `no_new_privs` is set.
     pub no_new_privs: bool,
-    /// Whether a throwaway-child trial actually installed a filter (via
-    /// setting `no_new_privs` on itself first, as a guest runtime does).
-    /// Mode/capability metadata alone does not prove installation or
-    /// nesting is permitted; strict mode (`mode == 1`) forbids it.
-    pub install_proved: bool,
+    /// Evidence from actually attempting a filter installation (via a
+    /// throwaway child setting `no_new_privs` on itself first, as a guest
+    /// runtime does). Mode/capability metadata alone does not prove
+    /// installation or nesting is permitted, and must never override a
+    /// failed or inconclusive trial.
+    pub install: InstallEvidence,
+}
+
+/// Outcome of a seccomp-installation trial, preserved three-way so a
+/// failure cannot be overridden by metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InstallEvidence {
+    /// A filter was installed in the trial.
+    Proved,
+    /// Installation was attempted and refused.
+    Refused,
+    /// The trial could not be performed or did not conclude.
+    Unknown,
 }
 
 /// W^X / mapping-policy facts relevant to in-guest arenas and gates.
@@ -1678,11 +1691,16 @@ fn environment_reasons(
             }
         }
         Activation::PreloadLate => match &env.p3_seccomp {
-            // Strict mode forbids installing another filter outright.
-            Knowledge::Proved(state) if state.mode == 1 => out.push(R::EnvDisproved("P3")),
-            // Only an actual install trial proves installation/nesting;
-            // mode and no_new_privs metadata do not.
-            Knowledge::Proved(state) if state.install_proved => {}
+            // Strict mode forbids installing another filter outright,
+            // and a refused install trial is a definitive denial. Mode
+            // and no_new_privs metadata never override either.
+            Knowledge::Proved(state)
+                if state.mode == 1 || state.install == InstallEvidence::Refused =>
+            {
+                out.push(R::EnvDisproved("P3"))
+            }
+            // Only a proved install trial proves installation/nesting.
+            Knowledge::Proved(state) if state.install == InstallEvidence::Proved => {}
             Knowledge::Proved(_) => out.push(R::EnvUnknown("P3")),
             Knowledge::Disproved => out.push(R::EnvDisproved("P3")),
             Knowledge::Unknown { .. } => out.push(R::EnvUnknown("P3")),
@@ -2488,7 +2506,7 @@ mod tests {
                 mode: 2,
                 filters: 1,
                 no_new_privs: true,
-                install_proved: true,
+                install: InstallEvidence::Proved,
             }),
             p4_sud: Knowledge::Proved(false),
             p5_cpuid_faulting: Knowledge::Proved(true),
@@ -3224,17 +3242,35 @@ mod tests {
             mode: 1,
             filters: 0,
             no_new_privs: true,
-            install_proved: false,
+            install: InstallEvidence::Unknown,
         });
         assert!(
             admit(&req).is_err(),
             "strict mode must refuse the trap cell"
         );
+        // A refused install trial is definitive: filter mode and
+        // no_new_privs metadata must not override it (the 1285 review's
+        // bypass witnesses).
         req.env.p3_seccomp = Knowledge::Proved(SeccompState {
             mode: 2,
             filters: 1,
             no_new_privs: true,
-            install_proved: false,
+            install: InstallEvidence::Refused,
+        });
+        let refusal = admit(&req).expect_err("refused install trial must not be overridden");
+        assert!(
+            refusal
+                .trace
+                .reasons_for(CellId("V4-preload-trap"))
+                .contains(&RemovalReason::EnvDisproved("P3")),
+            "{refusal}"
+        );
+        // An inconclusive trial is unproved, also not overridden.
+        req.env.p3_seccomp = Knowledge::Proved(SeccompState {
+            mode: 2,
+            filters: 1,
+            no_new_privs: true,
+            install: InstallEvidence::Unknown,
         });
         let refusal = admit(&req).expect_err("metadata without an install trial is unproved");
         assert_eq!(refusal.code, RefusalCode::REnvUnknown);
@@ -3243,7 +3279,7 @@ mod tests {
             mode: 0,
             filters: 0,
             no_new_privs: false,
-            install_proved: true,
+            install: InstallEvidence::Proved,
         });
         assert_eq!(
             admit(&req).expect("proved install").chosen,
