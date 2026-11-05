@@ -2565,8 +2565,7 @@ fn leader_self_exec_bounded_configured(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     // Host-capability refusal: same named skip as the broker library helper.
-    if !output.status.success()
-        && stderr.contains("ambient mount absent from bootstrap mountinfo")
+    if !output.status.success() && stderr.contains("ambient mount absent from bootstrap mountinfo")
     {
         let line = format!(
             "\nREVERIE_SKIP: {test}: broker ambient mount absent from bootstrap mountinfo on this host\n"
