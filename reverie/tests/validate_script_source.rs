@@ -103,6 +103,14 @@ fn validation_dag_builds_once_and_counts_every_test_node() {
     );
     assert!(VALIDATE_SCRIPT.contains("derive_nextest_skip_filter"));
     assert!(VALIDATE_SCRIPT.contains("run_validation_dag"));
+    // The fixture node must run the release-profile producer and feed the
+    // LiteInst A node that owns tool_tls; a SKIP echo is not evidence.
+    assert!(VALIDATE_DAG.contains(
+        r#"./scripts/build-liteinst-test-runtime.rs --for-ci \"$PWD/target/validate/liteinst-fixtures\""#
+    ));
+    assert!(VALIDATE_DAG.contains("source target/validate/liteinst-fixtures/bundle/fixture.env"));
+    assert!(!VALIDATE_DAG.contains("SKIP (dh-hkdh0)"));
+    assert!(!VALIDATE_SCRIPT.contains("--skip authenticated_"));
     // Every counted test node waits for the one build and the fixtures
     // node; fixtures therefore run concurrently with the test build.
     assert_eq!(VALIDATE_DAG.matches("\"build.test_binaries\",").count(), 9);
@@ -144,7 +152,7 @@ required-features = ["allocator-fixture"]"#;
         )
         .unwrap();
     let producer = VALIDATE_SCRIPT
-        .find("run_check \"LiteInst allocator fixtures (disabled: dh-hkdh0)\"")
+        .find("run_check \"LiteInst allocator fixtures\" build_liteinst_allocator_fixtures")
         .unwrap();
     // The counted runner accepts only a command that starts with `cargo
     // test`, so the fixture paths reach this step through the environment:

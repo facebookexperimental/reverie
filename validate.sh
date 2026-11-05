@@ -758,10 +758,10 @@ readonly -a REGULAR_TEST_SKIP_ARGS=(
     --skip tests::port_isolation
     --skip tests::seccomp_notify
     --skip tests::uid_namespace
-    # dh-hkdh0: the LiteInst allocator-fixtures producer is disabled below
-    # (parity-with-main), so its fixture environment is absent. These tests
-    # require that produced fixture; skip them by name until the held
-    # ordinary-dev publication cohort (reverie 1125) lands. Tracker: dh-hkdh0.
+    # dh-hkdh0: the release-profile allocator producer and the tool_tls
+    # inventory tests run with its fixture below. The remaining named
+    # fixture consumers stay skipped until their broader fixture wiring is
+    # re-enabled under dh-hkdh0; do not add tool_tls back to this list.
     --skip native_unpublished
     --skip explicit_getter_strace_uses_owned_generic_stack
     --skip explicit_none_reserves_owned_stack_without_runtime
@@ -797,8 +797,6 @@ readonly -a REGULAR_TEST_SKIP_ARGS=(
     --skip syscall_hook_preserves_displaced_self_relative_address
     --skip unsafe_clone_is_rejected_in_compatibility_and_strace_modes
     --skip active_leaf_has_returned_authenticated_bootstrap
-    --skip authenticated_dev_runtime_has_only_retained_tool_tls
-    --skip authenticated_elf_mutations_cannot_hide_owned_tls
     --skip generic_initializer_keeps_getenv_acquisition
     --skip inert_true_leaf_leaves_the_fixed_range_and_altstack_unmodified
     --skip local_leaf_root_survives_public_symbol_interposition
@@ -999,16 +997,7 @@ run_validation_dag() {
 run_validation_serial() {
 run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
 run_check "Build workspace" cargo build --workspace --features "$STABLE_FEATURES"
-# DISABLED (dh-hkdh0): the allocator-fixtures producer is red at base
-# (fixed_arena_backing needs the held ordinary-dev publication cohort,
-# reverie 1125). Waived to parity-with-main by the coordinator allocator
-# waiver (2026-11-05); re-enable by restoring the run_check below when
-# that cohort lands.
-disabled_liteinst_allocator_fixtures() {
-    echo "SKIP (dh-hkdh0): allocator producer disabled until held reverie 1125 cohort lands"
-}
-run_check "LiteInst allocator fixtures (disabled: dh-hkdh0)" \
-    disabled_liteinst_allocator_fixtures
+run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
 setup_validation_tmpdir || return 1
 # The counted runner accepts only a command that starts with `cargo test`, so
 # the fixture paths reach the tests through the environment rather than an

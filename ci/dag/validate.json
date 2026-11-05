@@ -110,23 +110,23 @@
     {
       "group": "fixtures",
       "job": "liteinst",
-      "desc": "LiteInst allocator fixtures (disabled: dh-hkdh0)",
-      "description": "DISABLED (dh-hkdh0), mirroring validate.sh: the allocator-fixtures producer is red at base (fixed_arena_backing needs the held ordinary-dev publication cohort, reverie 1125). Waived to parity-with-main by coordinator ruling C. Re-enable by replacing this command with the producer invocation (scripts/build-liteinst-test-runtime.rs --for-ci) writing its fixture.env under target/validate/; test nodes already depend on this node, and it runs concurrently with build.test_binaries.",
+      "desc": "LiteInst allocator fixtures",
+      "description": "Runs the standalone allocator-fixture producer, which explicitly builds the leaf with --profile release and refuses a dev-profile body as outside the contract. It writes fixture.env under target/validate/liteinst-fixtures/bundle for the LiteInst A test node; test nodes already depend on this node, and it runs concurrently with build.test_binaries.",
       "labels": [
         "full"
       ],
-      "cmd": "echo 'SKIP (dh-hkdh0): allocator producer disabled until held reverie 1125 cohort lands'",
+      "cmd": "rm -rf target/validate/liteinst-fixtures && mkdir -p target/validate && ./scripts/build-liteinst-test-runtime.rs --for-ci \"$PWD/target/validate/liteinst-fixtures\"",
       "deps": [],
       "env": {},
-      "timeout": 60,
-      "cpu_timeout": 10,
+      "timeout": 600,
+      "cpu_timeout": 600,
       "priority": 80,
       "hint": {
         "resources": {},
-        "est_duration_s": 1,
+        "est_duration_s": 120,
         "rss_baseline_bytes": 1000000000,
         "hard_mem_max_bytes": 16000000000,
-        "classification": "light",
+        "classification": "cpu-bound",
         "preferred_inner_jobs": 1
       },
       "jobs_flag": ""
@@ -139,7 +139,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_a.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=strace) | binary(=generic_bootstrap) | binary(=standalone_constructor) | binary(=tool_tls) | binary(=fixed_arena) | binary(=reverie_liteinst) | binary(=reverie-liteinst-trap-count-guest) | binary(=reverie-liteinst-strace) | binary(=reverie-liteinst-spoof-guest) | binary(=reverie-liteinst-rpc-tool-guest) | binary(=reverie-liteinst-lifecycle-guest))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "source target/validate/liteinst-fixtures/bundle/fixture.env && ./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_a.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=strace) | binary(=generic_bootstrap) | binary(=standalone_constructor) | binary(=tool_tls) | binary(=fixed_arena) | binary(=reverie_liteinst) | binary(=reverie-liteinst-trap-count-guest) | binary(=reverie-liteinst-strace) | binary(=reverie-liteinst-spoof-guest) | binary(=reverie-liteinst-rpc-tool-guest) | binary(=reverie-liteinst-lifecycle-guest))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"

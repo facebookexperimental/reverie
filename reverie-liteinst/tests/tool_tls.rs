@@ -1,6 +1,13 @@
-//! Closed owned-TLS inventory for the authenticated standalone DEV runtime.
-//! Optimized and Detcore images have different emission; the existing runtime
-//! consumer supplies the exact DEV/source/fixture recipe, without input skips.
+//! Closed owned-TLS inventory for the authenticated standalone release
+//! runtime. Owned cells must be LOCAL definitions present only in the
+//! symtab with full-byte STV_DEFAULT or STV_HIDDEN visibility: local
+//! binding already excludes them from dynamic export and interposition,
+//! so DEFAULT is admitted alongside HIDDEN and no other visibility is.
+//! The artifact
+//! qualifier's TLS boundary proof remains the authority for TLS access
+//! chains. Detcore images have different emission; the existing runtime
+//! consumer supplies the exact release/source/fixture recipe, without
+//! input skips.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -18,11 +25,14 @@ mod liteinst_runtime;
 
 use liteinst_runtime::artifact;
 
-// Complete Rust-v0 identities from the actual DEV emission, with only crate
-// disambiguators removed. The first sixteen are production cells; MARKER is
-// the retained allocator-fixture diagnostic. No CURRENT_EVENT replacement is
-// allowed, even if its spelling changes or an existing cell disappears.
-const EXPECTED: [(&str, u64); 17] = [
+// Complete Rust-v0 identities from the actual release emission, with only
+// crate disambiguators removed. The first fifteen are production cells;
+// MARKER is the retained allocator-fixture diagnostic. No CURRENT_EVENT
+// replacement is allowed, even if its spelling changes or an existing cell
+// disappears. RCB_CLOCK_AVAILABILITY (renamed from RCB_CLOCK_UNAVAILABLE in
+// source) has no retained cell in the optimized leaf emission and is
+// therefore absent here.
+const EXPECTED: [(&str, u64); 16] = [
     (
         "_RNvNCNKNvNtCs_16reverie_liteinst11patch_alloc18INSTALLATION_DEPTH0s_023___RUST_STD_INTERNAL_VAL",
         8,
@@ -50,10 +60,6 @@ const EXPECTED: [(&str, u64); 17] = [
     (
         "_RNvNCNKNvNtNtCs_15reverie_inguest5guest5clock18RCB_COUNTER_ORIGIN0s_023___RUST_STD_INTERNAL_VAL",
         8,
-    ),
-    (
-        "_RNvNCNKNvNtNtCs_15reverie_inguest5guest5clock21RCB_CLOCK_UNAVAILABLE0s_023___RUST_STD_INTERNAL_VAL",
-        1,
     ),
     (
         "_RNvNCNKNvNtNtCs_15reverie_inguest5guest5clock21RCB_HANDLER_DEDUCTION0s_023___RUST_STD_INTERNAL_VAL",
@@ -99,6 +105,29 @@ fn demand(condition: bool, message: impl Into<String>) -> Result<(), String> {
     } else {
         Err(message.into())
     }
+}
+
+fn binding_name(bind: u8) -> &'static str {
+    match bind {
+        sym::STB_LOCAL => "LOCAL",
+        sym::STB_GLOBAL => "GLOBAL",
+        sym::STB_WEAK => "WEAK",
+        _ => "OTHER",
+    }
+}
+
+fn visibility_name(other: u8) -> &'static str {
+    match other {
+        sym::STV_DEFAULT => "DEFAULT",
+        sym::STV_INTERNAL => "INTERNAL",
+        sym::STV_HIDDEN => "HIDDEN",
+        sym::STV_PROTECTED => "PROTECTED",
+        _ => "OTHER",
+    }
+}
+
+fn owned_role_name(cell: &TlsCell) -> &str {
+    cell.canonical.as_deref().unwrap_or(&cell.name)
 }
 
 // Same bounded Cs<alphanumeric>_ normalization as m1_artifact's private
@@ -257,8 +286,14 @@ fn validate_layout(elf: &Elf<'_>, bytes: &[u8], cells: &[TlsCell]) -> Result<(),
             demand(
                 cell.table == "symtab"
                     && symbol.st_bind() == sym::STB_LOCAL
-                    && symbol.st_other == sym::STV_HIDDEN,
-                format!("bad owned TLS definition/binding/visibility: {}", cell.name),
+                    && matches!(symbol.st_other, sym::STV_DEFAULT | sym::STV_HIDDEN),
+                format!(
+                    "owned TLS role is not LOCAL symtab-only (table={} bind={} visibility={}): {}",
+                    cell.table,
+                    binding_name(symbol.st_bind()),
+                    visibility_name(symbol.st_other),
+                    owned_role_name(cell),
+                ),
             )?;
         }
         // Foreign imports do not define storage in this image. Defined foreign
@@ -328,7 +363,7 @@ fn validate_inventory(elf: &Elf<'_>, bytes: &[u8], cells: &[TlsCell]) -> Result<
     demand(
         differences.is_empty(),
         format!(
-            "DEV owned TLS inventory differs from 16 production cells plus MARKER (observed {} owned):\n{}",
+            "owned TLS inventory is not exactly the pinned 16 roles (15 production cells plus MARKER; observed {} owned):\n{}",
             owned.len(),
             differences.join("\n"),
         ),
@@ -381,13 +416,13 @@ fn authenticated_bytes() -> Result<Vec<u8>, String> {
         fs::read(&runtime.path).map_err(|error| format!("read qualified runtime: {error}"))?;
     demand(
         artifact::sha256(&bytes) == runtime.receipt.artifact.sha256,
-        "runtime bytes changed after DEV qualification",
+        "runtime bytes changed after qualification",
     )?;
     Ok(bytes)
 }
 
 #[test]
-fn authenticated_dev_runtime_has_only_retained_tool_tls() -> Result<(), String> {
+fn authenticated_runtime_has_only_retained_tool_tls() -> Result<(), String> {
     let runtime = liteinst_runtime::required_runtime()?;
     let evidence = liteinst_runtime::evidence_directory("tool-tls")?;
     let bytes = authenticated_bytes()?;
@@ -459,8 +494,39 @@ fn authenticated_elf_mutations_cannot_hide_owned_tls() -> Result<(), String> {
         Ok::<_, String>(matching[0])
     };
     let depth = find(EXPECTED[0].0)?;
-    let ready = find(EXPECTED[13].0)?;
+    let ready = find(EXPECTED[12].0)?;
     let clock = find(EXPECTED[2].0)?;
+    let marker = find(EXPECTED[15].0)?;
+    let foreign = cells
+        .iter()
+        .find(|cell| {
+            cell.table == "symtab"
+                && !cell.owned
+                && cell.symbol.st_shndx != section_header::SHN_UNDEF as usize
+        })
+        .ok_or("negative controls require one defined foreign TLS cell")?;
+    let mut extra_candidate = None;
+    for symbol in elf.syms.iter() {
+        if symbol.st_type() == sym::STT_TLS {
+            continue;
+        }
+        let Some(name) = elf.strtab.get_at(symbol.st_name) else {
+            continue;
+        };
+        if !name.contains("reverie_liteinst") && !name.contains("reverie_inguest") {
+            continue;
+        }
+        let Some(canonical) = canonical_rust_symbol(name) else {
+            continue;
+        };
+        if EXPECTED.iter().any(|&(expected, _)| canonical == expected) {
+            continue;
+        }
+        extra_candidate = Some((symbol.st_name, name.to_owned(), canonical));
+        break;
+    }
+    let (extra_name_offset, extra_raw_name, extra_role) =
+        extra_candidate.ok_or("negative controls require one non-TLS owned symbol name")?;
     let tables: Vec<_> = elf
         .section_headers
         .iter()
@@ -481,6 +547,61 @@ fn authenticated_elf_mutations_cannot_hide_owned_tls() -> Result<(), String> {
     };
     let depth_entry = entry(depth)?;
     let ready_entry = entry(ready)?;
+    let marker_entry = entry(marker)?;
+    let foreign_entry = entry(foreign)?;
+    let dynsym_tables: Vec<_> = elf
+        .section_headers
+        .iter()
+        .filter(|section| section.sh_type == section_header::SHT_DYNSYM)
+        .collect();
+    demand(
+        dynsym_tables.len() == 1 && dynsym_tables[0].sh_entsize == 24,
+        "negative controls require actual ELF64 dynsym",
+    )?;
+    let dynsym_table = dynsym_tables[0];
+    let dynsym_strings = elf
+        .section_headers
+        .get(dynsym_table.sh_link as usize)
+        .ok_or("negative-control dynsym strings missing")?;
+    let mut dynsym_candidate = None;
+    for (index, symbol) in elf.dynsyms.iter().enumerate() {
+        let Some(name) = elf.dynstrtab.get_at(symbol.st_name) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let name_end = symbol
+            .st_name
+            .checked_add(extra_raw_name.len() + 1)
+            .ok_or("negative-control dynsym name offset overflow")?;
+        if name_end <= usize::try_from(dynsym_strings.sh_size).unwrap_or(usize::MAX) {
+            dynsym_candidate = Some((index, symbol));
+            break;
+        }
+    }
+    let (dynsym_index, dynsym_symbol) =
+        dynsym_candidate.ok_or("negative controls require one writable dynsym name")?;
+    let dynsym_entry = usize::try_from(extent(
+        dynsym_table.sh_offset,
+        u64::try_from(dynsym_index).unwrap_or(u64::MAX) * 24,
+    )?)
+    .map_err(|_| "negative-control dynsym offset overflow")?;
+    demand(
+        extent(dynsym_entry as u64, 24)? <= bytes.len() as u64,
+        "negative-control dynsym entry outside file",
+    )?;
+    let dynsym_name_offset = usize::try_from(extent(
+        dynsym_strings.sh_offset,
+        dynsym_symbol.st_name as u64,
+    )?)
+    .map_err(|_| "negative-control dynsym name offset overflow")?;
+    let extra_name_offset = u32::try_from(extra_name_offset)
+        .map_err(|_| "negative-control extra name offset overflow")?;
+    let foreign_name_offset = u32::try_from(foreign.symbol.st_name)
+        .map_err(|_| "negative-control foreign name offset overflow")?;
+    let depth_section = u16::try_from(depth.symbol.st_shndx)
+        .map_err(|_| "negative-control section index overflow")?;
     let strings = elf
         .section_headers
         .get(table.sh_link as usize)
@@ -529,6 +650,129 @@ fn authenticated_elf_mutations_cannot_hide_owned_tls() -> Result<(), String> {
             "wrong owned TLS size {}: expected=8 actual=4",
             EXPECTED[0].0
         ),
+    )?;
+    // The restated contract deliberately admits the release runtime's
+    // LOCAL+DEFAULT cells. Every other table/binding case the old
+    // LOCAL+HIDDEN demand refused must still refuse here by role name.
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[depth_entry + 4] = (sym::STB_GLOBAL << 4) | sym::STT_TLS;
+            changed[depth_entry + 5] = sym::STV_HIDDEN;
+        },
+        &format!(
+            "owned TLS role is not LOCAL symtab-only (table=symtab bind=GLOBAL visibility=HIDDEN): {}",
+            EXPECTED[0].0
+        ),
+    )?;
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[depth_entry + 4] = (sym::STB_GLOBAL << 4) | sym::STT_TLS;
+            changed[depth_entry + 5] = sym::STV_DEFAULT;
+        },
+        &format!(
+            "owned TLS role is not LOCAL symtab-only (table=symtab bind=GLOBAL visibility=DEFAULT): {}",
+            EXPECTED[0].0
+        ),
+    )?;
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[depth_entry + 4] = (sym::STB_WEAK << 4) | sym::STT_TLS;
+            changed[depth_entry + 5] = sym::STV_DEFAULT;
+        },
+        &format!(
+            "owned TLS role is not LOCAL symtab-only (table=symtab bind=WEAK visibility=DEFAULT): {}",
+            EXPECTED[0].0
+        ),
+    )?;
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[depth_entry + 4] = (sym::STB_LOCAL << 4) | sym::STT_TLS;
+            changed[depth_entry + 5] = sym::STV_PROTECTED;
+        },
+        &format!(
+            "owned TLS role is not LOCAL symtab-only (table=symtab bind=LOCAL visibility=PROTECTED): {}",
+            EXPECTED[0].0
+        ),
+    )?;
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[depth_entry + 4] = (sym::STB_LOCAL << 4) | sym::STT_TLS;
+            changed[depth_entry + 5] = sym::STV_INTERNAL;
+        },
+        &format!(
+            "owned TLS role is not LOCAL symtab-only (table=symtab bind=LOCAL visibility=INTERNAL): {}",
+            EXPECTED[0].0
+        ),
+    )?;
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[depth_entry + 4] = (sym::STB_LOCAL << 4) | sym::STT_TLS;
+            changed[depth_entry + 5] = sym::STV_HIDDEN | 0x80;
+        },
+        &format!(
+            "owned TLS role is not LOCAL symtab-only (table=symtab bind=LOCAL visibility=OTHER): {}",
+            EXPECTED[0].0
+        ),
+    )?;
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[dynsym_name_offset..dynsym_name_offset + extra_raw_name.len()]
+                .copy_from_slice(extra_raw_name.as_bytes());
+            changed[dynsym_name_offset + extra_raw_name.len()] = 0;
+            changed[dynsym_entry + 4] = (sym::STB_GLOBAL << 4) | sym::STT_TLS;
+            changed[dynsym_entry + 5] = sym::STV_DEFAULT;
+            changed[dynsym_entry + 6..dynsym_entry + 8]
+                .copy_from_slice(&depth_section.to_le_bytes());
+            changed[dynsym_entry + 8..dynsym_entry + 16]
+                .copy_from_slice(&depth.symbol.st_value.to_le_bytes());
+            changed[dynsym_entry + 16..dynsym_entry + 24]
+                .copy_from_slice(&depth.symbol.st_size.to_le_bytes());
+        },
+        &format!(
+            "owned TLS role is not LOCAL symtab-only (table=dynsym bind=GLOBAL visibility=DEFAULT): {extra_role}"
+        ),
+    )?;
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[dynsym_name_offset..dynsym_name_offset + extra_raw_name.len()]
+                .copy_from_slice(extra_raw_name.as_bytes());
+            changed[dynsym_name_offset + extra_raw_name.len()] = 0;
+            changed[dynsym_entry + 4] = (sym::STB_LOCAL << 4) | sym::STT_TLS;
+            changed[dynsym_entry + 5] = sym::STV_DEFAULT;
+            changed[dynsym_entry + 6..dynsym_entry + 8]
+                .copy_from_slice(&depth_section.to_le_bytes());
+            changed[dynsym_entry + 8..dynsym_entry + 16]
+                .copy_from_slice(&depth.symbol.st_value.to_le_bytes());
+            changed[dynsym_entry + 16..dynsym_entry + 24]
+                .copy_from_slice(&depth.symbol.st_size.to_le_bytes());
+        },
+        &format!(
+            "owned TLS role is not LOCAL symtab-only (table=dynsym bind=LOCAL visibility=DEFAULT): {extra_role}"
+        ),
+    )?;
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[foreign_entry..foreign_entry + 4]
+                .copy_from_slice(&extra_name_offset.to_le_bytes());
+        },
+        &format!("unexpected owned TLS role {extra_role}"),
+    )?;
+    reject_mutation(
+        &bytes,
+        |changed| {
+            changed[marker_entry..marker_entry + 4]
+                .copy_from_slice(&foreign_name_offset.to_le_bytes());
+        },
+        &format!("missing retained owned TLS role {}", EXPECTED[15].0),
     )?;
     reject_mutation(
         &bytes,

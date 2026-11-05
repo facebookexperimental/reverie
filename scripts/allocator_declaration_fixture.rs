@@ -142,7 +142,7 @@ fn select_rlib(
             "core library source differs",
         )?;
         check(
-            event["features"] == serde_json::json!(["allocator-fixture"])
+            event["features"] == serde_json::json!(["allocator-fixture", "liteinst"])
                 && &event["profile"] == profile,
             "core features/profile differ from diagnostic recipe",
         )?;

@@ -313,8 +313,8 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
         };
         let features = vec!["allocator-fixture".to_owned()];
         let profile = serde_json::json!({
-            "opt_level": "0", "debuginfo": 2, "debug_assertions": true,
-            "overflow_checks": true, "test": false,
+            "opt_level": "3", "debuginfo": 0, "debug_assertions": false,
+            "overflow_checks": false, "test": false,
         });
         let oracle_sha256 = BTreeMap::from([
             ("rust_exports".to_owned(), RUST_ORACLE_SHA256.to_owned()),
@@ -342,7 +342,7 @@ fn qualify_runtime() -> Result<QualifiedRuntime, String> {
                     compiled_sources: Some(compiled_sources),
                     package: &package,
                     features: &features,
-                    profile_name: "dev",
+                    profile_name: "release",
                     profile: &profile,
                     initializer: artifact::STANDALONE_ROOT,
                     source_head: &source.head,
