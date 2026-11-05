@@ -232,14 +232,14 @@ pub(super) fn prctl<M: GuestMemoryAccess<Error = crate::Error>>(
         }
         PR_CAPBSET_READ => {
             if args[1] <= crate::credentials::last_capability() {
-                i64::from(state.capability_bounding & (1_u64 << args[1]) != 0)
+                i64::from(state.credentials.capability_bounding & (1_u64 << args[1]) != 0)
             } else {
                 negative_errno(libc::EINVAL)
             }
         }
         PR_CAPBSET_DROP => {
             if args[1] <= crate::credentials::last_capability() {
-                state.capability_bounding &= !(1_u64 << args[1]);
+                state.credentials.capability_bounding &= !(1_u64 << args[1]);
                 0
             } else {
                 negative_errno(libc::EINVAL)
@@ -247,16 +247,18 @@ pub(super) fn prctl<M: GuestMemoryAccess<Error = crate::Error>>(
         }
         option if option == libc::PR_SET_KEEPCAPS as u64 => match args[1] {
             0 => {
-                state.keep_capabilities = false;
+                state.credentials.keep_capabilities = false;
                 0
             }
             1 => {
-                state.keep_capabilities = true;
+                state.credentials.keep_capabilities = true;
                 0
             }
             _ => negative_errno(libc::EINVAL),
         },
-        option if option == libc::PR_GET_KEEPCAPS as u64 => i64::from(state.keep_capabilities),
+        option if option == libc::PR_GET_KEEPCAPS as u64 => {
+            i64::from(state.credentials.keep_capabilities)
+        }
         // AUTONOMOUS-BOT-IMPLEMENTED
         option if option == libc::PR_SET_DUMPABLE as u64 => match args[1] {
             value @ (0 | 1) => {
@@ -327,7 +329,7 @@ pub(super) fn prctl_cap_ambient(
     capability: u64,
 ) -> i64 {
     if operation == libc::PR_CAP_AMBIENT_CLEAR_ALL as u64 {
-        state.capability_ambient = 0;
+        state.credentials.capability_ambient = 0;
         return 0;
     }
     if capability > crate::credentials::last_capability() {
@@ -336,18 +338,20 @@ pub(super) fn prctl_cap_ambient(
     let bit = 1_u64 << capability;
     match operation {
         option if option == libc::PR_CAP_AMBIENT_IS_SET as u64 => {
-            i64::from(state.capability_ambient & bit != 0)
+            i64::from(state.credentials.capability_ambient & bit != 0)
         }
         option if option == libc::PR_CAP_AMBIENT_RAISE as u64 => {
-            if state.capability_permitted & bit == 0 || state.capability_inheritable & bit == 0 {
+            if state.credentials.capability_permitted & bit == 0
+                || state.credentials.capability_inheritable & bit == 0
+            {
                 negative_errno(libc::EPERM)
             } else {
-                state.capability_ambient |= bit;
+                state.credentials.capability_ambient |= bit;
                 0
             }
         }
         option if option == libc::PR_CAP_AMBIENT_LOWER as u64 => {
-            state.capability_ambient &= !bit;
+            state.credentials.capability_ambient &= !bit;
             0
         }
         _ => negative_errno(libc::EINVAL),
@@ -386,9 +390,9 @@ pub(super) fn capget<M: GuestMemoryAccess<Error = crate::Error>>(
         return 0;
     }
     let bytes = capability_data_bytes(
-        state.capability_effective,
-        state.capability_permitted,
-        state.capability_inheritable,
+        state.credentials.capability_effective,
+        state.credentials.capability_permitted,
+        state.credentials.capability_inheritable,
     );
     match memory.write_exact(args[1], &bytes) {
         Ok(()) => 0,
@@ -418,16 +422,17 @@ pub(super) fn capset<M: GuestMemoryAccess<Error = crate::Error>>(
         return negative_errno(libc::EFAULT);
     };
     if effective & !permitted != 0
-        || permitted & !state.capability_permitted != 0
-        || inheritable & !state.capability_bounding != 0
+        || permitted & !state.credentials.capability_permitted != 0
+        || inheritable & !state.credentials.capability_bounding != 0
     {
         return negative_errno(libc::EPERM);
     }
     let mask = crate::credentials::capability_mask();
-    state.capability_effective = effective & mask;
-    state.capability_permitted = permitted & mask;
-    state.capability_inheritable = inheritable & mask;
-    state.capability_ambient &= state.capability_permitted & state.capability_inheritable;
+    state.credentials.capability_effective = effective & mask;
+    state.credentials.capability_permitted = permitted & mask;
+    state.credentials.capability_inheritable = inheritable & mask;
+    state.credentials.capability_ambient &=
+        state.credentials.capability_permitted & state.credentials.capability_inheritable;
     0
 }
 

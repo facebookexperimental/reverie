@@ -194,7 +194,7 @@ pub(super) fn get_robust_list(
     // cross-process reads require either a dumpable target or CAP_SYS_PTRACE.
     if target.tgid != state.pid
         && !target.dumpable
-        && state.capability_effective & (1_u64 << CAP_SYS_PTRACE) == 0
+        && state.credentials.capability_effective & (1_u64 << CAP_SYS_PTRACE) == 0
     {
         return negative_errno(libc::EPERM);
     }

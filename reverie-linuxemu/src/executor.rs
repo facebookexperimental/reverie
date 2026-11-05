@@ -526,15 +526,17 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         thread_group_leader_name: Arc::new(Mutex::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0")),
         thp_disabled: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         pkey_zero_claimed: Arc::new(AtomicBool::new(false)),
-        keep_capabilities: false,
-        capability_effective: crate::credentials::capability_mask(),
-        capability_permitted: crate::credentials::capability_mask(),
-        capability_inheritable: 0,
-        capability_bounding: crate::credentials::capability_mask(),
-        capability_ambient: 0,
-        credential_root: crate::credentials::RootIds {
-            effective: true,
-            real: true,
+        credentials: crate::elf::Credentials {
+            keep_capabilities: false,
+            capability_effective: crate::credentials::capability_mask(),
+            capability_permitted: crate::credentials::capability_mask(),
+            capability_inheritable: 0,
+            capability_bounding: crate::credentials::capability_mask(),
+            capability_ambient: 0,
+            credential_root: crate::credentials::RootIds {
+                effective: true,
+                real: true,
+            },
         },
         dumpable: true,
         process_signals: Arc::new(std::sync::Mutex::new(ProcessSignalState::default())),
@@ -40347,7 +40349,7 @@ mod tests {
             ),
             0
         );
-        parent.state.capability_effective &= !(1_u64 << CAP_SYS_PTRACE);
+        parent.state.credentials.capability_effective &= !(1_u64 << CAP_SYS_PTRACE);
         assert_eq!(
             get_robust_list(
                 &mut memory,
@@ -40359,7 +40361,7 @@ mod tests {
         assert_eq!(read_struct::<u64>(&memory, HEAD_OUTPUT), HEAD_SENTINEL);
         assert_eq!(read_struct::<u64>(&memory, LENGTH_OUTPUT), LENGTH_SENTINEL);
 
-        parent.state.capability_effective |= 1_u64 << CAP_SYS_PTRACE;
+        parent.state.credentials.capability_effective |= 1_u64 << CAP_SYS_PTRACE;
         assert_eq!(
             set_robust_list(
                 &mut parent.state,
@@ -44264,9 +44266,9 @@ mod tests {
             ),
             0
         );
-        assert_eq!(state.capability_effective, reduced);
-        assert_eq!(state.capability_permitted, reduced);
-        assert_eq!(state.capability_inheritable, 1);
+        assert_eq!(state.credentials.capability_effective, reduced);
+        assert_eq!(state.credentials.capability_permitted, reduced);
+        assert_eq!(state.credentials.capability_inheritable, 1);
 
         assert_eq!(
             prctl_cap_ambient(&mut state, libc::PR_CAP_AMBIENT_RAISE as u64, 0),
@@ -44288,7 +44290,7 @@ mod tests {
             ),
             0
         );
-        assert_eq!(state.capability_ambient, 0);
+        assert_eq!(state.credentials.capability_ambient, 0);
         memory
             .write(DATA, &capability_data_bytes(reduced, reduced, 1))
             .unwrap();
@@ -44316,34 +44318,34 @@ mod tests {
         assert_eq!(prctl(&mut state, &[PR_CAPBSET_READ, 0, 0, 0, 0, 0]), 1);
 
         let child = state.try_clone_for_fork(2).unwrap();
-        assert_eq!(child.capability_bounding, reduced);
+        assert_eq!(child.credentials.capability_bounding, reduced);
         let mut after_exec = test_state(&root.0);
         after_exec.inherit_process_state(state);
-        assert_eq!(after_exec.capability_effective, reduced);
-        assert_eq!(after_exec.capability_permitted, reduced);
-        assert_eq!(after_exec.capability_bounding, reduced);
-        assert_eq!(after_exec.capability_ambient, 1);
+        assert_eq!(after_exec.credentials.capability_effective, reduced);
+        assert_eq!(after_exec.credentials.capability_permitted, reduced);
+        assert_eq!(after_exec.credentials.capability_bounding, reduced);
+        assert_eq!(after_exec.credentials.capability_ambient, 1);
     }
 
     #[test]
     fn exec_of_a_non_root_guest_keeps_only_ambient_capabilities() {
         let root = TestDir::new();
         let mut state = test_state(&root.0);
-        state.credential_root = crate::credentials::RootIds::default();
-        state.capability_inheritable = 1;
-        state.capability_ambient = 1;
+        state.credentials.credential_root = crate::credentials::RootIds::default();
+        state.credentials.capability_inheritable = 1;
+        state.credentials.capability_ambient = 1;
         let mut after_exec = test_state(&root.0);
         after_exec.inherit_process_state(state);
-        assert_eq!(after_exec.capability_permitted, 1);
-        assert_eq!(after_exec.capability_effective, 1);
-        assert_eq!(after_exec.capability_inheritable, 1);
-        assert_eq!(after_exec.capability_ambient, 1);
+        assert_eq!(after_exec.credentials.capability_permitted, 1);
+        assert_eq!(after_exec.credentials.capability_effective, 1);
+        assert_eq!(after_exec.credentials.capability_inheritable, 1);
+        assert_eq!(after_exec.credentials.capability_ambient, 1);
         assert_eq!(
-            after_exec.capability_bounding,
+            after_exec.credentials.capability_bounding,
             crate::credentials::capability_mask()
         );
         assert_eq!(
-            after_exec.credential_root,
+            after_exec.credentials.credential_root,
             crate::credentials::RootIds::default()
         );
     }

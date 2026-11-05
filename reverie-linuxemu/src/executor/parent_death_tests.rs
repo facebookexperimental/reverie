@@ -324,8 +324,8 @@ fn pdeath_registration_reset_sticky_domain_and_exec_capability_gain() {
     leader.replace_after_exec(test_state(&root.0)).unwrap();
     assert_eq!(leader.state.task_lifecycle.lock().unwrap().parent_death_signal(leader.admitted_signal_identity()), Ok(libc::SIGUSR2));
     assert!(leader.parent_death_enrolled());
-    leader.state.capability_permitted = 0;
-    leader.state.capability_effective = 0;
+    leader.state.credentials.capability_permitted = 0;
+    leader.state.credentials.capability_effective = 0;
     leader.replace_after_exec(test_state(&root.0)).unwrap();
     assert_eq!(leader.state.task_lifecycle.lock().unwrap().parent_death_signal(leader.admitted_signal_identity()), Ok(0));
     assert!(leader.parent_death_enrolled());

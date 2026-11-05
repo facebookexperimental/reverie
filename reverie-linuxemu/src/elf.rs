@@ -1131,6 +1131,26 @@ pub struct FsContext {
     pub umask: libc::mode_t,
 }
 
+/// A task's credentials (Linux: the capability half of `struct cred`).
+/// Per-task values; fork and clone copy them, and exec recomputes the
+/// capability sets from them, as the flat fields did. The dumpable flag
+/// is part of this group in Linux but stays flat on `LoadedStaticElf`
+/// for now (see the TODO there).
+// TODO-HUMAN-REVIEW(PR-181): Review virtual capability lifecycle state.
+#[derive(Clone, Copy, Debug)]
+pub struct Credentials {
+    pub keep_capabilities: bool,
+    pub capability_effective: u64,
+    pub capability_permitted: u64,
+    pub capability_inheritable: u64,
+    pub capability_bounding: u64,
+    pub capability_ambient: u64,
+    /// Whether the guest's effective and real uids are root in its user
+    /// namespace. They are its launcher's, since LinuxEmu changes no uid, and
+    /// decide the capability change at each exec.
+    pub credential_root: crate::credentials::RootIds,
+}
+
 #[derive(Debug)]
 pub struct LoadedStaticElf {
     pub entry_point: u64,
@@ -1250,18 +1270,10 @@ pub struct LoadedStaticElf {
     /// `executor/pkeys.rs`). Threads and a vfork child share it, fork takes
     /// an independent copy, and exec starts a new address space without it.
     pub pkey_zero_claimed: std::sync::Arc<AtomicBool>,
-    // TODO-HUMAN-REVIEW(PR-181): Review virtual capability lifecycle state.
-    pub keep_capabilities: bool,
-    pub capability_effective: u64,
-    pub capability_permitted: u64,
-    pub capability_inheritable: u64,
-    pub capability_bounding: u64,
-    pub capability_ambient: u64,
-    /// Whether the guest's effective and real uids are root in its user
-    /// namespace. They are its launcher's, since LinuxEmu changes no uid, and
-    /// decide the capability change at each exec.
-    pub credential_root: crate::credentials::RootIds,
+    /// Capability credentials (R1 Credentials group).
+    pub credentials: Credentials,
     // TODO-HUMAN-REVIEW(PR-235): Review virtual dumpability lifecycle semantics.
+    // TODO(R1): join Credentials when the signal freeze lifts; frozen readers: executor/sys_signal.rs:3190,3260.
     pub dumpable: bool,
     /// Dispositions and process-pending signals shared by a thread group.
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1529,13 +1541,7 @@ impl LoadedStaticElf {
             pkey_zero_claimed: std::sync::Arc::new(AtomicBool::new(
                 self.pkey_zero_claimed.load(Ordering::SeqCst),
             )),
-            keep_capabilities: self.keep_capabilities,
-            capability_effective: self.capability_effective,
-            capability_permitted: self.capability_permitted,
-            capability_inheritable: self.capability_inheritable,
-            capability_bounding: self.capability_bounding,
-            capability_ambient: self.capability_ambient,
-            credential_root: self.credential_root,
+            credentials: self.credentials,
             dumpable: self.dumpable,
             process_signals: std::sync::Arc::new(std::sync::Mutex::new(process_signals)),
             signal_transaction: Default::default(),
@@ -1690,13 +1696,13 @@ impl LoadedStaticElf {
 
         // Linux's capability change at this exec, from the caller's sets.
         let capabilities = crate::credentials::CapabilitySets {
-            effective: previous.capability_effective,
-            permitted: previous.capability_permitted,
-            inheritable: previous.capability_inheritable,
-            bounding: previous.capability_bounding,
-            ambient: previous.capability_ambient,
+            effective: previous.credentials.capability_effective,
+            permitted: previous.credentials.capability_permitted,
+            inheritable: previous.credentials.capability_inheritable,
+            bounding: previous.credentials.capability_bounding,
+            ambient: previous.credentials.capability_ambient,
         }
-        .after_exec(previous.credential_root);
+        .after_exec(previous.credentials.credential_root);
 
         // All fallible executable preparation and sibling teardown happen
         // before this transition. Serialize the pending-state snapshot and
@@ -1721,7 +1727,7 @@ impl LoadedStaticElf {
                 .retain(|fd, _| files.contains_key(fd));
             lifecycle.reset_parent_death_after_exec(
                 previous.tid,
-                capabilities.permitted & !previous.capability_permitted != 0,
+                capabilities.permitted & !previous.credentials.capability_permitted != 0,
             );
             lifecycle.reset_after_exec_with_signals(
                 previous.tid,
@@ -1754,13 +1760,13 @@ impl LoadedStaticElf {
         self.tool_directory = previous.tool_directory;
         // `thread_name` intentionally remains the replacement image's name.
         self.thp_disabled = thp_disabled;
-        self.keep_capabilities = false;
-        self.capability_effective = capabilities.effective;
-        self.capability_permitted = capabilities.permitted;
-        self.capability_inheritable = capabilities.inheritable;
-        self.capability_bounding = capabilities.bounding;
-        self.capability_ambient = capabilities.ambient;
-        self.credential_root = previous.credential_root;
+        self.credentials.keep_capabilities = false;
+        self.credentials.capability_effective = capabilities.effective;
+        self.credentials.capability_permitted = capabilities.permitted;
+        self.credentials.capability_inheritable = capabilities.inheritable;
+        self.credentials.capability_bounding = capabilities.bounding;
+        self.credentials.capability_ambient = capabilities.ambient;
+        self.credentials.credential_root = previous.credentials.credential_root;
         self.dumpable = true;
         self.process_signals = std::sync::Arc::new(std::sync::Mutex::new(process_signals));
         self.signal_transaction = previous.signal_transaction;
@@ -2362,13 +2368,15 @@ fn load_executable(
         thread_group_leader_name: std::sync::Arc::new(std::sync::Mutex::new(thread_name)),
         thp_disabled: std::sync::Arc::new(AtomicU8::new(0)),
         pkey_zero_claimed: std::sync::Arc::new(AtomicBool::new(false)),
-        keep_capabilities: false,
-        capability_effective: capabilities.effective,
-        capability_permitted: capabilities.permitted,
-        capability_inheritable: capabilities.inheritable,
-        capability_bounding: capabilities.bounding,
-        capability_ambient: capabilities.ambient,
-        credential_root: launcher.root,
+        credentials: Credentials {
+            keep_capabilities: false,
+            capability_effective: capabilities.effective,
+            capability_permitted: capabilities.permitted,
+            capability_inheritable: capabilities.inheritable,
+            capability_bounding: capabilities.bounding,
+            capability_ambient: capabilities.ambient,
+            credential_root: launcher.root,
+        },
         dumpable: true,
         process_signals: std::sync::Arc::new(std::sync::Mutex::new(ProcessSignalState::default())),
         signal_transaction: Default::default(),
@@ -3633,11 +3641,11 @@ mod tests {
         let expected = launcher.guest_capabilities();
         assert_eq!(
             [
-                loaded.capability_effective,
-                loaded.capability_permitted,
-                loaded.capability_inheritable,
-                loaded.capability_bounding,
-                loaded.capability_ambient,
+                loaded.credentials.capability_effective,
+                loaded.credentials.capability_permitted,
+                loaded.credentials.capability_inheritable,
+                loaded.credentials.capability_bounding,
+                loaded.credentials.capability_ambient,
             ],
             [
                 expected.effective,
@@ -3647,7 +3655,7 @@ mod tests {
                 expected.ambient,
             ]
         );
-        assert_eq!(loaded.credential_root, launcher.root);
+        assert_eq!(loaded.credentials.credential_root, launcher.root);
         assert_eq!(loaded.fs_context.umask, launcher.umask);
         assert_eq!(
             loaded.linux_personality,
