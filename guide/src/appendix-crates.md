@@ -11,7 +11,7 @@
 | `reverie-loader` | image validation, gate audit, init stages | [Loaders](loaders.md) |
 | `reverie-kvm`, `reverie-kvm-core` | KVM backend (specialized runner) | [Backends](backends.md) |
 | `reverie-linuxemu` | KVM-internal userspace Linux emulation — not a backend or Tool-contract surface | [Backends](backends.md) |
-| `reverie-linux-provider` | **Deprecated shim** re-exporting `reverie::provider` for one release (used by KVM *and* ptrace/in-guest provider paths); import from core instead | [Mechanisms](mechanisms.md) |
+| `reverie-linux-provider` | **Deprecated shim** re-exporting `reverie::provider` for one release. The *core interface* is what the KVM executor implements and the ptrace/in-guest paths call (their provider is the host kernel); this shim crate itself has no in-repo consumer — import from core instead | [Tool API](tool-api.md) |
 | `reverie-rpc-transport` | UDS framed RPC (`RpcServer`, blocking/async clients) | [State](state.md) |
 | `reverie-examples` | the tool gallery + cross-backend launchers + e2e harness | [First tool](first-tool.md), [Testing](testing.md) |
 | `reverie-test-support` | shared test fixtures | [Testing](testing.md) |

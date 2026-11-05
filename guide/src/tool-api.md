@@ -9,7 +9,11 @@ authoritative reference, and this chapter is the map to it.
 ## Handlers: one per event stream
 
 Each trappable event has a handler with a default implementation, so
-you override only what you subscribe to:
+you override only what you subscribe to. The table lists the handlers
+most tools touch; the full surface (including the structured-signal
+family — `handle_raw_signal_event`, `handle_signal_dequeue`,
+`handle_structured_signal_event` — and capability-gated extras) is
+the `Tool` trait's rustdoc, which is authoritative:
 
 | Handler | Event | Default |
 |---|---|---|

@@ -55,7 +55,7 @@ machinery, and vice versa. When you port a tool, RPC placement is
 usually the invisible difference: latency per `send_rpc`, ordering
 across processes, and what "global" costs at 10⁶ syscalls/second.
 
-## The mechanism menu: axes A, B, and D
+## The mechanism menu: axes A–E
 
 Reverie's goal is a DynamoRIO-class toolkit with *swappable*
 mechanisms under one `Tool` semantics. The architecture names the
@@ -71,7 +71,15 @@ choices as axes, and a **combination (cell)** is one pick per axis:
   (LiteInst), **B4** page-fault gating, **B5** ahead-of-time/offline
   rewriting, **B6** out-of-place translation (mini-JIT → DBT),
   **B7** ptrace syscall stops.
+* **C — nondeterministic-instruction control:** CPUID, RDTSC, and the
+  wider class (RDRAND/RDSEED/XGETBV…), mediated via B3/B4/B5/B6 or
+  kernel faulting where available. Exhaustive mediation is claimed by
+  no shipped path today.
 * **D — tool placement:** in the guest, or out of process.
+* **E — lifecycle coverage:** threads (`clone`), signals (including
+  SIGTRAP/SIGSEGV ownership), `fork`, `exec` successors, `vfork`, and
+  mapping churn (`dlopen`, JIT). Not a menu pick so much as the axis
+  along which cells differ most — and refuse most often.
 
 Two truths about today's tree, stated before any menu: the production
 in-guest path has exactly **two selectable modes** — `Liteinst` (B3

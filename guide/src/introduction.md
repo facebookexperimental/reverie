@@ -61,7 +61,7 @@ Read front to back the first time. [Your first tool](first-tool.md)
 builds a working syscall counter early and previews the whole API;
 concept chapters then take each piece apart; project-flavoured
 sections grow the counter into a distributed, multi-process tool.
-Project chapters end with commands you can run against
+Project chapters contain commands you can run against
 `reverie-examples`; concept chapters point at the example that
 exercises the idea (and say so under construction where the runnable
 listing does not exist yet).

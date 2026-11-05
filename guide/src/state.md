@@ -34,8 +34,9 @@ Rules that follow from the table:
 `counter1` sent one RPC per syscall — simple, and exactly wrong at
 scale. `counter2` keeps the count where it happens: each thread
 accumulates locally and sends **one** `ThreadReport` RPC at exit
-(which the global half records *without* adding it to the tree
-totals), each process folds its threads in, and the process
+(the global half writes that thread's count to stderr and does *not*
+add it to the tree totals), each process folds its threads in, and
+the process
 contributes its totals to global state **once** at exit
 (`ProcessExit`). No double-counting by construction. The launcher
 then prints the tree totals it reads back from the returned global
