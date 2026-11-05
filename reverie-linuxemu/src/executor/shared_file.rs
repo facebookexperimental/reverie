@@ -119,14 +119,7 @@ pub(super) fn mmap_with_shared_files(
     let kind = if is_anonymous {
         super::MappingKind::Anonymous
     } else {
-        match state
-            .files
-            .get(&(args[4] as libc::c_int))
-            .map(std::fs::File::metadata)
-        {
-            Some(Ok(metadata)) if metadata.is_file() => super::MappingKind::RegularFile(args[5]),
-            _ => super::MappingKind::Other,
-        }
+        super::MappingKind::of_descriptor(state, args[4] as libc::c_int, args[5])
     };
     // A MAP_FIXED address is a user address; the bookkeeping below is by
     // physical address, and the result is the user address.
@@ -313,7 +306,7 @@ pub(super) fn mmap_with_shared_files(
             let Some(file) = state.files.get(&(args[4] as libc::c_int)) else {
                 return Ok(negative_errno(libc::EBADF));
             };
-            if !matches!(kind, super::MappingKind::RegularFile(_))
+            if !matches!(kind, super::MappingKind::RegularFile { .. })
                 && let Some(error) = super::host_mmap_probe(file.as_raw_fd(), args)
             {
                 return Ok(error);

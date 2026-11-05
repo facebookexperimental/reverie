@@ -4294,6 +4294,123 @@ mod tests {
         );
     }
 
+    /// A regular file's mapping without a hint is placed by its filesystem's
+    /// rule, as Linux's `__get_unmapped_area` asks the file's own
+    /// `get_unmapped_area`: on a filesystem with `thp_get_unmapped_area`
+    /// (btrfs, ext4, XFS, ...) a range holding a whole aligned large page
+    /// starts congruent to its offset modulo a large page; on any other
+    /// (overlayfs, NFS, ...) it takes the default placement, the highest free
+    /// gap, as an anonymous mapping of that length does.
+    #[test]
+    fn file_mapping_alignment_follows_its_filesystem() {
+        use crate::executor::FileAlignment;
+        use crate::executor::MappingKind;
+        const MIB: u64 = 1024 * 1024;
+        let (dir, image) = interpreted_pie("file-alignment", 0, 0x3000, PAGE_SIZE);
+        let mut memory = GuestMemory::new(0, (64 * MIB) as usize).unwrap();
+        let loaded = load(&mut memory, &image).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        memory.enable_user_access();
+        // glibc 2.42's libc.so.6 first mapping: 2133584 bytes from offset 0,
+        // page-rounded, which holds the file's first large page.
+        let length = 2_134_016;
+        let user = |kind, length| {
+            let physical =
+                crate::executor::place_mapping(&memory, &loaded, length, 0, kind, false).unwrap();
+            memory.physical_to_user(physical).unwrap()
+        };
+        let file = |offset, alignment| MappingKind::RegularFile { offset, alignment };
+        assert_eq!(
+            user(file(0, FileAlignment::LargePage), length) % LARGE_PAGE_SIZE,
+            0
+        );
+        // From an unaligned offset, a range long enough to hold the file's
+        // second large page starts congruent to the offset.
+        let long = 4 * MIB;
+        assert_eq!(
+            user(file(0x1000, FileAlignment::LargePage), long) % LARGE_PAGE_SIZE,
+            0x1000
+        );
+        let default = user(MappingKind::Anonymous, length);
+        assert_ne!(default % LARGE_PAGE_SIZE, 0);
+        assert_eq!(user(file(0, FileAlignment::Page), length), default);
+        assert_eq!(
+            user(file(0x1000, FileAlignment::Page), long + PAGE_SIZE),
+            user(MappingKind::Anonymous, long + PAGE_SIZE)
+        );
+        // A range holding no whole aligned large page is not aligned on
+        // either class.
+        let short = MappingKind::RegularFile {
+            offset: 0x1000,
+            alignment: FileAlignment::LargePage,
+        };
+        let physical =
+            crate::executor::place_mapping(&memory, &loaded, 2 * MIB, 0, short, false).unwrap();
+        let anonymous_short = crate::executor::place_mapping(
+            &memory,
+            &loaded,
+            2 * MIB - PAGE_SIZE,
+            0,
+            MappingKind::Anonymous,
+            false,
+        )
+        .unwrap();
+        assert_eq!(physical + PAGE_SIZE, anonymous_short);
+    }
+
+    /// The filesystems whose regular files Linux 6.17 places with
+    /// `thp_get_unmapped_area`, by `statfs` magic, and tmpfs (shmem's own
+    /// large-page rule, not modelled, keeps the large-page placement); every
+    /// other filesystem takes the default placement. A real file's class is
+    /// its filesystem's.
+    #[test]
+    fn file_alignment_follows_linux_filesystems() {
+        use crate::executor::FileAlignment;
+        for magic in [
+            0xef53,
+            0x9123_683e,
+            0x5846_5342,
+            0x6573_5546,
+            0xe0f5_e1e2,
+            0xca45_1a4e,
+            0x0102_1994,
+        ] {
+            assert_eq!(
+                FileAlignment::of_filesystem(magic),
+                FileAlignment::LargePage,
+                "{magic:#x}"
+            );
+        }
+        // overlayfs, NFS, 9p, ramfs, procfs, squashfs, CIFS.
+        for magic in [
+            0x794c_7630,
+            0x6969,
+            0x0102_1997,
+            0x8584_58f6,
+            0x9fa0,
+            0x7371_7368,
+            0xff53_4d42,
+        ] {
+            assert_eq!(
+                FileAlignment::of_filesystem(magic),
+                FileAlignment::Page,
+                "{magic:#x}"
+            );
+        }
+        let path = std::env::current_exe().unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let mut fs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: statfs writes one statfs to the buffer, read on success.
+        assert_eq!(unsafe { libc::statfs(c_path.as_ptr(), fs.as_mut_ptr()) }, 0);
+        // SAFETY: statfs succeeded.
+        let magic = unsafe { fs.assume_init() }.f_type;
+        assert_eq!(
+            FileAlignment::of_file(&file),
+            FileAlignment::of_filesystem(magic)
+        );
+    }
+
     /// Linux rounds ELF_ET_DYN_BASE down to the image's largest PT_LOAD
     /// alignment, and biases an image linked anywhere so its first segment
     /// lands there: a 2 MiB-aligned PIE starts at 0x555555400000, and ones

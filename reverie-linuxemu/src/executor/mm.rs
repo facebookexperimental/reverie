@@ -137,9 +137,16 @@ fn find_mremap_destination(
     old_address: u64,
     length: u64,
 ) -> Option<u64> {
+    // Linux asks the mapping's own file (`vma->vm_file`), which for an
+    // overlayfs mapping is the underlying file (`ovl_mmap`'s `vma_set_file`);
+    // the page record keeps no filesystem, so a moved file mapping keeps the
+    // large-page rule it had before filesystems were told apart.
     let kind = memory
         .file_offset(old_address)
-        .map_or(MappingKind::Anonymous, MappingKind::RegularFile);
+        .map_or(MappingKind::Anonymous, |offset| MappingKind::RegularFile {
+            offset,
+            alignment: FileAlignment::LargePage,
+        });
     place_mapping(memory, state, length, 0, kind, false)
 }
 
@@ -147,8 +154,11 @@ fn find_mremap_destination(
 #[derive(Clone, Copy)]
 pub(crate) enum MappingKind {
     Anonymous,
-    /// A regular file at this offset.
-    RegularFile(u64),
+    /// A regular file at this offset, placed by its filesystem's rule.
+    RegularFile {
+        offset: u64,
+        alignment: FileAlignment,
+    },
     /// Anything else (a device, a pipe): no alignment.
     Other,
 }
@@ -156,9 +166,86 @@ pub(crate) enum MappingKind {
 impl MappingKind {
     pub(crate) fn file_offset(self) -> Option<u64> {
         match self {
-            Self::RegularFile(offset) => Some(offset),
+            Self::RegularFile { offset, .. } => Some(offset),
             _ => None,
         }
+    }
+
+    /// The kind of a mapping of the guest's descriptor `fd` (not
+    /// MAP_ANONYMOUS) at file `offset`: a regular file placed by its
+    /// filesystem's rule, or anything else.
+    pub(crate) fn of_descriptor(state: &LoadedStaticElf, fd: libc::c_int, offset: u64) -> Self {
+        match state.files.get(&fd) {
+            Some(file) if file.metadata().is_ok_and(|metadata| metadata.is_file()) => {
+                Self::RegularFile {
+                    offset,
+                    alignment: FileAlignment::of_file(file),
+                }
+            }
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Whether Linux places a regular file's mapping without a hint on a large
+/// page boundary. `__get_unmapped_area` asks the file's own
+/// `get_unmapped_area` when its `file_operations` has one, and the default
+/// placement otherwise, which aligns nothing beyond a page. Only some
+/// filesystems give their files `thp_get_unmapped_area`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileAlignment {
+    /// `thp_get_unmapped_area` (`__thp_get_unmapped_area`): a range that holds
+    /// a whole aligned large page of the file starts congruent to its offset
+    /// modulo a large page.
+    LargePage,
+    /// The default placement: page alignment only.
+    Page,
+}
+
+/// `statfs` filesystem magic numbers (include/uapi/linux/magic.h) whose
+/// regular files Linux 6.17 places with `thp_get_unmapped_area`: ext2/3/4
+/// (`ext2_file_operations`, `ext4_file_operations`), btrfs, XFS, FUSE (and
+/// virtiofs, which is FUSE), EROFS and bcachefs.
+const LARGE_PAGE_FILESYSTEMS: [i64; 6] = [
+    0xef53,      // EXT2/3/4_SUPER_MAGIC
+    0x9123_683e, // BTRFS_SUPER_MAGIC
+    0x5846_5342, // XFS_SUPER_MAGIC
+    0x6573_5546, // FUSE_SUPER_MAGIC
+    0xe0f5_e1e2, // EROFS_SUPER_MAGIC_V1
+    0xca45_1a4e, // BCACHEFS_SUPER_MAGIC
+];
+/// TMPFS_MAGIC: a shmem file, which Linux places with
+/// `shmem_get_unmapped_area`, aligned to a large page by the mount's
+/// `huge=` option. That rule is not modelled; tmpfs keeps the large-page rule
+/// it had before filesystems were told apart.
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+
+impl FileAlignment {
+    /// The rule for a regular file on the filesystem with `statfs` magic
+    /// `magic`. Every other filesystem (overlayfs, NFS, 9p, ramfs, procfs
+    /// among them) has no `get_unmapped_area` for its files and takes the
+    /// default placement.
+    pub(crate) fn of_filesystem(magic: i64) -> Self {
+        if LARGE_PAGE_FILESYSTEMS.contains(&magic) || magic == TMPFS_MAGIC {
+            Self::LargePage
+        } else {
+            Self::Page
+        }
+    }
+
+    /// The rule for the host file behind a guest descriptor, by its
+    /// filesystem (`fstatfs`). A file whose filesystem cannot be read takes
+    /// the default placement, as a filesystem without its own rule does.
+    pub(crate) fn of_file(file: &std::fs::File) -> Self {
+        use std::os::fd::AsRawFd;
+        let mut fs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: fstatfs writes at most one statfs to the buffer, which is
+        // read only when it succeeds.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
+            return Self::Page;
+        }
+        // SAFETY: fstatfs succeeded and initialised the buffer.
+        Self::of_filesystem(unsafe { fs.assume_init() }.f_type)
     }
 }
 
@@ -173,7 +260,8 @@ pub(super) const MAP_32BIT_END: u64 = 0x8000_0000;
 /// page-aligned hint is used as it is; otherwise the highest free gap below
 /// mmap_base, with Linux's large-page alignment (`__thp_get_unmapped_area`)
 /// for an anonymous mapping whose length is a whole number of large pages and
-/// for a regular file range holding a whole aligned large page. A MAP_32BIT
+/// for a regular file range holding a whole aligned large page on a
+/// filesystem that places its files so ([`FileAlignment`]). A MAP_32BIT
 /// mapping stays below 2 GiB. A memory a loader never laid out keeps the
 /// bottom-up allocator.
 pub(crate) fn place_mapping(
@@ -264,10 +352,12 @@ pub(crate) fn place_mapping(
     let offset = match kind {
         // Linux aligns an anonymous mapping only when it has no hint.
         MappingKind::Anonymous if hint == 0 && length.is_multiple_of(LARGE_PAGE) => Some(0),
-        MappingKind::RegularFile(offset)
-            if offset.checked_add(length).is_some_and(|end| {
-                end / LARGE_PAGE * LARGE_PAGE > align_up(offset, LARGE_PAGE).unwrap_or(u64::MAX)
-            }) =>
+        MappingKind::RegularFile {
+            offset,
+            alignment: FileAlignment::LargePage,
+        } if offset.checked_add(length).is_some_and(|end| {
+            end / LARGE_PAGE * LARGE_PAGE > align_up(offset, LARGE_PAGE).unwrap_or(u64::MAX)
+        }) =>
         {
             Some(offset)
         }
@@ -372,14 +462,7 @@ pub(super) fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
     let kind = if is_anonymous {
         MappingKind::Anonymous
     } else {
-        match state
-            .files
-            .get(&(args[4] as libc::c_int))
-            .map(std::fs::File::metadata)
-        {
-            Some(Ok(metadata)) if metadata.is_file() => MappingKind::RegularFile(args[5]),
-            _ => MappingKind::Other,
-        }
+        MappingKind::of_descriptor(state, args[4] as libc::c_int, args[5])
     };
     // A MAP_FIXED address is a user address; the bookkeeping below is by
     // physical address, and the result is the user address.
@@ -445,7 +528,7 @@ pub(super) fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
                 }
             }
         }
-        if !matches!(kind, MappingKind::RegularFile(_))
+        if !matches!(kind, MappingKind::RegularFile { .. })
             && let Some(error) = host_mmap_probe(file.as_raw_fd(), args)
         {
             return error;
