@@ -994,22 +994,16 @@ mod tests {
         // clean workspace. The fixture never constructs opaque source authority.
         // Requires a clean Git checkout, Git and Cargo, and an offline Cargo
         // cache for locked workspace metadata. Missing prerequisites fail; no skip.
-        // Cargo uses a workspace-relative source path; path-included scripts
-        // use an absolute one, independent of their temporary Cargo package.
-        let source = Path::new(file!());
-        let source = if source.is_absolute() {
-            source.to_path_buf()
-        } else {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join(
-                source
-                    .strip_prefix("reverie-liteinst-artifact")
-                    .expect("preparation identity test source path is not package-relative"),
-            )
-        };
-        // Resolve lexical parents before touching the filesystem: a generated
-        // package directory in the source spelling may already be gone.
+        // Cargo spells file!() relative to the workspace root for workspace
+        // members, including through #[path] inclusion from another member's
+        // tests/support directory; path-included scripts use an absolute
+        // spelling, independent of their temporary Cargo package. Normalize
+        // lexical parents first so every relative spelling reduces to the
+        // workspace-relative source path before any filesystem access: a
+        // generated package directory in the spelling may already be gone.
+        let raw_source = Path::new(file!());
         let mut source_path = PathBuf::new();
-        for component in source.components() {
+        for component in raw_source.components() {
             match component {
                 std::path::Component::ParentDir => assert!(
                     source_path.pop(),
@@ -1019,13 +1013,26 @@ mod tests {
                 component => source_path.push(component.as_os_str()),
             }
         }
-        let workspace = fs::canonicalize(
-            source_path
+        let workspace = if source_path.is_absolute() {
+            fs::canonicalize(
+                source_path
+                    .ancestors()
+                    .nth(3)
+                    .expect("preparation identity test source path has no workspace ancestor"),
+            )
+            .expect("preparation identity test workspace source path cannot be resolved")
+        } else {
+            // The including crate's manifest dir names a workspace member,
+            // not necessarily this crate. Walk its ancestry for the first
+            // directory containing the normalized source path.
+            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let root = manifest_dir
                 .ancestors()
-                .nth(3)
-                .expect("preparation identity test source path has no workspace ancestor"),
-        )
-        .expect("preparation identity test workspace source path cannot be resolved");
+                .find(|ancestor| ancestor.join(&source_path).is_file())
+                .expect("preparation identity test source path is not under the workspace");
+            fs::canonicalize(root)
+                .expect("preparation identity test workspace source path cannot be resolved")
+        };
         let scratch = std::env::temp_dir().join(format!(
             "preparation-identity-entry-{}-{}",
             std::process::id(),
