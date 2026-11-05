@@ -21,10 +21,15 @@ fn main() {
     std::process::exit(2);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+// The spike body exists only for the binary entry point: in this
+// target's test-harness build there is no caller for it (the harness
+// supplies main; the witnessed tests live in tests/grouped_admission.rs
+// as subprocess clients), so scoping it to non-test builds keeps the
+// -D warnings gate honest without silencing anything.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(test)))]
 use spike::main;
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(test)))]
 mod spike {
     use std::ffi::c_void;
     use std::process;
