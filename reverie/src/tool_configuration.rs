@@ -44,8 +44,9 @@ impl<T: Tool> ToolConfiguration<T> {
     /// contract is once per tree. `thread_ownership` is likewise left to
     /// the backends that resolve it (including caller overrides) at
     /// their documented points. For those two, the retained
-    /// [`ToolQueries`] fields keep their defaults; a host running
-    /// admission fills the effective values at its own boundary.
+    /// [`ToolQueries`] fields are `None` (explicitly not collected, so
+    /// no default poses as an answer); a host running admission fills
+    /// the effective values at its own boundary.
     pub fn select(config: Arc<<T::GlobalState as GlobalTool>::Config>) -> Self {
         let subscriptions = T::subscriptions(&config);
         let requirements = EffectiveRequirements::compute(
@@ -56,9 +57,11 @@ impl<T: Tool> ToolConfiguration<T> {
                 observes_sigreturns: T::observes_sigreturns(&config),
                 may_observe_signal_dequeues: T::may_observe_signal_dequeues(&config),
                 in_guest_signal_delivery: T::in_guest_signal_delivery(&config),
-                enforces_serialized_execution: false,
+                // Not collected here (see above): explicitly absent, so
+                // no default can be mistaken for the tool's answer.
+                enforces_serialized_execution: None,
                 reserved_input: T::reserved_input_requirement(&config).is_some(),
-                thread_ownership: crate::ThreadOwnership::Tool,
+                thread_ownership: None,
             },
         );
         Self {
@@ -84,9 +87,13 @@ impl<T: Tool> ToolConfiguration<T> {
         &self.subscriptions
     }
 
-    /// The merged requirements computed at construction: the tool's
-    /// stated [`Tool::requirements`], its subscriptions, and its
-    /// query-method answers, as admission consumes them.
+    /// The merged requirements computed at construction. Potentially
+    /// partial: query answers this type deliberately does not collect
+    /// (see [`Self::select`]) are `None` in
+    /// [`EffectiveRequirements::queries`], and admission fails closed
+    /// wherever such an answer is load-bearing. A host that collects
+    /// the effective answers at its own boundary should build its
+    /// admission input from those, not treat `None` as a default.
     pub fn requirements(&self) -> &EffectiveRequirements {
         &self.requirements
     }
@@ -281,6 +288,14 @@ mod tests {
             "in-guest delivery read once, here; consumers use the retained value"
         );
         assert!(owner.requirements().queries.in_guest_signal_delivery);
+        // Blocker regression (musereview B1): the two uncollected
+        // answers are explicitly absent — the tool answers Host/true
+        // above, so any retained default would be laundering.
+        assert_eq!(owner.requirements().queries.thread_ownership, None);
+        assert_eq!(
+            owner.requirements().queries.enforces_serialized_execution,
+            None
+        );
         assert_eq!(
             SERIALIZED.load(Ordering::SeqCst),
             0,

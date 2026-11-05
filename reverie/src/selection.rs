@@ -480,20 +480,29 @@ pub struct ToolQueries {
     /// the tool takes the in-guest two-phase signal protocol, so only an
     /// in-guest cell can host it.
     pub in_guest_signal_delivery: bool,
-    /// [`Tool::enforces_serialized_execution`](crate::Tool::enforces_serialized_execution):
-    /// a declaration about the tool, recorded for the report; admission
-    /// does not gate on it (backends trust it as before).
-    pub enforces_serialized_execution: bool,
+    /// [`Tool::enforces_serialized_execution`](crate::Tool::enforces_serialized_execution),
+    /// or `None` when the retaining boundary did not collect it (its
+    /// implementations may re-enter `subscriptions`, so
+    /// [`ToolConfiguration`](crate::ToolConfiguration) deliberately does
+    /// not evaluate it). `None` is not `Some(false)`: admission fails
+    /// closed where this answer is load-bearing (the reserved-input
+    /// joint prerequisite), and backends keep consulting the method at
+    /// their documented points regardless.
+    pub enforces_serialized_execution: Option<bool>,
     /// [`Tool::reserved_input_requirement`](crate::Tool::reserved_input_requirement)
-    /// returned `Some`: the cell's tested envelope must include reserved
-    /// input.
+    /// returned `Some`: satisfiable only jointly with
+    /// `enforces_serialized_execution == Some(true)` on a cell whose
+    /// envelope includes reserved input — that is the installer's
+    /// actual prerequisite, not an unconditional backend fact.
     pub reserved_input: bool,
     /// The *effective* thread ownership for the run (the tool's
     /// [`Tool::thread_ownership`](crate::Tool::thread_ownership) answer
-    /// after any caller override). Admission gates it only for cells
-    /// whose envelope honors the setting; backends keep resolving it at
-    /// their documented points.
-    pub thread_ownership: ThreadOwnership,
+    /// after any caller override), or `None` when not collected.
+    /// Admission gates it only for cells whose envelope honors the
+    /// setting, and there `None` fails closed: monitored-threads
+    /// coverage is unproved until ownership is known not to be `Host`.
+    /// A default must never pose as this answer.
+    pub thread_ownership: Option<ThreadOwnership>,
 }
 
 /// Requirements after merging the tool's stated requirements with its
@@ -1365,6 +1374,7 @@ impl RemovalReason {
             Self::CodeUncovered => RefusalCode::RCode,
             Self::SignalUnavailable(_) => RefusalCode::RSignal,
             Self::EnvDisproved("P1") | Self::EnvDisproved("P2") => RefusalCode::RPtrace,
+            Self::EnvDisproved("P8") => RefusalCode::RSignal,
             Self::EnvDisproved("P7") => RefusalCode::RWx,
             Self::EnvDisproved("P10") => RefusalCode::RArch,
             Self::EnvDisproved(_) => RefusalCode::RLifecycle,
@@ -1541,13 +1551,23 @@ fn requirement_reasons(
     }
     // Host-owned threads run unmonitored on backends that honor the
     // setting: demanding monitored threads in that configuration is a
-    // contradiction, not a satisfiable requirement.
+    // contradiction, not a satisfiable requirement. Uncollected
+    // ownership (`None`) likewise fails closed there: coverage is
+    // unproved until ownership is known not to be Host.
     if life.threads
         && cell.envelope.honors_thread_ownership
-        && req.queries.thread_ownership == ThreadOwnership::Host
+        && req.queries.thread_ownership != Some(ThreadOwnership::Tool)
         && !out.contains(&R::LifecycleUnproven("threads"))
     {
         out.push(R::LifecycleUnproven("threads"));
+    }
+    // Joint installer prerequisite: in-guest signal delivery refuses a
+    // runtime with site patching on (a patched site reaches the tool
+    // without the fallback continuation the delivery protocol needs).
+    if req.queries.in_guest_signal_delivery && cell.config == CellConfig::PreloadPatching {
+        out.push(R::SignalUnavailable(
+            "in-guest signal delivery with site patching",
+        ));
     }
     if life.fork && !cell.lifecycle.fork.satisfies() {
         out.push(R::LifecycleUnproven("fork"));
@@ -1587,7 +1607,13 @@ fn requirement_reasons(
     if req.queries.observes_sigreturns && !cell.capabilities.reports_sigreturns {
         out.push(R::SignalUnavailable("sigreturn reports"));
     }
-    if req.queries.reserved_input && !cell.envelope.reserved_input {
+    // Joint installer prerequisite: the facility behind the envelope
+    // fact is constructed only for a tool that also enforces serialized
+    // execution — and an uncollected (`None`) answer cannot prove it.
+    if req.queries.reserved_input
+        && !(cell.envelope.reserved_input
+            && req.queries.enforces_serialized_execution == Some(true))
+    {
         out.push(R::ReservedInputUnsupported);
     }
     if !cell.envelope.guest.covers(guest) {
@@ -1609,7 +1635,12 @@ fn bool_probe(fact: &Knowledge<bool>, name: &'static str) -> Option<RemovalReaso
 ///
 /// P4 (SUD) is never consulted: it is optional acceleration only. P9 only
 /// tightens: proved JIT indicators remove a patch-only cell when dynamic
-/// coverage is required; P9 can never admit anything.
+/// coverage is required; P9 can never admit anything. P2 is deliberately
+/// not consulted here: for a fresh exec this backend *becomes* the
+/// tracer, so existing-tracer ownership of the actual guest is a
+/// handoff fact ([`HandoffFacts::tracer_pid`]), checked terminally
+/// there. P8 is consulted only when actually observed disproved —
+/// guest dispositions are otherwise handoff facts too.
 fn environment_reasons(
     req: &EffectiveRequirements,
     env: &EnvironmentSnapshot,
@@ -1641,6 +1672,16 @@ fn environment_reasons(
         },
         _ => {}
     }
+    // P8 early refusal only on an actually observed denial; the usual
+    // Unknown remains a handoff check, not an admission gate.
+    if cell.envelope.signal_ownership_at_handoff
+        && matches!(
+            env.p8_signal_ownership,
+            Knowledge::Proved(false) | Knowledge::Disproved
+        )
+    {
+        out.push(R::EnvDisproved("P8"));
+    }
     if cell.mechanism == Mechanism::InPlacePatching {
         match &env.p7_wx {
             Knowledge::Proved(WxPolicy::DualMapAllowed) => {}
@@ -1666,7 +1707,12 @@ fn environment_reasons(
             let fact = match probe {
                 "P5" => &env.p5_cpuid_faulting,
                 "P6" => &env.p6_pr_set_tsc,
-                _ => continue,
+                // An unknown prerequisite name is unproved, never a
+                // free pass (admit_over candidates may name future ones).
+                other => {
+                    out.push(R::EnvUnknown(other));
+                    continue;
+                }
             };
             match fact {
                 Knowledge::Proved(true) => {}
@@ -2134,11 +2180,27 @@ impl ExecutionPlan {
         &self.requirements
     }
 
-    fn terminal(code: RefusalCode, detail: String) -> AdmissionRefusal {
+    /// Build a terminal refusal carrying a one-stage trace naming the
+    /// failed check against the retained cell. (Admission refusals
+    /// carry the full multi-stage filter trace; post-installation
+    /// checks have exactly one stage.)
+    fn terminal(
+        &self,
+        stage: &'static str,
+        reason: RemovalReason,
+        code: RefusalCode,
+        detail: String,
+    ) -> AdmissionRefusal {
         AdmissionRefusal {
             code,
             detail,
-            trace: FilterTrace::default(),
+            trace: FilterTrace {
+                stages: vec![FilterStage {
+                    name: stage,
+                    removed: vec![(self.cell.id, vec![reason])],
+                }],
+                satisfying_designs: Vec::new(),
+            },
             terminal: true,
         }
     }
@@ -2148,19 +2210,26 @@ impl ExecutionPlan {
     /// [`RefusalCode::REnvUnknown`] (the predicate is unproved — it is
     /// never read as the convenient value).
     fn check_true(
+        &self,
+        stage: &'static str,
+        reason: RemovalReason,
         fact: &Knowledge<bool>,
         code: RefusalCode,
         what: &'static str,
     ) -> Result<(), AdmissionRefusal> {
         match fact {
             Knowledge::Proved(true) => Ok(()),
-            Knowledge::Proved(false) | Knowledge::Disproved => Err(Self::terminal(
+            Knowledge::Proved(false) | Knowledge::Disproved => Err(self.terminal(
+                stage,
+                reason,
                 code,
-                format!("handoff: {what} does not hold"),
+                format!("{stage}: {what} does not hold"),
             )),
-            Knowledge::Unknown { .. } => Err(Self::terminal(
+            Knowledge::Unknown { .. } => Err(self.terminal(
+                stage,
+                RemovalReason::EnvUnknown(stage),
                 RefusalCode::REnvUnknown,
-                format!("handoff: {what} is unproved"),
+                format!("{stage}: {what} is unproved"),
             )),
         }
     }
@@ -2176,7 +2245,9 @@ impl ExecutionPlan {
         let cell = &self.cell;
         // Zero-window claims stand or fall here, on the actual image.
         if cell.window == WindowGuarantee::Zero {
-            Self::check_true(
+            self.check_true(
+                "handoff",
+                RemovalReason::WindowMismatch,
                 &facts.first_instruction_pending,
                 RefusalCode::RWindow,
                 "no guest instruction has run before arming",
@@ -2188,13 +2259,17 @@ impl ExecutionPlan {
             match &facts.tracer_pid {
                 Knowledge::Proved(0) => {}
                 Knowledge::Proved(_) | Knowledge::Disproved => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "handoff",
+                        RemovalReason::EnvDisproved("P2"),
                         RefusalCode::RPtrace,
                         "handoff: guest already has a tracer".to_string(),
                     ));
                 }
                 Knowledge::Unknown { .. } => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "handoff",
+                        RemovalReason::EnvUnknown("P2"),
                         RefusalCode::REnvUnknown,
                         "handoff: guest tracer ownership is unproved".to_string(),
                     ));
@@ -2202,22 +2277,28 @@ impl ExecutionPlan {
             }
         }
         // Host-process cells trap through a backend-installed seccomp
-        // filter: the actual guest must carry *that* lineage. Inherited
-        // filters of unknown compatibility, or an unproved lineage, fail
-        // closed here — admission-time metadata proved nothing about
-        // this guest.
+        // filter: the actual guest must carry a lineage the backend
+        // accounts for. A backend that installed its filter atop an
+        // inherited baseline it fully accounts for reports
+        // BackendInstalled; Preexisting is reserved for lineage nobody
+        // accounted for, whose compatibility a filter count cannot
+        // establish. Admission-time metadata proved nothing here.
         if cell.mechanism != Mechanism::VmExits {
             match &facts.seccomp_lineage {
                 Knowledge::Proved(SeccompLineage::BackendInstalled) => {}
                 Knowledge::Proved(_) | Knowledge::Disproved => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "handoff",
+                        RemovalReason::LifecycleUnproven("seccomp lineage"),
                         RefusalCode::RLifecycle,
-                        "handoff: guest seccomp lineage is not the backend's own installation"
+                        "handoff: guest seccomp lineage is not accounted for by the backend"
                             .to_string(),
                     ));
                 }
                 Knowledge::Unknown { .. } => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "handoff",
+                        RemovalReason::EnvUnknown("seccomp lineage"),
                         RefusalCode::REnvUnknown,
                         "handoff: guest seccomp lineage is unproved".to_string(),
                     ));
@@ -2228,14 +2309,18 @@ impl ExecutionPlan {
             match &facts.at_secure {
                 Knowledge::Proved(false) => {}
                 Knowledge::Proved(true) | Knowledge::Disproved => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "handoff",
+                        RemovalReason::GuestShapeMismatch,
                         RefusalCode::RLifecycle,
                         "handoff: guest is in secure-execution mode, outside the tested envelope"
                             .to_string(),
                     ));
                 }
                 Knowledge::Unknown { .. } => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "handoff",
+                        RemovalReason::EnvUnknown("handoff"),
                         RefusalCode::REnvUnknown,
                         "handoff: secure-execution mode is unproved".to_string(),
                     ));
@@ -2246,14 +2331,18 @@ impl ExecutionPlan {
             match &facts.threads_at_handoff {
                 Knowledge::Proved(n) if *n <= 1 => {}
                 Knowledge::Proved(_) | Knowledge::Disproved => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "handoff",
+                        RemovalReason::LifecycleUnproven("threads"),
                         RefusalCode::RLifecycle,
                         "handoff: guest already has more threads than the tested envelope"
                             .to_string(),
                     ));
                 }
                 Knowledge::Unknown { .. } => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "handoff",
+                        RemovalReason::EnvUnknown("handoff"),
                         RefusalCode::REnvUnknown,
                         "handoff: thread count is unproved".to_string(),
                     ));
@@ -2261,7 +2350,9 @@ impl ExecutionPlan {
             }
         }
         if cell.envelope.signal_ownership_at_handoff {
-            Self::check_true(
+            self.check_true(
+                "handoff",
+                RemovalReason::SignalUnavailable("signal ownership"),
                 &facts.signal_ownership,
                 RefusalCode::RSignal,
                 "required signal ownership is available",
@@ -2277,18 +2368,34 @@ impl ExecutionPlan {
             match &child.preload_present {
                 Knowledge::Proved(true) => {}
                 Knowledge::Proved(false) | Knowledge::Disproved => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "readmission",
+                        RemovalReason::LifecycleUnproven("fork preload"),
                         RefusalCode::RLifecycle,
                         "fork child does not carry the preload activation".to_string(),
                     ));
                 }
                 Knowledge::Unknown { .. } => {
-                    return Err(Self::terminal(
+                    return Err(self.terminal(
+                        "readmission",
+                        RemovalReason::EnvUnknown("readmission"),
                         RefusalCode::REnvUnknown,
                         "fork child preload presence is unproved".to_string(),
                     ));
                 }
             }
+        }
+        // A fork child has exactly one thread by construction, but a
+        // backend-supplied contrary fact still binds the envelope.
+        if self.cell.envelope.threads == ThreadsBound::SingleThread
+            && matches!(child.threads, Knowledge::Proved(n) if n > 1)
+        {
+            return Err(self.terminal(
+                "readmission",
+                RemovalReason::LifecycleUnproven("threads"),
+                RefusalCode::RLifecycle,
+                "fork child exceeds the tested single-thread envelope".to_string(),
+            ));
         }
         Ok(self.clone())
     }
@@ -2300,13 +2407,35 @@ impl ExecutionPlan {
     pub fn readmit_on_exec(&self, succ: &SuccessionFacts) -> Result<Self, AdmissionRefusal> {
         debug_assert_eq!(succ.kind, SuccessionKind::Exec);
         match self.cell.envelope.exec {
-            ExecBound::Refused => Err(Self::terminal(
+            ExecBound::Refused => Err(self.terminal(
+                "readmission",
+                RemovalReason::ExecUnproven,
                 RefusalCode::RExec,
                 format!("cell {} does not re-arm exec successors", self.cell.id),
             )),
-            ExecBound::Emulated => Ok(self.clone()),
+            ExecBound::Emulated => {
+                // The substrate carries the successor, but a supplied
+                // fact proving instructions already ran still breaks a
+                // zero-window plan: emulation is not a blind pass.
+                if self.cell.window == WindowGuarantee::Zero
+                    && matches!(
+                        succ.first_instruction_pending,
+                        Knowledge::Proved(false) | Knowledge::Disproved
+                    )
+                {
+                    return Err(self.terminal(
+                        "readmission",
+                        RemovalReason::ExecUnproven,
+                        RefusalCode::RExec,
+                        "successor instructions ran before re-admission".to_string(),
+                    ));
+                }
+                Ok(self.clone())
+            }
             ExecBound::RearmedSameCell => {
-                Self::check_true(
+                self.check_true(
+                    "readmission",
+                    RemovalReason::ExecUnproven,
                     &succ.first_instruction_pending,
                     RefusalCode::RExec,
                     "successor image is re-armed before its first instruction",
@@ -2315,7 +2444,9 @@ impl ExecutionPlan {
                     Knowledge::Unknown { .. }
                         if self.cell.envelope.guest == GuestShape::DynamicPreloadableOnly =>
                     {
-                        return Err(Self::terminal(
+                        return Err(self.terminal(
+                            "readmission",
+                            RemovalReason::EnvUnknown("readmission"),
                             RefusalCode::REnvUnknown,
                             "successor secure-execution mode is unproved".to_string(),
                         ));
@@ -2327,6 +2458,7 @@ impl ExecutionPlan {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2588,6 +2720,7 @@ mod tests {
         vm_stated.lifecycle.exec_successor = false;
         vm_stated.lifecycle.signal_fidelity = false;
         let mut req = request(vm_stated, GuestProfile::StaticElfVm);
+        req.requirements.queries.thread_ownership = Some(ThreadOwnership::Tool);
         req.requirements.queries.requires_signal_control = true;
         assert_eq!(admit(&req).expect("VM cell").chosen, CellId("V11-kvm"));
 
@@ -3012,14 +3145,15 @@ mod tests {
             reasons.contains(&RemovalReason::LifecycleUnproven("signals")),
             "{reasons:?}"
         );
-        // Explicit relaxation of exactly those axes admits it again.
+        // Explicit relaxation of exactly those axes (plus collected
+        // Tool ownership) admits it again.
         let mut stated = ToolRequirements::default();
         stated.lifecycle.exec_successor = false;
         stated.lifecycle.signal_fidelity = false;
+        let mut req = request(stated, GuestProfile::StaticElfVm);
+        req.requirements.queries.thread_ownership = Some(ThreadOwnership::Tool);
         assert_eq!(
-            admit(&request(stated, GuestProfile::StaticElfVm))
-                .expect("relaxed VM request")
-                .chosen,
+            admit(&req).expect("relaxed VM request").chosen,
             CellId("V11-kvm")
         );
     }
@@ -3034,7 +3168,7 @@ mod tests {
         stated.lifecycle.exec_successor = false;
         stated.lifecycle.signal_fidelity = false;
         let mut req = request(stated.clone(), GuestProfile::StaticElfVm);
-        req.requirements.queries.thread_ownership = ThreadOwnership::Host;
+        req.requirements.queries.thread_ownership = Some(ThreadOwnership::Host);
         let refusal = admit(&req).expect_err("Host ownership contradicts monitored threads");
         assert!(
             refusal
@@ -3043,7 +3177,7 @@ mod tests {
                 .contains(&RemovalReason::LifecycleUnproven("threads"))
         );
         // Same request with Tool ownership admits.
-        req.requirements.queries.thread_ownership = ThreadOwnership::Tool;
+        req.requirements.queries.thread_ownership = Some(ThreadOwnership::Tool);
         assert_eq!(
             admit(&req).expect("tool-owned threads").chosen,
             CellId("V11-kvm")
@@ -3051,7 +3185,7 @@ mod tests {
         // And Host ownership does not disturb a backend that routes every
         // thread through the tool anyway.
         let mut req = request(ToolRequirements::default(), GuestProfile::HostProcessAny);
-        req.requirements.queries.thread_ownership = ThreadOwnership::Host;
+        req.requirements.queries.thread_ownership = Some(ThreadOwnership::Host);
         assert_eq!(
             admit(&req).expect("ptrace ignores ownership").chosen,
             CellId("V1-ptrace")
@@ -3124,6 +3258,118 @@ mod tests {
         assert!(refusal.terminal);
         facts.seccomp_lineage = Knowledge::Proved(SeccompLineage::BackendInstalled);
         plan.validate_handoff(&facts).unwrap();
+    }
+
+    /// Blocker regression (musereview B1): uncollected ownership must
+    /// fail closed where it is load-bearing — a retained default must
+    /// never launder Host (or unknown) ownership into "Tool".
+    #[test]
+    fn uncollected_ownership_fails_closed_where_load_bearing() {
+        let mut stated = ToolRequirements::default();
+        stated.lifecycle.exec_successor = false;
+        stated.lifecycle.signal_fidelity = false;
+        // ToolQueries::default(): thread_ownership is None here.
+        let req = request(stated.clone(), GuestProfile::StaticElfVm);
+        assert_eq!(req.requirements.queries.thread_ownership, None);
+        let refusal = admit(&req).expect_err("unknown ownership proves no monitored threads");
+        assert!(
+            refusal
+                .trace
+                .reasons_for(CellId("V11-kvm"))
+                .contains(&RemovalReason::LifecycleUnproven("threads"))
+        );
+        // The same None is harmless on a backend that ignores ownership.
+        let req = request(ToolRequirements::default(), GuestProfile::HostProcessAny);
+        assert_eq!(admit(&req).expect("ptrace").chosen, CellId("V1-ptrace"));
+    }
+
+    /// Blocker regression (musereview B2a): in-guest signal delivery is
+    /// refused by the installer when site patching is on, so V5 must
+    /// never satisfy a delivery tool; V4 (trap-only) still can.
+    #[test]
+    fn signal_delivery_refuses_patching_configuration() {
+        let mut req = request(
+            relaxed_preload_tool(),
+            GuestProfile::HostProcessDynamicPreloadable,
+        );
+        req.requirements.queries.in_guest_signal_delivery = true;
+        let report = admit(&req).expect("trap configuration remains");
+        assert_eq!(report.chosen, CellId("V4-preload-trap"));
+        assert!(!report.eligible.contains(&CellId("V5-preload-patch")));
+        req.explicit = ExplicitSelection::Cell(CellId("V5-preload-patch"));
+        let refusal = admit(&req).expect_err("delivery + patching is installer-refused");
+        assert_eq!(refusal.code, RefusalCode::RSignal);
+    }
+
+    /// Blocker regression (musereview B2b): reserved input is a joint
+    /// prerequisite with serialized execution; the envelope fact alone
+    /// (or an uncollected answer) must not promise the facility.
+    #[test]
+    fn reserved_input_requires_serialized_execution_jointly() {
+        let mut req = request(ToolRequirements::default(), GuestProfile::HostProcessAny);
+        req.requirements.queries.reserved_input = true;
+        // Uncollected (None): cannot prove the joint prerequisite.
+        assert!(admit(&req).is_err());
+        req.requirements.queries.enforces_serialized_execution = Some(false);
+        assert!(admit(&req).is_err());
+        req.requirements.queries.enforces_serialized_execution = Some(true);
+        assert_eq!(
+            admit(&req).expect("jointly satisfied").chosen,
+            CellId("V1-ptrace")
+        );
+    }
+
+    /// Lower-item regressions: an unknown instruction prerequisite is
+    /// unproved (never a free pass), an observed P8 denial refuses
+    /// early, emulated readmission honors a proved-false first
+    /// instruction, and terminal refusals carry their one-stage trace.
+    #[test]
+    fn unknown_prerequisite_p8_and_successor_facts_fail_closed() {
+        // Unknown RequiresEnv name on a synthetic candidate.
+        let mut synthetic = implemented_cells()[0];
+        synthetic.id = CellId("synthetic-future-prereq");
+        synthetic.instructions.cpuid = InstructionMediation::RequiresEnv("P99");
+        let mut req = request(ToolRequirements::default(), GuestProfile::HostProcessAny);
+        req.requirements.instructions.cpuid = true;
+        let refusal = admit_over(&req, &[synthetic]).expect_err("unknown prerequisite");
+        assert!(
+            refusal
+                .trace
+                .reasons_for(CellId("synthetic-future-prereq"))
+                .contains(&RemovalReason::EnvUnknown("P99"))
+        );
+
+        // Observed P8 denial removes handoff-ownership cells early.
+        let mut req = request(
+            relaxed_preload_tool(),
+            GuestProfile::HostProcessDynamicPreloadable,
+        );
+        req.explicit = ExplicitSelection::Cell(CellId("V4-preload-trap"));
+        req.env.p8_signal_ownership = Knowledge::Proved(false);
+        let refusal = admit(&req).expect_err("observed signal-ownership denial");
+        assert_eq!(refusal.code, RefusalCode::RSignal);
+
+        // Emulated exec still honors a proved-false first instruction,
+        // and the terminal refusal carries its stage trace.
+        let mut stated = ToolRequirements::default();
+        stated.lifecycle.exec_successor = false;
+        stated.lifecycle.signal_fidelity = false;
+        let mut vm_req = request(stated, GuestProfile::StaticElfVm);
+        vm_req.requirements.queries.thread_ownership = Some(ThreadOwnership::Tool);
+        let report = admit(&vm_req).unwrap();
+        let plan = ExecutionPlan::from_admission(&report).unwrap();
+        let ran = SuccessionFacts {
+            kind: SuccessionKind::Exec,
+            preload_present: Knowledge::Proved(true),
+            at_secure: Knowledge::Proved(false),
+            first_instruction_pending: Knowledge::Proved(false),
+            threads: Knowledge::Proved(1),
+        };
+        let refusal = plan.readmit_on_exec(&ran).unwrap_err();
+        assert_eq!(refusal.code, RefusalCode::RExec);
+        assert!(refusal.terminal);
+        assert_eq!(refusal.trace.stages.len(), 1);
+        assert_eq!(refusal.trace.stages[0].name, "readmission");
     }
 
     #[test]
