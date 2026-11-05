@@ -12,12 +12,32 @@ mod broker_test_client;
 #[path = "broker_test_protocol.rs"]
 mod broker_test_protocol;
 
+/// Writes a named skip past libtest output capture (fd 2 directly), so the
+/// counted runner and percrate scorecard can report it as skipped rather
+/// than as a silent pass.
+fn report_skip(test: &str, reason: &str) {
+    let line = format!("\nREVERIE_SKIP: {test}: {reason}\n");
+    let mut rest = line.as_bytes();
+    while !rest.is_empty() {
+        // SAFETY: writes only the buffer above to this process's stderr.
+        let written = unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+        assert!(
+            written > 0,
+            "write the named skip for {test}: {}",
+            std::io::Error::last_os_error()
+        );
+        rest = &rest[written as usize..];
+    }
+}
+
 const LAUNCHER_ENV: &str = "REVERIE_KVM_TEST_BROKER_LAUNCHER";
 const LAUNCHER_NAME: &str = concat!(env!("CARGO_PKG_NAME"), "-broker-test-launcher");
 
 /// Some means the authenticated, selected child may enter the test body.
-/// None means its isolated exact child completed successfully and was reaped.
-/// Neither unavailable helpers nor empty libtest selections are successes.
+/// None means its isolated exact child completed successfully and was reaped,
+/// or the host lacks the broker ambient mount and the test was named-skipped
+/// (`REVERIE_SKIP`). Neither unavailable helpers nor empty libtest selections
+/// are successes.
 pub(crate) fn selected_child(test: &str) -> Option<BrokerClient> {
     selected_child_without(test, &[])
 }
@@ -81,6 +101,18 @@ pub(crate) fn selected_child_without(test: &str, removed: &[&str]) -> Option<Bro
         .expect("start ordinary-main broker test launcher");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Host-capability probe: the broker launcher itself reports that this
+    // host's mount namespace has no ambient mount in its mountinfo. That is
+    // a named skip, never a silent pass; every other launcher failure stays
+    // a hard failure below.
+    if !output.status.success() && stderr.contains("ambient mount absent from bootstrap mountinfo")
+    {
+        report_skip(
+            test,
+            "broker ambient mount absent from bootstrap mountinfo on this host",
+        );
+        return None;
+    }
     assert!(
         output.status.success(),
         "{test}: status={:?} stdout={} stderr={}",

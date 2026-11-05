@@ -770,6 +770,16 @@ readonly -a REGULAR_TEST_SKIP_ARGS=(
     --skip standalone_fixed_arena_workload_and_literal_placement
     --skip native_mapping_boundaries_preserve_guards_break_abi_and_fork_owner
     --skip published_owner_guest_mprotect_and_munmap_preserve_real_spare_pages
+    --skip active_leaf_has_returned_authenticated_bootstrap
+    --skip authenticated_dev_runtime_has_only_retained_tool_tls
+    --skip authenticated_elf_mutations_cannot_hide_owned_tls
+    --skip generic_initializer_keeps_getenv_acquisition
+    --skip inert_true_leaf_leaves_the_fixed_range_and_altstack_unmodified
+    --skip local_leaf_root_survives_public_symbol_interposition
+    --skip raw_selector_presence_overrides_getenv_provider
+    --skip raw_selector_refusals_and_first_duplicate
+    --skip standalone_alt_stack_disabled_receives_no_owned_stack_credit
+    --skip standalone_leaf_registers_a_fixed_guarded_altstack
 )
 
 # These inputs belong to the required producer for this validation generation.
@@ -800,6 +810,16 @@ disabled_liteinst_allocator_fixtures() {
 }
 run_check "LiteInst allocator fixtures (disabled: dh-hkdh0)" \
     disabled_liteinst_allocator_fixtures
+# Tests that only need the preload shared object (not the producer's
+# qualified runtime receipts) use the workspace build's copy when the
+# producer did not stage one. Qualified-runtime tests stay skipped above.
+if [[ -z $REVERIE_LITEINST_PRELOAD ]]; then
+    built_preload="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/libreverie_liteinst_preload.so"
+    if [[ -f $built_preload ]]; then
+        REVERIE_LITEINST_PRELOAD="$built_preload"
+    fi
+    unset built_preload
+fi
 # Bounded recipe tests require TMPDIR inside the retained artifact domain.
 export TMPDIR="$ROOT_DIR/target/validate-tmp"
 mkdir -p "$TMPDIR"
