@@ -2370,10 +2370,10 @@ pub(super) fn readlinkat(
 
 // TODO-HUMAN-REVIEW(PR-136): Review shared readlinkat implementation semantics.
 //
-// The guest's own descriptor, working-directory and root links
+// The guest's descriptor, image, working-directory and root links
 // (`/proc/self/fd/<n>` and its `/dev/fd/<n>`, `/proc/thread-self/fd/<n>` and
-// `/proc/<pid>/fd/<n>` spellings, `/proc/self/cwd`, `/proc/self/root`) are a
-// Tool's to answer: the backend reports what a Tool needs through the
+// `/proc/<pid>/fd/<n>` spellings, `/proc/self/exe` and every other process's
+// `exe`, `/proc/self/cwd`, `/proc/self/root`) are a Tool's to answer: the backend reports what a Tool needs through the
 // `reverie::Guest::link_path` fact, and a Tool that answers these links does
 // so before the call reaches this executor, for whichever spellings that Tool
 // recognises. Any call that still reaches the executor, whether no Tool
@@ -2386,9 +2386,14 @@ pub(super) fn readlinkat(
 // `synthetic_proc_path_for_inode` (proc.rs), which named this executor's own
 // synthetic `/proc` files for it and carried TODO-HUMAN-REVIEW(PR-136)
 // (synthetic procfd link reconstruction); and the `/proc/self/cwd` arm, which
-// answered the path the last chdir set, and the `/proc/self/root` arm, which
-// answered `/`. The `exe` arm stays: another process's `exe`
-// (https://github.com/rrnewton/hermit/issues/4564).
+// answered the path the last chdir set, the `/proc/self/root` arm, which
+// answered `/`, and the `exe` arm, which named this process's image from the
+// supervisor's handle of it and answered ENOENT for another process's: the
+// `link_path` fact names any process's image now, and a Tool renders
+// another process's links (package K item 2b slice 2b-4 of
+// https://github.com/rrnewton/hermit/issues/4564). Following `/proc/self/exe`
+// (stat, and exec of the retained image, `guest_proc_exe_path`) is not a
+// readlink and stays.
 pub(super) fn readlink_at_impl(
     memory: &mut GuestMemory,
     state: &LoadedStaticElf,
@@ -2409,25 +2414,7 @@ pub(super) fn readlink_at_impl(
     }
     let capacity = requested_capacity.min(MAX_HOST_IO);
 
-    let executable_target = match guest_proc_exe_path(state, &path) {
-        Some(true) => match state.executable_file.as_ref() {
-            Some(file) => match canonical_fd_path(file.as_raw_fd()) {
-                Ok(path) => Some(path.into_os_string().into_vec()),
-                Err(error) => return error,
-            },
-            None => Some(state.executable_path.as_os_str().as_bytes().to_vec()),
-        },
-        Some(false) => return negative_errno(libc::ENOENT),
-        None => None,
-    };
-    if let Some(target) = executable_target {
-        let count = capacity.min(target.len());
-        return match memory.user().copy_to_user(output_address, &target[..count]) {
-            Ok(()) => count as i64,
-            Err(_) => negative_errno(libc::EFAULT),
-        };
-    }
-    // Any other procfs link, `/proc/self` and the guest's own descriptor,
+    // Any procfs link, `/proc/self` and the guest's own descriptor, image,
     // working-directory and root links included, is the supervisor's, not
     // the guest's: open_metadata_path refuses it with EACCES. The Tool
     // decides the guest's links (Detcore renders `/proc/self` itself).

@@ -43311,44 +43311,46 @@ mod tests {
         }
     }
 
+    /// The executor has no copy of any process's `exe` link either: a Tool
+    /// renders it, from the `link_path` fact for any process's image
+    /// (`ElfExecutor::link_path`, which names the image by its current name
+    /// and ` (deleted)` once it is unlinked or replaced). A guest that runs
+    /// without the Tool meets the procfs refusal, its buffer left alone,
+    /// whether the image has a file or not.
     #[test]
-    fn proc_executable_link_marks_unlinked_and_replaced_files_deleted() {
-        let proc_executable_link_target = |state: &LoadedStaticElf| {
-            let mut memory = GuestMemory::new(0, 8192).unwrap();
-            memory.write(0x100, b"/proc/self/exe\0").unwrap();
-            memory.write(0x1000, &[0xa5; 4096]).unwrap();
-            let count = readlink_at_impl(&mut memory, state, libc::AT_FDCWD, 0x100, 0x1000, 4096);
-            assert!((0..4096).contains(&count));
-            let mut output = [0; 4096];
-            memory.read(0x1000, &mut output).unwrap();
-            assert_eq!(&output[count as usize..], &[0xa5; 4096][count as usize..]);
-            output[..count as usize].to_vec()
-        };
+    fn proc_executable_link_is_refused_rather_than_answered_by_the_executor() {
         let dir = TestDir::new();
         let executable = dir.0.join("program");
         std::fs::write(&executable, b"first").unwrap();
         let mut state = test_state(&dir.0);
         state.executable_path = executable.clone();
         state.executable_file = Some(Arc::new(std::fs::File::open(&executable).unwrap()));
-        assert_eq!(
-            proc_executable_link_target(&state),
-            executable.as_os_str().as_bytes(),
-        );
-
-        let replacement = dir.0.join("replacement");
-        std::fs::write(&replacement, b"second").unwrap();
-        std::fs::rename(&replacement, &executable).unwrap();
-        let expected = format!("{} (deleted)", executable.display());
-        assert_eq!(proc_executable_link_target(&state), expected.as_bytes());
-
-        std::fs::remove_file(&executable).unwrap();
-        assert_eq!(proc_executable_link_target(&state), expected.as_bytes());
-        state.executable_file = None;
-        assert_eq!(
-            proc_executable_link_target(&state),
-            executable.as_os_str().as_bytes(),
-            "the embedding API's unknown initial identity stays best effort",
-        );
+        // Spellings the supervisor's own procfs holds, so that its lookup
+        // reaches the procfs refusal (a number it does not hold fails the
+        // host lookup first, with ENOENT: why a Tool decides every spelling).
+        let spellings = [
+            "/proc/self/exe".to_owned(),
+            "/proc/thread-self/exe".to_owned(),
+            format!("/proc/{}/exe", state.pid),
+        ];
+        for with_file in [true, false] {
+            if !with_file {
+                state.executable_file = None;
+            }
+            for path in &spellings {
+                let mut memory = GuestMemory::new(0, 8192).unwrap();
+                write_c_string(&mut memory, 0x100, path);
+                memory.write(0x1000, &[0xa5; 4096]).unwrap();
+                assert_eq!(
+                    readlink_at_impl(&mut memory, &state, libc::AT_FDCWD, 0x100, 0x1000, 4096),
+                    negative_errno(libc::EACCES),
+                    "{path} with_file={with_file}"
+                );
+                let mut output = [0; 4096];
+                memory.read(0x1000, &mut output).unwrap();
+                assert_eq!(output, [0xa5; 4096], "{path} with_file={with_file}");
+            }
+        }
     }
 
     /// A guest's execve records the filename it gave, byte for byte, as

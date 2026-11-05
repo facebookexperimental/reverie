@@ -985,6 +985,8 @@ fn file_script_exec_control(test: &str, case: &str) {
             assert_eq!(result.stdout, expected);
             assert!(result.stderr.is_empty());
         } else {
+            // No Tool renders the exe link here: the executor refuses it.
+            environment.push(("EXE_LINK_REFUSED".to_owned(), "1".to_owned()));
             let envp = environment
                 .into_iter()
                 .map(|(name, value)| format!("{name}={value}"))
@@ -1078,8 +1080,14 @@ int main(int argc, char **argv) {
         char link[4096];
         int length = snprintf(link, sizeof(link), "%s%s", path, !strcmp(mode, "unlink") || !strcmp(mode, "replace") ? " (deleted)" : "");
         if (length < 0 || length >= 4096) return 20;
-        memcpy(expected, link, length); memset(output, 0x5a, sizeof(output));
-        if (readlink("/proc/self/exe", (char *)output, sizeof(output)) != length || memcmp(output, expected, sizeof(output))) return 21;
+        if (getenv("EXE_LINK_REFUSED")) {
+            /* Under the KVM executor with no Tool: the exe link is a Tool's to render (Guest::link_path), so the executor refuses it, as any procfs link, and writes nothing. */
+            memset(output, 0x5a, sizeof(output)); memset(expected, 0x5a, sizeof(expected)); errno = 0;
+            if (readlink("/proc/self/exe", (char *)output, sizeof(output)) != -1 || errno != EACCES || memcmp(output, expected, sizeof(output))) return 21;
+        } else {
+            memcpy(expected, link, length); memset(output, 0x5a, sizeof(output));
+            if (readlink("/proc/self/exe", (char *)output, sizeof(output)) != length || memcmp(output, expected, sizeof(output))) return 21;
+        }
     }
     if (after) { puts("script final interpreter identity argv env name selfexec exact=PASS"); return 0; }
     if (prctl(PR_SET_NAME, "before-self") || setenv("SCRIPT_AFTER", "1", 1)) return 22;
@@ -1131,7 +1139,8 @@ fn file_script_exec_interpreter_identity() {
             .install_static_elf_file_with_context(
                 std::fs::File::open(input).unwrap(),
                 &[input.to_str().unwrap()],
-                &[&setting],
+                // No Tool renders the exe link here: the executor refuses it.
+                &[&setting, "EXE_LINK_REFUSED=1"],
                 &directory.0,
             )
             .unwrap();
@@ -1149,6 +1158,7 @@ fn file_script_exec_interpreter_identity() {
 
 const SCRIPT_IDENTITY_PROGRAM: &str = r###"
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1164,8 +1174,16 @@ int main(void) {
     memset(actual, 0x5a, sizeof(actual));
     memset(expected, 0x5a, sizeof(expected));
     memcpy(expected, path, strlen(path));
+    errno = 0;
     ssize_t count = readlink("/proc/self/exe", (char *)actual, sizeof(actual));
-    int link_equal = count == (ssize_t)strlen(path) && !memcmp(actual, expected, sizeof(actual));
+    int link_equal;
+    if (getenv("EXE_LINK_REFUSED")) {
+        /* Under the KVM executor with no Tool: the exe link is a Tool's to render (Guest::link_path), so the executor refuses it and writes nothing. */
+        memset(expected, 0x5a, sizeof(expected));
+        link_equal = count == -1 && errno == EACCES && !memcmp(actual, expected, sizeof(actual));
+    } else {
+        link_equal = count == (ssize_t)strlen(path) && !memcmp(actual, expected, sizeof(actual));
+    }
     int identity_equal = actual_stat.st_dev == expected_stat.st_dev && actual_stat.st_ino == expected_stat.st_ino;
     printf("interpreter_body=1 executable_inode_matches=%d link_full4096_matches=%d\n", identity_equal, link_equal);
     return identity_equal && link_equal ? 0 : 21;
@@ -1420,8 +1438,9 @@ int main(int argc, char **argv) {
         const char *link = getenv("BINDING_LINK");
         size_t length = strlen(link);
         if (length >= sizeof(expected)) return 12;
-        memcpy(expected, link, length);
-        if (readlink("/proc/self/exe", (char *)actual, sizeof(actual)) != (ssize_t)length || memcmp(actual, expected, sizeof(actual))) return 13;
+        /* The exe link is a Tool's to render; with no Tool the executor refuses it and writes nothing. */
+        memset(expected, 0x5a, sizeof(expected)); errno = 0;
+        if (readlink("/proc/self/exe", (char *)actual, sizeof(actual)) != -1 || errno != EACCES || memcmp(actual, expected, sizeof(actual))) return 13;
     } else if (result != -1 || error != ENOENT || memcmp(actual, expected, sizeof(actual))) {
         printf("unknown stat result=%d errno=%d full4096_unchanged=%d\n", result, error, !memcmp(actual, expected, sizeof(actual)));
         return 14;
@@ -1486,7 +1505,6 @@ fn initial_exec_file_with_execfn_control(test: &str, case: &str) {
         "image-file",
         INITIAL_EXEC_FILE_WITH_EXECFN_PROGRAM,
     );
-    let canonical = std::fs::canonicalize(&program).unwrap();
     let execfn = if case == "script" {
         let script = directory.0.join("launched-script");
         std::fs::write(&script, format!("#!{}\n", program.display())).unwrap();
@@ -1529,7 +1547,6 @@ fn initial_exec_file_with_execfn_control(test: &str, case: &str) {
     }
     let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
     let arguments = argv.join(" ");
-    let exe = canonical.display();
     // The first image's `comm=image-file` is a known deviation from Linux,
     // pinned here as the value both entries give today: Linux names the task
     // by the last component of the filename it was exec'd by
@@ -1539,13 +1556,13 @@ fn initial_exec_file_with_execfn_control(test: &str, case: &str) {
     // as Linux does.
     let expected = if case == "bytes" {
         format!(
-            "before argv={arguments} execfn={execfn_text} comm=image-file exe={exe} stat errno=2\n\
+            "before argv={arguments} execfn={execfn_text} comm=image-file exe=EACCES stat errno=2\n\
              self-exec errno=2\n"
         )
     } else {
         format!(
-            "before argv={arguments} execfn={execfn_text} comm=image-file exe={exe} same_file=1\n\
-             after argv={arguments} execfn=/proc/self/exe comm=exe exe={exe} same_file=1\n"
+            "before argv={arguments} execfn={execfn_text} comm=image-file exe=EACCES same_file=1\n\
+             after argv={arguments} execfn=/proc/self/exe comm=exe exe=EACCES same_file=1\n"
         )
     };
     assert_eq!(
@@ -1581,11 +1598,12 @@ int main(int argc, char **argv) {
     const char *execfn = (const char *)getauxval(AT_EXECFN);
     char name[17] = {0};
     if (prctl(PR_GET_NAME, name)) return 10;
+    /* The exe link is a Tool's to render; with no Tool the executor refuses it. */
     char link[4096];
+    errno = 0;
     ssize_t length = readlink("/proc/self/exe", link, sizeof(link) - 1);
-    if (length < 0) return 11;
-    link[length] = 0;
-    printf(" execfn=%s comm=%s exe=%s", execfn ? execfn : "(none)", name, link);
+    if (length != -1) return 11;
+    printf(" execfn=%s comm=%s exe=%s", execfn ? execfn : "(none)", name, errno == EACCES ? "EACCES" : "other");
     struct stat self, image;
     if (stat(getenv("EXEC_IMAGE"), &image)) return 12;
     if (stat("/proc/self/exe", &self)) {
@@ -1643,18 +1661,16 @@ int main(int argc, char **argv) {
             unsigned char expected[4096];
             if (actual == MAP_FAILED) return 11;
             memset(actual, 0x5a, 4096); memset(expected, 0x5a, sizeof(expected));
-            if (!access) {
-                if (operation) memcpy(expected, argv[0], strlen(argv[0]));
-                else if (syscall(SYS_newfstatat, AT_FDCWD, argv[0], expected, 0)) return 12;
-            }
+            /* readlink of the exe link: with no Tool the executor refuses it (EACCES) before it writes. */
+            if (!access && !operation && syscall(SYS_newfstatat, AT_FDCWD, argv[0], expected, 0)) return 12;
             int protection = access == 0 ? PROT_READ | PROT_WRITE : access == 1 ? PROT_READ : PROT_NONE;
             if (mprotect(actual, 4096, protection)) return 13;
             errno = 0;
             long result = operation ? syscall(SYS_readlink, "/proc/self/exe", actual, 4096) : syscall(SYS_newfstatat, AT_FDCWD, "/proc/self/exe", actual, 0);
             int error = errno;
             if (mprotect(actual, 4096, PROT_READ | PROT_WRITE)) return 14;
-            long expected_result = access ? -1 : operation ? (long)strlen(argv[0]) : 0;
-            int expected_error = access ? EFAULT : 0;
+            long expected_result = operation || access ? -1 : 0;
+            int expected_error = operation ? EACCES : access ? EFAULT : 0;
             int equal = memcmp(actual, expected, sizeof(expected)) == 0;
             if (result != expected_result || error != expected_error || !equal) {
                 printf("operation=%d access=%d result=%ld errno=%d full4096=%d expected_result=%ld expected_errno=%d\n", operation, access, result, error, equal, expected_result, expected_error);
@@ -1786,8 +1802,9 @@ int main(int argc, char **argv) {
         const char *path = getenv("SAVED_LINK");
         size_t length = strlen(path);
         if (length >= sizeof(expected)) return 34;
-        memcpy(expected, path, length);
-        if (readlink("/proc/self/exe", (char *)link, sizeof(link)) != (ssize_t)length || memcmp(link, expected, sizeof(link))) return 35;
+        /* The exe link is a Tool's to render; with no Tool the executor refuses it and writes nothing. */
+        memset(expected, 0x5a, sizeof(expected)); errno = 0;
+        if (readlink("/proc/self/exe", (char *)link, sizeof(link)) != -1 || errno != EACCES || memcmp(link, expected, sizeof(link))) return 35;
         if (prctl(PR_SET_NAME, "changed-after") || !name_is("changed-after")) return 36;
         if (!strcmp(stage, "thread")) {
             errno = 0;
@@ -1941,14 +1958,15 @@ fn self_exec_proc_aliases_use_loaded_image_after_unlink_or_replacement() {
                 mov $4096, %edx
                 mov $89, %eax
                 syscall
+                # The exe link is a Tool's to render (Guest::link_path); with no
+                # Tool the executor refuses it.
                 test %rax, %rax
-                js exit_with_errno
-                mov %eax, %edx
+                jns link_answered
                 mov $1, %edi
-                lea link_buffer(%rip), %rsi
+                lea refused_text(%rip), %rsi
+                mov $8, %edx
                 mov $1, %eax
                 syscall
-                call write_newline
 
                 mov $1, %edi
                 lea image_marker(%rip), %rsi
@@ -1987,6 +2005,11 @@ fn self_exec_proc_aliases_use_loaded_image_after_unlink_or_replacement() {
                 mov $231, %eax
                 syscall
 
+            link_answered:
+                mov $77, %edi
+                mov $231, %eax
+                syscall
+
             write_newline:
                 mov $1, %edi
                 lea newline(%rip), %rsi
@@ -1998,6 +2021,8 @@ fn self_exec_proc_aliases_use_loaded_image_after_unlink_or_replacement() {
                 .section .rodata
             self_path:
                 .asciz "{path}"
+            refused_text:
+                .ascii "refused\n"
             replacement_argv0:
                 .asciz "{argv0}"
             replacement_argv1:
@@ -2063,10 +2088,7 @@ fn self_exec_proc_aliases_use_loaded_image_after_unlink_or_replacement() {
         };
 
         let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
-        let expected = format!(
-            "{} (deleted)\n{IMAGE_MARKER}{ARGV0}\n{ARGV1}\n{ENVP0}\n",
-            executable.display(),
-        );
+        let expected = format!("refused\n{IMAGE_MARKER}{ARGV0}\n{ARGV1}\n{ENVP0}\n");
         assert_eq!(code, 0, "path={path} execveat={execveat} {mutation}");
         assert_eq!(
             stdout,
@@ -2100,15 +2122,15 @@ fn exec_through_symlink_reports_the_opened_executable_and_preserves_argv0() {
             mov $4096, %edx
             mov $89, %eax
             syscall
+            # The exe link is a Tool's to render (Guest::link_path); with no
+            # Tool the executor refuses it.
             test %rax, %rax
-            js exit_with_errno
-
-            mov %eax, %edx
+            jns link_answered
             mov $1, %edi
-            lea link_buffer(%rip), %rsi
+            lea refused_text(%rip), %rsi
+            mov $8, %edx
             mov $1, %eax
             syscall
-            call write_newline
 
             mov $1, %edi
             mov 8(%rsp), %rsi
@@ -2135,9 +2157,16 @@ fn exec_through_symlink_reports_the_opened_executable_and_preserves_argv0() {
             mov $231, %eax
             syscall
 
+        link_answered:
+            mov $77, %edi
+            mov $231, %eax
+            syscall
+
             .section .rodata
         self_path:
             .asciz "/proc/self/exe"
+        refused_text:
+            .ascii "refused\n"
         newline:
             .ascii "\n"
 
@@ -2148,7 +2177,7 @@ fn exec_through_symlink_reports_the_opened_executable_and_preserves_argv0() {
         "#,
         argv0_len = ARGV0.len(),
     );
-    let target = compile_assembly_program(&root.0, "actual-target", &target_source);
+    compile_assembly_program(&root.0, "actual-target", &target_source);
     std::fs::create_dir(root.0.join("components")).unwrap();
     let alias = root.0.join("exec-alias");
     std::os::unix::fs::symlink("components/../actual-target", &alias).unwrap();
@@ -2195,7 +2224,7 @@ fn exec_through_symlink_reports_the_opened_executable_and_preserves_argv0() {
         .unwrap();
 
     let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
-    let expected = format!("{}\n{ARGV0}\n", target.canonicalize().unwrap().display());
+    let expected = format!("refused\n{ARGV0}\n");
     assert_eq!(code, 0);
     assert_eq!(stdout, expected.as_bytes());
     assert!(stderr.is_empty());
@@ -2306,12 +2335,17 @@ fn repeated_self_exec_preserves_executable_identity_argv_and_envp() {
         mov $4096, %edx
         mov $89, %eax
         syscall
+        # The exe link is a Tool's to render (Guest::link_path); with no
+        # Tool the executor refuses it.
         test %rax, %rax
-        js exit_with_errno
-        mov %eax, %edx
-        lea link_buffer(%rip), %rsi
-        call write_buffer
-        jmp write_newline
+        jns link_answered
+        lea refused_text(%rip), %rsi
+        mov $8, %edx
+        jmp write_buffer
+
+    link_answered:
+        mov $77, %edi
+        jmp exit_with_code
 
     write_buffer:
         mov $1, %edi
@@ -2337,6 +2371,8 @@ fn repeated_self_exec_preserves_executable_identity_argv_and_envp() {
         .section .rodata
     self_path:
         .asciz "/proc/self/exe"
+    refused_text:
+        .ascii "refused\n"
     numeric_path:
         .asciz "/proc/37/exe"
     first_argv0:
@@ -2393,8 +2429,8 @@ fn repeated_self_exec_preserves_executable_identity_argv_and_envp() {
 
     let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
     let expected = format!(
-        "{STAGE_ONE_MARKER}{executable}\n{executable}\n{FIRST_ARGV0}\n{FIRST_ARGV1}\n{FIRST_ENVP0}\n\
-         {STAGE_TWO_MARKER}{executable}\n{executable}\n{SECOND_ARGV0}\n{SECOND_ARGV1}\n\
+        "{STAGE_ONE_MARKER}refused\nrefused\n{FIRST_ARGV0}\n{FIRST_ARGV1}\n{FIRST_ENVP0}\n\
+         {STAGE_TWO_MARKER}refused\nrefused\n{SECOND_ARGV0}\n{SECOND_ARGV1}\n\
          {SECOND_ARGV2}\n{SECOND_ENVP0}\n"
     );
     assert_eq!(code, 0);
@@ -2435,10 +2471,12 @@ static int write_all(const char *bytes, size_t length) {
 }
 
 static int print_identity(const char *argv0) {
+  /* The exe link is a Tool's to render (Guest::link_path); with no Tool the
+     executor refuses it. */
   char link[4096];
+  errno = 0;
   ssize_t link_length = readlink("/proc/self/exe", link, sizeof(link));
-  if (link_length < 0 || write_all(link, (size_t)link_length) != 0 ||
-      write_all("\n", 1) != 0) return -1;
+  if (link_length != -1 || errno != EACCES || write_all("EACCES\n", 7) != 0) return -1;
 
   /* The executor's comm, through its status Name line (its stat copy
      followed Detcore, package K slice D4c-1). */
@@ -2503,12 +2541,10 @@ int main(void) {{
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr)
     );
-    let target = target.canonicalize().unwrap();
-    let expected = format!(
-        "{target}\nalias-name\nnot-the-path\n{target}\nexe\nsecond-argv-zero\n",
-        target = target.display(),
+    assert_eq!(
+        stdout,
+        b"EACCES\nalias-name\nnot-the-path\nEACCES\nexe\nsecond-argv-zero\n"
     );
-    assert_eq!(stdout, expected.as_bytes());
     assert!(stderr.is_empty());
 }
 
@@ -2923,9 +2959,10 @@ int main(int argc, char **argv) {
         const char *expected = getenv("W12_LINK");
         size_t length = strlen(expected);
         if (length >= sizeof(expected_link)) return 52;
-        memcpy(expected_link, expected, length);
+        /* The exe link is a Tool's to render; with no Tool the executor refuses it and writes nothing. */
+        errno = 0;
         ssize_t count = readlink("/proc/self/exe", (char *)actual_link, sizeof(actual_link));
-        int link_equal = count == (ssize_t)length && !memcmp(actual_link, expected_link, sizeof(actual_link));
+        int link_equal = count == -1 && errno == EACCES && !memcmp(actual_link, expected_link, sizeof(actual_link));
         int argv_equal = argc == 2 && !strcmp(argv[0], "not-the-image") && !strcmp(argv[1], "after");
         int comm_equal = !memcmp(comm, expected_comm, sizeof(comm));
         printf("identity=%d link_full4096=%d argv=%d comm_full16=%d comm=", identity, link_equal, argv_equal, comm_equal);
@@ -3059,10 +3096,10 @@ int main(int argc, char **argv) {
         require(status_name_is(argv[3]), "initial status name");
         unsigned char actual[4096], expected[4096];
         memset(actual, 0x5a, sizeof(actual)); memset(expected, 0x5a, sizeof(expected));
-        size_t expected_length = strlen(argv[4]); memcpy(expected, argv[4], expected_length);
-        if (strcmp(argv[5], "normal")) { memcpy(expected+expected_length, " (deleted)", 10); expected_length += 10; }
+        /* The exe link is a Tool's to render (Guest::link_path); with no Tool the executor refuses it and writes nothing. */
+        errno = 0;
         ssize_t length = readlink("/proc/self/exe", (char *)actual, sizeof(actual));
-        require(length == (ssize_t)expected_length && !memcmp(actual, expected, sizeof(actual)), "retained executable identity full4096");
+        require(length == -1 && errno == EACCES && !memcmp(actual, expected, sizeof(actual)), "exe link refused without a Tool full4096");
         require(prctl(PR_SET_NAME, renamed, 0, 0, 0) == 0 && name_is(renamed), "mutable name after exec full64");
         require(status_name_is(renamed), "escaped status after exec");
         pthread_t worker; void *result = (void *)1;

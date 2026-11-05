@@ -347,18 +347,22 @@ impl ElfExecutor {
     ///   the process's start or its last exec, so the name follows a rename
     ///   and ends in ` (deleted)` once the file is unlinked, as Linux's
     ///   `exe` link does. Not provided for an image the executor was given
-    ///   without a file.
+    ///   without a file. Another process's image too: the run records each
+    ///   process's handle by its exact identity, thread group and process
+    ///   generation, where process creation and exec record its signal state
+    ///   (`ParentDeathState::images`), without holding it.
     /// - `cwd`: the supervisor's handle of the working directory
     ///   (`cwd_fd`), walked at the call, as `getcwd` walks it, so a removed
     ///   directory ends in ` (deleted)`, as Linux's `cwd` link does.
     ///
     /// The executor keeps a process's descriptor table, its image and each
     /// thread's working directory in the executors of that process's own
-    /// threads, so it answers for the asking thread's process only: the
+    /// threads, so it answers for the asking thread's process: the
     /// descriptor table and the image for any live thread of it, and the
-    /// working directory for the asking thread alone. Every other live
-    /// thread of the run is not provided, and neither is another thread's
-    /// working directory:
+    /// working directory for the asking thread alone. Of another process it
+    /// answers the image alone, from the run's record of each process's
+    /// image; another process's descriptors and working directories are not
+    /// provided, and neither is another thread's working directory:
     ///
     /// - The executor keeps a working directory per thread, where Linux
     ///   shares one between threads created with `CLONE_FS`, so another
@@ -393,21 +397,54 @@ impl ElfExecutor {
                     self.output.as_ref().map(CapturedOutput::metadata),
                 )
             }
-            reverie::PathLink::Executable => {
-                self.link_owner(tid)?;
-                let file = self
-                    .state
-                    .executable_file
-                    .as_ref()
-                    .ok_or(reverie::FactError::NotProvided)?;
-                handle_link(file.as_raw_fd())
-            }
+            reverie::PathLink::Executable => match self.link_owner(tid) {
+                Ok(_) => {
+                    let file = self
+                        .state
+                        .executable_file
+                        .as_ref()
+                        .ok_or(reverie::FactError::NotProvided)?;
+                    handle_link(file.as_raw_fd())
+                }
+                // A live thread of another process: its process's image, as
+                // the run recorded it.
+                Err(reverie::FactError::NotProvided) => {
+                    let file = self.other_process_image(tid)?;
+                    handle_link(file.as_raw_fd())
+                }
+                Err(error) => Err(error),
+            },
             reverie::PathLink::WorkingDirectory => match self.link_owner(tid)? {
                 LinkOwner::Caller => handle_link(self.state.fs_context.cwd_fd.as_raw_fd()),
                 LinkOwner::Sibling => Err(reverie::FactError::NotProvided),
             },
             _ => Err(reverie::FactError::NotProvided),
         }
+    }
+
+    /// The image of the process live thread `tid` belongs to, from the run's
+    /// record of each process's image (`ParentDeathState::images`): `ESRCH`
+    /// for a number that names no live task, and not provided where the
+    /// record names no file (an image the executor was given without one,
+    /// or a process whose threads have all dropped theirs).
+    fn other_process_image(
+        &self,
+        tid: libc::pid_t,
+    ) -> std::result::Result<Arc<std::fs::File>, reverie::FactError> {
+        let lifecycle = self
+            .state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let task = lifecycle
+            .get(tid)
+            .ok_or(reverie::FactError::Errno(reverie::Errno::ESRCH))?;
+        lifecycle
+            .parent_death
+            .images
+            .get(&(task.tgid, task.process_generation))
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(reverie::FactError::NotProvided)
     }
 
     /// Which thread of this process `tid` is, from the run's lifecycle table:
@@ -1688,8 +1725,9 @@ mod tests {
         }
 
         /// A live thread of another process is not provided, for every link,
-        /// even for a descriptor number this process holds; a number that
-        /// names no live task is `ESRCH`, zero and below included.
+        /// even for a descriptor number this process holds, its image
+        /// included where the run recorded none for its process; a number
+        /// that names no live task is `ESRCH`, zero and below included.
         #[test]
         fn another_processs_threads_are_not_provided_and_dead_numbers_are_esrch() {
             let directory = Directory::new();
@@ -1731,6 +1769,76 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// Another process's image is the file the run recorded for that
+        /// process (`ParentDeathState::images`), for any live thread of it,
+        /// by the name the file has at the call: renamed, then ` (deleted)`
+        /// once unlinked, as Linux's `exe` link names it. Its descriptors and
+        /// working directory stay not provided. Once the process's threads
+        /// drop the image the record names none, and once the thread has
+        /// exited the number is `ESRCH`.
+        #[test]
+        fn another_processs_image_is_the_file_the_run_recorded_for_it() {
+            let directory = Directory::new();
+            let executor = ElfExecutor::new(test_state(&directory.0), false);
+            let other = executor.state.pid + 30;
+            std::fs::write(directory.0.join("other"), b"another image").unwrap();
+            let image = Arc::new(std::fs::File::open(directory.0.join("other")).unwrap());
+            let (leader, thread) = {
+                let mut lifecycle = executor.state.task_lifecycle.lock().unwrap();
+                let leader = lifecycle.register(other, other, other, true);
+                let thread = lifecycle.register(other + 1, other, other, true);
+                let generation = lifecycle.get(other).unwrap().process_generation;
+                lifecycle
+                    .parent_death
+                    .images
+                    .insert((other, generation), Arc::downgrade(&image));
+                (leader, thread)
+            };
+            for tid in [other, other + 1] {
+                assert_eq!(
+                    executor.link_path(tid, PathLink::Executable),
+                    path(&canonical(&directory, "other")),
+                    "tid {tid}"
+                );
+                for link in [PathLink::Descriptor(0), PathLink::WorkingDirectory] {
+                    assert_eq!(
+                        executor.link_path(tid, link),
+                        Err(FactError::NotProvided),
+                        "tid {tid} {link:?}"
+                    );
+                }
+            }
+            std::fs::rename(directory.0.join("other"), directory.0.join("moved")).unwrap();
+            let moved = canonical(&directory, "moved");
+            assert_eq!(
+                executor.link_path(other, PathLink::Executable),
+                path(&moved)
+            );
+            std::fs::remove_file(directory.0.join("moved")).unwrap();
+            assert_eq!(
+                executor.link_path(other + 1, PathLink::Executable),
+                path(&[moved.as_slice(), b" (deleted)"].concat())
+            );
+            drop(image);
+            assert_eq!(
+                executor.link_path(other, PathLink::Executable),
+                Err(FactError::NotProvided)
+            );
+            let mut lifecycle = executor.state.task_lifecycle.lock().unwrap();
+            lifecycle.remove(other + 1, thread);
+            drop(lifecycle);
+            assert_eq!(
+                executor.link_path(other + 1, PathLink::Executable),
+                Err(FactError::Errno(reverie::Errno::ESRCH))
+            );
+            executor
+                .state
+                .task_lifecycle
+                .lock()
+                .unwrap()
+                .remove(other, leader);
         }
 
         /// A link query, answered or not, releases no lock the supervisor

@@ -2801,7 +2801,7 @@ impl KvmBackend {
     /// vCPU to enter it in long mode.
     ///
     /// `argv` must be non-empty; `argv[0]` becomes the program name reported to
-    /// the guest (initial stack and `AT_EXECFN`/`readlink("/proc/self/exe")`).
+    /// the guest (initial stack and `AT_EXECFN`).
     /// The guest observes a standard System V initial stack: `argc`, the `argv`
     /// pointer array, a NULL terminator, the `envp` pointer array, a NULL
     /// terminator, and the auxiliary vector.
@@ -2819,7 +2819,7 @@ impl KvmBackend {
     ///
     /// This entry does not establish a backing file from `argv[0]`. Executable
     /// following-stat and retained self-exec require a known backing file and
-    /// return ENOENT without one. The legacy nominal executable readlink remains.
+    /// return ENOENT without one, and `Guest::link_path` provides no image.
     pub fn install_static_elf_with_context(
         &mut self,
         image: &[u8],

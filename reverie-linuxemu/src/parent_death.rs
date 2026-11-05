@@ -66,6 +66,13 @@ pub(crate) struct ParentDeathState {
     pub(crate) controlled: bool,
     pub(crate) adopted: bool,
     pub(crate) signals: BTreeMap<ProcessKey, Weak<Mutex<ProcessSignalState>>>,
+    /// Each process's image, the file the executor read its current image
+    /// from (`LoadedStaticElf::executable_file`), by the same exact identity
+    /// and written at the same points as `signals` (process creation and
+    /// exec), for another process's `exe` link (`ElfExecutor::link_path`).
+    /// The run holds no image: an entry stops naming one once the process's
+    /// threads drop it.
+    pub(crate) images: BTreeMap<ProcessKey, Weak<std::fs::File>>,
     /// Selected once at a logical exit/exec, not once per host cleanup.
     dead: BTreeSet<TaskKey>,
     enrolled: BTreeSet<ProcessKey>,
