@@ -1,0 +1,80 @@
+# Activation and loaders
+
+Before any mechanism can intercept, the tool's runtime must be
+*present and armed* — ideally before the guest executes its first
+instruction. How control is first obtained is its own axis, because
+each answer leaves a different unmonitored window and a different set
+of deployment requirements.
+
+## The activation menu
+
+| Mode | How control starts | Unmonitored window | Needs ptrace? |
+|---|---|---|---|
+| **A1 — ptrace stop + Reverie loader** | stop at `exec`; the loader maps and arms the tool runtime at fixed addresses; hand over to the guest's `ld.so` | zero guest instructions (the design goal) | yes, for the stop |
+| **A2 — `LD_PRELOAD` late activation** | `ld.so` loads a preload DSO hosting the tool | `ld.so` itself, IFUNC resolvers, early constructors | no |
+| **A3 — custom userspace loader** | `execve(loader, [loader, prog, …])`: our loader builds the image and arms the runtime itself | zero, if exec-state parity is complete | no — the no-ptrace path |
+| **A4 — attach** | join an already-running process | everything before attach | typically yes |
+| **A5 — coexist with a debugger** | A3 + in-guest interception, leaving ptrace to the external debugger | per A3 | must not need it |
+
+A2 is what the in-guest examples use today (a preload that compiles
+your tool in, selected by name). It is honest about its window:
+acceptable exactly when missing `ld.so`-time behaviour is declared
+acceptable for the tool's purpose. A1 is the design of record for
+zero-window starts. A3 is the documented fallback where ptrace is
+unavailable (locked-down containers, no `CAP_SYS_PTRACE`) — and its
+long tail is exec-state parity: auxv, stack layout, TLS, and every
+other detail a real `execve` + `ld.so` pair establishes.
+
+## What a Reverie loader is (and is not)
+
+A loader at this layer loads **an arbitrary Reverie tool's runtime**:
+it validates and maps a runtime image, runs typed initialization
+stages in order (so a step can only follow the step before it),
+confines the runtime's own syscalls to declared gate ranges by audit,
+arms the tool's controls, and only then releases the guest. Tool
+*policy* — schedules, determinism, tracing formats — never belongs in
+the loader.
+
+The current `reverie-loader` crate contains the `unsafe`-free parts of
+that design: image validation (fixed-address `ET_EXEC`, no
+interpreter, no dynamic section, W^X, page-aligned segments in an
+allowed window), the syscall-gate audit, artifact checks, and the
+stage types. It is `no_std` so the loader itself can use it. Note the
+gap precisely: the typestate stage chain is currently **dead code** —
+its constructors are crate-private and nothing outside the crate
+consumes it — and the only integration is Hermit-private glue. The
+mechanics live in `reverie-inguest`; the *generic interface* is the
+missing piece.
+
+The tool-agnostic contract (L1 design, adopted by the architecture
+§4.3) is: a tool provides a data-only **`ToolManifest`** — one
+validated runtime image, declared gate ranges, a **`Controls`** set to
+arm (trap filter, CPUID faulting, RDTSC trapping, vDSO rewrite,
+handlers), and an init entry returning *ready* or a named refusal —
+and the loader guarantees **G1** no guest instruction before arm
+(typestate `Mapped → RuntimeStarted → ToolReady → Armed → HandedOff`,
+consumed by the launcher), **G2** handoff with kernel-built exec
+state untouched, **G3** exec parity through the same boundary
+(`execve` refused until it lands), **G4** total refusal (never
+partially armed), and **G5** isolation of tool windows. The manifest
+also carries the tool's `ToolRequirements`, so the same image can be
+admitted by A1 and refused by A2 (`R-WINDOW`) by name.
+
+> 🚧 **Under construction — loader generality (pending owner approval
+> of L0/L1).** The loader's docs and stage names currently describe
+> one consumer's runtime (`DetcoreReady`, a two-image hard-code)
+> rather than an arbitrary tool's. Architecture §4.3 adopts the L1
+> contract above; its decisions D1–D4 await the owner under item C of
+> [§6.3](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-11-04-liteinst-reverie-architecture.md#63-decisions-requested-from-the-owner-via-coord7).
+> TODO: rewrite this chapter against the landed tool-agnostic loader
+> with a non-Hermit `counter-inguest` achieving zero unarmed guest
+> instructions on `hello` and `ls` as the acceptance evidence. Until
+> then, treat A1 as designed and partially implemented, not shipped.
+> <!-- UC: loaders-generic -->
+> Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`loaders-generic`).
+>
+> 🚧 **Under construction — A3/A4/A5 status.** TODO: per-mode status,
+> parity checklist (auxv/stack/TLS/…), and refusal list as the
+> no-ptrace launch lane scopes them; A4/A5 are design rows today.
+> <!-- UC: loaders-a3 -->
+> Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`loaders-a3`).
