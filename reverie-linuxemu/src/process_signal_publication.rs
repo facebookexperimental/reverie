@@ -158,6 +158,10 @@ impl ProcessBinding {
             Arc::downgrade(&state.process_signals),
         );
         record_image(&mut lifecycle, process_key(self.identity), state);
+        lifecycle
+            .parent_death
+            .file_tables
+            .insert(process_key(self.identity), Arc::downgrade(files));
         drop(lifecycle);
         *self.image.lock().unwrap_or_else(|p| p.into_inner()) = CurrentImage {
             revision: ImageRevision(Arc::new(())),
@@ -461,6 +465,10 @@ impl ProcessSignalRegistry {
                 Arc::downgrade(&state.process_signals),
             );
             record_image(&mut lifecycle, (state.pid, generation), state);
+            lifecycle
+                .parent_death
+                .file_tables
+                .insert((state.pid, generation), Arc::downgrade(files));
         }
         // Successful exec and same-process executor reconstruction retain the
         // process generation; they are not a fork edge and cannot make a

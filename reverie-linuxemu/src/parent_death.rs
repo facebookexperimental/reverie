@@ -73,6 +73,14 @@ pub(crate) struct ParentDeathState {
     /// The run holds no image: an entry stops naming one once the process's
     /// threads drop it.
     pub(crate) images: BTreeMap<ProcessKey, Weak<std::fs::File>>,
+    /// Each process's descriptor table, the one its threads' syscalls
+    /// install (`ElfExecutor::file_table`), by the same exact identity and
+    /// written at the same points as `images`, for another process's
+    /// `fd/<fd>` links (`ElfExecutor::link_path`). Held weakly, as an
+    /// observer: a table goes with its process's executors, and an observer
+    /// that briefly holds it never retires its descriptors, which only the
+    /// executors' task token does (`ElfExecutor::file_table_task_owner`).
+    pub(crate) file_tables: BTreeMap<ProcessKey, Weak<Mutex<crate::executor::FileTableState>>>,
     /// Selected once at a logical exit/exec, not once per host cleanup.
     dead: BTreeSet<TaskKey>,
     enrolled: BTreeSet<ProcessKey>,

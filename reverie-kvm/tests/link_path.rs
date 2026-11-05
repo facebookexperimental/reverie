@@ -15,12 +15,12 @@
 //! timerfd and an epoll; the image, also after an exec through a hard link
 //! and once that link is unlinked; the working directory, also a
 //! subdirectory once it is removed; a sibling thread's descriptor and
-//! image; and a child process's image. A closed descriptor and a negative one are `EBADF`, and an exited
+//! image; and a child process's descriptor and image. A closed descriptor and a negative one are `EBADF`, and an exited
 //! child, as a zombie and once reaped, the guest's parent, a number no task
 //! has, zero and a negative number are `ESRCH`. The executor's limits show as
 //! named differences: a `/proc` file the executor makes itself, a sibling's
-//! working directory, and another process's descriptors and working
-//! directory are not provided.
+//! working directory, and another process's working directory are not
+//! provided.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -290,6 +290,7 @@ fn a_kvm_guest_reports_the_links_linux_shows() {
         EPOLL,
         SIBLING_FD,
         SIBLING_EXE,
+        CHILD_FD,
         CHILD_EXE,
         EXEC_EXE,
         EXEC_DELETED_EXE,
@@ -339,6 +340,7 @@ fn a_kvm_guest_reports_the_links_linux_shows() {
     assert_eq!(fact(EPOLL), &anonymous("anon_inode:[eventpoll]"));
     assert_eq!(fact(SIBLING_FD), &path(&under("regular")));
     assert_eq!(fact(SIBLING_EXE), &path(&image));
+    assert_eq!(fact(CHILD_FD), &path(&under("child-file")));
     assert_eq!(fact(CHILD_EXE), &path(&image));
     assert_eq!(fact(EXEC_EXE), &path(&under("relinked")));
     assert_eq!(fact(EXEC_DELETED_EXE), &path(&deleted("relinked")));
@@ -411,14 +413,11 @@ fn a_kvm_guest_reports_the_links_linux_shows() {
     // the threads share.
     assert_eq!(linux(SIBLING_CWD), work.as_os_str().as_encoded_bytes());
     assert_eq!(fact(SIBLING_CWD), &Err(FactError::NotProvided));
-    // Another process's descriptors and working directory are not
-    // provided, where Linux shows its descriptor's file and its own working
-    // directory. Its image is the run's record of it, named above.
-    assert_eq!(linux(CHILD_FD), under("child-file"));
+    // Another process's working directory is not provided, where Linux
+    // shows its own. Its descriptors and image are the run's records of
+    // them, named above.
     assert_eq!(linux(CHILD_CWD), under("childdir"));
-    for point in [CHILD_FD, CHILD_CWD] {
-        assert_eq!(fact(point), &Err(FactError::NotProvided), "point {point}");
-    }
+    assert_eq!(fact(CHILD_CWD), &Err(FactError::NotProvided));
     assert_ne!(facts[&CHILD_FD].0, tid);
     assert_eq!(facts[&ZOMBIE_CHILD].0, facts[&CHILD_FD].0);
 }
