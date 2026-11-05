@@ -5943,7 +5943,10 @@ mod tests {
     // and is missing on the test host when the binary was built remotely.
     pub(super) fn fixture(name: &str) -> PathBuf {
         std::env::var_os("CARGO_MANIFEST_DIR")
-            .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+            .map_or_else(
+                || PathBuf::from(option_env!("CARGO_MANIFEST_DIR").unwrap_or("reverie-ptrace")),
+                PathBuf::from,
+            )
             .join("tests/fixtures")
             .join(name)
     }

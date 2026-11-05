@@ -2283,7 +2283,11 @@ mod tests {
         // remotely.
         let source = std::env::var_os("CARGO_MANIFEST_DIR")
             .map_or_else(
-                || std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                || {
+                    std::path::PathBuf::from(
+                        option_env!("CARGO_MANIFEST_DIR").unwrap_or("reverie-linuxemu"),
+                    )
+                },
                 std::path::PathBuf::from,
             )
             .join("tests/fixtures")

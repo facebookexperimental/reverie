@@ -40,7 +40,10 @@ rust_library(
     # Same core crate identity; inert resource helpers, no eager activation.
     features = ["perf-fixture"],
     test_rustc_flags = sanitized_feature,
-    test_deps = ["fbsource//third-party/rust:tracing-subscriber"],
+    test_deps = [
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:tracing-subscriber",
+    ],
     deps = [
         "fbsource//third-party/rust:addr2line",
         "fbsource//third-party/rust:anyhow",
@@ -143,7 +146,10 @@ rust_library(
 
 rust_library(
     name = "reverie-ptrace",
-    srcs = glob(["reverie-ptrace/src/**/*.rs"]),
+    srcs = glob([
+        "reverie-ptrace/src/**/*.rs",
+        "reverie-ptrace/tests/**/*",
+    ]),
     autocargo = {
         "cargo_toml_config": {
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-ptrace", build = "build.rs"),
@@ -756,6 +762,10 @@ rust_library(
         ["reverie-inguest/src/**/*.rs"],
         exclude = ["reverie-inguest/src/bin/**"],
     ),
+    # The installed-callback and generic entry symbols are hidden per-image
+    # contracts (see guest/installed_stack.rs); link statically into the
+    # final images that resolve them, like reverie-liteinst below.
+    preferred_linkage = "static",
     autocargo = {
         "cargo_toml_config": {
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-inguest"),
@@ -830,6 +840,10 @@ rust_library(
 rust_library(
     name = "reverie-liteinst",
     srcs = glob(["reverie-liteinst/src/**/*.rs"]),
+    # selected_backing() reads the hidden descriptor a final image defines
+    # with a declare_* macro; a shared link of this library alone cannot
+    # resolve that per-image symbol, so link it statically into consumers.
+    preferred_linkage = "static",
     autocargo = {
         "cargo_toml_config": {
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-liteinst"),
@@ -860,7 +874,10 @@ rust_library(
 
 rust_library(
     name = "reverie-kvm-core",
-    srcs = glob(["reverie-kvm-core/src/**/*.rs"]),
+    srcs = glob([
+        "reverie-kvm-core/src/**/*.rs",
+        "reverie-kvm-core/tests/**/*",
+    ]),
     autocargo = {
         "cargo_toml_config": {
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-kvm-core"),
@@ -915,7 +932,10 @@ fb_native.cxx_library(
 
 rust_library(
     name = "reverie-linuxemu",
-    srcs = glob(["reverie-linuxemu/src/**/*.rs"]),
+    srcs = glob([
+        "reverie-linuxemu/src/**/*.rs",
+        "reverie-linuxemu/tests/**/*",
+    ]),
     autocargo = {
         "cargo_toml_config": {
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-linuxemu", build = "build.rs"),
@@ -945,7 +965,11 @@ rust_library(
 
 rust_library(
     name = "reverie-kvm",
-    srcs = glob(["reverie-kvm/src/**/*.rs"]),
+    srcs = glob([
+        "reverie-kvm/src/**/*.rs",
+        "reverie-kvm/tests/**/*",
+        "reverie-linuxemu/tests/support/**/*.rs",
+    ]),
     autocargo = {
         "cargo_toml_config": {
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-kvm"),

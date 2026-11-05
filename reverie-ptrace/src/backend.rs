@@ -373,7 +373,17 @@ mod tests {
     /// directory and returns the binary's path.
     #[cfg(target_arch = "x86_64")]
     fn guest_traced_mmap() -> std::path::PathBuf {
-        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        // Prefer the run-time CARGO_MANIFEST_DIR, which Cargo and the fbsource
+        // BUCK rule set; the compile-time value may be absent under Buck.
+        let source = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(
+                        option_env!("CARGO_MANIFEST_DIR").unwrap_or("reverie-ptrace"),
+                    )
+                },
+                std::path::PathBuf::from,
+            )
             .join("tests/fixtures/guest_traced_mmap.c");
         let output =
             std::env::temp_dir().join(format!("reverie-guest-traced-mmap-{}", std::process::id()));

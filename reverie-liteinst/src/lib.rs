@@ -12,6 +12,11 @@ use std::process::Command;
 compile_error!("reverie-liteinst requires Linux x86-64");
 
 mod allocator_backing;
+
+// This crate's own unit-test binary is a final image too: give it the legacy
+// backing declaration selected_backing() requires at link time.
+#[cfg(test)]
+crate::declare_legacy_tool_backing!();
 #[cfg(feature = "allocator-fixture")]
 #[doc(hidden)]
 pub mod allocator_fixture;
