@@ -147,9 +147,7 @@ where
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
             true,
-            runtime::LiteinstPatchHost {
-                publication: runtime::PatchPublication::Concurrent,
-            },
+            runtime::LiteinstPatchHost::new(runtime::PatchPublication::Concurrent),
         )
     }
 }
@@ -176,9 +174,7 @@ where
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
             true,
-            runtime::LiteinstPatchHost {
-                publication: runtime::PatchPublication::Quiescent,
-            },
+            runtime::LiteinstPatchHost::new(runtime::PatchPublication::Quiescent),
         )
     }
 }
@@ -203,9 +199,7 @@ where
         reverie_inguest::guest::tool_install::install_tool_with::<T, _>(
             coordinator.as_ref(),
             false,
-            runtime::LiteinstPatchHost {
-                publication: runtime::PatchPublication::Concurrent,
-            },
+            runtime::LiteinstPatchHost::new(runtime::PatchPublication::Concurrent),
         )
     }
 }
@@ -237,9 +231,7 @@ where
         reverie_inguest::guest::tool_install::install_tool_with_runtime::<T, _, R, _>(
             coordinator.as_ref(),
             false,
-            runtime::LiteinstPatchHost {
-                publication: runtime::PatchPublication::Concurrent,
-            },
+            runtime::LiteinstPatchHost::new(runtime::PatchPublication::Concurrent),
             |services| project(Box::new(services)),
         )
     }

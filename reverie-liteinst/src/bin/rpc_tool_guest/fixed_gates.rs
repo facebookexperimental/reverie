@@ -160,6 +160,49 @@ pub fn inherited_filter(path: &Path) {
     println!("fixed gate inherited filter: refused page=absent dispatcher=absent");
 }
 
+pub fn invalid_site_patching(path: &Path) {
+    // Selector syntax is refused before the gate page is published, so the
+    // parse error returns to the caller instead of terminating through it.
+    unsafe {
+        std::env::set_var(reverie_liteinst::SITE_PATCHING_ENV, "2");
+    }
+    let error = unsafe { reverie_liteinst::install_tool::<FixedGateTool>(path) }.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported REVERIE_LITEINST_SITE_PATCHING value"),
+        "{error}"
+    );
+    assert!(!reverie_inguest::trap::fixed_gates_published());
+    assert!(!reverie_inguest::trap::has_dispatcher());
+    println!(
+        "fixed gate invalid site patching: refused before publication page=absent dispatcher=absent"
+    );
+}
+
+pub fn invalid_straddler_ticks(path: &Path) {
+    // The straddler selector is validated with the other selectors before
+    // the gate page is published, at the same boundary and with the same
+    // no-publication outcome as site patching above.
+    unsafe {
+        std::env::set_var(reverie_liteinst::STRADDLER_STALENESS_TICKS_ENV, "banana");
+    }
+    let error = unsafe { reverie_liteinst::install_tool::<FixedGateTool>(path) }.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("REVERIE_LITEINST_STRADDLER_STALENESS_TICKS must be a nonzero"),
+        "{error}"
+    );
+    assert!(!reverie_inguest::trap::fixed_gates_published());
+    assert!(!reverie_inguest::trap::has_dispatcher());
+    println!(
+        "fixed gate invalid straddler ticks: refused before publication page=absent dispatcher=absent"
+    );
+}
+
 pub fn install_failure(path: &Path) {
     // The caller supplies a path with no server. Preparation succeeds, then
     // the real coordinator connection fails after irreversible publication.

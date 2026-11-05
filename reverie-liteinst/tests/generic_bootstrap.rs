@@ -389,6 +389,16 @@ fn ordinary_region_is_not_adopted_by_generic_entry() {
     trial("ordinary").unwrap();
 }
 
+// Ignored (visibly) under fixed-syscall-gates: that artifact refuses
+// every non-FullTool caller by design. The refusal on this same public
+// route is pinned by scoped_compat_caller_is_refused_by_fixed_gates
+// below, the fixed-gates branch of
+// rpc_tool::fallback_refusal_is_counted_separately_from_tool_errors,
+// and runtime::tests::fixed_gate_artifact_refuses_non_fulltool_before_publication.
+#[cfg_attr(
+    feature = "fixed-syscall-gates",
+    ignore = "fixed-syscall-gates artifact refuses non-FullTool callers by design"
+)]
 #[test]
 fn actual_scoped_compat_public_caller_remains_supported() -> Result<(), String> {
     let evidence = liteinst_runtime::evidence_directory("generic-scoped-compat")?;
@@ -463,4 +473,23 @@ fn actual_scoped_compat_public_caller_remains_supported() -> Result<(), String> 
             evidence.display()
         ))
     }
+}
+
+/// The by-design refusal of the same scoped-compat public caller that
+/// `actual_scoped_compat_public_caller_remains_supported` exercises
+/// in ordinary builds, asserted in this suite under fixed gates.
+#[cfg(feature = "fixed-syscall-gates")]
+#[test]
+fn scoped_compat_caller_is_refused_by_fixed_gates() {
+    let output = Command::new(env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest"))
+        .args(["syscall-fallback-refusal", "unused"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(127), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        output.stderr,
+        b"reverie-liteinst initialization failed: fixed syscall gates require the \
+          in-guest FullTool installation route\n"
+    );
 }

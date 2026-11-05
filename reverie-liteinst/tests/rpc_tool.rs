@@ -356,6 +356,18 @@ fn fallback_refusal_is_counted_separately_from_tool_errors() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest"));
     command.arg("syscall-fallback-refusal").arg("unused");
     let output = output_with_timeout(command, Duration::from_secs(20));
+    if cfg!(feature = "fixed-syscall-gates") {
+        // The compat route this mode selects is refused by the
+        // FullTool-only fixed-gate artifact before any guest code runs.
+        assert_eq!(output.status.code(), Some(127), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(
+            output.stderr,
+            b"reverie-liteinst initialization failed: fixed syscall gates require the \
+              in-guest FullTool installation route\n"
+        );
+        return;
+    }
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         output.stdout,

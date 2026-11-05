@@ -706,6 +706,43 @@ enum ChildWait {
     Output(Output),
 }
 
+/// Bytes of captured guest stderr a pre-connect error carries.
+const PRE_CONNECT_STDERR_LIMIT: usize = 2048;
+
+/// The error for a guest that exited before connecting: the exit status
+/// always, plus the tail of captured stderr when the launch captured
+/// output, so a pre-connect refusal keeps its own diagnostic.
+fn pre_connect_error(wait: &ChildWait) -> io::Error {
+    let (status, stderr) = match wait {
+        ChildWait::Status(status) => (*status, None),
+        ChildWait::Output(output) => (output.status, Some(output.stderr.as_slice())),
+    };
+    let mut message = format!(
+        "LiteInst guest exited before connecting to the coordinator; \
+         static executables and loader failures are unsupported; guest {status}"
+    );
+    if let Some(stderr) = stderr
+        && !stderr.is_empty()
+    {
+        let truncated = stderr.len() > PRE_CONNECT_STDERR_LIMIT;
+        let tail = if truncated {
+            &stderr[stderr.len() - PRE_CONNECT_STDERR_LIMIT..]
+        } else {
+            stderr
+        };
+        let excerpt = String::from_utf8_lossy(tail);
+        if truncated {
+            message.push_str(&format!(
+                "; guest stderr (last {PRE_CONNECT_STDERR_LIMIT} of {} bytes): {excerpt}",
+                stderr.len()
+            ));
+        } else {
+            message.push_str(&format!("; guest stderr: {excerpt}"));
+        }
+    }
+    io::Error::new(io::ErrorKind::ConnectionAborted, message)
+}
+
 async fn serve_rpc_until<G, F, T, B>(
     server: RpcServer<G>,
     stats_server: Option<RpcServer<crate::stats::LiteinstStatsGlobal>>,
@@ -1120,11 +1157,7 @@ where
         }
     };
     if !connected.load(Ordering::Acquire) {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "LiteInst guest exited before connecting to the coordinator; static executables and loader failures are unsupported",
-        )
-        .into());
+        return Err(pre_connect_error(&wait).into());
     }
     let global = unwrap_global_after_connections(global).await?;
     let stats = match stats_global {
@@ -1396,6 +1429,71 @@ mod tests {
         });
 
         assert_eq!(unwrap_global_after_connections(global).await.unwrap(), 17);
+    }
+
+    #[test]
+    fn pre_connect_error_preserves_status_and_bounded_stderr() {
+        fn exited(code: i32) -> std::process::ExitStatus {
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+        fn output(code: i32, stderr: Vec<u8>) -> ChildWait {
+            ChildWait::Output(Output {
+                status: exited(code),
+                stdout: Vec::new(),
+                stderr,
+            })
+        }
+
+        let error = pre_connect_error(&output(101, b"bad selector\n".to_vec()));
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        let message = error.to_string();
+        assert!(message.contains("exited before connecting"), "{message}");
+        assert!(message.contains("exit status: 101"), "{message}");
+        assert!(message.contains("bad selector"), "{message}");
+
+        let mut large = vec![b'x'; PRE_CONNECT_STDERR_LIMIT + 1000];
+        large.extend_from_slice(b"tail-marker");
+        let total = large.len();
+        let message = pre_connect_error(&output(42, large)).to_string();
+        assert!(
+            message.contains(&format!("last {PRE_CONNECT_STDERR_LIMIT} of {total} bytes")),
+            "{message}"
+        );
+        assert!(message.contains("tail-marker"), "{message}");
+        assert!(
+            message.len() < PRE_CONNECT_STDERR_LIMIT + 400,
+            "excerpt is bounded: {} bytes",
+            message.len()
+        );
+
+        let message = pre_connect_error(&output(42, vec![0xff, b'a'])).to_string();
+        assert!(message.contains('\u{fffd}'), "{message}");
+
+        let message = pre_connect_error(&output(42, Vec::new())).to_string();
+        assert!(!message.contains("guest stderr"), "{message}");
+
+        let message = pre_connect_error(&ChildWait::Status(exited(42))).to_string();
+        assert!(message.contains("exit status: 42"), "{message}");
+        assert!(!message.contains("guest stderr"), "{message}");
+
+        // The unchanged prefix, a signal exit, and an exactly-at-limit
+        // excerpt (no truncation marker).
+        let message = pre_connect_error(&ChildWait::Status(std::process::ExitStatus::from_raw(
+            libc::SIGKILL,
+        )))
+        .to_string();
+        assert!(
+            message.starts_with(
+                "LiteInst guest exited before connecting to the coordinator; \
+                 static executables and loader failures are unsupported; guest "
+            ),
+            "{message}"
+        );
+        assert!(message.contains("signal: 9 (SIGKILL)"), "{message}");
+        let at_limit = vec![b'y'; PRE_CONNECT_STDERR_LIMIT];
+        let message = pre_connect_error(&output(42, at_limit)).to_string();
+        assert!(message.contains("; guest stderr: "), "{message}");
+        assert!(!message.contains("last"), "{message}");
     }
 
     #[derive(Default)]

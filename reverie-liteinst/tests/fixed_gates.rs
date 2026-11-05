@@ -128,6 +128,16 @@ fn fixed_gate_installation_refuses_collisions_and_inherited_filters() {
             "fixed-gate-inherited-filter",
             "fixed gate inherited filter: refused page=absent dispatcher=absent\n",
         ),
+        (
+            "fixed-gate-invalid-site-patching",
+            "fixed gate invalid site patching: refused before publication page=absent \
+             dispatcher=absent\n",
+        ),
+        (
+            "fixed-gate-invalid-straddler-ticks",
+            "fixed gate invalid straddler ticks: refused before publication page=absent \
+             dispatcher=absent\n",
+        ),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest"));

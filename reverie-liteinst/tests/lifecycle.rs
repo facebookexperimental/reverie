@@ -1843,13 +1843,32 @@ async fn in_guest_tool_refuses_an_unsupported_site_patching_value() {
     let (_preload_directory, preload) = compile_noop_preload();
     let mut command = guest_command("patching-off");
     command.env(SITE_PATCHING_ENV, "2");
-    let (output, global) = tokio::time::timeout(
+    let result = tokio::time::timeout(
         Duration::from_secs(10),
         LiteinstBackend::run_with_output_and_preload::<CoordinatorOnlyTool>(command, (), preload),
     )
     .await
-    .expect("in-guest run with an unsupported site-patching value hung")
-    .unwrap();
+    .expect("in-guest run with an unsupported site-patching value hung");
+    if cfg!(feature = "fixed-syscall-gates") {
+        // Selector syntax is refused in preflight, before the guest
+        // connects, so the launcher reports a launch failure carrying the
+        // guest exit status and stderr. Assert this selector's refusal,
+        // not any pre-connect exit: the exact parse diagnostic and 101.
+        let error = result.unwrap_err();
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("LiteInst guest exited before connecting to the coordinator"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("exit status: 101"), "{rendered}");
+        assert!(rendered.contains("InvalidInput"), "{rendered}");
+        assert!(
+            rendered.contains("unsupported REVERIE_LITEINST_SITE_PATCHING value"),
+            "{rendered}"
+        );
+        return;
+    }
+    let (output, global) = result.unwrap();
 
     // The fixture unwraps the installation result, so the refusal is a panic
     // before the fixture's workload: no output and no getpid RPC.

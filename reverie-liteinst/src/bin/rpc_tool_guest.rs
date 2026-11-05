@@ -2145,6 +2145,20 @@ fn sigalrm_inherited_filter_guest(path: &Path) {
         )
     };
     assert_eq!(added, 0);
+    if cfg!(feature = "fixed-syscall-gates") {
+        // Fixed gates refuse installation under any inherited filter,
+        // before the gate page or a dispatcher is published.
+        let error = unsafe { reverie_liteinst::install_tool::<CounterTool>(path) }.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(
+            error.to_string(),
+            "fixed syscall gates refuse an inherited or unreadable seccomp filter state"
+        );
+        assert!(!reverie_inguest::trap::fixed_gates_published());
+        assert!(!reverie_inguest::trap::has_dispatcher());
+        println!("sigalrm-inherited-filter-ok");
+        return;
+    }
     unsafe { reverie_liteinst::install_tool::<CounterTool>(path) }.unwrap();
     assert!(!reverie_inguest::guest::sigalrm::admitted());
     assert_eq!(
@@ -3455,6 +3469,12 @@ fn main() {
         Some("fixed-gate-collision") => fixed_gates_guest::collision(Path::new(&path)),
         Some("fixed-gate-inherited-filter") => {
             fixed_gates_guest::inherited_filter(Path::new(&path))
+        }
+        Some("fixed-gate-invalid-site-patching") => {
+            fixed_gates_guest::invalid_site_patching(Path::new(&path))
+        }
+        Some("fixed-gate-invalid-straddler-ticks") => {
+            fixed_gates_guest::invalid_straddler_ticks(Path::new(&path))
         }
         Some("fixed-gate-install-failure") => fixed_gates_guest::install_failure(Path::new(&path)),
         Some("guest") => guest(Path::new(&path)),

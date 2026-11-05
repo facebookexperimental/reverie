@@ -1394,8 +1394,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        51879,
-        "b8099ce24313559ec22c1ba4c0b4246e044727be996ac753410cdac6e6ff0cdb",
+        51719,
+        "d8eb620718e9fc3d70eb41df7359df5a71e66251e4fd1a519fb7383c051b8de6",
     ),
     (
         "reverie/Cargo.toml",
@@ -1496,8 +1496,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     // Bind the added input-ownership and facility-admission source premises.
     (
         "reverie-inguest/src/launcher/mod.rs",
-        90555,
-        "6f03c009d55a607cac79bdf230259ea2ebd39e590510afc84abd8361a5420326",
+        94608,
+        "3fbd11f163faac386583cd648e4e8b8ec5034463ec44e6fc90654e0cd873254b",
     ),
     (
         "reverie/src/native_syscall.rs",

@@ -472,14 +472,19 @@ pub fn alt_stack_from_env_value(value: Option<&OsStr>) -> io::Result<bool> {
 /// Reads the process environment once; the parse itself is delegated to the pure
 /// [`alt_stack_from_env_value`].
 fn runtime_config_from_env() -> io::Result<RuntimeConfig> {
-    let use_alt_stack = alt_stack_from_env_value(std::env::var_os(ALT_STACK_ENV).as_deref())?;
+    Ok(runtime_config(alt_stack_from_env_value(
+        std::env::var_os(ALT_STACK_ENV).as_deref(),
+    )?))
+}
+
+fn runtime_config(use_alt_stack: bool) -> RuntimeConfig {
     // Signal phase 1: in the Tool mode every signal handler in the process is
     // the runtime's own and returns through its private restorer, so the
     // filter admits `rt_sigreturn` there alone.
-    Ok(RuntimeConfig {
+    RuntimeConfig {
         use_alt_stack,
         restrict_signal_return: TOOL_MODE.load(Ordering::Acquire) == TOOL_REVERIE,
-    })
+    }
 }
 
 pub(crate) fn initialize_from_environment() -> io::Result<()> {
@@ -679,6 +684,36 @@ fn process_forks_from_env() -> io::Result<bool> {
 /// preparation, its environment selectors, and its runtime services.
 pub(crate) struct LiteinstPatchHost {
     pub(crate) publication: PatchPublication,
+    #[cfg(feature = "fixed-syscall-gates")]
+    selectors: OnceLock<EnvSelectors>,
+}
+
+/// Environment selector values validated once in preflight, before the
+/// fixed gate page is published, and reused by the later selector steps.
+#[cfg(feature = "fixed-syscall-gates")]
+#[derive(Clone, Copy)]
+struct EnvSelectors {
+    site_patching: bool,
+    stage_stream: bool,
+    process_forks_allowed: bool,
+    sigalrm_handlers: bool,
+    use_alt_stack: bool,
+    straddler_staleness: Option<liteinst2::patcher::StalenessBudget>,
+}
+
+impl LiteinstPatchHost {
+    pub(crate) fn new(publication: PatchPublication) -> Self {
+        Self {
+            publication,
+            #[cfg(feature = "fixed-syscall-gates")]
+            selectors: OnceLock::new(),
+        }
+    }
+
+    #[cfg(feature = "fixed-syscall-gates")]
+    fn selectors(&self) -> Option<EnvSelectors> {
+        self.selectors.get().copied()
+    }
 }
 
 // SAFETY: LiteinstPatcher keeps the Patcher contract (see its SAFETY
@@ -694,7 +729,37 @@ unsafe impl PatchHost for LiteinstPatchHost {
     }
 
     fn preflight(&self) -> io::Result<()> {
-        crate::patch_alloc::preflight_allocator()
+        crate::patch_alloc::preflight_allocator()?;
+        // The shared installer publishes the irreversible fixed gate page
+        // right after this step; a selector syntax error found later would
+        // terminate through the gate without its diagnostic. Snapshot every
+        // selector's validated value now; the later steps reuse the
+        // snapshot, so no selector syntax is re-read after publication
+        // (including across Tool construction, which may mutate the env).
+        #[cfg(feature = "fixed-syscall-gates")]
+        {
+            let selectors = EnvSelectors {
+                site_patching: match reverie_inguest::bootstrap::bootstrap_site_patching() {
+                    Some(site_patching) => site_patching,
+                    None => site_patching_from_env_value(
+                        std::env::var_os(SITE_PATCHING_ENV).as_deref(),
+                    )?,
+                },
+                stage_stream: stage_stream_from_env()?,
+                process_forks_allowed: process_forks_from_env()?,
+                sigalrm_handlers: sigalrm_handlers_from_env_value(
+                    std::env::var_os(SIGALRM_HANDLERS_ENV).as_deref(),
+                )?,
+                use_alt_stack: alt_stack_from_env_value(
+                    std::env::var_os(ALT_STACK_ENV).as_deref(),
+                )?,
+                straddler_staleness: crate::straddler::straddler_staleness_from_env_value(
+                    std::env::var_os(crate::straddler::STRADDLER_STALENESS_TICKS_ENV).as_deref(),
+                )?,
+            };
+            let _ = self.selectors.set(selectors);
+        }
+        Ok(())
     }
 
     fn initialize_continuation(&self) -> io::Result<()> {
@@ -707,6 +772,10 @@ unsafe impl PatchHost for LiteinstPatchHost {
     }
 
     fn site_patching(&self) -> io::Result<bool> {
+        #[cfg(feature = "fixed-syscall-gates")]
+        if let Some(selectors) = self.selectors() {
+            return Ok(selectors.site_patching);
+        }
         // A launcher that sends tool data puts the selection in the bootstrap,
         // which guest code cannot change; the environment is the selector for
         // launchers that do not.
@@ -717,14 +786,26 @@ unsafe impl PatchHost for LiteinstPatchHost {
     }
 
     fn stage_stream(&self) -> io::Result<bool> {
+        #[cfg(feature = "fixed-syscall-gates")]
+        if let Some(selectors) = self.selectors() {
+            return Ok(selectors.stage_stream);
+        }
         stage_stream_from_env()
     }
 
     fn process_forks_allowed(&self) -> io::Result<bool> {
+        #[cfg(feature = "fixed-syscall-gates")]
+        if let Some(selectors) = self.selectors() {
+            return Ok(selectors.process_forks_allowed);
+        }
         process_forks_from_env()
     }
 
     fn sigalrm_handlers(&self) -> io::Result<bool> {
+        #[cfg(feature = "fixed-syscall-gates")]
+        if let Some(selectors) = self.selectors() {
+            return Ok(selectors.sigalrm_handlers);
+        }
         sigalrm_handlers_from_env_value(std::env::var_os(SIGALRM_HANDLERS_ENV).as_deref())
     }
 
@@ -746,11 +827,21 @@ unsafe impl PatchHost for LiteinstPatchHost {
         } else {
             GuardRouter::Omit
         };
-        prepare_instrumentation(InstrumentationPreparation::Patcher, router)?;
+        #[cfg(feature = "fixed-syscall-gates")]
+        let staleness = self
+            .selectors()
+            .map(|selectors| selectors.straddler_staleness);
+        #[cfg(not(feature = "fixed-syscall-gates"))]
+        let staleness = None;
+        prepare_instrumentation(InstrumentationPreparation::Patcher, router, staleness)?;
         install_vdso_sites(vdso_sites)
     }
 
     fn runtime_config(&self) -> io::Result<RuntimeConfig> {
+        #[cfg(feature = "fixed-syscall-gates")]
+        if let Some(selectors) = self.selectors() {
+            return Ok(runtime_config(selectors.use_alt_stack));
+        }
         runtime_config_from_env()
     }
 
@@ -821,7 +912,7 @@ fn install_runtime(
     // The private-image (loader) installs and the strace and compat runtimes
     // keep the router whatever the setting; only the shared Tool host's
     // preparation omits it (`LiteinstPatchHost::prepare_patcher`).
-    prepare_instrumentation(preparation, GuardRouter::Install)?;
+    prepare_instrumentation(preparation, GuardRouter::Install, None)?;
     install_vdso_sites(vdso_sites)?;
     #[cfg(feature = "exec-native-injection")]
     let (initial, before_frontend) = match initial {
@@ -1147,8 +1238,14 @@ enum GuardRouter {
 fn prepare_instrumentation(
     preparation: InstrumentationPreparation,
     router: GuardRouter,
+    staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
 ) -> io::Result<()> {
-    crate::straddler::initialize_from_environment()?;
+    // A supplied budget was validated before fixed-gate publication; other
+    // routes keep reading the selector here at their existing point.
+    match staleness {
+        Some(budget) => crate::straddler::initialize(budget)?,
+        None => crate::straddler::initialize_from_environment()?,
+    }
     match router {
         GuardRouter::Install => {
             // Initialization retains the guard router for modes that may
