@@ -2564,6 +2564,23 @@ fn leader_self_exec_bounded_configured(
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Host-capability refusal: same named skip as the broker library helper.
+    if !output.status.success()
+        && stderr.contains("ambient mount absent from bootstrap mountinfo")
+    {
+        let line = format!(
+            "\nREVERIE_SKIP: {test}: broker ambient mount absent from bootstrap mountinfo on this host\n"
+        );
+        let mut rest = line.as_bytes();
+        while !rest.is_empty() {
+            // SAFETY: writes only the line above to this process's stderr.
+            let written =
+                unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+            assert!(written > 0, "write named skip for {test}");
+            rest = &rest[written as usize..];
+        }
+        return false;
+    }
     assert!(
         output.status.success(),
         "{test}: status={:?} stdout={} stderr={}",
