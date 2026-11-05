@@ -96,8 +96,9 @@ pub enum PmuValidationError {
     #[cfg(target_arch = "x86_64")]
     #[error(
         "On AMD Zen CPUs, reverie timers will not work reliably unless you disable the \
-        hardware SpecLockMap optimization ({speclockmap_commits} of \
-        {locked_instructions} locked instructions were SpecLockMap commits). For \
+        hardware SpecLockMap optimization (the check counted \
+        {speclockmap_commits} SpecLockMap commits and {locked_instructions} \
+        locked instructions). For \
         instructions on how to do this, see https://github.com/rr-debugger/rr/wiki/Zen"
     )]
     AmdSpecLockMapShouldBeDisabled {
@@ -107,11 +108,10 @@ pub enum PmuValidationError {
         locked_instructions: i64,
     },
 
-    /// The SpecLockMap check counted no SpecLockMap commits, but fewer locked
-    /// instructions than it executed, so its zero shows nothing. This happens
-    /// when the retired-lock event (AMD PMCx025) counts nothing, as under a
-    /// hypervisor that filters it, and could happen on a Zen part whose
-    /// PMCx025 does not count every locked instruction.
+    /// The retired-lock pipeline counted nothing at all, so the check's
+    /// zero commit count shows nothing. This happens when the
+    /// retired-lock event (AMD PMCx025) counts nothing, as under a
+    /// hypervisor that filters it.
     #[cfg(target_arch = "x86_64")]
     #[error(
         "The AMD Zen SpecLockMap check is inconclusive: it executed {executed} locked \
@@ -124,6 +124,48 @@ pub enum PmuValidationError {
         counted: i64,
         /// How many locked instructions the check executed.
         executed: usize,
+    },
+
+    /// The retired-branch counter counted more branches over a loop of
+    /// locked instructions than over a branch-matched loop without
+    /// them: locked instructions are inflating the branch count, which
+    /// is the harm SpecLockMap does to branch counting whether or not
+    /// its own commit counter moved.
+    #[cfg(target_arch = "x86_64")]
+    #[error(
+        "The retired-branch counter counted {branches_with_locks} branches over a loop of \
+        locked instructions against {branches} over the same loop without them: locked \
+        instructions inflate the branch count on this host, as SpecLockMap does when it \
+        is not disabled. See https://github.com/rr-debugger/rr/wiki/Zen"
+    )]
+    AmdSpecLockMapBranchOvercount {
+        /// Branches counted over the branches-only loop.
+        branches: i64,
+        /// Branches counted over the branch-matched locked loop.
+        branches_with_locks: i64,
+    },
+
+    /// The direct branch-counter test could not establish its own
+    /// exactness: the branches-only loop did not read the identical
+    /// count twice, read fewer branches than it executed, read beyond
+    /// the fixed loop overhead the test accepts, or the locked loop
+    /// read fewer branches than the branches-only loop.
+    /// The counter's output shows nothing on this host, so the check
+    /// refuses rather than pass.
+    #[cfg(target_arch = "x86_64")]
+    #[error(
+        "The AMD Zen branch-counter check is inconclusive: a loop of exactly the same \
+        conditional branches read {branches} then {branches_repeat}, and with a locked \
+        instruction per iteration {branches_with_locks}; an exact counter must read the \
+        identical count every time. See https://github.com/rr-debugger/rr/wiki/Zen"
+    )]
+    BranchCounterCheckInconclusive {
+        /// Branches counted over the first branches-only loop.
+        branches: i64,
+        /// Branches counted over the repeated branches-only loop.
+        branches_repeat: i64,
+        /// Branches counted over the branch-matched locked loop.
+        branches_with_locks: i64,
     },
 
     #[cfg(target_arch = "x86_64")]
