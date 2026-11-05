@@ -27,7 +27,7 @@ framework carries the machinery; your code carries only the policy.
 
 <span class="filename">Listing FT-1: reverie-examples/counter1_tool.rs</span>
 
-```rust
+```rust,ignore
 #[derive(Debug, Default, Clone)]
 pub struct CounterGlobal {
     num_syscalls: Arc<AtomicU64>,
@@ -100,7 +100,7 @@ Running a tool always has the same shape: hand a backend a command and
 the tool's config; receive the guest's exit status together with the
 final global state. Through the abstract trait:
 
-```rust
+```rust,ignore
 use reverie::Backend;
 let (exit_status, global_state) =
     reverie_ptrace::PtraceBackend::run::<MyTool>(command, config).await?;
