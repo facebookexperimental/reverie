@@ -63,6 +63,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master; toolchain via input below
         with:
           toolchain: nightly
+      - name: Dependencies
+        # Same step as ci.yml: cargo doc runs build scripts (unwind-sys
+        # needs libunwind via pkg-config), so the doc step needs these.
+        # Refresh the index first: the runner image's index can name package
+        # versions the mirror no longer serves, and install then fails with 404.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
       - name: API docs (workspace, no deps, warnings denied)
         env:
           RUSTDOCFLAGS: "-D warnings"
