@@ -473,8 +473,11 @@ pub struct ToolQueries {
     /// the cell must report guest `rt_sigreturn`s.
     pub observes_sigreturns: bool,
     /// [`Tool::may_observe_signal_dequeues`](crate::Tool::may_observe_signal_dequeues):
-    /// an upper bound only; recorded, never an admission gate, and never
-    /// implies `requires_signal_control`.
+    /// an upper bound on dequeue observation. Not a gate by itself and
+    /// never implies `requires_signal_control` — but jointly with
+    /// thread ownership it is one on cells that honor ownership, where
+    /// the backend deterministically refuses observation under `Host`
+    /// ownership (admission requires proved `Tool` ownership there).
     pub may_observe_signal_dequeues: bool,
     /// [`Tool::in_guest_signal_delivery`](crate::Tool::in_guest_signal_delivery):
     /// the tool takes the in-guest two-phase signal protocol, so only an
@@ -1560,6 +1563,20 @@ fn requirement_reasons(
         && !out.contains(&R::LifecycleUnproven("threads"))
     {
         out.push(R::LifecycleUnproven("threads"));
+    }
+    // Joint prerequisite, independent of the threads axis: a backend
+    // that honors thread ownership deterministically refuses
+    // signal-dequeue observation under Host ownership (uninstrumented
+    // workers have no Guest on which to acknowledge removals), before
+    // any guest state exists. Unknown ownership fails closed here too.
+    // Observing dequeues still never implies process signal control.
+    if req.queries.may_observe_signal_dequeues
+        && cell.envelope.honors_thread_ownership
+        && req.queries.thread_ownership != Some(ThreadOwnership::Tool)
+    {
+        out.push(R::SignalUnavailable(
+            "signal-dequeue observation under host thread ownership",
+        ));
     }
     // Joint installer prerequisite: in-guest signal delivery refuses a
     // runtime with site patching on (a patched site reaches the tool
@@ -3281,6 +3298,60 @@ mod tests {
         // The same None is harmless on a backend that ignores ownership.
         let req = request(ToolRequirements::default(), GuestProfile::HostProcessAny);
         assert_eq!(admit(&req).expect("ptrace").chosen, CellId("V1-ptrace"));
+    }
+
+    /// Regression (Astra delta P2): dequeue observation makes ownership
+    /// load-bearing on honoring cells even with monitored-thread
+    /// coverage relaxed — the backend refuses that conjunction
+    /// unconditionally. Both witnesses admitted V11 on 7f087521.
+    #[test]
+    fn dequeue_observation_requires_tool_ownership_regardless_of_threads_axis() {
+        let mut stated = ToolRequirements::default();
+        stated.lifecycle.threads = false;
+        stated.lifecycle.exec_successor = false;
+        stated.lifecycle.signal_fidelity = false;
+        let mut req = request(stated, GuestProfile::StaticElfVm);
+        req.requirements.queries.may_observe_signal_dequeues = true;
+        // Positive control: proved Tool ownership admits.
+        req.requirements.queries.thread_ownership = Some(ThreadOwnership::Tool);
+        assert_eq!(
+            admit(&req).expect("tool-owned dequeues").chosen,
+            CellId("V11-kvm")
+        );
+        // Host ownership refuses even though threads coverage is relaxed.
+        req.requirements.queries.thread_ownership = Some(ThreadOwnership::Host);
+        let refusal = admit(&req).expect_err("host-owned dequeue observation");
+        assert!(
+            refusal
+                .trace
+                .reasons_for(CellId("V11-kvm"))
+                .iter()
+                .any(|r| matches!(
+                    r,
+                    RemovalReason::SignalUnavailable(
+                        "signal-dequeue observation under host thread ownership"
+                    )
+                )),
+            "{refusal}"
+        );
+        // Uncollected ownership fails closed the same way.
+        req.requirements.queries.thread_ownership = None;
+        assert!(admit(&req).is_err());
+        // Without dequeue observation, Host ownership with relaxed
+        // threads remains admissible (no over-gating), and dequeue
+        // observation does not disturb backends ignoring ownership.
+        req.requirements.queries.may_observe_signal_dequeues = false;
+        req.requirements.queries.thread_ownership = Some(ThreadOwnership::Host);
+        assert_eq!(
+            admit(&req).expect("host threads, no dequeues").chosen,
+            CellId("V11-kvm")
+        );
+        let mut req = request(ToolRequirements::default(), GuestProfile::HostProcessAny);
+        req.requirements.queries.may_observe_signal_dequeues = true;
+        assert_eq!(
+            admit(&req).expect("ptrace ignores ownership").chosen,
+            CellId("V1-ptrace")
+        );
     }
 
     /// Blocker regression (musereview B2a): in-guest signal delivery is
