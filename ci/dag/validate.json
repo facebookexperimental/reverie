@@ -65,7 +65,7 @@
       "deps": [],
       "env": {},
       "timeout": 600,
-      "cpu_timeout": 6500,
+      "cpu_timeout": 4200,
       "priority": 90,
       "hint": {
         "resources": {
@@ -73,9 +73,9 @@
         },
         "est_duration_s": 150,
         "rss_baseline_bytes": 24000000000,
-        "hard_mem_max_bytes": 48000000000,
+        "hard_mem_max_bytes": 40000000000,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 12
+        "preferred_inner_jobs": 8
       },
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS"
@@ -224,7 +224,7 @@
         "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
       },
       "timeout": 600,
-      "cpu_timeout": 1200,
+      "cpu_timeout": 2600,
       "priority": 40,
       "hint": {
         "resources": {},
