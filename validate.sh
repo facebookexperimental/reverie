@@ -830,8 +830,10 @@ disabled_liteinst_allocator_fixtures() {
 }
 run_check "LiteInst allocator fixtures (disabled: dh-hkdh0)" \
     disabled_liteinst_allocator_fixtures
-# Bounded recipe tests require TMPDIR inside the retained artifact domain.
-export TMPDIR="$ROOT_DIR/target/validate-tmp"
+# Bounded recipe tests require TMPDIR to be set. Keep it short: abstract
+# socket paths created under TMPDIR must fit SUN_LEN (107 bytes), which a
+# long checkout path would exceed.
+export TMPDIR="/tmp/reverie-validate-tmp"
 mkdir -p "$TMPDIR"
 # The counted runner accepts only a command that starts with `cargo test`, so
 # the fixture paths reach the tests through the environment rather than an
