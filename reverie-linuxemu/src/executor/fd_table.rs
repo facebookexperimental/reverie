@@ -90,6 +90,7 @@ impl FileTableState {
     }
 
     /// The consolidated slot for `fd`, as derived at the last mutation.
+    #[cfg(test)]
     pub(super) fn slot(&self, fd: i32) -> Option<&FdSlot> {
         self.slots.get(&fd)
     }
@@ -215,10 +216,10 @@ impl FileTableState {
         let retired = std::mem::replace(self, next);
         self.rebuild_slots(Some(state));
         for (fd, description) in prior_descriptions {
-            if let Some(slot) = self.slots.get_mut(&fd) {
-                if slot.description.is_none() {
-                    slot.description = Some(description);
-                }
+            if let Some(slot) = self.slots.get_mut(&fd)
+                && slot.description.is_none()
+            {
+                slot.description = Some(description);
             }
         }
         retired.retire(&state.file_retirement);
@@ -285,12 +286,11 @@ impl FileTableState {
                             .zip(published.entry_id(fd))
                             .is_some_and(|(current, previous)| Arc::ptr_eq(current, previous))
                 });
-                if unchanged {
-                    if let Some(description) =
+                if unchanged
+                    && let Some(description) =
                         published.and_then(|published| published.description(fd))
-                    {
-                        return Some((fd, description));
-                    }
+                {
+                    return Some((fd, description));
                 }
                 let file = files.get(&fd)?.try_clone().ok()?;
                 Some((fd, describe(file)))
@@ -331,15 +331,6 @@ impl FileTableState {
     /// they are: the same entries by identity (so every host fd is kept) and
     /// the same descriptor facts. Reads only; allocates nothing.
     pub(super) fn installed_matches(&self, state: &LoadedStaticElf) -> bool {
-        fn same_arcs<K: Ord, V>(
-            a: &std::collections::BTreeMap<K, Arc<V>>,
-            b: &std::collections::BTreeMap<K, Arc<V>>,
-        ) -> bool {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b)
-                    .all(|((ka, va), (kb, vb))| ka == kb && Arc::ptr_eq(va, vb))
-        }
         // Destructured without `..`, so a field added to the table fails to
         // compile here until it is either compared or shown not to be
         // installed.

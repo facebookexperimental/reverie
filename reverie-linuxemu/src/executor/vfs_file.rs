@@ -25,6 +25,9 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 
 /// One open file description: the object shared by dup/fork aliases.
+// raw_fd/read/write/write_at are consumed by the read/write wiring that
+// follows (dh-2mtq4 R2 remainder); seek/read_at/available are already live.
+#[allow(dead_code)]
 pub trait FileDescription: std::fmt::Debug + Send + Sync {
     /// Host descriptor backing this description, if it has one.
     fn raw_fd(&self) -> Option<i32>;

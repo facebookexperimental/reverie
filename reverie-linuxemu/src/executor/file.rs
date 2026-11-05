@@ -73,7 +73,7 @@ pub(super) fn lseek(state: &LoadedStaticElf, args: &[u64; 6], capture_output: bo
     // files. The clone shares the open description's offset, so this is the
     // same lseek; SEEK_DATA/SEEK_HOLE and non-table descriptors keep the raw
     // path below (the kernel answers their whence validation).
-    if let Some(mut description) = host_description(state, fd) {
+    if let Some(description) = host_description(state, fd) {
         let offset = args[1] as i64;
         let pos = match whence {
             libc::SEEK_SET if offset >= 0 => Some(std::io::SeekFrom::Start(offset as u64)),
