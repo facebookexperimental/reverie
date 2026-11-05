@@ -164,3 +164,11 @@ required-features = ["fixed-syscall-gates"]
 name = "private_prepare"
 path = "tests/private_prepare.rs"
 required-features = ["exec-private-init"]
+
+[[bin]]
+name = "reverie-liteinst-grouped-admission-spike"
+path = "src/bin/grouped_admission_spike.rs"
+
+[[test]]
+name = "grouped_admission"
+path = "tests/grouped_admission.rs"
