@@ -345,6 +345,29 @@ impl Drop for Fixture {
     }
 }
 
+/// Reaps `tid` iff it is this test process's own zombie child. An effect
+/// task orphaned when its root dies is reparented to the test process; the
+/// driver has already reported it SIGKILL-terminal, but nobody has waited
+/// on it, so `/proc/<tid>` lingers as a zombie until we reap it here.
+/// Waiting on that exact waitpid is waiting on the reap event itself.
+fn reap_adopted_zombie(tid: i32) {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{tid}/stat")) else {
+        return;
+    };
+    let Some(close) = stat.rfind(')') else { return };
+    let mut fields = stat[close + 2..].split_whitespace();
+    let (Some(state), Some(ppid)) = (fields.next(), fields.next()) else {
+        return;
+    };
+    if state != "Z" || ppid.parse::<u32>().ok() != Some(std::process::id()) {
+        return;
+    }
+    let mut status = 0;
+    // SAFETY: tid was just observed as our own zombie child; waitpid on it
+    // reaps exactly that child and writes only `status`.
+    unsafe { libc::waitpid(tid, &mut status, 0) };
+}
+
 async fn run(mode: Mode) {
     let fixture = Fixture::new(matches!(mode, Mode::ChildToolError));
     let mut command = Command::new(&fixture.path);
@@ -404,6 +427,7 @@ async fn run(mode: Mode) {
     );
     let effect_tid = effect_tid.load(Ordering::SeqCst);
     assert!(effect_tid > 0, "actual callback effect was never observed");
+    reap_adopted_zombie(effect_tid);
     assert!(
         !PathBuf::from(format!("/proc/{effect_tid}")).exists(),
         "effect task was not reaped"
@@ -552,6 +576,7 @@ async fn static_injected_cleanup_resource_follows_original_pending_owner() {
                 },
             );
             assert!(!PathBuf::from(format!("/proc/{}", self.root)).exists());
+            reap_adopted_zombie(self.effect.load(Ordering::SeqCst));
             assert!(
                 !PathBuf::from(format!("/proc/{}", self.effect.load(Ordering::SeqCst))).exists()
             );
