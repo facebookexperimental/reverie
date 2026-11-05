@@ -159,3 +159,8 @@ required-features = ["allocator-fixture"]
 name = "fixed_gates"
 path = "tests/fixed_gates.rs"
 required-features = ["fixed-syscall-gates"]
+
+[[test]]
+name = "private_prepare"
+path = "tests/private_prepare.rs"
+required-features = ["exec-private-init"]

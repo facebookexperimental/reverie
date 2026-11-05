@@ -284,6 +284,44 @@ enum ImageInstall<'a, T: Tool> {
     },
 }
 
+/// Parse the straddler selector from the runner's environ block
+/// directly: no getenv interposition and no allocation unless the
+/// parse constructs its error.
+#[cfg(feature = "exec-private-init")]
+fn validated_straddler_staleness() -> io::Result<Option<liteinst2::patcher::StalenessBudget>> {
+    use std::os::unix::ffi::OsStrExt;
+    let value = reverie_inguest::guest::support::environment_value(
+        crate::straddler::STRADDLER_STALENESS_TICKS_ENV.as_bytes(),
+    );
+    crate::straddler::straddler_staleness_from_env_value(value.map(std::ffi::OsStr::from_bytes))
+}
+
+/// The straddler budget validated before any private prepare entry
+/// takes ownership. Only [`validate_straddler_selector`] constructs
+/// one, so reaching a prepare entry proves the parse already passed.
+#[cfg(feature = "exec-private-init")]
+pub struct ValidatedStraddlerStaleness {
+    budget: Option<liteinst2::patcher::StalenessBudget>,
+}
+
+/// Validate `REVERIE_LITEINST_STRADDLER_STALENESS_TICKS` and capture
+/// its budget for a private prepare entry.
+///
+/// Call this FIRST in the private initialization sequence, before
+/// redeeming or constructing the admitted client, configuration,
+/// stream or successor consumer. The token type proves validation
+/// ran, not that it ran first: that temporal order remains the
+/// caller's obligation. A malformed value then returns as a
+/// plain named error while the caller still owns nothing admitted,
+/// instead of failing after gate adoption where only the silent
+/// terminal path remains.
+#[cfg(feature = "exec-private-init")]
+pub fn validate_straddler_selector() -> io::Result<ValidatedStraddlerStaleness> {
+    Ok(ValidatedStraddlerStaleness {
+        budget: validated_straddler_staleness()?,
+    })
+}
+
 /// Authenticated client and one native control prepared before Detcore setup.
 /// This affine owner must be consumed by the actual Tool installer.
 #[cfg(feature = "exec-private-init")]
@@ -293,6 +331,7 @@ pub struct PreparedInitialImage<T: Tool> {
     fatal: reverie_inguest::guest::exec_private::InitialImageAbortGuard,
     client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
     control: reverie_inguest::guest::exec_private::InitialImageControl,
+    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
 }
 
 /// Installed InitialImage, retaining fatal ownership through eager lifecycle.
@@ -312,6 +351,27 @@ impl InstalledInitialImage {
     }
 }
 
+/// Legacy initial-image preparation without caller-side straddler
+/// validation. Byte-compatible with the original entry for existing
+/// callers.
+///
+/// Known hazard (dh-6u6dq): on this entry the straddler selector is
+/// still parsed after gate adoption during installation, so a
+/// malformed value terminates silently instead of returning its
+/// diagnostic. Prefer [`prepare_tool_initial_image_validated`] with a
+/// [`validate_straddler_selector`] token obtained first; this entry
+/// remains only until existing callers migrate.
+///
+/// # Safety
+/// Every `prepare_tool_initial_image_validated` obligation applies.
+#[cfg(feature = "exec-private-init")]
+pub unsafe fn prepare_tool_initial_image<T: Tool>(
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+    native: *mut reverie_inguest::guest::exec_private::NativeControl,
+) -> io::Result<PreparedInitialImage<T>> {
+    unsafe { prepare_tool_initial_image_with_budget(client, native, None) }
+}
+
 /// Prepare authenticated fixed gates before caller-context Detcore setup.
 /// Ordinary preload initialization does not use this entry.
 ///
@@ -319,12 +379,25 @@ impl InstalledInitialImage {
 /// The consumed client must have redeemed the launching coordinator's one-use
 /// authorization for this exact watched image/filter lineage. Native control,
 /// private loader and mapping provenance must satisfy
-/// `publish_authenticated_control`. No guest code may have run. The Tool's
+/// `publish_authenticated_control`. Obtain `straddler` from
+/// [`validate_straddler_selector`] before redeeming the client, so a
+/// malformed selector refuses while the caller owns nothing admitted.
+/// No guest code may have run. The Tool's
 /// config must not require RCB time, preemption, threads, forks or exec yet.
 #[cfg(feature = "exec-private-init")]
-pub unsafe fn prepare_tool_initial_image<T: Tool>(
+pub unsafe fn prepare_tool_initial_image_validated<T: Tool>(
+    straddler: ValidatedStraddlerStaleness,
     client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
     native: *mut reverie_inguest::guest::exec_private::NativeControl,
+) -> io::Result<PreparedInitialImage<T>> {
+    unsafe { prepare_tool_initial_image_with_budget(client, native, Some(straddler.budget)) }
+}
+
+#[cfg(feature = "exec-private-init")]
+unsafe fn prepare_tool_initial_image_with_budget<T: Tool>(
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+    native: *mut reverie_inguest::guest::exec_private::NativeControl,
+    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
 ) -> io::Result<PreparedInitialImage<T>> {
     let fatal = unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
     let control =
@@ -333,7 +406,26 @@ pub unsafe fn prepare_tool_initial_image<T: Tool>(
         client,
         control,
         fatal,
+        straddler_staleness,
     })
+}
+
+/// Legacy mapped initial-image preparation without caller-side
+/// straddler validation. Byte-compatible with the original entry.
+///
+/// Known hazard (dh-6u6dq): same late straddler parse as the legacy
+/// initial entry. Prefer [`prepare_tool_mapped_initial_image_validated`];
+/// note the mapped prelude's own gate adoption precedes both entries,
+/// so the caller validates before creating the prelude as well.
+///
+/// # Safety
+/// Every `prepare_tool_mapped_initial_image_validated` obligation applies.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub unsafe fn prepare_tool_mapped_initial_image<T: Tool>(
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+    mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
+) -> io::Result<PreparedInitialImage<T>> {
+    unsafe { prepare_tool_mapped_initial_image_with_budget(client, mapped, None) }
 }
 
 /// Converge the mapped first image on the existing prepared InitialImage owner.
@@ -347,9 +439,19 @@ pub unsafe fn prepare_tool_initial_image<T: Tool>(
 /// owner and all `MappedToolPrelude::publish_authenticated` obligations. Guest
 /// has not run; all errors remain terminal under the original retained owner.
 #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
-pub unsafe fn prepare_tool_mapped_initial_image<T: Tool>(
+pub unsafe fn prepare_tool_mapped_initial_image_validated<T: Tool>(
+    straddler: ValidatedStraddlerStaleness,
     client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
     mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
+) -> io::Result<PreparedInitialImage<T>> {
+    unsafe { prepare_tool_mapped_initial_image_with_budget(client, mapped, Some(straddler.budget)) }
+}
+
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+unsafe fn prepare_tool_mapped_initial_image_with_budget<T: Tool>(
+    client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
+    mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
+    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
 ) -> io::Result<PreparedInitialImage<T>> {
     let fatal = unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
     // SAFETY: actual admitted client and physical producer contract above.
@@ -358,6 +460,7 @@ pub unsafe fn prepare_tool_mapped_initial_image<T: Tool>(
         fatal,
         client,
         control,
+        straddler_staleness,
     })
 }
 
@@ -381,6 +484,7 @@ where
         client,
         control,
         fatal,
+        straddler_staleness,
     } = prepared;
     unsafe {
         install_tool_inner::<T>(
@@ -391,6 +495,7 @@ where
             #[cfg(feature = "exec-native-injection")]
             None,
             true,
+            straddler_staleness,
         )?;
     }
     Ok(InstalledInitialImage { control, fatal })
@@ -486,6 +591,7 @@ pub struct PreparedSuccessorImage<T: Tool> {
     state: T::ThreadState,
     consumer: Box<dyn NativeSuccessorConsumer<T>>,
     control: reverie_inguest::guest::exec_private::SuccessorImageControl,
+    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
 }
 
 /// Actual installed successor retaining fatal ownership until exact completion.
@@ -548,6 +654,24 @@ fn check_successor_binding(
     Ok(())
 }
 
+/// Legacy successor preparation without caller-side straddler
+/// validation. Byte-compatible with the original entry.
+///
+/// Known hazard (dh-6u6dq): same late straddler parse as the legacy
+/// initial entry. Prefer [`prepare_tool_successor_image_validated`].
+///
+/// # Safety
+/// Every `prepare_tool_successor_image_validated` obligation applies.
+#[cfg(feature = "exec-native-injection")]
+pub unsafe fn prepare_tool_successor_image<T: Tool + 'static>(
+    client: reverie_rpc_transport::SuccessorClient<T::GlobalState, GuestRpcStream>,
+    native: *mut reverie_inguest::guest::exec_private::NativeControl,
+    binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    consumer: Box<dyn NativeSuccessorConsumer<T>>,
+) -> io::Result<PreparedSuccessorImage<T>> {
+    unsafe { prepare_tool_successor_image_with_budget(client, native, binding, consumer, None) }
+}
+
 /// Decode a genuinely redeemed successor before publishing its native control.
 ///
 /// # Safety
@@ -556,12 +680,34 @@ fn check_successor_binding(
 /// terminal gate, private loader/Tool FS/control extents and fresh allocator
 /// must already be authenticated; no guest code may have run. The consumer
 /// must uphold every unsafe trait contract. Errors or abandonment are terminal.
+/// Obtain `straddler` from [`validate_straddler_selector`] before
+/// constructing the client or consumer it is passed beside.
 #[cfg(feature = "exec-native-injection")]
-pub unsafe fn prepare_tool_successor_image<T: Tool + 'static>(
+pub unsafe fn prepare_tool_successor_image_validated<T: Tool + 'static>(
+    straddler: ValidatedStraddlerStaleness,
+    client: reverie_rpc_transport::SuccessorClient<T::GlobalState, GuestRpcStream>,
+    native: *mut reverie_inguest::guest::exec_private::NativeControl,
+    binding: reverie_inguest::guest::exec_private::SuccessorBinding,
+    consumer: Box<dyn NativeSuccessorConsumer<T>>,
+) -> io::Result<PreparedSuccessorImage<T>> {
+    unsafe {
+        prepare_tool_successor_image_with_budget(
+            client,
+            native,
+            binding,
+            consumer,
+            Some(straddler.budget),
+        )
+    }
+}
+
+#[cfg(feature = "exec-native-injection")]
+unsafe fn prepare_tool_successor_image_with_budget<T: Tool + 'static>(
     client: reverie_rpc_transport::SuccessorClient<T::GlobalState, GuestRpcStream>,
     native: *mut reverie_inguest::guest::exec_private::NativeControl,
     binding: reverie_inguest::guest::exec_private::SuccessorBinding,
     mut consumer: Box<dyn NativeSuccessorConsumer<T>>,
+    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
 ) -> io::Result<PreparedSuccessorImage<T>> {
     let fatal = SuccessorAbortGuard { active: true };
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
@@ -584,6 +730,7 @@ pub unsafe fn prepare_tool_successor_image<T: Tool + 'static>(
         state,
         consumer,
         control,
+        straddler_staleness,
     })
 }
 
@@ -611,6 +758,7 @@ pub unsafe fn install_tool_successor_image<T: Tool + 'static>(
         state,
         mut consumer,
         control,
+        straddler_staleness,
     } = prepared;
     unsafe {
         install_tool_inner::<T>(
@@ -626,6 +774,7 @@ pub unsafe fn install_tool_successor_image<T: Tool + 'static>(
             }),
             Some(driver),
             true,
+            straddler_staleness,
         )?;
     }
     Ok(InstalledSuccessorImage {
@@ -655,6 +804,7 @@ pub unsafe fn install_tool_initial_image_with_native_exec<T: Tool + 'static>(
         fatal,
         client,
         control,
+        straddler_staleness,
     } = prepared;
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
     require_native_success(qualify(client.config()));
@@ -666,6 +816,7 @@ pub unsafe fn install_tool_initial_image_with_native_exec<T: Tool + 'static>(
             Some(ImageInstall::Initial(client, &control, &fatal)),
             Some(driver),
             true,
+            straddler_staleness,
         )?;
     }
     Ok(InstalledInitialImage { fatal, control })
@@ -920,6 +1071,9 @@ unsafe fn install_tool_inner<T>(
         std::sync::Arc<dyn reverie_inguest::guest::native_exec::NativeExecDriver<T>>,
     >,
     #[cfg(feature = "exec-private-init")] skip_pmu: bool,
+    #[cfg(feature = "exec-private-init")] straddler_staleness: Option<
+        Option<liteinst2::patcher::StalenessBudget>,
+    >,
 ) -> io::Result<()>
 where
     T: Tool + 'static,
@@ -1196,6 +1350,7 @@ where
         #[cfg(feature = "exec-private-init")]
         initial_control.map(|control| runtime::PrivateRuntimeImage {
             control,
+            straddler_staleness,
             preparation: if skip_pmu {
                 // The authenticated entry requires a no-RCB/no-patching image.
                 // Ordinary/legacy installation retains

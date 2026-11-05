@@ -574,6 +574,7 @@ pub(crate) enum InstrumentationPreparation {
 #[cfg(feature = "exec-private-init")]
 pub(crate) struct PrivateRuntimeImage<'a> {
     pub(crate) control: crate::tool_host::PrivateImageControl<'a>,
+    pub(crate) straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
     #[cfg(feature = "exec-private-init")]
     pub(crate) preparation: InstrumentationPreparation,
     #[cfg(feature = "exec-native-injection")]
@@ -909,10 +910,14 @@ fn install_runtime(
             "native trap preparation requires patching off and no vDSO hooks",
         ));
     }
+    #[cfg(feature = "exec-private-init")]
+    let staleness = initial.as_ref().and_then(|image| image.straddler_staleness);
+    #[cfg(not(feature = "exec-private-init"))]
+    let staleness = None;
     // The private-image (loader) installs and the strace and compat runtimes
     // keep the router whatever the setting; only the shared Tool host's
     // preparation omits it (`LiteinstPatchHost::prepare_patcher`).
-    prepare_instrumentation(preparation, GuardRouter::Install, None)?;
+    prepare_instrumentation(preparation, GuardRouter::Install, staleness)?;
     install_vdso_sites(vdso_sites)?;
     #[cfg(feature = "exec-native-injection")]
     let (initial, before_frontend) = match initial {
