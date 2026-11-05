@@ -15,7 +15,7 @@ mod broker_test_protocol;
 /// Writes a named skip past libtest output capture (fd 2 directly), so the
 /// counted runner and percrate scorecard can report it as skipped rather
 /// than as a silent pass.
-fn report_skip(test: &str, reason: &str) {
+pub(crate) fn report_skip(test: &str, reason: &str) {
     let line = format!("\nREVERIE_SKIP: {test}: {reason}\n");
     let mut rest = line.as_bytes();
     while !rest.is_empty() {

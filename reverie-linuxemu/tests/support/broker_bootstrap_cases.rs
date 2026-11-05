@@ -19,6 +19,14 @@ enum Case {
 }
 
 pub fn run(name: &str) -> i32 {
+    // The ambient census below must see only descriptors this dedicated
+    // process opens itself. The spawning test runner leaves non-CLOEXEC
+    // descriptors (journal sockets, pipes) above stderr that would
+    // otherwise be misread as held originals. Close them before the
+    // fixture takes the first free descriptor.
+    // SAFETY: this dedicated early-launcher branch is single-threaded and
+    // owns no descriptor above stderr yet.
+    unsafe { libc::close_range(3, u32::MAX, 0) };
     let case = match name {
         "procfs-reject" => Case::Procfs,
         "memfd-accept" => Case::Memfd,

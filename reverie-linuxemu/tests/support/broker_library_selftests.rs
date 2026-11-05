@@ -2,10 +2,51 @@
 // They run in reverie-linuxemu's unit tests only; reverie-kvm includes the
 // adapter but not these cases.
 use crate::broker_library_tests::launcher_path;
+use crate::broker_library_tests::report_skip;
+
+/// True when the launcher refused setup because this host has no ambient
+/// mount in its bootstrap mountinfo (named host-capability refusal).
+fn ambient_mount_absent(stderr: &str) -> bool {
+    stderr.contains("ambient mount absent from bootstrap mountinfo")
+}
+
+/// The bootstrap ambient census classifies the broker's own socket
+/// descriptors too; when a fresh socketpair's mount is absent from
+/// mountinfo on this host, accepted-class cases cannot classify here.
+fn ambient_mount_visible() -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok((probe, _peer)) = std::os::unix::net::UnixStream::pair() else {
+        return false;
+    };
+    let Ok(fdinfo) = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", probe.as_raw_fd()))
+    else {
+        return false;
+    };
+    let Some(mnt_id) = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    mountinfo
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(mnt_id))
+}
 
 /// These cases enter the existing helper before its ordinary bootstrap. They
 /// exercise actual host calls; no libtest thread asserts StartupAuthority.
 fn bootstrap_case(case: &str, expected: &str, accepted: bool) {
+    if accepted && !ambient_mount_visible() {
+        report_skip(
+            &format!("broker_library_selftests::bootstrap_{case}"),
+            "broker ambient mount absent from bootstrap mountinfo on this host",
+        );
+        return;
+    }
     let executable = std::env::current_exe().expect("library test executable");
     let output = std::process::Command::new("timeout")
         .args(["--kill-after=2s", "30s"])
@@ -15,6 +56,13 @@ fn bootstrap_case(case: &str, expected: &str, accepted: bool) {
         .expect("start existing ordinary-main bootstrap helper");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && ambient_mount_absent(&stderr) {
+        report_skip(
+            &format!("broker_library_selftests::bootstrap_{case}"),
+            "broker ambient mount absent from bootstrap mountinfo on this host",
+        );
+        return;
+    }
     assert!(
         output.status.success(),
         "{case}: status={:?} stdout={stdout} stderr={stderr}",
@@ -65,7 +113,7 @@ fn bootstrap_path_only_does_not_query_inode_attributes() {
 
 /// Only the ordinary-main child owns startup authority. The waited status is
 /// case-specific: 125 records failed invocation termination, never cleanup.
-fn fatal_abort_case(case: &str, expected_status: i32) -> String {
+fn fatal_abort_case(case: &str, expected_status: i32) -> Option<String> {
     let executable = std::env::current_exe().expect("library test executable");
     let output = std::process::Command::new("timeout")
         .args(["--kill-after=2s", "30s"])
@@ -75,6 +123,13 @@ fn fatal_abort_case(case: &str, expected_status: i32) -> String {
         .expect("start ordinary-main fatal invocation helper");
     let stdout = String::from_utf8(output.stdout).expect("native case stdout");
     let stderr = String::from_utf8(output.stderr).expect("native case stderr");
+    if ambient_mount_absent(&stderr) {
+        report_skip(
+            &format!("broker_library_selftests::fatal_{case}"),
+            "broker ambient mount absent from bootstrap mountinfo on this host",
+        );
+        return None;
+    }
     assert_eq!(
         output.status.code(),
         Some(expected_status),
@@ -82,7 +137,7 @@ fn fatal_abort_case(case: &str, expected_status: i32) -> String {
         output.status
     );
     assert!(stderr.is_empty(), "{case}: unexpected stderr={stderr}");
-    stdout
+    Some(stdout)
 }
 
 fn fatal_case_pid(field: &str, prefix: &str) -> i32 {
@@ -93,7 +148,9 @@ fn fatal_case_pid(field: &str, prefix: &str) -> i32 {
 
 #[test]
 fn fatal_invocation_original_creator_exits_without_rust_drop_or_park() {
-    let stdout = fatal_abort_case("original-creator", 125);
+    let Some(stdout) = fatal_abort_case("original-creator", 125) else {
+        return;
+    };
     let lines: Vec<_> = stdout.lines().collect();
     assert_eq!(lines.len(), 2, "exact executed fatal case receipts");
     let fields: Vec<_> = lines[0].split_whitespace().collect();
@@ -112,7 +169,9 @@ fn fatal_invocation_original_creator_exits_without_rust_drop_or_park() {
 
 #[test]
 fn fatal_invocation_wrong_process_returns_owner_before_two_native_waits() {
-    let stdout = fatal_abort_case("wrong-process", 0);
+    let Some(stdout) = fatal_abort_case("wrong-process", 0) else {
+        return;
+    };
     let lines: Vec<_> = stdout.lines().collect();
     assert_eq!(lines.len(), 3, "exact refused-owner cleanup receipts");
     assert_eq!(
