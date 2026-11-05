@@ -9,7 +9,8 @@ plus a `println!`.
 
 ## What you get
 
-* `Sysno` — the syscall number as an enum, not an integer to look up.
+* `Sysno` — the syscall number as an enum (re-exported from the
+  `syscalls` crate), not an integer to look up.
 * `Syscall` and the per-syscall argument structs — pattern-match the
   syscall you care about; the compiler checks you used the right
   argument meanings.
@@ -17,9 +18,11 @@ plus a `println!`.
   you read *from the guest* with the backend's memory implementation,
   so the same tool code works whether the guest is across a ptrace
   boundary or in-process.
-* Display — every typed syscall formats itself the way `strace` would,
-  which makes logging handlers one-liners and diffing two backends'
-  traces a text operation.
+* Pretty-printing — deliberately *not* `std::fmt::Display` (formatting
+  needs guest memory), but `Displayable::display(&memory)`: every
+  typed syscall formats itself the way `strace` would, which makes
+  logging handlers one-liners and diffing two backends' traces a text
+  operation.
 
 ## The discipline typed wrappers enforce
 

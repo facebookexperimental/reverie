@@ -13,15 +13,17 @@ summarizes and must not contradict.
 
 | Backend | Mechanism | Generic `Backend`? | Tool runs… | Status |
 |---|---|---|---|---|
-| `reverie-ptrace` | seccomp `TRACE` filters + ptrace stops | yes — the reference | in the tracer | full lifecycle; slowest per event |
+| `reverie-ptrace` | seccomp `TRACE` filters + ptrace stops | yes — the reference | in the tracer | full lifecycle following; **signal fidelity Partial with named holes** (held-signal windows — and "same semantics" includes those holes until fixed in the reference first); slowest per event |
 | `reverie-liteinst` | shared seccomp `SIGSYS` trap; first use installs a LiteInst patch at the site | yes, with boundaries | in the guest (tool DSO) | dynamically linked x86-64; documented lifecycle limits |
 | in-guest-trap | LiteInst runtime with site patching off: every syscall traps | via the same runtime | in the guest | the patching backends' semantic reference |
 | `reverie-kvm` (+ `-core`) | VM exits from a KVM guest | specialized runner, not the generic trait | in the host, per-thread state in `KvmGuest` | static-ELF personality, growing. **`reverie-linuxemu` is KVM-internal** — its userspace Linux emulation is a building block of this backend, not a backend or Tool-contract surface of its own, and it gets no column in the conformance matrix |
 | e9patch, SaBRe, DynamoRIO | AOT rewrite, load-time rewrite, DBT | e9patch has a generic (ptrace-hosted) mode | varies | external repositories own these |
 
-In architecture vocabulary each backend is a **cell** — one activation
-(A) × one mechanism (B) × one placement (D): ptrace is A1×B7×out,
-`InGuestTrap` is A2×B1×in today, `Liteinst` adds B3, and so on
+In architecture vocabulary a **cell** is one activation (A) × one
+mechanism (B) × one placement (D) combination — and a single backend
+can host more than one cell (`LiteinstBackend` runs both the B3
+patching cell and, with patching off, the B1 in-guest-trap cell):
+ptrace is A1×B7×out, `InGuestTrap` is A2×B1×in today, and so on
 ([Mechanisms](mechanisms.md) has the full axis list). Note also that
 Reverie's LiteInst binding still pins an October LiteInst revision
 (1,971 commits behind `liteinst` 0.2.0): "LiteInst can do X" and "a

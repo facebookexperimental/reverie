@@ -10,7 +10,8 @@
 | `reverie-liteinst` (+ `-artifact`, `-preload`) | in-guest LiteInst patching backend + preload hosting | [Backends](backends.md) |
 | `reverie-loader` | image validation, gate audit, init stages | [Loaders](loaders.md) |
 | `reverie-kvm`, `reverie-kvm-core` | KVM backend (specialized runner) | [Backends](backends.md) |
-| `reverie-linuxemu`, `reverie-linux-provider` | KVM-internal userspace Linux emulation/provider — not a backend or Tool-contract surface | [Backends](backends.md) |
+| `reverie-linuxemu` | KVM-internal userspace Linux emulation — not a backend or Tool-contract surface | [Backends](backends.md) |
+| `reverie-linux-provider` | **Deprecated shim** re-exporting `reverie::provider` for one release (used by KVM *and* ptrace/in-guest provider paths); import from core instead | [Mechanisms](mechanisms.md) |
 | `reverie-rpc-transport` | UDS framed RPC (`RpcServer`, blocking/async clients) | [State](state.md) |
 | `reverie-examples` | the tool gallery + cross-backend launchers + e2e harness | [First tool](first-tool.md), [Testing](testing.md) |
 | `reverie-test-support` | shared test fixtures | [Testing](testing.md) |
@@ -19,6 +20,11 @@ External backends (DynamoRIO, SaBRe, e9patch) live in their own
 repositories; `docs/BACKEND_SOURCES.md` records ownership and license
 notes. The mechanism matrix in `BACKENDS.md` is the deep reference
 this guide summarizes.
+
+Scope note: the workspace's `experimental/` members (`nostd-print`,
+`reverie-rpc-macros`, `reverie-rpc`, `riptrace/rpc`) are deliberately
+omitted above — they are experiments, not part of the surface this
+guide teaches.
 
 Published crates (`reverie-core`, `reverie-ptrace`,
 `reverie-syscalls`, `reverie-process`, `reverie-memory`,

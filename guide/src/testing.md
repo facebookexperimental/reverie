@@ -36,11 +36,19 @@ Handler logic that does not need a live guest — argument rewriting
 rules, RPC accounting, path policies — should be factored into plain
 functions and unit-tested without a backend. Reserve live-guest tests
 for what only a live guest can prove: lifecycle, memory access,
-injection, signal interplay. The workspace runs its tests as:
+injection, signal interplay. The README's quick local run is:
 
 ```console
 $ cargo test --features reverie-ptrace/nightly -- --test-threads=1
 ```
+
+CI itself (`.github/workflows/ci.yml`) runs the workspace with
+`--all-features`: on hosted runners with the device-dependent crates
+excluded (`--exclude reverie-kvm --exclude reverie-kvm-core
+--exclude reverie-linuxemu --exclude reverie-inguest`) plus
+`cargo test --workspace --doc`, and on the self-hosted hardware
+job the full workspace. Quote CI, not the README, when you need the
+authoritative invocation.
 
 (Function-guest tests that collect printing macros need that feature,
 or run on stable with `--nocapture`; the ptrace crate's README

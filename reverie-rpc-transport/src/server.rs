@@ -853,7 +853,7 @@ where
     /// Identifies the process that opened each later connection and hands it
     /// to the global tool with every request from that connection, through
     /// [`GlobalTool::receive_rpc_with_identity`]
-    /// (https://github.com/rrnewton/hermit/issues/4362, part 2 step 1).
+    /// (<https://github.com/rrnewton/hermit/issues/4362>, part 2 step 1).
     ///
     /// On accept, the server takes the connecting process's pidfd
     /// (`SO_PEERPIDFD`, recorded by the kernel at `connect`) and asks the

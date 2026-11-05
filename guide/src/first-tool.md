@@ -21,8 +21,9 @@ Every Reverie tool is a pair:
 * the **global half** (`GlobalTool`) — one instance for the whole
   guest tree, reached from handlers by RPC.
 
-Listing FT-1 is the whole counter. It is short because the framework
-carries the machinery; your code carries only the policy.
+Listing FT-1 is the counter's policy (the full file adds only a
+`total()` accessor and a tracing line). It is short because the
+framework carries the machinery; your code carries only the policy.
 
 <span class="filename">Listing FT-1: reverie-examples/counter1_tool.rs</span>
 
@@ -82,10 +83,14 @@ Breaking it down:
   process boundary, while on ptrace it compiles down to a local call.
   The tool doesn't know which — and must not care.
 * `guest.tail_inject(syscall)` means "now actually perform the syscall
-  I was handed, and return its result." Most observability tools end
-  most handlers this way. (Return a value yourself instead, and you
-  have *elided* the syscall; return an error, and you have injected a
-  failure. `chaos` does both.)
+  I was handed" — and it **never returns** (its type is `Never`): the
+  guest resumes after the syscall, and the handler frame is gone, so
+  the result can neither be inspected nor altered afterwards. Most
+  observability tools end most handlers this way. When you *do* need
+  the result, use `guest.inject(...)` and return (or transform) it
+  yourself. (Return a value without injecting, and you have *elided*
+  the syscall; return an error value, and you have injected a failure.
+  `chaos` does both.)
 * `init_global_state` runs once for the tree. `Config` is `()` here;
   real tools take their run-time configuration through it.
 
@@ -104,7 +109,9 @@ let (exit_status, global_state) =
 The examples' shared launcher (`reverie-examples/backend.rs`) goes one
 step further: `--backend ptrace|liteinst|in-guest-trap|kvm` runs the
 *same* `T: Tool` through each backend's public entry point, so one
-tool and one program can be compared across mechanisms. A backend
+tool can be compared across mechanisms — with the program eligibility
+each backend states (KVM, for example, takes static ELF guests only).
+A backend
 either runs the tool or refuses by name (`RunError::Refused`) — for
 example, the in-guest backends refuse when no preload compiling your
 tool in can be found, saying so in the error. Keep that distinction in

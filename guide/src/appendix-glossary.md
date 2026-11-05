@@ -4,11 +4,14 @@
 loader, preload, custom loader, attach). Distinct from the
 interception mechanism used afterwards.
 
-**Axes (A/B/D)** — the toolkit choices: activation (A1–A5),
-interception mechanism (B1 seccomp trap, B2 SUD, B3 patching, B4 page
-gates, B5 offline rewriting, B6 translation, B7 ptrace), tool
-placement (D: in-guest / out-of-process). A **cell** (combination,
-V1–V11 valid, I1–I8 invalid) is one pick per axis.
+**Axes (A–E)** — the toolkit choices: activation (A1–A5),
+interception mechanism (B1 seccomp trap, B2 SUD *(absent in Reverie
+today)*, B3 patching, B4 page gates *(not yet selectable)*, B5
+offline rewriting, B6 translation *(unbuilt)*, B7 ptrace),
+nondeterministic-instruction control (C), tool placement (D:
+in-guest / out-of-process), and lifecycle coverage (E). A **cell**
+(combination, V1–V11 valid, I1–I8 invalid) is one A×B×D pick plus
+its C/E guarantees.
 
 **Backend** — a complete, tool-generic implementation of guest
 supervision + interception (`reverie::Backend`). Not a bare mechanism.
@@ -33,14 +36,17 @@ hosts it inside the guest for in-guest backends.
 injection (`LinuxProvider`): the host kernel (ptrace, in-guest) or an
 emulated personality (KVM).
 
-**Probes (P1–P10)** — the selector's pure environment observations
-(ptrace usable, existing tracer, seccomp, SUD, CPUID faulting, TSC,
-W^X policy, signal ownership, census feasibility, arch floor).
-Unknown counts as absent.
+**Probes (P1–P10)** — *(proposed, pending owner approval of the
+architecture contract; no probe suite exists in code yet)* the
+selector's pure environment observations (ptrace usable, existing
+tracer, seccomp, SUD, CPUID faulting, TSC, W^X policy, signal
+ownership, census feasibility, arch floor). Unknown counts as absent.
 
 **Refusal (`R-*`)** — a named declination to run a tool/program/cell
-combination (`R-WINDOW`, `R-CODE`, `R-EXEC`, …), carrying its filter
-trace. Fail-closed behaviour, not an error to hide.
+combination (`R-WINDOW`, `R-CODE`, `R-EXEC`, …). The fail-closed
+*behaviour* is current (surfaced today as `ENOSYS`/`EOPNOTSUPP`-style
+errors); the `R-*` *names* and their filter traces are proposed,
+pending owner approval.
 
 **Requirements (`ToolRequirements`)** — (proposed) how a tool states
 what it needs — window, instruction classes, lifecycle, placement —

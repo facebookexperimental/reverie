@@ -17,11 +17,16 @@ sites it was installed on, full stop.
 A *trap* catches what no hook covered, and its default must fail
 closed. The shared in-guest runtime (`reverie-inguest`) is Reverie's
 completeness trap for the patching backends: a seccomp filter turns
-every syscall into `SIGSYS`, a common handler owns the trusted gate
-and event-origin tagging, and a missed or unpatchable site still
-reaches the dispatcher — or fails with a named error (an unpatchable
-generic-tool site yields `EOPNOTSUPP` rather than running arbitrary
-Rust in signal context). Ptrace's completeness boundary is its
+syscalls into `SIGSYS` — with named exceptions (`rt_sigreturn` must
+run, the runtime's own trusted gate sites must not re-trap, and vDSO
+fast paths plus the ~40 loader/startup syscalls before the
+constructor are outside coverage; the filter documents its boundary
+in `reverie-inguest/src/seccomp.rs`) — a common handler owns the
+trusted gate and event-origin tagging, and a site with no hook
+(`NotPatched`) runs through the dispatcher's *fallback continuation*
+in normal context. Only when the backend refuses the site, or no
+continuation is available, does the trap fail with `EOPNOTSUPP`
+rather than running arbitrary Rust in signal context. Ptrace's completeness boundary is its
 subscription-derived seccomp `TRACE` filter: unsubscribed syscalls are
 *deliberately* allowed, which is sound only because the subscription
 is the tool's own declaration.

@@ -6,7 +6,7 @@ mechanism (a VM, a sandbox, a rewriter). It is a complete
 implementation of process supervision and event interception that
 hosts an **arbitrary** `T: Tool`.
 
-## The nine duties
+## The ten duties
 
 Given a command and the tool's static configuration, your backend must:
 
@@ -29,9 +29,16 @@ Given a command and the tool's static configuration, your backend must:
    collector; unsupported measurements are absent, never zero.
 9. **Capture output on request** — guest stdout/stderr bytes alongside
    status, state, and stats.
+10. **Describe itself** — `fn capabilities()` returns your backend's
+    static `BackendCapabilities`. It has *no default implementation*
+    (deliberately: inheriting another backend's answer would silently
+    misinform the tool), and `type Stats: BackendStatsSnapshot` is
+    likewise required. A backend built to duties 1–9 alone does not
+    compile — this duty is part of the trait, not garnish.
 
-The `reverie::Backend` trait captures duties 1–9 as `run`,
-`run_with_stats`, and `run_with_output`. A real backend also exposes a
+The `reverie::Backend` trait captures duties 1–10 as `run`,
+`run_with_stats`, `run_with_output`, `capabilities()`, and
+`type Stats`. A real backend also exposes a
 richer native builder (ptrace's `TracerBuilder`/`Tracer` adds a GDB
 server, function guests, and lifecycle/stdio control) — but the trait
 surface is the peer contract, and it is not optional garnish.

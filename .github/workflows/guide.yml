@@ -7,7 +7,9 @@ name: Guide
 # Deployment is a NO-OP until GitHub Pages is enabled for this repo
 # (Settings -> Pages -> Source: "GitHub Actions", a repo-admin/owner
 # decision) AND the repo variable ENABLE_PAGES is set to "true". The
-# build job always runs; upload/deploy are skipped while unenabled, so
+# build job runs whenever ci.yml's PR gating admits the run (draft and
+# hermit-bot3 PRs are skipped, matching base policy); upload/deploy are
+# skipped while unenabled, so
 # this workflow can merge before Pages exists.
 
 on:
@@ -18,8 +20,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: guide-${{ github.ref }}
@@ -53,7 +53,9 @@ jobs:
           echo "counted=$counted stated=$stated"
           [ "$counted" = "$stated" ]
       - uses: dtolnay/rust-toolchain@nightly
-      - name: API docs (workspace, no deps)
+      - name: API docs (workspace, no deps, warnings denied)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --all-features --no-deps
       - name: Upload Pages artifact
         if: vars.ENABLE_PAGES == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -65,6 +67,9 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     if: vars.ENABLE_PAGES == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
     runs-on: ubuntu-latest
     environment:
       name: github-pages

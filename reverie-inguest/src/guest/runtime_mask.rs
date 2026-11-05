@@ -10,7 +10,7 @@
 //! signal-delivery gate.
 //!
 //! The gate is the Tool's configuration predicate
-//! [`reverie::Tool::in_guest_signal_delivery`], read once, when the runtime is
+//! `reverie::Tool::in_guest_signal_delivery`, read once, when the runtime is
 //! installed in a process ([`enable`]), into a process-global flag that a fork
 //! child inherits with the rest of the process's memory. With it false nothing
 //! here runs and nothing changes. With it true:
@@ -68,7 +68,7 @@ static CACHED_TID: AtomicI32 = AtomicI32::new(0);
 static CACHED_PID: AtomicI32 = AtomicI32::new(0);
 
 /// Whether this process's runtime delivers signals itself: the Tool's
-/// [`reverie::Tool::in_guest_signal_delivery`], read once at installation.
+/// `reverie::Tool::in_guest_signal_delivery`, read once at installation.
 pub fn delivers_signals() -> bool {
     DELIVERS.load(Ordering::Acquire)
 }

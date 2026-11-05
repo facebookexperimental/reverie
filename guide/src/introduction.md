@@ -50,9 +50,10 @@ work, marked as such.
   intercepting events, hosting global state, tearing down. Backends
   are swappable: the same tool must run unchanged on any backend, or
   be refused by name.
-* A **subscription** is the tool's declaration of which event streams
-  it wants. Backends trap exactly what was subscribed — no more (you
-  pay for what you trap), no less (silence is not a semantics).
+* A **subscription** is the tool's declaration of which syscalls (and,
+  on x86-64, which of CPUID/RDTSC) to trap. Backends trap exactly what
+  was subscribed — no more (you pay for what you trap), no less
+  (silence is not a semantics).
 
 ## How to read this book
 
@@ -60,8 +61,10 @@ Read front to back the first time. [Your first tool](first-tool.md)
 builds a working syscall counter early and previews the whole API;
 concept chapters then take each piece apart; project-flavoured
 sections grow the counter into a distributed, multi-process tool.
-Every chapter ends with commands you can run against
-`reverie-examples` and the output to expect.
+Project chapters end with commands you can run against
+`reverie-examples`; concept chapters point at the example that
+exercises the idea (and say so under construction where the runnable
+listing does not exist yet).
 
 Boxes you will meet: **Under construction** (unfinished guide or
 feature, with its TODO), **Refusal** (a backend declines by name

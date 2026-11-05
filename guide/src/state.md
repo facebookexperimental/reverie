@@ -33,11 +33,13 @@ Rules that follow from the table:
 
 `counter1` sent one RPC per syscall — simple, and exactly wrong at
 scale. `counter2` keeps the count where it happens: each thread
-accumulates locally, each process folds its threads' totals in, and
-the process contributes to global state **once**. A thread report
-never double-adds what the process already contributed, and the final
-report goes through global state, so it survives even a guest that
-closes stderr.
+accumulates locally and sends **one** `ThreadReport` RPC at exit
+(which the global half records *without* adding it to the tree
+totals), each process folds its threads in, and the process
+contributes its totals to global state **once** at exit
+(`ProcessExit`). No double-counting by construction. The launcher
+then prints the tree totals it reads back from the returned global
+state, so the report survives even a guest that closes stderr.
 
 That is the MapReduce shape most real tools want: *map* in thread
 state (cheap, uncontended), *reduce* at process and tree boundaries
@@ -48,10 +50,13 @@ a turn, a deterministic clock — and expect to pay for it (see
 
 ## Common state bugs
 
-* **Counting in the wrong lifetime.** State that must survive `exec`
-  belongs in global state or must be re-established in
-  `handle_post_exec`; process state after exec is a design decision
-  your tool must make explicitly, per backend contract.
+* **Counting in the wrong lifetime.** The trait contract is explicit:
+  thread *and* process state are **unchanged across the `execve`
+  boundary** (`handle_post_exec`'s documentation) — the new image
+  inherits your tool state, it does not reset it. Tools that want a
+  clean slate per image must reset deliberately in
+  `handle_post_exec`; state that must outlive the whole tree belongs
+  in global state regardless.
 * **Assuming `receive_rpc` ordering across processes.** RPCs from
   different guest processes race exactly as their senders do. If order
   matters, carry sequence information in the request.

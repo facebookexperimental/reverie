@@ -253,7 +253,7 @@ pub fn verify_guest_receipt(
 /// child that is making progress can pass a tight wall bound while descheduled.
 /// A caller that bounds work gives each command its own CPU budget through
 /// [`Runner::run_cpu_bounded`]. That command runs in a fresh child of this
-/// process's cgroup ([`CommandCgroup`]), so `cpu.stat` counts the CPU of every
+/// process's cgroup (`CommandCgroup`), so `cpu.stat` counts the CPU of every
 /// process it starts, reaped or not, and `cgroup.kill` reaches all of them.
 pub struct Runner {
     pub logs: PathBuf,
@@ -1119,8 +1119,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-inguest/src/guest/runtime_mask.rs",
-        31559,
-        "1b155030b0440bf0b7a89283aebe925a67cd9c58896c2356d89859ac51457441",
+        31555,
+        "a02f801df3187185afb7d05357f753f26e7309462be7d3be67856500e9d45ecb",
     ),
     (
         "reverie-inguest/src/guest/sigalrm.rs",
@@ -1384,8 +1384,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        225914,
-        "dd65b2d0fdf8350734566ccbcdf3e0c75f8752c527e719e87ee13a536dd7a940",
+        225912,
+        "107c375b5016d8357184184c6c496587648425708b6f561262e9fb6fe4e3276c",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
@@ -1480,8 +1480,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-rpc-transport/src/server.rs",
-        121451,
-        "fdd1dd8a2d635426bab2bcd17867b70447cbffa52440bf08930432e904008ad2",
+        121453,
+        "fdc6396f781ca59bf8f1b54886401ba36a466d4c12a88b0d90d51326fe4c91e5",
     ),
     (
         "reverie-rpc-transport/src/blocking_client.rs",

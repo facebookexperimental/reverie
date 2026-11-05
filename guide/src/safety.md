@@ -20,12 +20,15 @@ violation, and the conformance suite exists to catch it
   dispatcher or fails; it never executes unobserved by accident.
   Unsubscribed syscalls execute only because the tool's subscription
   *declared* them unobserved.
-* **Patching:** an unpatchable site becomes a trap or a refusal
-  (`EOPNOTSUPP`), never a best-effort patch and never arbitrary Rust
+* **Patching:** a site with no hook runs the fallback continuation;
+  only a refused site (or an unavailable continuation) fails with
+  `EOPNOTSUPP` — never a best-effort patch and never arbitrary Rust
   in signal context.
 * **Activation:** a mode with an unmonitored window (preload) must be
-  *chosen* with the window declared; selection never downgrades
-  silently ([Mechanisms](mechanisms.md)).
+  *chosen* with the window declared. The no-silent-downgrade
+  *selection rule* that will enforce this mechanically is proposed
+  (pending owner approval — [Mechanisms](mechanisms.md)); today the
+  embedding binary makes the choice explicitly instead.
 * **Statistics:** unsupported measurements are absent, not zero.
 
 ## 3. The guest is not trusted; neither is the tool
@@ -43,7 +46,9 @@ Threads (`clone`), signals (including who owns `SIGTRAP`/`SIGSEGV`
 against guest handlers), `fork`, `exec` and successor images, `vfork`,
 and mapping churn (`dlopen`, JIT code) are where per-backend semantics
 diverge first. The current honest state, in brief: the ptrace backend
-covers the full lifecycle; in-guest paths cover documented subsets
+follows the full lifecycle (with *Partial* signal fidelity — named
+held-signal holes that count as part of the reference semantics);
+in-guest paths cover documented subsets
 and refuse outside them (guest-installed callable signal handlers are
 the canonical example); KVM's personality is narrower still. Any claim
 stronger than the per-backend tables in the repository's

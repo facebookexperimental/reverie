@@ -36,13 +36,13 @@ The gallery, graded by complexity:
 
 | Example | What it teaches |
 |---|---|
-| `noop` | The identity tool: intercept everything, change nothing. The overhead baseline and the best starting skeleton. |
+| `noop` | The empty tool: subscribes to *nothing* (`Subscription::none()`), so it intercepts nothing. The framework-overhead baseline and the best starting skeleton. |
 | `counter1` | Counting syscalls into one centralized global state. |
 | `counter2` | The same count, MapReduce-style: per-thread, per-process, and global state. |
 | `strace` / `strace_minimal` | Echoing events with typed-syscall pretty-printing. |
 | `chunky_print` | Intercepting `write` to gate and reorder output. |
 | `chaos` | Failure injection: one-byte reads and injected `EINTR`. |
-| `chrome-trace` | Emitting a `chrome://tracing/` trace file. |
+| `chrome_trace` | Emitting a `chrome://tracing/` trace file. |
 | `debug` | Acting as a GDB server for the guest. |
 
 ## The same tool, another backend

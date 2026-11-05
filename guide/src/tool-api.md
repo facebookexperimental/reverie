@@ -13,9 +13,10 @@ you override only what you subscribe to:
 
 | Handler | Event | Default |
 |---|---|---|
-| `handle_syscall_event` | a syscall at entry | (required — the raison d'être) |
+| `handle_syscall_event` | a syscall at entry | `tail_inject` (perform it unchanged) — override only to do more |
 | `handle_thread_start` | a new thread | no-op |
-| `handle_post_exec` / `handle_exec_commit` | after a successful `execve` | no-op |
+| `handle_post_exec` | after a successful `execve`, in the new image (thread/process state carried across unchanged) | no-op |
+| `handle_exec_commit` | *before* the image is replaced, once an injected exec can no longer fail; old image still live; **KVM-family only today**, and injecting a syscall here is refused | no-op |
 | `handle_signal_event` (+ raw/structured variants) | an inbound signal | deliver normally |
 | `handle_timer_event` | a tool-scheduled timer | no-op |
 | `handle_cpuid_event`, `handle_rdtsc_event` | those instructions (x86-64, subscription-gated) | execute natively |
@@ -33,11 +34,14 @@ lifecycle coverage is precisely where backends differ today (see
 Every handler receives `guest: &mut T` where `T: Guest<Self>`. Through
 it a tool can:
 
-* read and write guest memory and registers (with typed access to
-  syscall arguments — next chapter but one);
-* **inject** syscalls: perform this syscall (`tail_inject`), perform a
-  different or additional syscall, or perform none and fabricate the
-  result;
+* read and write guest memory, and read registers (with typed access
+  to syscall arguments — next chapter but one). Writing the full
+  register file (`set_regs`) is *not* universal: its default returns
+  `Errno::ENOSYS`, and only backends that implement it accept it —
+  the fail-closed pattern for every optional `Guest` operation;
+* **inject** syscalls: perform this syscall and never come back
+  (`tail_inject` → `Never`), perform one and get its result
+  (`inject`), or perform none and fabricate the result;
 * **send RPC** to global state (`send_rpc`), typed by your
   `GlobalTool::Request`/`Response`;
 * schedule timers, query task identity, and — where the backend
@@ -49,8 +53,10 @@ run concurrently, because on most backends they do.
 
 ## Subscriptions: trap only what you need
 
-`Tool::subscriptions` declares the event streams (and, within syscalls,
-the specific numbers) the tool cares about. The backend turns that
+`Tool::subscriptions` declares what to trap: the specific syscall
+numbers, plus (on x86-64) the CPUID and RDTSC instruction classes.
+Other events (signals, timers, lifecycle) arrive by their own rules,
+not via subscription. The backend turns that
 into its cheapest exact filter — a seccomp filter, a patch set, a
 hypercall mask. Subscribing to everything when you only need `openat`
 is the single most common self-inflicted slowdown; the
@@ -62,14 +68,18 @@ to let it run natively.
 Note what a subscription is *not*: a mechanism choice. A tool declares
 *events*, never *mechanisms* — today the embedding binary hard-wires
 the backend, and the proposed `ToolRequirements` value (window,
-instruction classes, lifecycle, placement; strictest by default) is
-how a tool will state what it needs without naming a backend. See
+instruction classes, lifecycle, placement; strictest by default —
+*proposed, pending owner approval of the architecture contract; no
+such type exists in code yet*) is how a tool will state what it needs
+without naming a backend. See
 [Mechanisms](mechanisms.md#selection-requirements-probes-refusals).
 
 ## Errors
 
-Handlers return `Result<_, Error>` (or `Errno` where the guest must
-see a specific errno). Distinguish three intents that novices merge:
+Most handlers return `Result<_, Error>` (or `Errno` where the guest
+must see a specific errno); a few return `()` and cannot fail
+(`handle_timer_event` is one — design timer work accordingly).
+Distinguish three intents that novices merge:
 
 * **Guest-visible failure** — you *want* the syscall to fail: return
   the errno as the syscall result. The guest continues, chastened.

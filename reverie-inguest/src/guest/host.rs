@@ -3566,7 +3566,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
     }
 
     /// Qualified at the guest's trusted physical gate, where this backend's
-    /// forwarded syscalls run ([`host_linux::forward`]), and only inside the
+    /// forwarded syscalls run (`host_linux::forward`), and only inside the
     /// admitted Tool callback that owns this guest thread's turn. Outside
     /// that scope, or once the guest admitted a seccomp filter of its own
     /// (which could fail or fake the gate's calls), nothing is executed and

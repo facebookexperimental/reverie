@@ -40,11 +40,12 @@ that design: image validation (fixed-address `ET_EXEC`, no
 interpreter, no dynamic section, W^X, page-aligned segments in an
 allowed window), the syscall-gate audit, artifact checks, and the
 stage types. It is `no_std` so the loader itself can use it. Note the
-gap precisely: the typestate stage chain is currently **dead code** —
-its constructors are crate-private and nothing outside the crate
-consumes it — and the only integration is Hermit-private glue. The
-mechanics live in `reverie-inguest`; the *generic interface* is the
-missing piece.
+gap precisely: `reverie-inguest` *does* integrate loader mechanics
+in-repo (the `exec-stop` and `loader-private-runtime` features), but
+the typestate stage chain itself is currently **dead code** — its
+constructors are crate-private and nothing consumes `stage::` — and
+the end-to-end A1 integration that exists is Hermit-private glue. The
+*tool-generic interface* is the missing piece, not the mechanics.
 
 The tool-agnostic contract (L1 design, adopted by the architecture
 §4.3) is: a tool provides a data-only **`ToolManifest`** — one
