@@ -830,6 +830,12 @@ impl FromStr for Mount {
 
         if is_bind_mount {
             mount = mount.flags(MountFlags::MS_BIND);
+        } else {
+            // A fresh filesystem's target is only a mountpoint: create it
+            // (with the same nofollow checks as pinned targets) instead of
+            // failing where it does not exist yet. Bind mounts keep
+            // requiring their target.
+            mount = mount.touch_target();
         }
 
         if let Some((key, value)) = map.remove_entry("readonly") {
@@ -977,9 +983,14 @@ mod tests {
             Mount::from_str("src=/foo,target=/bar,bind-propagation=rshared"),
             Ok(Mount::bind("/foo", "/bar").rshared())
         );
+        // A parsed fresh filesystem creates its target like Docker and like
+        // Mount::tmpfs("/test").touch_target() in container setup: the
+        // mountpoint must exist for mount(2), and creating it is always
+        // right for a fresh filesystem. Bind mounts keep requiring their
+        // target, so a typo'd path still fails instead of mounting empty.
         assert_eq!(
             Mount::from_str("type=tmpfs,target=/tmp"),
-            Ok(Mount::tmpfs("/tmp"))
+            Ok(Mount::tmpfs("/tmp").touch_target())
         );
         assert_eq!(
             Mount::from_str("type=tmpfs,target=/tmp,bind-propagation=rprivate"),

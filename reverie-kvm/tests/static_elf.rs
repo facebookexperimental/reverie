@@ -8,6 +8,10 @@
 
 #![cfg(target_arch = "x86_64")]
 #![allow(clippy::disallowed_methods, reason = "tests may make threads freely")]
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::FileTypeExt;
@@ -18545,6 +18549,10 @@ impl Tool for ClockTimestampTool {
     }
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+)]
 #[test]
 fn timestamp_callbacks_observe_retired_branches_without_counting_rpc_work() {
     if !kvm_available("KVM timestamp callback clock test") {
@@ -20237,6 +20245,10 @@ int main(int argc, char **argv) {
     }
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: needs /dev/kvm and exact PMU branch counts"
+)]
 #[test]
 fn storage_fd_syscalls_consume_low_words_on_kvm() {
     if !kvm_available("KVM storage fd low-word argument test") {

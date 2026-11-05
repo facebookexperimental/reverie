@@ -12,18 +12,26 @@
 #![cfg(target_arch = "x86_64")]
 
 use raw_cpuid::CpuIdResult;
+#[cfg(all(not(sanitized), test))]
 use reverie::Errno;
+#[cfg(all(not(sanitized), test))]
 use reverie::GlobalTool;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Pid;
+#[cfg(all(not(sanitized), test))]
 use reverie::Subscription;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct GlobalState {
     clock: u64,
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::global_tool]
 impl GlobalTool for GlobalState {
     type Request = ();
@@ -37,9 +45,11 @@ impl GlobalTool for GlobalState {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState {}
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = GlobalState;
@@ -62,19 +72,23 @@ impl Tool for LocalState {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 trait Cpuid {
     fn cpuid(&self, index: u32) -> Option<CpuIdResult>;
 }
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Clone, Copy)]
 struct InterceptedCpuid();
 
+#[cfg(all(not(sanitized), test))]
 impl InterceptedCpuid {
     pub fn new() -> Self {
         InterceptedCpuid()
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 impl Cpuid for InterceptedCpuid {
     fn cpuid(&self, index: u32) -> Option<CpuIdResult> {
         let request = index as usize;
