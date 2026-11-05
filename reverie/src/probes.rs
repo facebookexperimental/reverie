@@ -25,8 +25,14 @@
 //! tighten admission, never certify future code coverage.
 //!
 //! Call [`probe_environment`] from the host process before it spawns
-//! guests or extra threads: the child trials `fork`, and forked children
-//! here use only async-signal-safe operations before `_exit`.
+//! guests or extra threads: trials clone throwaway children (with a
+//! pidfd created atomically alongside each, so signalling can never
+//! address a reused pid) which use only async-signal-safe operations
+//! before `_exit`. Trial custody is bounded by monotonic deadlines; a
+//! child whose cleanup cannot finish is retained and reported by
+//! [`pending_trial_children`], never silently abandoned. If the
+//! inherited `SIGCHLD` disposition auto-reaps children, custody cannot
+//! be established and trials report `Unknown` instead of guessing.
 
 use crate::selection::ArchFloor;
 use crate::selection::CodeShape;
@@ -292,11 +298,15 @@ enum Trial {
 enum WaitReply {
     /// Still running; custody verified (it is our unreaped child).
     Running,
-    /// Exited with this status code.
+    /// Stopped (job-control or ptrace stop): live and still ours, NOT
+    /// terminal — a traced child reports stops without exiting.
+    Stopped,
+    /// Exited with this status code (terminal, reaped by this wait).
     Exited(i32),
-    /// Terminated by a signal.
+    /// Terminated by a signal (terminal, reaped by this wait).
     Signaled,
-    /// Interrupted before any state change; poll again.
+    /// Interrupted before any state change; poll again (the deadline
+    /// still applies — interruptions consume it like everything else).
     Interrupted,
     /// No such child (ECHILD): custody is lost (auto-reaped or reaped
     /// elsewhere) and the numeric pid must never be signalled again.
@@ -305,47 +315,138 @@ enum WaitReply {
     Failed,
 }
 
-/// Custody operations over one trial child. The production
-/// implementation wraps a pid; tests script replies to pin the custody
-/// discipline without forking.
+/// Outcome of a kill attempt through the stable child handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillReply {
+    /// The signal was sent to *this* child (identity-pinned handle).
+    Sent,
+    /// The child is already gone; nothing was signalled.
+    AlreadyGone,
+    /// The kill could not be sent; custody must be retained.
+    Failed,
+}
+
+/// Custody operations over one trial child, with an injected clock so
+/// the deadline discipline is testable without wall-clock sleeps. The
+/// production implementation signals through a pidfd obtained
+/// atomically at clone time, so a kill can never address a reused pid.
 trait TrialChild {
     /// One non-blocking wait poll.
     fn poll(&mut self) -> WaitReply;
-    /// Send SIGKILL. Only ever called while custody is verified
-    /// (the immediately preceding poll said `Running`).
-    fn kill(&mut self);
+    /// Kill through the identity-pinned handle (never a bare pid).
+    fn kill(&mut self) -> KillReply;
+    /// Monotonic milliseconds for deadline accounting.
+    fn now_ms(&mut self) -> u64;
     /// Pause between polls (production: a short sleep; tests: no-op).
     fn pause(&mut self);
 }
 
-/// Production [`TrialChild`] over a forked pid.
-struct PidChild(libc::pid_t);
+/// Whether reaping finished or custody remains unresolved. Unresolved
+/// custody is never silently dropped: production retains the child in
+/// the pending list (see [`pending_trial_children`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Custody {
+    /// Terminal status observed by our own wait (or custody lost to an
+    /// auto-reaper, in which case no child of ours remains).
+    Done,
+    /// The child may still exist and remains ours to reap.
+    Unresolved,
+}
+
+/// Production [`TrialChild`]: a pid plus the pidfd created atomically
+/// with it (`CLONE_PIDFD`), plus the monotonic start instant.
+struct PidChild {
+    pid: libc::pid_t,
+    pidfd: libc::c_int,
+    started: std::time::Instant,
+}
+
+impl Drop for PidChild {
+    fn drop(&mut self) {
+        if self.pidfd >= 0 {
+            // SAFETY: closing our own pidfd.
+            unsafe { libc::close(self.pidfd) };
+        }
+    }
+}
 
 impl TrialChild for PidChild {
     fn poll(&mut self) -> WaitReply {
-        let mut status: libc::c_int = 0;
-        // SAFETY: non-blocking wait on our own child by pid.
-        let waited = unsafe { libc::waitpid(self.0, &mut status, libc::WNOHANG) };
-        if waited == self.0 {
-            if libc::WIFEXITED(status) {
-                WaitReply::Exited(libc::WEXITSTATUS(status))
-            } else {
-                WaitReply::Signaled
+        // si_code values (kernel siginfo): a stopped/traced child is
+        // reported with WSTOPPED and is live, not terminal.
+        const CLD_EXITED: libc::c_int = 1;
+        const CLD_KILLED: libc::c_int = 2;
+        const CLD_DUMPED: libc::c_int = 3;
+        const CLD_TRAPPED: libc::c_int = 4;
+        const CLD_STOPPED: libc::c_int = 5;
+        // SAFETY: zeroed siginfo is the documented waitid input state.
+        let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
+        // SAFETY: waiting on our own child through its pidfd.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                self.pidfd as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WSTOPPED | libc::WNOHANG,
+            )
+        };
+        if waited == 0 {
+            // SAFETY: the kernel filled `info` for the waited==0 case
+            // (si_pid==0 when nothing changed state).
+            let (pid, status) = unsafe { (info.si_pid(), info.si_status()) };
+            if pid == 0 {
+                return WaitReply::Running;
             }
-        } else if waited == 0 {
-            WaitReply::Running
-        } else {
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => WaitReply::Interrupted,
-                Some(libc::ECHILD) => WaitReply::NoChild,
-                _ => WaitReply::Failed,
-            }
+            return match info.si_code {
+                CLD_EXITED => WaitReply::Exited(status),
+                CLD_KILLED | CLD_DUMPED => WaitReply::Signaled,
+                CLD_STOPPED | CLD_TRAPPED => WaitReply::Stopped,
+                _ => WaitReply::Running,
+            };
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => WaitReply::Interrupted,
+            Some(libc::ECHILD) => WaitReply::NoChild,
+            _ => WaitReply::Failed,
         }
     }
 
-    fn kill(&mut self) {
-        // SAFETY: killing our own verified-running child (see trait).
-        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    fn kill(&mut self) -> KillReply {
+        // SAFETY: signalling through the pidfd created with this child:
+        // it names exactly this process, or fails ESRCH — it can never
+        // address a reused numeric pid. SIGCONT follows so a stopped
+        // (e.g. traced) child actually processes the SIGKILL.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd,
+                libc::SIGKILL,
+                core::ptr::null::<u8>(),
+                0usize,
+            )
+        };
+        if sent != 0 {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => KillReply::AlreadyGone,
+                _ => KillReply::Failed,
+            };
+        }
+        // SAFETY: same identity-pinned handle; wake a stopped child so
+        // the pending SIGKILL is delivered.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd,
+                libc::SIGCONT,
+                core::ptr::null::<u8>(),
+                0usize,
+            )
+        };
+        KillReply::Sent
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        self.started.elapsed().as_millis() as u64
     }
 
     fn pause(&mut self) {
@@ -353,76 +454,187 @@ impl TrialChild for PidChild {
     }
 }
 
-/// Polls before the deadline kill (~2s at the production pause), and
-/// polls to reap after it (~500ms). Both bounds are poll counts so the
-/// discipline is testable without wall-clock sleeps.
-const TRIAL_POLLS: u32 = 400;
-const REAP_POLLS: u32 = 100;
+/// Verdict budget: the trial must conclude within this monotonic
+/// deadline, across *every* poll reply (interruptions included).
+const VERDICT_BUDGET_MS: u64 = 2000;
+/// Cleanup budget after the deadline kill.
+const CLEANUP_BUDGET_MS: u64 = 1000;
 
-/// Reap one trial child under the custody discipline: retry interrupted
-/// polls, kill only a child the previous poll verified as running, and
-/// never signal after custody is lost (ECHILD/other errors). Every loop
-/// is bounded; a child that cannot be reaped within the reap bound is
-/// reported `Inconclusive` with custody retained by the caller of last
-/// resort (init reaps it) — never claimed cleaned up.
-fn reap_trial(child: &mut dyn TrialChild) -> Trial {
-    let mut polls = 0;
+/// Reap one trial child under the custody discipline: a single monotonic
+/// deadline governs the verdict phase and a second bounds cleanup;
+/// interrupted polls consume the deadline like any other; stopped is
+/// live; the kill goes through the identity-pinned handle; after lost
+/// custody (ECHILD/other) nothing is ever signalled. Returns the verdict
+/// and whether custody is resolved — unresolved custody is the caller's
+/// to retain, never silently dropped here.
+fn reap_trial(child: &mut dyn TrialChild) -> (Trial, Custody) {
+    let verdict_deadline = child.now_ms() + VERDICT_BUDGET_MS;
     loop {
         match child.poll() {
-            WaitReply::Exited(TRIAL_OK) => return Trial::Ok,
-            WaitReply::Exited(TRIAL_REFUSED) => return Trial::Refused,
-            WaitReply::Exited(_) | WaitReply::Signaled => return Trial::Inconclusive,
-            WaitReply::Interrupted => {}
-            WaitReply::Running => {
-                polls += 1;
-                if polls > TRIAL_POLLS {
-                    break;
-                }
+            WaitReply::Exited(TRIAL_OK) => return (Trial::Ok, Custody::Done),
+            WaitReply::Exited(TRIAL_REFUSED) => return (Trial::Refused, Custody::Done),
+            WaitReply::Exited(_) | WaitReply::Signaled => {
+                return (Trial::Inconclusive, Custody::Done);
             }
-            // Custody lost or unverified: never signal the numeric pid.
-            WaitReply::NoChild | WaitReply::Failed => return Trial::Inconclusive,
+            WaitReply::NoChild | WaitReply::Failed => {
+                // Custody lost/unverified: no child remains ours to reap
+                // (auto-reap) or we cannot prove otherwise; never signal.
+                return (Trial::Inconclusive, Custody::Done);
+            }
+            WaitReply::Running | WaitReply::Stopped | WaitReply::Interrupted => {}
+        }
+        if child.now_ms() >= verdict_deadline {
+            break;
         }
         child.pause();
     }
-    // The immediately preceding poll verified the child is ours and
-    // running: this is the only kill site.
-    child.kill();
-    for _ in 0..REAP_POLLS {
-        match child.poll() {
-            WaitReply::Exited(_) | WaitReply::Signaled => break,
-            WaitReply::Interrupted | WaitReply::Running => child.pause(),
-            WaitReply::NoChild | WaitReply::Failed => break,
-        }
+    match child.kill() {
+        KillReply::Sent | KillReply::AlreadyGone => {}
+        KillReply::Failed => return (Trial::Inconclusive, Custody::Unresolved),
     }
-    Trial::Inconclusive
+    let cleanup_deadline = child.now_ms() + CLEANUP_BUDGET_MS;
+    loop {
+        match child.poll() {
+            WaitReply::Exited(_) | WaitReply::Signaled => {
+                return (Trial::Inconclusive, Custody::Done);
+            }
+            WaitReply::NoChild | WaitReply::Failed => {
+                return (Trial::Inconclusive, Custody::Done);
+            }
+            WaitReply::Running | WaitReply::Stopped | WaitReply::Interrupted => {}
+        }
+        if child.now_ms() >= cleanup_deadline {
+            return (Trial::Inconclusive, Custody::Unresolved);
+        }
+        child.pause();
+    }
 }
 
-/// Fork a throwaway child running `trial`, returning its pid wrapper.
-/// The child must use only async-signal-safe operations: it inherits a
-/// possibly multi-threaded parent's locks and must not touch Rust
-/// runtime state.
+/// Trial children whose cleanup could not finish within budget. Their
+/// custody is retained here — never dropped — and retried on later probe
+/// calls; [`pending_trial_children`] reports how many remain.
+static PENDING_CUSTODY: std::sync::Mutex<Vec<PidChild>> = std::sync::Mutex::new(Vec::new());
+
+/// How many trial children still await reaping (see module docs).
+/// Normally zero; non-zero means a trial child outlived its cleanup
+/// budget and custody was retained rather than abandoned.
+pub fn pending_trial_children() -> usize {
+    PENDING_CUSTODY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
+/// Non-blockingly retry reaping retained children; keep the rest.
+fn drain_pending_custody() {
+    let mut pending = PENDING_CUSTODY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.retain_mut(|child| {
+        matches!(
+            child.poll(),
+            WaitReply::Running | WaitReply::Stopped | WaitReply::Interrupted
+        )
+    });
+}
+
+/// Whether inherited SIGCHLD handling auto-reaps children
+/// (`SIG_IGN` or `SA_NOCLDWAIT`), which would destroy trial custody and
+/// exit-code evidence. Read-only query; on any doubt, assume yes.
+fn sigchld_auto_reaps() -> bool {
+    // SAFETY: querying the current disposition without changing it.
+    let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGCHLD, core::ptr::null(), &mut old) } != 0 {
+        return true;
+    }
+    old.sa_sigaction == libc::SIG_IGN || old.sa_flags & libc::SA_NOCLDWAIT != 0
+}
+
+/// Child entry for `clone`: runs the trial, then `_exit`. Only
+/// async-signal-safe work happens here (see [`fork_trial`]).
+extern "C" fn trial_child_entry(arg: *mut libc::c_void) -> libc::c_int {
+    // SAFETY: `arg` is the trial fn pointer passed by fork_trial.
+    let trial: fn() -> i32 = unsafe { core::mem::transmute(arg) };
+    let code = trial();
+    // SAFETY: terminating the cloned child without unwinding.
+    unsafe { libc::_exit(code) };
+}
+
+/// Create a throwaway child running `trial`, with its pidfd obtained
+/// atomically at creation (`CLONE_PIDFD`) so no numeric-pid race exists
+/// at any point. Returns `None` when custody cannot be established
+/// (auto-reaping SIGCHLD inheritance, or clone/pidfd unavailable) — no
+/// child is left running in that case beyond the failed creation itself.
 fn fork_trial(trial: fn() -> i32) -> Option<PidChild> {
-    // SAFETY: fork per the module contract; the child calls only
-    // `trial` (raw syscalls via libc) and `_exit`.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
+    drain_pending_custody();
+    if sigchld_auto_reaps() {
         return None;
     }
-    if pid == 0 {
-        let code = trial();
-        // SAFETY: terminating the forked child without unwinding.
-        unsafe { libc::_exit(code) };
+    const STACK_SIZE: usize = 1 << 20;
+    // SAFETY: anonymous stack for the clone child. Without CLONE_VM the
+    // child gets its own copy, so the parent may unmap immediately.
+    let stack = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            STACK_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if stack == libc::MAP_FAILED {
+        return None;
     }
-    Some(PidChild(pid))
+    let stack_top = unsafe { (stack as *mut u8).add(STACK_SIZE) } as *mut libc::c_void;
+    let started = std::time::Instant::now();
+    let mut pidfd: libc::c_int = -1;
+    // SAFETY: clone with a fresh stack; CLONE_PIDFD writes the pidfd to
+    // the parent-tid slot; without CLONE_VM this is fork-like. The child
+    // runs only `trial` (raw syscalls via libc) and `_exit`.
+    let pid = unsafe {
+        libc::clone(
+            trial_child_entry,
+            stack_top,
+            libc::CLONE_PIDFD | libc::SIGCHLD,
+            trial as usize as *mut libc::c_void,
+            &mut pidfd as *mut libc::c_int,
+            core::ptr::null_mut::<u8>(),
+            core::ptr::null_mut::<u8>(),
+        )
+    };
+    // SAFETY: the child (if any) runs on its own copy of the stack.
+    unsafe { libc::munmap(stack, STACK_SIZE) };
+    if pid < 0 || pidfd < 0 {
+        if pidfd >= 0 {
+            // SAFETY: closing a pidfd we just received.
+            unsafe { libc::close(pidfd) };
+        }
+        return None;
+    }
+    Some(PidChild {
+        pid,
+        pidfd,
+        started,
+    })
 }
 
 /// Run `trial` in a throwaway child and reap it under the custody
-/// discipline in [`reap_trial`].
+/// discipline in [`reap_trial`]. Unresolved custody is retained in the
+/// pending list, never dropped.
 fn run_trial(trial: fn() -> i32) -> Trial {
-    match fork_trial(trial) {
-        Some(mut child) => reap_trial(&mut child),
-        None => Trial::Inconclusive,
+    let Some(mut child) = fork_trial(trial) else {
+        return Trial::Inconclusive;
+    };
+    let (verdict, custody) = reap_trial(&mut child);
+    if custody == Custody::Unresolved {
+        PENDING_CUSTODY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(child);
+        return Trial::Inconclusive;
     }
+    verdict
 }
 
 /// Map a trial to `Knowledge<bool>`: success/refusal are observations of
@@ -450,14 +662,28 @@ fn seize_target_child() -> i32 {
 pub fn probe_ptrace_usable() -> Knowledge<bool> {
     let Some(mut child) = fork_trial(seize_target_child) else {
         return Knowledge::Unknown {
-            why: "fork for ptrace trial failed",
+            why: "trial-child custody could not be established",
         };
     };
     const PTRACE_SEIZE: libc::c_uint = 0x4206;
     // SAFETY: seizing our own child by pid; no data pointer used.
-    let seized = unsafe { libc::ptrace(PTRACE_SEIZE, child.0, 0usize, 0usize) };
+    let seized = unsafe { libc::ptrace(PTRACE_SEIZE, child.pid, 0usize, 0usize) };
     let errno = std::io::Error::last_os_error().raw_os_error();
-    let result = if seized == 0 {
+    // Bounded, custody-checked cleanup (the child pauses, so this takes
+    // the deadline-kill path by design; a stopped tracee is live, and
+    // the pidfd SIGCONT in kill() delivers the SIGKILL).
+    let (_, custody) = reap_trial(&mut child);
+    if custody == Custody::Unresolved {
+        PENDING_CUSTODY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(child);
+        // A seize result is not preserved across abandoned cleanup.
+        return Knowledge::Unknown {
+            why: "ptrace trial-child cleanup unresolved; custody retained",
+        };
+    }
+    if seized == 0 {
         Knowledge::Proved(true)
     } else if errno == Some(libc::EPERM) || errno == Some(libc::EACCES) {
         Knowledge::Proved(false)
@@ -465,11 +691,7 @@ pub fn probe_ptrace_usable() -> Knowledge<bool> {
         Knowledge::Unknown {
             why: "PTRACE_SEIZE trial failed inconclusively",
         }
-    };
-    // Bounded, custody-checked cleanup (the child pauses, so this takes
-    // the deadline-kill path by design).
-    let _ = reap_trial(&mut child);
-    result
+    }
 }
 
 /// P4 arming sequence, over an injected `prctl` so tests can pin the
@@ -786,6 +1008,10 @@ mod tests {
         replies: std::collections::VecDeque<WaitReply>,
         last: WaitReply,
         kills: usize,
+        kill_reply: KillReply,
+        polls: usize,
+        clock_ms: u64,
+        step_ms: u64,
     }
 
     impl Scripted {
@@ -794,23 +1020,33 @@ mod tests {
                 last: *replies.last().expect("non-empty script"),
                 replies: replies.iter().copied().collect(),
                 kills: 0,
+                kill_reply: KillReply::Sent,
+                polls: 0,
+                clock_ms: 0,
+                step_ms: 10,
             }
         }
     }
 
     impl TrialChild for Scripted {
         fn poll(&mut self) -> WaitReply {
+            self.polls += 1;
+            self.clock_ms += self.step_ms;
             self.replies.pop_front().unwrap_or(self.last)
         }
-        fn kill(&mut self) {
+        fn kill(&mut self) -> KillReply {
             self.kills += 1;
+            self.kill_reply
+        }
+        fn now_ms(&mut self) -> u64 {
+            self.clock_ms
         }
         fn pause(&mut self) {}
     }
 
-    /// Custody regressions (1285 findings 2–3): EINTR retries, ECHILD
-    /// never signals a possibly-reused pid, deadline kill happens only
-    /// with verified custody and is itself reaped boundedly.
+    /// Custody regressions (1285 findings 2–3, re-review): EINTR
+    /// consumes the monotonic deadline like every reply; stopped is
+    /// live; ECHILD never signals; kill failure retains custody.
     #[test]
     fn reap_trial_custody_discipline() {
         // Interrupted polls retry and reach the verdict, no kill.
@@ -820,34 +1056,76 @@ mod tests {
             WaitReply::Interrupted,
             WaitReply::Exited(TRIAL_OK),
         ]);
-        assert_eq!(reap_trial(&mut child), Trial::Ok);
+        assert_eq!(reap_trial(&mut child), (Trial::Ok, Custody::Done));
         assert_eq!(child.kills, 0);
 
-        // ECHILD: custody already lost — never kill a numeric pid that
-        // may have been reused.
+        // The reviewer's interruption witness: an all-Interrupted
+        // sequence must still terminate inside the advertised budget
+        // (10ms fake clock per poll; verdict 2000ms + cleanup 1000ms).
+        // On 83d55f46 interruptions never consumed the counter and this
+        // loop passed 502 polls without returning.
+        let mut child = Scripted::new(&[WaitReply::Interrupted]);
+        assert_eq!(
+            reap_trial(&mut child),
+            (Trial::Inconclusive, Custody::Unresolved)
+        );
+        assert!(
+            child.polls <= 310,
+            "interrupted waits escaped the deadline: {} polls",
+            child.polls
+        );
+        assert_eq!(child.kills, 1, "one identity-pinned kill at the deadline");
+
+        // Stopped (traced) is live, not terminal: custody is retained
+        // through stops until a real exit is observed.
+        let mut child = Scripted::new(&[
+            WaitReply::Stopped,
+            WaitReply::Stopped,
+            WaitReply::Exited(TRIAL_OK),
+        ]);
+        assert_eq!(reap_trial(&mut child), (Trial::Ok, Custody::Done));
+        assert_eq!(child.kills, 0);
+
+        // ECHILD: custody already lost — never kill.
         let mut child = Scripted::new(&[WaitReply::NoChild]);
-        assert_eq!(reap_trial(&mut child), Trial::Inconclusive);
+        assert_eq!(reap_trial(&mut child), (Trial::Inconclusive, Custody::Done));
         assert_eq!(child.kills, 0, "kill after ECHILD is a PID-reuse hazard");
 
         // Other wait failures likewise never signal.
         let mut child = Scripted::new(&[WaitReply::Failed]);
-        assert_eq!(reap_trial(&mut child), Trial::Inconclusive);
+        assert_eq!(reap_trial(&mut child), (Trial::Inconclusive, Custody::Done));
         assert_eq!(child.kills, 0);
 
-        // Deadline: kill exactly once (custody verified Running), then
-        // reap within the bounded second phase.
-        let mut replies = vec![WaitReply::Running; (TRIAL_POLLS + 2) as usize];
+        // Deadline with a verified-live child: kill once, reap in the
+        // bounded cleanup phase.
+        let mut replies = vec![WaitReply::Running; 250];
         replies.push(WaitReply::Signaled);
         let mut child = Scripted::new(&replies);
-        assert_eq!(reap_trial(&mut child), Trial::Inconclusive);
+        assert_eq!(reap_trial(&mut child), (Trial::Inconclusive, Custody::Done));
         assert_eq!(child.kills, 1);
 
-        // Refused verdict passes through.
+        // A failed kill retains custody explicitly (Unresolved), it is
+        // never collapsed into a completed cleanup.
+        let mut child = Scripted::new(&[WaitReply::Running]);
+        child.kill_reply = KillReply::Failed;
+        assert_eq!(
+            reap_trial(&mut child),
+            (Trial::Inconclusive, Custody::Unresolved)
+        );
+        assert_eq!(child.kills, 1);
+
+        // Cleanup that never observes a terminal status is Unresolved.
+        let mut child = Scripted::new(&[WaitReply::Running]);
+        assert_eq!(
+            reap_trial(&mut child),
+            (Trial::Inconclusive, Custody::Unresolved)
+        );
+
+        // Verdicts pass through.
         let mut child = Scripted::new(&[WaitReply::Exited(TRIAL_REFUSED)]);
-        assert_eq!(reap_trial(&mut child), Trial::Refused);
-        // Inconclusive exit code stays inconclusive.
+        assert_eq!(reap_trial(&mut child), (Trial::Refused, Custody::Done));
         let mut child = Scripted::new(&[WaitReply::Exited(TRIAL_INCONCLUSIVE)]);
-        assert_eq!(reap_trial(&mut child), Trial::Inconclusive);
+        assert_eq!(reap_trial(&mut child), (Trial::Inconclusive, Custody::Done));
     }
 
     /// SUD regression (1285 finding 4): OFF must pass zero
