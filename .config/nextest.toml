@@ -1,0 +1,37 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+nextest-version = "0.9.100"
+
+# Validation runs every test in its own process with bounded retries.
+# Per-test CPU is the primary limit on the serial path
+# (scripts/libtest-counts.rs `run`, REVERIE_TEST_CPU_SECONDS); on the DAG
+# path the dagrun node's cpu_timeout is the CPU bound and this profile's
+# slow-timeout is only the wall backstop for a wedged test process:
+# min(8 x 120 s CPU default, 600 s), the same rule validate.sh exports
+# for the counted libtest runner. The counted nextest runner
+# (`libtest-counts.rs run-nextest`) passes --retries from
+# REVERIE_TEST_RETRIES explicitly; the value here is the same default for
+# direct human runs.
+[profile.default]
+fail-fast = false
+test-threads = "num-cpus"
+retries = 2
+status-level = "pass"
+final-status-level = "slow"
+failure-output = "immediate-final"
+success-output = "never"
+slow-timeout = { period = "600s", terminate-after = 1, grace-period = "2s" }
+
+# The counted runner adds its own profile on top of this file with a
+# per-invocation JUnit path (concurrent DAG nodes must not share one
+# report file). This ci profile is the same shape for manual counted
+# runs: JUnit carries per-test output so REVERIE_SKIP lines from passing
+# tests stay harvestable.
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = true
+store-failure-output = true

@@ -89,6 +89,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: ./validate.sh [--label-pr|--no-label-pr] [--self-test-gate-counts]"
             echo "A green exact-head run writes a receipt; the optional PR label is derived cache."
+            echo "Gates run as a dagrun DAG (ci/dag/validate.json) when a dagrun binary"
+            echo "resolves; otherwise serially. REVERIE_VALIDATE_DAG=0 forces the serial path."
             echo "  -h, --help                 Show this help"
             echo "  --self-test-gate-counts    Exercise structured test-count evidence without validation"
             exit 0
@@ -365,7 +367,7 @@ aggregate_test_counts() {
     local executed=0 passed=0 filtered=0 i next
     for i in "${!ledger_gate_names[@]}"; do
         case "${ledger_gate_names[i]}" in
-            "Test regular workspace cases"|"Documentation tests")
+            "Test regular workspace cases"|"Tests: "*|"Documentation tests")
                 if [[ ${ledger_gate_executed_tests[i]} == null ||
                     ${ledger_gate_passed_tests[i]} == null ||
                     ${ledger_gate_filtered_tests[i]} == null ]]; then
@@ -819,6 +821,177 @@ build_liteinst_allocator_fixtures() {
     source "$generation/bundle/fixture.env"
 }
 
+# Bounded recipe tests require TMPDIR set, under a retained artifact
+# domain, while unix-socket tests (broker/coordinator sockets, the
+# gdbstub server) require socket paths under SUN_LEN (108 bytes): a
+# slot path under target/ alone is ~90 bytes. Measured 2026-11-05 at
+# 83cff0aa: 109 parallel failures with the long path, 21 with a short
+# one. The short path must be a REAL directory, not a symlink into
+# target/: exec-identity and pinned-cwd tests compare canonical paths,
+# and a symlink makes TMPDIR-derived paths disagree with their
+# canonical forms. One convention, aligned with musestable's repair:
+# /tmp/reverie-validate-tmp. Scratch subdirectories are pid+nanos
+# unique, so concurrent validations share it safely.
+VALIDATE_TMPDIR_READY=
+setup_validation_tmpdir() {
+    [[ -n $VALIDATE_TMPDIR_READY ]] && return 0
+    export TMPDIR=/tmp/reverie-validate-tmp
+    mkdir -p "$TMPDIR" || return 1
+    VALIDATE_TMPDIR_READY=1
+}
+
+# The nextest skip filterset is derived from the one skip list so the
+# serial libtest path and the DAG nextest path can never drift apart.
+derive_nextest_skip_filter() {
+    local filter='' i
+    for ((i = 0; i + 1 < ${#REGULAR_TEST_SKIP_ARGS[@]}; i += 2)); do
+        if [[ ${REGULAR_TEST_SKIP_ARGS[i]} != --skip ]]; then
+            printf 'validate.sh: REGULAR_TEST_SKIP_ARGS is not --skip pairs\n' >&2
+            return 1
+        fi
+        filter+="not test(${REGULAR_TEST_SKIP_ARGS[i + 1]}) & "
+    done
+    export REVERIE_NEXTEST_SKIP_FILTER=${filter%' & '}
+}
+
+DAG_UNIVERSE_TOTAL=0
+
+# Record one DAG node as a ledger gate, with the same counts refusals as
+# run_check_impl: a passing counted node whose counts are missing,
+# malformed, or internally inconsistent is refused (status 2).
+ingest_dag_gate() {
+    local name=$1 status=$2 seconds=$3 counts_file=$4
+    local counts counts_extra gate_executed=null gate_passed=null gate_filtered=null
+    checks=$((checks + 1))
+    printf '== %s ==\nDAG node status: %s (%ss)\n' "$name" "$status" "$seconds" >>"$LOG_FILE"
+    if [[ $counts_file != - ]]; then
+        local counts_path="$ROOT_DIR/$counts_file"
+        if [[ $counts_file == *counts-test-* ]]; then
+            # Counted nextest node: side files are part of its evidence.
+            local side
+            for side in skips.txt flaky.txt universe; do
+                if [[ ! -f ${counts_path%.json}.$side ]]; then
+                    printf 'count evidence refused: missing %s side file for %s\n' \
+                        "$side" "$name" >>"$LOG_FILE"
+                    if ((status == 0)); then status=2; fi
+                fi
+            done
+            if [[ -f ${counts_path%.json}.skips.txt ]]; then
+                cat "${counts_path%.json}.skips.txt" >>"$LOG_FILE"
+            fi
+            if [[ -f ${counts_path%.json}.flaky.txt ]]; then
+                cat "${counts_path%.json}.flaky.txt" >>"$LOG_FILE"
+            fi
+            if [[ -f ${counts_path%.json}.universe ]]; then
+                local universe
+                universe=$(cat "${counts_path%.json}.universe")
+                if [[ $universe =~ ^[0-9]+$ ]]; then
+                    DAG_UNIVERSE_TOTAL=$((DAG_UNIVERSE_TOTAL + universe))
+                else
+                    printf 'count evidence refused: malformed universe for %s\n' \
+                        "$name" >>"$LOG_FILE"
+                    if ((status == 0)); then status=2; fi
+                fi
+            fi
+        fi
+        if counts=$("$LIBTEST_COUNTS_TOOL" read "$counts_path" 2>>"$LOG_FILE") &&
+            read -r gate_executed gate_passed gate_filtered counts_extra <<<"$counts" &&
+            [[ -z $counts_extra ]] &&
+            is_supported_test_count "$gate_executed" &&
+            is_supported_test_count "$gate_passed" &&
+            is_supported_test_count "$gate_filtered"; then
+            if ((status == 0 && gate_passed != gate_executed)); then
+                printf 'count evidence refused: passing gate recorded %s passed of %s executed tests; rerun the counted test command\n' \
+                    "$gate_passed" "$gate_executed" >>"$LOG_FILE"
+                status=2
+            fi
+        else
+            gate_executed=null
+            gate_passed=null
+            gate_filtered=null
+            if ((status == 0)); then
+                status=2
+            fi
+        fi
+    fi
+    if ((status == 0)); then
+        printf "PASS: %s (%ss)\n" "$name" "$seconds"
+    else
+        failures=$((failures + 1))
+        printf "FAIL: %s (exit %s; %ss; log: %s)\n" \
+            "$name" "$status" "$seconds" "$LOG_FILE" >&2
+    fi
+    record_ledger_gate \
+        "$name" "$status" "$seconds" \
+        "$gate_executed" "$gate_passed" "$gate_filtered"
+}
+
+run_validation_dag() {
+    setup_validation_tmpdir || return 1
+    derive_nextest_skip_filter || return 1
+    mkdir -p "$ROOT_DIR/target/validate/perf" || return 1
+    rm -f "$ROOT_DIR"/target/validate/counts-*.json \
+        "$ROOT_DIR"/target/validate/counts-*.skips.txt \
+        "$ROOT_DIR"/target/validate/counts-*.flaky.txt \
+        "$ROOT_DIR"/target/validate/counts-*.universe \
+        "$ROOT_DIR/target/validate/binaries-metadata.json" \
+        "$ROOT_DIR/target/validate/list-full.json"
+    printf 'Running validation DAG (ci/dag/validate.json; log: %s)\n' "$LOG_FILE"
+    local dag_status=0
+    if "$ROOT_DIR/ci/run-dag.sh" --perf-dir target/validate/perf >>"$LOG_FILE" 2>&1; then
+        dag_status=0
+    else
+        dag_status=$?
+    fi
+    local gates_tsv
+    if ! gates_tsv=$("$ROOT_DIR/scripts/dag-gates.rs" \
+        "$ROOT_DIR/ci/dag/validate.json" "$ROOT_DIR/target/validate/perf" \
+        2>>"$LOG_FILE"); then
+        checks=$((checks + 1))
+        failures=$((failures + 1))
+        printf 'FAIL: DAG gate evidence refused (log: %s)\n' "$LOG_FILE" >&2
+        record_ledger_gate "Validation DAG evidence" 2 0 null null null
+        return 0
+    fi
+    local g_name g_status g_seconds g_counts
+    while IFS=$'\t' read -r g_name g_status g_seconds g_counts; do
+        [[ -n $g_name ]] || continue
+        ingest_dag_gate "$g_name" "$g_status" "$g_seconds" "$g_counts"
+    done <<<"$gates_tsv"
+    # Partition invariant: the test nodes' discovery universes must sum
+    # to the workspace test list produced by build.test_binaries, so a
+    # new binary or package can never fall out of every node silently.
+    local listed=
+    if [[ -f $ROOT_DIR/target/validate/list-full.json ]]; then
+        listed=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["test-count"])' \
+            "$ROOT_DIR/target/validate/list-full.json" 2>>"$LOG_FILE") || listed=
+    fi
+    checks=$((checks + 1))
+    if [[ -n $listed && $listed == "$DAG_UNIVERSE_TOTAL" ]]; then
+        printf "PASS: Test partition coverage (%s tests)\n" "$listed"
+        record_ledger_gate "Test partition coverage" 0 0 null null null
+    else
+        failures=$((failures + 1))
+        printf 'FAIL: Test partition coverage (nodes cover %s, workspace lists %s; log: %s)\n' \
+            "$DAG_UNIVERSE_TOTAL" "${listed:-unknown}" "$LOG_FILE" >&2
+        record_ledger_gate "Test partition coverage" 2 0 null null null
+    fi
+    local flaky_total
+    flaky_total=$(grep -c '^REVERIE_FLAKY:' "$LOG_FILE" || true)
+    if ((flaky_total > 0)); then
+        printf 'REVERIE_FLAKY_SUMMARY: %s test(s) passed only on retry\n' "$flaky_total" >>"$LOG_FILE"
+        printf 'REVERIE_FLAKY_SUMMARY: %s test(s) passed only on retry\n' "$flaky_total"
+    fi
+    if ((dag_status != 0 && failures == 0)); then
+        checks=$((checks + 1))
+        failures=$((failures + 1))
+        printf 'FAIL: Validation DAG runner (exit %s; log: %s)\n' "$dag_status" "$LOG_FILE" >&2
+        record_ledger_gate "Validation DAG runner" "$dag_status" 0 null null null
+    fi
+    return 0
+}
+
+run_validation_serial() {
 run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
 run_check "Build workspace" cargo build --workspace --all-features
 # DISABLED (dh-hkdh0): the allocator-fixtures producer is red at base
@@ -830,11 +1003,7 @@ disabled_liteinst_allocator_fixtures() {
 }
 run_check "LiteInst allocator fixtures (disabled: dh-hkdh0)" \
     disabled_liteinst_allocator_fixtures
-# Bounded recipe tests require TMPDIR to be set. Keep it short: abstract
-# socket paths created under TMPDIR must fit SUN_LEN (107 bytes), which a
-# long checkout path would exceed.
-export TMPDIR="/tmp/reverie-validate-tmp"
-mkdir -p "$TMPDIR"
+setup_validation_tmpdir || return 1
 # The counted runner accepts only a command that starts with `cargo test`, so
 # the fixture paths reach the tests through the environment rather than an
 # `env NAME=VALUE` prefix. They are exported for this step alone.
@@ -851,6 +1020,14 @@ run_test_check "Documentation tests" cargo test --workspace --doc
 run_check "Reverie-layer cross-backend e2e" "$ROOT_DIR/reverie-examples/e2e/run.sh"
 run_check "Clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
+}
+
+if [[ ${REVERIE_VALIDATE_DAG:-1} != 0 ]] &&
+    "$ROOT_DIR/ci/run-dag.sh" --print-dagrun >/dev/null 2>&1; then
+    run_validation_dag
+else
+    run_validation_serial
+fi
 
 if ((failures == 0)) && ! aggregate_test_counts_are_passing; then
     failures=$((failures + 1))

@@ -1,0 +1,456 @@
+{
+  "description": "Reverie full validation as a dagrun DAG (one node per gate; selected with --labels full). Authored 2026-11-05 from measured per-node wall/CPU/RSS at 83cff0aa; dagrun's profile feedback refines widths and memory caps from recorded runs.",
+  "resource_caps": {
+    "cargo-build": 1
+  },
+  "default_step_timeout": 600,
+  "steps": [
+    {
+      "group": "check",
+      "job": "skill_discovery",
+      "desc": "Cross-client skill discovery",
+      "description": "Runs scripts/check-skill-discovery.rs, the same check the serial validate.sh ran first.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/check-skill-discovery.rs",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 120,
+      "priority": 60,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 10,
+        "rss_baseline_bytes": 1000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 4
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "lint",
+      "job": "rustfmt",
+      "desc": "Rustfmt",
+      "description": "cargo fmt --all -- --check over the whole workspace.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "cargo fmt --all -- --check",
+      "deps": [],
+      "env": {},
+      "timeout": 300,
+      "cpu_timeout": 60,
+      "priority": 60,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 20,
+        "rss_baseline_bytes": 1000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 4
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "build",
+      "job": "test_binaries",
+      "desc": "Build test binaries (nextest metadata)",
+      "description": "Builds every workspace test binary once (--all-features) and records nextest binaries-metadata plus the full test list under target/validate/. Every test node runs from this metadata, so no test node rebuilds and feature unification is the workspace's. This replaces the serial driver's separate `cargo build --workspace --all-features` gate: measured 2026-11-05, all 274 artifact identities of that build are compiled by the test build (420 identities), and lint.clippy --all-targets additionally compiles the non-test lib profile, so dropping the duplicate build loses no compile coverage. Memory: a cold width-16 build OOM-killed at a 16 GB cap (peak 16.0 GB, 6 oom_kills, 2026-11-05); width 12 with a 24 GB baseline / 48 GB hard cap follows dagrun's size-above-recorded-peak rule.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "mkdir -p target/validate && cargo nextest list --workspace --all-features --list-type binaries-only --message-format json > target/validate/binaries-metadata.json && cargo nextest list --binaries-metadata target/validate/binaries-metadata.json --message-format json --list-type full > target/validate/list-full.json",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 6500,
+      "priority": 90,
+      "hint": {
+        "resources": {
+          "cargo-build": 1
+        },
+        "est_duration_s": 150,
+        "rss_baseline_bytes": 24000000000,
+        "hard_mem_max_bytes": 48000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 12
+      },
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
+    },
+    {
+      "group": "fixtures",
+      "job": "liteinst",
+      "desc": "LiteInst allocator fixtures (disabled: dh-hkdh0)",
+      "description": "DISABLED (dh-hkdh0), mirroring validate.sh: the allocator-fixtures producer is red at base (fixed_arena_backing needs the held ordinary-dev publication cohort, reverie 1125). Waived to parity-with-main by coordinator ruling C. Re-enable by replacing this command with the producer invocation (scripts/build-liteinst-test-runtime.rs --for-ci) writing its fixture.env under target/validate/; test nodes already depend on this node, and it runs concurrently with build.test_binaries.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "echo 'SKIP (dh-hkdh0): allocator producer disabled until held reverie 1125 cohort lands'",
+      "deps": [],
+      "env": {},
+      "timeout": 60,
+      "cpu_timeout": 10,
+      "priority": 80,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 1,
+        "rss_baseline_bytes": 1000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "light",
+        "preferred_inner_jobs": 1
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "liteinst_a",
+      "desc": "Tests: LiteInst binaries A",
+      "description": "Counted nextest over reverie-liteinst binaries strace, generic_bootstrap, standalone_constructor, tool_tls, fixed_arena, the lib tests, and the zero-case guest binaries. Binary lists in the two LiteInst nodes partition the package; validate.sh refuses if node totals drift from the workspace list.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_a.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=strace) | binary(=generic_bootstrap) | binary(=standalone_constructor) | binary(=tool_tls) | binary(=fixed_arena) | binary(=reverie_liteinst) | binary(=reverie-liteinst-trap-count-guest) | binary(=reverie-liteinst-strace) | binary(=reverie-liteinst-spoof-guest) | binary(=reverie-liteinst-rpc-tool-guest) | binary(=reverie-liteinst-lifecycle-guest))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "deps": [
+        "build.test_binaries",
+        "fixtures.liteinst"
+      ],
+      "env": {
+        "REVERIE_NEXTEST_TEST_THREADS": "32",
+        "REVERIE_LITEINST_PRELOAD": "",
+        "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
+      },
+      "timeout": 600,
+      "cpu_timeout": 900,
+      "priority": 40,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 150,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "liteinst_b",
+      "desc": "Tests: LiteInst binaries B",
+      "description": "Counted nextest over the remaining reverie-liteinst binaries (allocator, mapping, region, rpc_tool, lifecycle and guest controls).",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_b.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=native_unpublished) | binary(=allocator_contract) | binary(=region_stacks) | binary(=mapping_integrity) | binary(=lifecycle) | binary(=rpc_tool) | binary(=fixed_gates) | binary(=private_prepare) | binary(=concurrent_patching) | binary(=reverie-liteinst-fork-guest) | binary(=reverie-liteinst-exec-guest) | binary(=reverie-liteinst-allocator-private-control) | binary(=reverie-liteinst-allocator-install-control) | binary(=reverie-liteinst-allocator-host-control))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "deps": [
+        "build.test_binaries",
+        "fixtures.liteinst"
+      ],
+      "env": {
+        "REVERIE_NEXTEST_TEST_THREADS": "32",
+        "REVERIE_LITEINST_PRELOAD": "",
+        "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
+      },
+      "timeout": 600,
+      "cpu_timeout": 900,
+      "priority": 40,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 150,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "liteinst_artifact",
+      "desc": "Tests: LiteInst artifact + preload",
+      "description": "Counted nextest over reverie-liteinst-artifact and reverie-liteinst-preload.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_artifact.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst-artifact) | package(reverie-liteinst-preload)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "deps": [
+        "build.test_binaries",
+        "fixtures.liteinst"
+      ],
+      "env": {
+        "REVERIE_NEXTEST_TEST_THREADS": "16",
+        "REVERIE_LITEINST_PRELOAD": "",
+        "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
+      },
+      "timeout": 600,
+      "cpu_timeout": 300,
+      "priority": 40,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 60,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 16
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "ptrace",
+      "desc": "Tests: ptrace backend",
+      "description": "Counted nextest over reverie-ptrace, including the gdbstub suites.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-ptrace.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-ptrace)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "deps": [
+        "build.test_binaries",
+        "fixtures.liteinst"
+      ],
+      "env": {
+        "REVERIE_NEXTEST_TEST_THREADS": "32",
+        "REVERIE_LITEINST_PRELOAD": "",
+        "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
+      },
+      "timeout": 600,
+      "cpu_timeout": 1200,
+      "priority": 40,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 180,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "kvm",
+      "desc": "Tests: KVM backend",
+      "description": "Counted nextest over reverie-kvm and reverie-kvm-core.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-kvm.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-kvm) | package(reverie-kvm-core)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "deps": [
+        "build.test_binaries",
+        "fixtures.liteinst"
+      ],
+      "env": {
+        "REVERIE_NEXTEST_TEST_THREADS": "32",
+        "REVERIE_LITEINST_PRELOAD": "",
+        "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
+      },
+      "timeout": 600,
+      "cpu_timeout": 1200,
+      "priority": 40,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 180,
+        "rss_baseline_bytes": 16000000000,
+        "hard_mem_max_bytes": 32000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "emu",
+      "desc": "Tests: LinuxEmu + examples",
+      "description": "Counted nextest over reverie-linuxemu and reverie-examples.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-emu.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-linuxemu) | package(reverie-examples)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "deps": [
+        "build.test_binaries",
+        "fixtures.liteinst"
+      ],
+      "env": {
+        "REVERIE_NEXTEST_TEST_THREADS": "32",
+        "REVERIE_LITEINST_PRELOAD": "",
+        "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
+      },
+      "timeout": 600,
+      "cpu_timeout": 900,
+      "priority": 40,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 150,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "inguest",
+      "desc": "Tests: in-guest backend",
+      "description": "Counted nextest over reverie-inguest. Width is lower: bounded-recipe tests compile payloads at runtime, so each test process fans out further.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-inguest.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-inguest)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "deps": [
+        "build.test_binaries",
+        "fixtures.liteinst"
+      ],
+      "env": {
+        "REVERIE_NEXTEST_TEST_THREADS": "16",
+        "REVERIE_LITEINST_PRELOAD": "",
+        "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
+      },
+      "timeout": 600,
+      "cpu_timeout": 900,
+      "priority": 40,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 150,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 16
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "core",
+      "desc": "Tests: core + transport + support crates",
+      "description": "Counted nextest over the remaining workspace packages (core, safeptrace, rpc-transport, process, loader, memory, syscalls, test-support, util, and the zero-test experimental packages, whose listings keep the node totals exact).",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-core.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(safeptrace) | package(reverie-core) | package(reverie-rpc-transport) | package(reverie-process) | package(reverie-loader) | package(reverie-test-support) | package(reverie-syscalls) | package(reverie-memory) | package(reverie-util) | package(nostd-print) | package(reverie-linux-provider) | package(reverie-rpc) | package(riptrace-rpc)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "deps": [
+        "build.test_binaries",
+        "fixtures.liteinst"
+      ],
+      "env": {
+        "REVERIE_NEXTEST_TEST_THREADS": "32",
+        "REVERIE_LITEINST_PRELOAD": "",
+        "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
+      },
+      "timeout": 600,
+      "cpu_timeout": 600,
+      "priority": 40,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 120,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "doc",
+      "desc": "Documentation tests",
+      "description": "Counted doctests via the serial libtest runner (nextest does not run doctests): cargo test --workspace --doc with per-test CPU caps.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run target/validate/counts-doc.json -- cargo test --workspace --doc",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 300,
+      "priority": 40,
+      "hint": {
+        "resources": {
+          "cargo-build": 1
+        },
+        "est_duration_s": 60,
+        "rss_baseline_bytes": 4000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8
+      },
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
+    },
+    {
+      "group": "e2e",
+      "job": "cross_backend",
+      "desc": "Reverie-layer cross-backend e2e",
+      "description": "reverie-examples/e2e/run.sh: every backend this host has, judged against the ledger for its environment (report-only without one).",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./reverie-examples/e2e/run.sh",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 900,
+      "priority": 40,
+      "hint": {
+        "resources": {
+          "cargo-build": 1
+        },
+        "est_duration_s": 90,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8
+      },
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
+    },
+    {
+      "group": "lint",
+      "job": "clippy",
+      "desc": "Clippy",
+      "description": "cargo clippy --workspace --all-targets --all-features -- -D warnings. Also the compile-coverage backstop for the non-test lib profile now that the duplicate cargo build gate is gone.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 900,
+      "priority": 40,
+      "hint": {
+        "resources": {
+          "cargo-build": 1
+        },
+        "est_duration_s": 90,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 16
+      },
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
+    }
+  ],
+  "mem_cap_factor": 1.25,
+  "mem_cap_floor_bytes": 8589934592,
+  "outer_mem_safety_factor": 1.0
+}

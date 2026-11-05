@@ -22,6 +22,40 @@ fi"#;
     );
 }
 
+const VALIDATE_DAG: &str = include_str!("../../ci/dag/validate.json");
+
+#[test]
+fn validation_dag_builds_once_and_counts_every_test_node() {
+    // One workspace test build feeds every counted nextest node.
+    assert!(VALIDATE_DAG.contains("cargo nextest list --workspace --all-features"));
+    assert!(VALIDATE_DAG.contains("--binaries-metadata target/validate/binaries-metadata.json"));
+    // The duplicate serial `cargo build` gate is gone from the DAG: its
+    // 274 artifact identities are a subset of the test build's 420
+    // (measured 2026-11-05), with clippy --all-targets covering the
+    // non-test lib profile.
+    assert!(!VALIDATE_DAG.contains("\"cmd\": \"cargo build"));
+    assert!(VALIDATE_DAG.contains("cargo clippy --workspace --all-targets --all-features"));
+    // No DAG test node may fall back to serialized libtest execution.
+    assert!(!VALIDATE_DAG.contains("--test-threads=1"));
+    // Eight counted nextest test nodes, each over one shared skip list
+    // derived in validate.sh from REGULAR_TEST_SKIP_ARGS.
+    assert_eq!(VALIDATE_DAG.matches("counts-test-").count(), 8);
+    assert_eq!(
+        VALIDATE_DAG.matches("REVERIE_NEXTEST_SKIP_FILTER").count(),
+        8
+    );
+    assert!(VALIDATE_SCRIPT.contains("derive_nextest_skip_filter"));
+    assert!(VALIDATE_SCRIPT.contains("run_validation_dag"));
+    // Every counted test node waits for the one build and the fixtures
+    // node; fixtures therefore run concurrently with the test build.
+    assert_eq!(VALIDATE_DAG.matches("\"build.test_binaries\",").count(), 8);
+    // CPU-first limits: every step declares a CPU timeout.
+    assert_eq!(
+        VALIDATE_DAG.matches("\"cpu_timeout\"").count(),
+        VALIDATE_DAG.matches("\"group\":").count()
+    );
+}
+
 const WORKFLOW: &str = include_str!("../../.github/workflows/ci.yml");
 const CORE_MANIFEST: &str = include_str!("../../reverie-liteinst/Cargo.toml");
 const ALLOCATOR_TESTS: &str = include_str!("../../reverie-liteinst/tests/allocator_contract.rs");
