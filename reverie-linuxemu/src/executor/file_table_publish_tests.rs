@@ -68,7 +68,7 @@ mod file_table_publish_tests {
             state.files.keys().copied().collect::<Vec<_>>()
         );
         for fd in [3, 4, 6] {
-            assert!(Arc::ptr_eq(&table.fd_entry_ids[&fd], &state.fd_entry_ids[&fd]));
+            assert!(Arc::ptr_eq(table.entry_id(fd).expect("entry identity"), &state.fd_entry_ids[&fd]));
         }
     }
 
@@ -95,7 +95,7 @@ mod file_table_publish_tests {
             table
                 .files
                 .iter()
-                .map(|(&fd, file)| (fd, file.as_raw_fd(), Arc::as_ptr(&table.fd_entry_ids[&fd])))
+                .map(|(&fd, file)| (fd, file.as_raw_fd(), Arc::as_ptr(table.entry_id(fd).expect("entry identity"))))
                 .collect::<Vec<_>>()
         };
         let before = snapshot(&table);
@@ -173,7 +173,7 @@ mod file_table_publish_tests {
         let slot = table.slot(3).expect("slot derived at publication");
         assert!(std::sync::Arc::ptr_eq(
             slot.entry_id.as_ref().expect("entry identity in slot"),
-            &table.fd_entry_ids[&3]
+            table.entry_id(3).expect("entry identity")
         ));
         assert!(slot.description.is_some());
         assert!(table.slot(99).is_none());

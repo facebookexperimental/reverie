@@ -31,7 +31,6 @@ pub struct FileTableState {
     pub(super) stdin: Option<std::fs::File>,
     pub(super) stdin_entry_id: Arc<()>,
     pub(super) files: std::collections::BTreeMap<i32, std::fs::File>,
-    pub(super) fd_entry_ids: std::collections::BTreeMap<i32, Arc<crate::elf::FdEntry>>,
     pub(super) epoll_domain: Arc<Mutex<EpollDomain>>,
     pub(super) poll_table_id: Arc<NativePollTable>,
     pub(super) stdout_alias_fds: std::collections::BTreeSet<i32>,
@@ -85,6 +84,11 @@ impl FileTableState {
             .and_then(|slot| slot.description.clone())
     }
 
+    /// The published entry identity for `fd` (slot-owned since slice 16).
+    pub(super) fn entry_id(&self, fd: i32) -> Option<&Arc<crate::elf::FdEntry>> {
+        self.slots.get(&fd).and_then(|slot| slot.entry_id.as_ref())
+    }
+
     /// The consolidated slot for `fd`, as derived at the last mutation.
     pub(super) fn slot(&self, fd: i32) -> Option<&FdSlot> {
         self.slots.get(&fd)
@@ -96,7 +100,9 @@ impl FileTableState {
             slots.insert(
                 fd,
                 FdSlot {
-                    entry_id: self.fd_entry_ids.get(&fd).cloned(),
+                    entry_id: state
+                        .and_then(|state| state.fd_entry_ids.get(&fd).cloned())
+                        .or_else(|| self.slots.get(&fd).and_then(|slot| slot.entry_id.clone())),
                     native_poll: state
                         .and_then(|state| state.native_poll_fds.get(&fd).cloned())
                         .or_else(|| {
@@ -167,7 +173,7 @@ impl FileTableState {
             .files
             .keys()
             .filter(|&fd| !state.files.copies().contains_key(fd) || next.files.contains_key(fd))
-            .map(|&fd| (fd, self.fd_entry_ids.get(&fd).cloned()))
+            .map(|&fd| (fd, self.entry_id(fd).cloned()))
             .collect();
         let retired_stdin =
             (!same_stdin && self.stdin.is_some()).then(|| self.stdin_entry_id.clone());
@@ -248,7 +254,7 @@ impl FileTableState {
                         && state
                             .fd_entry_ids
                             .get(fd)
-                            .zip(published.fd_entry_ids.get(fd))
+                            .zip(published.entry_id(*fd))
                             .is_some_and(|(current, previous)| Arc::ptr_eq(current, previous))
                 })
             })
@@ -276,7 +282,7 @@ impl FileTableState {
                         && state
                             .fd_entry_ids
                             .get(&fd)
-                            .zip(published.fd_entry_ids.get(&fd))
+                            .zip(published.entry_id(fd))
                             .is_some_and(|(current, previous)| Arc::ptr_eq(current, previous))
                 });
                 if unchanged {
@@ -294,7 +300,6 @@ impl FileTableState {
             stdin: stdin.map(crate::elf::StagedFile::into_file),
             stdin_entry_id: state.stdin_entry_id.clone(),
             files,
-            fd_entry_ids: state.fd_entry_ids.clone(),
             epoll_domain: state.epoll_domain.clone(),
             poll_table_id: state.poll_table_id.clone(),
             stdout_alias_fds: state.stdout_alias_fds.clone(),
@@ -342,7 +347,6 @@ impl FileTableState {
             stdin: _,
             stdin_entry_id: _,
             files,
-            fd_entry_ids,
             epoll_domain,
             poll_table_id,
             stdout_alias_fds,
@@ -361,10 +365,21 @@ impl FileTableState {
         // same_stdin_entry compares stdin and stdin_entry_id.
         self.same_stdin_entry(state)
             && files.keys().eq(state.files.copies().keys())
-            && same_arcs(fd_entry_ids, &state.fd_entry_ids)
+            && {
+                let slot_ids: Vec<_> = self
+                    .slots
+                    .iter()
+                    .filter_map(|(&fd, slot)| slot.entry_id.as_ref().map(|id| (fd, id)))
+                    .collect();
+                slot_ids.len() == state.fd_entry_ids.len()
+                    && slot_ids
+                        .into_iter()
+                        .zip(&state.fd_entry_ids)
+                        .all(|((fa, va), (fb, vb))| fa == *fb && Arc::ptr_eq(va, vb))
+            }
             // install keeps a task's file only when both sides carry the same
             // entry identity; a file without one is always reinstalled.
-            && files.keys().all(|fd| fd_entry_ids.contains_key(fd))
+            && files.keys().all(|fd| self.entry_id(*fd).is_some())
             && Arc::ptr_eq(epoll_domain, &state.epoll_domain)
             && Arc::ptr_eq(poll_table_id, &state.poll_table_id)
             && {
@@ -479,7 +494,7 @@ impl FileTableState {
                 && state
                     .fd_entry_ids
                     .get(&fd)
-                    .zip(self.fd_entry_ids.get(&fd))
+                    .zip(self.entry_id(fd))
                     .is_some_and(|(previous, shared)| Arc::ptr_eq(previous, shared));
             if !same_entry {
                 installed_files.insert(fd, state.file_retirement.stage_clone(shared_file)?);
@@ -512,7 +527,11 @@ impl FileTableState {
                 .into_iter()
                 .chain(previous_files.into_values()),
         );
-        state.fd_entry_ids.clone_from(&self.fd_entry_ids);
+        state.fd_entry_ids = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.entry_id.clone().map(|id| (fd, id)))
+            .collect();
         state.epoll_domain.clone_from(&self.epoll_domain);
         state.poll_table_id.clone_from(&self.poll_table_id);
         state.native_poll_fds = self
@@ -575,6 +594,11 @@ impl FileTableState {
             .iter()
             .filter_map(|(&fd, slot)| slot.pipe_owner.clone().map(|o| (fd, o)))
             .collect();
+        let fd_entry_ids: std::collections::BTreeMap<_, _> = self
+            .slots
+            .iter()
+            .filter_map(|(&fd, slot)| slot.entry_id.clone().map(|id| (fd, id)))
+            .collect();
         let native_poll_fds: std::collections::BTreeMap<_, _> = self
             .slots
             .iter()
@@ -601,7 +625,7 @@ impl FileTableState {
             self.stdin_entry_id.clone(),
             retirement,
             ForkFacts {
-                fd_entry_ids: &self.fd_entry_ids,
+                fd_entry_ids: &fd_entry_ids,
                 epoll_domain: &self.epoll_domain,
                 poll_table_id: &self.poll_table_id,
                 native_poll_fds: &native_poll_fds,
