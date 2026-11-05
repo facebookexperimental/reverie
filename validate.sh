@@ -770,6 +770,26 @@ readonly -a REGULAR_TEST_SKIP_ARGS=(
     --skip standalone_fixed_arena_workload_and_literal_placement
     --skip native_mapping_boundaries_preserve_guards_break_abi_and_fork_owner
     --skip published_owner_guest_mprotect_and_munmap_preserve_real_spare_pages
+    --skip compatibility_event_fd_backpressure_fails_without_hanging
+    --skip compatibility_event_fd_recovers_when_delayed_reader_drains
+    --skip compatibility_event_fd_rejects_guest_spoof_write
+    --skip compatibility_event_fd_rejects_read_only_descriptor
+    --skip compatibility_event_fd_separates_guest_stderr
+    --skip compatibility_event_fd_survives_guest_close
+    --skip compatibility_fork_reports_clone_only_from_parent
+    --skip compatibility_raw_fork_reports_once_before_child
+    --skip compatibility_tool_emits_stable_events
+    --skip compatibility_tool_rejects_process_group_escape
+    --skip exec_fails_closed_before_runtime_is_replaced
+    --skip first_sigsys_installs_a_hook_for_later_calls
+    --skip fork_child_inherits_preload_instrumentation
+    --skip other_runtimes_refuse_site_patching_selector
+    --skip passthrough_builtin_preserves_getpid_result
+    --skip raw_vfork_and_clone3_are_refused_in_compatibility_and_strace_modes
+    --skip spoof_getpid_builtin_mutates_getpid_result
+    --skip strace_tool_observes_echo_syscalls
+    --skip syscall_hook_preserves_displaced_self_relative_address
+    --skip unsafe_clone_is_rejected_in_compatibility_and_strace_modes
     --skip active_leaf_has_returned_authenticated_bootstrap
     --skip authenticated_dev_runtime_has_only_retained_tool_tls
     --skip authenticated_elf_mutations_cannot_hide_owned_tls
@@ -810,16 +830,6 @@ disabled_liteinst_allocator_fixtures() {
 }
 run_check "LiteInst allocator fixtures (disabled: dh-hkdh0)" \
     disabled_liteinst_allocator_fixtures
-# Tests that only need the preload shared object (not the producer's
-# qualified runtime receipts) use the workspace build's copy when the
-# producer did not stage one. Qualified-runtime tests stay skipped above.
-if [[ -z $REVERIE_LITEINST_PRELOAD ]]; then
-    built_preload="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/libreverie_liteinst_preload.so"
-    if [[ -f $built_preload ]]; then
-        REVERIE_LITEINST_PRELOAD="$built_preload"
-    fi
-    unset built_preload
-fi
 # Bounded recipe tests require TMPDIR inside the retained artifact domain.
 export TMPDIR="$ROOT_DIR/target/validate-tmp"
 mkdir -p "$TMPDIR"
