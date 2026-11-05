@@ -8,6 +8,12 @@ name: Rust
 # repository (not a fork), and it is not a draft: a third party's code must not
 # run unreviewed on the PMU hosts, and an owner-opened pull request from someone
 # else's fork would otherwise run every later push from that fork there.
+# The producer-only `allocator-fixtures` job is deliberately broader: it
+# runs on every non-draft pull request, bot-authored included, because the
+# allocator-fixture producer otherwise went dark while its compiled cohort
+# drifted. It is hosted, uses no secrets, and is best-effort signal only:
+# local validation (`validate.sh`, which hard-fails on a producer refusal)
+# and its ledger remain the gate; no GitHub check is a required status check.
 on:
   workflow_dispatch:
   pull_request:
@@ -157,6 +163,32 @@ jobs:
         sudo -n sysctl -w "kernel.apparmor_restrict_unprivileged_userns=$ORIGINAL_RESTRICTION"
         [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) == "$ORIGINAL_RESTRICTION" ]]
         echo "Restored namespace restriction to recorded value $ORIGINAL_RESTRICTION."
+
+  allocator-fixtures:
+    name: LiteInst allocator fixtures (producer)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - name: Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+    - name: Rust toolchain
+      uses: dtolnay/rust-toolchain@nightly
+    - name: Fetch locked dependencies
+      run: cargo fetch --locked
+    - name: LiteInst allocator fixtures (producer)
+      timeout-minutes: 20
+      run: |
+        set -euo pipefail
+        cargo install --locked rust-script
+        generation="$RUNNER_TEMP/liteinst-allocator-$GITHUB_JOB-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        scripts/build-liteinst-test-runtime.rs --for-ci "$generation"
 
   hardware:
     name: Host-dependent tests (self-hosted)

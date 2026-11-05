@@ -50,7 +50,9 @@ verdicts without judging them and says so (`NO LEDGER`). To add an
 environment, run `run.sh --write-ledger FILE` there twice, check that the
 rows agree, and commit them under `ledgers/` with a comment naming each
 group's defect. `cargo test` runs the environment-independent part
-(`../tests/recorder.rs`).
+(`../tests/recorder.rs`, `../tests/conformance.rs`). `CONFORMANCE.md`
+defines the tool-by-backend matrix and each tool's oracle beyond the
+recorder row this directory judges today.
 
 ```text
 reverie-examples/e2e/run.sh                      # every backend this host has
