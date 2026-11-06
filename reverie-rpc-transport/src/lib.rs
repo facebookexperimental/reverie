@@ -79,6 +79,7 @@ pub mod guest_log;
 mod peer_identity;
 mod server;
 
+pub mod exec_ticket;
 #[cfg(target_os = "linux")]
 pub mod mapped;
 
