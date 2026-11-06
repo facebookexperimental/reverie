@@ -298,6 +298,36 @@ pub const PROBE_RUNTIME_MANIFEST: ToolManifest = ToolManifest {
     init: InitContract::ImageEntry,
 };
 
+/// A minimal syscall-counting runtime, expressed as a manifest: the
+/// runtime window with no TLS, its gate page, initialization from its
+/// entry point, and only the two controls counting needs — the trap
+/// filter and the SIGSYS handler that receives it. CPUID faulting and
+/// RDTSC trapping are deliberately not requested: a counter subscribes
+/// to syscalls only, and arming instruction controls would change the
+/// guest's own execution (for example libc feature selection) relative
+/// to an uninstrumented run, which would corrupt the count. This is a
+/// separate manifest rather than a weakening of [`RUNTIME_MANIFEST`]
+/// or [`PROBE_RUNTIME_MANIFEST`]: each checked-in manifest states
+/// exactly the controls its image arms.
+pub const COUNTER_RUNTIME_MANIFEST: ToolManifest = ToolManifest {
+    image: ImageSpec {
+        policy: Policy {
+            window: RUNTIME_WINDOW,
+            allow_tls: false,
+        },
+    },
+    gates: core::slice::from_ref(&RUNTIME_GATE),
+    controls: Controls {
+        trap_filter: true,
+        cpuid_faulting: false,
+        rdtsc_trapping: false,
+        vdso_rewrite: false,
+        sigsys_handler: true,
+        sigsegv_handler: false,
+    },
+    init: InitContract::ImageEntry,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +353,43 @@ mod tests {
         assert_eq!(LOADER_MANIFEST.validate(), Ok(()));
         assert_eq!(RUNTIME_MANIFEST.validate(), Ok(()));
         assert_eq!(PROBE_RUNTIME_MANIFEST.validate(), Ok(()));
+        assert_eq!(COUNTER_RUNTIME_MANIFEST.validate(), Ok(()));
+    }
+
+    #[test]
+    fn the_counter_manifest_requests_exactly_the_counting_controls() {
+        // Same image shape as the probe runtime (runtime window, no
+        // TLS, the runtime gate), but only the trap filter and its
+        // SIGSYS handler: arming CPUID/RDTSC would perturb the guest
+        // being counted.
+        assert_eq!(
+            COUNTER_RUNTIME_MANIFEST.image.policy,
+            PROBE_RUNTIME_MANIFEST.image.policy
+        );
+        assert_eq!(COUNTER_RUNTIME_MANIFEST.gates, &[RUNTIME_GATE]);
+        assert_eq!(COUNTER_RUNTIME_MANIFEST.init, InitContract::ImageEntry);
+        let controls = COUNTER_RUNTIME_MANIFEST.controls;
+        assert_eq!(
+            controls,
+            Controls {
+                trap_filter: true,
+                sigsys_handler: true,
+                ..Controls::NONE
+            }
+        );
+        // Refusal is total and named for either missing control, and
+        // arming exactly the requested set satisfies the manifest
+        // without any instruction control.
+        assert_eq!(controls.unmet(Controls::NONE), Some(Control::TrapFilter));
+        assert_eq!(
+            controls.unmet(Controls {
+                trap_filter: true,
+                ..Controls::NONE
+            }),
+            Some(Control::SigsysHandler)
+        );
+        assert_eq!(controls.unmet(controls), None);
+        assert_eq!(controls.unmet(Controls::ALL), None);
     }
 
     #[test]
