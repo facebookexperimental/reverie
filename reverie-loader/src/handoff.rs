@@ -1073,7 +1073,7 @@ mod tests {
             put(&mut b, 82 + i * 3, count);
             put(&mut b, 83 + i * 3, stride);
             if i == 6 {
-                b[offset..offset + 8].copy_from_slice(b"hermit!\0");
+                b[offset..offset + 8].copy_from_slice(b"tool!!!\0");
             }
             if i == 7 {
                 b[offset..offset + 10].copy_from_slice(b"/dev/null\0");
@@ -1295,7 +1295,7 @@ mod tests {
         assert!(View::parse(&b, 0x100000).is_ok());
         put(&mut b, 100, 8);
         assert_eq!(View::parse(&b, 0x100000).err(), Some(Error::Value));
-        b[name..name + 8].copy_from_slice(b"hermit!!");
+        b[name..name + 8].copy_from_slice(b"tool!!!!");
         assert_eq!(View::parse(&b, 0x100000).err(), Some(Error::Value));
         // Move env/aux into unused space, giving env one real string pointer
         // plus its terminating NULL. The string may reside in the blob tail;

@@ -8,7 +8,7 @@ license = "BSD-2-Clause"
 readme = "README.md"
 homepage = "https://hermetic-infra.org"
 documentation = "https://docs.rs/reverie-inguest"
-keywords = ["linux", "instrumentation", "hermit"]
+keywords = ["linux", "instrumentation", "reverie"]
 categories = ["development-tools::debugging", "os::linux-apis"]
 description = "Shared LD_PRELOAD + seccomp/SIGSYS instrumentation runtime for Reverie in-guest backends (e9patch, LiteInst, SaBRe)"
 

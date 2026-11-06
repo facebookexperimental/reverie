@@ -6,8 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Validation of the images the loader maps: the loader itself and Hermit's
-//! runtime. Both are linked at fixed addresses (their windows are in
+//! Validation of the images the loader maps: the loader itself and the
+//! tool runtime. Both are linked at fixed addresses (their windows are in
 //! [`crate::artifact`]), so mapping them needs no relocation. The guest's
 //! own layout stays put only while those windows are reserved, which is the
 //! mapper's job, not this module's.

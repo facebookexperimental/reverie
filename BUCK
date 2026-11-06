@@ -728,7 +728,7 @@ rust_library(
         "cargo_toml_config": {
             "package": {
                 "version": "0.5.4",
-                "description": "Hermit's in-guest loader: validation of the fixed-address loader and runtime images, and the loader's initialization stages.",
+                "description": "Reverie in-guest loader: validation of the fixed-address loader and tool runtime images, and the loader's initialization stages.",
                 "publish": False,
             },
         },
@@ -745,7 +745,7 @@ rust_library(
     ),
     autocargo = {
         "cargo_toml_config": {
-            "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-inguest"),
+            "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-inguest", keywords = ["linux", "instrumentation", "reverie"]),
             "dependencies_override": {
                 "dependencies": {
                     "nix": {"optional": True, "features": ["fs", "process", "signal"]},

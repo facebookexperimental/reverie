@@ -6,11 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Hermit's in-guest loader (dev-hermit
-//! `ai_docs/2026-10-18-inguest-first-instruction-design.md`, stage 1a).
+//! Reverie's in-guest loader (stage 1a).
 //!
-//! The loader maps Hermit's runtime into a new process image at fixed
-//! addresses and arms Detcore's controls before the image's first
+//! The loader maps a Reverie tool runtime into a new process image at
+//! fixed addresses and arms the tool's controls before the image's first
 //! instruction runs. This crate holds the parts that need no `unsafe`:
 //!
 //! - [`image`] validates a loader or runtime image against the narrow shape
