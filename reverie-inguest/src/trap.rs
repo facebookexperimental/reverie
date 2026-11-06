@@ -409,11 +409,11 @@ struct PendingPromotionData {
 
 #[cfg(target_arch = "aarch64")]
 struct PendingPromotions {
-    /// Owning pid: 0 = unowned, u64::MAX = reset in progress, else the
-    /// pid whose address space owns the table contents. Fork copies the
-    /// parent's word; the first accessor in the child notices the
-    /// mismatch and resets instead of acquiring a lock whose owner
-    /// thread vanished with the parent.
+    /// Owner word: 0 = unowned, a plain pid = that process owns the
+    /// contents, pid | PENDING_OWNER_RESETTING = that pid is resetting.
+    /// Tagging the resetting state with its pid lets a fork child tell a
+    /// live same-process reset (wait or drop) from a copied marker whose
+    /// resetter vanished with the parent (steal and complete it).
     owner: core::sync::atomic::AtomicU64,
     locked: core::sync::atomic::AtomicBool,
     data: core::cell::UnsafeCell<PendingPromotionData>,
@@ -427,18 +427,12 @@ struct PendingPromotions {
 unsafe impl Sync for PendingPromotions {}
 
 #[cfg(target_arch = "aarch64")]
-const PENDING_OWNER_RESETTING: u64 = u64::MAX;
+const PENDING_OWNER_RESETTING: u64 = 1 << 63;
 
-#[cfg(target_arch = "aarch64")]
-thread_local! {
-    /// This thread's established table owner pid, avoiding a getpid gate
-    /// call on every handler record. A fork copies the parent's cached
-    /// value, so it is trusted only while the global owner word still
-    /// equals it — the handler's fork-return reset below rewrites both
-    /// for handler-mediated forks, and the slow path revalidates by
-    /// getpid for every other case.
-    static PENDING_OWNER_KNOWN: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
-}
+// No thread-local owner cache exists, by design: a fork copies the
+// parent thread's TLS, so any cached pid would falsely match the copied
+// owner word in the child and the handler fast path would trust the
+// parent's ownership. Every record revalidates by getpid instead.
 
 #[cfg(target_arch = "aarch64")]
 impl PendingPromotions {
@@ -461,84 +455,12 @@ impl PendingPromotions {
         unsafe { raw_syscall6_gate(libc::SYS_getpid, [0; 6]) as u64 }
     }
 
-    /// Establish this process as table owner, resetting inherited fork
-    /// state without ever acquiring the inherited lock bit. With
-    /// `wait == false` (handler path), a reset already in progress by
-    /// another post-fork thread is reported as not-established instead
-    /// of spinning.
-    fn ensure_owner(&self, wait: bool) -> bool {
+    /// The reset body shared by both reset paths. Caller guarantees no
+    /// other accessor can hold or race the table (owner-word protocol
+    /// for ensure_owner, sole-survivor for the fork-child path).
+    fn reset_contents(&self, pid: u64) {
         use core::sync::atomic::Ordering;
-        let pid = Self::gate_getpid();
-        loop {
-            match self.owner.load(Ordering::Acquire) {
-                current if current == pid => {
-                    PENDING_OWNER_KNOWN.with(|known| known.set(pid));
-                    return true;
-                }
-                PENDING_OWNER_RESETTING => {
-                    if !wait {
-                        return false;
-                    }
-                    core::hint::spin_loop();
-                }
-                0 => {
-                    // First establishment in this process: the table has
-                    // no previous owner, so its lock and contents are
-                    // legitimate and must not be reset.
-                    if self
-                        .owner
-                        .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        PENDING_OWNER_KNOWN.with(|known| known.set(pid));
-                        return true;
-                    }
-                }
-                previous => {
-                    if self
-                        .owner
-                        .compare_exchange(
-                            previous,
-                            PENDING_OWNER_RESETTING,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        // The previous owner process is gone from this
-                        // address space (fresh start or fork): no thread
-                        // here can hold the inherited lock bit legitimately,
-                        // and every racing accessor waits on RESETTING.
-                        // SAFETY: exclusive by the owner-word protocol above.
-                        unsafe {
-                            *self.data.get() = PendingPromotionData {
-                                sites: [0; PENDING_PROMOTION_CAPACITY],
-                                known_len: 0,
-                                drained_len: 0,
-                                capacity_dropped: 0,
-                            };
-                        }
-                        self.contended_dropped.store(0, Ordering::Relaxed);
-                        self.locked.store(false, Ordering::Relaxed);
-                        self.owner.store(pid, Ordering::Release);
-                        PENDING_OWNER_KNOWN.with(|known| known.set(pid));
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Reset in a fork child at the handler's fork return, where this
-    /// thread is provably the only survivor and no other accessor can
-    /// have run in the child yet (the child has not returned to guest
-    /// code). Cheaper and stronger than the getpid backstop: later
-    /// records on this thread take the established fast path.
-    fn reset_in_fork_child(&self) {
-        use core::sync::atomic::Ordering;
-        let pid = Self::gate_getpid();
-        // SAFETY: sole surviving thread, still inside the fork's handler
-        // turn, so no accessor can hold or race the table in this child.
+        // SAFETY: exclusive by the caller's guarantee above.
         unsafe {
             *self.data.get() = PendingPromotionData {
                 sites: [0; PENDING_PROMOTION_CAPACITY],
@@ -550,7 +472,79 @@ impl PendingPromotions {
         self.contended_dropped.store(0, Ordering::Relaxed);
         self.locked.store(false, Ordering::Relaxed);
         self.owner.store(pid, Ordering::Release);
-        PENDING_OWNER_KNOWN.with(|known| known.set(pid));
+    }
+
+    /// Establish this process as table owner, resetting inherited fork
+    /// state without ever acquiring the inherited lock bit. The resetting
+    /// owner word carries its pid: a same-process reset is waited out
+    /// (or, with `wait == false` on the handler path, reported
+    /// not-established), while a copied marker naming another pid is a
+    /// dead parent's interrupted reset and is stolen and completed here.
+    fn ensure_owner(&self, wait: bool) -> bool {
+        use core::sync::atomic::Ordering;
+        let pid = Self::gate_getpid();
+        loop {
+            let word = self.owner.load(Ordering::Acquire);
+            let tagged = word & PENDING_OWNER_RESETTING != 0;
+            let owner_pid = word & !PENDING_OWNER_RESETTING;
+            if !tagged && owner_pid == pid {
+                return true;
+            }
+            if tagged && owner_pid == pid {
+                // A live reset by another thread of THIS process.
+                if !wait {
+                    return false;
+                }
+                core::hint::spin_loop();
+                continue;
+            }
+            if !tagged && owner_pid == 0 {
+                // First establishment in this process: the table has
+                // no previous owner, so its lock and contents are
+                // legitimate and must not be reset.
+                if self
+                    .owner
+                    .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return true;
+                }
+                continue;
+            }
+            // A different pid owns it, settled or mid-reset: that process
+            // is gone from this address space (fresh start or fork), and
+            // its threads cannot hold the lock here. Claim the reset.
+            if self
+                .owner
+                .compare_exchange(
+                    word,
+                    pid | PENDING_OWNER_RESETTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.reset_contents(pid);
+                return true;
+            }
+        }
+    }
+
+    /// Reset after a physically proven fork (see the handler): the
+    /// kernel returned 0 for a fork-family call AND this process's TGID
+    /// differs from the table owner. A dispatcher-synthesized zero in
+    /// the parent (TGID still the owner's) and a clone-thread return
+    /// (same TGID) both fail the second conjunct, so neither can clear
+    /// a live parent's lock or contents. In a proven child this thread
+    /// is the sole survivor and guest code has not run yet.
+    fn reset_if_physical_child(&self) {
+        use core::sync::atomic::Ordering;
+        let pid = Self::gate_getpid();
+        let owner_pid = self.owner.load(Ordering::Acquire) & !PENDING_OWNER_RESETTING;
+        if owner_pid == pid {
+            return;
+        }
+        self.reset_contents(pid);
     }
 
     fn try_lock(&self) -> bool {
@@ -577,11 +571,7 @@ impl PendingPromotions {
 
     fn try_record(&self, site: u64) -> PendingPromotionRecord {
         use core::sync::atomic::Ordering;
-        let established = PENDING_OWNER_KNOWN.with(|known| {
-            let known = known.get();
-            known != 0 && self.owner.load(Ordering::Acquire) == known
-        });
-        if !established && !self.ensure_owner(false) {
+        if !self.ensure_owner(false) {
             self.contended_dropped.fetch_add(1, Ordering::Relaxed);
             return PendingPromotionRecord::Contended;
         }
@@ -1264,7 +1254,7 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
     // before returning. Forks the handler never mediated are healed by
     // the table's PID-ownership check on first access instead.
     if crate::arch::is_fork_family(event.number()) && frame.register(0) == 0 {
-        PENDING_PROMOTIONS.reset_in_fork_child();
+        PENDING_PROMOTIONS.reset_if_physical_child();
     }
     IN_HANDLER.set(false);
 }
@@ -2078,11 +2068,14 @@ mod aarch64_gate_tests {
             // SAFETY: async-signal-safe calls only in the fork child.
             unsafe {
                 libc::alarm(1);
-                if table.stats().pending != 0 {
-                    libc::_exit(81);
-                }
+                // Record FIRST, before any stats/drain slow path can heal
+                // ownership: a copied thread-local cache must not let the
+                // handler path trust the parent's owner word.
                 if table.try_record(0x2000) != PendingPromotionRecord::NewSite {
                     libc::_exit(82);
+                }
+                if table.stats().pending != 1 {
+                    libc::_exit(81);
                 }
                 let mut out = [0_u64; 4];
                 if table.drain(&mut out) != 1 || out[0] != 0x2000 {
@@ -2102,6 +2095,26 @@ mod aarch64_gate_tests {
         let mut out = [0_u64; 4];
         assert_eq!(table.drain(&mut out), 1);
         assert_eq!(out[0], 0x1000);
+    }
+
+    #[test]
+    fn pending_table_recovers_copied_resetting_owner() {
+        // A fork that copies the owner word mid-reset leaves a resetting
+        // marker whose owner thread vanished with the parent. Ordinary
+        // access must steal and complete the reset, never spin on the
+        // dead resetter; if it spins, the test harness timeout is the
+        // failure signal.
+        let table = PendingPromotions::new();
+        table.owner.store(
+            PENDING_OWNER_RESETTING | 0x7fff_fffe,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        table
+            .locked
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        let stats = table.stats();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(table.try_record(0x4000), PendingPromotionRecord::NewSite);
     }
 
     #[test]
@@ -2149,6 +2162,8 @@ mod aarch64_gate_tests {
         core::arch::naked_asm!("nop", "mov x8, #172", "svc #0", "ret")
     }
 
+    static SYNTH_FORK_ARMED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
     static VL_ATTEMPT_ARMED: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
     static VL_DIRECT_RESULT: core::sync::atomic::AtomicI64 =
@@ -2161,6 +2176,15 @@ mod aarch64_gate_tests {
         }
 
         fn dispatch_signal(&self, event: &mut SyscallEvent, frame: &mut frame::SignalFrame<'_>) {
+            if event.number() == libc::SYS_clone
+                && SYNTH_FORK_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed)
+            {
+                // Synthesize a fork-child zero in the PARENT: no fork
+                // happened, so the pending table must not reset. Only a
+                // physical TGID change may prove a fork child.
+                event.set_result(0);
+                return;
+            }
             if event.number() == libc::SYS_gettid
                 && VL_ATTEMPT_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed)
             {
@@ -2237,8 +2261,7 @@ mod aarch64_gate_tests {
             }
             let mut first_sites = [0_u64; PENDING_PROMOTION_CAPACITY];
             if drain_pending_promotion_sites(&mut first_sites) != 1
-                || first_sites[0] == 0
-                || !first_sites[0].is_multiple_of(4)
+                || first_sites[0] != local_svc_getpid_a as *const () as u64 + 4
                 || pending_promotion_stats().pending != 0
                 || pending_promotion_stats().recorded_new != 1
             {
@@ -2263,7 +2286,7 @@ mod aarch64_gate_tests {
             let mut second_sites = [0_u64; PENDING_PROMOTION_CAPACITY];
             let pending_stats = pending_promotion_stats();
             if drain_pending_promotion_sites(&mut second_sites) != 1
-                || second_sites[0] == first_sites[0]
+                || second_sites[0] != local_svc_getpid_b as *const () as u64 + 8
                 || pending_stats.recorded_new != 2
                 || pending_stats.capacity_dropped != 0
                 || pending_stats.contended_dropped != 0
@@ -2342,6 +2365,29 @@ mod aarch64_gate_tests {
                 {
                     raw_syscall6(libc::SYS_exit_group, [67, 0, 0, 0, 0, 0]);
                 }
+            }
+            // Synthesized fork-child zero (dispatcher sets result 0 for a
+            // clone it never forwards): the table must retain everything
+            // recorded so far — a result register alone is not physical
+            // proof of a fork child.
+            let recorded_before_synth = pending_promotion_stats().recorded_new;
+            SYNTH_FORK_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+            if libc::syscall(
+                libc::SYS_clone,
+                libc::SIGCHLD as i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+            ) != 0
+            {
+                raw_syscall6(libc::SYS_exit_group, [70, 0, 0, 0, 0, 0]);
+            }
+            // The clone reuses the libc wrapper site already recorded
+            // by the VL phase, so the count may stay equal; a reset
+            // would drop it below the pre-synth value.
+            if pending_promotion_stats().recorded_new < recorded_before_synth {
+                raw_syscall6(libc::SYS_exit_group, [71, 0, 0, 0, 0, 0]);
             }
             raw_syscall6(libc::SYS_exit_group, [0, 0, 0, 0, 0, 0]);
         }
