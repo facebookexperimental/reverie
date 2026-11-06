@@ -8473,6 +8473,13 @@ mod test {
     const SUBPROCESS_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
     const PID_NAMESPACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
     const TRACEE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+    // Outer bound for an exact-test subprocess: a pure backstop that
+    // must exceed the sum of the inner sequence's own TRACEE_WAIT_TIMEOUT
+    // event waits plus process-start latency under load, so the outer
+    // SIGKILL never converts scheduling delay into a failure ahead of
+    // the inner assertions (the previous 5 s could). The test runner's
+    // per-test CPU/wall caps remain the hang backstop.
+    const EXACT_TEST_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
     const REGISTRATION_RETRY_TIMEOUT: Duration = Duration::from_millis(100);
 
     #[derive(Debug)]

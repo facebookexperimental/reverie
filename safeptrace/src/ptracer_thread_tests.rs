@@ -524,7 +524,7 @@ async fn explicit_legacy_cache_admits_real_native_sibling_without_another_owner(
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -662,7 +662,7 @@ async fn native_capture_before_legacy_open_refusal_keeps_native_wait_authority()
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -782,7 +782,7 @@ fn explicit_native_cache_admission_preserves_actual_local_sync_claim() {
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -1000,7 +1000,7 @@ async fn explicit_child_capture_policy_follows_each_request_before_parent_commit
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -1202,7 +1202,7 @@ async fn explicit_native_reattach_preserves_current_owner_and_original_driver() 
             &format!("notifier::test::{NAME}"),
             &[(INNER, "1")],
             false,
-            Duration::from_secs(5),
+            EXACT_TEST_SUBPROCESS_TIMEOUT,
         )
         .unwrap();
         match classify_exact_reuse_output(Some(&output.output), MARKER, UNAVAILABLE).unwrap() {
@@ -3016,7 +3016,7 @@ fn run_explicit_wait_role_outer(name: &str, marker: &str, cell_prefix: &str) -> 
         &format!("notifier::test::{name}"),
         &[(INNER, name)],
         false,
-        Duration::from_secs(5),
+        EXACT_TEST_SUBPROCESS_TIMEOUT,
     )
     .expect("start bounded original wait-role control");
     assert!(!result.timed_out, "wait-role control timed out: {result:?}");
