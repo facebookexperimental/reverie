@@ -166,6 +166,20 @@ pub fn ready(file: &File, nonce: [u64; 2]) -> Result<u64> {
     Ok(controls)
 }
 
+/// The measured pre-arm guest-event count: every committed journal row
+/// carrying `FLAG_GUEST` at the moment of the call. Read while the task
+/// is stopped at the ready marker, this is a measurement of the journal
+/// the runtime actually wrote, not an assumption about it. Any guest
+/// syscall entered before arming would appear here (its ENTER row is
+/// guest-flagged), as would a guest CPUID/TSC observation.
+pub fn pre_arm_guest_events(file: &File) -> Result<u64> {
+    let (events, _) = events(file)?;
+    Ok(events
+        .iter()
+        .filter(|e| e["flags"].as_u64().unwrap_or(0) & FLAG_GUEST as u64 != 0)
+        .count() as u64)
+}
+
 pub fn events(file: &File) -> Result<(Vec<Value>, Value)> {
     let page = page(file)?;
     let reserved = u64_at(&page, offset_of!(ProbeControlV1, events_reserved))?;

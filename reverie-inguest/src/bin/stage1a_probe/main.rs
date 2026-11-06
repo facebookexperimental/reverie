@@ -301,7 +301,10 @@ fn run(
     report["stack_unchanged"] = json!(true);
     report["stack_bytes"] = json!(armed.stop().context.stack_bytes().len());
     report["bootstrap_fds_closed"] = json!(true);
-    report["pre_arm_guest_syscalls"] = json!(0);
+    // Measured from the committed journal rows at this ready stop, not
+    // asserted: `control::ready` already refused a nonzero count, and
+    // this reports what the journal actually holds before handover.
+    report["pre_arm_guest_syscalls"] = json!(control::pre_arm_guest_events(observations)?);
     let (_handed_off, bundle) = armed.hand_over();
     let ProbeStop { task, owner, .. } = bundle;
     let running = task
