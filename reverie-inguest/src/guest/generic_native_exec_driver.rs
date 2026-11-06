@@ -880,6 +880,7 @@ mod tests {
         }
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
