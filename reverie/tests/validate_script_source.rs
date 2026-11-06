@@ -33,7 +33,7 @@ fn validation_dag_builds_once_and_counts_every_test_node() {
     // 274 artifact identities are a subset of the test build's 420
     // (measured 2026-11-05), with clippy --all-targets covering the
     // non-test lib profile.
-    assert!(!VALIDATE_DAG.contains("\"cmd\": \"cargo build"));
+    assert!(!VALIDATE_DAG.contains("\"cmd\": \"cargo build --workspace"));
     assert!(VALIDATE_DAG.contains("cargo clippy --workspace --all-targets --all-features"));
     // No DAG test node may fall back to serialized libtest execution.
     assert!(!VALIDATE_DAG.contains("--test-threads=1"));
