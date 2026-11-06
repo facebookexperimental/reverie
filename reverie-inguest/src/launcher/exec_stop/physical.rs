@@ -406,201 +406,241 @@ impl<'fd> InitialExecStop<'fd> {
             boundary,
             owner,
         } = self;
-        let mut state = PreparedMapping {
-            owner: Box::new(owner),
-            task: Some(task),
-            entry: borrowed_entry::RetainedEntry::default(),
-            context,
-            _boundary: boundary,
-            _inputs: inputs,
-            calls: Vec::new(),
-            filter: Vec::new(),
-            #[cfg(feature = "stage1a-probe")]
-            prevalidation: None,
-        };
-        let result = (|| -> Result<()> {
-            let inputs = &state._inputs;
-            for fd in [inputs.runtime_fd, inputs.handoff_fd, inputs.input_fd] {
-                if !state.owner._request.retains_descriptor(fd) {
-                    return Err("mapped_preparation_descriptor_not_inherited".into());
-                }
+        // SAFETY: the parts are this stop's own, paired by construction
+        // at its drained exec stop; every caller obligation above
+        // carries over to the parts form unchanged.
+        unsafe { prepare_mapping_parts(task, context, boundary, owner, inputs) }
+    }
+}
+
+/// Physical preparation over stopped-image parts, shared by the
+/// first-image stop and the exec supervisor's successor stops.
+///
+/// The fence argument is the pairing: `task`, `context`, `boundary`
+/// and `owner` must be the exact parts one retained exec stop was
+/// constructed from at a drained exec event (an [`InitialExecStop`]
+/// or a supervisor `SuccessorStop`, decomposed only through their
+/// crate-private conversions). This function rechecks that the
+/// three generation identities agree before any child mutation,
+/// but it cannot prove the parts were not reassembled inside this
+/// crate; that is why the parts form stays crate-private and every
+/// public entry point takes a whole retained stop.
+///
+/// # Safety
+/// Every obligation documented on
+/// [`InitialExecStop::prepare_mapping`] applies unchanged, with
+/// "this child's exec" read as the exec whose drained stop produced
+/// these parts: for a successor, the descriptor leases are the
+/// original launch's inherited descriptors, retained in the
+/// supervisor's `PreparedExec`, and they must still name the same
+/// open file descriptions in the successor image.
+pub(crate) unsafe fn prepare_mapping_parts<'fd>(
+    task: Stopped,
+    context: EntryContext,
+    boundary: ExecBoundary,
+    owner: ChildOwner<'fd>,
+    inputs: Preparation<'fd>,
+) -> std::result::Result<PreparedMapping<'fd>, Box<PreparationFailure<'fd>>> {
+    let mut state = PreparedMapping {
+        owner: Box::new(owner),
+        task: Some(task),
+        entry: borrowed_entry::RetainedEntry::default(),
+        context,
+        _boundary: boundary,
+        _inputs: inputs,
+        calls: Vec::new(),
+        filter: Vec::new(),
+        #[cfg(feature = "stage1a-probe")]
+        prevalidation: None,
+    };
+    let result = (|| -> Result<()> {
+        let stopped = state.task.as_ref().ok_or("mapped_preparation_lost_stop")?;
+        if stopped.generation() != state.context.generation
+            || stopped.generation() != state.owner.generation
+        {
+            return Err("mapped_preparation_foreign_parts".into());
+        }
+        let inputs = &state._inputs;
+        for fd in [inputs.runtime_fd, inputs.handoff_fd, inputs.input_fd] {
+            if !state.owner._request.retains_descriptor(fd) {
+                return Err("mapped_preparation_descriptor_not_inherited".into());
             }
-            if inputs.runtime_bytes.is_empty() || inputs.runtime_bytes.len() > 512 * 1024 * 1024 {
-                return Err("mapped_runtime_file_bound".into());
-            }
-            sealed_contents(
-                inputs.runtime_fd,
-                inputs.runtime_bytes,
-                inputs.runtime_bytes.len() as u64,
-            )?;
-            let parsed =
-                Image::parse(inputs.runtime_bytes).map_err(|e| format!("mapped_image: {e:?}"))?;
-            let image = parsed
-                .validate(&Policy {
-                    window: RUNTIME_WINDOW,
-                    allow_tls: true,
-                })
-                .map_err(|e| format!("mapped_image: {e:?}"))?;
-            image
-                .private_runtime_metadata()
-                .map_err(|e| format!("mapped_tls: {e:?}"))?;
-            let layout = target_layout(&image, inputs.runtime_bytes, inputs.layout_address)?;
-            let view = wire(View::parse(inputs.handoff_bytes, inputs.handoff_address))?;
-            if inputs.free_band.start < TOOL_REGION.start
-                || inputs.free_band.end > RUNTIME_WINDOW.start
-                || inputs.free_band.start >= inputs.free_band.end
-            {
-                return Err("mapped_free_band_outside_owned_data".into());
-            }
-            wire(view.validate_roles(inputs.free_band))?;
-            let actual_free_band = crate::guest::tool_region::scalar_free_band();
-            if inputs.free_band != actual_free_band {
-                return Err("mapped_preparation_target_free_band".into());
-            }
-            #[cfg(feature = "stage1a-probe")]
-            {
-                let task = state.task.as_ref().ok_or("mapped_preparation_lost_stop")?;
-                state.prevalidation = Some(PrevalidationObservation {
-                    registers: super::register_words(&task.getregs()?),
-                    signal_mask: task.getsigmask()?,
-                    xstate_exact: task.getxstate()? == state.context.xstate,
-                });
-            }
-            // Complete shared numeric checks precede EVERY child mutation,
-            // including setsigmask. Host storage is not the child address.
-            let _validated = wire(
-                reverie_loader::mapped_inputs::ProductionMappedInputs::validate_at(
-                    inputs.handoff_bytes,
-                    inputs.handoff_address,
-                    reverie_loader::mapped_inputs::ConsumerLayout {
-                        free_band: actual_free_band,
-                        region: Extent {
-                            start: TOOL_REGION.start,
-                            end: TOOL_REGION.end,
-                        },
-                        control_bytes: layout.control_bytes,
-                        relay_bytes: layout.relay_bytes,
-                        control_align: layout.control_align,
-                        relay_align: layout.relay_align,
-                    },
-                ),
-            )?;
-            let handoff = interior(wire(view.role(3))?)?;
-            if handoff.start != inputs.handoff_address
-                || handoff.end - handoff.start
-                    != (inputs.handoff_bytes.len() as u64).div_ceil(4096) * 4096
-            {
-                return Err("mapped_handoff_role_backing".into());
-            }
-            sealed_contents(
-                inputs.handoff_fd,
+        }
+        if inputs.runtime_bytes.is_empty() || inputs.runtime_bytes.len() > 512 * 1024 * 1024 {
+            return Err("mapped_runtime_file_bound".into());
+        }
+        sealed_contents(
+            inputs.runtime_fd,
+            inputs.runtime_bytes,
+            inputs.runtime_bytes.len() as u64,
+        )?;
+        let parsed =
+            Image::parse(inputs.runtime_bytes).map_err(|e| format!("mapped_image: {e:?}"))?;
+        let image = parsed
+            .validate(&Policy {
+                window: RUNTIME_WINDOW,
+                allow_tls: true,
+            })
+            .map_err(|e| format!("mapped_image: {e:?}"))?;
+        image
+            .private_runtime_metadata()
+            .map_err(|e| format!("mapped_tls: {e:?}"))?;
+        let layout = target_layout(&image, inputs.runtime_bytes, inputs.layout_address)?;
+        let view = wire(View::parse(inputs.handoff_bytes, inputs.handoff_address))?;
+        if inputs.free_band.start < TOOL_REGION.start
+            || inputs.free_band.end > RUNTIME_WINDOW.start
+            || inputs.free_band.start >= inputs.free_band.end
+        {
+            return Err("mapped_free_band_outside_owned_data".into());
+        }
+        wire(view.validate_roles(inputs.free_band))?;
+        let actual_free_band = crate::guest::tool_region::scalar_free_band();
+        if inputs.free_band != actual_free_band {
+            return Err("mapped_preparation_target_free_band".into());
+        }
+        #[cfg(feature = "stage1a-probe")]
+        {
+            let task = state.task.as_ref().ok_or("mapped_preparation_lost_stop")?;
+            state.prevalidation = Some(PrevalidationObservation {
+                registers: super::register_words(&task.getregs()?),
+                signal_mask: task.getsigmask()?,
+                xstate_exact: task.getxstate()? == state.context.xstate,
+            });
+        }
+        // Complete shared numeric checks precede EVERY child mutation,
+        // including setsigmask. Host storage is not the child address.
+        let _validated = wire(
+            reverie_loader::mapped_inputs::ProductionMappedInputs::validate_at(
                 inputs.handoff_bytes,
-                handoff.end - handoff.start,
-            )?;
-            if wire(view.registers().words())? != super::register_words(state.context.regs())
-                || wire(view.scalar(7))? != state.context.signal_mask()
-                || wire(view.scalar(0))? != state.owner.generation.pid().as_raw() as u64
-                || wire(view.scalar(5))? != inputs.input_fd.as_raw_fd() as u64
-            {
-                return Err("mapped_preparation_original_birth_context".into());
+                inputs.handoff_address,
+                reverie_loader::mapped_inputs::ConsumerLayout {
+                    free_band: actual_free_band,
+                    region: Extent {
+                        start: TOOL_REGION.start,
+                        end: TOOL_REGION.end,
+                    },
+                    control_bytes: layout.control_bytes,
+                    relay_bytes: layout.relay_bytes,
+                    control_align: layout.control_align,
+                    relay_align: layout.relay_align,
+                },
+            ),
+        )?;
+        let handoff = interior(wire(view.role(3))?)?;
+        if handoff.start != inputs.handoff_address
+            || handoff.end - handoff.start
+                != (inputs.handoff_bytes.len() as u64).div_ceil(4096) * 4096
+        {
+            return Err("mapped_handoff_role_backing".into());
+        }
+        sealed_contents(
+            inputs.handoff_fd,
+            inputs.handoff_bytes,
+            handoff.end - handoff.start,
+        )?;
+        if wire(view.registers().words())? != super::register_words(state.context.regs())
+            || wire(view.scalar(7))? != state.context.signal_mask()
+            || wire(view.scalar(0))? != state.owner.generation.pid().as_raw() as u64
+            || wire(view.scalar(5))? != inputs.input_fd.as_raw_fd() as u64
+        {
+            return Err("mapped_preparation_original_birth_context".into());
+        }
+        let control = wire(view.scalar(1))?;
+        let relay = wire(view.scalar(3))?;
+        let owned_state = interior(wire(view.role(4))?)?;
+        let staging = filter_staging(inputs.filter_scratch, &target_recipe(layout.gate)?)?;
+        if wire(view.scalar(2))? != layout.control_bytes
+            || wire(view.scalar(4))? != layout.relay_bytes
+            || control % layout.control_align != 0
+            || relay % layout.relay_align != 0
+            || !owned_state.contains(control, layout.control_bytes)
+            || !owned_state.contains(relay, layout.relay_bytes)
+            || overlap(control, layout.control_bytes, relay, layout.relay_bytes)
+            || !owned_state.contains(inputs.filter_scratch, staging.len() as u64)
+            || overlap(
+                inputs.filter_scratch,
+                staging.len() as u64,
+                control,
+                layout.control_bytes,
+            )
+            || overlap(
+                inputs.filter_scratch,
+                staging.len() as u64,
+                relay,
+                layout.relay_bytes,
+            )
+        {
+            return Err("mapped_preparation_state_layout".into());
+        }
+        let gate = image_bytes(&image, inputs.runtime_bytes, layout.gate, 4096, 5)?;
+        let reference_address = wire(view.scalar(10))?;
+        let reference = image_bytes(&image, inputs.runtime_bytes, reference_address, 4096, 1)?;
+        if wire(view.scalar(11))? != 4096
+            || overlap(layout.gate, 4096, reference_address, 4096)
+            || gate != reference
+        {
+            return Err("mapped_preparation_independent_gate_reference".into());
+        }
+        // Plan from the same locally validated image and parsed roles,
+        // never from the caller's proposed table0 rows. No kernel claim.
+        let steps = mapping_plan::production_steps(
+            &image,
+            [
+                wire(view.role(0))?,
+                wire(view.role(1))?,
+                wire(view.role(2))?,
+                wire(view.role(3))?,
+                wire(view.role(4))?,
+            ],
+        )?;
+        let task = state.task.take().ok_or("mapped_preparation_lost_stop")?;
+        task.setsigmask(u64::MAX)?;
+        let blocked = !((1_u64 << (libc::SIGKILL - 1)) | (1_u64 << (libc::SIGSTOP - 1)));
+        if task.getsigmask()? != blocked {
+            return Err("mapped_preparation_block_mask".into());
+        }
+        let mut injector = Injector::new(task)?;
+        let mapped = (|| -> Result<()> {
+            injector.reserve()?;
+            injector.map_production_plan(&steps, inputs.runtime_fd, inputs.handoff_fd)?;
+            let ledger = injector.mapping_ledger();
+            if wire(view.table(0))?.len() != ledger.len() {
+                return Err("mapped_preparation_ledger_count".into());
             }
-            let control = wire(view.scalar(1))?;
-            let relay = wire(view.scalar(3))?;
-            let owned_state = interior(wire(view.role(4))?)?;
-            let staging = filter_staging(inputs.filter_scratch, &target_recipe(layout.gate)?)?;
-            if wire(view.scalar(2))? != layout.control_bytes
-                || wire(view.scalar(4))? != layout.relay_bytes
-                || control % layout.control_align != 0
-                || relay % layout.relay_align != 0
-                || !owned_state.contains(control, layout.control_bytes)
-                || !owned_state.contains(relay, layout.relay_bytes)
-                || overlap(control, layout.control_bytes, relay, layout.relay_bytes)
-                || !owned_state.contains(inputs.filter_scratch, staging.len() as u64)
-                || overlap(
-                    inputs.filter_scratch,
-                    staging.len() as u64,
-                    control,
-                    layout.control_bytes,
-                )
-                || overlap(
-                    inputs.filter_scratch,
-                    staging.len() as u64,
-                    relay,
-                    layout.relay_bytes,
-                )
-            {
-                return Err("mapped_preparation_state_layout".into());
-            }
-            let gate = image_bytes(&image, inputs.runtime_bytes, layout.gate, 4096, 5)?;
-            let reference_address = wire(view.scalar(10))?;
-            let reference = image_bytes(&image, inputs.runtime_bytes, reference_address, 4096, 1)?;
-            if wire(view.scalar(11))? != 4096
-                || overlap(layout.gate, 4096, reference_address, 4096)
-                || gate != reference
-            {
-                return Err("mapped_preparation_independent_gate_reference".into());
-            }
-            // Plan from the same locally validated image and parsed roles,
-            // never from the caller's proposed table0 rows. No kernel claim.
-            let steps = mapping_plan::production_steps(
-                &image,
-                [
-                    wire(view.role(0))?,
-                    wire(view.role(1))?,
-                    wire(view.role(2))?,
-                    wire(view.role(3))?,
-                    wire(view.role(4))?,
-                ],
-            )?;
-            let task = state.task.take().ok_or("mapped_preparation_lost_stop")?;
-            task.setsigmask(u64::MAX)?;
-            let blocked = !((1_u64 << (libc::SIGKILL - 1)) | (1_u64 << (libc::SIGSTOP - 1)));
-            if task.getsigmask()? != blocked {
-                return Err("mapped_preparation_block_mask".into());
-            }
-            let mut injector = Injector::new(task)?;
-            let mapped = (|| -> Result<()> {
-                injector.reserve()?;
-                injector.map_production_plan(&steps, inputs.runtime_fd, inputs.handoff_fd)?;
-                let ledger = injector.mapping_ledger();
-                if wire(view.table(0))?.len() != ledger.len() {
-                    return Err("mapped_preparation_ledger_count".into());
+            for (i, actual) in ledger.iter().enumerate() {
+                let claimed = wire(view.map(i))?;
+                if *actual
+                    != [
+                        claimed.start,
+                        claimed.end,
+                        claimed.protection,
+                        claimed.flags,
+                    ]
+                {
+                    return Err("mapped_preparation_ledger_identity".into());
                 }
-                for (i, actual) in ledger.iter().enumerate() {
-                    let claimed = wire(view.map(i))?;
-                    if *actual
-                        != [
-                            claimed.start,
-                            claimed.end,
-                            claimed.protection,
-                            claimed.flags,
-                        ]
-                    {
-                        return Err("mapped_preparation_ledger_identity".into());
-                    }
-                }
-                state.filter = target_recipe(layout.gate)?;
-                injector.install_filter_last(inputs.filter_scratch, &state.filter)
-            })();
-            // Keep partial transcript on EVERY failure, not just a good finish.
-            state.calls = injector.calls.clone();
-            mapped?;
-            let (task, calls) = injector.finish()?;
-            state.calls = calls;
-            state.task = Some(task);
-            // Only ptrace operations after filter install; no child syscall,
-            // original guest instruction, entry invocation or writable input view.
-            state
-                .context
-                .restore(state.task.as_ref().ok_or("mapped_preparation_lost_stop")?)?;
-            Ok(())
+            }
+            state.filter = target_recipe(layout.gate)?;
+            injector.install_filter_last(inputs.filter_scratch, &state.filter)
         })();
-        match result {
-            Ok(()) => Ok(state),
-            Err(error) => {
-                state.owner.retire();
-                Err(Box::new(PreparationFailure { error, state }))
-            }
+        // Keep partial transcript on EVERY failure, not just a good finish.
+        state.calls = injector.calls.clone();
+        mapped?;
+        let (task, calls) = injector.finish()?;
+        state.calls = calls;
+        state.task = Some(task);
+        // Only ptrace operations after filter install; no child syscall,
+        // original guest instruction, entry invocation or writable input view.
+        state
+            .context
+            .restore(state.task.as_ref().ok_or("mapped_preparation_lost_stop")?)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(state),
+        Err(error) => {
+            state.owner.retire();
+            Err(Box::new(PreparationFailure { error, state }))
         }
     }
 }

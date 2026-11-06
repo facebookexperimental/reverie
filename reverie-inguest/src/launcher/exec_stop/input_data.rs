@@ -15,6 +15,8 @@ use reverie_loader::image::PrivateRuntimeMetadata;
 use reverie_loader::image::ValidatedImage;
 use reverie_loader::musl_tls;
 
+use super::ChildOwner;
+use super::EntryContext;
 use super::InitialExecStop;
 use super::Result;
 use super::initial_inputs::CapturedInitialInputs;
@@ -674,35 +676,58 @@ impl InitialExecStop<'_> {
         image: &ValidatedImage<'_>,
         request: &CopiedInputRequest,
     ) -> Result<CopiedInitialData> {
-        self.owner
-            ._thread
-            .as_ref()
-            .ok_or("exec_stop_missing_original_ptracer")?
-            .check_current()?;
-        if !captured.matches_stop(self) {
-            return Err("copied_input_foreign_capture".into());
-        }
-        initial_inputs::unchanged(self)?;
-        let body = (|| {
-            let page_size = captured
-                .original_aux()
-                .find(|(kind, _)| *kind == 6)
-                .map(|(_, value)| value)
-                .ok_or("copied_input_missing_original_page_size")?;
-            build_data(
-                image,
-                request,
-                page_size,
-                |private_image, base, capacity| captured.place(private_image, base, capacity),
-            )
-        })();
-        // Keep close-on-error as well: do not hide a lost original context behind
-        // a numeric refusal or replace a primary data failure with close success.
-        match (body, initial_inputs::unchanged(self)) {
-            (Ok(data), Ok(())) => Ok(data),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(body), Err(close)) => Err(format!("{body}; copied_input_close: {close}").into()),
-        }
+        prepare_copied_inputs_parts(
+            &self.task,
+            &self.context,
+            &self.owner,
+            captured,
+            image,
+            request,
+        )
+    }
+}
+
+/// The same copied-input assembly over stopped-image parts, for the
+/// exec supervisor's successor stops. The thread, capture-identity
+/// and unchanged-context checks are identical; the only producers
+/// are the two retained exec stops, which pair the parts by
+/// construction at a drained exec stop.
+pub(crate) fn prepare_copied_inputs_parts(
+    task: &safeptrace::Stopped,
+    context: &EntryContext,
+    owner: &ChildOwner<'_>,
+    captured: &CapturedInitialInputs,
+    image: &ValidatedImage<'_>,
+    request: &CopiedInputRequest,
+) -> Result<CopiedInitialData> {
+    owner
+        ._thread
+        .as_ref()
+        .ok_or("exec_stop_missing_original_ptracer")?
+        .check_current()?;
+    if !captured.matches_parts(task, context, owner) {
+        return Err("copied_input_foreign_capture".into());
+    }
+    initial_inputs::unchanged_parts(task, context, owner)?;
+    let body = (|| {
+        let page_size = captured
+            .original_aux()
+            .find(|(kind, _)| *kind == 6)
+            .map(|(_, value)| value)
+            .ok_or("copied_input_missing_original_page_size")?;
+        build_data(
+            image,
+            request,
+            page_size,
+            |private_image, base, capacity| captured.place(private_image, base, capacity),
+        )
+    })();
+    // Keep close-on-error as well: do not hide a lost original context behind
+    // a numeric refusal or replace a primary data failure with close success.
+    match (body, initial_inputs::unchanged_parts(task, context, owner)) {
+        (Ok(data), Ok(())) => Ok(data),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(body), Err(close)) => Err(format!("{body}; copied_input_close: {close}").into()),
     }
 }
 

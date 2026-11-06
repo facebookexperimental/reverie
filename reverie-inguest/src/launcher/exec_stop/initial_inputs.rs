@@ -7,6 +7,7 @@ use std::io::Read;
 use reverie_memory::Addr;
 use reverie_memory::MemoryAccess;
 
+use super::ChildOwner;
 use super::InitialExecStop;
 use super::Result;
 use super::initial_stack_inputs::Aux;
@@ -189,10 +190,22 @@ impl CapturedInitialInputs {
     // No public generation capability is exposed. The producer must bind this
     // before adding/replacing mappings; capture data alone cannot preserve them.
     pub(crate) fn matches_stop(&self, stop: &InitialExecStop<'_>) -> bool {
-        self.generation == stop.task.generation()
-            && self.generation == stop.owner.generation
-            && self.generation == stop.context.generation
-            && self.pid == stop.task.pid()
+        self.matches_parts(&stop.task, &stop.context, &stop.owner)
+    }
+
+    /// Same identity check over stopped-image parts, for the exec
+    /// supervisor's successor stops. Crate-private exactly like
+    /// [`Self::matches_stop`]: no public generation capability.
+    pub(crate) fn matches_parts(
+        &self,
+        task: &safeptrace::Stopped,
+        context: &super::EntryContext,
+        owner: &ChildOwner<'_>,
+    ) -> bool {
+        self.generation == task.generation()
+            && self.generation == owner.generation
+            && self.generation == context.generation
+            && self.pid == task.pid()
     }
 }
 fn parse_error(error: ParseError) -> Box<dyn std::error::Error> {
@@ -268,9 +281,9 @@ fn parse_maps(bytes: &[u8]) -> Result<Vec<InputMapping>> {
     }
     Ok(result)
 }
-fn read_maps(stop: &InitialExecStop<'_>) -> Result<Vec<u8>> {
+fn read_maps(pid: safeptrace::Pid) -> Result<Vec<u8>> {
     let mut raw = Vec::new();
-    std::fs::File::open(format!("/proc/{}/maps", stop.task.pid()))?
+    std::fs::File::open(format!("/proc/{}/maps", pid))?
         .take((MAX_MAP_BYTES + 1) as u64)
         .read_to_end(&mut raw)?;
     if raw.len() > MAX_MAP_BYTES {
@@ -309,7 +322,7 @@ fn read_exact_span(task: &safeptrace::Stopped, address: u64, length: usize) -> R
     Ok(bytes)
 }
 fn read_request(
-    stop: &InitialExecStop<'_>,
+    task: &safeptrace::Stopped,
     maps: &[InputMapping],
     request: ReadRequest,
     budget: &mut usize,
@@ -339,7 +352,7 @@ fn read_request(
             return Err("exec-stop incomplete bounded input read".into());
         }
         spend(budget, length)?;
-        let bytes = read_exact_span(&stop.task, address, length)?;
+        let bytes = read_exact_span(task, address, length)?;
         let take = match request.kind {
             ReadKind::CString => bytes.iter().position(|b| *b == 0).map(|i| i + 1),
             ReadKind::Random16 => (owned.bytes.len() + bytes.len() == 16).then_some(bytes.len()),
@@ -361,10 +374,20 @@ fn read_request(
     }
 }
 pub(super) fn unchanged(stop: &InitialExecStop<'_>) -> Result<()> {
-    let task = &stop.task;
-    let context = &stop.context;
+    unchanged_parts(&stop.task, &stop.context, &stop.owner)
+}
+
+/// The same unchanged-context proof over stopped-image parts, for the
+/// exec supervisor's successor stops. The three generation identities
+/// must already be the one generation; mismatch refuses before any
+/// register/stack comparison is trusted.
+pub(super) fn unchanged_parts(
+    task: &safeptrace::Stopped,
+    context: &super::EntryContext,
+    owner: &ChildOwner<'_>,
+) -> Result<()> {
     if task.generation() != context.generation
-        || task.generation() != stop.owner.generation
+        || task.generation() != owner.generation
         || register_words(&task.getregs()?) != register_words(&context.regs)
         || task.getsigmask()? != context.signal_mask
         || task.getxstate()? != context.xstate
@@ -387,89 +410,101 @@ impl InitialExecStop<'_> {
     /// shared/file-memory writers or later mapping destruction: the real host
     /// producer must retain exact source/mapping custody through handover.
     pub fn capture_initial_inputs(&self) -> Result<CapturedInitialInputs> {
-        unchanged(self)?;
-        let maps_before = read_maps(self)?;
-        let mappings = parse_maps(&maps_before)?;
-        let context = &self.context;
-        let stack_end = context
-            .stack_start
-            .checked_add(context.stack_bytes.len() as u64)
-            .ok_or("exec-stop original stack extent overflow")?;
-        if !mappings
-            .iter()
-            .any(|m| m.start == context.stack_start && m.end == stack_end && m.path == b"[stack]")
-        {
-            return Err("exec-stop current maps do not retain exact original stack VMA".into());
-        }
-        let parsed =
-            ParsedInitial::parse(context.stack_start, &context.stack_bytes, context.regs.rsp)
-                .map_err(parse_error)?;
-        let mut budget = 0;
-        let mut reads = Vec::new();
-        for request in parsed.read_requests().map_err(parse_error)? {
-            reads.push(read_request(self, &mappings, request, &mut budget)?);
-        }
-        let mut retained = Vec::new();
-        for aux in parsed
-            .original_aux()
-            .iter()
-            .filter(|a| matches!(a.kind, 7 | 9 | 32 | 33) && a.value != 0)
-        {
-            let index = mapping_at(&mappings, aux.value)?;
-            let map = &mappings[index];
-            let length = usize::try_from((map.end - aux.value).min(4096))?;
-            spend(&mut budget, length)?;
-            retained.push(RetainedRead {
-                mapping: index,
-                owned: RetainedAux {
-                    aux: *aux,
-                    #[cfg(any(test, feature = "loader-private-runtime"))]
-                    start: map.start,
-                    #[cfg(any(test, feature = "loader-private-runtime"))]
-                    end: map.end,
-                    observed: read_exact_span(&self.task, aux.value, length)?,
-                },
-            });
-        }
-        // Reconcile actual reads before any future mapping/entry mutation. Keep
-        // full raw chunk bytes, including harmless reads beyond a string NUL.
-        for read in &reads {
-            for chunk in &read.chunks {
-                if read_exact_span(&self.task, chunk.address, chunk.bytes.len())? != chunk.bytes {
-                    return Err("exec-stop external input bytes changed during capture".into());
-                }
-            }
-        }
-        for read in &retained {
-            if read_exact_span(&self.task, read.owned.aux.value, read.owned.observed.len())?
-                != read.owned.observed
-            {
-                return Err("exec-stop retained aux bytes changed during capture".into());
-            }
-        }
-        unchanged(self)?;
-        let maps_after = read_maps(self)?;
-        if maps_before != maps_after {
-            return Err("exec-stop mapping ledger changed during input capture".into());
-        }
-        let evidence = CapturedInitialInputs {
-            generation: self.task.generation(),
-            pid: self.task.pid(),
-            registers: register_words(&context.regs),
-            stack_start: context.stack_start,
-            stack_bytes: context.stack_bytes.clone(),
-            maps_before,
-            maps_after,
-            mappings,
-            original_aux: parsed.original_aux().to_vec(),
-            reads,
-            retained,
-        };
-        if !evidence.matches_stop(self) {
-            return Err("exec-stop capture identity changed before return".into());
-        }
-        Ok(evidence)
+        capture_initial_inputs_parts(&self.task, &self.context, &self.owner)
     }
+}
+
+/// Capture over stopped-image parts, for the exec supervisor's successor
+/// stops. The only producers are the two retained exec stops (first image
+/// and successor), which pair task, captured context and owner generation
+/// by construction at a drained exec stop; the parts are rechecked
+/// against each other before any read is trusted. No resume capability
+/// escapes, exactly as through [`InitialExecStop::capture_initial_inputs`].
+pub(crate) fn capture_initial_inputs_parts(
+    task: &safeptrace::Stopped,
+    context: &super::EntryContext,
+    owner: &ChildOwner<'_>,
+) -> Result<CapturedInitialInputs> {
+    unchanged_parts(task, context, owner)?;
+    let maps_before = read_maps(task.pid())?;
+    let mappings = parse_maps(&maps_before)?;
+    let stack_end = context
+        .stack_start
+        .checked_add(context.stack_bytes.len() as u64)
+        .ok_or("exec-stop original stack extent overflow")?;
+    if !mappings
+        .iter()
+        .any(|m| m.start == context.stack_start && m.end == stack_end && m.path == b"[stack]")
+    {
+        return Err("exec-stop current maps do not retain exact original stack VMA".into());
+    }
+    let parsed = ParsedInitial::parse(context.stack_start, &context.stack_bytes, context.regs.rsp)
+        .map_err(parse_error)?;
+    let mut budget = 0;
+    let mut reads = Vec::new();
+    for request in parsed.read_requests().map_err(parse_error)? {
+        reads.push(read_request(task, &mappings, request, &mut budget)?);
+    }
+    let mut retained = Vec::new();
+    for aux in parsed
+        .original_aux()
+        .iter()
+        .filter(|a| matches!(a.kind, 7 | 9 | 32 | 33) && a.value != 0)
+    {
+        let index = mapping_at(&mappings, aux.value)?;
+        let map = &mappings[index];
+        let length = usize::try_from((map.end - aux.value).min(4096))?;
+        spend(&mut budget, length)?;
+        retained.push(RetainedRead {
+            mapping: index,
+            owned: RetainedAux {
+                aux: *aux,
+                #[cfg(any(test, feature = "loader-private-runtime"))]
+                start: map.start,
+                #[cfg(any(test, feature = "loader-private-runtime"))]
+                end: map.end,
+                observed: read_exact_span(task, aux.value, length)?,
+            },
+        });
+    }
+    // Reconcile actual reads before any future mapping/entry mutation. Keep
+    // full raw chunk bytes, including harmless reads beyond a string NUL.
+    for read in &reads {
+        for chunk in &read.chunks {
+            if read_exact_span(task, chunk.address, chunk.bytes.len())? != chunk.bytes {
+                return Err("exec-stop external input bytes changed during capture".into());
+            }
+        }
+    }
+    for read in &retained {
+        if read_exact_span(task, read.owned.aux.value, read.owned.observed.len())?
+            != read.owned.observed
+        {
+            return Err("exec-stop retained aux bytes changed during capture".into());
+        }
+    }
+    unchanged_parts(task, context, owner)?;
+    let maps_after = read_maps(task.pid())?;
+    if maps_before != maps_after {
+        return Err("exec-stop mapping ledger changed during input capture".into());
+    }
+    let evidence = CapturedInitialInputs {
+        generation: task.generation(),
+        pid: task.pid(),
+        registers: register_words(&context.regs),
+        stack_start: context.stack_start,
+        stack_bytes: context.stack_bytes.clone(),
+        maps_before,
+        maps_after,
+        mappings,
+        original_aux: parsed.original_aux().to_vec(),
+        reads,
+        retained,
+    };
+    if !evidence.matches_parts(task, context, owner) {
+        return Err("exec-stop capture identity changed before return".into());
+    }
+    Ok(evidence)
 }
 
 #[cfg(test)]
@@ -584,7 +619,7 @@ mod tests {
         let receipt = super::super::CleanupReceipt::default();
         let stop = super::super::ExecStop::spawn(request, receipt.clone()).unwrap();
         let outcome = (|| -> Result<()> {
-            let maps = parse_maps(&read_maps(&stop)?)?;
+            let maps = parse_maps(&read_maps(stop.task.pid())?)?;
             let end = stop
                 .context
                 .stack_start
@@ -601,7 +636,7 @@ mod tests {
             );
             let mut budget = 0;
             let read = read_request(
-                &stop,
+                &stop.task,
                 &maps,
                 ReadRequest {
                     address: end - 1,
@@ -645,12 +680,12 @@ mod tests {
         let receipt = super::super::CleanupReceipt::default();
         let stop = super::super::ExecStop::spawn(request, receipt.clone()).unwrap();
         let outcome = (|| -> Result<()> {
-            let maps = parse_maps(&read_maps(&stop)?)?;
+            let maps = parse_maps(&read_maps(stop.task.pid())?)?;
             assert!(stop.context.stack_bytes.len() >= 8192);
             let address = stop.context.stack_start + 4096 - 7;
             let mut budget = 0;
             let read = read_request(
-                &stop,
+                &stop.task,
                 &maps,
                 ReadRequest {
                     address,
