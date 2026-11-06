@@ -672,6 +672,74 @@ mod tests {
         );
     }
 
+    /// Regression witness for the W7 review MEDIUM: a sibling connection
+    /// whose lock state was copied mid-exchange by fork must still be
+    /// closed by the drain (via the lock-free descriptor mirror), and
+    /// must not keep a stale protected-fd record.
+    #[test]
+    fn fork_drain_closes_copied_locked_connection() {
+        isolated_coordinator_move_test(
+            "guest::rpc::stream::tests::fork_drain_closes_copied_locked_connection",
+            || {
+                use std::os::unix::net::UnixListener;
+                use std::time::Duration;
+
+                use reverie_rpc_transport::codec::encode;
+
+                let directory =
+                    std::env::temp_dir().join(format!("ordinary-rpc-drain-{}", std::process::id()));
+                std::fs::create_dir(&directory).unwrap();
+                let directory_owner = std::fs::File::open(&directory).unwrap();
+                let path = std::path::PathBuf::from(format!(
+                    "/proc/self/fd/{}/socket",
+                    directory_owner.as_raw_fd()
+                ));
+                let listener = UnixListener::bind(&path).unwrap();
+                let peer = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let config = encode(&73_u64).unwrap();
+                    socket
+                        .write_all(&(config.len() as u32).to_be_bytes())
+                        .unwrap();
+                    socket.write_all(&config).unwrap();
+                    // Hold the socket open until the test body ends.
+                    std::thread::sleep(Duration::from_secs(2));
+                });
+                let rpc = crate::guest::rpc::CoordinatorRpc::<OrdinaryConnectionModel>::connect(
+                    &path,
+                    |_, _| panic!("ordinary connection unexpectedly reconnected"),
+                )
+                .unwrap();
+                let root_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+                // Lock the (only) connection and drain it as a sibling of
+                // an unrelated keep tid: the drain treats every entry the
+                // same, and the held lock is exactly the copied
+                // mid-exchange shape a fork produces.
+                let root = rpc.thread_connection();
+                let fd = root.fd();
+                assert!(fd >= 0);
+                crate::guest::protect::register_coordinator_conn_fd(fd).unwrap();
+                let guard = root.lock();
+                let drained = rpc.connection.ordinary().drain_except(root_tid + 999);
+                assert_eq!(drained.len(), 1);
+                crate::guest::rpc::close_drained_connections(drained);
+                // Closed despite the copied lock being held, and no
+                // protected-fd record remains.
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+                assert!(!crate::guest::protect::is_runtime_owned_fd(fd));
+                drop(guard);
+                peer.join().unwrap();
+                drop(rpc);
+                std::fs::remove_file(directory.join("socket")).unwrap();
+                drop(directory_owner);
+                std::fs::remove_dir(&directory).unwrap();
+            },
+        );
+    }
+
     #[test]
     fn ordinary_coordinator_move_preserves_ofd_peer_and_closes_original() {
         isolated_coordinator_move_test(

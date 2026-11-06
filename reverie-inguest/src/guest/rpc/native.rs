@@ -47,7 +47,7 @@ pub struct NativeFrameReply<'a, G: GlobalTool> {
     _connection: SpinGuard<'a, RpcConnection<G>>,
     // Owns the mutex `_connection` guards (per-thread connection map);
     // declared after the guard so the guard drops first.
-    _connection_arc: std::sync::Arc<crate::sync::SpinMutex<RpcConnection<G>>>,
+    _connection_arc: std::sync::Arc<super::ThreadConnection<G>>,
     length: usize,
 }
 
@@ -106,6 +106,15 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         // current thread's connection is the root one whenever this
         // exchange can proceed; a missing one is reported as in-flight,
         // as the native-configuration owner's refusal was.
+        //
+        // Connection-first is safe here: the cheap refusals (poisoned,
+        // bounds) already ran above, and the remaining stamp checks
+        // compare against the connection's own connect-time stamps, so
+        // the connection must be in hand to evaluate them. A lazy open
+        // on a thread that then fails the pid == tid check leaves behind
+        // only that thread's ordinary per-thread connection -- the same
+        // one its next ordinary send would open -- and no frame is
+        // exchanged on the refusal path.
         let connection_arc = match &self.connection {
             super::ConnectionOwner::NativeConfiguration => {
                 return Err(NativeFrameError::InFlight);

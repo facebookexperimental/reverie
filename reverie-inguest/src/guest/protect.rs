@@ -381,9 +381,15 @@ pub(crate) fn replace_recorded_fd(old: libc::c_int, new: libc::c_int) -> io::Res
 }
 
 /// How many per-thread coordinator connections one process protects beside
-/// the root connection ([`COORDINATOR_FD`]). Each admitted guest thread
-/// past the first opens its own connection (W7 per-thread RPC); every such
-/// descriptor is runtime-owned exactly like the root connection.
+/// the root connection ([`COORDINATOR_FD`]): a hard cap of 64 extra
+/// threads' connections. Each admitted guest thread past the first opens
+/// its own connection (W7 per-thread RPC); every such descriptor is
+/// runtime-owned exactly like the root connection. Failure mode at the
+/// cap: [`register_coordinator_conn_fd`] returns `OutOfMemory`, the lazy
+/// connect that was recording the descriptor fails, and the RPC layer
+/// ends the process with the tool-RPC failure exit (rpc_fatal) -- the
+/// 65th simultaneous guest thread is refused at its first RPC, never
+/// silently unprotected.
 const COORDINATOR_CONN_CAPACITY: usize = 64;
 
 /// The per-thread coordinator connection descriptors (-1 is a free slot).
