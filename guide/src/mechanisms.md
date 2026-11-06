@@ -94,42 +94,82 @@ names so a cell means the same thing in both places.
 
 ## Selection: requirements, probes, refusals
 
-Today a tool declares *events*, never *mechanisms* (`subscriptions()`),
-and the embedding binary hard-wires a backend — there is no selector
-yet. The proposed addition (architecture §3, pending owner approval)
-is deliberately small:
+The selector exists: `reverie::selection`, fed by
+`reverie::probes`. A tool still declares *events* with
+`subscriptions()`, but admission is a separate, explicit question —
+can *this* tool, in *this* environment, on *this* guest, be served
+without weakening what it asked for? The pieces:
 
-* `ToolRequirements` — one value next to `subscriptions()`: window
+* `ToolRequirements` — returned by `Tool::requirements()`: window
   tolerance, nondeterministic-instruction classes, lifecycle needs,
-  placement, debugger coexistence, and a `dense` flag (every-branch
-  instrumentation, B6-only). **Defaults are the strictest reading**:
-  a tool that says nothing gets reference semantics or a refusal,
-  never a preload window it did not declare. Relaxation is explicit
-  and visible in source and logs.
-* **Probes P1–P10** — pure host/loader observations before any guest
-  instruction (ptrace usable? existing tracer? seccomp nestable? SUD?
-  CPUID faulting? `PR_SET_TSC`? W^X policy? signal ownership? census
-  possible? arch/kernel floor?). A probe that cannot run returns
-  *Unknown*, and Unknown counts as *absent* — fail closed.
-* `select()` — filter the valid cells by requirements, then by probe
-  results, then by "actually built"; refuse with the most specific
-  `R-*` name if empty; else take the cheapest cell, tie-broken toward
-  the stronger guarantee. No silent downgrade, ever: SUD, CPUID
-  faulting, and `PR_SET_TSC` may *accelerate* a cell but may never be
-  load-bearing for its correctness (rule I6).
+  placement, debugger coexistence, and instrumentation density
+  (`dense` = every-branch, B6-only). **Defaults are the strictest
+  reading**: a tool that says nothing gets reference semantics or a
+  refusal, never a preload window it did not declare. Relaxation is
+  explicit, and `is_relaxation_of` makes "weaker" machine-checkable:
+  relaxing never removes eligible cells. Requirements are guest
+  behaviour, not event interests — declining `execve` notifications
+  does not prove the guest cannot exec, so subscriptions never relax
+  lifecycle requirements.
+* **Probes P1–P10** — `probe_environment()` fills an
+  `EnvironmentSnapshot` of `Knowledge` facts (`Proved` / `Disproved` /
+  `Unknown`) before any guest instruction. Trials that must try
+  something run in throwaway children of the host, never in a process
+  anyone will instrument, so their answers are *advisory* for the
+  actual guest. `Unknown` never stands in for a value: unknown tracer
+  ownership is not "no tracer", and a cell whose predicate depends on
+  an unknown fact is not admitted (`R-ENV-UNKNOWN`).
+* `admit()` — pure admission over the *implemented* cells: filter by
+  requirements and proven environment facts, then rank the eligible
+  remainder. It returns an `AdmissionReport` (the chosen cell plus a
+  retained `ExecutionPlan`) or a typed `AdmissionRefusal` carrying
+  the full filter trace; `select_cell()` is the convenience wrapper.
+  A **design cell** is an obligation; only an *implemented* cell —
+  registered with its tested envelope — is selectable, and a
+  backend-wide capability constant alone never certifies a
+  composition. Today four cells are registered: `V1-ptrace`,
+  `V4-preload-trap`, `V5-preload-patch`, and `V11-kvm`. An explicit
+  selection is honoured exactly or refused by name. Automatic ranking
+  is a cost-class *heuristic* over eligible cells only
+  (patch < gate+patch < trap < ptrace < translation), tie-broken
+  toward stronger guarantees — a shape, not a benchmark.
+* **Handoff is terminal.** The retained plan re-validates the actual
+  guest's facts at the backend's controlled stop
+  (`validate_handoff`); a failure there ends the launch — the host
+  must not retry another backend under a weaker reading. The older
+  admission hooks (`facility_admission`, the `install_*` hooks) stay
+  authoritative on the same path.
+
+### Guarantees per cell
+
+From architecture §2.2 (approved 2026-11-05 with amendments): **C** =
+nondeterministic-instruction coverage, **Thr** = new threads from
+their first instruction, **Sig** = signal fidelity, **Fork** =
+children followed, **Exec** = successors re-armed window-free,
+**Dyn** = new/JIT code. `✓` = reference-grade, `D` = weaker but
+declared, `R` = refuses by name. These are the contracts a valid
+cell must meet; conformance is how each gets proven.
+
+| Combo | C | Thr | Sig | Fork | Exec | Dyn |
+|---|---|---|---|---|---|---|
+| V1 ptrace ref | CPUID+RDTSC ✓ | ✓ | reference, holes included | ✓ | ✓ | trap any code |
+| V2 A-stop+trap | as V1; wider needs B3/B4 | ✓ | must match V1 verdicts | ✓ | R, then ✓ | trap covers (slow) |
+| V3 A-stop+patch | selected; rest trap or R | ✓ | as V2 + SIGTRAP ownership | ✓ | as V2 | gate (→V6) or R |
+| V4/V5 preload | D before init | D/R before init | as V2/V3 after init | as V2/V3 | D/R | as V2/V3 |
+| V6 page-gate | scan on first fetch | ✓ per-mapping | chain/refuse by name | re-arm before resume | re-gate | certified code; JIT R |
+| V7 offline | as scanned | ✓ | runtime-owned | ✓ if runtime in child | R unless rewritten | R/V6 |
+| V8/V9 no-ptrace | as chosen B | ✓ | runtime-owned | runtime-owned | runtime-owned | as chosen B |
+| V10 translation | total in principle | ✓ | runtime-owned | runtime-owned | retranslate | ✓ by construction |
+| V11 KVM | VM-controlled | ✓ | emulated | emulated | emulated | emulated |
+
+Exec is the gating row: until successor re-arming lands, the in-guest
+cells refuse `execve` (`R-EXEC`) — honest, shippable, and the reason
+execing programs sit outside the early conformance corpus. The
+oracle for every cell is Linux semantics plus the `Tool` contract,
+not bit-compatibility with ptrace: V1's named signal defects are its
+own ledger entries, not behaviour other cells must reproduce.
 
 The refusal names are catalogued in [Safety](safety.md).
-
-> 🚧 **Under construction — the selection rule (pending owner approval
-> of L0).** The matrix, `ToolRequirements`, probes P1–P10, and the
-> `R-*` taxonomy above are specified in the
-> [architecture document, §2–§3](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-11-04-liteinst-reverie-architecture.md)
-> and await the owner decisions in its
-> [§6.3](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-11-04-liteinst-reverie-architecture.md#63-decisions-requested-from-the-owner-via-coord7)
-> (items A, B, D). TODO: on approval, land the per-cell guarantee
-> tables here; until then this chapter summarizes, and no selector API
-> exists in code. <!-- UC: mech-selection -->
-> Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`mech-selection`).
 >
 > 🚧 **Under construction — SUD and page-fault modes.** TODO: document
 > B2 (SUD first-use acceleration *inside* B1/B3 cells — never a
