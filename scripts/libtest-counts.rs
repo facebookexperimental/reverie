@@ -261,8 +261,12 @@ fn retries_from_env() -> Result<u32, String> {
     Ok(retries as u32)
 }
 
-/// Sum utime+stime+cutime+cstime (clock ticks) over one process group.
-/// USER_HZ is 100 on Linux x86_64/aarch64 userspace.
+/// CPU time for one process group without double-counting: live members
+/// contribute utime+stime, and only the group leader additionally
+/// contributes cutime+cstime (its reaped descendants, whose own entries
+/// are gone by then). Summing child times at every level would count
+/// nested grandchildren once per ancestor. USER_HZ is 100 on Linux
+/// x86_64/aarch64 userspace.
 fn process_group_cpu_usec(pgid: u32) -> u64 {
     const TICKS_PER_SECOND: u64 = 100;
     let mut total_ticks = 0_u64;
@@ -275,17 +279,20 @@ fn process_group_cpu_usec(pgid: u32) -> u64 {
         if !name.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
         let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
-        if let Some(ticks) = proc_stat_cpu_ticks_for_group(&stat, pgid) {
+        if let Some(ticks) = proc_stat_cpu_ticks_for_group(&stat, pgid, pid == pgid) {
             total_ticks = total_ticks.saturating_add(ticks);
         }
     }
     total_ticks.saturating_mul(1_000_000 / TICKS_PER_SECOND)
 }
 
-fn proc_stat_cpu_ticks_for_group(stat: &str, pgid: u32) -> Option<u64> {
+fn proc_stat_cpu_ticks_for_group(stat: &str, pgid: u32, is_leader: bool) -> Option<u64> {
     let close = stat.rfind(')')?;
     let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
     // After comm: state ppid pgrp session tty tpgid flags minflt cminflt
@@ -294,8 +301,13 @@ fn proc_stat_cpu_ticks_for_group(stat: &str, pgid: u32) -> Option<u64> {
         return None;
     }
     let mut total = 0_u64;
-    for index in [11_usize, 12, 13, 14] {
+    for index in [11_usize, 12] {
         total = total.saturating_add(fields.get(index).and_then(|v| v.parse::<u64>().ok())?);
+    }
+    if is_leader {
+        for index in [13_usize, 14] {
+            total = total.saturating_add(fields.get(index).and_then(|v| v.parse::<u64>().ok())?);
+        }
     }
     Some(total)
 }
@@ -1092,8 +1104,9 @@ fn self_test() -> Result<(), String> {
         return Err("timeout budget resolution differs".to_string());
     }
     let stat = "123 (a b) S 1 4242 4242 0 -1 0 0 0 0 0 100 50 20 10 0 0 1 0 0";
-    if proc_stat_cpu_ticks_for_group(stat, 4242) != Some(180)
-        || proc_stat_cpu_ticks_for_group(stat, 7).is_some()
+    if proc_stat_cpu_ticks_for_group(stat, 4242, true) != Some(180)
+        || proc_stat_cpu_ticks_for_group(stat, 4242, false) != Some(150)
+        || proc_stat_cpu_ticks_for_group(stat, 7, true).is_some()
     {
         return Err("process-group CPU tick parsing differs".to_string());
     }
