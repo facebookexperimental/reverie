@@ -25,6 +25,39 @@ pub const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
 #[cfg(target_arch = "aarch64")]
 pub const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
 
+/// The words a seccomp program compares against `seccomp_data`: which audit
+/// architecture to admit and which syscall number is `rt_sigreturn` under
+/// that architecture. Filter construction takes this explicitly so the
+/// verdicts for a non-host architecture can be tested on any host by
+/// evaluating the emitted program; production builders always pass
+/// [`FILTER_ABI_NATIVE`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilterAbi {
+    /// `AUDIT_ARCH_*` value admitted by the filter.
+    pub audit_arch: u32,
+    /// Syscall number of `rt_sigreturn` under `audit_arch`.
+    pub rt_sigreturn: u32,
+}
+
+/// x86-64 filter ABI (`rt_sigreturn` is syscall 15 there).
+pub const FILTER_ABI_X86_64: FilterAbi = FilterAbi {
+    audit_arch: 0xc000_003e,
+    rt_sigreturn: 15,
+};
+
+/// aarch64 filter ABI (`rt_sigreturn` is syscall 139 there; the audit word
+/// and the number are pinned by the aarch64 trap probe measurements).
+pub const FILTER_ABI_AARCH64: FilterAbi = FilterAbi {
+    audit_arch: 0xc000_00b7,
+    rt_sigreturn: 139,
+};
+
+/// The filter ABI of the architecture this runtime was compiled for.
+#[cfg(target_arch = "x86_64")]
+pub const FILTER_ABI_NATIVE: FilterAbi = FILTER_ABI_X86_64;
+#[cfg(target_arch = "aarch64")]
+pub const FILTER_ABI_NATIVE: FilterAbi = FILTER_ABI_AARCH64;
+
 /// The host page size from `sysconf(_SC_PAGESIZE)`, queried on every call.
 ///
 /// Gate pages, trampoline arenas, signal-stack sizing and any other
@@ -47,6 +80,19 @@ mod tests {
         assert_eq!(AUDIT_ARCH_NATIVE, 0xc000_003e);
         #[cfg(target_arch = "aarch64")]
         assert_eq!(AUDIT_ARCH_NATIVE, 0xc000_00b7);
+    }
+
+    #[test]
+    fn filter_abi_native_matches_libc_and_audit_arch() {
+        assert_eq!(FILTER_ABI_NATIVE.audit_arch, AUDIT_ARCH_NATIVE);
+        assert_eq!(
+            FILTER_ABI_NATIVE.rt_sigreturn,
+            libc::SYS_rt_sigreturn as u32
+        );
+        assert_eq!(FILTER_ABI_X86_64.audit_arch, 0xc000_003e);
+        assert_eq!(FILTER_ABI_X86_64.rt_sigreturn, 15);
+        assert_eq!(FILTER_ABI_AARCH64.audit_arch, 0xc000_00b7);
+        assert_eq!(FILTER_ABI_AARCH64.rt_sigreturn, 139);
     }
 
     #[test]
