@@ -25,10 +25,10 @@ violation, and the conformance suite exists to catch it
   `EOPNOTSUPP` — never a best-effort patch and never arbitrary Rust
   in signal context.
 * **Activation:** a mode with an unmonitored window (preload) must be
-  *chosen* with the window declared. The no-silent-downgrade
-  *selection rule* that will enforce this mechanically is proposed
-  (pending owner approval — [Mechanisms](mechanisms.md)); today the
-  embedding binary makes the choice explicitly instead.
+  *chosen* with the window declared. The no-silent-downgrade rule is
+  enforced mechanically by admission
+  ([Mechanisms](mechanisms.md)): a windowed cell is eligible only
+  when the tool declared that window.
 * **Statistics:** unsupported measurements are absent, not zero.
 
 ## 3. The guest is not trusted; neither is the tool
@@ -58,41 +58,42 @@ stronger than the per-backend tables in the repository's
 
 Every refusal is a typed value surfaced *before* the guest runs (or, for
 mid-run discoveries, at the fault with the guest stopped). "Unsupported"
-without a name is a bug. The taxonomy (architecture §3.4, pending owner
-approval as user-visible API):
+without a name is a bug. The taxonomy is architecture §3.4, approved
+2026-11-05, and it is public API: `reverie::selection::RefusalCode`,
+carried by `AdmissionRefusal` — `code` (the machine-readable name),
+`detail` (one human line, never the only signal), `trace` (which cells
+each filter stage removed and why), and `terminal` (true when the
+failure was discovered after irreversible installation, where the host
+must stop rather than retry another backend). It prints as
+`REFUSED: R-…: <detail>`. An admission refusal is distinct from a guest
+errno and from per-operation unsupported results; the older surfaces
+still exist underneath it (a refused patch site still fails with
+`EOPNOTSUPP` *to the guest*, unprovided facts are still `NotProvided`)
+— those are mechanisms, this is the run-level verdict.
 
-| Name | Meaning |
-|---|---|
-| `R-ARCH` | Not Linux x86-64 / kernel floor unmet |
-| `R-PTRACE` | ptrace required but denied, or guest already traced |
-| `R-WINDOW` | Only windowed activation (A2) available; tool requires zero window |
-| `R-CODE` | Code cannot be censused/gated for the mechanism (JIT, interior entries, unpatchable site with no fallback) |
-| `R-SIGNAL` | Required signal ownership unavailable (SIGTRAP/SIGSYS/SIGSEGV conflict) |
-| `R-WX` | Mapping policy forbids the arena/gate shape (strict W^X) |
-| `R-INSTR` | Required nondeterministic-instruction class cannot be mediated in any admitted cell |
-| `R-EXEC` | Successor image cannot be re-armed (includes today's pre-stage-1b in-guest gap) |
-| `R-LIFECYCLE` | Required thread/fork/signal behaviour unproven in admitted cells |
-| `R-DENSE` | Tool requires dense instrumentation; no B6 cell built yet |
-| `R-UNBUILT` | Only valid-but-unbuilt cells satisfy (A3/A4/A5/B6 today) |
-| `R-ENV-UNKNOWN` | A load-bearing environment probe could not be performed |
+| Name | Trigger | Remedy |
+|---|---|---|
+| `R-ARCH` | Not Linux x86-64, or kernel floor unmet (P10) | Run on a supported host/kernel; no requirement relaxes this |
+| `R-PTRACE` | ptrace required but denied, or guest already traced (P1, P2) | Free the guest from its tracer, grant ptrace, or pick a no-ptrace cell when one is built |
+| `R-WINDOW` | Only windowed activation available; tool requires zero window | Declare the window in `ToolRequirements`, or use a zero-window activation |
+| `R-CODE` | Code cannot be censused/gated for the mechanism: JIT, interior entries, unpatchable site with no fallback | Trap/gate/translation cell, or exclude the code shape from the guest |
+| `R-SIGNAL` | Required signal ownership unavailable (`SIGTRAP`/`SIGSYS`/`SIGSEGV` conflict) | Resolve the ownership conflict; the guest handler and the framework cannot both own it |
+| `R-WX` | Mapping policy forbids the arena/gate shape (strict W^X) | Out-of-process cell (V1), or a W^X-clean runtime shape |
+| `R-INSTR` | A required nondeterministic-instruction class cannot be mediated in any admitted cell | Drop the instruction requirement, or provide the mediation prerequisite (e.g. CPUID faulting) |
+| `R-EXEC` | Successor image cannot be re-armed under the retained plan | Cell with re-arming, or a guest that does not exec |
+| `R-LIFECYCLE` | Required thread/fork/signal behaviour unproven in every admitted cell | Narrow the lifecycle requirement to a proven envelope |
+| `R-DENSE` | Dense (every-branch) instrumentation required; no translation cell implemented | Event-level instrumentation until a B6 cell exists |
+| `R-UNBUILT` | Only valid-but-unbuilt design cells satisfy | Wait for the cell, or relax to an implemented one |
+| `R-ENV-UNKNOWN` | A load-bearing environment fact could not be proved or disproved | Make the probe decidable (permissions, custody, host support); unknown never counts as proved |
 
 Refusals carry their filter trace — which cells each stage removed and
 why — so "why won't it run?" is answered by the log, not by reading
 source. Invalid combinations have names too (I1–I8 in architecture
 §2.3): preload can never serve a zero-window tool (I1); patching alone
 cannot cover arbitrary/JIT code (I2); no combination's *correctness*
-may require SUD, CPUID faulting, or `PR_SET_TSC` (I6); and so on.
-
-> 🚧 **Under construction — refusal taxonomy (pending owner approval
-> of L0).** The `R-*` names above are the architecture's proposal
-> ([§3.4](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-11-04-liteinst-reverie-architecture.md),
-> owner decision B in
-> [§6.3](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-11-04-liteinst-reverie-architecture.md#63-decisions-requested-from-the-owner-via-coord7)).
-> TODO: on approval, expand to the full catalogue (every public
-> refusal, trigger, remedy) as a searchable errors index; today the
-> code surfaces a subset of these ideas under older names
-> (`ENOSYS`/`EOPNOTSUPP`/`NotProvided`). <!-- UC: safety-taxonomy -->
-> Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`safety-taxonomy`).
+may require SUD, CPUID faulting, or `PR_SET_TSC` (I6, as amended: such
+support may be a cell prerequisite, its absence then yields a named
+refusal above); and so on.
 >
 > 🚧 **Under construction — lifecycle matrix.** TODO: the
 > thread/signal/fork/exec/mapping-churn × backend coverage matrix,
