@@ -504,6 +504,7 @@ macro_rules! native_bootstrap {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 native_bootstrap!(
     "Reserve and adopt a fresh fixed guarded stack before the first Rust call.\n\nOnly the supplied zero-argument scalar body runs on this bootstrap. The\ncomplete lease remains occupied for process lifetime and through plain fork\nCOW. Setup failure exits 127 without a guest-stack or allocator fallback.\nThis is key-zero placement, not protected interiors, whole caller-window\nequality, standalone activation, TLS isolation or arbitrary state capture.\nIt adds no mask, disposition, CPUID, PKRU or seccomp policy.\n\n# Safety\n\nCall once per image during single-threaded trusted startup, with no active\nruntime filter, using the scalar SysV ABI (including clear DF). The body must\nbe a valid C-ABI function which preserves its callee-saved state and does not\nunwind across this stack switch. A loader root may tail-jump here with the\nbody in RDI, retaining its genuine CALL/RET pair. Earlier handlers retain\ncurrent behavior and may access the unprotected interior; no signal-frame\nbyte-isolation or denied-key access guarantee is supplied.",
     constructor_entry,
@@ -536,6 +537,7 @@ native_bootstrap!(
 
 // Same fresh-only scalar entry, with a separate typed origin and an immediate
 // terminal attempt: unlike the retained constructor failure, no stderr write.
+#[cfg(target_arch = "x86_64")]
 native_bootstrap!(
     "Reserve a fresh generic startup stack before its first Rust call.\n\nThe permanent scalar lease is separate from constructor-origin diagnostics.\nA collision or second invocation attempts exit127 without a stderr write;\nthere is no relocated, ordinary-region or guest-stack fallback. The body\nruns on key-zero pages; this adds no signal, PKRU or clock policy.\n\n# Safety\nCall once per image in single-threaded trusted startup with clear DF and\nno active runtime filter. The valid zero-argument body must obey scalar\nSysV and return normally without unwinding or a nonlocal transfer. Earlier\nhandlers may access the unprotected interior; this is placement only.",
     generic_entry,
@@ -563,6 +565,22 @@ core::arch::global_asm!(
     ".hidden reverie_inguest_generic_entry",
     ".hidden reverie_inguest_generic_adopt_entry",
 );
+
+// No native bootstrap stack switch exists off x86-64 yet; both exported
+// entries trap immediately rather than run a body on the caller's stack.
+#[cfg(not(target_arch = "x86_64"))]
+#[unsafe(naked)]
+#[unsafe(export_name = "reverie_inguest_constructor_entry")]
+pub unsafe extern "C" fn constructor_entry(_body: unsafe extern "C" fn()) {
+    core::arch::naked_asm!("brk #0")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[unsafe(naked)]
+#[unsafe(export_name = "reverie_inguest_generic_entry")]
+pub unsafe extern "C" fn generic_entry(_body: unsafe extern "C" fn()) {
+    core::arch::naked_asm!("brk #0")
+}
 
 // The private scalar owner entry writes these two fields into caller-owned
 // MaybeUninit storage. Give that output an explicit layout rather than relying
@@ -632,6 +650,19 @@ impl NativeFreshOwner {
     /// matching scalar ticket fields alone never provide mapping authority.
     /// The caller supplies valid output storage and obeys scalar SysV with DF
     /// clear. Every called helper has an explicit C ABI and may not unwind.
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe extern "C" fn from_native_opaque(
+        _record: *mut c_void,
+        _adoption_rsp: usize,
+        _origin: usize,
+        _owner: *mut c_void,
+    ) -> i32 {
+        // No native prefix exists off x86-64 yet; refuse with output
+        // untouched, exactly as a refused native call leaves it.
+        libc::EOPNOTSUPP
+    }
+
+    #[cfg(target_arch = "x86_64")]
     #[unsafe(naked)]
     unsafe extern "C" fn from_native_opaque(
         _record: *mut c_void,
@@ -795,7 +826,14 @@ impl NativeFreshOwner {
 #[inline(never)]
 unsafe extern "C" fn reverie_inguest_constructor_adopt_entry(record: *mut NativeRecord) -> u32 {
     let rsp: usize;
-    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags)) };
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags))
+    };
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) rsp, options(nostack, preserves_flags))
+    };
     let fresh = unsafe { NativeFreshOwner::from_native(record, rsp, BootstrapOrigin::Constructor) };
     let Ok(fresh) = fresh else {
         return PREPARE_REFUSED;
@@ -811,7 +849,14 @@ unsafe extern "C" fn reverie_inguest_constructor_adopt_entry(record: *mut Native
 #[inline(never)]
 unsafe extern "C" fn reverie_inguest_generic_adopt_entry(record: *mut NativeRecord) -> u32 {
     let rsp: usize;
-    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags)) };
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags))
+    };
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) rsp, options(nostack, preserves_flags))
+    };
     let fresh =
         unsafe { NativeFreshOwner::from_native(record, rsp, BootstrapOrigin::ExplicitGeneric) };
     let Ok(fresh) = fresh else {
@@ -1043,7 +1088,7 @@ unsafe extern "C" {
 // returning or taking a native terminal path. Select before either gate's
 // memory-free interval, without touching the caller's stack or Linux operands.
 // The default artifact keeps its original direct gate operand and bytes.
-#[cfg(feature = "fixed-syscall-gates")]
+#[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
 #[unsafe(naked)]
 unsafe extern "C" fn native_gate() {
     core::arch::naked_asm!(

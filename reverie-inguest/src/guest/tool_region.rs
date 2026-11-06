@@ -583,7 +583,7 @@ impl Drop for StackLease {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[path = "tool_region_tests.rs"]
 mod tests;
 
@@ -864,15 +864,34 @@ mod mapped_image {
                 }
             }
             let rsp: usize;
+            #[cfg(target_arch = "x86_64")]
             unsafe {
                 core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags))
             };
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!("mov {}, sp", out(reg) rsp, options(nostack, preserves_flags))
+            };
+            // Thread-local base: FS base via arch_prctl on x86-64, the
+            // TPIDR_EL0 system register on aarch64.
             let mut fs = 0_usize;
+            #[cfg(target_arch = "x86_64")]
             let fs_result = unsafe {
                 raw_syscall6(
                     libc::SYS_arch_prctl,
                     [0x1003, (&raw mut fs) as u64, 0, 0, 0, 0],
                 )
+            };
+            #[cfg(target_arch = "aarch64")]
+            let fs_result = {
+                unsafe {
+                    core::arch::asm!(
+                        "mrs {}, tpidr_el0",
+                        out(reg) fs,
+                        options(nostack, preserves_flags)
+                    )
+                };
+                0
             };
             if fs_result != 0 {
                 return Err(libc::EINVAL);

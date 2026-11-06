@@ -208,7 +208,7 @@ unsafe extern "C" {
 // A native failure may precede pool preparation or follow filter admission.
 // Preserve Linux operands and R12, selecting before the memory-free gate.
 // This adds no selector instructions to the ordinary callback recipe.
-#[cfg(feature = "fixed-syscall-gates")]
+#[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
 #[unsafe(naked)]
 unsafe extern "C" fn native_gate() {
     core::arch::naked_asm!(
@@ -249,6 +249,23 @@ unsafe extern "C" fn native_gate() {
 /// existing supported execution scope is supplied, not new guest pthread/
 /// CLONE_VM/vfork or arbitrary Tool reentrancy. Nonlocal escape conservatively
 /// leaks its exact claim.
+// No installed-callback stack switch exists off x86-64 yet; the exported
+// entry traps immediately rather than run a body on the caller's stack.
+#[cfg(not(target_arch = "x86_64"))]
+#[unsafe(naked)]
+#[unsafe(export_name = "reverie_inguest_installed_callback_entry")]
+pub unsafe extern "C" fn entry(
+    _context: *mut libc::c_void,
+    _body: unsafe extern "C" fn(*mut libc::c_void),
+) {
+    core::arch::naked_asm!("brk #0")
+}
+
+/// # Safety
+///
+/// The full contract in the documentation above this module's off-x86 stub
+/// applies unchanged.
+#[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[unsafe(export_name = "reverie_inguest_installed_callback_entry")]
 pub unsafe extern "C" fn entry(
@@ -394,11 +411,11 @@ core::arch::global_asm!(
     ".hidden reverie_inguest_installed_callback_pool_locator",
 );
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[path = "installed_stack_tests.rs"]
 mod tests;
 
-#[cfg(all(test, not(feature = "fixed-syscall-gates")))]
+#[cfg(all(test, not(feature = "fixed-syscall-gates"), target_arch = "x86_64"))]
 mod ordinary_gate_byte_controls {
     use super::*;
 
@@ -450,7 +467,7 @@ mod ordinary_gate_byte_controls {
     }
 }
 
-#[cfg(all(test, feature = "fixed-syscall-gates"))]
+#[cfg(all(test, feature = "fixed-syscall-gates", target_arch = "x86_64"))]
 mod fixed_gate_tests {
     use super::*;
 

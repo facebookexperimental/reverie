@@ -201,6 +201,13 @@ unsafe extern "C" fn fixed_arena_mprotect(address: usize) -> i64 {
     }
 }
 
+// Off x86-64 there is no fixed-arena initialization entry yet; refuse with
+// a plain status, retaining caller ownership exactly as a failed entry does.
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) unsafe extern "C" fn initialize_fixed_arenas_opaque(_control: *mut c_void) -> i32 {
+    libc::EOPNOTSUPP
+}
+
 /// Complete the fresh owner's arenas through one source-owned scalar entry.
 ///
 /// # Safety
@@ -210,6 +217,7 @@ unsafe extern "C" fn fixed_arena_mprotect(address: usize) -> i64 {
 /// protections, metadata and permanent occupancy are complete; any nonzero
 /// status retains the caller's ownership and any completed protection change.
 /// This entry never publishes, releases INITIALIZING, or unmaps anything.
+#[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 pub(super) unsafe extern "C" fn initialize_fixed_arenas_opaque(_control: *mut c_void) -> i32 {
     // SAFETY: RBX alone retains Control across calls. Saving it aligns RSP to

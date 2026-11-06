@@ -756,7 +756,13 @@ mod tests {
         // Fork while this page is still live: only this thread survives in the
         // child's private address space, and its unmap/scan/exit path uses no
         // allocation, formatting, or inherited userspace locks.
+        #[cfg(target_arch = "x86_64")]
         let child = unsafe { raw_syscall6(libc::SYS_fork, [0; 6]) };
+        #[cfg(not(target_arch = "x86_64"))]
+        let child = unsafe {
+            // aarch64 has no fork number; a plain SIGCHLD clone is fork.
+            raw_syscall6(libc::SYS_clone, [libc::SIGCHLD as u64, 0, 0, 0, 0, 0])
+        };
         assert!(child >= 0, "raw fork failed: {child}");
         if child == 0 {
             let unmapped =

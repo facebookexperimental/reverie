@@ -1337,7 +1337,7 @@ pub(crate) mod tests {
         in_child_with_soft_nofile(2048, || {
             let recorded = place_runtime_fd(open_eventfd()).unwrap();
             record_runtime_fd(recorded).unwrap();
-            let mut dup = event(libc::SYS_dup2, [0, recorded as u64, 0, 0, 0, 0]);
+            let mut dup = event(libc::SYS_dup3, [0, recorded as u64, 0, 0, 0, 0]);
             assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
             assert!(!is_runtime_owned_fd(recorded));
             assert!(!is_open(recorded), "the runtime's copy is closed");
@@ -1348,7 +1348,7 @@ pub(crate) mod tests {
             let mut flags = event(libc::SYS_dup3, [0, other as u64, 1, 0, 0, 0]);
             assert!(unsafe { protect_runtime_descriptors(&mut flags, true) });
             assert_eq!(flags.result, -i64::from(libc::EINVAL));
-            let mut closed_source = event(libc::SYS_dup2, [9999, other as u64, 0, 0, 0, 0]);
+            let mut closed_source = event(libc::SYS_dup3, [9999, other as u64, 0, 0, 0, 0]);
             assert!(unsafe { protect_runtime_descriptors(&mut closed_source, true) });
             assert_eq!(closed_source.result, -i64::from(libc::EBADF));
             assert!(
@@ -1538,7 +1538,7 @@ pub(crate) mod tests {
                 record_runtime_fd(place_runtime_fd(open_eventfd()).unwrap()).unwrap();
             }
             for target in 1024 - RUNTIME_FD_RESERVE..1024 {
-                let dup = event(libc::SYS_dup2, [1, target as u64, 0, 0, 0, 0]);
+                let dup = event(libc::SYS_dup3, [1, target as u64, 0, 0, 0, 0]);
                 assert_eq!(run_guest_dup(dup), i64::from(target));
                 let tool = tool_output_fd().expect("the Tool output socket is kept");
                 assert_eq!(identity_of(tool), socket);
@@ -1563,12 +1563,12 @@ pub(crate) mod tests {
             let tool = unsafe { reserve_tool_output_fd(pair[0], b"retired") }.unwrap();
             suppress_close_of(tool);
             install_filter(
-                libc::SYS_dup2,
+                libc::SYS_dup3,
                 1,
                 tool as u32,
                 libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
             );
-            let mut dup = event(libc::SYS_dup2, [0, tool as u64, 0, 0, 0, 0]);
+            let mut dup = event(libc::SYS_dup3, [0, tool as u64, 0, 0, 0, 0]);
             assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
             assert_ne!(tool_output_fd(), Some(tool), "the socket moved");
             assert!(is_open(tool), "the filter kept the old number open");
@@ -1594,7 +1594,7 @@ pub(crate) mod tests {
             let recorded = place_runtime_fd(open_eventfd()).unwrap();
             record_runtime_fd(recorded).unwrap();
             suppress_close_of(recorded);
-            let mut dup = event(libc::SYS_dup2, [0, recorded as u64, 0, 0, 0, 0]);
+            let mut dup = event(libc::SYS_dup3, [0, recorded as u64, 0, 0, 0, 0]);
             assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
             assert!(
                 is_runtime_owned_fd(recorded),
@@ -1739,8 +1739,8 @@ pub(crate) mod tests {
                 (libc::SYS_dup3, [RUNTIME, 100, 1]),
                 (libc::SYS_dup3, [RUNTIME, 100, o_cloexec]),
                 (libc::SYS_dup3, [RUNTIME, 4096, 0]),
-                (libc::SYS_dup2, [RUNTIME, RUNTIME, 0]),
-                (libc::SYS_dup2, [RUNTIME, 100, 0]),
+                (libc::SYS_dup3, [RUNTIME, RUNTIME, 0]),
+                (libc::SYS_dup3, [RUNTIME, 100, 0]),
                 (libc::SYS_dup3, [0, RUNTIME, 1]),
                 (libc::SYS_dup3, [9999, RUNTIME, 0]),
             ] {
@@ -2243,7 +2243,9 @@ pub(crate) mod tests {
 
     /// The Tool's own signal controls are refused on their own path, before
     /// `protect_runtime_control`, and are not the guest's: nothing is
-    /// recorded for them.
+    /// recorded for them. Routes through `guest::trap_dispatch`, which is
+    /// x86-64-only until the continuation machinery is ported.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_tools_own_signal_controls_are_not_recorded() {
         let handler: [u64; 4] = [0x4000, 0, 0, 0];
@@ -2282,7 +2284,7 @@ mod mapped_input_lease_tests {
         let fd = 0x7fff_fffdu64;
         for (number, args) in [
             (libc::SYS_close, [fd | (1u64 << 32), 0, 0, 0, 0, 0]),
-            (libc::SYS_dup2, [12, fd | (1u64 << 32), 0, 0, 0, 0]),
+            (libc::SYS_dup3, [12, fd | (1u64 << 32), 0, 0, 0, 0]),
             (libc::SYS_fcntl, [fd, libc::F_SETFD as u64, 0, 0, 0, 0]),
             (libc::SYS_sendmsg, [fd, 0, 0, 0, 0, 0]),
         ] {

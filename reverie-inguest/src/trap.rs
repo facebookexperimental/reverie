@@ -1442,3 +1442,119 @@ mod tests {
         );
     }
 }
+
+/// Real-architecture proof for the aarch64 gates: the trusted gate executes
+/// a syscall through an installed filter, a nearby non-gate site traps, and
+/// the guest gate executes with caller rights. The handler here is test
+/// scaffolding only — it proves gate/filter semantics, not runtime
+/// admission, which waits for signal-frame support.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod aarch64_gate_tests {
+    use super::*;
+    use core::sync::atomic::AtomicU64;
+
+    static ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "C" fn spoofing_handler(
+        _signal: libc::c_int,
+        info: *mut libc::siginfo_t,
+        context: *mut libc::c_void,
+    ) {
+        ENTRIES.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the kernel built this SA_SIGINFO frame for this call.
+        unsafe {
+            if (*info).si_code != SYS_SECCOMP_CODE {
+                raw_syscall6(libc::SYS_exit_group, [44, 0, 0, 0, 0, 0]);
+                core::hint::unreachable_unchecked()
+            }
+            let uc = &mut *context.cast::<libc::ucontext_t>();
+            if uc.uc_mcontext.regs[8] != libc::SYS_getpid as u64 {
+                raw_syscall6(libc::SYS_exit_group, [45, 0, 0, 0, 0, 0]);
+                core::hint::unreachable_unchecked()
+            }
+            uc.uc_mcontext.regs[0] = 424_242;
+        }
+    }
+
+    fn gate_child() -> ! {
+        let pid = std::process::id() as i64;
+        // SAFETY: single-threaded child before any filter exists.
+        unsafe {
+            if crate::signal::install_sigsys_handler(spoofing_handler, false).is_err() {
+                raw_syscall6(libc::SYS_exit_group, [52, 0, 0, 0, 0, 0]);
+            }
+            let mut filter = crate::seccomp::SeccompFilter::for_trusted_gates(
+                trusted_gate(),
+                guest_syscall_gate(),
+            )
+            .unwrap();
+            if filter.install().is_err() {
+                raw_syscall6(libc::SYS_exit_group, [51, 0, 0, 0, 0, 0]);
+            }
+            // Through the gate: executes, no trap.
+            let via_gate = raw_syscall6(libc::SYS_getpid, [0; 6]);
+            if via_gate != pid || ENTRIES.load(Ordering::Relaxed) != 0 {
+                raw_syscall6(libc::SYS_exit_group, [61, 0, 0, 0, 0, 0]);
+            }
+            // Through the guest gate: executes, no trap.
+            let via_guest = raw_syscall6_with_pkru(libc::SYS_getpid, [0; 6], 0);
+            if via_guest != pid || ENTRIES.load(Ordering::Relaxed) != 0 {
+                raw_syscall6(libc::SYS_exit_group, [62, 0, 0, 0, 0, 0]);
+            }
+            // Nearby non-gate site (libc's own syscall stub): must trap.
+            let direct = libc::syscall(libc::SYS_getpid);
+            if direct != 424_242 || ENTRIES.load(Ordering::Relaxed) != 1 {
+                raw_syscall6(libc::SYS_exit_group, [63, 0, 0, 0, 0, 0]);
+            }
+            raw_syscall6(libc::SYS_exit_group, [0, 0, 0, 0, 0, 0]);
+        }
+        unreachable!("exit_group through the gate returned")
+    }
+
+    #[test]
+    fn aarch64_gate_executes_and_nearby_site_traps() {
+        const CHILD: &str = "REVERIE_TEST_AARCH64_GATE";
+        if std::env::var_os(CHILD).is_some() {
+            gate_child();
+        }
+        // Gate geometry: the reported return IP follows the 4-byte svc.
+        for gate in [trusted_gate(), guest_syscall_gate()] {
+            assert_eq!(gate.return_ip, gate.syscall_ip + 4);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trap::aarch64_gate_tests::aarch64_gate_executes_and_nearby_site_traps",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+
+    #[test]
+    fn aarch64_runtime_page_geometry_is_usable() {
+        let page = crate::arch::page_size().unwrap() as usize;
+        assert!(page.is_power_of_two() && page >= 4096);
+        // SAFETY: one anonymous page, unmapped below on every path.
+        unsafe {
+            let base = libc::mmap(
+                core::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(base, libc::MAP_FAILED);
+            base.cast::<u8>().add(page - 1).write(0xa5);
+            assert_eq!(base.cast::<u8>().add(page - 1).read(), 0xa5);
+            assert_eq!(
+                libc::mprotect(base, page, libc::PROT_READ | libc::PROT_EXEC),
+                0
+            );
+            assert_eq!(libc::munmap(base, page), 0);
+        }
+    }
+}

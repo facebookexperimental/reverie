@@ -314,8 +314,12 @@ mod tests {
 
     #[test]
     fn fork_like_classification() {
-        assert!(is_fork_like(libc::SYS_fork));
-        assert!(is_fork_like(libc::SYS_vfork));
+        if let Some(fork) = crate::arch::SYS_FORK {
+            assert!(is_fork_like(fork));
+        }
+        if let Some(vfork) = crate::arch::SYS_VFORK {
+            assert!(is_fork_like(vfork));
+        }
         assert!(is_fork_like(libc::SYS_clone));
         assert!(is_fork_like(libc::SYS_clone3));
         assert!(!is_fork_like(libc::SYS_write));
