@@ -742,6 +742,46 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
     IN_HANDLER.set(false);
 }
 
+/// Fixed-VL admission envelope: whether this trapped prctl would change
+/// the thread's SVE/SME vector length while a handler frame captured at
+/// the current length is live. Such a call is refused by name (the guest
+/// sees EINVAL, the dispatcher never sees the event) rather than let a
+/// saved frame be restored across a VL change. A request naming the
+/// current length, an ONEXEC-deferred change (no live-frame effect), or
+/// a facility the kernel does not offer here is not refused — the kernel
+/// decides those itself. The current length is read through the trusted
+/// gate, so the probe itself never traps.
+#[cfg(target_arch = "aarch64")]
+fn vl_change_refused(number: i64, args: [u64; 6]) -> bool {
+    const PR_SVE_SET_VL: u64 = 50;
+    const PR_SVE_GET_VL: u64 = 51;
+    const PR_SME_SET_VL: u64 = 63;
+    const PR_SME_GET_VL: u64 = 64;
+    const VL_LEN_MASK: u64 = 0xffff;
+    const VL_ONEXEC: u64 = 1 << 18;
+    if number != libc::SYS_prctl {
+        return false;
+    }
+    let get_op = match args[0] {
+        PR_SVE_SET_VL => PR_SVE_GET_VL,
+        PR_SME_SET_VL => PR_SME_GET_VL,
+        _ => return false,
+    };
+    if args[1] & VL_ONEXEC != 0 {
+        return false;
+    }
+    let requested = args[1] & VL_LEN_MASK;
+    if requested == 0 {
+        return false;
+    }
+    // SAFETY: a scalar prctl query through the trusted gate.
+    let current = unsafe { raw_syscall6(libc::SYS_prctl, [get_op, 0, 0, 0, 0, 0]) };
+    if current < 0 {
+        return false;
+    }
+    requested != (current as u64 & VL_LEN_MASK)
+}
+
 /// The `SA_SIGINFO` handler for `SIGSYS` on aarch64: same provenance,
 /// reentry, and dispatch flow as the x86-64 handler, over the aarch64
 /// frame (number in x8, arguments in x0-x5, result in x0, resume at pc).
@@ -799,6 +839,15 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
         frame.register(32) as u64,
     );
     event.set_guest_pkru(None);
+
+    // Admission is a fixed-VL envelope (see vl_change_refused): a guest
+    // prctl that would change the vector length under this live frame is
+    // refused by name before any dispatcher can forward it.
+    if vl_change_refused(event.number(), event.args()) {
+        frame.set_register(0, -i64::from(libc::EINVAL));
+        IN_HANDLER.set(false);
+        return;
+    }
 
     if let Some(dispatcher) = dispatcher() {
         dispatcher.dispatch_signal(&mut event, &mut frame);
@@ -1627,6 +1676,40 @@ mod aarch64_gate_tests {
             // Through the gate, untrapped: still the real pid.
             if raw_syscall6(libc::SYS_getpid, [0; 6]) != pid {
                 raw_syscall6(libc::SYS_exit_group, [63, 0, 0, 0, 0, 0]);
+            }
+            // Fixed-VL envelope witness, only where SVE VL exists: a
+            // trapped SET_VL naming the current length forwards, one
+            // naming a different length is refused EINVAL by the handler
+            // (VL unchanged after), and the same request through the gate
+            // reaches the kernel (native control). Last, since the
+            // native control may round the length it reports.
+            const PR_SVE_SET_VL: i64 = 50;
+            const PR_SVE_GET_VL: u64 = 51;
+            let current = raw_syscall6(libc::SYS_prctl, [PR_SVE_GET_VL, 0, 0, 0, 0, 0]);
+            if current >= 0 {
+                let cur_vl = current as u64 & 0xffff;
+                if libc::syscall(libc::SYS_prctl, PR_SVE_SET_VL, cur_vl as i64) < 0 {
+                    raw_syscall6(libc::SYS_exit_group, [64, 0, 0, 0, 0, 0]);
+                }
+                // The handler writes -EINVAL into the frame; libc's
+                // syscall wrapper surfaces that as -1 with errno set.
+                let refused = libc::syscall(libc::SYS_prctl, PR_SVE_SET_VL, (cur_vl + 16) as i64);
+                if refused != -1
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
+                {
+                    raw_syscall6(libc::SYS_exit_group, [65, 0, 0, 0, 0, 0]);
+                }
+                let after = raw_syscall6(libc::SYS_prctl, [PR_SVE_GET_VL, 0, 0, 0, 0, 0]);
+                if after as u64 & 0xffff != cur_vl {
+                    raw_syscall6(libc::SYS_exit_group, [66, 0, 0, 0, 0, 0]);
+                }
+                if raw_syscall6(
+                    libc::SYS_prctl,
+                    [PR_SVE_SET_VL as u64, cur_vl + 16, 0, 0, 0, 0],
+                ) < 0
+                {
+                    raw_syscall6(libc::SYS_exit_group, [67, 0, 0, 0, 0, 0]);
+                }
             }
             raw_syscall6(libc::SYS_exit_group, [0, 0, 0, 0, 0, 0]);
         }

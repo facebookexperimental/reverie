@@ -26,6 +26,7 @@ const AUDIT_ARCH: u32 = 0xc000_00b7;
 const RESERVED_OFFSET: usize = 288;
 const RESERVED_BYTES: usize = 4096;
 const EXTRA_MAGIC: u32 = 0x4558_5401;
+const SVE_MAGIC: u32 = 0x5356_4501;
 /// Architectural registers this frame addresses: x0-x30, then sp, pc,
 /// pstate, in sigcontext order.
 const REGISTERS: usize = 34;
@@ -58,6 +59,10 @@ struct ReservedChain {
     used: usize,
     /// Whether an extra_context record points outside the reserved area.
     has_extra: bool,
+    /// The SVE vector length recorded in the frame, when an SVE record
+    /// is present. Admission is a fixed-VL envelope: restore refuses a
+    /// mismatch instead of copying state across a VL change.
+    sve_vl: Option<u16>,
 }
 
 /// Walk the `_aarch64_ctx` record chain in `__reserved`, requiring every
@@ -70,6 +75,7 @@ struct ReservedChain {
 unsafe fn validate_reserved(reserved: *const u8) -> Result<ReservedChain, FrameError> {
     let mut offset = 0usize;
     let mut has_extra = false;
+    let mut sve_vl = None;
     loop {
         if offset + 8 > RESERVED_BYTES {
             return Err(FrameError);
@@ -85,10 +91,18 @@ unsafe fn validate_reserved(reserved: *const u8) -> Result<ReservedChain, FrameE
             return Ok(ReservedChain {
                 used: offset + 8,
                 has_extra,
+                sve_vl,
             });
         }
         if size < 16 || size % 8 != 0 || offset + size > RESERVED_BYTES {
             return Err(FrameError);
+        }
+        if magic == SVE_MAGIC {
+            if sve_vl.is_some() {
+                return Err(FrameError);
+            }
+            // SAFETY: an SVE record body starts with its vl/flags words.
+            sve_vl = Some(unsafe { reserved.add(offset + 8).cast::<u16>().read_unaligned() });
         }
         if magic == EXTRA_MAGIC {
             if size < 32 {
@@ -118,6 +132,7 @@ pub struct SavedState {
     pub pstate: u64,
     storage: Box<[Block]>,
     reserved_used: usize,
+    sve_vl: Option<u16>,
 }
 
 impl SavedState {
@@ -134,6 +149,7 @@ impl SavedState {
             pstate: 0,
             storage: storage.into_boxed_slice(),
             reserved_used: 0,
+            sve_vl: None,
         })
     }
 
@@ -341,6 +357,7 @@ impl<'signal> SignalFrame<'signal> {
             )
         };
         saved.reserved_used = self.chain.used;
+        saved.sve_vl = self.chain.sve_vl;
         Ok(())
     }
 
@@ -352,6 +369,16 @@ impl<'signal> SignalFrame<'signal> {
         }
         if self.chain.has_extra {
             return Err(FrameError);
+        }
+        // Fixed-VL admission envelope: never copy SVE state into a frame
+        // whose task runs at a different vector length (the fresh frame's
+        // own SVE header names the current VL). A saved frame with no SVE
+        // record restores as FPSIMD state, which the kernel defines for
+        // any current VL.
+        match (saved.sve_vl, self.chain.sve_vl) {
+            (Some(saved_vl), Some(current_vl)) if saved_vl == current_vl => {}
+            (None, _) => {}
+            _ => return Err(FrameError),
         }
         // SAFETY: reserved areas on both sides are RESERVED_BYTES; the
         // captured chain (terminator included) replaces this frame's.
@@ -414,6 +441,55 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    fn synthetic_frame(sve_vl: Option<u16>) -> (Box<libc::ucontext_t>, SignalFrame<'static>) {
+        let mut uc = Box::new(unsafe { core::mem::zeroed::<libc::ucontext_t>() });
+        let records: &[(u32, u32)] = match sve_vl {
+            Some(_) => &[(0x4650_8001, 528), (SVE_MAGIC, 16), (0, 0)],
+            None => &[(0x4650_8001, 528), (0, 0)],
+        };
+        let bytes = chain_bytes(records);
+        // SAFETY: the box outlives the frame in these tests by construction.
+        let reserved = unsafe {
+            core::ptr::addr_of_mut!(uc.uc_mcontext)
+                .cast::<u8>()
+                .add(RESERVED_OFFSET)
+        };
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), reserved, RESERVED_BYTES) };
+        if let Some(vl) = sve_vl {
+            // SVE record follows the 528-byte FPSIMD record; vl at +8.
+            unsafe { reserved.add(528 + 8).cast::<u16>().write_unaligned(vl) };
+        }
+        let chain = unsafe { validate_reserved(reserved) }.unwrap();
+        let frame = SignalFrame {
+            context: core::ptr::addr_of_mut!(*uc).cast::<u8>(),
+            chain,
+            _borrow: PhantomData,
+        };
+        (uc, frame)
+    }
+
+    #[test]
+    fn restore_refuses_sve_vl_mismatch_and_accepts_equal_or_absent() {
+        let (_uc_a, frame_a) = synthetic_frame(Some(32));
+        let mut saved = SavedState::new().unwrap();
+        frame_a.capture(&mut saved).unwrap();
+        assert_eq!(saved.sve_vl, Some(32));
+        // Different current VL: refuse, never copy across the change.
+        let (_uc_b, mut frame_b) = synthetic_frame(Some(16));
+        assert!(frame_b.restore(&saved).is_err());
+        // SVE record vanished entirely: also a mismatch.
+        let (_uc_c, mut frame_c) = synthetic_frame(None);
+        assert!(frame_c.restore(&saved).is_err());
+        // Equal VL restores; a saved frame without SVE restores anywhere.
+        let (_uc_d, mut frame_d) = synthetic_frame(Some(32));
+        frame_d.restore(&saved).unwrap();
+        let (_uc_e, frame_e) = synthetic_frame(None);
+        let mut saved_plain = SavedState::new().unwrap();
+        frame_e.capture(&mut saved_plain).unwrap();
+        let (_uc_f, mut frame_f) = synthetic_frame(Some(16));
+        frame_f.restore(&saved_plain).unwrap();
     }
 
     #[test]
