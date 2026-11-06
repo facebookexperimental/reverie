@@ -1481,13 +1481,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-rpc-transport/src/lib.rs",
-        4862,
-        "f0dec89933ddc8d520f0d7fbe634bbb5866826f4360b1a35d8a3fdedc4b36fbd",
+        4905,
+        "d326ba56eecfe72ec9fef5b992a14541b4950f912d8d7b6e9265cc211ee0d1fa",
     ),
     (
         "reverie-rpc-transport/src/server.rs",
-        121453,
-        "fdc6396f781ca59bf8f1b54886401ba36a466d4c12a88b0d90d51326fe4c91e5",
+        124661,
+        "dced4ec2c6a35adf3835b8cc632d32d88bca89ffbc29d6c5073d3ec3e67815e5",
     ),
     (
         "reverie-rpc-transport/src/blocking_client.rs",

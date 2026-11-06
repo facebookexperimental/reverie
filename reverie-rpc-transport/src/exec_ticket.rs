@@ -160,6 +160,17 @@ where
         }
     }
 
+    /// The single watched owner (server-derived, never caller-asserted).
+    pub fn proof_owner(&self) -> B::Owner {
+        self.proof.owner()
+    }
+
+    /// Proof peer check, callable *before* locking around redeem so no
+    /// proof callback runs under a caller's registry mutex.
+    pub fn matches_peer(&self, peer: &OwnedFd) -> bool {
+        self.proof.matches_peer(peer)
+    }
+
     fn check_owner(&self, owner: B::Owner) -> Result<(), ExecControlError> {
         if self.dead {
             return Err(ExecControlError::Dead);

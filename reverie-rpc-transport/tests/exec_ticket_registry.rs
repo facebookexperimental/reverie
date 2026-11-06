@@ -13,7 +13,7 @@ use reverie_rpc_transport::exec_ticket::TicketProof;
 use sha2::Digest;
 use sha2::Sha256;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Binding {
     owner: i32,
     config: [u8; 32],
@@ -222,4 +222,37 @@ fn died_and_failed_are_terminal() {
         ),
         Err(ExecControlError::Dead)
     );
+}
+
+#[test]
+fn control_client_round_trip_over_socketpair() {
+    use reverie_rpc_transport::exec_control::ExecControlClient;
+    use reverie_rpc_transport::exec_control::ExecIssuer;
+    use reverie_rpc_transport::exec_control::serve_exec_control;
+    let registry = std::sync::Arc::new(std::sync::Mutex::new(registry()));
+    let (client_stream, server_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+    let server_registry = registry.clone();
+    let server = std::thread::spawn(move || serve_exec_control(server_stream, &server_registry));
+    let mut client = ExecControlClient::new(client_stream);
+    let snap = b"tool".to_vec();
+    let t = client
+        .prepare(
+            Binding {
+                owner: 7,
+                config: [3u8; 32],
+            },
+            snap.clone(),
+            digest(&snap),
+        )
+        .unwrap();
+    let rt = b"runtime";
+    let sealed = client.seal(t, digest(rt), rt).unwrap();
+    client.mark_provision_delivered(t).unwrap();
+    assert_eq!(client.issue(t, sealed).unwrap(), t);
+    // Replay over the wire is refused by name, not served twice.
+    assert_eq!(client.issue(t, sealed), Err(ExecControlError::Transition));
+    drop(client);
+    server.join().unwrap().unwrap();
+    let registry = registry.lock().unwrap();
+    assert_eq!(registry.stage(t), Some(ExecStage::Issued));
 }

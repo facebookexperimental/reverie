@@ -766,6 +766,71 @@ where
         Self::bind_inner(path, global, config, Some(readiness), None)
     }
 
+    /// Issue one mapped (shared-memory) guest connection (C1 PR1).
+    ///
+    /// Creates a mapped pair with `capacity` bytes per direction, spawns
+    /// the host end on the current Tokio runtime serving this server's
+    /// global/config with the ordinary handshake/framing (including this
+    /// server's readiness flags and connection accounting), and returns
+    /// the guest setup memfd. Socket-only admission/peer-identity hooks
+    /// do not run for issued pairs: issuance itself is the admission.
+    /// Servers configured with admission, identify, initial-image,
+    /// native-successor, mapping-capture, or tool-activation hooks are
+    /// refused explicitly: those setups have no mapped equivalent yet.
+    ///
+    /// # Safety
+    /// Inherits the full `MappedStream::create` lifetime contract: from
+    /// return until all associated streams, abort handles, and
+    /// notification workers have released their mappings, the caller
+    /// must prevent writes through the returned descriptor, its
+    /// duplicates, inherited descriptors, or any other mapping of this
+    /// backing storage. The descriptor may be transferred only to one
+    /// trusted guest importer (`MappedStream::from_owned_fd`), which
+    /// consumes/closes it; duplicates surviving import violate the
+    /// contract just as direct writes do. Neither endpoint may be
+    /// duplicated by fork and operated concurrently.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn issue_mapped_connection(
+        &self,
+        capacity: usize,
+    ) -> std::io::Result<(OwnedFd, tokio::task::JoinHandle<Result<(), RpcError>>)> {
+        if self.admission.is_some()
+            || self.identify_connections
+            || self.initial_image.is_some()
+            || self.native_successor.is_some()
+            || self.mapping_capture.is_some()
+            || self.tool_activation.is_some()
+        {
+            return Err(std::io::Error::other(
+                "mapped issuance refuses socket-only server setup \
+                 (admission/identify/initial-image/native-successor/mapping-capture/tool-activation)",
+            ));
+        }
+        // SAFETY: forwarded to this method's caller contract above.
+        let (host, guest_fd) = unsafe { crate::mapped::MappedStream::create(capacity)? };
+        let host = host.into_async()?;
+        let guard = self.connections.connected();
+        let setup = ConnectionSetup {
+            readiness: self.readiness.clone(),
+            connection_readiness: self.connection_readiness.clone(),
+            ..ConnectionSetup::default()
+        };
+        let global = self.global.clone();
+        let config = self.config.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            serve_connection_owned(global, config, host, setup)
+                .await
+                .map_err(|error| match error {
+                    ConnectionError::Rpc(error) => error,
+                    ConnectionError::Cancelled(_) => RpcError::Io(std::io::Error::other(
+                        "unexpected request cancellation in mapped connection",
+                    )),
+                })
+        });
+        Ok((guest_fd, handle))
+    }
+
     // TODO-HUMAN-REVIEW(PR-139): Review the public config-handshake readiness boundary.
     /// Binds a coordinator and marks `readiness` after a guest receives its
     /// configuration handshake, before that guest sends its first request.
