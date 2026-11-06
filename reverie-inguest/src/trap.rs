@@ -370,7 +370,7 @@ pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
     // inside the SIGSYS handler, whatever entry a dispatcher took.
     #[cfg(target_arch = "aarch64")]
     if IN_HANDLER.get() && vl_change_refused(number, args) {
-        return -i64::from(libc::EINVAL);
+        return refuse_vl_change();
     }
     unsafe { raw_syscall6_gate(number, args) }
 }
@@ -409,7 +409,7 @@ unsafe fn raw_syscall6_gate(number: i64, args: [u64; 6]) -> i64 {
 pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     #[cfg(target_arch = "aarch64")]
     if IN_HANDLER.get() && vl_change_refused(number, [arg0, arg1, arg2, 0, 0, 0]) {
-        return -i64::from(libc::EINVAL);
+        return refuse_vl_change();
     }
     #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
@@ -433,7 +433,7 @@ pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) 
 pub unsafe fn raw_syscall6_with_pkru(number: i64, args: [u64; 6], pkru: u32) -> i64 {
     #[cfg(target_arch = "aarch64")]
     if IN_HANDLER.get() && vl_change_refused(number, args) {
-        return -i64::from(libc::EINVAL);
+        return refuse_vl_change();
     }
     #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
@@ -487,7 +487,7 @@ pub unsafe fn raw_syscall6_with_result(
     #[cfg(target_arch = "aarch64")]
     if IN_HANDLER.get() && vl_change_refused(number, args) {
         return NativeSyscallResult {
-            result: -i64::from(libc::EINVAL),
+            result: refuse_vl_change(),
             pkru: guest_pkru,
         };
     }
@@ -777,31 +777,28 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
     IN_HANDLER.set(false);
 }
 
-/// Fixed-VL admission envelope: whether this trapped prctl would change
-/// the thread's SVE/SME vector length while a handler frame captured at
-/// the current length is live. Such a call is refused by name (the guest
-/// sees EINVAL, the dispatcher never sees the event) rather than let a
-/// saved frame be restored across a VL change. A request naming the
-/// current length, an ONEXEC-deferred change (no live-frame effect), or
-/// a facility the kernel does not offer here is not refused — the kernel
-/// decides those itself. The current length is read through the trusted
-/// gate, so the probe itself never traps.
+/// Fixed-VL admission envelope decision, pure over the kernel-effective
+/// classification: Linux takes the syscall number and the prctl option as
+/// `int`, so both are classified at that width — a register value whose
+/// low 32 bits name the call IS that call, whatever its high bits carry.
+/// `current` is the queried current length, or `None` when the query
+/// failed: a denied GET is not evidence a SET cannot change state (a
+/// filter or hook can deny them independently), so an unestablishable
+/// current length refuses rather than forwards. Requests naming the
+/// current length, an ONEXEC-deferred change, or a zero length (the
+/// kernel rejects it itself before changing state) are not refused.
 #[cfg(target_arch = "aarch64")]
-fn vl_change_refused(number: i64, args: [u64; 6]) -> bool {
-    const PR_SVE_SET_VL: u64 = 50;
-    const PR_SVE_GET_VL: u64 = 51;
-    const PR_SME_SET_VL: u64 = 63;
-    const PR_SME_GET_VL: u64 = 64;
+fn vl_change_decision(number: i64, args: [u64; 6], current: Option<u64>) -> bool {
+    const PR_SVE_SET_VL: i32 = 50;
+    const PR_SME_SET_VL: i32 = 63;
     const VL_LEN_MASK: u64 = 0xffff;
     const VL_ONEXEC: u64 = 1 << 18;
-    if number != libc::SYS_prctl {
+    if number as i32 != libc::SYS_prctl as i32 {
         return false;
     }
-    let get_op = match args[0] {
-        PR_SVE_SET_VL => PR_SVE_GET_VL,
-        PR_SME_SET_VL => PR_SME_GET_VL,
-        _ => return false,
-    };
+    if !matches!(args[0] as i32, PR_SVE_SET_VL | PR_SME_SET_VL) {
+        return false;
+    }
     if args[1] & VL_ONEXEC != 0 {
         return false;
     }
@@ -809,13 +806,56 @@ fn vl_change_refused(number: i64, args: [u64; 6]) -> bool {
     if requested == 0 {
         return false;
     }
-    // SAFETY: a scalar prctl query through the trusted gate (the
-    // unchecked gate entry, so the boundary cannot recurse into itself).
-    let current = unsafe { raw_syscall6_gate(libc::SYS_prctl, [get_op, 0, 0, 0, 0, 0]) };
-    if current < 0 {
+    match current {
+        Some(current) => requested != (current & VL_LEN_MASK),
+        None => true,
+    }
+}
+
+/// Whether this call, issued from inside the SIGSYS handler, would change
+/// the thread's vector length under a live frame. The current length is
+/// read through the unchecked gate entry, so the probe itself never traps
+/// and the boundary cannot recurse into itself.
+#[cfg(target_arch = "aarch64")]
+fn vl_change_refused(number: i64, args: [u64; 6]) -> bool {
+    const PR_SVE_SET_VL: i32 = 50;
+    const PR_SVE_GET_VL: u64 = 51;
+    const PR_SME_SET_VL: i32 = 63;
+    const PR_SME_GET_VL: u64 = 64;
+    if number as i32 != libc::SYS_prctl as i32 {
         return false;
     }
-    requested != (current as u64 & VL_LEN_MASK)
+    let get_op = match args[0] as i32 {
+        PR_SVE_SET_VL => PR_SVE_GET_VL,
+        PR_SME_SET_VL => PR_SME_GET_VL,
+        _ => return false,
+    };
+    // Pass-through shapes decide without a query (deferred, or the
+    // kernel's own zero rejection): only a would-be change probes.
+    if args[1] & (1 << 18) != 0 || args[1] & 0xffff == 0 {
+        return false;
+    }
+    // SAFETY: a scalar prctl query through the trusted gate.
+    let queried = unsafe { raw_syscall6_gate(libc::SYS_prctl, [get_op, 0, 0, 0, 0, 0]) };
+    let current = (queried >= 0).then_some(queried as u64);
+    vl_change_decision(number, args, current)
+}
+
+/// Issue the fixed-VL refusal: the guest sees the kernel-faithful EINVAL,
+/// and the host stderr gets the envelope's name at the refusal site, so a
+/// synthetic errno is never indistinguishable from a kernel decision.
+#[cfg(target_arch = "aarch64")]
+fn refuse_vl_change() -> i64 {
+    const MESSAGE: &[u8] =
+        b"reverie-inguest: fixed-VL envelope: refusing VL-changing prctl while a signal frame is live\n";
+    // SAFETY: a scalar write of a static buffer through the trusted gate.
+    unsafe {
+        raw_syscall6_gate(
+            libc::SYS_write,
+            [2, MESSAGE.as_ptr() as u64, MESSAGE.len() as u64, 0, 0, 0],
+        )
+    };
+    -i64::from(libc::EINVAL)
 }
 
 /// The `SA_SIGINFO` handler for `SIGSYS` on aarch64: same provenance,
@@ -881,7 +921,7 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
     // prctl that would change the vector length under this live frame is
     // refused by name before any dispatcher can forward it.
     if vl_change_refused(event.number(), event.args()) {
-        frame.set_register(0, -i64::from(libc::EINVAL));
+        frame.set_register(0, refuse_vl_change());
         IN_HANDLER.set(false);
         return;
     }
@@ -1719,6 +1759,7 @@ mod aarch64_gate_tests {
             .unwrap()
             .parse()
             .unwrap();
+        assert_ne!(pid, 424_243, "spoof sentinel collides with child pid");
         CAPTURE.with(|slot| *slot.borrow_mut() = Some(frame::SavedState::new().unwrap()));
         set_dispatcher(Box::new(CaptureSpoofGetpid));
         // SAFETY: single-threaded child; handler before filter, as the
@@ -1768,6 +1809,20 @@ mod aarch64_gate_tests {
                     || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
                 {
                     raw_syscall6(libc::SYS_exit_group, [65, 0, 0, 0, 0, 0]);
+                }
+                // Kernel-effective aliases of the same call (Linux takes
+                // the syscall number and the prctl option as int) must be
+                // refused identically, never forwarded by truncation.
+                for (number, option, code) in [
+                    (0x1_0000_00a7_i64, PR_SVE_SET_VL, 73_u64),
+                    (libc::SYS_prctl, 0x1_0000_0032, 74),
+                ] {
+                    let refused = libc::syscall(number, option, (cur_vl + 16) as i64);
+                    if refused != -1
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
+                    {
+                        raw_syscall6(libc::SYS_exit_group, [code, 0, 0, 0, 0, 0]);
+                    }
                 }
                 // The same change attempted directly through the gate
                 // from inside dispatch (trapped gettid as the carrier)

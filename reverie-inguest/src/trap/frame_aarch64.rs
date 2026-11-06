@@ -27,6 +27,10 @@ const RESERVED_OFFSET: usize = 288;
 const RESERVED_BYTES: usize = 4096;
 const EXTRA_MAGIC: u32 = 0x4558_5401;
 const SVE_MAGIC: u32 = 0x5356_4501;
+const ZA_MAGIC: u32 = 0x5436_6345;
+/// SVE_SIG_FLAG_SM: the SVE record describes streaming-mode state, a
+/// different vector domain from the non-streaming one at the same VL.
+const SVE_SIG_FLAG_SM: u16 = 0x1;
 /// Architectural registers this frame addresses: x0-x30, then sp, pc,
 /// pstate, in sigcontext order.
 const REGISTERS: usize = 34;
@@ -63,6 +67,11 @@ struct ReservedChain {
     /// is present. Admission is a fixed-VL envelope: restore refuses a
     /// mismatch instead of copying state across a VL change.
     sve_vl: Option<u16>,
+    /// Whether the SVE record describes streaming-mode state.
+    sve_streaming: bool,
+    /// The SME ZA vector length, when a ZA record is present. Linux
+    /// requires it to match the task SME VL independently of SVE.
+    za_vl: Option<u16>,
 }
 
 /// Walk the `_aarch64_ctx` record chain in `__reserved`, requiring every
@@ -76,6 +85,8 @@ unsafe fn validate_reserved(reserved: *const u8) -> Result<ReservedChain, FrameE
     let mut offset = 0usize;
     let mut has_extra = false;
     let mut sve_vl = None;
+    let mut sve_streaming = false;
+    let mut za_vl = None;
     loop {
         if offset + 8 > RESERVED_BYTES {
             return Err(FrameError);
@@ -92,6 +103,8 @@ unsafe fn validate_reserved(reserved: *const u8) -> Result<ReservedChain, FrameE
                 used: offset + 8,
                 has_extra,
                 sve_vl,
+                sve_streaming,
+                za_vl,
             });
         }
         if size < 16 || size % 8 != 0 || offset + size > RESERVED_BYTES {
@@ -102,7 +115,21 @@ unsafe fn validate_reserved(reserved: *const u8) -> Result<ReservedChain, FrameE
                 return Err(FrameError);
             }
             // SAFETY: an SVE record body starts with its vl/flags words.
-            sve_vl = Some(unsafe { reserved.add(offset + 8).cast::<u16>().read_unaligned() });
+            let (vl, flags) = unsafe {
+                (
+                    reserved.add(offset + 8).cast::<u16>().read_unaligned(),
+                    reserved.add(offset + 10).cast::<u16>().read_unaligned(),
+                )
+            };
+            sve_vl = Some(vl);
+            sve_streaming = flags & SVE_SIG_FLAG_SM != 0;
+        }
+        if magic == ZA_MAGIC {
+            if za_vl.is_some() || size < 16 {
+                return Err(FrameError);
+            }
+            // SAFETY: a ZA record body starts with its vl word.
+            za_vl = Some(unsafe { reserved.add(offset + 8).cast::<u16>().read_unaligned() });
         }
         if magic == EXTRA_MAGIC {
             if size < 32 {
@@ -133,6 +160,8 @@ pub struct SavedState {
     storage: Box<[Block]>,
     reserved_used: usize,
     sve_vl: Option<u16>,
+    sve_streaming: bool,
+    za_vl: Option<u16>,
 }
 
 impl SavedState {
@@ -150,6 +179,8 @@ impl SavedState {
             storage: storage.into_boxed_slice(),
             reserved_used: 0,
             sve_vl: None,
+            sve_streaming: false,
+            za_vl: None,
         })
     }
 
@@ -358,6 +389,8 @@ impl<'signal> SignalFrame<'signal> {
         };
         saved.reserved_used = self.chain.used;
         saved.sve_vl = self.chain.sve_vl;
+        saved.sve_streaming = self.chain.sve_streaming;
+        saved.za_vl = self.chain.za_vl;
         Ok(())
     }
 
@@ -378,6 +411,20 @@ impl<'signal> SignalFrame<'signal> {
         match (saved.sve_vl, self.chain.sve_vl) {
             (Some(saved_vl), Some(current_vl)) if saved_vl == current_vl => {}
             (None, _) => {}
+            _ => return Err(FrameError),
+        }
+        // Every copied VL domain is authenticated before the first write:
+        // streaming mode is a separate domain at the same SVE VL, and ZA
+        // has its own SME VL that Linux requires to match the task's.
+        if saved.sve_vl.is_some()
+            && self.chain.sve_vl.is_some()
+            && saved.sve_streaming != self.chain.sve_streaming
+        {
+            return Err(FrameError);
+        }
+        match (saved.za_vl, self.chain.za_vl) {
+            (Some(saved_za), Some(current_za)) if saved_za == current_za => {}
+            (None, None) => {}
             _ => return Err(FrameError),
         }
         // SAFETY: reserved areas on both sides are RESERVED_BYTES; the
@@ -468,6 +515,40 @@ mod tests {
             _borrow: PhantomData,
         };
         (uc, frame)
+    }
+
+    fn synthetic_frame_za(
+        sve_vl: u16,
+        za_vl: u16,
+    ) -> (Box<libc::ucontext_t>, SignalFrame<'static>) {
+        let mut uc = Box::new(unsafe { core::mem::zeroed::<libc::ucontext_t>() });
+        let mut bytes = chain_bytes(&[(SVE_MAGIC, 16), (0x5436_6345, 16), (0, 0)]);
+        bytes[8..10].copy_from_slice(&sve_vl.to_ne_bytes());
+        bytes[16 + 8..16 + 10].copy_from_slice(&za_vl.to_ne_bytes());
+        let reserved = unsafe {
+            core::ptr::addr_of_mut!(uc.uc_mcontext)
+                .cast::<u8>()
+                .add(RESERVED_OFFSET)
+        };
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), reserved, RESERVED_BYTES) };
+        let chain = unsafe { validate_reserved(reserved) }.unwrap();
+        let frame = SignalFrame {
+            context: core::ptr::addr_of_mut!(*uc).cast::<u8>(),
+            chain,
+            _borrow: PhantomData,
+        };
+        (uc, frame)
+    }
+
+    #[test]
+    fn restore_refuses_za_vl_mismatch_with_equal_sve_vl() {
+        // Astra witness shape: SVE VL16 on both sides, ZA VL32 into ZA
+        // VL16 must refuse, never copy across.
+        let (_uc_a, frame_a) = synthetic_frame_za(16, 32);
+        let mut saved = SavedState::new().unwrap();
+        frame_a.capture(&mut saved).unwrap();
+        let (_uc_b, mut frame_b) = synthetic_frame_za(16, 16);
+        assert!(frame_b.restore(&saved).is_err());
     }
 
     #[test]
