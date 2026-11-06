@@ -26639,6 +26639,77 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
             (213, 7),
             (226, 9),
         ],
+    }, // Stable Rust 1.97.1 duplicate of template 55 (fixed_region_publication_get_opaque): identical
+    // exact shape, with the null panic GOT operand bound to
+    // panic_null_pointer_dereference, the entry stable core emits for
+    // the reference null check. Selection is by bound GOT callee
+    // (fixed_detcore_got_discriminate).
+    DetcoreValidateTemplate {
+        role: "fixed_region_publication_get_opaque",
+        hex: "504889fe40f6c607751e4885f6742b0fb6461831c984c0480f45ce48890c244889e0488b042459c3488d1569192200bf08000000ff15ae6a2300488d3d57192200ff1531a22300",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 43,
+                next: 47,
+                key: "fixed_scalar_publication_get_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 54,
+                next: 58,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 61,
+                next: 65,
+                key: "fixed_scalar_publication_get_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 67,
+                next: 71,
+                key: "fixed_heap_panic_null",
+                got: true,
+            },
+        ],
+        transfers: &[(52, 1), (65, 3)],
+    },
+    // Stable Rust 1.97.1 duplicate of template 81 (fixed_region_publication_set_opaque): identical
+    // exact shape, with the null panic GOT operand bound to
+    // panic_null_pointer_dereference, the entry stable core emits for
+    // the reference null check. Selection is by bound GOT callee
+    // (fixed_detcore_got_discriminate).
+    DetcoreValidateTemplate {
+        role: "fixed_region_publication_set_opaque",
+        hex: "5040f6c70775454885ff74550fb6471884c07413c74424040b000000488d4424048b44240459c30f1006488b4610488947100f1107c6471801c744240400000000488d4424048b44240459c3488d153da820004889febf08000000ff15bfdf2100488d3d28a82000ff1532182200",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 79,
+                next: 83,
+                key: "fixed_scalar_publication_set_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 93,
+                next: 97,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 100,
+                next: 104,
+                key: "fixed_scalar_publication_set_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 106,
+                next: 110,
+                key: "fixed_heap_panic_null",
+                got: true,
+            },
+        ],
+        transfers: &[(91, 1), (104, 3)],
     },
     DetcoreValidateTemplate {
         role: "fixed_patch_alloc",
