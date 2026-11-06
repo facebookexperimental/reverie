@@ -26050,6 +26050,196 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
             },
         ],
         transfers: &[(34, 2)],
+    }, // Observed stable Rust 1.97.1 standalone dev (Hermit native producer);
+    // complete 348B. Same source body as the 354B nightly template with
+    // reassigned stack slots; operands bound by resolved target below.
+    DetcoreValidateTemplate {
+        role: "fixed_constructor_prepare",
+        hex: "415741564154534883ec284889fb4989e748897c2408488d442408488b7c24084c897c2408488b74240848c744240801000000488b5424084c8d6424104c89642408488b4c2408e88c99ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e6f6c3070f85a00000004885db0f84ac0000004c8b7424104c897b5848b8001000000060000048894424104c89742418884c2420488d1d97b3370448895c2408488d442408488b7c24084c89642408488b742408e81957000085c0758541f6c60775694d85f6747949c7464803000000c60553b337040048895c2410488d442410488b7c2410e8975600004889c14885c0b8010000000f844bffffff31c0807910ff0f94c0e93dffffff488d1509613400bf080000004889deff1593543600488d3df4603400ff15668b3600488d15df5f3400bf080000004c89f6ff1571543600488d3dca5f3400ff15448b3600",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 72,
+                next: 76,
+                key: "fixed_native_from_native",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 165,
+                next: 169,
+                key: "fixed_region",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 195,
+                next: 199,
+                key: "fixed_region_publication_set_opaque",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 229,
+                key: "fixed_initializing",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 245,
+                next: 249,
+                key: "fixed_region_publication_get_opaque",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 283,
+                next: 287,
+                key: "fixed_naked_constructor_record_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 297,
+                next: 301,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 304,
+                next: 308,
+                key: "fixed_naked_constructor_record_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 310,
+                next: 314,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 317,
+                next: 321,
+                key: "fixed_naked_publish_record_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 331,
+                next: 335,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 338,
+                next: 342,
+                key: "fixed_naked_publish_record_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 344,
+                next: 348,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[
+            (71, 0),
+            (194, 2),
+            (244, 4),
+            (295, 6),
+            (308, 8),
+            (329, 10),
+            (342, 12),
+        ],
+    },
+    // Observed stable Rust 1.97.1 standalone dev (Hermit native producer);
+    // complete 348B. Generic counterpart of the constructor template above.
+    DetcoreValidateTemplate {
+        role: "fixed_generic_prepare",
+        hex: "415741564154534883ec284889fb4989e748897c2408488d442408488b7c24084c897c2408488b74240848c744240802000000488b5424084c8d6424104c89642408488b4c2408e82c98ffff85c07411b8010000004883c4285b415c415e415fc30fb64c2418b80100000084c974e6f6c3070f85a00000004885db0f84ac0000004c8b7424104c897b5848b8001000000060000048894424104c89742418884c2420488d1d37b2370448895c2408488d442408488b7c24084c89642408488b742408e8b955000085c0758541f6c60775694d85f6747949c7464803000000c605f3b137040048895c2410488d442410488b7c2410e8375500004889c14885c0b8010000000f844bffffff31c0807910ff0f94c0e93dffffff488d15c15f3400bf080000004889deff1533533600488d3dac5f3400ff15068a3600488d157f5e3400bf080000004c89f6ff1511533600488d3d6a5e3400ff15e4893600",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 72,
+                next: 76,
+                key: "fixed_native_from_native",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 165,
+                next: 169,
+                key: "fixed_region",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 195,
+                next: 199,
+                key: "fixed_region_publication_set_opaque",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 224,
+                next: 229,
+                key: "fixed_initializing",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 245,
+                next: 249,
+                key: "fixed_region_publication_get_opaque",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 283,
+                next: 287,
+                key: "fixed_naked_constructor_record_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 297,
+                next: 301,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 304,
+                next: 308,
+                key: "fixed_naked_constructor_record_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 310,
+                next: 314,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 317,
+                next: 321,
+                key: "fixed_naked_publish_record_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 331,
+                next: 335,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 338,
+                next: 342,
+                key: "fixed_naked_publish_record_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 344,
+                next: 348,
+                key: "fixed_panic_null_reference",
+                got: true,
+            },
+        ],
+        transfers: &[
+            (71, 0),
+            (194, 2),
+            (244, 4),
+            (295, 6),
+            (308, 8),
+            (329, 10),
+            (342, 12),
+        ],
     },
     DetcoreValidateTemplate {
         role: "fixed_patch_alloc",
