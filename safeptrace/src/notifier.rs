@@ -647,6 +647,14 @@ impl ExitWaiters {
     }
 }
 
+/// One generation's cached general-purpose registers (`Event::regs_cache`).
+#[derive(Clone, Copy, Debug)]
+struct CachedRegs {
+    regs: crate::Regs,
+    /// Recorded by `Stopped::setregs` and not yet written to the kernel.
+    dirty: bool,
+}
+
 #[derive(Debug)]
 struct Event {
     /// Cancellation-safe weak registrations for every pending exit waiter.
@@ -679,16 +687,22 @@ struct Event {
 
     /// This generation's general-purpose registers as last read from or
     /// written to the kernel during its current stop (`Stopped::getregs`
-    /// / `Stopped::setregs`). Every successful resume clears it
-    /// (`Stopped::into_running`): guest execution, syscall entry/exit and
-    /// signal delivery may all change the registers outside any ptrace
-    /// write. An `ESRCH` that shows the tracee left the stop clears it
-    /// too. It is never populated for a handle without a bound identity:
-    /// such a handle's generation may not be the registry's one for the
-    /// tracee, so its writes cannot be ordered against this cache.
-    regs_cache: Mutex<Option<crate::Regs>>,
+    /// / `Stopped::setregs`). A `setregs` records its value as dirty
+    /// instead of writing it at once; the write reaches the kernel in
+    /// one `NT_PRSTATUS` set before the next resume (and before the
+    /// few requests that observe kernel registers). Every successful
+    /// resume clears it (`Stopped::into_running`): guest execution,
+    /// syscall entry/exit and signal delivery may all change the
+    /// registers outside any ptrace write. An `ESRCH` that shows the
+    /// tracee left the stop clears it too. It is never populated for a
+    /// handle without a bound identity: such a handle's generation may
+    /// not be the registry's one for the tracee, so its writes cannot
+    /// be ordered against this cache.
+    regs_cache: Mutex<Option<CachedRegs>>,
     #[cfg(test)]
     regs_kernel_reads: AtomicUsize,
+    #[cfg(test)]
+    regs_kernel_writes: AtomicUsize,
 
     /// Waker for regular status events.
     status_waker: WakerSlot,
@@ -1415,6 +1429,8 @@ impl Event {
             regs_cache: Mutex::new(None),
             #[cfg(test)]
             regs_kernel_reads: AtomicUsize::new(0),
+            #[cfg(test)]
+            regs_kernel_writes: AtomicUsize::new(0),
             status_waker: WakerSlot::default(),
             status: Mutex::new(StatusState {
                 pending: VecDeque::new(),
@@ -3181,12 +3197,34 @@ impl EventHandle {
 
     /// The registers cached for this generation's current stop, if any.
     pub(super) fn cached_regs(&self) -> Option<crate::Regs> {
-        *self.event().regs_cache.lock()
+        self.event().regs_cache.lock().map(|cached| cached.regs)
     }
 
     /// Records `regs` as this generation's current kernel registers.
     pub(super) fn store_regs(&self, regs: crate::Regs) {
-        *self.event().regs_cache.lock() = Some(regs);
+        *self.event().regs_cache.lock() = Some(CachedRegs { regs, dirty: false });
+    }
+
+    /// Records `regs` as written by `Stopped::setregs`, to reach the
+    /// kernel at the next flush.
+    pub(super) fn store_regs_dirty(&self, regs: crate::Regs) {
+        *self.event().regs_cache.lock() = Some(CachedRegs { regs, dirty: true });
+    }
+
+    /// The dirty registers awaiting a kernel write, if any.
+    pub(super) fn dirty_regs(&self) -> Option<crate::Regs> {
+        self.event()
+            .regs_cache
+            .lock()
+            .filter(|cached| cached.dirty)
+            .map(|cached| cached.regs)
+    }
+
+    /// Marks the cached registers as written to the kernel.
+    pub(super) fn mark_regs_clean(&self) {
+        if let Some(cached) = &mut *self.event().regs_cache.lock() {
+            cached.dirty = false;
+        }
     }
 
     /// Drops the cached registers: the tracee left the stop they were
@@ -3207,6 +3245,20 @@ impl EventHandle {
     #[cfg(test)]
     pub(super) fn regs_kernel_reads(&self) -> usize {
         self.event().regs_kernel_reads.load(Ordering::Relaxed)
+    }
+
+    /// Counts one kernel register write, for tests of the cache.
+    #[cfg(test)]
+    pub(super) fn note_regs_kernel_write(&self) {
+        self.event()
+            .regs_kernel_writes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Kernel register writes so far, for tests of the cache.
+    #[cfg(test)]
+    pub(super) fn regs_kernel_writes(&self) -> usize {
+        self.event().regs_kernel_writes.load(Ordering::Relaxed)
     }
 
     fn identity(&self) -> Option<&Arc<WorkerIdentity>> {
@@ -12338,6 +12390,11 @@ mod test {
         stopped.1.event().regs_kernel_reads()
     }
 
+    /// Kernel `NT_PRSTATUS` writes this capability's generation has made.
+    fn regs_kernel_writes(stopped: &Stopped) -> usize {
+        stopped.1.event().regs_kernel_writes()
+    }
+
     /// The instruction pointer in `regs`.
     fn regs_ip(regs: &crate::Regs) -> u64 {
         #[cfg(target_arch = "x86_64")]
@@ -12525,6 +12582,108 @@ mod test {
         // The owner thread is unaffected and still needs no kernel read.
         stopped.getregs().unwrap();
         assert_eq!(regs_kernel_reads(&stopped), 1);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_writeback_collapses_setregs_until_flush() {
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        let mut regs = stopped.getregs().unwrap();
+        regs_scratch_set(&mut regs, 0x1111);
+        stopped.setregs(&regs).unwrap();
+        regs_scratch_set(&mut regs, 0x2222);
+        stopped.setregs(&regs).unwrap();
+        // Both writes stay in the cache: no kernel write yet, and a
+        // read serves the latest value without a kernel read.
+        assert_eq!(regs_kernel_writes(&stopped), 0);
+        assert_eq!(regs_scratch(&stopped.getregs().unwrap()), 0x2222);
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        // `peekuser` observes kernel registers, so it flushes first:
+        // exactly one kernel write for the two `setregs` calls.
+        stopped.peekuser(0).unwrap();
+        assert_eq!(regs_kernel_writes(&stopped), 1);
+        // What reached the kernel is the latest value: dropping the
+        // cache forces a kernel read, which still shows it. The child
+        // has not executed, so nothing else could have written it.
+        stopped.1.event().invalidate_regs();
+        assert_eq!(regs_scratch(&stopped.getregs().unwrap()), 0x2222);
+        assert_eq!(regs_kernel_reads(&stopped), 2);
+        // A further write after the flush is a new dirty run.
+        let mut regs = stopped.getregs().unwrap();
+        regs_scratch_set(&mut regs, 0x3333);
+        stopped.setregs(&regs).unwrap();
+        assert_eq!(regs_kernel_writes(&stopped), 1);
+        stopped.peekuser(0).unwrap();
+        assert_eq!(regs_kernel_writes(&stopped), 2);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_writeback_flushes_at_syscall_resume() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        let mut regs = stopped.getregs().unwrap();
+        regs_scratch_set(&mut regs, 0x4444);
+        stopped.setregs(&regs).unwrap();
+        assert_eq!(regs_kernel_writes(&stopped), 0);
+        let stopped = next_stopped(stopped.syscall(None).unwrap(), deadline).await;
+        // The flush ran before the resume request. The child ran
+        // freely to its next syscall, so its registers since are its
+        // own work; what proves the flush is the single kernel write,
+        // and what proves invalidation is the fresh kernel read (the
+        // value written is proven without execution in
+        // `regs_writeback_collapses_setregs_until_flush`).
+        assert_eq!(regs_kernel_writes(&stopped), 1);
+        stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 2);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_writeback_flushes_at_detach() {
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        let mut regs = stopped.getregs().unwrap();
+        regs_scratch_set(&mut regs, 0x5555);
+        stopped.setregs(&regs).unwrap();
+        assert_eq!(regs_kernel_writes(&stopped), 0);
+        let generation = stopped.generation();
+        drop(stopped.detach(None::<Signal>).unwrap());
+        let detached = generation.assume_stopped();
+        assert_eq!(regs_kernel_writes(&detached), 1);
+        drop(detached);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_writeback_foreign_thread_setregs_refused() {
+        let (_pid, stopped, cleanup) = spawn_traced_process_as(None, |pid| {
+            Stopped::new_unchecked_on_ptracer_thread(pid).unwrap()
+        })
+        .unwrap();
+        let regs = stopped.getregs().unwrap();
+        let original = regs_scratch(&regs);
+        // A foreign thread's `setregs` is refused before anything is
+        // recorded: no dirty value is left for the owner to flush.
+        let generation = stopped.generation();
+        let refused = thread::spawn(move || {
+            let foreign = generation.assume_stopped();
+            let mut regs = regs;
+            regs_scratch_set(&mut regs, 0x6666);
+            foreign.setregs(&regs)
+        })
+        .join()
+        .unwrap();
+        assert!(
+            matches!(refused, Err(Error::Errno(Errno::EPERM))),
+            "{refused:?}"
+        );
+        stopped.peekuser(0).unwrap();
+        assert_eq!(regs_kernel_writes(&stopped), 0);
+        stopped.1.event().invalidate_regs();
+        assert_eq!(regs_scratch(&stopped.getregs().unwrap()), original);
         drop(stopped);
         reap_stopped_process(cleanup);
     }
