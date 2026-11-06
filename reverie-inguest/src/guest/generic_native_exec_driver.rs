@@ -12,7 +12,8 @@
 //! catalog contents, determinism receipts, mm/files identity) stay
 //! with the embedder; this driver owns only: catalog admission at
 //! capture, state framing at prepare, ticket lifecycle through an
-//! [`ExecIssuer`], and the physical leaf call at issue.
+//! [`ExecIssuer`]. The physical leaf call is N2b (joint with
+//! musegate S-B); issue refuses by name until then.
 //!
 //! Absence of a catalog means reach-the-kernel admission: targets
 //! the kernel refuses (e.g. ENOENT) surface as genuine returned
@@ -141,6 +142,24 @@ fn terminal(message: &'static str) -> NativeExecFailure {
     })
 }
 
+/// Cancel after a prepare failure. Confirmed cancellation keeps the
+/// original failure; any cancel uncertainty is Terminal (a live
+/// Prepared ticket must never hide behind an ordinary refusal).
+fn cancel_or_terminal<I, B>(
+    issuer: &mut I,
+    ticket: reverie_rpc_transport::exec_ticket::ExecTicket,
+    original: NativeExecFailure,
+) -> NativeExecFailure
+where
+    I: ExecIssuer<B>,
+    B: TicketBinding,
+{
+    match issuer.cancel(ticket) {
+        Ok(()) => original,
+        Err(_) => terminal("reverie-inguest: generic native exec cancellation is uncertain"),
+    }
+}
+
 fn control_terminal(_error: ExecControlError) -> NativeExecFailure {
     terminal("reverie-inguest: generic native exec control transport failed")
 }
@@ -160,7 +179,7 @@ struct GenericPrepared<I, B, F> {
     framer: std::sync::Arc<F>,
     issuer: std::sync::Arc<Mutex<I>>,
     ticket: ExecTicket,
-    sealed_digest: [u8; 32],
+    _sealed_digest: [u8; 32],
     encoded: Vec<u8>,
 }
 
@@ -245,24 +264,27 @@ where
         let sealed_digest = match issuer.seal(ticket, runtime_digest, &self.runtime) {
             Ok(digest) => digest,
             Err(error) => {
-                let _ = issuer.cancel(ticket);
-                return Err(control_terminal(error));
+                return Err(cancel_or_terminal(
+                    &mut *issuer,
+                    ticket,
+                    control_terminal(error),
+                ));
             }
         };
         // Actual delivery first; the delivered fact is recorded only
         // after the embedder's receipt. No delivery => cancel+refuse.
         if let Err(error) = self.provisioner.deliver(ticket, sealed_digest) {
-            let _ = issuer.cancel(ticket);
-            return Err(match error {
+            let original = match error {
                 ExecControlError::Unavailable => NativeExecFailure::Refused(refused(
                     "reverie-inguest: generic native exec has no provision delivery",
                 )),
                 other => control_terminal(other),
-            });
+            };
+            return Err(cancel_or_terminal(&mut *issuer, ticket, original));
         }
         if let Err(error) = issuer.mark_provision_delivered(ticket) {
-            let _ = issuer.cancel(ticket);
-            return Err(control_terminal(error));
+            let original = control_terminal(error);
+            return Err(cancel_or_terminal(&mut *issuer, ticket, original));
         }
         drop(issuer);
         Ok(Box::new(GenericPrepared {
@@ -270,7 +292,7 @@ where
             framer: self.framer.clone(),
             issuer: self.issuer.clone(),
             ticket,
-            sealed_digest,
+            _sealed_digest: sealed_digest,
             encoded,
         }))
     }
@@ -307,35 +329,20 @@ where
         _cut: &ExecCut,
         _rpc: &CoordinatorRpc<T::GlobalState>,
     ) -> Result<ReturnedNativeExec, NativeExecFailure> {
-        // Final exact-state check after the last acknowledgment point
-        // available to this driver (leaf contract shape), then Issue.
         if self.framer.encode(state) != self.encoded {
             return Err(NativeExecFailure::Refused(refused(
                 "reverie-inguest: generic native exec prepared state changed at issue",
             )));
         }
-        {
-            let mut issuer = self
-                .issuer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            issuer
-                .issue(self.ticket, self.sealed_digest)
-                .map_err(control_terminal)?;
-        }
-        let leaf = unsafe { super::exec_private::IssuedNativeExecLeaf::after_issue(_cut) }?;
-        let encoded = self.encoded.clone();
-        let framer = &self.framer;
-        unsafe {
-            leaf.call(|| {
-                if framer.encode(state) != encoded {
-                    return Err(NativeExecFailure::Refused(refused(
-                        "reverie-inguest: generic native exec state changed at leaf",
-                    )));
-                }
-                Ok(())
-            })
-        }
+        // N2 scope (coord7/Astra delta): the physical leaf path is
+        // N2b, jointly with musegate S-B, where the leaf final-check
+        // contract (retained authority validation, allocation-free
+        // exact check, no post-Issue encode/clone) is implemented
+        // properly. Until then this driver refuses by name here and
+        // never issues the ticket.
+        Err(NativeExecFailure::Refused(refused(
+            "reverie-inguest: generic native exec leaf is N2b (joint with musegate S-B)",
+        )))
     }
 
     fn cancel(
@@ -417,8 +424,34 @@ mod tests {
         }
     }
 
+    type CallLog = Arc<Mutex<Vec<&'static str>>>;
     struct DirectIssuer {
         registry: Arc<Mutex<ExecTicketRegistry<TestProof, TestBinding>>>,
+        calls: CallLog,
+    }
+    thread_local! {
+        static PROVISION_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        static SHARED_CALLS: std::cell::RefCell<Vec<&'static str>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    struct SwitchProvisioner {
+        ok: bool,
+        calls: CallLog,
+    }
+    impl Provisioner for SwitchProvisioner {
+        fn deliver(
+            &self,
+            _ticket: ExecTicket,
+            _sealed_digest: [u8; 32],
+        ) -> Result<(), ExecControlError> {
+            self.calls.lock().unwrap().push("deliver");
+            SHARED_CALLS.with(|log| log.borrow_mut().push("deliver"));
+            if self.ok {
+                Ok(())
+            } else {
+                Err(ExecControlError::Unavailable)
+            }
+        }
     }
     struct TestProof;
     impl reverie_rpc_transport::exec_ticket::TicketProof<TestBinding> for TestProof {
@@ -449,6 +482,8 @@ mod tests {
             snapshot: Vec<u8>,
             digest: [u8; 32],
         ) -> Result<reverie_rpc_transport::exec_ticket::ExecTicket, ExecControlError> {
+            self.calls.lock().unwrap().push("prepare");
+            SHARED_CALLS.with(|l| l.borrow_mut().push("prepare"));
             self.registry
                 .lock()
                 .unwrap()
@@ -460,6 +495,8 @@ mod tests {
             digest: [u8; 32],
             runtime: &[u8],
         ) -> Result<[u8; 32], ExecControlError> {
+            self.calls.lock().unwrap().push("seal");
+            SHARED_CALLS.with(|l| l.borrow_mut().push("seal"));
             self.registry
                 .lock()
                 .unwrap()
@@ -469,6 +506,8 @@ mod tests {
             &mut self,
             ticket: reverie_rpc_transport::exec_ticket::ExecTicket,
         ) -> Result<(), ExecControlError> {
+            self.calls.lock().unwrap().push("mark");
+            SHARED_CALLS.with(|l| l.borrow_mut().push("mark"));
             self.registry
                 .lock()
                 .unwrap()
@@ -479,6 +518,8 @@ mod tests {
             ticket: reverie_rpc_transport::exec_ticket::ExecTicket,
             digest: [u8; 32],
         ) -> Result<reverie_rpc_transport::exec_ticket::ExecTicket, ExecControlError> {
+            self.calls.lock().unwrap().push("issue");
+            SHARED_CALLS.with(|l| l.borrow_mut().push("issue"));
             self.registry.lock().unwrap().issue(7, ticket, digest)?;
             Ok(ticket)
         }
@@ -486,6 +527,8 @@ mod tests {
             &mut self,
             ticket: reverie_rpc_transport::exec_ticket::ExecTicket,
         ) -> Result<(), ExecControlError> {
+            self.calls.lock().unwrap().push("cancel");
+            SHARED_CALLS.with(|l| l.borrow_mut().push("cancel"));
             self.registry.lock().unwrap().cancel(7, ticket)
         }
     }
@@ -508,7 +551,10 @@ mod tests {
             KernelCatalog,
             PairFramer,
             RefusingProvisioner,
-            DirectIssuer { registry },
+            DirectIssuer {
+                registry,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
             TestBinding { config: [3u8; 32] },
             b"runtime".to_vec(),
         );
@@ -660,22 +706,17 @@ mod tests {
         let tool = ExecTool {
             returned: returned.clone(),
         };
-        struct OkProvisioner;
-        impl Provisioner for OkProvisioner {
-            fn deliver(
-                &self,
-                _ticket: ExecTicket,
-                _sealed_digest: [u8; 32],
-            ) -> Result<(), ExecControlError> {
-                Ok(())
-            }
-        }
+        // SwitchProvisioner (tests scope) honors PROVISION_OK.
         let driver = GenericNativeExecDriver::new(
             KernelCatalog,
             PairFramer,
-            OkProvisioner,
+            SwitchProvisioner {
+                ok: PROVISION_OK.with(|ok| ok.get()),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
             DirectIssuer {
                 registry: registry.clone(),
+                calls: Arc::new(Mutex::new(Vec::new())),
             },
             TestBinding { config: [3u8; 32] },
             b"runtime".to_vec(),
@@ -705,15 +746,36 @@ mod tests {
         let (errno, refusal) = &results[0];
         assert_eq!(*errno, Errno::EOPNOTSUPP);
         let refusal = refusal.as_ref().expect("named leaf refusal");
-        // The wired leaf refuses by name here: synthetic dispatch has
-        // no genuine running fallback resume receipt (only a real
-        // fallback continuation entry mints one). Issue happened
-        // first; the host attempt then cancelled the ticket.
-        assert!(
-            refusal.diagnostic.contains("fallback resume mask"),
-            "{}",
-            refusal.diagnostic
-        );
+        if PROVISION_OK.with(|ok| ok.get()) {
+            // Delivery-positive: prepare/seal/deliver/mark succeeded,
+            // then the N2b leaf refusal (host cancels prepared ticket).
+            assert!(
+                refusal
+                    .diagnostic
+                    .contains("generic native exec leaf is N2b"),
+                "{}",
+                refusal.diagnostic
+            );
+            let calls = SHARED_CALLS.with(|l| l.borrow().clone());
+            assert_eq!(
+                calls,
+                ["prepare", "seal", "deliver", "mark", "cancel"],
+                "calls: {calls:?}"
+            );
+        } else {
+            // No-provision causal control: zero marks, zero issues.
+            assert!(
+                refusal.diagnostic.contains("no provision delivery"),
+                "{}",
+                refusal.diagnostic
+            );
+            let calls = SHARED_CALLS.with(|l| l.borrow().clone());
+            assert_eq!(
+                calls,
+                ["prepare", "seal", "deliver", "cancel"],
+                "calls: {calls:?}"
+            );
+        }
         drop(host);
         worker.join().unwrap();
     }
@@ -732,6 +794,7 @@ mod tests {
             RefusingProvisioner,
             DirectIssuer {
                 registry: registry.clone(),
+                calls: Arc::new(Mutex::new(Vec::new())),
             },
             TestBinding { config: [3u8; 32] },
             b"runtime".to_vec(),
@@ -750,5 +813,85 @@ mod tests {
             reg.issue(7, t, sealed),
             Err(reverie_rpc_transport::exec_ticket::ExecControlError::Transition)
         );
+    }
+
+    #[test]
+    fn cancel_uncertainty_is_terminal() {
+        struct FailCancel;
+        impl reverie_rpc_transport::exec_control::ExecIssuer<TestBinding> for FailCancel {
+            fn prepare(
+                &mut self,
+                _b: TestBinding,
+                _s: Vec<u8>,
+                _d: [u8; 32],
+            ) -> Result<ExecTicket, ExecControlError> {
+                unreachable!()
+            }
+            fn seal(
+                &mut self,
+                _t: ExecTicket,
+                _d: [u8; 32],
+                _r: &[u8],
+            ) -> Result<[u8; 32], ExecControlError> {
+                unreachable!()
+            }
+            fn mark_provision_delivered(&mut self, _t: ExecTicket) -> Result<(), ExecControlError> {
+                unreachable!()
+            }
+            fn issue(
+                &mut self,
+                _t: ExecTicket,
+                _d: [u8; 32],
+            ) -> Result<ExecTicket, ExecControlError> {
+                unreachable!()
+            }
+            fn cancel(&mut self, _t: ExecTicket) -> Result<(), ExecControlError> {
+                Err(ExecControlError::Dead)
+            }
+        }
+        let mut issuer = FailCancel;
+        let original = NativeExecFailure::Refused(refused("test original refusal"));
+        let out = cancel_or_terminal(&mut issuer, ExecTicket([1; 32]), original);
+        assert!(
+            matches!(out, NativeExecFailure::Terminal(_)),
+            "failed cancel must be Terminal, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn no_provision_dispatch_records_zero_marks_and_issues() {
+        // Causal driver-level control (Astra P2): real host dispatch
+        // with RefusingProvisioner; recording issuer must observe
+        // prepare,seal,deliver,cancel and ZERO mark/issue, and the
+        // handler records the named no-delivery refusal.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let status = if std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                dispatch_no_provision_body,
+            ))
+            .is_ok()
+            {
+                0
+            } else {
+                125
+            };
+            unsafe { libc::_exit(status) }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    fn dispatch_no_provision_body() {
+        // Reuse the witness harness shape via env-selected provisioner:
+        // simplest faithful route is the session prepare path through
+        // the recording issuer at registry level is NOT sufficient
+        // (Astra), so this drives GenericSession::prepare directly is
+        // impossible without a cut; instead assert through the full
+        // dispatch witness by swapping the provisioner via a thread-
+        // local switch read by SwitchProvisioner in dispatch_body2.
+        PROVISION_OK.with(|ok| ok.set(false));
+        dispatch_body2();
     }
 }
