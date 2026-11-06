@@ -25989,6 +25989,67 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
             (335, 10),
             (348, 12),
         ],
+    }, // Observed stable Rust 1.97.1 standalone dev (Hermit native producer,
+    // libdetcore_liteinst.so ce6526351c8be905); complete 74B. Same source
+    // body as the 88B nightly template with a push-rax frame idiom.
+    DetcoreValidateTemplate {
+        role: "fixed_arena_backing",
+        hex: "500fb6056065370484c0740431c9eb2d488d0559653704488904244889e0488b3c24e8c9f5ffff31c94885c0740f807810ff488d05e71dc9fe480f45c848890c244889e0488b042459c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_initializing",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 19,
+                next: 23,
+                key: "fixed_region",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 35,
+                next: 39,
+                key: "fixed_region_publication_get_opaque",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 53,
+                next: 57,
+                key: "fixed_backing_object",
+                got: false,
+            },
+        ],
+        transfers: &[(34, 2)],
+    },
+    // Observed stable Rust 1.97.1 standalone dev (Hermit native producer,
+    // libdetcore_liteinst.so ce6526351c8be905); complete 77B. Same source
+    // body as the 91B nightly template with a push-rax frame idiom.
+    DetcoreValidateTemplate {
+        role: "fixed_tool_heap_metadata",
+        hex: "500fb605f064370484c0740431c0eb30488d05e9643704488904244889e0488b3c24e859f5ffff4885c074e031c9807810ff48b80030020000600000480f44c1488904244889e0488b042459c3",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 4,
+                next: 8,
+                key: "fixed_initializing",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 19,
+                next: 23,
+                key: "fixed_region",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 35,
+                next: 39,
+                key: "fixed_region_publication_get_opaque",
+                got: false,
+            },
+        ],
+        transfers: &[(34, 2)],
     },
     DetcoreValidateTemplate {
         role: "fixed_patch_alloc",
