@@ -50,13 +50,15 @@ pub struct SyscallEvent {
     pub dispatch: SyscallDispatch,
     /// The guest's PKRU value to run the call under, when it is not the runtime's.
     pub guest_pkru: Option<u32>,
-    /// The typed backend refusal behind `result`, when the result is a
-    /// refusal rather than a genuine kernel answer and no live Tool
-    /// callback remained to consume it through
-    /// `Guest::take_unsupported_refusal` (tail-injected and
-    /// unsubscribed routes). The dispatch consumer reads the name
-    /// here; without this field those routes would surface only the
-    /// bare errno, indistinguishable from a kernel failure.
+    /// The typed backend refusal behind `result`, when the terminal
+    /// result IS that refusal and no live Tool callback remained to
+    /// consume it through `Guest::take_unsupported_refusal`
+    /// (tail-injected and unsubscribed routes write it at the
+    /// refusal site). An injection refusal a Tool received and
+    /// handled en route to its own selected result is never
+    /// attributed here. The dispatch consumer reads the name here;
+    /// without this field those routes would surface only the bare
+    /// errno, indistinguishable from a kernel failure.
     pub unsupported_refusal: Option<UnsupportedRefusal>,
 }
 

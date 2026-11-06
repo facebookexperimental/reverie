@@ -1138,6 +1138,9 @@ where
     /// its injections must not break Rust's memory invariants for any memory
     /// they touch.
     pub unsafe fn dispatch(&self, event: &mut SyscallEvent) {
+        // The refusal identity describes this dispatch's terminal
+        // result only; never carry a reused event's stale name.
+        event.unsupported_refusal = None;
         if self.native_threads.is_some() {
             fatal(126);
         }
@@ -1379,13 +1382,13 @@ where
         match driven {
             DrivenSyscall::Result(value) => {
                 guest.event.result = value;
-                // Carry any refusal the Tool did not consume (tail
-                // routes park forever, so the tag cannot be taken
-                // after tail_inject) onto the outward event, where
-                // the dispatch consumer reads the refusal's name.
-                if guest.event.unsupported_refusal.is_none() {
-                    guest.event.unsupported_refusal = guest.unsupported_refusal.take();
-                }
+                // Deliberately no harvest of guest.unsupported_refusal
+                // here: an injection refusal the Tool received and
+                // handled (taking the tag is an optional query) is
+                // not behind this Tool-selected result. Only routes
+                // whose terminal result IS the refusal (tail and
+                // unsubscribed) write the event's refusal identity,
+                // at the refusal site itself.
                 // Signals the Tool's handler sent the guest itself that would
                 // end its process (`InGuest::inject` staged them), now that
                 // the handler has run to its end, as a tracer delivers a
@@ -4352,8 +4355,11 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             // A tail call has no native cut of its own; with a driver
             // installed it refuses by name in every capture state
             // rather than forwarding past (or re-spending) the
-            // installed route. Unwatched, the guard below refuses.
-            self.unsupported_refusal = Some(refusal);
+            // installed route. The name rides on the event, whose
+            // terminal result this refusal is; the parked Tool
+            // continuation can never take it from the guest view.
+            // Unwatched, the guard below refuses.
+            self.event.unsupported_refusal = Some(refusal);
             self.tail
                 .set_result(-i64::from(Errno::EOPNOTSUPP.into_raw()));
         } else if let Some(error) = injected_syscall_guard(self.runtime, number, args) {

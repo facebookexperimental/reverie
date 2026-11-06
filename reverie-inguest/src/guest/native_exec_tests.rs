@@ -1124,6 +1124,8 @@ fn mock_driver_watched_ordinary_inject_keeps_native_priority() {
 #[derive(Clone, Copy, PartialEq)]
 enum WatchAction {
     HandlerInject,
+    HandlerHandledSuccess,
+    HandlerHandledError,
     TailInject,
     ThreadStartInject,
     PostExecInject,
@@ -1195,6 +1197,24 @@ impl Tool for WatchedTool {
             WatchAction::HandlerInject => {
                 self.record_exec(guest).await;
                 Ok(0)
+            }
+            WatchAction::HandlerHandledSuccess | WatchAction::HandlerHandledError => {
+                // Handle the injection refusal WITHOUT taking its tag
+                // (taking is an optional query), then answer with a
+                // Tool-selected result. The outward event must not
+                // attribute that handled refusal to this result.
+                let errno = guest
+                    .inject(syscall(self.number, self.null_args()))
+                    .await
+                    .unwrap_err();
+                // The pair records the errno only; the tag is
+                // deliberately left untaken.
+                self.returned.lock().unwrap().push((errno, None));
+                if self.action == WatchAction::HandlerHandledSuccess {
+                    Ok(42)
+                } else {
+                    Err(Errno::EIO.into())
+                }
             }
             WatchAction::TailInject => {
                 guest
@@ -1403,6 +1423,53 @@ fn watched_unsubscribed_exec_forwards_without_driver() {
             move || {
                 let outcome = run_watched_case(WatchAction::Plain, number, false, false);
                 assert_eq!(outcome.event_result, -i64::from(libc::EFAULT));
+            },
+            0,
+        );
+    }
+}
+
+#[test]
+fn watched_handled_inject_refusal_stays_off_event() {
+    // The Tool receives the installed driver's refusal, handles it
+    // without taking the optional tag, and answers with its own
+    // result. That handled refusal is not behind the terminal
+    // result, so the outward event must not attribute it.
+    for (action, expected) in [
+        (WatchAction::HandlerHandledSuccess, 42_i64),
+        (WatchAction::HandlerHandledError, -i64::from(libc::EIO)),
+    ] {
+        for number in [libc::SYS_execve, libc::SYS_execveat] {
+            isolated(
+                move || {
+                    let outcome = run_watched_case(action, number, true, true);
+                    assert_eq!(outcome.returned, [(Errno::EOPNOTSUPP, None)]);
+                    assert_eq!(outcome.event_result, expected);
+                    assert_eq!(outcome.event_refusal, None);
+                    assert_eq!(outcome.captures, 1);
+                },
+                0,
+            );
+        }
+    }
+}
+
+#[test]
+fn watched_consumed_tag_stays_off_event() {
+    // Positive control: the Tool takes the tag inside the handler;
+    // the event carries no refusal and the taken identity is exact.
+    for number in [libc::SYS_execve, libc::SYS_execveat] {
+        isolated(
+            move || {
+                let outcome = run_watched_case(WatchAction::HandlerInject, number, true, true);
+                assert_eq!(outcome.returned.len(), 1);
+                let (errno, refusal) = outcome.returned[0];
+                assert_eq!(errno, Errno::EOPNOTSUPP);
+                assert_eq!(
+                    refusal.map(|r| r.operation),
+                    Some(reverie::UnsupportedOperation::NativeExec)
+                );
+                assert_eq!(outcome.event_refusal, None);
             },
             0,
         );
