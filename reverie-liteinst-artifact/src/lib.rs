@@ -26240,6 +26240,99 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
             (329, 10),
             (342, 12),
         ],
+    }, // Observed stable Rust 1.97.1 standalone dev (Hermit native producer);
+    // complete 667B. Same source body as the 660B nightly template with
+    // reassigned stack slots; panic locations bound by line/column below.
+    DetcoreValidateTemplate {
+        role: "fixed_heap_allocate",
+        hex: "554157415641554154534883ec184889742410488b1fb10131c0f00fb04b10741a6666666666662e0f1f840000000000f39031c0f00fb04b1075f54c8b73084d85f60f84f8000000488b7708488b4424104883f80941bf080000004c0f43f84d8d671749f7df4883fa014989d54983d5004531db488d05bdc736004889442408eb1a66666666662e0f1f8400000000004d89d34d85f60f84a40000004e8d0c3641f6c1070f85860100004d85c90f84700100004d89f24d8b7108498b294c01d572ce4889f14c01d172c64883f9ef77c04c8d4110488d41184c39c072b34c01e14839c172ab4c21f94889c84c01e872a04829f00f82890100004883f8f877914883c0074883e0f84829c572844883fd1f0f86cb00000048892c064c897406084889c24c29d20f82420100004989114d85db0f85b600000048894308e9bf000000488b0b4883f9014889c84883d0074883f9f877754883e0f8488b770831c94989c14901f172654983f9ef775f498d49104d8d59184939cb7250488b4c24104883f90941ba080000004c0f43d14b8d0c0a4883c1174c39d9723049f7da4c21d14883fa014883d2004801ca721d4829f20f82900000004883faf8770e4883c2074883e2f8483b5710763c31c9c64310004889c84883c4185b415c415d415e415f5dc34c89f04d85db0f844affffff4c01de40f6c60775584885f67465488946084c8951f8ebc64889d74829c7726948893c0648c744060800000000488941f8488913eba8488d3d3ec63600ff15b0153900488d1531c63600bf080000004c89ceff15bbde3800488d05ecc53600eb2f488d1543c63600bf08000000ff15a0de3800488d3d31c63600ff1573153900488d050cc63600eb07488d05d3c536004889442408488b7c2408ff15e3d638000f0bc64310004889c7e81591aeff",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 119,
+                next: 123,
+                key: "fixed_detcore_validate_fixed_heap_allocate_571_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 550,
+                next: 554,
+                key: "fixed_detcore_validate_fixed_heap_allocate_537_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 556,
+                next: 560,
+                key: "fixed_heap_panic_null",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 563,
+                next: 567,
+                key: "fixed_detcore_validate_fixed_heap_allocate_550_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 577,
+                next: 581,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 584,
+                next: 588,
+                key: "fixed_detcore_validate_fixed_heap_allocate_571_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 593,
+                next: 597,
+                key: "fixed_detcore_validate_fixed_heap_allocate_586_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 604,
+                next: 608,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 611,
+                next: 615,
+                key: "fixed_detcore_validate_fixed_heap_allocate_607_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 617,
+                next: 621,
+                key: "fixed_heap_panic_null",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 624,
+                next: 628,
+                key: "fixed_detcore_validate_fixed_heap_allocate_620_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 633,
+                next: 637,
+                key: "fixed_detcore_validate_fixed_heap_allocate_629_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 649,
+                next: 653,
+                key: "fixed_heap_panic_sub_overflow",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 663,
+                next: 667,
+                key: "fixed_heap_unwind_resume",
+                got: false,
+            },
+        ],
+        transfers: &[(554, 2), (575, 4), (602, 7), (615, 9), (647, 12), (662, 13)],
     },
     DetcoreValidateTemplate {
         role: "fixed_patch_alloc",
