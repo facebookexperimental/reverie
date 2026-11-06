@@ -10,6 +10,7 @@
 
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicI32;
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::io;
@@ -72,12 +73,22 @@ pub fn note_fork_in_child() {
 
 struct RpcConnection<G: GlobalTool> {
     pid: Pid,
+    /// The fork generation this connection's `pid` was last verified
+    /// against. A connection inherited across fork carries the parent's
+    /// generation, so `exchange` can spot the stale `pid` from this
+    /// mismatch alone, even if the one-shot atfork flag was already
+    /// consumed by another exchange in the child.
+    fork_generation: u64,
     client: BlockingRpcClient<G, GuestRpcStream>,
 }
 
 impl<G: GlobalTool> RpcConnection<G> {
-    fn new(pid: Pid, client: BlockingRpcClient<G, GuestRpcStream>) -> Self {
-        Self { pid, client }
+    fn new(pid: Pid, fork_generation: u64, client: BlockingRpcClient<G, GuestRpcStream>) -> Self {
+        Self {
+            pid,
+            fork_generation,
+            client,
+        }
     }
 }
 
@@ -227,8 +238,17 @@ pub struct CoordinatorRpc<G: GlobalTool> {
     // Root rebinding after fork rides the inherited root entry's
     // pid-mismatch reconnect in `exchange` (fork_child_reset_if_needed).
     /// Serializes the once-per-fork-child connection reset and records
-    /// its completion (see `fork_child_reset_if_needed`).
-    fork_reset: SpinMutex<bool>,
+    /// the pid it completed for. Keyed by pid, not a plain bool: the
+    /// record is inherited across fork, so a grandchild (whose pid
+    /// differs) must run its own reset instead of seeing its parent's
+    /// completion. See `fork_child_reset_if_needed`.
+    fork_reset: SpinMutex<Option<Pid>>,
+    /// Bumped by every fork-child reset. Each connection stamps the
+    /// generation at which its pid was verified; `exchange` re-verifies
+    /// (and reconnects if the pid is stale) whenever a connection's
+    /// stamp lags, so reconnect is tied to the connection's own stale
+    /// pid rather than the one-shot atfork flag alone.
+    fork_generation: AtomicU64,
     #[cfg(feature = "exec-private-successor")]
     native_failed: AtomicBool,
 }
@@ -264,7 +284,8 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             fd: AtomicI32::new(-1),
             transport: reverie_rpc_transport::RpcTransport::Socket,
             on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
-            fork_reset: SpinMutex::new(false),
+            fork_reset: SpinMutex::new(None),
+            fork_generation: AtomicU64::new(0),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -282,7 +303,8 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             fd: AtomicI32::new(-1),
             transport: reverie_rpc_transport::RpcTransport::Socket,
             on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
-            fork_reset: SpinMutex::new(false),
+            fork_reset: SpinMutex::new(None),
+            fork_generation: AtomicU64::new(0),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         }
@@ -408,7 +430,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         Ok(Self {
             connection: ConnectionOwner::Ordinary(OrdinaryConnections::new(
                 tid.as_raw(),
-                RpcConnection::new(pid, client),
+                RpcConnection::new(pid, 0, client),
             )),
             config,
             path: Some(path.as_ref().to_path_buf()),
@@ -450,7 +472,8 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             fd: AtomicI32::new(-1),
             transport: reverie_rpc_transport::RpcTransport::Mapped,
             on_reconnect,
-            fork_reset: SpinMutex::new(false),
+            fork_reset: SpinMutex::new(None),
+            fork_generation: AtomicU64::new(0),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -476,14 +499,15 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         Ok(Self {
             connection: ConnectionOwner::Ordinary(OrdinaryConnections::new(
                 tid.as_raw(),
-                RpcConnection::new(pid, client),
+                RpcConnection::new(pid, 0, client),
             )),
             config,
             path: Some(path),
             fd: AtomicI32::new(fd),
             transport,
             on_reconnect,
-            fork_reset: SpinMutex::new(false),
+            fork_reset: SpinMutex::new(None),
+            fork_generation: AtomicU64::new(0),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -525,7 +549,10 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             crate::guest::protect::register_coordinator_conn_fd(new_fd)
         })
         .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
-        connections.insert(tid, RpcConnection::new(pid, client))
+        connections.insert(
+            tid,
+            RpcConnection::new(pid, self.fork_generation.load(Ordering::Acquire), client),
+        )
     }
 
     /// Once per fork child, before its first lazy connection exists:
@@ -541,11 +568,18 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         if matches!(self.connection, ConnectionOwner::NativeConfiguration) {
             return;
         }
-        let mut done = self.fork_reset.lock();
-        if *done || !FORKED_SINCE_LAST_RPC.load(Ordering::Acquire) {
+        // Common case (no fork): one atomic load, no lock, no syscall.
+        // The flag is set in the child before its first thread-start
+        // callback, so no racing store can be missed here.
+        if !FORKED_SINCE_LAST_RPC.load(Ordering::Acquire) {
             return;
         }
-        *done = true;
+        let mut done = self.fork_reset.lock();
+        let pid = current_id(libc::SYS_getpid).unwrap_or_else(|_| rpc_fatal(122));
+        if *done == Some(pid) {
+            return;
+        }
+        *done = Some(pid);
         // Both installed private domains already refuse fork/thread. A
         // retained native stream can never reconnect as ordinary I/O.
         #[cfg(feature = "exec-private-init")]
@@ -566,6 +600,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
                 .lock()
                 .insert(Self::current_tid().as_raw(), root);
         }
+        self.fork_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Close and forget this thread's coordinator connection (thread
@@ -624,10 +659,15 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE);
         }
         // Fork detection without a per-hop syscall: the common round-trip only
-        // reads the atfork flag. It is set exclusively in a freshly forked
-        // child, so `getpid`/`gettid` are issued only when a fork has actually
-        // happened and the inherited connection may still belong to the parent.
-        if FORKED_SINCE_LAST_RPC.swap(false, Ordering::AcqRel) {
+        // reads the atfork flag and this connection's fork-generation stamp.
+        // The flag is set exclusively in a freshly forked child and the stamp
+        // lags on a connection inherited from the parent, so `getpid`/`gettid`
+        // are issued only when a fork has actually happened and the inherited
+        // connection may still belong to the parent. Reconnect then keys on
+        // the connection's own stale pid, not on either signal alone.
+        let generation = self.fork_generation.load(Ordering::Acquire);
+        let connection_unverified = connection.fork_generation != generation;
+        if FORKED_SINCE_LAST_RPC.swap(false, Ordering::AcqRel) || connection_unverified {
             // C1 PR1: a mapped endpoint must never be duplicated by fork
             // (SPSC contract). Refuse by name (exit 124) instead of
             // operating the inherited copy; PR2 delivers fresh pairs.
@@ -668,11 +708,15 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
                 if !was_root {
                     crate::guest::protect::unregister_coordinator_conn_fd(thread.fd());
                 }
-                let inherited =
-                    std::mem::replace(&mut *connection, RpcConnection::new(pid, client));
+                let inherited = std::mem::replace(
+                    &mut *connection,
+                    RpcConnection::new(pid, generation, client),
+                );
                 thread.set_fd(connection.client.as_raw_fd());
                 let (_, _, stream) = inherited.client.into_parts();
                 close_inherited_stream(stream);
+            } else {
+                connection.fork_generation = generation;
             }
         }
         match connection.client.try_send_rpc(message) {

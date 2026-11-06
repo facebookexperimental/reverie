@@ -918,8 +918,10 @@ mod tests {
                     // (Sequential handling would deadlock the test: the
                     // sibling's reply must arrive before the fork, while
                     // the child's connection is only accepted after it.)
+                    // Four connects arrive: root, sibling, fork child,
+                    // grandchild.
                     let mut handlers = Vec::new();
-                    for index in 0..3 {
+                    for index in 0..4 {
                         let (mut socket, _) = listener.accept().unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1004,6 +1006,54 @@ mod tests {
                         // Root record rebounded to the child's own socket.
                         assert_ne!(rpc.raw_fd(), root_fd);
                         assert_eq!(crate::guest::protect::coordinator_fd(), Some(rpc.raw_fd()));
+                        // Second fork level: the grandchild inherits this
+                        // child's completed reset record. Completion keyed
+                        // by anything but the resetting pid (e.g. a plain
+                        // bool) makes the grandchild skip its own reset:
+                        // it would open a fresh connection on the map miss,
+                        // leak this child's root socket copy, and leave the
+                        // root record pointing at it.
+                        let child_root_fd = rpc.raw_fd();
+                        // SAFETY: fork with no other live threads in this
+                        // child; the grandchild exits by _exit below.
+                        let grandchild = unsafe { libc::fork() };
+                        assert!(grandchild >= 0, "second fork failed");
+                        if grandchild == 0 {
+                            super::super::note_fork_in_child();
+                            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                // Reset runs again for this pid: the
+                                // inherited (child) root entry is kept.
+                                rpc.fork_child_reset_if_needed();
+                                assert_ne!(
+                                    unsafe { libc::fcntl(child_root_fd, libc::F_GETFD) },
+                                    -1
+                                );
+                                assert_eq!(rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
+                                // Reconnect rebound the root and
+                                // closed the inherited copy.
+                                assert_ne!(rpc.raw_fd(), child_root_fd);
+                                assert_eq!(
+                                    crate::guest::protect::coordinator_fd(),
+                                    Some(rpc.raw_fd())
+                                );
+                                assert_eq!(
+                                    unsafe { libc::fcntl(child_root_fd, libc::F_GETFD) },
+                                    -1
+                                );
+                            }));
+                            // SAFETY: _exit avoids inherited atexit state.
+                            unsafe { libc::_exit(if ok.is_ok() { 0 } else { 71 }) };
+                        }
+                        let mut gc_status = 0;
+                        // SAFETY: `grandchild` is this child's direct child.
+                        assert_eq!(
+                            unsafe { libc::waitpid(grandchild, &mut gc_status, 0) },
+                            grandchild
+                        );
+                        assert!(
+                            libc::WIFEXITED(gc_status) && libc::WEXITSTATUS(gc_status) == 0,
+                            "fork grandchild failed with status {gc_status:#x}"
+                        );
                     }));
                     // SAFETY: _exit avoids parent atexit/flush state.
                     unsafe { libc::_exit(if ok.is_ok() { 0 } else { 71 }) };
