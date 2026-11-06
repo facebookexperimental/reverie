@@ -494,22 +494,57 @@ mod tests {
     }
 
     fn evaluate(filter: &SeccompFilter, arch: u32, number: i64, ip: u64) -> u32 {
+        evaluate_with_args(filter, arch, number, ip, [0; 6])
+    }
+
+    /// Classic-BPF interpreter for exactly the subset the builders emit:
+    /// `LD_W_ABS` over every `seccomp_data` word (nr, arch, both IP words,
+    /// and both words of each argument), `JEQ_K`, `JSET_K` (code 0x45, the
+    /// native recipe's x32-bit test), and `RET_K`. Anything else panics
+    /// rather than risk a silent mis-verdict.
+    fn evaluate_with_args(
+        filter: &SeccompFilter,
+        arch: u32,
+        number: i64,
+        ip: u64,
+        args: [u64; 6],
+    ) -> u32 {
+        const BPF_JMP_JSET_K: u16 = 0x45;
+        const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
+        fn load_word(offset: u32, arch: u32, number: i64, ip: u64, args: &[u64; 6]) -> u32 {
+            match offset {
+                SECCOMP_DATA_ARCH_OFFSET => arch,
+                SECCOMP_DATA_NR_OFFSET => number as u32,
+                SECCOMP_DATA_IP_LOW_OFFSET => ip as u32,
+                SECCOMP_DATA_IP_HIGH_OFFSET => (ip >> 32) as u32,
+                SECCOMP_DATA_ARGS_OFFSET..=60 if offset % 4 == 0 => {
+                    let index = ((offset - SECCOMP_DATA_ARGS_OFFSET) / 8) as usize;
+                    if offset % 8 == 0 {
+                        args[index] as u32
+                    } else {
+                        (args[index] >> 32) as u32
+                    }
+                }
+                offset => panic!("unexpected seccomp data offset {offset}"),
+            }
+        }
         let mut accumulator = 0;
         let mut pc = 0;
         loop {
             let instruction = &filter.program[pc];
             match instruction.code {
                 BPF_LD_W_ABS => {
-                    accumulator = match instruction.k {
-                        SECCOMP_DATA_ARCH_OFFSET => arch,
-                        SECCOMP_DATA_NR_OFFSET => number as u32,
-                        SECCOMP_DATA_IP_LOW_OFFSET => ip as u32,
-                        SECCOMP_DATA_IP_HIGH_OFFSET => (ip >> 32) as u32,
-                        offset => panic!("unexpected seccomp data offset {offset}"),
-                    };
+                    accumulator = load_word(instruction.k, arch, number, ip, &args);
                 }
                 BPF_JMP_JEQ_K => {
                     pc += usize::from(if accumulator == instruction.k {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    });
+                }
+                BPF_JMP_JSET_K => {
+                    pc += usize::from(if accumulator & instruction.k != 0 {
                         instruction.jt
                     } else {
                         instruction.jf
@@ -785,5 +820,131 @@ mod tests {
         assert!(ret_ks.contains(&SECCOMP_RET_TRAP));
         assert!(ret_ks.contains(&SECCOMP_RET_ALLOW));
         assert!(ret_ks.contains(&SECCOMP_RET_KILL_PROCESS));
+    }
+
+    /// The native-exec prefix verdicts that only the extended evaluator can
+    /// reach: the x32 syscall-bit deny (a `JSET` on the number), the denied
+    /// numbers, and the `prctl(PR_SET_SECCOMP)` deny keyed on argument 0 —
+    /// each refused even at a trusted gate — while ordinary calls at the
+    /// fixed gates and the restorer return site still pass the suffix.
+    /// Any aarch64 native recipe must pin its prefix the same way before it
+    /// exists; until then this guards the x86-64 recipe's JSET/arg words.
+    #[cfg(all(feature = "exec-native-injection", target_arch = "x86_64"))]
+    #[test]
+    fn native_exec_prefix_denies_x32_stacking_and_creation_even_at_gates() {
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        let eperm = SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let filter = SeccompFilter::for_native_exec_domain().unwrap();
+        assert_eq!(filter.len(), 69);
+        let gate = crate::trap::FIXED_GATE_BASE + 0x82;
+        let guest_gate = crate::trap::FIXED_GATE_BASE + 0x202;
+        let restorer = crate::trap::FIXED_SIGNAL_RESTORER_RETURN_IP;
+        // Wrong arch is killed before any prefix or gate logic.
+        assert_eq!(
+            evaluate_with_args(&filter, 0x4000_0003, libc::SYS_gettid, gate, [0; 6]),
+            SECCOMP_RET_KILL_PROCESS
+        );
+        // The x32 bit on an otherwise ordinary number is denied by JSET,
+        // even from a gate; without the bit the same call passes.
+        let x32_write = libc::SYS_write | 0x4000_0000;
+        assert_eq!(
+            evaluate_with_args(&filter, AUDIT_ARCH_X86_64, x32_write, gate, [0; 6]),
+            eperm
+        );
+        assert_eq!(
+            evaluate_with_args(&filter, AUDIT_ARCH_X86_64, libc::SYS_write, gate, [0; 6]),
+            SECCOMP_RET_ALLOW
+        );
+        // Denied numbers are refused even at the gates.
+        for number in [
+            libc::SYS_clone,
+            libc::SYS_clone3,
+            libc::SYS_fork,
+            libc::SYS_vfork,
+            libc::SYS_unshare,
+            libc::SYS_mount,
+            libc::SYS_seccomp,
+        ] {
+            for ip in [gate, guest_gate] {
+                assert_eq!(
+                    evaluate_with_args(&filter, AUDIT_ARCH_X86_64, number, ip, [0; 6]),
+                    eperm,
+                    "{number} at {ip:#x}"
+                );
+            }
+        }
+        // prctl is denied only when arg0 is PR_SET_SECCOMP (low word at
+        // seccomp_data offset 16), including with garbage in the high word
+        // the filter never loads; other prctl ops reach the suffix.
+        let set_seccomp = [
+            libc::PR_SET_SECCOMP as u64 | (0xdead_beef << 32),
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_prctl,
+                gate,
+                set_seccomp
+            ),
+            eperm
+        );
+        let get_seccomp = [21, 0, 0, 0, 0, 0]; // PR_GET_SECCOMP
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_prctl,
+                gate,
+                get_seccomp
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        // The gate suffix is unchanged behind the prefix.
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_gettid,
+                guest_gate,
+                [0; 6]
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_gettid,
+                0x7fff_dead_beef,
+                [0; 6]
+            ),
+            SECCOMP_RET_TRAP
+        );
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_rt_sigreturn,
+                restorer,
+                [0; 6]
+            ),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate_with_args(
+                &filter,
+                AUDIT_ARCH_X86_64,
+                libc::SYS_rt_sigreturn,
+                gate,
+                [0; 6]
+            ),
+            SECCOMP_RET_TRAP
+        );
     }
 }
