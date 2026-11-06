@@ -463,7 +463,7 @@ fn refuse_foreign_allocation() -> ! {
     // filter refuses it, UD2 terminates instead of returning or spinning.
     unsafe {
         crate::trap::raw_syscall6(libc::SYS_exit_group, [127, 0, 0, 0, 0, 0]);
-        core::arch::asm!("ud2", options(noreturn, nostack));
+        crate::arch::trap_unreachable();
     }
 }
 

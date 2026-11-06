@@ -75,7 +75,7 @@ pub unsafe extern "C" fn terminal_execve(
             0,
         );
         reverie_native_launch_syscall(libc::SYS_exit_group, 127, 0, 0, 0, 0, 0);
-        core::arch::asm!("ud2", options(noreturn));
+        crate::arch::trap_unreachable();
     }
 }
 
@@ -207,7 +207,7 @@ impl NativeFrontend {
         {
             unsafe {
                 reverie_native_launch_syscall(libc::SYS_exit_group, 127, 0, 0, 0, 0, 0);
-                core::arch::asm!("ud2", options(noreturn));
+                crate::arch::trap_unreachable();
             }
         }
         Ok(())

@@ -87,7 +87,7 @@ fn child_setup_failed() -> ! {
     // SYS_exit stays allowed by this control's filter. Avoid retrying the
     // deliberately held SYS_exit_group when setup itself failed.
     raw(libc::SYS_exit, [98, 0, 0, 0, 0, 0]);
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
+    crate::arch::trap_unreachable()
 }
 
 fn hold_exit_in_child(socket: i32) -> ! {

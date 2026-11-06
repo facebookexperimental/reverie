@@ -133,7 +133,7 @@ fn raw(number: i64, args: [u64; 6]) -> i64 {
 fn raw_exit(code: i32) -> ! {
     raw(libc::SYS_exit_group, [code as u64, 0, 0, 0, 0, 0]);
     // SAFETY: a returned terminal syscall is not allowed to return to a test.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
+    crate::arch::trap_unreachable()
 }
 
 fn capture(mut stream: impl Read) -> io::Result<(Vec<u8>, bool)> {

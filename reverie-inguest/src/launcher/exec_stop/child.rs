@@ -511,6 +511,6 @@ unsafe fn exit_child() -> ! {
     // SAFETY: exit_group cannot return without a hostile external supervisor;
     // retain a terminal trap instead of running any inherited Rust teardown.
     unsafe {
-        core::arch::asm!("ud2", options(noreturn));
+        crate::arch::trap_unreachable();
     }
 }

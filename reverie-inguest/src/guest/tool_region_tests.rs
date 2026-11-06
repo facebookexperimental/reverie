@@ -309,7 +309,7 @@ fn owns(region: &ToolRegion, start: usize, pages: usize) -> bool {
 fn raw_exit(code: i32) -> ! {
     raw(libc::SYS_exit_group, [code as u64, 0, 0, 0, 0, 0]);
     // SAFETY: exit_group must not return; fail closed if it does.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
+    crate::arch::trap_unreachable()
 }
 
 #[repr(C)]

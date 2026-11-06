@@ -470,7 +470,7 @@ impl Drop for FixedGateInstallation {
                 // Even stderr may be a full blocking pipe. Publication has
                 // made returning unsafe, so diagnostics cannot precede exit.
                 raw_syscall6(libc::SYS_exit_group, [127, 0, 0, 0, 0, 0]);
-                core::arch::asm!("ud2", options(noreturn));
+                crate::arch::trap_unreachable();
             }
         }
     }

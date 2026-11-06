@@ -116,6 +116,29 @@ pub fn page_size() -> std::io::Result<u64> {
     crate::guest::support::page_size()
 }
 
+/// Unconditionally trap with SIGILL at a point execution must never
+/// reach or must never leave — typically after an `exit_group` the
+/// kernel was expected not to return from, where running any further
+/// Rust (teardown, unwind, std) would be a correctness hazard. This is
+/// the crate's single site for the architecture's undefined
+/// instruction (`ud2` on x86-64, `udf #0` on aarch64); call sites never
+/// open-code the mnemonic. Always inlined: several callers run where the
+/// stack itself may be denied, so reaching the trap must not push a
+/// return address the open-coded instruction never needed.
+#[inline(always)]
+pub fn trap_unreachable() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: ud2 unconditionally raises SIGILL and does not return.
+    unsafe {
+        core::arch::asm!("ud2", options(noreturn, nostack))
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: udf unconditionally raises SIGILL and does not return.
+    unsafe {
+        core::arch::asm!("udf #0", options(noreturn, nostack))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
