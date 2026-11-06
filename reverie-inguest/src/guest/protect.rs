@@ -1167,6 +1167,16 @@ pub(crate) mod tests {
     use super::*;
     use crate::guest::event::SyscallDispatch;
 
+    /// The dup numbers to exercise: dup3 everywhere, plus dup2 where it
+    /// exists (its error order differs: no flags EINVAL pre-check in the
+    /// kernel, EBADF for a closed source including old == new).
+    pub(crate) fn dup_numbers() -> Vec<i64> {
+        let mut numbers = vec![libc::SYS_dup3];
+        #[cfg(target_arch = "x86_64")]
+        numbers.push(libc::SYS_dup2);
+        numbers
+    }
+
     pub(crate) fn event(number: i64, args: [u64; 6]) -> SyscallEvent {
         SyscallEvent {
             number,
@@ -1334,28 +1344,30 @@ pub(crate) mod tests {
     /// copy first, and the guest's call goes ahead on the free number.
     #[test]
     fn a_guest_dup2_onto_a_recorded_number_goes_ahead() {
-        in_child_with_soft_nofile(2048, || {
-            let recorded = place_runtime_fd(open_eventfd()).unwrap();
-            record_runtime_fd(recorded).unwrap();
-            let mut dup = event(libc::SYS_dup3, [0, recorded as u64, 0, 0, 0, 0]);
-            assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
-            assert!(!is_runtime_owned_fd(recorded));
-            assert!(!is_open(recorded), "the runtime's copy is closed");
-            // Linux's own checks come first, before anything moves: dup3 flags
-            // other than O_CLOEXEC, then a source that is not open.
-            let other = place_runtime_fd(open_eventfd()).unwrap();
-            record_runtime_fd(other).unwrap();
-            let mut flags = event(libc::SYS_dup3, [0, other as u64, 1, 0, 0, 0]);
-            assert!(unsafe { protect_runtime_descriptors(&mut flags, true) });
-            assert_eq!(flags.result, -i64::from(libc::EINVAL));
-            let mut closed_source = event(libc::SYS_dup3, [9999, other as u64, 0, 0, 0, 0]);
-            assert!(unsafe { protect_runtime_descriptors(&mut closed_source, true) });
-            assert_eq!(closed_source.result, -i64::from(libc::EBADF));
-            assert!(
-                is_runtime_owned_fd(other) && is_open(other),
-                "nothing moved"
-            );
-        });
+        for dup_number in dup_numbers() {
+            in_child_with_soft_nofile(2048, move || {
+                let recorded = place_runtime_fd(open_eventfd()).unwrap();
+                record_runtime_fd(recorded).unwrap();
+                let mut dup = event(dup_number, [0, recorded as u64, 0, 0, 0, 0]);
+                assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
+                assert!(!is_runtime_owned_fd(recorded));
+                assert!(!is_open(recorded), "the runtime's copy is closed");
+                // Linux's own checks come first, before anything moves: dup3 flags
+                // other than O_CLOEXEC, then a source that is not open.
+                let other = place_runtime_fd(open_eventfd()).unwrap();
+                record_runtime_fd(other).unwrap();
+                let mut flags = event(libc::SYS_dup3, [0, other as u64, 1, 0, 0, 0]);
+                assert!(unsafe { protect_runtime_descriptors(&mut flags, true) });
+                assert_eq!(flags.result, -i64::from(libc::EINVAL));
+                let mut closed_source = event(dup_number, [9999, other as u64, 0, 0, 0, 0]);
+                assert!(unsafe { protect_runtime_descriptors(&mut closed_source, true) });
+                assert_eq!(closed_source.result, -i64::from(libc::EBADF));
+                assert!(
+                    is_runtime_owned_fd(other) && is_open(other),
+                    "nothing moved"
+                );
+            });
+        }
     }
 
     /// A guest `F_DUPFD` whose answer under Linux would be a number the runtime
@@ -1526,30 +1538,32 @@ pub(crate) mod tests {
     /// block, staying the same socket throughout.
     #[test]
     fn every_guest_dup2_onto_the_band_under_a_1024_limit_goes_ahead() {
-        in_child_with_soft_nofile(1024, || {
-            let pair = socket_pair();
-            let tool = unsafe { reserve_tool_output_fd(pair[0], b"retired") }.unwrap();
-            assert!(
-                (1024 - RUNTIME_FD_RESERVE..1024).contains(&tool),
-                "reserved at {tool}"
-            );
-            let socket = identity_of(tool);
-            for _ in 0..2 {
-                record_runtime_fd(place_runtime_fd(open_eventfd()).unwrap()).unwrap();
-            }
-            for target in 1024 - RUNTIME_FD_RESERVE..1024 {
-                let dup = event(libc::SYS_dup3, [1, target as u64, 0, 0, 0, 0]);
-                assert_eq!(run_guest_dup(dup), i64::from(target));
-                let tool = tool_output_fd().expect("the Tool output socket is kept");
-                assert_eq!(identity_of(tool), socket);
-            }
-            let tool = tool_output_fd().unwrap();
-            assert!(tool < 1024 - RUNTIME_FD_RESERVE, "moved to {tool}");
-            assert_eq!(unsafe { libc::write(tool, b"x".as_ptr().cast(), 1) }, 1);
-            let mut byte = 0_u8;
-            assert_eq!(unsafe { libc::read(pair[1], (&raw mut byte).cast(), 1) }, 1);
-            assert_eq!(byte, b'x');
-        });
+        for dup_number in dup_numbers() {
+            in_child_with_soft_nofile(1024, move || {
+                let pair = socket_pair();
+                let tool = unsafe { reserve_tool_output_fd(pair[0], b"retired") }.unwrap();
+                assert!(
+                    (1024 - RUNTIME_FD_RESERVE..1024).contains(&tool),
+                    "reserved at {tool}"
+                );
+                let socket = identity_of(tool);
+                for _ in 0..2 {
+                    record_runtime_fd(place_runtime_fd(open_eventfd()).unwrap()).unwrap();
+                }
+                for target in 1024 - RUNTIME_FD_RESERVE..1024 {
+                    let dup = event(dup_number, [1, target as u64, 0, 0, 0, 0]);
+                    assert_eq!(run_guest_dup(dup), i64::from(target));
+                    let tool = tool_output_fd().expect("the Tool output socket is kept");
+                    assert_eq!(identity_of(tool), socket);
+                }
+                let tool = tool_output_fd().unwrap();
+                assert!(tool < 1024 - RUNTIME_FD_RESERVE, "moved to {tool}");
+                assert_eq!(unsafe { libc::write(tool, b"x".as_ptr().cast(), 1) }, 1);
+                let mut byte = 0_u8;
+                assert_eq!(unsafe { libc::read(pair[1], (&raw mut byte).cast(), 1) }, 1);
+                assert_eq!(byte, b'x');
+            });
+        }
     }
 
     /// All or nothing: when the runtime's close of the old number is faked
@@ -1558,31 +1572,33 @@ pub(crate) mod tests {
     /// socket, stays the runtime's: protected and reported, never the guest's.
     #[test]
     fn a_refused_guest_dup2_leaves_a_surviving_old_number_protected() {
-        in_child_with_soft_nofile(2048, || {
-            let pair = socket_pair();
-            let tool = unsafe { reserve_tool_output_fd(pair[0], b"retired") }.unwrap();
-            suppress_close_of(tool);
-            install_filter(
-                libc::SYS_dup3,
-                1,
-                tool as u32,
-                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
-            );
-            let mut dup = event(libc::SYS_dup3, [0, tool as u64, 0, 0, 0, 0]);
-            assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
-            assert_ne!(tool_output_fd(), Some(tool), "the socket moved");
-            assert!(is_open(tool), "the filter kept the old number open");
-            assert!(is_runtime_owned_fd(tool), "the old number stays protected");
-            dup.result = unsafe { raw_syscall6(dup.number, dup.args) };
-            assert_eq!(dup.result, -i64::from(libc::EPERM));
-            observe_guest_descriptor_change(&dup);
-            assert!(is_runtime_owned_fd(tool), "a refused dup2 replaced nothing");
-            for number in [libc::SYS_write, libc::SYS_close] {
-                let mut call = event(number, [tool as u64, 0, 0, 0, 0, 0]);
-                assert!(unsafe { protect_runtime_descriptors(&mut call, true) });
-                assert_eq!(call.result, -i64::from(libc::EBADF));
-            }
-        });
+        for dup_number in dup_numbers() {
+            in_child_with_soft_nofile(2048, move || {
+                let pair = socket_pair();
+                let tool = unsafe { reserve_tool_output_fd(pair[0], b"retired") }.unwrap();
+                suppress_close_of(tool);
+                install_filter(
+                    dup_number,
+                    1,
+                    tool as u32,
+                    libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                );
+                let mut dup = event(dup_number, [0, tool as u64, 0, 0, 0, 0]);
+                assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
+                assert_ne!(tool_output_fd(), Some(tool), "the socket moved");
+                assert!(is_open(tool), "the filter kept the old number open");
+                assert!(is_runtime_owned_fd(tool), "the old number stays protected");
+                dup.result = unsafe { raw_syscall6(dup.number, dup.args) };
+                assert_eq!(dup.result, -i64::from(libc::EPERM));
+                observe_guest_descriptor_change(&dup);
+                assert!(is_runtime_owned_fd(tool), "a refused dup2 replaced nothing");
+                for number in [libc::SYS_write, libc::SYS_close] {
+                    let mut call = event(number, [tool as u64, 0, 0, 0, 0, 0]);
+                    assert!(unsafe { protect_runtime_descriptors(&mut call, true) });
+                    assert_eq!(call.result, -i64::from(libc::EBADF));
+                }
+            });
+        }
     }
 
     /// The other half: once the guest's `dup2` onto a surviving old number
@@ -1590,25 +1606,27 @@ pub(crate) mod tests {
     /// the runtime's.
     #[test]
     fn a_guest_dup2_onto_a_surviving_old_number_makes_it_the_guests() {
-        in_child_with_soft_nofile(2048, || {
-            let recorded = place_runtime_fd(open_eventfd()).unwrap();
-            record_runtime_fd(recorded).unwrap();
-            suppress_close_of(recorded);
-            let mut dup = event(libc::SYS_dup3, [0, recorded as u64, 0, 0, 0, 0]);
-            assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
-            assert!(
-                is_runtime_owned_fd(recorded),
-                "protected until the guest's call replaces it"
-            );
-            dup.result = unsafe { raw_syscall6(dup.number, dup.args) };
-            assert_eq!(dup.result, i64::from(recorded));
-            observe_guest_descriptor_change(&dup);
-            assert!(
-                !is_runtime_owned_fd(recorded),
-                "the number is the guest's now"
-            );
-            assert_eq!(identity_of(recorded), identity_of(0));
-        });
+        for dup_number in dup_numbers() {
+            in_child_with_soft_nofile(2048, move || {
+                let recorded = place_runtime_fd(open_eventfd()).unwrap();
+                record_runtime_fd(recorded).unwrap();
+                suppress_close_of(recorded);
+                let mut dup = event(dup_number, [0, recorded as u64, 0, 0, 0, 0]);
+                assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
+                assert!(
+                    is_runtime_owned_fd(recorded),
+                    "protected until the guest's call replaces it"
+                );
+                dup.result = unsafe { raw_syscall6(dup.number, dup.args) };
+                assert_eq!(dup.result, i64::from(recorded));
+                observe_guest_descriptor_change(&dup);
+                assert!(
+                    !is_runtime_owned_fd(recorded),
+                    "the number is the guest's now"
+                );
+                assert_eq!(identity_of(recorded), identity_of(0));
+            });
+        }
     }
 
     /// Whether a process other than this one finds `fd`'s whole file
@@ -1734,16 +1752,23 @@ pub(crate) mod tests {
             let closed = 1500;
             assert!(!is_open(closed) && !is_open(100));
             let o_cloexec = libc::O_CLOEXEC as u64;
-            for (number, [source, target, flags]) in [
+            let mut cases: Vec<(i64, [u64; 3])> = vec![
                 (libc::SYS_dup3, [RUNTIME, RUNTIME, 0]),
                 (libc::SYS_dup3, [RUNTIME, 100, 1]),
                 (libc::SYS_dup3, [RUNTIME, 100, o_cloexec]),
                 (libc::SYS_dup3, [RUNTIME, 4096, 0]),
-                (libc::SYS_dup3, [RUNTIME, RUNTIME, 0]),
-                (libc::SYS_dup3, [RUNTIME, 100, 0]),
                 (libc::SYS_dup3, [0, RUNTIME, 1]),
                 (libc::SYS_dup3, [9999, RUNTIME, 0]),
-            ] {
+            ];
+            // The dup2 rows are distinct Linux error-order cases (old ==
+            // new is EBADF-checked, no flags EINVAL first); keep them
+            // wherever dup2 exists.
+            #[cfg(target_arch = "x86_64")]
+            cases.extend([
+                (libc::SYS_dup2, [RUNTIME, RUNTIME, 0]),
+                (libc::SYS_dup2, [RUNTIME, 100, 0]),
+            ]);
+            for (number, [source, target, flags]) in cases {
                 let with = |runtime: u64| {
                     let at = |fd: u64| if fd == RUNTIME { runtime } else { fd };
                     [at(source), at(target), flags, 0, 0, 0]
@@ -2282,12 +2307,15 @@ mod mapped_input_lease_tests {
     #[test]
     fn actual_input_lease_is_guarded_with_kernel_fd_width_before_publication() {
         let fd = 0x7fff_fffdu64;
-        for (number, args) in [
+        let mut cases: Vec<(i64, [u64; 6])> = vec![
             (libc::SYS_close, [fd | (1u64 << 32), 0, 0, 0, 0, 0]),
             (libc::SYS_dup3, [12, fd | (1u64 << 32), 0, 0, 0, 0]),
             (libc::SYS_fcntl, [fd, libc::F_SETFD as u64, 0, 0, 0, 0]),
             (libc::SYS_sendmsg, [fd, 0, 0, 0, 0, 0]),
-        ] {
+        ];
+        #[cfg(target_arch = "x86_64")]
+        cases.push((libc::SYS_dup2, [12, fd | (1u64 << 32), 0, 0, 0, 0]));
+        for (number, args) in cases {
             let mut event = SyscallEvent {
                 number,
                 args,
