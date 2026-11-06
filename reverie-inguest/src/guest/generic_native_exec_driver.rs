@@ -275,14 +275,19 @@ where
                 .issue(self.ticket, self.sealed_digest)
                 .map_err(control_terminal)?;
         }
-        // The physical leaf call is the remaining N2 wiring step
-        // (IssuedNativeExecLeaf::after_issue + call under
-        // exec-native-injection with a live fallback dispatch).
-        // Until it lands this refuses by name after Issue; the host
-        // cancellation path consumes the issued ticket.
-        Err(NativeExecFailure::Refused(refused(
-            "reverie-inguest: generic native exec leaf requires exec-native-injection wiring (N2 follow-on)",
-        )))
+        let leaf = unsafe { super::exec_private::IssuedNativeExecLeaf::after_issue(_cut) }?;
+        let encoded = self.encoded.clone();
+        let framer = &self.framer;
+        unsafe {
+            leaf.call(|| {
+                if framer.encode(state) != encoded {
+                    return Err(NativeExecFailure::Refused(refused(
+                        "reverie-inguest: generic native exec state changed at leaf",
+                    )));
+                }
+                Ok(())
+            })
+        }
     }
 
     fn cancel(
@@ -462,5 +467,198 @@ mod tests {
             b"runtime".to_vec(),
         );
         let _erased: Arc<dyn NativeExecDriver<TestTool>> = Arc::new(driver);
+    }
+
+    #[test]
+    fn generic_driver_host_dispatch_witness() {
+        // Fork-isolate: callback control pointer is process-global.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let status =
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(dispatch_body2)).is_ok() {
+                    0
+                } else {
+                    125
+                };
+            unsafe { libc::_exit(status) }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    fn dispatch_body2() {
+        use super::super::event::SyscallDispatch;
+        use super::super::event::SyscallEvent;
+        use crate::guest::host::HostRuntime;
+        use crate::guest::host::ToolHost;
+        use reverie::Errno;
+        use reverie::Error;
+        use reverie::Guest;
+        use reverie::syscalls::Syscall;
+        use reverie::syscalls::SyscallArgs;
+        use reverie::syscalls::SyscallInfo;
+        use reverie::syscalls::Sysno;
+        use std::collections::HashSet;
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        #[derive(Default)]
+        struct ExecTool {
+            returned: Arc<Mutex<Vec<(Errno, Option<reverie::UnsupportedRefusal>)>>>,
+        }
+        #[reverie::tool]
+        impl Tool for ExecTool {
+            type GlobalState = TestGlobal;
+            type ThreadState = (u64, u64);
+            fn init_thread_state(&self, _tid: Pid, _p: Option<(Pid, &(u64, u64))>) -> (u64, u64) {
+                (3, 1)
+            }
+            async fn handle_syscall_event<G: Guest<Self>>(
+                &self,
+                guest: &mut G,
+                call: Syscall,
+            ) -> Result<i64, Error> {
+                let (number, args) = call.into_parts();
+                assert_eq!(number, Sysno::execve);
+                *guest.thread_state_mut() = (4, 2);
+                let injected = [
+                    libc::AT_FDCWD as i64 as u64,
+                    args.arg0 as u64,
+                    args.arg1 as u64,
+                    args.arg2 as u64,
+                    0,
+                    0,
+                ];
+                let normalized = Syscall::from_raw(
+                    Sysno::new(libc::SYS_execveat as usize).unwrap(),
+                    SyscallArgs::new(
+                        injected[0] as usize,
+                        injected[1] as usize,
+                        injected[2] as usize,
+                        injected[3] as usize,
+                        injected[4] as usize,
+                        injected[5] as usize,
+                    ),
+                );
+                let errno = guest.inject(normalized).await.unwrap_err();
+                let refusal = guest.take_unsupported_refusal();
+                self.returned.lock().unwrap().push((errno, refusal));
+                *guest.thread_state_mut() = (3, 1);
+                Ok(-i64::from(errno.into_raw()))
+            }
+        }
+        struct Rt;
+        impl HostRuntime for Rt {
+            fn fork_child_rebind(&self) {}
+            fn emit_stage(&self, _stage: &[u8]) {}
+            fn fork_child_reset(&self, _event: &SyscallEvent) {}
+            fn cpuid_interception_enabled(&self) -> bool {
+                false
+            }
+            fn exit_process_stats(&self, _tid: Pid) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn read_clock(&self) -> std::io::Result<u64> {
+                Ok(0)
+            }
+            fn signal_action_supported(&self, number: i64, args: [u64; 6]) -> bool {
+                crate::guest::signal::signal_action_supported(number, args)
+            }
+            fn reserved_signal_mask(&self) -> u64 {
+                1_u64 << (libc::SIGSYS - 1)
+            }
+        }
+        fn frame(stream: &mut UnixStream, payload: &[u8]) {
+            use std::io::Write;
+            stream
+                .write_all(&(payload.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(payload).unwrap();
+        }
+        let _native = crate::guest::exec_private::native_exec_mock_callback();
+        assert!(crate::guest::exec_private::native_exec_callback_facts().is_some());
+        let (client, mut server) = UnixStream::pair().unwrap();
+        for socket in [&client, &server] {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+        }
+        let worker = std::thread::spawn(move || {
+            frame(
+                &mut server,
+                &reverie_rpc_transport::codec::encode(&902_u64).unwrap(),
+            );
+            let mut byte = [0_u8; 1];
+            let _ = server.read(&mut byte);
+        });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let client = reverie_rpc_transport::BlockingRpcClient::from_connected_stream(
+            crate::guest::rpc::GuestRpcStream::from(client),
+            tid,
+        )
+        .unwrap();
+        let rpc = CoordinatorRpc::<TestGlobal>::from_live_client(
+            "unused-generic-driver-test",
+            client,
+            |_, _| panic!("no reconnect"),
+        )
+        .unwrap();
+        let registry = Arc::new(Mutex::new(
+            ExecTicketRegistry::new(TestProof, [5u8; 32]).unwrap(),
+        ));
+        let returned: Arc<Mutex<Vec<(Errno, Option<reverie::UnsupportedRefusal>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let tool = ExecTool {
+            returned: returned.clone(),
+        };
+        let driver = GenericNativeExecDriver::new(
+            KernelCatalog,
+            PairFramer,
+            DirectIssuer {
+                registry: registry.clone(),
+            },
+            TestBinding { config: [3u8; 32] },
+            b"runtime".to_vec(),
+        );
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let mut host = Box::new(ToolHost::new(
+            tool,
+            rpc,
+            pid,
+            HashSet::from([Sysno::execve, Sysno::execveat, Sysno::getpid]),
+            false,
+            Rt,
+        ));
+        unsafe { host.install_native_exec_driver(Arc::new(driver)) }.unwrap();
+        let mut event = SyscallEvent {
+            number: libc::SYS_execve,
+            args: [0x1000, 0x2000, 0x3000, 0, 0, 0],
+            instruction_pointer: 0x1234,
+            result: 0,
+            context: 0,
+            dispatch: SyscallDispatch::Fallback,
+            guest_pkru: None,
+        };
+        unsafe { host.dispatch(&mut event) };
+        let results = returned.lock().unwrap();
+        assert_eq!(results.len(), 1, "results: {results:?}");
+        let (errno, refusal) = &results[0];
+        assert_eq!(*errno, Errno::EOPNOTSUPP);
+        let refusal = refusal.as_ref().expect("named leaf refusal");
+        // The wired leaf refuses by name here: synthetic dispatch has
+        // no genuine running fallback resume receipt (only a real
+        // fallback continuation entry mints one). Issue happened
+        // first; the host attempt then cancelled the ticket.
+        assert!(
+            refusal.diagnostic.contains("fallback resume mask"),
+            "{}",
+            refusal.diagnostic
+        );
+        drop(host);
+        worker.join().unwrap();
     }
 }
