@@ -175,6 +175,9 @@ where
                 mapping_driver: None,
                 #[cfg(feature = "exec-native-injection")]
                 native_exec_admitted: false,
+                #[cfg(feature = "exec-native-injection")]
+                native_exec_route_active: self.native_exec_admitted
+                    && self.native_exec_driver.is_some(),
                 unsupported_refusal: None,
                 injected_syscalls: 0,
             };

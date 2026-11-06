@@ -541,7 +541,9 @@ pub struct TrapOptions {
     /// `HostRuntime::exec_watch_armed`): guest exec forwards to the
     /// kernel instead of being refused. Only arm this when the
     /// launcher actually seized the process under a supervisor that
-    /// re-bootstraps successors.
+    /// re-bootstraps successors — including in fork children, which
+    /// inherit this gate but are not yet followed by the in-tree
+    /// single-leader supervisor.
     pub exec_watch: bool,
     /// The runtime's signal configuration.
     pub config: RuntimeConfig,

@@ -247,7 +247,10 @@ impl PassthroughDispatcher {
     /// instead of failing closed; every other guard is unchanged.
     /// Arming asserts the watcher really will re-bootstrap (or
     /// terminate) the successor before resuming it: the inherited
-    /// trap filter survives exec, its handler does not.
+    /// trap filter survives exec, its handler does not. Fork
+    /// children inherit this dispatcher state, so arming equally
+    /// asserts watcher coverage there; the in-tree supervisor
+    /// watches a single leader and does not follow forks yet.
     pub fn with_exec_watch(mut self) -> Self {
         self.exec_watch = true;
         self

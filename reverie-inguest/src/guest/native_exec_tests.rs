@@ -167,7 +167,9 @@ impl Tool for ModelTool {
     }
 }
 
-struct ModelRuntime;
+struct ModelRuntime {
+    watched: bool,
+}
 impl HostRuntime for ModelRuntime {
     fn fork_child_rebind(&self) {
         panic!("mock exec does not fork")
@@ -190,6 +192,9 @@ impl HostRuntime for ModelRuntime {
     }
     fn reserved_signal_mask(&self) -> u64 {
         1_u64 << (libc::SIGSYS - 1)
+    }
+    fn exec_watch_armed(&self) -> bool {
+        self.watched
     }
 }
 
@@ -445,6 +450,17 @@ fn run_model(
     admitted: bool,
     source: SyscallDispatch,
 ) {
+    run_model_watched(mode, original_execve, installed, admitted, source, false)
+}
+
+fn run_model_watched(
+    mode: usize,
+    original_execve: bool,
+    installed: bool,
+    admitted: bool,
+    source: SyscallDispatch,
+    watched: bool,
+) {
     let _native = crate::guest::exec_private::native_exec_mock_callback();
     let (rpc, worker) = rpc();
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -461,7 +477,7 @@ fn run_model(
         raw_pid(libc::SYS_getpid),
         HashSet::from([Sysno::execve, Sysno::execveat, Sysno::getpid, Sysno::clone]),
         false,
-        ModelRuntime,
+        ModelRuntime { watched },
     ));
     assert!(host.native_exec_driver.is_none());
     owner.store(
@@ -769,12 +785,19 @@ fn mock_driver_assertion_panic_is_an_explicit_nonzero_child_failure() {
 
 #[test]
 fn mock_driver_tail_exec_keeps_the_original_process_guard_refusal() {
-    let runtime = ModelRuntime;
+    let runtime = ModelRuntime { watched: false };
     for number in [libc::SYS_execve, libc::SYS_execveat] {
         assert_eq!(
             injected_syscall_guard(&runtime, number, [0; 6]),
             Some(Errno::EOPNOTSUPP)
         );
+    }
+    // The guard alone defers to the watch; installed-native priority
+    // on the tail route is enforced before the guard (see the
+    // watched tail witness below), not by this predicate.
+    let watched = ModelRuntime { watched: true };
+    for number in [libc::SYS_execve, libc::SYS_execveat] {
+        assert_eq!(injected_syscall_guard(&watched, number, [0; 6]), None);
     }
 }
 
@@ -836,7 +859,7 @@ fn admission_requires_installed_driver_and_is_single_shot() {
                 raw_pid(libc::SYS_getpid),
                 HashSet::from([Sysno::execve]),
                 false,
-                ModelRuntime,
+                ModelRuntime { watched: false },
             ));
             assert!(!host.native_exec_admitted());
             assert!(unsafe { host.admit_native_exec() }.is_err());
@@ -886,7 +909,7 @@ fn component_only_final_refusal_keeps_model_old_image_dispatching() {
                 raw_pid(libc::SYS_getpid),
                 HashSet::from([Sysno::execve, Sysno::execveat, Sysno::getpid]),
                 false,
-                ModelRuntime,
+                ModelRuntime { watched: false },
             ));
             owner.store(
                 &*host as *const ToolHost<ModelTool, ModelRuntime> as usize,
@@ -963,7 +986,7 @@ fn refused_first_empty_path_consumes_the_single_attempt() {
                 raw_pid(libc::SYS_getpid),
                 HashSet::from([Sysno::execve, Sysno::execveat, Sysno::getpid]),
                 false,
-                ModelRuntime,
+                ModelRuntime { watched: false },
             ));
             owner.store(
                 &*host as *const ToolHost<ModelTool, ModelRuntime> as usize,
@@ -1036,7 +1059,7 @@ fn admission_after_dispatch_is_refused() {
                 raw_pid(libc::SYS_getpid),
                 HashSet::from([Sysno::execve, Sysno::execveat, Sysno::getpid]),
                 false,
-                ModelRuntime,
+                ModelRuntime { watched: false },
             ));
             owner.store(
                 &*host as *const ToolHost<ModelTool, ModelRuntime> as usize,
@@ -1067,4 +1090,316 @@ fn admission_after_dispatch_is_refused() {
         },
         0,
     );
+}
+
+#[test]
+fn mock_driver_watched_ordinary_inject_keeps_native_priority() {
+    // Capture-refusing driver (mode 2) with the watch armed: the
+    // ordinary subscribed route must still consult the admitted
+    // native route and surface its exact NativeExec refusal.
+    for execve in [false, true] {
+        isolated(
+            move || run_model_watched(2, execve, true, true, SyscallDispatch::Fallback, true),
+            0,
+        );
+    }
+}
+
+// --- Watched-route controls (S-C fix round) ---
+//
+// Ordinary subscribed inject consults the admitted native route
+// first (above). These controls pin the other physical routes —
+// tail injection, lifecycle callbacks, unsubscribed originals —
+// where no native capture exists for the dispatch: with the route
+// admitted a watched exec must refuse by name instead of
+// forwarding past native authority; with no driver it forwards
+// and the kernel answers for the NULL path (EFAULT, untagged).
+// All cases run in fork-isolated children; filenames are NULL so
+// no exec can succeed.
+
+#[derive(Clone, Copy, PartialEq)]
+enum WatchAction {
+    HandlerInject,
+    TailInject,
+    ThreadStartInject,
+    PostExecInject,
+    Plain,
+}
+
+struct WatchedTool {
+    action: WatchAction,
+    number: i64,
+    returned: ReturnedCalls,
+}
+
+// Only for the Tool supertrait bound; tests always construct with an
+// explicit action and never fork (new_process would lose both).
+impl Default for WatchedTool {
+    fn default() -> Self {
+        Self {
+            action: WatchAction::Plain,
+            number: libc::SYS_execve,
+            returned: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl WatchedTool {
+    fn null_args(&self) -> [u64; 6] {
+        if self.number == libc::SYS_execveat {
+            [libc::AT_FDCWD as i64 as u64, 0, 0, 0, 0, 0]
+        } else {
+            [0; 6]
+        }
+    }
+
+    async fn record_exec<G: Guest<Self>>(&self, guest: &mut G) {
+        let errno = guest
+            .inject(syscall(self.number, self.null_args()))
+            .await
+            .unwrap_err();
+        let refusal = guest.take_unsupported_refusal();
+        self.returned.lock().unwrap().push((errno, refusal));
+    }
+}
+
+#[reverie::tool]
+impl Tool for WatchedTool {
+    type GlobalState = ModelGlobal;
+    type ThreadState = (u64, u64);
+    fn init_thread_state(&self, _tid: Pid, _parent: Option<(Pid, &(u64, u64))>) -> (u64, u64) {
+        (3, 1)
+    }
+    async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        if self.action == WatchAction::ThreadStartInject {
+            self.record_exec(guest).await;
+        }
+        Ok(())
+    }
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        if self.action == WatchAction::PostExecInject {
+            self.record_exec(guest).await;
+        }
+        Ok(())
+    }
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        _call: Syscall,
+    ) -> Result<i64, Error> {
+        match self.action {
+            WatchAction::HandlerInject => {
+                self.record_exec(guest).await;
+                Ok(0)
+            }
+            WatchAction::TailInject => {
+                guest
+                    .tail_inject(syscall(self.number, self.null_args()))
+                    .await
+            }
+            _ => Ok(guest
+                .inject(reverie::syscalls::Getpid::default())
+                .await
+                .unwrap()),
+        }
+    }
+}
+
+struct DenyDriver {
+    captures: Arc<AtomicUsize>,
+}
+
+// SAFETY: model-only deny driver; capture always refuses by name and
+// no session, ticket or kernel exec is ever created.
+unsafe impl NativeExecDriver<WatchedTool> for DenyDriver {
+    fn capture_old<'owner>(
+        &'owner self,
+        _tool: &WatchedTool,
+        _state: &(u64, u64),
+        _cut: &ExecCut,
+        _rpc: &CoordinatorRpc<ModelGlobal>,
+    ) -> Result<Box<dyn NativeExecSession<WatchedTool> + 'owner>, reverie::UnsupportedRefusal> {
+        self.captures.fetch_add(1, Ordering::SeqCst);
+        Err(named("deny-driver: capture refused"))
+    }
+}
+
+struct WatchOutcome {
+    event_result: i64,
+    returned: Vec<(Errno, Option<reverie::UnsupportedRefusal>)>,
+    captures: usize,
+}
+
+fn run_watched_case(
+    action: WatchAction,
+    number: i64,
+    admitted: bool,
+    subscribed: bool,
+) -> WatchOutcome {
+    let _native = crate::guest::exec_private::native_exec_mock_callback();
+    let (rpc, worker) = rpc();
+    let returned: ReturnedCalls = Arc::new(Mutex::new(Vec::new()));
+    let captures = Arc::new(AtomicUsize::new(0));
+    let tool = WatchedTool {
+        action,
+        number,
+        returned: returned.clone(),
+    };
+    let subscriptions = if subscribed {
+        HashSet::from([Sysno::execve, Sysno::execveat, Sysno::getpid])
+    } else {
+        HashSet::from([Sysno::getpid])
+    };
+    let mut host = Box::new(ToolHost::new(
+        tool,
+        rpc,
+        raw_pid(libc::SYS_getpid),
+        subscriptions,
+        false,
+        ModelRuntime { watched: true },
+    ));
+    if admitted {
+        unsafe {
+            host.install_native_exec_driver(Arc::new(DenyDriver {
+                captures: captures.clone(),
+            }))
+        }
+        .unwrap();
+        unsafe { host.admit_native_exec() }.unwrap();
+        assert!(host.native_exec_admitted());
+    }
+    let (event_number, event_args) = match action {
+        WatchAction::ThreadStartInject | WatchAction::PostExecInject => (libc::SYS_getpid, [0; 6]),
+        _ if number == libc::SYS_execveat => {
+            (number, [libc::AT_FDCWD as i64 as u64, 0, 0, 0, 0, 0])
+        }
+        _ => (number, [0; 6]),
+    };
+    let mut event = SyscallEvent {
+        number: event_number,
+        args: event_args,
+        instruction_pointer: 0x1234,
+        result: 0,
+        context: 0,
+        dispatch: SyscallDispatch::Fallback,
+        guest_pkru: None,
+    };
+    unsafe { host.dispatch(&mut event) };
+    let outcome = WatchOutcome {
+        event_result: event.result,
+        returned: returned.lock().unwrap().clone(),
+        captures: captures.load(Ordering::SeqCst),
+    };
+    drop(host);
+    worker.join().unwrap();
+    outcome
+}
+
+#[test]
+fn watched_tail_exec_refuses_with_admitted_driver() {
+    for number in [libc::SYS_execve, libc::SYS_execveat] {
+        isolated(
+            move || {
+                let outcome = run_watched_case(WatchAction::TailInject, number, true, true);
+                assert_eq!(outcome.event_result, -i64::from(libc::EOPNOTSUPP));
+                // The subscribed dispatch attempted its (refused)
+                // capture once; the tail refusal precedes any
+                // prepare/issue or physical forward.
+                assert_eq!(outcome.captures, 1);
+            },
+            0,
+        );
+    }
+}
+
+#[test]
+fn watched_tail_exec_forwards_without_driver() {
+    for number in [libc::SYS_execve, libc::SYS_execveat] {
+        isolated(
+            move || {
+                let outcome = run_watched_case(WatchAction::TailInject, number, false, true);
+                assert_eq!(outcome.event_result, -i64::from(libc::EFAULT));
+            },
+            0,
+        );
+    }
+}
+
+#[test]
+fn watched_lifecycle_exec_refuses_with_admitted_driver() {
+    for action in [WatchAction::ThreadStartInject, WatchAction::PostExecInject] {
+        for number in [libc::SYS_execve, libc::SYS_execveat] {
+            isolated(
+                move || {
+                    let outcome = run_watched_case(action, number, true, true);
+                    assert_eq!(outcome.returned.len(), 1);
+                    let (errno, refusal) = outcome.returned[0];
+                    assert_eq!(errno, Errno::EOPNOTSUPP);
+                    assert_eq!(
+                        refusal.map(|r| r.operation),
+                        Some(reverie::UnsupportedOperation::NativeExec)
+                    );
+                    assert_eq!(outcome.captures, 0);
+                    assert!(outcome.event_result > 0, "getpid completes the dispatch");
+                },
+                0,
+            );
+        }
+    }
+}
+
+#[test]
+fn watched_lifecycle_exec_forwards_without_driver() {
+    for action in [WatchAction::ThreadStartInject, WatchAction::PostExecInject] {
+        for number in [libc::SYS_execve, libc::SYS_execveat] {
+            isolated(
+                move || {
+                    let outcome = run_watched_case(action, number, false, true);
+                    assert_eq!(outcome.returned, [(Errno::EFAULT, None)]);
+                    assert!(outcome.event_result > 0, "getpid completes the dispatch");
+                },
+                0,
+            );
+        }
+    }
+}
+
+#[test]
+fn watched_unsubscribed_exec_refuses_with_admitted_driver() {
+    for number in [libc::SYS_execve, libc::SYS_execveat] {
+        isolated(
+            move || {
+                let outcome = run_watched_case(WatchAction::Plain, number, true, false);
+                assert_eq!(outcome.event_result, -i64::from(libc::EOPNOTSUPP));
+                assert_eq!(outcome.captures, 0);
+            },
+            0,
+        );
+    }
+}
+
+#[test]
+fn watched_unsubscribed_exec_forwards_without_driver() {
+    for number in [libc::SYS_execve, libc::SYS_execveat] {
+        isolated(
+            move || {
+                let outcome = run_watched_case(WatchAction::Plain, number, false, false);
+                assert_eq!(outcome.event_result, -i64::from(libc::EFAULT));
+            },
+            0,
+        );
+    }
+}
+
+#[test]
+fn watched_ordinary_inject_forwards_without_driver() {
+    for number in [libc::SYS_execve, libc::SYS_execveat] {
+        isolated(
+            move || {
+                let outcome = run_watched_case(WatchAction::HandlerInject, number, false, true);
+                assert_eq!(outcome.returned, [(Errno::EFAULT, None)]);
+            },
+            0,
+        );
+    }
 }
