@@ -945,6 +945,7 @@ run_validation_dag() {
     fi
     local gates_tsv
     if ! gates_tsv=$("$ROOT_DIR/scripts/dag-gates.rs" \
+        --since "$VALIDATION_STARTED_AT" \
         "$ROOT_DIR/ci/dag/validate.json" "$ROOT_DIR/target/validate/perf" \
         2>>"$LOG_FILE"); then
         checks=$((checks + 1))

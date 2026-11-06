@@ -1532,6 +1532,7 @@ fn run_nextest(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
         "--no-fail-fast",
         "--profile",
         "--config-file",
+        "--tool-config-file",
         "--test-threads",
     ] {
         if args
@@ -1566,7 +1567,11 @@ fn run_nextest(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     // A per-invocation profile keeps concurrent counted runs (DAG test
-    // nodes) from sharing one JUnit report file.
+    // nodes) from sharing one JUnit report file. It must be passed as a
+    // tool config file: --config-file would REPLACE the repository
+    // .config/nextest.toml, silently dropping its [profile.default]
+    // slow-timeout backstop for nextest's built-in default (musestable
+    // review of PR 1295, proven on nextest 0.9.100).
     let config_path = path.with_extension("nextest-config.toml");
     let junit_escaped = junit_absolute
         .display()
@@ -1601,8 +1606,8 @@ fn run_nextest(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
         .arg("--no-fail-fast")
         .arg("--profile")
         .arg("reverie-counted")
-        .arg("--config-file")
-        .arg(&config_path)
+        .arg("--tool-config-file")
+        .arg(format!("reverie:{}", config_path.display()))
         .env("NEXTEST_EXPERIMENTAL_LIBTEST_JSON", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -2082,7 +2087,9 @@ const RUN_NEXTEST_HELP: &str = "Usage: libtest-counts.rs run-nextest OUTPUT -- c
 Run one cargo-nextest command (one process per test), derive authoritative\n\
 counts from its libtest-json-plus event stream, and atomically write schema-2\n\
 JSON to OUTPUT. The runner owns --message-format, --retries, --fail-fast,\n\
---profile, and --config-file; a per-invocation profile writes JUnit to\n\
+--profile, --config-file, and --tool-config-file (the JUnit profile is\n\
+layered via --tool-config-file so the repository config still applies);\n\
+a per-invocation profile writes JUnit to\n\
 OUTPUT.junit.xml so REVERIE_SKIP lines from passing tests stay harvestable.\n\
 Passes on retry are reported as REVERIE_FLAKY, never silent. Per-test records\n\
 carry wall time and attempt (OUTPUT.cpu.jsonl); CPU bounds on this path are\n\

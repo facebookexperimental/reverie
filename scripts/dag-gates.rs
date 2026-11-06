@@ -28,14 +28,18 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-const HELP: &str = "Usage: dag-gates.rs VALIDATE_JSON PERF_DIR\n\
+const HELP: &str = "Usage: dag-gates.rs [--since ISO8601_UTC] VALIDATE_JSON PERF_DIR\n\
 \n\
 Print one tab-separated ledger gate row per DAG step (latest dagrun\n\
 run in PERF_DIR): gate name, exit status, whole seconds, counts file.\n\
-A step the run skipped (failed dependency) or never launched is\n\
-reported with status 3 so the gate is recorded, never dropped.\n\
+With --since, only profile rows timestamped at or after that instant\n\
+are gate evidence, so an append-only perf store can never lend a\n\
+previous run's rows to a run that wrote none. A step the run skipped\n\
+(failed dependency) or never launched is reported with status 3 so\n\
+the gate is recorded, never dropped.\n\
 \n\
 Options:\n\
+  --since T   only consider profile rows at or after UTC instant T\n\
   -h, --help  Show this help";
 
 struct StepRow {
@@ -47,7 +51,10 @@ fn csv_field<'a>(row: &[&'a str], header: &BTreeMap<&str, usize>, name: &str) ->
     header.get(name).and_then(|index| row.get(*index)).copied()
 }
 
-fn read_profiles(perf_dir: &Path) -> Result<BTreeMap<String, StepRow>, String> {
+fn read_profiles(
+    perf_dir: &Path,
+    since: Option<&str>,
+) -> Result<BTreeMap<String, StepRow>, String> {
     let mut files = Vec::new();
     let entries = fs::read_dir(perf_dir).map_err(|error| {
         format!(
@@ -84,7 +91,14 @@ fn read_profiles(perf_dir: &Path) -> Result<BTreeMap<String, StepRow>, String> {
             .enumerate()
             .map(|(index, name)| (name, index))
             .collect();
-        for name in ["step", "elapsed_s", "returncode", "ok", "run_id"] {
+        for name in [
+            "timestamp",
+            "step",
+            "elapsed_s",
+            "returncode",
+            "ok",
+            "run_id",
+        ] {
             if !header.contains_key(name) {
                 return Err(format!(
                     "{} header has no {name} column; dagrun profile schema drifted",
@@ -97,6 +111,20 @@ fn read_profiles(perf_dir: &Path) -> Result<BTreeMap<String, StepRow>, String> {
                 continue;
             }
             let row: Vec<&str> = line.split(',').collect();
+            // The perf store is append-only (dagrun learns widths and
+            // memory caps from it), so a run that wrote no new profiles
+            // must never ingest an older run's rows as its gate
+            // evidence: callers pass the validation start instant and
+            // only rows at or after it are considered. Timestamps are
+            // UTC ISO-8601 in both places, so string order is time order.
+            if let Some(since) = since {
+                let Some(timestamp) = csv_field(&row, &header, "timestamp") else {
+                    return Err(format!("{} has a row without a timestamp", file.display()));
+                };
+                if timestamp < since {
+                    continue;
+                }
+            }
             let (Some(step), Some(elapsed), Some(returncode), Some(ok), Some(run_id)) = (
                 csv_field(&row, &header, "step"),
                 csv_field(&row, &header, "elapsed_s"),
@@ -127,12 +155,16 @@ fn read_profiles(perf_dir: &Path) -> Result<BTreeMap<String, StepRow>, String> {
                 .insert(step.to_string(), StepRow { status, seconds });
         }
     }
-    by_run
-        .remove(&latest_run)
-        .ok_or_else(|| "dagrun perf CSVs contain no step rows".to_string())
+    by_run.remove(&latest_run).ok_or_else(|| match since {
+        Some(since) => format!(
+            "dagrun perf CSVs contain no step rows at or after {since}; \
+                 the run left no gate evidence"
+        ),
+        None => "dagrun perf CSVs contain no step rows".to_string(),
+    })
 }
 
-fn run(dag_path: &Path, perf_dir: &Path) -> Result<(), String> {
+fn run(dag_path: &Path, perf_dir: &Path, since: Option<&str>) -> Result<(), String> {
     let text = fs::read_to_string(dag_path)
         .map_err(|error| format!("cannot read {}: {error}", dag_path.display()))?;
     let dag: serde_json::Value = serde_json::from_str(&text)
@@ -141,7 +173,7 @@ fn run(dag_path: &Path, perf_dir: &Path) -> Result<(), String> {
         .get("steps")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| format!("{} has no steps array", dag_path.display()))?;
-    let profiles = read_profiles(perf_dir)?;
+    let profiles = read_profiles(perf_dir, since)?;
     for step in steps {
         let group = step.get("group").and_then(serde_json::Value::as_str);
         let job = step.get("job").and_then(serde_json::Value::as_str);
@@ -170,20 +202,34 @@ fn run(dag_path: &Path, perf_dir: &Path) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    match args.as_slice() {
+    let result = match args.as_slice() {
         [flag] if flag == "-h" || flag == "--help" => {
             println!("{HELP}");
-            ExitCode::SUCCESS
+            return ExitCode::SUCCESS;
         }
-        [dag, perf] => match run(Path::new(dag), Path::new(perf)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("dag-gates: {error}");
-                ExitCode::from(2)
+        [dag, perf] => run(Path::new(dag), Path::new(perf), None),
+        [flag, since, dag, perf] if flag == "--since" => {
+            run(Path::new(dag), Path::new(perf), Some(since))
+        }
+        [dag, perf, flag, since] if flag == "--since" => {
+            run(Path::new(dag), Path::new(perf), Some(since))
+        }
+        [since_arg, dag, perf] if since_arg.starts_with("--since=") => {
+            let Some(since) = since_arg.strip_prefix("--since=") else {
+                unreachable!("checked prefix above")
+            };
+            if since.is_empty() {
+                Err("--since requires a UTC instant".to_string())
+            } else {
+                run(Path::new(dag), Path::new(perf), Some(since))
             }
-        },
-        _ => {
-            eprintln!("dag-gates: expected VALIDATE_JSON PERF_DIR\n{HELP}");
+        }
+        _ => Err("expected [--since ISO8601_UTC] VALIDATE_JSON PERF_DIR".to_string()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("dag-gates: {error}\n{HELP}");
             ExitCode::from(2)
         }
     }
