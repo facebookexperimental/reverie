@@ -341,11 +341,11 @@
       "group": "test",
       "job": "inguest",
       "desc": "Tests: in-guest backend",
-      "description": "Counted nextest over reverie-inguest. Width is lower: bounded-recipe tests compile payloads at runtime, so each test process fans out further. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load). Also after test.ptrace (the longest node): the smoke spoof-getpid trap-arming race still fired with only the LiteInst burst removed.",
+      "description": "Counted nextest over reverie-inguest. Width is lower: bounded-recipe tests compile payloads at runtime, so each test process fans out further. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load). Also after test.ptrace (the longest node): the smoke spoof-getpid trap-arming race still fired with only the LiteInst burst removed. The node first rebuilds reverie-inguest --all-features under the cargo-build resource: deps/libreverie_inguest.so is an unhashed filename shared by every build graph, and reverie-liteinst depends on reverie-inguest with default-features=false (no preload-constructor), so a concurrent cargo build can overwrite the constructor-ful cdylib the smoke tests LD_PRELOAD (measured 2026-11-05: spoof-getpid inert until rebuilt). Holding cargo-build for the whole node makes the rebuild the last writer before the tests run.",
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-inguest.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-inguest)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "cargo build -p reverie-inguest --all-features && ./scripts/libtest-counts.rs run-nextest target/validate/counts-test-inguest.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-inguest)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst",
@@ -363,7 +363,9 @@
       "cpu_timeout": 900,
       "priority": 40,
       "hint": {
-        "resources": {},
+        "resources": {
+          "cargo-build": 1
+        },
         "est_duration_s": 150,
         "rss_baseline_bytes": 8000000000,
         "hard_mem_max_bytes": 16000000000,
