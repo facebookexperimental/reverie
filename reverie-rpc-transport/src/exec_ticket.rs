@@ -33,8 +33,11 @@ use sha2::Sha256;
 pub const MAX_TRANSITIONS: usize = 1024;
 /// Maximum tool snapshot bytes retained at prepare.
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
-/// Maximum sealed state bytes (header + tool + runtime).
-pub const MAX_STATE_BYTES: usize = 1024 * 1024 + 4096;
+/// Maximum sealed state bytes: the successor wire bound
+/// (`crate::successor::MAX_STATE_LEN`). The composite sealed bytes
+/// are exactly what redeem returns as successor state, so anything
+/// larger could only fail *after* redeem consumed the ticket.
+pub const MAX_STATE_BYTES: usize = crate::successor::MAX_STATE_LEN;
 const TICKET_DOMAIN: &[u8] = b"Reverie native exec ticket v1\0";
 
 /// A protected single-use exec token. Carries no guest-visible data.
@@ -147,17 +150,22 @@ where
     B: TicketBinding,
     P: TicketProof<B>,
 {
-    /// New registry for one watched birth. `nonce` is a secret run
-    /// nonce; it never touches deterministic guest state.
-    pub fn new(proof: P, nonce: [u8; 32]) -> Self {
-        Self {
+    /// New registry for one watched birth. `nonce` must be a fresh
+    /// CSPRNG secret of at least 256 bits; the all-zero nonce is
+    /// refused (Detcore parity: first ticket must not be derivable
+    /// from public constants). Ordinals start at 1 and never reuse.
+    pub fn new(proof: P, nonce: [u8; 32]) -> Result<Self, ExecControlError> {
+        if nonce == [0; 32] {
+            return Err(ExecControlError::Qualification);
+        }
+        Ok(Self {
             proof,
             nonce,
-            next_ticket: 0,
+            next_ticket: 1,
             transitions: BTreeMap::new(),
             dead: false,
             terminal_failure: false,
-        }
+        })
     }
 
     /// The single watched owner (server-derived, never caller-asserted).

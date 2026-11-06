@@ -64,6 +64,7 @@ fn registry() -> ExecTicketRegistry<Proof, Binding> {
         },
         [9u8; 32],
     )
+    .unwrap()
 }
 
 fn prepared(r: &mut ExecTicketRegistry<Proof, Binding>) -> ExecTicket {
@@ -165,7 +166,8 @@ fn peer_mismatch_refuses_without_consuming() {
             peer_ok: false,
         },
         [9u8; 32],
-    );
+    )
+    .unwrap();
     let snap = b"tool-bytes".to_vec();
     let d = digest(&snap);
     let t = r
@@ -255,4 +257,91 @@ fn control_client_round_trip_over_socketpair() {
     server.join().unwrap().unwrap();
     let registry = registry.lock().unwrap();
     assert_eq!(registry.stage(t), Some(ExecStage::Issued));
+}
+
+#[test]
+fn zero_nonce_refused_and_first_ticket_not_publicly_derivable() {
+    assert_eq!(
+        ExecTicketRegistry::new(
+            Proof {
+                owner: 7,
+                peer_ok: true
+            },
+            [0u8; 32]
+        )
+        .err(),
+        Some(ExecControlError::Qualification)
+    );
+    // Ordinal starts at 1 (Detcore parity): two registries with
+    // different nonces mint different first tickets.
+    let snap = b"s".to_vec();
+    let mut a = registry();
+    let mut b = ExecTicketRegistry::new(
+        Proof {
+            owner: 7,
+            peer_ok: true,
+        },
+        [8u8; 32],
+    )
+    .unwrap();
+    let ta = a
+        .prepare(
+            7,
+            Binding {
+                owner: 7,
+                config: [3u8; 32],
+            },
+            snap.clone(),
+            digest(&snap),
+        )
+        .unwrap();
+    let tb = b
+        .prepare(
+            7,
+            Binding {
+                owner: 7,
+                config: [3u8; 32],
+            },
+            snap.clone(),
+            digest(&snap),
+        )
+        .unwrap();
+    assert_ne!(ta, tb);
+}
+
+#[test]
+fn seal_composite_capped_at_successor_bound_exactly() {
+    use reverie_rpc_transport::exec_ticket::MAX_STATE_BYTES;
+    assert_eq!(
+        MAX_STATE_BYTES,
+        reverie_rpc_transport::successor::MAX_STATE_LEN
+    );
+    let mut r = registry();
+    // Snapshot at the bound minus one runtime byte: composite == bound passes.
+    let snap = vec![7u8; MAX_STATE_BYTES - 1];
+    let d = digest(&snap);
+    let t = r
+        .prepare(
+            7,
+            Binding {
+                owner: 7,
+                config: [3u8; 32],
+            },
+            snap,
+            d,
+        )
+        .unwrap();
+    // +2 runtime bytes => bound+1 must refuse at seal, before redeem.
+    assert_eq!(
+        r.seal(7, t, digest(b"xy"), b"xy"),
+        Err(ExecControlError::Bounds)
+    );
+    assert_eq!(r.stage(t), Some(ExecStage::Prepared), "not consumed");
+    // +1 runtime byte => exactly the bound seals and issues.
+    let sealed = r.seal(7, t, digest(b"x"), b"x").unwrap();
+    r.mark_provision_delivered(7, t).unwrap();
+    r.issue(7, t, sealed).unwrap();
+    let peer: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    let state = r.redeem(&peer, t, [3u8; 32], sealed).unwrap();
+    assert_eq!(state.len(), MAX_STATE_BYTES);
 }
