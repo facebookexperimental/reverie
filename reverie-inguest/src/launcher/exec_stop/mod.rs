@@ -46,7 +46,14 @@ mod mapping_plan;
 #[cfg(feature = "loader-private-runtime")]
 #[allow(unsafe_code)]
 pub mod physical;
+mod supervisor;
 mod trace;
+
+pub use supervisor::DetachedSupervisor;
+pub use supervisor::DetachedWaitFailure;
+pub use supervisor::Supervisor;
+pub use supervisor::SupervisorMode;
+pub use supervisor::SupervisorOutcome;
 
 use std::cell::RefCell;
 use std::rc::Rc;

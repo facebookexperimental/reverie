@@ -185,6 +185,7 @@ pub struct PreparedExec<'fd> {
     inherited: Vec<std::os::fd::BorrowedFd<'fd>>,
     cwd: Option<std::fs::File>,
     ptrace_launch_facts: bool,
+    supervisor_seize: bool,
     stdio: Option<reverie::process::PreparedStdio>,
     parent_stdio: Option<reverie::process::ParentStdio>,
 }
@@ -210,6 +211,14 @@ impl<'fd> PreparedExec<'fd> {
     /// The default constructor preserves its existing inherited behavior.
     pub fn with_ptrace_launch_facts(mut self) -> Self {
         self.ptrace_launch_facts = true;
+        self
+    }
+
+    /// Prepare the child for the parent's dormant `PTRACE_SEIZE` supervisor.
+    /// The child keeps the same setup and self-stop, but does not call
+    /// `PTRACE_TRACEME`; the parent must seize it before resuming it.
+    pub(super) fn with_supervisor_seize(mut self) -> Self {
+        self.supervisor_seize = true;
         self
     }
 
@@ -295,6 +304,7 @@ impl<'fd> PreparedExec<'fd> {
             inherited,
             cwd,
             ptrace_launch_facts: false,
+            supervisor_seize: false,
             stdio: None,
             parent_stdio: None,
         })
@@ -451,10 +461,11 @@ impl<'fd> PreparedExec<'fd> {
             {
                 exit_child();
             }
-            if syscall6(
-                libc::SYS_ptrace as u64,
-                [libc::PTRACE_TRACEME as u64, 0, 0, 0, 0, 0],
-            ) < 0
+            if !self.supervisor_seize
+                && syscall6(
+                    libc::SYS_ptrace as u64,
+                    [libc::PTRACE_TRACEME as u64, 0, 0, 0, 0, 0],
+                ) < 0
             {
                 exit_child();
             }
