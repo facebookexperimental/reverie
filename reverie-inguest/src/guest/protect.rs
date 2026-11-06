@@ -1757,6 +1757,7 @@ pub(crate) mod tests {
                 (libc::SYS_dup3, [RUNTIME, 100, 1]),
                 (libc::SYS_dup3, [RUNTIME, 100, o_cloexec]),
                 (libc::SYS_dup3, [RUNTIME, 4096, 0]),
+                (libc::SYS_dup3, [RUNTIME, 100, 0]),
                 (libc::SYS_dup3, [0, RUNTIME, 1]),
                 (libc::SYS_dup3, [9999, RUNTIME, 0]),
             ];
