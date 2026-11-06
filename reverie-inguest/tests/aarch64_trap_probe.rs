@@ -15,10 +15,18 @@
 //! ucontext `pc`, whether syscall arguments survive into the frame, where
 //! a private restorer's `rt_sigreturn` is reported, which BTI landing pads
 //! gate entries need, what the SVE signal-record chain looks like, and the
-//! host page size (targeted hosts run both 4 KiB and 64 KiB pages). This
-//! test builds the probe with `cc`, runs it, and asserts on its raw
-//! `KEY=VALUE` measurements, so a kernel or probe change that breaks a
-//! pinned relation fails here instead of inside the runtime.
+//! host page size (targeted hosts run both 4 KiB and 64 KiB pages).
+//!
+//! On aarch64, the test at the bottom of this file builds the probe with
+//! `cc`, runs it, and asserts on its parsed `KEY=VALUE` measurements with
+//! exact typed comparisons. On every other architecture only the parser
+//! unit tests run; the probe execution is staged, not counted as coverage.
+//! The crate's architecture gate still refuses aarch64 builds, so today
+//! the probe executes only by building the C fixture directly on aarch64
+//! hardware (see its header). Widening that gate must make
+//! `cargo test --test aarch64_trap_probe` execute the real test below on
+//! aarch64; until then its constants enter as hardware-measured claims
+//! whose host-side consequences are pinned by the seccomp evaluator tests.
 //!
 //! Regression pinned by name: the probe's P1 verdict strings derive from a
 //! pid cached *before* the discriminating filter installs (comparing
@@ -28,6 +36,155 @@
 //! Syscall user dispatch is capability-dependent (targeted kernels may be
 //! built without it): the test accepts either a measured trap or an
 //! explicit enable failure, and fails on anything else.
+
+use std::collections::BTreeMap;
+
+/// One parsed probe run: measurement key to its exact value token.
+///
+/// Fixture rows are `KEY=VALUE` optionally followed by space-delimited
+/// diagnostics (for example `P1_IP_CANDIDATE_SITE=NO (ret=-273)` or
+/// `P6_BTI_C_BLR=OK ret=1234`); the value token ends at the first space or
+/// tab. Lines whose key contains whitespace (`RESULT ...` summaries,
+/// `== TEST ==` banners) are not measurements and are skipped here;
+/// `RESULT` lines are parsed by [`result_exit`].
+struct Measurements<'a> {
+    values: BTreeMap<&'a str, &'a str>,
+}
+
+fn parse_measurements(out: &str) -> Result<Measurements<'_>, String> {
+    let mut values = BTreeMap::new();
+    for line in out.lines() {
+        let Some((key, rest)) = line.split_once('=') else {
+            continue;
+        };
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            continue;
+        }
+        let value = rest.split([' ', '\t']).next().unwrap_or("");
+        if values.insert(key, value).is_some() {
+            return Err(format!("duplicate measurement key {key:?}"));
+        }
+    }
+    Ok(Measurements { values })
+}
+
+impl Measurements<'_> {
+    fn get(&self, key: &str) -> Result<&str, String> {
+        self.values
+            .get(key)
+            .copied()
+            .ok_or_else(|| format!("missing measurement {key:?}"))
+    }
+
+    fn check_str(&self, key: &str, expected: &str) -> Result<(), String> {
+        let actual = self.get(key)?;
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!("{key}={actual:?}, want {expected:?}"))
+        }
+    }
+
+    fn check_i64(&self, key: &str, expected: i64) -> Result<(), String> {
+        let raw = self.get(key)?;
+        let actual = raw
+            .parse::<i64>()
+            .map_err(|_| format!("{key}={raw:?} does not parse as an integer"))?;
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!("{key}={actual}, want {expected} (raw {raw:?})"))
+        }
+    }
+
+    fn check_hex(&self, key: &str, expected: u64) -> Result<(), String> {
+        let raw = self.get(key)?;
+        let digits = raw
+            .strip_prefix("0x")
+            .ok_or_else(|| format!("{key}={raw:?} is not 0x-prefixed hex"))?;
+        let value = u64::from_str_radix(digits, 16)
+            .map_err(|_| format!("{key}={raw:?} does not parse as hex"))?;
+        if value == expected {
+            Ok(())
+        } else {
+            Err(format!("{key}={raw:?}, want {expected:#x}"))
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+}
+
+/// The `RESULT <name> STATUS=... CODE=...` terminal record for one child.
+fn result_exit(out: &str, name: &str) -> Result<(String, Option<i64>), String> {
+    let prefix = format!("RESULT {name} ");
+    let line = out
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .ok_or_else(|| format!("missing RESULT line for {name:?}"))?;
+    let mut status = None;
+    let mut code = None;
+    for field in line[prefix.len()..].split_whitespace() {
+        if let Some(value) = field.strip_prefix("STATUS=") {
+            status = Some(value.to_string());
+        } else if let Some(value) = field.strip_prefix("CODE=") {
+            code = Some(
+                value
+                    .parse::<i64>()
+                    .map_err(|_| format!("RESULT {name}: unparsable CODE in {line:?}"))?,
+            );
+        }
+    }
+    match status {
+        Some(status) => Ok((status, code)),
+        None => Err(format!("RESULT {name}: no STATUS field in {line:?}")),
+    }
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+
+    #[test]
+    fn exact_values_reject_numeric_prefix_extensions() {
+        // Near-miss controls: a prefix predicate accepted both of these.
+        let plus40 = parse_measurements("P1_CALL_MINUS_SITE=+40\n").unwrap();
+        assert!(plus40.check_i64("P1_CALL_MINUS_SITE", 4).is_err());
+        let thousand = parse_measurements("P5_ENTRIES=1000\n").unwrap();
+        assert!(thousand.check_i64("P5_ENTRIES", 100).is_err());
+        let exact = parse_measurements("P1_CALL_MINUS_SITE=+4\nP5_ENTRIES=100\n").unwrap();
+        exact.check_i64("P1_CALL_MINUS_SITE", 4).unwrap();
+        exact.check_i64("P5_ENTRIES", 100).unwrap();
+    }
+
+    #[test]
+    fn delimited_diagnostic_suffix_is_not_part_of_the_value() {
+        let m =
+            parse_measurements("P1_IP_CANDIDATE_SITE=NO (ret=-273)\nP6_BTI_C_BLR=OK ret=1234\n")
+                .unwrap();
+        m.check_str("P1_IP_CANDIDATE_SITE", "NO").unwrap();
+        m.check_str("P6_BTI_C_BLR", "OK").unwrap();
+        assert!(m.check_str("P1_IP_CANDIDATE_SITE", "N").is_err());
+    }
+
+    #[test]
+    fn duplicate_keys_are_rejected() {
+        assert!(parse_measurements("P3_RESUME_OK=1\nP3_RESUME_OK=0\n").is_err());
+        assert!(parse_measurements("P3_RESUME_OK=1\nP3_RESUME_OK=1\n").is_err());
+    }
+
+    #[test]
+    fn result_lines_parse_status_and_code_exactly() {
+        let out = "RESULT P4 STATUS=EXITED CODE=0\nRESULT P6 STATUS=SIGNALED SIG=4\n";
+        assert_eq!(
+            result_exit(out, "P4").unwrap(),
+            ("EXITED".to_string(), Some(0))
+        );
+        assert_eq!(result_exit(out, "P6").unwrap().0, "SIGNALED");
+        assert!(result_exit(out, "MISSING").is_err());
+    }
+}
 
 #[cfg(target_arch = "aarch64")]
 #[path = "../../reverie-rpc-transport/tests/fixtures/owned_lifecycle.rs"]
@@ -44,6 +201,8 @@ mod probe {
     use std::time::Duration;
 
     use super::owned_lifecycle;
+    use super::parse_measurements;
+    use super::result_exit;
 
     struct Fixture(PathBuf);
     impl Drop for Fixture {
@@ -86,54 +245,55 @@ mod probe {
         }
     }
 
-    fn assert_line(out: &str, prefix: &str) {
-        assert!(
-            out.lines().any(|line| line.starts_with(prefix)),
-            "missing or wrong measurement {prefix:?} in probe output:\n{out}"
-        );
-    }
-
     #[test]
     fn aarch64_trap_kernel_semantics() {
         let out = Fixture::build().run();
+        let m = parse_measurements(&out)
+            .unwrap_or_else(|error| panic!("{error} in probe output:\n{out}"));
+        let check = |result: Result<(), String>| {
+            result.unwrap_or_else(|error| panic!("{error} in probe output:\n{out}"));
+        };
         // Page size is environment input (4 KiB and 64 KiB hosts both run
         // this): the probe must observe exactly what the runtime queries.
-        assert_line(
-            &out,
-            &format!("P0_PAGESZ={}", reverie_inguest::arch::page_size()),
-        );
+        check(m.check_i64(
+            "P0_PAGESZ",
+            reverie_inguest::arch::page_size().unwrap() as i64,
+        ));
         // Filter-visible IP for svc is the following instruction, and the
         // siginfo call address equals the frame pc.
-        assert_line(&out, "P1_CALL_MINUS_SITE=+4");
-        assert_line(&out, "P1_PC_MINUS_SITE=+4");
-        assert_line(&out, "P1_CALL_MINUS_PC=+0");
-        assert_line(&out, "P1_SI_CODE=1");
-        assert_line(&out, "P1_SI_ARCH=0xc00000b7");
+        check(m.check_i64("P1_CALL_MINUS_SITE", 4));
+        check(m.check_i64("P1_PC_MINUS_SITE", 4));
+        check(m.check_i64("P1_CALL_MINUS_PC", 0));
+        check(m.check_i64("P1_SI_CODE", 1));
+        check(m.check_hex("P1_SI_ARCH", 0xc000_00b7));
         // Regression: verdicts from raw returns with a pre-install pid.
-        assert_line(&out, "P1_IP_CANDIDATE_SITE=NO");
-        assert_line(&out, "P1_IP_CANDIDATE_SITE_PLUS4=MATCH");
+        check(m.check_str("P1_IP_CANDIDATE_SITE", "NO"));
+        check(m.check_str("P1_IP_CANDIDATE_SITE_PLUS4", "MATCH"));
         // Arguments arrive intact; one result write resumes after the svc.
-        assert_line(&out, "P2_ARGS_INTACT_X0_TO_X5=1");
-        assert_line(&out, "P3_RESUME_OK=1");
+        check(m.check_i64("P2_ARGS_INTACT_X0_TO_X5", 1));
+        check(m.check_i64("P3_RESUME_OK", 1));
         // The private restorer returns at its svc + 4.
-        assert_line(&out, "P4_RETURNED=888");
-        assert_line(&out, "RESULT P4_RESTORER_SVC_PLUS4 STATUS=EXITED CODE=0");
+        check(m.check_i64("P4_RETURNED", 888));
+        assert_eq!(
+            result_exit(&out, "P4_RESTORER_SVC_PLUS4").unwrap(),
+            ("EXITED".to_string(), Some(0))
+        );
         // Sustained trapping, BTI landing pads, SVE records, inheritance.
-        assert_line(&out, "P5_ENTRIES=100");
-        assert_line(&out, "P5_BAD_RESULTS=0");
-        assert_line(&out, "P6_BTI_C_BLR=OK");
-        assert_line(&out, "P6_BTI_J_BR=OK");
-        assert_line(&out, "P6_BTI_JC_BLR=OK");
-        assert_line(&out, "P7_REC_0_MAGIC=0x46508001"); // FPSIMD_MAGIC
-        assert_line(&out, "P8_FORK_CHILD_EXIT=0");
-        assert_line(&out, "P8_TSYNC_THREAD_RET=555");
+        check(m.check_i64("P5_ENTRIES", 100));
+        check(m.check_i64("P5_BAD_RESULTS", 0));
+        check(m.check_str("P6_BTI_C_BLR", "OK"));
+        check(m.check_str("P6_BTI_J_BR", "OK"));
+        check(m.check_str("P6_BTI_JC_BLR", "OK"));
+        check(m.check_hex("P7_REC_0_MAGIC", 0x4650_8001)); // FPSIMD_MAGIC
+        check(m.check_i64("P8_FORK_CHILD_EXIT", 0));
+        check(m.check_i64("P8_TSYNC_THREAD_RET", 555));
         // Trap filters stack over a pre-installed allowlist filter.
-        assert_line(&out, "P11_SECCOMP_STACK_TRAP_OK=1");
+        check(m.check_i64("P11_SECCOMP_STACK_TRAP_OK", 1));
         // Syscall user dispatch: a measured trap or a named absence.
         assert!(
-            out.contains("P9_SUD_TRAP_OK=1") || out.contains("P9_SUD_ENABLE_FAIL_ERRNO="),
+            m.check_i64("P9_SUD_TRAP_OK", 1).is_ok() || m.contains("P9_SUD_ENABLE_FAIL_ERRNO"),
             "SUD neither trapped nor reported its absence:\n{out}"
         );
-        assert_line(&out, "PROBE_DONE=1");
+        check(m.check_i64("PROBE_DONE", 1));
     }
 }

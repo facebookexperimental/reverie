@@ -308,6 +308,21 @@ static void p4_restorer(unsigned long addr) {
     _exit(0);
 }
 
+/* Wait for exactly `child`, retrying on EINTR. Returns 0 with *status set
+ * by that wait, or -1 with errno preserved. Callers must never report a
+ * child outcome from a status no successful wait produced: a failed fork
+ * leaves a zero-initialized status that decodes as a clean exit 0. */
+static int wait_exact(pid_t child, int *status) {
+    for (;;) {
+        pid_t waited = waitpid(child, status, 0);
+        if (waited == child)
+            return 0;
+        if (waited < 0 && errno == EINTR)
+            continue;
+        return -1;
+    }
+}
+
 /* P5: sustained forwarding: 100 trapped getpids, handler spoofs real pid. */
 static void p5_sustained(void) {
     long pid = (long)getpid();
@@ -433,12 +448,20 @@ static void p8_fork_inherit(void) {
     install_filter_a();
     h_spoof = 1; h_spoof_result = 777;
     pid_t g = fork();
+    if (g < 0) {
+        kv_l("P8_FORK_FAIL_ERRNO", errno);
+        _exit(86);
+    }
     if (g == 0) {
         long r = probe_svc_call(SYS_getpid, 0, 0, 0, 0, 0, 0);
         _exit(r == 777 ? 0 : 3);
     }
+    /* g is the positive child pid in the parent. */
     int st = 0;
-    waitpid(g, &st, 0);
+    if (wait_exact(g, &st) != 0) {
+        kv_l("P8_FORK_WAIT_FAIL_ERRNO", errno);
+        _exit(86);
+    }
     kv_l("P8_FORK_CHILD_EXIT", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
     kv_l("P8_FORK_CHILD_SIGNAL", WIFSIGNALED(st) ? WTERMSIG(st) : 0);
     _exit(0);
@@ -538,6 +561,10 @@ static void p10_cost(void) {
     kv_l("P10_BASELINE_NS_PER_SVC", (long)(best * 1000000000UL / (freq * (unsigned long)N)));
     /* seccomp trap cost */
     pid_t c = fork();
+    if (c < 0) {
+        kv_l("P10_FORK_FAIL_ERRNO", errno);
+        _exit(86);
+    }
     if (c == 0) {
         install_handler(0);
         install_filter_a();
@@ -558,7 +585,11 @@ static void p10_cost(void) {
         fflush(stdout);
         _exit(0);
     }
-    int st = 0; waitpid(c, &st, 0);
+    int st = 0;
+    if (wait_exact(c, &st) != 0) {
+        kv_l("P10_FORK_WAIT_FAIL_ERRNO", errno);
+        _exit(86);
+    }
     kv_l("P10_SECCOMP_CHILD_EXIT", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
     /* SUD trap cost */
     install_handler(0);
@@ -700,16 +731,28 @@ int main(void) {
     kv_x("PROBE_SVC_SITE", (unsigned long)probe_svc_site);
     kv_x("PROBE_RESTORER", (unsigned long)probe_restorer);
     kv_x("PROBE_RESTORER_SVC", (unsigned long)probe_restorer_svc);
+    int failures = 0;
     for (size_t i = 0; i < sizeof(TESTS) / sizeof(TESTS[0]); i++) {
         printf("== TEST %s ==\n", TESTS[i].name);
         fflush(stdout);
         pid_t pid = fork();
+        if (pid < 0) {
+            printf("RESULT %s STATUS=FORK_FAIL ERRNO=%d\n", TESTS[i].name, errno);
+            fflush(stdout);
+            failures++;
+            continue;
+        }
         if (pid == 0) {
             TESTS[i].fn(); /* never returns */
             _exit(99);
         }
         int st = 0;
-        waitpid(pid, &st, 0);
+        if (wait_exact(pid, &st) != 0) {
+            printf("RESULT %s STATUS=WAIT_FAIL ERRNO=%d\n", TESTS[i].name, errno);
+            fflush(stdout);
+            failures++;
+            continue;
+        }
         if (WIFEXITED(st))
             printf("RESULT %s STATUS=EXITED CODE=%d\n", TESTS[i].name, WEXITSTATUS(st));
         else if (WIFSIGNALED(st))
@@ -719,6 +762,6 @@ int main(void) {
         fflush(stdout);
     }
     printf("PROBE_DONE=1\n");
-    return 0;
+    return failures == 0 ? 0 : 1;
 }
 
