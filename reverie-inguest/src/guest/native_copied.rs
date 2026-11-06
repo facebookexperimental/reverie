@@ -105,6 +105,7 @@ where
             cpuid_interception: self.cpuid_interception,
             states: super::thread_lease::ThreadStates::new(),
             active_dispatches: core::sync::atomic::AtomicUsize::new(0),
+            install_gate: crate::sync::SpinMutex::new(()),
             native_threads: Some(NativeThreads::new()),
             ordinary_root_state: SpinMutex::new(None),
             runtime,

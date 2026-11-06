@@ -319,11 +319,13 @@ pub struct ToolHost<T: Tool, R: HostRuntime> {
     /// [`thread_lease::ThreadStates`]). No lock into this registry is held
     /// across Tool code, RPC, or any blocking call.
     states: thread_lease::ThreadStates<T::ThreadState>,
-    /// Dispatches currently inside a Tool callback on any thread. The
-    /// install/initial-image flows that used to prove "no callback is
-    /// active" by failing to take the tool/state locks now read this
-    /// counter, because those locks are only ever held briefly.
+    /// Dispatches currently inside a Tool callback on any thread, and the
+    /// gate that makes incrementing it atomic against install flows'
+    /// quiescence checks: `begin_dispatch` takes the gate briefly to
+    /// increment, install flows hold it across their check-and-install
+    /// section, so "counter was zero" cannot race a dispatch starting.
     active_dispatches: core::sync::atomic::AtomicUsize,
+    install_gate: SpinMutex<()>,
     native_threads: Option<native_state::NativeThreads<T::ThreadState>>,
     // Prepared only by the ordinary installer, before publication. Keeping it
     // outside `states` preserves the real first-event lifecycle callbacks.
@@ -354,11 +356,29 @@ impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
         &self.rpc
     }
 
-    /// Marks one dispatch active until the returned guard drops.
+    /// Marks one dispatch active until the returned guard drops. The
+    /// increment happens under `install_gate` so an install flow holding
+    /// the gate and observing zero cannot race a dispatch starting.
     fn begin_dispatch(&self) -> ActiveDispatch<'_, T, R> {
+        let _gate = self.install_gate.lock();
         self.active_dispatches
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         ActiveDispatch { host: self }
+    }
+
+    /// Begin an install/initial-image section that requires quiescence:
+    /// succeeds only when no dispatch is active, and the returned guard
+    /// keeps new dispatches from starting (they spin briefly in
+    /// `begin_dispatch`) until the section ends. This replaces the old
+    /// proof by failed `try_lock` on locks dispatch used to hold across
+    /// callbacks; unlike a bare counter read it has no check-then-act
+    /// window.
+    fn begin_install(&self) -> Option<crate::sync::SpinGuard<'_, ()>> {
+        let gate = self.install_gate.lock();
+        if self.dispatch_active() {
+            return None;
+        }
+        Some(gate)
     }
 
     fn dispatch_active(&self) -> bool {
@@ -388,12 +408,12 @@ impl<T: Tool, R: HostRuntime> ToolHost<T, R> {
         }
         let _allocation_scope = super::alloc::enter_dispatch();
         let tid = raw_pid(libc::SYS_gettid).as_raw();
-        if self.dispatch_active() {
+        let Some(_install) = self.begin_install() else {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Tool state dispatch is active",
             ));
-        }
+        };
         self.states.try_publish(tid, state).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -582,6 +602,7 @@ where
             cpuid_interception,
             states: thread_lease::ThreadStates::new(),
             active_dispatches: core::sync::atomic::AtomicUsize::new(0),
+            install_gate: SpinMutex::new(()),
             native_threads: None,
             ordinary_root_state: SpinMutex::new(None),
             runtime,
@@ -657,6 +678,9 @@ where
                 "native exec driver already installed",
             ));
         }
+        // Field-level gate: holding the returned guard would borrow all
+        // of `self` and block the driver assignment below.
+        let _install = self.install_gate.lock();
         if self.dispatch_active() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -707,12 +731,12 @@ where
             {
                 return Err(io::Error::other("successor host root identity differs"));
             }
-            if self.dispatch_active() {
+            let Some(_install) = self.begin_install() else {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "successor state dispatch is active",
                 ));
-            }
+            };
             let mut pending = self.prepared_exec.try_lock().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::WouldBlock, "successor restoration is active")
             })?;
@@ -750,12 +774,12 @@ where
         if tid != self.root_pid {
             return Err(io::Error::other("successor host root identity differs"));
         }
-        if self.dispatch_active() {
+        let Some(_install) = self.begin_install() else {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "successor Tool callback is active",
             ));
-        }
+        };
         let tool_arc = self
             .tool_process()
             .ok_or_else(|| io::Error::other("successor Tool is absent"))?;
@@ -845,12 +869,12 @@ where
         if tid != self.root_pid {
             return Err(io::Error::other("InitialImage host root identity differs"));
         }
-        if self.dispatch_active() {
+        let Some(_install) = self.begin_install() else {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "InitialImage Tool callback is active",
             ));
-        }
+        };
         let tool_arc = self
             .tool_process()
             .ok_or_else(|| io::Error::other("InitialImage Tool is absent"))?;
@@ -4572,6 +4596,39 @@ mod process_owner_tests {
                 "a completed tail must never be forwarded again"
             );
         }
+    }
+
+    /// The install gate and the active-dispatch counter are atomic
+    /// against each other: an install section that observed zero cannot
+    /// race a dispatch starting, and a live dispatch refuses install.
+    #[test]
+    fn install_gate_and_dispatch_counter_are_atomic() {
+        let _test = TEST_LOCK.lock().unwrap();
+        let (host, _peer) = host(false, false);
+        // No dispatch: install may begin.
+        let install = host.begin_install().expect("quiescent host installs");
+        assert!(!host.dispatch_active());
+        // While install holds the gate, a dispatch cannot mark itself
+        // active: its begin spins on the gate, counter still zero.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let began = std::thread::scope(|scope| {
+            let blocker = scope.spawn(|| {
+                let _active = host.begin_dispatch();
+                tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            });
+            let early = rx.recv_timeout(std::time::Duration::from_millis(150));
+            assert!(early.is_err(), "dispatch began during install section");
+            assert!(!host.dispatch_active());
+            drop(install);
+            blocker.join().unwrap();
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok()
+        });
+        assert!(began, "dispatch proceeds after install section ends");
+        assert!(!host.dispatch_active());
+        // While a dispatch is active, install is refused.
+        let _active = host.begin_dispatch();
+        assert!(host.begin_install().is_none());
     }
 
     /// Two dispatches for distinct guest threads run their Tool callbacks

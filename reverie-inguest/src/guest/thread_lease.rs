@@ -81,16 +81,21 @@ impl<S> ThreadStates<S> {
     /// Returns `None` when the state is already leased (a re-entrant
     /// dispatch for the same thread, which the caller treats as the
     /// invariant break it is today).
+    ///
+    /// `init` runs Tool code (`init_thread_state`), so it runs *outside*
+    /// the registry lock: the slot is reserved as `Leased` first, the lock
+    /// is dropped, and only then is the state created. The brief-lock
+    /// claim for this registry therefore covers creation too.
     pub(super) fn checkout(&self, tid: i32, init: impl FnOnce() -> S) -> Option<Lease<'_, S>> {
         let mut slots = self.slots.lock();
         match slots.get_mut(&tid) {
             None => {
-                let state = init();
                 slots.insert(tid, Slot::Leased);
+                drop(slots);
                 Some(Lease {
                     states: self,
                     tid,
-                    state: Some(state),
+                    state: Some(init()),
                     is_new: true,
                 })
             }
