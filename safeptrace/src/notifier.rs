@@ -12620,6 +12620,25 @@ mod test {
         reap_stopped_process(cleanup);
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_writeback_set_syscall_flushes_before_invalidating() {
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        let mut regs = stopped.getregs().unwrap();
+        regs_scratch_set(&mut regs, 0x7777);
+        stopped.setregs(&regs).unwrap();
+        assert_eq!(regs_kernel_writes(&stopped), 0);
+        // `set_syscall` invalidates the cache (the kernel syscall
+        // number lives outside `NT_PRSTATUS`); it must flush the
+        // dirty `setregs` first or that write is silently dropped.
+        stopped.set_syscall(-1).unwrap();
+        assert_eq!(regs_kernel_writes(&stopped), 1);
+        assert_eq!(regs_scratch(&stopped.getregs().unwrap()), 0x7777);
+        assert_eq!(regs_kernel_reads(&stopped), 2);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn regs_writeback_flushes_at_syscall_resume() {
         let deadline = Instant::now() + Duration::from_secs(3);

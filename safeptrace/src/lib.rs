@@ -1797,6 +1797,9 @@ impl Stopped {
     #[cfg(target_arch = "aarch64")]
     pub fn set_syscall(&self, nr: i32) -> Result<(), Error> {
         const NT_ARM_SYSTEM_CALL: i32 = 0x404;
+        // Flush first: the invalidation below would otherwise drop a
+        // dirty `setregs` recorded at this stop without ever writing it.
+        self.flush_regs()?;
         self.setregset(NT_ARM_SYSTEM_CALL, &nr)?;
         // The kernel's syscall number lives outside `NT_PRSTATUS` here,
         // but the register view derived from `x8` and the number the
