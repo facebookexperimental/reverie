@@ -1609,7 +1609,7 @@ fn traced_identity_reads(tool: &str, calls: u64) -> (u64, u64) {
         let mut info = [0_u64; 12];
         let size = unsafe {
             libc::ptrace(
-                GET_SYSCALL_INFO,
+                GET_SYSCALL_INFO as _,
                 pid,
                 core::mem::size_of_val(&info),
                 info.as_mut_ptr(),

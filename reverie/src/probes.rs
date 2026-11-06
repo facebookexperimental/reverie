@@ -796,7 +796,7 @@ pub fn probe_ptrace_usable() -> Knowledge<bool> {
     };
     const PTRACE_SEIZE: libc::c_uint = 0x4206;
     // SAFETY: seizing our own child by pid; no data pointer used.
-    let seized = unsafe { libc::ptrace(PTRACE_SEIZE, child.pid, 0usize, 0usize) };
+    let seized = unsafe { libc::ptrace(PTRACE_SEIZE as _, child.pid, 0usize, 0usize) };
     let errno = std::io::Error::last_os_error().raw_os_error();
     // Bounded, custody-checked cleanup (the child pauses, so this takes
     // the deadline-kill path by design; a stopped tracee is live, and

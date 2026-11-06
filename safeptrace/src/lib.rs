@@ -569,15 +569,21 @@ impl Event {
 #[cfg(target_arch = "aarch64")]
 const NT_ARM_HW_BREAK: i32 = 0x402;
 
-/// `ptrace(request, pid, 0, sig)` for a resuming request, with the signal as a
-/// raw number so that one `nix` cannot name can be delivered.
+/// The libc `ptrace` request word is `c_uint` on glibc and `c_int` on musl.
+#[cfg(target_env = "musl")]
+type PtraceRequest = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type PtraceRequest = libc::c_uint;
+
 /// `PTRACE_SINGLEBLOCK` (arch/x86/include/uapi/asm/ptrace-abi.h), which the
 /// libc crate does not define. Linux accepts it on every x86-64 processor
 /// (`arch_has_block_step`).
 #[cfg(target_arch = "x86_64")]
-const PTRACE_SINGLEBLOCK: libc::c_uint = 33;
+const PTRACE_SINGLEBLOCK: PtraceRequest = 33;
 
-fn ptrace_resume_raw(request: libc::c_uint, pid: Pid, sig: i32) -> Result<(), Errno> {
+/// `ptrace(request, pid, 0, sig)` for a resuming request, with the signal as a
+/// raw number so that one `nix` cannot name can be delivered.
+fn ptrace_resume_raw(request: PtraceRequest, pid: Pid, sig: i32) -> Result<(), Errno> {
     Errno::result(unsafe {
         libc::ptrace(
             request,
@@ -1994,7 +2000,7 @@ impl Stopped {
             .on_held_tid(|| {
                 Errno::result(unsafe {
                     libc::ptrace(
-                        libc::PTRACE_GETSIGMASK,
+                        libc::PTRACE_GETSIGMASK as _,
                         self.0.as_raw(),
                         core::mem::size_of::<u64>(),
                         &mut mask as *mut u64,
@@ -2014,7 +2020,7 @@ impl Stopped {
             .on_held_tid(|| {
                 Errno::result(unsafe {
                     libc::ptrace(
-                        libc::PTRACE_SETSIGMASK,
+                        libc::PTRACE_SETSIGMASK as _,
                         self.0.as_raw(),
                         core::mem::size_of::<u64>(),
                         &mask as *const u64,
