@@ -259,7 +259,8 @@ where
     // Everything installation allocates lives in the runtime's private Tool
     // heap, never in the guest's own malloc heap; see LiteInst's installer.
     let _private_allocations = crate::guest::alloc::enter_dispatch();
-    if let Err(error) = host.preflight() {
+    let preflight = host.preflight();
+    if preflight.is_err() {
         // A preflight refusal (for example an invalid env selector,
         // which the LiteInst host validates in its preflight snapshot)
         // happens before the coordinator RPC connection below exists,
@@ -277,8 +278,8 @@ where
                 crate::guest::protect::replace_coordinator_fd,
             );
         }
-        return Err(error);
     }
+    preflight?;
     #[cfg(feature = "fixed-syscall-gates")]
     let mut fixed_install = FixedGateInstallation { complete: false };
     #[cfg(feature = "fixed-syscall-gates")]

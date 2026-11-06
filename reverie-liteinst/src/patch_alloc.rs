@@ -116,14 +116,17 @@ thread_local! {
     static INSTALLATION_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(any(test, feature = "liteinst", feature = "allocator-fixture"))]
 pub(crate) struct PatchAllocationScope;
 
+#[cfg(any(test, feature = "liteinst", feature = "allocator-fixture"))]
 impl Drop for PatchAllocationScope {
     fn drop(&mut self) {
         INSTALLATION_DEPTH.set(INSTALLATION_DEPTH.get() - 1);
     }
 }
 
+#[cfg(any(test, feature = "liteinst", feature = "allocator-fixture"))]
 pub(crate) fn enter() -> PatchAllocationScope {
     INSTALLATION_DEPTH.set(INSTALLATION_DEPTH.get() + 1);
     PatchAllocationScope

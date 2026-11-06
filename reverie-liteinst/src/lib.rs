@@ -24,7 +24,9 @@ pub mod fixed_arena_fixture;
 pub mod generic_fixture;
 #[cfg(feature = "exec-private-init")]
 mod initial_image_stats;
+#[cfg(feature = "liteinst")]
 mod interior_entry;
+#[cfg(feature = "liteinst")]
 mod liteinst_census;
 #[cfg(feature = "native-exec-state")]
 pub mod native_exec_state;
@@ -101,6 +103,7 @@ pub use runtime::site_patching_enabled;
 pub use runtime::site_patching_from_env_value;
 pub use runtime::tool_output_fd;
 pub use straddler::STRADDLER_STALENESS_TICKS_ENV;
+#[cfg(feature = "liteinst")]
 pub use straddler::straddler_staleness_from_env_value;
 #[cfg(feature = "exec-private-init")]
 pub use tool_host::InstalledInitialImage;
@@ -537,6 +540,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "liteinst")]
     #[test]
     fn site_patching_setter_round_trips_through_the_parser() {
         for enabled in [true, false] {
@@ -556,6 +560,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "liteinst")]
     #[test]
     fn site_patching_parser_defaults_on_and_rejects_other_values() {
         assert!(site_patching_from_env_value(None).unwrap());
@@ -567,6 +572,27 @@ mod tests {
                 std::io::ErrorKind::InvalidInput,
                 "{rejected:?}"
             );
+        }
+    }
+    #[cfg(not(feature = "liteinst"))]
+    #[test]
+    fn trap_only_build_defaults_off_and_refuses_explicit_patching() {
+        assert!(!site_patching_from_env_value(None).unwrap());
+        assert!(!site_patching_from_env_value(Some(OsStr::new("0"))).unwrap());
+        let mut command = Command::new("/bin/true");
+        set_guest_site_patching(&mut command, true);
+        let requested = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(SITE_PATCHING_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        let error = site_patching_from_env_value(Some(requested)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("built without LiteInst"));
+        for rejected in ["", " 0", "0 ", "off", "false", "2", "yes"] {
+            let error = site_patching_from_env_value(Some(OsStr::new(rejected)))
+                .expect_err("invalid selectors must still be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
     }
 }
