@@ -189,13 +189,9 @@ impl CapturedInitialInputs {
     }
     // No public generation capability is exposed. The producer must bind this
     // before adding/replacing mappings; capture data alone cannot preserve them.
-    pub(crate) fn matches_stop(&self, stop: &InitialExecStop<'_>) -> bool {
-        self.matches_parts(&stop.task, &stop.context, &stop.owner)
-    }
-
-    /// Same identity check over stopped-image parts, for the exec
-    /// supervisor's successor stops. Crate-private exactly like
-    /// [`Self::matches_stop`]: no public generation capability.
+    /// Identity check over stopped-image parts, shared by the first
+    /// image and the exec supervisor's successor stops. Crate-private:
+    /// no public generation capability.
     pub(crate) fn matches_parts(
         &self,
         task: &safeptrace::Stopped,
@@ -373,11 +369,7 @@ fn read_request(
         }
     }
 }
-pub(super) fn unchanged(stop: &InitialExecStop<'_>) -> Result<()> {
-    unchanged_parts(&stop.task, &stop.context, &stop.owner)
-}
-
-/// The same unchanged-context proof over stopped-image parts, for the
+/// The unchanged-context proof over stopped-image parts, shared by the
 /// exec supervisor's successor stops. The three generation identities
 /// must already be the one generation; mismatch refuses before any
 /// register/stack comparison is trusted.
@@ -555,7 +547,7 @@ mod tests {
         let receipt = super::super::CleanupReceipt::default();
         let stop = super::super::ExecStop::spawn(request, receipt.clone()).unwrap();
         let inputs = stop.capture_initial_inputs().unwrap();
-        assert!(inputs.matches_stop(&stop));
+        assert!(inputs.matches_parts(&stop.task, &stop.context, &stop.owner));
         assert_eq!(inputs.pid(), stop.pid());
         assert_eq!(inputs.registers(), &register_words(stop.entry().regs()));
         assert_eq!(inputs.stack_bytes(), stop.entry().stack_bytes());
@@ -658,7 +650,7 @@ mod tests {
                 read_exact_span(&stop.task, end - 1, 2).is_err(),
                 "partial/inaccessible span must refuse"
             );
-            unchanged(&stop)?;
+            unchanged_parts(&stop.task, &stop.context, &stop.owner)?;
             Ok(())
         })();
         let cancelled = stop.cancel().unwrap();
@@ -707,7 +699,7 @@ mod tests {
                     chunk.bytes
                 );
             }
-            unchanged(&stop)?;
+            unchanged_parts(&stop.task, &stop.context, &stop.owner)?;
             Ok(())
         })();
         let cancelled = stop.cancel().unwrap();

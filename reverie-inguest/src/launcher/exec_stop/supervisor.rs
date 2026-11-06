@@ -869,6 +869,44 @@ impl<'fd> SuccessorStop<'fd> {
     pub fn cancel(self) -> std::result::Result<CleanupState, Box<ChildOwner<'fd>>> {
         self.owner.cancel()
     }
+
+    /// Read the successor's original input bytes from this actual
+    /// stopped generation, exactly as
+    /// [`super::InitialExecStop::capture_initial_inputs`] does for a
+    /// first image. No resume capability escapes.
+    pub fn capture_initial_inputs(&self) -> Result<super::initial_inputs::CapturedInitialInputs> {
+        super::initial_inputs::capture_initial_inputs_parts(&self.task, &self.context, &self.owner)
+    }
+
+    /// Assemble copied original inputs for this successor stop,
+    /// exactly as [`super::InitialExecStop::prepare_copied_inputs`]
+    /// does for a first image. Returns no handoff or entry
+    /// capability.
+    #[cfg(feature = "loader-private-runtime")]
+    pub fn prepare_copied_inputs(
+        &self,
+        captured: &super::initial_inputs::CapturedInitialInputs,
+        image: &reverie_loader::image::ValidatedImage<'_>,
+        request: &super::CopiedInputRequest,
+    ) -> Result<super::CopiedInitialData> {
+        super::input_data::prepare_copied_inputs_parts(
+            &self.task,
+            &self.context,
+            &self.owner,
+            captured,
+            image,
+            request,
+        )
+    }
+
+    /// Crate-private decomposition into stopped-image parts. The
+    /// public hook surface always keeps the stop whole; only the
+    /// physical-preparation entry in this crate may split it, and
+    /// the parts are rechecked against each other there.
+    #[cfg(feature = "loader-private-runtime")]
+    pub(crate) fn into_parts(self) -> (Stopped, EntryContext, ExecBoundary, ChildOwner<'fd>) {
+        (self.task, self.context, self.boundary, self.owner)
+    }
 }
 
 #[cfg(test)]
@@ -1119,5 +1157,686 @@ mod tests {
         );
         assert!(failure.cleanup().confirmed);
         assert!(!Path::new(&format!("/proc/{}", pid.as_raw())).exists());
+    }
+
+    /// Preparation-re-run witness (W9 mechanical half): full physical
+    /// preparation — reserve, map, filter-last, transcript-checked —
+    /// run on a first image and again on a self-exec successor,
+    /// cancel-terminated. This is NOT successor arming: no image
+    /// entry runs, no relay is installed, no Ready or admission is
+    /// claimed, and the guest is never released after preparation.
+    #[cfg(all(feature = "loader-private-runtime", feature = "stage1a-probe"))]
+    #[allow(unsafe_code)]
+    mod preparation_rerun {
+        use std::fs::File;
+        use std::os::fd::AsFd;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+
+        use nix::fcntl::FcntlArg;
+        use nix::fcntl::SealFlag;
+        use nix::fcntl::fcntl;
+        use nix::sys::memfd::MFdFlags;
+        use nix::sys::memfd::memfd_create;
+        use reverie_loader::artifact::RUNTIME_WINDOW;
+        use reverie_loader::artifact::TOOL_REGION;
+        use reverie_loader::handoff;
+        use reverie_loader::handoff::Extent;
+        use reverie_loader::handoff::View;
+        use reverie_loader::image::Image;
+        use reverie_loader::image::Policy;
+        use reverie_loader::image::ValidatedImage;
+
+        use super::*;
+        use crate::launcher::exec_stop::CopiedInputRequest;
+        use crate::launcher::exec_stop::physical::Preparation;
+        use crate::launcher::exec_stop::register_words;
+
+        const PAGE: u64 = 4096;
+        const INERT_PACKET: &[u8] = b"PREPARATION_ONLY_NOT_HLIINIT1";
+
+        fn synthetic_runtime() -> Vec<u8> {
+            let base = RUNTIME_WINDOW.start;
+            let mut gate = vec![0x90_u8; 4096];
+            for offset in [0x80_usize, 0x90, 0xa0, 0xb0, 0x200] {
+                gate[offset..offset + 2].copy_from_slice(&[0x0f, 0x05]);
+            }
+            let mut bytes = vec![0; 16384];
+            bytes[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1]);
+            bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+            bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+            bytes[24..32].copy_from_slice(&(base + 4096).to_le_bytes());
+            bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+            bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+            bytes[56..58].copy_from_slice(&7_u16.to_le_bytes());
+            for (i, (kind, flags, offset, address, file, memory, align)) in [
+                (1_u32, 4_u32, 0_u64, base, 4096_u64, 4096_u64, 4096_u64),
+                (1, 5, 4096, base + 4096, 4096, 4096, 4096),
+                (1, 6, 8192, base + 8192, 512, 4096, 4096),
+                (7, 4, 8192, base + 8192, 16, 80, 8),
+                (0x6474_e551, 6, 0, 0, 0, 8 * 1024 * 1024, 0),
+                (6, 4, 64, base + 64, 392, 392, 8),
+                (1, 4, 12288, base + 12288, 4096, 4096, 4096),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let at = 64 + i * 56;
+                bytes[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+                bytes[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+                for (relative, value) in [
+                    (8, offset),
+                    (16, address),
+                    (32, file),
+                    (40, memory),
+                    (48, align),
+                ] {
+                    bytes[at + relative..at + relative + 8].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            for (i, word) in [
+                u64::from_le_bytes(*b"HLMLAY01"),
+                1,
+                96,
+                handoff::VERSION,
+                handoff::HEADER_BYTES as u64,
+                handoff::MAX_BYTES as u64,
+                64,
+                16,
+                128,
+                8,
+                base + 4096,
+                base + 4096 + 0x7c,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                bytes[512 + i * 8..520 + i * 8].copy_from_slice(&word.to_le_bytes());
+            }
+            bytes[1024..1034].copy_from_slice(b"/dev/null\0");
+            bytes[4096..8192].copy_from_slice(&gate);
+            bytes[12288..16384].copy_from_slice(&gate);
+            bytes
+        }
+
+        fn descriptor_words(runtime: &[u8]) -> [u64; 12] {
+            let mut words = [0_u64; 12];
+            for (i, word) in words.iter_mut().enumerate() {
+                *word = u64::from_le_bytes(runtime[512 + i * 8..520 + i * 8].try_into().unwrap());
+            }
+            words
+        }
+
+        fn memfd(bytes: &[u8], seal: bool) -> std::io::Result<File> {
+            let mut file = File::from(
+                memfd_create(
+                    c"preparation-rerun-witness",
+                    MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+                )
+                .map_err(std::io::Error::from)?,
+            );
+            std::io::Write::write_all(&mut file, bytes)?;
+            if seal {
+                seal_file(&file)?;
+            }
+            Ok(file)
+        }
+
+        fn seal_file(file: &File) -> std::io::Result<()> {
+            fcntl(
+                file,
+                FcntlArg::F_ADD_SEALS(
+                    SealFlag::F_SEAL_WRITE
+                        | SealFlag::F_SEAL_GROW
+                        | SealFlag::F_SEAL_SHRINK
+                        | SealFlag::F_SEAL_SEAL,
+                ),
+            )
+            .map_err(std::io::Error::from)?;
+            Ok(())
+        }
+
+        fn validated(runtime: &[u8]) -> ValidatedImage<'_> {
+            let parsed = Image::parse(runtime).expect("synthetic runtime parses");
+            let image = parsed
+                .validate(&Policy {
+                    window: RUNTIME_WINDOW,
+                    allow_tls: true,
+                })
+                .expect("synthetic runtime validates");
+            image
+                .private_runtime_metadata()
+                .expect("synthetic runtime metadata");
+            image
+        }
+
+        fn exact_rx<'a>(
+            image: &ValidatedImage<'a>,
+            address: u64,
+            length: usize,
+        ) -> Result<&'a [u8]> {
+            let end = address
+                .checked_add(length as u64)
+                .ok_or("RX span overflow")?;
+            for load in image.segments() {
+                let initialized = image
+                    .mapped_file_bytes(load)
+                    .map_err(|e| format!("RX load: {e:?}"))?;
+                if load.permissions.read
+                    && load.permissions.execute
+                    && !load.permissions.write
+                    && load.memory.start <= address
+                    && end
+                        <= load
+                            .memory
+                            .start
+                            .checked_add(load.file.end - load.file.start)
+                            .ok_or("RX end overflow")?
+                {
+                    let at = usize::try_from(address - load.memory.start)?;
+                    return initialized
+                        .get(at..at + length)
+                        .ok_or_else(|| "RX file bounds".into());
+                }
+            }
+            Err("outside initialized RX bytes".into())
+        }
+
+        fn aligned(value: u64, alignment: u64) -> u64 {
+            assert!(alignment.is_power_of_two());
+            (value + alignment - 1) & !(alignment - 1)
+        }
+
+        fn payload_words(
+            data: &crate::launcher::exec_stop::CopiedInitialData,
+            address: u64,
+            count: u64,
+        ) -> Result<Vec<u64>> {
+            let start = usize::try_from(address - data.address())?;
+            let length = usize::try_from(count * 8)?;
+            Ok(data.bytes()[start..start + length]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|row| u64::from_le_bytes(*row))
+                .collect())
+        }
+
+        fn payload_bytes(
+            data: &crate::launcher::exec_stop::CopiedInitialData,
+            address: u64,
+            length: u64,
+        ) -> Result<&[u8]> {
+            let start = usize::try_from(address - data.address())?;
+            let end = start + usize::try_from(length)?;
+            data.bytes()
+                .get(start..end)
+                .ok_or_else(|| "copied bytes bounds".into())
+        }
+
+        struct Geometry {
+            roles: [Extent; 5],
+            free_band: Extent,
+            control: u64,
+            relay: u64,
+            filter_scratch: u64,
+            copied_address: u64,
+            copied_capacity: usize,
+        }
+
+        fn geometry(descriptor: &[u64; 12]) -> Geometry {
+            let free_band = crate::guest::tool_region::scalar_free_band();
+            let base = free_band.start;
+            let roles = core::array::from_fn(|i| Extent {
+                start: base + i as u64 * 0x10000,
+                end: base + i as u64 * 0x10000 + 0x8000,
+            });
+            let control = roles[4].start + PAGE;
+            let relay = aligned(control + descriptor[6], descriptor[9]);
+            let address = roles[3].start + PAGE;
+            let copied_address = address + 2 * PAGE;
+            let copied_capacity = usize::try_from(roles[3].end - PAGE - copied_address).unwrap();
+            Geometry {
+                roles,
+                free_band,
+                control,
+                relay,
+                filter_scratch: roles[4].start + 8192,
+                copied_address,
+                copied_capacity,
+            }
+        }
+
+        struct WireContext {
+            pid: u64,
+            regs: [u64; 27],
+            mask: u64,
+            input_fd: u64,
+            pkru: u32,
+        }
+
+        // Happy-path numeric wire only, adapted from the probe's
+        // preparation-only wire. It is deliberately not an admission
+        // or execution-eligible handoff producer.
+        fn build_wire(
+            image: &ValidatedImage<'_>,
+            descriptor: &[u64; 12],
+            geometry: &Geometry,
+            data: &crate::launcher::exec_stop::CopiedInitialData,
+            context: &WireContext,
+        ) -> Result<Vec<u8>> {
+            let roles = &geometry.roles;
+            let gate = descriptor[10];
+            let address = roles[3].start + PAGE;
+            let length = usize::try_from(roles[3].end - address - PAGE)?;
+            assert!(length <= handoff::MAX_BYTES && length >= 3 * PAGE as usize);
+            let mut bytes = vec![0; length];
+            let at = usize::try_from(data.address() - address)?;
+            bytes[at..at + data.bytes().len()].copy_from_slice(data.bytes());
+            let metadata = data.image_metadata();
+            let handler = gate + 0x100;
+            assert_eq!(exact_rx(image, handler, 16)?.len(), 16);
+            let dev_null = RUNTIME_WINDOW.start + 1024;
+            let mut code = Vec::new();
+            for load in image.segments() {
+                if load.permissions.read && load.permissions.execute && !load.permissions.write {
+                    code.push(handoff::Code {
+                        start: load.memory.start,
+                        end: load.memory.start + (load.file.end - load.file.start),
+                    });
+                }
+            }
+            let mut sites = Vec::new();
+            for (offset, number, operation) in [
+                (0x80_u64, 158_u64, 1_u64),
+                (0x90, 218, 2),
+                (0xa0, 7, 3),
+                (0xb0, 2, 4),
+            ] {
+                let ip = gate + offset;
+                assert_eq!(exact_rx(image, ip, 2)?, [0x0f, 0x05]);
+                sites.push(handoff::SiteRecord {
+                    syscall_ip: ip,
+                    return_ip: ip + 2,
+                    number,
+                    operation,
+                });
+            }
+            sites.sort_unstable_by_key(|site| site.return_ip);
+            let tool_init = [gate + 0x202];
+            assert_eq!(exact_rx(image, gate + 0x200, 2)?, [0x0f, 0x05]);
+            let maps = data.planned_maps().to_vec();
+            let locations = data.locations();
+            let env = payload_words(data, locations.envp, locations.envp_words)?;
+            let aux = payload_words(data, locations.raw_aux, locations.raw_aux_words)?;
+            let name = payload_bytes(data, locations.program_name, locations.program_name_bytes)?;
+            let tls = &metadata.tls;
+            let backing = data.tls_geometry().backing();
+            let mut header = handoff::Header {
+                prefix: [
+                    handoff::MAGIC,
+                    handoff::VERSION,
+                    length as u64,
+                    handoff::HEADER_BYTES as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                binding: [[0; 4]; 5],
+                roles: *roles,
+                registers: context.regs,
+                scalars: [
+                    context.pid,
+                    geometry.control,
+                    data.control_bytes(),
+                    geometry.relay,
+                    data.relay_bytes(),
+                    context.input_fd,
+                    u64::from(context.pkru),
+                    context.mask,
+                    data.tls_geometry().pthread().start as u64,
+                    handler,
+                    RUNTIME_WINDOW.start + 12288,
+                    PAGE,
+                    metadata.gnu_stack_bytes,
+                    dev_null,
+                    0,
+                    0,
+                ],
+                tables: std::array::from_fn(|_| handoff::Table {
+                    offset: 0,
+                    count: 0,
+                    stride: 0,
+                }),
+                tls: [
+                    metadata.program_headers.start,
+                    56,
+                    u64::from(metadata.program_header_count),
+                    tls.address,
+                    tls.file_bytes,
+                    tls.memory_bytes,
+                    tls.alignment,
+                    backing.start as u64,
+                    backing.bytes as u64,
+                    tls.load.memory.start,
+                    tls.load.memory.end - tls.load.memory.start,
+                    tls.load.file.end - tls.load.file.start,
+                ],
+            };
+            let mut cursor = handoff::HEADER_BYTES as u64;
+            for (index, count, stride) in [
+                (0, maps.len(), 32_u64),
+                (1, code.len(), 16),
+                (2, sites.len(), 32),
+                (3, INERT_PACKET.len(), 1),
+                (7, 10, 1),
+                (8, tool_init.len(), 8),
+            ] {
+                cursor = aligned(cursor, 8);
+                header.tables[index] = handoff::Table {
+                    offset: cursor,
+                    count: count as u64,
+                    stride,
+                };
+                cursor += count as u64 * stride;
+            }
+            assert!(cursor <= at as u64, "metadata overlaps copied payload");
+            for (index, location, count, stride) in [
+                (4, locations.envp, locations.envp_words, 8_u64),
+                (5, locations.raw_aux, locations.raw_aux_words, 8),
+                (6, locations.program_name, locations.program_name_bytes, 1),
+            ] {
+                header.tables[index] = handoff::Table {
+                    offset: location - address,
+                    count,
+                    stride,
+                };
+            }
+            let tables = handoff::TableData {
+                maps: &maps,
+                code: &code,
+                sites: &sites,
+                packet: INERT_PACKET,
+                env: &env,
+                aux: &aux,
+                program_name: name,
+                dev_null: b"/dev/null\0",
+                tool_init: &tool_init,
+            };
+            handoff::serialize(&header, &tables, address, &mut bytes)
+                .map_err(|e| format!("wire serialize: {e:?}"))?;
+            reverie_loader::mapped_inputs::ProductionMappedInputs::validate_at(
+                &bytes,
+                address,
+                reverie_loader::mapped_inputs::ConsumerLayout {
+                    free_band: geometry.free_band,
+                    region: Extent {
+                        start: TOOL_REGION.start,
+                        end: TOOL_REGION.end,
+                    },
+                    control_bytes: descriptor[6],
+                    relay_bytes: descriptor[8],
+                    control_align: descriptor[7],
+                    relay_align: descriptor[9],
+                },
+            )
+            .map_err(|e| format!("wire validate_at: {e:?}"))?;
+            View::parse(&bytes, address).map_err(|e| format!("wire parse: {e:?}"))?;
+            Ok(bytes)
+        }
+
+        fn watched_guest<'fd>(
+            runtime_file: &'fd File,
+            handoff_file: &'fd File,
+            input_file: &'fd File,
+        ) -> WatchedSupervisor<'fd> {
+            let args: Vec<OsString> = ["sh", "-c", "exec /bin/sh -c true"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            let request = PreparedExec::new(
+                Path::new("/bin/sh"),
+                &args,
+                &[],
+                None,
+                vec![
+                    runtime_file.as_fd(),
+                    handoff_file.as_fd(),
+                    input_file.as_fd(),
+                ],
+            )
+            .unwrap();
+            Supervisor::spawn_watched(request, CleanupReceipt::default()).unwrap()
+        }
+
+        fn next_exec(watched: WatchedSupervisor<'_>) -> SuccessorStop<'_> {
+            match watched.wait_next().unwrap() {
+                WatchedStep::Exec(stop) => *stop,
+                WatchedStep::Finished(outcome) => {
+                    panic!("expected an exec stop, got terminal {outcome:?}")
+                }
+            }
+        }
+
+        fn status_u64(status: &str, key: &str) -> u64 {
+            status
+                .lines()
+                .find(|line| line.starts_with(key))
+                .and_then(|line| line[key.len()..].trim().parse().ok())
+                .unwrap_or_else(|| panic!("status key {key} missing"))
+        }
+
+        // Full physical preparation on this stop, then cancel. The
+        // guest is never released after preparation.
+        fn prepare_and_cancel<'fd>(
+            stop: SuccessorStop<'fd>,
+            runtime: &[u8],
+            descriptor: &[u64; 12],
+            geometry: &Geometry,
+            runtime_file: &'fd File,
+            handoff_file: &'fd File,
+            input_file: &'fd File,
+        ) {
+            let original_regs = register_words(stop.entry().regs());
+            let original_mask = stop.entry().signal_mask();
+            let original_entry = trace::read(&stop.task, stop.entry().regs().rip, 16).unwrap();
+            let image = validated(runtime);
+            let captured = stop.capture_initial_inputs().unwrap();
+            let copied = stop
+                .prepare_copied_inputs(
+                    &captured,
+                    &image,
+                    &CopiedInputRequest {
+                        roles: geometry.roles,
+                        free_band: geometry.free_band,
+                        layout_address: RUNTIME_WINDOW.start + 512,
+                        copied_address: geometry.copied_address,
+                        copied_capacity: geometry.copied_capacity,
+                        control_address: geometry.control,
+                        relay_address: geometry.relay,
+                        filter_scratch: geometry.filter_scratch,
+                    },
+                )
+                .unwrap();
+            // SAFETY: EntryContext owns the complete unchanged real
+            // ptrace XSAVE capture for this held generation (same
+            // obligation the probe documents for this read).
+            let pkru = unsafe { stop.entry().xstate().pkru() }.expect("stopped PKRU");
+            let wire = build_wire(
+                &image,
+                descriptor,
+                geometry,
+                &copied,
+                &WireContext {
+                    pid: stop.pid().as_raw() as u64,
+                    regs: original_regs,
+                    mask: original_mask,
+                    input_fd: input_file.as_raw_fd() as u64,
+                    pkru,
+                },
+            )
+            .unwrap();
+            let role_bytes = geometry.roles[3].end - geometry.roles[3].start - 2 * PAGE;
+            assert_eq!(role_bytes, (wire.len() as u64).div_ceil(PAGE) * PAGE);
+            handoff_file.write_all_at(&wire, 0).unwrap();
+            handoff_file.set_len(role_bytes).unwrap();
+            seal_file(handoff_file).unwrap();
+            let preparation = Preparation {
+                runtime_fd: runtime_file.as_fd(),
+                runtime_bytes: runtime,
+                layout_address: RUNTIME_WINDOW.start + 512,
+                handoff_fd: handoff_file.as_fd(),
+                handoff_bytes: &wire,
+                handoff_address: geometry.roles[3].start + PAGE,
+                input_fd: input_file.as_fd(),
+                free_band: geometry.free_band,
+                filter_scratch: geometry.filter_scratch,
+            };
+            // SAFETY: original ptracer thread, inherited immutable
+            // descriptors retained by the launch request, genuine
+            // captured context of this stop, outer test bounds. No
+            // image/guest entry is called; preparation only.
+            let prepared = match unsafe { stop.prepare_mapping(preparation) } {
+                Ok(prepared) => prepared,
+                Err(failure) => panic!(
+                    "preparation refused: {} cleanup={:?}",
+                    failure.error,
+                    failure.cleanup()
+                ),
+            };
+            let observed = prepared.diagnostic_observation().unwrap();
+            assert_eq!(observed.registers, original_regs);
+            assert_eq!(observed.signal_mask, original_mask);
+            assert!(observed.xstate_exact);
+            assert!(observed.stack_exact);
+            assert_eq!(observed.entry_bytes, original_entry);
+            assert!(observed.runtime_contents_exact);
+            assert!(observed.handoff_exact);
+            assert_eq!(status_u64(&observed.status, "Seccomp:"), 2);
+            assert_eq!(status_u64(&observed.status, "NoNewPrivs:"), 1);
+            let cancelled = match prepared.cancel() {
+                Ok(cancelled) => cancelled,
+                Err(retained) => panic!("preparation cancel unconfirmed: {:?}", retained.cleanup()),
+            };
+            assert!(cancelled.cleanup.confirmed);
+            assert_eq!(cancelled.filter_bytes.len(), 23 * 8);
+            let last = cancelled.injected_calls.last().expect("injected calls");
+            assert_eq!(last.0, libc::SYS_seccomp as u64);
+            assert_eq!(last.2, 0);
+            assert!(
+                cancelled
+                    .injected_calls
+                    .iter()
+                    .any(|call| call.0 == libc::SYS_mmap as u64),
+                "preparation transcript must contain real mappings"
+            );
+        }
+
+        #[test]
+        fn preparation_rerun_first_image() {
+            let runtime = synthetic_runtime();
+            let descriptor = descriptor_words(&runtime);
+            let geometry = geometry(&descriptor);
+            let runtime_file = memfd(&runtime, true).unwrap();
+            let handoff_file = memfd(&[], false).unwrap();
+            let input_file = memfd(INERT_PACKET, true).unwrap();
+            let watched = watched_guest(&runtime_file, &handoff_file, &input_file);
+            let stop = next_exec(watched);
+            prepare_and_cancel(
+                stop,
+                &runtime,
+                &descriptor,
+                &geometry,
+                &runtime_file,
+                &handoff_file,
+                &input_file,
+            );
+        }
+
+        #[test]
+        fn preparation_rerun_self_exec_successor() {
+            let runtime = synthetic_runtime();
+            let descriptor = descriptor_words(&runtime);
+            let geometry = geometry(&descriptor);
+            let runtime_file = memfd(&runtime, true).unwrap();
+            let handoff_file = memfd(&[], false).unwrap();
+            let input_file = memfd(INERT_PACKET, true).unwrap();
+            let mut watched = watched_guest(&runtime_file, &handoff_file, &input_file);
+            // Release the first image UNPREPARED so it can self-exec;
+            // a prepared image has no release transition in this
+            // slice (cancel-only), which is the named residual gap
+            // for a one-lineage prepared->exec->prepared chain.
+            let first = next_exec(watched);
+            let pid = first.pid();
+            watched = first
+                .rearm_and_resume(|task, _entry, _boundary| Ok(task))
+                .unwrap();
+            let successor = next_exec(watched);
+            assert_eq!(successor.pid(), pid);
+            assert_eq!(successor.former_tid(), pid);
+            prepare_and_cancel(
+                successor,
+                &runtime,
+                &descriptor,
+                &geometry,
+                &runtime_file,
+                &handoff_file,
+                &input_file,
+            );
+        }
+
+        #[test]
+        fn preparation_parts_refuse_foreign_context() {
+            use crate::launcher::exec_stop::physical::prepare_mapping_parts;
+
+            let runtime = synthetic_runtime();
+            let descriptor = descriptor_words(&runtime);
+            let geometry = geometry(&descriptor);
+            let runtime_file = memfd(&runtime, true).unwrap();
+            let handoff_file = memfd(&[], false).unwrap();
+            let input_file = memfd(INERT_PACKET, true).unwrap();
+            let watched_a = watched_guest(&runtime_file, &handoff_file, &input_file);
+            let stop_a = next_exec(watched_a);
+            let runtime_file_b = memfd(&runtime, true).unwrap();
+            let handoff_file_b = memfd(&[], false).unwrap();
+            let input_file_b = memfd(INERT_PACKET, true).unwrap();
+            let watched_b = watched_guest(&runtime_file_b, &handoff_file_b, &input_file_b);
+            let stop_b = next_exec(watched_b);
+            let (task_a, _context_a, boundary_a, owner_a) = stop_a.into_parts();
+            let (task_b, context_b, _boundary_b, owner_b) = stop_b.into_parts();
+            let preparation = Preparation {
+                runtime_fd: runtime_file.as_fd(),
+                runtime_bytes: &runtime,
+                layout_address: RUNTIME_WINDOW.start + 512,
+                handoff_fd: handoff_file.as_fd(),
+                handoff_bytes: &[],
+                handoff_address: geometry.roles[3].start + PAGE,
+                input_fd: input_file.as_fd(),
+                free_band: geometry.free_band,
+                filter_scratch: geometry.filter_scratch,
+            };
+            // SAFETY: same obligations as the happy witness; the
+            // deliberately foreign pairing must refuse before any
+            // child mutation, which is the fence under test.
+            let failure = match unsafe {
+                prepare_mapping_parts(task_a, context_b, boundary_a, owner_a, preparation)
+            } {
+                Ok(_) => panic!("foreign parts unexpectedly prepared"),
+                Err(failure) => failure,
+            };
+            assert!(
+                failure
+                    .error
+                    .to_string()
+                    .contains("mapped_preparation_foreign_parts"),
+                "unexpected refusal: {}",
+                failure.error
+            );
+            assert!(failure.cleanup().confirmed);
+            drop(task_b);
+            let cancelled = owner_b.cancel().unwrap();
+            assert!(cancelled.confirmed);
+        }
     }
 }

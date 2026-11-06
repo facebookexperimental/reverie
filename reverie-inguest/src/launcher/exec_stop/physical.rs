@@ -23,6 +23,7 @@ use super::EntryContext;
 use super::ExecBoundary;
 use super::InitialExecStop;
 use super::Result;
+use super::SuccessorStop;
 use super::inject::InjectedCall;
 use super::inject::Injector;
 use super::mapping_plan;
@@ -642,6 +643,37 @@ pub(crate) unsafe fn prepare_mapping_parts<'fd>(
             state.owner.retire();
             Err(Box::new(PreparationFailure { error, state }))
         }
+    }
+}
+
+impl<'fd> SuccessorStop<'fd> {
+    /// Map the genuine private image into this successor, install the
+    /// final filter, restore the successor's original context and
+    /// STOP, exactly as [`InitialExecStop::prepare_mapping`] does for
+    /// a first image. This is preparation re-run only: it does not
+    /// run the image entry, install its relay, claim initialization
+    /// or admit the successor anywhere.
+    ///
+    /// # Safety
+    /// Every obligation documented on
+    /// [`InitialExecStop::prepare_mapping`] applies, read against
+    /// the exec whose drained stop produced this successor stop. In
+    /// particular the descriptor leases are the original launch's
+    /// inherited descriptors retained in the supervisor's
+    /// `PreparedExec`; they must still name the same open file
+    /// descriptions under the same numbers in the successor image
+    /// (the caller excludes guest closure/replacement across the
+    /// exec), and the handoff must encode this successor's own
+    /// captured context, never the first image's.
+    pub unsafe fn prepare_mapping(
+        self,
+        inputs: Preparation<'fd>,
+    ) -> std::result::Result<PreparedMapping<'fd>, Box<PreparationFailure<'fd>>> {
+        let (task, context, boundary, owner) = self.into_parts();
+        // SAFETY: the parts are this stop's own, paired by
+        // construction at its drained exec stop; every caller
+        // obligation above carries over to the parts form unchanged.
+        unsafe { prepare_mapping_parts(task, context, boundary, owner, inputs) }
     }
 }
 

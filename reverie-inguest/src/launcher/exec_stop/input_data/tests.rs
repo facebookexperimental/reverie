@@ -357,7 +357,7 @@ fn genuine_captured_stop_uses_the_host_bridge_and_remains_unchanged_until_cancel
         at(&data, word(at(&data, data.locations().envp, 8)), 11),
         b"ORIGINAL=1\0"
     );
-    initial_inputs::unchanged(&stop).unwrap();
+    initial_inputs::unchanged_parts(&stop.task, &stop.context, &stop.owner).unwrap();
     let other_request = PreparedExec::new(
         std::path::Path::new("/bin/true"),
         &["foreign-copy-control".into()],
@@ -375,7 +375,7 @@ fn genuine_captured_stop_uses_the_host_bridge_and_remains_unchanged_until_cancel
             .to_string(),
         "copied_input_foreign_capture"
     );
-    initial_inputs::unchanged(&other).unwrap();
+    initial_inputs::unchanged_parts(&other.task, &other.context, &other.owner).unwrap();
     assert!(other.cancel().unwrap().confirmed);
     assert!(stop.cancel().unwrap().confirmed);
 }
