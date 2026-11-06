@@ -37,18 +37,19 @@ fn validation_dag_builds_once_and_counts_every_test_node() {
     assert!(VALIDATE_DAG.contains("cargo clippy --workspace --all-targets --all-features"));
     // No DAG test node may fall back to serialized libtest execution.
     assert!(!VALIDATE_DAG.contains("--test-threads=1"));
-    // Eight counted nextest test nodes, each over one shared skip list
+    // Nine counted nextest test nodes (the launch_descriptor_window
+    // binary runs at low width in its own node), each over one shared skip list
     // derived in validate.sh from REGULAR_TEST_SKIP_ARGS.
-    assert_eq!(VALIDATE_DAG.matches("counts-test-").count(), 8);
+    assert_eq!(VALIDATE_DAG.matches("counts-test-").count(), 9);
     assert_eq!(
         VALIDATE_DAG.matches("REVERIE_NEXTEST_SKIP_FILTER").count(),
-        8
+        9
     );
     assert!(VALIDATE_SCRIPT.contains("derive_nextest_skip_filter"));
     assert!(VALIDATE_SCRIPT.contains("run_validation_dag"));
     // Every counted test node waits for the one build and the fixtures
     // node; fixtures therefore run concurrently with the test build.
-    assert_eq!(VALIDATE_DAG.matches("\"build.test_binaries\",").count(), 8);
+    assert_eq!(VALIDATE_DAG.matches("\"build.test_binaries\",").count(), 9);
     // CPU-first limits: every step declares a CPU timeout.
     assert_eq!(
         VALIDATE_DAG.matches("\"cpu_timeout\"").count(),

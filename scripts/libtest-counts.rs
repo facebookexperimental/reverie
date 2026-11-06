@@ -1398,6 +1398,23 @@ fn nextest_selection_scope(args: &[String]) -> (Vec<String>, Vec<String>) {
             arg.strip_prefix("--filter-expr=")
         };
         if let Some(filter) = filter {
+            // Negated binary terms shrink the universe; record them
+            // with a '!' prefix and keep them out of the positive scan.
+            let mut masked = filter.to_string();
+            while let Some(at) = masked.find("not binary(") {
+                let tail = &masked[at + "not binary(".len()..];
+                let Some(end) = tail.find(')') else { break };
+                let name = tail[..end].trim().trim_start_matches('=').trim();
+                if !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    binaries.push(format!("!{name}"));
+                }
+                masked.replace_range(at..at + "not binary(".len() + end + 1, " ");
+            }
+            let filter: &str = &masked;
             for (marker, sink) in [("package(", &mut packages), ("binary(", &mut binaries)] {
                 let mut rest = filter;
                 while let Some(at) = rest.find(marker) {
@@ -1473,7 +1490,17 @@ fn discover_nextest_total(args: &[String]) -> Result<u64, String> {
         if !packages.is_empty() && !packages.iter().any(|name| name == package) {
             continue;
         }
-        if !binaries.is_empty() && !binaries.iter().any(|name| name == binary) {
+        let excluded = binaries
+            .iter()
+            .any(|name| name.strip_prefix('!') == Some(binary));
+        if excluded {
+            continue;
+        }
+        let positives: Vec<&String> = binaries
+            .iter()
+            .filter(|name| !name.starts_with('!'))
+            .collect();
+        if !positives.is_empty() && !positives.iter().any(|name| *name == binary) {
             continue;
         }
         total += suite
@@ -2002,7 +2029,7 @@ fn self_test_nextest() -> Result<(), String> {
         "run",
         "--workspace",
         "-E",
-        "(package(reverie-liteinst) | package(=reverie-kvm)) & binary(strace) & not test(tests::mount_proc)",
+        "(package(reverie-liteinst) | package(=reverie-kvm)) & binary(strace) & not binary(=rpc_tool) & not test(tests::mount_proc)",
         "-p",
         "safeptrace",
     ]
@@ -2010,7 +2037,9 @@ fn self_test_nextest() -> Result<(), String> {
     .map(|arg| arg.to_string())
     .collect();
     let (packages, binaries) = nextest_selection_scope(&scope_args);
-    if packages != ["reverie-liteinst", "reverie-kvm", "safeptrace"] || binaries != ["strace"] {
+    if packages != ["reverie-liteinst", "reverie-kvm", "safeptrace"]
+        || binaries != ["!rpc_tool", "strace"]
+    {
         return Err(format!(
             "nextest self-test scope mismatch: packages={packages:?} binaries={binaries:?}"
         ));

@@ -211,7 +211,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-ptrace.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-ptrace)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-ptrace.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-ptrace) & not binary(=launch_descriptor_window)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"
@@ -233,6 +233,39 @@
         "hard_mem_max_bytes": 16000000000,
         "classification": "cpu-bound",
         "preferred_inner_jobs": 32
+      },
+      "jobs_flag": ""
+    },
+    {
+      "group": "test",
+      "job": "ptrace_launch",
+      "desc": "Tests: ptrace launch descriptor window",
+      "description": "Counted nextest over the launch_descriptor_window binary alone, at low width. These tests race two tracer launches against a held transient descriptor and a sub-second overlap window (they already self-serialize in-process via a SERIAL mutex); under full-DAG load at width 32 the window closed before the launch waited, failing EMFILE (measured 2026-11-05, load 65-157). Isolating the binary at width 4 keeps its sibling launches from starving the window; the tests themselves stay parallel-unsafe by design and are named here rather than serialized silently.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-ptrace_launch.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-ptrace) & binary(=launch_descriptor_window)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "deps": [
+        "build.test_binaries",
+        "fixtures.liteinst"
+      ],
+      "env": {
+        "REVERIE_NEXTEST_TEST_THREADS": "4",
+        "REVERIE_LITEINST_PRELOAD": "",
+        "REVERIE_LITEINST_TEST_RUNTIME_MANIFEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST": "",
+        "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
+      },
+      "timeout": 600,
+      "cpu_timeout": 300,
+      "priority": 70,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 60,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 4
       },
       "jobs_flag": ""
     },
