@@ -125,7 +125,7 @@
         "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
       },
       "timeout": 600,
-      "cpu_timeout": 900,
+      "cpu_timeout": 1600,
       "priority": 40,
       "hint": {
         "resources": {},
@@ -158,7 +158,7 @@
         "REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST": ""
       },
       "timeout": 600,
-      "cpu_timeout": 900,
+      "cpu_timeout": 1600,
       "priority": 40,
       "hint": {
         "resources": {},
@@ -240,14 +240,15 @@
       "group": "test",
       "job": "ptrace_launch",
       "desc": "Tests: ptrace launch descriptor window",
-      "description": "Counted nextest over the launch_descriptor_window binary alone, at low width. These tests race two tracer launches against a held transient descriptor and a sub-second overlap window (they already self-serialize in-process via a SERIAL mutex); under full-DAG load at width 32 the window closed before the launch waited, failing EMFILE (measured 2026-11-05, load 65-157). Isolating the binary at width 4 keeps its sibling launches from starving the window; the tests themselves stay parallel-unsafe by design and are named here rather than serialized silently.",
+      "description": "Counted nextest over the launch_descriptor_window binary alone, at low width. These tests race two tracer launches against a held transient descriptor and a sub-second overlap window (they already self-serialize in-process via a SERIAL mutex); under full-DAG load at width 32 the window closed before the launch waited, failing EMFILE (measured 2026-11-05, load 65-157). Isolating the binary at width 4 keeps its sibling launches from starving the window; the tests themselves stay parallel-unsafe by design and are named here rather than serialized silently. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load).",
       "labels": [
         "full"
       ],
       "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-ptrace_launch.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-ptrace) & binary(=launch_descriptor_window)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
-        "fixtures.liteinst"
+        "fixtures.liteinst",
+        "test.liteinst_a"
       ],
       "env": {
         "REVERIE_NEXTEST_TEST_THREADS": "4",
@@ -339,14 +340,15 @@
       "group": "test",
       "job": "inguest",
       "desc": "Tests: in-guest backend",
-      "description": "Counted nextest over reverie-inguest. Width is lower: bounded-recipe tests compile payloads at runtime, so each test process fans out further.",
+      "description": "Counted nextest over reverie-inguest. Width is lower: bounded-recipe tests compile payloads at runtime, so each test process fans out further. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load).",
       "labels": [
         "full"
       ],
       "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-inguest.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-inguest)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
-        "fixtures.liteinst"
+        "fixtures.liteinst",
+        "test.liteinst_a"
       ],
       "env": {
         "REVERIE_NEXTEST_TEST_THREADS": "16",
