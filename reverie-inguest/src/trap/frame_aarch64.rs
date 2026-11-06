@@ -153,7 +153,7 @@ impl SavedState {
         })
     }
 
-    /// No protection-key rights are saved on this architecture yet; the
+    /// This implementation saves no protection-key rights yet; the
     /// POE record is copied verbatim with the rest of the chain, and
     /// permission observation is its own stage.
     pub fn pkru(&self) -> Option<u32> {
@@ -320,7 +320,7 @@ impl<'signal> SignalFrame<'signal> {
         }
     }
 
-    /// No protection-key rights are observed on this architecture yet
+    /// This implementation observes no protection-key rights yet
     /// (the POE record, when present, is preserved verbatim by capture).
     pub fn pkru(&self) -> Result<Option<u32>, FrameError> {
         Ok(None)

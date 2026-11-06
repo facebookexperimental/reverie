@@ -122,7 +122,8 @@ pub fn pkru_present() -> bool {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        // No userspace protection keys exist off x86-64.
+        // This implementation does not use protection keys off x86-64
+        // (aarch64 POE rights are not observed yet), so none is present.
         false
     }
 }
@@ -365,6 +366,21 @@ thread_local! {
 /// The call must return through its original stack; this is not an ordinary
 /// wrapper for `rt_sigreturn` or `clone` with a replaced child stack.
 pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
+    // Fixed-VL envelope (aarch64): never issue a VL-changing prctl from
+    // inside the SIGSYS handler, whatever entry a dispatcher took.
+    #[cfg(target_arch = "aarch64")]
+    if IN_HANDLER.get() && vl_change_refused(number, args) {
+        return -i64::from(libc::EINVAL);
+    }
+    unsafe { raw_syscall6_gate(number, args) }
+}
+
+/// The trusted-gate call itself, without the fixed-VL boundary check
+/// (the boundary's own VL probe must not recurse into it).
+///
+/// # Safety
+/// As [`raw_syscall6`].
+unsafe fn raw_syscall6_gate(number: i64, args: [u64; 6]) -> i64 {
     #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
         return unsafe { fixed_gates::scalar(number, args) };
@@ -391,6 +407,10 @@ pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
 /// as for `raw_syscall6`; unused syscall arguments are zero.
 #[inline(never)]
 pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    #[cfg(target_arch = "aarch64")]
+    if IN_HANDLER.get() && vl_change_refused(number, [arg0, arg1, arg2, 0, 0, 0]) {
+        return -i64::from(libc::EINVAL);
+    }
     #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
         return unsafe { fixed_gates::scalar3_or6(number, arg0, arg1, arg2, 0, 0, 0) };
@@ -411,6 +431,10 @@ pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) 
 /// Like the ordinary gate, this cannot resume a clone with a different stack
 /// and must not be used as an ordinary wrapper around rt_sigreturn.
 pub unsafe fn raw_syscall6_with_pkru(number: i64, args: [u64; 6], pkru: u32) -> i64 {
+    #[cfg(target_arch = "aarch64")]
+    if IN_HANDLER.get() && vl_change_refused(number, args) {
+        return -i64::from(libc::EINVAL);
+    }
     #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
         return unsafe { fixed_gates::guest(number, &args, pkru).result };
@@ -457,6 +481,16 @@ pub unsafe fn raw_syscall6_with_result(
     args: [u64; 6],
     guest_pkru: Option<u32>,
 ) -> NativeSyscallResult {
+    // Fixed-VL boundary at the forwarding issue point: a dispatcher that
+    // rewrote a forwarded event into a VL change is refused here, with
+    // the caller's observed rights unchanged (nothing was issued).
+    #[cfg(target_arch = "aarch64")]
+    if IN_HANDLER.get() && vl_change_refused(number, args) {
+        return NativeSyscallResult {
+            result: -i64::from(libc::EINVAL),
+            pkru: guest_pkru,
+        };
+    }
     match guest_pkru {
         Some(pkru) => {
             #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
@@ -467,7 +501,8 @@ pub unsafe fn raw_syscall6_with_result(
             };
             #[cfg(not(all(feature = "fixed-syscall-gates", target_arch = "x86_64")))]
             let result = unsafe { reverie_inguest_guest_syscall(number, args.as_ptr(), pkru) };
-            // Off x86-64 there are no protection-key rights to observe:
+            // This implementation observes no protection-key rights off
+            // x86-64 (aarch64 POE is not observed yet):
             // the guest gate executes with caller rights and reports none.
             #[cfg(target_arch = "x86_64")]
             let observed_pkru = Some(result.pkru as u32);
@@ -774,8 +809,9 @@ fn vl_change_refused(number: i64, args: [u64; 6]) -> bool {
     if requested == 0 {
         return false;
     }
-    // SAFETY: a scalar prctl query through the trusted gate.
-    let current = unsafe { raw_syscall6(libc::SYS_prctl, [get_op, 0, 0, 0, 0, 0]) };
+    // SAFETY: a scalar prctl query through the trusted gate (the
+    // unchecked gate entry, so the boundary cannot recurse into itself).
+    let current = unsafe { raw_syscall6_gate(libc::SYS_prctl, [get_op, 0, 0, 0, 0, 0]) };
     if current < 0 {
         return false;
     }
@@ -785,7 +821,8 @@ fn vl_change_refused(number: i64, args: [u64; 6]) -> bool {
 /// The `SA_SIGINFO` handler for `SIGSYS` on aarch64: same provenance,
 /// reentry, and dispatch flow as the x86-64 handler, over the aarch64
 /// frame (number in x8, arguments in x0-x5, result in x0, resume at pc).
-/// There are no protection-key rights to preserve or restore here.
+/// This implementation preserves no protection-key rights here yet
+/// (aarch64 POE rights are a later stage, not an architecture claim).
 ///
 /// # Safety
 ///
@@ -1551,6 +1588,9 @@ mod aarch64_gate_tests {
 
     fn gate_child() -> ! {
         let pid = std::process::id() as i64;
+        // The spoof sentinel must be provably distinct from the real pid,
+        // or an untrapped getpid could satisfy the interception check.
+        assert_ne!(pid, 424_242, "spoof sentinel collides with child pid");
         // SAFETY: single-threaded child before any filter exists.
         unsafe {
             if crate::signal::install_sigsys_handler(spoofing_handler, false).is_err() {
@@ -1616,12 +1656,42 @@ mod aarch64_gate_tests {
             const { core::cell::RefCell::new(None) };
     }
 
+    static VL_ATTEMPT_ARMED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static VL_DIRECT_RESULT: core::sync::atomic::AtomicI64 =
+        core::sync::atomic::AtomicI64::new(i64::MIN);
+    static VL_ATTEMPT_TO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
     impl SyscallDispatcher for CaptureSpoofGetpid {
         fn dispatch(&self, event: &mut SyscallEvent) {
             event.forward();
         }
 
         fn dispatch_signal(&self, event: &mut SyscallEvent, frame: &mut frame::SignalFrame<'_>) {
+            if event.number() == libc::SYS_gettid
+                && VL_ATTEMPT_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed)
+            {
+                // Direct gate issue from inside dispatch, bypassing the
+                // handler's own pre-check: the forwarding boundary in the
+                // gate helpers must still refuse the VL change.
+                // SAFETY: scalar prctl through the trusted gate.
+                let result = unsafe {
+                    raw_syscall6(
+                        libc::SYS_prctl,
+                        [
+                            50,
+                            VL_ATTEMPT_TO.load(core::sync::atomic::Ordering::Relaxed),
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                    )
+                };
+                VL_DIRECT_RESULT.store(result, core::sync::atomic::Ordering::Relaxed);
+                event.forward();
+                return;
+            }
             if event.number() != libc::SYS_getpid {
                 event.forward();
                 return;
@@ -1698,6 +1768,23 @@ mod aarch64_gate_tests {
                     || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
                 {
                     raw_syscall6(libc::SYS_exit_group, [65, 0, 0, 0, 0, 0]);
+                }
+                // The same change attempted directly through the gate
+                // from inside dispatch (trapped gettid as the carrier)
+                // hits the forwarding boundary, not just the handler's.
+                VL_ATTEMPT_TO.store(cur_vl + 16, core::sync::atomic::Ordering::Relaxed);
+                VL_ATTEMPT_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                // This child body runs on a libtest thread, whose tid is
+                // not the pid: the forwarded gettid must match the tid
+                // observed directly through the gate, not the pid.
+                let tid = raw_syscall6(libc::SYS_gettid, [0; 6]);
+                if libc::syscall(libc::SYS_gettid) != tid {
+                    raw_syscall6(libc::SYS_exit_group, [68, 0, 0, 0, 0, 0]);
+                }
+                if VL_DIRECT_RESULT.load(core::sync::atomic::Ordering::Relaxed)
+                    != -i64::from(libc::EINVAL)
+                {
+                    raw_syscall6(libc::SYS_exit_group, [69, 0, 0, 0, 0, 0]);
                 }
                 let after = raw_syscall6(libc::SYS_prctl, [PR_SVE_GET_VL, 0, 0, 0, 0, 0]);
                 if after as u64 & 0xffff != cur_vl {
