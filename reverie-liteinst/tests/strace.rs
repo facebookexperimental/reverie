@@ -822,6 +822,11 @@ fn assert_compatibility_fork_event(arguments: &[&str], syscall: i64) {
 }
 
 #[test]
+// Unwatched ordinary route (S-C re-scope): with no exec watch armed,
+// exec still fails closed with ENOTSUP before any runtime replacement.
+// The watched forward path is covered at the guard level in
+// reverie-inguest's dispatch/host tests until a producer fixture can
+// launch a guest under a seized supervisor.
 fn exec_fails_closed_before_runtime_is_replaced() {
     let output = run_guest(env!("CARGO_BIN_EXE_reverie-liteinst-exec-guest"), &[]);
     assert!(

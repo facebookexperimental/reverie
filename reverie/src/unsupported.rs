@@ -47,6 +47,10 @@ pub enum UnsupportedOperation {
     ProcessGroups,
     /// `execve` or `execveat` on a backend that cannot replace the process
     /// image at all. No replacement image ran; the caller runs on unchanged.
+    /// A backend running under an external exec watcher (a supervisor that
+    /// catches the kernel exec event and re-bootstraps the successor)
+    /// forwards the exec instead and records no refusal: this name covers
+    /// only the unwatched configuration.
     Exec,
     /// A scheduling, priority or I/O-priority call (`setpriority`,
     /// `getpriority`, the `sched_set*` and `sched_get*` calls that name a

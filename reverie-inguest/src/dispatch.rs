@@ -220,17 +220,36 @@ pub fn is_fork_like(number: i64) -> bool {
 pub struct PassthroughDispatcher {
     /// Optional child-side fork hook (see [`crate::fork`]).
     fork_hook: Option<crate::fork::ForkHook>,
+    /// Whether an external exec watcher is armed for this process.
+    exec_watch: bool,
 }
 
 impl PassthroughDispatcher {
-    /// A passthrough dispatcher with no fork hook.
+    /// A passthrough dispatcher with no fork hook and no exec watch.
     pub const fn new() -> Self {
-        Self { fork_hook: None }
+        Self {
+            fork_hook: None,
+            exec_watch: false,
+        }
     }
 
     /// Attach a hook invoked in the child after a successful fork-like syscall.
     pub fn with_fork_hook(mut self, hook: crate::fork::ForkHook) -> Self {
         self.fork_hook = Some(hook);
+        self
+    }
+
+    /// Declare an armed external exec watch for this process: a
+    /// supervisor seized over the guest that catches the kernel
+    /// exec event and re-bootstraps the successor before its first
+    /// instruction (the exec-stop supervisor's watched mode). With
+    /// a watch armed, `execve`/`execveat` forward to the kernel
+    /// instead of failing closed; every other guard is unchanged.
+    /// Arming asserts the watcher really will re-bootstrap (or
+    /// terminate) the successor before resuming it: the inherited
+    /// trap filter survives exec, its handler does not.
+    pub fn with_exec_watch(mut self) -> Self {
+        self.exec_watch = true;
         self
     }
 
@@ -240,14 +259,16 @@ impl PassthroughDispatcher {
     /// These mirror the boundaries established by `research-ldpreload-derisking`:
     /// an inherited TRAP filter cannot safely cross `execve`, cannot resume a
     /// non-null-stack `clone`, and must keep `SIGSYS` reserved.
-    pub(crate) fn apply_guards(event: &mut SyscallEvent) -> bool {
+    pub(crate) fn apply_guards(event: &mut SyscallEvent, exec_watch_armed: bool) -> bool {
         let number = event.number();
         let args = event.args();
 
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // exec cannot safely cross an inherited trap filter: the filter survives
-        // but the handler, altstack, and mappings do not.
-        if number == libc::SYS_execve || number == libc::SYS_execveat {
+        // Unwatched, exec cannot safely cross an inherited trap filter: the
+        // filter survives but the handler, altstack, and mappings do not.
+        // With an armed exec watch the watcher catches the kernel exec
+        // event and re-bootstraps the successor, so the exec forwards.
+        if (number == libc::SYS_execve || number == libc::SYS_execveat) && !exec_watch_armed {
             event.fail(libc::ENOTSUP);
             return true;
         }
@@ -290,7 +311,7 @@ impl PassthroughDispatcher {
 
 impl SyscallDispatcher for PassthroughDispatcher {
     fn dispatch(&self, event: &mut SyscallEvent) {
-        if Self::apply_guards(event) {
+        if Self::apply_guards(event, self.exec_watch) {
             return;
         }
 
@@ -344,11 +365,30 @@ mod tests {
         assert_eq!(direct.source(), SyscallEventSource::DirectInstrumentation);
     }
 
+    // Base-93 exec proof, re-scoped by S-C: this refusal covers the
+    // unwatched ordinary route only. With an armed exec watch the
+    // same numbers forward (next test); every other guard is
+    // unchanged in both modes.
     #[test]
-    fn exec_is_guarded_enotsup() {
-        let mut event = SyscallEvent::new(libc::SYS_execve, [0; 6], 0);
-        assert!(PassthroughDispatcher::apply_guards(&mut event));
-        assert_eq!(event.result(), Some(-i64::from(libc::ENOTSUP)));
+    fn exec_is_guarded_enotsup_without_watch() {
+        for number in [libc::SYS_execve, libc::SYS_execveat] {
+            let mut event = SyscallEvent::new(number, [0; 6], 0);
+            assert!(PassthroughDispatcher::apply_guards(&mut event, false));
+            assert_eq!(event.result(), Some(-i64::from(libc::ENOTSUP)));
+        }
+    }
+
+    #[test]
+    fn exec_is_forwarded_with_watch() {
+        for number in [libc::SYS_execve, libc::SYS_execveat] {
+            let mut event = SyscallEvent::new(number, [0; 6], 0);
+            assert!(!PassthroughDispatcher::apply_guards(&mut event, true));
+            assert_eq!(event.result(), None);
+        }
+        // The watch scopes to exec only: clone3 stays guarded.
+        let mut clone3 = SyscallEvent::new(libc::SYS_clone3, [0; 6], 0);
+        assert!(PassthroughDispatcher::apply_guards(&mut clone3, true));
+        assert_eq!(clone3.result(), Some(-i64::from(libc::ENOTSUP)));
     }
 
     #[test]
@@ -356,7 +396,7 @@ mod tests {
         let mut args = [0; 6];
         args[0] = libc::SIGSYS as u64;
         let mut event = SyscallEvent::new(libc::SYS_rt_sigaction, args, 0);
-        assert!(PassthroughDispatcher::apply_guards(&mut event));
+        assert!(PassthroughDispatcher::apply_guards(&mut event, false));
         assert_eq!(event.result(), Some(-i64::from(libc::EPERM)));
     }
 
@@ -366,18 +406,18 @@ mod tests {
         mutation_args[0] = libc::SIG_BLOCK as u64;
         mutation_args[1] = 0xdead_beef;
         let mut mutation = SyscallEvent::new(libc::SYS_rt_sigprocmask, mutation_args, 0);
-        assert!(PassthroughDispatcher::apply_guards(&mut mutation));
+        assert!(PassthroughDispatcher::apply_guards(&mut mutation, false));
         assert_eq!(mutation.result(), Some(-i64::from(libc::EPERM)));
 
         let mut unblock_args = mutation_args;
         unblock_args[0] = libc::SIG_UNBLOCK as u64;
         let mut unblock = SyscallEvent::new(libc::SYS_rt_sigprocmask, unblock_args, 0);
-        assert!(!PassthroughDispatcher::apply_guards(&mut unblock));
+        assert!(!PassthroughDispatcher::apply_guards(&mut unblock, false));
 
         let mut query_args = mutation_args;
         query_args[1] = 0;
         let mut query = SyscallEvent::new(libc::SYS_rt_sigprocmask, query_args, 0);
-        assert!(!PassthroughDispatcher::apply_guards(&mut query));
+        assert!(!PassthroughDispatcher::apply_guards(&mut query, false));
     }
 
     #[test]
@@ -385,17 +425,17 @@ mod tests {
         let mut mutation_args = [0; 6];
         mutation_args[0] = 0xdead_beef;
         let mut mutation = SyscallEvent::new(libc::SYS_sigaltstack, mutation_args, 0);
-        assert!(PassthroughDispatcher::apply_guards(&mut mutation));
+        assert!(PassthroughDispatcher::apply_guards(&mut mutation, false));
         assert_eq!(mutation.result(), Some(-i64::from(libc::EPERM)));
 
         let mut query = SyscallEvent::new(libc::SYS_sigaltstack, [0; 6], 0);
-        assert!(!PassthroughDispatcher::apply_guards(&mut query));
+        assert!(!PassthroughDispatcher::apply_guards(&mut query, false));
     }
 
     #[test]
     fn ordinary_syscall_is_not_guarded() {
         let mut event = SyscallEvent::new(libc::SYS_getpid, [0; 6], 0);
-        assert!(!PassthroughDispatcher::apply_guards(&mut event));
+        assert!(!PassthroughDispatcher::apply_guards(&mut event, false));
         assert_eq!(event.result(), None);
     }
 
@@ -404,9 +444,9 @@ mod tests {
         let mut with_stack = [0; 6];
         with_stack[1] = 0xdead_beef;
         let mut event = SyscallEvent::new(libc::SYS_clone, with_stack, 0);
-        assert!(PassthroughDispatcher::apply_guards(&mut event));
+        assert!(PassthroughDispatcher::apply_guards(&mut event, false));
 
         let mut plain = SyscallEvent::new(libc::SYS_clone, [0; 6], 0);
-        assert!(!PassthroughDispatcher::apply_guards(&mut plain));
+        assert!(!PassthroughDispatcher::apply_guards(&mut plain, false));
     }
 }

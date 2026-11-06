@@ -139,6 +139,30 @@ pub trait HostRuntime: Send + Sync + 'static {
     /// The signals the runtime keeps for itself; stripped from any set the
     /// guest blocks.
     fn reserved_signal_mask(&self) -> u64;
+    /// Whether an external exec watcher is armed for this process: a
+    /// supervisor seized over the guest that catches the kernel exec
+    /// event and re-bootstraps the successor image before its first
+    /// instruction runs (the exec-stop supervisor's watched mode).
+    ///
+    /// When this returns `true`, `execve`/`execveat` are forwarded to
+    /// the kernel instead of refused — dynamic and static images
+    /// alike, from the initial leader and from plain-fork children
+    /// (each is its own thread-group leader under this runtime's
+    /// single-thread model; thread creation stays refused, so a
+    /// non-leader exec cannot arise). A successful exec never
+    /// returns here: this runtime image is replaced, and successor
+    /// admission/reconnection is the coordinator's business. A
+    /// failed exec returns the genuine kernel errno, untagged.
+    ///
+    /// Arming the watch asserts the watcher will in fact catch the
+    /// exec and re-bootstrap the successor (or terminate it) before
+    /// resuming it: the inherited trap filter survives exec but its
+    /// handler does not, so a successor resumed without
+    /// re-bootstrap is not viable. The default is unarmed, which
+    /// keeps the historical fail-closed refusal.
+    fn exec_watch_armed(&self) -> bool {
+        false
+    }
 }
 
 /// Decide a guest signal call through the runtime's virtual SIGALRM state;
@@ -3369,8 +3393,11 @@ fn injected_syscall_guard(
             || number == libc::SYS_clone3
             || Some(number) == crate::arch::SYS_VFORK)
             && !is_plain_fork(number, args))
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || matches!(number, libc::SYS_execve | libc::SYS_execveat);
+        // With an armed exec watch the exec forwards to the kernel
+        // and the watcher re-bootstraps the successor; without one
+        // it stays refused (see HostRuntime::exec_watch_armed).
+        || (matches!(number, libc::SYS_execve | libc::SYS_execveat)
+            && !runtime.exec_watch_armed());
     let protected_signal =
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-133): Review fail-closed guest signal-handler policy.
@@ -3993,10 +4020,16 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
                 };
             }
         }
-        if matches!(number, libc::SYS_execve | libc::SYS_execveat) {
+        if matches!(number, libc::SYS_execve | libc::SYS_execveat)
+            && !self.runtime.exec_watch_armed()
+        {
             // A typed refusal, so the Tool can tell this from an exec that
-            // Linux failed: without an installed native exec route the
-            // in-guest runtime has no way to replace the process image.
+            // Linux failed: without an installed native exec route or an
+            // armed exec watch the in-guest runtime has no way to replace
+            // the process image. With a watch armed, execution falls
+            // through to the ordinary forward below: success never
+            // returns (the watcher re-bootstraps the successor), and
+            // failure returns the genuine kernel errno untagged.
             self.unsupported_refusal = Some(reverie::UnsupportedRefusal::new(
                 reverie::UnsupportedOperation::Exec,
                 Errno::EOPNOTSUPP,
@@ -5916,6 +5949,62 @@ mod tests {
             fn reserved_signal_mask(&self) -> u64 {
                 super::ToolSyscallRuntime.reserved_signal_mask()
             }
+        }
+
+        /// TailStartRuntime with an armed exec watch.
+        struct WatchedRuntime;
+        impl HostRuntime for WatchedRuntime {
+            fn fork_child_rebind(&self) {
+                TailStartRuntime.fork_child_rebind()
+            }
+            fn emit_stage(&self, stage: &[u8]) {
+                TailStartRuntime.emit_stage(stage)
+            }
+            fn fork_child_reset(&self, event: &SyscallEvent) {
+                TailStartRuntime.fork_child_reset(event)
+            }
+            fn cpuid_interception_enabled(&self) -> bool {
+                TailStartRuntime.cpuid_interception_enabled()
+            }
+            fn exit_process_stats(&self, tid: Pid) -> io::Result<()> {
+                TailStartRuntime.exit_process_stats(tid)
+            }
+            fn read_clock(&self) -> io::Result<u64> {
+                TailStartRuntime.read_clock()
+            }
+            fn signal_action_supported(&self, number: i64, args: [u64; 6]) -> bool {
+                TailStartRuntime.signal_action_supported(number, args)
+            }
+            fn reserved_signal_mask(&self) -> u64 {
+                TailStartRuntime.reserved_signal_mask()
+            }
+            fn exec_watch_armed(&self) -> bool {
+                true
+            }
+        }
+
+        #[test]
+        fn exec_guard_refuses_unwatched_and_forwards_watched() {
+            for number in [libc::SYS_execve, libc::SYS_execveat] {
+                assert_eq!(
+                    injected_syscall_guard(&TailStartRuntime, number, [0; 6]),
+                    Some(Errno::EOPNOTSUPP)
+                );
+                assert_eq!(
+                    injected_syscall_guard(&WatchedRuntime, number, [0; 6]),
+                    None
+                );
+            }
+            // The watch scopes to exec only: a thread-creating clone
+            // (non-null child stack via clone3) stays refused.
+            assert_eq!(
+                injected_syscall_guard(&WatchedRuntime, libc::SYS_clone3, [0; 6]),
+                Some(Errno::EOPNOTSUPP)
+            );
+            assert_eq!(
+                injected_syscall_guard(&WatchedRuntime, libc::SYS_getpid, [0; 6]),
+                None
+            );
         }
 
         static EVENTS: AtomicUsize = AtomicUsize::new(0);
