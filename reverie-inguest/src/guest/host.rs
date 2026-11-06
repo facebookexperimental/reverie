@@ -13,6 +13,7 @@
 //! trap and hook paths implements [`HostRuntime`] for the services the host
 //! calls back into.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
@@ -172,6 +173,17 @@ pub trait HostRuntime: Send + Sync + 'static {
     /// keeps the historical fail-closed refusal.
     fn exec_watch_armed(&self) -> bool {
         false
+    }
+
+    /// Per-thread admission checklist step (W7): verify any backend
+    /// per-thread arming for a just-created guest thread — alternate
+    /// signal stack above all — before its first Tool callback runs.
+    /// Called on the new thread itself, after its state lease exists and
+    /// before `handle_thread_start`. An error is a host invariant break
+    /// (the thread physically exists), so failure is fatal, never a
+    /// guest errno. Default: nothing per-thread to arm.
+    fn verify_thread_admission(&self, _tid: Pid) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -405,6 +417,16 @@ pub struct ToolHost<T: Tool, R: HostRuntime> {
     /// section, so "counter was zero" cannot race a dispatch starting.
     active_dispatches: core::sync::atomic::AtomicUsize,
     install_gate: SpinMutex<()>,
+    /// W7 thread-admission capability: when false (default), guest thread
+    /// creation refuses exactly as before W7; when true, admitted
+    /// CLONE_THREAD shapes are performed through the birth trampoline.
+    admit_threads: bool,
+    /// Runtime birth stacks by admitted thread tid (base, len), freed by
+    /// `finish_tool_exit` when that thread retires. Registered by the
+    /// child itself during admission (its tid is unknown parent-side
+    /// until the clone returns, and the record must exist before the
+    /// child can be signalled as a thread).
+    birth_stacks: SpinMutex<HashMap<i32, (usize, usize)>>,
     native_threads: Option<native_state::NativeThreads<T::ThreadState>>,
     // Prepared only by the ordinary installer, before publication. Keeping it
     // outside `states` preserves the real first-event lifecycle callbacks.
@@ -725,6 +747,8 @@ where
             states: thread_lease::ThreadStates::new(),
             active_dispatches: core::sync::atomic::AtomicUsize::new(0),
             install_gate: SpinMutex::new(()),
+            admit_threads: false,
+            birth_stacks: SpinMutex::new(HashMap::new()),
             native_threads: None,
             ordinary_root_state: SpinMutex::new(None),
             #[cfg(feature = "exec-private-init")]
@@ -778,6 +802,26 @@ where
     /// concurrently against the shared `Arc`.
     fn tool_process(&self) -> Option<Arc<ToolProcess<T>>> {
         self.tool.lock().clone()
+    }
+
+    /// Enable or disable guest thread admission (W7). Default off:
+    /// CLONE_THREAD creations refuse exactly as before. Set before the
+    /// host dispatches; toggling mid-run is not synchronized against
+    /// in-flight creations.
+    pub fn set_thread_admission(&mut self, enabled: bool) {
+        self.admit_threads = enabled;
+    }
+
+    /// The physical thread-birth entry for guests built by this host, or
+    /// `None` while thread admission is off.
+    fn thread_birth_ops(&self) -> Option<ThreadBirthOps>
+    where
+        T: 'static,
+    {
+        self.admit_threads.then_some(ThreadBirthOps {
+            host: core::ptr::from_ref(self) as usize,
+            forward: forward_thread_creation::<T, R>,
+        })
     }
 
     fn new_thread_state(&self, tool: &ToolProcess<T>, tid: Pid) -> T::ThreadState {
@@ -1391,6 +1435,8 @@ where
             native: None,
             tail: &tail,
             cpuid_interception: self.cpuid_interception,
+            admit_threads: self.admit_threads,
+            thread_birth: self.thread_birth_ops(),
             fork_parent_state: None,
             runtime: &self.runtime,
             staged_signals: Vec::new(),
@@ -1408,6 +1454,16 @@ where
             injected_syscalls: 0,
         };
 
+        // Admission checklist (W7): a thread first seen here was either
+        // admitted at birth (lease not new) or is being seen without a
+        // birth (admission off, or a backend-created thread); verify its
+        // per-thread arming before its first callback either way.
+        if is_new
+            && self.admit_threads
+            && let Err(error) = self.runtime.verify_thread_admission(tid)
+        {
+            tool_fatal(126, &Error::from(error));
+        }
         let mut lifecycle =
             CallbackLifecycle::new(is_new, is_new && tid.as_raw() == self.root_pid.as_raw());
         if let Err(failure) = enter_tool_callbacks(tool, &mut guest, &mut lifecycle) {
@@ -1513,7 +1569,9 @@ where
                 guest.event.unsupported_refusal = Some(refusal);
                 guest.event.result = -i64::from(Errno::EOPNOTSUPP.into_raw());
                 return;
-            } else if let Some(error) = injected_syscall_guard(&self.runtime, number, args) {
+            } else if let Some(error) =
+                injected_syscall_guard(&self.runtime, number, args, self.admit_threads)
+            {
                 guest.event.result = -i64::from(error.into_raw());
                 return;
             } else if let Some(result) = super::restorer::mapping_change_result(number, args) {
@@ -1729,6 +1787,8 @@ where
             native: None,
             tail: &tail,
             cpuid_interception: self.cpuid_interception,
+            admit_threads: self.admit_threads,
+            thread_birth: self.thread_birth_ops(),
             fork_parent_state: None,
             runtime: &self.runtime,
             staged_signals: Vec::new(),
@@ -1745,6 +1805,16 @@ where
             unsupported_refusal: None,
             injected_syscalls: 0,
         };
+        // Admission checklist (W7): a thread first seen here was either
+        // admitted at birth (lease not new) or is being seen without a
+        // birth (admission off, or a backend-created thread); verify its
+        // per-thread arming before its first callback either way.
+        if is_new
+            && self.admit_threads
+            && let Err(error) = self.runtime.verify_thread_admission(tid)
+        {
+            tool_fatal(126, &Error::from(error));
+        }
         let mut lifecycle =
             CallbackLifecycle::new(is_new, is_new && tid.as_raw() == self.root_pid.as_raw());
         if let Err(failure) = enter_tool_callbacks(tool, &mut guest, &mut lifecycle) {
@@ -1892,6 +1962,8 @@ fn finish_fork_child<T: Tool + 'static, R: HostRuntime>(
         native: None,
         tail: &child_tail,
         cpuid_interception: runtime.cpuid_interception_enabled(),
+        admit_threads: host.admit_threads,
+        thread_birth: host.thread_birth_ops(),
         fork_parent_state: None,
         runtime,
         staged_signals: Vec::new(),
@@ -1964,6 +2036,16 @@ fn finish_tool_exit<T: Tool + 'static, R: HostRuntime>(
     };
     if let Err(error) = on_exit {
         tool_fatal(125, &error);
+    }
+    if let Some((birth_base, birth_len)) = host.birth_stacks.lock().remove(&tid.as_raw()) {
+        // The exiting thread resumed on its guest stack long ago; its
+        // birth stack is free to release from here.
+        unsafe {
+            raw_syscall6(
+                libc::SYS_munmap,
+                [birth_base as u64, birth_len as u64, 0, 0, 0, 0],
+            )
+        };
     }
     if process_exit {
         let tool = host.tool.lock().take().unwrap_or_else(|| fatal(126));
@@ -2508,6 +2590,16 @@ struct NativeGuestView<'callback, G: GlobalTool> {
 
 /// The common Tool-facing Guest. Fields remain private: only the local host
 /// and an admitted native callback lease can construct a view.
+/// Type-erased physical thread creation for one host instantiation:
+/// performs an admitted CLONE_THREAD creation and returns in the parent
+/// only (child tid or negative errno); the child starts life in the
+/// birth path and never returns through the injecting frames.
+#[derive(Clone, Copy)]
+struct ThreadBirthOps {
+    host: usize,
+    forward: unsafe fn(usize, i64, [u64; 6], &SyscallEvent) -> i64,
+}
+
 pub struct InGuest<'a, T: Tool, R: HostRuntime> {
     event: &'a mut SyscallEvent,
     tid: Pid,
@@ -2518,6 +2610,12 @@ pub struct InGuest<'a, T: Tool, R: HostRuntime> {
     native: Option<NativeGuestView<'a, T::GlobalState>>,
     tail: &'a TailResult,
     cpuid_interception: bool,
+    /// Mirrors the host's W7 thread-admission capability for guard checks
+    /// on injected creations.
+    admit_threads: bool,
+    /// Physical thread-birth entry (host pointer + monomorphized
+    /// forward), present only where a dispatch installed it.
+    thread_birth: Option<ThreadBirthOps>,
     fork_parent_state: Option<T::ThreadState>,
     runtime: &'a R,
     /// Signals sent to the caller itself that would end its process, held
@@ -2886,11 +2984,15 @@ fn is_plain_fork(number: i64, args: [u64; 6]) -> bool {
         && args[0] & !(SIGNAL_MASK | allowed_flags) == 0
 }
 
-fn clone3_is_plain_fork(address: u64, size: u64) -> bool {
+/// Read up to the first 88 bytes (eleven words) of a guest
+/// `struct clone_args`, or `None` when the record is absent, short, or
+/// unreadable. Fields past the guest's stated size read as zero, as the
+/// kernel's own zero-extension presents them.
+fn read_clone3_fields(address: u64, size: u64) -> Option<[u64; 11]> {
     const CLONE_ARGS_SIZE_VER0: usize = 64;
     const CLONE_ARGS_SIZE_VER2: usize = 88;
     if address == 0 || size < CLONE_ARGS_SIZE_VER0 as u64 {
-        return false;
+        return None;
     }
     let mut fields = [0_u64; CLONE_ARGS_SIZE_VER2 / core::mem::size_of::<u64>()];
     let read_len = usize::try_from(size)
@@ -2918,11 +3020,101 @@ fn clone3_is_plain_fork(address: u64, size: u64) -> bool {
             ],
         )
     };
-    if read != read_len as i64 {
-        return false;
-    }
+    (read == read_len as i64).then_some(fields)
+}
 
-    clone_args_are_plain_fork(&fields)
+fn clone3_is_plain_fork(address: u64, size: u64) -> bool {
+    read_clone3_fields(address, size).is_some_and(|fields| clone_args_are_plain_fork(&fields))
+}
+
+/// How one guest creation call is admitted when thread admission is on
+/// (see [`ToolHost::set_thread_admission`]). With admission off, every
+/// shape but [`CreationAdmission::PlainFork`] is refused exactly as
+/// before W7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreationAdmission {
+    /// The existing plain-fork subset.
+    PlainFork,
+    /// A `CLONE_THREAD` creation the runtime can track: performed
+    /// through the thread-birth trampoline so the new thread's first
+    /// runtime act is its admission checklist, never shared frames.
+    ThreadBirth,
+    /// `CLONE_THREAD` is set but the shape cannot create a thread
+    /// (missing `CLONE_VM`, no stack): forward it and let the kernel
+    /// produce its own errno; no child can result.
+    KernelDecides,
+    /// Shapes the runtime cannot track (namespaces, set_tid, cgroup,
+    /// pidfd outputs, shared-VM processes, unknown flag bits).
+    Unsupported,
+}
+
+/// The clone flag bits a thread creation may carry besides the required
+/// sharing set. Anything outside this allowlist — namespace creation,
+/// pidfd outputs, ptrace, parent-sibling creation, future bits — is
+/// [`CreationAdmission::Unsupported`].
+const THREAD_ALLOWED_FLAGS: u64 = (libc::CLONE_VM
+    | libc::CLONE_FS
+    | libc::CLONE_FILES
+    | libc::CLONE_SIGHAND
+    | libc::CLONE_THREAD
+    | libc::CLONE_SYSVSEM
+    | libc::CLONE_SETTLS
+    | libc::CLONE_PARENT_SETTID
+    | libc::CLONE_CHILD_SETTID
+    | libc::CLONE_CHILD_CLEARTID) as u64;
+
+/// Pure flag/stack half of thread admission (table-tested).
+fn thread_flags_admission(flags: u64, stack: u64) -> CreationAdmission {
+    const REQUIRED: u64 = (libc::CLONE_VM
+        | libc::CLONE_FS
+        | libc::CLONE_FILES
+        | libc::CLONE_SIGHAND
+        | libc::CLONE_THREAD) as u64;
+    if flags & libc::CLONE_THREAD as u64 == 0 {
+        return CreationAdmission::Unsupported;
+    }
+    if flags & !THREAD_ALLOWED_FLAGS != 0 {
+        return CreationAdmission::Unsupported;
+    }
+    if flags & REQUIRED == REQUIRED && stack != 0 {
+        CreationAdmission::ThreadBirth
+    } else {
+        CreationAdmission::KernelDecides
+    }
+}
+
+/// `clone_args` half of thread admission: set_tid/cgroup outputs and a
+/// nonzero exit signal stay unsupported (the kernel's own answer for a
+/// thread exit signal differs between clone and clone3, and no runtime
+/// path tracks chosen-TID or cgroup births); everything else defers to
+/// [`thread_flags_admission`]. Fields are the eleven ver2 words
+/// (flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+/// stack_size, tls, set_tid, set_tid_size, cgroup).
+fn clone_args_thread_admission(fields: &[u64; 11]) -> CreationAdmission {
+    if fields[8] != 0 || fields[9] != 0 || fields[10] != 0 || fields[4] != 0 {
+        return CreationAdmission::Unsupported;
+    }
+    thread_flags_admission(fields[0], fields[5])
+}
+
+/// Classify one creation call for admission. Plain fork keeps its exact
+/// existing meaning; thread shapes are recognized only for the caller to
+/// admit under the thread-admission capability.
+fn creation_admission(number: i64, args: [u64; 6]) -> CreationAdmission {
+    if is_plain_fork(number, args) {
+        return CreationAdmission::PlainFork;
+    }
+    const SIGNAL_MASK: u64 = 0xff;
+    if number == libc::SYS_clone {
+        return thread_flags_admission(args[0] & !SIGNAL_MASK, args[1]);
+    }
+    if number == libc::SYS_clone3 {
+        return match read_clone3_fields(args[0], args[1]) {
+            Some(fields) => clone_args_thread_admission(&fields),
+            None => CreationAdmission::Unsupported,
+        };
+    }
+    CreationAdmission::Unsupported
 }
 
 /// Whether `struct clone_args` fields (at least its first 88 bytes, as
@@ -3645,6 +3837,236 @@ fn reported_creation(
     result
 }
 
+/// Runtime-owned stack a newborn guest thread runs its admission on
+/// before resuming on its guest stack. Bounded by the coordinator
+/// connection cap in practice (one live birth stack per admitted
+/// thread); freed by `finish_tool_exit` when the thread retires.
+const BIRTH_STACK_BYTES: usize = 64 * 1024;
+
+/// Birth record handed across the physical clone: the trap context
+/// (whose first fields the trampoline reads) plus what admission needs.
+#[repr(C)]
+struct ThreadBirth<T: Tool, R: HostRuntime> {
+    trap: crate::trap::ThreadBirthContext,
+    host: *const ToolHost<T, R>,
+    number: i64,
+    args: [u64; 6],
+    birth_stack: (usize, usize),
+}
+
+// SAFETY: the record crosses into the child by shared memory (the clone
+// shares the address space); the parent neither reads nor writes it after
+// a successful clone, and the child owns it from birth (it drops the Box
+// it was allocated in). The host pointer is the process-singleton host
+// the birth was dispatched from.
+unsafe impl<T: Tool, R: HostRuntime> Send for ThreadBirth<T, R> {}
+
+/// Perform one admitted `CLONE_THREAD` creation physically and return in
+/// the parent only. The child starts in [`thread_birth_admit`] on a
+/// runtime birth stack and resumes as guest code from its clone return;
+/// it never returns through the injecting frames it shares memory with.
+///
+/// # Safety
+/// `host` must be the live `ToolHost<T, R>` this pointer was taken from,
+/// and `event` the dispatch's event for the clone call.
+unsafe fn forward_thread_creation<T: Tool + 'static, R: HostRuntime>(
+    host: usize,
+    number: i64,
+    args: [u64; 6],
+    event: &SyscallEvent,
+) -> i64 {
+    let host = unsafe { &*(host as *const ToolHost<T, R>) };
+    if event.context == 0
+        || event
+            .guest_pkru
+            .is_some_and(|_| crate::trap::pkru_present())
+    {
+        // No saved guest context to resume a child from, or a PKRU guest
+        // whose permissions the plain trusted-gate trampoline cannot
+        // honor: the typed refusal the guard would have produced.
+        return -i64::from(libc::EOPNOTSUPP);
+    }
+    // SAFETY: event.context names this dispatch's RegisterContext.
+    let saved = unsafe { core::ptr::read(event.context as *const RegisterContext) };
+    let mut guest_regs = [0_u64; 22];
+    // SAFETY: RegisterContext is a 176-byte repr(C) register block; the
+    // trap context's guest array has its asserted layout.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            &raw const saved as *const u8,
+            guest_regs.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<RegisterContext>(),
+        );
+    }
+    guest_regs[16] = 0; // rax: the child's clone return value
+    guest_regs[0] = match event.dispatch {
+        SyscallDispatch::Trap => event.instruction_pointer,
+        _ => event.instruction_pointer + 2,
+    };
+    guest_regs[1] = if number == libc::SYS_clone3 {
+        match read_clone3_fields(args[0], args[1]) {
+            Some(fields) => fields[5].saturating_add(fields[6]),
+            None => return -i64::from(libc::EOPNOTSUPP),
+        }
+    } else {
+        args[1]
+    };
+    // SAFETY: anonymous private mapping owned by this birth until the
+    // child registers it for retire-time release.
+    let birth_base = unsafe {
+        raw_syscall6(
+            libc::SYS_mmap,
+            [
+                0,
+                BIRTH_STACK_BYTES as u64,
+                (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64,
+                u64::MAX,
+                0,
+            ],
+        )
+    };
+    if (-4095..0).contains(&birth_base) {
+        return birth_base;
+    }
+    let birth_base = birth_base as usize;
+    let mut birth = Box::new(ThreadBirth {
+        trap: crate::trap::ThreadBirthContext {
+            birth_stack_top: (birth_base + BIRTH_STACK_BYTES) as u64 & !15,
+            birth: thread_birth_entry::<T, R>,
+            opaque: [0; 4],
+            guest: guest_regs,
+            guest_pkru: u64::from(event.guest_pkru.unwrap_or(0)),
+            has_pkru: u64::from(event.guest_pkru.is_some()),
+        },
+        host,
+        number,
+        args,
+        birth_stack: (birth_base, BIRTH_STACK_BYTES),
+    });
+    let result =
+        unsafe { crate::trap::thread_clone(number, args, core::ptr::addr_of_mut!(birth.trap)) };
+    if result < 0 {
+        // No child: reclaim the stack and record on the parent side.
+        unsafe {
+            raw_syscall6(
+                libc::SYS_munmap,
+                [birth_base as u64, BIRTH_STACK_BYTES as u64, 0, 0, 0, 0],
+            );
+        }
+        drop(birth);
+        return result;
+    }
+    // The child owns the record and the birth stack from here.
+    core::mem::forget(birth);
+    result
+}
+
+/// Trampoline target (monomorphized per host): unpack and admit.
+unsafe extern "C" fn thread_birth_entry<T: Tool + 'static, R: HostRuntime>(
+    context: *mut crate::trap::ThreadBirthContext,
+) -> ! {
+    // SAFETY: the trampoline was handed the address of the `trap` field,
+    // the first field of ThreadBirth (repr(C) on both), boxed by
+    // forward_thread_creation and not yet touched by the parent since.
+    let birth = unsafe { Box::from_raw(context as *mut ThreadBirth<T, R>) };
+    unsafe { thread_birth_admit(birth) }
+}
+
+/// Admission checklist for a newborn guest thread, on its birth stack:
+/// state lease, backend per-thread arming, thread-start callbacks, then
+/// resume as guest code at its clone return. Never returns.
+unsafe fn thread_birth_admit<T: Tool + 'static, R: HostRuntime>(
+    birth: Box<ThreadBirth<T, R>>,
+) -> ! {
+    let host = unsafe { &*birth.host };
+    let tid = raw_pid(libc::SYS_gettid);
+    let pid = raw_pid(libc::SYS_getpid);
+    // Register the birth stack for retire-time release before anything
+    // can observe this thread as admitted.
+    host.birth_stacks
+        .lock()
+        .insert(tid.as_raw(), birth.birth_stack);
+    if let Err(error) = host.runtime.verify_thread_admission(tid) {
+        tool_fatal(126, &Error::from(error));
+    }
+    let tool = host.tool_process().unwrap_or_else(|| fatal(126));
+    let _active = host.begin_dispatch();
+    let mut lease = host
+        .states
+        .checkout(tid.as_raw(), || host.new_thread_state(&tool, tid))
+        .unwrap_or_else(|| fatal(126));
+    if !lease.is_new() {
+        // A birth whose state already exists is a host invariant break:
+        // this thread was just created by this very clone.
+        fatal(126);
+    }
+    let mut event = SyscallEvent {
+        number: birth.number,
+        args: birth.args,
+        instruction_pointer: birth.trap.guest[0],
+        result: 0,
+        context: core::ptr::addr_of!(birth.trap.guest) as usize,
+        dispatch: SyscallDispatch::Trap,
+        guest_pkru: (birth.trap.has_pkru != 0).then_some(birth.trap.guest_pkru as u32),
+        unsupported_refusal: None,
+    };
+    let tail = TailResult::default();
+    let mut guest = InGuest::<T, R> {
+        event: &mut event,
+        tid,
+        pid,
+        ppid: Some(raw_pid(libc::SYS_getppid)),
+        state: lease.state_mut(),
+        rpc: &host.rpc,
+        native: None,
+        tail: &tail,
+        cpuid_interception: host.cpuid_interception,
+        admit_threads: host.admit_threads,
+        thread_birth: host.thread_birth_ops(),
+        fork_parent_state: None,
+        runtime: &host.runtime,
+        staged_signals: Vec::new(),
+        staged_signal_delivery: false,
+        in_syscall_handler: false,
+        #[cfg(feature = "exec-native-injection")]
+        exec: None,
+        #[cfg(feature = "exec-native-injection")]
+        mapping_driver: None,
+        #[cfg(feature = "exec-native-injection")]
+        native_exec_admitted: host.native_exec_admitted(),
+        #[cfg(feature = "exec-native-injection")]
+        native_exec_route_active: host.native_exec_admitted(),
+        unsupported_refusal: None,
+        injected_syscalls: 0,
+    };
+    let mut lifecycle = CallbackLifecycle::new(true, false);
+    match enter_tool_callbacks(&tool, &mut guest, &mut lifecycle) {
+        Ok(()) => {}
+        Err(EntryFailure::Tool(error)) => {
+            drop(guest);
+            tool_fatal(124, &error);
+        }
+        Err(EntryFailure::Ending(ending)) => {
+            drop(guest);
+            drop(tool);
+            finish_ending(host, lease, (tid, pid), ending);
+        }
+    }
+    drop(guest);
+    drop(lease);
+    drop(tool);
+    drop(_active);
+    // The context outlives the box on the birth stack copy below; read
+    // the registers out before freeing the record.
+    // SAFETY: the box is uniquely owned here and dropped right after.
+    let trap_context = unsafe { core::ptr::read(&birth.trap) };
+    drop(birth);
+    // SAFETY: built by forward_thread_creation from the clone event's
+    // saved registers with rax=0 and the guest stack from its arguments.
+    unsafe { crate::trap::resume_guest_context(&trap_context) }
+}
+
 fn forward_plain_fork(number: i64, args: [u64; 6], guest_pkru: Option<&mut Option<u32>>) -> i64 {
     let result = if let Some(hook) = CREATION_HOOK.get().copied() {
         reported_creation(hook, number, args, guest_pkru)
@@ -3700,6 +4122,7 @@ fn injected_syscall_guard(
     runtime: &impl HostRuntime,
     number: i64,
     args: [u64; 6],
+    admit_threads: bool,
 ) -> Option<Errno> {
     // Every forwarded guest call passes here, so this is where a guest's own
     // seccomp filter is noticed or refused.
@@ -3730,7 +4153,16 @@ fn injected_syscall_guard(
         ((number == libc::SYS_clone
             || number == libc::SYS_clone3
             || Some(number) == crate::arch::SYS_VFORK)
-            && !is_plain_fork(number, args))
+            && match creation_admission(number, args) {
+                CreationAdmission::PlainFork => false,
+                // Admitted thread shapes are performed by the caller's
+                // birth path, never by plain forwarding; with admission
+                // off they refuse here exactly as before W7.
+                CreationAdmission::ThreadBirth | CreationAdmission::KernelDecides => {
+                    !admit_threads
+                }
+                CreationAdmission::Unsupported => true,
+            })
         // With an armed exec watch the exec forwards to the kernel
         // and the watcher re-bootstraps the successor; without one
         // it stays refused (see HostRuntime::exec_watch_armed).
@@ -3909,7 +4341,7 @@ pub(super) fn guard_lifecycle_injection(
     if !mapping_allowed() {
         return GuardedLifecycleInjection::Refused(Err(Errno::EOPNOTSUPP));
     }
-    if let Some(error) = injected_syscall_guard(runtime, number, args) {
+    if let Some(error) = injected_syscall_guard(runtime, number, args, false) {
         return GuardedLifecycleInjection::Refused(Err(error));
     }
     if let Some(result) = super::restorer::mapping_change_result(number, args) {
@@ -4375,6 +4807,19 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             return Errno::from_ret(result as usize).map(|value| value as i64);
         }
 
+        if self.admit_threads
+            && creation_admission(number, raw_args) == CreationAdmission::ThreadBirth
+        {
+            let Some(birth) = self.thread_birth else {
+                return Err(Errno::EOPNOTSUPP);
+            };
+            // SAFETY: creation_admission just classified this exact call
+            // as an admissible thread shape, and the event is this
+            // dispatch's live guest event with its saved context.
+            let result = unsafe { (birth.forward)(birth.host, number, raw_args, self.event) };
+            return Errno::from_ret(result as usize).map(|value| value as i64);
+        }
+
         #[cfg(feature = "exec-native-injection")]
         if (matches!(number, libc::SYS_clone | libc::SYS_clone3)
             || Some(number) == crate::arch::SYS_VFORK)
@@ -4481,7 +4926,7 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         #[cfg(feature = "exec-native-injection")]
         self.check_native_mapping(number, raw_args)?;
         self.refuse_filter_while_staging(number, raw_args);
-        if let Some(error) = injected_syscall_guard(self.runtime, number, raw_args) {
+        if let Some(error) = injected_syscall_guard(self.runtime, number, raw_args, false) {
             return Err(error);
         }
         if let Some(result) = super::restorer::mapping_change_result(number, raw_args) {
@@ -4689,7 +5134,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             self.event.unsupported_refusal = Some(refusal);
             self.tail
                 .set_result(-i64::from(Errno::EOPNOTSUPP.into_raw()));
-        } else if let Some(error) = injected_syscall_guard(self.runtime, number, args) {
+        } else if let Some(error) =
+            injected_syscall_guard(self.runtime, number, args, self.admit_threads)
+        {
             self.tail.set_result(-i64::from(error.into_raw()));
         } else if let Some(result) = super::restorer::mapping_change_result(number, args) {
             self.tail.set_result(result);
@@ -5222,6 +5669,187 @@ mod process_owner_tests {
         }
     }
 
+    /// The thread-admission taxonomy: every creation shape lands in
+    /// exactly one class, with plain fork's meaning unchanged.
+    #[test]
+    fn creation_admission_taxonomy() {
+        const REQUIRED: u64 = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD) as u64;
+        // Full pthread shape -> birth; missing sharing or stack -> the
+        // kernel decides (its own EINVAL, no child); anything outside the
+        // allowlist -> unsupported even with every required bit.
+        assert_eq!(
+            thread_flags_admission(REQUIRED, 0x1000),
+            CreationAdmission::ThreadBirth
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED | libc::CLONE_SETTLS as u64, 0x1000),
+            CreationAdmission::ThreadBirth
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED, 0),
+            CreationAdmission::KernelDecides
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED & !(libc::CLONE_VM as u64), 0x1000),
+            CreationAdmission::KernelDecides
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED & !(libc::CLONE_SIGHAND as u64), 0x1000),
+            CreationAdmission::KernelDecides
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED | libc::CLONE_NEWNS as u64, 0x1000),
+            CreationAdmission::Unsupported
+        );
+        assert_eq!(
+            thread_flags_admission(REQUIRED | libc::CLONE_PIDFD as u64, 0x1000),
+            CreationAdmission::Unsupported
+        );
+        assert_eq!(
+            thread_flags_admission(libc::CLONE_VM as u64, 0x1000),
+            CreationAdmission::Unsupported,
+            "shared-VM process without CLONE_THREAD stays unsupported"
+        );
+        // clone_args: set_tid / cgroup / exit_signal stay unsupported.
+        let mut fields = [0_u64; 11];
+        fields[0] = REQUIRED;
+        fields[5] = 0x1000;
+        assert_eq!(
+            clone_args_thread_admission(&fields),
+            CreationAdmission::ThreadBirth
+        );
+        fields[8] = 1;
+        assert_eq!(
+            clone_args_thread_admission(&fields),
+            CreationAdmission::Unsupported
+        );
+        fields[8] = 0;
+        fields[4] = libc::SIGCHLD as u64;
+        assert_eq!(
+            clone_args_thread_admission(&fields),
+            CreationAdmission::Unsupported
+        );
+    }
+
+    // The born thread's whole guest program: write its own tid to the
+    // pointer in rdi, then exit. It runs on the guest stack the birth
+    // resume installs, after admission has already run on the birth
+    // stack, and must touch nothing else (no Rust runtime, no TLS).
+    // x86_64 only, like the birth trampoline it exercises.
+    #[cfg(target_arch = "x86_64")]
+    core::arch::global_asm!(
+        r#"
+        .text
+        .p2align 4
+        .global w7_birth_stub
+        .hidden w7_birth_stub
+        .type w7_birth_stub,@function
+    w7_birth_stub:
+        endbr64
+        mov rax, 186
+        syscall
+        mov [rdi], rax
+        mov rax, 60
+        xor edi, edi
+        syscall
+        ud2
+        .size w7_birth_stub, .-w7_birth_stub
+    "#
+    );
+
+    /// Physical thread birth end to end: a real clone through the birth
+    /// trampoline. The child is admitted (lease + thread-start) on its
+    /// birth stack, then resumes at the stub above on its guest stack,
+    /// records its tid, and exits — all inside this test process.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn physical_thread_birth_admits_and_resumes() {
+        let _test = TEST_LOCK.lock().unwrap();
+        let (mut host, _peer) = host(false, false);
+        host.set_thread_admission(true);
+        static SEEN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+        SEEN.store(0, core::sync::atomic::Ordering::Release);
+        EVENTS.lock().unwrap().clear();
+        // Guest stack for the child (its clone stack argument).
+        let guest_stack_len = 64 * 1024usize;
+        let guest_stack = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                guest_stack_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest_stack, libc::MAP_FAILED);
+        let stack_top = guest_stack as u64 + guest_stack_len as u64;
+        unsafe extern "C" {
+            fn w7_birth_stub();
+        }
+        let mut saved = RegisterContext::default();
+        saved.rdi = core::ptr::addr_of!(SEEN) as u64;
+        let flags = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM) as u64;
+        let args = [flags, stack_top, 0, 0, 0, 0];
+        assert_eq!(
+            creation_admission(libc::SYS_clone, args),
+            CreationAdmission::ThreadBirth
+        );
+        let event = SyscallEvent {
+            number: libc::SYS_clone,
+            args,
+            instruction_pointer: w7_birth_stub as *const () as usize as u64,
+            result: 0,
+            context: &raw const saved as usize,
+            dispatch: SyscallDispatch::Trap,
+            guest_pkru: None,
+            unsupported_refusal: None,
+        };
+        // SAFETY: host/event as constructed above; the child resumes at
+        // the stub with SEEN's address in rdi and exits by raw syscall.
+        let child_tid = unsafe {
+            forward_thread_creation::<Probe, Runtime>(
+                core::ptr::from_ref(&host) as usize,
+                libc::SYS_clone,
+                args,
+                &event,
+            )
+        };
+        assert!(child_tid > 0, "clone failed with {child_tid}");
+        // The child writes its own tid before exiting; poll briefly.
+        let mut seen = 0;
+        for _ in 0..500 {
+            seen = SEEN.load(core::sync::atomic::Ordering::Acquire);
+            if seen != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(seen, child_tid, "born thread ran its guest stub");
+        // Admission ran on the child: a lease exists for its tid and the
+        // birth stack is registered for retire-time release.
+        assert!(host.states.contains(child_tid as i32));
+        assert!(host.birth_stacks.lock().contains_key(&(child_tid as i32)));
+        assert!(
+            EVENTS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| *name == "start"),
+            "thread_start callback ran for the born thread"
+        );
+        unsafe { libc::munmap(guest_stack, guest_stack_len) };
+    }
+
     /// The install gate and the active-dispatch counter are atomic
     /// against each other: an install section that observed zero cannot
     /// race a dispatch starting, and a live dispatch refuses install.
@@ -5740,6 +6368,8 @@ mod tests {
             native: None,
             tail: &tail,
             cpuid_interception: false,
+            admit_threads: false,
+            thread_birth: None,
             fork_parent_state: None,
             runtime: &ToolSyscallRuntime,
             staged_signals: Vec::new(),
@@ -5885,6 +6515,8 @@ mod tests {
             native: None,
             tail: &tail,
             cpuid_interception: false,
+            admit_threads: false,
+            thread_birth: None,
             fork_parent_state: None,
             runtime: &ToolSyscallRuntime,
             staged_signals: Vec::new(),
@@ -6452,22 +7084,22 @@ mod tests {
         fn exec_guard_refuses_unwatched_and_forwards_watched() {
             for number in [libc::SYS_execve, libc::SYS_execveat] {
                 assert_eq!(
-                    injected_syscall_guard(&TailStartRuntime, number, [0; 6]),
+                    injected_syscall_guard(&TailStartRuntime, number, [0; 6], false),
                     Some(Errno::EOPNOTSUPP)
                 );
                 assert_eq!(
-                    injected_syscall_guard(&WatchedRuntime, number, [0; 6]),
+                    injected_syscall_guard(&WatchedRuntime, number, [0; 6], false),
                     None
                 );
             }
             // The watch scopes to exec only: a thread-creating clone
             // (non-null child stack via clone3) stays refused.
             assert_eq!(
-                injected_syscall_guard(&WatchedRuntime, libc::SYS_clone3, [0; 6]),
+                injected_syscall_guard(&WatchedRuntime, libc::SYS_clone3, [0; 6], false),
                 Some(Errno::EOPNOTSUPP)
             );
             assert_eq!(
-                injected_syscall_guard(&WatchedRuntime, libc::SYS_getpid, [0; 6]),
+                injected_syscall_guard(&WatchedRuntime, libc::SYS_getpid, [0; 6], false),
                 None
             );
         }
@@ -6515,9 +7147,13 @@ mod tests {
             // a bypass of injected_syscall_guard. The scope-refusal child still
             // fails earlier at the actual outside-handler check.
             assert!(
-                injected_syscall_guard(&TailStartRuntime, libc::SYS_exit_group, [0; 6]).is_none()
+                injected_syscall_guard(&TailStartRuntime, libc::SYS_exit_group, [0; 6], false)
+                    .is_none()
             );
-            assert!(injected_syscall_guard(&TailStartRuntime, libc::SYS_getpid, [0; 6]).is_none());
+            assert!(
+                injected_syscall_guard(&TailStartRuntime, libc::SYS_getpid, [0; 6], false)
+                    .is_none()
+            );
             reverie::set_tail_start_forwarder(observe).unwrap();
             let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
             let config = reverie_rpc_transport::codec::encode(&()).unwrap();
@@ -6556,6 +7192,8 @@ mod tests {
                 native: None,
                 tail: &tail,
                 cpuid_interception: false,
+                admit_threads: false,
+                thread_birth: None,
                 fork_parent_state: None,
                 runtime: &TailStartRuntime,
                 staged_signals: Vec::new(),

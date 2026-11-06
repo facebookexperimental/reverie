@@ -164,6 +164,8 @@ where
                 }),
                 tail: &tail,
                 cpuid_interception: services.facts().cpuid_interception,
+                admit_threads: self.admit_threads,
+                thread_birth: None,
                 fork_parent_state: None,
                 runtime: &self.runtime,
                 staged_signals: Vec::new(),

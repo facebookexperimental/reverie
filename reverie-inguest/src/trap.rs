@@ -356,6 +356,179 @@ reverie_inguest_guest_syscall_return_ip:
 "#
 );
 
+/// Context a physical thread creation hands to the child side. Layout is
+/// read by the thread-clone trampoline: `birth_stack_top` at offset 0 and
+/// `birth` at offset 8 are the only fields assembly touches; the guest
+/// register block at offset 48 has [`crate::guest::context::RegisterContext`]'s
+/// asserted 176-byte layout.
+#[repr(C)]
+pub struct ThreadBirthContext {
+    /// Top of the runtime-owned stack the child switches to before any
+    /// other stack access.
+    pub birth_stack_top: u64,
+    /// Admission entry, called on the birth stack; never returns.
+    pub birth: unsafe extern "C" fn(*mut ThreadBirthContext) -> !,
+    /// Opaque slots for the host's own birth record (host pointer, the
+    /// creation number/arguments the child was born from).
+    pub opaque: [usize; 4],
+    /// Guest registers to resume with (rax = 0, rsp = guest stack).
+    pub guest: [u64; 22],
+    /// Guest PKRU to install before resuming (valid when `has_pkru`).
+    pub guest_pkru: u64,
+    pub has_pkru: u64,
+}
+
+const _: () = {
+    assert!(std::mem::offset_of!(ThreadBirthContext, birth_stack_top) == 0);
+    assert!(std::mem::offset_of!(ThreadBirthContext, birth) == 8);
+    assert!(std::mem::offset_of!(ThreadBirthContext, guest) == 48);
+    assert!(std::mem::offset_of!(ThreadBirthContext, guest_pkru) == 224);
+    assert!(std::mem::offset_of!(ThreadBirthContext, has_pkru) == 232);
+};
+
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    r#"
+    .text
+    .p2align 4
+    .global reverie_inguest_thread_clone
+    .hidden reverie_inguest_thread_clone
+    .type reverie_inguest_thread_clone,@function
+reverie_inguest_thread_clone:
+    // SysV entry: rdi = syscall number, rsi = six arguments, rdx = context.
+    // The physical clone runs through the trusted gate (its syscall
+    // instruction is the allowlisted one) with R12 as the continuation.
+    // The child returns from the syscall with RSP set by the kernel to the
+    // guest stack argument, so after the gate the child path must not
+    // touch the stack until it has switched to the birth stack.
+    endbr64
+    push r12
+    push r13
+    mov r13, rdx
+    lea r12, [rip + .Lthread_clone_return]
+    mov r10, [rsi + 24]
+    mov r8, [rsi + 32]
+    mov r9, [rsi + 40]
+    mov rdx, [rsi + 16]
+    mov rax, rdi
+    mov rdi, [rsi]
+    mov rcx, [rsi + 8]
+    mov rsi, rcx
+    jmp reverie_inguest_trusted_syscall_ip
+.Lthread_clone_return:
+    endbr64
+    test rax, rax
+    jnz .Lthread_clone_parent
+    // Child: RSP is the guest stack. Switch before any stack access.
+    mov rsp, [r13]
+    mov rdi, r13
+    call qword ptr [r13 + 8]
+    ud2
+.Lthread_clone_parent:
+    pop r13
+    pop r12
+    ret
+    .size reverie_inguest_thread_clone, .-reverie_inguest_thread_clone
+
+    .p2align 4
+    .global reverie_inguest_resume_guest_context
+    .hidden reverie_inguest_resume_guest_context
+    .type reverie_inguest_resume_guest_context,@function
+reverie_inguest_resume_guest_context:
+    // SysV entry: rdi = ThreadBirthContext. Loads the guest register
+    // block at offset 48 and jumps to its instruction pointer. RCX and
+    // R11 carry the resume address/stack and are therefore the syscall
+    // ABI's clobbered registers, exactly as a real clone return leaves
+    // them.
+    endbr64
+    cmp qword ptr [rdi + 232], 0
+    je .Lresume_no_pkru
+    mov eax, [rdi + 224]
+    xor ecx, ecx
+    xor edx, edx
+    wrpkru
+.Lresume_no_pkru:
+    lea r13, [rdi + 48]
+    mov rcx, [r13 + 8]
+    mov r11, [r13]
+    mov r15, [r13 + 16]
+    mov r14, [r13 + 24]
+    mov r10, [r13 + 56]
+    mov r9, [r13 + 64]
+    mov r8, [r13 + 72]
+    mov rdi, [r13 + 80]
+    mov rsi, [r13 + 88]
+    mov rbp, [r13 + 96]
+    mov rbx, [r13 + 104]
+    mov rdx, [r13 + 112]
+    mov rax, [r13 + 128]
+    push qword ptr [r13 + 136]
+    popfq
+    mov r12, [r13 + 40]
+    mov r13, [r13 + 32]
+    mov rsp, rcx
+    jmp r11
+    .size reverie_inguest_resume_guest_context, .-reverie_inguest_resume_guest_context
+"#
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn reverie_inguest_thread_clone(
+        number: i64,
+        args: *const u64,
+        context: *mut ThreadBirthContext,
+    ) -> i64;
+    fn reverie_inguest_resume_guest_context(context: *const ThreadBirthContext) -> !;
+}
+
+/// Issue one physical `clone`/`clone3` thread creation through the
+/// trusted gate. Returns in the parent only (child tid or negative
+/// errno); in the child, control passes to `context.birth` on the birth
+/// stack and never returns here.
+///
+/// # Safety
+/// `args` must be the exact guest creation arguments the caller has
+/// already classified as an admissible thread shape, and `context` must
+/// stay valid until the child finishes reading it (the birth entry takes
+/// ownership in the child; on an error return the caller still owns it).
+/// The syscall runs with the caller's current PKRU (no guest-permission
+/// switch), matching the ordinary raw gate.
+pub unsafe fn thread_clone(number: i64, args: [u64; 6], context: *mut ThreadBirthContext) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { reverie_inguest_thread_clone(number, args.as_ptr(), context) }
+    }
+    // No aarch64 birth trampoline yet: thread creation stays refused
+    // (the capability is default-off; admission never reaches here).
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (number, args, context);
+        -i64::from(libc::ENOSYS)
+    }
+}
+
+/// Resume guest execution from `context`'s saved registers. Diverges.
+///
+/// # Safety
+/// The register block must describe a valid guest resume point for this
+/// thread (its clone return: rax = 0, rsp = the guest stack).
+pub unsafe fn resume_guest_context(context: *const ThreadBirthContext) -> ! {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { reverie_inguest_resume_guest_context(context) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = context;
+        // Unreachable while thread_clone refuses above; fail closed.
+        unsafe { raw_syscall6(libc::SYS_exit_group, [126, 0, 0, 0, 0, 0]) };
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 // SysV classifies this concrete 16-byte integer pair into RAX and RDX. Rust's
 // Option layout never crosses the assembly boundary.
 #[repr(C)]

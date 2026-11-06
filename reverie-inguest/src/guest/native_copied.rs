@@ -106,6 +106,8 @@ where
             states: super::thread_lease::ThreadStates::new(),
             active_dispatches: core::sync::atomic::AtomicUsize::new(0),
             install_gate: crate::sync::SpinMutex::new(()),
+            admit_threads: self.admit_threads,
+            birth_stacks: crate::sync::SpinMutex::new(std::collections::HashMap::new()),
             native_threads: Some(NativeThreads::new()),
             ordinary_root_state: SpinMutex::new(None),
             #[cfg(feature = "exec-private-init")]
