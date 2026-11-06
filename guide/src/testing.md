@@ -73,8 +73,173 @@ pass as a failing test that hasn't confessed yet.
 > <!-- UC: testing-scorecard -->
 > Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`testing-scorecard`).
 >
-> 🚧 **Under construction — tool test skeleton.** TODO: a copyable
-> test module for a new tool crate: oracle comparison against ptrace,
-> one refusal assertion, one lifecycle case.
-> <!-- UC: testing-skeleton -->
-> Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`testing-skeleton`).
+## A copyable skeleton
+
+One integration-test file carries the three shapes above: an oracle
+comparison against the ptrace backend, one lifecycle case, and one
+admission refusal asserted by name. It needs `reverie-core`,
+`reverie-ptrace`, `serde` (derive), and `tokio` (`macros,rt,time`)
+as dev-dependencies against a checkout — the admission surface is
+newer than the published 0.5.0 pair in
+[Getting started](getting-started.md). Save the two listings, in
+order, as `tests/tool_oracle.rs`; as printed they pass
+`cargo test -- --test-threads=1` (3 tests) against this tree.
+Replace the counter with your tool and the two guest programs with
+your corpus; keep the three assertions' shapes.
+
+Listing RT-1 is the tool and runner: the counter from
+[Your first tool](first-tool.md), plus a `run_guest` helper that
+captures output through `run_with_output` on a current-thread
+`LocalSet` (the backend future is not `Send`).
+
+<span class="filename">Listing RT-1: tests/tool_oracle.rs (part 1)</span>
+
+```rust,ignore
+//! Copyable oracle tests for a new Reverie tool crate: ptrace-oracle
+//! comparison, one admission refusal, one fork/exec lifecycle case.
+//! Checkout APIs (selection/admission are newer than crates.io 0.5.0).
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use reverie::process::Command;
+use reverie::selection::{
+    AdmissionRequest, Density, EffectiveRequirements, EnvironmentSnapshot, ExplicitSelection,
+    GuestProfile, RefusalCode, ToolQueries, ToolRequirements, admit,
+};
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
+use reverie::{Backend, Error, GlobalTool, Guest, Pid, Subscription, Tool};
+use reverie_ptrace::PtraceBackend;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Default, Clone)]
+pub struct CounterGlobal {
+    num_syscalls: Arc<AtomicU64>,
+}
+
+impl CounterGlobal {
+    pub fn total(&self) -> u64 {
+        self.num_syscalls.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub struct IncrMsg(pub Sysno);
+
+#[reverie::global_tool]
+impl GlobalTool for CounterGlobal {
+    type Request = IncrMsg;
+    type Response = ();
+    type Config = ();
+
+    async fn init_global_state(_: &Self::Config) -> Self {
+        Self::default()
+    }
+
+    async fn receive_rpc(&self, _from: Pid, _msg: IncrMsg) {
+        self.num_syscalls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct CounterLocal;
+
+#[reverie::tool]
+impl Tool for CounterLocal {
+    type GlobalState = CounterGlobal;
+    type ThreadState = ();
+
+    async fn handle_syscall_event<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let _ = guest.send_rpc(IncrMsg(syscall.number())).await;
+        guest.tail_inject(syscall).await
+    }
+}
+
+fn run_guest(program: &str, args: &[&str]) -> (Vec<u8>, i32, u64) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    let local = tokio::task::LocalSet::new();
+    let mut command = Command::new(program);
+    for arg in args {
+        command.arg(arg);
+    }
+    let (output, global, _stats) = local
+        .block_on(
+            &runtime,
+            PtraceBackend::run_with_output::<CounterLocal>(command, ()),
+        )
+        .expect("ptrace backend run");
+    (
+        output.stdout,
+        output.status.code().expect("guest exited by code"),
+        global.total(),
+    )
+}
+
+```
+
+Listing RT-2 is the tests. The oracle is the same program run
+*without* the tool; the lifecycle case is a shell that forks and
+execs a child; the refusal is pure admission — no guest starts, and
+the refusal must arrive under its exact name.
+
+<span class="filename">Listing RT-2: tests/tool_oracle.rs (part 2)</span>
+
+```rust,ignore
+#[test]
+fn oracle_echo_matches_uninstrumented() {
+    let oracle = std::process::Command::new("/bin/echo")
+        .arg("hello")
+        .output()
+        .expect("oracle run");
+    let (stdout, code, total) = run_guest("/bin/echo", &["hello"]);
+    assert_eq!(stdout, oracle.stdout, "guest stdout must match the oracle");
+    assert_eq!(code, oracle.status.code().unwrap());
+    assert!(total > 0, "tool must have observed syscalls");
+}
+
+#[test]
+fn lifecycle_shell_child_matches_oracle() {
+    // One lifecycle case: the shell forks and execs a child; both
+    // processes' output must survive instrumentation unchanged.
+    let script = "echo parent; /bin/echo child";
+    let oracle = std::process::Command::new("/bin/sh")
+        .args(["-c", script])
+        .output()
+        .expect("oracle run");
+    let (stdout, code, total) = run_guest("/bin/sh", &["-c", script]);
+    assert_eq!(stdout, oracle.stdout);
+    assert_eq!(code, 0);
+    assert!(total > 0);
+}
+
+#[test]
+fn dense_requirement_is_refused_by_name() {
+    // Admission is pure: no guest is started for this refusal.
+    let stated = ToolRequirements {
+        density: Density::Dense,
+        ..ToolRequirements::default()
+    };
+    let request = AdmissionRequest {
+        requirements: EffectiveRequirements::compute(
+            stated,
+            Subscription::all_syscalls(),
+            ToolQueries::default(),
+        ),
+        guest: GuestProfile::HostProcessAny,
+        env: EnvironmentSnapshot::default(),
+        explicit: ExplicitSelection::Auto,
+    };
+    let refusal = admit(&request).expect_err("no translation cell is implemented");
+    assert_eq!(refusal.code, RefusalCode::RDense);
+}
+```
