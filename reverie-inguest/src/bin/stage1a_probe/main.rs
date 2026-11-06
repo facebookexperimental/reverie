@@ -111,6 +111,14 @@ struct ProbeControls<'a> {
     fault: Fault,
     pause_checkpoint: Option<&'a Path>,
     runtime_kind: RuntimeKind,
+    /// Link-time virtual address of a guest witness slot: an
+    /// eight-byte cell the guest's first instruction (or its first
+    /// constructor) overwrites. The host resolves it through the
+    /// image load bias and reads it at the exec-drain stop and again
+    /// at the ready stop; an untouched value at both proves zero
+    /// guest instructions ran before arming, independently of the
+    /// journal.
+    witness: Option<u64>,
 }
 
 /// The stopped-task bundle the loader's stage chain carries from
@@ -174,6 +182,7 @@ fn run(
         fault,
         pause_checkpoint,
         runtime_kind,
+        witness,
     } = controls;
     report["runtime_kind"] = json!(runtime_kind.name());
     let loader_image = loader.checked()?;
@@ -214,6 +223,18 @@ fn run(
     report["entry_sp"] = json!(entry.rsp);
     report["entry_rax"] = json!(entry.rax);
     report["exec_return_drained"] = json!(true);
+    // The task is stopped with no guest instruction run since the
+    // exec stop: resolve and read the witness slot now, and again at
+    // the ready stop below.
+    let witness_address = match witness {
+        Some(link_vaddr) => {
+            let address = resolve_witness(&task, entry.rsp, link_vaddr)?;
+            report["witness_address"] = json!(address);
+            report["witness_at_exec_drain"] = json!(read_witness(&task, address)?);
+            Some(address)
+        }
+        None => None,
+    };
     if let Some(path) = pause_checkpoint {
         return pause_after_exec_drain(task, entry, path, report);
     }
@@ -321,6 +342,12 @@ fn run(
         runtime_kind.required_controls(),
         runtime_kind.ready_evidence(),
     )?;
+    // Still stopped at the ready marker, guest not yet released: the
+    // second witness read. Equal, untouched values at both stops
+    // prove zero guest instructions ran across the arming window.
+    if let Some(address) = witness_address {
+        report["witness_at_ready"] = json!(read_witness(started.stop().task(), address)?);
+    }
     let ready = started.tool_ready();
     // Armed is claimed only once every control the running runtime's
     // manifest requires is reported armed; an unmet control is a
@@ -382,6 +409,78 @@ fn run(
     }
 
     Ok(())
+}
+
+/// Reads the eight witness bytes at `address` from the stopped guest.
+fn read_witness(task: &Stopped, address: u64) -> Result<u64> {
+    let bytes = trace::read(task, address, 8)?;
+    Ok(u64::from_le_bytes(
+        bytes.try_into().map_err(|_| "short witness read")?,
+    ))
+}
+
+/// Resolves a guest link-time virtual address through the image load
+/// bias, derived from `AT_PHDR` and the `PT_PHDR` segment read from
+/// the stopped guest: bias = AT_PHDR - PT_PHDR.vaddr. That is zero
+/// for a fixed-address static image and the PIE load bias for a
+/// dynamic one, so one rule serves both witness guests.
+fn resolve_witness(task: &Stopped, rsp: u64, link_vaddr: u64) -> Result<u64> {
+    const AT_NULL: u64 = 0;
+    const AT_PHDR: u64 = 3;
+    const AT_PHNUM: u64 = 5;
+    const PT_PHDR: u32 = 6;
+    const MAX_WORDS: u64 = 4096;
+    // The initial stack at rsp is argc, the argv pointers and their
+    // NULL, the envp pointers and their NULL, then the auxv pairs.
+    // Read word at a time so no read crosses the top of the mapping.
+    let word = |index: u64| -> Result<u64> {
+        if index > MAX_WORDS {
+            return Err("loader refused: initial stack scan bound exceeded".into());
+        }
+        let address = rsp
+            .checked_add(index.checked_mul(8).ok_or("witness stack overflow")?)
+            .ok_or("witness stack overflow")?;
+        read_witness(task, address)
+    };
+    let argc = word(0)?;
+    if argc > MAX_WORDS {
+        return Err("loader refused: implausible guest argc at witness resolution".into());
+    }
+    let mut index = argc + 2; // past argv[0..argc] and its NULL.
+    while word(index)? != 0 {
+        index += 1;
+    }
+    index += 1; // past the envp NULL terminator.
+    let (mut phdr, mut phnum) = (None, None);
+    loop {
+        let (key, value) = (word(index)?, word(index + 1)?);
+        index += 2;
+        match key {
+            AT_NULL => break,
+            AT_PHDR => phdr = Some(value),
+            AT_PHNUM => phnum = Some(value),
+            _ => {}
+        }
+    }
+    let phdr = phdr.ok_or("loader refused: no AT_PHDR for witness resolution")?;
+    let phnum = phnum.ok_or("loader refused: no AT_PHNUM for witness resolution")?;
+    if !(1..=128).contains(&phnum) {
+        return Err("loader refused: implausible AT_PHNUM for witness resolution".into());
+    }
+    let headers = trace::read(task, phdr, (phnum * 56) as usize)?;
+    for header in headers.as_chunks::<56>().0 {
+        let p_type = u32::from_le_bytes(header[0..4].try_into().expect("phdr type"));
+        if p_type == PT_PHDR {
+            let p_vaddr = u64::from_le_bytes(header[16..24].try_into().expect("phdr vaddr"));
+            let bias = phdr
+                .checked_sub(p_vaddr)
+                .ok_or("loader refused: AT_PHDR below PT_PHDR vaddr")?;
+            return link_vaddr
+                .checked_add(bias)
+                .ok_or("loader refused: witness address overflow".into());
+        }
+    }
+    Err("loader refused: guest image has no PT_PHDR for witness resolution".into())
 }
 
 fn syscall_info_json(info: &safeptrace::SyscallInfo) -> Value {
@@ -835,13 +934,34 @@ fn main() {
     } else {
         RuntimeKind::Probe
     };
+    let witness = if args.first().is_some_and(|a| a == "--witness") {
+        args.remove(0);
+        let text = args
+            .first()
+            .and_then(|a| a.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                eprintln!("loader refused: missing witness link address");
+                std::process::exit(REFUSAL_EXIT);
+            });
+        args.remove(0);
+        let parsed = text
+            .strip_prefix("0x")
+            .map_or_else(|| text.parse::<u64>(), |hex| u64::from_str_radix(hex, 16));
+        Some(parsed.unwrap_or_else(|_| {
+            eprintln!("loader refused: invalid witness link address {text:?}");
+            std::process::exit(REFUSAL_EXIT);
+        }))
+    } else {
+        None
+    };
     if (pause_checkpoint.is_some() && fault != Fault::None)
         || (runtime_kind == RuntimeKind::Counter && fault != Fault::None)
         || args.len() < 5
         || args[3] != "--"
     {
         eprintln!(
-            "usage: reverie-loader-stage1a-probe [--inject-cpuid-arm-enosys | --pause-after-exec-drain CHECKPOINT] [--runtime-kind=counter] LOADER RUNTIME REPORT -- PROGRAM [ARGS...]"
+            "usage: reverie-loader-stage1a-probe [--inject-cpuid-arm-enosys | --pause-after-exec-drain CHECKPOINT] [--runtime-kind=counter] [--witness LINK_VADDR] LOADER RUNTIME REPORT -- PROGRAM [ARGS...]"
         );
         std::process::exit(REFUSAL_EXIT);
     }
@@ -868,6 +988,7 @@ fn main() {
                 fault,
                 pause_checkpoint: pause_checkpoint.as_deref(),
                 runtime_kind,
+                witness,
             },
             cleanup_evidence.clone(),
             &mut report,
