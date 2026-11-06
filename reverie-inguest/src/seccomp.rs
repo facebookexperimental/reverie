@@ -517,9 +517,9 @@ mod tests {
                 SECCOMP_DATA_NR_OFFSET => number as u32,
                 SECCOMP_DATA_IP_LOW_OFFSET => ip as u32,
                 SECCOMP_DATA_IP_HIGH_OFFSET => (ip >> 32) as u32,
-                SECCOMP_DATA_ARGS_OFFSET..=60 if offset % 4 == 0 => {
+                SECCOMP_DATA_ARGS_OFFSET..=60 if offset.is_multiple_of(4) => {
                     let index = ((offset - SECCOMP_DATA_ARGS_OFFSET) / 8) as usize;
-                    if offset % 8 == 0 {
+                    if offset.is_multiple_of(8) {
                         args[index] as u32
                     } else {
                         (args[index] >> 32) as u32
