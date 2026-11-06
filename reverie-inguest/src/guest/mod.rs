@@ -24,6 +24,8 @@ pub mod continuation;
 pub mod event;
 #[cfg(feature = "exec-private-init")]
 pub mod exec_private;
+#[cfg(feature = "exec-native-injection")]
+pub mod generic_native_exec_driver;
 #[cfg(feature = "coordinator-rpc")]
 pub mod host;
 pub mod installed_stack;

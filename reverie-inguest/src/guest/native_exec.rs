@@ -127,7 +127,10 @@ impl ExecCut {
         }
     }
 
-    fn capture(event: &SyscallEvent, site: &ExecSite) -> Result<Self, UnsupportedRefusal> {
+    pub(crate) fn capture(
+        event: &SyscallEvent,
+        site: &ExecSite,
+    ) -> Result<Self, UnsupportedRefusal> {
         site.validate()?;
         if !is_exec(event.number) {
             return Err(refusal(
