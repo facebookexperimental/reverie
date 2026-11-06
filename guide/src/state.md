@@ -104,7 +104,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use tracing::debug;
 
-
 /// Global counter2 totals.
 #[derive(Debug, Default)]
 pub struct GlobalInner {
