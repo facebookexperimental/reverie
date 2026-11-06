@@ -1134,8 +1134,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-inguest/src/guest/tool_install.rs",
-        25614,
-        "e22613d605b984846de8a9e2ce26671587d335292c000500ba913744c90f69b6",
+        25859,
+        "527b74c43a82c5f79980dc78dc60b9dcce78061562238bc7ec615f7c4f43d0d6",
     ),
     (
         "reverie-inguest/src/signal.rs",
@@ -1319,8 +1319,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-liteinst/Cargo.toml",
-        5329,
-        "072bb73fa5146fb09119d2a2e06267fa2f62bc2bed8d6f4e19dbcf3acad6e029",
+        5505,
+        "fd91ba0c9bf4c3819502aaf6ee693752f3991a99fc838b1341c568add207c410",
     ),
     (
         "reverie-liteinst/src/lib.rs",
@@ -1404,13 +1404,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie/src/tool_configuration.rs",
-        5777,
-        "4f2268a867f08d151589525fb1ad93529e0535aff7e27a8175613ae8511d720e",
+        12136,
+        "4ff810b6d3dc814e937deab612495ae0b19351dd584cdccef87004aa81ef6e07",
     ),
     (
         "reverie/src/lib.rs",
-        7206,
-        "8856e2b563ca1610c6b2f12c8ea3e7b2f88382bd163847b63db1778e31252e8a",
+        7263,
+        "c8c23b8628a83099732be4e58530ab70685837821fccbb27447830a5bf726cc3",
     ),
     (
         "reverie/src/perf.rs",
@@ -1522,8 +1522,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie/src/tool.rs",
-        78807,
-        "6bc09671bc1960d3c1029bc0901047307ac29a7e1fbc1cbc915bec296bb2cc4d",
+        79939,
+        "d0ece0753a03016c9c6c3136bb04861b63e374d87012ca0d1b0eeae4b59fb8ab",
     ),
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared
