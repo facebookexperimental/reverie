@@ -45,56 +45,9 @@ mod fixed_gates;
 pub use fixed_gates::mapped_initial_gate_reference;
 #[cfg(target_arch = "x86_64")]
 pub mod frame;
-/// Signal-frame access has no aarch64 implementation yet (that is the next
-/// stage): the type exists so the dispatcher seam compiles, but it cannot
-/// be constructed, and no handler can run on this architecture.
 #[cfg(not(target_arch = "x86_64"))]
-pub mod frame {
-    use core::marker::PhantomData;
-    use std::io;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub struct FrameError;
-    impl std::fmt::Display for FrameError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("signal frames are not implemented on this architecture")
-        }
-    }
-    impl std::error::Error for FrameError {}
-
-    pub fn initialize() -> io::Result<()> {
-        Ok(())
-    }
-
-    /// Unconstructible off x86-64: `from_raw` always refuses, so no code
-    /// path can observe a fabricated frame.
-    pub struct SignalFrame<'signal> {
-        _borrow: PhantomData<&'signal mut ()>,
-    }
-
-    impl<'signal> SignalFrame<'signal> {
-        /// # Safety
-        /// Same contract as the x86-64 original; always refuses here.
-        pub unsafe fn from_raw(
-            _context: *mut libc::c_void,
-            _info: *const libc::siginfo_t,
-        ) -> Result<Self, FrameError> {
-            Err(FrameError)
-        }
-        pub fn register(&self, _index: usize) -> i64 {
-            unreachable!("no SignalFrame can exist on this architecture")
-        }
-        pub fn set_register(&mut self, _index: usize, _value: i64) {
-            unreachable!("no SignalFrame can exist on this architecture")
-        }
-        pub fn pkru(&self) -> Result<Option<u32>, FrameError> {
-            Ok(None)
-        }
-        pub fn set_pkru(&mut self, _value: Option<u32>) -> Result<(), FrameError> {
-            Err(FrameError)
-        }
-    }
-}
+#[path = "trap/frame_aarch64.rs"]
+pub mod frame;
 mod panic_report;
 #[cfg(target_arch = "x86_64")]
 mod pkru;
@@ -789,6 +742,81 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
     IN_HANDLER.set(false);
 }
 
+/// The `SA_SIGINFO` handler for `SIGSYS` on aarch64: same provenance,
+/// reentry, and dispatch flow as the x86-64 handler, over the aarch64
+/// frame (number in x8, arguments in x0-x5, result in x0, resume at pc).
+/// There are no protection-key rights to preserve or restore here.
+///
+/// # Safety
+///
+/// Only the kernel calls this, on a real `SIGSYS`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe extern "C" fn sigsys_handler(
+    signal_number: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-133): Review fail-closed SIGSYS provenance validation.
+    if signal_number != libc::SIGSYS
+        || info.is_null()
+        || context.is_null()
+        || unsafe { (*info).si_code } != SYS_SECCOMP_CODE
+    {
+        unsafe { exit_now(126) };
+    }
+
+    // Reentrancy guard: a trapped syscall inside the handler is a bug (the
+    // dispatcher must use the trusted gate). Fail closed rather than recurse.
+    if IN_HANDLER.get() {
+        unsafe { exit_now(125) };
+    }
+    IN_HANDLER.set(true);
+
+    let mut frame = match unsafe { frame::SignalFrame::from_raw(context, info) } {
+        Ok(frame) => frame,
+        Err(_) => unsafe { exit_now(126) },
+    };
+    // The filter traps `rt_sigreturn` only when it admits it at the
+    // runtime's restorer alone, so a trapped one is never the runtime's.
+    if is_rt_sigreturn(frame.register(8)) {
+        unsafe { refuse_guest_signal_return() };
+    }
+    if dispatcher().is_some_and(|dispatcher| dispatcher.dispatch_private_signal(&mut frame)) {
+        IN_HANDLER.set(false);
+        return;
+    }
+    let mut event = SyscallEvent::new(
+        frame.register(8),
+        [
+            frame.register(0) as u64,
+            frame.register(1) as u64,
+            frame.register(2) as u64,
+            frame.register(3) as u64,
+            frame.register(4) as u64,
+            frame.register(5) as u64,
+        ],
+        frame.register(32) as u64,
+    );
+    event.set_guest_pkru(None);
+
+    if let Some(dispatcher) = dispatcher() {
+        dispatcher.dispatch_signal(&mut event, &mut frame);
+    } else {
+        event.fail(libc::ENOSYS);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if let Some(resume_address) = event.resume_address() {
+        // Preserve the syscall-number register so the replacement callback
+        // observes the original entry state after sigreturn.
+        frame.set_register(32, resume_address as i64);
+    } else {
+        frame.set_register(0, event.resolved_result());
+    }
+    IN_HANDLER.set(false);
+}
+
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     r#"
@@ -904,17 +932,13 @@ pub(crate) fn prepare_handler() -> io::Result<PreparedHandler> {
     Ok(PreparedHandler { entry: handler })
 }
 
-/// No SIGSYS handler can run without signal-frame support for this
-/// architecture (the next stage), so installation refuses by name rather
-/// than registering a handler that cannot reconstruct an event.
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn prepare_handler() -> io::Result<PreparedHandler> {
     panic_report::install();
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the SIGSYS handler requires signal-frame support not yet \
-         implemented on this architecture",
-    ))
+    frame::initialize()?;
+    Ok(PreparedHandler {
+        entry: sigsys_handler,
+    })
 }
 
 #[cfg(all(feature = "exec-private-init", target_arch = "x86_64"))]
@@ -1528,6 +1552,104 @@ mod aarch64_gate_tests {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+
+    /// Admission evidence: the real handler reconstructs events from
+    /// aarch64 frames, a dispatcher captures/restores the frame and
+    /// mutates one result, and another syscall forwards untouched.
+    struct CaptureSpoofGetpid;
+
+    thread_local! {
+        static CAPTURE: core::cell::RefCell<Option<frame::SavedState>> =
+            const { core::cell::RefCell::new(None) };
+    }
+
+    impl SyscallDispatcher for CaptureSpoofGetpid {
+        fn dispatch(&self, event: &mut SyscallEvent) {
+            event.forward();
+        }
+
+        fn dispatch_signal(&self, event: &mut SyscallEvent, frame: &mut frame::SignalFrame<'_>) {
+            if event.number() != libc::SYS_getpid {
+                event.forward();
+                return;
+            }
+            CAPTURE.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let saved = slot.as_mut().expect("capture storage prepared");
+                if frame.capture(saved).is_err() {
+                    // SAFETY: exit through the gate; libc exit would trap.
+                    unsafe { raw_syscall6(libc::SYS_exit_group, [71, 0, 0, 0, 0, 0]) };
+                }
+                frame.set_register(0, -999);
+                if frame.restore(saved).is_err() || frame.register(0) as u64 != saved.registers[0] {
+                    // SAFETY: as above.
+                    unsafe { raw_syscall6(libc::SYS_exit_group, [72, 0, 0, 0, 0, 0]) };
+                }
+            });
+            event.set_result(424_243);
+        }
+    }
+
+    fn admission_child() -> ! {
+        let pid = std::process::id() as i64;
+        let ppid: i64 = std::env::var("REVERIE_TEST_AARCH64_ADMISSION_PPID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        CAPTURE.with(|slot| *slot.borrow_mut() = Some(frame::SavedState::new().unwrap()));
+        set_dispatcher(Box::new(CaptureSpoofGetpid));
+        // SAFETY: single-threaded child; handler before filter, as the
+        // lifecycle install orders them.
+        unsafe {
+            if install_handler(false).is_err() {
+                raw_syscall6(libc::SYS_exit_group, [51, 0, 0, 0, 0, 0]);
+            }
+            let mut filter = crate::seccomp::SeccompFilter::for_trusted_gates(
+                trusted_gate(),
+                guest_syscall_gate(),
+            )
+            .unwrap();
+            if filter.install().is_err() {
+                raw_syscall6(libc::SYS_exit_group, [52, 0, 0, 0, 0, 0]);
+            }
+            // Trapped and spoofed, with capture/restore in between.
+            if libc::syscall(libc::SYS_getpid) != 424_243 {
+                raw_syscall6(libc::SYS_exit_group, [61, 0, 0, 0, 0, 0]);
+            }
+            // Trapped and forwarded: the real parent pid comes back.
+            if libc::syscall(libc::SYS_getppid) != ppid {
+                raw_syscall6(libc::SYS_exit_group, [62, 0, 0, 0, 0, 0]);
+            }
+            // Through the gate, untrapped: still the real pid.
+            if raw_syscall6(libc::SYS_getpid, [0; 6]) != pid {
+                raw_syscall6(libc::SYS_exit_group, [63, 0, 0, 0, 0, 0]);
+            }
+            raw_syscall6(libc::SYS_exit_group, [0, 0, 0, 0, 0, 0]);
+        }
+        unreachable!("exit_group through the gate returned")
+    }
+
+    #[test]
+    fn aarch64_handler_admits_dispatches_and_restores() {
+        const CHILD: &str = "REVERIE_TEST_AARCH64_ADMISSION";
+        if std::env::var_os(CHILD).is_some() {
+            admission_child();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trap::aarch64_gate_tests::aarch64_handler_admits_dispatches_and_restores",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(
+                "REVERIE_TEST_AARCH64_ADMISSION_PPID",
+                std::process::id().to_string(),
+            )
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(0), "{output:?}");
