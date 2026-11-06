@@ -26,8 +26,14 @@
 use std::io;
 use std::ptr;
 
-/// `AUDIT_ARCH_X86_64` from `<linux/audit.h>`.
+/// `AUDIT_ARCH_X86_64` from `<linux/audit.h>`. The builders below compare
+/// against [`crate::arch::AUDIT_ARCH_NATIVE`]; this constant names the x86-64
+/// value explicitly for the filter-evaluator tests, which pin exact verdicts
+/// per architecture word.
+#[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AUDIT_ARCH_X86_64 == crate::arch::AUDIT_ARCH_NATIVE);
 
 // Offsets into `struct seccomp_data`.
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
@@ -80,9 +86,9 @@ impl SeccompFilter {
         gate.validate()?;
         let high = (gate.syscall_ip >> 32) as u32;
         let program = vec![
-            // Reject any non-x86-64 syscall ABI outright.
+            // Reject any non-native syscall ABI outright.
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
-            jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+            jump(BPF_JMP_JEQ_K, crate::arch::AUDIT_ARCH_NATIVE, 1, 0),
             stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
             // Load the syscall number.
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
@@ -124,7 +130,7 @@ impl SeccompFilter {
         second.validate()?;
         let mut program = vec![
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
-            jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+            jump(BPF_JMP_JEQ_K, crate::arch::AUDIT_ARCH_NATIVE, 1, 0),
             stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
         ];
@@ -165,11 +171,14 @@ impl SeccompFilter {
     /// x32 entry and filter stacking even at trusted gates. The unchanged
     /// exact 23-instruction signal-return/two-gate suffix follows it. This is
     /// one installed filter with a new identity, never the ordinary 23 recipe.
-    #[cfg(feature = "exec-native-injection")]
+    // The fixed gates and restorer this recipe names are x86-64 sites, and the
+    // prefix denies fork/vfork numbers that only exist there; the aarch64
+    // recipe arrives with its fixed gates.
+    #[cfg(all(feature = "exec-native-injection", target_arch = "x86_64"))]
     pub fn for_native_exec_domain() -> io::Result<Self> {
         let mut prefix = vec![
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
-            jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+            jump(BPF_JMP_JEQ_K, crate::arch::AUDIT_ARCH_NATIVE, 1, 0),
             stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
             stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
             jump(0x45, 0x4000_0000, 0, 1),
@@ -226,7 +235,7 @@ impl SeccompFilter {
 
     /// Canonical little-endian bytes of the distinct native filter recipe.
     /// Content comparison is not authority to install or attest a filter.
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(all(feature = "exec-native-injection", target_arch = "x86_64"))]
     pub fn native_exec_recipe_bytes() -> io::Result<[u8; 69 * 8]> {
         let filter = Self::for_native_exec_domain()?;
         let mut bytes = [0; 69 * 8];

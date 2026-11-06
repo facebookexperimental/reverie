@@ -54,6 +54,7 @@
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("reverie-inguest requires Linux x86-64");
 
+pub mod arch;
 pub mod bootstrap;
 pub mod dispatch;
 pub mod fmt;
