@@ -70,14 +70,19 @@ if [[ -z $environment ]]; then
 fi
 
 target_dir=${CARGO_TARGET_DIR:-$ROOT_DIR/target}
-binaries=$target_dir/debug
+# Keep this script's default-feature build out of the shared workspace
+# target: the validation DAG populates that target with $STABLE_FEATURES,
+# and both builds would otherwise replace target/debug/deps'
+# libreverie_examples.so. The comparator must use this build's binaries.
+e2e_target_dir=$target_dir/e2e-cargo
+binaries=$e2e_target_dir/debug
 artifacts=${artifacts:-$target_dir/e2e}
 mkdir -p "$artifacts" || exit 2
 
 say() { printf 'reverie e2e: %s\n' "$*"; }
 
 say "environment $environment; backends requested: $backends"
-if ! cargo build --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
+if ! CARGO_TARGET_DIR="$e2e_target_dir" cargo build --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
     -p reverie-examples --lib --bins; then
     say "build failed"
     exit 2

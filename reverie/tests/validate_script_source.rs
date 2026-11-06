@@ -7,6 +7,7 @@
  */
 
 const VALIDATE_SCRIPT: &str = include_str!("../../validate.sh");
+const E2E_SCRIPT: &str = include_str!("../../reverie-examples/e2e/run.sh");
 const PERCRATE_SCRIPT: &str = include_str!("../../scripts/run-percrate-tests.sh");
 
 #[test]
@@ -52,6 +53,23 @@ fi"#;
     assert!(
         VALIDATE_SCRIPT.contains(LEDGER_SELECTION),
         "a nested validation must publish through its discovered parent; the home-relative adapter is only the standalone fallback"
+    );
+}
+
+#[test]
+fn e2e_build_uses_an_isolated_cargo_target_dir() {
+    // The DAG's shared target is also populated by build.test_binaries with
+    // $STABLE_FEATURES. The e2e runner intentionally builds with defaults,
+    // so sharing target/debug/deps lets the two feature graphs replace the
+    // same unhashed libreverie_examples.so. Its build must therefore use a
+    // distinct Cargo target directory and look for its binaries there.
+    assert!(
+        E2E_SCRIPT.contains("CARGO_TARGET_DIR=\"$e2e_target_dir\" cargo build"),
+        "e2e must build into its isolated Cargo target directory"
+    );
+    assert!(
+        E2E_SCRIPT.contains("binaries=$e2e_target_dir/debug"),
+        "e2e must execute the binaries from its isolated build"
     );
 }
 
