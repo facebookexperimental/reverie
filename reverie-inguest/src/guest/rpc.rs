@@ -163,6 +163,26 @@ impl<G: GlobalTool> OrdinaryConnections<G> {
     /// Remove every connection but `keep` (fork child: the other entries
     /// are copies of the parent's threads' connections, which do not
     /// exist in the child).
+    /// Take out the connection whose descriptor mirror is `fd`, if any.
+    fn take_by_fd(&self, fd: libc::c_int) -> Option<Arc<ThreadConnection<G>>> {
+        let mut by_tid = self.by_tid.lock();
+        let tid = by_tid
+            .iter()
+            .find(|(_, connection)| connection.fd() == fd)
+            .map(|(tid, _)| *tid)?;
+        by_tid.remove(&tid)
+    }
+
+    /// Remove every connection (fork child: all entries are copies of
+    /// the parent's threads' connections, which do not exist here).
+    fn drain_all(&self) -> Vec<Arc<ThreadConnection<G>>> {
+        self.by_tid
+            .lock()
+            .drain()
+            .map(|(_, connection)| connection)
+            .collect()
+    }
+
     fn drain_except(&self, keep: i32) -> Vec<Arc<ThreadConnection<G>>> {
         let mut by_tid = self.by_tid.lock();
         let kept = by_tid.remove(&keep);
@@ -204,6 +224,11 @@ pub struct CoordinatorRpc<G: GlobalTool> {
     fd: AtomicI32,
     transport: reverie_rpc_transport::RpcTransport,
     on_reconnect: ReconnectHook,
+    // Root rebinding after fork rides the inherited root entry's
+    // pid-mismatch reconnect in `exchange` (fork_child_reset_if_needed).
+    /// Serializes the once-per-fork-child connection reset and records
+    /// its completion (see `fork_child_reset_if_needed`).
+    fork_reset: SpinMutex<bool>,
     #[cfg(feature = "exec-private-successor")]
     native_failed: AtomicBool,
 }
@@ -239,6 +264,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             fd: AtomicI32::new(-1),
             transport: reverie_rpc_transport::RpcTransport::Socket,
             on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
+            fork_reset: SpinMutex::new(false),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -256,6 +282,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             fd: AtomicI32::new(-1),
             transport: reverie_rpc_transport::RpcTransport::Socket,
             on_reconnect: |_, _| Err(io::Error::from_raw_os_error(libc::EPROTO)),
+            fork_reset: SpinMutex::new(false),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         }
@@ -423,6 +450,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             fd: AtomicI32::new(-1),
             transport: reverie_rpc_transport::RpcTransport::Mapped,
             on_reconnect,
+            fork_reset: SpinMutex::new(false),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -455,6 +483,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             fd: AtomicI32::new(fd),
             transport,
             on_reconnect,
+            fork_reset: SpinMutex::new(false),
             #[cfg(feature = "exec-private-successor")]
             native_failed: AtomicBool::new(false),
         })
@@ -477,6 +506,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
     /// threads register theirs in the per-thread coordinator FD set as
     /// the placement records them.
     fn thread_connection(&self) -> Arc<ThreadConnection<G>> {
+        self.fork_child_reset_if_needed();
         let tid = Self::current_tid().as_raw();
         let connections = self.connection.ordinary();
         if let Some(connection) = connections.get(tid) {
@@ -496,6 +526,46 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         })
         .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
         connections.insert(tid, RpcConnection::new(pid, client))
+    }
+
+    /// Once per fork child, before its first lazy connection exists:
+    /// drain and close every inherited connection copy, and mark the
+    /// next connection opened here as the new root. Keying connections
+    /// by the *child's* tid alone would never run this (P2): the map
+    /// miss would open a fresh, pid-correct connection and `exchange`'s
+    /// pid-mismatch fork path would never fire, leaking the parent's
+    /// sockets and leaving the root descriptor record pointing at an
+    /// inherited copy. Doing the reset here, before any insert, also
+    /// covers a fork that happened on a thread which had never sent.
+    fn fork_child_reset_if_needed(&self) {
+        if matches!(self.connection, ConnectionOwner::NativeConfiguration) {
+            return;
+        }
+        let mut done = self.fork_reset.lock();
+        if *done || !FORKED_SINCE_LAST_RPC.load(Ordering::Acquire) {
+            return;
+        }
+        *done = true;
+        // Both installed private domains already refuse fork/thread. A
+        // retained native stream can never reconnect as ordinary I/O.
+        #[cfg(feature = "exec-private-init")]
+        if super::exec_private::active() {
+            rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE);
+        }
+        // Hand the child its inherited root entry, rekeyed to its own
+        // tid: `exchange` then sees the pid mismatch on it and runs the
+        // long-proven reconnect path (root hook rebind included), while
+        // sibling copies close here.
+        let connections = self.connection.ordinary();
+        let root = connections.take_by_fd(self.fd.load(Ordering::Acquire));
+        let drained = connections.drain_all();
+        close_drained_connections(drained);
+        if let Some(root) = root {
+            connections
+                .by_tid
+                .lock()
+                .insert(Self::current_tid().as_raw(), root);
+        }
     }
 
     /// Close and forget this thread's coordinator connection (thread

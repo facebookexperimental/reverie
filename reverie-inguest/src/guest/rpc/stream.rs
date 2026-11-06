@@ -882,6 +882,150 @@ mod tests {
         );
     }
 
+    /// Real-fork regression (W7 P2): in the child, the first send must
+    /// drain and close every inherited connection copy (root and
+    /// sibling) and rebind the root descriptor record to the child's
+    /// fresh connection, instead of opening a fresh per-thread
+    /// connection beside the inherited ones (which leaks the parent's
+    /// sockets and leaves the root record naming a dead copy).
+    #[test]
+    fn fork_child_drains_inherited_connections_and_rebinds_root() {
+        isolated_coordinator_move_test(
+            "guest::rpc::stream::tests::fork_child_drains_inherited_connections_and_rebinds_root",
+            || {
+                use std::os::unix::net::UnixListener;
+                use std::time::Duration;
+
+                use reverie_rpc_transport::RequestEnvelope;
+                use reverie_rpc_transport::codec::decode;
+                use reverie_rpc_transport::codec::encode;
+
+                let directory =
+                    std::env::temp_dir().join(format!("ordinary-rpc-fork-{}", std::process::id()));
+                std::fs::create_dir(&directory).unwrap();
+                let directory_owner = std::fs::File::open(&directory).unwrap();
+                let path = std::path::PathBuf::from(format!(
+                    "/proc/self/fd/{}/socket",
+                    directory_owner.as_raw_fd()
+                ));
+                let listener = UnixListener::bind(&path).unwrap();
+                // Sequential server: config each accepted connection,
+                // then answer one request per connection, in accept
+                // order (root handshake, worker request, child request).
+                let peer = std::thread::spawn(move || {
+                    // One handler thread per accepted connection: each
+                    // sends config, then answers at most one request.
+                    // (Sequential handling would deadlock the test: the
+                    // sibling's reply must arrive before the fork, while
+                    // the child's connection is only accepted after it.)
+                    let mut handlers = Vec::new();
+                    for index in 0..3 {
+                        let (mut socket, _) = listener.accept().unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        handlers.push(std::thread::spawn(move || {
+                            let config = encode(&73_u64).unwrap();
+                            socket
+                                .write_all(&(config.len() as u32).to_be_bytes())
+                                .unwrap();
+                            socket.write_all(&config).unwrap();
+                            // The root connection never sends; do not wait
+                            // out a read timeout on it (the isolated
+                            // harness kills the whole test at 5 seconds).
+                            if index == 0 {
+                                return;
+                            }
+                            let mut prefix = [0; 4];
+                            if socket.read_exact(&mut prefix).is_ok() {
+                                let mut bytes = vec![0; u32::from_be_bytes(prefix) as usize];
+                                socket.read_exact(&mut bytes).unwrap();
+                                let envelope: RequestEnvelope<u64> = decode(&bytes).unwrap();
+                                assert_eq!(envelope.request, 19);
+                                let response = encode(&91_u64).unwrap();
+                                socket
+                                    .write_all(&(response.len() as u32).to_be_bytes())
+                                    .unwrap();
+                                socket.write_all(&response).unwrap();
+                            }
+                        }));
+                    }
+                    for handler in handlers {
+                        handler.join().unwrap();
+                    }
+                });
+                let rpc = std::sync::Arc::new(
+                    crate::guest::rpc::CoordinatorRpc::<OrdinaryConnectionModel>::connect(
+                        &path,
+                        crate::guest::protect::replace_coordinator_fd,
+                    )
+                    .unwrap(),
+                );
+                crate::guest::protect::reserve_coordinator_fd(rpc.raw_fd()).unwrap();
+                let root_fd = rpc.raw_fd();
+                // A sibling thread opens the second connection.
+                let sibling_rpc = rpc.clone();
+                let sibling = std::thread::spawn(move || {
+                    assert_eq!(sibling_rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
+                });
+                sibling.join().unwrap();
+                let sibling_fd = rpc
+                    .connection
+                    .ordinary()
+                    .snapshot()
+                    .iter()
+                    .map(|connection| connection.fd())
+                    .find(|fd| *fd != root_fd)
+                    .expect("sibling connection recorded");
+                // SAFETY: fork with no other live test threads (sibling
+                // joined above); the child exits by _exit below.
+                let forked = unsafe { libc::fork() };
+                assert!(
+                    forked >= 0,
+                    "fork failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                if forked == 0 {
+                    // Child: host fork paths call this first thing.
+                    super::super::note_fork_in_child();
+                    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // At the reset boundary: the sibling copy is
+                        // drained and closed, the inherited root entry is
+                        // kept (rekeyed) for exchange's reconnect.
+                        rpc.fork_child_reset_if_needed();
+                        assert_eq!(unsafe { libc::fcntl(sibling_fd, libc::F_GETFD) }, -1);
+                        assert_ne!(unsafe { libc::fcntl(root_fd, libc::F_GETFD) }, -1);
+                        assert_eq!(rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
+                        // The reconnect opens its socket before closing
+                        // the inherited root copy, so the new root number
+                        // differs from root_fd and may reuse sibling_fd;
+                        // root closure is proven by the rebind below
+                        // (record moved off root_fd).
+                        // Root record rebounded to the child's own socket.
+                        assert_ne!(rpc.raw_fd(), root_fd);
+                        assert_eq!(crate::guest::protect::coordinator_fd(), Some(rpc.raw_fd()));
+                    }));
+                    // SAFETY: _exit avoids parent atexit/flush state.
+                    unsafe { libc::_exit(if ok.is_ok() { 0 } else { 71 }) };
+                }
+                let mut status = 0;
+                // SAFETY: `forked` is this test's direct child.
+                assert_eq!(unsafe { libc::waitpid(forked, &mut status, 0) }, forked);
+                assert!(
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                    "fork child failed with status {status:#x}"
+                );
+                // The parent's own connections are untouched.
+                assert_ne!(unsafe { libc::fcntl(root_fd, libc::F_GETFD) }, -1);
+                peer.join().unwrap();
+                drop(rpc);
+                std::fs::remove_file(directory.join("socket")).unwrap();
+                drop(directory_owner);
+                std::fs::remove_dir(&directory).unwrap();
+            },
+        );
+    }
+
     #[test]
     fn ordinary_coordinator_move_preserves_ofd_peer_and_closes_original() {
         isolated_coordinator_move_test(

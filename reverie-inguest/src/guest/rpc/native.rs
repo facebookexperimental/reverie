@@ -115,11 +115,30 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         // only that thread's ordinary per-thread connection -- the same
         // one its next ordinary send would open -- and no frame is
         // exchanged on the refusal path.
+        // The inherited root entry itself, never a lazy open: stamp
+        // checks below compare against its connect-time stamps, and a
+        // fork child must meet Owner refusal (its stamps are the
+        // parent's), not a reconnect. Ordinary sends own fork reset.
         let connection_arc = match &self.connection {
             super::ConnectionOwner::NativeConfiguration => {
                 return Err(NativeFrameError::InFlight);
             }
-            super::ConnectionOwner::Ordinary(_) => self.thread_connection(),
+            super::ConnectionOwner::Ordinary(connections) => {
+                let snapshot = connections.snapshot();
+                let root_fd = self.fd.load(Ordering::Acquire);
+                // The root record can be cleared (tests swap it to -1 to
+                // force the stamp mismatch below); with a single live
+                // connection that one is unambiguously the root entry
+                // whose stamps the checks must judge.
+                match snapshot
+                    .iter()
+                    .find(|connection| connection.fd() == root_fd)
+                    .or_else(|| (snapshot.len() == 1).then(|| &snapshot[0]))
+                {
+                    Some(connection) => connection.clone(),
+                    None => return Err(NativeFrameError::InFlight),
+                }
+            }
         };
         let connection = connection_arc
             .try_lock()
