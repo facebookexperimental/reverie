@@ -25,6 +25,30 @@ $ cd reverie-examples
 $ cargo run --bin strace -- ls
 ```
 
+The guest's stdout is the directory listing:
+
+```text
+backend.rs
+Cargo.toml
+chaos_launcher.rs
+chaos.rs
+chrome-trace
+...
+```
+
+The tool's trace goes to stderr. Its final lines have this shape
+(the process ID and addresses vary from run to run):
+
+```text
+[pid 3146459] openat(-100, 0x555555582920 -> ".", OFlag(O_CLOEXEC | O_DIRECTORY | O_NDELAY), Mode(0x0)) = 3
+[pid 3146459] getdents64(3, 0x555555582970, 32768) = 976
+[pid 3146459] getdents64(3, 0x555555582970, 32768) = 0
+[pid 3146459] write(1, 0x555555582bc0, 355) = 355
+[pid 3146459] exit_group(0) = ?
+Thread 3146459 exited with status Exited(0)
+Process 3146459 exited with status Exited(0)
+```
+
 You just ran `/bin/ls` as a guest under the `strace` tool on the
 default (ptrace) backend. The tool echoes every intercepted event,
 `strace`-style, while the guest's own output passes through. Notice
@@ -54,7 +78,14 @@ through the shared example preload:
 ```console
 $ cargo build -p reverie-examples --lib --bin reverie-liteinst-examples
 $ target/debug/reverie-liteinst-examples --tool counter1 -- /bin/echo hello
+hello
+ [counter tool] Total system calls in process tree: 79
 ```
+
+The `hello` line is the guest's stdout; the counter's total goes to
+stderr. The number itself is a property of the guest, host libc, and
+startup path, so expect the same shape rather than the same count on
+every machine.
 
 Same `Tool` implementation, different mechanism: no per-syscall ptrace
 stop. That sentence — *same tool, swappable mechanism, same semantics
@@ -62,15 +93,59 @@ or a named refusal* — is the thesis of this book, and
 [Backends](backends.md) and [Testing your tool](testing.md) are where
 it is proved rather than asserted.
 
-> 🚧 **Under construction — expected output transcripts.** TODO: paste
-> exact, trimmed transcripts for the `strace` and `counter1` runs
-> above from a clean build of this tree, so readers can verify their
-> environment matches the book's. <!-- UC: gs-transcripts -->
-> Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`gs-transcripts`).
->
-> 🚧 **Under construction — `cargo add` path.** TODO: document
-> starting from crates.io (`reverie-core` + a backend crate) in a
-> fresh `cargo init` project, including which published versions this
-> guide targets; the checkout path above is the one verified today.
-> <!-- UC: gs-cratesio -->
-> Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`gs-cratesio`).
+## Starting from crates.io
+
+The checkout above is the path this book's later chapters follow,
+because they track the workspace as it changes. If you want only the
+published framework and the ptrace backend, start a fresh binary
+project and pin the pair this section was verified against:
+`reverie-core` 0.5.0 (imported as `reverie`) and `reverie-ptrace`
+0.5.0, using stable Rust 1.97.1, the workspace toolchain used for
+the verification.
+
+```console
+$ cargo new my-tool
+$ cd my-tool
+$ cargo add reverie-core@=0.5.0 reverie-ptrace@=0.5.0
+$ cargo add tokio --features macros,rt,time
+```
+
+Replace `src/main.rs` with the smallest useful launcher. It runs
+`/bin/echo hello` under the built-in unit tool (`()` implements
+`Tool`), so it proves the published crates, backend, and host setup
+line up before you write policy of your own. The backend future is
+not `Send`, so it runs on a current-thread Tokio runtime inside a
+`LocalSet`:
+
+```rust,ignore
+use reverie::Backend;
+use reverie::process::Command;
+use reverie_ptrace::PtraceBackend;
+
+fn main() -> Result<(), reverie::Error> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread Tokio runtime");
+    let local = tokio::task::LocalSet::new();
+    let (status, ()) = local.block_on(&runtime, {
+        let mut command = Command::new("/bin/echo");
+        command.arg("hello");
+        PtraceBackend::run::<()>(command, ())
+    })?;
+    println!("guest exited with {status:?}");
+    Ok(())
+}
+```
+
+```console
+$ cargo run
+hello
+guest exited with Exited(0)
+```
+
+That is the whole published-crate smoke test used for this section.
+For the full tool in the next chapter — and for APIs newer than
+0.5.0, including the selection/admission surface — use the checkout
+path above; the workspace version in this tree is ahead of the
+published 0.5.0 pair.

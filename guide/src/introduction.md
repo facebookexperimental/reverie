@@ -14,7 +14,7 @@ determinism engine, but Hermit is a *consumer* of this framework: this
 book is about Reverie itself, and every example in it runs without
 Hermit.
 
-> **Under-construction regions in this guide: 21.** This guide was
+> **Under-construction regions in this guide: 19.** This guide was
 > started early, on purpose: writing it is how we check that our
 > concepts are clear and that the layers fit together. Every
 > unfinished or unimplemented part is marked with an *Under
