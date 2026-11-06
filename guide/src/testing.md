@@ -39,20 +39,24 @@ for what only a live guest can prove: lifecycle, memory access,
 injection, signal interplay. The README's quick local run is:
 
 ```console
-$ cargo test --features reverie-ptrace/nightly -- --test-threads=1
+$ cargo test -- --test-threads=1
 ```
 
-CI itself (`.github/workflows/ci.yml`) runs the workspace with
-`--all-features`: on hosted runners with the device-dependent crates
+CI itself (`.github/workflows/ci.yml`) runs the workspace on the pinned
+stable toolchain with the stable feature set in
+`scripts/stable-features.sh` (every workspace feature except the
+nightly-only ones): on hosted runners with the device-dependent crates
 excluded (`--exclude reverie-kvm --exclude reverie-kvm-core
 --exclude reverie-linuxemu --exclude reverie-inguest`) plus
 `cargo test --workspace --doc`, and on the self-hosted hardware
-job the full workspace. Quote CI, not the README, when you need the
+job the full workspace. The nightly lane
+(`.github/workflows/nightly.yml`) runs `--all-features` on a nightly
+compiler. Quote CI, not the README, when you need the
 authoritative invocation.
 
-(Function-guest tests that collect printing macros need that feature,
-or run on stable with `--nocapture`; the ptrace crate's README
-explains why.)
+(Function-guest tests that collect printing macros need the nightly
+feature on a nightly compiler, or run on stable with `--nocapture`;
+the ptrace crate's README explains why.)
 
 ## Determinism of the test itself
 

@@ -3,7 +3,7 @@
 //! A LiteInst jump patch overwrites the first five bytes of the whole
 //! instructions it displaces from a `syscall` site. A control transfer that
 //! lands strictly inside those bytes then executes the tail of the jump as
-//! code. liteinst2 refuses a direct branch into the window only when the
+//! code. liteinst refuses a direct branch into the window only when the
 //! branch lies in the bytes it decoded, and those start at the site itself
 //! (<https://github.com/rrnewton/reverie/issues/812>). glibc's `posix_madvise`
 //! is an example: a `je` before its `syscall` targets the `ret` that the patch

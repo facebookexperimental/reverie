@@ -7,8 +7,8 @@
 //! The runtime builds the census itself from an [`ObjectImage`].
 
 use iced_x86::Mnemonic;
-use liteinst2::patcher::NEAR_JUMP_BYTES;
-use liteinst2::scanner::ScannedInstruction;
+use liteinst::patcher::NEAR_JUMP_BYTES;
+use liteinst::scanner::ScannedInstruction;
 
 pub(crate) use crate::liteinst_census::Census;
 pub(crate) use crate::liteinst_census::CensusError;
@@ -102,7 +102,7 @@ pub(crate) fn prove_within(
 
 /// Returns the end of the instructions a jump patch at `address` displaces.
 ///
-/// This follows `JumpPatchPlan::from_scan` in liteinst2 2032b49d: whole
+/// This follows `JumpPatchPlan::from_scan` in liteinst (2032b49d, unchanged in 0.2.0): whole
 /// consecutive instructions from the site until they cover
 /// [`NEAR_JUMP_BYTES`].
 pub(crate) fn displaced_end(address: u64, instructions: &[ScannedInstruction]) -> Option<u64> {
@@ -128,9 +128,9 @@ mod tests {
     use iced_x86::DecoderOptions;
     use iced_x86::Mnemonic;
     use iced_x86::OpKind;
-    use liteinst2::patcher::JumpPatchPlan;
-    use liteinst2::patcher::WORD_PATCH_BYTES;
-    use liteinst2::scanner::InstructionScanner;
+    use liteinst::patcher::JumpPatchPlan;
+    use liteinst::patcher::WORD_PATCH_BYTES;
+    use liteinst::scanner::InstructionScanner;
 
     use super::Census;
     use super::ObjectImage;
@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn the_displaced_end_matches_liteinst2() {
+    fn the_displaced_end_matches_liteinst() {
         let scanner = InstructionScanner::default();
         for bytes in [
             &[0x0f, 0x05, 0xf7, 0xd8, 0xc3, 0x90, 0x90, 0x90][..],

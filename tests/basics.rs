@@ -10,6 +10,10 @@
 
 #[path = "support/basics_commands.rs"]
 mod commands;
+// Without the `nightly` feature, `print_body` has no caller in this target
+// (its only use is the feature-gated half of `run_guest_func_print_test`);
+// the command guest and conformance crates include the same file separately.
+#[cfg_attr(not(feature = "nightly"), allow(dead_code))]
 #[path = "support/basics_rust_guest.rs"]
 mod rust_guest;
 #[path = "tool_fixtures/basics.rs"]
@@ -183,11 +187,20 @@ fn run_guest_func_write_test() {
 #[cfg(not(sanitized))]
 #[test]
 fn run_guest_func_print_test() {
-    let msg = "abcd";
-    let (output, _state) = test_fn::<CounterLocal, _>(move || rust_guest::print_body(msg)).unwrap();
+    // The function guest prints with `println!`, which libtest's capture
+    // intercepts before it reaches the output pipes unless reverie-ptrace's
+    // `nightly` feature clears that capture across the fork. On stable the
+    // command-guest half below still covers the same body and oracle; the
+    // function half runs in the nightly CI lane.
+    #[cfg(feature = "nightly")]
+    {
+        let msg = "abcd";
+        let (output, _state) =
+            test_fn::<CounterLocal, _>(move || rust_guest::print_body(msg)).unwrap();
 
-    assert_eq!(output.status, ExitStatus::Exited(0));
-    assert_eq!(output.stdout.as_slice(), b"abcd\n");
+        assert_eq!(output.status, ExitStatus::Exited(0));
+        assert_eq!(output.stdout.as_slice(), b"abcd\n");
+    }
     rust_output_command_test("print");
 }
 

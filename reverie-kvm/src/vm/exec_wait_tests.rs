@@ -701,14 +701,12 @@ fn exec_join_helper_parent_spawn_hook_panic_restores_original_ownership() {
         let address = (&*payload as *const JoinPanicToken) as usize;
         let payload: crate::failure::owned_future::PanicPayload = payload;
         let hook_payload = Arc::new(Mutex::new(Some(payload)));
-        std::thread::add_spawn_hook(move |thread| {
-            if thread.name() == Some("reverie-kvm-join") {
-                let payload = { hook_payload.lock().unwrap().take() };
-                if let Some(payload) = payload {
-                    std::panic::resume_unwind(payload);
-                }
+        super::worker_join::add_join_spawn_hook(move || {
+            let payload = { hook_payload.lock().unwrap().take() };
+            if let Some(payload) = payload {
+                std::panic::resume_unwind(payload);
             }
-            || {}
+            Box::new(|| {})
         });
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             group.start_worker_join_helper_with(
@@ -767,19 +765,15 @@ fn exec_join_helper_child_spawn_hook_panic_retains_handle_payload_and_originals(
         let (entered, wait_entered) = mpsc::channel();
         let (release, wait_release) = mpsc::channel();
         let hook_state = Arc::new(Mutex::new(Some((payload, entered, wait_release))));
-        std::thread::add_spawn_hook(move |thread| {
-            let state = if thread.name() == Some("reverie-kvm-join") {
-                hook_state.lock().unwrap().take()
-            } else {
-                None
-            };
-            move || {
+        super::worker_join::add_join_spawn_hook(move || {
+            let state = hook_state.lock().unwrap().take();
+            Box::new(move || {
                 if let Some((payload, entered, release)) = state {
                     let _ = entered.send(());
                     let _ = release.recv_timeout(WAIT);
                     std::panic::resume_unwind(payload);
                 }
-            }
+            })
         });
         let body_entered = Arc::new(AtomicBool::new(false));
         let body_flag = body_entered.clone();
@@ -852,19 +846,15 @@ fn exec_join_helper_reuses_thread_and_defers_inherited_tls_to_outer_drain() {
         let hook_probe = Arc::new(Mutex::new(Some(probe)));
         let installed = Arc::new(AtomicUsize::new(0));
         let hook_installed = installed.clone();
-        std::thread::add_spawn_hook(move |thread| {
-            let probe = if thread.name() == Some("reverie-kvm-join") {
-                hook_probe.lock().unwrap().take()
-            } else {
-                None
-            };
+        super::worker_join::add_join_spawn_hook(move || {
+            let probe = hook_probe.lock().unwrap().take();
             let installed = hook_installed.clone();
-            move || {
+            Box::new(move || {
                 if let Some(probe) = probe {
                     HELD_TLS_EXIT.with(|slot| *slot.borrow_mut() = Some(probe));
                     installed.fetch_add(1, Ordering::SeqCst);
                 }
-            }
+            })
         });
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);

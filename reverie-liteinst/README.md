@@ -7,7 +7,7 @@ backend and [`hermit-run`](https://crates.io/crates/hermit-run) for the CLI.
 Hermit's `liteinst` feature is optional and off by default.
 
 `reverie-liteinst` is an experimental Linux x86-64 Reverie backend built on the
-standalone `liteinst2` patching library, the shared `reverie-inguest` runtime,
+standalone `liteinst` patching library, the shared `reverie-inguest` runtime,
 and `reverie-rpc-transport`.
 
 ## Preload and allocator ownership
@@ -450,7 +450,7 @@ owned Tool stacks and protected Tool memory are not established by this path.
   syscall injection do so; a tool future that depends on an unrelated executor
   can stall.
 - The five-byte patch window and executable mapping must be supported by
-  `liteinst2` to install a hook. Unpatchable syscalls use deferred Tool dispatch;
+  `liteinst` to install a hook. Unpatchable syscalls use deferred Tool dispatch;
   other intercepted instructions still require a prepared reachable arena.
 - `execve` cannot safely cross the inherited filter because the handler and DSO
   mappings disappear. It remains fail closed; completing exec requires a
@@ -476,8 +476,8 @@ owned Tool stacks and protected Tool memory are not established by this path.
     is only detected, as for the network-filesystem case.
 - This is in-process instrumentation, not a security sandbox.
 
-Hermit CLI linkage and a published `liteinst2` revision are separate integration
-steps. The direct Backend harness has run Detcore with `/bin/echo`, `/bin/true`,
+This crate builds against the published `liteinst` 0.2.0 crates.io release.
+Hermit CLI linkage is a separate integration step. The direct Backend harness has run Detcore with `/bin/echo`, `/bin/true`,
 and `/bin/cat /dev/null`; this does not make `hermit --backend liteinst` real
 until that CLI path constructs `LiteinstBackend` and the corresponding Detcore
 preload DSO on the same landed revisions.

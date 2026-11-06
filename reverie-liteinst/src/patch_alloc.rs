@@ -1,7 +1,7 @@
 //! The allocation reserve for instrumentation planning.
 //!
 //! A seccomp SIGSYS handler cannot let the system allocator issue brk or mmap.
-//! During a bounded installation scope, allocations from liteinst2 and
+//! During a bounded installation scope, allocations from liteinst and
 //! iced-x86 therefore come from this prepublished process-lifetime buffer.
 //! Objects that survive registration are intentionally never reclaimed. Preload
 //! leaves use [`FixedPrivatePatchAllocator`], whose other allocations always use

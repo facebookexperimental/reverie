@@ -1,5 +1,8 @@
 # Get help on options with `rustfmt --help=config`
 # Please keep these in alphabetical order.
+# format_code_in_doc_comments, group_imports, and imports_granularity are
+# nightly-only: stable rustfmt warns and ignores them (stable --check still
+# passes on this tree), so the nightly CI lane is what enforces them.
 edition = "2024"
 format_code_in_doc_comments = true
 group_imports = "StdExternalCrate"

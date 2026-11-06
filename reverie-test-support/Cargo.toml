@@ -10,6 +10,12 @@ edition = "2024"
 license = "BSD-2-Clause"
 publish = false
 
+[features]
+# Enables reverie-ptrace's nightly libtest-capture clearing so the
+# function-guest printing-macro half of `run_guest_func_print_test` runs.
+# Needs a nightly compiler; exercised by the nightly CI lane.
+nightly = ["reverie-ptrace/nightly"]
+
 [dependencies]
 libc = "0.2.186"
 syscalls = "0.6.18"
@@ -19,9 +25,11 @@ reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace" }
 
 [dev-dependencies]
 close-err = "1.0.2"
-# Inherited function guests must clear libtest's thread-local output capture.
-# The workspace already pins nightly; ordinary library users need no feature.
-reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace", features = ["nightly"] }
+# No `nightly` feature here: the workspace builds and tests on stable Rust.
+# Function guests that print with std macros rely on descriptor writes or an
+# uncaptured test runner, as `spawn_fn_with_config` documents; the nightly
+# printing-macro capture case runs in the nightly CI lane.
+reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace" }
 serde = { version = "1.0.219", features = ["derive"] }
 tempfile = "3.27.0"
 tracing = "0.1.41"

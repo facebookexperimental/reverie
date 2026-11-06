@@ -1,13 +1,12 @@
 [toolchain]
 # @fb-only: path = "../../../third-party/rust-toolchain/rustup/current/basic"
-# Pinned to the last known-good nightly. nightly-2026-07-30 (rustc 8ab9fdff5)
-# changed cargo's cdylib artifact uplift under `cargo test`, so
-# `target/debug/libreverie_examples.so` is no longer present when the
-# reverie-examples liteinst integration tests run, breaking all reverie CI.
-# Unpin once the cdylib/`cargo test` interaction is fixed upstream or the
-# liteinst fixture is made robust to the artifact layout.
-channel = "nightly-2026-07-29" # @oss-only
-# Date-pinning installs a fresh dated toolchain; rustup only adds clippy/rustfmt
-# for it when they are requested here (the unpinned `nightly` got them from the
-# CI toolchain-setup action). Both shipped in the 2026-07-29 nightly.
+# Pinned stable. The workspace builds and tests on this release; the only
+# nightly-only code left is behind the off-by-default `nightly` Cargo
+# features (libtest printing-macro capture in forked function guests),
+# exercised by the nightly CI lane. The earlier nightly-2026-07-29 pin
+# dodged a nightly-2026-07-30 cargo cdylib-uplift regression; stable cargo
+# never had it (the reverie-examples liteinst tests pass on this pin).
+channel = "1.97.1" # @oss-only
+# Date/version pinning installs a fresh toolchain; rustup only adds clippy
+# and rustfmt for it when they are requested here.
 components = ["clippy", "rustfmt"] # @oss-only

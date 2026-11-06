@@ -8,7 +8,7 @@
 # Run the workspace test suite one package at a time and write a per-package
 # scorecard. This splits validate.sh's "Test regular workspace cases" gate
 # per package for attribution; it is not a substitute for that gate:
-# per-package --all-features loses workspace feature unification, and
+# per-package feature selection loses workspace feature unification, and
 # validate.sh itself builds the LiteInst fixtures and exports their
 # variables into the gate (below they only pass through). A green run here
 # is weaker evidence than a green validate.sh. Counts come from scripts/libtest-counts.rs
@@ -37,6 +37,10 @@ set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
+
+# Stable feature set; each package gets its own entries from the list.
+# shellcheck source=stable-features.sh
+source "$ROOT_DIR/scripts/stable-features.sh"
 
 RESULTS="$ROOT_DIR/target/percrate"
 SKIP_LIST=1
@@ -141,9 +145,15 @@ for pkg in "${PACKAGE_LIST[@]}"; do
     if [[ ${PERCRATE_TIMEOUT:-2400} != 0 ]]; then
         timeout_cmd=(timeout --signal=TERM --kill-after=30 "${PERCRATE_TIMEOUT:-2400}")
     fi
+    pkg_features=()
+    for feature in $STABLE_FEATURES; do
+        [[ $feature == "$pkg"/* ]] && pkg_features+=("$feature")
+    done
+    feature_args=()
+    ((${#pkg_features[@]})) && feature_args=(--features "${pkg_features[*]}")
     /usr/bin/time -v "${timeout_cmd[@]}" \
         "$ROOT_DIR/scripts/libtest-counts.rs" run "$counts" -- \
-        cargo test -p "$pkg" --all-features --no-fail-fast \
+        cargo test -p "$pkg" "${feature_args[@]}" --no-fail-fast \
         -- --test-threads=1 "${SKIP_ARGS[@]}" >"$log" 2>&1
     rc=$?
     wall=$((SECONDS - start))

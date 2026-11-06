@@ -12,7 +12,7 @@
 /// The guest's general-purpose registers at a hooked or continued
 /// instruction, saved by the trampoline or continuation that entered the
 /// runtime. Its layout is fixed (176 bytes): it is the same block LiteInst's
-/// trampolines (liteinst2's `HookContext`) and the fallback continuation save,
+/// trampolines (liteinst's `HookContext`) and the fallback continuation save,
 /// and the runtime reads and writes it through a pointer.
 #[repr(C)]
 #[derive(Debug, Default)]

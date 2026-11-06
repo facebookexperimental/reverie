@@ -16,7 +16,7 @@
 //! its runtime services, and its runtime option selectors. [`TrapHost`] has no
 //! patcher: every trapped syscall runs through the fallback continuation, the
 //! vDSO gets the trapping stubs, and CPUID/RDTSC are emulated, with no
-//! liteinst2 code in the process.
+//! liteinst code in the process.
 //!
 //! The order of the steps below is LiteInst's installation order, which the
 //! corpus gate holds identical; a step a host does not need is a no-op.

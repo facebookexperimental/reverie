@@ -1103,8 +1103,8 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     (
         "reverie-liteinst-artifact/src/preparation_identity.rs",
-        47133,
-        "8bcd76024fed01842752781495f668d8fee2594f87356daa8534e863147958ec",
+        49430,
+        "4a2c6fafef085ed18cb87c66f048c15b5825f9eb6d3c068a6da90dcb14981829",
     ),
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
@@ -1134,8 +1134,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-inguest/src/guest/tool_install.rs",
-        25615,
-        "3dc7ab43763fc3c0cc308050d785d058581701096a94193833587d2df1dd8795",
+        25614,
+        "e22613d605b984846de8a9e2ce26671587d335292c000500ba913744c90f69b6",
     ),
     (
         "reverie-inguest/src/signal.rs",
@@ -1319,8 +1319,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-liteinst/Cargo.toml",
-        5441,
-        "3e84133b0ad9301f45b43eaca6639905e35509d1a14b2917f82d3f67be0a1028",
+        5329,
+        "072bb73fa5146fb09119d2a2e06267fa2f62bc2bed8d6f4e19dbcf3acad6e029",
     ),
     (
         "reverie-liteinst/src/lib.rs",
@@ -1339,8 +1339,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-liteinst/src/patch_alloc.rs",
-        24730,
-        "4e624b555d15acaeb72c9d4bf4d29e52666b377fb9a9ef48ef07447b6e834561",
+        24729,
+        "d17373084f4d3b16cd3f5bdf6e8314331de3ca279b1287a89c8b5566e16b5dfa",
     ),
     (
         "reverie-inguest/src/guest/alloc.rs",
@@ -1394,8 +1394,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-liteinst/src/tool_host.rs",
-        59035,
-        "96c710799ecfd0a2e228b9c6ee64ff1bf5846f6e2ec1c7929bb347249d002663",
+        59026,
+        "fcb1b651f5dc1142521b6ff8140c438c71b7b862ff6feb0d48ac63c52dbb570a",
     ),
     (
         "reverie/Cargo.toml",
@@ -10449,7 +10449,7 @@ const FIXED_READONLY_SPECS: &[FixedReadonlySpec] = &[
     FixedReadonlySpec {
         key: "publication_dev_data_369138",
         kind: "location",
-        hex: "00000000000000002e00000000000000de00000013000000",
+        hex: "00000000000000002e00000000000000e300000013000000",
         file_hex: "726576657269652d696e67756573742f7372632f67756573742f746f6f6c5f726567696f6e5f6172656e612e7273",
         owner: "",
         switch: &[],
@@ -11379,6 +11379,11 @@ const FIXED_OPERATION_ROLE_SYMBOLS: &[(&str, &str)] = &[
         "_RNvMNtNtCs_4core3ptr7mut_ptrOh7is_nullCs_7futures",
         "_RNvMNtNtCs_4core3ptr7mut_ptrOh7is_nullCs_7futures",
     ),
+    // Retained-cohort spellings, still matched by live fail-closed
+    // qualifiers: `Cs_9liteinst2` names the pre-0.2.0 crate in historical
+    // build images. Exact matching refuses (never mis-admits) an image
+    // whose symbols differ, so do not rename without recapturing a
+    // `Cs_8liteinst` cohort from a real 0.2.0 build.
     (
         "_RNvMNtNtCs_4core3ptr7mut_ptrOh7is_nullCs_9liteinst2",
         "_RNvMNtNtCs_4core3ptr7mut_ptrOh7is_nullCs_9liteinst2",
@@ -16951,6 +16956,8 @@ const FIXED_OPTIMIZED_TLS_THUNK_DIAGNOSTIC_HEX: &str =
     "50488d3da0960a00e8832f0a00488d808800000059c3";
 const FIXED_DEV_TLS_CELL_GETTER_HEX: &str =
     "4883ec1848897c24084889742410488d3daba42100e8b6321e00488d80480000004883c418c3";
+const FIXED_DEV_TLS_CELL_GETTER_STABLE_HEX: &str =
+    "4883ec1848897c24084889742410488d3df3ca1e00e8866f1b00488d80300000004883c418c3";
 const FIXED_DEV_TLS_CELL_GETTER_EVENT_ARGUMENT_HEX: &str =
     "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3";
 const FIXED_DEV_TLS_CELL_GETTER_DIAGNOSTIC_EVENT_ARGUMENT_HEX: &str =
@@ -16994,6 +17001,11 @@ fn fixed_tls_cell_access_recipe(
             16,
             &[(4, 8), (9, 13)],
         ),
+        ("fixed_tls_cell_getter", 0x30) => (
+            FIXED_DEV_TLS_CELL_GETTER_STABLE_HEX,
+            29,
+            &[(17, 21), (22, 26)],
+        ),
         ("fixed_tls_cell_getter", 0x48) => {
             (FIXED_DEV_TLS_CELL_GETTER_HEX, 29, &[(17, 21), (22, 26)])
         }
@@ -17034,7 +17046,12 @@ fn fixed_tls_cell_access_recipe(
             16,
             &[(4, 8), (9, 13)],
         ),
-        _ => return Err("unsupported whole TLS read role/cell-offset pair".into()),
+        _ => {
+            return Err(format!(
+                "unsupported whole TLS read role/cell-offset pair: role={role}, cell={:#x}",
+                cell.address
+            ));
+        }
     };
     require(
         operands
@@ -17671,12 +17688,25 @@ fn qualify_allocator_tls_boundary_in_source_context(
             local_got_slot: None,
         });
         let (function, function_bytes) = bind("fixed_tls_fn_once")?;
-        fixed_whole_recipe(
-            function,
-            function_bytes,
-            "4883ec1848897c2410488b742410488d7c240fe8a802000048890424488b04244883c418c3",
-            &[(20, 24, getter)],
-        )?;
+        if function_bytes.len() == 65 {
+            // Stable codegen retains an unwind landing pad for the getter
+            // call. Bind its direct transfer to the actual local
+            // _Unwind_Resume implementation; the remaining bytes are exact.
+            let unwind_resume = private_function(elf, "_Unwind_Resume")?.st_value;
+            fixed_whole_recipe(
+                function,
+                function_bytes,
+                "4883ec2848897c2410488b742410488d7c240fe8d8f0010048890424eb1a488b7c2418e8d8e6feff4889c189d048894c241889442420ebe6488b04244883c428c3",
+                &[(20, 24, getter), (36, 40, unwind_resume)],
+            )?;
+        } else {
+            fixed_whole_recipe(
+                function,
+                function_bytes,
+                "4883ec1848897c2410488b742410488d7c240fe8a802000048890424488b04244883c418c3",
+                &[(20, 24, getter)],
+            )?;
+        }
         let (get, get_bytes) = bind("fixed_tls_get")?;
         let get_to_with =
             fixed_local_call_operand(get, get_bytes, 7, 11, roles["fixed_tls_with"].st_value, got)?;
@@ -17721,28 +17751,54 @@ fn qualify_allocator_tls_boundary_in_source_context(
         // not an expected backing or an admitted external provider.
         loaded_bytes(elf, bytes, refusal_data, 24)?;
         let (try_with, try_bytes) = bind("fixed_tls_try_with")?;
-        let callback = fixed_local_call_operand(
-            try_with,
-            try_bytes,
-            0x65,
-            0x69,
-            roles["fixed_tls_cell_callback"].st_value,
-            got,
-        )?;
-        fixed_whole_recipe(
-            try_with,
-            try_bytes,
-            FIXED_DEV_TLS_TRY_WITH_HEX,
-            &[(0x65, 0x69, callback)],
-        )?;
-        // Entire exact prefix retains the incoming immutable LocalKey in RAX,
-        // supplies the None argument, and calls precisely *(RAX). This edge is
-        // qualified by the bound readonly LocalKey object, not a register-call
-        // allowlist. No body/function pointer from the guest earns this role.
-        let transfer = ConstructorTransfer {
-            instruction: try_with + 0x15,
-            target: fn_once,
-            local_got_slot: None,
+        // The two exact bodies differ in how the LocalKey init pointer is
+        // called: nightly calls *(RAX) at +0x15 after retaining the key in
+        // RAX; stable first loads (*RDI) into RAX and calls *RAX at +0x18,
+        // loads the callback through its GOT slot, and retains an unwind
+        // landing pad. Each edge below is qualified by the bound readonly
+        // LocalKey object, not a register-call allowlist. No body or
+        // function pointer from the guest earns this role.
+        let transfer = if try_bytes.len() == 235 {
+            let callback = fixed_local_call_operand(
+                try_with,
+                try_bytes,
+                0xab,
+                0xaf,
+                roles["fixed_tls_cell_callback"].st_value,
+                got,
+            )?;
+            let unwind_resume = private_function(elf, "_Unwind_Resume")?.st_value;
+            fixed_whole_recipe(
+                try_with,
+                try_bytes,
+                FIXED_DEV_TLS_TRY_WITH_STABLE_HEX,
+                &[(0xab, 0xaf, callback), (0xe5, 0xe9, unwind_resume)],
+            )?;
+            ConstructorTransfer {
+                instruction: try_with + 0x18,
+                target: fn_once,
+                local_got_slot: None,
+            }
+        } else {
+            let callback = fixed_local_call_operand(
+                try_with,
+                try_bytes,
+                0x65,
+                0x69,
+                roles["fixed_tls_cell_callback"].st_value,
+                got,
+            )?;
+            fixed_whole_recipe(
+                try_with,
+                try_bytes,
+                FIXED_DEV_TLS_TRY_WITH_HEX,
+                &[(0x65, 0x69, callback)],
+            )?;
+            ConstructorTransfer {
+                instruction: try_with + 0x15,
+                target: fn_once,
+                local_got_slot: None,
+            }
         };
         let (callback_address, callback_bytes) = bind("fixed_tls_cell_callback")?;
         // Missing or unrecognized emission must refuse, not panic on indexing.
@@ -17816,6 +17872,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
 }
 
 const FIXED_DEV_TLS_TRY_WITH_HEX: &str = "4883ec784889f84889442448c64424470131c989cfff1048894424104889442458488b4424104883f8007444488b4424104889442438488b44243848894424604889442430488b44243048894424684889442428488b7c242848897c2470c644244700ff153f6d1a004889442408eb1d48c74424380000000048c74424300000000048c744241801000000eb13488b442408488944242048c744241800000000488b442418488b5424204883c478c3";
+const FIXED_DEV_TLS_TRY_WITH_STABLE_HEX: &str = "4881ec8800000048897c2448c644244701488b0731c989cfffd04889442410eb20f6442447010f85bd000000e9ae0000004889c189d048894c245889442460ebe0488b44241048894424684883f800751d48c74424380000000048c74424300000000048c744241801000000eb4a488b4424104889442438488b44243848894424704889442430488b44243048894424784889442428488b7c24284889bc2480000000c644244700488b0511ea0c00ffd04889442408eb12488b442418488b5424204881c488000000c3488b442408488944242048c744241800000000ebd9488b7c2458e887aceaffebf4";
 
 const FIXED_OPTIMIZED_PATCH_ALLOC_HEX: &str = "41574156415453504889d34989f6ff15a4740a004885c074774c8b78204d85ff746e4989c4488d3d446f0a00e83f080a004883b848000000007463498b542410498b0f498d76ff49f7de31c04889cf4801d7723e4801f772394c21f74989f84929d04901d8410f92c14981f801000002410f93c24508ca75194889c8f04d0fb1074889c1b80000000075c14889f8eb0231c04883c4085b415c415e415fc3bf010000004c89f64889da4883c4085b415c415e415fff2526740a00";
 
@@ -17885,7 +17942,7 @@ fn fixed_role_symbols(elf: &Elf<'_>) -> Result<BTreeMap<String, sym::Sym>> {
     Ok(result)
 }
 
-// Observed equality cohorts can coexist in one DSO. This finite census
+// Three observed equality cohorts can coexist in one DSO. This finite census
 // grants byte coverage only; admission chooses one pair from complete callers.
 const FIXED_HEAP_EQUAL_COHORTS: [(&str, &str); 3] = [
     (
@@ -18393,7 +18450,7 @@ fn validate_fixed_backing_evidence_in_source_context(
             && canonical_rust_symbol(&tls.tls_cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
             && match image_kind {
                 FixedImageKind::Standalone => {
-                    matches!(tls.tls_cell.address, 0x40 | 0x48 | 0x80 | 0x88)
+                    matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x48 | 0x80 | 0x88)
                 }
                 FixedImageKind::Detcore => {
                     matches!(
@@ -18442,7 +18499,7 @@ fn validate_fixed_backing_evidence_in_source_context(
             resolution == "local_relative_readonly_function_pointer"
                 && (tls.tls_cell.address == 0x48
                     || (image_kind == FixedImageKind::Standalone
-                        && matches!(tls.tls_cell.address, 0x40 | 0x80)))
+                        && matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x80)))
                 && edge.local_got_slot.is_none()
                 && tls
                     .local_chain
@@ -18499,7 +18556,7 @@ fn validate_fixed_backing_evidence_in_source_context(
         _ => return Err("Fixed TLS local function-pointer evidence is inconsistent".into()),
     }
     if image_kind == FixedImageKind::Standalone
-        && matches!(tls.tls_cell.address, 0x40 | 0x80)
+        && matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x80)
         && tls.local_key_object.is_some()
     {
         let try_with = tls.local_chain.get("fixed_tls_try_with");
@@ -18512,7 +18569,13 @@ fn validate_fixed_backing_evidence_in_source_context(
                     .is_some_and(|key| key != 0 && key.is_multiple_of(8))
                 && tls.local_key_transfer.as_ref().is_some_and(|edge| {
                     try_with.is_some_and(|caller| {
-                        caller.address.checked_add(0x15) == Some(edge.instruction)
+                        let call_offset = match (tls.tls_cell.address, caller.size) {
+                            (0x30, 235) => Some(0x18),
+                            (0x40 | 0x80, 175) => Some(0x15),
+                            _ => None,
+                        };
+                        call_offset.and_then(|offset| caller.address.checked_add(offset))
+                            == Some(edge.instruction)
                     })
                 })
                 && tls
@@ -25384,6 +25447,77 @@ fn fixed_tls_transfers(
                     .ok_or("TLS local closure has unchecked GOT target")?,
                 local_got_slot: Some(slot),
             });
+        } else if b == &[0xff, 0xd0] {
+            // Stable dev try_with uses CALL RAX twice, and only these two
+            // exact sites earn edges: at +0x18 RAX was just loaded from
+            // (*RDI), the incoming LocalKey's first word; at +0xaf RAX was
+            // just loaded from the exact callback GOT slot. Any other
+            // register call remains uncovered and is refused by the census.
+            let instruction_at = |offset: u64| {
+                instructions.iter().find(|candidate| {
+                    symbol.st_value.checked_add(offset) == Some(candidate.address)
+                })
+            };
+            if symbol.st_value.checked_add(0x18) == Some(instruction.address) {
+                let key = tls
+                    .local_key_object
+                    .ok_or("TLS register call lacks its readonly LocalKey object")?;
+                let getter = tls
+                    .local_chain
+                    .get("fixed_tls_fn_once")
+                    .ok_or("TLS LocalKey lacks its exact typed FnOnce target")?;
+                let edge = tls
+                    .local_key_transfer
+                    .as_ref()
+                    .filter(|e| e.instruction == instruction.address)
+                    .ok_or("TLS register call lacks exact readonly local key proof")?;
+                require(
+                    role == "fixed_tls_try_with"
+                        && symbol.st_size == 235
+                        && instruction_at(0x00)
+                            .is_some_and(|i| i.bytes == [0x48, 0x81, 0xec, 0x88, 0, 0, 0])
+                        && instruction_at(0x07)
+                            .is_some_and(|i| i.bytes == [0x48, 0x89, 0x7c, 0x24, 0x48])
+                        && instruction_at(0x0c)
+                            .is_some_and(|i| i.bytes == [0xc6, 0x44, 0x24, 0x47, 0x01])
+                        && instruction_at(0x11).is_some_and(|i| i.bytes == [0x48, 0x8b, 0x07])
+                        && instruction_at(0x14).is_some_and(|i| i.bytes == [0x31, 0xc9])
+                        && instruction_at(0x16).is_some_and(|i| i.bytes == [0x89, 0xcf])
+                        && tls.local_key_resolution.as_deref()
+                            == Some("local_relative_readonly_function_pointer")
+                        && getter.address != 0
+                        && edge.target == getter.address
+                        && edge.local_got_slot.is_none()
+                        && got.get(&key) == Some(&getter.address),
+                    "TLS register call differs from its exact LocalKey/typed getter proof",
+                )?;
+                edges.push(edge.clone());
+            } else if symbol.st_value.checked_add(0xaf) == Some(instruction.address) {
+                let load = instruction_at(0xa8)
+                    .ok_or("stable TLS callback call lacks its exact GOT load")?;
+                require(
+                    role == "fixed_tls_try_with"
+                        && symbol.st_size == 235
+                        && load.bytes.len() == 7
+                        && load.bytes.starts_with(&[0x48, 0x8b, 0x05]),
+                    "stable TLS callback call differs from its exact GOT load",
+                )?;
+                let slot = fixed_rip_target(load.address, &load.bytes, 3, 7)?;
+                let target = *got
+                    .get(&slot)
+                    .ok_or("TLS local closure has unchecked GOT target")?;
+                require(
+                    tls.local_chain
+                        .get("fixed_tls_cell_callback")
+                        .is_some_and(|callback| callback.address == target),
+                    "stable TLS callback call differs from its exact typed callback",
+                )?;
+                edges.push(ConstructorTransfer {
+                    instruction: instruction.address,
+                    target,
+                    local_got_slot: Some(slot),
+                });
+            }
         } else if b == &[0xff, 0x10] {
             // Actual dev try_with calls the function pointer stored in the
             // incoming immutable LocalKey: CALL [RAX], not CALL RAX. Its full
@@ -29491,7 +29625,8 @@ fn preparation_role(name: &str) -> Option<&'static str> {
         "_RINvYINtNtNtCs_4core3ops5range5RangejENtNtNtNtBa_4iter6traits8iterator8Iterator8try_folduNCINvNvBL_3all5checkjNCNvMs_NtNtNtCs_15reverie_inguest5guest11tool_region11constructorNtB22_16NativeFreshOwner11from_natives_0E0INtNtB8_12control_flow11ControlFlowuEEB28_" => {
             Some("from_native_bitmap_range")
         }
-        "_RNvMs16_NtNtCs_4core4sync6atomicINtB6_6AtomicjE5storeCs_15reverie_inguest" => {
+        "_RNvMs16_NtNtCs_4core4sync6atomicINtB6_6AtomicjE5storeCs_15reverie_inguest"
+        | "_RNvMs1k_NtNtCs_4core4sync6atomicINtB6_6AtomicjE5storeCs_15reverie_inguest" => {
             Some("atomic_usize_store")
         }
         "_RNvMs_NtNtNtCs_15reverie_inguest5guest11tool_region11constructorNtB4_16NativeFreshOwner11from_native" => {
@@ -29503,6 +29638,9 @@ fn preparation_role(name: &str) -> Option<&'static str> {
         "_RNvNtCs_4core9panicking19panic_cannot_unwind" => Some("panic_cannot_unwind"),
         "_RNvNtCs_4core9panicking32panic_null_reference_constructed" => {
             Some("panic_null_reference_constructed")
+        }
+        "_RNvNtCs_4core9panicking30panic_null_pointer_dereference" => {
+            Some("panic_null_pointer_dereference")
         }
         "_RNvNtCs_4core9panicking36panic_misaligned_pointer_dereference" => {
             Some("panic_misaligned_pointer_dereference")
@@ -39805,6 +39943,132 @@ mod tests {
             )
             .is_err()
         );
+        // Measured standalone diagnostic Location from the reviewed arena source.
+        // The input is retained ELF data, not generated from the selected spec.
+        // These physical controls do not qualify a whole runtime or authorize execution.
+        {
+            const KEY: &str = "publication_dev_data_369138";
+            fn bind_location(
+                bytes: &[u8],
+                relocation_count: usize,
+            ) -> Result<FixedReadonlyEvidence> {
+                let mut elf = Elf::parse(bytes).map_err(|e| e.to_string())?;
+                elf.dynrelas = goblin::elf::reloc::RelocSection::parse(
+                    bytes,
+                    0x3400,
+                    relocation_count * 24,
+                    true,
+                    goblin::container::Ctx::new(
+                        goblin::container::Container::Big,
+                        goblin::container::Endian::Little,
+                    ),
+                )
+                .map_err(|e| e.to_string())?;
+                let mut evidence = BTreeMap::new();
+                fixed_bind_operand_data(
+                    &elf,
+                    bytes,
+                    KEY,
+                    0x1200,
+                    &mut BTreeMap::new(),
+                    &mut BTreeMap::new(),
+                    &mut evidence,
+                )?;
+                evidence
+                    .remove(KEY)
+                    .ok_or("Location evidence absent".into())
+            }
+            let mut location = fixture();
+            location[0x1200..0x1218].copy_from_slice(&fixed_hex(
+                "00000000000000002e00000000000000e300000013000000",
+            ));
+            location[0x1300..0x132e]
+                .copy_from_slice(b"reverie-inguest/src/guest/tool_region_arena.rs");
+            put(&mut location, 0x3400, 8, 0x1200);
+            put(
+                &mut location,
+                0x3408,
+                8,
+                u64::from(reloc::R_X86_64_RELATIVE),
+            );
+            put(&mut location, 0x3410, 8, 0x1300);
+            let observed = bind_location(&location, 1).unwrap();
+            assert_eq!(observed.size, 24);
+            assert_eq!(observed.relative_pointer_slot, Some(0x1200));
+            assert_eq!(observed.file_address, Some(0x1300));
+            assert_eq!(
+                observed.sha256,
+                "8b21b3868610fdf144fc00bdce9f6b32da312087ee7f8b16d67e531729bd684b"
+            );
+            assert_eq!(
+                observed.file_sha256.as_deref(),
+                Some("a13d1d5966ffa80325d65ae12985a3531af936cc0f1e0ab1cfd91c963a31a36c")
+            );
+            let mut protected = location.clone();
+            put(&mut protected, 68, 4, 6);
+            put(
+                &mut protected,
+                120,
+                4,
+                u64::from(program_header::PT_GNU_RELRO),
+            );
+            put(&mut protected, 136, 8, 0x1000);
+            put(&mut protected, 160, 8, 0x2000);
+            assert_eq!(bind_location(&protected, 1).unwrap(), observed);
+            for byte in 0..24 {
+                for bit in 0..8 {
+                    let mut bad = location.clone();
+                    bad[0x1200 + byte] ^= 1 << bit;
+                    assert_eq!(
+                        bind_location(&bad, 1).unwrap_err(),
+                        "wrong complete Fixed source Location",
+                        "complete Location mutation {byte}/{bit}"
+                    );
+                }
+            }
+            // The former line 222 expectation and historical line 203 do not
+            // describe this exact source. Adjacent locations are not alternatives.
+            for line in [203, 222, 226, 228] {
+                let mut bad = location.clone();
+                put(&mut bad, 0x1210, 4, line);
+                assert_eq!(
+                    bind_location(&bad, 1).unwrap_err(),
+                    "wrong complete Fixed source Location"
+                );
+            }
+            for column in [18, 20] {
+                let mut bad = location.clone();
+                put(&mut bad, 0x1214, 4, column);
+                assert_eq!(
+                    bind_location(&bad, 1).unwrap_err(),
+                    "wrong complete Fixed source Location"
+                );
+            }
+            let mut wrong_file = location.clone();
+            wrong_file[0x1300] ^= 1;
+            assert_eq!(
+                bind_location(&wrong_file, 1).unwrap_err(),
+                "Fixed Location filename differs from exact source role"
+            );
+            assert!(bind_location(&location, 0).is_err());
+            for (offset, value) in [
+                (0x3400, 0x1208),
+                (0x3408, u64::from(reloc::R_X86_64_GLOB_DAT)),
+                (0x3408, (1u64 << 32) | u64::from(reloc::R_X86_64_RELATIVE)),
+                (0x3410, 0x1301),
+            ] {
+                let mut bad = location.clone();
+                put(&mut bad, offset, 8, value);
+                assert!(bind_location(&bad, 1).is_err());
+            }
+            let mut duplicate = location.clone();
+            duplicate.copy_within(0x3400..0x3418, 0x3418);
+            assert!(bind_location(&duplicate, 2).is_err());
+            let mut file_writer = duplicate;
+            put(&mut file_writer, 0x3418, 8, 0x1300);
+            put(&mut file_writer, 0x3428, 8, 0);
+            assert!(bind_location(&file_writer, 2).is_err());
+        }
         // The full census cannot silently omit the return or a direct call.
         let code = [0xe8, 0, 0, 0, 0, 0xc3];
         let instructions = vec![
@@ -41299,6 +41563,13 @@ mod tests {
             ),
             (
                 "fixed_tls_cell_getter",
+                1653920,
+                "4883ec1848897c24084889742410488d3df3ca1e00e8866f1b00488d80300000004883c418c3",
+                48,
+                &[(17, 21, 3671976), (22, 26, 3451968)],
+            ),
+            (
+                "fixed_tls_cell_getter",
                 1588208,
                 "4883ec1848897c24084889742410488d3ddb4a2200e8a6d11e00488d80400000004883c418c3",
                 64,
@@ -41712,6 +41983,107 @@ mod tests {
         let edges = check(&bytes, &tls, &got).unwrap();
         assert_eq!(edges.len(), 2);
         assert_eq!(edges[0], edge);
+        // The stable body loads (*RDI) before CALL RAX and loads its
+        // callback from the GOT before a second CALL RAX. Only those exact
+        // sites/prefixes earn the same two typed edges (plus the direct
+        // unwind-resume edge the census records from the landing pad).
+        {
+            let stable_bytes = fixed_hex(FIXED_DEV_TLS_TRY_WITH_STABLE_HEX);
+            let stable_symbol = sym::Sym {
+                st_value: address,
+                st_size: stable_bytes.len() as u64,
+                ..sym::Sym::default()
+            };
+            let stable_offsets: &[usize] = &[
+                0, 7, 12, 17, 20, 22, 24, 26, 31, 33, 38, 44, 49, 52, 54, 59, 63, 65, 70, 75, 79,
+                81, 88, 90, 97, 99, 106, 108, 110, 115, 120, 125, 130, 135, 140, 145, 150, 155,
+                162, 163, 168, 175, 177, 182, 184, 189, 194, 201, 202, 207, 212, 219, 221, 223,
+                228, 233,
+            ];
+            let stable_instructions = |code: &[u8]| -> Result<Vec<EncodedConstructorInstruction>> {
+                stable_offsets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, offset)| {
+                        let end = stable_offsets.get(i + 1).copied().unwrap_or(code.len());
+                        Ok(EncodedConstructorInstruction {
+                            address: address + *offset as u64,
+                            bytes: code
+                                .get(*offset..end)
+                                .ok_or("truncated stable TLS control")?
+                                .to_vec(),
+                        })
+                    })
+                    .collect()
+            };
+            let mut stable_tls = tls.clone();
+            stable_tls
+                .local_chain
+                .get_mut("fixed_tls_try_with")
+                .unwrap()
+                .size = stable_bytes.len() as u64;
+            stable_tls.local_chain.insert(
+                "fixed_tls_cell_callback".into(),
+                function("actual_callback", callback, 25),
+            );
+            stable_tls.local_key_transfer = Some(ConstructorTransfer {
+                instruction: address + 0x18,
+                target: fn_once,
+                local_got_slot: None,
+            });
+            let stable_slot = 0x2c75c0;
+            let mut stable_got = got.clone();
+            stable_got.insert(stable_slot, callback);
+            fixed_whole_recipe(
+                address,
+                &stable_bytes,
+                FIXED_DEV_TLS_TRY_WITH_STABLE_HEX,
+                &[(0xab, 0xaf, stable_slot), (0xe5, 0xe9, 0xa3870)],
+            )
+            .unwrap();
+            let stable_ins = stable_instructions(&stable_bytes).unwrap();
+            let stable_edges = fixed_tls_transfers(
+                "fixed_tls_try_with",
+                &stable_symbol,
+                &stable_ins,
+                &stable_tls,
+                &stable_got,
+            )
+            .unwrap();
+            assert!(stable_edges.contains(&ConstructorTransfer {
+                instruction: address + 0x18,
+                target: fn_once,
+                local_got_slot: None,
+            }));
+            assert!(stable_edges.contains(&ConstructorTransfer {
+                instruction: address + 0xaf,
+                target: callback,
+                local_got_slot: Some(stable_slot),
+            }));
+            fixed_census_transfers(
+                &stable_ins,
+                address,
+                &stable_bytes,
+                &stable_edges,
+                &stable_got,
+                false,
+            )
+            .unwrap();
+            // Removing the (*RDI) load must remove the LocalKey edge.
+            let mut bad = stable_bytes.clone();
+            bad[0x11] ^= 1;
+            let bad_ins = stable_instructions(&bad).unwrap();
+            assert!(
+                fixed_tls_transfers(
+                    "fixed_tls_try_with",
+                    &stable_symbol,
+                    &bad_ins,
+                    &stable_tls,
+                    &stable_got
+                )
+                .is_err()
+            );
+        }
         assert_eq!(
             edges[1],
             ConstructorTransfer {
@@ -46477,6 +46849,7 @@ mod tests {
             "_RNvNtCsayI02cGi06u_4core9panicking36panic_misaligned_pointer_dereference",
             "_RNvMs16_NtNtCsayI02cGi06u_4core4sync6atomicINtB6_6AtomicjE5storeCsk1nybVdH5QO_15reverie_inguest",
             "_RNvNtCsayI02cGi06u_4core9panicking32panic_null_reference_constructed",
+            "_RNvNtCsayI02cGi06u_4core9panicking30panic_null_pointer_dereference",
             "_RNvMs_NtNtNtCsk1nybVdH5QO_15reverie_inguest5guest11tool_region11constructorNtB4_16NativeFreshOwner7publish",
         ];
         let mut roles = BTreeSet::new();
@@ -46500,7 +46873,19 @@ mod tests {
                     || !name.contains("NativeFreshOwner")
             );
         }
-        assert_eq!(roles.len(), 9);
+        assert_eq!(roles.len(), 10);
+        // Stable 1.97.1 emits the same typed Atomic<usize>::store role with
+        // the Ms1k shim spelling; only that exact alternate spelling resolves.
+        assert_eq!(
+            preparation_role(
+                "_RNvMs1k_NtNtCsayI02cGi06u_4core4sync6atomicINtB6_6AtomicjE5storeCsk1nybVdH5QO_15reverie_inguest"
+            ),
+            Some("atomic_usize_store")
+        );
+        assert!(preparation_role(
+            "_RNvMs1x_NtNtCsayI02cGi06u_4core4sync6atomicINtB6_6AtomicjE5storeCsk1nybVdH5QO_15reverie_inguest"
+        )
+        .is_none());
         for unproved in [
             "from_native",
             "NativeFreshOwner::publish",
@@ -46934,21 +47319,21 @@ mod tests {
             fixed_select_heap_equal_cohort(&elf, bytes, &code, &got, &mut roles)?;
             Ok(roles)
         }
-        for cohort in [0, 1] {
+        for cohort in [0, 1, 2] {
             let bytes = fixture(cohort);
             let selected = select(&bytes, false).unwrap();
             assert_eq!(
                 selected["fixed_heap_option_usize_equal"].st_value,
-                [0x2000, 0x2200][cohort]
+                [0x2000, 0x2200, 0x2400][cohort]
             );
             assert_eq!(
                 selected["fixed_heap_usize_equal"].st_value,
-                [0x2100, 0x2300][cohort]
+                [0x2100, 0x2300, 0x2500][cohort]
             );
             assert!(select(&bytes, true).is_err());
             for (offset, width, value) in [
                 (0x4000, 8, 1),
-                (0x6528, 8, [0x2200, 0x2000][cohort]),
+                (0x6528, 8, [0x2200, 0x2000, 0x2000][cohort]),
                 (0x6508, 8, 6),
                 (64 + 4 * 56 + 40, 8, 0x800),
                 (64 + 56 + 4, 4, 4),
@@ -46962,17 +47347,36 @@ mod tests {
                     "accepted cohort metadata mutation {offset:#x}"
                 );
             }
-            let option = [0x2000, 0x2200][cohort];
-            let scalar = [0x2100, 0x2300][cohort];
+            let option = [0x2000, 0x2200, 0x2400][cohort];
+            let scalar = [0x2100, 0x2300, 0x2500][cohort];
             let mut cross = bytes.clone();
             relative(
                 &mut cross[option as usize..option as usize + 124],
                 option,
                 105,
                 109,
-                [0x2300, 0x2100][cohort],
+                [0x2300, 0x2100, 0x2100][cohort],
             );
             assert!(select(&cross, false).is_err());
+            // Pairwise alternatives keep the two caller operands and the
+            // provider's scalar call bound to one complete declared pair.
+            for other in [0, 1, 2] {
+                if other == cohort {
+                    continue;
+                }
+                let mut split = bytes.clone();
+                put(&mut split, 0x6528, 8, [0x2000, 0x2200, 0x2400][other]);
+                assert!(select(&split, false).is_err());
+                let mut mixed = bytes.clone();
+                relative(
+                    &mut mixed[option as usize..option as usize + 124],
+                    option,
+                    105,
+                    109,
+                    [0x2100, 0x2300, 0x2500][other],
+                );
+                assert!(select(&mixed, false).is_err());
+            }
             for address in [option, scalar] {
                 let mut bad = bytes.clone();
                 bad[address as usize] ^= 1;
@@ -46992,11 +47396,7 @@ mod tests {
                         "implsj"
                     },
                     "2eq",
-                    if cohort == 0 {
-                        "regex_syntax"
-                    } else {
-                        "safeptrace"
-                    },
+                    ["regex_syntax", "safeptrace", "reverie_inguest"][cohort],
                 ] {
                     let mut bad = bytes.clone();
                     let offset = name + spelling.find(pattern).unwrap() + pattern.len() - 1;
@@ -47013,7 +47413,7 @@ mod tests {
             put(&mut exposed, 0x6a04, 4, 2);
             assert!(select(&exposed, false).is_err());
             let mut duplicate = bytes.clone();
-            let other = 0x6000 + (4 - cohort * 2) * 24;
+            let other = 0x6000 + [4, 2, 2][cohort] * 24;
             duplicate[other..other + 4].copy_from_slice(&bytes[row..row + 4]);
             assert!(select(&duplicate, false).is_err());
             // An inactive selector does not admit a different caller body:

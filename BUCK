@@ -209,12 +209,16 @@ rust_library(
 rust_library(
     name = "reverie-test-support",
     srcs = glob(["reverie-test-support/src/**/*.rs"]),
+    features = ["nightly"],
     autocargo = {
         "cargo_toml_config": {
             "package": {
                 "version": "0.5.4",
                 "description": "Command helpers for generic Reverie conformance tests.",
                 "publish": False,
+            },
+            "features": {
+                "nightly": ["reverie-ptrace/nightly"],
             },
             "test": [
                 {"name": "basics", "path": "../tests/basics.rs"},
@@ -276,7 +280,6 @@ rust_library(
                     "nix": {"features": ["fs", "process", "signal"]},
                 },
                 "dev-dependencies": {
-                    "reverie-ptrace": {"features": ["nightly"]},
                     "serde": {"features": ["derive"]},
                 },
             },
@@ -440,6 +443,7 @@ rust_unittest(
         "tests/tool_fixtures/basics.rs",
     ],
     crate_root = "tests/basics.rs",
+    features = ["nightly"],
     rustc_flags = sanitized_feature,
     env = {
         "CARGO_BIN_EXE_basics-rust-command-guest": "$(location :basics-rust-command-guest)",
@@ -830,7 +834,7 @@ rust_library(
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:iced-x86",
         "fbsource//third-party/rust:libc",
-        "fbsource//third-party/rust:liteinst2",
+        "fbsource//third-party/rust:liteinst",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tokio",

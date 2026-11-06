@@ -118,7 +118,7 @@ fn self_lea(hooked: bool) {
     // the entry census cannot tell a computed code address from a later jump
     // target (https://github.com/rrnewton/reverie/issues/812), so LiteInst
     // must leave this site on the trap path and every call must still return
-    // the original address. liteinst2's own relocation tests keep covering
+    // the original address. liteinst's own relocation tests keep covering
     // the retained-LEA encoding.
     //
     // reverie_liteinst_start_lea's LEA names the function start, outside the

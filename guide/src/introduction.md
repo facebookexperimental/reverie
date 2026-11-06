@@ -83,5 +83,5 @@ from a real file in this repository).
   the generic contract. [Backends](backends.md) states each one's
   status precisely; this book never upgrades a specialized path into a
   general claim.
-* The workspace pins a nightly toolchain for development; the
+* The workspace pins an exact stable toolchain for development; the
   published libraries build on stable Rust.

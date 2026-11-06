@@ -57,11 +57,11 @@
       "group": "build",
       "job": "test_binaries",
       "desc": "Build test binaries (nextest metadata)",
-      "description": "Builds every workspace test binary once (--all-features) and records nextest binaries-metadata plus the full test list under target/validate/. Every test node runs from this metadata, so no test node rebuilds and feature unification is the workspace's. This replaces the serial driver's separate `cargo build --workspace --all-features` gate: measured 2026-11-05, all 274 artifact identities of that build are compiled by the test build (420 identities), and lint.clippy --all-targets additionally compiles the non-test lib profile, so dropping the duplicate build loses no compile coverage. Memory: a cold width-16 build OOM-killed at a 16 GB cap (peak 16.0 GB, 6 oom_kills, 2026-11-05); width 12 with a 24 GB baseline / 48 GB hard cap follows dagrun's size-above-recorded-peak rule.",
+      "description": "Builds every workspace test binary once (--features \"$STABLE_FEATURES\", sourced from scripts/stable-features.sh; the stable set 1282 pins, same as validate.sh's serial path) and records nextest binaries-metadata plus the full test list under target/validate/. Every test node runs from this metadata, so no test node rebuilds and feature unification is the workspace's. This replaces the serial driver's separate `cargo build --workspace --features \"$STABLE_FEATURES\"` gate: measured 2026-11-05, all 274 artifact identities of that build are compiled by the test build (420 identities), and lint.clippy --all-targets additionally compiles the non-test lib profile, so dropping the duplicate build loses no compile coverage. Memory: a cold width-16 build OOM-killed at a 16 GB cap (peak 16.0 GB, 6 oom_kills, 2026-11-05); width 12 with a 24 GB baseline / 48 GB hard cap follows dagrun's size-above-recorded-peak rule.",
       "labels": [
         "full"
       ],
-      "cmd": "mkdir -p target/validate && cargo nextest list --workspace --all-features --list-type binaries-only --message-format json > target/validate/binaries-metadata.json && cargo nextest list --binaries-metadata target/validate/binaries-metadata.json --message-format json --list-type full > target/validate/list-full.json",
+      "cmd": "source scripts/stable-features.sh && mkdir -p target/validate && cargo nextest list --workspace --features \"$STABLE_FEATURES\" --list-type binaries-only --message-format json > target/validate/binaries-metadata.json && cargo nextest list --binaries-metadata target/validate/binaries-metadata.json --message-format json --list-type full > target/validate/list-full.json",
       "deps": [],
       "env": {},
       "timeout": 600,
@@ -145,7 +145,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_b.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=native_unpublished) | binary(=allocator_contract) | binary(=region_stacks) | binary(=mapping_integrity) | binary(=lifecycle) | binary(=rpc_tool) | binary(=fixed_gates) | binary(=private_prepare) | binary(=concurrent_patching) | binary(=reverie-liteinst-fork-guest) | binary(=reverie-liteinst-exec-guest) | binary(=reverie-liteinst-allocator-private-control) | binary(=reverie-liteinst-allocator-install-control) | binary(=reverie-liteinst-allocator-host-control))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_b.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=native_unpublished) | binary(=allocator_contract) | binary(=region_stacks) | binary(=mapping_integrity) | binary(=lifecycle) | binary(=rpc_tool) | binary(=fixed_gates) | binary(=private_prepare) | binary(=concurrent_patching) | binary(=nop_window) | binary(=reverie-liteinst-fork-guest) | binary(=reverie-liteinst-exec-guest) | binary(=reverie-liteinst-allocator-private-control) | binary(=reverie-liteinst-allocator-install-control) | binary(=reverie-liteinst-allocator-host-control))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"
@@ -342,11 +342,11 @@
       "group": "test",
       "job": "inguest",
       "desc": "Tests: in-guest backend",
-      "description": "Counted nextest over reverie-inguest. Width is lower: bounded-recipe tests compile payloads at runtime, so each test process fans out further. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load). Also after test.ptrace (the longest node): the smoke spoof-getpid trap-arming race still fired with only the LiteInst burst removed. The node first rebuilds reverie-inguest --all-features under the cargo-build resource: deps/libreverie_inguest.so is an unhashed filename shared by every build graph, and reverie-liteinst depends on reverie-inguest with default-features=false (no preload-constructor), so a concurrent cargo build can overwrite the constructor-ful cdylib the smoke tests LD_PRELOAD (measured 2026-11-05: spoof-getpid inert until rebuilt). Holding cargo-build for the whole node makes the rebuild the last writer before the tests run.",
+      "description": "Counted nextest over reverie-inguest. Width is lower: bounded-recipe tests compile payloads at runtime, so each test process fans out further. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load). Also after test.ptrace (the longest node): the smoke spoof-getpid trap-arming race still fired with only the LiteInst burst removed. The node first rebuilds reverie-inguest with its STABLE_FEATURES subset (derived from scripts/stable-features.sh, preload-constructor included) under the cargo-build resource: deps/libreverie_inguest.so is an unhashed filename shared by every build graph, and reverie-liteinst depends on reverie-inguest with default-features=false (no preload-constructor), so a concurrent cargo build can overwrite the constructor-ful cdylib the smoke tests LD_PRELOAD (measured 2026-11-05: spoof-getpid inert until rebuilt). Holding cargo-build for the whole node makes the rebuild the last writer before the tests run.",
       "labels": [
         "full"
       ],
-      "cmd": "cargo build -p reverie-inguest --all-features && ./scripts/libtest-counts.rs run-nextest target/validate/counts-test-inguest.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-inguest)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": ". scripts/stable-features.sh && feats=\"\"; for f in $STABLE_FEATURES; do case $f in reverie-inguest/*) feats=\"$feats $f\";; esac; done; cargo build -p reverie-inguest --features \"$feats\" && ./scripts/libtest-counts.rs run-nextest target/validate/counts-test-inguest.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-inguest)) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst",
@@ -466,11 +466,11 @@
       "group": "lint",
       "job": "clippy",
       "desc": "Clippy",
-      "description": "cargo clippy --workspace --all-targets --all-features -- -D warnings. Also the compile-coverage backstop for the non-test lib profile now that the duplicate cargo build gate is gone.",
+      "description": "cargo clippy --workspace --all-targets --features \"$STABLE_FEATURES\" -- -D warnings (stable set from scripts/stable-features.sh, same as validate.sh's serial path). Also the compile-coverage backstop for the non-test lib profile now that the duplicate cargo build gate is gone.",
       "labels": [
         "full"
       ],
-      "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "cmd": "source scripts/stable-features.sh && cargo clippy --workspace --all-targets --features \"$STABLE_FEATURES\" -- -D warnings",
       "deps": [],
       "env": {},
       "timeout": 600,

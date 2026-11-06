@@ -6,11 +6,11 @@ use core::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 
-use liteinst2::patcher::JumpPatchPlan;
-use liteinst2::patcher::LiveJumpPatch;
-use liteinst2::patcher::PatchError;
-use liteinst2::patcher::StalenessBudget;
-use liteinst2::scanner::InstructionScanner;
+use liteinst::patcher::JumpPatchPlan;
+use liteinst::patcher::LiveJumpPatch;
+use liteinst::patcher::PatchError;
+use liteinst::patcher::StalenessBudget;
+use liteinst::scanner::InstructionScanner;
 
 const PAGE_BYTES: usize = 4096;
 const FUNCTION_OFFSET: usize = 56;

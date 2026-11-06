@@ -161,8 +161,8 @@ impl Drop for Launch<'_> {
 }
 
 fn run_helper(mut bootstrap: Bootstrap, before_ready: impl FnOnce()) {
-    // Empty in production; the startup control uses this marker to prove an
-    // inherited child spawn-hook panic prevented the body from being entered.
+    // Empty in production; the startup control uses this marker to prove a
+    // child spawn-hook panic prevented the body from being entered.
     before_ready();
     bootstrap.entered = true;
     let joins = bootstrap.joins.clone();
@@ -280,9 +280,17 @@ impl GuestThreadGroup {
             joins: self.worker_joins.clone(),
             entered: false,
         };
+        // Parent test hooks run after `launch` exists, so a panicking hook
+        // unwinds through the same ownership restoration as a spawn panic.
+        #[cfg(test)]
+        let child_hooks = join_spawn_hook::run_parent_hooks();
         // No originals are transferred until both Ready and this exact handle
         // are in the ledger. Refusal returns the bootstrap owner to this scope.
         match crate::failure::spawn_owned(builder, bootstrap, move |bootstrap| {
+            #[cfg(test)]
+            for hook in child_hooks {
+                hook();
+            }
             run_helper(bootstrap, before_ready)
         }) {
             Ok(handle) => {
@@ -642,5 +650,47 @@ impl crate::executor::GuestWorkers for GuestThreadGroup {
 
     fn join_workers(&self) {
         GuestThreadGroup::join_workers(self)
+    }
+}
+
+/// Test-only spawn seam for the join helper, mirroring the two halves of
+/// std's unstable thread spawn hooks: a parent hook runs on the launching
+/// thread and returns a child hook that runs on the helper thread before
+/// `run_helper`. Registered hooks are thread-local to the launching thread
+/// and live for its lifetime; tests register one-shot hooks on the thread
+/// that drives the launch. Unlike std, hooks run in registration order and
+/// are not inherited by other threads. Production builds contain no seam.
+/// Register a test spawn hook for later join-helper launches on this
+/// thread; see `join_spawn_hook`.
+#[cfg(test)]
+pub(super) fn add_join_spawn_hook(hook: impl Fn() -> Box<dyn FnOnce() + Send + 'static> + 'static) {
+    join_spawn_hook::add(hook);
+}
+
+#[cfg(test)]
+mod join_spawn_hook {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    pub(super) type ChildHook = Box<dyn FnOnce() + Send + 'static>;
+    type ParentHook = Rc<dyn Fn() -> ChildHook + 'static>;
+
+    thread_local! {
+        static HOOKS: RefCell<Vec<ParentHook>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn add(hook: impl Fn() -> ChildHook + 'static) {
+        HOOKS.with(|hooks| hooks.borrow_mut().push(Rc::new(hook)));
+    }
+
+    /// Snapshot the hooks, then run them with no borrow held, so a hook may
+    /// itself register hooks or launch (as std's clone-then-iterate does).
+    /// Collect child hooks in registration order. A panicking parent hook
+    /// unwinds to the caller; hooks already run keep their effects, and
+    /// collected child hooks drop during that unwind outside any borrow.
+    pub(super) fn run_parent_hooks() -> Vec<ChildHook> {
+        let snapshot: Vec<ParentHook> =
+            HOOKS.with(|hooks| hooks.borrow().iter().map(Rc::clone).collect());
+        snapshot.iter().map(|hook| hook()).collect()
     }
 }

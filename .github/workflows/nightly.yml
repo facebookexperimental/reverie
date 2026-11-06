@@ -1,0 +1,60 @@
+name: Nightly features (best-effort)
+
+# The workspace pins stable Rust (rust-toolchain.toml). This lane is the one
+# place the off-by-default `nightly` Cargo features are exercised:
+# libtest printing-macro capture in forked function guests
+# (reverie-ptrace, reverie-process). Schedule/manual only: it never gates a
+# pull request and must not become a required status check.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C link-arg=-llzma
+  # rust-toolchain.toml outranks `rustup default`, so the lane must name the
+  # nightly toolchain explicitly or every step silently runs stable.
+  RUSTUP_TOOLCHAIN: nightly
+
+jobs:
+  nightly-features:
+    name: Nightly-only features
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - name: Dependencies
+      run: sudo apt-get update && sudo apt-get install -y libunwind-dev liblzma-dev
+    - name: Rust toolchain (floating nightly, best-effort)
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: clippy, rustfmt
+    - name: Assert nightly in-repo
+      run: |
+        rustc --version
+        rustc --version | grep -q nightly
+    - name: Build all features
+      run: cargo build --workspace --all-features --all-targets
+    # No -D warnings here: this lane floats on latest nightly, whose new
+    # lints would redden it for pre-existing code. Warning denial happens
+    # on the pinned stable toolchain (validate.sh); this step reports.
+    - name: Clippy and format (nightly-only options enforced here)
+      run: |
+        cargo clippy --workspace --all-targets --all-features
+        cargo fmt --all -- --check
+    - name: API docs all features (warnings denied)
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+      run: cargo doc --workspace --all-features --no-deps
+    - name: Printing-macro capture tests
+      run: |
+        cargo test -p reverie-ptrace --all-features --test function_output -- --test-threads=1
+        cargo test -p reverie-test-support --features nightly --test basics run_guest_func_print_test -- --test-threads=1
+    - name: Join-helper seam tests on nightly
+      run: cargo test -p reverie-kvm --lib exec_wait -- --test-threads=1

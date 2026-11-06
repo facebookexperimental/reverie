@@ -24,7 +24,6 @@
 //! host signal requirements.
 
 #![cfg(target_arch = "x86_64")]
-#![cfg_attr(test, feature(thread_spawn_hook))]
 
 mod clock;
 mod cpuid_instruction;

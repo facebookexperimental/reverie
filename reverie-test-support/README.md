@@ -7,9 +7,11 @@ ptrace's runtime, output capture, and caller-owned Tool configuration. Shared
 Tools remain in `tests/tool_fixtures/`; inherited function tests keep the
 original ptrace helpers and assertions.
 
-The test dependency enables ptrace's existing `nightly` output-capture reset,
-so inherited `println!` output reaches the guest pipe under ordinary libtest
-capture. The workspace's pinned nightly toolchain supplies that API.
+The function-guest `println!` half of `run_guest_func_print_test` needs
+ptrace's `nightly` output-capture reset to reach the guest pipe under
+ordinary libtest capture; it runs with this package's `nightly` feature in
+the nightly CI lane. Everything else, including the same body as a command
+guest, runs on the workspace's pinned stable toolchain.
 
 Run the registered targets with ordinary libtest capture:
 

@@ -35,6 +35,10 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
 
+# Stable feature set (all workspace features except the nightly-only ones).
+# shellcheck source=scripts/stable-features.sh
+source "$ROOT_DIR/scripts/stable-features.sh"
+
 # Find the dev-hermit wrapper without making it a prerequisite. A canonical
 # nested slot is three directories below the parent; bounding the walk keeps a
 # standalone Reverie checkout independent of unrelated ancestors.
@@ -994,11 +998,12 @@ run_validation_dag() {
 
 run_validation_serial() {
 run_check "Cross-client skill discovery" "$ROOT_DIR/scripts/check-skill-discovery.rs"
-run_check "Build workspace" cargo build --workspace --all-features
+run_check "Build workspace" cargo build --workspace --features "$STABLE_FEATURES"
 # DISABLED (dh-hkdh0): the allocator-fixtures producer is red at base
 # (fixed_arena_backing needs the held ordinary-dev publication cohort,
-# reverie 1125). Waived to parity-with-main by coordinator ruling C;
-# re-enable by restoring the run_check below when that cohort lands.
+# reverie 1125). Waived to parity-with-main by the coordinator allocator
+# waiver (2026-11-05); re-enable by restoring the run_check below when
+# that cohort lands.
 disabled_liteinst_allocator_fixtures() {
     echo "SKIP (dh-hkdh0): allocator producer disabled until held reverie 1125 cohort lands"
 }
@@ -1010,7 +1015,7 @@ setup_validation_tmpdir || return 1
 # `env NAME=VALUE` prefix. They are exported for this step alone.
 export REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
     REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
-run_test_check "Test regular workspace cases" cargo test --workspace --all-features \
+run_test_check "Test regular workspace cases" cargo test --workspace --features "$STABLE_FEATURES" \
     -- --test-threads=1 "${REGULAR_TEST_SKIP_ARGS[@]}"
 export -n REVERIE_LITEINST_PRELOAD REVERIE_LITEINST_TEST_RUNTIME_MANIFEST \
     REVERIE_LITEINST_ALLOCATOR_GUEST REVERIE_LITEINST_ALLOCATOR_GUEST_MANIFEST
@@ -1019,7 +1024,7 @@ run_test_check "Documentation tests" cargo test --workspace --doc
 # backend whose inputs are missing is refused by name, and a host with no
 # ledger gets its verdicts reported, not judged (reverie-examples/e2e/README.md).
 run_check "Reverie-layer cross-backend e2e" "$ROOT_DIR/reverie-examples/e2e/run.sh"
-run_check "Clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
+run_check "Clippy" cargo clippy --workspace --all-targets --features "$STABLE_FEATURES" -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
 }
 

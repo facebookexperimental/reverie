@@ -5,7 +5,7 @@
 use std::io;
 use std::path::Path;
 
-use liteinst2::trampoline::HookContext;
+use liteinst::trampoline::HookContext;
 #[cfg(feature = "exec-private-init")]
 use reverie::GlobalRPC;
 use reverie::Pid;
@@ -288,7 +288,7 @@ enum ImageInstall<'a, T: Tool> {
 /// directly: no getenv interposition and no allocation unless the
 /// parse constructs its error.
 #[cfg(feature = "exec-private-init")]
-fn validated_straddler_staleness() -> io::Result<Option<liteinst2::patcher::StalenessBudget>> {
+fn validated_straddler_staleness() -> io::Result<Option<liteinst::patcher::StalenessBudget>> {
     use std::os::unix::ffi::OsStrExt;
     let value = reverie_inguest::guest::support::environment_value(
         crate::straddler::STRADDLER_STALENESS_TICKS_ENV.as_bytes(),
@@ -301,7 +301,7 @@ fn validated_straddler_staleness() -> io::Result<Option<liteinst2::patcher::Stal
 /// one, so reaching a prepare entry proves the parse already passed.
 #[cfg(feature = "exec-private-init")]
 pub struct ValidatedStraddlerStaleness {
-    budget: Option<liteinst2::patcher::StalenessBudget>,
+    budget: Option<liteinst::patcher::StalenessBudget>,
 }
 
 /// Validate `REVERIE_LITEINST_STRADDLER_STALENESS_TICKS` and capture
@@ -331,7 +331,7 @@ pub struct PreparedInitialImage<T: Tool> {
     fatal: reverie_inguest::guest::exec_private::InitialImageAbortGuard,
     client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
     control: reverie_inguest::guest::exec_private::InitialImageControl,
-    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
+    straddler_staleness: Option<Option<liteinst::patcher::StalenessBudget>>,
 }
 
 /// Installed InitialImage, retaining fatal ownership through eager lifecycle.
@@ -397,7 +397,7 @@ pub unsafe fn prepare_tool_initial_image_validated<T: Tool>(
 unsafe fn prepare_tool_initial_image_with_budget<T: Tool>(
     client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
     native: *mut reverie_inguest::guest::exec_private::NativeControl,
-    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
+    straddler_staleness: Option<Option<liteinst::patcher::StalenessBudget>>,
 ) -> io::Result<PreparedInitialImage<T>> {
     let fatal = unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
     let control =
@@ -451,7 +451,7 @@ pub unsafe fn prepare_tool_mapped_initial_image_validated<T: Tool>(
 unsafe fn prepare_tool_mapped_initial_image_with_budget<T: Tool>(
     client: reverie_rpc_transport::InitialImageClient<T::GlobalState, GuestRpcStream>,
     mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
-    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
+    straddler_staleness: Option<Option<liteinst::patcher::StalenessBudget>>,
 ) -> io::Result<PreparedInitialImage<T>> {
     let fatal = unsafe { reverie_inguest::guest::exec_private::InitialImageAbortGuard::arm() };
     // SAFETY: actual admitted client and physical producer contract above.
@@ -591,7 +591,7 @@ pub struct PreparedSuccessorImage<T: Tool> {
     state: T::ThreadState,
     consumer: Box<dyn NativeSuccessorConsumer<T>>,
     control: reverie_inguest::guest::exec_private::SuccessorImageControl,
-    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
+    straddler_staleness: Option<Option<liteinst::patcher::StalenessBudget>>,
 }
 
 /// Actual installed successor retaining fatal ownership until exact completion.
@@ -707,7 +707,7 @@ unsafe fn prepare_tool_successor_image_with_budget<T: Tool + 'static>(
     native: *mut reverie_inguest::guest::exec_private::NativeControl,
     binding: reverie_inguest::guest::exec_private::SuccessorBinding,
     mut consumer: Box<dyn NativeSuccessorConsumer<T>>,
-    straddler_staleness: Option<Option<liteinst2::patcher::StalenessBudget>>,
+    straddler_staleness: Option<Option<liteinst::patcher::StalenessBudget>>,
 ) -> io::Result<PreparedSuccessorImage<T>> {
     let fatal = SuccessorAbortGuard { active: true };
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
@@ -1072,7 +1072,7 @@ unsafe fn install_tool_inner<T>(
     >,
     #[cfg(feature = "exec-private-init")] skip_pmu: bool,
     #[cfg(feature = "exec-private-init")] straddler_staleness: Option<
-        Option<liteinst2::patcher::StalenessBudget>,
+        Option<liteinst::patcher::StalenessBudget>,
     >,
 ) -> io::Result<()>
 where

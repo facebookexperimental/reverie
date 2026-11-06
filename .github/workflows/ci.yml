@@ -95,16 +95,23 @@ jobs:
         fi
         echo 'Namespace probe passed after the controlled restriction change.'
     - name: Rust toolchain
-      id: toolchain
-      uses: dtolnay/rust-toolchain@nightly
-      with:
-        components: clippy, rustfmt
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+        rustc --version
     - name: Cross-client skill discovery
       run: |
         rustc scripts/check-skill-discovery.rs -o "$RUNNER_TEMP/check-skill-discovery"
         "$RUNNER_TEMP/check-skill-discovery"
     - name: Build
-      run: cargo build --workspace --all-features
+      run: |
+        source scripts/stable-features.sh
+        cargo build --workspace --features "${STABLE_FEATURES}"
     - name: LiteInst allocator fixtures
       timeout-minutes: 10
       run: |
@@ -114,33 +121,36 @@ jobs:
         scripts/build-liteinst-test-runtime.rs --for-ci "$generation"
         cat "$generation/bundle/github.env" >> "$GITHUB_ENV"
     - name: Test regular workspace cases
-      run: >-
-        cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --all-features --no-fail-fast --
-        --test-threads=1
-        --skip container::tests::bind_to_low_port
-        --skip container::tests::mount_error_from_child_is_returned
-        --skip container::tests::test_directory_is_available_after_mount
-        --skip container::tests::pin_affinity_to_all_cores
-        --skip tests::domainname
-        --skip tests::hostname
-        --skip tests::local_networking_loopback_flags
-        --skip tests::local_networking_ping
-        --skip tests::local_networking_there_can_be_only_one
-        --skip tests::mount_and_move_tmpfs
-        --skip tests::mount_bind
-        --skip tests::mount_bind_readonly_rejects_writes
-        --skip tests::mount_devpts_basic
-        --skip tests::mount_devpts_isolated
-        --skip tests::mount_proc
-        --skip tests::mount_tmpfs
-        --skip tests::pid_namespace
-        --skip tests::port_isolation
-        --skip tests::seccomp_notify
+      run: |
+        source scripts/stable-features.sh
+        cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --features "${STABLE_FEATURES_REGULAR}" --no-fail-fast -- \
+        --test-threads=1 \
+        --skip container::tests::bind_to_low_port \
+        --skip container::tests::mount_error_from_child_is_returned \
+        --skip container::tests::test_directory_is_available_after_mount \
+        --skip container::tests::pin_affinity_to_all_cores \
+        --skip tests::domainname \
+        --skip tests::hostname \
+        --skip tests::local_networking_loopback_flags \
+        --skip tests::local_networking_ping \
+        --skip tests::local_networking_there_can_be_only_one \
+        --skip tests::mount_and_move_tmpfs \
+        --skip tests::mount_bind \
+        --skip tests::mount_bind_readonly_rejects_writes \
+        --skip tests::mount_devpts_basic \
+        --skip tests::mount_devpts_isolated \
+        --skip tests::mount_proc \
+        --skip tests::mount_tmpfs \
+        --skip tests::pid_namespace \
+        --skip tests::port_isolation \
+        --skip tests::seccomp_notify \
         --skip tests::uid_namespace
     - name: Documentation tests
       run: cargo test --workspace --doc
     - name: Clippy
-      run: cargo clippy --workspace --all-targets --all-features
+      run: |
+        source scripts/stable-features.sh
+        cargo clippy --workspace --all-targets --features "${STABLE_FEATURES}"
     - name: Format
       run: cargo fmt --all -- --check
     # The cross-backend check on every backend that needs no device. A hosted
@@ -179,7 +189,15 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
     - name: Rust toolchain
-      uses: dtolnay/rust-toolchain@nightly
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        rustup toolchain install "$channel" --profile minimal
+        rustc --version
     - name: Fetch locked dependencies
       run: cargo fetch --locked
     - name: LiteInst allocator fixtures (producer)
@@ -281,9 +299,19 @@ jobs:
           sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
         fi
     - name: Rust toolchain
-      uses: dtolnay/rust-toolchain@nightly
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+        rustup toolchain install "$channel" --profile minimal
+        rustc --version
     - name: Build
-      run: cargo build --workspace --all-features
+      run: |
+        source scripts/stable-features.sh
+        cargo build --workspace --features "${STABLE_FEATURES}"
     - name: LiteInst allocator fixtures
       timeout-minutes: 10
       run: |
@@ -310,7 +338,8 @@ jobs:
           --soft-deadline 300 --hard-box 540 &
         watchdog=$!
         set +e
-        cargo test --workspace --all-features -- --test-threads=1
+        source scripts/stable-features.sh
+        cargo test --workspace --features "${STABLE_FEATURES}" -- --test-threads=1
         status=$?
         kill "$watchdog" 2>/dev/null || true
         wait "$watchdog" 2>/dev/null || true

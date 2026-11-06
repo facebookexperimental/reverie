@@ -60,9 +60,16 @@ jobs:
           stated=$(grep -o 'Under-construction regions in this guide: [0-9]*' guide/src/introduction.md | grep -o '[0-9]*$')
           echo "counted=$counted stated=$stated"
           [ "$counted" = "$stated" ]
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master; toolchain via input below
-        with:
-          toolchain: nightly
+      - name: Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            export PATH="$HOME/.cargo/bin:$PATH"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          rustup toolchain install "$channel" --profile minimal
+          rustc --version
       - name: Dependencies
         # Same step as ci.yml: cargo doc runs build scripts (unwind-sys
         # needs libunwind via pkg-config), so the doc step needs these.
@@ -74,7 +81,9 @@ jobs:
       - name: API docs (workspace, no deps, warnings denied)
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --all-features --no-deps
+        run: |
+          source scripts/stable-features.sh
+          cargo doc --workspace --features "${STABLE_FEATURES}" --no-deps
       - name: Upload Pages artifact
         if: vars.PAGES_ENABLED == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3

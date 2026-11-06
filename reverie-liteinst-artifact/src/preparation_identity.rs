@@ -9,40 +9,61 @@ const SPILLED_RDI_IDENTITY: &[u8] = &[
     0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x8d, 0x44, 0x24, 0xf0, 0x48,
     0x8b, 0x44, 0x24, 0xf0, 0xc3,
 ];
+const REVERSED_SPILLED_RDI_IDENTITY: &[u8] = &[
+    0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8d, 0x44, 0x24, 0xf8, 0x48,
+    0x8b, 0x44, 0x24, 0xf8, 0xc3,
+];
 const NULL_BRANCH_RDI_IDENTITY: &[u8] = &[
     0x48, 0x89, 0x7c, 0x24, 0xe8, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x83, 0xff, 0x00, 0x74, 0x0c,
     0x48, 0x8b, 0x44, 0x24, 0xe8, 0x48, 0x89, 0x44, 0x24, 0xf0, 0xeb, 0x09, 0x48, 0xc7, 0x44, 0x24,
     0xf0, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3,
 ];
+const REVERSED_NULL_BRANCH_RDI_IDENTITY: &[u8] = &[
+    0x48, 0x89, 0x7c, 0x24, 0xe8, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x83, 0xff, 0x00, 0x75, 0x0b,
+    0x48, 0xc7, 0x44, 0x24, 0xf0, 0x00, 0x00, 0x00, 0x00, 0xeb, 0x0a, 0x48, 0x8b, 0x44, 0x24, 0xe8,
+    0x48, 0x89, 0x44, 0x24, 0xf0, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // Rdi names the register every class spills
 enum IdentityClass {
     SpilledRdi,
+    ReversedSpilledRdi,
     NullBranchRdi,
+    ReversedNullBranchRdi,
 }
 impl IdentityClass {
     fn label(self) -> &'static str {
         match self {
             Self::SpilledRdi => "spilled_rdi_identity",
+            Self::ReversedSpilledRdi => "reversed_spilled_rdi_identity",
             Self::NullBranchRdi => "null_branch_rdi_identity",
+            Self::ReversedNullBranchRdi => "reversed_null_branch_rdi_identity",
         }
     }
 }
 
 fn identity_class(body: &[u8]) -> Result<IdentityClass> {
     // Linux x86-64 SysV call premise: RSP names a real return address and the
-    // caller supplies the ordinary 128-byte red zone below entry RSP. Neither
-    // complete function changes RSP, a callee-saved register or foreign memory.
-    // The 21-byte variant spills only to RSP-8/-16, then returns incoming RDI in
-    // RAX. The 43-byte variant spills only to -8/-16/-24. JE +14->+28 chooses a
-    // zero spill when RDI=0; otherwise JMP +26->+37 rejoins the incoming value.
-    // Both return exactly the initial 64-bit RDI for every input. RET consumes
-    // the unchanged return address. The second variant changes arithmetic flags,
+    // caller supplies the ordinary 128-byte red zone below entry RSP. None of
+    // these complete functions changes RSP, a callee-saved register or foreign
+    // memory. The two 21-byte variants spill only to RSP-8/-16, in opposite
+    // orders; each address-takes and reloads its second spill, then returns
+    // incoming RDI in RAX. The two 43-byte variants spill only to -8/-16/-24.
+    // In one, JE +14->+28 chooses a zero spill when RDI=0; otherwise
+    // JMP +26->+37 rejoins the incoming value. In the reversed layout,
+    // JNE +14->+27 chooses the incoming spill when RDI is nonzero; the zero
+    // spill falls through and JMP +25->+37 rejoins the final load. All return
+    // exactly the initial 64-bit RDI for every input. RET consumes the
+    // unchanged return address. The 43-byte variants change arithmetic flags,
     // which SysV callers may not keep live across an ordinary function call.
-    // No source-level pointer validity/Option layout or unmodeled body is proved.
+    // No source-level pointer validity/Option layout or unmodeled body is
+    // proved.
     match body {
         SPILLED_RDI_IDENTITY => Ok(IdentityClass::SpilledRdi),
+        REVERSED_SPILLED_RDI_IDENTITY => Ok(IdentityClass::ReversedSpilledRdi),
         NULL_BRANCH_RDI_IDENTITY => Ok(IdentityClass::NullBranchRdi),
+        REVERSED_NULL_BRANCH_RDI_IDENTITY => Ok(IdentityClass::ReversedNullBranchRdi),
         _ => Err("unrecognized complete preparation identity ABI body".to_owned()),
     }
 }
@@ -499,32 +520,59 @@ mod tests {
     }
 
     #[test]
-    fn both_complete_preparation_identity_classes_have_exact_abi_bodies() {
+    fn all_complete_preparation_identity_classes_have_exact_abi_bodies() {
         assert_eq!(
             identity_class(SPILLED_RDI_IDENTITY).unwrap(),
             IdentityClass::SpilledRdi
         );
         assert_eq!(
+            identity_class(REVERSED_SPILLED_RDI_IDENTITY).unwrap(),
+            IdentityClass::ReversedSpilledRdi
+        );
+        assert_eq!(
             identity_class(NULL_BRANCH_RDI_IDENTITY).unwrap(),
             IdentityClass::NullBranchRdi
         );
+        assert_eq!(
+            identity_class(REVERSED_NULL_BRANCH_RDI_IDENTITY).unwrap(),
+            IdentityClass::ReversedNullBranchRdi
+        );
         assert_eq!(SPILLED_RDI_IDENTITY.len(), 21);
+        assert_eq!(REVERSED_SPILLED_RDI_IDENTITY.len(), 21);
         assert_eq!(NULL_BRANCH_RDI_IDENTITY.len(), 43);
+        assert_eq!(REVERSED_NULL_BRANCH_RDI_IDENTITY.len(), 43);
         // Independently fixed spill/return and null-path bytes pin the ABI claim;
-        // neither identity is inferred from symbol spelling or an observed hash.
+        // no identity is inferred from symbol spelling or an observed hash.
         assert_eq!(
             &SPILLED_RDI_IDENTITY[15..],
             &[0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3]
+        );
+        assert_eq!(
+            &REVERSED_SPILLED_RDI_IDENTITY[..10],
+            &[0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x89, 0x7c, 0x24, 0xf8]
+        );
+        assert_eq!(
+            &REVERSED_SPILLED_RDI_IDENTITY[15..],
+            &[0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3]
         );
         assert_eq!(&NULL_BRANCH_RDI_IDENTITY[14..16], &[0x74, 0x0c]);
         assert_eq!(&NULL_BRANCH_RDI_IDENTITY[26..28], &[0xeb, 0x09]);
         assert_eq!(16 + 12, 28);
         assert_eq!(28 + 9, 37);
+        assert_eq!(&REVERSED_NULL_BRANCH_RDI_IDENTITY[14..16], &[0x75, 0x0b]);
+        assert_eq!(&REVERSED_NULL_BRANCH_RDI_IDENTITY[25..27], &[0xeb, 0x0a]);
+        assert_eq!(16 + 11, 27);
+        assert_eq!(27 + 10, 37);
     }
 
     #[test]
     fn complete_identity_recipes_refuse_every_byte_change_and_extent_change() {
-        for original in [SPILLED_RDI_IDENTITY, NULL_BRANCH_RDI_IDENTITY] {
+        for original in [
+            SPILLED_RDI_IDENTITY,
+            REVERSED_SPILLED_RDI_IDENTITY,
+            NULL_BRANCH_RDI_IDENTITY,
+            REVERSED_NULL_BRANCH_RDI_IDENTITY,
+        ] {
             for offset in 0..original.len() {
                 let mut changed = original.to_vec();
                 changed[offset] ^= 1;

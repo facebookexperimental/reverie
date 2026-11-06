@@ -13,8 +13,8 @@ $ sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev
 
 That is the Ubuntu recipe; Fedora uses `libunwind-devel` and
 `xz-devel` for the same libraries. You also need Rust — the published
-libraries build on stable, while this workspace pins nightly for
-development (see `rust-toolchain.toml`).
+libraries and this workspace build on stable Rust; the workspace pins
+the exact stable release (see `rust-toolchain.toml`).
 
 ## Run the strace example
 

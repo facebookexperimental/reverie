@@ -9,7 +9,7 @@ description: "Use when changing LiteInst syscall discovery, text patching, tramp
 
 - `src/runtime.rs` site discovery, registry, patch, hook, or fallback changes.
 - `src/patch_alloc.rs` allocation behavior.
-- `liteinst2` API or pinned-revision updates.
+- `liteinst` API or pinned-revision updates.
 - Bugs involving dynamic executable mappings, stale sites, text protections,
   repeated SIGSYS traps, or hook recursion.
 

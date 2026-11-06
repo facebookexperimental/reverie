@@ -16,8 +16,8 @@ use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
 use std::io;
 
-use liteinst2::trampoline::HookCallback;
-use liteinst2::trampoline::HookContext;
+use liteinst::trampoline::HookCallback;
+use liteinst::trampoline::HookContext;
 pub(crate) use reverie_inguest::guest::installed_stack::PreparedCallbacks;
 
 pub(super) struct Callbacks {

@@ -853,14 +853,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "liteinst2"
-version = "0.1.0"
-source = "git+https://github.com/rrnewton/liteinst2?rev=d64dc833418a4c265803645653b8f597d0f25060#d64dc833418a4c265803645653b8f597d0f25060"
+name = "liteinst"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38e2e683117ef65c460ef78aa3d4e80a8ba5f8c81890bed76c799cc7a0b7d828"
 dependencies = [
  "iced-x86",
  "libc",
+ "liteinst-x86",
  "memmap2",
  "nix 0.31.3",
+]
+
+[[package]]
+name = "liteinst-x86"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c663b904c7a56bd98d1acc594d0b26d4eee1c96a6c50eb4a982505f0ced3bad3"
+dependencies = [
+ "iced-x86",
 ]
 
 [[package]]
@@ -1384,7 +1395,7 @@ dependencies = [
  "goblin",
  "iced-x86",
  "libc",
- "liteinst2",
+ "liteinst",
  "reverie-core",
  "reverie-inguest",
  "reverie-rpc-transport",
