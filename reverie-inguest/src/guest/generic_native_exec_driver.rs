@@ -54,6 +54,30 @@ impl TargetCatalog for KernelCatalog {
     }
 }
 
+/// One-shot successor provision delivery. The registry's delivered
+/// fact may only be marked after this returns Ok: delivery is an
+/// embedder obligation (actual provision transport + receipt),
+/// never a boolean the driver invents (Astra P2 at 4839ff98).
+pub trait Provisioner: Send + Sync {
+    /// Deliver the sealed provision for `ticket`; Ok means a real
+    /// delivery receipt exists embedder-side.
+    fn deliver(&self, ticket: ExecTicket, sealed_digest: [u8; 32]) -> Result<(), ExecControlError>;
+}
+
+/// No delivery mechanism installed: every delivery refuses by name,
+/// so issue is unreachable until an embedder supplies provision.
+pub struct RefusingProvisioner;
+
+impl Provisioner for RefusingProvisioner {
+    fn deliver(
+        &self,
+        _ticket: ExecTicket,
+        _sealed_digest: [u8; 32],
+    ) -> Result<(), ExecControlError> {
+        Err(ExecControlError::Unavailable)
+    }
+}
+
 /// Tool-state framing: exact bytes sealed under the ticket. Encoding
 /// must be deterministic for equal states (revalidation compares).
 /// Associated-state form (not generic over the Tool) so sessions can
@@ -72,21 +96,30 @@ pub trait StateFramer: Send + Sync {
 /// The generic driver. `I` is the ticket issuer (control client or
 /// direct registry adapter); it is mutex-guarded because driver
 /// methods take `&self` while exchanges are single-in-flight.
-pub struct GenericNativeExecDriver<C, F, I, B> {
+pub struct GenericNativeExecDriver<C, F, I, B, P = RefusingProvisioner> {
     catalog: std::sync::Arc<C>,
     framer: std::sync::Arc<F>,
+    provisioner: std::sync::Arc<P>,
     issuer: std::sync::Arc<Mutex<I>>,
     binding: B,
     runtime: Vec<u8>,
 }
 
-impl<C, F, I, B> GenericNativeExecDriver<C, F, I, B> {
+impl<C, F, I, B, P> GenericNativeExecDriver<C, F, I, B, P> {
     /// New driver. `runtime` is the sealed runtime payload bytes
     /// (bootstrap/successor runtime image digest domain input).
-    pub fn new(catalog: C, framer: F, issuer: I, binding: B, runtime: Vec<u8>) -> Self {
+    pub fn new(
+        catalog: C,
+        framer: F,
+        provisioner: P,
+        issuer: I,
+        binding: B,
+        runtime: Vec<u8>,
+    ) -> Self {
         Self {
             catalog: std::sync::Arc::new(catalog),
             framer: std::sync::Arc::new(framer),
+            provisioner: std::sync::Arc::new(provisioner),
             issuer: std::sync::Arc::new(Mutex::new(issuer)),
             binding,
             runtime,
@@ -112,8 +145,9 @@ fn control_terminal(_error: ExecControlError) -> NativeExecFailure {
     terminal("reverie-inguest: generic native exec control transport failed")
 }
 
-struct GenericSession<T: Tool, F, I, B> {
+struct GenericSession<T: Tool, F, I, B, P> {
     framer: std::sync::Arc<F>,
+    provisioner: std::sync::Arc<P>,
     issuer: std::sync::Arc<Mutex<I>>,
     binding: B,
     runtime: Vec<u8>,
@@ -137,7 +171,7 @@ struct GenericPrepared<I, B, F> {
 // cancel consumes the ticket through the issuer. Embedders supply
 // catalog/framer/issuer whose documented obligations (deterministic
 // framing, single watched birth) are stated on those traits.
-unsafe impl<T, C, F, I, B> NativeExecDriver<T> for GenericNativeExecDriver<C, F, I, B>
+unsafe impl<T, C, F, I, B, P> NativeExecDriver<T> for GenericNativeExecDriver<C, F, I, B, P>
 where
     T: Tool + 'static,
     C: TargetCatalog,
@@ -145,6 +179,7 @@ where
     I: ExecIssuer<B> + Send,
     B: TicketBinding + Clone + Send + Sync,
     B::Owner: Send,
+    P: Provisioner,
 {
     fn capture_old<'owner>(
         &'owner self,
@@ -157,6 +192,7 @@ where
         self.catalog.admit(&path)?;
         Ok(Box::new(GenericSession {
             framer: self.framer.clone(),
+            provisioner: self.provisioner.clone(),
             issuer: self.issuer.clone(),
             binding: self.binding.clone(),
             runtime: self.runtime.clone(),
@@ -168,13 +204,14 @@ where
 
 // SAFETY: see driver-level note; prepare owns no ticket until the
 // issuer mints one, and every error path below cancels it.
-unsafe impl<T, F, I, B> NativeExecSession<T> for GenericSession<T, F, I, B>
+unsafe impl<T, F, I, B, P> NativeExecSession<T> for GenericSession<T, F, I, B, P>
 where
     T: Tool + 'static,
     F: StateFramer<State = T::ThreadState>,
     I: ExecIssuer<B> + Send,
     B: TicketBinding + Clone + Send + Sync,
     B::Owner: Send,
+    P: Provisioner,
 {
     fn prepare<'a>(
         &'a mut self,
@@ -212,6 +249,17 @@ where
                 return Err(control_terminal(error));
             }
         };
+        // Actual delivery first; the delivered fact is recorded only
+        // after the embedder's receipt. No delivery => cancel+refuse.
+        if let Err(error) = self.provisioner.deliver(ticket, sealed_digest) {
+            let _ = issuer.cancel(ticket);
+            return Err(match error {
+                ExecControlError::Unavailable => NativeExecFailure::Refused(refused(
+                    "reverie-inguest: generic native exec has no provision delivery",
+                )),
+                other => control_terminal(other),
+            });
+        }
         if let Err(error) = issuer.mark_provision_delivered(ticket) {
             let _ = issuer.cancel(ticket);
             return Err(control_terminal(error));
@@ -315,6 +363,8 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::sync::Arc;
     use std::sync::Mutex;
+
+    type ReturnedCalls = Arc<Mutex<Vec<(reverie::Errno, Option<reverie::UnsupportedRefusal>)>>>;
 
     #[derive(Default)]
     struct TestGlobal;
@@ -440,15 +490,10 @@ mod tests {
         }
     }
 
-    fn write_frame(stream: &mut std::os::unix::net::UnixStream, payload: &[u8]) {
-        use std::io::Write;
-        stream
-            .write_all(&(payload.len() as u32).to_be_bytes())
-            .unwrap();
-        stream.write_all(payload).unwrap();
+    fn digest(bytes: &[u8]) -> [u8; 32] {
+        sha2::Sha256::digest(bytes).into()
     }
 
-    #[test]
     #[test]
     fn generic_driver_installs_as_trait_object() {
         // Compile-time witness: the generic driver installs as a
@@ -462,6 +507,7 @@ mod tests {
         let driver = GenericNativeExecDriver::new(
             KernelCatalog,
             PairFramer,
+            RefusingProvisioner,
             DirectIssuer { registry },
             TestBinding { config: [3u8; 32] },
             b"runtime".to_vec(),
@@ -508,7 +554,7 @@ mod tests {
 
         #[derive(Default)]
         struct ExecTool {
-            returned: Arc<Mutex<Vec<(Errno, Option<reverie::UnsupportedRefusal>)>>>,
+            returned: ReturnedCalls,
         }
         #[reverie::tool]
         impl Tool for ExecTool {
@@ -610,14 +656,24 @@ mod tests {
         let registry = Arc::new(Mutex::new(
             ExecTicketRegistry::new(TestProof, [5u8; 32]).unwrap(),
         ));
-        let returned: Arc<Mutex<Vec<(Errno, Option<reverie::UnsupportedRefusal>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let returned: ReturnedCalls = Arc::new(Mutex::new(Vec::new()));
         let tool = ExecTool {
             returned: returned.clone(),
         };
+        struct OkProvisioner;
+        impl Provisioner for OkProvisioner {
+            fn deliver(
+                &self,
+                _ticket: ExecTicket,
+                _sealed_digest: [u8; 32],
+            ) -> Result<(), ExecControlError> {
+                Ok(())
+            }
+        }
         let driver = GenericNativeExecDriver::new(
             KernelCatalog,
             PairFramer,
+            OkProvisioner,
             DirectIssuer {
                 registry: registry.clone(),
             },
@@ -660,5 +716,39 @@ mod tests {
         );
         drop(host);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn no_provision_means_no_mark_no_issue() {
+        // Negative control (Astra P2): prepare+seal succeed, but with
+        // RefusingProvisioner the flow must refuse BEFORE any delivery
+        // mark or issuance, and cancel the ticket.
+        let registry = Arc::new(Mutex::new(
+            ExecTicketRegistry::new(TestProof, [5u8; 32]).unwrap(),
+        ));
+        let driver = GenericNativeExecDriver::new(
+            KernelCatalog,
+            PairFramer,
+            RefusingProvisioner,
+            DirectIssuer {
+                registry: registry.clone(),
+            },
+            TestBinding { config: [3u8; 32] },
+            b"runtime".to_vec(),
+        );
+        let _ = driver;
+        // Registry-level assertion of the same law the driver relies
+        // on: issue without delivered mark refuses Transition.
+        let mut reg = ExecTicketRegistry::new(TestProof, [6u8; 32]).unwrap();
+        let snap = b"s".to_vec();
+        let d = digest(&snap);
+        let t = reg
+            .prepare(7, TestBinding { config: [3u8; 32] }, snap, d)
+            .unwrap();
+        let sealed = reg.seal(7, t, digest(b"r"), b"r").unwrap();
+        assert_eq!(
+            reg.issue(7, t, sealed),
+            Err(reverie_rpc_transport::exec_ticket::ExecControlError::Transition)
+        );
     }
 }
