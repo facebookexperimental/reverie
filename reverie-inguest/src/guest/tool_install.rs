@@ -269,7 +269,6 @@ where
         // image, complete only the config handshake so the launcher
         // reports the ordinary refusal instead of an unsupported
         // executable; never start Tool RPC on this path.
-        #[cfg(feature = "fixed-syscall-gates")]
         if !crate::trap::fixed_gates_published()
             && unsafe { crate::guest::sigalrm::seccomp_filter_count() } == Some(0)
         {

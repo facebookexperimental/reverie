@@ -1247,7 +1247,7 @@ where
     let site_patching = if private_initial {
         false
     } else if let Some(site_patching) = reverie_inguest::bootstrap::bootstrap_site_patching() {
-        site_patching
+        install_try!(runtime::validate_site_patching(site_patching))
     } else {
         install_try!(runtime::site_patching_from_env_value(
             std::env::var_os(runtime::SITE_PATCHING_ENV).as_deref(),
