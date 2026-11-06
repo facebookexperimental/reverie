@@ -11,6 +11,7 @@
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicI32;
 use core::sync::atomic::Ordering;
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -72,6 +73,21 @@ pub fn note_fork_in_child() {
 struct RpcConnection<G: GlobalTool> {
     pid: Pid,
     client: BlockingRpcClient<G, GuestRpcStream>,
+    /// Mirror of `client.as_raw_fd()`, readable without the connection
+    /// lock (relocation lookup, fork-child cleanup of connections whose
+    /// lock state was copied mid-exchange).
+    fd: AtomicI32,
+}
+
+impl<G: GlobalTool> RpcConnection<G> {
+    fn new(pid: Pid, client: BlockingRpcClient<G, GuestRpcStream>) -> Self {
+        let fd = AtomicI32::new(client.as_raw_fd());
+        Self { pid, client, fd }
+    }
+
+    fn fd(&self) -> libc::c_int {
+        self.fd.load(Ordering::Acquire)
+    }
 }
 
 // Native application callbacks own their separate primary/contention routes.
@@ -79,21 +95,67 @@ struct RpcConnection<G: GlobalTool> {
 // Keeping this owner explicit also prevents ordinary/private RPC APIs from
 // manufacturing a connection or selecting a fallback on a native config owner.
 enum ConnectionOwner<G: GlobalTool> {
-    Ordinary(SpinMutex<RpcConnection<G>>),
+    Ordinary(OrdinaryConnections<G>),
     NativeConfiguration,
 }
 
-impl<G: GlobalTool> ConnectionOwner<G> {
-    fn try_lock(&self) -> Option<crate::sync::SpinGuard<'_, RpcConnection<G>>> {
-        match self {
-            Self::Ordinary(connection) => connection.try_lock(),
-            Self::NativeConfiguration => None,
+/// One independently blocking coordinator connection per guest thread
+/// (W7): `BlockingRpcClient` stamps its connect-time TID, and Detcore
+/// requires a connection per thread so a scheduler RPC that blocks until
+/// a sibling runs cannot deadlock against that sibling's own RPC.
+/// Connections open lazily on a thread's first send and are closed when
+/// its host thread state retires ([`CoordinatorRpc::close_current_thread`]).
+/// The map lock is held only to look up or insert an `Arc`, never across
+/// an exchange.
+struct OrdinaryConnections<G: GlobalTool> {
+    by_tid: SpinMutex<HashMap<i32, Arc<SpinMutex<RpcConnection<G>>>>>,
+}
+
+impl<G: GlobalTool> OrdinaryConnections<G> {
+    fn new(root_tid: i32, root: RpcConnection<G>) -> Self {
+        let mut by_tid = HashMap::new();
+        by_tid.insert(root_tid, Arc::new(SpinMutex::new(root)));
+        Self {
+            by_tid: SpinMutex::new(by_tid),
         }
     }
 
-    fn lock(&self) -> crate::sync::SpinGuard<'_, RpcConnection<G>> {
+    fn get(&self, tid: i32) -> Option<Arc<SpinMutex<RpcConnection<G>>>> {
+        self.by_tid.lock().get(&tid).cloned()
+    }
+
+    fn insert(&self, tid: i32, connection: RpcConnection<G>) -> Arc<SpinMutex<RpcConnection<G>>> {
+        let connection = Arc::new(SpinMutex::new(connection));
+        self.by_tid.lock().insert(tid, Arc::clone(&connection));
+        connection
+    }
+
+    fn remove(&self, tid: i32) -> Option<Arc<SpinMutex<RpcConnection<G>>>> {
+        self.by_tid.lock().remove(&tid)
+    }
+
+    /// Remove every connection but `keep` (fork child: the other entries
+    /// are copies of the parent's threads' connections, which do not
+    /// exist in the child).
+    fn drain_except(&self, keep: i32) -> Vec<Arc<SpinMutex<RpcConnection<G>>>> {
+        let mut by_tid = self.by_tid.lock();
+        let kept = by_tid.remove(&keep);
+        let drained: Vec<_> = by_tid.drain().map(|(_, connection)| connection).collect();
+        if let Some(kept) = kept {
+            by_tid.insert(keep, kept);
+        }
+        drained
+    }
+
+    fn snapshot(&self) -> Vec<Arc<SpinMutex<RpcConnection<G>>>> {
+        self.by_tid.lock().values().cloned().collect()
+    }
+}
+
+impl<G: GlobalTool> ConnectionOwner<G> {
+    fn ordinary(&self) -> &OrdinaryConnections<G> {
         match self {
-            Self::Ordinary(connection) => connection.lock(),
+            Self::Ordinary(connections) => connections,
             // An ordinary send on a native config owner is an owner mismatch,
             // not permission to open another route or a fake successful reply.
             Self::NativeConfiguration => rpc_fatal(123),
@@ -192,32 +254,48 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
     /// every signal (protect::block_all_signals); no syscall here goes through
     /// libc.
     pub(crate) fn relocate(&self, from: libc::c_int) -> io::Result<libc::c_int> {
-        let connection = self
-            .connection
-            .try_lock()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
-        if connection.client.as_raw_fd() != from {
-            return Err(io::Error::from_raw_os_error(libc::EBADF));
-        }
-        let moved = crate::guest::protect::dup_into_runtime_range(from);
-        if moved < 0 {
-            return Err(io::Error::from_raw_os_error(-moved as i32));
-        }
-        let moved = moved as libc::c_int;
-        // SAFETY: `moved` is a fresh duplicate of the connection's socket,
-        // owned from here by the client's new stream.
-        let stream = GuestRpcStream::from(unsafe { UnixStream::from_raw_fd(moved) });
-        match connection.client.replace_stream(stream) {
-            // The old number is released without closing it; see above.
-            GuestRpcStream::Ordinary(previous) => {
-                let _ = previous.into_raw_fd();
+        // Find the owning per-thread connection. A busy connection whose
+        // descriptor cannot be checked makes the answer EBUSY, as the
+        // single-connection lock did: relocating under an in-flight
+        // request would move its socket mid-exchange.
+        let mut busy = false;
+        for candidate in self.connection.ordinary().snapshot() {
+            let Some(connection) = candidate.try_lock() else {
+                busy = true;
+                continue;
+            };
+            if connection.client.as_raw_fd() != from {
+                continue;
             }
-            #[cfg(feature = "exec-private-init")]
-            GuestRpcStream::Native(previous) => core::mem::forget(previous),
+            let moved = crate::guest::protect::dup_into_runtime_range(from);
+            if moved < 0 {
+                return Err(io::Error::from_raw_os_error(-moved as i32));
+            }
+            let moved = moved as libc::c_int;
+            // SAFETY: `moved` is a fresh duplicate of the connection's socket,
+            // owned from here by the client's new stream.
+            let stream = GuestRpcStream::from(unsafe { UnixStream::from_raw_fd(moved) });
+            match connection.client.replace_stream(stream) {
+                // The old number is released without closing it; see above.
+                GuestRpcStream::Ordinary(previous) => {
+                    let _ = previous.into_raw_fd();
+                }
+                #[cfg(feature = "exec-private-init")]
+                GuestRpcStream::Native(previous) => core::mem::forget(previous),
+            }
+            connection.fd.store(moved, Ordering::Release);
+            if self.fd.load(Ordering::Acquire) == from {
+                self.fd.store(moved, Ordering::Release);
+                crate::guest::protect::replace_coordinator_fd(from, moved)?;
+            } else {
+                crate::guest::protect::replace_coordinator_conn_fd(from, moved)?;
+            }
+            return Ok(moved);
         }
-        self.fd.store(moved, Ordering::Release);
-        crate::guest::protect::replace_coordinator_fd(from, moved)?;
-        Ok(moved)
+        if busy {
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        Err(io::Error::from_raw_os_error(libc::EBADF))
     }
 
     /// Adopt a live blocking client without reconnecting or duplicating its fd.
@@ -252,7 +330,10 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         }
         let config = Arc::new(client.config().clone());
         Ok(Self {
-            connection: ConnectionOwner::Ordinary(SpinMutex::new(RpcConnection { pid, client })),
+            connection: ConnectionOwner::Ordinary(OrdinaryConnections::new(
+                tid.as_raw(),
+                RpcConnection::new(pid, client),
+            )),
             config,
             path: Some(path.as_ref().to_path_buf()),
             fd: AtomicI32::new(fd),
@@ -274,7 +355,10 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         let config = Arc::new(client.config().clone());
         let fd = client.as_raw_fd();
         Ok(Self {
-            connection: ConnectionOwner::Ordinary(SpinMutex::new(RpcConnection { pid, client })),
+            connection: ConnectionOwner::Ordinary(OrdinaryConnections::new(
+                tid.as_raw(),
+                RpcConnection::new(pid, client),
+            )),
             config,
             path: Some(path),
             fd: AtomicI32::new(fd),
@@ -291,17 +375,71 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
 pub struct RequestInFlight;
 
 impl<G: GlobalTool> CoordinatorRpc<G> {
+    fn current_tid() -> Pid {
+        current_id(libc::SYS_gettid).unwrap_or_else(|_| rpc_fatal(122))
+    }
+
+    /// This thread's own coordinator connection, opened lazily on first
+    /// use. The root thread's connection is the one built at construction
+    /// (its descriptor is the process's reserved coordinator FD); later
+    /// threads register theirs in the per-thread coordinator FD set as
+    /// the placement records them.
+    fn thread_connection(&self) -> Arc<SpinMutex<RpcConnection<G>>> {
+        let tid = Self::current_tid().as_raw();
+        let connections = self.connection.ordinary();
+        if let Some(connection) = connections.get(tid) {
+            return connection;
+        }
+        let pid = current_id(libc::SYS_getpid).unwrap_or_else(|_| rpc_fatal(122));
+        let path = self.path.as_deref().unwrap_or_else(|| rpc_fatal(123));
+        let client = connect_ordinary::<G>(path, Pid::from_raw(tid), |new_fd| {
+            crate::guest::protect::register_coordinator_conn_fd(new_fd)
+        })
+        .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
+        connections.insert(tid, RpcConnection::new(pid, client))
+    }
+
+    /// Close and forget this thread's coordinator connection (thread
+    /// exit). For the root thread this removes its map entry only; the
+    /// reserved coordinator descriptor record stays, so the number
+    /// remains protected for the process's lifetime.
+    pub fn close_current_thread(&self) {
+        let ConnectionOwner::Ordinary(connections) = &self.connection else {
+            return;
+        };
+        let tid = Self::current_tid().as_raw();
+        if let Some(connection) = connections.remove(tid) {
+            let fd = connection
+                .try_lock()
+                .map(|connection| connection.fd())
+                .unwrap_or(-1);
+            if fd >= 0 {
+                crate::guest::protect::unregister_coordinator_conn_fd(fd);
+            }
+            // Dropping the last Arc closes the socket; an exchange still
+            // in flight on this thread cannot exist at its exit callbacks.
+            drop(connection);
+        }
+    }
+
     /// Sends `message` and waits for the response, from Tool code that runs
     /// outside a Tool callback's own `send_rpc` (for example inside a
-    /// synchronous method the callback called). A process's guest code is
-    /// single-threaded and its callbacks complete each request before
-    /// returning, so another request in flight means re-entry; that is
-    /// refused rather than waited on, because waiting would deadlock.
+    /// synchronous method the callback called). Each guest thread has its
+    /// own connection and its callbacks complete each request before
+    /// returning, so another request in flight *on this thread's
+    /// connection* means re-entry; that is refused rather than waited on,
+    /// because waiting would deadlock.
     pub fn send_blocking_unless_in_flight(
         &self,
         message: G::Request,
     ) -> Result<G::Response, RequestInFlight> {
-        let connection = self.connection.try_lock().ok_or(RequestInFlight)?;
+        // A native-configuration owner has no ordinary connection to try:
+        // the refusal this returned before per-thread connections.
+        if matches!(self.connection, ConnectionOwner::NativeConfiguration) {
+            return Err(RequestInFlight);
+        }
+        let connection = self.thread_connection();
+        let connection = connection.try_lock().ok_or(RequestInFlight)?;
         Ok(self.exchange(connection, message))
     }
 
@@ -330,45 +468,54 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             let pid = current_id(libc::SYS_getpid).unwrap_or_else(|_| rpc_fatal(122));
             if connection.pid != pid {
                 let tid = current_id(libc::SYS_gettid).unwrap_or_else(|_| rpc_fatal(122));
-                // The new connection is recorded as the coordinator's
-                // before the placement unblocks signals, so a guest handler
-                // run then already finds it protected.
-                let path = self.path.as_deref().unwrap_or_else(|| rpc_fatal(123));
-                let client = connect_ordinary::<G>(path, tid, |new_fd| {
-                    let old_fd = self.fd.swap(new_fd, Ordering::AcqRel);
-                    (self.on_reconnect)(old_fd, new_fd)
-                })
-                .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
-                let inherited = std::mem::replace(&mut *connection, RpcConnection { pid, client });
-                let (_, _, stream) = inherited.client.into_parts();
-                match stream {
-                    // This child's copy of its parent's connection. The
-                    // runtime closes it with its own syscall, with every
-                    // signal blocked until it has checked the number: a close
-                    // a guest seccomp filter faked leaves that number open,
-                    // and the runtime then keeps it as its own, so it is
-                    // neither reachable nor unreported.
-                    GuestRpcStream::Ordinary(stream) => {
-                        let inherited_fd = stream.into_raw_fd();
+                // Sibling threads do not exist in this child: their
+                // inherited connection copies must close here, or the
+                // coordinator sees phantom sessions and their descriptors
+                // stay guest-reachable numbers. Their lock state was
+                // copied mid-exchange at worst, so close by descriptor
+                // mirror without taking locks, and forget the Arcs
+                // rather than dropping a locked client into a second
+                // close of the same number.
+                for other in self.connection.ordinary().drain_except(tid.as_raw()) {
+                    let fd = other.try_lock().map(|other| other.fd()).unwrap_or(-1);
+                    if fd >= 0 {
+                        crate::guest::protect::unregister_coordinator_conn_fd(fd);
                         let blocked =
                             crate::guest::protect::block_all_signals().unwrap_or_else(|_| {
                                 rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE)
                             });
-                        unsafe {
-                            raw_syscall6(libc::SYS_close, [inherited_fd as u64, 0, 0, 0, 0, 0])
-                        };
-                        crate::guest::protect::record_if_open(inherited_fd).unwrap_or_else(|_| {
+                        unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
+                        crate::guest::protect::record_if_open(fd).unwrap_or_else(|_| {
                             rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE)
                         });
                         drop(blocked);
                     }
-                    // Not reached: connect_ordinary builds only Ordinary
-                    // streams, and an active exec-private domain exits with
-                    // 123 above. Dropped as before, without the survivor
-                    // check.
-                    #[cfg(feature = "exec-private-init")]
-                    GuestRpcStream::Native(stream) => drop(stream),
+                    core::mem::forget(other);
                 }
+                // The new connection is recorded as the coordinator's
+                // before the placement unblocks signals, so a guest handler
+                // run then already finds it protected. The reconnect hook
+                // (which rebinds the reserved root descriptor) runs only
+                // when this connection is the root one; a per-thread
+                // connection re-registers in the connection set instead.
+                let path = self.path.as_deref().unwrap_or_else(|| rpc_fatal(123));
+                let was_root = self.fd.load(Ordering::Acquire) == connection.fd();
+                let client = connect_ordinary::<G>(path, tid, |new_fd| {
+                    if was_root {
+                        let old_fd = self.fd.swap(new_fd, Ordering::AcqRel);
+                        (self.on_reconnect)(old_fd, new_fd)
+                    } else {
+                        crate::guest::protect::register_coordinator_conn_fd(new_fd)
+                    }
+                })
+                .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
+                if !was_root {
+                    crate::guest::protect::unregister_coordinator_conn_fd(connection.fd());
+                }
+                let inherited =
+                    std::mem::replace(&mut *connection, RpcConnection::new(pid, client));
+                let (_, _, stream) = inherited.client.into_parts();
+                close_inherited_stream(stream);
             }
         }
         match connection.client.try_send_rpc(message) {
@@ -378,10 +525,33 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
     }
 }
 
+/// Close this child's copy of a parent connection's stream, with every
+/// signal blocked until the number has been checked: a close a guest
+/// seccomp filter faked leaves that number open, and the runtime then
+/// keeps it as its own, so it is neither reachable nor unreported.
+fn close_inherited_stream(stream: GuestRpcStream) {
+    match stream {
+        GuestRpcStream::Ordinary(stream) => {
+            let inherited_fd = stream.into_raw_fd();
+            let blocked = crate::guest::protect::block_all_signals()
+                .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
+            unsafe { raw_syscall6(libc::SYS_close, [inherited_fd as u64, 0, 0, 0, 0, 0]) };
+            crate::guest::protect::record_if_open(inherited_fd)
+                .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
+            drop(blocked);
+        }
+        // Not reached on the ordinary path: connect_ordinary builds only
+        // Ordinary streams. Dropped as before, without the survivor check.
+        #[cfg(feature = "exec-private-init")]
+        GuestRpcStream::Native(stream) => drop(stream),
+    }
+}
+
 #[reverie::tool]
 impl<G: GlobalTool> GlobalRPC<G> for CoordinatorRpc<G> {
     async fn send_rpc(&self, message: G::Request) -> G::Response {
-        self.exchange(self.connection.lock(), message)
+        let connection = self.thread_connection();
+        self.exchange(connection.lock(), message)
     }
 
     fn config(&self) -> &G::Config {

@@ -541,7 +541,8 @@ mod tests {
                 crate::guest::protect::reserve_coordinator_fd(from).unwrap();
                 assert_eq!(rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
                 {
-                    let _in_flight = rpc.connection.lock();
+                    let conn = rpc.thread_connection();
+                    let _in_flight = conn.lock();
                     assert_eq!(
                         rpc.relocate(from).unwrap_err().raw_os_error(),
                         Some(libc::EBUSY)
@@ -558,6 +559,112 @@ mod tests {
                 assert_eq!(rpc.send_blocking_unless_in_flight(23).unwrap(), 97);
                 drop(rpc);
                 peer.join().unwrap();
+                std::fs::remove_file(directory.join("socket")).unwrap();
+                drop(directory_owner);
+                std::fs::remove_dir(&directory).unwrap();
+            },
+        );
+    }
+
+    /// Two guest threads get independent coordinator connections: the
+    /// server reads both requests (one per connection, stamped with the
+    /// sending thread's tid) before replying to either, so a single
+    /// shared blocking connection would serialize or deadlock them.
+    #[test]
+    fn per_thread_coordinator_connections_block_independently() {
+        isolated_coordinator_move_test(
+            "guest::rpc::stream::tests::per_thread_coordinator_connections_block_independently",
+            || {
+                use std::os::unix::net::UnixListener;
+                use std::time::Duration;
+
+                use reverie_rpc_transport::RequestEnvelope;
+                use reverie_rpc_transport::codec::decode;
+                use reverie_rpc_transport::codec::encode;
+
+                let directory = std::env::temp_dir()
+                    .join(format!("ordinary-rpc-threads-{}", std::process::id()));
+                std::fs::create_dir(&directory).unwrap();
+                let directory_owner = std::fs::File::open(&directory).unwrap();
+                let path = std::path::PathBuf::from(format!(
+                    "/proc/self/fd/{}/socket",
+                    directory_owner.as_raw_fd()
+                ));
+                let listener = UnixListener::bind(&path).unwrap();
+                let peer = std::thread::spawn(move || {
+                    // Three connections arrive: the root thread's (opened
+                    // by CoordinatorRpc::connect, never sends here) and
+                    // one per worker thread. Config goes to all three;
+                    // requests are read from the two worker sockets.
+                    let mut sockets = Vec::new();
+                    for _ in 0..3 {
+                        let (mut socket, _) = listener.accept().unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        let config = encode(&73_u64).unwrap();
+                        socket
+                            .write_all(&(config.len() as u32).to_be_bytes())
+                            .unwrap();
+                        socket.write_all(&config).unwrap();
+                        sockets.push(socket);
+                    }
+                    // Read BOTH worker requests before replying to
+                    // either: with a single shared connection the second
+                    // request could never be stamped by its own thread,
+                    // and with one connection lock the second sender
+                    // would never send.
+                    let mut from_tids = Vec::new();
+                    for socket in &mut sockets[1..] {
+                        let mut prefix = [0; 4];
+                        socket.read_exact(&mut prefix).unwrap();
+                        let mut bytes = vec![0; u32::from_be_bytes(prefix) as usize];
+                        socket.read_exact(&mut bytes).unwrap();
+                        let envelope: RequestEnvelope<u64> = decode(&bytes).unwrap();
+                        assert_eq!(envelope.request, 19);
+                        from_tids.push(envelope.from.as_raw());
+                    }
+                    for socket in &mut sockets[1..] {
+                        let response = encode(&91_u64).unwrap();
+                        socket
+                            .write_all(&(response.len() as u32).to_be_bytes())
+                            .unwrap();
+                        socket.write_all(&response).unwrap();
+                    }
+                    from_tids
+                });
+                let rpc = std::sync::Arc::new(
+                    crate::guest::rpc::CoordinatorRpc::<OrdinaryConnectionModel>::connect(
+                        &path,
+                        |_, _| panic!("ordinary connection unexpectedly reconnected"),
+                    )
+                    .unwrap(),
+                );
+                // Join handles keep (my tid, result) per worker thread,
+                // so a line that outlives its scope variable keeps the
+                // borrow checker from conflating the two `let`.
+                let work = |rpc: std::sync::Arc<
+                    crate::guest::rpc::CoordinatorRpc<OrdinaryConnectionModel>,
+                >| {
+                    move || {
+                        let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+                        let result = rpc.send_blocking_unless_in_flight(19).unwrap();
+                        (my_tid, result)
+                    }
+                };
+                let first = std::thread::spawn(work(rpc.clone()));
+                let second = std::thread::spawn(work(rpc.clone()));
+                let mut got: Vec<(i32, u64)> = vec![first.join().unwrap(), second.join().unwrap()];
+                got.sort_unstable();
+                assert!(got.iter().all(|(_, result)| *result == 91));
+                let mut from_tids = peer.join().unwrap();
+                from_tids.sort_unstable();
+                let want: Vec<i32> = got.iter().map(|(tid, _)| *tid).collect();
+                assert_eq!(from_tids, want, "each request carried its own thread's tid");
+                drop(rpc);
                 std::fs::remove_file(directory.join("socket")).unwrap();
                 drop(directory_owner);
                 std::fs::remove_dir(&directory).unwrap();

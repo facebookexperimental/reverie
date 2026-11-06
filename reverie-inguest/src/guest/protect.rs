@@ -380,6 +380,80 @@ pub(crate) fn replace_recorded_fd(old: libc::c_int, new: libc::c_int) -> io::Res
         .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
 }
 
+/// How many per-thread coordinator connections one process protects beside
+/// the root connection ([`COORDINATOR_FD`]). Each admitted guest thread
+/// past the first opens its own connection (W7 per-thread RPC); every such
+/// descriptor is runtime-owned exactly like the root connection.
+const COORDINATOR_CONN_CAPACITY: usize = 64;
+
+/// The per-thread coordinator connection descriptors (-1 is a free slot).
+/// Plain descriptors, not pid-packed: connections are process-scoped (any
+/// thread may need to relocate another thread's connection when the guest
+/// takes its number), and a fork child unregisters the inherited copies
+/// as it closes them (`CoordinatorRpc` fork reset).
+static COORDINATOR_CONN_FDS: [AtomicI32; COORDINATOR_CONN_CAPACITY] =
+    [const { AtomicI32::new(-1) }; COORDINATOR_CONN_CAPACITY];
+
+/// Records `fd` as one of this process's per-thread coordinator
+/// connections. Fails with `OutOfMemory` when every slot is in use;
+/// registering the same descriptor twice is a no-op success.
+pub fn register_coordinator_conn_fd(fd: libc::c_int) -> io::Result<()> {
+    if fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a coordinator connection descriptor must be open",
+        ));
+    }
+    if is_coordinator_conn_fd(fd) {
+        return Ok(());
+    }
+    for slot in &COORDINATOR_CONN_FDS {
+        if slot
+            .compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        "every coordinator connection descriptor slot is in use",
+    ))
+}
+
+/// Forgets `fd` as a per-thread coordinator connection (its owner is
+/// closing it). Absence is not an error.
+pub fn unregister_coordinator_conn_fd(fd: libc::c_int) {
+    for slot in &COORDINATOR_CONN_FDS {
+        let _ = slot.compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// Rebinds the per-thread coordinator connection record after a move
+/// (`CoordinatorRpc::relocate`). Fails when `old` is not recorded.
+pub fn replace_coordinator_conn_fd(old: libc::c_int, new: libc::c_int) -> io::Result<()> {
+    COORDINATOR_CONN_FDS
+        .iter()
+        .any(|slot| {
+            slot.compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+        .then_some(())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "coordinator connection FD changed concurrently: {old} not recorded"
+            ))
+        })
+}
+
+/// Whether `fd` is a recorded per-thread coordinator connection.
+fn is_coordinator_conn_fd(fd: libc::c_int) -> bool {
+    fd >= 0
+        && COORDINATOR_CONN_FDS
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) == fd)
+}
+
 /// Forgets every record of `fd`, whichever process recorded it.
 fn forget_recorded_fd(fd: libc::c_int) {
     for slot in &RECORDED_FDS {
@@ -660,9 +734,9 @@ pub fn protect_runtime_control(event: &mut SyscallEvent) -> bool {
 /// native-exec leases.
 /// Returns the array and how many of its leading entries are in use.
 #[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
-const PROTECTED_FD_CAPACITY: usize = 9 + RECORDED_FD_CAPACITY;
+const PROTECTED_FD_CAPACITY: usize = 9 + RECORDED_FD_CAPACITY + COORDINATOR_CONN_CAPACITY;
 #[cfg(not(any(feature = "exec-native-injection", feature = "loader-private-runtime")))]
-const PROTECTED_FD_CAPACITY: usize = 2 + RECORDED_FD_CAPACITY;
+const PROTECTED_FD_CAPACITY: usize = 2 + RECORDED_FD_CAPACITY + COORDINATOR_CONN_CAPACITY;
 
 fn protected_descriptors(guest_syscall: bool) -> ([u64; PROTECTED_FD_CAPACITY], usize) {
     let mut protected = [u64::MAX; PROTECTED_FD_CAPACITY];
@@ -681,6 +755,13 @@ fn protected_descriptors(guest_syscall: bool) -> ([u64; PROTECTED_FD_CAPACITY], 
     }
     for slot in &RECORDED_FDS {
         if let Some(fd) = recorded_slot_fd(slot.load(Ordering::Acquire)) {
+            protected[count] = fd as u64;
+            count += 1;
+        }
+    }
+    for slot in &COORDINATOR_CONN_FDS {
+        let fd = slot.load(Ordering::Acquire);
+        if fd >= 0 {
             protected[count] = fd as u64;
             count += 1;
         }
@@ -1014,7 +1095,7 @@ unsafe fn relocate_runtime_fd(fd: libc::c_int) -> Result<(), i64> {
     let _blocked = block_all_signals().map_err(errno_of)?;
     if TOOL_OUTPUT_FD.load(Ordering::Acquire) == fd {
         unsafe { relocate_tool_output(fd) };
-    } else if COORDINATOR_FD.load(Ordering::Acquire) == fd {
+    } else if COORDINATOR_FD.load(Ordering::Acquire) == fd || is_coordinator_conn_fd(fd) {
         relocate_coordinator(fd).map_err(errno_of)?;
         unsafe { raw_syscall6(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
     } else if is_recorded(fd) {

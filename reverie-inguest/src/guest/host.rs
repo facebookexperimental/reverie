@@ -1542,6 +1542,9 @@ fn finish_tool_exit<T: Tool + 'static, R: HostRuntime>(
     if let Err(error) = on_exit {
         tool_fatal(125, &error);
     }
+    // The callbacks above may have used this thread's connection; it will
+    // not be used again past this point.
+    rpc.close_current_thread();
     if process_exit {
         let tool = host.tool.lock().take().unwrap_or_else(|| fatal(126));
         let mut tool = Arc::try_unwrap(tool).unwrap_or_else(|_| fatal(126));
