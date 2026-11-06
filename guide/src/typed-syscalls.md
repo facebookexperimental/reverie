@@ -208,8 +208,41 @@ typed handler above is roughly the `openat` arm of that match with
 the pretty-printer replaced by a policy — read, decide, optionally
 rewrite, tail-inject.
 >
-> 🚧 **Under construction — coverage statement.** TODO: state which
-> syscalls have full typed wrappers vs fall back to raw arguments, per
-> architecture, generated from the crate's own tables.
-> <!-- UC: typed-coverage -->
-> Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`typed-coverage`).
+## Coverage, counted from the crate's own tables
+
+Coverage is a property of two tables, so count it from them: the
+dispatch entries in `syscall_list!` (`reverie-syscalls/src/syscalls.rs`)
+against the `Sysno` enum of the pinned `syscalls` crate (0.6.18),
+per architecture:
+
+```console
+$ grep -cE '^[[:space:]]*[a-z0-9_]+ => ' reverie-syscalls/src/syscalls.rs   # typed entries, all cfgs
+341
+$ grep -cE '^[[:space:]]{8}[a-z0-9_]+ = [0-9]+,' ~/.cargo/registry/src/*/syscalls-0.6.18/src/arch/x86_64.rs
+373
+```
+
+Applying each entry's `#[cfg]` gate gives, at the time of writing:
+
+| Architecture | `Sysno` total | Typed wrappers | Uncovered (raw fallback) |
+|---|---:|---:|---:|
+| x86-64 | 373 | 340 (91.2%) | 33 |
+| aarch64 | 337 | 283 (84.0%) | 54 |
+
+Everything without a wrapper still reaches your handler, as
+`Syscall::Other(Sysno, SyscallArgs)` — six anonymous words, exactly
+the raw form this chapter started from. Coverage is therefore about
+*ergonomics and checked argument meanings*, never about whether a
+syscall can be intercepted.
+
+The uncovered set has a shape worth knowing. On x86-64 all 33 are
+relative newcomers: the mount API (`open_tree`, `move_mount`,
+`fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`,
+`statmount`, `listmount`), the landlock and LSM families, the
+pidfd pair, `futex_waitv`/`futex_wake`/`futex_requeue`, `rseq`,
+`io_pgetevents`, `close_range`, `cachestat`, `map_shadow_stack`,
+and friends. aarch64 additionally lacks the `*_time64` family and
+`sync_file_range2`. If your tool must *interpret* one of those
+today, you read its arguments raw (or add the wrapper — the macro
+makes that a local change); if it must merely pass them through,
+`Other` already does the right thing.
