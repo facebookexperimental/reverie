@@ -1050,10 +1050,11 @@ fn run(path: PathBuf, args: Vec<String>) -> Result<i32, String> {
         if outcome.failed.is_empty() {
             break;
         }
+        // Each attempt is an independent shot: a batch in which nothing
+        // passes must not consume the remaining attempts (a load-correlated
+        // flake fails the whole first batch, which previously broke the
+        // loop and never used attempt 2).
         let passed = run_retry_batch(&commands.retry_base, &outcome.failed)?;
-        if passed.is_empty() {
-            break;
-        }
         flaky_total += passed.len();
         for name in &passed {
             eprintln!("REVERIE_FLAKY: {name} passed on retry attempt {attempt}");
