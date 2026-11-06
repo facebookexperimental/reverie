@@ -637,7 +637,7 @@ mod tests {
                 unsafe { host.bind_successor_image_control(&owner) }.unwrap();
                 unsafe { host.restore_prepared_exec_state((99, 0x1234_5678_abcd_4321), &owner) }
                     .unwrap();
-                assert!(host.states.lock().is_empty());
+                assert!(host.states.is_empty());
                 assert!(calls.lock().unwrap().is_empty());
                 mark_successor_test_frontend_installed(&owner);
                 host.run_post_exec_before_loader(&mut entry, &owner)
@@ -646,8 +646,9 @@ mod tests {
                 assert_eq!(*memory, [0x5a; 16]); // pre-loader consumer, before dispatch
                 assert_eq!(*calls.lock().unwrap(), ["post-exec"]);
                 assert_eq!(
-                    host.states.lock().get(&raw_pid(libc::SYS_gettid).as_raw()),
-                    Some(&(100, 0xf2c4b6db626031e7))
+                    host.states
+                        .with_state(raw_pid(libc::SYS_gettid).as_raw(), |state| state.copied()),
+                    Some((100, 0xf2c4b6db626031e7))
                 );
                 assert!(host.prepared_exec.lock().is_none());
                 // A controlled component dispatch after completion; this supplies
@@ -699,7 +700,7 @@ mod tests {
                     } else {
                         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
                     }
-                    assert!(host.states.lock().is_empty());
+                    assert!(host.states.is_empty());
                     let pending = host.prepared_exec.lock();
                     assert!(matches!(
                         pending.as_ref().unwrap().phase,
@@ -780,7 +781,7 @@ mod tests {
                         .is_err()
                 );
                 assert!(calls.lock().unwrap().is_empty());
-                assert!(first.states.lock().is_empty());
+                assert!(first.states.is_empty());
                 drop(first);
                 drop(other);
                 assert!(worker1.join().unwrap().is_empty());

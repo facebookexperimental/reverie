@@ -152,7 +152,7 @@ fn ordinary_root_handoff_preserves_first_event_and_normal_fields() {
             Ok(())
         })
         .unwrap();
-        assert!(host.states.lock().is_empty());
+        assert!(host.states.is_empty());
         let event_name = if instruction {
             "instruction"
         } else {
@@ -197,8 +197,9 @@ fn ordinary_root_handoff_preserves_first_event_and_normal_fields() {
             ]
         );
         assert_eq!(
-            host.states.lock().get(&root.as_raw()),
-            Some(&(root.as_raw(), 97))
+            host.states
+                .with_state(root.as_raw(), |state| state.copied()),
+            Some((root.as_raw(), 97))
         );
         assert!(host.ordinary_root_state.lock().is_none());
     }
@@ -215,7 +216,7 @@ fn ordinary_root_refusal_cannot_publish_a_default_replacement() {
         .unwrap_err();
     assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
     assert!(host.ordinary_root_state.lock().is_none());
-    assert!(host.states.lock().is_empty());
+    assert!(host.states.is_empty());
     // The standard installer propagates this error before publish_tool/activation.
 }
 
@@ -248,7 +249,7 @@ fn ordinary_root_preparation_is_one_use_and_does_not_reseed_other_threads() {
 #[test]
 fn existing_installer_without_handoff_keeps_lazy_root_construction() {
     let (host, _peer) = host();
-    assert!(host.states.lock().is_empty());
+    assert!(host.states.is_empty());
     assert!(host.ordinary_root_state.lock().is_none());
     let tool = host.tool.lock();
     assert_eq!(

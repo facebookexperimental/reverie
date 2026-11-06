@@ -402,7 +402,7 @@ fn native_real_tool_rpc_allows_sibling_progress_while_primary_waits() {
         // first Tool has sent its request and waits on the actual primary.
         waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(host.tool.try_lock().is_some());
-        assert!(host.states.try_lock().is_some());
+        assert!(!host.states.any_leased());
         let callback = Callback::new(1);
         let id = callback.identity();
         let services = callback.services(None);

@@ -176,11 +176,14 @@ struct ModelPrepared<'a> {
 
 fn assert_host_guards(host: &AtomicUsize) {
     // Read-only component observation of the exact fixture host; never used by
-    // a concrete driver. Failed try_lock cannot release the existing owner.
+    // a concrete driver. Under the lease model no lock is held across the
+    // callback: the proof is now that a dispatch is counted active and the
+    // calling thread's state is leased out, so reacquisition by the driver
+    // would be refused rather than deadlock.
     let host =
         unsafe { &*(host.load(Ordering::Acquire) as *const ToolHost<ModelTool, ModelRuntime>) };
-    assert!(host.tool.try_lock().is_none());
-    assert!(host.states.try_lock().is_none());
+    assert!(host.dispatch_active());
+    assert!(host.states.any_leased());
 }
 fn named(text: &'static str) -> reverie::UnsupportedRefusal {
     reverie::UnsupportedRefusal::new(
@@ -472,8 +475,9 @@ fn run_model(mode: usize, original_execve: bool, installed: bool, source: Syscal
     let (errno, refusal) = results[0];
     assert_eq!(event.result, -i64::from(errno.into_raw()));
     assert_eq!(
-        host.states.lock().get(&raw_pid(libc::SYS_gettid).as_raw()),
-        Some(&(3, 1))
+        host.states
+            .with_state(raw_pid(libc::SYS_gettid).as_raw(), |state| state.copied()),
+        Some((3, 1))
     );
     if !installed {
         assert_eq!(errno, Errno::EOPNOTSUPP);
