@@ -31,8 +31,12 @@ The production `exec-stop` interface exposes only child identity, immutable entr
 and boundary observations, and cancellation. It exposes no owning `Stopped` or
 generation handle from which a caller could resume the guest. Raw stop transfer,
 sealed-image mapping and injection are restricted to `stage1a-probe`; they serve
-the separate fixture protocol. Commit 3 must add a genuine Detcore-ready release
-transition before a production caller can proceed. The library contains no fixture journal, READY nonce,
+the separate fixture protocol. The production release transition is
+`InitialExecStop::release` (and the exec supervisor's successor release):
+the caller's hook performs mapping, filter installation, handover and
+its own readiness checks on the stopped image, after which the library
+restores the exact original entry context and detaches at the kernel
+entry. Readiness policy stays with the caller. The library contains no fixture journal, READY nonce,
 control mask, runtime syscall policy, or fault-injection mode, and grants no
 `ToolReady` or runtime-readiness token.
 

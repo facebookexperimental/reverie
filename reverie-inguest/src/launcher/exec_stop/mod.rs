@@ -51,9 +51,13 @@ mod trace;
 
 pub use supervisor::DetachedSupervisor;
 pub use supervisor::DetachedWaitFailure;
+pub use supervisor::SuccessorStop;
 pub use supervisor::Supervisor;
 pub use supervisor::SupervisorMode;
 pub use supervisor::SupervisorOutcome;
+pub use supervisor::WatchedOutcome;
+pub use supervisor::WatchedStep;
+pub use supervisor::WatchedSupervisor;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -253,7 +257,6 @@ impl<'fd> ChildOwner<'fd> {
 
     // Called only after an actual terminal event from this retained driver's
     // generation. Never exposed as a caller-supplied status/retirement setter.
-    #[cfg(feature = "loader-private-runtime")]
     fn record_detached_terminal(&mut self, status: ExitStatus) {
         {
             let mut receipt = self.receipt.borrow_mut();
@@ -450,6 +453,68 @@ impl EntryContext {
     }
 }
 
+/// Drain only the exec syscall's kernel return at an exec-event stop and
+/// capture the untouched entry context. Shared by the first-image launcher
+/// and the exec supervisor's successor stops so every caught exec proves
+/// the same no-guest-progress boundary before any mapping work.
+fn drain_and_capture(
+    exec: Stopped,
+    former_tid: safeptrace::Pid,
+) -> Result<(Stopped, EntryContext, ExecBoundary)> {
+    let at_event = exec.getregs()?;
+    let at_event_info = exec.getsyscallinfo()?;
+    if at_event.orig_rax != libc::SYS_execve as u64 {
+        return Err("exec-stop refused: exec event did not originate in execve".into());
+    }
+    let (task, event) = trace::stopped(exec.syscall(None)?, "exec syscall-exit drain")?;
+    let info = task.getsyscallinfo()?;
+    let entry = task.getregs()?;
+    if !matches!(event, Event::Syscall)
+        || info.architecture != 0xc000_003e
+        || info.operation
+            != (SyscallInfoOp::Exit {
+                return_value: 0,
+                is_error: false,
+            })
+        || entry.rip != at_event.rip
+        || entry.rsp != at_event.rsp
+        || info.instruction_pointer != entry.rip
+        || info.stack_pointer != entry.rsp
+    {
+        return Err(format!(
+            "exec-stop refused: exec return did not drain without entry progress: {info:?}"
+        )
+        .into());
+    }
+    let context = EntryContext::capture(&task)?;
+    let boundary = ExecBoundary {
+        event_regs: at_event,
+        event_info: at_event_info,
+        former_tid,
+        exit_regs: entry,
+        exit_info: info,
+    };
+    Ok((task, context, boundary))
+}
+
+/// Production release transition for one retained exec stop: restore the
+/// exact original entry context (unchanged guest stack, registers, xstate
+/// and signal mask, all read back) and detach at the kernel entry. This
+/// grants no readiness token; whatever mapping, filter installation and
+/// readiness checks a caller requires must already have run while the
+/// image was stopped. The detach signal is the caller's choice: the
+/// first-image launcher detaches silently, while the seize-based
+/// supervisor detaches with `SIGCONT` so no residual handshake
+/// group-stop state can park the released guest.
+fn release_restored(
+    task: Stopped,
+    context: &EntryContext,
+    detach_signal: Option<Signal>,
+) -> Result<Running> {
+    context.restore(&task)?;
+    Ok(task.detach(detach_signal)?)
+}
+
 /// A genuine stopped initial image together with its physical lifetime owner.
 #[must_use = "retain this actual stop and physical owner until terminal cleanup"]
 pub struct InitialExecStop<'fd> {
@@ -516,10 +581,51 @@ impl<'fd> InitialExecStop<'fd> {
         self.owner.cancel()
     }
     /// Fixture-only transfer for the separate test-runtime protocol.
-    /// Production release must instead require genuine Detcore readiness.
+    /// Production release instead goes through [`Self::release`], whose
+    /// caller hook owns readiness policy.
     #[cfg(feature = "stage1a-probe")]
     pub fn into_parts(self) -> (Stopped, EntryContext, ExecBoundary, ChildOwner<'fd>) {
         (self.task, self.context, self.boundary, self.owner)
+    }
+
+    /// Production release: run the caller's stopped-image hook, then
+    /// restore the exact original entry context and detach at the kernel
+    /// entry. The hook owns everything that must hold before the guest
+    /// runs (mapping, filter installation, handover, readiness checks);
+    /// it receives the stopped task and must return that same stop.
+    /// Release itself proves only that the hook returned the stop and
+    /// the original context restored exactly. On any error the child is
+    /// cancelled and the failure retains an unconfirmed owner. Pair the
+    /// returned state with [`ChildOwner::wait`] on the original ptracer.
+    pub fn release<F>(
+        self,
+        hook: F,
+    ) -> std::result::Result<(Running, ChildOwner<'fd>), LaunchFailure<'fd>>
+    where
+        F: FnOnce(Stopped, &EntryContext) -> Result<Stopped>,
+    {
+        let Self {
+            task,
+            context,
+            boundary: _,
+            mut owner,
+        } = self;
+        let result = hook(task, &context).and_then(|task| release_restored(task, &context, None));
+        match result {
+            Ok(running) => Ok((running, owner)),
+            Err(error) => {
+                let receipt = owner.receipt.clone();
+                let parent_stdio = owner._request.take_parent_stdio();
+                let deferred = owner.cancel().err();
+                Err(LaunchFailure {
+                    error,
+                    receipt,
+                    owner: deferred,
+                    pending: None,
+                    parent_stdio,
+                })
+            }
+        }
     }
 }
 
@@ -669,47 +775,12 @@ impl ExecStop {
                     | Options::PTRACE_O_TRACESYSGOOD,
             )?;
             let (exec, event) = trace::stopped(initial.resume(None)?, "kernel exec event")?;
-            let at_event = exec.getregs()?;
-            let at_event_info = exec.getsyscallinfo()?;
             if !matches!(event, Event::Exec(former) if former == pid) {
                 return Err(
                     format!("loader refused: expected initial exec event, got {event:?}").into(),
                 );
             }
-            if at_event.orig_rax != libc::SYS_execve as u64 {
-                return Err(
-                    "loader refused: exec event did not originate in the launcher's execve".into(),
-                );
-            }
-            let (task, event) = trace::stopped(exec.syscall(None)?, "exec syscall-exit drain")?;
-            let info = task.getsyscallinfo()?;
-            let entry = task.getregs()?;
-            if !matches!(event, Event::Syscall)
-                || info.architecture != 0xc000_003e
-                || info.operation
-                    != (SyscallInfoOp::Exit {
-                        return_value: 0,
-                        is_error: false,
-                    })
-                || entry.rip != at_event.rip
-                || entry.rsp != at_event.rsp
-                || info.instruction_pointer != entry.rip
-                || info.stack_pointer != entry.rsp
-            {
-                return Err(format!(
-                    "loader refused: exec return did not drain without entry progress: {info:?}"
-                )
-                .into());
-            }
-            let context = EntryContext::capture(&task)?;
-            let boundary = ExecBoundary {
-                event_regs: at_event,
-                event_info: at_event_info,
-                former_tid: pid,
-                exit_regs: entry,
-                exit_info: info,
-            };
-            Ok((task, context, boundary))
+            drain_and_capture(exec, pid)
         })();
         match result {
             Ok((task, context, boundary)) => Ok(InitialExecStop {
