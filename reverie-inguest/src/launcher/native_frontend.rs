@@ -97,6 +97,11 @@ impl NativeFrontend {
     pub unsafe fn new(gate: Box<[u8; GATE_BYTES]>) -> io::Result<Self> {
         Ok(Self {
             gate,
+            // Widening break, by name: `for_native_exec_domain` is cfg'd
+            // to x86_64 (its fixed gates/restorer and fork/vfork deny list
+            // are x86 sites), so opening aarch64 compilation must cfg or
+            // port this frontend together with that recipe; it will fail
+            // to compile there, never silently substitute another filter.
             filter: SeccompFilter::for_native_exec_domain()?,
             prepared: AtomicBool::new(false),
             installed: AtomicBool::new(false),

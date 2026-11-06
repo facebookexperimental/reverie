@@ -29,8 +29,9 @@ use std::ptr;
 /// `AUDIT_ARCH_X86_64` from `<linux/audit.h>`. The builders below compare
 /// against [`crate::arch::AUDIT_ARCH_NATIVE`]; this constant names the x86-64
 /// value explicitly for the filter-evaluator tests, which pin exact verdicts
-/// per architecture word.
-#[cfg(target_arch = "x86_64")]
+/// per architecture word. Compiled for tests on every architecture (the
+/// aarch64 verdict tests name it as a foreign word), not only on x86-64.
+#[cfg(any(test, target_arch = "x86_64"))]
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 #[cfg(target_arch = "x86_64")]
 const _: () = assert!(AUDIT_ARCH_X86_64 == crate::arch::AUDIT_ARCH_NATIVE);

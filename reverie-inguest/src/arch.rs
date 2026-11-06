@@ -19,7 +19,11 @@
 /// `AUDIT_ARCH_*` from `<linux/audit.h>` for the ABI this runtime traps.
 ///
 /// The seccomp filter kills any syscall whose `arch` word is not this value,
-/// which is what refuses compat ABIs (x32 on x86-64, compat32 on aarch64).
+/// refusing ABIs with a distinct audit architecture (compat32 on aarch64 is
+/// `AUDIT_ARCH_ARM`). x32 shares `AUDIT_ARCH_X86_64` and is distinguished
+/// only by `__X32_SYSCALL_BIT` in the syscall number, so the arch word alone
+/// does not refuse it; filters that must exclude x32 check that bit
+/// separately (the native-exec recipe does).
 #[cfg(target_arch = "x86_64")]
 pub const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
 #[cfg(target_arch = "aarch64")]
@@ -58,16 +62,20 @@ pub const FILTER_ABI_NATIVE: FilterAbi = FILTER_ABI_X86_64;
 #[cfg(target_arch = "aarch64")]
 pub const FILTER_ABI_NATIVE: FilterAbi = FILTER_ABI_AARCH64;
 
-/// The host page size from `sysconf(_SC_PAGESIZE)`, queried on every call.
+/// The host page size, from the kernel's auxiliary vector.
 ///
 /// Gate pages, trampoline arenas, signal-stack sizing and any other
 /// page-granular computation must use this rather than a literal: an
 /// aarch64 host with 64 KiB pages rejects 4 KiB-granular `mmap`/`mprotect`
 /// arithmetic that an x86-64 host accepts.
-pub fn page_size() -> usize {
-    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    assert!(size > 0 && (size as usize).is_power_of_two());
-    size as usize
+///
+/// This delegates to the single existing definition,
+/// [`crate::guest::support::page_size`], which reads `AT_PAGESZ` through
+/// the runtime's own syscall gate. It must not become a `sysconf` call:
+/// `sysconf` is an interposable dynamic symbol, so in-guest code calling
+/// it would run guest- or preload-defined code.
+pub fn page_size() -> std::io::Result<u64> {
+    crate::guest::support::page_size()
 }
 
 #[cfg(test)]
@@ -97,7 +105,7 @@ mod tests {
 
     #[test]
     fn page_size_is_a_power_of_two_at_least_4kib() {
-        let size = page_size();
+        let size = page_size().unwrap();
         assert!(size.is_power_of_two());
         assert!(size >= 4096);
     }
