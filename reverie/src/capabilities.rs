@@ -301,11 +301,16 @@ pub struct BackendCapabilities {
     /// serialized, so that a mask the tool reads cannot change before the
     /// kernel acts on it.
     ///
+    /// On KVM no kernel makes that choice: under Tool-controlled signal
+    /// delivery a guest thread takes a process-directed signal only with a
+    /// delivery permit the tool reserves for it, so the target is the tool's
+    /// choice, made from the masks the backend reports (`Guest::signal_sets`).
+    ///
     /// Until 2026-10 tools read this from
-    /// `supports_blocked_wait_signal_interruption`, and every backend keeps
-    /// the value that field has. False is not a statement that the kernel's
-    /// choice is unpredictable on that backend, only that no tool may rely on
-    /// predicting it there yet.
+    /// `supports_blocked_wait_signal_interruption`, and every backend but KVM
+    /// keeps the value that field has. False is not a statement that the
+    /// kernel's choice is unpredictable on that backend, only that no tool may
+    /// rely on predicting it there yet.
     pub kernel_signal_targets_are_predictable: bool,
 
     /// A tool may read or signal a guest thread through the host task of the
@@ -604,7 +609,12 @@ impl BackendCapabilities {
         reports_kernel_child_exit_signals: false,
         supports_blocked_wait_signal_interruption: false,
         kernel_signal_state_is_guests: false,
-        kernel_signal_targets_are_predictable: false,
+        // The backend chooses no receiver for a process-directed signal: under
+        // Tool-controlled signal delivery a thread takes one only with the
+        // delivery permit the tool reserves for it, and the tool reads every
+        // thread's guest mask from the backend (`Guest::signal_sets`) while
+        // guest threads are serialized. The tool's choice is the target.
+        kernel_signal_targets_are_predictable: true,
         host_task_reads_reach_guest_threads: false,
         host_timed_signals_are_physical: false,
         reports_sigreturns: false,
@@ -802,7 +812,6 @@ mod tests {
                 "reports_kernel_child_exit_signals": false,
                 "supports_blocked_wait_signal_interruption": false,
                 "kernel_signal_state_is_guests": false,
-                "kernel_signal_targets_are_predictable": false,
                 "host_task_reads_reach_guest_threads": false,
                 "host_timed_signals_are_physical": false,
                 "reports_sigreturns": false,
