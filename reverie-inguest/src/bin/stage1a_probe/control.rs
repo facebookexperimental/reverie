@@ -27,6 +27,7 @@ pub fn initialize(
     mask: u64,
     runtime: u64,
     fds: &[i32],
+    required_controls: u64,
 ) -> Result<[u64; 2]> {
     if fds.len() > 8 || fds.iter().any(|fd| *fd <= 2) {
         return Err("loader refused: invalid inherited bootstrap descriptor set".into());
@@ -74,6 +75,7 @@ pub fn initialize(
     put!(altstack_hi, ALTSTACK_TOP);
     put!(journal_base, JOURNAL_ADDRESS);
     put!(journal_capacity, EVENT_CAPACITY);
+    put!(required_controls, required_controls);
     put32(
         &mut page,
         offset_of!(ProbeControlV1, fd_count),
@@ -114,7 +116,25 @@ pub fn page(file: &File) -> Result<[u8; CONTROL_BYTES]> {
     Ok(page)
 }
 
-pub fn ready(file: &File, nonce: [u64; 2]) -> Result<u64> {
+/// What the running runtime kind must prove before the ready marker
+/// is accepted. Both kinds prove the trap with the loader's trapped
+/// gettid; only the mechanics probe additionally proves CPUID/RDTSC
+/// interception with canary self-tests, because the counting runtime
+/// arms no instruction control and must produce no such evidence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReadyEvidence {
+    /// Trapped-syscall evidence only.
+    SyscallTrapOnly,
+    /// Trapped-syscall plus CPUID/RDTSC/RDTSCP canary evidence.
+    InstructionProbes,
+}
+
+pub fn ready(
+    file: &File,
+    nonce: [u64; 2],
+    required_controls: u64,
+    evidence: ReadyEvidence,
+) -> Result<u64> {
     let page = page(file)?;
     let phase = u32_at(&page, offset_of!(ProbeControlV1, phase))?;
     let error = u32_at(&page, offset_of!(ProbeControlV1, error))?;
@@ -125,7 +145,7 @@ pub fn ready(file: &File, nonce: [u64; 2]) -> Result<u64> {
     ];
     if phase != PHASE_TEST_CONTROLS_READY
         || error != ERROR_NONE
-        || controls != REQUIRED_CONTROLS
+        || controls != required_controls
         || ready_nonce != nonce
     {
         return Err(format!("loader refused: incomplete test-runtime readiness (phase={phase}, error={error}, controls={controls:#x})").into());
@@ -142,11 +162,13 @@ pub fn ready(file: &File, nonce: [u64; 2]) -> Result<u64> {
             .iter()
             .filter(move |event| event["kind"] == kind && event["flags"] == FLAG_SELF_TEST)
     };
-    if !self_test(EVENT_CPUID).any(|event| {
-        event["nr_or_opcode"] == MAGIC_CPUID_LEAF && event["results"] == json!(CPUID_REPLY)
-    }) || !self_test(EVENT_RDTSC).any(|event| event["results"][0] == TSC_REPLY)
-        || !self_test(EVENT_RDTSCP)
-            .any(|event| event["results"][0] == TSC_REPLY && event["results"][1] == TSC_AUX_REPLY)
+    if evidence == ReadyEvidence::InstructionProbes
+        && (!self_test(EVENT_CPUID).any(|event| {
+            event["nr_or_opcode"] == MAGIC_CPUID_LEAF && event["results"] == json!(CPUID_REPLY)
+        }) || !self_test(EVENT_RDTSC).any(|event| event["results"][0] == TSC_REPLY)
+            || !self_test(EVENT_RDTSCP).any(|event| {
+                event["results"][0] == TSC_REPLY && event["results"][1] == TSC_AUX_REPLY
+            }))
     {
         return Err("loader refused: missing CPUID/RDTSC/RDTSCP interception evidence".into());
     }

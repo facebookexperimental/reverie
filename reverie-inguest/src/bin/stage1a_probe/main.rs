@@ -39,6 +39,7 @@ use reverie_inguest::launcher::exec_stop::images;
 use reverie_inguest::launcher::exec_stop::inject as trace;
 use reverie_inguest::launcher::exec_stop::register_words;
 use reverie_loader::artifact;
+use reverie_loader::manifest::COUNTER_RUNTIME_MANIFEST;
 use reverie_loader::manifest::Controls;
 use reverie_loader::stage::Mapped;
 use safeptrace::Event;
@@ -61,9 +62,55 @@ enum Fault {
     CpuidArmEnosys,
 }
 
+/// Which test runtime image this run arms. One host serves both: the
+/// kind selects the image manifest (through [`Kind`]), the required
+/// control word written into the control page, and the ready
+/// evidence demanded. The protocol control word is the test-ABI
+/// expression of the kind's manifest controls plus the mechanics
+/// bits (alternate stack, closed descriptors, self-test probes) that
+/// have no manifest counterpart and are mapped by [`armed_controls`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeKind {
+    /// The mechanics probe runtime: every control, canary self-tests.
+    Probe,
+    /// The counting runtime: trap filter and SIGSYS handler only.
+    Counter,
+}
+
+impl RuntimeKind {
+    fn image_kind(self) -> Kind {
+        match self {
+            RuntimeKind::Probe => Kind::Runtime,
+            RuntimeKind::Counter => Kind::Custom(&COUNTER_RUNTIME_MANIFEST),
+        }
+    }
+
+    fn required_controls(self) -> u64 {
+        match self {
+            RuntimeKind::Probe => REQUIRED_CONTROLS,
+            RuntimeKind::Counter => COUNTER_REQUIRED_CONTROLS,
+        }
+    }
+
+    fn ready_evidence(self) -> control::ReadyEvidence {
+        match self {
+            RuntimeKind::Probe => control::ReadyEvidence::InstructionProbes,
+            RuntimeKind::Counter => control::ReadyEvidence::SyscallTrapOnly,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            RuntimeKind::Probe => "probe",
+            RuntimeKind::Counter => "counter",
+        }
+    }
+}
+
 struct ProbeControls<'a> {
     fault: Fault,
     pause_checkpoint: Option<&'a Path>,
+    runtime_kind: RuntimeKind,
 }
 
 /// The stopped-task bundle the loader's stage chain carries from
@@ -126,7 +173,9 @@ fn run(
     let ProbeControls {
         fault,
         pause_checkpoint,
+        runtime_kind,
     } = controls;
+    report["runtime_kind"] = json!(runtime_kind.name());
     let loader_image = loader.checked()?;
     let runtime_image = runtime.checked()?;
     let inherited = [loader.fd(), runtime.fd(), observations.as_raw_fd()];
@@ -180,6 +229,7 @@ fn run(
         mask,
         runtime_image.entry(),
         &inherited,
+        runtime_kind.required_controls(),
     )?;
     let mut injector = trace::Injector::new(task)?;
     let mapped = (|| -> Result<()> {
@@ -265,12 +315,18 @@ fn run(
     if ready_regs.rip != READY_STOP_IP || ready_regs.rax != READY_MAGIC {
         return Err("loader refused: unauthenticated ready breakpoint".into());
     }
-    let controls = control::ready(observations, nonce)?;
+    let controls = control::ready(
+        observations,
+        nonce,
+        runtime_kind.required_controls(),
+        runtime_kind.ready_evidence(),
+    )?;
     let ready = started.tool_ready();
-    // Armed is claimed only once every control the probe runtime's
+    // Armed is claimed only once every control the running runtime's
     // manifest requires is reported armed; an unmet control is a
     // named refusal, never a partially armed handoff.
-    if let Some(unmet) = Kind::Runtime
+    if let Some(unmet) = runtime
+        .kind()
         .manifest()
         .controls
         .unmet(armed_controls(controls))
@@ -773,9 +829,19 @@ fn main() {
     } else {
         Fault::None
     };
-    if (pause_checkpoint.is_some() && fault != Fault::None) || args.len() < 5 || args[3] != "--" {
+    let runtime_kind = if args.first().is_some_and(|a| a == "--runtime-kind=counter") {
+        args.remove(0);
+        RuntimeKind::Counter
+    } else {
+        RuntimeKind::Probe
+    };
+    if (pause_checkpoint.is_some() && fault != Fault::None)
+        || (runtime_kind == RuntimeKind::Counter && fault != Fault::None)
+        || args.len() < 5
+        || args[3] != "--"
+    {
         eprintln!(
-            "usage: reverie-loader-stage1a-probe [--inject-cpuid-arm-enosys | --pause-after-exec-drain CHECKPOINT] LOADER RUNTIME REPORT -- PROGRAM [ARGS...]"
+            "usage: reverie-loader-stage1a-probe [--inject-cpuid-arm-enosys | --pause-after-exec-drain CHECKPOINT] [--runtime-kind=counter] LOADER RUNTIME REPORT -- PROGRAM [ARGS...]"
         );
         std::process::exit(REFUSAL_EXIT);
     }
@@ -790,7 +856,7 @@ fn main() {
     let mut observation = None;
     let result = (|| -> Result<()> {
         let loader = SealedImage::read(Path::new(&args[0]), Kind::Loader)?;
-        let runtime = SealedImage::read(Path::new(&args[1]), Kind::Runtime)?;
+        let runtime = SealedImage::read(Path::new(&args[1]), runtime_kind.image_kind())?;
         let file = control::observation_file(CONTROL_BYTES as u64 + JOURNAL_BYTES)?;
         observation = Some(file);
         run(
@@ -801,6 +867,7 @@ fn main() {
             ProbeControls {
                 fault,
                 pause_checkpoint: pause_checkpoint.as_deref(),
+                runtime_kind,
             },
             cleanup_evidence.clone(),
             &mut report,

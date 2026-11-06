@@ -271,6 +271,7 @@ fn valid_control(c: &ProbeControlV1) -> bool {
         || c.events_committed.load(Ordering::Acquire) != 0
         || c.overflow.load(Ordering::Acquire) != 0
         || c.ready_nonce.iter().any(|n| n.load(Ordering::Acquire) != 0)
+        || c.required_controls != COUNTER_REQUIRED_CONTROLS
         || c.reserved_input.iter().any(|&n| n != 0)
         || c.reserved_status.iter().any(|&n| n != 0)
     {

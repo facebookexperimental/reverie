@@ -78,7 +78,11 @@ global_asm!(
     "jne 9f",
     "cmp dword ptr [r12 + {error}], 0",
     "jne 9f",
-    "cmp qword ptr [r12 + {controls}], {required}",
+    // The required control word is the host's, written into the
+    // control page from the runtime kind's manifest; the loader
+    // itself is runtime-kind agnostic.
+    "mov rax, [r12 + {required_controls}]",
+    "cmp qword ptr [r12 + {controls}], rax",
     "jne 9f",
     "mov rax, [r12 + {nonce}]",
     "cmp rax, [r12 + {ready_nonce}]",
@@ -99,10 +103,10 @@ global_asm!(
     phase = const offset_of!(ProbeControlV1, phase),
     error = const offset_of!(ProbeControlV1, error),
     controls = const offset_of!(ProbeControlV1, controls),
+    required_controls = const offset_of!(ProbeControlV1, required_controls),
     nonce = const offset_of!(ProbeControlV1, nonce),
     ready_nonce = const offset_of!(ProbeControlV1, ready_nonce),
     ready_phase = const PHASE_TEST_CONTROLS_READY,
-    required = const REQUIRED_CONTROLS,
     ready_magic = const READY_MAGIC,
 );
 

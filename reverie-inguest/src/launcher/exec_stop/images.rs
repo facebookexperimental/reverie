@@ -39,6 +39,11 @@ pub enum Kind {
     Loader,
     /// Fixed runtime window and audited gate, with TLS refused.
     Runtime,
+    /// A runtime image checked against a caller-supplied manifest,
+    /// through the same [`artifact::check_image`] path. This is how a
+    /// second tool image (for example a counting runtime) rides the
+    /// probe lane without a new fixed kind per tool.
+    Custom(&'static ToolManifest),
 }
 
 impl Kind {
@@ -50,6 +55,7 @@ impl Kind {
         match self {
             Kind::Loader => &LOADER_MANIFEST,
             Kind::Runtime => &PROBE_RUNTIME_MANIFEST,
+            Kind::Custom(manifest) => manifest,
         }
     }
 }
@@ -95,12 +101,17 @@ impl SealedImage {
         Ok(this)
     }
 
+    /// The image contract these sealed bytes were read under.
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
     /// Validate the retained sealed bytes under this fixed image contract.
     pub fn checked(&self) -> Result<ValidatedImage<'_>> {
         artifact::check_image(&self.bytes, self.kind.manifest()).map_err(|e| {
             let reason = match self.kind {
                 Kind::Loader => "invalid_loader_image",
-                Kind::Runtime => "invalid_runtime_image",
+                Kind::Runtime | Kind::Custom(_) => "invalid_runtime_image",
             };
             format!("{reason}: {e:?}").into()
         })
