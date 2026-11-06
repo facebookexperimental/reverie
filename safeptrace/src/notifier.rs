@@ -3205,6 +3205,15 @@ impl EventHandle {
         *self.event().regs_cache.lock() = Some(CachedRegs { regs, dirty: false });
     }
 
+    /// Whether the cache already holds `regs` as the kernel's current
+    /// registers, so writing them again would change nothing.
+    pub(super) fn regs_already_current(&self, regs: &crate::Regs) -> bool {
+        self.event()
+            .regs_cache
+            .lock()
+            .is_some_and(|cached| !cached.dirty && &cached.regs == regs)
+    }
+
     /// Records `regs` as written by `Stopped::setregs`, to reach the
     /// kernel at the next flush.
     pub(super) fn store_regs_dirty(&self, regs: crate::Regs) {
@@ -12635,6 +12644,20 @@ mod test {
         assert_eq!(regs_kernel_writes(&stopped), 1);
         assert_eq!(regs_scratch(&stopped.getregs().unwrap()), 0x7777);
         assert_eq!(regs_kernel_reads(&stopped), 2);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_writeback_elides_a_no_op_setregs() {
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        let regs = stopped.getregs().unwrap();
+        // Writing back exactly what the kernel holds records nothing:
+        // the flush at `peekuser` has nothing to write.
+        stopped.setregs(&regs).unwrap();
+        stopped.peekuser(0).unwrap();
+        assert_eq!(regs_kernel_writes(&stopped), 0);
+        assert_eq!(regs_kernel_reads(&stopped), 1);
         drop(stopped);
         reap_stopped_process(cleanup);
     }

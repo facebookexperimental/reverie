@@ -1523,7 +1523,14 @@ impl Stopped {
             return self
                 .1
                 .on_held_tid(|| {
-                    self.1.event().store_regs_dirty(regs);
+                    // Writing the values the kernel already holds (a
+                    // clean cache) changes nothing; e.g. setting a
+                    // return value the in-place exit stop already left
+                    // in the result register. Only the kernel write is
+                    // skipped — the TID-hold refusals above still ran.
+                    if !self.1.event().regs_already_current(&regs) {
+                        self.1.event().store_regs_dirty(regs);
+                    }
                     Ok(())
                 })
                 .map_err(|err| self.map_err(err));
