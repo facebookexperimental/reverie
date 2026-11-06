@@ -774,6 +774,7 @@ mod tests {
             context: 0,
             dispatch: SyscallDispatch::Fallback,
             guest_pkru: None,
+            unsupported_refusal: None,
         };
         if ISSUE_ARMED.with(|armed| armed.get()) {
             crate::guest::native_exec::arm_test_issue();

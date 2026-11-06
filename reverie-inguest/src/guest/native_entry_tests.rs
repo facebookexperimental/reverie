@@ -275,6 +275,7 @@ fn event(operation: u64) -> SyscallEvent {
         context: 0,
         dispatch: SyscallDispatch::InstalledHook,
         guest_pkru: None,
+        unsupported_refusal: None,
     }
 }
 fn value(result: NativeCallResult<'_, Probe, i64>) -> i64 {

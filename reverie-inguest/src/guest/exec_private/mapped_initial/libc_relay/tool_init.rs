@@ -199,6 +199,7 @@ pub(super) unsafe fn forward(s: &RelayState, p: &mut Progress, frame: &mut Boots
         context: 0,
         dispatch: SyscallDispatch::Trap,
         guest_pkru: None,
+        unsupported_refusal: None,
     };
     let guarded =
         unsafe { crate::guest::protect::protect_tool_init_descriptors(&mut event, extra) };

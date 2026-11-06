@@ -661,6 +661,7 @@ mod tests {
                     context: 0,
                     dispatch: SyscallDispatch::Trap,
                     guest_pkru: None,
+                    unsupported_refusal: None,
                 };
                 unsafe { host.dispatch(&mut event) };
                 assert_eq!(event.result, 77);
@@ -759,6 +760,7 @@ mod tests {
                             context: 0,
                             dispatch: SyscallDispatch::Trap,
                             guest_pkru: None,
+                            unsupported_refusal: None,
                         };
                         unsafe { host.dispatch(&mut event) };
                     }

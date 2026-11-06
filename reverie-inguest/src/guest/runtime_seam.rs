@@ -377,6 +377,7 @@ mod tests {
             context: 0,
             dispatch: crate::guest::event::SyscallDispatch::Fallback,
             guest_pkru: None,
+            unsupported_refusal: None,
         });
         seam.record_fallback(libc::SYS_getpid);
         seam.record_refusal(libc::SYS_getpid);

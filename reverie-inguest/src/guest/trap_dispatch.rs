@@ -188,6 +188,7 @@ impl<S: TrapSeam> InGuestDispatcher<S> {
                 context: 0,
                 dispatch: SyscallDispatch::Trap,
                 guest_pkru: event.guest_pkru(),
+                unsupported_refusal: None,
             };
             // SAFETY: a trapped event is genuine (`new`'s contract) and made
             // while a Tool callback is active on this thread: the callback's
@@ -710,6 +711,7 @@ mod tests {
             context: 0,
             dispatch: SyscallDispatch::Trap,
             guest_pkru: None,
+            unsupported_refusal: None,
         };
         let executed = core::cell::Cell::new(false);
         let observed = core::cell::Cell::new(false);

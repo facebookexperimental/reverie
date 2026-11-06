@@ -1273,6 +1273,7 @@ pub(crate) mod tests {
             context: 0,
             dispatch: SyscallDispatch::Trap,
             guest_pkru: None,
+            unsupported_refusal: None,
         }
     }
 
@@ -2412,6 +2413,7 @@ mod mapped_input_lease_tests {
                 context: 0,
                 dispatch: SyscallDispatch::Trap,
                 guest_pkru: None,
+                unsupported_refusal: None,
             };
             // Every case is numerically refused before any physical operation.
             assert!(unsafe { protect_tool_init_descriptors(&mut event, Some(fd)) });

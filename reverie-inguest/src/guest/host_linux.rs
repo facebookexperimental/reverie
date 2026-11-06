@@ -552,6 +552,7 @@ mod tests {
             context: 0,
             dispatch: SyscallDispatch::InstalledHook,
             guest_pkru: None,
+            unsupported_refusal: None,
         };
         let tail = TailResult::default();
         let mut state = ();
