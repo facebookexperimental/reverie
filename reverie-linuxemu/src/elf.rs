@@ -1824,6 +1824,8 @@ pub fn load_static_elf_with_execfn(
     cwd: &Path,
 ) -> Result<LoadedStaticElf> {
     initialize_regular_create_directory_policy()?;
+    // Fix the host core_pattern before the first image runs (`core_dump`).
+    crate::core_dump::host_core_pattern();
     // TODO-HUMAN-REVIEW(PR-132): Review ELF user-map construction.
     let owner = memory.clone();
     let _transaction = owner.allocation_guard();
@@ -1877,6 +1879,8 @@ pub fn load_static_elf_file_with_execfn(
     cwd: &Path,
 ) -> Result<LoadedStaticElf> {
     initialize_regular_create_directory_policy()?;
+    // Fix the host core_pattern before the first image runs (`core_dump`).
+    crate::core_dump::host_core_pattern();
     let image = read_file_image(&file)?;
     let invoked_path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
     let owner = memory.clone();

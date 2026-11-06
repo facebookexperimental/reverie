@@ -138,7 +138,7 @@ impl ElfExecutor {
                 (1..=64).contains(&status)
                     && default_signal_disposition(status) == SignalDisposition::Terminate
             }
-            libc::CLD_DUMPED => signal_has_core_default(status),
+            libc::CLD_DUMPED => crate::core_dump::default_action_dumps_core(status),
             _ => false,
         };
         if errno != 0 || child <= 0 || !valid_status || user_time < 0 || system_time < 0 {
@@ -3260,26 +3260,12 @@ pub(super) fn process_dumpable(state: &LoadedStaticElf) -> bool {
         .map_or(state.dumpable, |task| task.dumpable)
 }
 
+/// The status of a death by `signal`, whose core flag says whether Linux
+/// would write a core for it (`crate::core_dump::guest_writes_core`).
 fn terminating_signal_status(signal: libc::c_int, dumpable: bool) -> Option<ExitStatus> {
     let signal_kind = Signal::try_from(signal).ok()?;
-    let core_dumped = dumpable && signal_has_core_default(signal);
+    let core_dumped = crate::core_dump::guest_writes_core(signal, dumpable);
     Some(ExitStatus::Signaled(signal_kind, core_dumped))
-}
-
-fn signal_has_core_default(signal: libc::c_int) -> bool {
-    matches!(
-        signal,
-        libc::SIGQUIT
-            | libc::SIGILL
-            | libc::SIGTRAP
-            | libc::SIGABRT
-            | libc::SIGBUS
-            | libc::SIGFPE
-            | libc::SIGSEGV
-            | libc::SIGXCPU
-            | libc::SIGXFSZ
-            | libc::SIGSYS
-    )
 }
 
 /// Resolves the effective disposition of `signal`, honoring any installed

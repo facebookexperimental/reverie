@@ -18,6 +18,7 @@
 //! Its modules and the gVisor Sentry packages (`pkg/sentry/...`) they
 //! correspond to:
 //!
+//! - [`core_dump`]: whether a death by signal writes a core (`kernel/task_exit`).
 //! - [`credentials`]: the credentials a guest starts with and their change at
 //!   exec (`kernel/auth`).
 //! - [`executor`]: syscall dispatch and the per-syscall handlers
@@ -39,6 +40,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
+pub mod core_dump;
 pub mod credentials;
 pub mod elf;
 pub mod executor;

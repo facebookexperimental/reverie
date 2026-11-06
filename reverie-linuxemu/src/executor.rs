@@ -41631,7 +41631,8 @@ mod tests {
             0,
         );
         let status = apply_next_default_signal(&mut executor);
-        assert_eq!(status, ExitStatus::Signaled(Signal::SIGABRT, true));
+        let core = crate::core_dump::guest_writes_core(libc::SIGABRT, true);
+        assert_eq!(status, ExitStatus::Signaled(Signal::SIGABRT, core));
         assert_eq!(conventional_exit_code(status), 128 + libc::SIGABRT);
     }
 
@@ -41763,7 +41764,10 @@ mod tests {
         );
         assert_eq!(
             apply_next_default_signal(&mut deferred),
-            ExitStatus::Signaled(Signal::SIGSEGV, true),
+            ExitStatus::Signaled(
+                Signal::SIGSEGV,
+                crate::core_dump::guest_writes_core(libc::SIGSEGV, true)
+            ),
         );
 
         let mut immediate = test_state(&dir.0);

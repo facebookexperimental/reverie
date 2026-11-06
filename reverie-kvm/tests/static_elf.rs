@@ -5509,11 +5509,20 @@ fn unwrap_shared_guest_exception(error: Error) -> Error {
     }
 }
 
+/// How a dumpable guest that `signal` kills ends. The core flag is Linux's
+/// decision under this process's RLIMIT_CORE and the host's core_pattern
+/// (`reverie_linuxemu::core_dump`), not a constant: a limit of 1, for one,
+/// writes no core under any pattern.
+fn killed_by(signal: i32) -> ExitStatus {
+    let core = reverie_linuxemu::core_dump::guest_writes_core(signal, true);
+    ExitStatus::from_raw(signal | if core { 0x80 } else { 0 })
+}
+
 /// A user-mode #UD is the guest's own fault, not a backend error: Linux's
 /// `exc_invalid_op` raises SIGILL, whose default action terminates the process
-/// and dumps core.
+/// and dumps core when Linux would ([`killed_by`]).
 fn assert_invalid_opcode_signal(status: ExitStatus) {
-    assert_eq!(status, ExitStatus::from_raw(libc::SIGILL | 0x80));
+    assert_eq!(status, killed_by(libc::SIGILL));
 }
 
 fn assert_page_fault(error: Error) {
@@ -14160,7 +14169,7 @@ int main(int argc, char **argv) {
         assert_eq!(stdout, expected_stdout.as_bytes(), "case {argument}");
         assert!(stderr.is_empty(), "case {argument}: {stderr:?}");
         let expected_status = if argument == "311" {
-            ExitStatus::from_raw(libc::SIGSEGV | 0x80)
+            killed_by(libc::SIGSEGV)
         } else {
             ExitStatus::SUCCESS
         };
@@ -14523,7 +14532,7 @@ fn page_zero_nested_null_ignored() {
         &image,
         &[executable.to_str().unwrap(), "ignored-return"],
         &directory,
-        ExitStatus::from_raw(libc::SIGSEGV | 0x80),
+        killed_by(libc::SIGSEGV),
         b"handler\n",
     );
 }
@@ -14544,7 +14553,7 @@ fn page_zero_nested_null_blocked() {
         &image,
         &[executable.to_str().unwrap(), "blocked-return"],
         &directory,
-        ExitStatus::from_raw(libc::SIGSEGV | 0x80),
+        killed_by(libc::SIGSEGV),
         b"handler\n",
     );
 }
@@ -15205,7 +15214,7 @@ fn check_page_zero_fault_context(name: &str, operation: &str, disposition: &str,
             if disposition == "caught" {
                 ExitStatus::SUCCESS
             } else {
-                ExitStatus::from_raw(libc::SIGSEGV | 0x80)
+                killed_by(libc::SIGSEGV)
             },
             expected,
         );
@@ -15607,7 +15616,7 @@ fn typed_null_restorer_returning_status() {
     check_null_restorer_typed_status(
         "typed_null_restorer_returning_status",
         "null-return",
-        ExitStatus::from_raw(libc::SIGSEGV | 0x80),
+        killed_by(libc::SIGSEGV),
         b"handler\n",
     );
 }

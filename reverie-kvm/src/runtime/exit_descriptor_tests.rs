@@ -497,7 +497,10 @@ mod unpermitted_retirement {
             // not guest fault admission or a determinism claim for that path.
             self.executor.force_signal_exit(libc::SIGSEGV);
             let exit = self.executor.take_exit().unwrap();
-            let status = ExitStatus::from_raw(libc::SIGSEGV | 0x80);
+            // The core flag is Linux's decision for this process's limit and
+            // the host's core_pattern (`reverie_linuxemu::core_dump`).
+            let core = reverie_linuxemu::core_dump::guest_writes_core(libc::SIGSEGV, true);
+            let status = ExitStatus::from_raw(libc::SIGSEGV | if core { 0x80 } else { 0 });
             assert_eq!(exit.status, status);
             assert!(exit.group);
             self.backend.request_guest_thread_group_exit(exit.status);

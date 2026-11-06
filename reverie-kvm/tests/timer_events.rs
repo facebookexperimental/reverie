@@ -3294,6 +3294,13 @@ fn rt_sigreturn_takes_mxcsr_from_a_frame_whose_header_leaves_sse_initial() {
     }
 }
 
+/// Whether this process's soft RLIMIT_CORE is 1, the native runs' limit.
+fn limit_is_one() -> bool {
+    // SAFETY: limit is writable for the call.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) == 0 && limit.rlim_cur == 1 }
+}
+
 /// Runs `program` natively, with no core dump, and returns how it ended.
 fn native_output(program: &Program) -> std::process::Output {
     use std::os::unix::process::CommandExt;
@@ -5950,15 +5957,16 @@ fn a_fatal_signal_at_a_timer_boundary_ends_every_thread_with_linuxs_status() {
         };
         let (events, ending) = run_status(&program, plan);
         let context = format!("{context}: {events:?}");
-        // KVM sets the core flag for a dumpable process killed by a signal
-        // whose default action dumps core, and writes no dump: Linux sets it
-        // only when a dump was written
-        // (https://github.com/rrnewton/reverie/issues/1204).
-        let kvm_status = if dumpable && signal == libc::SIGQUIT {
-            signal | 0x80
-        } else {
-            signal
-        };
+        // KVM decides the core flag as Linux does, from this process's
+        // RLIMIT_CORE and the host's core_pattern
+        // (`reverie_linuxemu::core_dump`). This process's limit is not the
+        // native tracer's 1, so the flag follows the rule; where the limit is
+        // 1 (as in validation), it is the native status exactly.
+        let core = reverie_linuxemu::core_dump::guest_writes_core(signal, dumpable);
+        let kvm_status = signal | if core { 0x80 } else { 0 };
+        if limit_is_one() {
+            assert_eq!(kvm_status, native.status, "{context}");
+        }
         assert_eq!(ending, Ok((kvm_status, vec![], vec![])), "{context}");
         assert_eq!(exit_statuses(&events), [kvm_status; 2], "{context}");
         let (timer_at, timer_clock) = first_timer(&events);

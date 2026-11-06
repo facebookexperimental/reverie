@@ -7785,6 +7785,14 @@ mod tests {
 
     use super::*;
 
+    /// The raw wait status of a dumpable guest that SIGSEGV kills: the core
+    /// flag is Linux's decision under this process's RLIMIT_CORE and the
+    /// host's core_pattern (`reverie_linuxemu::core_dump`).
+    fn sigsegv_wait_status() -> i32 {
+        let core = reverie_linuxemu::core_dump::guest_writes_core(libc::SIGSEGV, true);
+        libc::SIGSEGV | if core { 0x80 } else { 0 }
+    }
+
     include!("cpuid_runtime_tests.rs");
     include!("vm/entry_public_tests.rs");
     include!("vm/entry_main_tests.rs");
@@ -10722,13 +10730,13 @@ mod tests {
             .unwrap();
         let mut after_wrapper = [0; 4096];
         memory.read(STACK_SCRATCH, &mut after_wrapper).unwrap();
-        assert_eq!(status.into_raw(), libc::SIGSEGV | 0x80);
+        assert_eq!(status.into_raw(), sigsegv_wait_status());
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
         if with_tool {
             assert_eq!(
                 *log.observations.lock().unwrap(),
-                vec![(libc::SIGSEGV | 0x80, vec![0x5a; 4096])]
+                vec![(sigsegv_wait_status(), vec![0x5a; 4096])]
             );
         } else {
             assert!(log.observations.lock().unwrap().is_empty());
@@ -10746,7 +10754,7 @@ mod tests {
         assert_eq!(executor.execute(&request, &parent.memory), 2);
         let mut wait_status = [0; 4];
         parent.memory.read(STACK_SCRATCH, &mut wait_status).unwrap();
-        assert_eq!(i32::from_ne_bytes(wait_status), libc::SIGSEGV | 0x80);
+        assert_eq!(i32::from_ne_bytes(wait_status), sigsegv_wait_status());
     }
 
     #[test]
@@ -11195,13 +11203,13 @@ mod tests {
             .unwrap();
         let mut after_wrapper = [0; 4096];
         memory.read(STACK_SCRATCH, &mut after_wrapper).unwrap();
-        assert_eq!(status.into_raw(), libc::SIGSEGV | 0x80);
+        assert_eq!(status.into_raw(), sigsegv_wait_status());
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
         if with_tool {
             assert_eq!(
                 *log.observations.lock().unwrap(),
-                vec![(libc::SIGSEGV | 0x80, vec![0x5a; 4096])]
+                vec![(sigsegv_wait_status(), vec![0x5a; 4096])]
             );
         } else {
             assert!(log.observations.lock().unwrap().is_empty());
@@ -11219,7 +11227,7 @@ mod tests {
         assert_eq!(executor.execute(&request, &parent.memory), 2);
         let mut wait_status = [0; 4];
         parent.memory.read(STACK_SCRATCH, &mut wait_status).unwrap();
-        assert_eq!(i32::from_ne_bytes(wait_status), libc::SIGSEGV | 0x80);
+        assert_eq!(i32::from_ne_bytes(wait_status), sigsegv_wait_status());
     }
 
     #[test]
@@ -11564,7 +11572,7 @@ mod tests {
         let expected_status = if cancel_before_start {
             0
         } else {
-            libc::SIGSEGV | 0x80
+            sigsegv_wait_status()
         };
         assert_eq!(observations, vec![(expected_status, 0, expected.clone())]);
         expected[offset as usize..offset as usize + 4].fill(0x6b);
