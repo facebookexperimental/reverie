@@ -41,14 +41,57 @@ use std::collections::BTreeMap;
 
 /// One parsed probe run: measurement key to its exact value token.
 ///
-/// Fixture rows are `KEY=VALUE` optionally followed by space-delimited
-/// diagnostics (for example `P1_IP_CANDIDATE_SITE=NO (ret=-273)` or
-/// `P6_BTI_C_BLR=OK ret=1234`); the value token ends at the first space or
-/// tab. Lines whose key contains whitespace (`RESULT ...` summaries,
-/// `== TEST ==` banners) are not measurements and are skipped here;
-/// `RESULT` lines are parsed by [`result_exit`].
+/// Scalar fixture rows are exactly `KEY=VALUE` with nothing after the
+/// value: any trailing field rejects the whole run (a second measurement
+/// hidden after a space or tab must not be silently discarded). Only the
+/// fixture's named diagnostic rows may carry a suffix, each parsed and
+/// discarded only in its exact form: `P1_IP_CANDIDATE_*` rows end with
+/// ` (ret=<i64>)`, `P6_*` case rows end with ` ret=<i64>` or
+/// ` errno=<i64>`. Lines whose key contains whitespace (`RESULT ...`
+/// summaries, `== TEST ==` banners) are not measurements and are skipped
+/// here; `RESULT` lines are parsed by [`result_exit`].
 struct Measurements<'a> {
     values: BTreeMap<&'a str, &'a str>,
+}
+
+fn measurement_value<'a>(key: &str, rest: &'a str, line: &str) -> Result<&'a str, String> {
+    fn check_token(key: &str, value: &str, line: &str) -> Result<(), String> {
+        if value.is_empty() || value.contains([' ', '\t', '=']) {
+            return Err(format!(
+                "malformed measurement value for {key:?} in {line:?}"
+            ));
+        }
+        Ok(())
+    }
+    if key.starts_with("P1_IP_CANDIDATE_") {
+        if let Some((value, suffix)) = rest.split_once(" (ret=") {
+            let digits = suffix
+                .strip_suffix(')')
+                .ok_or_else(|| format!("malformed ret suffix for {key:?} in {line:?}"))?;
+            digits
+                .parse::<i64>()
+                .map_err(|_| format!("malformed ret suffix for {key:?} in {line:?}"))?;
+            check_token(key, value, line)?;
+            return Ok(value);
+        }
+    }
+    if key.starts_with("P6_") {
+        for marker in [" ret=", " errno="] {
+            if let Some((value, suffix)) = rest.split_once(marker) {
+                suffix
+                    .parse::<i64>()
+                    .map_err(|_| format!("malformed suffix for {key:?} in {line:?}"))?;
+                check_token(key, value, line)?;
+                return Ok(value);
+            }
+        }
+    }
+    if rest.is_empty() || rest.contains([' ', '\t']) {
+        return Err(format!(
+            "measurement {key:?} has trailing fields in {line:?}"
+        ));
+    }
+    Ok(rest)
 }
 
 fn parse_measurements(out: &str) -> Result<Measurements<'_>, String> {
@@ -60,7 +103,7 @@ fn parse_measurements(out: &str) -> Result<Measurements<'_>, String> {
         if key.is_empty() || key.contains(char::is_whitespace) {
             continue;
         }
-        let value = rest.split([' ', '\t']).next().unwrap_or("");
+        let value = measurement_value(key, rest, line)?;
         if values.insert(key, value).is_some() {
             return Err(format!("duplicate measurement key {key:?}"));
         }
@@ -116,30 +159,68 @@ impl Measurements<'_> {
     }
 }
 
-/// The `RESULT <name> STATUS=... CODE=...` terminal record for one child.
+/// The single `RESULT <name> STATUS=...` terminal record for one child.
+///
+/// Exactly one record may exist for `name` — a second, even identical,
+/// rejects the run, so a later failure record can never hide behind an
+/// earlier success. Within the record every field is unique and the field
+/// set must match the status: `EXITED` carries only `CODE`, `SIGNALED`
+/// only `SIG`, `FORK_FAIL`/`WAIT_FAIL` only `ERRNO`, `OTHER` only `RAW`.
+/// Conflicting or duplicate fields reject rather than overwrite.
 fn result_exit(out: &str, name: &str) -> Result<(String, Option<i64>), String> {
+    fn set_once<T>(slot: &mut Option<T>, value: T, what: &str, line: &str) -> Result<(), String> {
+        if slot.replace(value).is_some() {
+            return Err(format!("duplicate {what} field in {line:?}"));
+        }
+        Ok(())
+    }
+    fn field_i64(value: &str, what: &str, line: &str) -> Result<i64, String> {
+        value
+            .parse::<i64>()
+            .map_err(|_| format!("unparsable {what} in {line:?}"))
+    }
     let prefix = format!("RESULT {name} ");
-    let line = out
-        .lines()
-        .find(|line| line.starts_with(&prefix))
+    let mut records = out.lines().filter(|line| line.starts_with(&prefix));
+    let line = records
+        .next()
         .ok_or_else(|| format!("missing RESULT line for {name:?}"))?;
-    let mut status = None;
-    let mut code = None;
+    if records.next().is_some() {
+        return Err(format!("duplicate RESULT lines for {name:?}"));
+    }
+    let mut status: Option<String> = None;
+    let mut code: Option<i64> = None;
+    let mut sig: Option<i64> = None;
+    let mut errno_value: Option<i64> = None;
+    let mut raw: Option<String> = None;
     for field in line[prefix.len()..].split_whitespace() {
-        if let Some(value) = field.strip_prefix("STATUS=") {
-            status = Some(value.to_string());
-        } else if let Some(value) = field.strip_prefix("CODE=") {
-            code = Some(
-                value
-                    .parse::<i64>()
-                    .map_err(|_| format!("RESULT {name}: unparsable CODE in {line:?}"))?,
-            );
+        let Some((key, value)) = field.split_once('=') else {
+            return Err(format!("malformed RESULT field {field:?} in {line:?}"));
+        };
+        match key {
+            "STATUS" => set_once(&mut status, value.to_string(), key, line)?,
+            "CODE" => set_once(&mut code, field_i64(value, key, line)?, key, line)?,
+            "SIG" => set_once(&mut sig, field_i64(value, key, line)?, key, line)?,
+            "ERRNO" => set_once(&mut errno_value, field_i64(value, key, line)?, key, line)?,
+            "RAW" => set_once(&mut raw, value.to_string(), key, line)?,
+            _ => return Err(format!("unknown RESULT field {key:?} in {line:?}")),
         }
     }
-    match status {
-        Some(status) => Ok((status, code)),
-        None => Err(format!("RESULT {name}: no STATUS field in {line:?}")),
+    let status = status.ok_or_else(|| format!("RESULT {name}: no STATUS field in {line:?}"))?;
+    let consistent = match status.as_str() {
+        "EXITED" => code.is_some() && sig.is_none() && errno_value.is_none() && raw.is_none(),
+        "SIGNALED" => sig.is_some() && code.is_none() && errno_value.is_none() && raw.is_none(),
+        "FORK_FAIL" | "WAIT_FAIL" => {
+            errno_value.is_some() && code.is_none() && sig.is_none() && raw.is_none()
+        }
+        "OTHER" => raw.is_some() && code.is_none() && sig.is_none() && errno_value.is_none(),
+        _ => false,
+    };
+    if !consistent {
+        return Err(format!(
+            "RESULT {name}: fields inconsistent with STATUS={status} in {line:?}"
+        ));
     }
+    Ok((status, code))
 }
 
 #[cfg(test)]
@@ -183,6 +264,59 @@ mod parser_tests {
         );
         assert_eq!(result_exit(out, "P6").unwrap().0, "SIGNALED");
         assert!(result_exit(out, "MISSING").is_err());
+    }
+
+    // Witnessed malformed shapes (delta review): none of these may be
+    // normalized into an accepted measurement or terminal record.
+    #[test]
+    fn scalar_must_not_accept_numeric_suffix() {
+        let raw = "P1_CALL_MINUS_SITE=+4 0\n";
+        let got = parse_measurements(raw).and_then(|m| m.check_i64("P1_CALL_MINUS_SITE", 4));
+        assert!(got.is_err(), "malformed row accepted: {raw:?}");
+    }
+
+    #[test]
+    fn scalar_must_not_hide_duplicate_after_space() {
+        let raw = "P3_RESUME_OK=1 P3_RESUME_OK=0\n";
+        let got = parse_measurements(raw).and_then(|m| m.check_i64("P3_RESUME_OK", 1));
+        assert!(got.is_err(), "conflicting record hidden: {raw:?}");
+    }
+
+    #[test]
+    fn scalar_must_not_hide_duplicate_after_tab() {
+        let raw = "P3_RESUME_OK=1\tP3_RESUME_OK=0\n";
+        let got = parse_measurements(raw).and_then(|m| m.check_i64("P3_RESUME_OK", 1));
+        assert!(got.is_err(), "conflicting record hidden: {raw:?}");
+    }
+
+    #[test]
+    fn result_must_not_replace_signaled_with_exited() {
+        let raw = "RESULT P4 STATUS=SIGNALED SIG=4 STATUS=EXITED CODE=0\n";
+        assert!(
+            result_exit(raw, "P4").is_err(),
+            "conflicting status: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn result_must_not_replace_nonzero_code() {
+        let raw = "RESULT P4 STATUS=EXITED CODE=7 CODE=0\n";
+        assert!(result_exit(raw, "P4").is_err(), "conflicting code: {raw:?}");
+    }
+
+    #[test]
+    fn result_must_not_hide_later_failed_terminal_record() {
+        let raw = "RESULT P4 STATUS=EXITED CODE=0\nRESULT P4 STATUS=WAIT_FAIL ERRNO=10\n";
+        assert!(
+            result_exit(raw, "P4").is_err(),
+            "later record hidden: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn result_must_reject_duplicate_identical_terminal_records() {
+        let raw = "RESULT P4 STATUS=EXITED CODE=0\nRESULT P4 STATUS=EXITED CODE=0\n";
+        assert!(result_exit(raw, "P4").is_err(), "duplicate record: {raw:?}");
     }
 }
 
