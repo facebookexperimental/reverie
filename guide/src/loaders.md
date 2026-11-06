@@ -63,18 +63,21 @@ admitted by A1 and refused by A2 (`R-WINDOW`) by name.
 
 > 🚧 **Under construction — loader generality.** Approval is no
 > longer the blocker: architecture §4.3 and its decisions D1–D4 were
-> resolved 2026-11-05
+> resolved as PROCEED-with-amendments on 2026-11-05
 > ([§6.3](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/plans/2026-11-04-liteinst-reverie-architecture.md),
-> item C as amended). Implementation is: `reverie-inguest`'s exec-stop
-> mechanics are a named prototype (`reverie-inguest/STAGE1A.md`) whose
-> production interface deliberately exposes no resume path yet — a
-> genuine Detcore-ready release transition is still owed before any
-> production caller can proceed, and no `DetcoreReady` or
-> runtime-readiness token is granted. TODO: rewrite this chapter
-> against the landed tool-agnostic loader with a non-Hermit
-> `counter-inguest` achieving zero unarmed guest instructions on
-> `hello` and `ls` as the acceptance evidence. Until then, treat A1
-> as designed and partially implemented, not shipped.
+> item C as amended), with implementation in progress. The former
+> consumer-named ready stage was renamed to `ToolReady` in L1-a
+> (landed locally), but the loader is not yet shipped as
+> tool-generic (L1-b/c pending). Implementation is:
+> `reverie-inguest`'s exec-stop mechanics are a named prototype
+> (`reverie-inguest/STAGE1A.md`) whose production interface
+> deliberately exposes no resume path yet — a genuine tool-ready
+> release transition is still owed before any production caller can
+> proceed, and no runtime-readiness token is granted. TODO: rewrite
+> this chapter against the landed tool-agnostic loader with a
+> non-Hermit `counter-inguest` achieving zero unarmed guest
+> instructions on `hello` and `ls` as the acceptance evidence. Until
+> then, treat A1 as designed and partially implemented, not shipped.
 > <!-- UC: loaders-generic -->
 > Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`loaders-generic`).
 >
