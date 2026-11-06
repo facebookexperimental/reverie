@@ -64,6 +64,12 @@ pub const CONTROL_CPUID_PROBE: u64 = 1 << 7;
 pub const CONTROL_TSC_PROBE: u64 = 1 << 8;
 pub const CONTROL_SYSCALL_PROBE: u64 = 1 << 9;
 pub const REQUIRED_CONTROLS: u64 = (1 << 10) - 1;
+/// The counting runtime's required control word: the SIGSYS handler,
+/// its alternate stack, the trap filter, closed bootstrap descriptors
+/// and the trapped-syscall self-test. No CPUID/TSC/SIGSEGV bits: the
+/// counting image arms none of those controls.
+pub const COUNTER_REQUIRED_CONTROLS: u64 =
+    CONTROL_SIGSYS | CONTROL_ALTSTACK | CONTROL_FILTER | CONTROL_FDS_CLOSED | CONTROL_SYSCALL_PROBE;
 
 pub const EVENT_BOOTSTRAP: u32 = 1;
 pub const EVENT_SYSCALL_ENTER: u32 = 2;
