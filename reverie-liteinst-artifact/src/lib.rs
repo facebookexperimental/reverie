@@ -20828,6 +20828,61 @@ const FIXED_GUARDED_TERMINAL_PAIRS: &[(&str, &str, &str)] = &[
         "fixed_tls_access_refusal",
         "qualified_local_tls_getter_always_some",
     ),
+    (
+        "fixed_region_publication_get_opaque",
+        "fixed_heap_panic_null",
+        "scalar_publication_actual_aligned_live_region",
+    ),
+    (
+        "fixed_region_publication_set_opaque",
+        "fixed_heap_panic_null",
+        "scalar_publication_actual_aligned_live_region",
+    ),
+    (
+        "fixed_native_from_native",
+        "fixed_heap_panic_null",
+        "native_authenticated_record_region_metadata_storage",
+    ),
+    (
+        "fixed_native_publish",
+        "fixed_heap_panic_null",
+        "native_authenticated_record_region_metadata_storage",
+    ),
+    (
+        "fixed_constructor_prepare",
+        "fixed_heap_panic_null",
+        "native_authenticated_record_region_metadata_storage",
+    ),
+    (
+        "fixed_generic_prepare",
+        "fixed_heap_panic_null",
+        "native_authenticated_record_region_metadata_storage",
+    ),
+    (
+        "fixed_region_publication_get",
+        "fixed_heap_panic_null",
+        "native_authenticated_record_region_metadata_storage",
+    ),
+    (
+        "fixed_region_publication_set",
+        "fixed_heap_panic_null",
+        "native_authenticated_record_region_metadata_storage",
+    ),
+    (
+        "fixed_patch_heap",
+        "fixed_heap_panic_null",
+        "authenticated_aligned_storage_bounded_shift",
+    ),
+    (
+        "fixed_published_metadata",
+        "fixed_heap_panic_null",
+        "authenticated_aligned_storage_bounded_shift",
+    ),
+    (
+        "fixed_setup_bitmap_range",
+        "fixed_heap_panic_null",
+        "authenticated_aligned_storage_bounded_shift",
+    ),
 ];
 
 // Exact finite role catalog derived from complete physical symbols.
@@ -27384,6 +27439,46 @@ const DETCORE_VALIDATE_GUARDED_TERMINAL_PAIRS: &[(&str, &str, &str)] = &[
         "fixed_constructor_prepare",
         "fixed_publication_cannot_unwind",
         "native_complete_fresh_owner_no_unwind",
+    ),
+    (
+        "fixed_region_publication_get_opaque",
+        "fixed_heap_panic_null",
+        "scalar_publication_actual_aligned_live_region",
+    ),
+    (
+        "fixed_region_publication_set_opaque",
+        "fixed_heap_panic_null",
+        "scalar_publication_actual_aligned_live_region",
+    ),
+    (
+        "fixed_patch_alloc",
+        "fixed_heap_panic_null",
+        "valid_layout_intact_locked_metadata",
+    ),
+    (
+        "fixed_patch_realloc",
+        "fixed_heap_panic_null",
+        "valid_layout_intact_locked_metadata",
+    ),
+    (
+        "fixed_patch_dealloc",
+        "fixed_heap_panic_null",
+        "valid_layout_intact_locked_metadata",
+    ),
+    (
+        "fixed_generic_prepare",
+        "fixed_heap_panic_null",
+        "native_authenticated_record_region_metadata_storage",
+    ),
+    (
+        "fixed_setup_bitmap_range",
+        "fixed_heap_panic_null",
+        "native_authenticated_record_region_metadata_storage",
+    ),
+    (
+        "fixed_constructor_prepare",
+        "fixed_heap_panic_null",
+        "native_authenticated_record_region_metadata_storage",
     ),
 ];
 
