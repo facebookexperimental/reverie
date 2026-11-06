@@ -60,6 +60,12 @@
 #define SYSCALL_DISPATCH_FILTER_ALLOW 0
 #define SYSCALL_DISPATCH_FILTER_BLOCK 1
 #endif
+/* PR_SYS_DISPATCH_ON is EXCLUSIVE (range = always-allowed dispatcher).
+ * This probe wants INCLUSIVE: range = dispatched per selector (kernel
+ * Documentation/admin-guide/syscall-user-dispatch.rst). */
+#ifndef PR_SYS_DISPATCH_INCLUSIVE_ON
+#define PR_SYS_DISPATCH_INCLUSIVE_ON 2
+#endif
 #define SI_CODE_SYS_USER_DISPATCH 2 /* asm-generic siginfo.h SYS_USER_DISPATCH */
 #define SI_CODE_SYS_SECCOMP 1
 
@@ -158,16 +164,36 @@ static void install_filter(struct sock_filter *f, size_t n, int tsync) {
         probe_escape(51);
 }
 
+/* Kernel struct sigaction for raw rt_sigaction: libc wrappers do not
+ * reliably pass a caller restorer through (musl always installs its own
+ * __restore_rt), which silently changes which restorer the filter sees.
+ * The runtime installs through the raw gate for the same reason. */
+struct kernel_sigaction {
+    void *handler;
+    unsigned long flags;
+    void *restorer;
+    unsigned long mask[2];
+};
+
 static void install_handler(int use_restorer) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = sigsys_rec;
-    sa.sa_flags = SA_SIGINFO;
-    if (use_restorer) {
-        sa.sa_flags |= SA_RESTORER;
-        sa.sa_restorer = (void (*)(void))probe_restorer;
+    if (!use_restorer) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = sigsys_rec;
+        sa.sa_flags = SA_SIGINFO;
+        if (sigaction(SIGSYS, &sa, NULL) != 0)
+            probe_escape(52);
+        return;
     }
-    if (sigaction(SIGSYS, &sa, NULL) != 0)
+    struct kernel_sigaction ka = {
+        .handler = (void *)sigsys_rec,
+        .flags = SA_SIGINFO | SA_RESTORER,
+        .restorer = (void *)probe_restorer,
+        .mask = {0, 0},
+    };
+    /* No filter is installed yet at every call site, so libc syscall() is
+     * the raw entry; sigsetsize is the kernel's 8-byte rt sigset word. */
+    if (syscall(SYS_rt_sigaction, SIGSYS, &ka, NULL, 8) != 0)
         probe_escape(52);
 }
 
@@ -506,7 +532,8 @@ static void p8_tsync(void) {
 static volatile unsigned char sud_sel, sud_sel2;
 
 static int sud_enable(unsigned long off, unsigned long len, volatile unsigned char *sel) {
-    return prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON, off, len, (unsigned long)sel);
+    return prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_INCLUSIVE_ON,
+                 off, len, (unsigned long)sel);
 }
 
 static void p9_sud_basic(void) {
@@ -616,7 +643,7 @@ static void p10_cost(void) {
  * seccomp are allowlisted: the assumption under test. */
 static void install_allowlist_filter(void) {
     static const long allowed[] = {
-        SYS_read, SYS_write, SYS_exit, SYS_exit_group, SYS_rt_sigreturn,
+        SYS_read, SYS_write, SYS_readv, SYS_writev, SYS_exit, SYS_exit_group, SYS_rt_sigreturn,
         SYS_rt_sigaction, SYS_rt_sigprocmask, SYS_brk, SYS_mmap, SYS_mprotect,
         SYS_munmap, SYS_getpid, SYS_gettid, SYS_prctl, SYS_seccomp,
         SYS_newfstatat, SYS_ioctl, SYS_lseek, SYS_futex, SYS_clock_gettime,
