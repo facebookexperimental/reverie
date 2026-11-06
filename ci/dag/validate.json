@@ -240,7 +240,7 @@
       "group": "test",
       "job": "ptrace_launch",
       "desc": "Tests: ptrace launch descriptor window",
-      "description": "Counted nextest over the launch_descriptor_window binary alone, at low width. These tests race two tracer launches against a held transient descriptor and a sub-second overlap window (they already self-serialize in-process via a SERIAL mutex); under full-DAG load at width 32 the window closed before the launch waited, failing EMFILE (measured 2026-11-05, load 65-157). Isolating the binary at width 4 keeps its sibling launches from starving the window; the tests themselves stay parallel-unsafe by design and are named here rather than serialized silently. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load). Width 1: the binary serializes itself in-process (SERIAL mutex + process-wide descriptor fills); parallel processes of it still starve each other's launch-overlap window (EMFILE at width 4 under full-DAG load).",
+      "description": "Counted nextest over the launch_descriptor_window binary alone, at low width. These tests race two tracer launches against a held transient descriptor and a sub-second overlap window (they already self-serialize in-process via a SERIAL mutex); under full-DAG load at width 32 the window closed before the launch waited, failing EMFILE (measured 2026-11-05, load 65-157). Isolating the binary at width 4 keeps its sibling launches from starving the window; the tests themselves stay parallel-unsafe by design and are named here rather than serialized silently. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load). Width 1: the binary serializes itself in-process (SERIAL mutex + process-wide descriptor fills); parallel processes of it still starve each other's launch-overlap window (EMFILE at width 4 under full-DAG load). Runs last (after test.inguest): even at width 1 in the quiet tail it EMFILE-failed under concurrent full-DAG load (host load 73-157); with every other test node finished, only foreign host load remains.",
       "labels": [
         "full"
       ],
@@ -249,7 +249,8 @@
         "build.test_binaries",
         "fixtures.liteinst",
         "test.liteinst_a",
-        "test.ptrace"
+        "test.ptrace",
+        "test.inguest"
       ],
       "env": {
         "REVERIE_NEXTEST_TEST_THREADS": "1",
