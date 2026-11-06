@@ -63,17 +63,17 @@ fn measurement_value<'a>(key: &str, rest: &'a str, line: &str) -> Result<&'a str
         }
         Ok(())
     }
-    if key.starts_with("P1_IP_CANDIDATE_") {
-        if let Some((value, suffix)) = rest.split_once(" (ret=") {
-            let digits = suffix
-                .strip_suffix(')')
-                .ok_or_else(|| format!("malformed ret suffix for {key:?} in {line:?}"))?;
-            digits
-                .parse::<i64>()
-                .map_err(|_| format!("malformed ret suffix for {key:?} in {line:?}"))?;
-            check_token(key, value, line)?;
-            return Ok(value);
-        }
+    if key.starts_with("P1_IP_CANDIDATE_")
+        && let Some((value, suffix)) = rest.split_once(" (ret=")
+    {
+        let digits = suffix
+            .strip_suffix(')')
+            .ok_or_else(|| format!("malformed ret suffix for {key:?} in {line:?}"))?;
+        digits
+            .parse::<i64>()
+            .map_err(|_| format!("malformed ret suffix for {key:?} in {line:?}"))?;
+        check_token(key, value, line)?;
+        return Ok(value);
     }
     if key.starts_with("P6_") {
         for marker in [" ret=", " errno="] {
@@ -247,6 +247,18 @@ mod parser_tests {
         m.check_str("P1_IP_CANDIDATE_SITE", "NO").unwrap();
         m.check_str("P6_BTI_C_BLR", "OK").unwrap();
         assert!(m.check_str("P1_IP_CANDIDATE_SITE", "N").is_err());
+    }
+
+    #[test]
+    fn hex_values_and_contains_are_exact() {
+        let m = parse_measurements("P1_SI_ARCH=0xc00000b7\nP9_SUD_ENABLE_FAIL_ERRNO=22\n").unwrap();
+        m.check_hex("P1_SI_ARCH", 0xc000_00b7).unwrap();
+        assert!(m.check_hex("P1_SI_ARCH", 0xc000_00b7 << 4).is_err());
+        assert!(m.check_hex("P1_SI_ARCH", 0xc000_003e).is_err());
+        assert!(m.contains("P9_SUD_ENABLE_FAIL_ERRNO"));
+        assert!(!m.contains("P9_SUD_TRAP_OK"));
+        let bare = parse_measurements("P1_SI_ARCH=c00000b7\n").unwrap();
+        assert!(bare.check_hex("P1_SI_ARCH", 0xc000_00b7).is_err());
     }
 
     #[test]
