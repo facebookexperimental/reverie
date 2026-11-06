@@ -551,11 +551,21 @@ fn send_retirement(socket: libc::c_int, message: &[u8]) {
                 events: libc::POLLOUT,
                 revents: 0,
             };
+            // Infinite wait for writability: `poll` where that number
+            // exists, `ppoll` with a null timeout where only it does
+            // (aarch64 generic table has no `poll`).
             let polled = unsafe {
-                raw_syscall6(
-                    libc::SYS_poll,
-                    [(&raw mut writable) as u64, 1, -1i64 as u64, 0, 0, 0],
-                )
+                #[cfg(target_arch = "x86_64")]
+                {
+                    raw_syscall6(
+                        libc::SYS_poll,
+                        [(&raw mut writable) as u64, 1, -1i64 as u64, 0, 0, 0],
+                    )
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    raw_syscall6(libc::SYS_ppoll, [(&raw mut writable) as u64, 1, 0, 0, 0, 0])
+                }
             };
             if polled < 0 && polled != -i64::from(libc::EINTR) {
                 return;
@@ -851,7 +861,9 @@ enum GuestTarget {
 /// outcome; see [`make_room_for_dup`] and [`make_room_for_f_dupfd`].
 unsafe fn make_room_for_guest_descriptor(event: &SyscallEvent, protected: &[u64]) -> GuestTarget {
     match event.number {
-        libc::SYS_dup2 | libc::SYS_dup3 => unsafe { make_room_for_dup(event, protected) },
+        number if crate::arch::is_dup_number(number) => unsafe {
+            make_room_for_dup(event, protected)
+        },
         libc::SYS_fcntl
             if matches!(
                 event.args[1] as u32 as libc::c_int,
@@ -1038,7 +1050,7 @@ fn record_survivor_or_exit(fd: libc::c_int) {
 /// number that survived a faked close, kept protected in case the call
 /// failed; see `relocate_runtime_fd`) is forgotten.
 pub fn observe_guest_descriptor_change(event: &SyscallEvent) {
-    let creates = matches!(event.number, libc::SYS_dup2 | libc::SYS_dup3)
+    let creates = crate::arch::is_dup_number(event.number)
         || (event.number == libc::SYS_fcntl
             && matches!(
                 event.args[1] as u32 as libc::c_int,

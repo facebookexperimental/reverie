@@ -309,13 +309,7 @@ pub(crate) fn nested_tool_control_result(number: i64, private_registrations: boo
     }
     let unsupported_process =
         // AUTONOMOUS-BOT-IMPLEMENTED
-        number == libc::SYS_clone
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || number == libc::SYS_clone3
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || number == libc::SYS_fork
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        || number == libc::SYS_vfork
+        crate::arch::is_fork_family(number)
         // AUTONOMOUS-BOT-IMPLEMENTED
         || number == libc::SYS_execve
         // AUTONOMOUS-BOT-IMPLEMENTED

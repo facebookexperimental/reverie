@@ -62,6 +62,44 @@ pub const FILTER_ABI_NATIVE: FilterAbi = FILTER_ABI_X86_64;
 #[cfg(target_arch = "aarch64")]
 pub const FILTER_ABI_NATIVE: FilterAbi = FILTER_ABI_AARCH64;
 
+/// Syscall numbers that exist in the x86-64 table but not in the aarch64
+/// generic table, where the same operation arrives under a different
+/// number (`fork`/`vfork` are `clone` shapes there; `dup2` is `dup3`).
+/// Callers compare with `Some(number) == SYS_FORK` so the missing numbers
+/// simply never match instead of failing to compile.
+#[cfg(target_arch = "x86_64")]
+pub const SYS_FORK: Option<i64> = Some(libc::SYS_fork);
+#[cfg(target_arch = "aarch64")]
+pub const SYS_FORK: Option<i64> = None;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_VFORK: Option<i64> = Some(libc::SYS_vfork);
+#[cfg(target_arch = "aarch64")]
+pub const SYS_VFORK: Option<i64> = None;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_DUP2: Option<i64> = Some(libc::SYS_dup2);
+#[cfg(target_arch = "aarch64")]
+pub const SYS_DUP2: Option<i64> = None;
+
+/// Whether `number` creates a process that returns from the same trapped
+/// syscall in both parent and child, under this architecture's table.
+pub fn is_fork_family(number: i64) -> bool {
+    number == libc::SYS_clone
+        || number == libc::SYS_clone3
+        || Some(number) == SYS_FORK
+        || Some(number) == SYS_VFORK
+}
+
+/// Whether `number` is `vfork` (never on aarch64, where it is a clone flag).
+pub fn is_vfork(number: i64) -> bool {
+    Some(number) == SYS_VFORK
+}
+
+/// Whether `number` duplicates a descriptor onto an exact number
+/// (`dup2`/`dup3`; only `dup3` exists on aarch64).
+pub fn is_dup_number(number: i64) -> bool {
+    number == libc::SYS_dup3 || Some(number) == SYS_DUP2
+}
+
 /// The host page size, from the kernel's auxiliary vector.
 ///
 /// Gate pages, trampoline arenas, signal-stack sizing and any other
