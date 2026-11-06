@@ -11,6 +11,42 @@ pub use crate::pmu::RcbMetric;
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub const RETIRED_LOCK_INSTRUCTIONS_EVENT: u64 = 0x510f25;
+/// A performance-counter count that either was measured over a window in
+/// which its counter ran throughout, or was not measured at all. Diagnostics
+/// use this instead of an integer so an unscheduled window prints as
+/// `unmeasured`, never as an invented count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeasuredCount {
+    /// The counter ran for the whole window and yielded this delta.
+    Measured(i64),
+    /// The counter did not run for the whole window; there is no count.
+    Unmeasured,
+}
+
+impl core::fmt::Display for MeasuredCount {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MeasuredCount::Measured(count) => write!(f, "{count}"),
+            MeasuredCount::Unmeasured => write!(f, "unmeasured"),
+        }
+    }
+}
+
+impl From<Option<i64>> for MeasuredCount {
+    fn from(count: Option<i64>) -> Self {
+        match count {
+            Some(count) => MeasuredCount::Measured(count),
+            None => MeasuredCount::Unmeasured,
+        }
+    }
+}
+
+impl From<i64> for MeasuredCount {
+    fn from(count: i64) -> Self {
+        MeasuredCount::Measured(count)
+    }
+}
+
 /// Why this host's performance counters failed validation. See
 /// `reverie_ptrace::pmu_validation`.
 #[derive(Error, Debug)]
@@ -104,8 +140,10 @@ pub enum PmuValidationError {
     AmdSpecLockMapShouldBeDisabled {
         /// How many SpecLockMap commits the check counted.
         speclockmap_commits: i64,
-        /// How many locked instructions the check counted.
-        locked_instructions: i64,
+        /// How many locked instructions the check counted, or
+        /// [`MeasuredCount::Unmeasured`] when that counter did not run
+        /// for the whole window in the attempt that counted the commits.
+        locked_instructions: MeasuredCount,
     },
 
     /// The retired-lock pipeline counted nothing at all, so the check's
@@ -124,6 +162,27 @@ pub enum PmuValidationError {
         counted: i64,
         /// How many locked instructions the check executed.
         executed: usize,
+    },
+
+    /// A performance counter the SpecLockMap check depends on was not
+    /// scheduled for the whole measurement window (its perf
+    /// `time_running` never caught up with `time_enabled`, e.g. it was
+    /// multiplexed out under load), in every bounded attempt. Its
+    /// reading is not a measurement - in particular it is not a
+    /// counted zero - so the check refuses as inconclusive rather
+    /// than let a verdict consume it as a count.
+    #[cfg(target_arch = "x86_64")]
+    #[error(
+        "The AMD Zen SpecLockMap check is inconclusive: the {counter} performance \
+        counter was not scheduled for the whole measurement window in {attempts} \
+        attempts (time_running < time_enabled), so its reading is unmeasured and \
+        cannot decide. See https://github.com/rr-debugger/rr/wiki/Zen"
+    )]
+    SpecLockMapCounterUnmeasured {
+        /// Which counter(s) never ran for a whole window.
+        counter: String,
+        /// How many bounded measurement attempts were made.
+        attempts: usize,
     },
 
     /// The retired-branch counter counted more branches over a loop of
@@ -160,12 +219,15 @@ pub enum PmuValidationError {
         identical count every time. See https://github.com/rr-debugger/rr/wiki/Zen"
     )]
     BranchCounterCheckInconclusive {
-        /// Branches counted over the first branches-only loop.
-        branches: i64,
-        /// Branches counted over the repeated branches-only loop.
-        branches_repeat: i64,
-        /// Branches counted over the branch-matched locked loop.
-        branches_with_locks: i64,
+        /// Branches counted over the first branches-only loop, or
+        /// unmeasured if that counter window did not run throughout.
+        branches: MeasuredCount,
+        /// Branches counted over the repeated branches-only loop, or
+        /// unmeasured if that counter window did not run throughout.
+        branches_repeat: MeasuredCount,
+        /// Branches counted over the branch-matched locked loop, or
+        /// unmeasured if that counter window did not run throughout.
+        branches_with_locks: MeasuredCount,
     },
 
     #[cfg(target_arch = "x86_64")]
