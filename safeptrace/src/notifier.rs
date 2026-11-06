@@ -677,6 +677,19 @@ struct Event {
     #[cfg(test)]
     numeric_auth_force_directory: AtomicBool,
 
+    /// This generation's general-purpose registers as last read from or
+    /// written to the kernel during its current stop (`Stopped::getregs`
+    /// / `Stopped::setregs`). Every successful resume clears it
+    /// (`Stopped::into_running`): guest execution, syscall entry/exit and
+    /// signal delivery may all change the registers outside any ptrace
+    /// write. An `ESRCH` that shows the tracee left the stop clears it
+    /// too. It is never populated for a handle without a bound identity:
+    /// such a handle's generation may not be the registry's one for the
+    /// tracee, so its writes cannot be ordered against this cache.
+    regs_cache: Mutex<Option<crate::Regs>>,
+    #[cfg(test)]
+    regs_kernel_reads: AtomicUsize,
+
     /// Waker for regular status events.
     status_waker: WakerSlot,
 
@@ -1399,6 +1412,9 @@ impl Event {
             numeric_auth_status_reads: AtomicUsize::new(0),
             #[cfg(test)]
             numeric_auth_force_directory: AtomicBool::new(false),
+            regs_cache: Mutex::new(None),
+            #[cfg(test)]
+            regs_kernel_reads: AtomicUsize::new(0),
             status_waker: WakerSlot::default(),
             status: Mutex::new(StatusState {
                 pending: VecDeque::new(),
@@ -3151,6 +3167,46 @@ impl EventHandle {
     /// See [`Event::superseded_new_child`].
     pub(super) fn superseded_new_child(&self, epoch: usize) -> Result<(), SupersededStopRefusal> {
         self.event().superseded_new_child(epoch)
+    }
+
+    /// Whether this generation's register cache (`Event::regs_cache`) may
+    /// be used through this handle: only with a bound identity, which a
+    /// registry handle for a live tracee always has. A handle minted
+    /// without one (an identity-capture fallback) may name a different
+    /// generation object than the registry's for the same tracee, so its
+    /// register reads and writes must not be ordered against the cache.
+    pub(super) fn regs_cacheable(&self) -> bool {
+        self.identity().is_some()
+    }
+
+    /// The registers cached for this generation's current stop, if any.
+    pub(super) fn cached_regs(&self) -> Option<crate::Regs> {
+        *self.event().regs_cache.lock()
+    }
+
+    /// Records `regs` as this generation's current kernel registers.
+    pub(super) fn store_regs(&self, regs: crate::Regs) {
+        *self.event().regs_cache.lock() = Some(regs);
+    }
+
+    /// Drops the cached registers: the tracee left the stop they were
+    /// read in, or a request outside `setregs` may have changed them.
+    pub(super) fn invalidate_regs(&self) {
+        *self.event().regs_cache.lock() = None;
+    }
+
+    /// Counts one kernel register read, for tests of the cache.
+    #[cfg(test)]
+    pub(super) fn note_regs_kernel_read(&self) {
+        self.event()
+            .regs_kernel_reads
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Kernel register reads so far, for tests of the cache.
+    #[cfg(test)]
+    pub(super) fn regs_kernel_reads(&self) -> usize {
+        self.event().regs_kernel_reads.load(Ordering::Relaxed)
     }
 
     fn identity(&self) -> Option<&Arc<WorkerIdentity>> {
@@ -12275,6 +12331,219 @@ mod test {
         ));
         assert!(terminal.wait(deadline.saturating_duration_since(Instant::now())));
         cleanup.disarm();
+    }
+
+    /// Kernel `NT_PRSTATUS` reads this capability's generation has made.
+    fn regs_kernel_reads(stopped: &Stopped) -> usize {
+        stopped.1.event().regs_kernel_reads()
+    }
+
+    /// The instruction pointer in `regs`.
+    fn regs_ip(regs: &crate::Regs) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            regs.rip
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            regs.pc
+        }
+    }
+
+    /// A callee-saved register a stopped child will not read before it
+    /// exits, for observing a `setregs` through the cache.
+    fn regs_scratch(regs: &crate::Regs) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            regs.rbx
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            regs.regs[19]
+        }
+    }
+
+    /// Sets the register [`regs_scratch`] reads.
+    fn regs_scratch_set(regs: &mut crate::Regs, value: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            regs.rbx = value;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            regs.regs[19] = value;
+        }
+    }
+
+    /// Waits for `running`'s next stop within the test deadline.
+    async fn next_stopped(running: crate::Running, deadline: Instant) -> Stopped {
+        let wait = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            running.next_state(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        wait.assume_stopped().0
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_cache_reads_kernel_once_per_stop() {
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        let first = stopped.getregs().unwrap();
+        let second = stopped.getregs().unwrap();
+        assert_eq!(regs_ip(&first), regs_ip(&second));
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_cache_setregs_updates_without_kernel_read() {
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        let mut regs = stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        regs_scratch_set(&mut regs, 0x5eed);
+        stopped.setregs(&regs).unwrap();
+        // The written value is what the kernel holds now; serving the
+        // next read from the write needs no second kernel read.
+        assert_eq!(regs_scratch(&stopped.getregs().unwrap()), 0x5eed);
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_cache_step_invalidates() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        let before = stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        let stopped = next_stopped(stopped.step(None).unwrap(), deadline).await;
+        let after = stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 2);
+        assert_ne!(regs_ip(&before), regs_ip(&after));
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_cache_syscall_invalidates() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        // `PTRACE_SYSCALL` from the initial stop runs the child to its
+        // next syscall stop; the registers there are the kernel's, not
+        // the cached ones.
+        let stopped = next_stopped(stopped.syscall(None).unwrap(), deadline).await;
+        stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 2);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_cache_signal_delivery_invalidates() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (_pid, stopped, cleanup) = spawn_traced_process(None).unwrap();
+        stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        // Delivering a signal on the resume (SIGWINCH: ignored by
+        // default, so the child steps on) goes through the same resume
+        // invalidation as a plain step: a handler's frame would have
+        // replaced every register the cache holds.
+        let stopped = next_stopped(stopped.step(Some(Signal::SIGWINCH)).unwrap(), deadline).await;
+        stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 2);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_cache_exec_invalidates() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (root, mut cleanup, stopped) = spawn_exec_tracee(deadline);
+        let mut exit = Box::pin(cleanup.exit_event(&stopped).unwrap());
+        stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        let stopped = next_stopped(stopped.resume(None).unwrap(), deadline).await;
+        // At the exec stop the image is new: its registers come from
+        // the kernel, never from the pre-exec cache.
+        stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 2);
+        assert_eq!(unsafe { libc::kill(root.as_raw(), libc::SIGKILL) }, 0);
+        // The fatal signal takes the tracee out of its exec stop into
+        // its exit stop without a tracer request; claim that stop
+        // instead of resuming the exec stop's capability.
+        drop(stopped);
+        let exit_stop = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            exit.as_mut(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        cleanup.mark_claimed_exit();
+        let final_wait = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            exit_stop.resume(None).unwrap().wait_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            final_wait.assume_exited(),
+            (
+                root.into(),
+                crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+            )
+        );
+        cleanup.disarm();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_cache_hit_keeps_ptracer_thread_refusal() {
+        let (_pid, stopped, cleanup) = spawn_traced_process_as(None, |pid| {
+            Stopped::new_unchecked_on_ptracer_thread(pid).unwrap()
+        })
+        .unwrap();
+        stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        // The cache now holds the registers, but a hit still runs
+        // under the TID hold: from a foreign thread the explicit
+        // ptracer-thread policy refuses it exactly as it refuses the
+        // kernel request, instead of serving the cached copy.
+        let generation = stopped.generation();
+        let refused = thread::spawn(move || generation.assume_stopped().getregs())
+            .join()
+            .unwrap();
+        assert!(
+            matches!(refused, Err(Error::Errno(Errno::EPERM))),
+            "{refused:?}"
+        );
+        // The owner thread is unaffected and still needs no kernel read.
+        stopped.getregs().unwrap();
+        assert_eq!(regs_kernel_reads(&stopped), 1);
+        drop(stopped);
+        reap_stopped_process(cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regs_cache_is_per_generation() {
+        let (_p, first, first_cleanup) = spawn_traced_process(None).unwrap();
+        let (_p, second, second_cleanup) = spawn_traced_process(None).unwrap();
+        first.getregs().unwrap();
+        first.getregs().unwrap();
+        second.getregs().unwrap();
+        // A clone/fork child is a distinct generation with its own
+        // cache: the first child's cached read neither serves nor
+        // suppresses the second child's kernel read.
+        assert_eq!(regs_kernel_reads(&first), 1);
+        assert_eq!(regs_kernel_reads(&second), 1);
+        drop((first, second));
+        reap_stopped_process(first_cleanup);
+        reap_stopped_process(second_cleanup);
     }
 
     #[tokio::test(flavor = "current_thread")]
