@@ -248,7 +248,8 @@
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst",
-        "test.liteinst_a"
+        "test.liteinst_a",
+        "test.ptrace"
       ],
       "env": {
         "REVERIE_NEXTEST_TEST_THREADS": "4",
@@ -340,7 +341,7 @@
       "group": "test",
       "job": "inguest",
       "desc": "Tests: in-guest backend",
-      "description": "Counted nextest over reverie-inguest. Width is lower: bounded-recipe tests compile payloads at runtime, so each test process fans out further. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load).",
+      "description": "Counted nextest over reverie-inguest. Width is lower: bounded-recipe tests compile payloads at runtime, so each test process fans out further. Scheduled after test.liteinst_a (the heaviest CPU node): these tests measure sub-second launch/trap timing windows that full-DAG CPU burst contention closes (measured 2026-11-05: PASS in isolation at width 16/4, EMFILE/SIGSYS-miss under concurrent cold/warm DAG load). Also after test.ptrace (the longest node): the smoke spoof-getpid trap-arming race still fired with only the LiteInst burst removed.",
       "labels": [
         "full"
       ],
@@ -348,7 +349,8 @@
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst",
-        "test.liteinst_a"
+        "test.liteinst_a",
+        "test.ptrace"
       ],
       "env": {
         "REVERIE_NEXTEST_TEST_THREADS": "16",
