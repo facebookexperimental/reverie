@@ -172,3 +172,8 @@ path = "src/bin/grouped_admission_spike.rs"
 [[test]]
 name = "grouped_admission"
 path = "tests/grouped_admission.rs"
+
+[[test]]
+name = "raw_mseal"
+path = "tests/raw_mseal.rs"
+required-features = ["allocator-fixture"]
