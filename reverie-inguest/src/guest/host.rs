@@ -1521,6 +1521,24 @@ where
                     guest.event.result = result;
                 }
                 return;
+            } else if self.admit_threads
+                && creation_admission(number, args) == CreationAdmission::ThreadBirth
+            {
+                // Pre-callback intercept (W7 review): an admitted thread
+                // creation reaching dispatch unsubscribed must run the
+                // birth trampoline here, never the raw forward below --
+                // a plain forward would return the child into these
+                // frames on its guest stack.
+                let Some(birth) = guest.thread_birth else {
+                    guest.event.result = -i64::from(libc::EOPNOTSUPP);
+                    return;
+                };
+                // SAFETY: creation_admission classified this exact call
+                // ThreadBirth above; the event is this dispatch's live
+                // guest event with its saved context.
+                guest.event.result =
+                    unsafe { (birth.forward)(birth.host, number, args, guest.event) };
+                return;
             } else if is_exit_syscall(number) {
                 drop(guest);
                 drop(tool_arc);
@@ -3987,15 +4005,19 @@ unsafe fn thread_birth_admit<T: Tool + 'static, R: HostRuntime>(
     host.birth_stacks
         .lock()
         .insert(tid.as_raw(), birth.birth_stack);
-    if let Err(error) = host.runtime.verify_thread_admission(tid) {
-        tool_fatal(126, &Error::from(error));
-    }
+    // One admission checklist order everywhere (trait doc): state lease,
+    // then per-thread arming verification, then thread-start callbacks.
+    // The per-thread coordinator connection opens lazily at this
+    // thread's first RPC (slice 2), between lease and first callback use.
     let tool = host.tool_process().unwrap_or_else(|| fatal(126));
     let _active = host.begin_dispatch();
     let mut lease = host
         .states
         .checkout(tid.as_raw(), || host.new_thread_state(&tool, tid))
         .unwrap_or_else(|| fatal(126));
+    if let Err(error) = host.runtime.verify_thread_admission(tid) {
+        tool_fatal(126, &Error::from(error));
+    }
     if !lease.is_new() {
         // A birth whose state already exists is a host invariant break:
         // this thread was just created by this very clone.
@@ -5134,6 +5156,21 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
             self.event.unsupported_refusal = Some(refusal);
             self.tail
                 .set_result(-i64::from(Errno::EOPNOTSUPP.into_raw()));
+        } else if self.admit_threads
+            && creation_admission(number, args) == CreationAdmission::ThreadBirth
+        {
+            // Tail-injected admitted creations run the same birth
+            // trampoline as every other admitted path (W7 review);
+            // the plain forward below must never execute one raw.
+            match self.thread_birth {
+                Some(birth) => {
+                    // SAFETY: classified ThreadBirth just above; the
+                    // event is this dispatch's live guest event.
+                    let result = unsafe { (birth.forward)(birth.host, number, args, self.event) };
+                    self.tail.set_result(result);
+                }
+                None => self.tail.set_result(-i64::from(libc::EOPNOTSUPP)),
+            }
         } else if let Some(error) =
             injected_syscall_guard(self.runtime, number, args, self.admit_threads)
         {
@@ -5760,6 +5797,173 @@ mod process_owner_tests {
         .size w7_birth_stub, .-w7_birth_stub
     "#
     );
+
+    /// Raw clone syscall for tail-inject tests (typed Clone needs the
+    /// nix sched type this crate does not depend on in tests).
+    #[cfg(target_arch = "x86_64")]
+    #[derive(Copy, Clone)]
+    struct RawClone([u64; 6]);
+
+    #[cfg(target_arch = "x86_64")]
+    impl reverie::syscalls::Displayable for RawClone {
+        fn fmt<M: reverie::syscalls::MemoryAccess>(
+            &self,
+            _memory: &M,
+            _outputs: bool,
+            f: &mut core::fmt::Formatter,
+        ) -> core::fmt::Result {
+            write!(f, "clone({:#x}, {:#x})", self.0[0], self.0[1])
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl reverie::syscalls::SyscallInfo for RawClone {
+        type Return = Result<i64, Errno>;
+
+        fn name(&self) -> &'static str {
+            "clone"
+        }
+
+        fn number(&self) -> reverie::syscalls::Sysno {
+            reverie::syscalls::Sysno::clone
+        }
+
+        fn into_parts(self) -> (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs) {
+            (
+                reverie::syscalls::Sysno::clone,
+                reverie::syscalls::SyscallArgs::new(
+                    self.0[0] as usize,
+                    self.0[1] as usize,
+                    self.0[2] as usize,
+                    self.0[3] as usize,
+                    self.0[4] as usize,
+                    self.0[5] as usize,
+                ),
+            )
+        }
+    }
+
+    /// A default-Tool tail_inject of an admitted thread creation runs
+    /// the same birth trampoline (and checklist) as dispatch and inject
+    /// (W7 review): the tail result is the child tid, the child was
+    /// admitted (thread-start observed), and its stub ran.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn tail_injected_thread_creation_runs_birth_checklist() {
+        let _test = TEST_LOCK.lock().unwrap();
+        let (mut host, _peer) = host(false, false);
+        host.set_thread_admission(true);
+        static TAIL_SEEN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+        TAIL_SEEN.store(0, core::sync::atomic::Ordering::Release);
+        EVENTS.lock().unwrap().clear();
+        let guest_stack_len = 64 * 1024usize;
+        let guest_stack = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                guest_stack_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest_stack, libc::MAP_FAILED);
+        let stack_top = guest_stack as u64 + guest_stack_len as u64;
+        unsafe extern "C" {
+            fn w7_birth_stub();
+        }
+        let mut saved = RegisterContext::default();
+        saved.rdi = core::ptr::addr_of!(TAIL_SEEN) as u64;
+        let root_tid = raw_pid(libc::SYS_gettid);
+        let pid = raw_pid(libc::SYS_getpid);
+        let mut event = SyscallEvent {
+            number: libc::SYS_getpid,
+            args: [0; 6],
+            instruction_pointer: w7_birth_stub as *const () as usize as u64,
+            result: 0,
+            context: &raw const saved as usize,
+            dispatch: SyscallDispatch::Trap,
+            guest_pkru: None,
+            unsupported_refusal: None,
+        };
+        let tail = TailResult::default();
+        let mut state = State {
+            pid: pid.as_raw(),
+            tid: root_tid.as_raw(),
+            attempts: 0,
+        };
+        let mut guest = InGuest::<Probe, Runtime> {
+            event: &mut event,
+            tid: root_tid,
+            pid,
+            ppid: None,
+            state: &mut state,
+            rpc: &host.rpc,
+            native: None,
+            tail: &tail,
+            cpuid_interception: false,
+            admit_threads: true,
+            thread_birth: host.thread_birth_ops(),
+            fork_parent_state: None,
+            runtime: &host.runtime,
+            staged_signals: Vec::new(),
+            staged_signal_delivery: false,
+            in_syscall_handler: true,
+            #[cfg(feature = "exec-native-injection")]
+            exec: None,
+            #[cfg(feature = "exec-native-injection")]
+            mapping_driver: None,
+            #[cfg(feature = "exec-native-injection")]
+            native_exec_installed: host.native_exec_driver.is_some(),
+            unsupported_refusal: None,
+            injected_syscalls: 0,
+        };
+        let flags = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM) as u64;
+        let call = RawClone([flags, stack_top, 0, 0, 0, 0]);
+        let mut tail_future = core::pin::pin!(guest.tail_inject(call));
+        // tail_inject parks once it has stored the result.
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(matches!(
+            tail_future.as_mut().poll(&mut context),
+            core::task::Poll::Pending
+        ));
+        let result = match crate::tool_host::drive_syscall(
+            std::future::pending::<Result<i64, Error>>(),
+            &tail,
+        ) {
+            crate::tool_host::SyscallOutcome::Return(result) => {
+                result.expect("tail thread creation failed")
+            }
+            _ => panic!("tail_inject did not park a result"),
+        };
+        assert!(result > 0, "child tid {result}");
+        let child_tid = result as i32;
+        let mut seen = 0;
+        for _ in 0..500 {
+            seen = TAIL_SEEN.load(core::sync::atomic::Ordering::Acquire);
+            if seen != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(seen, i64::from(child_tid), "born thread ran its guest stub");
+        assert!(
+            EVENTS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| *name == "start"),
+            "birth checklist ran thread-start for the tail-injected creation"
+        );
+        assert!(host.states.contains(child_tid));
+        unsafe { libc::munmap(guest_stack, guest_stack_len) };
+    }
 
     /// Physical thread birth end to end: a real clone through the birth
     /// trampoline. The child is admitted (lease + thread-start) on its
