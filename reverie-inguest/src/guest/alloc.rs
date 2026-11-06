@@ -552,6 +552,7 @@ pub fn fixed_tool_heap_contains(pointer: *const u8) -> bool {
 /// x86-64 SysV clear-direction-flag contract used by all Rust Tool entries.
 #[doc(hidden)]
 #[inline(never)]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn fixed_zero_bytes(pointer: *mut u8, length: usize) {
     // SAFETY: the valid writable range and clear DF are caller requirements.
     // REP changes only the declared index/count registers, preserving flags.
@@ -566,6 +567,22 @@ pub unsafe fn fixed_zero_bytes(pointer: *mut u8, length: usize) {
     }
 }
 
+/// aarch64 counterpart: no DF contract exists there; volatile stores keep
+/// the clear free of interposable libc calls and compiler-intrinsic
+/// lowering to them.
+///
+/// # Safety
+/// `pointer` must cover `length` writable bytes.
+#[doc(hidden)]
+#[inline(never)]
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn fixed_zero_bytes(pointer: *mut u8, length: usize) {
+    for index in 0..length {
+        // SAFETY: the valid writable range is a caller requirement.
+        unsafe { pointer.add(index).write_volatile(0) };
+    }
+}
+
 /// Copy live disjoint Fixed allocations without an interposable libc call.
 ///
 /// # Safety
@@ -574,6 +591,7 @@ pub unsafe fn fixed_zero_bytes(pointer: *mut u8, length: usize) {
 /// clear-direction-flag contract used by all Rust Tool entries.
 #[doc(hidden)]
 #[inline(never)]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn fixed_copy_bytes(source: *const u8, destination: *mut u8, length: usize) {
     // SAFETY: the two valid disjoint ranges and clear DF are caller requirements.
     unsafe {
@@ -584,6 +602,24 @@ pub unsafe fn fixed_copy_bytes(source: *const u8, destination: *mut u8, length: 
             inout("rcx") length => _,
             options(nostack, preserves_flags),
         );
+    }
+}
+
+/// aarch64 counterpart: volatile copies, as in [`fixed_zero_bytes`].
+///
+/// # Safety
+/// `source` and `destination` must cover `length` readable and writable
+/// bytes, respectively, and must not overlap.
+#[doc(hidden)]
+#[inline(never)]
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn fixed_copy_bytes(source: *const u8, destination: *mut u8, length: usize) {
+    for index in 0..length {
+        // SAFETY: the two valid disjoint ranges are caller requirements.
+        unsafe {
+            let byte = source.add(index).read_volatile();
+            destination.add(index).write_volatile(byte);
+        }
     }
 }
 

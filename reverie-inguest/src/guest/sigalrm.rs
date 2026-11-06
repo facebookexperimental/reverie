@@ -504,6 +504,9 @@ fn sigaction(policy: &Policy, args: [u64; 6]) -> Result<i64, i32> {
     Ok(0)
 }
 
+// Off x86-64 the to-handler path refuses early (below), leaving the
+// physical-install tail unreachable and its locals unused on that target.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unreachable_code, unused_variables))]
 fn change_action(
     policy: &Policy,
     mut new: KernelSigaction,
@@ -554,11 +557,18 @@ fn change_action(
         }
         current_physical_mask()? & !UNBLOCKABLE
     };
-    let physical = physical_action(
-        &new,
-        sigalrm_trampoline as *const () as u64,
-        policy.reserved,
-    );
+    // The physical delivery trampoline edits an x86-64 frame; until an
+    // aarch64 frame implementation exists, installing a guest SIGALRM
+    // handler there is refused rather than approximated.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return Err(libc::EOPNOTSUPP);
+    }
+    #[cfg(target_arch = "x86_64")]
+    let trampoline = sigalrm_trampoline as *const () as u64;
+    #[cfg(not(target_arch = "x86_64"))]
+    let trampoline = 0_u64;
+    let physical = physical_action(&new, trampoline, policy.reserved);
     install_physical_action(&physical)?;
     if let Err(error) = install_physical_mask(next_mask, true, policy.reserved) {
         restore_physical_action(&old_physical);
@@ -911,10 +921,13 @@ pub fn take_window() -> Option<u64> {
 }
 
 /// Offsets in Linux's x86-64 `ucontext_t` prefix.
+#[cfg(target_arch = "x86_64")]
 const UC_STACK_OFFSET: usize = 16;
+#[cfg(target_arch = "x86_64")]
 const UC_SIGMASK_OFFSET: usize = 296;
 /// `uc_mcontext.gregs[REG_OLDMASK]` (Linux's `sigcontext.oldmask`): the
 /// kernel stores the first word of the pre-delivery mask there too.
+#[cfg(target_arch = "x86_64")]
 const UC_OLDMASK_OFFSET: usize = 40 + 8 * libc::REG_OLDMASK as usize;
 
 fn delivery_lost(message: &[u8]) -> ! {
@@ -934,6 +947,7 @@ fn delivery_lost(message: &[u8]) -> ! {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 // Calls the guest's SIGALRM handler (rcx) with the trampoline's three
 // arguments (rdi, rsi, rdx; Linux passes all three whatever SA_SIGINFO says),
 // and on its return restores the rights in r8d before any memory write when
@@ -970,6 +984,7 @@ reverie_inguest_sigalrm_call_handler:
 "#
 );
 
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
     fn reverie_inguest_sigalrm_call_handler(
         signal: libc::c_int,
@@ -982,6 +997,7 @@ unsafe extern "C" {
 }
 
 /// The current PKRU; only with OSPKE.
+#[cfg(target_arch = "x86_64")]
 fn read_pkru() -> u32 {
     let rights: u32;
     unsafe {
@@ -1008,6 +1024,7 @@ fn read_pkru() -> u32 {
 /// runtime's own alternate stack back in the frame, and returns through the
 /// runtime's restorer. The frame's saved PKRU is never touched, so
 /// rt_sigreturn restores it (or the guest's edit of it) as Linux would.
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn sigalrm_trampoline(
     signal: libc::c_int,
     info: *mut libc::siginfo_t,

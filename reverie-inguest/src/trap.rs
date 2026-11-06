@@ -35,12 +35,68 @@ use crate::dispatch::SyscallDispatcher;
 use crate::dispatch::SyscallEvent;
 use crate::seccomp::TrustedGate;
 use crate::signal;
-#[cfg(feature = "fixed-syscall-gates")]
+#[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
 mod fixed_gates;
-#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+#[cfg(all(
+    feature = "loader-private-runtime",
+    target_env = "musl",
+    target_arch = "x86_64"
+))]
 pub use fixed_gates::mapped_initial_gate_reference;
+#[cfg(target_arch = "x86_64")]
 pub mod frame;
+/// Signal-frame access has no aarch64 implementation yet (that is the next
+/// stage): the type exists so the dispatcher seam compiles, but it cannot
+/// be constructed, and no handler can run on this architecture.
+#[cfg(not(target_arch = "x86_64"))]
+pub mod frame {
+    use core::marker::PhantomData;
+    use std::io;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct FrameError;
+    impl std::fmt::Display for FrameError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("signal frames are not implemented on this architecture")
+        }
+    }
+    impl std::error::Error for FrameError {}
+
+    pub fn initialize() -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Unconstructible off x86-64: `from_raw` always refuses, so no code
+    /// path can observe a fabricated frame.
+    pub struct SignalFrame<'signal> {
+        _borrow: PhantomData<&'signal mut ()>,
+    }
+
+    impl<'signal> SignalFrame<'signal> {
+        /// # Safety
+        /// Same contract as the x86-64 original; always refuses here.
+        pub unsafe fn from_raw(
+            _context: *mut libc::c_void,
+            _info: *const libc::siginfo_t,
+        ) -> Result<Self, FrameError> {
+            Err(FrameError)
+        }
+        pub fn register(&self, _index: usize) -> i64 {
+            unreachable!("no SignalFrame can exist on this architecture")
+        }
+        pub fn set_register(&mut self, _index: usize, _value: i64) {
+            unreachable!("no SignalFrame can exist on this architecture")
+        }
+        pub fn pkru(&self) -> Result<Option<u32>, FrameError> {
+            Ok(None)
+        }
+        pub fn set_pkru(&mut self, _value: Option<u32>) -> Result<(), FrameError> {
+            Err(FrameError)
+        }
+    }
+}
 mod panic_report;
+#[cfg(target_arch = "x86_64")]
 mod pkru;
 
 /// Frozen optional gate ABI. These constants emit no default-path code.
@@ -66,11 +122,11 @@ pub const FIXED_SIGNAL_RESTORER_RETURN_IP: u64 = FIXED_GATE_BASE + 0x30b;
 
 /// Whether this process permanently selected the fully sealed fixed gate page.
 pub fn fixed_gates_published() -> bool {
-    #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     {
         fixed_gates::published()
     }
-    #[cfg(not(feature = "fixed-syscall-gates"))]
+    #[cfg(not(all(feature = "fixed-syscall-gates", target_arch = "x86_64")))]
     {
         false
     }
@@ -91,11 +147,11 @@ pub fn fixed_gate_region() -> Option<(u64, u64)> {
 /// Later installation failure must terminate through the selected gate; the
 /// page must never be unmapped or reverted after successful publication.
 pub unsafe fn prepare_fixed_gates() -> io::Result<()> {
-    #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     {
         unsafe { fixed_gates::prepare() }
     }
-    #[cfg(not(feature = "fixed-syscall-gates"))]
+    #[cfg(not(all(feature = "fixed-syscall-gates", target_arch = "x86_64")))]
     {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -107,16 +163,31 @@ pub unsafe fn prepare_fixed_gates() -> io::Result<()> {
 /// Whether the runtime's installation found OSPKE enabled (RDPKRU and WRPKRU
 /// run); false before installation.
 pub fn pkru_present() -> bool {
-    pkru::present()
+    #[cfg(target_arch = "x86_64")]
+    {
+        pkru::present()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // No userspace protection keys exist off x86-64.
+        false
+    }
 }
 
-#[cfg(feature = "exec-private-init")]
+#[cfg(all(feature = "exec-private-init", target_arch = "x86_64"))]
 pub(crate) fn prepare_private_signal_features() -> io::Result<bool> {
     frame::initialize()?;
     pkru::initialize()
 }
+
+#[cfg(all(feature = "exec-private-init", not(target_arch = "x86_64")))]
+pub(crate) fn prepare_private_signal_features() -> io::Result<bool> {
+    frame::initialize()?;
+    Ok(false)
+}
 const SYS_SECCOMP_CODE: libc::c_int = 1;
 
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     r#"
     .pushsection .text.reverie_inguest_trusted_syscall,"ax",@progbits
@@ -214,11 +285,79 @@ reverie_inguest_guest_syscall_return_ip:
 "#
 );
 
+// The aarch64 gates keep the same symbols and Rust signatures. Differences
+// from x86-64, all forced by the architecture: `svc` preserves x30, so no
+// continuation register is needed (the native entry takes kernel registers
+// with x30 as its continuation, as a plain `bl` leaves it); each entry
+// starts with the `bti c` landing pad a BTI-guarded indirect call requires;
+// and there is no PKRU, so the guest gate performs no permission switch
+// and its result's rights word is zero (callers on this architecture never
+// observe it: see `raw_syscall6_with_result`).
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    r#"
+    .pushsection .text.reverie_inguest_trusted_syscall,"ax",@progbits
+    .p2align 4
+    .global reverie_inguest_trusted_syscall
+    .hidden reverie_inguest_trusted_syscall
+    .type reverie_inguest_trusted_syscall,@function
+reverie_inguest_trusted_syscall:
+    // AAPCS64 entry: x0 = number, x1..x6 = args. Shuffle to kernel regs.
+    bti c
+    mov x8, x0
+    mov x0, x1
+    mov x1, x2
+    mov x2, x3
+    mov x3, x4
+    mov x4, x5
+    mov x5, x6
+    .global reverie_inguest_trusted_syscall_ip
+    .hidden reverie_inguest_trusted_syscall_ip
+reverie_inguest_trusted_syscall_ip:
+    // Native assembly entry: Linux syscall registers, x30 = continuation.
+    svc #0
+    .global reverie_inguest_trusted_syscall_return_ip
+    .hidden reverie_inguest_trusted_syscall_return_ip
+reverie_inguest_trusted_syscall_return_ip:
+    ret
+    .size reverie_inguest_trusted_syscall, .-reverie_inguest_trusted_syscall
+    .popsection
+
+    .text
+    .p2align 4
+    .global reverie_inguest_guest_syscall
+    .hidden reverie_inguest_guest_syscall
+    .type reverie_inguest_guest_syscall,@function
+reverie_inguest_guest_syscall:
+    // AAPCS64: x0 = number, x1 = args pointer, w2 = rights (none here).
+    bti c
+    mov x8, x0
+    mov x9, x1
+    ldr x0, [x9]
+    ldr x1, [x9, #8]
+    ldr x2, [x9, #16]
+    ldr x3, [x9, #24]
+    ldr x4, [x9, #32]
+    ldr x5, [x9, #40]
+    .global reverie_inguest_guest_syscall_ip
+    .hidden reverie_inguest_guest_syscall_ip
+reverie_inguest_guest_syscall_ip:
+    svc #0
+    .global reverie_inguest_guest_syscall_return_ip
+    .hidden reverie_inguest_guest_syscall_return_ip
+reverie_inguest_guest_syscall_return_ip:
+    mov x1, xzr
+    ret
+    .size reverie_inguest_guest_syscall, .-reverie_inguest_guest_syscall
+"#
+);
+
 // SysV classifies this concrete 16-byte integer pair into RAX and RDX. Rust's
 // Option layout never crosses the assembly boundary.
 #[repr(C)]
 struct GuestSyscallResult {
     result: i64,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pkru: u64,
 }
 
@@ -273,7 +412,7 @@ thread_local! {
 /// The call must return through its original stack; this is not an ordinary
 /// wrapper for `rt_sigreturn` or `clone` with a replaced child stack.
 pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
-    #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
         return unsafe { fixed_gates::scalar(number, args) };
     }
@@ -299,7 +438,7 @@ pub unsafe fn raw_syscall6(number: i64, args: [u64; 6]) -> i64 {
 /// as for `raw_syscall6`; unused syscall arguments are zero.
 #[inline(never)]
 pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
-    #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
         return unsafe { fixed_gates::scalar3_or6(number, arg0, arg1, arg2, 0, 0, 0) };
     }
@@ -319,7 +458,7 @@ pub(crate) unsafe fn raw_syscall3(number: i64, arg0: u64, arg1: u64, arg2: u64) 
 /// Like the ordinary gate, this cannot resume a clone with a different stack
 /// and must not be used as an ordinary wrapper around rt_sigreturn.
 pub unsafe fn raw_syscall6_with_pkru(number: i64, args: [u64; 6], pkru: u32) -> i64 {
-    #[cfg(feature = "fixed-syscall-gates")]
+    #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
     if fixed_gates_published() {
         return unsafe { fixed_gates::guest(number, &args, pkru).result };
     }
@@ -367,17 +506,23 @@ pub unsafe fn raw_syscall6_with_result(
 ) -> NativeSyscallResult {
     match guest_pkru {
         Some(pkru) => {
-            #[cfg(feature = "fixed-syscall-gates")]
+            #[cfg(all(feature = "fixed-syscall-gates", target_arch = "x86_64"))]
             let result = if fixed_gates_published() {
                 unsafe { fixed_gates::guest(number, &args, pkru) }
             } else {
                 unsafe { reverie_inguest_guest_syscall(number, args.as_ptr(), pkru) }
             };
-            #[cfg(not(feature = "fixed-syscall-gates"))]
+            #[cfg(not(all(feature = "fixed-syscall-gates", target_arch = "x86_64")))]
             let result = unsafe { reverie_inguest_guest_syscall(number, args.as_ptr(), pkru) };
+            // Off x86-64 there are no protection-key rights to observe:
+            // the guest gate executes with caller rights and reports none.
+            #[cfg(target_arch = "x86_64")]
+            let observed_pkru = Some(result.pkru as u32);
+            #[cfg(not(target_arch = "x86_64"))]
+            let observed_pkru = None;
             NativeSyscallResult {
                 result: result.result,
-                pkru: Some(result.pkru as u32),
+                pkru: observed_pkru,
             }
         }
         None => NativeSyscallResult {
@@ -399,7 +544,7 @@ pub unsafe fn physical_guest_syscall6(
     args: [u64; 6],
     pkru: Option<u32>,
 ) -> NativeSyscallResult {
-    #[cfg(feature = "exec-private-init")]
+    #[cfg(all(feature = "exec-private-init", target_arch = "x86_64"))]
     if crate::guest::exec_private::active() {
         return unsafe { crate::guest::exec_private::physical_syscall(number, args, pkru) };
     }
@@ -565,6 +710,7 @@ only the runtime's signal restorer may return from a signal, so the process ends
 /// # Safety
 ///
 /// Only the kernel calls this, on a real `SIGSYS`.
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe extern "C" fn sigsys_handler(
     signal_number: libc::c_int,
     info: *mut libc::siginfo_t,
@@ -643,6 +789,7 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
     IN_HANDLER.set(false);
 }
 
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     r#"
     .text
@@ -667,6 +814,7 @@ reverie_inguest_sigsys_pkru:
     handler = sym sigsys_handler,
 );
 
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
     fn reverie_inguest_sigsys_pkru(
         signal_number: libc::c_int,
@@ -737,6 +885,7 @@ impl PreparedHandler {
 }
 /// Finish possibly allocating/trapping preparation before an owned frontend
 /// replacement interval. This does not register a stack or change a disposition.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn prepare_handler() -> io::Result<PreparedHandler> {
     panic_report::install();
     frame::initialize()?;
@@ -755,7 +904,20 @@ pub(crate) fn prepare_handler() -> io::Result<PreparedHandler> {
     Ok(PreparedHandler { entry: handler })
 }
 
-#[cfg(feature = "exec-private-init")]
+/// No SIGSYS handler can run without signal-frame support for this
+/// architecture (the next stage), so installation refuses by name rather
+/// than registering a handler that cannot reconstruct an event.
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn prepare_handler() -> io::Result<PreparedHandler> {
+    panic_report::install();
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the SIGSYS handler requires signal-frame support not yet \
+         implemented on this architecture",
+    ))
+}
+
+#[cfg(all(feature = "exec-private-init", target_arch = "x86_64"))]
 pub(crate) unsafe fn adopt_authenticated_initial_gate() -> io::Result<()> {
     unsafe { fixed_gates::adopt_authenticated_initial_page() }
 }
@@ -775,7 +937,8 @@ pub(crate) unsafe fn adopt_authenticated_initial_gate() -> io::Result<()> {
 #[cfg(all(
     feature = "exec-private-init",
     feature = "loader-private-runtime",
-    target_env = "musl"
+    target_env = "musl",
+    target_arch = "x86_64"
 ))]
 pub(crate) unsafe fn adopt_mapped_initial_gate(expected: &'static [u8; 4096]) -> Result<(), i32> {
     // SAFETY: forwarded complete physical-producer contract.
@@ -788,7 +951,11 @@ pub(crate) unsafe fn adopt_mapped_initial_gate(expected: &'static [u8; 4096]) ->
 /// The caller owns the actual inherited qualified gate/filter and excludes
 /// Guest execution, workers and mapping changes. This proves neither admission
 /// nor permission to publish a Tool or native control.
-#[cfg(all(feature = "exec-private-init", feature = "coordinator-rpc"))]
+#[cfg(all(
+    feature = "exec-private-init",
+    feature = "coordinator-rpc",
+    target_arch = "x86_64"
+))]
 pub(crate) unsafe fn verify_native_io_gate() -> io::Result<()> {
     unsafe { fixed_gates::verify_initial_page() }
 }
@@ -799,12 +966,16 @@ pub(crate) unsafe fn verify_native_io_gate() -> io::Result<()> {
 /// A checked native I/O scope must retain the real qualified RX page/filter,
 /// original task/private FS and valid scalar arguments/return stack. No Guest
 /// may invoke this mechanism, and it supplies no image admission authority.
-#[cfg(all(feature = "exec-private-init", feature = "coordinator-rpc"))]
+#[cfg(all(
+    feature = "exec-private-init",
+    feature = "coordinator-rpc",
+    target_arch = "x86_64"
+))]
 pub(crate) unsafe fn native_io_syscall(number: i64, args: [u64; 6]) -> i64 {
     unsafe { fixed_gates::scalar(number, args) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
 

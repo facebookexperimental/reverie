@@ -8,9 +8,11 @@
 #[cfg(feature = "exec-stop")]
 pub mod exec_stop;
 
-#[cfg(feature = "exec-native-injection")]
+// The native frontend drives the x86-64 fixed-gate recipe; on aarch64 it
+// is refused at compile time until that recipe exists there.
+#[cfg(all(feature = "exec-native-injection", target_arch = "x86_64"))]
 pub mod native;
-#[cfg(feature = "exec-native-injection")]
+#[cfg(all(feature = "exec-native-injection", target_arch = "x86_64"))]
 pub mod native_frontend;
 
 use std::ffi::OsStr;

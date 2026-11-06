@@ -22,6 +22,7 @@ use std::io;
 
 use crate::trap::raw_syscall6;
 
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     r#"
     .text
@@ -40,12 +41,34 @@ reverie_inguest_signal_restorer_return_ip:
 "#
 );
 
+// `rt_sigreturn` is 139 on aarch64 and the reported return IP is the
+// instruction after the 4-byte `svc` (measured by the trap probe).
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    r#"
+    .text
+    .p2align 4
+    .global reverie_inguest_signal_restorer
+    .hidden reverie_inguest_signal_restorer
+    .type reverie_inguest_signal_restorer,@function
+reverie_inguest_signal_restorer:
+    mov x8, #139
+    svc #0
+    .global reverie_inguest_signal_restorer_return_ip
+    .hidden reverie_inguest_signal_restorer_return_ip
+reverie_inguest_signal_restorer_return_ip:
+    brk #0
+    .size reverie_inguest_signal_restorer, .-reverie_inguest_signal_restorer
+"#
+);
+
 unsafe extern "C" {
     fn reverie_inguest_signal_restorer();
     fn reverie_inguest_signal_restorer_return_ip();
 }
 
-/// The runtime's private signal restorer: `rt_sigreturn` (15), then `ud2`.
+/// The runtime's private signal restorer: `rt_sigreturn`, then a trap
+/// instruction (`ud2` on x86-64, `brk` on aarch64) if it ever returns.
 ///
 /// Every runtime signal handler returns through it (`SA_RESTORER`), so a
 /// syscall filter can admit `rt_sigreturn` only at

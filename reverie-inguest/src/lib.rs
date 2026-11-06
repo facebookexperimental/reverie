@@ -35,7 +35,7 @@
 //!
 //! Established by the `research-ldpreload-derisking` task and enforced here:
 //! this runtime is for **trusted, dynamically linked, non-`AT_SECURE`, no-exec**
-//! x86-64 guests. This crate does not itself rewrite vDSO fast paths (LiteInst
+//! guests. This crate does not itself rewrite vDSO fast paths (LiteInst
 //! replaces the subscribed ones with trapping stubs), and it does not cover the
 //! ~40 loader/startup syscalls before the constructor runs, static binaries, or
 //! `execve`. `fork` *is* fully covered because the kernel inherits the filter
@@ -51,8 +51,11 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-compile_error!("reverie-inguest requires Linux x86-64");
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+compile_error!("reverie-inguest requires Linux x86-64 or aarch64");
 
 pub mod arch;
 pub mod bootstrap;
