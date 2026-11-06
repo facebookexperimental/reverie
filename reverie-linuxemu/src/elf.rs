@@ -33,6 +33,7 @@ use goblin::elf::header::ELFDATA2LSB;
 use goblin::elf::header::EM_X86_64;
 use goblin::elf::header::ET_DYN;
 use goblin::elf::header::ET_EXEC;
+use goblin::elf::program_header::PF_R;
 use goblin::elf::program_header::PF_W;
 use goblin::elf::program_header::PF_X;
 use goblin::elf::program_header::PT_GNU_STACK;
@@ -48,6 +49,7 @@ use crate::bootstrap::PROGRAM_HEADERS_ADDRESS;
 use crate::bootstrap::VDSO_ADDRESS;
 use crate::memory::AllocationCursors;
 use crate::memory::MMAP_BASE;
+use crate::memory::MappingIdentity;
 use crate::memory::RegionKind;
 use crate::memory::USER_ADDRESS_END;
 use crate::memory::USER_STACK_TOP;
@@ -1823,6 +1825,23 @@ pub fn load_static_elf_with_execfn(
     envp: &[&str],
     cwd: &Path,
 ) -> Result<LoadedStaticElf> {
+    load_static_elf_image_of(memory, image, None, execfn, argv, envp, cwd)
+}
+
+/// [`load_static_elf_with_execfn`] for `image` read from `executable_file`,
+/// the file an `execve` opened: its segments are mappings of that file, as
+/// the process's memory map lists them (`executor::mapping_list`), and its
+/// `PT_INTERP` interpreter is read through a file of its own, likewise.
+/// `None` loads an image that is no file's.
+pub fn load_static_elf_image_of(
+    memory: &mut GuestMemory,
+    image: &[u8],
+    executable_file: Option<Arc<File>>,
+    execfn: Option<&[u8]>,
+    argv: &[&str],
+    envp: &[&str],
+    cwd: &Path,
+) -> Result<LoadedStaticElf> {
     initialize_regular_create_directory_policy()?;
     // Fix the host core_pattern before the first image runs (`core_dump`).
     crate::core_dump::host_core_pattern();
@@ -1840,7 +1859,7 @@ pub fn load_static_elf_with_execfn(
         envp,
         cwd,
         0,
-        None,
+        executable_file,
     );
     if result.is_err() {
         memory.clear_user_access();
@@ -2070,9 +2089,19 @@ fn load_executable(
         }
     }
 
-    let interpreter_image = interpreter_path(image, &elf)?
-        .map(|path| read_interpreter_image(&path))
-        .transpose()?;
+    let (interpreter_image, interpreter_file) = match interpreter_path(image, &elf)? {
+        Some(path) => {
+            let (image, file) = read_interpreter(&path)?;
+            (Some(image), Some(file))
+        }
+        None => (None, None),
+    };
+    let image_identity = executable_file
+        .as_ref()
+        .and_then(crate::executor::mapping_list::MappedObject::file);
+    let interpreter_identity = interpreter_file
+        .as_ref()
+        .and_then(crate::executor::mapping_list::MappedObject::file);
     let interpreter = interpreter_image
         .as_deref()
         .map(|interpreter_image| -> Result<_> {
@@ -2132,9 +2161,13 @@ fn load_executable(
     let (main_bias, main_end) = match &pie_window {
         Some(window) => {
             let physical_start = window.physical_start + (pie_start - window.user_start);
-            let physical_end = load_segments_relocated(memory, image, &elf, &|address| {
-                address.checked_sub(main_first)?.checked_add(physical_start)
-            })?;
+            let physical_end = load_segments_relocated(
+                memory,
+                image,
+                &elf,
+                &|address| address.checked_sub(main_first)?.checked_add(physical_start),
+                image_identity.as_ref(),
+            )?;
             (
                 pie_start.wrapping_sub(main_first),
                 pie_start + (physical_end - physical_start),
@@ -2146,7 +2179,10 @@ fn load_executable(
             } else {
                 0
             };
-            (bias, load_segments(memory, image, &elf, bias)?)
+            (
+                bias,
+                load_segments(memory, image, &elf, bias, image_identity.as_ref())?,
+            )
         }
     };
     // The user address of a linked address in the main image.
@@ -2196,6 +2232,7 @@ fn load_executable(
                 interpreter_image.as_deref().unwrap_or_default(),
                 interpreter,
                 physical_bias,
+                interpreter_identity.as_ref(),
             )?;
             reserve_vdso_gap(memory, physical_start)?;
             let interpreter_entry = user_bias.checked_add(interpreter.entry).ok_or_else(|| {
@@ -2728,7 +2765,14 @@ fn interpreter_open_error(path: &str, action: &str, error: std::io::Error) -> Er
     }
 }
 
+#[cfg(test)]
 fn read_interpreter_image(path: &str) -> Result<Vec<u8>> {
+    read_interpreter(path).map(|(image, _)| image)
+}
+
+/// The image of the program interpreter at `path`, and the file it was read
+/// from, which the interpreter's mappings map.
+fn read_interpreter(path: &str) -> Result<(Vec<u8>, Arc<File>)> {
     let file =
         std::fs::File::open(path).map_err(|error| interpreter_open_error(path, "open", error))?;
     let metadata = file
@@ -2755,7 +2799,8 @@ fn read_interpreter_image(path: &str) -> Result<Vec<u8>> {
             what: "the program interpreter's image",
             bytes: length,
         })?;
-    file.take(MAX_INTERPRETER_BYTES + 1)
+    (&file)
+        .take(MAX_INTERPRETER_BYTES + 1)
         .read_to_end(&mut image)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::OutOfMemory {
@@ -2772,7 +2817,7 @@ fn read_interpreter_image(path: &str) -> Result<Vec<u8>> {
             "interpreter {path:?} exceeds {MAX_INTERPRETER_BYTES} bytes",
         )));
     }
-    Ok(image)
+    Ok((image, Arc::new(file)))
 }
 
 /// Loads `elf`'s PT_LOAD segments at physical `physical_bias + p_vaddr` and
@@ -2783,21 +2828,34 @@ fn load_segments(
     image: &[u8],
     elf: &Elf<'_>,
     physical_bias: u64,
+    identity: Option<&MappingIdentity>,
 ) -> Result<u64> {
-    load_segments_relocated(memory, image, elf, &|address| {
-        physical_bias.checked_add(address)
-    })
+    load_segments_relocated(
+        memory,
+        image,
+        elf,
+        &|address| physical_bias.checked_add(address),
+        identity,
+    )
 }
 
 /// [`load_segments`], placing each linked address where `relocate` puts it
 /// (`None` refuses it). A PIE window's image relocates relative to its first
 /// segment, so an image linked above where it lands moves down without
 /// wrapping arithmetic.
+///
+/// `identity` names the file the image was read from, which Linux's mappings
+/// of the segments map (`elf_map` in `fs/binfmt_elf.c`), for the list of
+/// mappings (`mapping_list`): each segment's file pages are declared with the
+/// segment's protection, and the anonymous pages past its file contents as
+/// `vm_brk_flags` maps them, read-write and executable for an executable
+/// segment.
 fn load_segments_relocated(
     memory: &mut GuestMemory,
     image: &[u8],
     elf: &Elf<'_>,
     relocate: &dyn Fn(u64) -> Option<u64>,
+    identity: Option<&MappingIdentity>,
 ) -> Result<u64> {
     let entry = relocate(elf.entry)
         .ok_or_else(|| Error::UnsupportedElf("ELF entry point overflow".to_string()))?;
@@ -2868,6 +2926,19 @@ fn load_segments_relocated(
                 file_end - mapped_start,
                 Some(header.p_offset & !(PAGE_SIZE - 1)),
             );
+            memory.describe_mapping(
+                mapped_start,
+                file_end - mapped_start,
+                Some(segment_prot(header.p_flags)),
+                // A writable segment is a private writable mapping, charged
+                // (`VM_ACCOUNT`).
+                if header.p_flags & PF_W != 0 {
+                    crate::executor::FLAG_ACCOUNT
+                } else {
+                    0
+                },
+                identity.cloned(),
+            );
         }
         if header.p_memsz > header.p_filesz {
             let anonymous_start = if header.p_filesz == 0 {
@@ -2876,6 +2947,19 @@ fn load_segments_relocated(
                 file_end
             };
             memory.map_user_range(anonymous_start, mapped_end - anonymous_start, false)?;
+            let exec = if header.p_flags & PF_X != 0 {
+                libc::PROT_EXEC
+            } else {
+                0
+            };
+            memory.describe_mapping(
+                anonymous_start,
+                mapped_end - anonymous_start,
+                Some((libc::PROT_READ | libc::PROT_WRITE | exec) as u8),
+                // `vm_brk_flags` charges what it maps (`VM_ACCOUNT`).
+                crate::executor::FLAG_ACCOUNT,
+                None,
+            );
         }
 
         entry_is_executable |=
@@ -2889,6 +2973,22 @@ fn load_segments_relocated(
         ));
     }
     Ok(image_end)
+}
+
+/// The protection Linux maps a segment with flags `p_flags` with
+/// (`make_prot` in `fs/binfmt_elf.c`).
+fn segment_prot(p_flags: u32) -> u8 {
+    let mut prot = 0;
+    if p_flags & PF_R != 0 {
+        prot |= libc::PROT_READ;
+    }
+    if p_flags & PF_W != 0 {
+        prot |= libc::PROT_WRITE;
+    }
+    if p_flags & PF_X != 0 {
+        prot |= libc::PROT_EXEC;
+    }
+    prot as u8
 }
 
 fn copy_program_headers(memory: &mut GuestMemory, image: &[u8], elf: &Elf<'_>) -> Result<()> {
@@ -3282,7 +3382,17 @@ pub(crate) fn reserve_vdso_gap(memory: &mut GuestMemory, below: u64) -> Result<(
     memory
         .reserve_region(start, VDSO_GAP, RegionKind::Mmap)?
         .commit();
-    memory.map_user_permissions(start, VDSO_GAP, false, false)
+    memory.map_user_permissions(start, VDSO_GAP, false, false)?;
+    // Not the guest's mapping: the list of mappings leaves it out.
+    memory.record_file_pages(start, VDSO_GAP, None);
+    memory.describe_mapping(
+        start,
+        VDSO_GAP,
+        None,
+        0,
+        Some(crate::executor::mapping_list::MappedObject::hidden()),
+    );
+    Ok(())
 }
 
 /// A minimal static ELF image whose one load segment holds `code`, for tests.

@@ -81,6 +81,18 @@ pub(crate) struct ParentDeathState {
     /// that briefly holds it never retires its descriptors, which only the
     /// executors' task token does (`ElfExecutor::file_table_task_owner`).
     pub(crate) file_tables: BTreeMap<ProcessKey, Weak<Mutex<crate::executor::FileTableState>>>,
+    /// Each process's address space, and what its image fixed, by the same
+    /// exact identity, written when a task of the process binds its memory
+    /// and at each exec (`ElfExecutor::record_address_space`), for another
+    /// process's `maps` (`ElfExecutor::memory_map`). Held weakly, as an
+    /// observer: an address space goes with its process's threads.
+    pub(crate) address_spaces: BTreeMap<
+        ProcessKey,
+        (
+            crate::memory::WeakGuestMemory,
+            crate::executor::mapping_list::ImageMapFacts,
+        ),
+    >,
     /// Selected once at a logical exit/exec, not once per host cleanup.
     dead: BTreeSet<TaskKey>,
     enrolled: BTreeSet<ProcessKey>,

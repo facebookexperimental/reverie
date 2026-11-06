@@ -71,6 +71,8 @@ pub(super) fn brk(memory: &mut GuestMemory, state: &mut LoadedStaticElf, request
             }
             reservation.commit();
             memory.record_file_pages(physical, end - first, None);
+            // `do_brk_flags` charges what it maps (`VM_ACCOUNT`).
+            memory.describe_mapping(physical, end - first, None, FLAG_ACCOUNT, None);
         }
     } else if requested < previous {
         let Some(unmap_start) = align_up(requested, PAGE_SIZE) else {
@@ -551,6 +553,19 @@ pub(super) fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
         None
     };
 
+    // What the mapping maps, for the list of mappings (`mapping_list`).
+    let identity = if !is_anonymous {
+        state
+            .files
+            .get(&(args[4] as libc::c_int))
+            .and_then(super::mapping_list::MappedObject::file_from)
+    } else if is_shared {
+        super::mapping_list::MappedObject::shared_anonymous(
+            memory.physical_to_user(address).unwrap_or(address),
+        )
+    } else {
+        None
+    };
     let Ok(reservation) = memory.reserve_region(address, length as u64, RegionKind::Mmap) else {
         return negative_errno(libc::ENOMEM);
     };
@@ -632,6 +647,13 @@ pub(super) fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
         length as u64,
         kind.file_offset(),
         is_anonymous && is_shared,
+    );
+    memory.describe_mapping(
+        address,
+        length as u64,
+        None,
+        new_mapping_flags(flags, prot),
+        identity,
     );
     if !fixed {
         state.mm.mmap_next = state.mm.mmap_next.max(end);
@@ -1089,6 +1111,12 @@ pub(super) fn mremap(
     let Ok(reservation) = memory.reserve_region(destination, new_length, RegionKind::Mmap) else {
         return negative_errno(libc::EFAULT);
     };
+    // A shared anonymous mapping that moves keeps its offsets in its object
+    // on Linux; the list of mappings reckons them from where it was made, so
+    // it no longer knows them (`mapping_list::MappedObject::SharedAnonymous`).
+    for identity in memory.mapping_identities_in(old_address, old_length) {
+        super::mapping_list::MappedObject::note_moved(&identity);
+    }
     let mut bytes = vec![0; copy_length];
     if memory.read_raw(old_address, &mut bytes).is_err()
         || memory.zero_raw(destination, new_length_usize).is_err()
@@ -1201,6 +1229,31 @@ pub(super) const FLAG_SEQUENTIAL: u8 = 2;
 pub(super) const FLAG_HUGEPAGE: u8 = 4;
 pub(super) const FLAG_NOHUGEPAGE: u8 = 8;
 pub(super) const FLAG_MERGEABLE: u8 = 16;
+/// Linux's `VM_ACCOUNT`: a private mapping charged to the commit limit since
+/// it was made writable (`accountable_mapping` in `mm/vma.c`, `mprotect_fixup`
+/// in `mm/mprotect.c`). Linux merges no two mappings whose flags differ, so
+/// it keeps such a mapping apart from one never writable, as the list of
+/// mappings must (`mapping_list`).
+pub(crate) const FLAG_ACCOUNT: u8 = 32;
+/// Linux's `VM_NORESERVE`: a mapping made with `MAP_NORESERVE`, which is never
+/// charged.
+pub(crate) const FLAG_NORESERVE: u8 = 64;
+
+/// The flags Linux gives a new mapping made with `mmap(2)` flags `flags` and
+/// protection `prot` (`do_mmap` and `accountable_mapping`): `VM_NORESERVE`
+/// for `MAP_NORESERVE`, and `VM_ACCOUNT` for a private writable mapping
+/// without it.
+pub(crate) fn new_mapping_flags(flags: u64, prot: u64) -> u8 {
+    let noreserve = flags & libc::MAP_NORESERVE as u64 != 0;
+    let shared = flags & libc::MAP_SHARED as u64 != 0;
+    if noreserve {
+        FLAG_NORESERVE
+    } else if !shared && prot & libc::PROT_WRITE as u64 != 0 {
+        FLAG_ACCOUNT
+    } else {
+        0
+    }
+}
 
 /// The flags a madvise(2) call that this backend accepts as a hint sets and
 /// clears on the mappings it covers, as `(start, length, set, clear)` with

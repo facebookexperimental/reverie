@@ -632,9 +632,18 @@ impl ElfExecutor {
     /// Leaves `address_space` equal to `Some(memory.clone())`; see
     /// [`GuestMemory::rebind_from`] for why reusing unchanged parts is that.
     pub fn bind_address_space(&mut self, memory: &GuestMemory) {
+        let rebound = self
+            .address_space
+            .as_ref()
+            .is_none_or(|bound| !bound.same_address_space(memory));
         match &mut self.address_space {
             Some(bound) => bound.rebind_from(memory),
             None => self.address_space = Some(memory.clone()),
+        }
+        // Another address space than before (this task's first, or a fork's
+        // copy): the run's record of this process's names it.
+        if rebound {
+            self.record_address_space();
         }
     }
 
@@ -2526,6 +2535,9 @@ impl ElfExecutor {
             }
         });
         self.signal_binding.rebind(&self.state, &file_table);
+        // The new image's stack and program break, for another process's
+        // `maps`.
+        self.record_address_space();
         drop(replaced_signals);
         self.state.children = ChildWaitContext::bind(
             self.signal_registry.clone(),

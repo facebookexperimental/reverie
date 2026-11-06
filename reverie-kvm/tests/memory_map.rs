@@ -6,9 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `Guest::memory_map` on a KVM guest lists the mappings of the stack window,
-//! the process's `[stack]` and the parts a split left of it, as Linux lists
-//! them, and says that the list is not complete. The same C guest
+//! `Guest::memory_map` on a KVM guest lists every mapping of the address
+//! space and says that the list is complete; these tests check its mappings
+//! of the stack window, the process's `[stack]` and the parts a split left
+//! of it, against Linux's. The same C guest
 //! (`fixtures/memory_map.c`), run natively without address randomization and
 //! with an empty environment (the layout and the environment the backend
 //! gives every guest), reads `/proc/<tid>/maps` at the points where the KVM
@@ -398,6 +399,8 @@ fn kvm(directory: &Directory, executable: &Path, args: &[&str]) -> (Listing, BTr
 /// `linux`, `[stack]` and the parts a split left of it, field by field but
 /// for where the lowest starts.
 fn assert_window(point: u64, fact: &MemoryMap, linux: &MemoryMap) {
+    assert!(fact.complete, "point {point}: {fact:?}");
+    let fact = MemoryMap::new(stack_area(fact), false).unwrap();
     let linux = stack_area(linux);
     assert_eq!(
         fact.mappings.len(),
@@ -469,10 +472,7 @@ fn a_kvm_guest_lists_its_stack_window_as_linux_does() {
     assert_eq!(kvm.asked, (START..=NO_TASK).collect::<Vec<_>>());
     assert_eq!(facts.len() as u64, POINTS, "{facts:?}");
     let fact = |point: u64| match &facts[&point] {
-        Ok(map) => {
-            assert!(!map.complete, "point {point}: {map:?}");
-            map.clone()
-        }
+        Ok(map) => map.clone(),
         other => panic!("point {point}: {other:?}"),
     };
 
@@ -524,11 +524,14 @@ fn a_kvm_guest_lists_its_stack_window_as_linux_does() {
     }
     // Asked by a sibling thread about the leader, before it changes anything.
     assert_window(SIBLING, &fact(SIBLING), &native.map(SIBLING));
-    assert_eq!(fact(START), stack(RW));
+    assert_eq!(stack_area(&fact(START)), stack(RW).mappings);
     // The guard zone ends glibc's stack: on Linux the stack then reaches
     // only down to the zone.
     let guarded = native.stacks[&GUARDED];
-    assert_eq!(guarded.top - guarded.size, fact(GUARDED).mappings[1].end);
+    assert_eq!(
+        guarded.top - guarded.size,
+        stack_area(&fact(GUARDED))[1].end
+    );
     assert!(guarded.size < native.stacks[&START].size);
     assert_eq!(kvm.results[&MLOCKED], (-1, libc::ENOSYS));
     assert!(!native.results.contains_key(&MLOCKED), "{native:?}");
@@ -543,7 +546,7 @@ fn a_kvm_guest_lists_its_stack_window_as_linux_does() {
     // backend's list as it was. MADV_DONTFORK (ENOSYS), where Linux splits
     // the stack in three; a MAP_FIXED mapping where a page was unmapped
     // (ENOMEM), where Linux maps a third line in the hole.
-    assert_eq!(fact(REFUSED_HINT), stack(RW));
+    assert_eq!(stack_area(&fact(REFUSED_HINT)), stack(RW).mappings);
     assert_eq!(kvm.results[&REFUSED_HINT], (-1, libc::ENOSYS));
     assert_eq!(native.results[&REFUSED_HINT], (0, 0));
     assert_eq!(stack_area(&native.map(REFUSED_HINT)).len(), 3);
@@ -587,10 +590,10 @@ fn a_kvm_guest_lists_its_stack_window_as_linux_does() {
         assert_ne!(native.tids[&point], native.tids[&START], "point {point}");
     }
 
-    // Another process's address space is not this one's; no task has the
-    // last number (natively the child's map is readable, and the number's
-    // is not).
-    assert_eq!(facts[&CHILD], Err(FactError::NotProvided));
+    // Another process's address space is its own, as the run recorded it:
+    // the child's window is Linux's child's; no task has the last number
+    // (natively the child's map is readable, and the number's is not).
+    assert_window(CHILD, &fact(CHILD), &native.map(CHILD));
     assert!(native.reads[&CHILD].is_ok());
     assert_eq!(facts[&NO_TASK], Err(FactError::Errno(Errno::ESRCH)));
     assert_eq!(native.reads[&NO_TASK], Err(libc::ENOENT));
@@ -664,8 +667,9 @@ fn a_kvm_guest_with_an_executable_stack_reports_it() {
     let native = native(&executable, &["native", "start"]);
     let (kvm, facts) = kvm(&directory, &executable, &["tool", "start"]);
     assert_eq!(kvm.asked, [START]);
-    assert_eq!(facts[&START], Ok(stack(RWX)));
-    assert_window(START, &stack(RWX), &native.map(START));
+    let started = facts[&START].as_ref().unwrap();
+    assert_eq!(stack_area(started), stack(RWX).mappings);
+    assert_window(START, started, &native.map(START));
 }
 
 /// A program that keeps a guard zone on its main thread's stack, as a JVM
@@ -679,15 +683,13 @@ fn a_kvm_guest_with_an_executable_stack_reports_it() {
 /// the child's stack at it; and in the parent once it removes its own zone,
 /// which merges again.
 ///
-/// Then the named difference at the stack's rlimit: with the stack whole the
-/// list has no line before `[stack]`, where Linux has the mappings below the
-/// stack. Natively the stack then ends at the mapping below it. From the
-/// list, at a limit of one page, less than the arguments above the stack's
-/// first page (glibc's subtraction wraps), and with no limit, it reaches down
-/// to address 0; at a limit of 256 MiB, more than the distance to the mapping
-/// below, it is that limit less the arguments, larger than Linux's but
-/// finite. With the zone again, and no limit, the answers agree, since the
-/// list has the line below `[stack]`.
+/// Then at the stack's rlimit: at a limit of one page, less than the
+/// arguments above the stack's first page (glibc's subtraction wraps), at
+/// 256 MiB, more than the distance to the mapping below, and with no limit,
+/// natively the stack ends at the mapping below it, and so it does from the
+/// list, which lists the mappings below the window as Linux lists them below
+/// the stack. (Before the list held every mapping, it had no line before
+/// `[stack]` there, and glibc's answer from it was larger than Linux's.)
 #[test]
 fn a_kvm_guest_with_a_guard_zone_on_its_stack_reads_it_as_linux_does() {
     const BEFORE: u64 = 1;
@@ -757,46 +759,39 @@ fn a_kvm_guest_with_a_guard_zone_on_its_stack_reads_it_as_linux_does() {
             .max()
             .unwrap();
         assert_eq!(linux.size, linux.top - below, "step {step}");
-        // From the list, it is the limit less the arguments, or reaches down
-        // to address 0 where the subtraction wraps or there is no limit.
+        // From the list, which has the mappings below the window as Linux's
+        // has them below the stack, the same.
         let guest = kvm.stacks[&step];
-        let from_list = if step == RAISED {
-            (linux.limit - (TOP - linux.top)) & !4095
-        } else {
-            linux.top
-        };
-        assert!(from_list > linux.size, "step {step}");
         assert_eq!(
             glibc_main_stack(&fact.mappings, guest.stack_end, linux.limit),
-            Some((linux.top, from_list)),
+            Some((linux.top, linux.size)),
             "step {step}: {fact:?}"
         );
     }
-    let guarded = facts[&GUARDED].as_ref().unwrap();
-    assert_eq!(guarded.mappings.len(), 3);
-    assert_eq!(guarded.mappings[1].prot, 0);
+    let guarded = stack_area(facts[&GUARDED].as_ref().unwrap());
+    assert_eq!(guarded.len(), 3);
+    assert_eq!(guarded[1].prot, 0);
     for step in [GUARDED, USED] {
         let linux = native.stacks[&step];
-        assert_eq!(
-            linux.top - linux.size,
-            guarded.mappings[1].end,
-            "step {step}"
-        );
+        assert_eq!(linux.top - linux.size, guarded[1].end, "step {step}");
     }
     assert_eq!(native.stacks[&BEFORE].size, native.stacks[&UNGUARDED].size);
     assert!(native.stacks[&GUARDED].size < native.stacks[&BEFORE].size);
     // The child's zone, accessible again, is still a mapping of its own,
     // and the child's stack still ends at it; the parent's merges again.
-    let child = facts[&CHILD_UNGUARDED].as_ref().unwrap();
-    assert_eq!(child.mappings.len(), 3);
-    assert!(child.mappings.iter().all(|mapping| mapping.prot == RW));
+    let child = stack_area(facts[&CHILD_UNGUARDED].as_ref().unwrap());
+    assert_eq!(child.len(), 3);
+    assert!(child.iter().all(|mapping| mapping.prot == RW));
     assert_eq!(
         native.stacks[&CHILD_UNGUARDED].size,
         native.stacks[&GUARDED].size
     );
     assert_ne!(kvm.tids[&CHILD_UNGUARDED], kvm.tids[&BEFORE]);
     assert_ne!(native.tids[&CHILD_UNGUARDED], native.tids[&BEFORE]);
-    assert_eq!(facts[&PARENT_UNGUARDED], Ok(stack(RW)));
+    assert_eq!(
+        stack_area(facts[&PARENT_UNGUARDED].as_ref().unwrap()),
+        stack(RW).mappings
+    );
     assert_eq!(
         native.stacks[&PARENT_UNGUARDED].size,
         native.stacks[&BEFORE].size

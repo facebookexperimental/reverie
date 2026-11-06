@@ -282,6 +282,7 @@ pub(super) fn mmap_with_shared_files(
                 "file-view extent exceeds nonnegative host off_t",
             ));
         }
+        let identity = super::mapping_list::MappedObject::file_from(file);
         let file = match file.as_fd().try_clone_to_owned() {
             Ok(file) => file,
             Err(error) => return Ok(io_error(error)),
@@ -299,6 +300,15 @@ pub(super) fn mmap_with_shared_files(
                 cursors: Some(cursors),
             },
         )?;
+        // The view's protection, which the publication gave as access alone,
+        // and what it maps, for the list of mappings (`mapping_list`).
+        memory.describe_mapping(
+            address,
+            length as u64,
+            Some(prot as u8),
+            super::new_mapping_flags(flags, prot),
+            identity,
+        );
     } else {
         // The target overlaps an ordinary-file view. Prepare the private
         // replacement's contents without writing or zeroing that old view.
@@ -333,6 +343,18 @@ pub(super) fn mmap_with_shared_files(
                 "replacement flags need unsupported file-view semantics",
             ));
         }
+        let identity = if !is_anonymous {
+            state
+                .files
+                .get(&(args[4] as libc::c_int))
+                .and_then(super::mapping_list::MappedObject::file_from)
+        } else if is_shared {
+            super::mapping_list::MappedObject::shared_anonymous(
+                memory.physical_to_user(address).unwrap_or(address),
+            )
+        } else {
+            None
+        };
         memory.publish_private_range(
             allocation,
             PrivateRangePlan {
@@ -351,6 +373,13 @@ pub(super) fn mmap_with_shared_files(
                 }),
             },
         )?;
+        memory.describe_mapping(
+            address,
+            length as u64,
+            Some(prot as u8),
+            super::new_mapping_flags(flags, prot),
+            identity,
+        );
     }
     // Either publication recorded the new mapping's provenance with it
     // (a shared view's file offset by `publish_shared_file_range`).

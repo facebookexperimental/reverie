@@ -852,11 +852,15 @@ fn execute_basic_syscall_inner(
         _ if number == libc::SYS_mremap as u64 => mremap(memory, state, args),
         _ if number == libc::SYS_mprotect as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED
-            mprotect(&ProviderMemory(memory), args)
+            let result = mprotect(&ProviderMemory(memory), args);
+            account_writable_range(memory, result, args);
+            result
         }
         _ if number == libc::SYS_pkey_mprotect as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED
-            pkey_mprotect(&ProviderMemory(memory), args)
+            let result = pkey_mprotect(&ProviderMemory(memory), args);
+            account_writable_range(memory, result, args);
+            result
         }
         _ if number == libc::SYS_pkey_alloc as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -871,6 +875,12 @@ fn execute_basic_syscall_inner(
             // mappings it covers: the pages keep them (`DeclaredMapping::flags`).
             if let Some((start, length, set, clear)) = madvise_flag_change(args) {
                 memory.flag_user_range(start, length, set, clear);
+                memory.edit_user_declared(start, length, |declared, _| {
+                    crate::memory::DeclaredMapping {
+                        flags: declared.flags & !clear | set,
+                        ..declared
+                    }
+                });
             }
             madvise(&ProviderMemory(memory), args)
         }
@@ -1195,6 +1205,30 @@ impl ElfExecutor {
             }
         }
     }
+}
+
+/// After a successful `mprotect(2)` or `pkey_mprotect(2)` (`result`, of
+/// `args`) that made a range writable, charges each private mapping of it
+/// that was not charged and is not `MAP_NORESERVE` memory (`VM_ACCOUNT`, as
+/// `mprotect_fixup` in `mm/mprotect.c` sets it), for the list of mappings
+/// (`mapping_list`). Linux also takes the charge back from an anonymous
+/// mapping made read-only before any page of it was written (one with no
+/// `anon_vma`); the pages do not say whether one was written, so a charge
+/// stays, as on Linux for every mapping that was.
+fn account_writable_range(memory: &GuestMemory, result: i64, args: &[u64; 6]) {
+    if result != 0 || args[2] & libc::PROT_WRITE as u64 == 0 {
+        return;
+    }
+    memory.edit_user_declared(args[0], args[1], |declared, shared| {
+        if shared || declared.flags & FLAG_NORESERVE != 0 {
+            declared
+        } else {
+            crate::memory::DeclaredMapping {
+                flags: declared.flags | FLAG_ACCOUNT,
+                ..declared
+            }
+        }
+    });
 }
 
 // Unit tests historically exercise the concrete executor as a raw Linux

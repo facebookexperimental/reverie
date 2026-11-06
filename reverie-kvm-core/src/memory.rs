@@ -37,9 +37,14 @@ use crate::failure::FailureContext;
 
 const PAGE_SIZE: usize = 4096;
 
+mod mapping_list;
 mod page_maps;
 mod shared_file;
 mod vfork;
+pub use mapping_list::MappingIdentity;
+pub use mapping_list::UserMappingRun;
+pub use mapping_list::UserMappingRuns;
+pub use mapping_list::WeakGuestMemory;
 use page_maps::UserPages;
 use page_maps::Versioned;
 pub use shared_file::AllocationGuard;
@@ -424,6 +429,14 @@ struct AddressSpaceState {
     /// share the map until one of them changes it, so a fork does not copy
     /// it page by page.
     mapping_incarnations: Arc<BTreeMap<u64, u64>>,
+    /// The identity a provider gave each mapping incarnation
+    /// ([`GuestMemory::describe_mapping`]), shared by copies until one of
+    /// them changes it, as `mapping_incarnations` is. An incarnation no page
+    /// has any more is forgotten now and then (`keep_identity`).
+    mapping_identities: Arc<BTreeMap<u64, MappingIdentity>>,
+    /// How many identities `mapping_identities` held after it last forgot
+    /// those of incarnations no page has.
+    live_identities: usize,
     /// Facts about hidden Tool-scratch pages that let the next expose and
     /// hide skip every tree; see [`ScratchCache`].
     scratch_cache: ScratchCache,
@@ -681,6 +694,8 @@ impl AddressSpaceState {
             file_pages: Versioned::new(BTreeMap::new()),
             shared_anonymous_pages: Versioned::new(BTreeSet::new()),
             mapping_incarnations: Arc::default(),
+            mapping_identities: Arc::default(),
+            live_identities: 0,
             scratch_cache: ScratchCache::default(),
             backing_pages: BTreeMap::new(),
         }
@@ -1524,6 +1539,20 @@ impl UserPageState {
             | Self::NoAccess { declared }
             | Self::Guarded { declared, .. } => declared,
         }
+    }
+
+    /// Whether `self` and `other` give the guest the same access.
+    fn same_access(self, other: Self) -> bool {
+        let access = |state: Self| match state {
+            Self::Accessible { writable, .. } => (true, writable, false),
+            Self::NoAccess { .. } => (false, false, false),
+            Self::Guarded {
+                accessible,
+                writable,
+                ..
+            } => (accessible, writable, true),
+        };
+        access(self) == access(other)
     }
 
     /// Whether this is a guard page.
@@ -2798,6 +2827,8 @@ impl GuestMemory {
         access.file_pages.edit().clear();
         access.shared_anonymous_pages.edit().clear();
         access.mapping_incarnations = Arc::default();
+        access.mapping_identities = Arc::default();
+        access.live_identities = 0;
         access.reservations.edit().clear();
         access.cursors = None;
     }
@@ -3493,6 +3524,9 @@ impl GuestMemory {
             .collect::<Vec<_>>();
         let grown_incarnation =
             (new_last - new_first > old_last - old_first).then(fresh_mapping_incarnation);
+        // The pages a grow adds belong to the mapping they grow, and so name
+        // what it maps (`MappingIdentity`).
+        let grown_identity = access.identity_of(old_last);
         for page in old_first..=old_last {
             access.pages.remove(&page);
             access.file_pages.edit().remove(&page);
@@ -3563,6 +3597,7 @@ impl GuestMemory {
                 );
             }
         }
+        access.grow_identity(grown_identity, grown_incarnation);
         Ok(())
     }
 

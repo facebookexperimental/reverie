@@ -83,6 +83,7 @@ use crate::elf::initial_thread_name;
 use crate::elf::load_static_elf;
 use crate::elf::load_static_elf_file;
 use crate::elf::load_static_elf_file_with_execfn;
+use crate::elf::load_static_elf_image_of;
 use crate::elf::load_static_elf_with_execfn;
 use crate::error::ErrorExt;
 use crate::executor::AbandonedRuns;
@@ -3299,15 +3300,18 @@ impl KvmBackend {
 
         let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
         let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut loaded = load_static_elf_with_execfn(
+        let (executable_path, executable_file) = executable;
+        // The image is a mapping of the file the exec opened, as the
+        // process's memory map lists it (`elf::load_static_elf_image_of`).
+        let mut loaded = load_static_elf_image_of(
             &mut self.memory,
             image,
+            executable_file.clone(),
             execfn,
             &argv,
             &envp,
             executor.cwd(),
         )?;
-        let (executable_path, executable_file) = executable;
         loaded.executable_path = executable_file
             .as_ref()
             .and_then(|file| std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok())

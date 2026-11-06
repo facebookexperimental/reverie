@@ -826,9 +826,19 @@ impl GuestMemory {
             );
             match permissions {
                 Some((readable, writable)) => {
-                    prepared
-                        .pages
-                        .insert(page, UserPageState::undeclared(readable, writable));
+                    let undeclared = UserPageState::undeclared(readable, writable);
+                    // A publication that maps the same mapping anew (a fork's
+                    // shared views) keeps the mapping it declared, which
+                    // gives the same access; a new mapping's provider
+                    // declares its own (`GuestMemory::describe_mapping`).
+                    let kept = provenance
+                        .is_none()
+                        .then(|| prepared.pages.get(&page).copied())
+                        .flatten()
+                        .and_then(UserPageState::declared)
+                        .map(UserPageState::of)
+                        .filter(|declared| declared.same_access(undeclared));
+                    prepared.pages.insert(page, kept.unwrap_or(undeclared));
                 }
                 None => {
                     prepared.pages.remove(&page);

@@ -108,6 +108,7 @@ use process_signal_publication::ProcessSignalRegistry;
 #[path = "executor/shared_file.rs"]
 mod shared_file;
 use shared_file::mmap_with_shared_files;
+pub(crate) mod mapping_list;
 
 mod refusal;
 pub use refusal::*;

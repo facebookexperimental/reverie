@@ -611,30 +611,72 @@ impl ElfExecutor {
         memory: &GuestMemory,
         tid: libc::pid_t,
     ) -> std::result::Result<reverie::MemoryMap, reverie::FactError> {
-        // The same threads as a link of this process.
-        self.link_owner(tid)?;
-        let mut mappings = Vec::new();
-        let start_stack = self.state.stack_pointer;
-        if self.state.linux_personality & READ_IMPLIES_EXEC == 0
-            && let Some(pages) = memory.user_stack_window_pages()
-        {
-            let runs = stack_window_runs(&pages);
-            // One page whose mapping is not known empties the whole list.
-            if runs.iter().all(|run| run.declared.is_some()) {
-                for run in runs {
-                    let backing = if (run.start..=run.end).contains(&start_stack) {
-                        reverie::MappingBacking::Stack
-                    } else {
-                        reverie::MappingBacking::Anonymous
-                    };
-                    let prot = run.declared.map_or(0, |declared| u32::from(declared.prot));
-                    mappings.push(reverie::MappingFact::new(
-                        run.start, run.end, prot, false, 0, backing,
-                    )?);
-                }
+        match self.link_owner(tid) {
+            // A thread of this process: the address space its syscalls change.
+            Ok(_) => super::mapping_list::list_mappings(
+                memory,
+                &super::mapping_list::ImageMapFacts::of(&self.state),
+            ),
+            // A live thread of another process: its process's address space,
+            // as the run recorded it, while that process's threads hold it.
+            Err(reverie::FactError::NotProvided) => {
+                let (other, image) = self.other_process_address_space(tid)?;
+                super::mapping_list::list_mappings(&other, &image)
             }
+            Err(error) => Err(error),
         }
-        reverie::MemoryMap::new(mappings, false)
+    }
+
+    /// The address space of the process live thread `tid` belongs to, and
+    /// what its image fixed, from the run's record of each process's
+    /// (`ParentDeathState::address_spaces`): `ESRCH` for a number that names
+    /// no live task, and not provided where the record names no address
+    /// space (one the process's threads no longer hold).
+    fn other_process_address_space(
+        &self,
+        tid: libc::pid_t,
+    ) -> std::result::Result<(GuestMemory, super::mapping_list::ImageMapFacts), reverie::FactError>
+    {
+        let lifecycle = self
+            .state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let task = lifecycle
+            .get(tid)
+            .ok_or(reverie::FactError::Errno(reverie::Errno::ESRCH))?;
+        let (memory, image) = lifecycle
+            .parent_death
+            .address_spaces
+            .get(&(task.tgid, task.process_generation))
+            .ok_or(reverie::FactError::NotProvided)?;
+        let image = *image;
+        let memory = memory.upgrade().ok_or(reverie::FactError::NotProvided)?;
+        drop(lifecycle);
+        Ok((memory, image))
+    }
+
+    /// Records this process's address space, and what its image fixed, as
+    /// the run's record of it (`ParentDeathState::address_spaces`), for
+    /// another process's `memory_map`. Held weakly, as an observer: the
+    /// address space goes with its process's threads.
+    pub(super) fn record_address_space(&self) {
+        let Some(memory) = &self.address_space else {
+            return;
+        };
+        self.state
+            .task_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .parent_death
+            .address_spaces
+            .insert(
+                (self.state.pid, self.process_generation),
+                (
+                    memory.downgrade(),
+                    super::mapping_list::ImageMapFacts::of(&self.state),
+                ),
+            );
     }
 
     /// Keeps apart, in a forked child's copy of the address space (a fork's,
@@ -663,6 +705,41 @@ impl ElfExecutor {
             }
         }
     }
+}
+
+/// The stack window's mappings as Linux lists them (`ElfExecutor::memory_map`
+/// documents each field), for the address space `memory` whose image fixed
+/// `image`: `None` when they cannot be established (the window's record is
+/// not certain, one page's mapping is not known, or the process runs with
+/// `READ_IMPLIES_EXEC`).
+pub(super) fn stack_window_mappings(
+    memory: &GuestMemory,
+    image: &super::mapping_list::ImageMapFacts,
+) -> std::result::Result<Option<Vec<reverie::MappingFact>>, reverie::FactError> {
+    if image.read_implies_exec {
+        return Ok(None);
+    }
+    let Some(pages) = memory.user_stack_window_pages() else {
+        return Ok(None);
+    };
+    let runs = stack_window_runs(&pages);
+    // One page whose mapping is not known empties the whole list.
+    if runs.iter().any(|run| run.declared.is_none()) {
+        return Ok(None);
+    }
+    let mut mappings = Vec::new();
+    for run in runs {
+        let backing = if (run.start..=run.end).contains(&image.start_stack) {
+            reverie::MappingBacking::Stack
+        } else {
+            reverie::MappingBacking::Anonymous
+        };
+        let prot = run.declared.map_or(0, |declared| u32::from(declared.prot));
+        mappings.push(reverie::MappingFact::new(
+            run.start, run.end, prot, false, 0, backing,
+        )?);
+    }
+    Ok(Some(mappings))
 }
 
 /// A run of the stack window: adjacent mapped pages with the same declared
@@ -705,7 +782,7 @@ fn stack_window_runs(pages: &[crate::memory::WindowPage]) -> Vec<WindowRun> {
 }
 
 /// Linux's `READ_IMPLIES_EXEC` personality flag (`include/uapi/linux/personality.h`).
-const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
+pub(super) const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
 
 /// The name of guest descriptor `fd` of `table`: see
 /// [`ElfExecutor::link_path`]. `capture` is the run's captured output, if it
@@ -2790,6 +2867,23 @@ mod memory_map_tests {
         reverie::MemoryMap::new(Vec::new(), false).unwrap()
     }
 
+    /// The part of `map` in the stack window, as an incomplete list: what
+    /// these tests check of the stack window's mappings, which the list of
+    /// the whole address space holds beside the image's and every other
+    /// mapping (`mapping_list::list_mappings`).
+    fn window(map: Result<reverie::MemoryMap, FactError>) -> Result<reverie::MemoryMap, FactError> {
+        map.map(|map| {
+            reverie::MemoryMap::new(
+                map.mappings
+                    .into_iter()
+                    .filter(|mapping| WINDOW.0 <= mapping.start && mapping.end <= WINDOW.1)
+                    .collect(),
+                false,
+            )
+            .unwrap()
+        })
+    }
+
     fn change(
         executor: &mut ElfExecutor,
         memory: &GuestMemory,
@@ -2815,7 +2909,7 @@ mod memory_map_tests {
         let (mut executor, memory) = loaded(&directory);
         let tid = executor.state.tid;
         assert!(!executor.state.stack_executable);
-        assert_eq!(executor.memory_map(&memory, tid), Ok(stack(RW)));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(stack(RW)));
         let text = String::from_utf8(proc_self_maps_content(&executor.state)).unwrap();
         assert_eq!(
             text,
@@ -2834,7 +2928,7 @@ mod memory_map_tests {
             ),
             (base + 3 * PAGE_SIZE) as i64
         );
-        assert_eq!(executor.memory_map(&memory, tid), Ok(stack(RW)));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(stack(RW)));
     }
 
     /// A mapping of the window, `[stack]` or a part a split left.
@@ -3010,7 +3104,11 @@ mod memory_map_tests {
                     "{name}: {result}"
                 );
             }
-            assert_eq!(executor.memory_map(&memory, tid), Ok(expected), "{name}");
+            assert_eq!(
+                window(executor.memory_map(&memory, tid)),
+                Ok(expected),
+                "{name}"
+            );
         }
     }
 
@@ -3075,7 +3173,7 @@ mod memory_map_tests {
             run(WINDOW.0, STACK_PAGE, RW, Anonymous),
             run(STACK_PAGE + page, WINDOW.1, RW, Stack),
         ]);
-        assert_eq!(executor.memory_map(&memory, tid), Ok(gap.clone()));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(gap.clone()));
         let destination = memory.user_range_to_guest(one, page).unwrap();
         assert_eq!(
             memory.declared_mapping(destination),
@@ -3097,7 +3195,7 @@ mod memory_map_tests {
             ),
             -i64::from(libc::EINVAL)
         );
-        assert_eq!(executor.memory_map(&memory, tid), Ok(gap));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(gap));
         // A same-size move over two of the window's mappings moves both.
         let low = STACK_PAGE - 2 * page;
         assert_eq!(
@@ -3117,7 +3215,7 @@ mod memory_map_tests {
             run(WINDOW.0, low, RW, Anonymous),
             run(STACK_PAGE + page, WINDOW.1, RW, Stack),
         ]);
-        assert_eq!(executor.memory_map(&memory, tid), Ok(moved.clone()));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(moved.clone()));
         // A same-size move of a range with a hole after its start is refused.
         assert_eq!(
             call(
@@ -3128,7 +3226,7 @@ mod memory_map_tests {
             ),
             -i64::from(libc::EINVAL)
         );
-        assert_eq!(executor.memory_map(&memory, tid), Ok(moved));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(moved));
         // A move that grows a range over two mappings is applied.
         let lower = low - 3 * page;
         assert_eq!(
@@ -3150,7 +3248,7 @@ mod memory_map_tests {
             three as i64
         );
         assert_eq!(
-            executor.memory_map(&memory, tid),
+            window(executor.memory_map(&memory, tid)),
             Ok(listed(vec![
                 run(WINDOW.0, lower, RW, Anonymous),
                 run(lower + 2 * page, low, RW, Anonymous),
@@ -3229,10 +3327,18 @@ mod memory_map_tests {
             let (mut executor, memory) = loaded(&directory);
             let tid = executor.state.tid;
             layout(&memory, &mut executor);
-            assert_eq!(executor.memory_map(&memory, tid), Ok(empty()), "{name}");
+            assert_eq!(
+                window(executor.memory_map(&memory, tid)),
+                Ok(empty()),
+                "{name}"
+            );
             // Known again, the page is listed with the rest.
             undo(&memory, &mut executor);
-            assert_ne!(executor.memory_map(&memory, tid), Ok(empty()), "{name}");
+            assert_ne!(
+                window(executor.memory_map(&memory, tid)),
+                Ok(empty()),
+                "{name}"
+            );
         }
     }
 
@@ -3254,7 +3360,7 @@ mod memory_map_tests {
             0
         );
         assert_eq!(
-            executor.memory_map(&memory, tid),
+            window(executor.memory_map(&memory, tid)),
             Ok(listed(vec![
                 run(WINDOW.0, boundary, RW, Stack),
                 run(boundary, boundary + page, libc::PROT_READ as u32, Stack),
@@ -3291,7 +3397,7 @@ mod memory_map_tests {
             advise(&mut executor, STACK_PAGE, second);
             advise(&mut executor, STACK_PAGE + page, second);
             assert_eq!(
-                executor.memory_map(&memory, tid),
+                window(executor.memory_map(&memory, tid)),
                 Ok(listed(vec![
                     run(WINDOW.0, STACK_PAGE, RW, Anonymous),
                     run(STACK_PAGE, STACK_PAGE + 2 * page, RW, Anonymous),
@@ -3304,7 +3410,11 @@ mod memory_map_tests {
 
     /// The pages keep the protection the guest declared, outside the window
     /// too: the heap's new pages are read-write, a mapping has what mmap
-    /// asked for, and mprotect changes it. Flags are kept in the window only.
+    /// asked for, and mprotect changes it. They keep the flags Linux keeps on
+    /// the mapping that decide whether two mappings merge, outside the window
+    /// too: `VM_ACCOUNT` for the program break's pages (`do_brk_flags`) and
+    /// for a private mapping once it is writable (`mprotect_fixup`), none for
+    /// a read-only one, and the advice madvise records (`VM_RAND_READ`).
     #[test]
     fn the_pages_keep_the_protection_the_guest_declared() {
         let directory = Directory::new();
@@ -3312,13 +3422,16 @@ mod memory_map_tests {
         let page = PAGE_SIZE;
         let declared =
             |user: u64| memory.declared_mapping(memory.user_range_to_guest(user, page).unwrap());
-        let mapping = |prot: u32| {
+        let mapping_with = |prot: u32, flags: u8| {
             Some(crate::memory::DeclaredMapping {
                 prot: prot as u8,
-                flags: 0,
+                flags,
                 lineage: 0,
             })
         };
+        let mapping = |prot: u32| mapping_with(prot, 0);
+        let account = super::super::mm::FLAG_ACCOUNT;
+        let random = super::super::mm::FLAG_RANDOM;
         let base = executor.state.mm.heap_base;
         assert_eq!(
             change(
@@ -3329,7 +3442,7 @@ mod memory_map_tests {
             ),
             (base + 2 * page) as i64
         );
-        assert_eq!(declared(base + page), mapping(RW));
+        assert_eq!(declared(base + page), mapping_with(RW, account));
         let private = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
         let mapped = call(
             &mut executor,
@@ -3349,7 +3462,7 @@ mod memory_map_tests {
             ),
             0
         );
-        assert_eq!(declared(mapped), mapping(RWX));
+        assert_eq!(declared(mapped), mapping_with(RWX, account));
         assert_eq!(
             change(
                 &mut executor,
@@ -3359,7 +3472,7 @@ mod memory_map_tests {
             ),
             0
         );
-        assert_eq!(declared(mapped), mapping(RWX));
+        assert_eq!(declared(mapped), mapping_with(RWX, account | random));
         assert_eq!(declared(STACK_PAGE), mapping(RW));
     }
 
@@ -3563,7 +3676,7 @@ mod memory_map_tests {
             ),
             -i64::from(libc::EINVAL)
         );
-        assert_eq!(executor.memory_map(&memory, tid), Ok(stack(RW)));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(stack(RW)));
     }
 
     /// The stack is executable for an image whose last `PT_GNU_STACK` header
@@ -3587,7 +3700,7 @@ mod memory_map_tests {
             assert_eq!(executor.state.stack_executable, prot == RWX, "{flags:?}");
             let tid = executor.state.tid;
             assert_eq!(
-                executor.memory_map(&memory, tid),
+                window(executor.memory_map(&memory, tid)),
                 Ok(stack(prot)),
                 "{flags:?}"
             );
@@ -3596,17 +3709,151 @@ mod memory_map_tests {
         let (mut executor, memory) = loaded(&directory);
         let tid = executor.state.tid;
         executor.state.linux_personality |= READ_IMPLIES_EXEC;
-        assert_eq!(executor.memory_map(&memory, tid), Ok(empty()));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(empty()));
         executor.state.linux_personality &= !READ_IMPLIES_EXEC;
-        assert_eq!(executor.memory_map(&memory, tid), Ok(stack(RW)));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(stack(RW)));
         let start_stack = executor.state.stack_pointer;
         executor.state.stack_pointer = WINDOW.0 - PAGE_SIZE;
         assert_eq!(
-            executor.memory_map(&memory, tid),
+            window(executor.memory_map(&memory, tid)),
             Ok(listed(vec![run(WINDOW.0, WINDOW.1, RW, Anonymous)]))
         );
         executor.state.stack_pointer = start_stack;
-        assert_eq!(executor.memory_map(&memory, tid), Ok(stack(RW)));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(stack(RW)));
+    }
+
+    /// An image loaded from a file lists the whole address space, complete,
+    /// as Linux lists it: the image's segment from its file and offset, the
+    /// program break's `[heap]` on a line of its own from `start_brk`, a
+    /// private anonymous range `mprotect` split in three, shared anonymous
+    /// memory as `/dev/zero (deleted)`, and the stack window. An image loaded
+    /// from bytes has pages whose file is not known: they are left out, the
+    /// list says it is incomplete, and the stack window is still listed.
+    #[test]
+    fn the_map_lists_the_whole_address_space_of_an_image_from_a_file() {
+        use reverie::MappingBacking;
+        let directory = Directory::new();
+        let path = directory.0.join("maps-image");
+        std::fs::write(&path, crate::elf::minimal_test_elf(&[0xf4])).unwrap();
+        let mut memory = GuestMemory::new(0, 16 * 1024 * 1024).unwrap();
+        let mut state = crate::elf::load_static_elf_file(
+            &mut memory,
+            std::fs::File::open(&path).unwrap(),
+            &["maps"],
+            &[],
+            &directory.0,
+        )
+        .unwrap();
+        state.children = ChildWaitContext::test_root();
+        let mut executor = ElfExecutor::new(state, false);
+        let tid = executor.state.tid;
+        let base = executor.state.mm.heap_base;
+        let grown = base + 3 * PAGE_SIZE;
+        assert_eq!(
+            change(&mut executor, &memory, libc::SYS_brk, [grown, 0, 0]),
+            grown as i64
+        );
+        let mmap = |executor: &mut ElfExecutor, length: u64, prot: i32, flags: i32| {
+            let address = call(
+                executor,
+                &memory,
+                libc::SYS_mmap,
+                [0, length, prot as u64, flags as u64, u64::MAX, 0],
+            );
+            assert!(address > 0, "mmap: {address}");
+            address as u64
+        };
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let private = mmap(
+            &mut executor,
+            3 * PAGE_SIZE,
+            rw,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        );
+        assert_eq!(
+            change(
+                &mut executor,
+                &memory,
+                libc::SYS_mprotect,
+                [private + PAGE_SIZE, PAGE_SIZE, libc::PROT_NONE as u64]
+            ),
+            0
+        );
+        let shared = mmap(
+            &mut executor,
+            PAGE_SIZE,
+            rw,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+        );
+
+        let map = executor.memory_map(&memory, tid).unwrap();
+        assert!(map.complete, "{map:?}");
+        let line = |start: u64| {
+            map.mappings
+                .iter()
+                .find(|mapping| mapping.start == start)
+                .unwrap_or_else(|| panic!("no line at {start:#x}: {map:?}"))
+        };
+        let image = line(0x20_0000);
+        assert_eq!(
+            (image.end, image.prot, image.shared, image.offset),
+            (
+                0x20_1000,
+                (libc::PROT_READ | libc::PROT_EXEC) as u32,
+                false,
+                0x1000
+            )
+        );
+        match &image.backing {
+            MappingBacking::File { path: named, .. } => {
+                assert!(named.ends_with(b"/maps-image"), "{named:?}")
+            }
+            other => panic!("image backed by {other:?}"),
+        }
+        let heap = line(base);
+        assert_eq!(
+            (heap.end, heap.backing.clone()),
+            (grown, MappingBacking::Heap)
+        );
+        for (start, prot) in [
+            (private, rw as u32),
+            (private + PAGE_SIZE, 0),
+            (private + 2 * PAGE_SIZE, rw as u32),
+        ] {
+            let part = line(start);
+            assert_eq!(
+                (part.end, part.prot, part.shared, part.backing.clone()),
+                (start + PAGE_SIZE, prot, false, MappingBacking::Anonymous),
+                "{start:#x}"
+            );
+        }
+        let zero = line(shared);
+        assert!(zero.shared);
+        match &zero.backing {
+            MappingBacking::File { path: named, .. } => {
+                assert_eq!(named.as_slice(), b"/dev/zero (deleted)")
+            }
+            other => panic!("shared anonymous memory backed by {other:?}"),
+        }
+        assert_eq!(window(Ok(map.clone())), Ok(stack(RW)));
+        assert!(
+            map.mappings
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start),
+            "{map:?}"
+        );
+
+        let (bytes, bytes_memory) = loaded(&directory);
+        let bytes_tid = bytes.state.tid;
+        let partial = bytes.memory_map(&bytes_memory, bytes_tid).unwrap();
+        assert!(!partial.complete);
+        assert!(
+            partial
+                .mappings
+                .iter()
+                .all(|mapping| mapping.start != 0x20_0000)
+        );
+        assert_eq!(window(Ok(partial)), Ok(stack(RW)));
     }
 
     /// A forked child's address space is a copy of its parent's, as the
@@ -3626,7 +3873,10 @@ mod memory_map_tests {
             .unwrap();
         let child_memory = forked(&memory);
         let child_tid = child.state.tid;
-        assert_eq!(child.memory_map(&child_memory, child_tid), Ok(stack(RW)));
+        assert_eq!(
+            window(child.memory_map(&child_memory, child_tid)),
+            Ok(stack(RW))
+        );
         assert_eq!(
             change(
                 &mut executor,
@@ -3637,19 +3887,25 @@ mod memory_map_tests {
             0
         );
         let read_only = split(libc::PROT_READ as u32);
-        assert_eq!(executor.memory_map(&memory, tid), Ok(read_only.clone()));
-        assert_eq!(child.memory_map(&child_memory, child_tid), Ok(stack(RW)));
+        assert_eq!(
+            window(executor.memory_map(&memory, tid)),
+            Ok(read_only.clone())
+        );
+        assert_eq!(
+            window(child.memory_map(&child_memory, child_tid)),
+            Ok(stack(RW))
+        );
         let grandchild = executor
             .fork_child(executor.state.pid + 41, false, false)
             .unwrap();
         let grandchild_memory = forked(&memory);
         assert_eq!(
-            grandchild.memory_map(&grandchild_memory, grandchild.state.tid),
+            window(grandchild.memory_map(&grandchild_memory, grandchild.state.tid)),
             Ok(read_only)
         );
         let sibling = child.thread_child(child_tid + 1).unwrap();
         assert_eq!(
-            sibling.memory_map(&child_memory, child_tid + 1),
+            window(sibling.memory_map(&child_memory, child_tid + 1)),
             Ok(stack(RW))
         );
 
@@ -3670,14 +3926,14 @@ mod memory_map_tests {
             0
         );
         assert_eq!(
-            protected.memory_map(&protected_memory, protected_tid),
+            window(protected.memory_map(&protected_memory, protected_tid)),
             Ok(split(RW))
         );
         assert_eq!(
             change(&mut executor, &memory, libc::SYS_mprotect, protect(RW)),
             0
         );
-        assert_eq!(executor.memory_map(&memory, tid), Ok(stack(RW)));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(stack(RW)));
         assert_eq!(
             change(
                 &mut executor,
@@ -3702,7 +3958,7 @@ mod memory_map_tests {
             0
         );
         assert_eq!(
-            advised.memory_map(&advised_memory, advised_tid),
+            window(advised.memory_map(&advised_memory, advised_tid)),
             Ok(split(RW))
         );
         assert_eq!(
@@ -3714,7 +3970,7 @@ mod memory_map_tests {
             ),
             0
         );
-        assert_eq!(executor.memory_map(&memory, tid), Ok(stack(RW)));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(stack(RW)));
     }
 
     /// Linux applies mprotect(2) one mapping at a time and keeps what it
@@ -3750,7 +4006,7 @@ mod memory_map_tests {
                     "{name}, {prot}"
                 );
                 assert_eq!(
-                    executor.memory_map(&memory, tid),
+                    window(executor.memory_map(&memory, tid)),
                     Ok(empty()),
                     "{name}, {prot}"
                 );
@@ -3777,7 +4033,10 @@ mod memory_map_tests {
                 .unwrap();
             let child_memory = memory.snapshot_sharing_address_space().unwrap();
             let child_tid = child.state.tid;
-            assert_eq!(child.memory_map(&child_memory, child_tid), Ok(stack(RW)));
+            assert_eq!(
+                window(child.memory_map(&child_memory, child_tid)),
+                Ok(stack(RW))
+            );
             let result = if child_changes {
                 change(&mut child, &child_memory, libc::SYS_mprotect, protect)
             } else {
@@ -3786,8 +4045,8 @@ mod memory_map_tests {
             assert_eq!(result, 0, "child changes: {child_changes}");
             let read_only = split(libc::PROT_READ as u32);
             let (parent, child) = (
-                executor.memory_map(&memory, tid),
-                child.memory_map(&child_memory, child_tid),
+                window(executor.memory_map(&memory, tid)),
+                window(child.memory_map(&child_memory, child_tid)),
             );
             let (changer, other) = if child_changes {
                 (child, parent)
@@ -3825,9 +4084,13 @@ mod memory_map_tests {
             state.children = ChildWaitContext::test_root();
             let mut image = ElfExecutor::new(state, false);
             let image_tid = image.state.tid;
-            assert_eq!(executor.memory_map(&memory, tid), Ok(stack(RW)), "{label}");
             assert_eq!(
-                image.memory_map(&child_memory, image_tid),
+                window(executor.memory_map(&memory, tid)),
+                Ok(stack(RW)),
+                "{label}"
+            );
+            assert_eq!(
+                window(image.memory_map(&child_memory, image_tid)),
                 Ok(stack(RW)),
                 "{label}"
             );
@@ -3835,15 +4098,15 @@ mod memory_map_tests {
                 let result = change(&mut image, &child_memory, libc::SYS_mprotect, protect);
                 assert_eq!(result, 0, "{label}");
                 (
-                    image.memory_map(&child_memory, image_tid),
-                    executor.memory_map(&memory, tid),
+                    window(image.memory_map(&child_memory, image_tid)),
+                    window(executor.memory_map(&memory, tid)),
                 )
             } else {
                 let result = change(&mut executor, &memory, libc::SYS_mprotect, protect);
                 assert_eq!(result, 0, "{label}");
                 (
-                    executor.memory_map(&memory, tid),
-                    image.memory_map(&child_memory, image_tid),
+                    window(executor.memory_map(&memory, tid)),
+                    window(image.memory_map(&child_memory, image_tid)),
                 )
             };
             assert_eq!(changed, Ok(split(libc::PROT_READ as u32)), "{label}");
@@ -3860,24 +4123,33 @@ mod memory_map_tests {
         let directory = Directory::new();
         let (executor, memory) = loaded(&directory);
         let tid = executor.state.tid;
-        let own = executor.memory_map(&memory, tid).unwrap();
+        let own = window(executor.memory_map(&memory, tid)).unwrap();
         assert_eq!(own, stack(RW));
         let mut sibling = executor.thread_child(tid + 1).unwrap();
-        assert_eq!(executor.memory_map(&memory, tid + 1), Ok(own.clone()));
-        assert_eq!(sibling.memory_map(&memory, tid + 1), Ok(own.clone()));
-        assert_eq!(sibling.memory_map(&memory, tid), Ok(own.clone()));
+        assert_eq!(
+            window(executor.memory_map(&memory, tid + 1)),
+            Ok(own.clone())
+        );
+        assert_eq!(
+            window(sibling.memory_map(&memory, tid + 1)),
+            Ok(own.clone())
+        );
+        assert_eq!(window(sibling.memory_map(&memory, tid)), Ok(own.clone()));
         let child = executor
             .fork_child(executor.state.pid + 40, false, false)
             .unwrap();
         let child_tid = child.state.tid;
         assert_eq!(
-            executor.memory_map(&memory, child_tid),
+            window(executor.memory_map(&memory, child_tid)),
             Err(FactError::NotProvided)
         );
-        assert_eq!(child.memory_map(&memory, tid), Err(FactError::NotProvided));
+        assert_eq!(
+            window(child.memory_map(&memory, tid)),
+            Err(FactError::NotProvided)
+        );
         for number in [0, -1, i32::MIN, tid + 5, i32::MAX] {
             assert_eq!(
-                executor.memory_map(&memory, number),
+                window(executor.memory_map(&memory, number)),
                 Err(FactError::Errno(reverie::Errno::ESRCH)),
                 "tid {number}"
             );
@@ -3891,7 +4163,7 @@ mod memory_map_tests {
             ),
             0
         );
-        assert_eq!(executor.memory_map(&memory, tid), Ok(split(RW)));
-        assert_eq!(sibling.memory_map(&memory, tid + 1), Ok(split(RW)));
+        assert_eq!(window(executor.memory_map(&memory, tid)), Ok(split(RW)));
+        assert_eq!(window(sibling.memory_map(&memory, tid + 1)), Ok(split(RW)));
     }
 }
