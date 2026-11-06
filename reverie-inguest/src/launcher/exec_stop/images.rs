@@ -26,6 +26,9 @@ use nix::sys::memfd::MFdFlags;
 use nix::sys::memfd::memfd_create;
 use reverie_loader::artifact;
 use reverie_loader::image::ValidatedImage;
+use reverie_loader::manifest::LOADER_MANIFEST;
+use reverie_loader::manifest::PROBE_RUNTIME_MANIFEST;
+use reverie_loader::manifest::ToolManifest;
 
 use super::Result;
 
@@ -36,6 +39,19 @@ pub enum Kind {
     Loader,
     /// Fixed runtime window and audited gate, with TLS refused.
     Runtime,
+}
+
+impl Kind {
+    /// The manifest this probe checks the image against. The probe's
+    /// runtime is the separate TLS-off [`PROBE_RUNTIME_MANIFEST`], not
+    /// the production runtime manifest: this mechanics probe
+    /// deliberately initializes no TLS.
+    pub fn manifest(self) -> &'static ToolManifest {
+        match self {
+            Kind::Loader => &LOADER_MANIFEST,
+            Kind::Runtime => &PROBE_RUNTIME_MANIFEST,
+        }
+    }
 }
 
 /// Validated bytes and their immutable source descriptor, inseparable for mapping.
@@ -81,20 +97,7 @@ impl SealedImage {
 
     /// Validate the retained sealed bytes under this fixed image contract.
     pub fn checked(&self) -> Result<ValidatedImage<'_>> {
-        match self.kind {
-            Kind::Loader => artifact::check_loader(&self.bytes),
-            // The generic artifact contract permits a later runtime to own
-            // TLS. This mechanics probe deliberately initializes none.
-            Kind::Runtime => artifact::check(
-                &self.bytes,
-                &reverie_loader::image::Policy {
-                    window: artifact::RUNTIME_WINDOW,
-                    allow_tls: false,
-                },
-                &[artifact::RUNTIME_GATE],
-            ),
-        }
-        .map_err(|e| {
+        artifact::check_image(&self.bytes, self.kind.manifest()).map_err(|e| {
             let reason = match self.kind {
                 Kind::Loader => "invalid_loader_image",
                 Kind::Runtime => "invalid_runtime_image",

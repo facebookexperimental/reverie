@@ -27,16 +27,20 @@ use std::time::Duration;
 use images::Kind;
 use images::SealedImage;
 use protocol::*;
+use reverie_inguest::launcher::exec_stop::ChildOwner;
 use reverie_inguest::launcher::exec_stop::CleanupConfirmation;
 use reverie_inguest::launcher::exec_stop::CleanupOwner;
 use reverie_inguest::launcher::exec_stop::CleanupReceipt;
 use reverie_inguest::launcher::exec_stop::CleanupState;
+use reverie_inguest::launcher::exec_stop::EntryContext;
 use reverie_inguest::launcher::exec_stop::ExecStop;
 use reverie_inguest::launcher::exec_stop::PreparedExec;
 use reverie_inguest::launcher::exec_stop::images;
 use reverie_inguest::launcher::exec_stop::inject as trace;
 use reverie_inguest::launcher::exec_stop::register_words;
 use reverie_loader::artifact;
+use reverie_loader::manifest::Controls;
+use reverie_loader::stage::Mapped;
 use safeptrace::Event;
 use safeptrace::ExitStatus;
 use safeptrace::Regs;
@@ -60,6 +64,54 @@ enum Fault {
 struct ProbeControls<'a> {
     fault: Fault,
     pause_checkpoint: Option<&'a Path>,
+}
+
+/// The stopped-task bundle the loader's stage chain carries from
+/// mapping to handover: the task itself, its saved entry context and
+/// the child owner that waits for it after detach. `task` is an
+/// `Option` only so [`bootstrap_until_ready`], which consumes and
+/// returns the stop, can run it through [`ProbeStop::run_task`]; it is
+/// `Some` at every stage boundary.
+struct ProbeStop<'fd> {
+    task: Option<Stopped>,
+    context: EntryContext,
+    owner: ChildOwner<'fd>,
+}
+
+impl ProbeStop<'_> {
+    fn task(&self) -> &Stopped {
+        self.task.as_ref().expect("probe stop retains its task")
+    }
+
+    fn task_mut(&mut self) -> &mut Stopped {
+        self.task.as_mut().expect("probe stop retains its task")
+    }
+
+    fn run_task<T>(&mut self, run: impl FnOnce(Stopped) -> Result<(Stopped, T)>) -> Result<T> {
+        let task = self.task.take().expect("probe stop retains its task");
+        let (task, value) = run(task)?;
+        self.task = Some(task);
+        Ok(value)
+    }
+}
+
+/// Maps the probe runtime's reported control word (probe_protocol
+/// `CONTROL_*` bits) onto the manifest's [`Controls`]. The probe has
+/// no vDSO-rewrite bit — its runtime performs no vDSO rewrite — so
+/// `vdso_rewrite` is always false here, which is exactly why the
+/// probe is checked against the separate probe manifest that does
+/// not require it. Probe-only bits (altstack, fds-closed and the
+/// self-test probes) have no manifest counterpart and are enforced
+/// by `control::ready` instead.
+fn armed_controls(controls: u64) -> Controls {
+    Controls {
+        trap_filter: controls & CONTROL_FILTER != 0,
+        cpuid_faulting: controls & CONTROL_CPUID != 0,
+        rdtsc_trapping: controls & CONTROL_TSC != 0,
+        vdso_rewrite: false,
+        sigsys_handler: controls & CONTROL_SIGSYS != 0,
+        sigsegv_handler: controls & CONTROL_SIGSEGV != 0,
+    }
 }
 
 fn run(
@@ -179,12 +231,22 @@ fn run(
             .collect::<Vec<_>>()
     );
     report["entry_bytes_restored"] = json!(true);
+    // The images are mapped at their fixed addresses and no guest
+    // instruction has run since the exec stop: the stop enters the
+    // loader's stage chain (Mapped::from_mapped_stop's trust
+    // boundary) and is touched only through it until handover.
+    let bundle = ProbeStop {
+        task: Some(task),
+        context,
+        owner,
+    };
+    let mut mapped = Mapped::from_mapped_stop(bundle);
     let mut bootstrap = entry;
     bootstrap.rip = loader_image.entry();
     bootstrap.rsp = STACK_TOP - 8; // SysV function entry, private zero return slot.
     bootstrap.rdi = CONTROL_ADDRESS;
     bootstrap.orig_rax = u64::MAX;
-    task.setregs(&bootstrap)?;
+    mapped.stop_mut().task_mut().setregs(&bootstrap)?;
     let executable: Vec<_> = loader_image
         .segments()
         .chain(runtime_image.segments())
@@ -192,8 +254,11 @@ fn run(
         .map(|s| s.pages())
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| format!("executable segment: {e:?}"))?;
-    let task = bootstrap_until_ready(task, &executable, fault, report)?;
-    let ready_regs = task.getregs()?;
+    mapped.stop_mut().run_task(|task| {
+        bootstrap_until_ready(task, &executable, fault, &mut *report).map(|task| (task, ()))
+    })?;
+    let started = mapped.runtime_started();
+    let ready_regs = started.stop().task().getregs()?;
     // Retain the actual unauthenticated observation on refusal as well.
     report["ready_stop_ip"] = json!(ready_regs.rip);
     report["ready_rax"] = json!(ready_regs.rax);
@@ -201,6 +266,20 @@ fn run(
         return Err("loader refused: unauthenticated ready breakpoint".into());
     }
     let controls = control::ready(observations, nonce)?;
+    let ready = started.tool_ready();
+    // Armed is claimed only once every control the probe runtime's
+    // manifest requires is reported armed; an unmet control is a
+    // named refusal, never a partially armed handoff.
+    if let Some(unmet) = Kind::Runtime
+        .manifest()
+        .controls
+        .unmet(armed_controls(controls))
+    {
+        return Err(format!(
+            "loader refused: required control not armed: {unmet:?} (controls={controls:#x})"
+        )
+        .into());
+    }
     for fd in inherited {
         match std::fs::symlink_metadata(format!("/proc/{pid}/fd/{fd}")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -211,15 +290,23 @@ fn run(
             }
         }
     }
-    context.restore(&task)?;
+    let armed = ready.armed();
+    {
+        let stop = armed.stop();
+        stop.context.restore(stop.task())?;
+    }
     report["controls"] = json!(controls);
     report["ready_stop_ip"] = json!(ready_regs.rip);
     report["ready_nonce_matches"] = json!(true);
     report["stack_unchanged"] = json!(true);
-    report["stack_bytes"] = json!(context.stack_bytes().len());
+    report["stack_bytes"] = json!(armed.stop().context.stack_bytes().len());
     report["bootstrap_fds_closed"] = json!(true);
     report["pre_arm_guest_syscalls"] = json!(0);
-    let running = task.detach(None)?;
+    let (_handed_off, bundle) = armed.hand_over();
+    let ProbeStop { task, owner, .. } = bundle;
+    let running = task
+        .ok_or("loader refused: probe stop lost its task")?
+        .detach(None)?;
     report["detached"] = json!(true);
     report["outcome"] = json!("handoff");
     let terminal = match owner.wait(running) {
