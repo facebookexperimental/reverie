@@ -89,7 +89,7 @@ may require SUD, CPUID faulting, or `PR_SET_TSC` (I6); and so on.
 > owner decision B in
 > [§6.3](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-11-04-liteinst-reverie-architecture.md#63-decisions-requested-from-the-owner-via-coord7)).
 > TODO: on approval, expand to the full catalogue (every public
-> refusal, trigger, remedy) as a Bevy-style errors index; today the
+> refusal, trigger, remedy) as a searchable errors index; today the
 > code surfaces a subset of these ideas under older names
 > (`ENOSYS`/`EOPNOTSUPP`/`NotProvided`). <!-- UC: safety-taxonomy -->
 > Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`safety-taxonomy`).

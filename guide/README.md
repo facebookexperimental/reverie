@@ -10,7 +10,7 @@ mdbook serve guide     # live preview
 
 Conventions:
 
-- Rust Book style: concepts first, one growing project (the syscall
+- Structure: concepts first, one growing project (the syscall
   counter) across chapters, run-then-break-down in project chapters,
   reference material in appendices / docs.rs — never inline API dumps.
 - Unfinished or unimplemented material gets an Under construction box:

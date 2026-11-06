@@ -128,5 +128,5 @@ into `counter2`, where the counting itself is distributed.
 > counter stage by stage across the next chapters (subscriptions to
 > count only `openat`; per-syscall histograms via thread state;
 > identical runs on three backends) with a "full code at this step"
-> link per stage, Tokio-tutorial style. <!-- UC: ft-grow -->
+> link per stage. <!-- UC: ft-grow -->
 > Tracking: [reverie#1272](https://github.com/rrnewton/reverie/issues/1272) (`ft-grow`).
