@@ -354,6 +354,143 @@ thread_local! {
     static IN_HANDLER: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Maximum number of distinct lazy-promotion candidates retained before a
+/// drain. Overflow is counted and the affected sites remain on the ordinary
+/// trap path; capacity never changes syscall forwarding behavior.
+#[cfg(target_arch = "aarch64")]
+pub const PENDING_PROMOTION_CAPACITY: usize = 64;
+
+/// Result of attempting to record one first-seen trapped `svc` site.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingPromotionRecord {
+    /// This is the first observation of the site and it is now pending.
+    NewSite,
+    /// This site has already been recorded, whether or not it has drained.
+    AlreadyKnown,
+    /// The fixed table is full; this candidate was not retained.
+    TableFull,
+    /// Ordinary-context code held the table when the handler ran. The
+    /// handler does not spin or wait; this candidate was not retained.
+    Contended,
+}
+
+/// Snapshot of lazy-promotion candidate accounting.
+///
+/// Known sites are retained after drain so an unflipped site that traps
+/// again is recognized rather than repeatedly queued for the promoter.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PendingPromotionStats {
+    /// Distinct candidates currently waiting to be drained.
+    pub pending: usize,
+    /// Distinct known candidates accepted since process start, including
+    /// drained candidates retained for de-duplication.
+    pub recorded_new: u64,
+    /// First-seen candidates dropped because the fixed table was full.
+    pub capacity_dropped: u64,
+    /// Record attempts dropped because the handler could not immediately
+    /// acquire the table without waiting.
+    pub contended_dropped: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+struct PendingPromotionData {
+    sites: [u64; PENDING_PROMOTION_CAPACITY],
+    known_len: usize,
+    drained_len: usize,
+    capacity_dropped: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+struct PendingPromotions {
+    inner: crate::sync::SpinMutex<PendingPromotionData>,
+    contended_dropped: core::sync::atomic::AtomicU64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl PendingPromotions {
+    const fn new() -> Self {
+        Self {
+            inner: crate::sync::SpinMutex::new(PendingPromotionData {
+                sites: [0; PENDING_PROMOTION_CAPACITY],
+                known_len: 0,
+                drained_len: 0,
+                capacity_dropped: 0,
+            }),
+            contended_dropped: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn try_record(&self, site: u64) -> PendingPromotionRecord {
+        let Some(mut state) = self.inner.try_lock() else {
+            self.contended_dropped
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return PendingPromotionRecord::Contended;
+        };
+        if state.sites[..state.known_len].contains(&site) {
+            return PendingPromotionRecord::AlreadyKnown;
+        }
+        if state.known_len == PENDING_PROMOTION_CAPACITY {
+            state.capacity_dropped += 1;
+            return PendingPromotionRecord::TableFull;
+        }
+        let insertion = state.known_len;
+        state.sites[insertion] = site;
+        state.known_len += 1;
+        PendingPromotionRecord::NewSite
+    }
+
+    fn drain(&self, out: &mut [u64]) -> usize {
+        let mut state = self.inner.lock();
+        let available = state.known_len - state.drained_len;
+        let count = available.min(out.len());
+        let start = state.drained_len;
+        out[..count].copy_from_slice(&state.sites[start..start + count]);
+        state.drained_len += count;
+        count
+    }
+
+    fn stats(&self) -> PendingPromotionStats {
+        let state = self.inner.lock();
+        PendingPromotionStats {
+            pending: state.known_len - state.drained_len,
+            recorded_new: state.known_len as u64,
+            capacity_dropped: state.capacity_dropped,
+            contended_dropped: self
+                .contended_dropped
+                .load(core::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+static PENDING_PROMOTIONS: PendingPromotions = PendingPromotions::new();
+
+/// Record the first observation of a candidate lazy-promotion site without
+/// allocating or waiting in signal context.
+///
+/// This is record-only plumbing for a future patch promoter. It does not
+/// inspect, patch, or otherwise alter guest code.
+#[cfg(target_arch = "aarch64")]
+pub fn record_pending_promotion_site(site: u64) -> PendingPromotionRecord {
+    PENDING_PROMOTIONS.try_record(site)
+}
+
+/// Remove up to `out.len()` pending sites in first-observed order and
+/// return how many were copied. Intended for ordinary runtime context; this
+/// function may briefly spin if a handler currently holds the table.
+#[cfg(target_arch = "aarch64")]
+pub fn drain_pending_promotion_sites(out: &mut [u64]) -> usize {
+    PENDING_PROMOTIONS.drain(out)
+}
+
+/// Snapshot pending-site accounting from ordinary runtime context.
+#[cfg(target_arch = "aarch64")]
+pub fn pending_promotion_stats() -> PendingPromotionStats {
+    PENDING_PROMOTIONS.stats()
+}
+
 /// Execute a real syscall through the trusted gate.
 ///
 /// The gate's `syscall` instruction is whitelisted in the seccomp filter, so
@@ -898,6 +1035,13 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
     // runtime's restorer alone, so a trapped one is never the runtime's.
     if is_rt_sigreturn(frame.register(8)) {
         unsafe { refuse_guest_signal_return() };
+    }
+    // Record-only lazy-promotion evidence: the validated frame's PC is the
+    // instruction after the 4-byte `svc`. Recording neither examines nor
+    // changes the instruction and never changes whether this call is
+    // dispatched or forwarded.
+    if let Some(site) = (frame.register(32) as u64).checked_sub(4) {
+        let _ = record_pending_promotion_site(site);
     }
     if dispatcher().is_some_and(|dispatcher| dispatcher.dispatch_private_signal(&mut frame)) {
         IN_HANDLER.set(false);
@@ -1665,6 +1809,76 @@ mod aarch64_gate_tests {
     }
 
     #[test]
+    fn pending_promotions_dedup_drain_in_order_and_count_capacity() {
+        let table = PendingPromotions::new();
+        assert_eq!(table.try_record(0x1000), PendingPromotionRecord::NewSite);
+        assert_eq!(
+            table.try_record(0x1000),
+            PendingPromotionRecord::AlreadyKnown
+        );
+        assert_eq!(table.try_record(0x2000), PendingPromotionRecord::NewSite);
+
+        let mut first = [0_u64; 1];
+        assert_eq!(table.drain(&mut first), 1);
+        assert_eq!(first, [0x1000]);
+        assert_eq!(
+            table.stats(),
+            PendingPromotionStats {
+                pending: 1,
+                recorded_new: 2,
+                capacity_dropped: 0,
+                contended_dropped: 0,
+            }
+        );
+
+        // A drained site remains known, so a later trap at that site does
+        // not repeatedly queue the same candidate before promotion.
+        assert_eq!(
+            table.try_record(0x1000),
+            PendingPromotionRecord::AlreadyKnown
+        );
+        let mut rest = [0_u64; PENDING_PROMOTION_CAPACITY];
+        assert_eq!(table.drain(&mut rest), 1);
+        assert_eq!(&rest[..1], &[0x2000]);
+
+        let capacity_table = PendingPromotions::new();
+        for index in 0..PENDING_PROMOTION_CAPACITY {
+            let site = 0x4000 + index as u64 * 4;
+            assert_eq!(
+                capacity_table.try_record(site),
+                PendingPromotionRecord::NewSite
+            );
+        }
+        assert_eq!(
+            capacity_table.try_record(0x9000),
+            PendingPromotionRecord::TableFull
+        );
+        let mut drained = [0_u64; PENDING_PROMOTION_CAPACITY];
+        assert_eq!(
+            capacity_table.drain(&mut drained),
+            PENDING_PROMOTION_CAPACITY
+        );
+        // Retained known-site identity still occupies the bounded table
+        // after drain; capacity is a lifetime-known bound in this slice.
+        assert_eq!(
+            capacity_table.try_record(0x9000),
+            PendingPromotionRecord::TableFull
+        );
+        assert_eq!(capacity_table.stats().capacity_dropped, 2);
+    }
+
+    #[test]
+    fn pending_promotions_never_spin_from_handler_context() {
+        let table = PendingPromotions::new();
+        let result = {
+            let _held_by_ordinary_context = table.inner.lock();
+            table.try_record(0x3000)
+        };
+        assert_eq!(result, PendingPromotionRecord::Contended);
+        assert_eq!(table.stats().contended_dropped, 1);
+    }
+
+    #[test]
     fn aarch64_gate_executes_and_nearby_site_traps() {
         const CHILD: &str = "REVERIE_TEST_AARCH64_GATE";
         if std::env::var_os(CHILD).is_some() {
@@ -1694,6 +1908,19 @@ mod aarch64_gate_tests {
     thread_local! {
         static CAPTURE: core::cell::RefCell<Option<frame::SavedState>> =
             const { core::cell::RefCell::new(None) };
+    }
+
+    // Two distinct local SVC sites for pending-promotion evidence. A libc
+    // variadic syscall wrapper would make distinct guest calls share its one
+    // internal SVC address, so it cannot prove site identity by itself.
+    #[unsafe(naked)]
+    unsafe extern "C" fn local_svc_getpid_a() -> i64 {
+        core::arch::naked_asm!("mov x8, #172", "svc #0", "ret")
+    }
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn local_svc_getpid_b() -> i64 {
+        core::arch::naked_asm!("nop", "mov x8, #172", "svc #0", "ret")
     }
 
     static VL_ATTEMPT_ARMED: core::sync::atomic::AtomicBool =
@@ -1776,9 +2003,46 @@ mod aarch64_gate_tests {
             if filter.install().is_err() {
                 raw_syscall6(libc::SYS_exit_group, [52, 0, 0, 0, 0, 0]);
             }
-            // Trapped and spoofed, with capture/restore in between.
-            if libc::syscall(libc::SYS_getpid) != 424_243 {
+            // Trapped and spoofed, with capture/restore in between. The two
+            // local SVC sites prove pending recording is by exact trapped
+            // instruction address, not merely syscall number.
+            if local_svc_getpid_a() != 424_243 {
                 raw_syscall6(libc::SYS_exit_group, [61, 0, 0, 0, 0, 0]);
+            }
+            let mut first_sites = [0_u64; PENDING_PROMOTION_CAPACITY];
+            if drain_pending_promotion_sites(&mut first_sites) != 1
+                || first_sites[0] == 0
+                || !first_sites[0].is_multiple_of(4)
+                || pending_promotion_stats().pending != 0
+                || pending_promotion_stats().recorded_new != 1
+            {
+                raw_syscall6(libc::SYS_exit_group, [75, 0, 0, 0, 0, 0]);
+            }
+            if local_svc_getpid_a() != 424_243 {
+                raw_syscall6(libc::SYS_exit_group, [61, 0, 0, 0, 0, 0]);
+            }
+            let mut repeated_sites = [0_u64; PENDING_PROMOTION_CAPACITY];
+            let repeated_count = drain_pending_promotion_sites(&mut repeated_sites);
+            if repeated_count != 0 {
+                let diagnostic = if repeated_count == 1 && repeated_sites[0] == first_sites[0] {
+                    76
+                } else {
+                    79
+                };
+                raw_syscall6(libc::SYS_exit_group, [diagnostic, 0, 0, 0, 0, 0]);
+            }
+            if local_svc_getpid_b() != 424_243 {
+                raw_syscall6(libc::SYS_exit_group, [77, 0, 0, 0, 0, 0]);
+            }
+            let mut second_sites = [0_u64; PENDING_PROMOTION_CAPACITY];
+            let pending_stats = pending_promotion_stats();
+            if drain_pending_promotion_sites(&mut second_sites) != 1
+                || second_sites[0] == first_sites[0]
+                || pending_stats.recorded_new != 2
+                || pending_stats.capacity_dropped != 0
+                || pending_stats.contended_dropped != 0
+            {
+                raw_syscall6(libc::SYS_exit_group, [78, 0, 0, 0, 0, 0]);
             }
             // Trapped and forwarded: the real parent pid comes back.
             if libc::syscall(libc::SYS_getppid) != ppid {
