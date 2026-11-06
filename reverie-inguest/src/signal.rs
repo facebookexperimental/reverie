@@ -341,8 +341,13 @@ mod tests {
             ..KernelSigaction::default()
         };
         unsafe { raw_sigaction(signal, Some(&default), None) }.unwrap();
-        // The restorer's syscall is `mov eax, 15` (5 bytes) then `syscall` (2).
+        // The restorer's syscall instruction follows its number load:
+        // x86-64 `mov eax, 15` (5 bytes) + `syscall` (2); aarch64
+        // `mov x8, #139` (4) + `svc` (4). The return IP is just past it.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(signal_restorer_return_ip(), signal_restorer() + 7);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(signal_restorer_return_ip(), signal_restorer() + 8);
     }
 
     #[test]

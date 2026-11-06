@@ -797,10 +797,12 @@ mod tests {
     #[test]
     fn own_byte_reads_stop_at_an_unreadable_page_without_faulting() {
         use super::read_own_bytes;
+        // Hosts run 4 KiB and 64 KiB pages; geometry follows the runtime.
+        let page = crate::arch::page_size().unwrap() as usize;
         let pages = unsafe {
             libc::mmap(
                 core::ptr::null_mut(),
-                8192,
+                page * 2,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -810,25 +812,25 @@ mod tests {
         .cast::<u8>();
         assert_ne!(pages.cast(), libc::MAP_FAILED);
         unsafe {
-            pages.add(4094).write(0x0f);
-            pages.add(4095).write(0xa2);
+            pages.add(page - 2).write(0x0f);
+            pages.add(page - 1).write(0xa2);
             assert_eq!(
-                libc::mprotect(pages.add(4096).cast(), 4096, libc::PROT_NONE),
+                libc::mprotect(pages.add(page).cast(), page, libc::PROT_NONE),
                 0
             );
         }
         let mut bytes = [0_u8; 8];
         assert_eq!(
-            unsafe { read_own_bytes(pages as u64 + 4094, &mut bytes) },
+            unsafe { read_own_bytes(pages as u64 + (page - 2) as u64, &mut bytes) },
             2
         );
         assert_eq!(&bytes[..2], &[0x0f, 0xa2]);
         assert_eq!(
-            unsafe { read_own_bytes(pages as u64 + 4096, &mut bytes) },
+            unsafe { read_own_bytes(pages as u64 + page as u64, &mut bytes) },
             0
         );
         assert_eq!(unsafe { read_own_bytes(0, &mut bytes) }, 0);
         assert_eq!(unsafe { read_own_bytes(u64::MAX - 1, &mut bytes) }, 0);
-        unsafe { libc::munmap(pages.cast(), 8192) };
+        unsafe { libc::munmap(pages.cast(), page * 2) };
     }
 }

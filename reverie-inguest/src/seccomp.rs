@@ -662,13 +662,14 @@ mod tests {
             return_ip: 0x5678_0000_2002,
         };
         let restorer = 0x9abc_0000_3007;
+        let native_arch = crate::arch::FILTER_ABI_NATIVE.audit_arch;
         let filter =
             SeccompFilter::for_trusted_gates_with_signal_return(first, second, Some(restorer))
                 .unwrap();
         assert_eq!(filter.len(), 23);
         let sigreturn = libc::SYS_rt_sigreturn;
         assert_eq!(
-            evaluate(&filter, AUDIT_ARCH_X86_64, sigreturn, restorer),
+            evaluate(&filter, native_arch, sigreturn, restorer),
             SECCOMP_RET_ALLOW
         );
         for elsewhere in [
@@ -682,7 +683,7 @@ mod tests {
             0x7fff_dead_beef,
         ] {
             assert_eq!(
-                evaluate(&filter, AUDIT_ARCH_X86_64, sigreturn, elsewhere),
+                evaluate(&filter, native_arch, sigreturn, elsewhere),
                 SECCOMP_RET_TRAP,
                 "{elsewhere:#x}"
             );
@@ -696,8 +697,8 @@ mod tests {
                 0x7fff_dead_beef,
             ] {
                 assert_eq!(
-                    evaluate(&filter, AUDIT_ARCH_X86_64, number, address),
-                    evaluate(&plain, AUDIT_ARCH_X86_64, number, address),
+                    evaluate(&filter, native_arch, number, address),
+                    evaluate(&plain, native_arch, number, address),
                     "{number} at {address:#x}"
                 );
             }
@@ -708,7 +709,7 @@ mod tests {
         );
         // Without a restorer, rt_sigreturn is admitted anywhere, as before.
         assert_eq!(
-            evaluate(&plain, AUDIT_ARCH_X86_64, sigreturn, 0x7fff_dead_beef),
+            evaluate(&plain, native_arch, sigreturn, 0x7fff_dead_beef),
             SECCOMP_RET_ALLOW
         );
     }
@@ -723,12 +724,13 @@ mod tests {
             syscall_ip: 0x5678_0000_2000,
             return_ip: 0x5678_0000_2002,
         };
+        let native_arch = crate::arch::FILTER_ABI_NATIVE.audit_arch;
         let filter = SeccompFilter::for_trusted_gates(first, second).unwrap();
         assert_eq!(filter.len(), 17);
         for gate in [first, second] {
             for address in [gate.syscall_ip, gate.return_ip] {
                 assert_eq!(
-                    evaluate(&filter, AUDIT_ARCH_X86_64, libc::SYS_write, address),
+                    evaluate(&filter, native_arch, libc::SYS_write, address),
                     SECCOMP_RET_ALLOW
                 );
                 for forbidden in [
@@ -738,7 +740,7 @@ mod tests {
                     address as u32 as u64,
                 ] {
                     assert_eq!(
-                        evaluate(&filter, AUDIT_ARCH_X86_64, libc::SYS_write, forbidden),
+                        evaluate(&filter, native_arch, libc::SYS_write, forbidden),
                         SECCOMP_RET_TRAP,
                         "{forbidden:#x}"
                     );
@@ -750,7 +752,7 @@ mod tests {
             }
         }
         assert_eq!(
-            evaluate(&filter, AUDIT_ARCH_X86_64, libc::SYS_rt_sigreturn, 0),
+            evaluate(&filter, native_arch, libc::SYS_rt_sigreturn, 0),
             SECCOMP_RET_ALLOW
         );
         assert_eq!(
@@ -758,21 +760,11 @@ mod tests {
             SECCOMP_RET_KILL_PROCESS
         );
         assert_eq!(
-            evaluate(
-                &filter,
-                AUDIT_ARCH_X86_64,
-                libc::SYS_write,
-                0x1234_0000_2000
-            ),
+            evaluate(&filter, native_arch, libc::SYS_write, 0x1234_0000_2000),
             SECCOMP_RET_TRAP
         );
         assert_eq!(
-            evaluate(
-                &filter,
-                AUDIT_ARCH_X86_64,
-                libc::SYS_write,
-                0x5678_0000_1000
-            ),
+            evaluate(&filter, native_arch, libc::SYS_write, 0x5678_0000_1000),
             SECCOMP_RET_TRAP
         );
         let invalid = TrustedGate {
