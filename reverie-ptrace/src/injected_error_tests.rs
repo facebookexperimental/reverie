@@ -345,26 +345,20 @@ impl Drop for Fixture {
     }
 }
 
-/// Reaps `tid` iff it is this test process's own zombie child. An effect
-/// task orphaned when its root dies is reparented to the test process; the
+/// Reaps `tid` iff it is this test process's own child. An effect task
+/// orphaned when its root dies is reparented to the test process; the
 /// driver has already reported it SIGKILL-terminal, but nobody has waited
 /// on it, so `/proc/<tid>` lingers as a zombie until we reap it here.
-/// Waiting on that exact waitpid is waiting on the reap event itself.
+/// A blocking waitpid on the exact tid waits on the reap event itself:
+/// it returns once the delivered SIGKILL makes the task a zombie and
+/// reaps it, and fails with ECHILD at once when the task is not our
+/// child (or was already reaped). Sampling `/proc` state once instead
+/// raced the zombie transition under load (green6, 2026-11-05: the
+/// one-shot check observed a pre-zombie state and returned unreaped).
 fn reap_adopted_zombie(tid: i32) {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{tid}/stat")) else {
-        return;
-    };
-    let Some(close) = stat.rfind(')') else { return };
-    let mut fields = stat[close + 2..].split_whitespace();
-    let (Some(state), Some(ppid)) = (fields.next(), fields.next()) else {
-        return;
-    };
-    if state != "Z" || ppid.parse::<u32>().ok() != Some(std::process::id()) {
-        return;
-    }
     let mut status = 0;
-    // SAFETY: tid was just observed as our own zombie child; waitpid on it
-    // reaps exactly that child and writes only `status`.
+    // SAFETY: waitpid on an exact tid reaps at most that one child and
+    // writes only `status`; for a non-child it fails without effect.
     unsafe { libc::waitpid(tid, &mut status, 0) };
 }
 
