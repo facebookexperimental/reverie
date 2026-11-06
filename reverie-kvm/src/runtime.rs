@@ -5977,13 +5977,15 @@ impl KvmBackend {
                         let frame_address = exit.args[0];
                         let return_slot = std::ptr::from_mut(exit.ret) as usize;
                         let registers = self.vcpu.get_regs()?;
-                        let request = SyscallRequest::read_from(&memory, frame_address)?;
-                        let syscall = request.into_syscall()?;
+                        let mut request = SyscallRequest::read_from(&memory, frame_address)?;
+                        let mut syscall = request.into_syscall()?;
                         let subscribed = subscribed_syscalls.contains(syscall.number());
                         let result = if subscribed {
-                            // Same `ERESTARTSYS` restart protocol as the
-                            // process-syscall path below; see
-                            // `classify_handler_result`.
+                            // Same restart protocol as the process-syscall
+                            // path below; see `classify_handler_result`. This
+                            // transport delivers no signals, so a restart class
+                            // always takes Linux's no-handler rule
+                            // (`RestartClass::number_without_handler`).
                             loop {
                                 let handler_signal = Arc::new(Mutex::new(None));
                                 let pending_child_starts = Arc::new(Mutex::new(Vec::new()));
@@ -6043,8 +6045,25 @@ impl KvmBackend {
                                 break match outcome {
                                     HandlerOutcome::Returned(result) => {
                                         match classify_handler_result(result)? {
-                                            Some(raw) => raw,
-                                            None => continue,
+                                            HandlerResult::Complete(raw) => raw,
+                                            HandlerResult::Restart(class)
+                                                if class.reruns_same_syscall() =>
+                                            {
+                                                continue;
+                                            }
+                                            // `restart_syscall` with the
+                                            // interrupted call's arguments.
+                                            HandlerResult::Restart(class) => {
+                                                request = SyscallRequest::new(
+                                                    class.number_without_handler(request.number()),
+                                                    *request.args(),
+                                                );
+                                                syscall = request.into_syscall()?;
+                                                if subscribed_syscalls.contains(syscall.number()) {
+                                                    continue;
+                                                }
+                                                executor.execute(&request, &memory)
+                                            }
                                         }
                                     }
                                     HandlerOutcome::TailInjected { result, .. } => {
@@ -8122,16 +8141,18 @@ impl KvmBackend {
                     restart_requested,
                 ) = if subscribed {
                     let mut handler_process_completed = false;
-                    // With no eligible virtual signal, ERESTARTSYS immediately
-                    // re-enters the callback as before. With one, leave the loop so
-                    // the structured signal hook and disposition decide whether
-                    // the saved context reports EINTR or rewinds the syscall under
-                    // SA_RESTART. The private errno itself never reaches userspace.
+                    // With no eligible virtual signal, a restart class that
+                    // re-runs the same syscall immediately re-enters the
+                    // callback. With one, or for ERESTART_RESTARTBLOCK, leave
+                    // the loop so the structured signal hook, the disposition,
+                    // SA_RESTART and the class decide whether the saved context
+                    // reports EINTR or rewinds the syscall (`RestartClass`).
+                    // The private errno itself never reaches userspace.
                     loop {
                         // The syscall event cancels an outstanding timer
                         // request before its callback, which may request
-                        // another. A callback run again after ERESTARTSYS is
-                        // the syscall's event again.
+                        // another. A callback run again after a restart class
+                        // is the syscall's event again.
                         self.vcpu.cancel_timer();
                         let (handler_signal, pending_child_starts) = callback_context.begin();
                         self.check_entry_owner()?;
@@ -8243,21 +8264,28 @@ impl KvmBackend {
                                     }
                                 };
                                 match classified {
-                                    Some(raw) => (raw, false, handler_process_completed, false),
-                                    None if !handler_process_completed
-                                        && (executor.has_prepared_signal()
-                                            || executor.has_eligible_pending_signal()) =>
+                                    HandlerResult::Complete(raw) => {
+                                        (raw, false, handler_process_completed, None)
+                                    }
+                                    HandlerResult::Restart(class)
+                                        if !handler_process_completed
+                                            && (executor.has_prepared_signal()
+                                                || executor.has_eligible_pending_signal()) =>
                                     {
                                         // A prepared signal was already removed from
                                         // pending. Deliver its frame before another
                                         // callback invalidates the selection's nonce;
-                                        // the frame's SA_RESTART policy decides whether
-                                        // the syscall runs again after the handler.
-                                        (-(libc::EINTR as i64), false, false, true)
+                                        // the class and the frame's SA_RESTART decide
+                                        // whether the syscall runs again after the
+                                        // handler.
+                                        (-(libc::EINTR as i64), false, false, Some(class))
                                     }
                                     // A restart is only meaningful while the process
                                     // is still live to re-run the syscall.
-                                    None if !handler_process_completed => {
+                                    HandlerResult::Restart(class)
+                                        if !handler_process_completed
+                                            && class.reruns_same_syscall() =>
+                                    {
                                         self.start_pending_tool_children(
                                             executor,
                                             &pending_child_starts,
@@ -8265,12 +8293,18 @@ impl KvmBackend {
                                         callback_context.keep_child_starts(pending_child_starts);
                                         continue;
                                     }
-                                    None => (
-                                        -(i64::from(Errno::ERESTARTSYS.into_raw())),
-                                        false,
-                                        handler_process_completed,
-                                        false,
-                                    ),
+                                    // ERESTART_RESTARTBLOCK with no signal: the
+                                    // return boundary resumes the guest at the
+                                    // syscall instruction with restart_syscall in
+                                    // rax, which the Tool then sees as its own
+                                    // event, unless a signal selected there runs a
+                                    // handler, which makes it EINTR.
+                                    HandlerResult::Restart(class) if !handler_process_completed => {
+                                        (-(libc::EINTR as i64), false, false, Some(class))
+                                    }
+                                    HandlerResult::Restart(class) => {
+                                        (class.raw(), false, handler_process_completed, None)
+                                    }
                                 }
                             }
                             HandlerOutcome::TailInjected {
@@ -8281,7 +8315,7 @@ impl KvmBackend {
                                 result_to_raw(result),
                                 image_replaced,
                                 handler_process_completed,
-                                false,
+                                None,
                             ),
                             HandlerOutcome::GroupExit(status) => {
                                 self.prepare_wait_group_exit(
@@ -8393,7 +8427,7 @@ impl KvmBackend {
                         Some(raw),
                     )
                     .await?;
-                    (raw, false, false, false)
+                    (raw, false, false, None)
                 };
                 // The ring0 trampoline reads the result from the frame and then
                 // SYSRETs, so the hypercall return slot is unused here.
@@ -8401,9 +8435,13 @@ impl KvmBackend {
                 // returned values and a tuple.
                 let mut returned_registers = registers;
                 let mut restarted_registers = None;
-                if restart_requested {
+                if let Some(class) = restart_requested {
                     // A rewind can fail between the read and the store, and
                     // then nothing may be stored: keep the two copies.
+                    // `restarted_registers` holds the no-handler restart; a
+                    // caught signal uses it only for a class that restarts
+                    // after a handler, whose number is the interrupted
+                    // syscall's (`RestartClass::restarts_after_handler`).
                     returned_registers = process_syscall_return_registers(
                         &memory,
                         registers,
@@ -8413,7 +8451,7 @@ impl KvmBackend {
                     )?;
                     restarted_registers = Some(restart_syscall_registers(
                         returned_registers,
-                        request.number(),
+                        class.number_without_handler(request.number()),
                     )?);
                     SyscallRequest::write_result(&mut memory, frame_address, result)?;
                 } else {
@@ -8486,8 +8524,11 @@ impl KvmBackend {
                             None,
                         )?;
                         restarted_registers = restart_requested
-                            .then(|| {
-                                restart_syscall_registers(returned_registers, request.number())
+                            .map(|class| {
+                                restart_syscall_registers(
+                                    returned_registers,
+                                    class.number_without_handler(request.number()),
+                                )
                             })
                             .transpose()?;
                     }
@@ -8684,7 +8725,7 @@ impl KvmBackend {
                         && let Some(pending) = pending
                     {
                         let signal_registers = if restart_requested
-                            && executor.caught_signal_restarts_syscall(pending)
+                            .is_some_and(|class| caught_signal_restarts(executor, pending, class))
                         {
                             restarted_registers.expect("restart registers were constructed")
                         } else {
@@ -8713,11 +8754,12 @@ impl KvmBackend {
                     };
                     #[cfg(test)]
                     signal_return_observation::note_boundary_outcome(signal_boundary_outcome);
-                    if restart_requested && !delivered && pending_exit.is_none() {
-                        // Suppression, an ignored replacement, or a replacement
-                        // newly blocked by its signal number means no handler ran;
-                        // resume by re-executing the original syscall rather than
-                        // leaking EINTR or the kernel-private ERESTARTSYS value.
+                    if restart_requested.is_some() && !delivered && pending_exit.is_none() {
+                        // No signal, suppression, an ignored replacement, or a
+                        // replacement newly blocked by its signal number means no
+                        // handler ran; resume by re-executing the syscall the
+                        // class names (`RestartClass::number_without_handler`)
+                        // rather than leaking EINTR or the kernel-private value.
                         stage_process_syscall_return(
                             &mut memory,
                             &self.vcpu,
@@ -8843,47 +8885,157 @@ fn entry_handler_outcome_needs_routing<R>(outcome: &HandlerOutcome<R>, entry: &R
     entry.is_err() || matches!(outcome, HandlerOutcome::RuntimeError(_))
 }
 
+/// A Linux-internal syscall restart class a Tool handler returned
+/// (include/linux/errno.h, v6.17: `ERESTARTSYS` 512, `ERESTARTNOINTR` 513,
+/// `ERESTARTNOHAND` 514, `ERESTART_RESTARTBLOCK` 516). Linux never delivers
+/// one to userspace: its signal-delivery path consumes it at the syscall's
+/// return and either reports `EINTR` or restarts the syscall.
+///
+/// Under `reverie-ptrace` the host kernel does that: the tracee's return
+/// register holds the class and Linux's signal path applies the rule below.
+/// A KVM guest is not a host process resumed through that path, so this
+/// backend applies the same rule at its own syscall-return boundary. It only
+/// rewrites the frame the guest resumes with (the return word, or the syscall
+/// number and instruction pointer of a restart); it emulates no syscall.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartClass {
+    /// `ERESTARTSYS`: `EINTR` after a handler unless its action has
+    /// `SA_RESTART`; restarted when no handler runs.
+    Sys,
+    /// `ERESTARTNOINTR`: always restarted, handler or not.
+    NoIntr,
+    /// `ERESTARTNOHAND`: `EINTR` after a handler; restarted when none runs.
+    NoHand,
+    /// `ERESTART_RESTARTBLOCK`: `EINTR` after a handler; when none runs the
+    /// thread resumes at the syscall instruction with `restart_syscall` in
+    /// `rax` and its argument registers as they were.
+    RestartBlock,
+}
+
+impl RestartClass {
+    fn from_errno(errno: Errno) -> Option<Self> {
+        match errno {
+            Errno::ERESTARTSYS => Some(Self::Sys),
+            Errno::ERESTARTNOINTR => Some(Self::NoIntr),
+            Errno::ERESTARTNOHAND => Some(Self::NoHand),
+            Errno::ERESTART_RESTARTBLOCK => Some(Self::RestartBlock),
+            _ => None,
+        }
+    }
+
+    /// The class as the raw negative word Linux leaves in `rax`.
+    fn raw(self) -> i64 {
+        let errno = match self {
+            Self::Sys => Errno::ERESTARTSYS,
+            Self::NoIntr => Errno::ERESTARTNOINTR,
+            Self::NoHand => Errno::ERESTARTNOHAND,
+            Self::RestartBlock => Errno::ERESTART_RESTARTBLOCK,
+        };
+        -i64::from(errno.into_raw())
+    }
+
+    /// Whether the syscall restarts when a caught signal's handler frame is
+    /// set up, given whether that handler's action has `SA_RESTART`.
+    ///
+    /// arch/x86/kernel/signal.c (v6.17) `handle_signal`:
+    /// `-ERESTART_RESTARTBLOCK` and `-ERESTARTNOHAND` become `-EINTR`;
+    /// `-ERESTARTSYS` becomes `-EINTR` unless `SA_RESTART` is set, and
+    /// otherwise falls through to `-ERESTARTNOINTR`, which always restarts
+    /// (`regs->ax = regs->orig_ax; regs->ip -= 2`).
+    fn restarts_after_handler(self, sa_restart: bool) -> bool {
+        match self {
+            Self::Sys => sa_restart,
+            Self::NoIntr => true,
+            Self::NoHand | Self::RestartBlock => false,
+        }
+    }
+
+    /// The syscall number the thread re-executes when no handler runs: no
+    /// signal, or one that was ignored or suppressed.
+    ///
+    /// arch/x86/kernel/signal.c (v6.17) `arch_do_signal_or_restart`:
+    /// `-ERESTARTNOHAND`, `-ERESTARTSYS` and `-ERESTARTNOINTR` restore
+    /// `orig_ax`; `-ERESTART_RESTARTBLOCK` loads `get_nr_restart_syscall()`
+    /// (`__NR_restart_syscall` for a 64-bit task). Both rewind `ip` by two.
+    fn number_without_handler(self, interrupted: u64) -> u64 {
+        match self {
+            Self::RestartBlock => libc::SYS_restart_syscall as u64,
+            Self::Sys | Self::NoIntr | Self::NoHand => interrupted,
+        }
+    }
+
+    /// Whether a restart without a handler re-runs the interrupted syscall
+    /// itself, so the backend may re-enter the same Tool callback in place
+    /// rather than resume the guest at the rewound instruction. A
+    /// `restart_syscall` is a different syscall the guest then makes: the
+    /// Tool sees it as its own event, which is how it finds the restart
+    /// record it kept when it returned `ERESTART_RESTARTBLOCK` (Linux's
+    /// `current->restart_block`, kernel/signal.c `sys_restart_syscall`).
+    fn reruns_same_syscall(self) -> bool {
+        !matches!(self, Self::RestartBlock)
+    }
+}
+
+/// What a Tool handler's return value asks of the syscall frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandlerResult {
+    /// The raw word the guest's syscall returns.
+    Complete(i64),
+    /// A Linux-internal restart class, which signal disposition resolves.
+    Restart(RestartClass),
+}
+
 /// Resolve a Tool handler's return value into the raw word written to the
-/// guest's syscall frame, or `None` when the `ERESTARTSYS` protocol requires
-/// either re-running the Tool callback or applying signal-disposition restart
-/// policy at the static-ELF return boundary.
+/// guest's syscall frame, or the [`RestartClass`] whose Linux rule the
+/// backend then applies.
 ///
-/// `ERESTARTSYS` is kernel-private: Linux never delivers it to userspace. It
-/// either re-issues the interrupted syscall or reports `EINTR`. Detcore returns
-/// it from `signal_interrupt_errno()` for the syscalls it models as restartable
-/// (`read`, `futex`, ...) to mean exactly "re-run me". Under `reverie-ptrace`
-/// the host kernel consumes it: the tracee's return register is set to
-/// `-ERESTARTSYS` alongside a pending signal and Linux's signal-delivery path
-/// rewinds and re-issues the syscall. A KVM guest is not a host process resumed
-/// through that path, so this backend must repeat the callback itself. Without
-/// it the private 512 reaches the guest as an application-visible errno.
+/// Detcore returns these classes exactly as Linux's own syscalls do:
+/// `ERESTARTSYS` from `signal_interrupt_errno()` for the syscalls it models
+/// as restartable (`read`, `futex`, ...), `ERESTARTNOINTR` for a transparent
+/// restart, `ERESTARTNOHAND` for a wait a handler interrupts, and
+/// `ERESTART_RESTARTBLOCK` for a timed wait it keeps a restart record for.
+/// Without this resolution a private value would reach the guest as an
+/// application-visible errno.
 ///
-/// With no eligible virtual signal the callback is re-entered immediately. If
-/// one is pending, the static-ELF loop runs the structured signal hook first,
-/// then saves either `EINTR` or a rewound syscall according to the final
-/// signal's disposition and `SA_RESTART`. The other Linux-internal restart
-/// classes are not part of Reverie's current Tool contract and fail explicitly
-/// if a Tool manufactures one.
+/// With no eligible virtual signal, a class that re-runs the same syscall
+/// (all but `ERESTART_RESTARTBLOCK`) re-enters the callback immediately. If a
+/// signal is pending, or the class is `ERESTART_RESTARTBLOCK`, the static-ELF
+/// loop goes on to its return boundary: the structured signal hook runs
+/// first, then the frame saves `EINTR` or a rewound syscall according to the
+/// final signal's disposition, its `SA_RESTART`, and the class
+/// ([`RestartClass::restarts_after_handler`],
+/// [`RestartClass::number_without_handler`]).
 ///
 /// Isolating the policy in one pure function keeps it directly testable. Note
 /// that testing it does not test restart execution; integration tests cover
 /// both callback re-entry and signal-disposition-dependent frame restoration.
 fn classify_handler_result(
     result: std::result::Result<i64, reverie::Error>,
-) -> Result<Option<i64>> {
+) -> Result<HandlerResult> {
     match result {
-        Ok(value) => Ok(Some(value)),
-        Err(error) => match error.into_errno().map_err(Error::Reverie)? {
-            Errno::ERESTARTSYS => Ok(None),
-            errno if matches!(errno.into_raw(), 513 | 514 | 516) => {
-                Err(Error::UnexpectedVcpuExit(format!(
-                    "unsupported Linux-internal syscall restart class {}",
-                    errno.into_raw(),
-                )))
-            }
-            errno => Ok(Some(-(i64::from(errno.into_raw())))),
-        },
+        Ok(value) => Ok(HandlerResult::Complete(value)),
+        Err(error) => {
+            let errno = error.into_errno().map_err(Error::Reverie)?;
+            Ok(match RestartClass::from_errno(errno) {
+                Some(class) => HandlerResult::Restart(class),
+                None => HandlerResult::Complete(-(i64::from(errno.into_raw()))),
+            })
+        }
     }
+}
+
+/// Whether a caught signal's handler frame saves the rewound syscall for
+/// `class` rather than `EINTR` (`RestartClass::restarts_after_handler`). Only
+/// a signal whose disposition is a handler sets up a frame; any other leaves
+/// the no-handler restart to the caller.
+fn caught_signal_restarts(
+    executor: &ElfExecutor,
+    pending: PendingSignal,
+    class: RestartClass,
+) -> bool {
+    executor.signal_disposition(pending.event.signal())
+        == crate::executor::SignalDisposition::Handled
+        && class.restarts_after_handler(executor.caught_signal_restarts_syscall(pending))
 }
 
 fn restart_syscall_registers(mut registers: kvm_regs, syscall_number: u64) -> Result<kvm_regs> {
@@ -9684,49 +9836,77 @@ mod tests {
     }
 
     #[test]
-    fn erestartsys_requests_a_restart_and_every_other_result_is_returned() {
-        // The whole point of the protocol: the kernel-private 512 must never
-        // become the guest's syscall result, so it maps to "re-run", not to a
-        // raw word.
+    fn restart_classes_request_a_restart_and_every_other_result_is_returned() {
+        // The whole point of the protocol: no kernel-private restart class
+        // may become the guest's syscall result, so each maps to a restart
+        // whose Linux rule the return boundary applies, not to a raw word.
+        // include/linux/errno.h (v6.17) numbers them 512, 513, 514 and 516.
+        for (raw, class) in [
+            (512, RestartClass::Sys),
+            (513, RestartClass::NoIntr),
+            (514, RestartClass::NoHand),
+            (516, RestartClass::RestartBlock),
+        ] {
+            assert_eq!(
+                classify_handler_result(Err(Errno::new(raw).into())).unwrap(),
+                HandlerResult::Restart(class),
+                "restart class {raw}",
+            );
+            assert_eq!(class.raw(), -i64::from(raw));
+        }
+
+        // 515 (ENOIOCTLCMD) is kernel-private too but is no restart class;
+        // it is not this function's business to reinterpret it.
         assert_eq!(
-            classify_handler_result(Err(Errno::ERESTARTSYS.into())).unwrap(),
-            None
+            classify_handler_result(Err(Errno::new(515).into())).unwrap(),
+            HandlerResult::Complete(-515)
         );
 
         // Ordinary errnos still reach the guest, negated, exactly as before.
         assert_eq!(
             classify_handler_result(Err(Errno::EINTR.into())).unwrap(),
-            Some(-(libc::EINTR as i64))
+            HandlerResult::Complete(-(libc::EINTR as i64))
         );
         assert_eq!(
             classify_handler_result(Err(Errno::EBADF.into())).unwrap(),
-            Some(-(libc::EBADF as i64))
+            HandlerResult::Complete(-(libc::EBADF as i64))
         );
 
-        for unsupported in [513, 514, 516] {
-            let error = classify_handler_result(Err(Errno::new(unsupported).into())).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("unsupported Linux-internal syscall restart class"),
-                "unexpected error for restart class {unsupported}: {error}",
-            );
-        }
-
         // Success values pass through untouched, including 0 and large reads.
-        assert_eq!(classify_handler_result(Ok(0)).unwrap(), Some(0));
-        assert_eq!(classify_handler_result(Ok(4096)).unwrap(), Some(4096));
+        assert_eq!(
+            classify_handler_result(Ok(0)).unwrap(),
+            HandlerResult::Complete(0)
+        );
+        assert_eq!(
+            classify_handler_result(Ok(4096)).unwrap(),
+            HandlerResult::Complete(4096)
+        );
+    }
 
-        // A guard against the defect this replaced: no input may produce the
-        // private restart value as a guest-visible result.
-        let private = -(i64::from(Errno::ERESTARTSYS.into_raw()));
-        for result in [
-            Err(Errno::ERESTARTSYS.into()),
-            Err(Errno::EINTR.into()),
-            Err(Errno::EAGAIN.into()),
-            Ok(0),
+    #[test]
+    fn restart_classes_follow_linux_handle_signal_and_arch_do_signal_or_restart() {
+        const INTERRUPTED: u64 = libc::SYS_getpid as u64;
+        const RESTART_SYSCALL: u64 = libc::SYS_restart_syscall as u64;
+        // (class, restarts after a handler without SA_RESTART, with it,
+        // syscall number re-executed when no handler runs)
+        for (class, without, with, no_handler) in [
+            (RestartClass::Sys, false, true, INTERRUPTED),
+            (RestartClass::NoIntr, true, true, INTERRUPTED),
+            (RestartClass::NoHand, false, false, INTERRUPTED),
+            (RestartClass::RestartBlock, false, false, RESTART_SYSCALL),
         ] {
-            assert_ne!(classify_handler_result(result).unwrap(), Some(private));
+            assert_eq!(class.restarts_after_handler(false), without, "{class:?}");
+            assert_eq!(class.restarts_after_handler(true), with, "{class:?}");
+            assert_eq!(
+                class.number_without_handler(INTERRUPTED),
+                no_handler,
+                "{class:?}"
+            );
+            assert_eq!(
+                class.reruns_same_syscall(),
+                no_handler == INTERRUPTED,
+                "{class:?}"
+            );
         }
     }
 

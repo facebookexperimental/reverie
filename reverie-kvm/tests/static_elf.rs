@@ -14092,6 +14092,247 @@ int main(int argc, char **argv) {
     }
 }
 
+/// The callbacks `RestartClassTool` saw, in order: 0 for the interrupted
+/// `getpid`, 1 for the structured signal hook, 2 for `restart_syscall`.
+#[derive(Default)]
+struct RestartClassLog {
+    callbacks: Mutex<Vec<u8>>,
+}
+
+impl RestartClassLog {
+    fn callbacks(&self) -> Vec<u8> {
+        self.callbacks
+            .lock()
+            .expect("restart class log lock poisoned")
+            .clone()
+    }
+}
+
+#[reverie::global_tool]
+impl GlobalTool for RestartClassLog {
+    type Request = u8;
+    type Response = ();
+    /// `class * 100 + mode`; see `RestartClassTool`.
+    type Config = u32;
+
+    async fn receive_rpc(&self, _from: Pid, callback: u8) {
+        self.callbacks
+            .lock()
+            .expect("restart class log lock poisoned")
+            .push(callback);
+    }
+}
+
+/// The argument the guest passes its interrupted `getpid` in `rdi`, which a
+/// `restart_syscall` must still hold: Linux's restart rewrites only `rax` and
+/// the instruction pointer (`arch_do_signal_or_restart`).
+const RESTART_CLASS_MARKER: u64 = 0x5150;
+
+/// Returns the Linux-internal restart class `config / 100` from the first
+/// `getpid`, after deferring a SIGUSR1 to the calling thread unless the mode
+/// (`config % 100`) is 3. Mode 4 replaces that signal with the default-ignored
+/// SIGWINCH in the signal hook, and mode 5 suppresses it, so no handler runs
+/// in modes 3 to 5. The second `getpid` returns 77 and a `restart_syscall`
+/// returns 88.
+#[derive(Clone, Copy, Debug, Default)]
+struct RestartClassTool;
+
+#[reverie::tool]
+impl Tool for RestartClassTool {
+    type GlobalState = RestartClassLog;
+    type ThreadState = (u64, u64);
+
+    fn subscriptions(_config: &u32) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        subscriptions.syscall(Sysno::getpid);
+        subscriptions.syscall(Sysno::restart_syscall);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        let (number, args) = syscall.into_parts();
+        if number == Sysno::restart_syscall {
+            guest.send_rpc(2).await;
+            assert_eq!(
+                args.arg0 as u64, RESTART_CLASS_MARKER,
+                "restart_syscall lost the interrupted call's argument registers"
+            );
+            let calls = guest.thread_state_mut();
+            calls.1 += 1;
+            assert_eq!(calls.1, 1, "restart_syscall ran more than once");
+            return Ok(88);
+        }
+        assert_eq!(number, Sysno::getpid);
+        let ordinal = {
+            let calls = guest.thread_state_mut();
+            calls.0 += 1;
+            calls.0
+        };
+        guest.send_rpc(0).await;
+        let class = (*guest.config() / 100) as i32;
+        let mode = *guest.config() % 100;
+        if ordinal == 1 {
+            if mode != 3 {
+                let mut info = [0; reverie::SIGNAL_INFO_SIZE];
+                info[0..4].copy_from_slice(&libc::SIGUSR1.to_ne_bytes());
+                info[8..12].copy_from_slice(&libc::SI_TKILL.to_ne_bytes());
+                let event = SignalEvent::new(
+                    libc::SIGUSR1,
+                    info,
+                    SignalTarget::Thread {
+                        pid: guest.pid(),
+                        tid: guest.tid(),
+                    },
+                )?;
+                guest.defer_signal_delivery(event).await?;
+            }
+            return Err(Errno::new(class).into());
+        }
+        assert_eq!(ordinal, 2, "a syscall restarted more than once");
+        Ok(77)
+    }
+
+    async fn handle_structured_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        event: SignalEvent,
+    ) -> Result<Option<SignalEvent>, Errno> {
+        guest.send_rpc(1).await;
+        match *guest.config() % 100 {
+            4 => {
+                let mut info = event.siginfo();
+                info[0..4].copy_from_slice(&libc::SIGWINCH.to_ne_bytes());
+                Ok(Some(SignalEvent::new(
+                    libc::SIGWINCH,
+                    info,
+                    event.target(),
+                )?))
+            }
+            5 => Ok(None),
+            _ => Ok(Some(event)),
+        }
+    }
+}
+
+/// Each Linux-internal restart class a Tool returns, with a caught signal
+/// (without and with `SA_RESTART`) and with no handler (no signal, an ignored
+/// one, a suppressed one), gives the guest what Linux gives it:
+/// arch/x86/kernel/signal.c (v6.17) `handle_signal` when a handler runs and
+/// `arch_do_signal_or_restart` when none does. The guest prints nothing and
+/// exits 0 only when its `getpid` result and handler count match.
+#[test]
+fn tool_restart_classes_follow_linux_signal_restart_policy() {
+    if !kvm_available("tool restart classes test") {
+        return;
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "tool-restart-classes",
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t usr1_calls;
+
+static void usr1_handler(int signo) {
+  if (signo == SIGUSR1) ++usr1_calls;
+}
+
+int main(int argc, char **argv) {
+  if (argc != 4) return 20;
+  int mode = atoi(argv[1]);
+  long expected = atol(argv[2]);
+  int expected_calls = atoi(argv[3]);
+  struct sigaction action = {0};
+  action.sa_handler = usr1_handler;
+  action.sa_flags = mode == 2 ? SA_RESTART : 0;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, 0) != 0) return 21;
+
+  errno = 0;
+  long result = syscall(SYS_getpid, 0x5150L);
+  int saved_errno = errno;
+  if (expected < 0) {
+    if (result != -1 || saved_errno != -expected) return 22;
+  } else if (result != expected) {
+    return 23;
+  }
+  if (usr1_calls != expected_calls) return 24;
+  return 0;
+}
+"#,
+    );
+    let executable = executable.to_str().unwrap();
+    let image = std::fs::read(executable).unwrap();
+    const EINTR: i64 = -(libc::EINTR as i64);
+    // (class, mode, guest result, handler calls, callbacks)
+    let cases: &[(u32, u32, i64, i32, &[u8])] = &[
+        // ERESTARTSYS: EINTR after a handler unless SA_RESTART, else restart.
+        (512, 1, EINTR, 1, &[0, 1]),
+        (512, 2, 77, 1, &[0, 1, 0]),
+        (512, 3, 77, 0, &[0, 0]),
+        (512, 4, 77, 0, &[0, 1, 0]),
+        (512, 5, 77, 0, &[0, 1, 0]),
+        // ERESTARTNOINTR: always restarted.
+        (513, 1, 77, 1, &[0, 1, 0]),
+        (513, 2, 77, 1, &[0, 1, 0]),
+        (513, 3, 77, 0, &[0, 0]),
+        (513, 4, 77, 0, &[0, 1, 0]),
+        (513, 5, 77, 0, &[0, 1, 0]),
+        // ERESTARTNOHAND: EINTR after any handler, restarted without one.
+        (514, 1, EINTR, 1, &[0, 1]),
+        (514, 2, EINTR, 1, &[0, 1]),
+        (514, 3, 77, 0, &[0, 0]),
+        (514, 4, 77, 0, &[0, 1, 0]),
+        (514, 5, 77, 0, &[0, 1, 0]),
+        // ERESTART_RESTARTBLOCK: EINTR after any handler, restart_syscall
+        // without one.
+        (516, 1, EINTR, 1, &[0, 1]),
+        (516, 2, EINTR, 1, &[0, 1]),
+        (516, 3, 88, 0, &[0, 2]),
+        (516, 4, 88, 0, &[0, 1, 2]),
+        (516, 5, 88, 0, &[0, 1, 2]),
+    ];
+    for &(class, mode, expected, calls, callbacks) in cases {
+        let arguments = [mode.to_string(), expected.to_string(), calls.to_string()];
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[executable, &arguments[0], &arguments[1], &arguments[2]],
+                &["PATH=/usr/bin:/bin"],
+                &directory.0,
+            )
+            .unwrap();
+        let (log, code, stdout, stderr) = futures::executor::block_on(
+            backend.run_static_elf_with_tool::<RestartClassTool>(class * 100 + mode, true),
+        )
+        .unwrap_or_else(|error| panic!("restart class {class} mode {mode}: {error}"));
+        assert_eq!(
+            code,
+            0,
+            "restart class {class} mode {mode} failed; stdout={}; stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        );
+        assert_eq!(
+            log.callbacks(),
+            callbacks,
+            "restart class {class} mode {mode}"
+        );
+    }
+}
+
 #[test]
 fn static_elf_rt_sigreturn_requires_only_consumed_prefix() {
     if !kvm_available("static_elf_rt_sigreturn_requires_only_consumed_prefix") {
