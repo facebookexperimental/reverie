@@ -1222,6 +1222,9 @@ where
             let guest_pkru = guest.event.guest_pkru;
             #[cfg(feature = "exec-native-injection")]
             if let Err(error) = guest.check_native_mapping(number, args) {
+                // Terminal unsubscribed return: no Tool callback
+                // runs, so the stored name rides on the event.
+                guest.surface_terminal_refusal();
                 guest.event.result = -i64::from(error.into_raw());
                 return;
             }
@@ -2407,6 +2410,20 @@ impl<T: Tool, R: HostRuntime> InGuest<'_, T, R> {
             ));
         }
         None
+    }
+
+    /// Move this view's stored refusal onto the outward event.
+    /// Only for terminal routes whose result IS that refusal and
+    /// where no live Tool callback remains to take it from the
+    /// view (tail and unsubscribed mapping refusals; the exec
+    /// routes write the event directly at their refusal sites).
+    /// Never call this for a refusal a Tool received and handled
+    /// en route to its own selected result.
+    #[cfg(feature = "exec-native-injection")]
+    fn surface_terminal_refusal(&mut self) {
+        if self.event.unsupported_refusal.is_none() {
+            self.event.unsupported_refusal = self.unsupported_refusal.take();
+        }
     }
 
     #[cfg(feature = "exec-native-injection")]
@@ -4307,6 +4324,9 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         let number = number.id() as i64;
         #[cfg(feature = "exec-native-injection")]
         if let Err(error) = self.check_native_mapping(number, args) {
+            // Terminal tail return: the parked Tool can never take
+            // the stored tag, so it rides on the event.
+            self.surface_terminal_refusal();
             self.tail.set_result(-i64::from(error.into_raw()));
             return std::future::pending().await;
         }

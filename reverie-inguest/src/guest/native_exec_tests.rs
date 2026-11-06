@@ -1127,6 +1127,7 @@ enum WatchAction {
     HandlerHandledSuccess,
     HandlerHandledError,
     TailInject,
+    TailMapping,
     ThreadStartInject,
     PostExecInject,
     Plain,
@@ -1220,6 +1221,9 @@ impl Tool for WatchedTool {
                 guest
                     .tail_inject(syscall(self.number, self.null_args()))
                     .await
+            }
+            WatchAction::TailMapping => {
+                guest.tail_inject(syscall(libc::SYS_mprotect, [0; 6])).await
             }
             _ => Ok(guest
                 .inject(reverie::syscalls::Getpid::default())
@@ -1474,6 +1478,55 @@ fn watched_consumed_tag_stays_off_event() {
             0,
         );
     }
+}
+
+#[test]
+fn watched_tail_mapping_refusal_identity_reaches_event() {
+    // check_native_mapping's terminal tail return: the driver's
+    // typed refusal must surface on the outward event, whose
+    // terminal result it is — not die in the guest-local slot.
+    isolated(
+        || {
+            let outcome = run_watched_case(WatchAction::TailMapping, libc::SYS_getpid, true, true);
+            assert_eq!(outcome.event_result, -i64::from(libc::EOPNOTSUPP));
+            let refusal = outcome
+                .event_refusal
+                .expect("tail mapping refusal identity on the event");
+            assert_eq!(refusal.operation, reverie::UnsupportedOperation::NativeExec);
+            assert!(
+                refusal
+                    .diagnostic
+                    .contains("native executable mapping owner is not installed"),
+                "{refusal:?}"
+            );
+            // A non-exec dispatch attempts no native capture; the
+            // mapping refusal precedes any prepare/issue.
+            assert_eq!(outcome.captures, 0);
+        },
+        0,
+    );
+}
+
+#[test]
+fn watched_unsubscribed_mapping_refusal_identity_reaches_event() {
+    isolated(
+        || {
+            let outcome = run_watched_case(WatchAction::Plain, libc::SYS_mprotect, true, false);
+            assert_eq!(outcome.event_result, -i64::from(libc::EOPNOTSUPP));
+            let refusal = outcome
+                .event_refusal
+                .expect("unsubscribed mapping refusal identity on the event");
+            assert_eq!(refusal.operation, reverie::UnsupportedOperation::NativeExec);
+            assert!(
+                refusal
+                    .diagnostic
+                    .contains("native executable mapping owner is not installed"),
+                "{refusal:?}"
+            );
+            assert_eq!(outcome.captures, 0);
+        },
+        0,
+    );
 }
 
 #[test]
