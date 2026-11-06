@@ -33,10 +33,6 @@ pub struct RuntimeStarted(());
 #[derive(Debug)]
 pub struct ToolReady(());
 
-/// Compatibility alias for [`ToolReady`].
-#[deprecated(note = "use ToolReady")]
-pub type DetcoreReady = ToolReady;
-
 /// The trap filter, the SIGSYS and SIGSEGV handlers, CPUID faulting, RDTSC
 /// trapping and the vDSO rewrite are all in place.
 #[derive(Debug)]
@@ -79,13 +75,6 @@ impl RuntimeStarted {
     /// contract.
     pub(crate) fn tool_ready(self) -> ToolReady {
         ToolReady(())
-    }
-
-    /// Compatibility wrapper for [`RuntimeStarted::tool_ready`].
-    #[deprecated(note = "use tool_ready")]
-    #[allow(dead_code, reason = "compatibility wrapper kept for existing callers")]
-    pub(crate) fn detcore_ready(self) -> ToolReady {
-        self.tool_ready()
     }
 }
 
