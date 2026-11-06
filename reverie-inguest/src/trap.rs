@@ -354,9 +354,12 @@ thread_local! {
     static IN_HANDLER: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Maximum number of distinct lazy-promotion candidates retained before a
-/// drain. Overflow is counted and the affected sites remain on the ordinary
-/// trap path; capacity never changes syscall forwarding behavior.
+/// Maximum number of distinct lazy-promotion candidates retained as known
+/// for the process lifetime; draining advances a cursor and frees no slots
+/// in this slice. Overflow attempts are counted (including repeats of an
+/// address that was never retained) and the affected sites remain on the
+/// ordinary trap path; capacity never changes syscall forwarding behavior,
+/// and a full table does not imply promotion coverage.
 #[cfg(target_arch = "aarch64")]
 pub const PENDING_PROMOTION_CAPACITY: usize = 64;
 
@@ -387,7 +390,9 @@ pub struct PendingPromotionStats {
     /// Distinct known candidates accepted since process start, including
     /// drained candidates retained for de-duplication.
     pub recorded_new: u64,
-    /// First-seen candidates dropped because the fixed table was full.
+    /// Record attempts rejected because the fixed table was full. This
+    /// counts attempts, including repeats of an address never retained,
+    /// not distinct dropped sites.
     pub capacity_dropped: u64,
     /// Record attempts dropped because the handler could not immediately
     /// acquire the table without waiting.
@@ -404,15 +409,44 @@ struct PendingPromotionData {
 
 #[cfg(target_arch = "aarch64")]
 struct PendingPromotions {
-    inner: crate::sync::SpinMutex<PendingPromotionData>,
+    /// Owning pid: 0 = unowned, u64::MAX = reset in progress, else the
+    /// pid whose address space owns the table contents. Fork copies the
+    /// parent's word; the first accessor in the child notices the
+    /// mismatch and resets instead of acquiring a lock whose owner
+    /// thread vanished with the parent.
+    owner: core::sync::atomic::AtomicU64,
+    locked: core::sync::atomic::AtomicBool,
+    data: core::cell::UnsafeCell<PendingPromotionData>,
     contended_dropped: core::sync::atomic::AtomicU64,
+}
+
+// SAFETY: data is accessed only under `locked`, or by the single thread
+// performing a post-fork reset while every other accessor either spins on
+// the resetting owner word or (handler path) drops its record attempt.
+#[cfg(target_arch = "aarch64")]
+unsafe impl Sync for PendingPromotions {}
+
+#[cfg(target_arch = "aarch64")]
+const PENDING_OWNER_RESETTING: u64 = u64::MAX;
+
+#[cfg(target_arch = "aarch64")]
+thread_local! {
+    /// This thread's established table owner pid, avoiding a getpid gate
+    /// call on every handler record. A fork copies the parent's cached
+    /// value, so it is trusted only while the global owner word still
+    /// equals it — the handler's fork-return reset below rewrites both
+    /// for handler-mediated forks, and the slow path revalidates by
+    /// getpid for every other case.
+    static PENDING_OWNER_KNOWN: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
 #[cfg(target_arch = "aarch64")]
 impl PendingPromotions {
     const fn new() -> Self {
         Self {
-            inner: crate::sync::SpinMutex::new(PendingPromotionData {
+            owner: core::sync::atomic::AtomicU64::new(0),
+            locked: core::sync::atomic::AtomicBool::new(false),
+            data: core::cell::UnsafeCell::new(PendingPromotionData {
                 sites: [0; PENDING_PROMOTION_CAPACITY],
                 known_len: 0,
                 drained_len: 0,
@@ -422,45 +456,185 @@ impl PendingPromotions {
         }
     }
 
+    fn gate_getpid() -> u64 {
+        // SAFETY: scalar getpid through the trusted gate.
+        unsafe { raw_syscall6_gate(libc::SYS_getpid, [0; 6]) as u64 }
+    }
+
+    /// Establish this process as table owner, resetting inherited fork
+    /// state without ever acquiring the inherited lock bit. With
+    /// `wait == false` (handler path), a reset already in progress by
+    /// another post-fork thread is reported as not-established instead
+    /// of spinning.
+    fn ensure_owner(&self, wait: bool) -> bool {
+        use core::sync::atomic::Ordering;
+        let pid = Self::gate_getpid();
+        loop {
+            match self.owner.load(Ordering::Acquire) {
+                current if current == pid => {
+                    PENDING_OWNER_KNOWN.with(|known| known.set(pid));
+                    return true;
+                }
+                PENDING_OWNER_RESETTING => {
+                    if !wait {
+                        return false;
+                    }
+                    core::hint::spin_loop();
+                }
+                0 => {
+                    // First establishment in this process: the table has
+                    // no previous owner, so its lock and contents are
+                    // legitimate and must not be reset.
+                    if self
+                        .owner
+                        .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        PENDING_OWNER_KNOWN.with(|known| known.set(pid));
+                        return true;
+                    }
+                }
+                previous => {
+                    if self
+                        .owner
+                        .compare_exchange(
+                            previous,
+                            PENDING_OWNER_RESETTING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        // The previous owner process is gone from this
+                        // address space (fresh start or fork): no thread
+                        // here can hold the inherited lock bit legitimately,
+                        // and every racing accessor waits on RESETTING.
+                        // SAFETY: exclusive by the owner-word protocol above.
+                        unsafe {
+                            *self.data.get() = PendingPromotionData {
+                                sites: [0; PENDING_PROMOTION_CAPACITY],
+                                known_len: 0,
+                                drained_len: 0,
+                                capacity_dropped: 0,
+                            };
+                        }
+                        self.contended_dropped.store(0, Ordering::Relaxed);
+                        self.locked.store(false, Ordering::Relaxed);
+                        self.owner.store(pid, Ordering::Release);
+                        PENDING_OWNER_KNOWN.with(|known| known.set(pid));
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reset in a fork child at the handler's fork return, where this
+    /// thread is provably the only survivor and no other accessor can
+    /// have run in the child yet (the child has not returned to guest
+    /// code). Cheaper and stronger than the getpid backstop: later
+    /// records on this thread take the established fast path.
+    fn reset_in_fork_child(&self) {
+        use core::sync::atomic::Ordering;
+        let pid = Self::gate_getpid();
+        // SAFETY: sole surviving thread, still inside the fork's handler
+        // turn, so no accessor can hold or race the table in this child.
+        unsafe {
+            *self.data.get() = PendingPromotionData {
+                sites: [0; PENDING_PROMOTION_CAPACITY],
+                known_len: 0,
+                drained_len: 0,
+                capacity_dropped: 0,
+            };
+        }
+        self.contended_dropped.store(0, Ordering::Relaxed);
+        self.locked.store(false, Ordering::Relaxed);
+        self.owner.store(pid, Ordering::Release);
+        PENDING_OWNER_KNOWN.with(|known| known.set(pid));
+    }
+
+    fn try_lock(&self) -> bool {
+        self.locked
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    fn lock(&self) {
+        while !self.try_lock() {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn unlock(&self) {
+        self.locked
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
+
     fn try_record(&self, site: u64) -> PendingPromotionRecord {
-        let Some(mut state) = self.inner.try_lock() else {
-            self.contended_dropped
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        use core::sync::atomic::Ordering;
+        let established = PENDING_OWNER_KNOWN.with(|known| {
+            let known = known.get();
+            known != 0 && self.owner.load(Ordering::Acquire) == known
+        });
+        if !established && !self.ensure_owner(false) {
+            self.contended_dropped.fetch_add(1, Ordering::Relaxed);
             return PendingPromotionRecord::Contended;
-        };
-        if state.sites[..state.known_len].contains(&site) {
-            return PendingPromotionRecord::AlreadyKnown;
         }
-        if state.known_len == PENDING_PROMOTION_CAPACITY {
+        if !self.try_lock() {
+            self.contended_dropped.fetch_add(1, Ordering::Relaxed);
+            return PendingPromotionRecord::Contended;
+        }
+        // SAFETY: lock held; see Sync impl.
+        let state = unsafe { &mut *self.data.get() };
+        let result = if state.sites[..state.known_len].contains(&site) {
+            PendingPromotionRecord::AlreadyKnown
+        } else if state.known_len == PENDING_PROMOTION_CAPACITY {
             state.capacity_dropped += 1;
-            return PendingPromotionRecord::TableFull;
-        }
-        let insertion = state.known_len;
-        state.sites[insertion] = site;
-        state.known_len += 1;
-        PendingPromotionRecord::NewSite
+            PendingPromotionRecord::TableFull
+        } else {
+            let insertion = state.known_len;
+            state.sites[insertion] = site;
+            state.known_len += 1;
+            PendingPromotionRecord::NewSite
+        };
+        self.unlock();
+        result
     }
 
     fn drain(&self, out: &mut [u64]) -> usize {
-        let mut state = self.inner.lock();
+        self.ensure_owner(true);
+        self.lock();
+        // SAFETY: lock held; see Sync impl.
+        let state = unsafe { &mut *self.data.get() };
         let available = state.known_len - state.drained_len;
         let count = available.min(out.len());
         let start = state.drained_len;
         out[..count].copy_from_slice(&state.sites[start..start + count]);
         state.drained_len += count;
+        self.unlock();
         count
     }
 
     fn stats(&self) -> PendingPromotionStats {
-        let state = self.inner.lock();
-        PendingPromotionStats {
+        self.ensure_owner(true);
+        self.lock();
+        // SAFETY: lock held; see Sync impl.
+        let state = unsafe { &*self.data.get() };
+        let stats = PendingPromotionStats {
             pending: state.known_len - state.drained_len,
             recorded_new: state.known_len as u64,
             capacity_dropped: state.capacity_dropped,
             contended_dropped: self
                 .contended_dropped
                 .load(core::sync::atomic::Ordering::Relaxed),
-        }
+        };
+        self.unlock();
+        stats
     }
 }
 
@@ -1083,6 +1257,14 @@ pub(crate) unsafe extern "C" fn sigsys_handler(
         frame.set_register(32, resume_address as i64);
     } else {
         frame.set_register(0, event.resolved_result());
+    }
+    // In the fork child (result register 0) this thread is the sole
+    // survivor and guest code has not run yet: reset the pending-site
+    // table it inherited (possibly locked by a vanished parent thread)
+    // before returning. Forks the handler never mediated are healed by
+    // the table's PID-ownership check on first access instead.
+    if crate::arch::is_fork_family(event.number()) && frame.register(0) == 0 {
+        PENDING_PROMOTIONS.reset_in_fork_child();
     }
     IN_HANDLER.set(false);
 }
@@ -1870,12 +2052,56 @@ mod aarch64_gate_tests {
     #[test]
     fn pending_promotions_never_spin_from_handler_context() {
         let table = PendingPromotions::new();
-        let result = {
-            let _held_by_ordinary_context = table.inner.lock();
-            table.try_record(0x3000)
-        };
+        table.lock();
+        let result = table.try_record(0x3000);
+        table.unlock();
         assert_eq!(result, PendingPromotionRecord::Contended);
         assert_eq!(table.stats().contended_dropped, 1);
+    }
+
+    /// Bounded fork witness: with the table lock held across fork, the
+    /// child (whose locking thread vanished) must still record, drain,
+    /// and report stats — self-healed by PID ownership — instead of
+    /// spinning on the inherited held bit. The child's alarm(1) turns
+    /// any hang into a SIGALRM death the parent asserts against, so the
+    /// test is bounded either way. The parent's own table is untouched
+    /// by the child's reset (separate address spaces after fork).
+    #[test]
+    fn pending_table_self_heals_in_fork_child_with_lock_held() {
+        let table = Box::leak(Box::new(PendingPromotions::new()));
+        assert_eq!(table.try_record(0x1000), PendingPromotionRecord::NewSite);
+        table.lock();
+        // SAFETY: the child below runs only table calls and _exit.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {child}");
+        if child == 0 {
+            // SAFETY: async-signal-safe calls only in the fork child.
+            unsafe {
+                libc::alarm(1);
+                if table.stats().pending != 0 {
+                    libc::_exit(81);
+                }
+                if table.try_record(0x2000) != PendingPromotionRecord::NewSite {
+                    libc::_exit(82);
+                }
+                let mut out = [0_u64; 4];
+                if table.drain(&mut out) != 1 || out[0] != 0x2000 {
+                    libc::_exit(83);
+                }
+                libc::_exit(0);
+            }
+        }
+        table.unlock();
+        let mut status = 0;
+        // SAFETY: reaping the exact child forked above.
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(waited, child);
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        // The parent's table kept its own entry across the child's reset.
+        let mut out = [0_u64; 4];
+        assert_eq!(table.drain(&mut out), 1);
+        assert_eq!(out[0], 0x1000);
     }
 
     #[test]
