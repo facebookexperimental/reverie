@@ -19813,12 +19813,36 @@ fn fixed_required_publication_roles<'a>(
         FIXED_PUBLICATION_REQUIRED_ROLES
     }
 }
+/// The roles the standalone (scalar-publication) image qualifies. This
+/// membership is declared, never inferred from a template's position in
+/// DETCORE_VALIDATE_TEMPLATES: appending a Detcore-cohort template at
+/// the end of that table (as the 0x110 acceptance did for
+/// `fixed_patch_alloc` and `fixed_tls_fn_once`) must not widen the
+/// standalone image's qualification scope, which is exactly the
+/// dh-5244-fixture failure that motivated this list. (The template
+/// index itself still carries meaning elsewhere: templates at or after
+/// FIXED_SCALAR_TEMPLATE_START derive `scalar_storage` in no-scope
+/// qualification. That is a property of a chosen template, not of a
+/// role's image scope.)
+const FIXED_SCALAR_ROLES: &[&str] = &[
+    "fixed_arena_backing",
+    "fixed_arena_mprotect",
+    "fixed_arena_setup",
+    "fixed_constructor_prepare",
+    "fixed_generic_prepare",
+    "fixed_native_from_native",
+    "fixed_native_owner_gettid",
+    "fixed_region_publication_get_opaque",
+    "fixed_region_publication_set_opaque",
+    "fixed_tool_alloc",
+    "fixed_tool_dealloc",
+    "fixed_tool_heap_metadata",
+    "fixed_tool_realloc",
+    "fixed_tool_require_owned",
+];
+
 fn fixed_scalar_recipe_role(role: &str) -> bool {
-    role == "fixed_arena_setup"
-        || (role != "fixed_setup_bitmap_range"
-            && DETCORE_VALIDATE_TEMPLATES[FIXED_SCALAR_TEMPLATE_START..]
-                .iter()
-                .any(|t| t.role == role))
+    FIXED_SCALAR_ROLES.contains(&role)
 }
 
 const FIXED_PUBLICATION_REQUIRED_ROLES: &[&str] = &[
@@ -59874,6 +59898,72 @@ mod tests {
             ),
             Some("fixed_native_from_native")
         );
+    }
+
+    #[test]
+    fn scalar_recipe_membership_is_declared_not_positional() {
+        // The producer failure shape at the 0x110 append: templates for
+        // these Detcore-cohort roles sit at or after
+        // FIXED_SCALAR_TEMPLATE_START, yet neither role is in the
+        // standalone image's declared scope, exactly as before the
+        // append. Before the explicit list, both classified as scalar
+        // and the standalone leaf's untemplated code refused the run.
+        assert!(
+            DETCORE_VALIDATE_TEMPLATES[FIXED_SCALAR_TEMPLATE_START..]
+                .iter()
+                .any(|t| t.role == "fixed_patch_alloc")
+        );
+        assert!(
+            DETCORE_VALIDATE_TEMPLATES[FIXED_SCALAR_TEMPLATE_START..]
+                .iter()
+                .any(|t| t.role == "fixed_tls_fn_once")
+        );
+        assert!(!fixed_scalar_recipe_role("fixed_patch_alloc"));
+        assert!(!fixed_scalar_recipe_role("fixed_tls_fn_once"));
+        assert!(!fixed_scalar_recipe_role("fixed_setup_bitmap_range"));
+        // Declared membership is the whole classification: for every
+        // role the table knows, the answer equals list membership, so
+        // appending a template for any role at the end of the table
+        // cannot change any role's classification.
+        let mut roles: Vec<&str> = DETCORE_VALIDATE_TEMPLATES.iter().map(|t| t.role).collect();
+        roles.push(DETCORE_NO_SCOPE_ALLOC.role);
+        roles.sort_unstable();
+        roles.dedup();
+        for role in roles {
+            assert_eq!(
+                fixed_scalar_recipe_role(role),
+                FIXED_SCALAR_ROLES.contains(&role),
+                "scalar classification of {role} must come from the declared list"
+            );
+        }
+        for role in FIXED_SCALAR_ROLES {
+            assert!(fixed_scalar_recipe_role(role), "{role} lost scalar scope");
+        }
+    }
+
+    #[test]
+    fn detcore_patch_alloc_uniquely_matches_the_0110_template() {
+        // The Detcore leaf's 241-byte alloc (cell offset 0x110) still
+        // selects exactly one template: index 94, the 0x110 entry added
+        // by the same append that must not widen standalone scope.
+        let (index, template) = (94, &DETCORE_VALIDATE_TEMPLATES[94]);
+        assert_eq!(template.role, "fixed_patch_alloc");
+        assert_eq!(fixed_hex(template.hex).len(), 241);
+        let actual = fixed_hex(template.hex);
+        let candidates: Vec<usize> = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.role == "fixed_patch_alloc"
+                    && fixed_template_shape(
+                        &actual,
+                        &fixed_hex(t.hex),
+                        t.operands.iter().map(|op| op.displacement),
+                    )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(candidates, vec![index]);
     }
 
     // Both complete bridge fixtures come from retained native ELF output,
