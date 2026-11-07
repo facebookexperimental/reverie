@@ -67,8 +67,10 @@ state untouched, **G3** exec parity through the same boundary
 partially armed), and **G5** isolation of tool windows. The manifest
 carries nothing beyond image, gates, controls and init: there is no
 tool-requirements or policy payload in it. This loader contract is
-x86-64 with 4 KiB pages only; other host page sizes are refused by
-name rather than assumed away.
+x86-64 with 4 KiB pages only; a launcher that checks or seals an
+image with its host page size (`check_image_with_page_size`,
+`SealedImage::checked`) is refused by name on any other host page
+size rather than silently assuming 4 KiB.
 
 > 🚧 **Under construction — loader generality.** Approval is no
 > longer the blocker: architecture §4.3 and its decisions D1–D4 were

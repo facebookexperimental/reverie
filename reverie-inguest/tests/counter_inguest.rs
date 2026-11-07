@@ -34,9 +34,9 @@
 //! Rust runtime installing its stack-overflow handler), so
 //! "executes exactly as uninstrumented" does **not** hold for Rust
 //! std guests on this lane. Restoring parity for the clone3 and
-//! constructor guests is tracked as a follow-up minibead (named in
-//! the landing commit) and plan §3 remains open for those two
-//! guests; nothing in this file claims their parity.
+//! constructor guests is tracked as follow-up minibead dh-girok,
+//! and plan §3 remains open for those two guests; nothing in this
+//! file claims their parity.
 //!
 //! Baseline binaries (fail-closed, never skipped): `counter1` and
 //! `recorder` from the examples, located via `REVERIE_COUNTER1_BIN`
