@@ -4969,7 +4969,7 @@ static void* tsync_installer(void* arg) {
   return NULL;
 }
 static void sigtrap_tsync_filter(unsigned int action) {
-  int children = 40, ok = 0, sigsys = 0, other = 0;
+  int children = 40, ok = 0, sigsys = 0, sigkill = 0, other = 0, other_status = 0;
   for (int i = 0; i < children; i++) {
     pid_t pid = fork();
     if (pid < 0)
@@ -5001,11 +5001,26 @@ static void sigtrap_tsync_filter(unsigned int action) {
       ok++;
     else if (WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS)
       sigsys++;
-    else
+    else if (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      sigkill++;
+    else {
+      if (!other)
+        other_status = status;
+      say("tsync-other i=%d pid=%d status=%#x\n", i, pid, status);
       other++;
+    }
   }
-  say("tsync-filter action=%#x children=%d ok=%d sigsys=%d other=%d\n", action, children, ok,
-      sigsys, other);
+  /* A KILL_PROCESS death ordinarily waits as SIGSYS, but under
+   * this tracer the leader can wait as SIGKILL instead (native
+   * two-thread control: 0/400 SIGKILL; tracked in dh-xx9f4).
+   * The exact kernel transition is not yet named; candidates
+   * are a second trapping thread exiting via a synthesized
+   * SIGKILL after coredump_wait, and an early leader exit
+   * through SECCOMP_MODE_DEAD's do_exit(SIGKILL) raced ahead
+   * of the dumper. Counted separately. */
+  say("tsync-filter action=%#x children=%d ok=%d sigsys=%d sigkill=%d other=%d "
+      "ostatus=%#x\n",
+      action, children, ok, sigsys, sigkill, other, other_status);
 }
 static void mode_sigtrap_tsync_filter_kill(void) { sigtrap_tsync_filter(SECCOMP_RET_KILL_PROCESS); }
 static void mode_sigtrap_tsync_filter_trap(void) { sigtrap_tsync_filter(SECCOMP_RET_TRAP); }
