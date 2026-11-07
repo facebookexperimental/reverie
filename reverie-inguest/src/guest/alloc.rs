@@ -13,9 +13,11 @@
 //! allocations are therefore isolated from libc until they are released or
 //! the process exits.
 //!
-//! Legacy storage is zero-initialized and page-aligned, so the loader places it in
-//! anonymous memory (`.bss`) rather than in a mapping of the file that holds
-//! it. A backend that reads an object's file mappings for code addresses
+//! Legacy storage is zero-initialized and aligned to the largest supported
+//! page size, so no heap page shares the file-backed final data page and the
+//! loader places it in anonymous memory (`.bss`) rather than in a mapping of
+//! the file that holds it. A backend that reads an object's file mappings for
+//! code addresses
 //! (LiteInst's entry census) therefore never finds the runtime's own state
 //! there, wherever the runtime is linked. Explicit fixed consumers instead use
 //! already-published ToolRegion storage, with no allocator-triggered setup.
@@ -37,8 +39,14 @@ pub(crate) const TOOL_HEAP_BYTES: usize = 32 * 1024 * 1024;
 /// it), so this can be 0 and the whole heap's initial value is zero.
 const FREE_LIST_END: usize = 0;
 
-#[repr(align(4096))]
+pub const MAX_PAGE_SIZE: usize = 65_536;
+
+// Align to the largest supported page size: on a 64 KiB-page host the last
+// file-backed data page can otherwise reach into the first heap page.
+#[repr(align(65536))]
 struct ToolHeapBytes([u8; TOOL_HEAP_BYTES]);
+
+const _: () = assert!(align_of::<ToolHeapBytes>() == MAX_PAGE_SIZE);
 
 #[repr(C)]
 struct ToolHeapBlock {
@@ -785,8 +793,14 @@ mod tests {
     /// code addresses of the object.
     #[test]
     fn tool_heap_is_anonymous_memory() {
+        assert!(align_of::<ToolHeapBytes>() >= MAX_PAGE_SIZE);
         let start = TOOL_HEAP.base() as u64;
-        assert_eq!(start % 4096, 0, "the Tool heap is not page-aligned");
+        let page_size = crate::guest::support::page_size().unwrap();
+        assert_eq!(
+            start % page_size,
+            0,
+            "the Tool heap is not runtime-page-aligned"
+        );
         let last = start + TOOL_HEAP_BYTES as u64 - 1;
         let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
         for address in [start, last] {

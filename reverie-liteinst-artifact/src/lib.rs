@@ -1399,8 +1399,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/alloc.rs",
-        36599,
-        "3c6e8229d6daf422036416d30e8c868040a9b3fff5c719af6d3f40320b23cdef",
+        37144,
+        "8179a15bf28fbaebae61cbc24ef212d0e0aeff959a4846ba96df3ed08bf8c6f0",
     ),
     (
         "reverie-inguest/src/guest/tool_region_constructor.rs",
