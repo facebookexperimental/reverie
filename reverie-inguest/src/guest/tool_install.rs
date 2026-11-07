@@ -91,6 +91,14 @@ pub unsafe trait PatchHost {
         initialize_shared_continuation()
     }
 
+    /// The stack backing the seccomp controller's continuation
+    /// stacks use. The default reserves the ToolRegion; a host
+    /// without ToolRegion arenas may select the legacy anonymous
+    /// backing where the ToolRegion layout is refused.
+    fn stack_backing(&self) -> io::Result<StackBacking> {
+        Ok(StackBacking::ToolRegion(ToolRegion::reserve()?))
+    }
+
     /// After the coordinator and statistics are connected and before the
     /// guest clock starts: prepares the patcher's hook entries.
     fn prepare_entries(&self) -> io::Result<()> {
@@ -429,8 +437,7 @@ fn activate_runtime(
         ));
     }
     // Reserve before any instruction, guard or SIGSYS handler is installed.
-    let region = ToolRegion::reserve()?;
-    let controller = InProcessSeccomp::with_stack_backing(StackBacking::ToolRegion(region));
+    let controller = InProcessSeccomp::with_stack_backing(host.stack_backing()?);
     host.prepare_patcher(vdso_sites)?;
     let config = host.runtime_config()?;
     let patcher = host.patcher();
@@ -579,6 +586,41 @@ unsafe impl PatchHost for TrapHost {
 
     fn patcher(&self) -> &'static PatcherRef {
         &TRAP_PATCHER
+    }
+
+    fn initialize_continuation(&self) -> io::Result<()> {
+        // The shared continuation stacks on the ToolRegion, whose
+        // version-one layout is expressed in 4096-byte pages and
+        // refuses other page sizes by name. TrapHost has no patcher
+        // and no ToolRegion arenas, so on those hosts its
+        // continuation runs on the legacy anonymous stack instead;
+        // the patching backends keep the refusal until the layout
+        // itself is page-size-generic.
+        if NativeIsa::page_size()? == crate::guest::tool_region::LAYOUT_PAGE as u64 {
+            return initialize_shared_continuation();
+        }
+        // SAFETY: the shared handlers below are this module's own
+        // continuation callbacks, bound to this same registration
+        // cache for the process lifetime, as in
+        // initialize_shared_continuation.
+        unsafe {
+            continuation::initialize_registered(
+                &SHARED_REGISTRATION,
+                continuation::ContinuationHandlers {
+                    syscall: continue_syscall,
+                    instruction: continue_instruction,
+                },
+                StackBacking::Legacy,
+            )
+        }
+    }
+
+    fn stack_backing(&self) -> io::Result<StackBacking> {
+        if NativeIsa::page_size()? == crate::guest::tool_region::LAYOUT_PAGE as u64 {
+            Ok(StackBacking::ToolRegion(ToolRegion::reserve()?))
+        } else {
+            Ok(StackBacking::Legacy)
+        }
     }
 
     fn stage_stream(&self) -> io::Result<bool> {

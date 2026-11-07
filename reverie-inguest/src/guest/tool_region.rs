@@ -40,7 +40,10 @@ pub const BASE: usize = 0x6000_0000_0000;
 pub const BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// End of the half-open fixed reservation.
 pub const END: usize = BASE + BYTES;
-const PAGE: usize = 4096;
+/// The page unit the version-one layout is expressed in. Hosts with
+/// a different runtime page size are refused by [`ToolRegion::reserve`].
+pub(crate) const LAYOUT_PAGE: usize = 4096;
+const PAGE: usize = LAYOUT_PAGE;
 const CONTROL_BYTES: usize = 1024 * 1024;
 const DATA_FIRST: usize = CONTROL_BYTES / PAGE;
 const DATA_END: usize = BYTES / PAGE - 1;

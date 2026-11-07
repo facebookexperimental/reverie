@@ -383,3 +383,142 @@ fn retained_configuration_preflight_failure_never_constructs_the_tool() {
     drop(directory_owner);
     std::fs::remove_dir(directory).unwrap();
 }
+
+// S6d acceptance: a real Tool installed through TrapHost (no patcher)
+// answers a trapped syscall from the fallback continuation, twice, in
+// a fresh subprocess. The parent is the coordinator: it sends the
+// shared config and then only holds the connection open. Witness
+// bytes on fd 0 order the phases the child cannot report after the
+// filter lands: S subscriptions, N Tool::new, I installed, C per
+// answered syscall callback.
+#[cfg(feature = "rcb-clock")]
+const TRAP_HOST_CHILD: &str = "REVERIE_TRAP_HOST_CHILD";
+#[cfg(feature = "rcb-clock")]
+const TRAP_HOST_SOCKET: &str = "REVERIE_TRAP_HOST_SOCKET";
+
+#[cfg(feature = "rcb-clock")]
+fn trap_host_witness(event: u8) {
+    // SAFETY: fd 0 is the child-only witness socket; the trusted gate
+    // writes one live byte without trapping.
+    let written = unsafe {
+        crate::trap::raw_syscall6(
+            libc::SYS_write,
+            [0, (&event as *const u8) as u64, 1, 0, 0, 0],
+        )
+    };
+    if written != 1 {
+        unsafe { libc::_exit(125) };
+    }
+}
+
+#[cfg(feature = "rcb-clock")]
+#[derive(Default)]
+struct TrapProbe;
+#[cfg(feature = "rcb-clock")]
+#[reverie::tool]
+impl Tool for TrapProbe {
+    type GlobalState = Remote;
+    type ThreadState = ();
+    fn subscriptions(config: &u64) -> Subscription {
+        assert_eq!(*config, 71);
+        trap_host_witness(b'S');
+        Subscription::from_iter([Sysno::getpid])
+    }
+    fn new(_pid: Pid, config: &u64) -> Self {
+        assert_eq!(*config, 71);
+        trap_host_witness(b'N');
+        Self
+    }
+    fn init_thread_state(&self, _: Pid, _: Option<(Pid, &Self::ThreadState)>) {}
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: reverie::syscalls::Syscall,
+    ) -> Result<i64, reverie::Error> {
+        assert_eq!(call.number(), Sysno::getpid);
+        trap_host_witness(b'C');
+        Ok(424_245)
+    }
+}
+
+#[cfg(feature = "rcb-clock")]
+#[test]
+fn trap_host_installs_and_answers_a_trapped_syscall() {
+    use super::super::tool_install::install_tool_with;
+    use super::super::tool_install::{TrapHost, TrapOptions};
+
+    const TEST: &str =
+        "guest::host::tool_configuration_tests::trap_host_installs_and_answers_a_trapped_syscall";
+    if std::env::var_os(TRAP_HOST_CHILD).is_none() {
+        // A short literal socket path: sun_path is bounded, and the
+        // slot TMPDIR used for builds is far too long for it.
+        let path = std::path::PathBuf::from(format!("/tmp/rt-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (mut witness, child_witness) = UnixStream::pair().unwrap();
+        witness
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(TRAP_HOST_CHILD, "1")
+            .env(TRAP_HOST_SOCKET, &path)
+            .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                child_witness,
+            )))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let bytes = encode(&71_u64).unwrap();
+        server
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .unwrap();
+        server.write_all(&bytes).unwrap();
+        let mut events = Vec::new();
+        witness.read_to_end(&mut events).unwrap();
+        let output = child.wait_with_output().unwrap();
+        // The child exits through the gate after its second answer;
+        // only then may the coordinator connection close.
+        let mut sink = Vec::new();
+        let _ = server.read_to_end(&mut sink);
+        drop(server);
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(events, b"SNICC");
+        return;
+    }
+    let path = std::path::PathBuf::from(std::env::var_os(TRAP_HOST_SOCKET).unwrap());
+    let pid = std::process::id() as i64;
+    assert_ne!(pid, 424_245);
+    // SAFETY: one fresh subprocess on its test thread before any
+    // application threads; TrapHost never patches, so every trapped
+    // call below runs the fallback continuation.
+    let installed = unsafe {
+        install_tool_with::<TrapProbe, _>(&path, false, TrapHost::new(TrapOptions::default()))
+    };
+    if let Err(error) = &installed {
+        trap_host_witness(b'E');
+        for byte in error.to_string().bytes() {
+            trap_host_witness(byte);
+        }
+        unsafe { libc::_exit(90) };
+    }
+    trap_host_witness(b'I');
+    for _ in 0..2 {
+        if unsafe { libc::syscall(libc::SYS_getpid) } != 424_245 {
+            unsafe { libc::_exit(91) };
+        }
+    }
+    // Through the trusted gate the real pid still answers.
+    if unsafe { crate::trap::raw_syscall6(libc::SYS_getpid, [0; 6]) } != pid {
+        unsafe { libc::_exit(92) };
+    }
+    unsafe { libc::_exit(0) };
+}
