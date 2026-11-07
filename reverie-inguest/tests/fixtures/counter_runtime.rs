@@ -10,13 +10,28 @@
 //! count-equivalent counting image, not any hosted tool's object code.
 //! It keeps the mechanics probe's trap filter, SIGSYS handler, journal
 //! and named refusals, and deliberately arms no CPUID faulting and no
-//! RDTSC trapping, so the guest executes its own instructions exactly
-//! as it would uninstrumented and only its syscalls are observed. The
+//! RDTSC trapping, so only its syscalls are observed. The
 //! count is the journal's guest-flagged syscall ENTER rows, read by the
 //! parent after exit. No allocator, libc start-up, TLS, vDSO rewrite
 //! or production activation path. Every actual syscall is in `.gate`;
 //! the handler records before forwarding. The parent restores the real
 //! kernel entry image after the loader's ready stop.
+//!
+//! Fixture evidence, labelled as such (PR1311 Minor 4): this file is a
+//! deliberate fork of the probe runtime fixture (`probe_runtime.rs`),
+//! not `counter1_tool` hosted in-guest over RPC, and not a shared
+//! fixture. It forks because the two images must differ exactly where
+//! counting demands it — this image arms only the trap filter and
+//! SIGSYS handler (arming CPUID/RDTSC would perturb the guest being
+//! counted), runs no instruction canaries, and refuses a different
+//! required-controls word — while each image is linked, audited and
+//! checked as one self-contained fixed-address file against its own
+//! manifest. Sharing the trap/handler/journal body would need a
+//! shared no_std fixture crate both link scripts can consume; until
+//! that exists, the fork is the honest shape and any fix to the
+//! shared-shaped code must be applied to both files. What this
+//! fixture proves is therefore the loader lane (zero pre-arm, count
+//! parity against the ptrace lane), not a hosted-tool runtime.
 
 #![no_std]
 #![no_main]

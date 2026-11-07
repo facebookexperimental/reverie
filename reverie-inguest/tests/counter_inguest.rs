@@ -25,6 +25,19 @@
 //! by the counting runtime appear as `=EOPNOTSUPP` outcomes and so
 //! cannot hide inside a matching total.
 //!
+//! Narrowed parity criterion, explicit follow-up (PR1311 Minor 2):
+//! full ptrace parity is proven only for the static hello and
+//! `/bin/ls` guests. The clone3 guest is refusal-only and excluded
+//! from count parity (the ptrace lane would really create its
+//! thread), and the constructor-witness guest has no parity check:
+//! the counting runtime refuses its `rt_sigaction(SIGSEGV)` (the
+//! Rust runtime installing its stack-overflow handler), so
+//! "executes exactly as uninstrumented" does **not** hold for Rust
+//! std guests on this lane. Restoring parity for the clone3 and
+//! constructor guests is tracked as a follow-up minibead (named in
+//! the landing commit) and plan §3 remains open for those two
+//! guests; nothing in this file claims their parity.
+//!
 //! Baseline binaries (fail-closed, never skipped): `counter1` and
 //! `recorder` from the examples, located via `REVERIE_COUNTER1_BIN`
 //! / `REVERIE_RECORDER_BIN` when set, else beside this test binary's
@@ -318,6 +331,49 @@ fn observe_counter(
         .arg("--")
         .arg(program)
         .args(args);
+    let capture = retained_command(&mut command, &scratch.0, "probe", Duration::from_secs(60));
+    assert!(fs::metadata(&report_path).unwrap().len() <= CAPTURE_LIMIT);
+    let report = serde_json::from_slice(&fs::read(report_path).unwrap())
+        .expect("complete JSON probe report");
+    Observation {
+        _scratch: scratch,
+        capture,
+        report,
+    }
+}
+
+/// The probe (mechanics) runtime image, compiled once, for the
+/// kind/image swap refusal test.
+fn probe_runtime() -> &'static Path {
+    static PROBE_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
+    PROBE_RUNTIME.get_or_init(|| {
+        let scratch = Scratch::new("probe-runtime");
+        fixture_source(&scratch.0, "probe_protocol.rs");
+        // Scratch has no Drop cleanup; the retained directory (and
+        // the compiled image in it) outlives this handle.
+        compile(&scratch.0, "probe_runtime", Some("probe_runtime.ld"))
+    })
+}
+
+/// Runs the probe host with an explicitly paired runtime kind and
+/// runtime image (the swap test pairs them wrong on purpose).
+fn observe_swapped(
+    scratch: Scratch,
+    counter_kind: bool,
+    runtime: &Path,
+    program: &Path,
+) -> Observation {
+    let report_path = scratch.0.join("report.json");
+    let mut command = Command::new(PROBE);
+    if counter_kind {
+        command.arg("--runtime-kind=counter");
+    }
+    command
+        .arg(&images().loader)
+        .arg(runtime)
+        .arg(&report_path)
+        .arg("--")
+        .arg(program);
     let capture = retained_command(&mut command, &scratch.0, "probe", Duration::from_secs(60));
     assert!(fs::metadata(&report_path).unwrap().len() <= CAPTURE_LIMIT);
     let report = serde_json::from_slice(&fs::read(report_path).unwrap())
@@ -952,5 +1008,47 @@ fn counter_clone3_named_refusal_without_guest_thread() {
             assert_eq!(u(&other["args"][0]), libc::SIGSEGV as u64);
             assert_eq!(u(&other["results"][0]), REFUSAL_GUEST_CONTROL);
         }
+    }
+}
+
+#[test]
+fn runtime_kind_paired_with_the_other_kinds_image_is_refused_both_ways() {
+    // Fail-closed in both directions (PR1311 Major (c)): each
+    // runtime kind paired with the other kind's image is refused
+    // with no handoff — the host demands the kind's control word
+    // and ready evidence, and each image refuses a control page
+    // whose required word is not its own. The guest never runs.
+    let true_bin = Path::new("/bin/true");
+    assert!(true_bin.is_file(), "swap guest /bin/true must exist");
+    for (name, counter_kind, runtime) in [
+        ("probe-kind-counter-image", false, images().runtime.clone()),
+        (
+            "counter-kind-probe-image",
+            true,
+            probe_runtime().to_path_buf(),
+        ),
+    ] {
+        let observation = observe_swapped(Scratch::new(name), counter_kind, &runtime, true_bin);
+        assert_eq!(
+            observation.capture.status.code(),
+            Some(122),
+            "{name} must exit with the probe refusal code; stderr: {}",
+            String::from_utf8_lossy(&observation.capture.stderr)
+        );
+        assert_eq!(
+            observation.report["outcome"], "refused",
+            "{name} report: {}",
+            observation.report
+        );
+        assert_ne!(
+            observation.report["detached"], true,
+            "{name} must never detach a handed-off guest"
+        );
+        assert!(
+            observation.report["refusal"].is_string()
+                || observation.report["journal_error"].is_string(),
+            "{name} must name its refusal: {}",
+            observation.report
+        );
     }
 }
