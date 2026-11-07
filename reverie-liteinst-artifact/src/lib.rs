@@ -4000,47 +4000,29 @@ const NO_INSTALLATION_SCOPE_SOURCE: (&str, u64, &str) = (
     26462,
     "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
 );
-// Complete22B getters physically retained by the measured native OFF image.
-// These are other TLS, never allocator-operation targets or isolation credit.
-const NO_SCOPE_OTHER_GETTERS: [(&str, u64); 4] = [
+/// Complete22B getters retained in a no-scope image, as (thunk, cell)
+/// canonical-name pairs. The thunk's shape is exact in every byte but
+/// its cell-offset field; the offset itself is bound from the same
+/// ELF's authenticated TLS symbol for the named cell, never recorded
+/// here, so TLS layout drift in either repository cannot break or
+/// widen recognition. These are other TLS, never allocator-operation
+/// targets or isolation credit.
+const NO_SCOPE_OTHER_GETTERS: [(&str, &str); 4] = [
     (
         "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest7support20TOOL_CALLBACK_ACTIVE0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1s_6option6OptionQIB27_INtNtNtB1s_4sync6atomic6AtomicbEEEEE9call_onceBc_",
-        0x199,
+        "_RNvNCNKNvNtNtCs_15reverie_inguest5guest7support20TOOL_CALLBACK_ACTIVE0s_023___RUST_STD_INTERNAL_VAL",
     ),
     (
         "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation5OWNER0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1i_6option6OptionQIB1X_INtNtB1i_4cell4CellONtB8_12ContinuationEEEEE9call_onceBc_",
-        0x180,
+        "_RNvNCNKNvNtNtCs_15reverie_inguest5guest12continuation5OWNER0s_023___RUST_STD_INTERNAL_VAL",
     ),
     (
         "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation7PENDING0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CellIB1Z_NtB8_7PendingEEEEEE9call_onceBc_",
-        0x28,
+        "_RNvNCNKNvNtNtCs_15reverie_inguest5guest12continuation7PENDING0s_023___RUST_STD_INTERNAL_VAL",
     ),
     (
         "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest5alloc14DISPATCH_DEPTH0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CelljEEEEE9call_onceBc_",
-        0x190,
-    ),
-];
-
-/// The same four getters in the ordinary (non-native) Detcore image, whose
-/// TLS layout assigns different offsets (measured from the built staged
-/// runtime: TOOL_CALLBACK_ACTIVE 0x118, OWNER 0x120, PENDING 0x0,
-/// DISPATCH_DEPTH 0x110). Same named cells; per-image-kind layout only.
-const ORDINARY_NO_SCOPE_OTHER_GETTERS: [(&str, u64); 4] = [
-    (
-        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest7support20TOOL_CALLBACK_ACTIVE0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1s_6option6OptionQIB27_INtNtNtB1s_4sync6atomic6AtomicbEEEEE9call_onceBc_",
-        0x118,
-    ),
-    (
-        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation5OWNER0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1i_6option6OptionQIB1X_INtNtB1i_4cell4CellONtB8_12ContinuationEEEEE9call_onceBc_",
-        0x120,
-    ),
-    (
-        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation7PENDING0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CellIB1Z_NtB8_7PendingEEEEEE9call_onceBc_",
-        0x0,
-    ),
-    (
-        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest5alloc14DISPATCH_DEPTH0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CelljEEEEE9call_onceBc_",
-        0x110,
+        "_RNvNCNKNvNtNtCs_15reverie_inguest5guest5alloc14DISPATCH_DEPTH0s_023___RUST_STD_INTERNAL_VAL",
     ),
 ];
 
@@ -18376,7 +18358,7 @@ struct NoScopeCensus {
 fn no_installation_scope_census(
     elf: &Elf<'_>,
     bytes: &[u8],
-    other_getters: &[(&str, u64)],
+    other_getters: &[(&str, &str)],
 ) -> Result<NoScopeCensus> {
     let mut raw_names = Vec::new();
     for (dynamic, symbols, strings) in [
@@ -18403,7 +18385,7 @@ fn no_installation_scope_census(
         }
     }
     let mut other_tls_getters = Vec::new();
-    for &(canonical, cell_offset) in other_getters {
+    for &(canonical, cell_canonical) in other_getters {
         let candidates: Vec<_> = elf
             .syms
             .iter()
@@ -18440,6 +18422,59 @@ fn no_installation_scope_census(
             "other TLS getter is not complete file-backed RX",
         )?;
         let code = &bytes[at..at + 22];
+        // Bind the cell offset from this ELF's own authenticated TLS
+        // symbol for the named cell; the thunk's shape is then exact
+        // with that offset implanted. A missing, duplicated, dynamic
+        // or nonlocal cell, or an encoded offset that disagrees with
+        // it, refuses by name.
+        let cells: Vec<_> = elf
+            .syms
+            .iter()
+            .filter(|candidate| {
+                candidate.st_type() == sym::STT_TLS
+                    && elf
+                        .strtab
+                        .get_at(candidate.st_name)
+                        .and_then(canonical_rust_symbol)
+                        .as_deref()
+                        == Some(cell_canonical)
+            })
+            .collect();
+        require(
+            cells.len() == 1,
+            format!(
+                "other TLS getter {canonical} cell {cell_canonical} absent or duplicated in no-scope image"
+            ),
+        )?;
+        let cell_symbol = cells[0];
+        let cell_name = elf
+            .strtab
+            .get_at(cell_symbol.st_name)
+            .ok_or("other TLS getter cell name absent")?;
+        require(
+            cell_symbol.st_bind() == sym::STB_LOCAL
+                && cell_symbol.st_size != 0
+                && !elf
+                    .dynsyms
+                    .iter()
+                    .any(|dynamic| elf.dynstrtab.get_at(dynamic.st_name) == Some(cell_name)),
+            format!(
+                "other TLS getter {canonical} cell {cell_canonical} is malformed/dynamic/nonlocal in no-scope image"
+            ),
+        )?;
+        let cell_offset = cell_symbol.st_value;
+        let encoded_offset = u32::from_le_bytes(
+            code[16..20]
+                .try_into()
+                .map_err(|e: std::array::TryFromSliceError| e.to_string())?,
+        );
+        require(
+            u64::from(encoded_offset) == cell_offset,
+            format!(
+                "other TLS getter {canonical} at entry {:#x} encodes cell offset {:#x}, expected {:#x} from its authenticated TLS cell {cell_canonical}",
+                symbol.st_value, encoded_offset, cell_offset
+            ),
+        )?;
         let module_slot = fixed_rip_target(symbol.st_value, code, 4, 8)?;
         let plt_address = fixed_rip_target(symbol.st_value, code, 9, 13)?;
         let mut expected = fixed_hex("50488d3d00000000e800000000488d800000000059c3");
@@ -18657,14 +18692,7 @@ fn derive_no_installation_scope_evidence(
         )?;
     }
     authenticate_loader_metadata(elf, bytes)?;
-    let census = no_installation_scope_census(
-        elf,
-        bytes,
-        match cohort {
-            NoScopeCohort::DetcoreOrdinary101 => &ORDINARY_NO_SCOPE_OTHER_GETTERS,
-            _ => &NO_SCOPE_OTHER_GETTERS,
-        },
-    )?;
+    let census = no_installation_scope_census(elf, bytes, &NO_SCOPE_OTHER_GETTERS)?;
     Ok(NoInstallationScopeEvidence {
         kind: "no_installation_scope".into(),
         version: 1,
@@ -18785,9 +18813,9 @@ fn validate_no_installation_scope_evidence(
         let canonical = canonical_rust_symbol(&getter.getter.name)
             .ok_or("other TLS getter type name malformed")?;
         require(
-            (NO_SCOPE_OTHER_GETTERS.contains(&(canonical.as_str(), getter.cell_offset))
-                || ORDINARY_NO_SCOPE_OTHER_GETTERS
-                    .contains(&(canonical.as_str(), getter.cell_offset)))
+            NO_SCOPE_OTHER_GETTERS
+                .iter()
+                .any(|(name, _cell)| *name == canonical.as_str())
                 && retained.insert(canonical)
                 && getter.getter.binding == sym::STB_LOCAL
                 && getter.getter.size == 22
@@ -46650,7 +46678,7 @@ mod tests {
             other_tls_getters: NO_SCOPE_OTHER_GETTERS
                 .iter()
                 .enumerate()
-                .map(|(index, (name, offset))| UnisolatedTlsGetter {
+                .map(|(index, (name, _cell))| UnisolatedTlsGetter {
                     getter: SymbolEvidence {
                         name: name.replace("Cs_", "CsTest_"),
                         address: 0x1500 + index as u64 * 0x40,
@@ -46658,7 +46686,7 @@ mod tests {
                         binding: sym::STB_LOCAL,
                         visibility: sym::STV_DEFAULT,
                     },
-                    cell_offset: *offset,
+                    cell_offset: [0x199, 0x180, 0x28, 0x190][index],
                     module_slot: 0x3300,
                     plt_address: 0x1810,
                     sha256: "9".repeat(64),
@@ -46720,7 +46748,7 @@ mod tests {
                 13 => bad.mappings[0].flags = 7,
                 14 => bad.other_tls_getters.pop().map(|_| ()).unwrap(),
                 15 => bad.other_tls_getters[1] = bad.other_tls_getters[0].clone(),
-                16 => bad.other_tls_getters[0].cell_offset += 1,
+                16 => bad.other_tls_getters[0].module_slot += 1,
                 17 => bad.other_tls_getters[0].getter.binding = sym::STB_GLOBAL,
                 18 => bad.other_tls_getters[0].getter.name.push('x'),
                 19 => bad.other_getter_pointer_slots = vec![8, 8],
@@ -46814,9 +46842,16 @@ mod tests {
         }
         let mut static_names = vec![0u8];
         let mut static_offsets = Vec::new();
-        for (index, (canonical, cell_offset)) in NO_SCOPE_OTHER_GETTERS.into_iter().enumerate() {
+        let mut cell_name_offsets = Vec::new();
+        // One synthetic TLS layout; the census must bind each getter's
+        // offset from these cell symbols, whatever layout is chosen.
+        let fixture_offsets = [0x199_u64, 0x180, 0x28, 0x190];
+        for (index, (canonical, cell_canonical)) in NO_SCOPE_OTHER_GETTERS.into_iter().enumerate() {
             static_offsets.push(static_names.len());
             static_names.extend_from_slice(canonical.replace("Cs_", "Cs1_").as_bytes());
+            static_names.push(0);
+            cell_name_offsets.push(static_names.len());
+            static_names.extend_from_slice(cell_canonical.replace("Cs_", "Cs1_").as_bytes());
             static_names.push(0);
             let row = 0x4000 + (index + 1) * 24;
             let address = 0x1500 + index * 0x40;
@@ -46829,8 +46864,20 @@ mod tests {
             ] {
                 put(&mut base, row + offset, width, value);
             }
+            // The named cell itself: a unique local TLS symbol whose
+            // value is the offset the thunk must encode.
+            let cell_row = 0x4000 + (index + 5) * 24;
+            for (offset, width, value) in [
+                (0, 4, cell_name_offsets[index] as u64),
+                (4, 1, sym::STT_TLS as u64),
+                (6, 2, 1),
+                (8, 8, fixture_offsets[index]),
+                (16, 8, 8),
+            ] {
+                put(&mut base, cell_row + offset, width, value);
+            }
             let mut getter = fixed_hex("50488d3d00000000e800000000488d800000000059c3");
-            getter[16..20].copy_from_slice(&(cell_offset as u32).to_le_bytes());
+            getter[16..20].copy_from_slice(&(fixture_offsets[index] as u32).to_le_bytes());
             rip(&mut getter, address as u64, 4, 8, 0x3300);
             rip(&mut getter, address as u64, 9, 13, 0x1810);
             base[address..address + 22].copy_from_slice(&getter);
@@ -46920,7 +46967,7 @@ mod tests {
         base[0x5500..0x5500 + section_names.len()].copy_from_slice(section_names);
         for (index, name, kind, flags, address, size, link, entry) in [
             (1, ".plt", 1, 6, 0x1800, 32, 0, 16),
-            (2, ".symtab", 2, 0, 0x4000, 120, 3, 24),
+            (2, ".symtab", 2, 0, 0x4000, 216, 3, 24),
             (3, ".strtab", 3, 0, 0x6000, static_names.len() as u64, 0, 0),
             (4, ".dynsym", 11, 2, 0x4400, 48, 5, 24),
             (5, ".dynstr", 3, 2, 0x4600, dynamic_names.len() as u64, 0, 0),
@@ -46971,6 +47018,38 @@ mod tests {
         };
         let good = census(&base).expect("complete physical no-scope census positive");
         assert_eq!(good.other_tls_getters.len(), 4);
+        // A second real layout (today's native OFF image) is accepted
+        // unchanged: each getter's offset is bound from its own TLS
+        // cell symbol, so moving every cell keeps the census green.
+        let mut relaid = base.clone();
+        for (index, offset) in [0x191_u64, 0x110, 0x0, 0x188].into_iter().enumerate() {
+            let address = 0x1500 + index * 0x40;
+            put(&mut relaid, address + 16, 4, offset);
+            put(&mut relaid, 0x4000 + (index + 5) * 24 + 8, 8, offset);
+        }
+        let relaid = census(&relaid).expect("second TLS layout census positive");
+        assert_eq!(relaid.other_tls_getters.len(), 4);
+        // A getter whose encoded offset disagrees with its own named
+        // cell (here: another cell's offset) is refused.
+        let mut wrong_offset = base.clone();
+        put(&mut wrong_offset, 0x1500 + 16, 4, 0x180);
+        assert!(
+            census(&wrong_offset).is_err(),
+            "getter encoding another cell's offset must refuse"
+        );
+        // A getter whose named cell is absent (renamed to another
+        // cell's name, duplicating it) is refused.
+        let mut wrong_static = base.clone();
+        put(
+            &mut wrong_static,
+            0x4000 + 5 * 24,
+            4,
+            cell_name_offsets[1] as u64,
+        );
+        assert!(
+            census(&wrong_static).is_err(),
+            "getter whose named cell is absent or duplicated must refuse"
+        );
         assert_eq!(good.loader_writer_count, 2);
         assert!(good.other_getter_pointer_slots.is_empty());
         assert_eq!(good.mappings.len(), 1);
