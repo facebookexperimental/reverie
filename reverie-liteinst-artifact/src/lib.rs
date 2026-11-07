@@ -61053,9 +61053,9 @@ mod tests {
     #[test]
     fn detcore_patch_alloc_uniquely_matches_the_0110_template() {
         // The Detcore leaf's 241-byte alloc (cell offset 0x110) still
-        // selects exactly one template: index 94, the 0x110 entry added
+        // selects exactly one template: index 106, the 0x110 entry added
         // by the same append that must not widen standalone scope.
-        let (index, template) = (94, &DETCORE_VALIDATE_TEMPLATES[94]);
+        let (index, template) = (106, &DETCORE_VALIDATE_TEMPLATES[106]);
         assert_eq!(template.role, "fixed_patch_alloc");
         assert_eq!(fixed_hex(template.hex).len(), 241);
         let actual = fixed_hex(template.hex);
