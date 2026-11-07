@@ -41,6 +41,7 @@ pub use borrowed_entry::RcbObservationCoordinates;
 pub use borrowed_entry::RcbReturnBoundary;
 pub use borrowed_entry::ReleaseFailure;
 pub use borrowed_entry::ReleasedPreparedMapping;
+pub use borrowed_entry::RuntimeEntrySpec;
 pub use borrowed_entry::VerifiedReady;
 
 /// Numeric preparation inputs, NOT image/source/entry qualification authority.

@@ -42,6 +42,49 @@ pub struct BootstrapEntryCoordinates {
     pub terminal_int3: u64,
 }
 
+/// Interim runtime-entry specification for ToolInitialization:
+/// the caller-qualified entry coordinates plus the actual
+/// reserved-signal set, as one value. This is the data surface a
+/// future ToolManifest will generate from artifact metadata; until
+/// then the caller source-qualifies every field under the same
+/// unsafe contract as [`BootstrapEntryCoordinates`] (deriving the
+/// entry from an ELF header is deliberately not done: no canonical
+/// private-image symbol contract exists yet, and the runtime entry
+/// is not in general the image entry). The native gate is not a
+/// field here: it remains derived from the sealed target-layout
+/// descriptor inside the handover, the image's own declaration.
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeEntrySpec {
+    /// Actual qualified private C entry, with arguments (handoff pointer, length).
+    pub entry: u64,
+    /// Actual source-qualified terminal trap instruction.
+    pub terminal_trap: u64,
+    /// Actual configured AND source-qualified reserved signal set.
+    pub reserved_signals: u64,
+}
+
+impl RuntimeEntrySpec {
+    /// Coordinates for the existing observer entry points.
+    pub fn coordinates(&self) -> BootstrapEntryCoordinates {
+        BootstrapEntryCoordinates {
+            entry: self.entry,
+            terminal_int3: self.terminal_trap,
+        }
+    }
+
+    /// Interim construction from existing caller-qualified coordinates.
+    pub fn from_coordinates(
+        coordinates: &BootstrapEntryCoordinates,
+        reserved_signals: u64,
+    ) -> Self {
+        Self {
+            entry: coordinates.entry,
+            terminal_trap: coordinates.terminal_int3,
+            reserved_signals,
+        }
+    }
+}
+
 /// Explicit observer domain under the caller's real unsafe entry contract.
 /// Constructing this value authenticates no source, frontend, child or readiness.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -335,15 +378,17 @@ impl PreparedMapping<'_> {
     /// `ObservationDomain::ToolInitialization` applies unchanged.
     pub async unsafe fn observe_tool_initialization_until_ready(
         &mut self,
-        coordinates: &BootstrapEntryCoordinates,
-        reserved_signals: u64,
+        spec: &RuntimeEntrySpec,
         deadline: Instant,
     ) -> Result<(BootstrapTerminalStop, VerifiedReady)> {
         // SAFETY: exactly the delegated ToolInitialization contract above.
+        let coordinates = spec.coordinates();
         let stop = unsafe {
             self.observe_until_terminal(
-                coordinates,
-                ObservationDomain::ToolInitialization { reserved_signals },
+                &coordinates,
+                ObservationDomain::ToolInitialization {
+                    reserved_signals: spec.reserved_signals,
+                },
                 deadline,
             )
             .await?
@@ -352,7 +397,7 @@ impl PreparedMapping<'_> {
             .entry
             .initialized_stop
             .ok_or("mapped_tool_init_ready_missing")?;
-        if terminal_ip != coordinates.terminal_int3 || verified_reserved != reserved_signals {
+        if terminal_ip != spec.terminal_trap || verified_reserved != spec.reserved_signals {
             return Err("mapped_tool_init_ready_mismatch".into());
         }
         Ok((
@@ -896,6 +941,21 @@ fn tool_init_site(view: View<'_>, info: &[u8; 128], regs: &Regs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_entry_spec_preserves_coordinates_exactly() {
+        let coordinates = BootstrapEntryCoordinates {
+            entry: 0x4010_0000,
+            terminal_int3: 0x4010_2400,
+        };
+        let spec = RuntimeEntrySpec::from_coordinates(&coordinates, 0x5a5a);
+        assert_eq!(spec.entry, coordinates.entry);
+        assert_eq!(spec.terminal_trap, coordinates.terminal_int3);
+        assert_eq!(spec.reserved_signals, 0x5a5a);
+        let back = spec.coordinates();
+        assert_eq!(back.entry, coordinates.entry);
+        assert_eq!(back.terminal_int3, coordinates.terminal_int3);
+    }
 
     fn put_i32(bytes: &mut [u8; 128], offset: usize, value: i32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
