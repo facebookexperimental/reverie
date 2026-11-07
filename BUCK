@@ -849,6 +849,7 @@ rust_library(
             "package": dict(_PUBLIC_CRATE_METADATA, documentation = "https://docs.rs/reverie-liteinst"),
             "features": {
                 "default": ["preload-constructor"],
+                "liteinst": [],
                 "preload-constructor": [],
             },
         },
@@ -861,7 +862,6 @@ rust_library(
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:iced-x86",
         "fbsource//third-party/rust:libc",
-        "fbsource//third-party/rust:liteinst",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tokio",
