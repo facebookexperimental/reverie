@@ -19,6 +19,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
+use std::io::Read as _;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -238,6 +239,13 @@ impl PreloadBackend {
         future: F,
     ) -> F::Output {
         CONNECTION_ADMISSION.scope(admission, future).await
+    }
+
+    /// Runs `future` with the static-executable refusal disabled.
+    /// Reserved for activation paths that arm static guests
+    /// themselves (exec-stop); ordinary preload launches refuse.
+    pub async fn with_static_executables_allowed<F: Future>(future: F) -> F::Output {
+        STATIC_OPTOUT.scope(AllowStaticExecutables, future).await
     }
 
     /// Runs a tool using an explicit tool-specific preload library.
@@ -703,6 +711,85 @@ impl Backend for PreloadBackend {
     }
 }
 
+/// Typed opt-out from the static-executable refusal, for the future
+/// exec-stop activation path (which arms static guests itself).
+/// Builder-scoped like connection admission; never an env var.
+#[derive(Clone, Copy)]
+pub struct AllowStaticExecutables;
+
+tokio::task_local! {
+    static STATIC_OPTOUT: AllowStaticExecutables;
+}
+
+/// Read the target ELF's program headers; true when PT_INTERP is
+/// absent (static executable). Any read/parse failure is an error:
+/// an uninspectable target must not run unconfined either.
+fn target_is_static(program: &std::path::Path) -> io::Result<bool> {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    let mut file = std::fs::File::open(program)?;
+    let mut ident = [0u8; 20];
+    file.read_exact(&mut ident)?;
+    if &ident[0..4] != b"\x7fELF" {
+        return Ok(false);
+    }
+    let class = ident[4];
+    let read_u16 = |file: &mut std::fs::File, offset: u64| -> io::Result<u16> {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; 2];
+        file.read_exact(&mut buf)?;
+        Ok(u16::from_ne_bytes(buf))
+    };
+    let read_u64 = |file: &mut std::fs::File, offset: u64| -> io::Result<u64> {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf)?;
+        Ok(u64::from_ne_bytes(buf))
+    };
+    let (phoff, phentsize, phnum) = match class {
+        2 => (
+            read_u64(&mut file, 32)?,
+            read_u16(&mut file, 54)?,
+            read_u16(&mut file, 56)?,
+        ),
+        1 => (
+            read_u16(&mut file, 28).map(u64::from)?,
+            read_u16(&mut file, 42)?,
+            read_u16(&mut file, 44)?,
+        ),
+        _ => return Ok(false),
+    };
+    if phoff == 0 || phnum == 0 || phentsize < 4 {
+        return Ok(true);
+    }
+    const PT_INTERP: u32 = 3;
+    for index in 0..u64::from(phnum) {
+        file.seek(SeekFrom::Start(phoff + index * u64::from(phentsize)))?;
+        let mut kind = [0u8; 4];
+        file.read_exact(&mut kind)?;
+        if u32::from_ne_bytes(kind) == PT_INTERP {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Refuse static targets before spawn unless the typed opt-out is in
+/// scope. A static guest has no interpreter to load the preload
+/// runtime, so launching it would run it unconfined.
+fn refuse_static_target(program: &std::path::Path) -> io::Result<()> {
+    if STATIC_OPTOUT.try_with(|_| ()).is_ok() {
+        return Ok(());
+    }
+    if target_is_static(program)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "static executables are not supported by the in-guest backend (no PT_INTERP)",
+        ));
+    }
+    Ok(())
+}
+
 enum ChildWait {
     Status(std::process::ExitStatus),
     Output(Output),
@@ -1034,6 +1121,7 @@ where
     let preload = preload.canonicalize()?;
     let arg0 = command.get_arg0().to_owned();
     let program = command.find_program()?;
+    refuse_static_target(&program)?;
     command.program(program).arg0(arg0);
 
     let directory = tempfile::Builder::new()
@@ -2455,5 +2543,92 @@ mod tests {
             effective_command_env(&cleared, OsStr::new("LD_PRELOAD")),
             Some(OsString::from("/liteinst/runtime.so"))
         );
+    }
+
+    fn build_fixture(dir: &Path, name: &str, marker: &Path, statik: bool) -> std::path::PathBuf {
+        let c = dir.join("fixture.c");
+        std::fs::write(
+            &c,
+            format!(
+                "#include <stdio.h>\nint main(void){{FILE*f=fopen(\"{}\",\"w\");if(f){{fputs(\"ran\",f);fclose(f);}}return 7;}}\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let out = dir.join(name);
+        let mut cmd = std::process::Command::new("cc");
+        if statik {
+            cmd.arg("-static");
+        }
+        let status = cmd.arg("-o").arg(&out).arg(&c).status().unwrap();
+        assert!(status.success(), "cc fixture build failed");
+        out
+    }
+
+    #[test]
+    fn static_detection_reads_program_headers() {
+        let dir = short_socket_tempdir();
+        let marker = dir.path().join("marker");
+        let statik = build_fixture(dir.path(), "fx-static", &marker, true);
+        let dynamic = build_fixture(dir.path(), "fx-dynamic", &marker, false);
+        assert!(target_is_static(&statik).unwrap());
+        assert!(!target_is_static(&dynamic).unwrap());
+        assert!(!target_is_static(Path::new("/bin/true")).unwrap());
+    }
+
+    #[test]
+    fn static_target_refused_before_spawn_marker_absent() {
+        let dir = short_socket_tempdir();
+        let marker = dir.path().join("marker");
+        let statik = build_fixture(dir.path(), "fx-static2", &marker, true);
+        let err = refuse_static_target(&statik).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("no PT_INTERP"), "{err}");
+        assert!(!marker.exists());
+        let dynamic = build_fixture(dir.path(), "fx-dynamic2", &marker, false);
+        refuse_static_target(&dynamic).unwrap();
+    }
+
+    #[tokio::test]
+    async fn static_guest_never_spawns_dynamic_guest_runs() {
+        #[derive(Default, Debug)]
+        struct EchoGlobal;
+        #[reverie::tool]
+        impl reverie::GlobalTool for EchoGlobal {
+            type Request = u64;
+            type Response = u64;
+            type Config = u64;
+            async fn receive_rpc(&self, _from: reverie::Pid, message: u64) -> u64 {
+                message
+            }
+        }
+        #[derive(Default)]
+        struct EchoTool;
+        #[reverie::tool]
+        impl reverie::Tool for EchoTool {
+            type GlobalState = EchoGlobal;
+            type ThreadState = ();
+        }
+        let dir = short_socket_tempdir();
+        let preload = dir.path().join("preload.so");
+        std::fs::write(&preload, b"unused-before-refusal").unwrap();
+        let marker = dir.path().join("marker-static");
+        let statik = build_fixture(dir.path(), "fx-static3", &marker, true);
+        let command = reverie::process::Command::new(statik.to_str().unwrap());
+        // MUTATION ARM: deleting refuse_static_target from launch()
+        // lets this fixture run unconfined (marker appears).
+        let err = PreloadBackend::run_with_preload::<EchoTool>(command, 7, preload.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no PT_INTERP"),
+            "static refusal: {err}"
+        );
+        assert!(!marker.exists(), "static guest ran unconfined");
+        let marker2 = dir.path().join("marker-dynamic");
+        let dynamic = build_fixture(dir.path(), "fx-dynamic3", &marker2, false);
+        let command2 = reverie::process::Command::new(dynamic.to_str().unwrap());
+        let _ = PreloadBackend::run_with_preload::<EchoTool>(command2, 7, preload).await;
+        assert!(marker2.exists(), "dynamic guest never spawned");
     }
 }
