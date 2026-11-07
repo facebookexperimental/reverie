@@ -27225,16 +27225,31 @@ fn fixed_detcore_no_scope_qualified_operation(
     internal_switch: bool,
 ) -> Result<AuthenticatedDetcoreOperation> {
     let got = bindings.got;
-    let (kind, edges) = if role == "fixed_patch_alloc" {
+    let targets = bindings.targets;
+    let (kind, edges, scalar_storage) = if role == "fixed_patch_alloc" {
         (
             AuthenticatedDetcoreOperationKind::NoInstallationScopeAlloc101,
             fixed_detcore_no_scope_allocation_recipe(address, bytes, bindings)?,
+            None,
         )
     } else {
         let recipe = fixed_detcore_validate_recipe_in_scope(role, address, bytes, bindings, None)?;
+        let scalar_storage = if recipe.template_index >= FIXED_SCALAR_TEMPLATE_START {
+            Some((
+                *targets
+                    .get("fixed_region")
+                    .ok_or("scalar recipe lacks authenticated REGION")?,
+                *targets
+                    .get("fixed_initializing")
+                    .ok_or("scalar recipe lacks authenticated INITIALIZING")?,
+            ))
+        } else {
+            None
+        };
         (
             AuthenticatedDetcoreOperationKind::ValidateTemplate(recipe.template_index),
             recipe.edges,
+            scalar_storage,
         )
     };
     fixed_census_transfers(instructions, address, bytes, &edges, got, internal_switch)?;
@@ -27243,7 +27258,7 @@ fn fixed_detcore_no_scope_qualified_operation(
         address,
         kind,
         edges,
-        scalar_storage: None,
+        scalar_storage,
     })
 }
 
@@ -58942,21 +58957,21 @@ mod tests {
                 2,
                 "fixed_naked_constructor_record_location",
                 "tool_region_constructor.rs",
-                803,
+                841,
                 14,
             ),
             (
                 3,
                 "fixed_naked_generic_record_location",
                 "tool_region_constructor.rs",
-                820,
+                865,
                 14,
             ),
             (
                 4,
                 "fixed_naked_publish_record_location",
                 "tool_region_constructor.rs",
-                785,
+                816,
                 18,
             ),
             (
