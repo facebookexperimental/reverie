@@ -18949,7 +18949,7 @@ fn qualify_allocator_tls_boundary_in_source_context(
     {
         require(
             allocation_bytes.len() == 241
-                && matches!(cell.address, 0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x128),
+                && matches!(cell.address, 0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x110 | 0x128),
             format!(
                 "Detcore validate allocation/TLS shape differs: allocation length {}, cell offset {:#x}",
                 allocation_bytes.len(),
@@ -19949,7 +19949,7 @@ fn validate_existing_allocator_tls_boundary(
                 FixedImageKind::Detcore => {
                     matches!(
                         tls.tls_cell.address,
-                        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x128
+                        0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x110 | 0x128
                     )
                 }
             }
@@ -20025,7 +20025,7 @@ fn validate_existing_allocator_tls_boundary(
         (None, None, None) => {
             let extent = match (image_kind, tls.tls_cell.address) {
                 (FixedImageKind::Standalone, 0x40 | 0x80) => Some(186),
-                (FixedImageKind::Detcore, 0x98 | 0xd8 | 0xe8 | 0x128) => Some(241),
+                (FixedImageKind::Detcore, 0x98 | 0xd8 | 0xe8 | 0x110 | 0x128) => Some(241),
                 _ => None,
             };
             if let Some(extent) = extent {
