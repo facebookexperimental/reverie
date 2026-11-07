@@ -394,12 +394,17 @@ mod tests {
 
     #[test]
     fn no_patcher_declines_every_site() {
+        use crate::guest::isa::Isa;
+        use crate::guest::isa::NativeIsa;
+
         let seam = RuntimeSeam::new(&NO_PATCHER, GuestStatsHooks::DISABLED);
+        let site = 0x1000;
+        let resume = site + NativeIsa::SYSCALL_LEN;
         // SAFETY: NoPatcher reads nothing at these addresses.
         unsafe {
-            assert_eq!(seam.syscall_site(0x1002), 0x1000);
+            assert_eq!(seam.syscall_site(resume), site);
             assert!(matches!(
-                seam.patch_syscall_site(0x1000, libc::SYS_getpid),
+                seam.patch_syscall_site(site, libc::SYS_getpid),
                 SitePatch::NotPatched
             ));
         }
