@@ -115,7 +115,7 @@ libc = "0.2.186"
 nix = { version = "0.30.1", features = ["ptrace", "signal"] }
 reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
 reverie-kvm = { version = "0.5.4", path = "../reverie-kvm", optional = true }
-reverie-liteinst = { version = "0.5.4", path = "../reverie-liteinst", default-features = false, optional = true }
+reverie-liteinst = { version = "0.5.4", path = "../reverie-liteinst", default-features = false, features = ["liteinst"], optional = true }
 reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace", optional = true }
 reverie-util = { version = "0.5.4", path = "../reverie-util" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }

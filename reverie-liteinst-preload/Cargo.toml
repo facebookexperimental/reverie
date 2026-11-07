@@ -16,7 +16,7 @@ allocator-fixture = ["reverie-liteinst/allocator-fixture"]
 [dependencies]
 libc = "0.2.186"
 reverie = { package = "reverie-core", version = "0.5.4", path = "../reverie" }
-reverie-liteinst = { version = "0.5.4", path = "../reverie-liteinst", default-features = false }
+reverie-liteinst = { version = "0.5.4", path = "../reverie-liteinst", default-features = false, features = ["liteinst"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

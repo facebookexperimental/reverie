@@ -150,52 +150,20 @@ fn fixed_gate_installation_refuses_collisions_and_inherited_filters() {
 }
 
 #[test]
-fn preflight_refusal_completes_config_only_handshake() {
-    use std::io::Read;
-    use std::io::Write;
-    // A selector (preflight) refusal happens before any gate
-    // publication; installation must still surface it to the
-    // coordinator through a config-only handshake so the launcher
-    // reports the ordinary refusal instead of an unsupported
-    // executable. Exactly one connection, config written by the
-    // coordinator, then EOF with no Tool RPC byte.
+fn preflight_refusal_never_connects() {
+    // A preflight (selector) refusal must not complete any coordinator
+    // connection: the launcher's pre-connect error, which carries the
+    // guest stderr diagnostic, is the ordinary refusal report. (An
+    // earlier config-only handshake here flipped the launcher's
+    // connected determination and masked the refusal as a connected
+    // run; it was removed.)
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("coordinator.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let coordinator = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(pair) => break pair,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "preflight refusal never connected to the coordinator"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("coordinator accept: {error}"),
-            }
-        };
-        let config = bincode::serde::encode_to_vec((), bincode::config::legacy()).unwrap();
-        stream
-            .write_all(&(config.len() as u32).to_be_bytes())
-            .unwrap();
-        stream.write_all(&config).unwrap();
-        let mut byte = [0];
-        assert_eq!(stream.read(&mut byte).unwrap(), 0, "unexpected Tool RPC");
-        // Exactly one connection.
-        listener.set_nonblocking(true).unwrap();
-        assert!(matches!(
-            listener.accept(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
-    });
     let mut command = Command::new(env!("CARGO_BIN_EXE_reverie-liteinst-rpc-tool-guest"));
     command.arg("fixed-gate-invalid-site-patching").arg(&socket);
     let output = bounded_output(command);
-    coordinator.join().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         output.stdout,
@@ -203,6 +171,13 @@ fn preflight_refusal_completes_config_only_handshake() {
           dispatcher=absent\n"
     );
     assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(
+        matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "preflight refusal connected to the coordinator"
+    );
 }
 
 #[test]
