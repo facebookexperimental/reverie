@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 
 [features]
 allocator-fixture = ["reverie-liteinst/allocator-fixture"]
+liteinst = ["reverie-liteinst/liteinst"]
 
 [dependencies]
 libc = "0.2.186"
