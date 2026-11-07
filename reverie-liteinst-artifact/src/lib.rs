@@ -27076,20 +27076,18 @@ fn fixed_detcore_got_discriminate<'a>(
     if !layouts_match || !shapes_match {
         return candidates.to_vec();
     }
+    // Only GOT operands participate in this discrimination. Differing
+    // non-GOT (readonly data) operands, such as the bitmap pair's panic
+    // Location profiles, are left to the caller's exact-data discrimination.
     let differing: Vec<usize> = (0..first.operands.len())
         .filter(|&index| {
-            candidates
-                .iter()
-                .any(|(_, other)| other.operands[index].key != first.operands[index].key)
+            first.operands[index].got
+                && candidates
+                    .iter()
+                    .any(|(_, other)| other.operands[index].key != first.operands[index].key)
         })
         .collect();
-    if differing.is_empty()
-        || differing.iter().any(|&index| {
-            candidates
-                .iter()
-                .any(|(_, other)| !other.operands[index].got)
-        })
-    {
+    if differing.is_empty() {
         return candidates.to_vec();
     }
     let binds_at = |template: &DetcoreValidateTemplate, index: usize| {
