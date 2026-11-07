@@ -3969,6 +3969,29 @@ const NO_SCOPE_OTHER_GETTERS: [(&str, u64); 4] = [
     ),
 ];
 
+/// The same four getters in the ordinary (non-native) Detcore image, whose
+/// TLS layout assigns different offsets (measured from the built staged
+/// runtime: TOOL_CALLBACK_ACTIVE 0x118, OWNER 0x120, PENDING 0x0,
+/// DISPATCH_DEPTH 0x110). Same named cells; per-image-kind layout only.
+const ORDINARY_NO_SCOPE_OTHER_GETTERS: [(&str, u64); 4] = [
+    (
+        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest7support20TOOL_CALLBACK_ACTIVE0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1s_6option6OptionQIB27_INtNtNtB1s_4sync6atomic6AtomicbEEEEE9call_onceBc_",
+        0x118,
+    ),
+    (
+        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation5OWNER0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1i_6option6OptionQIB1X_INtNtB1i_4cell4CellONtB8_12ContinuationEEEEE9call_onceBc_",
+        0x120,
+    ),
+    (
+        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation7PENDING0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CellIB1Z_NtB8_7PendingEEEEEE9call_onceBc_",
+        0x0,
+    ),
+    (
+        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest5alloc14DISPATCH_DEPTH0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CelljEEEEE9call_onceBc_",
+        0x110,
+    ),
+];
+
 /// Versioned finite absence evidence, not a TLS-isolation or source authority.
 /// Consumer admission always re-extracts this from its actual ELF and verified
 /// compiled sources and compares the entire qualification record.
@@ -18298,7 +18321,11 @@ struct NoScopeCensus {
 }
 // Physical census only. The production caller separately requires actual
 // verified sources, actual compiler feature events and the whole101B recipe.
-fn no_installation_scope_census(elf: &Elf<'_>, bytes: &[u8]) -> Result<NoScopeCensus> {
+fn no_installation_scope_census(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    other_getters: &[(&str, u64)],
+) -> Result<NoScopeCensus> {
     let mut raw_names = Vec::new();
     for (dynamic, symbols, strings) in [
         (false, &elf.syms, &elf.strtab),
@@ -18324,7 +18351,7 @@ fn no_installation_scope_census(elf: &Elf<'_>, bytes: &[u8]) -> Result<NoScopeCe
         }
     }
     let mut other_tls_getters = Vec::new();
-    for (canonical, cell_offset) in NO_SCOPE_OTHER_GETTERS {
+    for &(canonical, cell_offset) in other_getters {
         let candidates: Vec<_> = elf
             .syms
             .iter()
@@ -18535,7 +18562,7 @@ fn derive_no_installation_scope_evidence(
         .current_build
         .as_ref()
         .ok_or("no-scope allocation needs actual current-build witness")?;
-    no_scope_build_features(build)?;
+    let cohort = no_scope_build_features(build)?;
     let compiled_sources_sha256 =
         sha256(&serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?);
     require(
@@ -18578,7 +18605,14 @@ fn derive_no_installation_scope_evidence(
         )?;
     }
     authenticate_loader_metadata(elf, bytes)?;
-    let census = no_installation_scope_census(elf, bytes)?;
+    let census = no_installation_scope_census(
+        elf,
+        bytes,
+        match cohort {
+            NoScopeCohort::DetcoreOrdinary101 => &ORDINARY_NO_SCOPE_OTHER_GETTERS,
+            _ => &NO_SCOPE_OTHER_GETTERS,
+        },
+    )?;
     Ok(NoInstallationScopeEvidence {
         kind: "no_installation_scope".into(),
         version: 1,
@@ -18699,7 +18733,9 @@ fn validate_no_installation_scope_evidence(
         let canonical = canonical_rust_symbol(&getter.getter.name)
             .ok_or("other TLS getter type name malformed")?;
         require(
-            NO_SCOPE_OTHER_GETTERS.contains(&(canonical.as_str(), getter.cell_offset))
+            (NO_SCOPE_OTHER_GETTERS.contains(&(canonical.as_str(), getter.cell_offset))
+                || ORDINARY_NO_SCOPE_OTHER_GETTERS
+                    .contains(&(canonical.as_str(), getter.cell_offset)))
                 && retained.insert(canonical)
                 && getter.getter.binding == sym::STB_LOCAL
                 && getter.getter.size == 22
@@ -45804,8 +45840,13 @@ mod tests {
             }
         }
         put(&mut base, 0x8000 + 9 * 64 + 44, 4, 1);
-        let census =
-            |bytes: &[u8]| no_installation_scope_census(&Elf::parse(bytes).unwrap(), bytes);
+        let census = |bytes: &[u8]| {
+            no_installation_scope_census(
+                &Elf::parse(bytes).unwrap(),
+                bytes,
+                &NO_SCOPE_OTHER_GETTERS,
+            )
+        };
         let good = census(&base).expect("complete physical no-scope census positive");
         assert_eq!(good.other_tls_getters.len(), 4);
         assert_eq!(good.loader_writer_count, 2);
