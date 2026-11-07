@@ -24,6 +24,8 @@ use std::sync::OnceLock;
 
 use super::context::RegisterContext;
 use super::event::InstructionEventKind;
+use super::isa::Isa;
+use super::isa::NativeIsa;
 use super::tool_region::StackBacking;
 use super::tool_region::StackLease;
 use crate::trap::frame::FrameError;
@@ -82,7 +84,7 @@ impl PendingKind {
     /// Bytes from the instruction's address to its saved resume address.
     fn frame_offset(self) -> u64 {
         match self {
-            Self::Syscall => 2,
+            Self::Syscall => NativeIsa::SYSCALL_LEN,
             Self::Instruction(_) => 0,
         }
     }
@@ -90,7 +92,7 @@ impl PendingKind {
     /// Bytes the committed guest context advances past the instruction.
     fn length(self) -> u64 {
         match self {
-            Self::Syscall => 2,
+            Self::Syscall => NativeIsa::SYSCALL_LEN,
             Self::Instruction(kind) => kind.encoded_len(),
         }
     }
@@ -701,15 +703,8 @@ fn prepare_signal_for(
                 tid: owner.owner_tid,
                 generation: owner.generation,
                 mask: frame.signal_mask(),
-                number: owner.context.rax as i64,
-                args: [
-                    owner.context.rdi,
-                    owner.context.rsi,
-                    owner.context.rdx,
-                    owner.context.r10,
-                    owner.context.r8,
-                    owner.context.r9,
-                ],
+                number: NativeIsa::syscall_number(&owner.context),
+                args: NativeIsa::syscall_args(&owner.context),
                 instruction,
                 pkru: owner.saved.pkru(),
             });
@@ -736,59 +731,11 @@ fn prepare_signal_for(
 }
 
 fn context_from_image(saved: &SavedState, instruction: u64) -> RegisterContext {
-    let r = &saved.registers;
-    let mut context = RegisterContext::default();
-    context.instruction_pointer = instruction;
-    context.stack_pointer = r[libc::REG_RSP as usize] as u64;
-    context.rax = r[libc::REG_RAX as usize] as u64;
-    context.rbx = r[libc::REG_RBX as usize] as u64;
-    context.rcx = r[libc::REG_RCX as usize] as u64;
-    context.rdx = r[libc::REG_RDX as usize] as u64;
-    context.rsi = r[libc::REG_RSI as usize] as u64;
-    context.rdi = r[libc::REG_RDI as usize] as u64;
-    context.rbp = r[libc::REG_RBP as usize] as u64;
-    context.r8 = r[libc::REG_R8 as usize] as u64;
-    context.r9 = r[libc::REG_R9 as usize] as u64;
-    context.r10 = r[libc::REG_R10 as usize] as u64;
-    context.r11 = r[libc::REG_R11 as usize] as u64;
-    context.r12 = r[libc::REG_R12 as usize] as u64;
-    context.r13 = r[libc::REG_R13 as usize] as u64;
-    context.r14 = r[libc::REG_R14 as usize] as u64;
-    context.r15 = r[libc::REG_R15 as usize] as u64;
-    context.rflags = r[libc::REG_EFL as usize] as u64;
-    debug_assert!(context.extended_state_unavailable());
-    context
+    NativeIsa::context_from_saved(saved, instruction)
 }
 
 fn commit_context(owner: &mut Continuation, length: u64) -> Result<(), FrameError> {
-    let c = &owner.context;
-    let r = &mut owner.saved.registers;
-    for (index, value) in [
-        (libc::REG_R8, c.r8),
-        (libc::REG_R9, c.r9),
-        (libc::REG_R10, c.r10),
-        (libc::REG_R11, c.r11),
-        (libc::REG_R12, c.r12),
-        (libc::REG_R13, c.r13),
-        (libc::REG_R14, c.r14),
-        (libc::REG_R15, c.r15),
-        (libc::REG_RDI, c.rdi),
-        (libc::REG_RSI, c.rsi),
-        (libc::REG_RBP, c.rbp),
-        (libc::REG_RBX, c.rbx),
-        (libc::REG_RDX, c.rdx),
-        (libc::REG_RAX, c.rax),
-        (libc::REG_RCX, c.rcx),
-        (libc::REG_RSP, c.stack_pointer),
-        (libc::REG_EFL, c.rflags),
-    ] {
-        r[index as usize] = value as i64;
-    }
-    r[libc::REG_RIP as usize] = c
-        .instruction_pointer
-        .checked_add(length)
-        .ok_or(FrameError)? as i64;
-    Ok(())
+    NativeIsa::commit_context(&mut owner.saved, &owner.context, length)
 }
 
 /// While the runtime delivers signals itself (`runtime_mask`), the guest mask
@@ -889,13 +836,7 @@ unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
     let mut pkru = unsafe { (*pointer).saved.pkru() };
     // The registers the syscall dispatch writes, for a syscall that is to
     // start again (signal phase 1's delivery at syscall entry).
-    let entry = unsafe {
-        (
-            (*pointer).context.rax,
-            (*pointer).context.rcx,
-            (*pointer).context.r11,
-        )
-    };
+    let entry = unsafe { NativeIsa::restart_snapshot(&(*pointer).context) };
     unsafe {
         let context = core::ptr::addr_of_mut!((*pointer).context);
         match pending.kind {
@@ -926,7 +867,7 @@ unsafe extern "C" fn dispatch(pointer: *mut Continuation) {
         if !matches!(pending.kind, PendingKind::Syscall) {
             fatal()
         }
-        (owner.context.rax, owner.context.rcx, owner.context.r11) = entry;
+        NativeIsa::restore_restart_snapshot(&mut owner.context, entry);
         length = 0;
     }
     if owner.owner_tid != current_tid()

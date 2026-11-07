@@ -21,6 +21,8 @@ use crate::dispatch::SyscallEventSource;
 use crate::guest::continuation;
 use crate::guest::event::SyscallDispatch;
 use crate::guest::event::SyscallEvent;
+use crate::guest::isa::Isa;
+use crate::guest::isa::NativeIsa;
 use crate::guest::protect::protect_runtime_control;
 use crate::guest::protect::protect_runtime_descriptors;
 use crate::guest::support::exit_now;
@@ -97,7 +99,7 @@ pub unsafe trait TrapSeam: Send + Sync {
     /// `resume_address` is the arrival resume address of a SIGSYS-delivered
     /// trap that has not run, so the code just before it was executing.
     unsafe fn syscall_site(&self, resume_address: u64) -> u64 {
-        resume_address.saturating_sub(2)
+        NativeIsa::syscall_site(resume_address)
     }
 
     /// Patches the trap's syscall site, if the backend patches.
@@ -250,7 +252,7 @@ impl<S: TrapSeam> InGuestDispatcher<S> {
             }
             instruction_pointer
         } else {
-            resume_address.saturating_sub(2)
+            NativeIsa::syscall_site(resume_address)
         };
 
         self.seam.record_fallback(event.number());

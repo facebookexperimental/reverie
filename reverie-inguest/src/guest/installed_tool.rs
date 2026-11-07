@@ -385,6 +385,8 @@ pub unsafe fn dispatch_saved_syscall(
     use super::clock::enter_rcb_handler;
     use super::clock::leave_rcb_handler;
     use super::event::SyscallDispatch;
+    use super::isa::Isa;
+    use super::isa::NativeIsa;
     use super::support::ToolCallbackGuard;
     use super::support::exit_now;
     use super::support::tool_callback_active;
@@ -403,16 +405,9 @@ pub unsafe fn dispatch_saved_syscall(
     let context_pointer = context as usize;
     let context = unsafe { &mut *context };
     let mut event = SyscallEvent {
-        number: number.unwrap_or(context.rax as i64),
-        args: [
-            context.rdi,
-            context.rsi,
-            context.rdx,
-            context.r10,
-            context.r8,
-            context.r9,
-        ],
-        instruction_pointer: context.instruction_pointer,
+        number: number.unwrap_or_else(|| NativeIsa::syscall_number(context)),
+        args: NativeIsa::syscall_args(context),
+        instruction_pointer: NativeIsa::instruction_pointer(context),
         result: UNSET_RESULT,
         context: context_pointer,
         dispatch,
@@ -439,9 +434,7 @@ pub unsafe fn dispatch_saved_syscall(
         // SAFETY: a genuine hook entry made while a Tool callback is active on
         // this thread: the callback's own syscall, which may run natively.
         unsafe { forward_nested_tool_syscall(&mut event, observe_nested_mapping) };
-        context.rax = event.result as u64;
-        context.rcx = context.instruction_pointer.saturating_add(2);
-        context.r11 = context.rflags;
+        NativeIsa::finish_syscall(context, event.result);
         if let Some(output) = guest_pkru {
             *output = event.guest_pkru;
         }
@@ -460,9 +453,7 @@ pub unsafe fn dispatch_saved_syscall(
     if event.result == UNSET_RESULT {
         event.result = -i64::from(libc::ENOSYS);
     }
-    context.rax = event.result as u64;
-    context.rcx = context.instruction_pointer.saturating_add(2);
-    context.r11 = context.rflags;
+    NativeIsa::finish_syscall(context, event.result);
     if let Some(output) = guest_pkru {
         *output = event.guest_pkru;
     }

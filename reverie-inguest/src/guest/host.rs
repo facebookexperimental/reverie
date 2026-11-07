@@ -44,6 +44,9 @@ use super::context::RegisterContext;
 use super::event::InstructionEventKind;
 use super::event::SyscallDispatch;
 use super::event::SyscallEvent;
+use super::isa::InstructionResult;
+use super::isa::Isa;
+use super::isa::NativeIsa;
 use super::native_rpc::NativeApplicationRpc;
 use super::native_rpc::NativeRpc;
 use super::native_services::NativeEntryObservation;
@@ -1340,7 +1343,7 @@ where
         let mut event = SyscallEvent {
             number: -1,
             args: [0; 6],
-            instruction_pointer: context.instruction_pointer,
+            instruction_pointer: NativeIsa::instruction_pointer(context),
             result: 0,
             context: context as *mut RegisterContext as usize,
             dispatch: SyscallDispatch::InstalledHook,
@@ -1386,7 +1389,11 @@ where
                 let outcome = drive_callback(
                     tool.as_ref()
                         .expect("checked live Tool")
-                        .handle_cpuid_event(&mut guest, context.rax as u32, context.rcx as u32),
+                        .handle_cpuid_event(
+                            &mut guest,
+                            NativeIsa::cpuid_inputs(context).0,
+                            NativeIsa::cpuid_inputs(context).1,
+                        ),
                     &tail,
                 );
                 let result = match callback_result(outcome) {
@@ -1399,10 +1406,16 @@ where
                         finish_ending(self, lease, (tid, pid), ending)
                     }
                 };
-                context.rax = u64::from(result.eax);
-                context.rbx = u64::from(result.ebx);
-                context.rcx = u64::from(result.ecx);
-                context.rdx = u64::from(result.edx);
+                NativeIsa::apply_instruction_result(
+                    context,
+                    kind,
+                    InstructionResult::Cpuid {
+                        eax: result.eax,
+                        ebx: result.ebx,
+                        ecx: result.ecx,
+                        edx: result.edx,
+                    },
+                );
             }
             InstructionEventKind::Rdtsc | InstructionEventKind::Rdtscp => {
                 let request = if kind == InstructionEventKind::Rdtscp {
@@ -1426,11 +1439,14 @@ where
                         finish_ending(self, lease, (tid, pid), ending)
                     }
                 };
-                context.rax = result.tsc as u32 as u64;
-                context.rdx = result.tsc.checked_shr(32).unwrap_or(0);
-                if let Some(aux) = result.aux {
-                    context.rcx = u64::from(aux);
-                }
+                NativeIsa::apply_instruction_result(
+                    context,
+                    kind,
+                    InstructionResult::Tsc {
+                        value: result.tsc,
+                        aux: result.aux,
+                    },
+                );
             }
         }
         // The instruction callback can send the guest a signal that ends it;
@@ -3681,40 +3697,15 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
                 .regs()
                 .expect("native failed to translate the guest registers");
         }
-        let mut regs = unsafe { core::mem::zeroed::<libc::user_regs_struct>() };
         if self.event.context != 0 {
             let context = unsafe { &*(self.event.context as *const RegisterContext) };
-            regs.r15 = context.r15;
-            regs.r14 = context.r14;
-            regs.r13 = context.r13;
-            regs.r12 = context.r12;
-            regs.rbp = context.rbp;
-            regs.rbx = context.rbx;
-            regs.r11 = context.r11;
-            regs.r10 = context.r10;
-            regs.r9 = context.r9;
-            regs.r8 = context.r8;
-            regs.rax = context.rax;
-            regs.rcx = context.rcx;
-            regs.rdx = context.rdx;
-            regs.rsi = context.rsi;
-            regs.rdi = context.rdi;
-            regs.orig_rax = context.rax;
-            regs.rip = context.instruction_pointer;
-            regs.rsp = context.stack_pointer;
-            regs.eflags = context.rflags;
-            return regs;
+            return NativeIsa::user_regs_from_context(context);
         }
-        regs.rax = self.event.number as u64;
-        regs.orig_rax = self.event.number as u64;
-        regs.rdi = self.event.args[0];
-        regs.rsi = self.event.args[1];
-        regs.rdx = self.event.args[2];
-        regs.r10 = self.event.args[3];
-        regs.r8 = self.event.args[4];
-        regs.r9 = self.event.args[5];
-        regs.rip = self.event.instruction_pointer;
-        regs
+        NativeIsa::user_regs_from_event(
+            self.event.number,
+            self.event.args,
+            self.event.instruction_pointer,
+        )
     }
     async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), Error> {
         if self.tail.ending() {
@@ -3724,27 +3715,10 @@ impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
         if let Some(native) = &self.native {
             return native.services.set_regs(&regs).map_err(Error::from);
         }
-        self.event.number = regs.rax as i64;
-        self.event.args = [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9];
+        (self.event.number, self.event.args) = NativeIsa::event_from_user_regs(&regs);
         if self.event.context != 0 {
             let context = unsafe { &mut *(self.event.context as *mut RegisterContext) };
-            context.r15 = regs.r15;
-            context.r14 = regs.r14;
-            context.r13 = regs.r13;
-            context.r12 = regs.r12;
-            context.rbp = regs.rbp;
-            context.rbx = regs.rbx;
-            context.r11 = regs.r11;
-            context.r10 = regs.r10;
-            context.r9 = regs.r9;
-            context.r8 = regs.r8;
-            context.rax = regs.rax;
-            context.rcx = regs.rcx;
-            context.rdx = regs.rdx;
-            context.rsi = regs.rsi;
-            context.rdi = regs.rdi;
-            context.stack_pointer = regs.rsp;
-            context.rflags = regs.eflags;
+            NativeIsa::apply_user_regs(context, &regs);
         }
         Ok(())
     }

@@ -47,6 +47,7 @@ pub mod installed_stack;
 pub mod installed_tool;
 #[cfg(target_arch = "x86_64")]
 pub mod instruction;
+pub mod isa;
 /// CPUID/RDTSC faulting has no aarch64 counterpart in this stage; nothing
 /// can be subscribed there, which the subscription surface reports as-is.
 #[cfg(not(target_arch = "x86_64"))]

@@ -6,18 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Instruction control for the in-guest trap path. When the Tool subscribes to
-//! CPUID or RDTSC/RDTSCP, the runtime turns on CPUID faulting
-//! (`ARCH_SET_CPUID`) and `PR_TSC_SIGSEGV`, so each such instruction raises a
-//! `SIGSEGV`. This module holds the process's subscriptions, the preflight and
-//! the switches for those controls, the decoder for the faulting encodings,
-//! native execution at private helper sites that are never patched, and the
-//! hand-off of a fault to the fallback continuation for emulation, and the
-//! `SIGSEGV` handler itself, which asks the backend (through an
-//! [`InstructionFaultSeam`]) where a fault lies and whether its site can be
-//! patched.
+//! Instruction control for the in-guest trap path. When the Tool subscribes
+//! to a faulting instruction, the native [`Isa`] implementation turns on
+//! its faulting control so the instruction raises `SIGSEGV`. This module
+//! holds the process's subscriptions and the generic handler control flow:
+//! it asks the backend (through an [`InstructionFaultSeam`]) where a fault
+//! lies and whether its site can be patched, and hands unpatched faults to
+//! the fallback continuation for emulation. Every arch mechanism
+//! (controls, decoding, native execution) lives behind [`Isa`].
 
-use core::arch::global_asm;
 use core::ptr;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU8;
@@ -26,9 +23,10 @@ use std::io;
 
 use crate::guest::context::RegisterContext;
 use crate::guest::event::InstructionEventKind;
+use crate::guest::isa::Isa;
+use crate::guest::isa::NativeIsa;
 use crate::guest::support::IN_GUEST_STAGE_WRITE_FAILURE_STATUS;
 use crate::guest::support::KernelSigaction;
-use crate::guest::support::SignalInstallGuard;
 use crate::guest::support::StackLine;
 use crate::guest::support::emit_in_guest_stage;
 use crate::guest::support::exit_now;
@@ -38,81 +36,16 @@ use crate::guest::support::stage_stream_enabled;
 use crate::guest::support::tool_callback_active;
 use crate::trap::raw_syscall6;
 
-global_asm!(
-    r#"
-    .text
-    # These instruction sites are reached only after the nested-hook path has
-    # temporarily enabled native execution. Keeping them private to that path
-    # guarantees they have never been patched when they are first executed.
-    .p2align 4
-    .global reverie_inguest_native_cpuid
-    .hidden reverie_inguest_native_cpuid
-    .type reverie_inguest_native_cpuid,@function
-reverie_inguest_native_cpuid:
-    push rbx
-    mov r8, rdx
-    mov eax, edi
-    mov ecx, esi
-    cpuid
-    mov dword ptr [r8], eax
-    mov dword ptr [r8 + 4], ebx
-    mov dword ptr [r8 + 8], ecx
-    mov dword ptr [r8 + 12], edx
-    pop rbx
-    ret
-    .size reverie_inguest_native_cpuid, .-reverie_inguest_native_cpuid
-
-    .p2align 4
-    .global reverie_inguest_native_rdtsc
-    .hidden reverie_inguest_native_rdtsc
-    .type reverie_inguest_native_rdtsc,@function
-reverie_inguest_native_rdtsc:
-    rdtsc
-    shl rdx, 32
-    or rax, rdx
-    ret
-    .size reverie_inguest_native_rdtsc, .-reverie_inguest_native_rdtsc
-
-    .p2align 4
-    .global reverie_inguest_native_rdtscp
-    .hidden reverie_inguest_native_rdtscp
-    .type reverie_inguest_native_rdtscp,@function
-reverie_inguest_native_rdtscp:
-    mov r8, rdi
-    rdtscp
-    mov dword ptr [r8], ecx
-    shl rdx, 32
-    or rax, rdx
-    ret
-    .size reverie_inguest_native_rdtscp, .-reverie_inguest_native_rdtscp
-"#
-);
-
-unsafe extern "C" {
-    fn reverie_inguest_native_cpuid(eax: u32, ecx: u32, result: *mut NativeCpuidResult);
-    fn reverie_inguest_native_rdtsc() -> u64;
-    fn reverie_inguest_native_rdtscp(aux: *mut u32) -> u64;
-}
-
 const INSTRUCTION_CPUID: u8 = 1;
 const INSTRUCTION_RDTSC: u8 = 2;
 static INSTRUCTION_SUBSCRIPTIONS: AtomicU8 = AtomicU8::new(0);
-
-#[derive(Default)]
-#[repr(C)]
-struct NativeCpuidResult {
-    eax: u32,
-    ebx: u32,
-    ecx: u32,
-    edx: u32,
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 /// Which faulting instructions the Tool subscribes to.
 pub struct InstructionSubscriptions {
     /// CPUID, trapped by CPUID faulting.
     pub cpuid: bool,
-    /// RDTSC and RDTSCP, trapped by `PR_TSC_SIGSEGV`.
+    /// RDTSC and RDTSCP, trapped by the native TSC faulting control.
     pub rdtsc: bool,
 }
 
@@ -154,170 +87,28 @@ pub fn instruction_is_subscribed(kind: InstructionEventKind) -> bool {
     }
 }
 
-/// Recognize the exact CPUID, RDTSC, and RDTSCP encodings that instruction
-/// faulting traps, given the readable bytes starting at the faulting RIP.
+/// Recognize a faulting instruction encoding at the start of `bytes`,
+/// through the native architecture's decoder.
 pub fn decode_instruction(bytes: &[u8]) -> Option<(InstructionEventKind, &'static [u8])> {
-    match bytes {
-        [0x0f, 0xa2, ..] => Some((InstructionEventKind::Cpuid, &[0x0f, 0xa2])),
-        [0x0f, 0x31, ..] => Some((InstructionEventKind::Rdtsc, &[0x0f, 0x31])),
-        [0x0f, 0x01, 0xf9, ..] => Some((InstructionEventKind::Rdtscp, &[0x0f, 0x01, 0xf9])),
-        _ => None,
-    }
+    NativeIsa::decode_instruction(bytes)
 }
 
 /// Checks that this thread can turn on the faulting each subscribed
-/// instruction needs, by setting it and restoring the previous setting with
-/// every signal blocked. Fails with `Unsupported` when the kernel or CPU lacks
-/// the control; ends the process with status 126 if a restore fails.
+/// instruction needs, through the native architecture's admission
+/// probe. Fails with `Unsupported` when the architecture, kernel or
+/// CPU lacks the control.
 pub fn preflight_instruction_faulting(subscriptions: InstructionSubscriptions) -> io::Result<()> {
-    if !subscriptions.cpuid && !subscriptions.rdtsc {
-        return Ok(());
-    }
-
-    // The exact setter probes temporarily change this thread's instruction
-    // controls. Keep inherited asynchronous handlers from running application
-    // CPUID/RDTSC during that bounded window, and restore the caller's exact
-    // signal mask on every return path.
-    #[cfg(feature = "exec-private-init")]
-    let all_signals = if super::exec_private::active() {
-        !(1_u64 << (libc::SIGSYS - 1))
-    } else {
-        u64::MAX
-    };
-    #[cfg(not(feature = "exec-private-init"))]
-    let all_signals = u64::MAX;
-    let mut previous_mask = 0;
-    let masked = unsafe {
-        raw_syscall6(
-            libc::SYS_rt_sigprocmask,
-            [
-                libc::SIG_SETMASK as u64,
-                (&raw const all_signals) as u64,
-                (&raw mut previous_mask) as u64,
-                core::mem::size_of::<u64>() as u64,
-                0,
-                0,
-            ],
-        )
-    };
-    if masked != 0 {
-        return Err(io::Error::from_raw_os_error((-masked) as i32));
-    }
-    let _signal_mask = SignalInstallGuard::restoring(previous_mask);
-
-    if subscriptions.cpuid {
-        const ARCH_GET_CPUID: u64 = 0x1011;
-        const ARCH_SET_CPUID: u64 = 0x1012;
-        let previous =
-            unsafe { raw_syscall6(libc::SYS_arch_prctl, [ARCH_GET_CPUID, 0, 0, 0, 0, 0]) };
-        if previous < 0 {
-            return Err(instruction_control_unavailable("CPUID faulting", previous));
-        }
-        let result = unsafe { raw_syscall6(libc::SYS_arch_prctl, [ARCH_SET_CPUID, 0, 0, 0, 0, 0]) };
-        if result != 0 {
-            return Err(instruction_control_unavailable("CPUID faulting", result));
-        }
-        let restored = unsafe {
-            raw_syscall6(
-                libc::SYS_arch_prctl,
-                [ARCH_SET_CPUID, previous as u64, 0, 0, 0, 0],
-            )
-        };
-        if restored != 0 {
-            unsafe { exit_now(126) };
-        }
-    }
-    if subscriptions.rdtsc {
-        let mut previous = 0;
-        let result = unsafe {
-            raw_syscall6(
-                libc::SYS_prctl,
-                [
-                    libc::PR_GET_TSC as u64,
-                    (&raw mut previous) as u64,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            )
-        };
-        if result != 0 {
-            return Err(instruction_control_unavailable("TSC faulting", result));
-        }
-        let result = unsafe {
-            raw_syscall6(
-                libc::SYS_prctl,
-                [
-                    libc::PR_SET_TSC as u64,
-                    libc::PR_TSC_SIGSEGV as u64,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            )
-        };
-        if result != 0 {
-            return Err(instruction_control_unavailable("TSC faulting", result));
-        }
-        let restored = unsafe {
-            raw_syscall6(
-                libc::SYS_prctl,
-                [libc::PR_SET_TSC as u64, previous as u64, 0, 0, 0, 0],
-            )
-        };
-        if restored != 0 {
-            unsafe { exit_now(126) };
-        }
-    }
-    Ok(())
+    NativeIsa::admit_instruction_subscriptions(subscriptions)
 }
 
-fn instruction_control_unavailable(control: &str, result: i64) -> io::Error {
-    let error = io::Error::from_raw_os_error((-result) as i32);
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "{control} is unavailable: {}",
-            crate::guest::support::describe_io_error(&error)
-        ),
-    )
-}
-
-/// Turns on CPUID faulting and `PR_TSC_SIGSEGV` on this thread for the
-/// subscribed instructions.
+/// Turns on this thread's faulting controls for the subscribed
+/// instructions, through the native architecture.
 pub fn enable_instruction_faulting(subscriptions: InstructionSubscriptions) -> io::Result<()> {
-    if subscriptions.cpuid {
-        const ARCH_SET_CPUID: u64 = 0x1012;
-        let result = unsafe { raw_syscall6(libc::SYS_arch_prctl, [ARCH_SET_CPUID, 0, 0, 0, 0, 0]) };
-        if result != 0 {
-            return Err(io::Error::from_raw_os_error((-result) as i32));
-        }
-    }
-    if subscriptions.rdtsc {
-        let result = unsafe {
-            raw_syscall6(
-                libc::SYS_prctl,
-                [
-                    libc::PR_SET_TSC as u64,
-                    libc::PR_TSC_SIGSEGV as u64,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::from_raw_os_error((-result) as i32));
-        }
-    }
-    Ok(())
+    NativeIsa::enable_instruction_faulting(subscriptions)
 }
 
-/// Lets `kind` execute natively on this thread (`enabled`), or makes it fault
-/// again.
+/// Lets `kind` execute natively on this thread (`enabled`), or makes it
+/// fault again, through the native architecture.
 ///
 /// # Safety
 ///
@@ -325,37 +116,7 @@ pub fn enable_instruction_faulting(subscriptions: InstructionSubscriptions) -> i
 /// code runs again on this thread, or the guest executes the instruction
 /// natively and the Tool never sees it.
 pub unsafe fn set_instruction_native(kind: InstructionEventKind, enabled: bool) -> io::Result<()> {
-    let result = match kind {
-        InstructionEventKind::Cpuid => unsafe {
-            const ARCH_SET_CPUID: u64 = 0x1012;
-            raw_syscall6(
-                libc::SYS_arch_prctl,
-                [ARCH_SET_CPUID, u64::from(enabled), 0, 0, 0, 0],
-            )
-        },
-        InstructionEventKind::Rdtsc | InstructionEventKind::Rdtscp => unsafe {
-            raw_syscall6(
-                libc::SYS_prctl,
-                [
-                    libc::PR_SET_TSC as u64,
-                    if enabled {
-                        libc::PR_TSC_ENABLE as u64
-                    } else {
-                        libc::PR_TSC_SIGSEGV as u64
-                    },
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            )
-        },
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error((-result) as i32))
-    }
+    unsafe { NativeIsa::set_instruction_native(kind, enabled) }
 }
 
 /// [`set_instruction_native`] for every subscribed instruction.
@@ -375,8 +136,9 @@ pub unsafe fn set_all_instruction_native(enabled: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Executes `kind` at the private native helper with `context`'s registers as
-/// input and writes its results back into `context`.
+/// Executes `kind` natively with `context`'s registers as input and
+/// writes its results back into `context`, through the native
+/// architecture.
 ///
 /// # Safety
 ///
@@ -386,77 +148,24 @@ pub unsafe fn execute_native_instruction(
     kind: InstructionEventKind,
     context: &mut RegisterContext,
 ) {
-    match kind {
-        InstructionEventKind::Cpuid => {
-            let mut result = NativeCpuidResult::default();
-            unsafe {
-                reverie_inguest_native_cpuid(context.rax as u32, context.rcx as u32, &mut result)
-            };
-            context.rax = u64::from(result.eax);
-            context.rbx = u64::from(result.ebx);
-            context.rcx = u64::from(result.ecx);
-            context.rdx = u64::from(result.edx);
-        }
-        InstructionEventKind::Rdtsc => {
-            let value = unsafe { reverie_inguest_native_rdtsc() };
-            context.rax = value as u32 as u64;
-            context.rdx = value >> 32;
-        }
-        InstructionEventKind::Rdtscp => {
-            let mut aux = 0;
-            let value = unsafe { reverie_inguest_native_rdtscp(&mut aux) };
-            context.rax = value as u32 as u64;
-            context.rdx = value >> 32;
-            context.rcx = u64::from(aux);
-        }
-    }
+    unsafe { NativeIsa::execute_native_instruction(kind, context) };
 }
 
-/// Executes `kind` at the private native helper with the frame's registers
-/// as input, writes its results into the frame and advances RIP past the
-/// `instruction_len`-byte instruction.
+/// Executes `kind` natively with the frame's registers as input,
+/// writes its results into the frame and advances its resume
+/// address past the instruction, through the native architecture.
 ///
 /// # Safety
 ///
-/// `context` must be a `SIGSEGV` kernel frame for a `kind` instruction, and
-/// native execution of `kind` must be enabled on this thread
+/// `context` must be a kernel fault frame for a `kind` instruction,
+/// and native execution of `kind` must be enabled on this thread
 /// ([`set_instruction_native`]); otherwise the helper faults again.
 pub unsafe fn execute_native_fault_instruction(
     kind: InstructionEventKind,
     context: &mut libc::ucontext_t,
     instruction_len: usize,
 ) {
-    let registers = &mut context.uc_mcontext.gregs;
-    match kind {
-        InstructionEventKind::Cpuid => {
-            let mut result = NativeCpuidResult::default();
-            unsafe {
-                reverie_inguest_native_cpuid(
-                    registers[libc::REG_RAX as usize] as u32,
-                    registers[libc::REG_RCX as usize] as u32,
-                    &mut result,
-                )
-            };
-            registers[libc::REG_RAX as usize] = i64::from(result.eax);
-            registers[libc::REG_RBX as usize] = i64::from(result.ebx);
-            registers[libc::REG_RCX as usize] = i64::from(result.ecx);
-            registers[libc::REG_RDX as usize] = i64::from(result.edx);
-        }
-        InstructionEventKind::Rdtsc => {
-            let value = unsafe { reverie_inguest_native_rdtsc() };
-            registers[libc::REG_RAX as usize] = i64::from(value as u32);
-            registers[libc::REG_RDX as usize] = (value >> 32) as i64;
-        }
-        InstructionEventKind::Rdtscp => {
-            let mut aux = 0;
-            let value = unsafe { reverie_inguest_native_rdtscp(&mut aux) };
-            registers[libc::REG_RAX as usize] = i64::from(value as u32);
-            registers[libc::REG_RDX as usize] = (value >> 32) as i64;
-            registers[libc::REG_RCX as usize] = i64::from(aux);
-        }
-    }
-    registers[libc::REG_RIP as usize] =
-        registers[libc::REG_RIP as usize].saturating_add(instruction_len as i64);
+    unsafe { NativeIsa::execute_native_fault_instruction(kind, context, instruction_len) };
 }
 
 /// Execute a faulting instruction reached from inside an active Tool callback
@@ -536,7 +245,7 @@ pub unsafe fn emulate_through_continuation(
                 InstructionEventKind::Rdtsc => b"instruction-fault-continuation-rdtsc",
                 InstructionEventKind::Rdtscp => b"instruction-fault-continuation-rdtscp",
             });
-            frame.set_register(libc::REG_RIP as usize, entry as i64);
+            NativeIsa::set_frame_resume(&mut frame, entry);
         }
         Ok(None) => {
             emit_in_guest_stage(b"instruction-sigsegv-continuation-unavailable");
@@ -719,9 +428,8 @@ pub(crate) unsafe extern "C" fn instruction_sigsegv_handler(
     // Keep the raw kernel pointer: the fallback continuation borrows the same
     // frame through `SignalFrame`, which must not alias a live reference.
     let raw_context = context;
-    let address = unsafe {
-        (*raw_context.cast::<libc::ucontext_t>()).uc_mcontext.gregs[libc::REG_RIP as usize]
-    } as u64;
+    let address =
+        NativeIsa::fault_instruction_pointer(unsafe { &*raw_context.cast::<libc::ucontext_t>() });
     let (kind, expected) =
         match unsafe { (seam.locate)(address, info, raw_context.cast::<libc::ucontext_t>()) } {
             FaultSite::Patchable { kind, encoding } => (kind, encoding),
@@ -754,7 +462,7 @@ pub(crate) unsafe extern "C" fn instruction_sigsegv_handler(
     match unsafe { (seam.patch)(address, kind, expected) } {
         PatchOutcome::Resume(entry) => {
             let context = unsafe { &mut *raw_context.cast::<libc::ucontext_t>() };
-            context.uc_mcontext.gregs[libc::REG_RIP as usize] = entry as i64;
+            NativeIsa::set_fault_instruction_pointer(context, entry);
         }
         PatchOutcome::Emulate => unsafe {
             emulate_through_continuation(info, raw_context, address, kind)
@@ -769,9 +477,9 @@ pub(crate) unsafe extern "C" fn instruction_sigsegv_handler(
 /// backend can patch (for LiteInst, every arena recorded at startup), so no
 /// hook can ever be published there.
 ///
-/// Only a kernel-raised fault (`SI_KERNEL`, the #GP of CPUID faulting or
-/// `PR_TSC_SIGSEGV`) whose bytes, read without risking a nested fault, are
-/// exactly CPUID, RDTSC, or RDTSCP is emulated. Everything else keeps the
+/// Only a kernel-raised fault (`SI_KERNEL` from the native instruction
+/// faulting controls) whose bytes, read without risking a nested fault,
+/// decode as a subscribed instruction is emulated. Everything else keeps the
 /// default `SIGSEGV` the guest would have received without the runtime.
 unsafe fn emulate_unpatchable_instruction(
     info: *const libc::siginfo_t,
