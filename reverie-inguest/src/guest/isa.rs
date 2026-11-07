@@ -9,10 +9,11 @@
 //! The one architecture seam for the in-guest runtime.
 //!
 //! Division of responsibility: `crate::arch` owns the seccomp ABI
-//! (audit architecture, rt_sigreturn number, runtime page size),
-//! `trap::frame` owns the kernel signal-frame layout, and this
-//! trait owns register/instruction/continuation facts. Facts live
-//! in exactly one of those homes.
+//! (audit architecture, rt_sigreturn number) and runtime page-size
+//! discovery, `trap::frame` owns the kernel signal-frame layout,
+//! and this trait owns register/instruction/continuation facts and
+//! surfaces the page-size fact guest code must use. Facts live in
+//! exactly one of those homes.
 //!
 //! Generic guest code names only [`Isa`] (through [`NativeIsa`]): the
 //! register-context layout, the syscall ABI over that layout, conversion
@@ -38,6 +39,10 @@ pub type NativeIsa = x86_64::X86_64;
 /// The instruction-set architecture this runtime was compiled for.
 #[cfg(target_arch = "aarch64")]
 pub type NativeIsa = aarch64::Aarch64;
+
+/// First completion-syscall argument authenticating a fallback
+/// continuation completion. "LIFALLBK".
+pub(crate) const COMPLETION_COOKIE: u64 = 0x4c49_4641_4c4c_424b;
 
 /// Which faulting-instruction controls this architecture can admit.
 /// Admission still requires the runtime preflight on capable
@@ -150,6 +155,45 @@ pub trait Isa: Copy + Send + Sync + 'static {
     /// own and is never taken from the view.
     fn apply_user_regs(context: &mut Self::RegisterContext, regs: &libc::user_regs_struct);
 
+    /// The runtime base page size. Discovery lives in
+    /// `crate::arch` (auxv); guest code consumes the fact here so
+    /// no guest file hardcodes a page size.
+    fn page_size() -> io::Result<u64> {
+        crate::arch::page_size()
+    }
+    /// Discovers and validates this architecture's saved-state
+    /// configuration once (x86 XSAVE/PKRU geometry; aarch64 has
+    /// nothing to discover).
+    fn configure_saved_state() -> Result<(), &'static str>;
+    /// The saved image's resume address.
+    fn saved_instruction_pointer(saved: &Self::SavedState) -> u64;
+    /// A signal frame's resume address.
+    fn frame_pc(frame: &SignalFrame<'_>) -> u64;
+    /// Points `frame` at the fallback continuation entry on the
+    /// owned stack: stack pointer, first argument = owner, flags
+    /// and permission state made safe for ordinary callback code.
+    /// The caller sets the resume address to
+    /// [`Self::fallback_entry`] afterwards.
+    fn prepare_frame_for_entry(
+        frame: &mut SignalFrame<'_>,
+        stack_top: usize,
+        owner: usize,
+        saved: &Self::SavedState,
+    ) -> Result<(), FrameError>;
+    /// The fallback continuation entry address.
+    fn fallback_entry() -> u64;
+    /// The completion syscall instruction's address.
+    fn completion_syscall_address() -> u64;
+    /// The address just past the completion syscall, where a
+    /// genuine completion frame resumes.
+    fn completion_return_address() -> u64;
+    /// Whether `frame` is this owner's genuine completion syscall
+    /// (instruction bytes, number, cookie, generation, owner).
+    /// Phase/thread/pending checks stay with the continuation.
+    fn validate_completion_frame(frame: &SignalFrame<'_>, generation: u64, owner: usize) -> bool;
+    /// The faulting stack pointer in a kernel fault frame.
+    fn fault_stack_pointer(context: &libc::ucontext_t) -> u64;
+
     /// Which faulting-instruction controls this architecture can
     /// admit at all. A capable architecture still probes the actual
     /// controls in [`Self::admit_instruction_subscriptions`].
@@ -243,6 +287,13 @@ mod tests {
         assert_eq!(NativeIsa::syscall_args(&context), [0; 6]);
         NativeIsa::set_instruction_pointer(&mut context, 0x1234);
         assert_eq!(NativeIsa::instruction_pointer(&context), 0x1234);
+    }
+
+    #[test]
+    fn page_size_fact_is_the_runtime_page_size() {
+        let page = NativeIsa::page_size().unwrap();
+        assert_eq!(page, crate::arch::page_size().unwrap());
+        assert!(page.is_power_of_two() && page >= 4096);
     }
 
     #[test]

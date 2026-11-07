@@ -10,6 +10,7 @@
 //! The aarch64 [`Isa`] implementation: the only aarch64 cfg site for
 //! the guest runtime's architecture facts.
 
+use core::arch::global_asm;
 use std::io;
 
 use super::InstructionCapabilities;
@@ -21,6 +22,59 @@ use crate::trap::frame::FrameError;
 use crate::trap::frame::REG_PC;
 use crate::trap::frame::SavedState;
 use crate::trap::frame::SignalFrame;
+
+// The completion cookie chunks below are checked against the shared
+// constant at compile time.
+const _: () = assert!(super::COMPLETION_COOKIE == 0x4c49_4641_4c4c_424b);
+
+unsafe extern "C" {
+    fn fallback_entry();
+    static fallback_completion_syscall: u8;
+    static fallback_completion_return: u8;
+}
+
+global_asm!(
+    r#"
+    .pushsection .text.reverie_inguest_fallback_entry,"ax",@progbits
+    .p2align 2
+    .global fallback_entry
+    .hidden fallback_entry
+    .type fallback_entry,@function
+fallback_entry:
+    // First genuine sigreturn supplied an owned, 16-aligned stack with the
+    // owner pointer in x0. The saved guest image retains every FP/SVE
+    // component independently; ordinary callback code runs with the
+    // default FP control/status instead of the guest's.
+    bti c
+    msr fpcr, xzr
+    msr fpsr, xzr
+    mov x19, x0
+    mov x29, xzr
+    bl {dispatch}
+    bl {generation}
+    mov x1, x0
+    mov x2, x19
+    movz x0, #0x424b
+    movk x0, #0x4c4c, lsl #16
+    movk x0, #0x4641, lsl #32
+    movk x0, #0x4c49, lsl #48
+    mov x8, {getpid}
+    .global fallback_completion_syscall
+    .hidden fallback_completion_syscall
+fallback_completion_syscall:
+    svc #0
+    .global fallback_completion_return
+    .hidden fallback_completion_return
+fallback_completion_return:
+    // A correct completion resumes the saved guest, never this continuation.
+    udf #0
+    .size fallback_entry, .-fallback_entry
+    .popsection
+"#,
+    dispatch = sym crate::guest::continuation::dispatch,
+    generation = sym crate::guest::continuation::completion_generation,
+    getpid = const libc::SYS_getpid,
+);
 
 /// The guest's general-purpose registers at a hooked or continued
 /// instruction, saved by the continuation that entered the runtime.
@@ -164,6 +218,59 @@ impl Isa for Aarch64 {
         context.regs = regs.regs;
         context.stack_pointer = regs.sp;
         context.pstate = regs.pstate;
+    }
+
+    fn configure_saved_state() -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    fn saved_instruction_pointer(saved: &SavedState) -> u64 {
+        saved.pc
+    }
+
+    fn frame_pc(frame: &SignalFrame<'_>) -> u64 {
+        frame.register(REG_PC) as u64
+    }
+
+    fn prepare_frame_for_entry(
+        frame: &mut SignalFrame<'_>,
+        stack_top: usize,
+        owner: usize,
+        saved: &SavedState,
+    ) -> Result<(), FrameError> {
+        // Sigcontext order: x0-x30 (0..30), sp (31), pc, pstate.
+        frame.set_register(31, (stack_top & !15) as i64);
+        frame.set_register(0, owner as i64);
+        frame.set_pkru(saved.pkru().map(|_| 0))
+    }
+
+    fn fallback_entry() -> u64 {
+        fallback_entry as *const () as u64
+    }
+
+    fn completion_syscall_address() -> u64 {
+        core::ptr::addr_of!(fallback_completion_syscall) as usize as u64
+    }
+
+    fn completion_return_address() -> u64 {
+        core::ptr::addr_of!(fallback_completion_return) as usize as u64
+    }
+
+    fn validate_completion_frame(frame: &SignalFrame<'_>, generation: u64, owner: usize) -> bool {
+        let instruction = Self::completion_syscall_address() as usize;
+        instruction.checked_add(Self::SYSCALL_LEN as usize)
+            == Some(Self::completion_return_address() as usize)
+            && unsafe {
+                core::slice::from_raw_parts(instruction as *const u8, Self::SYSCALL_INSN.len())
+            } == Self::SYSCALL_INSN
+            && frame.register(8) == libc::SYS_getpid
+            && frame.register(0) as u64 == super::COMPLETION_COOKIE
+            && frame.register(1) as u64 == generation
+            && frame.register(2) as usize == owner
+    }
+
+    fn fault_stack_pointer(context: &libc::ucontext_t) -> u64 {
+        context.uc_mcontext.sp
     }
 
     fn instruction_capabilities() -> InstructionCapabilities {

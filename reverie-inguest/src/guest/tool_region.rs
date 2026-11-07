@@ -29,6 +29,8 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use std::io;
 
+use super::isa::Isa;
+use super::isa::NativeIsa;
 use super::support::raw_zero_result;
 use crate::trap::raw_syscall6;
 
@@ -233,6 +235,22 @@ impl ToolRegion {
     /// An interrupted or concurrent initialization returns EAGAIN without
     /// waiting. Successfully published owners and retained errors are reused.
     pub fn reserve() -> io::Result<&'static Self> {
+        // The version-one layout below is expressed in 4096-byte pages
+        // (bitmap words, control offset, guard placement). On a host
+        // whose runtime page size differs it would misplace every
+        // guard and mprotect boundary, so refuse by name instead of
+        // reinterpreting the layout. A page-size-generic layout is
+        // its own change.
+        let runtime_page = NativeIsa::page_size()?;
+        if runtime_page != PAGE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "tool region layout requires {PAGE}-byte pages; \
+                     this host uses {runtime_page}-byte pages"
+                ),
+            ));
+        }
         if REGION.get().is_none() {
             let _initializing = InitializationGuard::acquire()?;
             if REGION.get().is_none() {
@@ -251,8 +269,8 @@ impl ToolRegion {
     }
 
     fn reserve_inner() -> Result<Self, i32> {
-        // Linux x86-64 has 4096-byte base pages, including huge-page hosts.
-        // Do not reinterpret the fixed layout using a runtime-sized page.
+        // reserve() has refused every non-4096 runtime page size by
+        // name, so the fixed layout's page unit is exact here.
         let result = unsafe {
             raw_syscall6(
                 libc::SYS_mmap,

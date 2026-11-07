@@ -2416,6 +2416,144 @@ mod aarch64_gate_tests {
         assert_eq!(output.status.code(), Some(0), "{output:?}");
     }
 
+    /// S6b witness: the fallback continuation itself runs on aarch64.
+    /// A trapped svc is captured, resumed at the aarch64 fallback
+    /// entry on the owned stack, answered by the ordinary-context
+    /// handler, and completed through the completion svc — twice.
+    struct ContinuationSpoof;
+
+    static CONTINUATION_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+    unsafe fn continuation_syscall(
+        context: *mut crate::guest::context::RegisterContext,
+        _guest_pkru: &mut Option<u32>,
+    ) {
+        use crate::guest::isa::Isa as _;
+        use crate::guest::isa::NativeIsa;
+        let local = 0_usize;
+        if !crate::guest::continuation::on_owned_stack(&local as *const usize as usize) {
+            // SAFETY: exit through the gate from callback context.
+            unsafe { raw_syscall6(libc::SYS_exit_group, [84, 0, 0, 0, 0, 0]) };
+        }
+        // SAFETY: the continuation owns this live context for the callback.
+        let context = unsafe { &mut *context };
+        if NativeIsa::syscall_number(context) != libc::SYS_getpid {
+            unsafe { raw_syscall6(libc::SYS_exit_group, [85, 0, 0, 0, 0, 0]) };
+        }
+        CONTINUATION_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+        NativeIsa::finish_syscall(context, 424_244);
+    }
+
+    unsafe fn continuation_instruction(
+        _context: *mut crate::guest::context::RegisterContext,
+        _kind: crate::guest::event::InstructionEventKind,
+    ) {
+        // SAFETY: no instruction event can be admitted in this child.
+        unsafe { raw_syscall6(libc::SYS_exit_group, [86, 0, 0, 0, 0, 0]) };
+    }
+
+    impl SyscallDispatcher for ContinuationSpoof {
+        fn dispatch(&self, event: &mut SyscallEvent) {
+            event.forward();
+        }
+
+        fn dispatch_private_signal(&self, frame: &mut frame::SignalFrame<'_>) -> bool {
+            match crate::guest::continuation::complete(frame) {
+                Ok(handled) => handled,
+                Err(_) => unsafe {
+                    raw_syscall6(libc::SYS_exit_group, [87, 0, 0, 0, 0, 0]);
+                    core::hint::unreachable_unchecked()
+                },
+            }
+        }
+
+        fn dispatch_signal(&self, event: &mut SyscallEvent, frame: &mut frame::SignalFrame<'_>) {
+            use crate::guest::isa::Isa as _;
+            use crate::guest::isa::NativeIsa;
+            if event.number() != libc::SYS_getpid {
+                event.forward();
+                return;
+            }
+            let instruction = NativeIsa::syscall_site(event.instruction_pointer());
+            // SAFETY: this is the SIGSYS handler for the trapped svc
+            // at `instruction`; the entry is deferred to below.
+            match unsafe { crate::guest::continuation::prepare_signal(instruction, frame) } {
+                Ok(Some(entry)) => event.defer_to(entry),
+                Ok(None) => unsafe {
+                    raw_syscall6(libc::SYS_exit_group, [88, 0, 0, 0, 0, 0]);
+                },
+                Err(_) => unsafe {
+                    raw_syscall6(libc::SYS_exit_group, [89, 0, 0, 0, 0, 0]);
+                },
+            }
+        }
+    }
+
+    fn continuation_child() -> ! {
+        let pid = std::process::id() as i64;
+        assert_ne!(pid, 424_244, "spoof sentinel collides with child pid");
+        // SAFETY: single-threaded child; handlers and continuation are
+        // installed before the filter, as lifecycle orders them.
+        unsafe {
+            if crate::guest::continuation::register_handlers(
+                crate::guest::continuation::ContinuationHandlers {
+                    syscall: continuation_syscall,
+                    instruction: continuation_instruction,
+                },
+            )
+            .is_err()
+                || crate::guest::continuation::initialize().is_err()
+            {
+                raw_syscall6(libc::SYS_exit_group, [80, 0, 0, 0, 0, 0]);
+            }
+            set_dispatcher(Box::new(ContinuationSpoof));
+            if install_handler(false).is_err() {
+                raw_syscall6(libc::SYS_exit_group, [81, 0, 0, 0, 0, 0]);
+            }
+            let mut filter = crate::seccomp::SeccompFilter::for_trusted_gates(
+                trusted_gate(),
+                guest_syscall_gate(),
+            )
+            .unwrap();
+            if filter.install().is_err() {
+                raw_syscall6(libc::SYS_exit_group, [82, 0, 0, 0, 0, 0]);
+            }
+            for expected in 1..=2 {
+                if local_svc_getpid_a() != 424_244
+                    || CONTINUATION_CALLBACKS.load(Ordering::Relaxed) != expected
+                {
+                    raw_syscall6(libc::SYS_exit_group, [83, 0, 0, 0, 0, 0]);
+                }
+            }
+            // Through the gate, untrapped: the real pid, no callback.
+            if raw_syscall6(libc::SYS_getpid, [0; 6]) != pid
+                || CONTINUATION_CALLBACKS.load(Ordering::Relaxed) != 2
+            {
+                raw_syscall6(libc::SYS_exit_group, [90, 0, 0, 0, 0, 0]);
+            }
+            raw_syscall6(libc::SYS_exit_group, [0, 0, 0, 0, 0, 0]);
+        }
+        unreachable!("exit_group through the gate returned")
+    }
+
+    #[test]
+    fn aarch64_fallback_continuation_runs_on_owned_stack() {
+        const CHILD: &str = "REVERIE_TEST_AARCH64_CONTINUATION";
+        if std::env::var_os(CHILD).is_some() {
+            continuation_child();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trap::aarch64_gate_tests::aarch64_fallback_continuation_runs_on_owned_stack",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+
     #[test]
     fn aarch64_runtime_page_geometry_is_usable() {
         let page = crate::arch::page_size().unwrap() as usize;

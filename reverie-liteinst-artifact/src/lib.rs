@@ -1112,8 +1112,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
-        51265,
-        "06bcf37c7e7aa8d4e67f47be05508d9ff2f6222058f862054bb2b896864c8135",
+        44673,
+        "7a2e070e0d4734a06e1f3b314f9de235003269a8a2538b87eb9f72c25a122f7c",
     ),
     (
         "reverie-inguest/src/guest/instruction.rs",
@@ -1122,18 +1122,18 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/isa.rs",
-        12150,
-        "a95e729b06aafa482aa9e5ddf92ef2c23336ec65866e18f71c8943bbd7a1dbff",
+        14510,
+        "32498a5b2d0430f6461e8ddaba09077d099493ebe573f20bad2c328cd9f2538c",
     ),
     (
         "reverie-inguest/src/guest/isa/aarch64.rs",
-        12639,
-        "497bb387af2695c34850c2c8be1fd0cbf1b6ad000084e01bef3846be67aa9458",
+        16069,
+        "18d2f143b0bf5159aab22f677d23cffbdc52344a6e03390dcccd6cc6ba8c0239",
     ),
     (
         "reverie-inguest/src/guest/isa/x86_64.rs",
-        22367,
-        "e012212dbb6d9b669b75c0b0e2d8ddd947da7f312c6c1f22aaa9f756f06b4264",
+        30491,
+        "d62280b3f3a4c3fad040531004eca09df6f38021113bb9a13da8efbc49e06e4c",
     ),
     (
         "reverie-inguest/src/guest/runtime_mask.rs",
@@ -1377,8 +1377,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/tool_region.rs",
-        51920,
-        "13b271ccc95b8fd3c2f5d04f05c0482b70449ed703e7957d2b65ee55cb49adb6",
+        52701,
+        "5daf1bbec48c98dbebf64eb8d1a5b9bc8c59a47a8598666f7f9d2f1376252192",
     ),
     (
         "reverie-inguest/src/guest/tool_region_keyed.rs",
@@ -1392,8 +1392,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
-        3870,
-        "4cd2e642520c2560ab75366bc45e69ef8d4ec1170c415d21c49a890d7e98484e",
+        3370,
+        "df5350ea56e3e1bb565c56179f09a9b9a5e700ceccad8894d58f78281a5e4f42",
     ),
     (
         "reverie-inguest/src/guest/rpc.rs",

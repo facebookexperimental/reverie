@@ -15,6 +15,10 @@ use std::io;
 
 use super::InstructionCapabilities;
 use super::InstructionResult;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::Ordering;
+
 use super::Isa;
 use crate::guest::event::InstructionEventKind;
 use crate::guest::event::InstructionSubscriptions;
@@ -100,6 +104,98 @@ fn instruction_control_unavailable(control: &str, result: i64) -> io::Error {
         ),
     )
 }
+
+static SAVE_BYTES: AtomicU32 = AtomicU32::new(512);
+static SAVE_MASK: AtomicU64 = AtomicU64::new(0);
+static PKRU_OFFSET: AtomicU32 = AtomicU32::new(0);
+static CALLBACK_MXCSR: u32 = 0x1f80;
+
+fn configure_save() -> Result<(), &'static str> {
+    let features = core::arch::x86_64::__cpuid(1);
+    if features.ecx & ((1 << 26) | (1 << 27)) == ((1 << 26) | (1 << 27)) {
+        // XCR0 includes every enabled user component, including components
+        // unknown to this runtime. Never silently discard a component here.
+        let enabled = unsafe { core::arch::x86_64::_xgetbv(0) };
+        let state = core::arch::x86_64::__cpuid_count(0xD, 0);
+        let supported = u64::from(state.eax) | (u64::from(state.edx) << 32);
+        let (mask, bytes) = save_configuration(enabled, supported, state.ebx)?;
+        // Choose the PKRU-aware entry before returning from SIGSYS. It must
+        // open runtime memory before reading any global or TLS storage.
+        let features = core::arch::x86_64::__cpuid_count(7, 0);
+        if mask & (1 << 9) != 0 && features.ecx & (1 << 4) != 0 {
+            let component = core::arch::x86_64::__cpuid_count(0xD, 9);
+            let offset = pkru_offset(component.ebx, component.eax, state.ebx)?;
+            PKRU_OFFSET.store(offset, Ordering::Relaxed);
+        }
+        SAVE_BYTES.store(bytes, Ordering::Relaxed);
+        SAVE_MASK.store(mask, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+fn save_configuration(
+    enabled: u64,
+    supported: u64,
+    bytes: u32,
+) -> Result<(u64, u32), &'static str> {
+    let bytes = bytes.checked_add(63).ok_or("XSAVE size overflow")? & !63;
+    if enabled == 0 || enabled & !supported != 0 || bytes < 576 || bytes > i32::MAX as u32 {
+        return Err("unsupported XSAVE configuration");
+    }
+    Ok((enabled, bytes))
+}
+
+fn pkru_offset(offset: u32, size: u32, bytes: u32) -> Result<u32, &'static str> {
+    if size != 8 || offset < 576 || offset.checked_add(size).is_none_or(|end| end > bytes) {
+        return Err("unsupported PKRU XSAVE layout");
+    }
+    Ok(offset)
+}
+
+unsafe extern "C" {
+    fn fallback_entry();
+    static fallback_completion_syscall: u8;
+    static fallback_completion_return: u8;
+}
+
+global_asm!(
+    r#"
+    .pushsection .text.reverie_inguest_fallback_entry,"ax",@progbits
+    .p2align 4
+    .global fallback_entry
+    .hidden fallback_entry
+    .type fallback_entry,@function
+fallback_entry:
+    // First genuine sigreturn supplied an owned, aligned stack and open PKRU.
+    // The saved guest image retains DF and every FP component independently.
+    cld
+    fninit
+    ldmxcsr [rip + {callback_mxcsr}]
+    mov r12, rdi
+    call {dispatch}
+    call {generation}
+    mov rsi, rax
+    mov rdx, r12
+    mov rdi, {cookie}
+    mov eax, {getpid}
+    .global fallback_completion_syscall
+    .hidden fallback_completion_syscall
+fallback_completion_syscall:
+    syscall
+    .global fallback_completion_return
+    .hidden fallback_completion_return
+fallback_completion_return:
+    // A correct completion resumes the saved guest, never this continuation.
+    ud2
+    .size fallback_entry, .-fallback_entry
+    .popsection
+"#,
+    dispatch = sym crate::guest::continuation::dispatch,
+    generation = sym crate::guest::continuation::completion_generation,
+    callback_mxcsr = sym CALLBACK_MXCSR,
+    cookie = const super::COMPLETION_COOKIE,
+    getpid = const libc::SYS_getpid,
+);
 
 /// The guest's general-purpose registers at a hooked or continued
 /// instruction, saved by the trampoline or continuation that entered
@@ -358,6 +454,64 @@ impl Isa for X86_64 {
         context.rdi = regs.rdi;
         context.stack_pointer = regs.rsp;
         context.rflags = regs.eflags;
+    }
+
+    fn configure_saved_state() -> Result<(), &'static str> {
+        configure_save()
+    }
+
+    fn saved_instruction_pointer(saved: &SavedState) -> u64 {
+        saved.registers[libc::REG_RIP as usize] as u64
+    }
+
+    fn frame_pc(frame: &SignalFrame<'_>) -> u64 {
+        frame.register(libc::REG_RIP as usize) as u64
+    }
+
+    fn prepare_frame_for_entry(
+        frame: &mut SignalFrame<'_>,
+        stack_top: usize,
+        owner: usize,
+        saved: &SavedState,
+    ) -> Result<(), FrameError> {
+        frame.set_register(libc::REG_RSP as usize, (stack_top & !15) as i64);
+        frame.set_register(libc::REG_RDI as usize, owner as i64);
+        // The ABI requires DF clear in ordinary Rust code; the saved guest
+        // image retains its own flags independently of this callback frame.
+        frame.set_register(
+            libc::REG_EFL as usize,
+            frame.register(libc::REG_EFL as usize) & !(1 << 10),
+        );
+        frame.set_pkru(saved.pkru().map(|_| 0))
+    }
+
+    fn fallback_entry() -> u64 {
+        fallback_entry as *const () as u64
+    }
+
+    fn completion_syscall_address() -> u64 {
+        core::ptr::addr_of!(fallback_completion_syscall) as usize as u64
+    }
+
+    fn completion_return_address() -> u64 {
+        core::ptr::addr_of!(fallback_completion_return) as usize as u64
+    }
+
+    fn validate_completion_frame(frame: &SignalFrame<'_>, generation: u64, owner: usize) -> bool {
+        let instruction = Self::completion_syscall_address() as usize;
+        instruction.checked_add(Self::SYSCALL_LEN as usize)
+            == Some(Self::completion_return_address() as usize)
+            && unsafe {
+                core::slice::from_raw_parts(instruction as *const u8, Self::SYSCALL_INSN.len())
+            } == Self::SYSCALL_INSN
+            && frame.register(libc::REG_RAX as usize) == libc::SYS_getpid
+            && frame.register(libc::REG_RDI as usize) as u64 == super::COMPLETION_COOKIE
+            && frame.register(libc::REG_RSI as usize) as u64 == generation
+            && frame.register(libc::REG_RDX as usize) as usize == owner
+    }
+
+    fn fault_stack_pointer(context: &libc::ucontext_t) -> u64 {
+        context.uc_mcontext.gregs[libc::REG_RSP as usize] as u64
     }
 
     fn instruction_capabilities() -> InstructionCapabilities {
@@ -655,5 +809,67 @@ impl Isa for X86_64 {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthesized_context_preserves_registers_and_has_no_extended_state() {
+        let mut saved = SavedState::new().unwrap();
+        for (index, register) in saved.registers.iter_mut().enumerate() {
+            *register = 0x1000 + index as i64;
+        }
+
+        let context = X86_64::context_from_saved(&saved, 0xfeed_face_cafe_beef);
+        assert_eq!(context.instruction_pointer, 0xfeed_face_cafe_beef);
+        for (index, actual) in [
+            (libc::REG_RSP, context.stack_pointer),
+            (libc::REG_RAX, context.rax),
+            (libc::REG_RBX, context.rbx),
+            (libc::REG_RCX, context.rcx),
+            (libc::REG_RDX, context.rdx),
+            (libc::REG_RSI, context.rsi),
+            (libc::REG_RDI, context.rdi),
+            (libc::REG_RBP, context.rbp),
+            (libc::REG_R8, context.r8),
+            (libc::REG_R9, context.r9),
+            (libc::REG_R10, context.r10),
+            (libc::REG_R11, context.r11),
+            (libc::REG_R12, context.r12),
+            (libc::REG_R13, context.r13),
+            (libc::REG_R14, context.r14),
+            (libc::REG_R15, context.r15),
+            (libc::REG_EFL, context.rflags),
+        ] {
+            assert_eq!(actual, saved.registers[index as usize] as u64);
+        }
+        assert!(context.extended_state_unavailable());
+    }
+
+    #[test]
+    fn every_enabled_user_component_is_saved_without_a_fixed_mask() {
+        // Include MPX, AMX, and a future high component bit: CPU-provided
+        // layout and XCR0, rather than an instruction-set list, own the mask.
+        let enabled = 0x2ff | (3 << 17) | (1 << 40);
+        assert_eq!(
+            save_configuration(enabled, enabled, 11_009),
+            Ok((enabled, 11_072))
+        );
+        assert!(save_configuration(enabled, 0x2e7, 11_009).is_err());
+        assert!(save_configuration(0, 0, 576).is_err());
+        assert!(save_configuration(3, 3, 512).is_err());
+        assert!(save_configuration(3, 3, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn pkru_layout_must_fit_the_standard_save_area() {
+        assert_eq!(pkru_offset(2688, 8, 2696), Ok(2688));
+        assert!(pkru_offset(2688, 8, 2695).is_err());
+        assert!(pkru_offset(512, 8, 2696).is_err());
+        assert!(pkru_offset(2688, 4, 2696).is_err());
+        assert!(pkru_offset(u32::MAX - 3, 8, u32::MAX).is_err());
     }
 }

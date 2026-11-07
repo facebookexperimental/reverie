@@ -20,21 +20,7 @@ pub mod alloc;
 #[cfg(feature = "rcb-clock")]
 pub mod clock;
 pub mod context;
-#[cfg(target_arch = "x86_64")]
 pub mod continuation;
-/// No fallback continuation exists off x86-64 yet (its frame machinery is a
-/// later stage), so no thread can be running one: mask storage honestly
-/// reports exactly that, using the same `None`/`false` the real storage
-/// returns when no continuation is running.
-#[cfg(not(target_arch = "x86_64"))]
-pub mod continuation {
-    pub fn saved_guest_mask() -> Option<u64> {
-        None
-    }
-    pub fn set_saved_guest_mask(_mask: u64) -> bool {
-        false
-    }
-}
 pub mod event;
 #[cfg(feature = "exec-private-init")]
 pub mod exec_private;
