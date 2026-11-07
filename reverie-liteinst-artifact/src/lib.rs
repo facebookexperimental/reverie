@@ -57015,6 +57015,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn no_scope_scalar_storage_derivation_controls() {
+        // Layer-4 contract: a no-scope operation on a scalar template
+        // (index >= FIXED_SCALAR_TEMPLATE_START) retains the authenticated
+        // (REGION, INITIALIZING) pair; a pre-scalar template keeps None.
+        let address = 0x100000_u64;
+        let instructions = |body: &[u8], offsets: &[usize]| -> Vec<EncodedConstructorInstruction> {
+            offsets
+                .iter()
+                .enumerate()
+                .map(|(i, &offset)| EncodedConstructorInstruction {
+                    address: address + offset as u64,
+                    bytes: body[offset..offsets.get(i + 1).copied().unwrap_or(body.len())].to_vec(),
+                })
+                .collect()
+        };
+        let mprotect =
+            fixed_hex("504889febf0a000000ba00000002b903000000e8d898000059c3ff15a0001300");
+        let mprotect_offsets = [0_usize, 1, 4, 9, 14, 19, 24, 25, 26];
+        let mut targets = BTreeMap::from([
+            ("fixed_initializing".to_string(), 0x600000_u64),
+            ("fixed_region".to_string(), 0x600008_u64),
+            (
+                "fixed_scalar_syscall".to_string(),
+                fixed_rip_target(address, &mprotect, 20, 24).unwrap(),
+            ),
+            ("fixed_publication_cannot_unwind".to_string(), 0x200900_u64),
+        ]);
+        let got = BTreeMap::from([(
+            fixed_rip_target(address, &mprotect, 28, 32).unwrap(),
+            0x200900_u64,
+        )]);
+        let readonly = BTreeMap::new();
+        let context = BTreeMap::new();
+        let qualify = |ts: &BTreeMap<String, u64>| {
+            fixed_detcore_no_scope_qualified_operation(
+                "fixed_arena_mprotect",
+                address,
+                (&mprotect, &instructions(&mprotect, &mprotect_offsets)),
+                DetcoreRecipeBindings {
+                    targets: ts,
+                    got: &got,
+                    readonly: &readonly,
+                    context: &context,
+                },
+                false,
+            )
+        };
+        let witness = qualify(&targets).unwrap();
+        assert_eq!(
+            witness.kind,
+            AuthenticatedDetcoreOperationKind::ValidateTemplate(83)
+        );
+        assert_eq!(witness.scalar_storage, Some((0x600008, 0x600000)));
+        let mut no_region = targets.clone();
+        no_region.remove("fixed_region");
+        assert!(
+            qualify(&no_region)
+                .err()
+                .expect("missing REGION must refuse")
+                .contains("scalar recipe lacks authenticated REGION")
+        );
+        let mut no_initializing = targets.clone();
+        no_initializing.remove("fixed_initializing");
+        assert!(
+            qualify(&no_initializing)
+                .err()
+                .expect("missing INITIALIZING must refuse")
+                .contains("scalar recipe lacks authenticated INITIALIZING")
+        );
+        // A pre-scalar template (index 26 < 55) keeps None even with both
+        // authenticated targets present.
+        let syscall = fixed_hex("5048c70424000000004531c04531c9ff15b382120059c3");
+        let syscall_offsets = [0_usize, 1, 9, 12, 15, 21, 22];
+        targets.insert("reverie_inguest_trusted_syscall".to_string(), 0x210000_u64);
+        let syscall_got = BTreeMap::from([(
+            fixed_rip_target(address, &syscall, 17, 21).unwrap(),
+            0x210000_u64,
+        )]);
+        let witness = fixed_detcore_no_scope_qualified_operation(
+            "fixed_scalar_syscall",
+            address,
+            (&syscall, &instructions(&syscall, &syscall_offsets)),
+            DetcoreRecipeBindings {
+                targets: &targets,
+                got: &syscall_got,
+                readonly: &readonly,
+                context: &context,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            witness.kind,
+            AuthenticatedDetcoreOperationKind::ValidateTemplate(26)
+        );
+        assert_eq!(witness.scalar_storage, None);
+    }
+
     // Literal extents and independently retained bindings from gate40 ELF d86724af.
     // These recipe/schema controls do not claim physical qualification or execution.
     #[test]
