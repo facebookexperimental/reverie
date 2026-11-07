@@ -440,7 +440,7 @@ pub(super) mod fatal_capacity_tests {
                     matches!(rescued, Ok(ToolRunOutcome::Complete(_)))
                 );
                 panic!(
-                    "capacity did not complete under the original shared 3s deadline: {description}"
+                    "capacity did not complete under the original shared deadline: {description}"
                 );
             }
         };
@@ -484,7 +484,7 @@ pub(super) mod fatal_capacity_tests {
         }
         // A reduced process-wide fd limit belongs only to this exact isolated
         // test process. The deadline begins before the re-exec, not after it.
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([name, "--exact", "--nocapture", "--test-threads=1"])
             .env("REVERIE_FATAL_CAPACITY_TEST", name)
@@ -509,8 +509,12 @@ pub(super) mod fatal_capacity_tests {
         } else {
             "tracer::tests::fatal_capacity_tests::retired_processes_release_descriptors_under_reduced_nofile"
         };
-        // Enter the same isolated predicate directly. Its original shared 3s
-        // deadline still begins before this re-exec; retain the literal red.
+        // Enter the same isolated predicate directly. This control's
+        // expected failure IS the deadline expiring (a held hook never
+        // completes), so its deadline stays a literal 3s: expiry is the
+        // mechanism under test here, unlike the positive controls'
+        // backstop. It still begins before this re-exec; retain the
+        // literal red.
         let deadline = fatal_monotonic_ns() + 3_000_000_000;
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([name, "--exact", "--nocapture", "--test-threads=1"])
@@ -578,7 +582,7 @@ pub(super) mod fatal_capacity_tests {
             format!(
                 "capacity original predicate: threads=true, soft_nofile=128, required_tasks=96, samples=[], outcome={outcome}\n\
                  capacity rescue only: completed=true\n\
-                 capacity did not complete under the original shared 3s deadline: {outcome}\n"
+                 capacity did not complete under the original shared deadline: {outcome}\n"
             )
         };
         assert!(capacity_original_timeout_before_rescue(&stderr(
@@ -682,7 +686,7 @@ pub(super) mod fatal_capacity_tests {
         let stderr = capacity_negative_control(
             true,
             "hold-one-exit-hook",
-            "capacity did not complete under the original shared 3s deadline",
+            "capacity did not complete under the original shared deadline",
             "capacity retirement checkpoint: registered=97, completed=95, retained=0, held_hook=true, steady_fds=None",
         );
         assert!(

@@ -10,7 +10,7 @@ mod fatal_exit_payload_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn actual_exec_without_prior_payload_retains_same_owner_across_refusal() {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + GENEROUS_WALL_BACKSTOP;
         let _observations = FatalReapObservationScope::new();
         let control = Arc::new(ExitPayloadControl::default());
         EXIT_PAYLOAD_CONTROL.with(|slot| *slot.borrow_mut() = Some(control.clone()));
@@ -162,7 +162,7 @@ mod fatal_exit_payload_tests {
     }
 
     async fn real_exit_resume_control(kill: bool) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + GENEROUS_WALL_BACKSTOP;
         let started = Instant::now();
         let _observations = FatalReapObservationScope::new();
         let _control_scope = ExitResumeScope;

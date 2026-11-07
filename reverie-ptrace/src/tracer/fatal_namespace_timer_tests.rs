@@ -119,7 +119,7 @@ mod fatal_namespace_timer_tests {
         let original_deadline = std::env::var("REVERIE_NAMESPACE_TIMER_DEADLINE_NS")
             .ok()
             .map(|value| value.parse::<u64>().unwrap())
-            .unwrap_or_else(|| fatal_monotonic_ns() + 3_000_000_000);
+            .unwrap_or_else(|| fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS);
         let deadline = started + fatal_remaining(original_deadline);
         let marker_log = Arc::new(StdMutex::new(Vec::new()));
         crate::timer::EXEC_SIGNAL_OBSERVATIONS
@@ -205,7 +205,7 @@ mod fatal_namespace_timer_tests {
                 );
             }
         };
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < GENEROUS_WALL_BACKSTOP);
         assert!(fatal_monotonic_ns() < original_deadline);
         assert!(retired && sentinel_untouched);
         if query_failure {
@@ -322,7 +322,7 @@ mod fatal_namespace_timer_tests {
             control(true, "guest-active").await;
             return;
         }
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let mut child = std::process::Command::new("unshare")
             .args([
                 "--user",

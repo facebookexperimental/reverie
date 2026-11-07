@@ -4770,7 +4770,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn supervisor_termination_keeps_healthy_loop_owned_until_actual_completion() {
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(3);
+        let deadline = started + GENEROUS_WALL_BACKSTOP;
         let words = FatalWords::new();
         let address = words.0 as usize;
         let tracer = spawn_fn::<(), _>(move || {
@@ -5306,7 +5306,7 @@ mod tests {
         let deadline = Instant::now()
             + handed_deadline
                 .map(fatal_remaining)
-                .unwrap_or(Duration::from_secs(3));
+                .unwrap_or(GENEROUS_WALL_BACKSTOP);
         let mut natural_reaper = handed_deadline.map(|_| {
             assert!(fail && fork_descendant && !blocked_newborn);
             assert_eq!(
@@ -5735,7 +5735,7 @@ mod tests {
             }
             return;
         }
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let mut reaper = fatal_child_command(TEST, "reaper");
         reaper.env("REVERIE_FATAL_HANDED_DEADLINE_NS", deadline.to_string());
         unsafe {
@@ -6071,7 +6071,7 @@ mod tests {
         crate::task::EXEC_TIMER_TRANSFERS
             .with(|slot| *slot.borrow_mut() = Some(timer_transfers.clone()));
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(3);
+        let deadline = started + GENEROUS_WALL_BACKSTOP;
         let payload = (timer_mode == 0 || timer_mode >= 3).then(fatal_exec_timer_payload);
         // A raw exec thread runs only timer mode 0's body: exec the payload.
         assert!(
@@ -6211,7 +6211,9 @@ mod tests {
                     "exec owner rescue only: signal={signal:?}, completed={}",
                     matches!(rescued, Ok(ToolRunOutcome::Complete(_)))
                 );
-                panic!("exec owner did not Complete within original3s predicate: {description}");
+                panic!(
+                    "exec owner did not Complete within original generous-backstop predicate: {description}"
+                );
             }
         };
         verify_exec_owner_completion(
@@ -6291,7 +6293,7 @@ mod tests {
         markers: Vec<(i32, i32, i32, i32, u64, bool, bool)>,
     ) {
         assert_exec_owner_completed_result(fail, root, &events, &completed.result);
-        assert!(started.elapsed() <= Duration::from_secs(3));
+        assert!(started.elapsed() <= GENEROUS_WALL_BACKSTOP);
         assert!(
             root_absent,
             "original product completion did not reap root before rescue"
@@ -8233,7 +8235,7 @@ mod tests {
             freeze_refusal_recovery(true).await;
             return;
         }
-        let deadline = fatal_monotonic_ns() + 3_000_000_000;
+        let deadline = fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
             .env(CHILD, NAME)
@@ -8455,6 +8457,17 @@ mod tests {
         })
     }
 
+    /// Hang backstop for the fatal families' shared original deadline,
+    /// not a latency gate: the work inside it is milliseconds, so at
+    /// three seconds it measured host scheduling, not the product
+    /// (owner rule: tests pass at high load; dh-ovzxo). Every ordering
+    /// assertion that reads a deadline below keeps its form and moves
+    /// with this bound, so an event must still land before the deadline
+    /// it hands on. What this knowingly gives up: a still-correct
+    /// 10x slowdown on these paths is no longer caught here.
+    const GENEROUS_WALL_BACKSTOP: Duration = Duration::from_secs(60);
+    const GENEROUS_WALL_BACKSTOP_NS: u64 = 60_000_000_000;
+
     fn fatal_monotonic_ns() -> u64 {
         let mut now: libc::timespec = unsafe { std::mem::zeroed() };
         assert_eq!(
@@ -8467,7 +8480,7 @@ mod tests {
     fn fatal_remaining(deadline: u64) -> Duration {
         let remaining = deadline
             .checked_sub(fatal_monotonic_ns())
-            .expect("combined fatal cleanup exceeded its one 3s deadline");
+            .expect("combined fatal cleanup exceeded its one generous-backstop deadline");
         assert_ne!(remaining, 0);
         Duration::from_nanos(remaining)
     }
@@ -8520,7 +8533,8 @@ mod tests {
             fs::metadata(format!("/proc/{root}")).unwrap().ino(),
             root_inode
         );
-        let deadline = handed_deadline.unwrap_or_else(|| fatal_monotonic_ns() + 3_000_000_000);
+        let deadline =
+            handed_deadline.unwrap_or_else(|| fatal_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS);
         channel
             .set_read_timeout(Some(fatal_remaining(deadline)))
             .unwrap();
@@ -12623,7 +12637,7 @@ mod tests {
         }
         let error = tokio::time::timeout_at(deadline, initialization_error(pid, died))
             .await
-            .expect("initialization conversion exceeded the one total three-second bound");
+            .expect("initialization conversion exceeded the one total generous-backstop bound");
         assert!(matches!(error, Error::Tool(_)));
         let message = error.to_string();
         if consume_elsewhere {
@@ -12767,7 +12781,7 @@ mod tests {
                     TracerBuilder::<InitialWaitCallbackWitness>::new(command).spawn(),
                 )
                 .await
-                .expect("public spawn exceeded the one total three-second bound")
+                .expect("public spawn exceeded the one total generous-backstop bound")
                 {
                     Err(error) => error,
                     Ok(_) => panic!("early pre-TRACEME exit must not construct a Tracer"),
@@ -12804,7 +12818,7 @@ mod tests {
 
         // As with the precise-timer control, re-exec just this test to isolate
         // process-global state. One deadline includes startup and final wait.
-        let deadline = initial_wait_monotonic_ns() + 3_000_000_000;
+        let deadline = initial_wait_monotonic_ns() + GENEROUS_WALL_BACKSTOP_NS;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .env(INNER, test_name)
@@ -12822,7 +12836,7 @@ mod tests {
             }
             assert!(
                 initial_wait_monotonic_ns() < deadline,
-                "initial-wait regression exceeded its one total three-second bound; child not known terminal"
+                "initial-wait regression exceeded its one total generous-backstop bound; child not known terminal"
             );
             std::thread::sleep(Duration::from_millis(1));
         }

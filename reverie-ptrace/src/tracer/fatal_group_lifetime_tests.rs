@@ -57,7 +57,7 @@ mod fatal_group_lifetime_tests {
     }
     #[tokio::test(flavor = "current_thread")]
     async fn completed_subscription_is_noop_but_unknown_capture_is_refused() {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + GENEROUS_WALL_BACKSTOP;
         let _observations = FatalReapObservationScope::new();
         let tracer = tokio::time::timeout_at(
             deadline.into(),

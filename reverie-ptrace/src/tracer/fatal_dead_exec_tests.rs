@@ -85,7 +85,7 @@ mod fatal_dead_exec_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fatal_freeze_consumes_a_killed_exec_without_holding_it() {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + GENEROUS_WALL_BACKSTOP;
         let (pid, running) = killed_exec_tracee(deadline);
         let waits = Arc::new(PtracerWaitOwner::default());
         waits.bind_running(&running);
@@ -130,7 +130,7 @@ mod fatal_dead_exec_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fatal_newborn_reap_consumes_a_killed_exec() {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + GENEROUS_WALL_BACKSTOP;
         let (pid, running) = killed_exec_tracee(deadline);
         let session = FatalSession::for_test(pid);
         let newborn = FatalNewborn::new(pid, &running);
@@ -224,7 +224,7 @@ mod fatal_dead_exec_tests {
     /// decoding".
     #[tokio::test(flavor = "current_thread")]
     async fn ordinary_terminal_retires_a_killed_exec_and_reaches_its_exit() {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + GENEROUS_WALL_BACKSTOP;
         let (pid, running) = killed_exec_tracee(deadline);
         let (status, session, terminal) = finish_killed(pid, running, deadline).await;
         assert_eq!(
@@ -245,7 +245,7 @@ mod fatal_dead_exec_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn ordinary_terminal_refuses_a_killed_fork_stop_queued_before_the_exit_stop() {
         const FORK_STOP: i32 = (libc::PTRACE_EVENT_FORK << 16) | (libc::SIGTRAP << 8) | 0x7f;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + GENEROUS_WALL_BACKSTOP;
         let pid = match unsafe { unistd::fork() }.expect("fork fork tracee") {
             ForkResult::Child => {
                 safeptrace::traceme_and_stop().expect("TRACEME fork tracee");
