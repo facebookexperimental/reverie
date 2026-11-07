@@ -9961,7 +9961,7 @@ fn dev_fixed_heap_readonly(
         }
         "fixed_heap_location_alloc_269_41" => {
             require(
-                actual == &fixed_hex("000000000000000022000000000000000d01000029000000"),
+                actual == &fixed_hex("000000000000000022000000000000001501000029000000"),
                 "wrong complete dev heap readonly payload",
             )?;
             let file = dev_fixed_heap_target(targets, "fixed_heap_location_alloc_269_41_file")?;
@@ -11331,7 +11331,7 @@ const FIXED_READONLY_SPECS: &[FixedReadonlySpec] = &[
     FixedReadonlySpec {
         key: "publication_dev_data_3655e8",
         kind: "location",
-        hex: "000000000000000023000000000000006c00000018000000",
+        hex: "000000000000000023000000000000007300000018000000",
         file_hex: "726576657269652d6c697465696e73742f7372632f70617463685f616c6c6f632e7273",
         owner: "",
         switch: &[],
@@ -11459,7 +11459,7 @@ const FIXED_READONLY_SPECS: &[FixedReadonlySpec] = &[
     FixedReadonlySpec {
         key: "fixed_patch_reference_location",
         kind: "location",
-        hex: "000000000000000023000000000000006c00000018000000",
+        hex: "000000000000000023000000000000007300000018000000",
         file_hex: "726576657269652d6c697465696e73742f7372632f70617463685f616c6c6f632e7273",
         owner: "",
         switch: &[],
@@ -11603,7 +11603,7 @@ const FIXED_READONLY_SPECS: &[FixedReadonlySpec] = &[
     FixedReadonlySpec {
         key: "fixed_heap_location_alloc_269_41",
         kind: "location",
-        hex: "000000000000000022000000000000000d01000029000000",
+        hex: "000000000000000022000000000000001501000029000000",
         file_hex: "726576657269652d696e67756573742f7372632f67756573742f616c6c6f632e7273",
         owner: "",
         switch: &[],
@@ -11843,7 +11843,7 @@ const FIXED_READONLY_SPECS: &[FixedReadonlySpec] = &[
     FixedReadonlySpec {
         key: "fixed_operation_data_4",
         kind: "location",
-        hex: "000000000000000023000000000000004f0000001a000000",
+        hex: "00000000000000002300000000000000560000001a000000",
         file_hex: "726576657269652d6c697465696e73742f7372632f70617463685f616c6c6f632e7273",
         owner: "",
         switch: &[],
@@ -11851,7 +11851,7 @@ const FIXED_READONLY_SPECS: &[FixedReadonlySpec] = &[
     FixedReadonlySpec {
         key: "fixed_operation_data_5",
         kind: "location",
-        hex: "000000000000000023000000000000006200000010000000",
+        hex: "000000000000000023000000000000006900000010000000",
         file_hex: "726576657269652d6c697465696e73742f7372632f70617463685f616c6c6f632e7273",
         owner: "",
         switch: &[],
@@ -21235,10 +21235,10 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_tool_span_end_data",
         location: true,
-        hex: "00000000000000005f000000000000001701000010000000",
+        hex: "00000000000000005f000000000000001f01000010000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 279,
+        line: 287,
         column: 16,
     },
     DetcoreValidateDataSpec {
@@ -21262,91 +21262,91 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_alloc_194_data",
         location: true,
-        hex: "000000000000000060000000000000004f0000001a000000",
+        hex: "00000000000000006000000000000000560000001a000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 79,
+        line: 86,
         column: 26,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
         location: true,
-        hex: "000000000000000060000000000000006c00000018000000",
+        hex: "000000000000000060000000000000007300000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 108,
+        line: 115,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
         location: true,
-        hex: "000000000000000060000000000000006c00000018000000",
+        hex: "000000000000000060000000000000007300000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 108,
+        line: 115,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_537_data",
         location: true,
-        hex: "00000000000000005f00000000000000a60000002a000000",
+        hex: "00000000000000005f00000000000000ae0000002a000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 166,
+        line: 174,
         column: 42,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_550_data",
         location: true,
-        hex: "00000000000000005f00000000000000a60000002a000000",
+        hex: "00000000000000005f00000000000000ae0000002a000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 166,
+        line: 174,
         column: 42,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_571_data",
         location: true,
-        hex: "00000000000000005f000000000000009500000022000000",
+        hex: "00000000000000005f000000000000009d00000022000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 149,
+        line: 157,
         column: 34,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_586_data",
         location: true,
-        hex: "00000000000000005f00000000000000c000000019000000",
+        hex: "00000000000000005f00000000000000c800000019000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 192,
+        line: 200,
         column: 25,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_607_data",
         location: true,
-        hex: "00000000000000005f00000000000000c000000019000000",
+        hex: "00000000000000005f00000000000000c800000019000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 192,
+        line: 200,
         column: 25,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_620_data",
         location: true,
-        hex: "00000000000000005f00000000000000b600000029000000",
+        hex: "00000000000000005f00000000000000be00000029000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 182,
+        line: 190,
         column: 41,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_allocate_629_data",
         location: true,
-        hex: "00000000000000005f00000000000000dd00000017000000",
+        hex: "00000000000000005f00000000000000e500000017000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 221,
+        line: 229,
         column: 23,
     },
     DetcoreValidateDataSpec {
@@ -21370,127 +21370,127 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_realloc_357_data",
         location: true,
-        hex: "000000000000000060000000000000006c00000018000000",
+        hex: "000000000000000060000000000000007300000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 108,
+        line: 115,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_realloc_375_data",
         location: true,
-        hex: "000000000000000060000000000000006c00000018000000",
+        hex: "000000000000000060000000000000007300000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 108,
+        line: 115,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_realloc_388_data",
         location: true,
-        hex: "000000000000000060000000000000006200000010000000",
+        hex: "000000000000000060000000000000006900000010000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 98,
+        line: 105,
         column: 16,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_realloc_401_data",
         location: true,
-        hex: "000000000000000060000000000000004f0000001a000000",
+        hex: "00000000000000006000000000000000560000001a000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 79,
+        line: 86,
         column: 26,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_308_data",
         location: true,
-        hex: "00000000000000005f00000000000000f500000018000000",
+        hex: "00000000000000005f00000000000000fd00000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 245,
+        line: 253,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_321_data",
         location: true,
-        hex: "00000000000000005f00000000000000f500000018000000",
+        hex: "00000000000000005f00000000000000fd00000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 245,
+        line: 253,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_342_data",
         location: true,
-        hex: "00000000000000005f00000000000000f80000000d000000",
+        hex: "00000000000000005f00000000000000000100000d000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 248,
+        line: 256,
         column: 13,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_363_data",
         location: true,
-        hex: "00000000000000005f00000000000000f80000000d000000",
+        hex: "00000000000000005f00000000000000000100000d000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 248,
+        line: 256,
         column: 13,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_376_data",
         location: true,
-        hex: "00000000000000005f00000000000000fc00000011000000",
+        hex: "00000000000000005f000000000000000401000011000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 252,
+        line: 260,
         column: 17,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_397_data",
         location: true,
-        hex: "00000000000000005f00000000000000fc00000011000000",
+        hex: "00000000000000005f000000000000000401000011000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 252,
+        line: 260,
         column: 17,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_410_data",
         location: true,
-        hex: "00000000000000005f000000000000000b01000043000000",
+        hex: "00000000000000005f000000000000001301000043000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 267,
+        line: 275,
         column: 67,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_431_data",
         location: true,
-        hex: "00000000000000005f000000000000000b01000043000000",
+        hex: "00000000000000005f000000000000001301000043000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 267,
+        line: 275,
         column: 67,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_444_data",
         location: true,
-        hex: "00000000000000005f000000000000000d01000040000000",
+        hex: "00000000000000005f000000000000001501000040000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 269,
+        line: 277,
         column: 64,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_heap_deallocate_462_data",
         location: true,
-        hex: "00000000000000005f000000000000000d01000040000000",
+        hex: "00000000000000005f000000000000001501000040000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/alloc.rs"),
-        line: 269,
+        line: 277,
         column: 64,
     },
     DetcoreValidateDataSpec {
@@ -21514,28 +21514,28 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_dealloc_188_data",
         location: true,
-        hex: "000000000000000060000000000000006c00000018000000",
+        hex: "000000000000000060000000000000007300000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 108,
+        line: 115,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_dealloc_206_data",
         location: true,
-        hex: "000000000000000060000000000000006c00000018000000",
+        hex: "000000000000000060000000000000007300000018000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 108,
+        line: 115,
         column: 24,
     },
     DetcoreValidateDataSpec {
         key: "fixed_detcore_validate_fixed_patch_dealloc_219_data",
         location: true,
-        hex: "000000000000000060000000000000006200000010000000",
+        hex: "000000000000000060000000000000006900000010000000",
         file_hex: "",
         source_context_key: Some("rv:reverie-liteinst/src/patch_alloc.rs"),
-        line: 98,
+        line: 105,
         column: 16,
     },
     DetcoreValidateDataSpec {
@@ -41257,7 +41257,7 @@ mod tests {
                 ),
                 (
                     0x369d20,
-                    fixed_hex("000000000000000022000000000000000d01000029000000"),
+                    fixed_hex("000000000000000022000000000000001501000029000000"),
                 ),
                 (
                     0x369d38,
@@ -42208,7 +42208,7 @@ mod tests {
                     ("fixed_operation_data_4", 3562744),
                 ],
                 &[(3781408, 1579904), (3781392, 1579648), (3783320, 3542496)],
-                &[(3562744, "000000000000000023000000000000004f0000001a000000")],
+                &[(3562744, "00000000000000002300000000000000560000001a000000")],
             ),
             (
                 "fixed_patch_contains",
@@ -42226,7 +42226,7 @@ mod tests {
                     ("fixed_operation_data_5", 3562768),
                 ],
                 &[(3780472, 1990944), (3782976, 3542304)],
-                &[(3562768, "000000000000000023000000000000006200000010000000")],
+                &[(3562768, "000000000000000023000000000000006900000010000000")],
             ),
             (
                 "fixed_patch_require_owned",
@@ -53215,14 +53215,14 @@ mod tests {
             targets.insert("publication_dev_data_3655e8".into(), 3560936u64);
             readonly.insert(
                 3560936u64,
-                fixed_hex("000000000000000023000000000000006c00000018000000"),
+                fixed_hex("000000000000000023000000000000007300000018000000"),
             );
             targets.insert("fixed_heap_panic_misaligned".into(), 3537351u64);
             got.insert(3778536u64, 3537351u64);
             targets.insert("publication_dev_data_3655e8".into(), 3560936u64);
             readonly.insert(
                 3560936u64,
-                fixed_hex("000000000000000023000000000000006c00000018000000"),
+                fixed_hex("000000000000000023000000000000007300000018000000"),
             );
             targets.insert("fixed_panic_null_reference".into(), 3537326u64);
             got.insert(3778544u64, 3537326u64);
@@ -58211,7 +58211,7 @@ mod tests {
         let readonly = BTreeMap::from([
             (
                 0xeb8300,
-                fixed_hex("000000000000000066000000000000006c00000018000000"),
+                fixed_hex("000000000000000066000000000000007300000018000000"),
             ),
             (0x8892a, filename),
         ]);
@@ -58545,8 +58545,8 @@ mod tests {
         // Only the instruction extents/targets/digests and source coordinates are ELF literals.
         let context = detcore_validate_control_context("5b9df54");
         let filename = context["rv:reverie-liteinst/src/patch_alloc.rs"].clone();
-        let location79 = fixed_hex("000000000000000060000000000000004f0000001a000000");
-        let location108 = fixed_hex("000000000000000060000000000000006c00000018000000");
+        let location79 = fixed_hex("00000000000000006000000000000000560000001a000000");
+        let location108 = fixed_hex("000000000000000060000000000000007300000018000000");
         let readonly = BTreeMap::from([
             (0xd04b98, location79),
             (0xd04bf8, location108),
@@ -63827,92 +63827,92 @@ mod tests {
             .find(|spec| spec.key == "fixed_detcore_validate_fixed_tool_span_end_data")
             .unwrap();
         // This eighteenth row is source-bound only; HOST153 did not select it.
-        assert_eq!((span.line, span.column), (279, 16));
+        assert_eq!((span.line, span.column), (287, 16));
         for (key, whole, old_line) in [
             (
                 "fixed_detcore_validate_fixed_heap_allocate_537_data",
-                "0000000000000000f400000000000000a60000002a000000",
-                177u32,
+                "0000000000000000f400000000000000ae0000002a000000",
+                185u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_550_data",
-                "0000000000000000f400000000000000a60000002a000000",
-                177u32,
+                "0000000000000000f400000000000000ae0000002a000000",
+                185u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_571_data",
-                "0000000000000000f4000000000000009500000022000000",
-                160u32,
+                "0000000000000000f4000000000000009d00000022000000",
+                168u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_586_data",
-                "0000000000000000f400000000000000c000000019000000",
-                203u32,
+                "0000000000000000f400000000000000c800000019000000",
+                211u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_607_data",
-                "0000000000000000f400000000000000c000000019000000",
-                203u32,
+                "0000000000000000f400000000000000c800000019000000",
+                211u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_620_data",
-                "0000000000000000f400000000000000b600000029000000",
-                193u32,
+                "0000000000000000f400000000000000be00000029000000",
+                201u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_allocate_629_data",
-                "0000000000000000f400000000000000dd00000017000000",
-                232u32,
+                "0000000000000000f400000000000000e500000017000000",
+                240u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_308_data",
-                "0000000000000000f400000000000000f500000018000000",
-                256u32,
+                "0000000000000000f400000000000000fd00000018000000",
+                264u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_321_data",
-                "0000000000000000f400000000000000f500000018000000",
-                256u32,
+                "0000000000000000f400000000000000fd00000018000000",
+                264u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_342_data",
-                "0000000000000000f400000000000000f80000000d000000",
-                259u32,
+                "0000000000000000f400000000000000000100000d000000",
+                267u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_363_data",
-                "0000000000000000f400000000000000f80000000d000000",
-                259u32,
+                "0000000000000000f400000000000000000100000d000000",
+                267u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_376_data",
-                "0000000000000000f400000000000000fc00000011000000",
-                263u32,
+                "0000000000000000f4000000000000000401000011000000",
+                271u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_397_data",
-                "0000000000000000f400000000000000fc00000011000000",
-                263u32,
+                "0000000000000000f4000000000000000401000011000000",
+                271u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_410_data",
-                "0000000000000000f4000000000000000b01000043000000",
-                278u32,
+                "0000000000000000f4000000000000001301000043000000",
+                286u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_431_data",
-                "0000000000000000f4000000000000000b01000043000000",
-                278u32,
+                "0000000000000000f4000000000000001301000043000000",
+                286u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_444_data",
-                "0000000000000000f4000000000000000d01000040000000",
-                280u32,
+                "0000000000000000f4000000000000001501000040000000",
+                288u32,
             ),
             (
                 "fixed_detcore_validate_fixed_heap_deallocate_462_data",
-                "0000000000000000f4000000000000000d01000040000000",
-                280u32,
+                "0000000000000000f4000000000000001501000040000000",
+                288u32,
             ),
         ] {
             let spec = DETCORE_VALIDATE_DATA
@@ -63958,7 +63958,7 @@ mod tests {
         let filename=b"/build/.cargo/git/checkouts/reverie-fixture/0123456/reverie-liteinst/src/patch_alloc.rs".to_vec();
         let mut location = vec![0u8; 24];
         location[8..16].copy_from_slice(&(filename.len() as u64).to_le_bytes());
-        location[16..20].copy_from_slice(&79u32.to_le_bytes());
+        location[16..20].copy_from_slice(&86u32.to_le_bytes());
         location[20..24].copy_from_slice(&26u32.to_le_bytes());
         let key = "rv:reverie-liteinst/src/patch_alloc.rs".to_owned();
         let context = BTreeMap::from([(key.clone(), filename.clone())]);
