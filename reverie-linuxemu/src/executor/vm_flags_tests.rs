@@ -1443,18 +1443,203 @@ fn review_nested_fork_keeps_newly_unlocked_neighbor_apart() {
     );
 }
 
-/// Finding 3: a mapping unlocked in a fork child takes the least lineage
-/// neither neighbour has, whatever lineages earlier forks gave them.
+/// Round 2, finding 3 witness (`rv1342-delta-api-lineage-probe.log`:
+/// child-moved-A, child-moved-C): two locked mappings inherited by a fork
+/// child stay two after a move makes them neighbours, and only A has `gu`.
 #[test]
-fn an_unlocked_mappings_lineage_is_neither_neighbours() {
-    use super::facts::unlocked_lineage;
-    assert_eq!(unlocked_lineage(None, None), 1);
-    assert_eq!(unlocked_lineage(Some(0), Some(0)), 1);
-    assert_eq!(unlocked_lineage(Some(1), None), 2);
-    assert_eq!(unlocked_lineage(None, Some(1)), 2);
-    assert_eq!(unlocked_lineage(Some(1), Some(2)), 3);
-    assert_eq!(unlocked_lineage(Some(2), Some(1)), 3);
-    assert_eq!(unlocked_lineage(Some(3), Some(7)), 1);
+fn reviewer_remapped_inherited_locked_mappings_keep_distinct_lineages() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let base = room(&mut executor, &memory, 4);
+    for at in [base, base + 3 * PAGE] {
+        mmap(
+            &mut executor,
+            &memory,
+            at,
+            1,
+            RW,
+            PRIVATE | FIXED | libc::MAP_LOCKED as u64,
+        );
+        let physical = memory.user_range_to_guest(at, 1).unwrap();
+        memory.write_raw(physical, &[1]).unwrap();
+    }
+    let child_memory = memory.snapshot().unwrap();
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    let mut child = executor
+        .fork_child(executor.state.pid + 40, false, false)
+        .unwrap();
+    ok(call(
+        &mut child,
+        &child_memory,
+        libc::SYS_madvise,
+        [base, PAGE, mm::MADV_GUARD_INSTALL as u64, 0, 0, 0],
+    ));
+    assert_eq!(
+        call(
+            &mut child,
+            &child_memory,
+            libc::SYS_mremap,
+            [
+                base + 3 * PAGE,
+                PAGE,
+                PAGE,
+                (libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED) as u64,
+                base + PAGE,
+                0
+            ]
+        ),
+        (base + PAGE) as i64
+    );
+    let observed = [
+        flags_at(&child, &child_memory, base),
+        flags_at(&child, &child_memory, base + PAGE),
+    ];
+    assert_eq!(
+        observed,
+        [
+            (base, base + PAGE, text("rd wr mr mw me gu ac")),
+            (base + PAGE, base + 2 * PAGE, text("rd wr mr mw me ac"))
+        ]
+    );
+}
+
+/// Round 2, finding 3: each mapping a fork child inherits locked gets a
+/// lineage no other page has, and its own parts, split and joined again,
+/// are one mapping again (`fix2_probe.log`: child-inherited,
+/// child-split-first/second, child-rejoined).
+#[test]
+fn an_inherited_locked_mapping_has_a_lineage_of_its_own_and_rejoins_its_parts() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let locked = PRIVATE | FIXED | libc::MAP_LOCKED as u64;
+    let base = room(&mut executor, &memory, 5);
+    mmap(&mut executor, &memory, base, 2, RW, locked);
+    mmap(&mut executor, &memory, base + 3 * PAGE, 2, RW, locked);
+    let child_memory = memory.snapshot().unwrap();
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    let lineage = |at: u64| {
+        child_memory
+            .declared_mapping(child_memory.user_range_to_guest(at, PAGE).unwrap())
+            .unwrap()
+            .lineage
+    };
+    assert_eq!(
+        lineage(base),
+        lineage(base + PAGE),
+        "one mapping, one lineage"
+    );
+    assert_ne!(lineage(base), lineage(base + 3 * PAGE), "two mappings, two");
+    let others: BTreeSet<u16> = child_memory
+        .user_mapping_runs()
+        .runs
+        .iter()
+        .filter(|run| run.end <= base || base + 5 * PAGE <= run.start)
+        .filter_map(|run| run.declared)
+        .map(|declared| declared.lineage)
+        .collect();
+    for at in [base, base + 3 * PAGE] {
+        assert!(
+            lineage(at) != 0 && !others.contains(&lineage(at)),
+            "{others:?}"
+        );
+    }
+    let mut child = executor
+        .fork_child(executor.state.pid + 40, false, false)
+        .unwrap();
+    assert_eq!(
+        flags_at(&child, &child_memory, base),
+        (base, base + 2 * PAGE, text("rd wr mr mw me ac")),
+        "child-inherited"
+    );
+    ok(call(
+        &mut child,
+        &child_memory,
+        libc::SYS_mprotect,
+        [base + PAGE, PAGE, R, 0, 0, 0],
+    ));
+    assert_eq!(
+        [base, base + PAGE].map(|at| flags_at(&child, &child_memory, at)),
+        [
+            (base, base + PAGE, text("rd wr mr mw me ac")),
+            // `rd mr mw me ac` natively once written; whether it was is
+            // not known here (`FLAG_ACCOUNT_UNKNOWN`).
+            (base + PAGE, base + 2 * PAGE, None),
+        ],
+        "child-split-first, child-split-second"
+    );
+    ok(call(
+        &mut child,
+        &child_memory,
+        libc::SYS_mprotect,
+        [base + PAGE, PAGE, RW, 0, 0, 0],
+    ));
+    assert_eq!(
+        flags_at(&child, &child_memory, base),
+        (base, base + 2 * PAGE, text("rd wr mr mw me ac")),
+        "child-rejoined"
+    );
+}
+
+/// Round 2, finding 3: when a line of descent of forks has used lineages
+/// up to `u16::MAX`, the lineages are renumbered in order before new ones
+/// are given, keeping every two pages' lineages equal or different as they
+/// were, and the new ones are again those of no other page.
+#[test]
+fn fresh_lineages_renumber_before_they_run_out() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let base = room(&mut executor, &memory, 7);
+    let lineage_of = |memory: &GuestMemory, at: u64| {
+        memory
+            .declared_mapping(memory.user_range_to_guest(at, PAGE).unwrap())
+            .unwrap()
+            .lineage
+    };
+    // Three mappings with lineages left by earlier forks, the last two
+    // alike, and a locked one.
+    for (at, lineage) in [
+        (base, u16::MAX),
+        (base + 2 * PAGE, 65000),
+        (base + 4 * PAGE, 65000),
+    ] {
+        mmap(&mut executor, &memory, at, 1, RW, PRIVATE | FIXED);
+        memory.edit_user_declared(at, PAGE, |declared, _| crate::memory::DeclaredMapping {
+            lineage,
+            ..declared
+        });
+    }
+    let locked = base + 6 * PAGE;
+    mmap(
+        &mut executor,
+        &memory,
+        locked,
+        1,
+        RW,
+        PRIVATE | FIXED | libc::MAP_LOCKED as u64,
+    );
+    let child = memory.snapshot().unwrap();
+    ElfExecutor::inherit_mappings_in_forked_child(&child);
+    let [high, low, alike, unlocked] =
+        [base, base + 2 * PAGE, base + 4 * PAGE, locked].map(|at| lineage_of(&child, at));
+    assert!(low < high, "renumbered in order: {low} {high}");
+    assert_eq!(low, alike, "equal lineages stay equal");
+    assert!(high < 1000, "renumbered down: {high}");
+    let all: Vec<u16> = child
+        .user_mapping_runs()
+        .runs
+        .iter()
+        .filter(|run| !(locked..locked + PAGE).contains(&run.start))
+        .filter_map(|run| run.declared)
+        .map(|declared| declared.lineage)
+        .collect();
+    assert!(
+        unlocked != 0 && !all.contains(&unlocked),
+        "{unlocked} {all:?}"
+    );
+    assert_eq!(lineage_of(&memory, base), u16::MAX, "the parent's stay");
 }
 
 /// Finding 4 witness (`rv1342-flags-mergeable-probe.log`: shared).
@@ -1666,6 +1851,86 @@ fn unlocking_takes_locked_from_exactly_the_mappings_unlocked() {
         "unlockall-rw, unlockall-r, and every other locked mapping"
     );
     assert_eq!(memory.flagged_pages(FLAG_LOCKED), 0);
+}
+
+/// Round 2, finding 5 witness (`rv1342-delta-flags-unlock-prefix-probe.log`):
+/// a munlock that fails with ENOMEM still unlocks the mapped prefix.
+#[test]
+fn review_unlock_error_still_clears_mapped_prefix() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let base = room(&mut executor, &memory, 1);
+    mmap(
+        &mut executor,
+        &memory,
+        base,
+        1,
+        RW,
+        PRIVATE | FIXED | libc::MAP_LOCKED as u64,
+    );
+    let length = crate::memory::USER_ADDRESS_END - base;
+    assert!(
+        memory.user_range_to_guest(base, length).is_none(),
+        "range crosses the provider's address-window boundary"
+    );
+    assert_eq!(
+        call(
+            &mut executor,
+            &memory,
+            libc::SYS_munlock,
+            [base, length, 0, 0, 0, 0]
+        ),
+        negative_errno(libc::ENOMEM)
+    );
+    // Native apply_vma_lock_flags unlocks the first VMA, then reports
+    // ENOMEM at the following hole. Failure does not undo that prefix.
+    assert_eq!(
+        flags_at(&executor, &memory, base).2,
+        text("rd wr mr mw me ac")
+    );
+}
+
+/// Round 2, finding 5: a munlock Linux refuses for its arguments (EINVAL,
+/// a range that wraps) changes nothing, and one that starts in a hole and
+/// fails (ENOMEM) unlocks nothing.
+#[test]
+fn a_munlock_refused_before_any_mapping_unlocks_nothing() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let base = room(&mut executor, &memory, 2);
+    mmap(
+        &mut executor,
+        &memory,
+        base + PAGE,
+        1,
+        RW,
+        PRIVATE | FIXED | libc::MAP_LOCKED as u64,
+    );
+    assert_eq!(
+        call(
+            &mut executor,
+            &memory,
+            libc::SYS_munlock,
+            [base + PAGE, u64::MAX - base, 0, 0, 0, 0]
+        ),
+        negative_errno(libc::EINVAL)
+    );
+    let length = crate::memory::USER_ADDRESS_END - base;
+    assert_eq!(
+        call(
+            &mut executor,
+            &memory,
+            libc::SYS_munlock,
+            [base, length, 0, 0, 0, 0]
+        ),
+        negative_errno(libc::ENOMEM)
+    );
+    assert_eq!(
+        flags_at(&executor, &memory, base + PAGE).2,
+        text("rd wr mr mw me lo ac")
+    );
 }
 
 /// Finding 2 witness (`rv1342-flags-probe.log`: seal-first, seal-second).

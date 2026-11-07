@@ -706,10 +706,13 @@ impl ElfExecutor {
     /// each copy, `mm/mmap.c`; `FLAG_LOCKED`), while every other flag is
     /// copied as it is. `dup_mmap` copies each mapping as a mapping of its
     /// own and merges none, so the pages of each mapping that loses
-    /// `FLAG_LOCKED` also get a lineage that neither mapping beside it has
-    /// (`unlocked_lineage`), and the mapping stays a line of its own rather
-    /// than merge with a neighbour whose flags it now has, in this fork and
-    /// in any later one. Only `memory`, the child's copy, changes. A copy
+    /// `FLAG_LOCKED` also get a lineage of the mapping's own, which no other
+    /// page of the address space has (`fresh_lineages`): the mapping stays a
+    /// line of its own rather than merge with a neighbour whose flags it now
+    /// has, in this fork, in any later one, and wherever a move puts it
+    /// later (mremap keeps a page's lineage), while its own parts, split and
+    /// joined again, still merge. Only `memory`, the child's copy, changes.
+    /// A copy
     /// that shares its parent's address space
     /// ([`GuestMemory::shares_parent_address_space`]) is left as it is: on
     /// Linux it is the parent's own address space, whose mappings stay
@@ -725,40 +728,26 @@ impl ElfExecutor {
         // No locked mapping lies in the window, which no mapping can be
         // placed in after load; the edits skip the window's pages.
         let runs = memory.user_mapping_runs().runs;
-        // The lineage of the run before the one at hand, as it is now, and
-        // where that run ends.
-        let mut before: Option<(u64, u16)> = None;
-        let mut index = 0;
-        while index < runs.len() {
-            let run = &runs[index];
+        // Each locked mapping: a run of adjacent pages declared alike.
+        let mut mappings: Vec<(u64, u64)> = Vec::new();
+        let mut last: Option<crate::memory::DeclaredMapping> = None;
+        for run in &runs {
             let Some(declared) = run
                 .declared
                 .filter(|declared| declared.flags & super::FLAG_LOCKED != 0)
             else {
-                before = run.declared.map(|declared| (run.end, declared.lineage));
-                index += 1;
+                last = None;
                 continue;
             };
-            // The locked mapping: the adjacent runs declared alike.
-            let mut end = run.end;
-            index += 1;
-            while let Some(next) = runs.get(index)
-                && next.start == end
-                && next.declared == Some(declared)
-            {
-                end = next.end;
-                index += 1;
+            match mappings.last_mut() {
+                Some((_, end)) if *end == run.start && last == Some(declared) => *end = run.end,
+                _ => mappings.push((run.start, run.end)),
             }
-            let lineage = unlocked_lineage(
-                before
-                    .filter(|(before_end, _)| *before_end == run.start)
-                    .map(|(_, lineage)| lineage),
-                runs.get(index)
-                    .filter(|next| next.start == end)
-                    .and_then(|next| next.declared)
-                    .map(|declared| declared.lineage),
-            );
-            memory.edit_user_declared(run.start, end - run.start, |declared, _| {
+            last = Some(declared);
+        }
+        let mut lineage = fresh_lineages(memory, mappings.len());
+        for (start, end) in mappings {
+            memory.edit_user_declared(start, end - start, |declared, _| {
                 if declared.flags & super::FLAG_LOCKED == 0 {
                     declared
                 } else {
@@ -769,7 +758,7 @@ impl ElfExecutor {
                     }
                 }
             });
-            before = Some((end, lineage));
+            lineage = lineage.wrapping_add(1).max(1);
         }
     }
 
@@ -832,19 +821,55 @@ pub(super) fn stack_window_mappings(
     Ok(Some(mappings))
 }
 
-/// The lineage (`DeclaredMapping::lineage`) a forked child's mapping that
-/// was locked in the parent gets
-/// ([`ElfExecutor::inherit_mappings_in_forked_child`]), when the mapping
-/// just below it has lineage `below` and the one just above it `above`
-/// (`None`: no mapping is adjacent there): the least nonzero lineage that
-/// neither has, so that the child's mapping merges with neither, whatever
-/// lineages earlier forks left them (a mapping made since has lineage
-/// zero). The lineage of the mapping below is its new one where it was
-/// unlocked too.
-pub(super) fn unlocked_lineage(below: Option<u16>, above: Option<u16>) -> u16 {
-    (1..=3)
-        .find(|lineage| below != Some(*lineage) && above != Some(*lineage))
-        .expect("two neighbours leave one of three lineages free")
+/// The first of `count` consecutive lineages (`DeclaredMapping::lineage`)
+/// that no page of `memory` has, for the mappings of a forked child that
+/// were locked in the parent, one each
+/// ([`ElfExecutor::inherit_mappings_in_forked_child`]): those just past the
+/// greatest lineage of any page. A move keeps a page's lineage, so two such
+/// mappings never merge, nor one with any other mapping, wherever they are
+/// put later; a mapping made since has lineage zero.
+///
+/// The lineages of a line of descent of forks grow by one per locked
+/// mapping each fork unlocks. Should they reach `u16::MAX`, the lineages of
+/// the pages outside the stack window are first renumbered `1..=k`, in
+/// order, `k` being how many distinct nonzero ones they have, which keeps
+/// every two pages' lineages equal or different as they were. That leaves
+/// room unless the address space holds more than about 65,000 distinct
+/// lineages, more mappings than Linux's default `vm.max_map_count` (65,530)
+/// allows one process; past that, lineages are reused.
+pub(super) fn fresh_lineages(memory: &GuestMemory, count: usize) -> u16 {
+    let greatest = |runs: &[crate::memory::UserMappingRun]| {
+        runs.iter()
+            .filter_map(|run| run.declared)
+            .map(|declared| usize::from(declared.lineage))
+            .max()
+            .unwrap_or(0)
+    };
+    let runs = memory.user_mapping_runs().runs;
+    if greatest(&runs) + count <= usize::from(u16::MAX) {
+        return (greatest(&runs) + 1) as u16;
+    }
+    let ranks: std::collections::BTreeMap<u16, u16> = runs
+        .iter()
+        .filter(|run| run.reservation != Some(crate::memory::RegionKind::Stack))
+        .filter_map(|run| run.declared)
+        .map(|declared| declared.lineage)
+        .filter(|lineage| *lineage != 0)
+        .collect::<std::collections::BTreeSet<u16>>()
+        .into_iter()
+        .zip(1..=u16::MAX)
+        .collect();
+    memory.edit_user_declared(0, crate::memory::USER_ADDRESS_END, |declared, _| {
+        crate::memory::DeclaredMapping {
+            lineage: ranks
+                .get(&declared.lineage)
+                .copied()
+                .unwrap_or(declared.lineage),
+            ..declared
+        }
+    });
+    let greatest = greatest(&memory.user_mapping_runs().runs);
+    u16::try_from(greatest + 1).unwrap_or(1)
 }
 
 /// The stack window's mapping of `memory` that holds the page at user

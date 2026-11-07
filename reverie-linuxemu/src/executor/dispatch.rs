@@ -978,7 +978,10 @@ fn execute_basic_syscall_inner(
         _ if number == libc::SYS_munlock as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED
             let result = munlock_guest_range(&ProviderMemory(memory), args[0], args[1]);
-            if result == 0 {
+            // Linux checks the arguments (EINVAL) before it changes anything,
+            // but unlocks the mappings before a hole and only then fails
+            // there (ENOMEM): its unlocked prefix stays unlocked.
+            if result != negative_errno(libc::EINVAL) {
                 unlock_mappings(memory, args[0], args[1]);
             }
             result
@@ -1303,13 +1306,16 @@ impl ElfExecutor {
     }
 }
 
-/// After a `munlock(2)` of `[address, address + length)` that succeeded:
-/// takes `FLAG_LOCKED` from the mappings it unlocked, as
-/// `apply_vma_lock_flags` clears `VM_LOCKED_MASK` (`mm/mlock.c`): the pages
-/// of the range, rounded to whole pages as Linux rounds it, from its start
-/// up to the first page no mapping holds, where Linux stops (and fails with
-/// ENOMEM, which this backend's validation does not report, see
-/// `munlock_guest_range`). A mapping it covers part of is split there, and
+/// After a `munlock(2)` of `[address, address + length)` whose arguments
+/// Linux accepts (no EINVAL), whether it then succeeded or failed with
+/// ENOMEM: takes `FLAG_LOCKED` from the mappings it unlocked, as
+/// `apply_vma_lock_flags` clears `VM_LOCKED_MASK` (`mm/mlock.c`), mapping
+/// by mapping, in address order: the pages of the range, rounded to whole
+/// pages as Linux rounds it, from its start up to the first page no mapping
+/// holds, where Linux stops and fails with ENOMEM. (This backend's
+/// validation reports that ENOMEM for a range that leaves the user address
+/// space, not for a hole inside it, see `munlock_guest_range`; either way
+/// the prefix is unlocked.) A mapping it covers part of is split there, and
 /// a part left with the flags of its neighbour merges with it, as
 /// `mlock_fixup` merges them; the list of mappings finds both from the
 /// pages.
