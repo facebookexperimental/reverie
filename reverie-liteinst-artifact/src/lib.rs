@@ -67105,52 +67105,30 @@ mod runner_cpu_budget_tests {
     /// A budgeted command that succeeds records its CPU, and accounting costs
     /// the producer itself one small file read per poll, not a /proc scan.
     ///
-    /// The cost guard compares paired unbudgeted/budgeted sleeps. A single
-    /// pair's own-thread CPU also carries heavy-tailed kernel cgroup
-    /// lifecycle charges under host load, so the guard is the median
-    /// overhead of three pairs: a systematically expensive accounting path
-    /// raises every sample, while one load spike does not decide the test.
-    /// The allowance keeps the original per-second bound (250 ms for a
-    /// 5-second sleep, here 100 ms for each 2-second sleep).
+    /// The cost guard measures a fixed number of accounting reads against
+    /// the same number of baseline reads (the neighbouring `cgroup.events`
+    /// file, read through the same helper), both by this thread's own CPU.
+    /// Own CPU only advances while this thread runs and each batch does a
+    /// fixed amount of work, so host load stretches the batches' wall time
+    /// without inflating either measurement; the earlier paired-sleep
+    /// comparison instead let load-inflated kernel cgroup charges over a
+    /// wall-bounded run decide the bound (dh-qe5ht). An accounting path
+    /// that scans files or rereads per poll multiplies the accounting
+    /// batch and fails against the baseline.
     #[test]
     fn cpu_budget_records_measured_cpu_and_costs_the_producer_little() {
         let scratch = Scratch::new("cost");
         let mut runner =
             Runner::new(scratch.0.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
-        let mut samples = Vec::new();
-        for pair in 0..3 {
-            let before = own_cpu();
-            let unbudgeted_wall = Instant::now();
-            runner.run("/bin/sh", &sh("sleep 2"), &scratch.0).unwrap();
-            let unbudgeted = own_cpu() - before;
-            let unbudgeted_wall = unbudgeted_wall.elapsed();
-            let before = own_cpu();
-            let budgeted_wall = Instant::now();
-            runner
-                .run_cpu_bounded(
-                    "/bin/sh",
-                    &sh("sleep 2"),
-                    &scratch.0,
-                    Duration::from_secs(60),
-                )
-                .unwrap();
-            let budgeted = own_cpu() - before;
-            let budgeted_wall = budgeted_wall.elapsed();
-            let overhead = budgeted.saturating_sub(unbudgeted);
-            println!(
-                "producer CPU for sleep 2 pair {pair}: unbudgeted {unbudgeted:?} \
-                 (wall {unbudgeted_wall:?}), budgeted {budgeted:?} \
-                 (wall {budgeted_wall:?}), overhead {overhead:?}"
-            );
-            samples.push((overhead, unbudgeted, budgeted));
-        }
-        let mut overheads: Vec<Duration> = samples.iter().map(|sample| sample.0).collect();
-        overheads.sort();
-        let median = overheads[overheads.len() / 2];
-        assert!(
-            median < Duration::from_millis(100),
-            "CPU accounting median overhead {median:?} over paired sleep-2 samples {samples:?}"
-        );
+        runner.run("/bin/sh", &sh("sleep 2"), &scratch.0).unwrap();
+        runner
+            .run_cpu_bounded(
+                "/bin/sh",
+                &sh("sleep 2"),
+                &scratch.0,
+                Duration::from_secs(60),
+            )
+            .unwrap();
         let output = runner
             .run_cpu_bounded(
                 "/bin/sh",
@@ -67160,17 +67138,45 @@ mod runner_cpu_budget_tests {
             )
             .unwrap();
         assert_eq!(output, b"done\n");
-        assert_eq!(runner.command_cpu.len(), 7);
-        for pair in 0..3 {
-            assert_eq!(runner.command_cpu[pair * 2], None);
-            let sleep_cpu = runner.command_cpu[pair * 2 + 1].unwrap();
-            assert!(sleep_cpu < Duration::from_millis(500), "{sleep_cpu:?}");
-        }
-        let busy_cpu = runner.command_cpu[6].unwrap();
+        assert_eq!(runner.command_cpu.len(), 3);
+        assert_eq!(runner.command_cpu[0], None);
+        let sleep_cpu = runner.command_cpu[1].unwrap();
+        assert!(sleep_cpu < Duration::from_millis(500), "{sleep_cpu:?}");
+        let busy_cpu = runner.command_cpu[2].unwrap();
         assert!(
             !busy_cpu.is_zero() && busy_cpu < Duration::from_secs(30),
             "{busy_cpu:?}"
         );
-        assert_own_cgroups_removed(&runner, 4);
+        assert_own_cgroups_removed(&runner, 2);
+
+        // Fixed-work cost guard: 2000 accounting reads interleaved with
+        // 2000 baseline reads, charged to this thread only.
+        let cgroup = CommandCgroup::create(&runner.cgroup_parent().unwrap()).unwrap();
+        let mut accounting = Duration::ZERO;
+        let mut baseline = Duration::ZERO;
+        for _ in 0..10 {
+            let before = own_cpu();
+            for _ in 0..200 {
+                cgroup.usage().unwrap();
+            }
+            accounting += own_cpu() - before;
+            let before = own_cpu();
+            for _ in 0..200 {
+                cgroup.populated().unwrap();
+            }
+            baseline += own_cpu() - before;
+        }
+        let accounted_path = cgroup.path.clone();
+        cgroup.finish().unwrap();
+        assert!(!accounted_path.exists(), "cost-guard cgroup was left");
+        println!("accounting cost for 2000 reads: {accounting:?} against baseline {baseline:?}");
+        assert!(
+            accounting < Duration::from_millis(100),
+            "CPU accounting cost {accounting:?} for 2000 reads against baseline {baseline:?}"
+        );
+        assert!(
+            accounting < baseline + Duration::from_millis(250),
+            "CPU accounting cost {accounting:?} for 2000 reads against baseline {baseline:?}"
+        );
     }
 }
