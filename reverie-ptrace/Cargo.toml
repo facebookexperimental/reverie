@@ -24,7 +24,7 @@ rcb-observation = []
 nightly = []
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(reverie_asan)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(reverie_asan)', 'cfg(sanitized)'] }
 
 [dependencies]
 anyhow = "1.0.103"

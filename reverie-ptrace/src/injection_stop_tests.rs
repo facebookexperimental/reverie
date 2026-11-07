@@ -16,7 +16,6 @@ use reverie::RdtscResult;
 use reverie::Stack as _;
 use reverie::process::Stdio;
 use reverie::syscalls::Addr;
-use reverie::syscalls::AddrMut;
 use reverie::syscalls::Close;
 use reverie::syscalls::Exit;
 use reverie::syscalls::Futex;
@@ -46,7 +45,6 @@ const HANDLED: usize = WORD + 24;
 const SHARED_PATH: usize = WORD + 64;
 const SIGACT: usize = WORD + 128;
 const SIGSET: usize = WORD + 160;
-const ITIMER: usize = WORD + 176;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 enum Mode {
@@ -286,7 +284,9 @@ impl Tool for StopTool {
                     Mode::ReplaceInterruptedRestart => {
                         if *guest.thread_state() != 0 {
                             // The restarted guest write itself: run it.
-                            return guest.tail_inject(original).await;
+                            // (tail_inject diverges: it cancels this
+                            // callback, so there is no value to return.)
+                            guest.tail_inject(original).await
                         }
                         *guest.thread_state_mut() = 1;
                         // The rewritten call blocks in a futex wait
@@ -519,11 +519,6 @@ impl Fixture {
         if mode == Mode::ReplaceWithPendingSignal {
             // Blocked set at SIGSET: SIGUSR1 only.
             elf[0x20a0..0x20a8].copy_from_slice(&(1u64 << (10 - 1)).to_le_bytes());
-        }
-        if mode == Mode::ReplaceInterruptedRestart {
-            // itimerval at ITIMER: no interval, 80 ms one-shot value
-            // (it_value.tv_usec at +24).
-            elf[0x20c8..0x20d0].copy_from_slice(&80_000u64.to_le_bytes());
         }
         let shared = if mode == Mode::PostExecTail {
             let shared = path.with_extension("shared-word");

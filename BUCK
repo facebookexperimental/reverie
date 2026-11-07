@@ -160,6 +160,14 @@ rust_library(
                 },
             },
             "features": {"default": [], "nightly": [], "rcb-observation": []},
+            "lints": {
+                "rust": {
+                    "unexpected_cfgs": {
+                        "check-cfg": ["cfg(sanitized)"],
+                        "level": "warn",
+                    },
+                },
+            },
             "test": [
                 {"name": "first_instruction_cpuid", "path": "../tests/first_instruction_cpuid.rs"},
                 {"name": "convert", "path": "../tests/convert.rs"},
