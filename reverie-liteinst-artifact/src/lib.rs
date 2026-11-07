@@ -708,6 +708,15 @@ fn cpu_budget_failure(used: Duration, budget: Duration, wall: Duration) -> Strin
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `read_at` operations and bytes performed through `field` on this
+    /// thread, so a test can bound the work of one accounting read
+    /// deterministically, with no clock involved.
+    static FIELD_READ_OPS: std::cell::Cell<u64> = std::cell::Cell::new(0);
+    static FIELD_READ_BYTES: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
 impl CommandCgroup {
     fn create(parent: &Path) -> Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -770,6 +779,11 @@ impl CommandCgroup {
         let length = file
             .read_at(&mut buffer, 0)
             .map_err(|e| format!("cannot read {name}: {e}"))?;
+        #[cfg(test)]
+        {
+            FIELD_READ_OPS.with(|ops| ops.set(ops.get() + 1));
+            FIELD_READ_BYTES.with(|bytes| bytes.set(bytes.get() + length as u64));
+        }
         let text =
             std::str::from_utf8(&buffer[..length]).map_err(|_| format!("{name} is not UTF-8"))?;
         text.lines()
@@ -67111,36 +67125,18 @@ mod runner_cpu_budget_tests {
         assert_eq!(runner.command_cpu, vec![None]);
     }
 
-    /// CPU of the calling thread, which runs the Runner's poll loop and is
-    /// not shared with concurrent tests.
-    fn own_cpu() -> Duration {
-        // SAFETY: an all-zero rusage is a valid output buffer for getrusage.
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        // SAFETY: RUSAGE_THREAD with a writable buffer.
-        assert_eq!(
-            unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) },
-            0
-        );
-        let micros = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
-        Duration::from_micros(micros(usage.ru_utime) + micros(usage.ru_stime))
-    }
-
     /// A budgeted command that succeeds records its CPU, and accounting costs
     /// the producer itself one small file read per poll, not a /proc scan.
     ///
-    /// The cost guard measures a fixed number of accounting reads against
-    /// the same number of baseline reads (the neighbouring `cgroup.events`
-    /// file, read through the same helper), both by this thread's own CPU.
-    /// Own CPU only advances while this thread runs and each batch does a
-    /// fixed amount of work, so host load stretches the batches' wall time
-    /// without inflating either measurement; the earlier paired-sleep
-    /// comparison instead let load-inflated kernel cgroup charges over a
-    /// wall-bounded run decide the bound (dh-qe5ht). An accounting path
-    /// that scans files or rereads per poll multiplies the accounting
-    /// batch and fails against the baseline. A separate poll-count bound
-    /// on the real budgeted run (one read per 50 ms poll, counted through
-    /// a test-only counter) keeps the polls-times-cost coverage: a busy
-    /// poll raises the count and fails, at any load.
+    /// The cost guard is structural, with no clock: a poll-count bound on
+    /// the real budgeted run (one read per 50 ms poll, counted through a
+    /// test-only counter; busy polling raises the count and fails at any
+    /// load), and a per-read bound asserting each accounting read is
+    /// exactly one `read_at` of at most 1024 bytes. Timed versions of
+    /// this guard (paired sleeps, fixed-work CPU batches) kept failing
+    /// under load because a `cpu.stat` read's charged CPU inflates under
+    /// concurrent cgroup churn even though the work is fixed (dh-qe5ht);
+    /// counting operations and bytes cannot inflate.
     #[test]
     fn cpu_budget_records_measured_cpu_and_costs_the_producer_little() {
         let scratch = Scratch::new("cost");
@@ -67194,34 +67190,28 @@ mod runner_cpu_budget_tests {
         );
         assert_eq!(runner.accounting_reads[0], 0);
 
-        // Fixed-work cost guard: 2000 accounting reads interleaved with
-        // 2000 baseline reads, charged to this thread only.
+        // Structural per-read guard: each accounting read is exactly one
+        // `read_at` of `cpu.stat` and at most 1024 bytes (the file is
+        // ~170 bytes; the read buffer is 4096). Together with the
+        // poll-count bound above this bounds total accounting work
+        // (polls x reads x bytes) deterministically, with no clock: a
+        // timed cap fails under the suite's own concurrent cgroup churn
+        // even though the work is fixed (dh-qe5ht).
         let cgroup = CommandCgroup::create(&runner.cgroup_parent().unwrap()).unwrap();
-        let mut accounting = Duration::ZERO;
-        let mut baseline = Duration::ZERO;
-        for _ in 0..10 {
-            let before = own_cpu();
-            for _ in 0..200 {
-                cgroup.usage().unwrap();
-            }
-            accounting += own_cpu() - before;
-            let before = own_cpu();
-            for _ in 0..200 {
-                cgroup.populated().unwrap();
-            }
-            baseline += own_cpu() - before;
+        for _ in 0..200 {
+            FIELD_READ_OPS.with(|ops| ops.set(0));
+            FIELD_READ_BYTES.with(|bytes| bytes.set(0));
+            cgroup.usage().unwrap();
+            let ops = FIELD_READ_OPS.with(|ops| ops.get());
+            let bytes = FIELD_READ_BYTES.with(|bytes| bytes.get());
+            assert_eq!(ops, 1, "one accounting read did {ops} read_at operations");
+            assert!(
+                bytes <= 1024,
+                "one accounting read read {bytes} bytes of cpu.stat"
+            );
         }
         let accounted_path = cgroup.path.clone();
         cgroup.finish().unwrap();
         assert!(!accounted_path.exists(), "cost-guard cgroup was left");
-        println!("accounting cost for 2000 reads: {accounting:?} against baseline {baseline:?}");
-        assert!(
-            accounting < Duration::from_millis(100),
-            "CPU accounting cost {accounting:?} for 2000 reads against baseline {baseline:?}"
-        );
-        assert!(
-            accounting < baseline + Duration::from_millis(250),
-            "CPU accounting cost {accounting:?} for 2000 reads against baseline {baseline:?}"
-        );
     }
 }
