@@ -15846,6 +15846,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         if is_liteinst_mapping_syscall(nr) {
             return Ok(false);
         }
+        // A tracer thread that may run under a seccomp filter (its
+        // status unreadable counts as filtered) must not be asked
+        // with the mask and queue peeks below: a filter can kill
+        // or trap the tracer at those requests, where the procfs
+        // check this replaced only failed to open. Refuse before
+        // any ptrace query, as the no-query decisions elsewhere do.
+        if thread_may_be_seccomp_filtered() {
+            return Ok(false);
+        }
         // A signal already deliverable (held by the tracer, or queued
         // unblocked in the kernel) must interrupt the injection as
         // it does on the stepped transports, where the step dequeues
