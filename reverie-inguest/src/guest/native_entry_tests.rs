@@ -1610,3 +1610,38 @@ fn native_exit_outcome_distinguishes_completed_tool_error_from_owner_refusal() {
         fixture::close_test_primary(&rpc, &callback);
     }
 }
+
+#[test]
+fn native_callback_entry_waits_out_tool_slot_contention() {
+    let (host, _peer) = make_host();
+    let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let host_ref = &host;
+        let child = scope.spawn(move || {
+            let host = host_ref;
+            let callback = Callback::new(1);
+            let identity = callback.identity();
+            let handle = unsafe {
+                host.register_native_image_thread(identity, State::seeded())
+                    .unwrap()
+            };
+            registered_tx.send(handle).unwrap();
+            go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let entered = unsafe { host.enter_native_callback(handle, identity) };
+            entered_tx.send(entered.is_ok()).unwrap();
+            drop(entered);
+        });
+        let _handle = registered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let held = host.tool.lock();
+        go_tx.send(()).unwrap();
+        assert!(
+            entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "native callback entry finished while another thread held the Tool slot"
+        );
+        drop(held);
+        assert!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        child.join().unwrap();
+    });
+}

@@ -24,6 +24,7 @@ use reverie::ToolProcess;
 use super::super::native_rpc::NativeInvocation;
 use super::CallbackLifecycle;
 use super::LocalStack;
+use crate::sync::SpinGuard;
 use crate::sync::SpinMutex;
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -197,6 +198,12 @@ pub(super) struct NativeThreads<S> {
 }
 
 impl<S> NativeThreads<S> {
+    fn registry(&self) -> io::Result<SpinGuard<'_, Registry<S>>> {
+        self.registry
+            .lock_unless_reentered()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EDEADLK))
+    }
+
     pub(super) fn new() -> Self {
         let owner = NEXT_OWNER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
@@ -234,10 +241,7 @@ impl<S> NativeThreads<S> {
         state: S,
         lifecycle: CallbackLifecycle,
     ) -> io::Result<NativeThreadHandle> {
-        let mut registry = self
-            .registry
-            .try_lock()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let mut registry = self.registry()?;
         if registry.slots.values().any(|slot| {
             !matches!(slot.phase, Phase::Retired)
                 && slot.identity.physical_pid == identity.physical_pid
@@ -273,10 +277,7 @@ impl<S> NativeThreads<S> {
         &self,
         identity: NativeThreadIdentity,
     ) -> io::Result<NativeInitialization<'_, S>> {
-        let mut registry = self
-            .registry
-            .try_lock()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let mut registry = self.registry()?;
         if registry.slots.values().any(|slot| {
             slot.identity == identity
                 || (!matches!(slot.phase, Phase::Retired)
@@ -316,10 +317,7 @@ impl<S> NativeThreads<S> {
         {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
-        let mut registry = self
-            .registry
-            .try_lock()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let mut registry = self.registry()?;
         let slot = self.checked_slot(&mut registry, parent.parent_handle, parent.parent)?;
         match &slot.phase {
             // A genuine snapshot may outlive its parent's normal retirement.
@@ -357,10 +355,7 @@ impl<S> NativeThreads<S> {
         handle: NativeThreadHandle,
         identity: NativeThreadIdentity,
     ) -> io::Result<StateLease<'_, S>> {
-        let mut registry = self
-            .registry
-            .try_lock()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let mut registry = self.registry()?;
         let slot = self.checked_slot(&mut registry, handle, identity)?;
         match &slot.phase {
             Phase::Available(_) => {}
@@ -388,10 +383,7 @@ impl<S> NativeThreads<S> {
     }
 
     pub(super) fn ensure_retired(&self) -> io::Result<()> {
-        let registry = self
-            .registry
-            .try_lock()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let registry = self.registry()?;
         for slot in registry.slots.values() {
             match &slot.phase {
                 Phase::Retired => {}
@@ -411,10 +403,7 @@ impl<S> NativeThreads<S> {
         handle: NativeThreadHandle,
         identity: NativeThreadIdentity,
     ) -> io::Result<S> {
-        let mut registry = self
-            .registry
-            .try_lock()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let mut registry = self.registry()?;
         let slot = self.checked_slot(&mut registry, handle, identity)?;
         match &slot.phase {
             Phase::Available(_) => {}
@@ -832,5 +821,121 @@ impl<'owner, T: Tool> DeferredNative<'owner, T> {
     ) -> io::Result<(Arc<ToolProcess<T>>, T::ThreadState)> {
         let NativeCallbackLease { tool, state } = self.callback;
         Ok((tool, state.retire(identity)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn actual_identity(image: u64) -> NativeThreadIdentity {
+        let pid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_getpid) } as i32);
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        unsafe { NativeThreadIdentity::from_admitted(pid, tid, pid, tid, image).unwrap() }
+    }
+
+    #[test]
+    fn registry_operations_wait_out_cross_thread_contention() {
+        // Reserve against its own held registry.
+        {
+            let owner = NativeThreads::<u64>::new();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let guard = owner.registry.lock();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    result_tx
+                        .send(owner.reserve(actual_identity(1)).map(|_| ()))
+                        .unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                    "reserve finished while another thread held the registry"
+                );
+                drop(guard);
+                result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+
+        // Enter against its own held registry.
+        {
+            let owner = NativeThreads::<u64>::new();
+            let identity = actual_identity(2);
+            let handle = owner.register(identity, 72).unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let guard = owner.registry.lock();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    result_tx
+                        .send(
+                            owner
+                                .enter(handle, identity)
+                                .map(|lease| lease.complete(identity)),
+                        )
+                        .unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                    "enter finished while another thread held the registry"
+                );
+                drop(guard);
+                result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+
+        // Same-thread re-entry is refused rather than spinning on itself.
+        {
+            let owner = NativeThreads::<u64>::new();
+            let identity = actual_identity(4);
+            let handle = owner.register(identity, 74).unwrap();
+            let _guard = owner.registry.lock();
+            assert_eq!(
+                owner.retire(handle, identity).unwrap_err().raw_os_error(),
+                Some(libc::EDEADLK)
+            );
+        }
+
+        // Retire against its own held registry.
+        {
+            let owner = NativeThreads::<u64>::new();
+            let identity = actual_identity(3);
+            let handle = owner.register(identity, 73).unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let guard = owner.registry.lock();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    result_tx.send(owner.retire(handle, identity)).unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                    "retire finished while another thread held the registry"
+                );
+                drop(guard);
+                assert_eq!(
+                    result_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap(),
+                    73
+                );
+            });
+        }
     }
 }

@@ -40,8 +40,8 @@ where
         // clone/projection callback or synchronous coordinator exchange.
         let tool = self
             .tool
-            .try_lock()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?
+            .lock_unless_reentered()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EDEADLK))?
             .as_ref()
             .cloned()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
