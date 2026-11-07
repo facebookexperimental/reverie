@@ -15780,9 +15780,11 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// rewritten to `nr`/`args`) may run in place at its seccomp stop
     /// instead of through `private_inject`'s skip plus private-page
     /// step. In place the kernel runs the rewritten call itself at the
-    /// resume, with its own restart and signal semantics, and neither
-    /// single step happens. Refused where that changes more than the
-    /// transport:
+    /// resume and neither single step happens; the exit-stop restore
+    /// then returns the guest's argument registers and `orig_rax`, so
+    /// restart and signal handling at the final resume see the
+    /// guest's call, not the rewritten one. Refused where that
+    /// changes more than the transport:
     /// - a legacy vsyscall stop, whose fixed-page return the kernel
     ///   owns (`handle_seccomp` keeps it on its synthetic path);
     /// - a guest seccomp filter of its own, whose trace/trap verdict
@@ -15813,7 +15815,15 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///   exit-stop restore;
     /// - a LiteInst mapping call, which the tail path already routes
     ///   privately so its result can be published before the resume
-    ///   (`is_liteinst_mapping_syscall`).
+    ///   (`is_liteinst_mapping_syscall`);
+    /// - any injection with a deliverable signal already pending,
+    ///   including a blocked synchronous signal: the stepped
+    ///   transports dequeue it before the private call, where a
+    ///   syscall resume would run the rewritten call first
+    ///   (`pending_signal_refuses_in_place`);
+    /// - a seccomp baseline other than exactly Reverie's own filter,
+    ///   which means an inherited filter may trap the rewritten call
+    ///   (`in_place_seccomp_baseline_admitted`).
     fn in_place_rewrite_admitted(
         &self,
         task: &Stopped,
@@ -15865,9 +15875,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         // An inherited filter (the baseline counts filters the tracer
         // thread itself runs under, plus Reverie's own) may trap the
         // rewritten call: the kernel would roll it back and force
-        // SIGSYS, which the private transport discards at its step
-        // stop but an in-place run cannot consume mid-callback
-        // without resuming the guest past this stop.
+        // SIGSYS. The private transport classifies that rollback as
+        // the trapped call's ENOSYS result at its step stop; an
+        // in-place run instead reports the rolled-back number as a
+        // successful result and cannot consume the SIGSYS
+        // mid-callback without resuming the guest past this stop.
         Ok(
             in_place_seccomp_baseline_admitted(self.global_state.seccomp_filter_baseline)
                 && !self.guest_has_own_seccomp_filter(task.pid()),

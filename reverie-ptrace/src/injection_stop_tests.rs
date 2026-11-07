@@ -385,6 +385,15 @@ impl Tool for StopTool {
                         "pending SIGUSR1 was not delivered after the write callback"
                     );
                 }
+                if mode == Mode::InheritedTrapRewrite {
+                    // The Tool saw Err(ENOSYS) for the trapped rewrite;
+                    // the guest's write must return -ENOSYS (-38).
+                    assert_eq!(
+                        word(guest, EMULATED_RESULT),
+                        (-(libc::ENOSYS as i64)) as u64,
+                        "guest write did not return -ENOSYS"
+                    );
+                }
                 guest.send_rpc(Observation::Boundary(expected)).await;
                 let frame = frame_of(&guest.regs().await);
                 guest.send_rpc(Observation::Frame(frame)).await;
@@ -446,8 +455,15 @@ struct Fixture {
 impl Fixture {
     fn new(mode: Mode) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Fixed-width counter: the two transports of one `run` must
+        // exec fixtures whose paths have identical length. The path
+        // is argv[0] and AT_EXECFN, so a length change moves the
+        // guest's initial stack, and in some environment-size
+        // residues rsp (compared in `Observation::Frame`) shifts by
+        // 16 between transports. The pid is shared by both runs and
+        // cancels; only NEXT differs.
         let path = std::env::temp_dir().join(format!(
-            "reverie-injection-stop-{}-{}",
+            "reverie-injection-stop-{}-{:08}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -503,6 +519,11 @@ impl Fixture {
             code.extend_from_slice(&(ORIGINAL as u32).to_le_bytes());
             code.extend_from_slice(&[0xba, 1, 0, 0, 0, 0x0f, 0x05]);
             memory_instruction(&mut code, &[0x48, 0xff, 0x05], WORD);
+        }
+        if mode == Mode::InheritedTrapRewrite {
+            // Keep the guest write's own result (still in rax) where
+            // the boundary callback can assert it is -ENOSYS.
+            memory_instruction(&mut code, &[0x48, 0x89, 0x05], EMULATED_RESULT); // mov [rip+disp32],rax
         }
         getpid(&mut code);
         code.extend_from_slice(&[0xb8, 60, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05]);
@@ -778,12 +799,12 @@ async fn divergent_inject_interrupted_restarts_the_guest_call() {
 }
 
 /// Witness for the inherited-filter refusal: a dedicated thread
-/// installs a RET_TRAP filter on uname (inherited by the guest it
-/// then traces on that same thread, so the seccomp baseline is 2),
-/// and the Tool rewrites the guest's write to quotactl. On both
-/// transports the Tool must see Err(ENOSYS) and the guest -38, as
-/// on main; deleting the baseline gate call lets it run in place
-/// and report Ok(110) instead.
+/// installs a RET_TRAP filter on quotactl (inherited by the guest
+/// it then traces on that same thread, so the seccomp baseline
+/// is 2), and the Tool rewrites the guest's write to quotactl. On
+/// both transports the Tool must see Err(ENOSYS) and the guest
+/// -38, as on main; deleting the baseline gate call lets it run
+/// in place and report Ok(179) instead.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn inherited_ret_trap_rewrite_reports_enosys_on_both_transports() {
