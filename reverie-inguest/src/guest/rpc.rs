@@ -439,13 +439,15 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         };
         let tid = Self::current_tid().as_raw();
         if let Some(connection) = connections.remove(tid) {
-            let fd = connection.fd();
-            if fd >= 0 {
-                crate::guest::protect::unregister_coordinator_conn_fd(fd);
-            }
-            // Dropping the last Arc closes the socket; an exchange still
-            // in flight on this thread cannot exist at its exit callbacks.
-            drop(connection);
+            // Close through the trusted gate and forget the Arc, exactly
+            // as fork-drained copies are closed. Dropping the stream here
+            // would close through libc from a non-gate address: the guest
+            // filter traps that close back into this runtime, descriptor
+            // protection answers EBADF for the coordinator number, and
+            // std aborts the guest on the "already closed" owned
+            // descriptor. An exchange still in flight on this thread
+            // cannot exist at its exit callbacks.
+            close_drained_connections(vec![connection]);
         }
     }
 

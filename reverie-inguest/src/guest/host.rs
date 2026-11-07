@@ -261,12 +261,31 @@ thread_local! {
     /// Arenas committed by this thread's in-flight dispatch. Per-thread:
     /// a sibling dispatch's scope entry/exit must never free arenas this
     /// thread committed and may still reference through stack guards.
+    ///
+    /// Only ever touch this with `try_with`: dispatch also runs for the
+    /// syscalls a thread makes after libc destroyed its TLS — the
+    /// `exit_group` that follows `exit()`'s `__cxa_thread_atexit`
+    /// destructors, and the thread-exit syscall after pthread teardown —
+    /// where `.with()` panics with `AccessError` inside the nounwind
+    /// trap handler and aborts the guest.
     static COMMITTED_STACKS: core::cell::RefCell<Vec<Box<[u8]>>> =
         const { core::cell::RefCell::new(Vec::new()) };
 }
 
 fn retain_committed_stack(arena: Box<[u8]>) {
-    COMMITTED_STACKS.with(|stacks| stacks.borrow_mut().push(arena));
+    let mut arena = Some(arena);
+    let retained = COMMITTED_STACKS.try_with(|stacks| {
+        stacks
+            .borrow_mut()
+            .push(arena.take().expect("arena retained once"));
+    });
+    if retained.is_err() {
+        // This thread's TLS is already destroyed (exit teardown): no
+        // later dispatch on it will clear the vector. Leaking the arena
+        // is the only sound answer — freeing it here could release
+        // memory a stack guard of this final dispatch still references.
+        std::mem::forget(arena.take().expect("arena retained once"));
+    }
 }
 
 struct DispatchScratchScope {
@@ -275,7 +294,10 @@ struct DispatchScratchScope {
 
 impl DispatchScratchScope {
     fn enter() -> Self {
-        COMMITTED_STACKS.with(|stacks| stacks.borrow_mut().clear());
+        // A destroyed thread-local means this dispatch is part of exit
+        // teardown; the vector was already dropped with the TLS, so
+        // there is nothing left to clear.
+        let _ = COMMITTED_STACKS.try_with(|stacks| stacks.borrow_mut().clear());
         Self {
             _allocation_scope: super::alloc::enter_dispatch(),
         }
@@ -593,7 +615,7 @@ where
         cpuid_interception: bool,
         runtime: R,
     ) -> Self {
-        COMMITTED_STACKS.with(|stacks| stacks.borrow_mut().clear());
+        let _ = COMMITTED_STACKS.try_with(|stacks| stacks.borrow_mut().clear());
         Self {
             tool: SpinMutex::new(Some(Arc::new(tool))),
             rpc,
@@ -5724,5 +5746,81 @@ mod tests {
             }
             assert_eq!(EVENTS.load(Ordering::SeqCst), 1);
         }
+    }
+
+    /// Regression for the W7 TLS-teardown abort: a guest thread's last
+    /// syscalls dispatch after libc destroyed that thread's TLS
+    /// (`exit_group` after `exit()` ran the main thread's
+    /// `__cxa_thread_atexit` destructors, the thread-exit syscall after
+    /// pthread teardown on a worker), and every dispatch enters
+    /// [`DispatchScratchScope`]. Its `COMMITTED_STACKS` access must
+    /// survive a destroyed thread-local instead of panicking in the
+    /// nounwind trap handler. The probe TLS below is touched before
+    /// `COMMITTED_STACKS` on each thread, so its destructor runs after
+    /// `COMMITTED_STACKS` is destroyed and re-enters the scope exactly
+    /// like that late dispatch. Subprocess-isolated: the failure this
+    /// guards against is a process abort, not a catchable panic.
+    #[test]
+    fn dispatch_scratch_scope_survives_tls_teardown_at_exit() {
+        use std::io::Write;
+        const CHILD: &str = "REVERIE_TLS_TEARDOWN_TEST_CHILD";
+        const TEST: &str =
+            "guest::host::tests::dispatch_scratch_scope_survives_tls_teardown_at_exit";
+        const READY: &[u8] = b"tls-teardown-ready\n";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, TEST)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stderr, READY, "{output:?}");
+            return;
+        }
+
+        struct ReenterOnTeardown;
+        impl Drop for ReenterOnTeardown {
+            fn drop(&mut self) {
+                let scope = DispatchScratchScope::enter();
+                retain_committed_stack(vec![0; STACK_CAPACITY].into_boxed_slice());
+                drop(scope);
+            }
+        }
+        thread_local! {
+            static REENTER_ON_TEARDOWN: ReenterOnTeardown = const { ReenterOnTeardown };
+        }
+
+        let states = std::sync::Arc::new(super::thread_lease::ThreadStates::<u32>::new());
+        // Worker-thread teardown: at pthread exit COMMITTED_STACKS is
+        // destroyed before the probe destructor re-enters the scope,
+        // while the thread holds a live lease.
+        let worker_states = std::sync::Arc::clone(&states);
+        std::thread::spawn(move || {
+            REENTER_ON_TEARDOWN.with(|_| {});
+            let mut lease = worker_states.checkout(4243, || 7).unwrap();
+            *lease.state_mut() += 1;
+            let scope = DispatchScratchScope::enter();
+            retain_committed_stack(vec![0; STACK_CAPACITY].into_boxed_slice());
+            drop(scope);
+            drop(lease);
+        })
+        .join()
+        .unwrap();
+
+        // exit()-driven teardown on this dispatching thread, modeling the
+        // guest main thread: libc exit() runs this thread's TLS
+        // destructors, after which the exit_group dispatch re-enters the
+        // scope via the probe destructor. The lease stays live across
+        // exit() on purpose.
+        REENTER_ON_TEARDOWN.with(|_| {});
+        let _lease = states.checkout(4242, || 7).unwrap();
+        let scope = DispatchScratchScope::enter();
+        retain_committed_stack(vec![0; STACK_CAPACITY].into_boxed_slice());
+        drop(scope);
+        std::io::stderr().write_all(READY).unwrap();
+        // SAFETY: exit runs this thread's TLS destructors and then
+        // terminates; the intentionally leaked lease/Arc are reclaimed by
+        // process teardown.
+        unsafe { libc::exit(0) };
     }
 }

@@ -740,6 +740,112 @@ mod tests {
         );
     }
 
+    /// Thread exit closes exactly that thread's connection: its
+    /// descriptor is closed, the root connection keeps answering, and a
+    /// repeated close on the exiting thread is a no-op. (The abort this
+    /// guards against -- std dropping the stream through libc under the
+    /// guest filter -- needs the liteinst node suites to reproduce;
+    /// this pins the close semantics themselves.)
+    #[test]
+    fn close_current_thread_closes_only_the_callers_connection() {
+        isolated_coordinator_move_test(
+            "guest::rpc::stream::tests::close_current_thread_closes_only_the_callers_connection",
+            || {
+                use std::os::unix::net::UnixListener;
+                use std::time::Duration;
+
+                use reverie_rpc_transport::RequestEnvelope;
+                use reverie_rpc_transport::codec::decode;
+                use reverie_rpc_transport::codec::encode;
+
+                let directory = std::env::temp_dir()
+                    .join(format!("ordinary-rpc-close-thread-{}", std::process::id()));
+                std::fs::create_dir(&directory).unwrap();
+                let directory_owner = std::fs::File::open(&directory).unwrap();
+                let path = std::path::PathBuf::from(format!(
+                    "/proc/self/fd/{}/socket",
+                    directory_owner.as_raw_fd()
+                ));
+                let listener = UnixListener::bind(&path).unwrap();
+                // Two connects arrive: root, then the worker's. Each
+                // handler sends config, then answers requests until EOF.
+                let peer = std::thread::spawn(move || {
+                    let mut handlers = Vec::new();
+                    for _ in 0..2 {
+                        let (mut socket, _) = listener.accept().unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        handlers.push(std::thread::spawn(move || {
+                            let config = encode(&73_u64).unwrap();
+                            socket
+                                .write_all(&(config.len() as u32).to_be_bytes())
+                                .unwrap();
+                            socket.write_all(&config).unwrap();
+                            loop {
+                                let mut prefix = [0; 4];
+                                if socket.read_exact(&mut prefix).is_err() {
+                                    return;
+                                }
+                                let mut bytes = vec![0; u32::from_be_bytes(prefix) as usize];
+                                socket.read_exact(&mut bytes).unwrap();
+                                let envelope: RequestEnvelope<u64> = decode(&bytes).unwrap();
+                                assert_eq!(envelope.request, 19);
+                                let response = encode(&91_u64).unwrap();
+                                socket
+                                    .write_all(&(response.len() as u32).to_be_bytes())
+                                    .unwrap();
+                                socket.write_all(&response).unwrap();
+                            }
+                        }));
+                    }
+                    for handler in handlers {
+                        handler.join().unwrap();
+                    }
+                });
+                let rpc = std::sync::Arc::new(
+                    crate::guest::rpc::CoordinatorRpc::<OrdinaryConnectionModel>::connect(
+                        &path,
+                        crate::guest::protect::replace_coordinator_fd,
+                    )
+                    .unwrap(),
+                );
+                crate::guest::protect::reserve_coordinator_fd(rpc.raw_fd()).unwrap();
+                let root_fd = rpc.raw_fd();
+                let worker_rpc = rpc.clone();
+                let worker_fd = std::thread::spawn(move || {
+                    assert_eq!(worker_rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
+                    let fd = worker_rpc
+                        .connection
+                        .ordinary()
+                        .snapshot()
+                        .iter()
+                        .map(|connection| connection.fd())
+                        .find(|fd| *fd != root_fd)
+                        .expect("worker connection recorded");
+                    worker_rpc.close_current_thread();
+                    // A repeated close on the same thread is a no-op.
+                    worker_rpc.close_current_thread();
+                    fd
+                })
+                .join()
+                .unwrap();
+                // The worker's descriptor is closed; the root survives and
+                // still answers.
+                assert_eq!(unsafe { libc::fcntl(worker_fd, libc::F_GETFD) }, -1);
+                assert_ne!(unsafe { libc::fcntl(root_fd, libc::F_GETFD) }, -1);
+                assert_eq!(rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
+                rpc.close_current_thread();
+                assert_eq!(unsafe { libc::fcntl(root_fd, libc::F_GETFD) }, -1);
+                peer.join().unwrap();
+                drop(rpc);
+                std::fs::remove_file(directory.join("socket")).unwrap();
+                drop(directory_owner);
+                std::fs::remove_dir(&directory).unwrap();
+            },
+        );
+    }
+
     #[test]
     fn ordinary_coordinator_move_preserves_ofd_peer_and_closes_original() {
         isolated_coordinator_move_test(
