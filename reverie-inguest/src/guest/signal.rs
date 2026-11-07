@@ -26,7 +26,10 @@ use crate::trap::raw_syscall6;
 /// Signals the runtime receives as forced signals and so must never be
 /// blocked: SIGSYS for every trapped system call, and SIGSEGV for CPUID or
 /// RDTSC faulting while an instruction is subscribed. Linux resets a blocked
-/// forced signal to its default action, which kills the process.
+/// forced signal to its default action, which kills the process. The one
+/// exception is the runtime's own close-and-check window
+/// ([`crate::guest::protect::block_all_signals`]), which blocks these too and
+/// so makes no trapped syscall and executes no subscribed instruction.
 pub fn reserved_signal_mask() -> u64 {
     let mut reserved = 1_u64 << (libc::SIGSYS - 1);
     if any_instruction_subscribed() {
@@ -322,6 +325,12 @@ pub fn guest_action(signal: i32, kernel_handler: u64) -> u64 {
     )
 }
 
+/// The signal a routing handler is registered for
+/// ([`register_routing_handler`]), or 0 for none.
+pub fn routed_signal() -> i32 {
+    ROUTED_SIGNAL.load(Ordering::Acquire)
+}
+
 /// [`guest_action`] for the registration `(signal, router, guest action)`.
 fn guest_action_with(routing: Option<(i32, u64, u64)>, signal: i32, kernel_handler: u64) -> u64 {
     match routing {
@@ -373,8 +382,13 @@ pub unsafe fn signal_ends_process_now(signal: i32) -> bool {
     result == 0 && self_signal_ends_process(signal, blocked, guest_action(signal, action.handler))
 }
 
-/// The calling thread's blocked set, through the trusted gate.
+/// The calling thread's blocked set, through the trusted gate; while the
+/// runtime delivers signals itself, the guest mask its running continuation
+/// saved (`guest::runtime_mask`), since the kernel's is then the runtime's.
 unsafe fn current_blocked_set() -> Option<u64> {
+    if crate::guest::runtime_mask::delivers_signals() {
+        return crate::guest::continuation::saved_guest_mask();
+    }
     let mut blocked = 0_u64;
     let result = unsafe {
         raw_syscall6(

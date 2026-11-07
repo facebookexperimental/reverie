@@ -73,6 +73,17 @@ pub enum UnsupportedOperation {
     /// backend that refuses one performed none of the call's own effects. A
     /// tool that answers the call itself never sees this refusal.
     ToolDecided,
+    /// `madvise(2)` advice whose effect a program can observe, such as what a
+    /// fork copies or a core dump holds, on a backend that does not implement
+    /// that advice. A backend that refuses it changed no mapping and no page;
+    /// the refusal's diagnostic names the advice.
+    MemoryAdvice,
+    /// An operation on a `signalfd(2)` descriptor that the backend does not
+    /// model, such as a read that would wait for a signal, or creating a
+    /// process that inherits the descriptor. A backend that refuses it read no
+    /// signal, created nothing and registered nothing; the refusal's
+    /// diagnostic names the operation.
+    Signalfd,
 }
 
 /// A backend's refusal of an injected syscall, or of a `Guest` operation,

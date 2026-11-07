@@ -564,57 +564,210 @@ core::arch::global_asm!(
     ".hidden reverie_inguest_generic_adopt_entry",
 );
 
+// The private scalar owner entry writes these two fields into caller-owned
+// MaybeUninit storage. Give that output an explicit layout rather than relying
+// on Rust's field ordering; padding is neither an input nor an ownership token.
+#[repr(C)]
 struct NativeFreshOwner {
     record: *mut NativeRecord,
     origin: BootstrapOrigin,
 }
 
+const _: () = {
+    assert!(size_of::<NativeFreshOwner>() == 16);
+    assert!(align_of::<NativeFreshOwner>() == 8);
+    assert!(offset_of!(NativeFreshOwner, record) == 0);
+    assert!(offset_of!(NativeFreshOwner, origin) == 8);
+    assert!(size_of::<BootstrapOrigin>() == 1);
+    assert!(offset_of!(Control, occupied) == 8);
+    assert!(DATA_FIRST + STACK_PAGES <= BITMAP_WORDS * 64);
+    assert!(DATA_FIRST + STACK_PAGES < i32::MAX as usize);
+};
+
+// The naked owner must not call a Rust-ABI function by assuming its current
+// lowering. This zero-argument C bridge retains raw_syscall3's existing choice
+// of legacy versus published fixed gates; it introduces no new syscall route.
+#[inline(never)]
+unsafe extern "C" fn native_owner_gettid() -> i64 {
+    // SAFETY: gettid has no pointer arguments and does not change stack owner.
+    unsafe { crate::trap::raw_syscall3(libc::SYS_gettid, 0, 0, 0) }
+}
+
 impl NativeFreshOwner {
     // This constructor is private. Only the native prefix's successful exact
     // NOREPLACE mapping supplies provenance; record magic never supplies it.
+    #[inline(always)]
     unsafe fn from_native(
         record: *mut NativeRecord,
         adoption_rsp: usize,
         origin: BootstrapOrigin,
     ) -> Result<Self, i32> {
-        if record as usize != origin.record_address()
-            || !INITIALIZING.load(Ordering::Acquire)
-            || !(STACK_BOTTOM..STACK_TOP).contains(&adoption_rsp)
-        {
-            return Err(libc::EINVAL);
+        let mut owner = MaybeUninit::<Self>::uninit();
+        // SAFETY: retain the native prefix's exclusive ownership. The output
+        // is aligned, disjoint, uninitialized storage owned by this call. Only
+        // a zero status initializes it; no Rust enum crosses the ABI boundary.
+        let status = unsafe {
+            Self::from_native_opaque(
+                black_box(record.cast()),
+                black_box(adoption_rsp),
+                black_box(origin as usize),
+                black_box(owner.as_mut_ptr().cast()),
+            )
+        };
+        if status == 0 {
+            // SAFETY: the qualified scalar callee writes exactly one owner
+            // before returning zero; nonzero returns never reach this read.
+            Ok(unsafe { owner.assume_init() })
+        } else {
+            Err(status)
         }
-        let current = unsafe { crate::trap::raw_syscall3(libc::SYS_gettid, 0, 0, 0) };
-        let record_ref = unsafe { &*record };
-        if current <= 0
-            || record_ref.owner_tid != current as usize
-            || record_ref.version != VERSION
-            || record_ref.body == 0
-            || record_ref.caller_rsp % 16 != 8
-            || REGION.get().is_some()
-        {
-            return Err(libc::EINVAL);
-        }
-        record_ref
-            .phase
-            .compare_exchange(NATIVE, ADOPTING, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| libc::EINVAL)?;
-        let control = unsafe { &*((BASE + PAGE) as *const Control) };
-        if control.held.load(Ordering::Acquire) {
-            return Err(libc::EAGAIN);
-        }
-        let bitmap = unsafe { &*control.occupied.get() };
-        if !(DATA_FIRST..DATA_FIRST + STACK_PAGES)
-            .all(|page| bitmap[page / 64] & (1_u64 << (page % 64)) != 0)
-        {
-            return Err(libc::EINVAL);
-        }
-        // Both origins supply authenticated fresh native ownership. Complete
-        // payload protections/scalar metadata/permanent bands before READY or
-        // any body allocation; failure keeps the native owned stack in place.
-        unsafe { arena::initialize_fixed_arenas((BASE + PAGE) as *mut Control) }?;
-        Ok(Self { record, origin })
     }
 
+    /// The caller retains the native prefix's exclusive initialization lease.
+    /// The output is disjoint, aligned storage for one NativeFreshOwner, which
+    /// is initialized only on zero. Other statuses leave the output untouched.
+    ///
+    /// # Safety
+    /// The native prefix owns the exact fresh reservation and INITIALIZING;
+    /// matching scalar ticket fields alone never provide mapping authority.
+    /// The caller supplies valid output storage and obeys scalar SysV with DF
+    /// clear. Every called helper has an explicit C ABI and may not unwind.
+    #[unsafe(naked)]
+    unsafe extern "C" fn from_native_opaque(
+        _record: *mut c_void,
+        _adoption_rsp: usize,
+        _origin: usize,
+        _owner: *mut c_void,
+    ) -> i32 {
+        // SAFETY: preserve the original validation and side-effect order.
+        // Five saved registers align RSP to 16 bytes before each C call; all
+        // SysV callee-saved registers are restored on every returning path.
+        // x86 loads implement the acquire observations, and LOCK CMPXCHG
+        // implements the AcqRel/Acquire phase transition. No nomem/readonly
+        // promise lets a Rust caller move memory effects across this call.
+        // After a successful CAS, every refusal retains ADOPTING, INITIALIZING
+        // and the live owned stack. This function never publishes or unmaps.
+        core::arch::naked_asm!(
+            "push rbx",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "mov rbx, rdi",
+            "mov r12, rcx",
+            "mov r13, rdx",
+            // Select the exact ticket before touching any ticket memory.
+            "cmp rdx, {constructor_origin}",
+            "je 2f",
+            "cmp rdx, {generic_origin}",
+            "jne 90f",
+            "movabs rax, {generic_record}",
+            "jmp 3f",
+            "2:",
+            "movabs rax, {constructor_record}",
+            "3:",
+            "cmp rbx, rax",
+            "jne 90f",
+            "cmp byte ptr [rip + {initializing}], 0",
+            "je 90f",
+            "movabs rax, {stack_bottom}",
+            "cmp rsi, rax",
+            "jb 90f",
+            "movabs rax, {stack_top}",
+            "cmp rsi, rax",
+            "jae 90f",
+            "call {gettid}",
+            "test rax, rax",
+            "jle 90f",
+            "cmp qword ptr [rbx + {owner_tid}], rax",
+            "jne 90f",
+            "cmp qword ptr [rbx + {version_offset}], {version}",
+            "jne 90f",
+            "cmp qword ptr [rbx + {body}], 0",
+            "je 90f",
+            "mov rax, [rbx + {caller_rsp}]",
+            "and eax, 15",
+            "cmp eax, 8",
+            "jne 90f",
+            "lea rdi, [rip + {region}]",
+            "call {get_region}",
+            "test rax, rax",
+            "jne 90f",
+            "mov eax, {native}",
+            "mov edx, {adopting}",
+            "lock cmpxchg qword ptr [rbx + {phase}], rdx",
+            "jne 90f",
+            "movabs r14, {control}",
+            "cmp byte ptr [r14 + {held}], 0",
+            "jne 91f",
+            // Read every page in the exact complete bootstrap extent. The
+            // register BT masks its bit index to 0..63; the explicit /64
+            // address calculation selects the corresponding occupied word.
+            "mov eax, {first_page}",
+            "4:",
+            "mov rcx, rax",
+            "shr rcx, 6",
+            "mov rdx, [r14 + rcx*8 + {occupied}]",
+            "bt rdx, rax",
+            "jnc 90f",
+            "inc rax",
+            "cmp rax, {end_page}",
+            "jb 4b",
+            // Complete all permanent bands before initializing the output.
+            // Preserve the setup helper's exact full nonzero errno in EAX.
+            "mov rdi, r14",
+            "call {setup}",
+            "test eax, eax",
+            "jne 92f",
+            "mov [r12 + {output_record}], rbx",
+            "mov byte ptr [r12 + {output_origin}], r13b",
+            "xor eax, eax",
+            "jmp 92f",
+            "90:",
+            "mov eax, {invalid}",
+            "jmp 92f",
+            "91:",
+            "mov eax, {again}",
+            "92:",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop rbx",
+            "ret",
+            constructor_origin = const BootstrapOrigin::Constructor as usize,
+            generic_origin = const BootstrapOrigin::ExplicitGeneric as usize,
+            constructor_record = const RECORD_ADDRESS,
+            generic_record = const GENERIC_RECORD_ADDRESS,
+            initializing = sym INITIALIZING,
+            stack_bottom = const STACK_BOTTOM,
+            stack_top = const STACK_TOP,
+            gettid = sym native_owner_gettid,
+            owner_tid = const offset_of!(NativeRecord, owner_tid),
+            version_offset = const offset_of!(NativeRecord, version),
+            version = const VERSION,
+            body = const offset_of!(NativeRecord, body),
+            caller_rsp = const offset_of!(NativeRecord, caller_rsp),
+            region = sym REGION,
+            get_region = sym RegionPublication::get_opaque,
+            native = const NATIVE,
+            adopting = const ADOPTING,
+            phase = const offset_of!(NativeRecord, phase),
+            control = const BASE + PAGE,
+            held = const offset_of!(Control, held),
+            first_page = const DATA_FIRST,
+            end_page = const DATA_FIRST + STACK_PAGES,
+            occupied = const offset_of!(Control, occupied),
+            setup = sym arena::initialize_fixed_arenas_opaque,
+            output_record = const offset_of!(Self, record),
+            output_origin = const offset_of!(Self, origin),
+            invalid = const libc::EINVAL,
+            again = const libc::EAGAIN,
+        );
+    }
+
+    // Keep this transaction in each complete qualified prepare entry.
+    #[inline(always)]
     fn publish(self) -> Result<&'static ToolRegion, i32> {
         // SAFETY: self retains the native prefix's exclusive INITIALIZING
         // ownership from its successful CAS. from_native authenticated this
@@ -677,6 +830,33 @@ pub(super) fn malformed_ticket_control() {
     // These reject-only controls are not native constructor execution credit.
     let region = ToolRegion::reserve_inner().unwrap();
     let _guard = InitializationGuard::acquire().unwrap();
+    // Rejection must not manufacture an initialized owner or alter the
+    // caller's output storage. Unknown scalar origins reject before any record
+    // access, and a wrong record address rejects before ticket dereference.
+    let mut output = MaybeUninit::<NativeFreshOwner>::uninit();
+    let output_bytes = output.as_mut_ptr().cast::<u8>();
+    // SAFETY: writing/observing the MaybeUninit storage as bytes does not read
+    // a NativeFreshOwner. Neither refused call may initialize it.
+    unsafe { output_bytes.write_bytes(0xa5, size_of::<NativeFreshOwner>()) };
+    for origin in [0, 3, usize::MAX, BootstrapOrigin::Constructor as usize] {
+        // SAFETY: the current test owns INITIALIZING. The output is aligned,
+        // exclusive storage; these inputs must reject before record access.
+        let status = unsafe {
+            NativeFreshOwner::from_native_opaque(
+                core::ptr::null_mut(),
+                STACK_TOP - 16,
+                origin,
+                output.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, libc::EINVAL);
+        // SAFETY: every byte was initialized above and the result was refused.
+        assert!(
+            unsafe { core::slice::from_raw_parts(output_bytes, size_of::<NativeFreshOwner>()) }
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+    }
     let tid = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) } as usize;
     let pointer = RECORD_ADDRESS as *mut NativeRecord;
     let value = NativeRecord {
@@ -768,6 +948,85 @@ pub(super) fn malformed_ticket_control() {
     assert!(REGION.get().is_none());
     // Consume no legitimate owner and publish no partial failure.
     assert_eq!(unsafe { (*pointer).body }, 0);
+
+    // Exercise the scalar entry's later refusals with independently poisoned
+    // output storage. No refused path may manufacture even part of an owner.
+    let refused_output = move || {
+        let mut output = MaybeUninit::<NativeFreshOwner>::uninit();
+        let bytes = output.as_mut_ptr().cast::<u8>();
+        // SAFETY: the test owns both the fresh reservation and INITIALIZING;
+        // output is aligned, disjoint storage initialized as bytes, not Self.
+        unsafe { bytes.write_bytes(0xa5, size_of::<NativeFreshOwner>()) };
+        let status = unsafe {
+            NativeFreshOwner::from_native_opaque(
+                pointer.cast(),
+                STACK_TOP - 16,
+                BootstrapOrigin::Constructor as usize,
+                output.as_mut_ptr().cast(),
+            )
+        };
+        assert_ne!(status, 0);
+        // SAFETY: the sentinel initializes every byte, including padding.
+        assert!(
+            unsafe { core::slice::from_raw_parts(bytes, size_of::<NativeFreshOwner>()) }
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        assert!(INITIALIZING.load(Ordering::Acquire));
+        assert!(REGION.get().is_none());
+        status
+    };
+    // Ticket alignment must fail before the NATIVE -> ADOPTING transition.
+    unsafe {
+        (*pointer).body = malformed_ticket_control as *const () as usize;
+        (*pointer).caller_rsp = 0;
+        (*pointer).phase.store(NATIVE, Ordering::Release);
+    }
+    assert_eq!(refused_output(), libc::EINVAL);
+    assert_eq!(unsafe { (*pointer).phase.load(Ordering::Acquire) }, NATIVE);
+    unsafe { (*pointer).caller_rsp = 8 };
+    // A held control preserves its distinct EAGAIN and the acquired phase.
+    let control = unsafe { &*((BASE + PAGE) as *const Control) };
+    control.held.store(true, Ordering::Release);
+    assert_eq!(refused_output(), libc::EAGAIN);
+    assert_eq!(
+        unsafe { (*pointer).phase.load(Ordering::Acquire) },
+        ADOPTING
+    );
+    assert!(control.held.load(Ordering::Acquire));
+    control.held.store(false, Ordering::Release);
+    // Check both edges and an interior bit of the full bootstrap extent.
+    for page in [
+        DATA_FIRST,
+        DATA_FIRST + STACK_PAGES / 2,
+        DATA_FIRST + STACK_PAGES - 1,
+    ] {
+        // SAFETY: INITIALIZING exclusively owns this unpublished bitmap; the
+        // claim above occupied every page, and each mutation is restored.
+        let cell = unsafe { control.occupied.get().cast::<u64>().add(page / 64) };
+        let value = unsafe { cell.read() };
+        let mask = 1_u64 << (page % 64);
+        assert_ne!(value & mask, 0);
+        unsafe {
+            cell.write(value & !mask);
+            (*pointer).phase.store(NATIVE, Ordering::Release);
+        }
+        assert_eq!(refused_output(), libc::EINVAL);
+        assert_eq!(
+            unsafe { (*pointer).phase.load(Ordering::Acquire) },
+            ADOPTING
+        );
+        unsafe { cell.write(value) };
+    }
+    // reserve_inner already initialized the permanent arena bands. Repeating
+    // setup must propagate its preflight EINVAL without writing the output or
+    // releasing the live stack/initialization lease after the successful CAS.
+    unsafe { (*pointer).phase.store(NATIVE, Ordering::Release) };
+    assert_eq!(refused_output(), libc::EINVAL);
+    assert_eq!(
+        unsafe { (*pointer).phase.load(Ordering::Acquire) },
+        ADOPTING
+    );
 }
 
 #[cfg(feature = "fixed-syscall-gates")]

@@ -68,6 +68,7 @@ pub mod codec;
 pub mod initial_image;
 pub mod mapping_capture;
 pub mod successor;
+pub mod tool_activation;
 
 mod client;
 mod envelope;
@@ -86,10 +87,16 @@ pub use blocking_client::InitialImageClient;
 pub use blocking_client::RpcRequest;
 pub use blocking_client::RpcResponse;
 pub use blocking_client::SuccessorClient;
+pub use blocking_client::exchange_tool_control;
 pub use blocking_client::read_config_frame;
 pub use client::RpcClient;
 pub use envelope::RequestEnvelope;
 pub use error::RpcError;
+/// Fail-closed process status for an in-guest Tool owner that loses its RPC
+/// transport. This names the existing trap-owner policy; each backend retains
+/// its own termination and cleanup mechanism. It is not an application errno
+/// or a successful Tool response.
+pub const TOOL_RPC_FAILURE_EXIT_CODE: i32 = 123;
 pub use server::Admitted;
 pub use server::CancellationDrain;
 pub use server::CancelledRequest;

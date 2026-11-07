@@ -20,6 +20,9 @@
 //! inherits the mappings, occupied pages and live contents through COW.
 
 use core::cell::UnsafeCell;
+use core::ffi::c_void;
+use core::hint::black_box;
+use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicUsize;
@@ -62,15 +65,41 @@ impl RegionPublication {
         }
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn get(&self) -> Option<&RegionResult> {
-        if !self.published.load(Ordering::Acquire) {
-            return None;
-        }
-        // SAFETY: the release publication precedes this acquire observation;
-        // there is no writer after publication. The cast uses MaybeUninit<T>'s
-        // documented layout equivalence, not guessed Rust enum offsets.
-        Some(unsafe { &*self.value.get().cast::<RegionResult>() })
+        let publication = black_box(core::ptr::from_ref(self).cast::<c_void>());
+        // SAFETY: publication is this live slot. The scalar getter returns
+        // null or its initialized immutable value, with this slot's lifetime.
+        let value = unsafe { Self::get_opaque(publication) };
+        // SAFETY: the getter observed release publication before returning a
+        // non-null value; no writer can change it while self remains borrowed.
+        unsafe { value.cast::<RegionResult>().as_ref() }
+    }
+
+    /// Observe only a live publication slot; never infer ownership from its
+    /// address. Opaque inputs/outputs constrain interprocedural specialization,
+    /// but emitted code still requires complete physical qualification.
+    ///
+    /// # Safety
+    /// publication must point to a live RegionPublication. The caller may use
+    /// the result only while that slot and its published owner remain live.
+    #[inline(never)]
+    unsafe extern "C" fn get_opaque(publication: *const c_void) -> *const c_void {
+        // SAFETY: the caller supplies an aligned, live publication slot.
+        let publication = unsafe { &*publication.cast::<Self>() };
+        let value = if publication.published.load(Ordering::Acquire) {
+            // MaybeUninit<T> has T's layout. Acquire publication authenticates
+            // initialization before any caller can dereference this pointer.
+            publication
+                .value
+                .get()
+                .cast::<RegionResult>()
+                .cast_const()
+                .cast::<c_void>()
+        } else {
+            core::ptr::null()
+        };
+        black_box(value)
     }
 
     /// # Safety
@@ -78,16 +107,50 @@ impl RegionPublication {
     /// observe that its byte is true. No second publication writer may run.
     /// The input must be the actual ordinary reserve result or authenticated
     /// fresh native owner. The slot and its owner must outlive all references.
-    #[inline(never)]
+    #[inline(always)]
     unsafe fn set_under_gate(&self, value: RegionResult) -> Result<(), RegionResult> {
-        if self.published.load(Ordering::Acquire) {
-            return Err(value);
+        let mut value = ManuallyDrop::new(value);
+        let publication = black_box(core::ptr::from_ref(self).cast::<c_void>());
+        let payload = black_box(core::ptr::from_mut(&mut *value).cast::<c_void>());
+        // SAFETY: the caller owns the initialization gate; payload is the
+        // actual initialized result and is exclusively borrowed for this call.
+        if unsafe { Self::set_opaque(publication, payload) } == 0 {
+            // The scalar setter moved the complete value into the slot. Its
+            // former stack storage must never be read or dropped again.
+            Ok(())
+        } else {
+            // Refusal does not read, move or modify payload; return ownership
+            // of the original result rather than reconstructing its variant.
+            Err(ManuallyDrop::into_inner(value))
+        }
+    }
+
+    /// Move an initialized result only on successful exclusive publication.
+    ///
+    /// # Safety
+    /// publication must be a live slot whose writes are exclusively owned by
+    /// the caller (INITIALIZING for the runtime slot). payload must point to an
+    /// initialized, exclusively owned RegionResult, disjoint from the slot.
+    /// Zero transfers ownership; any nonzero status leaves the payload intact.
+    #[inline(never)]
+    unsafe extern "C" fn set_opaque(publication: *const c_void, payload: *mut c_void) -> i32 {
+        // SAFETY: the caller supplies an aligned, live publication slot.
+        let publication = unsafe { &*publication.cast::<Self>() };
+        if publication.published.load(Ordering::Acquire) {
+            return black_box(libc::EAGAIN);
         }
         // SAFETY: exclusive gate ownership and unpublished state prevent any
-        // competing writer or reader of this storage. No existing value drops.
-        unsafe { self.value.get().cast::<RegionResult>().write(value) };
-        self.published.store(true, Ordering::Release);
-        Ok(())
+        // competing writer or reader. The initialized, disjoint payload moves
+        // once; the caller promises not to read or drop its former storage.
+        unsafe {
+            publication
+                .value
+                .get()
+                .cast::<RegionResult>()
+                .write(payload.cast::<RegionResult>().read());
+        }
+        publication.published.store(true, Ordering::Release);
+        black_box(0)
     }
 }
 

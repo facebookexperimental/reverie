@@ -198,7 +198,7 @@ fn initial_exec_preflight_requires_original_context_and_keeps_enrollment_after_r
         );
         assert!(e.last_result.is_none());
         e.process_context =
-            ProcessExecutionContext::SyscallBoundary(CompletedSyscallBoundary::for_test());
+            ProcessExecutionContext::SyscallBoundary(&CompletedSyscallBoundary::FOR_TEST);
         e.original_syscall = Some(original);
         assert!(<StaticElfSyscallExecutor<'_> as LinuxEmuSignalControl>::parent_death_syscall_preflight(
             &e, original.into_syscall().unwrap()).is_err(), "raw original exec without retained image is not authority");
@@ -249,7 +249,7 @@ fn default_preflight_refuses_but_live_unopted_static_executor_continues() {
             executor: &mut executor,
             memory: memory.clone(),
             process_context: ProcessExecutionContext::SyscallBoundary(
-                CompletedSyscallBoundary::for_test(),
+                &CompletedSyscallBoundary::FOR_TEST,
             ),
             callback_site: Some(site),
             original_syscall: Some(original),
@@ -362,7 +362,7 @@ fn original_exec_callback_drop_revokes_staged_image_without_injection() {
             executor: &mut executor,
             memory: memory.clone(),
             process_context: ProcessExecutionContext::SyscallBoundary(
-                CompletedSyscallBoundary::for_test(),
+                &CompletedSyscallBoundary::FOR_TEST,
             ),
             callback_site: Some(site),
             original_syscall: Some(original),
@@ -416,7 +416,7 @@ fn provider_refuses_a_task_other_than_its_executors_before_any_effect() {
             executor: &mut executor,
             memory: memory.clone(),
             process_context: ProcessExecutionContext::SyscallBoundary(
-                CompletedSyscallBoundary::for_test(),
+                &CompletedSyscallBoundary::FOR_TEST,
             ),
             callback_site: None,
             original_syscall: None,

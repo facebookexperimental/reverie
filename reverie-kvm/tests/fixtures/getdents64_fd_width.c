@@ -25,6 +25,9 @@
 #define CAP (16U * 1024U * 1024U)
 
 static unsigned calls;
+// The getdents64 calls of the legacy matrix: the guest makes none on /proc,
+// which the backend refuses to open.
+static unsigned expected_calls = 874;
 static const uint64_t upper_words[] = {
     0, UINT64_C(1) << 32, UINT64_C(1) << 63,
     UINT64_C(0x5a5a5a5a00000000), UINT64_C(0xffffffff00000000)};
@@ -214,7 +217,8 @@ static void proc_path_open_policy(int guest, int inherited) {
   errno = 0;
   const int fd = open("/proc", O_PATH | O_DIRECTORY);
   if (guest) {
-    CHECK(fd == -1 && errno == EINVAL);
+    // The backend refuses its own procfs, /proc itself included.
+    CHECK(fd == -1 && errno == EACCES);
   } else {
     CHECK(fd >= 0 && errno == 0);
     struct stat expected, actual;
@@ -224,7 +228,7 @@ static void proc_path_open_policy(int guest, int inherited) {
     CHECK(fcntl(fd, F_GETFL) == fcntl(inherited, F_GETFL));
     CHECK(close(fd) == 0);
   }
-  puts(guest ? "getdents64 policy=synthetic-proc-opath open=EINVAL"
+  puts(guest ? "getdents64 policy=procfs-opath open=EACCES"
              : "getdents64 policy=native-proc-opath open=success");
 }
 
@@ -359,7 +363,16 @@ static void staging_boundary(const struct records *baseline) {
 
 static void proc_policy(int guest) {
   const unsigned before = calls;
+  errno = 0;
   int fd = open("/proc", O_RDONLY | O_DIRECTORY);
+  if (guest) {
+    // The backend refuses its own procfs, /proc itself included, so no
+    // getdents64 call is made on it.
+    CHECK(fd == -1 && errno == EACCES);
+    CHECK(calls == before);
+    puts("getdents64 policy=procfs open=EACCES");
+    return;
+  }
   CHECK(fd >= 0);
   int alias = dup(fd);
   CHECK(alias >= 0);
@@ -369,13 +382,7 @@ static void proc_policy(int guest) {
       for (size_t count = 0; count < 5; ++count) {
         uint64_t raw_fd = upper_words[high] | (uint32_t)descriptors[descriptor];
         rewind_directory(fd);
-        if (guest) {
-          // Synthetic proc is deliberately unenumerable, before pointer and
-          // count validation, including through a dup alias.
-          expect_zero(raw_fd, 0, counts[count]);
-          expect_zero(raw_fd, 1, counts[count]);
-          CHECK(lseek(fd, 0, SEEK_CUR) == 0);
-        } else if (count < 3) {
+        if (count < 3) {
           expect_error(raw_fd, 0, counts[count], EINVAL);
           expect_error(raw_fd, 1, counts[count], EINVAL);
         } else {
@@ -388,8 +395,7 @@ static void proc_policy(int guest) {
       }
   CHECK(close(alias) == 0 && close(fd) == 0);
   CHECK(calls - before == 100);
-  puts(guest ? "getdents64 policy=synthetic-proc rows=100 zero-before-buffer unchanged"
-             : "getdents64 policy=native-proc rows=100 records-and-errors checked");
+  puts("getdents64 policy=native-proc rows=100 records-and-errors checked");
 }
 
 // Count-width coverage is additive: calls and the original 874-call matrix are
@@ -583,7 +589,7 @@ static void count_width_controls(int directory, int regular, int path_only) {
                    128, start, start ? eof : 0, 0, pages, RAW_PAGES,
                    prefixes[prefix], protection, 0);
   CHECK(munmap(pages, RAW_PAGES) == 0 && close(alias) == 0);
-  CHECK(calls == legacy_calls && calls == 874);
+  CHECK(calls == legacy_calls && calls == expected_calls);
   CHECK(raw_rows == 188 && raw_calls == 754);
   printf("getdents64 raw-count checked rows=%u calls=%u\n", raw_rows, raw_calls);
 }
@@ -592,6 +598,7 @@ int main(int argc, char **argv) {
   CHECK(argc == 5);
   int guest = strcmp(argv[1], "kvm") == 0;
   CHECK(guest || strcmp(argv[1], "native") == 0);
+  expected_calls = guest ? 774 : 874;
   const int proc_path_only = inherit_proc_path();
   install_at(open(argv[2], O_RDONLY | O_DIRECTORY), 3);
   CHECK(dup2(3, 0) == 0);
@@ -625,11 +632,11 @@ int main(int argc, char **argv) {
   staging_boundary(&baselines[1]);
   proc_path_open_policy(guest, proc_path_only);
   proc_policy(guest);
-  CHECK(calls == 874);
+  CHECK(calls == expected_calls);
   printf("getdents64 checked calls=%u\n", calls);
   count_width_controls(3, regular, path_only);
   CHECK(close(regular) == 0 && close(path_only) == 0 && close(proc_path_only) == 0);
   CHECK(close(0) == 0 && close(3) == 0 && close(257) == 0);
-  CHECK(calls == 874);
+  CHECK(calls == expected_calls);
   return 0;
 }

@@ -1,0 +1,33 @@
+# OSS-only external caller artifact over the unchanged Strace Tool sources.
+# Keep a corresponding internal target synchronized before the next export.
+[package]
+name = "reverie-strace-dbt-runtime"
+version = "0.5.4"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "caller_tool"
+crate-type = ["cdylib"]
+
+[package.metadata.reverie-dbt]
+artifact-label = "strace"
+input-roots = ["../strace"]
+
+# Deliberately independent: a parent --workspace --all-features build enables
+# DBT's prototype exports, which must not be linked into this caller artifact.
+# The explicit producer and standalone gates below remain mandatory.
+[workspace]
+resolver = "2"
+
+[dependencies]
+reverie = { version = "0.5.4", path = "../../reverie", package = "reverie-core" }
+reverie-dbt = { version = "0.5.4", path = "../../reverie-dbt", default-features = false }
+serde = { version = "1.0.219", features = ["derive"] }
+
+[profile.validate]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+lto = "off"

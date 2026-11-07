@@ -1,0 +1,25 @@
+#ifndef FRAME_PROBE_H
+#define FRAME_PROBE_H
+#define ORIGINAL_RSP 0
+#define RETURNED_RSP 1
+#define RESULT_RAX 2
+#define RESULT_FLAGS 3
+#define RESULT_R11 4
+#define RESULT_R12 5
+#define RESULT_RBP 6
+#define RESULT_R15 7
+#define FRAME_BASE 8
+#define EXPECTED_FLAGS 9
+#define FRAME_RETURN 10
+#define FRAME_RETURN_OFFSET 11
+#define SCRATCH_SEEN 12
+#define RESULT_R13 13
+#define RESULT_RCX 14
+#define REDZONE_START 16
+#define RUST_FRAME_RETURN 32
+#define RUST_FRAME_FAKE_RETURN 33
+#define RUST_GUEST_RSP 34
+#define PROBE_WORDS 35
+#define REDZONE_END 32
+#define SLOT(n) ((n) * 8)
+#endif

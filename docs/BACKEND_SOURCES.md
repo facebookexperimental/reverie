@@ -93,6 +93,10 @@ cargo build -p reverie-sabre
 cargo build -p reverie-e9patch
 ```
 
+The DBT command builds its reusable Rust library, package binaries, and SDK.
+`reverie-dbt/scripts/build-client.sh` explicitly builds the prototype runtime
+shared object and links its native client.
+
 The native build prerequisites are documented in each package README. Source
 revision markers and required sentinels are validated by each build script.
 

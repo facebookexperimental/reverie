@@ -36,6 +36,77 @@
 //! `capabilities()` on backends that do not implement that trait. Those return
 //! the matching constant. The tests below pin every constant field by field.
 //!
+//! # What every backend does
+//!
+//! A fact that holds on every backend is part of the backend contract, not a
+//! field here. Three that used to be fields:
+//!
+//! - **Registers a `syscall` instruction clobbers.** On x86-64, when a guest
+//!   resumes at the instruction after its `syscall`, `%rcx` holds that
+//!   instruction's address and `%r11` the guest's RFLAGS, as after a native
+//!   Linux return, however the backend serviced the call. `rt_sigreturn` is not
+//!   such a resumption (it restores both registers from the signal frame), nor
+//!   is a successful `execve`, whose new image starts afresh.
+//!   - reverie-ptrace leaves the kernel's values, and restores the guest's own
+//!     after an injected call. With e9patch preprocessing, the frame a
+//!     rewritten site restores is given the native values (the site's address
+//!     plus two, and the guest's RFLAGS) before the call is dispatched.
+//!   - reverie-dbt's client sets them after each call it skips or completes,
+//!     except the private call its signal continuation makes, whose registers
+//!     are the interrupted context's.
+//!   - reverie-kvm returns with SYSRETQ from the staged return address and
+//!     RFLAGS.
+//!   - The in-guest backends (LiteInst) set them from the context captured at
+//!     the guest's `syscall`: its address plus two, and the RFLAGS saved there.
+//!   - SaBRe's rewriter loads them before its handler runs: the trampoline of
+//!     each rewritten `syscall` sets `%r11` from RFLAGS and `%rcx` to the site's
+//!     next address (`experimental/reverie-sabre/vendor/sabre`, rewriter.c).
+//!
+//!   Two known exceptions remain:
+//!   - On reverie-kvm, a signal handler whose frame is set up at a syscall's
+//!     return starts with the handler's address in `%rcx` and the handler's
+//!     RFLAGS in `%r11`, where Linux leaves the interrupted call's values.
+//!   - On reverie-dbt, the child of a `vfork` starts with a DynamoRIO address
+//!     in `%rcx` (the same value in four runs of one probe). DynamoRIO delivers
+//!     no post-syscall event to it, so the client's correction does not reach
+//!     it. The child of a shared-memory clone takes the same path and has not
+//!     been measured.
+//!
+//! - **`madvise`.** A tool may forward any advice to the backend. A backend
+//!   that does not implement an advice whose effect, or whose possible
+//!   failure, a program can observe (what a fork copies, what a core dump
+//!   holds, a punched hole) answers it with ENOSYS and the typed refusal
+//!   [`UnsupportedOperation::MemoryAdvice`](crate::UnsupportedOperation::MemoryAdvice),
+//!   which names the advice. Every backend implements `MADV_DONTNEED` over
+//!   anonymous memory: private pages then read as zeros, and shared contents
+//!   survive.
+//!   - reverie-ptrace, e9patch preprocessing, reverie-dbt, the in-guest
+//!     backends (LiteInst) and SaBRe let the host kernel perform the call.
+//!   - reverie-kvm implements `MADV_DONTNEED` over anonymous memory; refuses
+//!     it over a private file mapping, and refuses the fork, core-dump,
+//!     locked-page, hole-punching, population, collapse, memory-failure and
+//!     guard-region advice; answers an advice Linux does not know with EINVAL;
+//!     and answers the rest (the access-pattern hints, `MADV_FREE`,
+//!     `MADV_COLD`, `MADV_PAGEOUT`, the KSM and huge-page advice) as hints it
+//!     does not act on, with Linux's result for the range. Linux may refuse
+//!     some of those for a mapping of the wrong kind, which reverie-kvm does
+//!     not model.
+//!
+//! - **When a `vfork` child registers.** When the tool injects a `clone`,
+//!   `clone3` or `vfork` with `CLONE_VFORK`, a failed call's child never
+//!   registers with the tool, and a successful call's child may register
+//!   before or after the parent's call returns to the tool. A missing child at
+//!   the parent's return is therefore not a failed call. A successful call's
+//!   child can also be torn down before it starts (killed before its first
+//!   stop), and then never registers: the tool learns of that only through
+//!   the child's own teardown, so a tool that waits for the child waits for
+//!   its registration, the call's failure, or that teardown.
+//!   - reverie-ptrace: the kernel keeps the parent inside the call until the
+//!     child execs or exits, so the child has registered before the parent's
+//!     call returns.
+//!   - reverie-kvm starts the child only after the parent's call has returned
+//!     to the tool, so the child registers after it.
+//!
 //! # Adding a field
 //!
 //! The struct is `#[non_exhaustive]`, so code outside this crate cannot build
@@ -67,13 +138,6 @@ pub struct BackendCapabilities {
     /// handed across the exec explicitly.
     pub rediscovers_descriptors_after_exec: bool,
 
-    /// Scheduler turns for I/O on a tool-managed internal pipe (a pipe that is
-    /// physically nonblocking while the guest sees it as blocking) include a
-    /// descriptor-discovery turn whose count depends on host timing. The tool
-    /// marks those turns so their count is not treated as guest-visible
-    /// progress.
-    pub internal_pipe_turns_are_host_timed: bool,
-
     /// A zero-timeout poll by a task that owns a loopback connection must
     /// yield its turn to another runnable task first; without that yield a
     /// poller can starve the loopback peer it is waiting for.
@@ -83,11 +147,6 @@ pub struct BackendCapabilities {
     /// absolute futex deadline may have been computed from the host clock
     /// rather than from the tool's logical clock.
     pub guest_clock_reads_bypass_backend: bool,
-
-    /// The backend already returns deterministic values in every register that
-    /// a `syscall` instruction clobbers, so the tool must not write the whole
-    /// register set back after a syscall.
-    pub virtualizes_syscall_clobbers: bool,
 
     /// A pending tool request from a thread that the tool has logically killed
     /// is not resolved by the kernel's exit-group teardown, so the tool must
@@ -106,12 +165,6 @@ pub struct BackendCapabilities {
     /// such an exit is pending, or a peer could observe the exiting process's
     /// descriptors still open.
     pub process_exits_complete_asynchronously: bool,
-
-    /// A signal interrupts a blocking syscall that the backend runs outside the
-    /// tool's scheduler, and the interrupted thread's continuation request
-    /// arrives only afterwards. The tool must wait for that continuation
-    /// instead of treating the thread as parked inside its own scheduler.
-    pub signal_interrupts_external_syscalls: bool,
 
     /// The backend reports every process child through the tool's
     /// child-registration callbacks, so the tool's own record of children is
@@ -133,21 +186,6 @@ pub struct BackendCapabilities {
     /// parked when another task signals the writer, preserving Linux's signal
     /// mask, disposition and syscall-restart behavior.
     pub supports_parked_write_signal_interruption: bool,
-
-    /// The backend starts a `CLONE_VFORK` child only after the parent's clone
-    /// call has returned to the tool, so the child registers after the parent
-    /// asks to continue. The tool must keep waiting for the late child rather
-    /// than treat its absence as a failed clone.
-    pub defers_vfork_child_registration: bool,
-
-    /// The backend implements guest-visible `madvise` semantics, so the tool
-    /// may forward an `madvise` call to it.
-    pub supports_madvise: bool,
-
-    /// The backend implements `MADV_DONTNEED` (private anonymous pages then
-    /// read as zeros; shared contents survive), so the tool may forward that
-    /// advice even when it may not forward the others (`supports_madvise`).
-    pub supports_madv_dontneed: bool,
 
     /// The backend reports, through
     /// [`GlobalTool::on_backend_process_exited`](crate::GlobalTool::on_backend_process_exited),
@@ -322,21 +360,15 @@ impl BackendCapabilities {
     pub const PTRACE: Self = Self {
         tool_shares_guest_descriptor_table: false,
         rediscovers_descriptors_after_exec: false,
-        internal_pipe_turns_are_host_timed: false,
         loopback_pollers_yield_to_peers: false,
         guest_clock_reads_bypass_backend: false,
-        virtualizes_syscall_clobbers: false,
         needs_killed_thread_rpc_cancellation: false,
         reports_physical_process_exits: false,
         process_exits_complete_asynchronously: false,
-        signal_interrupts_external_syscalls: false,
         tracks_process_children: true,
         runs_exit_robust_list: true,
         requires_thread_directed_process_signals: false,
         supports_parked_write_signal_interruption: true,
-        defers_vfork_child_registration: false,
-        supports_madvise: true,
-        supports_madv_dontneed: true,
         reports_child_exit_publication: true,
         reports_kernel_child_exit_signals: true,
         provides_process_signal_control: false,
@@ -392,13 +424,10 @@ impl BackendCapabilities {
     pub const SABRE: Self = Self {
         tool_shares_guest_descriptor_table: true,
         rediscovers_descriptors_after_exec: true,
-        internal_pipe_turns_are_host_timed: true,
         loopback_pollers_yield_to_peers: true,
         guest_clock_reads_bypass_backend: true,
-        virtualizes_syscall_clobbers: true,
         needs_killed_thread_rpc_cancellation: true,
         reports_physical_process_exits: true,
-        signal_interrupts_external_syscalls: true,
         runs_exit_robust_list: false,
         supports_parked_write_signal_interruption: false,
         reports_child_exit_publication: false,
@@ -443,8 +472,6 @@ impl BackendCapabilities {
     pub const KVM: Self = Self {
         needs_killed_thread_rpc_cancellation: true,
         runs_exit_robust_list: false,
-        defers_vfork_child_registration: true,
-        supports_madvise: false,
         provides_process_signal_control: true,
         emulates_child_waits: true,
         reports_child_exit_publication: false,
@@ -477,21 +504,15 @@ mod tests {
         serde_json::json!({
             "tool_shares_guest_descriptor_table": false,
             "rediscovers_descriptors_after_exec": false,
-            "internal_pipe_turns_are_host_timed": false,
             "loopback_pollers_yield_to_peers": false,
             "guest_clock_reads_bypass_backend": false,
-            "virtualizes_syscall_clobbers": false,
             "needs_killed_thread_rpc_cancellation": false,
             "reports_physical_process_exits": false,
             "process_exits_complete_asynchronously": false,
-            "signal_interrupts_external_syscalls": false,
             "tracks_process_children": true,
             "runs_exit_robust_list": true,
             "requires_thread_directed_process_signals": false,
             "supports_parked_write_signal_interruption": true,
-            "defers_vfork_child_registration": false,
-            "supports_madvise": true,
-            "supports_madv_dontneed": true,
             "reports_child_exit_publication": true,
             "reports_kernel_child_exit_signals": true,
             "provides_process_signal_control": false,
@@ -579,13 +600,10 @@ mod tests {
             ptrace_with(serde_json::json!({
                 "tool_shares_guest_descriptor_table": true,
                 "rediscovers_descriptors_after_exec": true,
-                "internal_pipe_turns_are_host_timed": true,
                 "loopback_pollers_yield_to_peers": true,
                 "guest_clock_reads_bypass_backend": true,
-                "virtualizes_syscall_clobbers": true,
                 "needs_killed_thread_rpc_cancellation": true,
                 "reports_physical_process_exits": true,
-                "signal_interrupts_external_syscalls": true,
                 "runs_exit_robust_list": false,
                 "supports_parked_write_signal_interruption": false,
                 "reports_child_exit_publication": false,
@@ -634,8 +652,6 @@ mod tests {
             ptrace_with(serde_json::json!({
                 "needs_killed_thread_rpc_cancellation": true,
                 "runs_exit_robust_list": false,
-                "defers_vfork_child_registration": true,
-                "supports_madvise": false,
                 "provides_process_signal_control": true,
                 "emulates_child_waits": true,
                 "reports_child_exit_publication": false,

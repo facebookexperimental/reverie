@@ -70,17 +70,6 @@ impl ToolHeapMetadata {
             locked: AtomicBool::new(false),
         }
     }
-
-    /// Initialize only authenticated fresh, unpublished anonymous storage.
-    pub(crate) unsafe fn initialize_at(address: *mut Self) {
-        // SAFETY: the fresh owner exclusively owns writable aligned storage.
-        // Individual scalar stores avoid constructing any arena/bitmap value.
-        unsafe {
-            ptr::addr_of_mut!((*address).next).write(UnsafeCell::new(0));
-            ptr::addr_of_mut!((*address).free_head).write(UnsafeCell::new(FREE_LIST_END));
-            ptr::addr_of_mut!((*address).locked).write(AtomicBool::new(false));
-        }
-    }
 }
 
 /// Legacy BSS ownership stays separate from the allocation algorithm.

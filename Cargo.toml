@@ -20,6 +20,7 @@ members = [
     "reverie-kvm",
     "reverie-kvm-core",
     "reverie-linux-provider",
+    "reverie-linuxemu",
     "reverie-liteinst",
     "reverie-liteinst-artifact",
     "reverie-liteinst-preload",
@@ -29,7 +30,16 @@ members = [
     "reverie-ptrace",
     "reverie-rpc-transport",
     "reverie-syscalls",
+    "reverie-test-support",
     "reverie-util",
     "safeptrace",
 ]
-exclude = ["public_autocargo/experimental"]
+# The caller cdylib has an independent lock and mandatory explicit producer.
+# Workspace all-features must not unify its dependency with prototype exports.
+# Keep the separate caller target/gates synchronized in internal exports.
+exclude = [
+    "public_autocargo/experimental",
+    "reverie-examples/strace-dbt-runtime",
+    "reverie-examples/counter1-dbt-runtime",
+    "reverie-dbt/tests/fixtures/caller-lifecycle-runtime",
+]

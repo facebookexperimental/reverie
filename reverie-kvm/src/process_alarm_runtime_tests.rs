@@ -149,7 +149,7 @@ fn process_alarm_signal_into_guest_forwards_complete_outcomes_without_guest_effe
                     Arc::new(AdapterTool::default()),
                     memory,
                     &[],
-                    unsafe { std::mem::zeroed() },
+                    &crate::runtime::ZEROED_USER_REGISTERS,
                     &mut state,
                     &mut executor,
                     &(),
@@ -237,7 +237,7 @@ fn process_alarm_signal_guest_executor_default_refuses_explicitly() {
         Arc::new(AdapterTool::default()),
         memory,
         &[],
-        unsafe { std::mem::zeroed() },
+        &crate::runtime::ZEROED_USER_REGISTERS,
         &mut state,
         &mut executor,
         &(),
@@ -292,13 +292,13 @@ fn process_alarm_signal_transport_contexts_match_resumable_boundaries() {
         ),
         ("lifecycle", ProcessExecutionContext::Lifecycle, false),
         (
-            "thread entry signal",
-            ProcessExecutionContext::ThreadEntrySignal,
+            "user instruction signal",
+            ProcessExecutionContext::UserInstructionSignal,
             true,
         ),
         (
             "signal",
-            ProcessExecutionContext::SignalBoundary(CompletedSyscallBoundary::for_test()),
+            ProcessExecutionContext::SignalBoundary(&CompletedSyscallBoundary::FOR_TEST),
             true,
         ),
         (
@@ -308,7 +308,7 @@ fn process_alarm_signal_transport_contexts_match_resumable_boundaries() {
         ),
         (
             "syscall",
-            ProcessExecutionContext::SyscallBoundary(CompletedSyscallBoundary::for_test()),
+            ProcessExecutionContext::SyscallBoundary(&CompletedSyscallBoundary::FOR_TEST),
             true,
         ),
     ];

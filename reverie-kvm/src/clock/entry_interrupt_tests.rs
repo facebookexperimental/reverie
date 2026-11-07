@@ -470,6 +470,68 @@ fn a_nonzero_synced_interrupt_bitmap_is_read_from_kvm() {
     println!("synced bitmap: a stale nonzero bitmap was read from KVM");
 }
 
+/// The register reads into a caller's storage return what the returning
+/// reads return, from the same source: KVM's synced copy after an exit, the
+/// ioctls once the raw fd has been borrowed, and `KVM_GET_SREGS` when the
+/// synced interrupt bitmap is stale. Whatever the destination held before is
+/// overwritten.
+#[test]
+fn register_reads_into_place_match_the_returning_reads() {
+    let mut backend =
+        crate::KvmBackend::new(16 * 1024 * 1024).expect("synced registers require /dev/kvm");
+    install_counted_program(&mut backend, &finite_program(1 << 10));
+    reaches_getpid(&mut backend.vcpu);
+    let stale_regs = kvm_bindings::kvm_regs {
+        rax: u64::MAX,
+        rip: u64::MAX,
+        rsp: 0x5a5a,
+        ..Default::default()
+    };
+    let stale_special = kvm_bindings::kvm_sregs {
+        cr0: u64::MAX,
+        efer: u64::MAX,
+        interrupt_bitmap: [7; 4],
+        ..Default::default()
+    };
+    let check = |vcpu: &CountedVcpu, source: &str| {
+        let mut registers = stale_regs;
+        vcpu.get_regs_into(&mut registers).unwrap();
+        assert_eq!(registers, vcpu.get_regs().unwrap(), "{source}");
+        let mut special = stale_special;
+        vcpu.get_sregs_into(&mut special).unwrap();
+        assert_eq!(special, vcpu.get_sregs().unwrap(), "{source}");
+    };
+    let synced = backend.vcpu.sync_regs;
+    if synced {
+        assert!(backend.vcpu.synced_exit.load(Ordering::Relaxed));
+        check(&backend.vcpu, "synced copy");
+        assert!(backend.vcpu.synced_exit.load(Ordering::Relaxed));
+        // A stale synced bitmap bit: both reads ask KVM instead.
+        backend.vcpu.fd.sync_regs_mut().sregs.interrupt_bitmap[0] = 1;
+        let mut special = stale_special;
+        backend.vcpu.get_sregs_into(&mut special).unwrap();
+        assert_eq!(special.interrupt_bitmap, [0; 4]);
+        assert_eq!(special, backend.vcpu.get_sregs().unwrap());
+        backend.vcpu.fd.sync_regs_mut().sregs.interrupt_bitmap[0] = 0;
+    }
+    // Borrowing the raw fd retires the synced copy: the ioctls answer.
+    let raw: &kvm_ioctls::VcpuFd = &backend.vcpu;
+    let ioctl = (raw.get_regs().unwrap(), raw.get_sregs().unwrap());
+    assert!(!backend.vcpu.synced_exit.load(Ordering::Relaxed));
+    check(&backend.vcpu, "ioctl");
+    let mut registers = stale_regs;
+    backend.vcpu.get_regs_into(&mut registers).unwrap();
+    assert_eq!(registers, ioctl.0);
+    println!(
+        "register reads into place: matched the returning reads ({})",
+        if synced {
+            "synced copy, stale bitmap and ioctl"
+        } else {
+            "ioctl only; KVM lacks KVM_CAP_SYNC_REGS here"
+        }
+    );
+}
+
 fn change_sigurg(how: libc::c_int) {
     // SAFETY: the set is initialized before pthread_sigmask reads it, and the
     // change affects only this test thread.

@@ -1,0 +1,1 @@
+./test.pie -M 'jmp or call or return' -P 'entry((static)addr,(static)target,(static)next,bytes,size,asm)@inst'

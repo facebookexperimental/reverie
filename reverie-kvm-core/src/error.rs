@@ -445,6 +445,24 @@ pub enum Error {
     #[error("KVM guest threads cannot replace the process image")]
     GuestThreadExecUnsupported,
 
+    /// A Tool's timer-event callback (`Tool::handle_timer_event`) injected a
+    /// syscall that the callback cannot perform on this backend: a process
+    /// action (fork, vfork, clone, clone3 or exec), a tail injection other
+    /// than an exit, a signal that needs a syscall return frame, or an
+    /// `rt_sigprocmask` that would make a pending signal deliverable, which
+    /// needs one too. It was refused before it had any effect, and the run
+    /// fails, so that the Tool cannot take the refusal for an ordinary
+    /// failure of the syscall. The refusal stays the callback's outcome: an
+    /// injection the callback makes afterwards never runs, and a later exit
+    /// or retirement does not replace it.
+    #[error(
+        "KVM timer-event callback injected syscall {syscall}, which a timer event cannot perform: it can inject syscalls that return, and exits, but no process action, and no signal or signal-mask change that needs a syscall return frame"
+    )]
+    TimerCallbackInjectionUnsupported {
+        /// The refused syscall's number.
+        syscall: u64,
+    },
+
     /// Exec cancelled its siblings, but one of their consuming hooks failed.
     /// The Tool owner must finish consuming its own state before returning this
     /// error; no old or replacement guest continuation remains available.

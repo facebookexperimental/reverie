@@ -33,11 +33,12 @@
 //! under test between them.
 
 //!
-//! The traps here are `icebp` and a guest's `tgkill` of SIGTRAP, which Reverie
-//! still neither handles nor delivers. A guest's own `int3` is not one of
-//! them: Reverie delivers its SIGTRAP as Linux does, so it is a signal the
-//! Tool sees (`tests/guest_int3.rs`,
-//! <https://github.com/rrnewton/hermit/issues/1715>).
+//! The trap here is `icebp`, which Reverie still neither handles nor
+//! delivers. A guest's own `int3` and its `tgkill` of SIGTRAP are not traps of
+//! this kind: Reverie delivers their SIGTRAPs as Linux does, so each is a
+//! signal the Tool sees (`tests/guest_int3.rs`,
+//! <https://github.com/rrnewton/hermit/issues/1715>, and
+//! `tests/guest_sent_sigtrap.rs`).
 
 #![cfg(target_arch = "x86_64")]
 
@@ -181,11 +182,6 @@ enum Between {
     /// processor sets no DR6 status bit for it. An AMD EPYC 9D85 sets none
     /// even when it single-steps the instruction.
     Icebp,
-    /// A `tgkill` of SIGTRAP to the guest's own thread, which Linux reports
-    /// with SI_TKILL. A step of its `syscall` would report TRAP_BRKPT as the
-    /// syscall returns, but the guest's SIGTRAP is already pending then, and
-    /// Linux does not queue a second.
-    Tgkill,
     /// A `getpid` just after two loads of SS. Of consecutive loads of SS,
     /// Intel documents only the first as sure to hold the debug trap back,
     /// but an AMD EPYC 9D85 runs both and the `syscall` in one step, which
@@ -239,25 +235,6 @@ impl Between {
             Between::Nop => between_loops!(before, after, ["nop"]),
             // `icebp`, also known as `int1`.
             Between::Icebp => between_loops!(before, after, [".byte 0xf1"]),
-            Between::Tgkill => {
-                let pid = unsafe { libc::getpid() } as usize;
-                let tid = unsafe { libc::gettid() } as usize;
-                between_loops!(
-                    before,
-                    after,
-                    [
-                        "mov eax, {tgkill}",
-                        "mov rdi, {pid}",
-                        "mov rsi, {tid}",
-                        "mov edx, {sigtrap}",
-                        "syscall"
-                    ],
-                    pid = in(reg) pid,
-                    tid = in(reg) tid,
-                    tgkill = const libc::SYS_tgkill,
-                    sigtrap = const libc::SIGTRAP
-                )
-            }
             Between::SyscallAfterLoadsOfSs => between_loops!(
                 before,
                 after,
@@ -373,8 +350,6 @@ fn timer_events(between: Between, schedule: Schedule, before: u64) -> Run {
 // the margin; a later signal comes after the trap's stop.
 #[test_case(Between::Icebp, LESS_RCBS; "icebp, artificial signal")]
 #[test_case(Between::Icebp, PERF_RCBS; "icebp, perf signal")]
-#[test_case(Between::Tgkill, LESS_RCBS; "tgkill, artificial signal")]
-#[test_case(Between::Tgkill, PERF_RCBS; "tgkill, perf signal")]
 #[test_case(Between::IcebpAfterLoadsOfSs, LESS_RCBS; "icebp after loads of SS")]
 fn a_trap_before_the_target_does_not_cancel_the_timer(between: Between, rcbs: u64) {
     ret_without_perf!();
@@ -396,7 +371,6 @@ fn a_trap_before_the_target_does_not_cancel_the_timer(between: Between, rcbs: u6
 // therefore comes before the PMU signal on every host, and whether the event
 // fires must not depend on which side of the trap the signal came.
 #[test_case(Between::Icebp; "icebp")]
-#[test_case(Between::Tgkill; "tgkill")]
 fn a_trap_before_the_perf_signal_does_not_cancel_the_timer(between: Between) {
     ret_without_perf!();
     let run = timer_events(between, Schedule::rcbs(PERF_RCBS), 1);
@@ -422,7 +396,6 @@ fn the_timer_fires_without_a_trap(between: Between, rcbs: u64) {
 // point: a PMU signal more than the skid margin late would come after the
 // trap's stop.
 #[test_case(Between::Icebp; "icebp")]
-#[test_case(Between::Tgkill; "tgkill")]
 fn a_trap_past_the_target_does_not_cancel_the_timer(between: Between) {
     ret_without_perf!();
     let run = timer_events(between, Schedule::rcbs(LESS_RCBS), LESS_RCBS);
@@ -440,7 +413,6 @@ fn a_trap_past_the_target_does_not_cancel_the_timer(between: Between) {
 // too.
 #[test_case(Between::Nop, 2; "nop")]
 #[test_case(Between::Icebp, 2; "icebp")]
-#[test_case(Between::Tgkill, 6; "tgkill")]
 fn a_trap_among_the_instructions_past_the_target_counts_once(between: Between, instructions: u64) {
     ret_without_perf!();
     let schedule = Schedule {
@@ -567,7 +539,7 @@ fn an_observed_stop_cancels_the_timer_in_a_loop_that_traps_in_every_round(getppi
 
 extern "C" fn ignore_trap(_signum: libc::c_int) {}
 
-/// Installs a SIGTRAP handler that returns at once, so a delivered `int3`
+/// Installs a SIGTRAP handler that returns at once, so a delivered SIGTRAP
 /// does not end the guest.
 fn catch_sigtrap() {
     // SAFETY: installs a handler that does nothing.
@@ -582,25 +554,63 @@ fn catch_sigtrap() {
     }
 }
 
-/// Makes the `clock_getres` at which the Tool requests the timer, then runs
-/// `before` rounds of a loop with one conditional branch each, an `int3`, and
-/// `after` more rounds.
-fn int3_between_loops(before: u64, after: u64) {
-    between_loops!(before, after, ["int3"]);
+/// A SIGTRAP of the guest's own that Reverie delivers.
+#[derive(Debug, Clone, Copy)]
+enum GuestSigtrap {
+    /// `int3`, which Linux reports with SI_KERNEL.
+    Int3,
+    /// A `tgkill` of SIGTRAP to the guest's own thread, which Linux reports
+    /// with SI_TKILL. A step of its `syscall` would report TRAP_BRKPT as the
+    /// syscall returns, but the guest's SIGTRAP is already pending then, and
+    /// Linux does not queue a second.
+    Tgkill,
 }
 
-// A guest's own `int3` is delivered, as on Linux (`tests/guest_int3.rs`), so
-// its stop is a signal the Tool observes rather than a trap Reverie
-// disregards. Whether it comes among the steps toward the target or long
-// before the PMU signal, it decides the event the way an observed stop does.
-#[test_case(LESS_RCBS, LESS_RCBS - 1; "among the steps")]
-#[test_case(PERF_RCBS, 1; "before the perf signal")]
-fn a_delivered_int3_is_an_observed_stop(rcbs: u64, before: u64) {
+impl GuestSigtrap {
+    /// Makes the `clock_getres` at which the Tool requests the timer, then
+    /// runs `before` rounds of a loop with one conditional branch each, the
+    /// SIGTRAP, and `after` more rounds.
+    fn run(self, before: u64, after: u64) {
+        match self {
+            GuestSigtrap::Int3 => between_loops!(before, after, ["int3"]),
+            GuestSigtrap::Tgkill => {
+                let pid = unsafe { libc::getpid() } as usize;
+                let tid = unsafe { libc::gettid() } as usize;
+                between_loops!(
+                    before,
+                    after,
+                    [
+                        "mov eax, {tgkill}",
+                        "mov rdi, {pid}",
+                        "mov rsi, {tid}",
+                        "mov edx, {sigtrap}",
+                        "syscall"
+                    ],
+                    pid = in(reg) pid,
+                    tid = in(reg) tid,
+                    tgkill = const libc::SYS_tgkill,
+                    sigtrap = const libc::SIGTRAP
+                )
+            }
+        }
+    }
+}
+
+// A guest's own `int3` (`tests/guest_int3.rs`) and its `tgkill` of SIGTRAP
+// (`tests/guest_sent_sigtrap.rs`) are delivered, as on Linux, so each stop is
+// a signal the Tool observes rather than a trap Reverie disregards. Whether it
+// comes among the steps toward the target or long before the PMU signal, it
+// decides the event the way an observed stop does.
+#[test_case(GuestSigtrap::Int3, LESS_RCBS, LESS_RCBS - 1; "int3 among the steps")]
+#[test_case(GuestSigtrap::Int3, PERF_RCBS, 1; "int3 before the perf signal")]
+#[test_case(GuestSigtrap::Tgkill, LESS_RCBS, LESS_RCBS - 1; "tgkill among the steps")]
+#[test_case(GuestSigtrap::Tgkill, PERF_RCBS, 1; "tgkill before the perf signal")]
+fn a_delivered_guest_sigtrap_is_an_observed_stop(trap: GuestSigtrap, rcbs: u64, before: u64) {
     ret_without_perf!();
     let run = run(
         move || {
             catch_sigtrap();
-            int3_between_loops(before, 2 * rcbs - before);
+            trap.run(before, 2 * rcbs - before);
         },
         Schedule::rcbs(rcbs),
     );

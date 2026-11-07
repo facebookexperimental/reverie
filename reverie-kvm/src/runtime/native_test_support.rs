@@ -368,7 +368,7 @@ where
             memory,
             &[],
             // No instruction executes; operations requiring real registers are outside this seam.
-            unsafe { std::mem::zeroed() },
+            &crate::runtime::ZEROED_USER_REGISTERS,
             self.thread.as_mut().unwrap(),
             &mut executor,
             self.global.as_ref(),

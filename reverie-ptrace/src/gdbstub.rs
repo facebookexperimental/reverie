@@ -22,6 +22,7 @@ mod packet;
 mod request;
 mod server;
 mod session;
+mod signals;
 
 mod regs;
 
@@ -40,6 +41,9 @@ pub use inferior::Inferior;
 pub use inferior::InferiorThreadId;
 pub use inferior::ResumeInferior;
 pub use inferior::StoppedInferior;
+pub use inferior::ThreadState;
+pub use inferior::ThreadStateGuard;
+pub use inferior::ThreadView;
 pub use regs::CoreRegs;
 pub use request::GdbRequest;
 pub use server::GdbServer;

@@ -152,11 +152,27 @@ pub unsafe fn install_runtime_handler(
     handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void),
     extra_flags: i32,
 ) -> io::Result<()> {
+    unsafe { install_masked_runtime_handler(signal, handler, extra_flags, 0) }
+}
+
+/// [`install_runtime_handler`] with `mask` as the action's `sa_mask`: the
+/// signals the kernel blocks, besides `signal` itself, while the handler runs
+/// and before its first instruction.
+///
+/// # Safety
+///
+/// As [`install_runtime_handler`].
+pub unsafe fn install_masked_runtime_handler(
+    signal: i32,
+    handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void),
+    extra_flags: i32,
+    mask: u64,
+) -> io::Result<()> {
     let action = KernelSigaction {
         handler: handler as *const () as u64,
         flags: (libc::SA_SIGINFO | SA_RESTORER | extra_flags) as u64,
         restorer: signal_restorer(),
-        mask: 0,
+        mask,
     };
     unsafe { raw_sigaction(signal, Some(&action), None) }.map_err(io::Error::from_raw_os_error)
 }
@@ -184,12 +200,15 @@ pub unsafe fn install_sigsys_handler(
     on_alt_stack: bool,
 ) -> io::Result<()> {
     // Through the private restorer, so a filter can admit `rt_sigreturn` only
-    // there ([`install_runtime_handler`]).
+    // there ([`install_runtime_handler`]). Under the in-guest signal-delivery
+    // gate its mask is the runtime mask, so no guest signal is delivered from
+    // the trap on (`guest::runtime_mask`); otherwise none.
     unsafe {
-        install_runtime_handler(
+        install_masked_runtime_handler(
             libc::SIGSYS,
             handler,
             if on_alt_stack { libc::SA_ONSTACK } else { 0 },
+            crate::guest::runtime_mask::runtime_action_mask(),
         )
     }
 }

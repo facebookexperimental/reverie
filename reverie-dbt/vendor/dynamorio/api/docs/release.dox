@@ -1,0 +1,2542 @@
+/* ******************************************************************************
+ * Copyright (c) 2010-2026 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011 Massachusetts Institute of Technology  All rights reserved.
+ * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
+ * ******************************************************************************/
+
+/*
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ *
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ *
+ * * Neither the name of VMware, Inc. nor the names of its contributors may be
+ *   used to endorse or promote products derived from this software without
+ *   specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL VMWARE, INC. OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ */
+
+/**
+***************************************************************************
+***************************************************************************
+***************************************************************************
+
+\page release_notes Release Notes for Version \DR_VERSION
+
+This section is divided into the following subsections:
+
+ - \ref sec_package
+ - \ref sec_changes
+ - \ref sec_limits
+ - \ref sec_future
+
+***************************************************************************
+\htmlonly
+<table width=100% bgcolor="#000000" cellspacing=0 cellpadding=2 border=0>
+  <tr><td><table width=100% bgcolor="#0000C0" cellspacing=0 cellpadding=1 border=0>
+  <tr><td><table width=100% bgcolor="#0000C0" cellspacing=0 cellpadding=1 border=0>
+  <tr><td></td></tr></table></td></tr></table></td></tr></table>
+\endhtmlonly
+\section sec_package Distribution Contents
+
+The following are part of the DynamoRIO release distribution:
+
+\if profiling
+  PR 225255: list profile library too
+\endif
+
+ - Four different DynamoRIO libraries: debug and release for each of
+   32-bit and 64-bit (for ARM or AArch64 builds, only a single bitwidth
+   matching the ISA is provided).
+   The debug library enables assertion messages to more easily diagnose
+   API usage errors.
+ - Four different IA-32/AMD64/ARM/AArch64 decoding static libraries: debug and release
+   for each of 32-bit and 64-bit (only 32-bit for ARM and 64-bit for AArch64).
+   The debug library enables assertion messages to more easily diagnose
+   API usage errors.
+ - A variety of DynamoRIO Extension libraries that augment the core
+   DynamoRIO API (see \ref page_ext).
+ - Additional Extension libraries from the Dr. Memory Framework (DRMF).
+   If this documentation is part of a DynamoRIO public release, <a
+   href="../../drmemory/drmemory/docs/html/page_drmf.html">this link</a> should
+   point at the local documentation for DRMF.
+ - The DynamoRIO configuration and execution libraries and command-line
+   utilities \c drconfiglib.dll, \c drinjectlib.dll, \c drfrontendlib.lib,
+   \c drconfig.exe, \c drrun.exe, and \c drinject.exe.
+   On Linux, the tools are named \c drconfig, \c drrun, and \c drinject.
+ - A utility \c drview.exe for viewing which processes
+   are running under DynamoRIO control (Windows package only).
+ - Header files for the DynamoRIO APIs.
+ - This documentation.
+ - \ref API_samples "Sample clients".
+ - A graphical statistics viewer \c DRstats.exe that displays internal
+   DynamoRIO statistics as well as custom statistics defined
+   by a client (see \ref sec_drstats) (Windows package only).
+   DynamoRIO exports a large number of statistics in its debug build, and
+   a handful in release builds.
+ - A binary tracedump reader, which also functions as a sample
+   client using DynamoRIO as a standalone library (see \ref
+   sec_standalone).
+ - A number of end-user tools including a code coverage tool (see \ref
+   page_drcov), a multi-process cache simulator (see \ref page_drcachesim),
+   a last-level cache miss analyzer (see \ref page_drcachesim),
+   and a legacy CPU testing tool (see \ref page_drcpusim).
+   If this is a DynamoRIO public release, it also includes the
+   Dr. Memory memory debugging tool (see \ref page_drmemory), a system call
+   tracer for Windows (see \ref page_drstrace), a library tracing tool (see
+   \ref page_drltrace), and a symbol querying tool (see \ref page_symquery).
+
+When unpacking the release package on Windows, be aware that the Cygwin
+unzip utility does not preserve executable permissions properly.  After
+unzipping with Cygwin, add ugo+rx permissions to all of the .dll and .exe
+files in the resulting directory tree:
+\code
+find . -name \*.dll -exec chmod ugo+rx {} \; -o -name \*.exe -exec chmod ugo+rx {} \;
+\endcode
+
+***************************************************************************
+\htmlonly
+<table width=100% bgcolor="#000000" cellspacing=0 cellpadding=2 border=0>
+  <tr><td><table width=100% bgcolor="#0000C0" cellspacing=0 cellpadding=1 border=0>
+  <tr><td><table width=100% bgcolor="#0000C0" cellspacing=0 cellpadding=1 border=0>
+  <tr><td></td></tr></table></td></tr></table></td></tr></table>
+\endhtmlonly
+\section sec_changes Changes Since Prior Releases
+
+The current version is \DR_VERSION.  It includes Dr. Memory and the
+Dr. Memory Framework (DRMF) in the same package as DynamoRIO.  DRMF
+provides the umbra, drsyscall, and drsymcache Extensions for use by
+clients.
+
+The changes between version \DR_VERSION and 11.3.0 include the following compatibility
+changes:
+ - On 32-bit Arm the size of #dr_mcontext_t has been increased by 4 and the
+   struct is now required to be 8-byte aligned. The offset of the field "simd"
+   has changed.
+ - Added new fields elf_path and elf_path_size to dr_memory_dump_spec_t. When
+   dr_create_memory_dump() returns true and elf_path is not NULL, elf_path will be
+   written with the path to the memory dump file.
+ - Added new argument access_type of enum cache_access_type_t to the method
+   access_update() of the classes dynamorio::drmemtrace::cache_replacement_policy_t and
+   dynamorio::drmemtrace::caching_device_t. Possible values are:
+   - cache_access_type_t::HIT,
+   - cache_access_type_t::MISS.
+ - Removed dynamorio::drmemtrace::reader_t::read_queued_entry(), which now does not
+   require subclasses of #dynamorio::drmemtrace::reader_t to check for queued
+   entries in their implementation of
+   #dynamorio::drmemtrace::reader_t::read_next_entry().
+ - Renamed eof_ to at_eof_ for #dynamorio::drmemtrace:record_reader_t, which must be
+   set by subclasses of #dynamorio::drmemtrace:record_reader_t to indicate EOF.
+ - Renamed cur_entry_ to entry_copy_ for subclasses of
+   #dynamorio::drmemtrace:record_reader_t, which can be used instead to store the
+   entry that is read from the trace file.
+ - Changed signature of dynamorio::drmemtrace:record_reader_t::read_next_entry() to
+   return a pointer to the read #dynamorio::drmemtrace:trace_entry_t instead of a bool.
+ - Added a parameter to the constructor of #dynamorio::drmemtrace:reader_t and
+   #dynamorio::drmemtrace:record_reader_t that indicates whether it is being used in
+   the online or offline mode.
+ - Moved the switch type enum from scheduler.h to trace_entry.h, now referenced as
+   #dynamorio::drmemtrace::switch_type_t.
+ - Added #drvector_t.config field which contains additional configuration parameters for
+   a #drvector_t. It currently contains #drvector_config_t.zero_alloc that when set to
+   true sets every entry pointer of the drvector's storage to 0 using memset().
+
+The changes between version \DR_VERSION and 11.3.0 include the following minor
+compatibility changes:
+
+ - Added drmgr_register_exit_event(), drmgr_unregister_exit_event(),
+   drmgr_register_exit_event_user_data(), and drmgr_unregister_exit_event_user_data(),
+   which are required to be used instead of dr_register_exit_event() when using drmgr
+   and provide priorities and user data to the exit event.
+ - Added drmgr_register_filter_syscall_event(), drmgr_unregister_filter_syscall_event(),
+   drmgr_register_filter_syscall_event_user_data(), and
+   drmgr_unregister_filter_syscall_event_user_data(), which are required to be used
+   instead of dr_register_filter_syscall_event() when using drmgr and provide
+   priorities and user data to the filter event.
+ - Added a separate cache replacement policy object to `caching_device_t`. `init` now
+   takes an `std::unique_ptr<cache_replacement_policy_t>` that defines the replacement
+   policy. It can be created manually or by using `create_cache_replacement_policy`.
+   Removed the subclasses `cache_lru_t`, `cache_fifo_t`, `tlb_lfu_t`, `tlb_plru_t` that
+   implemented specific cache replacement policies. Added implementations for the
+   matching policies as subclasses of `cache_replacement_policy_t`.
+ - Added the workload to the top bits of the tid for multi-workload drmemtrace
+   scheduling.  The drmemtrace view tool now prints the workload and tid in
+   the form "Wn.Tmmm".
+ - Changed the #dynamorio::drmemtrace::scheduler_tmpl_t::input_thread_info_t.
+   regions_of_interest structure layout, requiring recompiling using code.
+ - Changed the #dynamorio::drmemtrace::analysis_tool_tmpl_t::process_memref and
+   #dynamorio::drmemtrace::analysis_tool_tmpl_t::parallel_shard_memref return
+   conditions to no longer indicate an error if the error string is empty.
+   This can now be used to exit early without reporting an error.
+ - Changed the -skip_refs drmemtrace option to not count markers, matching the
+   -sim_refs and -warmup_refs options.  (The new -skip_records counts markers.)
+ - Dropped support for -skip_refs and -sim_refs in the view tool (use the new
+   -skip_records and -exit_after_records instead).
+ - The post-attach event is now called in every injection/attach mode, and
+   dr_register_post_attach_event() always returns true.
+   A new API query dr_attached_midrun() is added to distinguish attach from
+   launch injection to replace the return value of dr_register_post_attach_event().
+ - Changed takeover of other threads at start time from a staggered takeover
+   where each thread starts running as soon as it can to instead a synchronous
+   takeover where all threads must be taken over before any can start
+   executing.  The post-attach event becomes a safe spot for a snapshot of
+   global properties while all threads are paused.  Setting -no_synchronous_attach
+   switches to the old behavior, which may be needed for apps with a large number of
+   threads that have some awareness of their slowdown and may construe it as a hang.
+ - Added drmgr_register_post_attach_event(), drmgr_unregister_post_attach_event(),
+   drmgr_register_post_attach_event_user_data(), and
+   drmgr_unregister_post_attach_event_user_data(), which are required to be used
+   instead of dr_register_post_attach_event() when using drmgr and provide
+   priorities and user data to the post-attach event.
+ - Added drmgr_register_pre_detach_event(), drmgr_unregister_pre_detach_event(),
+   drmgr_register_pre_detach_event_user_data(), and
+   drmgr_unregister_pre_detach_event_user_data(), which are required to be used
+   instead of dr_register_pre_detach_event() when using drmgr and provide
+   priorities and user data to the pre-detach event.
+ - A C++17-supporting toolchain is now required to build.
+
+Further non-compatibility-affecting changes include:
+ - Changed the types of `block_size`, `total_size`, `num_blocks`, to `int64_t`
+   in dynamorio::drmemtrace::caching_device_t and its deriving classes.
+ - Added support for reading a single drmemtrace trace file from stdin
+   via "-infile -".
+ - Added the #dynamorio::drmemtrace::decode_cache_t library to make it easier and more
+   efficient for drmemtrace analysis tools to obtain decoded information about
+   instructions in the trace. This works for traces that have embedded instruction
+   encodings in them, and also for legacy traces without embedded encodings where the
+   encodings are obtained from the application binaries instead.
+ - Added a new drmemtrace analyzer flag -sched_syscall_file to allow specifying the
+   system call trace template file to be used for dynamic injection of system call trace
+   templates. Added similar options for the drmemtrace scheduler: #dynamorio::drmemtrace::
+   scheduler_tmpl_t::scheduler_options_t::kernel_syscall_trace_path, and #dynamorio::
+   drmemtrace::scheduler_tmpl_t::scheduler_options_t::kernel_syscall_reader.
+ - Added initial implementation of a noise generator in the drmemtrace framework. The
+   noise generator produces synthetic records to schedule with one or more target traces.
+   These synthetic records are interleaved with real trace records by the dynamic
+   scheduler. We currently don't support mixing of noise and trace records in non-dynamic
+   modes.
+   To produce noise generation we implemented:
+    - #dynamorio::drmemtrace::noise_generator_t scaffolding as a
+      #dynamorio::drmemtrace::reader_t to produce synthetic trace records.
+    - #dynamorio::drmemtrace::noise_generator_info_t, which contains the metadata
+      information to drive the generation of synthetic records.
+    - #dynamorio::drmemtrace::noise_generator_factory_t that creates
+      #dynamorio::drmemtrace::noise_generator_t, which can then be added to the input
+      workloads of #dynamorio::drmemtrace::scheduler_tmpl_t.
+    - the flag -add_noise_generator to the drmemtrace framework that enables noise
+      generation alongside the scheduled traces.
+ - Added AUX_SUBDIR (== "aux") to the subdirs in which get_aux_file_path() looks for
+   auxiliary files (e.g., v2p.textproto).
+ - Added -memdump_on_window option to the drmemtrace trace analysis tools framework.
+   This option triggers a memory dump when a trace window opens by -trace_after_instrs,
+   -trace_instr_intervals_file, or -retrace_every_instrs. If -retrace_every_instrs is
+   also enabled, a memory dump will be captured for each individual tracing window.
+ - Added reg_is_avx512().
+ - Added routine dr_invoke_syscall_as_app() to invoke a system call as though the
+   application made it, meaning it goes through DR's handling.
+ - Added drx_register_time_scaling() which scales timers on UNIX to align with
+   the slowdown of heavyweight instrumentation.
+ - Added a new drmemtrace option -exit_after_records which applies to all
+   tools and exits after N records.
+ - Added get_output_record_ordinal() to the drmemtrace scheduler.
+ - Added a new drmemtrace option -skip_records which applies to all
+   tools and skips the first N records.
+ - Added -trim_before_instr and -trim_after_instr options to trim_filter (part of
+   drmemtrace's record_filter). They allow the trimming of a trace using instruction
+   ordinals. The trimming is approximated to the closest timestamp in the trace that
+   follows the provided instuction ordinals, as timestamps are a safe spot to trim a
+   trace.
+ - Added a new library, drsyscall_record_lib, for reading and writing detailed syscall
+   records. These records capture arguments, memory regions, and return codes. A new
+   viewer, drsyscall_record_viewer, was also added to display the contents of these
+   records.
+ - Added the class dynamorio::drmemtrace::policy_rrip_t which implements RRIP cache
+   replacement policy model for the drcachesim tool.
+ - Added a new memtrace_stream_t::get_next_trace_pc() API for offline analysis and
+   scheduling of non-i-filtered thread-sharded traces that returns the next continuous
+   PC in the trace, which is from the next instruction or the next
+   #dynamorio::drmemtrace::TRACE_MARKER_TYPE_KERNEL_EVENT marker, whichever comes
+   first.
+ - Added a new #hashtable_t iterator hashtable_apply_to_all_key_payload_pairs_user_data()
+   that exposes the key of every element in the table.
+ - Added a new DynamoRIO client "DrPoints" in clients/drpoints to compute the Basic Block
+   Vectors of a program given a user-defined instruction interval.
+ - Added a new drmemtrace option -exit_after_instrs which applies to all
+   tools and exits after N instructions.
+ - Added drvector_clear() API that clears a #drvector_t storage without deleting it.
+ - Added #drvector_config_t that contains additional config parameters for a #drvector_t.
+ - Added drvector_init_ex() API that initializes a #drvector_t with extra parameters
+   defined in #drvector_config_t.
+ - Added instr_get_isa_feature() which performs an encoding walk and returns the
+   instruction ISA_FEAT_ constant.
+ - Added instr_get_isa_feature_name() which returns the string name of an ISA_FEAT_
+   constant.
+ - Added -filter_kernel and -filter_kernel_except_syscalls to the drmemtrace
+   analyzer that invokes #dynamorio::drmemtrace::kernel_filter_t to remove kernel
+   content from a trace.
+
+**************************************************
+<hr>
+
+The changes between version 11.3.0 and 11.2.0 include the following compatibility
+changes:
+ - No compatibility changes yet.
+
+Further non-compatibility-affecting changes include:
+ - Added support for statically linking clients and the DynamoRIO library into
+   a pure-static application via a new configure_DynamoRIO_static_client() CMake
+   function and new "_drstatic" static library CMake targets for the provided
+   extension libraries.
+ - Allow v2p.textproto file in a trace directory. This file is present in public traces.
+ - Allow v2p.textproto file to have one missing virtual_address field, which indicates
+   virtual_address == 0x0. Necessary in case a trace accesses virtual address 0x0.
+
+**************************************************
+<hr>
+
+The changes between version 11.2.0 and 11.1.0 include the following compatibility
+changes:
+ - Added #dynamorio::drmemtrace::TRACE_ENTRY_VERSION_RETIRED_INSTRUCTIONS_ONLY to
+   increase the trace version for drmemtraces with uncompleted instructions removed.
+
+Further non-compatibility-affecting changes include:
+ - Added instr_get_operation_size() and instr_set_operation_size() APIs for
+   #DR_ISA_REGDEPS #instr_t.
+
+**************************************************
+<hr>
+
+The changes between version 11.1.0 and 11.0.0 include the following compatibility
+changes:
+ - Removed uncompleted instructions and the corresponding memrefs from drmemtraces.
+   Instructions which are fetched but not completed due to asynchronous signal or
+   fault are removed. A new marker
+   #dynamorio::drmemtrace::TRACE_MARKER_TYPE_UNCOMPLETED_INSTRUCTION was added
+   to indicate an uncompleted instruction was removed. The value of the marker
+   is the encoding of the removed instruction up to a pointer's length.
+   OFFLINE_FILE_VERSION_RETIRED_INSTRUCTIONS_ONLY was added by mistake and it was changed to
+   #OFFLINE_FILE_VERSION_NO_OP.
+
+ - Moved module file read logic into read_module_file() in raw2trace_shared, and
+   removed raw2trace_directory_t::initialize_module_file() since the
+   read_module_file() can be directly used without having to pull in the whole
+   raw2trace_directory_t.
+
+Further non-compatibility-affecting changes include:
+ - Added X64 Linux support to dr_create_memory_dump(). This API has the same
+   restriction as dr_suspend_all_other_threads_ex(). For X86_64 platform, the feature is
+   supported only when fast FP save and restore is supported. And mixed mode is not
+   supported.
+ - Added the AArch64 FPMR register as DR_REG_FPMR.
+ - Added OPSZ_addr which chooses the appropriate operand size on X86 from 2/4/8 based
+   on the 32/64 bit mode and the presence or absence of the address size prefix.
+ - Fixed the order of operands for the vpexpandd/vpexpandq opcodes (previously the
+   source and destination operands were reversed).
+ - Fixed the VEX-encoded forms of vaesdec/vaesdeclast/vaesenc/vaesenclast/vpclmulqdq
+   to obey VEX.L, which they previously ignored.
+
+**************************************************
+<hr>
+
+The changes between version 11.0.0 and 10.0.0 include the following compatibility
+changes:
+ - Marked x86 rep instructions as predicated.
+ - The #dr_instr_category_t enum underwent changes to support new categories
+   such as STATE, MOVE, CONVERT, and MATH.
+   INT_MATH has been removed and replaced with MATH.
+   FP_MATH has been removed and replaced with FP|MATH.
+   The enumeration was organized in a different order, the old numbers become invalid
+ - The #dynamorio::drmemtrace::TRACE_MARKER_TYPE_FUNC_RETVAL marker for system
+   calls changed to contain the actual return value, rather than just whether
+   successful.  A new marker #dynamorio::drmemtrace::TRACE_MARKER_TYPE_SYSCALL_FAILED
+   was added to indicate failure.
+ - Changed the enum value of #dynamorio::drmemtrace::scheduler_t::DEPENDENCY_TIMESTAMPS
+   to include direct switch dependencies.  This is not a binary compatibility change
+   as the old value still refers purely to timestamps, but on a recompile it
+   refers to timestamps and direct switches, which is what most users should want.
+ - Rename the macro INSTR_CREATE_mul_sve to INSTR_CREATE_mul_sve_imm to
+   differentiate it from the other SVE MUL instructions.
+ - Renamed a protected data member in #dynamorio::drmemtrace::analyzer_tmpl_t from
+   merged_interval_snapshots_ to whole_trace_interval_snapshots_ (may be relevant for
+   users sub-classing analyzer_tmpl_t).
+ - Converted #dynamorio::drmemtrace::analysis_tool_tmpl_t::interval_state_snapshot_t
+   into a class with all its data members marked private with public accessor functions.
+ - Changed the type of the AArch64 #dr_mcontext_t members svep and ffr to #dr_svep_t.
+   This breaks binary compatibility with clients that were built against versions of
+   DynamoRIO before this change.
+ - Changed #dynamorio::drmemtrace::record_filter_t::record_filter_func_t
+   parallel_shard_filter() interface.  Added a new parameter of type
+   #dynamorio::drmemtrace::record_filter_t::record_filter_info_t that allows
+   #dynamorio::drmemtrace::record_filter_t to share data with its filters.
+ - Changed the way we cache the feature register values on AArch64. We now use an array of
+   uint64 values rather than individual variables for each feature register. This
+   allows the code to be more readable and easier to maintain.
+ - Renamed dr_set_sve_vector_length() to dr_set_vector_length() to share function
+   signature between AArch64 and RISC-V.
+ - Renamed dr_get_sve_vector_length() to dr_get_vector_length() to share function
+   signature between AArch64 and RISC-V.
+ - Changed the drcachesim -LL_miss_file option by adding a process ID field to the output.
+   This helps in better analyzing cache misses in multi-process environments.
+
+Further non-compatibility-affecting changes include:
+ - Added DWARF-5 support to the drsyms library by linking in 4 static libraries
+   from elfutils.  These libraries have LGPL licenses.
+ - Added raw2trace support to inject system call kernel trace templates collected from
+   elsewhere (e.g., QEMU, Gem5) into the user-space drmemtrace traces at the
+   corresponding system call number marker. This is done by specifying the path to the
+   template file via the new -syscall_template_file option.
+ - Added a new scheme for the modoffs field in the PC trace entry which allows L0
+   filtering of non-module code; see
+   #dynamorio::drmemtrace::ENCODING_FILE_TYPE_SEPARATE_NON_MOD_INSTRS. Also added
+   file type entry to the header of encoding files.
+ - Fixed a bug in the AArch64 codec with the way that SVE scalar+immediate predicated
+   contiguous load and store instructions represented the immediate offset in the IR.
+   In 10.0.0 the memory operand in these instruction used the immediate value from the
+   instruction (which is an index to be scaled by the vector length) as the displacement,
+   whereas the displacement value in a DynamoRIO memory operand should always be a byte
+   offset. This has now been corrected.
+   Traces and other tool results created with DynamoRIO prior to this fix may have
+   incorrect results if the application contained these instructions.
+   See <a href="https://github.com/DynamoRIO/dynamorio/pull/6390">PR #6390</a> for the
+   full list of affected instructions.
+ - Added core-sharded analysis tool support where traces are sharded by
+   core instead of by thread, with the thread schedules onto the cores
+   either following how they were traced or using a dynamic schedule.
+   Adds #dynamorio::drmemtrace::shard_type_t passed to initialize_shard_type()
+   to inform tools of the shard type.
+   Adds a new memtrace_stream_t::get_output_cpuid() query.
+   Adds a number of drcachesim options to set sharding mode (-core_sharding,
+   -core_serial) and control the schedule
+   (-sched_quantum, -sched_time, sched_order_time, -record_file,
+   -replay_file, -cpu_schedule_file).
+ - Added additional timestamps to drmemtrace traces: at the end of each buffer,
+   and before and after each system call.
+ - Added type_is_read() API that returns true if a trace type reads from memory.
+ - Added instr_num_memory_read_access() and instr_num_memory_write_access() that return
+   the number of memory read and write accesses of an instruction respectively.
+ - Added realloc to the set of functions traced by -record_heap by default.
+ - Deprecated #dr_fp_type_t for Floating-Point operation types in favor of the new
+   #dr_instr_category_t.
+   Deprecated instr_is_floating_ex(), replacing it with instr_is_floating_type().
+   The old versions will continue to work.
+ - Added several routines to the #dynamorio::drmemtrace::memtrace_stream_t interface
+   for drmemtrace analysis tools: get_output_cpuid(), get_workload_id(),
+   get_input_id(), get_input_interface().
+ - Added -record_syscall to drmemtrace for recording syscall parameters.
+ - Added opportunity to run multiple drcachesim analysis tools simultaneously.
+ - Added support of loading separately-built analysis tools to drcachesim dynamically.
+ - Added instr_is_opnd_store_source().
+ - Added kernel context switch sequence injection support to the drmemtrace scheduler.
+ - Added dr_running_under_dynamorio().
+ - Added instr_get_category_name() API that returns the string version (as char*) of a
+   category.
+ - Added #dynamorio::drmemtrace::TRACE_MARKER_TYPE_VECTOR_LENGTH marker to indicate the
+   current vector length for architectures with a hardware defined or runtime changeable
+   vector length (such as AArch64's SVE scalable vectors).
+ - Added a new drmemtrace analyzer option \p -interval_instr_count that enables trace
+   analyzer interval results for every given count of instrs in each shard. This mode
+   does not support merging the shard interval snapshots to output the whole-trace
+   interval snapshots. Instead, the print_interval_results() API is called separately
+   for each shard with the interval state snapshots of that shard.
+ - Added a new finalize_interval_snapshots() API to
+   #dynamorio::drmemtrace::analysis_tool_t to allow the tool to make holistic
+   adjustments to the interval snapshots after all have been generated, and before
+   they are used for merging across shards (potentially), and printing the results.
+ - Added opnd_is_vector_base_disp() to test if an opnd_t is a base+disp memory operand
+   that uses a vector register for the base or index register.
+ - Added -abort_on_invariant_error flag that instructs the invariant checker drmemtrace
+   analysis tool to abort trace analysis when a trace invariant error is found. This
+   is set to true by default to match the existing behavior of the invariant checker.
+ - Added a new instr API instr_is_xrstor() that tells whether an instruction is any
+   variant of the x86 xrstor opcode.
+ - Added a new #dr_isa_mode_t: #DR_ISA_REGDEPS, which is a synthetic ISA with the main
+   purpose of preserving register dependencies.
+ - Added instr_convert_to_isa_regdeps() API that converts an #instr_t from a real ISA
+   (e.g., #DR_ISA_AMD64) to the #DR_ISA_REGDEPS synthetic ISA.
+ - Added encodings2regdeps_filter_t filter to #dynamorio::drmemtrace::record_filter_t to
+   generate #DR_ISA_REGDEPS traces.
+ - Added #dynamorio::drmemtrace::OFFLINE_FILE_TYPE_ARCH_REGDEPS file type for
+   #DR_ISA_REGDEPS traces.
+ - Added -tool as the preferred alias for -simulator_type for the drmemtrace/drcachesim
+   trace analysis tool framework.
+ - Added "-t drmemtrace" as the preferred launcher for the drmemtrace/drcachesim
+   trace analysis tool framework.
+ - Added func_id_filter_t to #dynamorio::drmemtrace::record_filter_t to filter function
+   markers based on the function ID. This filter is enabled by "-filter_keep_func_ids"
+   followed by a comma-separated list of function IDs to preserve in the output trace.
+   All function markers whose ID is not in the list are removed.
+ - Added -skip_to_timestamp and #dynamorio::drmemtrace::scheduler_tmpl_t::
+   input_workload_t::times_of_interest to the drmemtrace scheduler.
+ - Added v2p_reader_t to parse a virtual-to-physical mapping in textproto format and
+   v2p_info_t to hold that mapping in memory.
+ - Added -v2p_file option to drcachesim TLB tool to set the path to a v2p.textproto file,
+   which provides a virtual to physical mapping of addresses for an offline trace. This
+   option overwrites both -page_size and
+   #dynamorio::drmemtrace::TRACE_MARKER_TYPE_PAGE_SIZE (if present) with the page size in
+   v2p.textproto. Option -use_physical (in offline mode) must also be set to use the
+   mapping in v2p.textproto (note that -use_physical during tracing is not necessary, nor
+   related to -use_physical offline).
+ - Added -trace_instr_intervals_file option to the drmemtrace trace analysis tools
+   framework. The file must be in CSV format containing a <start,duration> tracing
+   interval per line where start and duration are expressed in number of instructions.
+ - Added modify_marker_value_filter_t to #dynamorio::drmemtrace::record_filter_t to modify
+   the value of TRACE_MARKER_TYPE_ markers. This filter takes a list of
+   <TRACE_MARKER_TYPE_,new_value> and changes every listed marker in the trace to its
+   corresponding new_value.
+ - Added trace_analysis_tool::preferred_shard_type() to the drmemtrace framework to
+   allow switching to core-sharded by default if all tools prefer that mode.
+ - For the drmemtrace framework, if only core-sharded-preferring tools are enabled
+   (these include cache and TLB simulators and the schedule_stats tool), -core_sharded or
+   -core_serial is automatically turned on for offline analysis to enable more
+   representative simulated software thread scheduling onto virtual cores.
+
+**************************************************
+<hr>
+
+The changes between version 10.0.0 and 9.0.1 include the following compatibility
+changes:
+ - Eliminated the -skip_syscall option to drrun and drinject, which is now always
+   on by default.
+ - Changed the drcachesim -use_physical option to not modify the regular trace
+   entry virtual addresses but to instead insert metadata containing translation
+   information for converting virtual to physical addresses.
+ - Changed the layout of the DR_FAST_IR struct to add an element size property
+   that supports more information about vectors. This changes the method of accessing
+   the register in the structure from struct.value.reg to
+   struct.value.reg_and_element_size.reg. The element size can be accessed directly
+   via struct.value.reg_and_element_size.element_size.
+ - Changed the size of the #instr_t structure by appending a field which is used
+   for relative offsets while encoding.  The note field is no longer modified
+   during encoding.
+ - Reduced the value of #DR_NOTE_FIRST_RESERVED.  This is not expected to cause
+   problems unless clients are directly choosing high note values without using
+   drmgr_reserve_note_range().
+ - Changed the values of the AArch64 DR_REG_Z* constants so that Z registers can be
+   used in base+disp operands in SVE scatter/gather instructions. This breaks binary
+   compatibility for clients built against an older version of opnd_api.h, but source
+   code compatibility is unchanged.
+ - Removed the drcachesim external iterator analyzer interface.  Users should instead
+   use the new #dynamorio::drmemtrace::scheduler_tmpl_t interface for direct control
+   over iteration.  See \ref sec_drcachesim_sched for example code.
+ - Refactored the drmemtrace reader and file reader classes to better fit the
+   new scheduler model: now each reader owns just one single stream of records
+   with all multi-stream interleaving owned by the scheduler.
+ - Replaced the AArch64 OP_reta with OP_retaa and OP_retab. "reta" is not a real
+   AArch64 instruction and "reta" entries in the AArch64 codec were being used to
+   decode "retaa" and "retab". These instructions will now encode and decode correctly
+   as "retaa" and "retab".
+ - Added a #DR_XFER_RSEQ_ABORT event for a signal generated during an rseq region.
+ - Changed the interrupted PC for #DR_XFER_RSEQ_ABORT for native execution aborts to be
+   the abort handler (a signal during the instrumented execution will continue to have
+   the actual interrupted PC); changed the interrupted PC for #DR_XFER_SIGNAL_DELIVERY
+   for a signal generated during an rseq region to be the abort handler, matching the
+   kernel behavior.
+ - Changed the arguments and decode behavior of the INSTR_CREATE_orr_sve_pred(),
+   INSTR_CREATE_eor_sve_pred(), INSTR_CREATE_and_sve_pred() and
+   INSTR_CREATE_bic_sve_pred() to use the new vector element registers and to
+   correctly encode the predicate mode.
+ - ud2a and ud2b have been renamed to ud2 and ud1, respectively. The old constants
+   #OP_ud2a and #OP_ud2b, as well as the #INSTR_CREATE_ud2a()/#INSTR_CREATE_ud2b()
+   macros, are \#defined to the new names, #OP_ud2, #OP_ud1, #INSTR_CREATE_ud2(),
+   and #INSTR_CREATE_ud1() respectively. ud1 now correctly accounts for its operands
+   so manipulation of ud1 is not backwards compatible.
+ - All drcachesim/ code was changed to use the dynamorio::drmemtrace namespace.
+   External code using any drcachesim or drmemtrace library will need to be
+   recompiled.
+ - The droption header library is now inside the dynamorio::droption namespace.
+ - The drmemtrace record type #dynamorio::drmemtrace::TRACE_TYPE_INSTR_CONDITIONAL_JUMP
+   is deprecated in offline traces where it is replaced by
+   #dynamorio::drmemtrace::TRACE_TYPE_INSTR_TAKEN_JUMP and
+   #dynamorio::drmemtrace::TRACE_TYPE_INSTR_UNTAKEN_JUMP.
+ - All int_least64_t and uint_least64_t types in drcachesim were replaced with
+   their precise counterparts int64_t and uint64_t.
+ - The #dynamorio::drmemtrace::memref_t structure has a new field appended for
+   holding the actual target of each indirect branch.
+ - Increased the size of dr_simd_t to accommodate AArch64's Scalable Vector
+   Extension (SVE) as well as adding two new dr_simd_t instances to
+   #dr_mcontext_t: SVE predicate registers svep[] and the SVE first-fault
+   register, ffr. This is a significant binary compatibility change and will
+   require re-building clients built before SVE was added.
+ - The #instr_t structure has a new field inserted for holding the category type
+   #dr_instr_category_t which changes the size and the offsets of most fields
+   in 32-bit.  64-bit compatibility is not affected.
+
+Further non-compatibility-affecting changes include:
+ - Added new drmemtrace option -L0_filter_until_instrs which enables filtering
+   for the specified instruction count before switching to full instruction tracing.
+   Such bimodal filtered traces have #dynamorio::drmemtrace::OFFLINE_FILE_TYPE_BIMODAL_FILTERED_WARMUP
+   in their file type, and a #dynamorio::drmemtrace::TRACE_MARKER_TYPE_FILTER_ENDPOINT marker
+   at the point in the trace when filtering ended.
+ - Added AArchXX support for attaching to a running process.
+ - Added new fields analyze_case_ex and instrument_instr_ex to #drbbdup_options_t.
+ - Added drbbdup support to drwrap via #DRWRAP_INVERT_CONTROL, drwrap_invoke_insert(),
+   and drwrap_invoke_insert_cleanup_only().
+ - Added -trace_for_instrs and -retrace_every_instrs options to drcachesim
+   for periodic trace bustrs of an unmodified application.
+ - Added compression of drmemtrace raw offline files with various compression
+   choices under the -raw_compress option.  Compressing with lz4 is now the
+   default (if built with lz4 support).
+ - Added drmodtrack_lookup_pc_from_index().
+ - Added -use_physical support to drcachesim offline traces using three new
+   marker types: #dynamorio::drmemtrace::TRACE_MARKER_TYPE_PHYSICAL_ADDRESS,
+   #dynamorio::drmemtrace::TRACE_MARKER_TYPE_VIRTUAL_ADDRESS, and
+   #dynamorio::drmemtrace::TRACE_MARKER_TYPE_PHYSICAL_ADDRESS_NOT_AVAILABLE.
+ - Added an open-address hashtable implementation for cases where third-party
+   libraries must be avoided and open addressing is best: dr_hashtable_create(),
+   dr_hashtable_destroy(), dr_hashtable_clear(), dr_hashtable_lookup(),
+   dr_hashtable_add(), dr_hashtable_remove().
+ - Added a new #dynamorio::drmemtrace::TRACE_MARKER_TYPE_PAGE_SIZE record to drcachesim offline traces.
+ - Added new drmemtrace options -L0I_filter and -L0D_filter that allow enabling
+   online filtering for only instruction or only data entries respectively. The
+   old option -L0_filter is deprecated but still supported for backward
+   compatibility. It simply sets both the new options.
+ - Added a new DR extension, namely "drpttracer", which provides clients with tracing
+   functionality via Intel's PT instruction tracing feature. This feature is still
+   experimental and available only on Intel processors.
+ - Added a new drmemtrace option -enable_kernel_tracing that allows recording each
+   syscall's Kernel PT and writes every syscall's PT and metadata to files in
+   -outdir/kernel.raw/ for later offline analysis. This feature is still experimental
+   and available only on Intel processors that support the Intel@ Processor Trace
+   feature.
+ - Added drmemtrace_get_encoding_path().
+ - Added preliminary support for generated code to drmemtrace.
+ - Changed the default drmemtrace offline file format from .gz to .zip and
+   added the option -chunk_instr_count to control the split of a file within
+   the .zip, which sets the granularity of a fast seek.
+ - Added dr_register_post_attach_event(), dr_unregister_post_attach_event(),
+   dr_register_pre_detach_event(), and dr_unregister_pre_detach_event().
+ - Added instruction encodings to drmemtrace offline traces.
+ - Added drmemtrace_replace_file_ops_ex().
+ - Added -align_endpoints to drmemtrace to avoid uneven attach/detach periods.
+ - Added a method of representing vector registers with element sizes.
+   They can be created with opnd_create_reg_element_vector(), detected with
+   opnd_is_element_vector_reg() and have their element size retrieved by
+   opnd_get_vector_element_size().
+ - Deprecated the drmemtrace analysis tool functions initialize() and
+   parallel_shard_init(), replacing them with initialize_stream() and
+   parallel_shard_init_stream().  The old versions will continue to work.
+   The stream interface passed to analysis tools provides tools with the
+   record and instruction ordinals along with the values of top-level
+   headers.
+ - Added #dynamorio::drmemtrace::record_analyzer_t and #dynamorio::drmemtrace::record_analysis_tool_t for analyzing the
+   sequence of #dynamorio::drmemtrace::trace_entry_t exactly as present in a stored offline trace.
+ - Added opnd_size_to_shift_amount() and opnd_create_base_disp_shift_aarch64()
+   for explicitly specifying shift amounts in the creation of operands for
+   AArch64 memory addresses.
+ - Added opnd_create_increment_reg() to create a register from an existing
+   register whose register number is incremented by some amount, wrapping
+   at the max register number for that register.
+ - Added opnd_create_vector_base_disp_aarch64() and reg_is_z() for creating
+   memory address operands that use SVE Z registers with a specified element
+   size.
+ - Added a new #dynamorio::drmemtrace::scheduler_tmpl_t interface providing scheduling
+   of drmemtrace offline files onto configurable output streams, meant for use by
+   microarchitectural simulators.
+ - Added a #dynamorio::drmemtrace::memtrace_stream_t interface for drmemtrace analysis tools to
+   query key attributes of each input trace.
+ - Added instr_create_1dst_6src() convenience function that returns an instr_t
+   with one destination and six sources.
+ - Added a new label to help in handling "rseq" (Linux restartable sequence) regions:
+   #DR_NOTE_RSEQ_ENTRY.
+ - Added instr_get_offset() API for getting the offset of an instr in an instrlist that
+   has been encoded with instrlist_encode* set of APIs.
+ - Added a new drmemtrace analyzer option \p -interval_microseconds and various new
+   #dynamorio::drmemtrace::analysis_tool_t APIs for producing per-interval results. The analyzer framework
+   invokes the generate_interval_snapshot() and generate_shard_interval_snapshot()
+   analysis tool APIs periodically every \p -interval_microseconds of the trace as
+   measured by the #dynamorio::drmemtrace::TRACE_MARKER_TYPE_TIMESTAMP marker values. In these callbacks, the
+   tool creates and returns a snapshot of their internal state that is required to
+   produce and print per-interval results in a later print_interval_results() call.
+   The tool's internal state is a struct derived from the
+   #dynamorio::drmemtrace::analysis_tool_tmpl_t::interval_state_snapshot_t base struct. Additionally, the tool
+   implements combine_interval_snapshot() to combine two interval snapshot structs,
+   which is required for producing whole-trace results in the parallel mode of analyzer
+   operation, and also release_interval_snapshot() which is used to release the
+   analyzer framework's claim to the interval snapshot objects.
+ - Added a new drmemtrace analysis tool: syscall_mix, to count frequency of system
+   calls in a trace. This tool works in both the online and offline modes of
+   drmemtrace.
+ - Added proc_get_vector_length_bytes() for AArch64. This returns the current
+   vector length on all ARMv8 hardware including hardware which supports the
+   Scalable Vector Extension (SVE).
+
+**************************************************
+<hr>
+
+The changes between version 9.0.1 and 9.0.0 include the following compatibility
+changes:
+ - Introduced a new CMake option called BUILD_PACKAGE to skip glibc
+   compatibility checks. This is off by default such that building DynamoRIO
+   from source is straight-forward to do on rolling release Linux
+   distributions, and enabled by make/package.cmake when building a
+   distributable version of DynamoRIO.
+
+Further non-compatibility-affecting changes include:
+ - Fixed a significant performance regression between 8.0.0 and 9.0.0
+   (between 8.0.18740 and 8.0.18747) affecting Windows programs with
+   varying indirect branches on hot code paths.
+ - Added alias support to droption.
+ - The drcpusim option -blacklist was renamed to -blocklist but the old name
+   is still accepted.
+ - Added droption_parser_t::clear_values() for re-setting accumulating option
+   values on re-attach for statically linked clients.
+ - Added the count of cache exits to #dr_stats_t.
+ - Added dr_register_inject_paths() and a corresponding -use_alt_dll drrun/drconfig
+   parameter for control over DynamoRIO library paths, in particular the other
+   bitwidth path, when configuring target processes.
+ - Added -tool_dir drrun/drconfig parameter to control where to look for tool
+   config files.
+
+**************************************************
+<hr>
+
+The changes between version 9.0.0 and 8.0.0 include the following compatibility
+changes:
+
+ - The AArch64 opcode enum ordering changed.
+ - A source compatibilty change in drcachesim analysis tools for users
+   who have created derived classes from existing analysis tools:
+   member fields of classes are now following a consistent style with
+   an underscore suffix.  References to renamed fields will need to be
+   updated.
+ - A change in the load callbacks used with drmodtrack_add_custom_data()
+   and drmemtrace_custom_module_data(): they each take an additional parameter, the
+   segment index.  The custom data field is now per-segment and not per-module,
+   and all callbacks are invoked separately for each segment.
+
+The changes between version 9.0.0 and 8.0.0 include the following minor
+compatibility changes:
+
+ - drconfiglib (and thus drrun and drconfig) now sets only the new client path
+   options which are added in this release to support other-bitwidth child processes.
+   This means that a drconfiglib from this version will not properly configure for a
+   DynamoRIO core library from a prior version.
+ - A new option -ldstex2cas is on by default on ARM and AArch64.  This converts
+   load-exclusive store-exclusive sequences to use compare-and-swap instead,
+   which enables normal instrumentation of such sequences without clearing
+   the exclusive monitor and causing infinite loops.  However, the compare-
+   and-swap's semantics are not identical: it does not detect "ABA" changes and
+   could cause errors in lock-free data structures or other application constructs.
+   See \ref sec_ldrex for more information.
+ - The header file dr_tools.h has been split up, with module information now in a new
+   file dr_modules.h, os-specific queries in dr_os_api.h, and tracedump types in
+   dr_tracedump.h.  dr_api.h includes the new files, so users including dr_api.h are
+   unaffected.
+ - The header files dr_ir_utils.h, dr_ir_opnd.h, dr_ir_instr.h, and dr_ir_instrlist.h
+   have been split up, with encoding routines now in a new file dr_ir_encode.h,
+   decoding routines in dr_ir_decode.h, disassembly routines in dr_ir_disassemble.h.
+   dr_api.h includes the new files, so users including dr_api.h are unaffected.
+ - The routines dr_insert_save_fpstate(), dr_insert_restore_fpstate(),
+   and dr_insert_get_seg_base() moved from dr_proc.h to dr_ir_utils.h.
+ - Added a flags field to #emulated_instr_t and two emulator-set flags values:
+   #DR_EMULATE_REST_OF_BLOCK, indicating an emulation sequence that has no end label
+   and includes the rest of the block; and #DR_EMULATE_INSTR_ONLY, indicating
+   an emulation for which instrumentation should still examine the
+   emulation sequence for observing data operations.  A third value is set by
+   drmgr_in_emulation_region(): #DR_EMULATE_IS_FIRST_INSTR.  This flag addition preserves
+   binary compatibility, but source code that did not zero the structure could end
+   up with an uninitialized flags field when calling drmgr_insert_emulation_start().
+ - drcov's output now uses a module segment offset, rather than a module base offset.
+   This better supports modules with code beyond the first segment and with
+   gaps between segments.
+ - Changed the drcachesim view tool's behavior to count all trace entries, rather
+   than just instructions, with respect to the -skip_refs and -sim_refs flags.
+   This matches the cache and TLB simulator behavior.
+ - drcachesim's child cache statistics now include hits from all lower levels and
+   not just the immediately lower level child caches.
+ - For AArch64 the OP_sys opcode is still implemented but has been split up
+   into its data and instruction cache opcodes. In cases where OP_sys was used
+   with enums representing data and instruction cache opcodes, OP_sys is no
+   longer used, replaced by the relevant data and instruction cache opcodes
+   starting with OP_dc_ and OP_ic_, e.g. OP_ic_ivau, OP_dc_zva.
+
+Further non-compatibility-affecting changes include:
+
+ - On x86 Windows, different-bitwidth child processes are now followed into.
+   The default injection method has also changed to a new method relying on
+   an image entry hook in some cases.  The old behavior can be requested by
+   passing "-late" to drrun or calling dr_inject_use_late_injection().
+ - Added drmgr_register_opcode_instrumentation_event() and
+   drmgr_unregister_opcode_instrumentation_event() so that drmgr supports
+   opcode event instrumentation.
+ - Added dr_num_app_args(), dr_get_app_args() and dr_app_arg_as_cstring() to
+   enable the gathering of application command-line args. Currently, implemented
+   for Unix systems only.
+ - Added dr_get_error_code() to obtain the error code of the last failed API routine.
+   Not all API routines support the setting of error codes. Please look at their
+   documentation to check if they do.
+ - Added -instr_only_trace option to drcachesim.
+ - Added other-bitwidth child process support, with the other client library
+   specified by "-c32" "-c64" to drrun or drdeploy, by dr_register_client_ex()
+   with #dr_config_client_t.is_alt_bitwidth=true to drconfiglib, and by
+   CLIENT{32,64}_{ABS,REL} in tool files.
+   Added dr_get_client_info_ex() and dr_client_iterator_next_ex() to support
+   querying other-bitwidth client registration.
+ - Added a new drcachesim option \p -max_global_trace_refs for specifying a global
+   trace size limit that does not terminate the process.
+ - Added opnd_create_immed_double(), opnd_get_immed_double() and
+   opnd_is_immed_double() to enable the creation and handling of double
+   precision floating-point operands.
+ - Added dr_flush_region_ex API that accepts a callback to be executed after synch
+   flush but before the threads are resumed. The existing dr_flush_region API
+   is modified to invoke dr_flush_region_ex with a NULL callback.
+ - Added instr_is_exclusive_load().
+ - Added XINST_CREATE_store_pair() and XINST_CREATE_load_pair().
+ - Added instr_replace_reg_resize() and opnd_replace_reg_resize().
+ - Added #DRX_COUNTER_REL_ACQ flag to optionally enable release-acquire semantics for
+   drx_insert_counter_update() on AArchXX.
+ - Added a preferred base field to the #_module_data_t struct and to the
+   #_drmodtrack_info_t struct.
+ - Added support for running under QEMU via the \ref op_xarch_root "-xarch_root"
+   runtime option which locates guest system libraries and enables workarounds for
+   problems with QEMU's threads.
+ - Added dr_is_detaching(), an API to query whether detach is in progress.
+ - Added instr_zeroes_zmmh() that returns true if an instruction clears the
+   upper bits of a ZMM register with zeros.
+ - Added instr_clear_label_callback().
+ - Added #DRREG_HANDLE_MULTI_PHASE_SLOT_RESERVATIONS to #drreg_bb_properties_t to
+   enable logic that avoids conflicts in spill slots when drreg is used to reserve
+   registers in multiple phases.
+ - Added drmgr_in_emulation_region(), drmgr_orig_app_instr_for_fetch(), and
+   drmgr_orig_app_instr_for_operands() for more conveniently handling emulation.
+ - Added the reconstructed #instrlist_t when available for the faulting fragment
+   to #dr_fault_fragment_info_t. This makes it available to the restore state
+   event callback(s) via the #dr_restore_state_info_t arg.
+ - Added the source context for restartable sequence aborts (#DR_XFER_RSEQ_ABORT)
+   which was previously missing.
+ - Added a #dynamorio::drmemtrace::TRACE_MARKER_TYPE_VERSION entry to drmemtrace traces.
+ - Augmented drmemtrace #dynamorio::drmemtrace::TRACE_MARKER_TYPE_KERNEL_EVENT entries with the absolute
+   PC of the interruption point, including for restartable sequence aborts, which
+   now also have an additional #dynamorio::drmemtrace::TRACE_MARKER_TYPE_RSEQ_ABORT identifier.
+ - Added a fifth instrumentation phase (meta_instru) that executes after the
+   insertion of instrumentation and instrumentation optimizations. Its primary purpose
+   is to enable debugging of instrumentation sequences and detection of
+   instrumentation-induced bugs.
+ - Added \p drstatecmp Extension which provides mechanisms to enable systematic
+   and exhaustive machine state comparisons across instrumentation sequences.
+ - Added drmodtrack_lookup_segment().
+ - Added a new drrun option \p -attach for attaching to a running process.
+   This is currently an experimental option and is not yet as well-supported
+   as launching a new process.  It is only supported on x86 at this time.
+ - Added \ref page_drcallstack Extension for walking application callstacks, with
+   an initial Linux-only implementation.
+ - Added new #dr_cleancall_save_t flags which are required for proper interaction
+   between clean calls and drreg: #DR_CLEANCALL_READS_APP_CONTEXT must be set for
+   dr_get_mcontext() to obtain the proper values, and #DR_CLEANCALL_WRITES_APP_CONTEXT
+   must be set to ensure that dr_set_mcontext() is persistent.
+   If the call may be skipped by tool-inserted control flow, #DR_CLEANCALL_MULTIPATH
+   must additionally be set.
+ - Added a new event dr_register_clean_call_insertion_event(), meant for use by
+   register management libraries.
+ - Added drreg_statelessly_restore_all().
+ - Completed drx_expand_scatter_gather() support for emulating x86 scatter/gather
+   instructions using a sequence of scalar stores/loads. The scalar store/load
+   sequence makes it easier for clients to instrument each memory access.
+
+**************************************************
+<hr>
+
+Version 8.0.0 includes Dr. Memory and the
+Dr. Memory Framework (DRMF) in the same package as DynamoRIO.  DRMF
+provides the umbra, drsyscall, and drsymcache Extensions for use by
+clients.
+
+The changes between version 8.0.0 and 7.1.0 include the following compatibility
+changes:
+
+ - Changed the enumeration of the DR_REG_ enum by adding x86 AVX-512 registers as well
+   as reserved ranges for future extensions.
+   This is a binary compatibility change for the DR_REG_ enum.
+ - Changed the enumeration of the OPSZ_ enum by moving its start back to 0. The OPSZ_
+   enum now completely overlaps the DR_REG_ enum.
+   This is a binary compatibility change for the OPSZ_ enum.
+ - Added a new encoding hint field to #instr_t.
+ - Added a requirement that a C++11-compliant compiler be used with \ref page_droption.
+ - Changed the syntax of the drcachesim -record_function option.  It no longer takes
+   in an identifier: the identifier is computed by the tracer.  It thus takes pairs,
+   with an optional third argument for flags such as "noret" to indicate that the
+   return value should not be recorded.
+   The tracer writes out a file listing functions traced and their identifiers
+   with "id,library!symbol" on each line of the file.
+ - Added free_key_func to the drcontainers hashtable_configure(), which adds a field
+   to #hashtable_config_t.  Binary compatibility is maintained via the size field
+   of the struct, but users who were not zeroing the whole structure and who update
+   and recompile without setting the field may see crashes due to
+   free_key_func being uninitialized.
+ - Changed the 32-bit x86 stack alignment of DynamoRIO and clients built using
+   DR's CMake configuration from 4 to 16 on Linux to match modern conventions.
+
+The changes between version 8.0.0 and 7.1.0 include the following minor
+compatibility changes:
+
+ - Added the define #MCXT_NUM_SIMD_SLOTS that was renamed from NUM_SIMD_SLOTS.
+   #MCXT_NUM_SIMD_SLOTS is now a constant that shall be used only to determine
+   the number of SIMD slots in DynamoRIO's mcontext.
+ - Replaced NUM_SIMD_SLOTS with proc_num_simd_saved().
+   Clients may set(DynamoRIO_NUM_SIMD_SLOTS_COMPATIBILITY ON) in order to provide
+   the define NUM_SIMD_SLOTS using proc_num_simd_saved(). The macro is not a constant
+   expression and code relying on this needs to be rewritten.
+   DynamoRIO_NUM_SIMD_SLOTS_COMPATIBILITY is set automatically if clients target
+   version 7.1.0 or earlier.
+ - Renamed mcontext's "ymm" structure to "simd".
+ - Deprecated reg_is_xmm() and reg_is_ymm().
+ - The function reg_is_extended() now returns true for the upper 8 simd registers
+   as part of AVX-512, e.g. xmm16 - xmm31.
+ - Dropped support for clients used with statically linked DynamoRIO to reach
+   the code cache with 32-bit displacements.
+ - An additional parameter in the accessors to the drcachesim cache stats
+   (namely cache_stats_t and caching_device_stats_t) that passes a pointer to
+   the cache block being accessed (on a hit) or being replaced (on a miss).
+   This allows users to extend the cache block and stats classes in order to
+   collect more stats.
+ - Moves the immediate operand of the VEX encoded version of vextractps and vinsertps
+   to be the first source.
+ - The GPR versions of the vmovd and vmovq AVX opcodes are no longer combined into a
+   single vmovd.
+ - Changed the #PFX format string specifier to use %p rather than %x internally.
+ - DR no longer forwards _snprintf, _snwprintf, _vsnprintf, sprintf, or sscanf to
+   ntdll.  Clients should use the dr_-prefixed versions of these functions.
+ - PC-relative control transfer instructions are now auto-re-relativized by the
+   general decoder and encoder.  This affects clients and standalone tools that use
+   decode_from_copy() or instr_encode_to_copy() or instrlist_encode_to_copy().
+   Previously, re-relativization for instruction references only happened when an
+   instruction was re-encoded.  This auto-PC-relativization can be avoided by calling
+   instr_set_rip_rel_valid() and setting the validity of the PC-relative data to false.
+ - Fixed major synchronization bugs on ARM and AArch64.
+
+Further non-compatibility-affecting changes include:
+
+ - Added the function proc_num_simd_registers().
+ - Added drfront_set_verbose() to obtain diagnostics from drfrontendlib.
+ - Added new fields to #dr_os_version_info_t which contain the build number,
+   edition, and Windows 10 release identifier.
+ - Added the function instr_is_xsave().
+ - Added the type #dr_zmm_t.
+ - Added the type #dr_opmask_t.
+ - Added the define #MCXT_NUM_OPMASK_SLOTS for the number of AVX-512 OpMask registers.
+ - Renamed mcontext's ymm structure into simd.
+ - Added a new option -logprefix to drcov.
+ - Added the AVX-512 registers #DR_REG_XMM16 - #DR_REG_XMM31, #DR_REG_YMM16 -
+   #DR_REG_YMM31 and their #DR_REG_ZMM0 - #DR_REG_ZMM31 siblings as well as
+   #DR_REG_K0 - #DR_REG_K7.
+ - Added the function reg_is_opmask().
+ - Added the functions reg_is_strictly_xmm(), reg_is_strictly_ymm() and
+   reg_is_strictly_zmm().
+ - Added the function reg_is_avx512_extended().
+ - Added the function instr_is_opmask().
+ - Added reg_set_value_ex() to set XMM, YMM and ZMM values.
+ - Added the functions instr_set_encoding_hint(), instr_has_encoding_hint().
+ - Added the type #dr_encoding_hint_type_t.
+ - Added #INSTR_ENCODING_HINT macro.
+ - Added dr_standalone_exit() with support for re-attaching afterward.
+ - Added dr_register_low_on_memory_event() for tracking low on memory events.
+ - Added dr_mcontext_zmm_fields_valid() to query the state of lazy AVX-512 context
+   switching.
+ - Added the function proc_avx512_enabled().
+ - Added support for applications using the Linux kernel's restartable sequence
+   ("rseq") feature, subject to the limitations listed in \ref sec_rseq.
+ - Added coherence support in drcachesim.
+ - Added the function proc_num_opmask_registers();
+ - reg_get_value_ex() now supports reading AVX-512 mask registers.
+ - Added the function reg_is_bnd().
+ - Added the functions instr_is_gather() and instr_is_scatter().
+ - Added the function drx_expand_scatter_gather().
+ - Added the function dr_atomic_add64_return_sum().
+ - Added the function instr_reads_from_exact_reg() to test whether instructions
+   read from exact registers.
+ - Added the function reg_is_vector_simd() to test whether registers are
+   either XMM, YMM or ZMM, excluding any MMX register checks.
+ - Added DR_NUM_SIMD_VECTOR_REGS as an alias to MCXT_NUM_SIMD_SLOTS in order
+   to get the static number of supported SIMD vectors.
+ - Added drmgr_register_low_on_memory_event(), drmgr_unregister_low_on_memory_event()
+   and their variants so that drmgr can support low-on-memory events.
+ - Added drmgr_is_first_nonlabel_instr() and instrlist_first_nonlabel().
+ - Added a new standalone tool "drdisas" which disassembles raw bytes using
+   DR's decoder.
+ - Added decode_sizeof_ex() and instr_get_rel_data_or_instr_target() handling
+   relative instruction references.
+ - Added drx_instrlist_size() and drx_instrlist_app_size() to obtain the size
+   of a basic block.
+ - Added drreg_restore_all() to restore all unreserved registers currently
+   maintained by drreg.
+ - Added a func_view tool to drcachesim for analyzing function traces.
+ - Added a non-heap-using instruction structure #instr_noalloc_t for use when
+   decoding in a signal handler, along with instr_noalloc_init() and
+   instr_from_noalloc().
+ - Added drwrap_get_stats().
+ - Added #DRWRAP_NO_DYNAMIC_RETADDRS for reducing drwrap overhead at the cost
+   of missing some post-call callbacks.
+ - Added #DRWRAP_REPLACE_RETADDR for an alternative method of setting up post-call
+   control points by replacing return addresses.  This does not work for every
+   application, but reduces overhead.
+ - Added -record_dynsym_only to drcachesim for faster function tracing symbol
+   lookups when internal symbols are not needed.
+ - Added -record_replace_retaddr_only to drcachesim for faster function tracing
+   wrapping for well-behaved applications.
+ - Added dr_merge_arith_flags() as a convenience routine to merge arithmetic flags
+   for restoration done by outlined code.
+ - Added dr_annotation_pass_pc() to obtain the interrupted PC in an annotation
+   handler.
+ - Added atomics for safe and visible aligned loads and stores on all platforms:
+   dr_atomic_load32(), dr_atomic_store32(), dr_atomic_load64() dr_atomic_store64().
+ - The state restore event (dr_register_restore_state_event()) is now called for
+   all translation attempts, even when the register state already contains
+   application values, to allow clients to restore memory.
+ - Added the function dr_get_process_id_from_drcontext() for obtaining a process ID
+   associated with the given drcontext, which may be different from the current
+   dr_get_process_id() in some contexts.
+ - The private loader's malloc redirection now guarantees double-pointer-sized
+   alignment, to match what system-provided allocators use.
+ - Added a new DR extension, namely "drbbdup", which enables different case
+   instrumentation of the same basic block by duplicating code.
+
+**************************************************
+<hr>
+
+Version 7.1.0 includes Dr. Memory and the Dr. Memory Framework (DRMF) in
+the same package as DynamoRIO.  DRMF provides the umbra, drsyscall, and
+drsymcache Extensions for use by clients.
+
+The changes between version 7.1.0 and 7.0.0 include the following minor
+compatibility changes:
+
+ - The drltrace tool has been moved to the Dr.Memory Framework.
+ - Removed DRMGR_PRIORITY_INSERT_CLS_ENTRY, DRMGR_PRIORITY_INSERT_CLS_EXIT,
+   DRMGR_PRIORITY_NAME_CLS_ENTRY, and DRMGR_PRIORITY_NAME_CLS_EXIT, as
+   the new kernel xfer event (drmgr_register_kernel_xfer_event()) removes the
+   need for them.
+ - Renamed the LOG_ macros (#LOG_NONE, #LOG_ALL, etc.) to have a DR_ prefix
+   to avoid name conflicts.  Clients should set(DynamoRIO_LOG_COMPATIBILITY ON)
+   prior to configure_DynamoRIO_client() to use the old constants and avoid
+   any source changes; this will happen automatically if the client
+   targets version 7.0.0 or earlier.  Binary compatibility is unaffected.
+ - Added a parameter to cmake functions DynamoRIO_get_target_path_for_execution and
+   DynamoRIO_copy_target_to_device. External projects outside of DynamoRIO need
+   to pass _DR_location_suffix.
+ - The drcachesim tool's offline traces are now stored in separate files per traced
+   application thread, rather than a single interleaved file.  Reading and analyzing
+   a legacy interleaved file is still supported, but all new generated traces are
+   split.  Splitting enables parallelized post-processing and trace analysis.
+ - In standalone mode, there are no 32-bit-displacement reachability guarantees
+   regarding DynamoRIO's heap.
+
+Further non-compatibility-affecting changes include:
+
+ - Added drx_buf_insert_buf_memcpy().
+ - Added XINST_CREATE_add_sll(), XINST_CREATE_jump_cond(), and XINST_CREATE_slr_s().
+ - Added thread synchronization events via dr_event_create(), dr_event_destroy(),
+   dr_event_wait(), dr_event_signal(), and dr_event_reset().
+ - Added drmodtrack customization via drmodtrack_add_custom_data() and
+   post-processing support via drmodtrack_offline_write().
+ - Added drcachesim customization via drmemtrace_replace_file_ops(),
+   drmemtrace_custom_module_data(), drmemtrace_get_output_path(),
+   drmemtrace_get_modlist_path(), and a separate rawtrace library for
+   post-processing customization with raw2trace_t::handle_custom_data(),
+   raw2trace_t::do_module_parsing(), raw2trace_t::do_conversion(), and
+   raw2trace_directory_t.  The raw2trace library also includes an interface
+   for obtaining further instruction information than is stored in the
+   trace via raw2trace_t::do_module_parsing_and_mapping() and
+   raw2trace_t::find_mapped_trace_address().
+   A corresponding CMake function for finding the
+   tracer customization header is use_DynamoRIO_drmemtrace_tracer().
+ - Added drreg_restore_app_aflags().
+ - Added a set_value() function to the \ref page_droption.
+ - Added instrlist_get_auto_predicate() and instrlist_set_auto_predicate().
+ - Globally enabled auto predication in the drmgr instrumentation insertion event by
+   default.
+ - Added drmgr_disable_auto_predication().
+ - Added a new option -signal_stack_size with a smaller default value than
+   before, to save space on applications with many threads.
+ - Added instr_predicate_is_cond().
+ - Added a hardware data next-line prefetcher to drcachesim.  It is on by
+   default, so simulation results may not match those in prior releases.
+   It can be disabled by running with "-data_prefetcher none" (see \ref
+   sec_drcachesim_ops).
+ - Added a last-level cache miss recording feature to drcachesim.
+ - Added a delayed tracing feature to drcachesim.
+ - Added an option to drcachesim to specify cache warmup by loaded fraction of the
+   last level cache.
+ - On Linux, the VDSO module is now included in the module list at program
+   startup.
+ - Added support for Windows 10 1703.  We provide an artificial version
+   identifier #DR_WINDOWS_VERSION_10_1703 to distinguish this major update.
+ - Added support for Windows 10 1709.  We provide an artificial version
+   identifier #DR_WINDOWS_VERSION_10_1709 to distinguish this major update.
+ - Added an event for kernel-mediated control flow via
+   dr_register_kernel_xfer_event() with corresponding routines
+   drmgr_register_kernel_xfer_event() and drmgr_register_kernel_xfer_event_ex().
+ - Added a new option -ignore_all_libs to drcpusim.
+ - Added several new trace analysis tools to drcachesim: reuse distance,
+   reuse time, histogram, and trace basic counts.
+ - Added a trace analysis tool framework to facilitate creating custom
+   trace tools using the CMake function use_DynamoRIO_drmemtrace() and
+   exported drmemtrace_analyzer and analysis tool libraries.
+ - Added the CMake function configure_DynamoRIO_main_headers() to
+   facilitate using drfrontendlib by itself.
+ - Added instr_is_string_op() and instr_is_rep_string_op().
+ - Added dr_app_recurlock_lock().
+ - Added hashtable_apply_to_all_payloads() to iterate over all payloads in a
+   hashtable.
+ - Added drutil_insert_get_mem_addr_ex().
+ - Added dr_vfprintf().
+ - Added drmgr_register_thread_init_event_user_data() and
+   drmgr_unregister_thread_init_event_user_data() to enable passing of user data.
+ - Added drmgr_register_thread_exit_event_user_data() and
+   drmgr_unregister_thread_exit_event_usr_data() to enable passing of user data.
+ - Added drmgr_register_module_load_event_user_data() and
+   drmgr_unregister_module_load_event_user_data() to enable passing of user data.
+ - Added drmgr_register_module_unload_event_user_data() and
+   drmgr_unregister_module_unload_event() to enable passing of user data.
+ - Added a new drcachesim feature that records which cpu each thread
+   executed on along with an optional simulator scheduling feature to
+   schedule threads on simulated cores to match the recorded execution on
+   physical cpus.
+ - Added #DR_DISALLOW_UNSAFE_STATIC and dr_allow_unsafe_static_behavior()
+   for sanity checks to help support statically-linked clients.
+ - Added drmgr_register_pre_syscall_event_user_data() and
+   drmgr_unregister_pre_syscall_event_user_data() to enable passing of user data.
+ - Added drmgr_register_post_syscall_event_user_data() and
+   drmgr_unregister_post_syscall_event_user_data() to enable passing of user data.
+ - Added dr_where_am_i(), dr_track_where_am_i(), and dr_is_tracking_where_am_i()
+   better support client self-profiling via sampling.
+ - Added dr_get_stats() to retrieve runtime stats. Currently limited to number
+   of built basic blocks.
+ - Added drreg_reservation_info_ex(), drreg_statelessly_restore_app_value(),
+   and drreg_is_instr_spill_or_restore().
+ - Added dr_app_stop_and_cleanup_with_stats() to obtain stats values right before
+   cleanup.
+ - drmodtrack now allocates an entry per segment for each loaded module.
+   Added a file offset field to module_segment_data_t for UNIX platforms.
+   drcachesim saves file offset information in modules.log on UNIX platforms.
+ - Added dr_prepopulate_cache() and dr_prepopulate_indirect_targets() for
+   setting up the code cache prior to execution.
+ - Added support for Windows 10 1803. We provide an artificial version
+   identifier #DR_WINDOWS_VERSION_10_1803 to distinguish this major update.
+ - Generalization of the drcachesim #dynamorio::drmemtrace::raw2trace_t API (Issue #3129):
+   - Added #dynamorio::drmemtrace::module_mapper_t, which factors out the module mapping functionality
+     out of #dynamorio::drmemtrace::raw2trace_t, replacing the following #dynamorio::drmemtrace::raw2trace_t APIs:
+     #dynamorio::drmemtrace::raw2trace_t::handle_custom_data(), #dynamorio::drmemtrace::raw2trace_t::do_module_parsing(),
+     #dynamorio::drmemtrace::raw2trace_t::do_module_parsing_and_mapping(), and
+     #dynamorio::drmemtrace::raw2trace_t::find_mapped_trace_address().
+   - Added #dynamorio::drmemtrace::trace_metadata_writer_t, a set of utility functions used by drcachesim's
+     #dynamorio::drmemtrace::raw2trace_t for writing trace metadata: process/thread ids, timestamps, etc.
+   - Added #dynamorio::drmemtrace::trace_metadata_reader_t, a set of utilities for checking and validating
+     thread start successions of offline entries in a raw data file.
+   - Added trace_converter_t, an extensibility mechanism for raw trace conversion.
+ - Added drmemtrace_get_timestamp_from_offline_trace(), an API for fetching the timestamp
+   from the beginning of a raw trace bundle (regardless of whether it is a thread start
+   or just a subsequent bundle).
+ - Added dr_abort_with_code().
+ - Added support for interoperability between emulation clients and observational
+   clients: #emulated_instr_t, drmgr_insert_emulation_start(),
+   drmgr_insert_emulation_end(), drmgr_is_emulation_start(), drmgr_is_emulation_end()
+   and drmgr_get_emulated_instr_data().
+ - Added drmgr_register_signal_event_user_data() and
+   drmgr_unregister_signal_event_user_data() to enable passing of user data.
+ - Added hashtable_apply_to_all_payloads_user_data() to iterate over all payloads
+   in a hashtable with user data also available.
+ - Added cmake function DynamoRIO_get_full_path that shall be used instead of reading
+   the LOCATION target property.
+ - Added a drcachesim/drmemtrace analysis tool routine initialize() to help separate
+   initialization that could fail from tool construction.
+ - Split raw2trace_directory_t initialization from its constructors
+   into new initialize() and initialize_module_file() methods.
+ - Added drcachesim/drmemtrace support for analyzing offline traces in parallel,
+   concurrently operating on each traced thread (or other sharding division).  This
+   is made possible by the new storage of traces in separate files.  Adds a new
+   analysis_tool_t interface where if the tool's parallel_shard_supported() returns
+   true, analyzer_t switches to a parallel operation mode.  Today, a simple static
+   scheduling among worker threads is used.  Each worker completely owns one or more
+   shards, eliminating the need for synchronization when processing a thread's trace
+   entries.  The tools' parallel_shard_init() function is invoked to create
+   traced-thread-local data, which is passed to parallel_shard_memref().  A
+   parallel_shard_exit() is provided for cleanup, though most tools will sort,
+   aggregate, and clean up in print_results().
+ - Added module_mapper_t::find_mapped_trace_bounds() to allow callers to cache
+   results and avoid global locks during parallel operation.
+
+**************************************************
+<hr>
+
+Version 7.0.0 includes Dr. Memory and the Dr. Memory Framework (DRMF) in
+the same package as DynamoRIO.  DRMF provides the umbra, drsyscall, and
+drsymcache Extensions for use by clients.
+
+The changes between version 7.0.0 and 6.2.0 include the following minor
+compatibility changes:
+
+ - Changed dr_app_stop() to send all threads native instead of only the
+   calling thread.
+ - Replaced PAGE_SIZE with dr_page_size() and removed PAGE_START from the API.
+   However, clients may set(DynamoRIO_PAGE_SIZE_COMPATIBILITY ON), in which
+   case definitions of PAGE_SIZE and PAGE_START using dr_page_size() are
+   provided, though code that uses these macros in a constant expression,
+   such as a static initialiser, will still need to be rewritten.
+   DynamoRIO_PAGE_SIZE_COMPATIBILITY will be set automatically if the
+   client targets version 6.2 or earlier.
+
+Further non-compatibility-affecting changes include:
+
+ - Added preliminary AArch64 ARMv8 support: see \ref sec_limits for a
+   description of what is not yet expected to work.
+ - Added a static library form of DynamoRIO for use either with
+   auto-takeover or the start/stop API.  The configure_DynamoRIO_static()
+   and use_DynamoRIO_static_client() CMake utilities facilitate this.
+ - Enabled \ref page_drcachesim for Windows for single-process applications.
+ - Added a module tracking feature \p drmodtrack for quick identification of which
+   library a program counter belongs to and for persistent labeling of
+   modules for post-processing and across library reloads.  This is part of
+   the \p drcovlib Extension.  See #drmodtrack_init() and related functions.
+ - Added drx_open_unique_appid_dir().
+ - Added #DRX_FILE_SKIP_OPEN.
+ - Added %[] support to dr_sscanf.
+ - Added dr_map_executable_file() and dr_unmap_executable_file().
+ - Added dr_get_microseconds().
+ - Added #DR_CLEANCALL_ALWAYS_OUT_OF_LINE.
+ - Added instr_create_4dst_2src().
+ - Added drreg_restore_app_values() and drreg_restore_app_aflags().
+ - Added drx_tail_pad_block().
+ - Added XINST_CREATE_load_1byte_zext4().
+
+**************************************************
+<hr>
+
+Version 6.2.0 includes Dr. Memory and the Dr. Memory Framework (DRMF) in
+the same package as DynamoRIO.  DRMF provides the umbra, drsyscall, and
+drsymcache Extensions for use by clients.
+
+The changes between version 6.2.0 and 6.1.0 include:
+
+ - Added support for Windows 10 1607.  We provide an artificial version
+   identifier #DR_WINDOWS_VERSION_10_1607 to distinguish this major update.
+ - Split the memory trace sample memtrace_x86 into memtrace_x86_text and
+   memtrace_x86_binary to highlight the huge performance difference.
+ - Added instruction trace samples instrace_simple, instrace_x86_text, and
+   instrace_x86_binary.
+ - Added better drreg support for intra-bb control flow by adding
+   drreg_set_bb_properties().
+ - Added priority-controlled drmgr_register_thread_init_event_ex() and
+   drmgr_register_thread_exit_event_ex().
+ - Added \ref sec_drx_buf to drx: drx_buf_create_circular_buffer(),
+   drx_buf_create_trace_buffer(), and more.
+ - Documented that drx_insert_counter_update() does rely on drx_init().
+ - Better international string support for usernames and application
+   paths.
+
+**************************************************
+<hr>
+
+Version 6.1.0 includes Dr. Memory and the Dr. Memory Framework (DRMF) in
+the same package as DynamoRIO.  DRMF provides the umbra, drsyscall, and
+drsymcache Extensions for use by clients.
+
+The changes between version 6.1.0 and 6.0.0 include the
+following minor compatibility changes:
+
+ - Fixed problems with configuration directories on Android.  This involved
+   changing drfront_access() to attempt to create a file by calling a new
+   routine that is also exported, drfront_dir_try_writable().
+ - Fixed several bugs.
+
+**************************************************
+<hr>
+
+Version 6.1.0 includes Dr. Memory and the Dr. Memory Framework (DRMF) in
+the same package as DynamoRIO.  DRMF provides the umbra, drsyscall, and
+drsymcache Extensions for use by clients.
+
+The changes between version 6.1.0 and 6.0.0 include the
+following minor compatibility changes:
+
+ - Changed drreg_aflags_liveness() to take in the target instruction.
+
+Further non-compatibility-affecting changes include:
+
+ - Added support for C++ clients on Android via private loader support for
+   Bionic.
+ - opnd_size_in_bytes() and opnd_size_in_bits() no longer accept DR_REG_
+   constants as input (the caller must first call reg_get_size()).
+   This was true in the 6.0.0 release but the documentation and the
+   routines themselves did not reflect this.
+ - Added drreg_init_and_fill_vector() and drreg_set_vector_entry().
+ - Augmented drx_insert_counter_update() to work with drreg.
+ - Added dr_raw_tls_opnd().
+ - Added drreg_reservation_info().
+ - Added opnd_create_rel_addr() and opnd_is_rel_addr() support for ARM.
+ - Added drreg_is_register_dead() and drreg_reserve_dead_register().
+ - Split out the core functionality of the \ref page_drcov tool into
+   a new Extension \p drcovlib for easier inclusion of coverage output in
+   other tools.
+ - Added support for the Windows 10 TH2 1511 update.  We provide an
+   artificial version identifier #DR_WINDOWS_VERSION_10_1511 to distinguish
+   this major update.
+
+**************************************************
+<hr>
+
+Version 6.0.0 includes Dr. Memory and the Dr. Memory Framework (DRMF)
+in the same package as DynamoRIO.  DRMF provides the umbra, drsyscall, and
+drsymcache Extensions for use by clients.
+
+The changes between version 6.0.0 and 5.0.0 include the
+following minor compatibility changes:
+
+ - Deprecated dr_init() as a client's entry point, replacing it with
+   dr_client_main() which is passed an argv-style array of client options
+   just like a regular application's main() routine.
+ - Changed the default injection method on Linux to use "early injection"
+   which begins executing the target application from its very first
+   instruction.  Clients on Linux will now see more application code than
+   they did previously.  The old behavior can be requested by passing
+   "-late" to drrun or drinject, or including "-no_early_inject" in the
+   options to drinjectlib.
+ - Moved the module load event to a later point where the application first
+   executes code from the library.  This enables clients to access properly
+   relocated values inside the library, which was not possible with the
+   prior event point at the first memory mapping of the library.
+   Applications that still wish to see the first mapping will need to
+   monitor system calls to replicate the old control point.
+ - To support conditionally executed instructions, added a new parameter of
+   type #dr_opnd_query_flags_t to routines that explicitly query what was
+   read or written by an instruction: instr_get_eflags(),
+   instr_get_arith_flags(), decode_eflags_usage(), instr_writes_to_reg(),
+   instr_reads_from_reg(), and instr_writes_to_exact_reg().  This new
+   parameter determines how to treat conditionally accessed operands.  We
+   decided that breaking compatibility directly was the best solution to
+   ensure that clients performing liveness analysis versus other types of
+   usage analysis are properly updated to handle conditionally executed
+   instructions.  All other API routines include all operands whether
+   conditionally accessed or not.
+ - Removed the artificial additional source operand that was added to each
+   OP_cmovcc and OP_fcmovcc instruction in the past.  We have replaced this
+   with the new predication API (instr_is_predicated(), etc.) and new
+   parameters to read/write query routines (#dr_opnd_query_flags_t).
+ - Widened the #reg_id_t type from a byte to a ushort.
+ - Changed both drconfiglib and drinjectlib to be static libraries rather
+   than shared libraries on UNIX platforms, for simpler usage without
+   worrying about locating them at runtime, as well as making it easier to
+   use on Android.  They remain shared libraries on Windows.
+ - Deprecated dr_get_options(), replacing it with direct arguments to
+   dr_client_main() or alternatively with dr_get_option_array().
+ - Deprecated set_x86_mode(), replacing it with dr_set_isa_mode().
+ - Deprecated get_x86_mode(), replacing it with dr_get_isa_mode().
+ - Deprecated instr_set_x86_mode(), replacing it with instr_set_isa_mode().
+ - Deprecated instr_get_x86_mode(), replacing it with instr_get_isa_mode().
+ - Added a third parameter to drfront_is_64bit_app().
+ - Deprecated instr_is_sse_or_sse2().
+ - Removed legacy executable bbcov2lcov.
+ - Removed legacy "-t bbcov" support.
+
+Further non-compatibility-affecting changes include:
+
+ - Added AArch32 ARMv7 and ARMv8 support.
+ - Added experimental Android support.  C clients are supported, but C++
+   clients are not yet supported.
+ - Added Windows 10 support.
+ - Added a new scratch register coordination Extension, \p drreg.
+   The \p drreg Extension is still considered experimental and its
+   interface is subject to change in the next release.
+ - Added easy-to-use option declaration and parsing for C++ clients
+   and standalone applications via a new Extension, the \ref page_droption
+   and the #dynamorio::droption::droption_t class.
+ - Added a new tool: \ref page_drcachesim, a multi-process cache simulator.
+ - Added a new tool: \ref page_drcpusim, a CPU simulator for illegal
+   instructions on legacy processors.
+ - Added distinctions between reasons for dr_query_memory_ex() to fail
+ - Added opnd_size_in_bits().
+ - Added cross-platform instruction creation macros
+   XINST_CREATE_debug_instr(), XINST_CREATE_load(), XINST_CREATE_store(),
+   XINST_CREATE_move(), XINST_CREATE_load_simd(), XINST_CREATE_store_simd(),
+   XINST_CREATE_jump_mem(), XINST_CREATE_jump_reg(), XINST_CREATE_load_int(),
+   XINST_CREATE_jump(), XINST_CREATE_jump_short(),
+   XINST_CREATE_call(), XINST_CREATE_return(),
+   XINST_CREATE_add(), XINST_CREATE_add_2src(), XINST_CREATE_add_s(),
+   XINST_CREATE_sub(), XINST_CREATE_sub_s(),
+   XINST_CREATE_and_s(), XINST_CREATE_cmp(),
+   XINST_CREATE_interrupt(), XINST_CREATE_nop(),
+   XINST_CREATE_load_1byte(), XINST_CREATE_load_2bytes(),
+   XINST_CREATE_store_1byte(), and XINST_CREATE_store_2bytes().
+ - Added a new feature: a binary annotation framework that facilitates communication
+   between the target app and the DynamoRIO client and core. See \ref sec_annotations
+   and dr_annotation.h.
+ - Added instr_is_predicated(), instr_get_predicate(), and
+   instr_set_predicate().
+ - Added instr_predicate_triggered().
+ - Added dr_save_arith_flags_to_reg() and dr_restore_arith_flags_from_reg().
+ - Added opnd_get_index_shift() and opnd_set_index_shift().
+ - Added opnd_create_reg_ex() and opnd_get_flags().
+ - Added opnd_create_base_disp_arm().
+ - Added reg_is_simd().
+ - Added instr_create_0dst_4src(), instr_create_1dst_4src(),
+   instr_create_2dst_5src(), instr_create_Ndst_Msrc_vardst(),
+   and instr_create_Ndst_Msrc_varsrc().
+ - Added OPND_CREATE_MEMLIST().
+ - Added dr_get_stolen_reg(), dr_insert_get_stolen_reg_value(),
+   dr_insert_set_stolen_reg_value(), and reg_is_stolen().
+ - Added opnd_create_immed_uint().
+ - Added instr_remove_srcs() and instr_remove_dsts().
+ - Added cross-platform #EFLAGS_READ_ARITH and #EFLAGS_WRITE_ARITH.
+ - Added instr_invert_predicate() and instr_predicate_name().
+ - Added instr_it_block_get_count(), instr_it_block_get_pred(),
+   instr_it_block_compute_immediates(), and instr_it_block_create()
+   for manipulating IT block instructions on ARM.
+ - Added opnd_set_flags().
+ - Added opnd_create_immed_int64(), opnd_is_immed_int64(), and
+   opnd_get_immed_int64() for 64-bit immediate SIMD constants on 32-bit ARM.
+ - Added dr_set_client_version_string().
+ - Added instr_get_prev_app() and instrlist_last_app().
+ - Added the \ref op_syntax_arm "-syntax_arm" runtime option.
+ - Added opnd_add_flags().
+ - Added drmgr_unregister_bb_insertion_event().
+ - Added drmgr_is_first_instr() and drmgr_is_last_instr().
+ - Added dr_app_pc_as_jump_target() and dr_app_pc_as_load_target().
+ - Added dr_remove_it_instrs() and dr_insert_it_instrs().
+ - Added automated conditional instrumentation to drmgr.
+ - Added dr_insert_read_raw_tls() and dr_insert_write_raw_tls().
+ - Added instr_is_exclusive_store().
+ - Added #DR_FILE_WRITE_ONLY.
+ - Added dr_get_option_array().
+ - Added drwrap_redirect_execution().
+ - Added support for common calling conventions in drwrap.
+ - Added a new sample client, named ssljack.
+ - Added the -pathmap option to the post-processor for \ref page_drcov.
+ - Added instr_is_sse() and instr_is_sse2().
+ - Added instr_is_3DNow(), instr_is_sse3(), and instr_is_ssse3().
+ - Added instr_is_sse41(), instr_is_sse42(), and instr_is_sse4A().
+ - Added instr_is_reg_spill_or_restore().
+ - Added #DR_MEMPROT_VDSO.
+
+**************************************************
+<hr>
+
+Version 5.0.0 includes Dr. Memory and the Dr. Memory Framework (DRMF)
+in the same package as DynamoRIO.  DRMF provides the umbra, drsyscall, and
+drsymcache Extensions for use by clients.
+
+The changes between version 5.0.0 and 4.2.0 also include the
+following minor compatibility changes:
+
+ - Dropped official support for Windows 2000.  The core DynamoRIO engine
+   should continue to work there, but the official release package
+   will not run on Windows 2000.
+ - Changed the third parameter to drsym_search_symbols_ex() from a bool to
+   a uint flags in order to take in demangling flags.  Binary compatibility
+   is maintained as drsym_info_t's size was changed, but source
+   compatibility is affected by this change.
+ - Added collapsing of template parameters to "<>" for drsyms operations on
+   Windows PDB symbols when #DRSYM_DEMANGLE is specified.  This can be
+   undone by specifying #DRSYM_DEMANGLE_PDB_TEMPLATES.
+ - Removed empty parentheses "()" from partially-demangled symbols (when
+   #DRSYM_DEMANGLE is specified) for #DRSYM_ELF_SYMTAB and #DRSYM_PECOFF_SYMTAB.
+   Windows and Linux symbols are now consistent for #DRSYM_DEMANGLE.
+ - Changed the operand sizes of instructions that read or write only part
+   of a multimedia register (mmx, xmm, or ymm) to reflect the partial size.
+ - Added return value for dr_fprintf to indicate how many bytes are written.
+ - Renamed the function add_rel_rpaths() in DynamoRIOConfig.cmake to
+   DynamoRIO_add_rel_rpaths().
+ - Deprecated instr_ok_to_mangle() and instr_set_ok_to_mangle()
+   (replaced with instr_is_app(), instr_is_meta(), instr_set_app(), and
+   instr_set_meta()).
+
+Further non-compatibility-affecting changes include:
+
+ - Added dr_syscall_get_result_ex() and dr_syscall_set_result_ex() for
+   future MacOS support.
+ - Added Mach-O support to drsyms.
+ - Added INSTR_CREATE_cmpxchg_8() for 64-bit cmpxchg
+ - Changed the default -stderr_mask on Windows to 0xC (for both release
+   and debug), and the default -msgbox_mask on Windows release builds
+   to 0xC, for better error reporting.  For interactive runs, then,
+   the user should explicitly pass -msgbox_mask 0.
+ - Added a flags output parameter to #drsym_info_t.
+ - Added dr_module_contains_addr() to make handling non-contiguous
+   libraries easier.
+ - Added hashtable_lock_self_owns() to the drcontainers Extension.
+ - Added opnd_create_reg_partial() and opnd_is_reg_partial() for
+   representing a partial multimedia register
+ - Added operand size suffixes on disassembly in the default mode.
+   This can be disabled via -disasm_mask 0x8 or by calling
+   disassemble_set_syntax(DR_DISASM_NO_OPND_SIZE).
+ - Added instr_zeroes_ymmh().
+ - Added new fields to module_data_t: timestamp for Linux and MacOS, and
+   version and uuid fields for MacOS.
+ - Added a new library drfrontendlib to be used for building tool
+   front-ends.  For more information see dr_frontend.h.
+ - Added dr_create_memory_dump().
+ - Added dr_mcontext_to_context().
+ - Added dr_call_on_clean_stack().
+ - Added dr_set_client_name() for customizing the diagnostic message
+   presented to users when an error occurs or when dr_messagebox() is called.
+ - Added instr_get_next_app() and instrlist_first_app() to allow clients to
+   traverse only application (non-meta) instructions.
+ - Added dr_config_status_code_to_string().
+ - Added custom tool front-end launching support to drrrun tool config files.
+ - Added a tool notification feature to drrun tool config files.
+ - Added get_visualstudio_info() for looking up visual studio
+   installation information.
+ - Renamed the strace sample to "syscall" and removed its tracing feature,
+   in favor of a superior strace sample inside DRMF.
+ - Included a copy of dbghelp.dll for drsyms
+ - Added dr_insert_cbr_instrumentation_ex(),
+   which provides the fall-through address.
+ - Added instr_is_app(), instr_is_meta(), instr_set_app(), and instr_set_meta().
+ - Added reg_get_value_ex().
+
+**************************************************
+<hr>
+The changes between version 4.2.0 and 4.1.0 include:
+
+ - Added preliminary Windows 8.1 support
+ - Added a new Library Tracing Tool, drltrace.
+ - Re-branded our \ref page_drcov
+ - Added an export iterator: dr_symbol_export_iterator_start(),
+   dr_symbol_export_iterator_hasnext(), dr_symbol_export_iterator_next(),
+   dr_symbol_export_iterator_stop()
+ - Added relative directory support to file routines on Windows
+ - Added dr_get_current_directory()
+ - Added dr_delete_dir()
+ - Added drx_open_unique_file() and drx_open_unique_appid_file()
+ - Added proc_avx_enabled()
+ - Added support for recent IA-32/AMD64 instructions: the rdrand,
+   fsgsbase, FMA4, XOP, TBM, LWP, BMI1, BMI2, SMX, INVPCID,
+   TSX, and AVX2 instruction groups
+ - Added vector addressing (VSIB) support to instr_compute_address(),
+   instr_compute_address_ex() and
+   instr_compute_address_ex_pos()
+ - Added opnd_is_vsib()
+ - Fixed misnamed opcodes: OP_pmovsxdw is now OP_pmovsxwd,
+   OP_pmovzxdw is now OP_pmovzxwd, OP_vpmovsxdw is now OP_vpmovsxwd,
+   and OP_vpmovzxdw is now OP_vpmovzxwd.
+ - Renamed DRgui to DRstats in anticipation of a new DRgui graphical tool framework
+ - dr_exit_process() now supports sending a fatal signal via the 2nd byte of
+   the exit code being set to the signal number
+ - Added a return value of NULL to dr_standalone_init() to indicate
+   failure, such as running on an unsupported OS
+ - Added a "soft kills" feature to the \p drx Extension via
+   drx_register_soft_kills() to avoid child process termination preventing
+   output of instrumentation results
+ - Added dr_convert_pid_to_handle()
+ - Added dr_syscall_intercept_natively()
+ - Added dr_app_handle_mbr_target()
+ - Added dr_app_running_under_dynamorio()
+ - Added drvector_set_entry()
+ - Re-ordered the initial thread init event to be prior to the initial
+   module load events
+ - Changed DynamoRIO_USE_LIBC to be on by default for all clients,
+   including clients written in C
+ - Added static library versions of most Extension libraries: drmgr_static,
+   drutil_static, drwrap_static, drsyms_static, and drx_static.
+   Be sure to check the licenses and other restrictions (in particular,
+   most of these Extensions will not work properly if duplicated)
+   before using these static versions.
+ - Various bug fixes
+
+**************************************************
+<hr>
+The changes between version 4.1.0 and 4.0.1 include the
+following compatibility changes:
+
+ - The #drsym_info_t data structure has changed.  The file name is now
+   a caller-allocated buffer, and it and the symbol name are separated out.
+   This affects code that calls drsym_lookup_address().
+ - Memory allocated through system libraries (including malloc, operator
+   new, and HeapAlloc) is not guaranteed to be reachable by a 32-bit
+   displacement from the code cache: only memory directly allocated via
+   DR's API.  The \ref op_reachable_heap "-reachable_heap runtime option"
+   can be used to guarantee that all memory is reachable.
+ - For 64-bit, the opcode constants OP_fxsave, OP_fxrstor, OP_xsave,
+   OP_xrstor, and OP_xsaveopt have all been replaced with two versions: one
+   with a "32" suffix and one with a "64" suffix.  E.g., OP_fxsave is split
+   into #OP_fxsave32 and #OP_fxsave64.  The 32 version corresponds to the
+   no-suffix assembler mnemonic while the 64 version coresponds to the
+   assembler mnemonic of the same name.  Previously, the 64-bit versions of
+   these instrutions could not be distinguished nor encoded from scratch.
+
+Further non-compatibility-affecting changes include:
+
+ - Added instr_is_floating_ex()
+ - Ported the stats.c sample and DRgui to 64-bit.  As part of this, the
+   shared memory structure changed shape on Windows: pid is now of type
+   process_id_t.
+ - Added the \p drtable Extension which provides simple table management
+ - Added opnd_size_from_bytes()
+ - Added path searching support to dr_load_aux_library()
+ - Added limited, experimental support for 32-bit WOW64 clients to use
+   64-bit libraries and code via dr_load_aux_x64_library(),
+   dr_lookup_aux_x64_library_routine(), dr_unload_aux_x64_library(), and
+   dr_invoke_x64_routine().
+ - Added drmgr_current_bb_phase()
+ - The deployment tools (drrun, drconfig, and drinject) are now helper
+   binaries instead of shell scripts.
+ - The deployment tools (drrun etc.) now interpret -v as an alias for
+   -verbose and use -version to print version info.
+ - Added instrlist_insert_mov_immed_ptrsz() and instrlist_insert_push_immed_ptrsz()
+ - Added instrlist_insert_mov_instr_addr() and instrlist_insert_push_instr_addr()
+ - Added drsym_enumerate_lines()
+ - Added #DR_DISASM_STRICT_INVALID
+ - Added a new runtime option \ref op_syntax_att "-syntax_att" for
+   AT&T-style disassembly that hides the implicit operands.
+   Also added #DR_DISASM_DR to name DR's default disassembly style, with
+   #DR_DISASM_ATT selecting a true AT&T disassembly style that hides
+   implicit operands.  The only compatibility change here is if a client
+   selected DR_DISASM_ATT and expected DR-style disassembly.
+ - Added #DR_MAP_IMAGE
+ - Added -t option to drrun for end-user tools
+ - Added 64-bit reachability support to dr_insert_call() and
+   dr_insert_clean_call().  Added explicit control over reachability
+   in a new routine dr_insert_call_ex() and in #DR_CLEANCALL_INDIRECT
+   for dr_insert_clean_call_ex().
+ - Added auto-magic conversion of absolute and pc-relative memory
+   operands to each other for more flexible 64-bit encoding.
+ - Added opnd_create_instr_ex() and opnd_get_shift()
+ - Added dr_custom_alloc()
+ - Added dr_raw_mremap() and dr_raw_brk()
+ - Added #DR_EMIT_GO_NATIVE, dr_suspend_all_other_threads_ex(),
+   dr_retakeover_suspended_native_thread(), and dr_is_thread_native() for
+   temporarily-native support.
+ - Added dr_get_token()
+ - Added dr_switch_to_app_state_ex() and dr_switch_to_dr_state_ex()
+ - Added dr_is_nudge_thread()
+ - Added support for nudging 64-bit Windows applications
+ - Added dr_get_dr_thread_handle()
+ - Added #DR_MEMTYPE_RESERVED to #dr_mem_info_t
+ - proc_save_fpstate(), proc_restore_fpstate(), dr_insert_save_fpstate(),
+   and dr_insert_restore_fpstate() now use the current thread's x86 mode
+   to determine which fxsave state format to use.
+ - Added partial support for presenting the proper floating point program
+   counter when floating point state is saved.
+   Xref the \ref op_translate_fpu_pc "-translate_fpu_pc runtime option".
+ - Added \p drx Extension: the DynamoRIO Instrumentation Utility
+   Extension with BSD license
+ - Added automatic restarting of appropriate system calls interrupted by signals.
+ - Various bug fixes
+
+**************************************************
+<hr>
+The changes between version 4.0.1 and 4.0.0 include:
+
+ - Fixed a bug resulting in large 64-bit applications failing to allocate
+   heap (Issue 1041)
+
+**************************************************
+<hr>
+The changes between version 4.0.0 and 3.2.0 include a
+compatibility change in the drsyms Extension:
+
+ - Changed the drsyms type query data structures (#drsym_type_t,
+   #drsym_func_type_t, #drsym_int_type_t, #drsym_ptr_type_t).
+   This is a binary compatibility change for drsym_get_func_type().
+
+And in the drmgr Extension:
+
+ - The post-syscall, module load, module unload, signal, exception,
+   and restore state events are now mediated and ordered by drmgr.
+   Thus, clients should call drmgr_register_post_syscall_event()
+   (for a default priority) or drmgr_register_post_syscall_event_ex() (to
+   specify a priority) rather than
+   dr_register_post_syscall_event().  The same applies to
+   drmgr_register_module_load_event() +
+   drmgr_register_module_load_event_ex(),
+   drmgr_register_module_unload_event() +
+   drmgr_register_module_unload_event_ex(),
+   drmgr_register_signal_event() +
+   drmgr_register_signal_event_ex(),
+   drmgr_register_exception_event() +
+   drmgr_register_exception_event_ex(), and
+   drmgr_register_restore_state_event() +
+   drmgr_register_restore_state_ex_event() +
+   drmgr_register_restore_state_ex_event_ex().
+
+And in the core API:
+
+ - dr_get_milliseconds() now returns the number of milliseconds since Jan
+   1, 1601 on all platforms.
+
+And in the non-core APIs:
+
+ - dr_inject_process_create() now takes a NULL-terminated array of strings for
+   the app command line to better support porting to Linux.
+
+Further non-compatibility-affecting changes include:
+
+ - Added preliminary Windows 8 support, though private kernelbase.dll is
+   not yet supported
+ - Added persistent cache support for clients via
+   dr_register_persist_ro(), dr_register_persist_rx(),
+   dr_register_persist_rw(), dr_register_persist_patch(), and
+   #DR_EMIT_PERSISTABLE.  However, dr_register_persist_patch() is
+   still experimental, is in flux, and is subject to change in
+   the next release.
+ - Added hashtable persistence support via hashtable_persist_size(),
+   hashtable_persist(), and hashtable_resurrect()
+ - Added drsym_get_type(), drsym_expand_type(), and support for additional
+   type categories for Windows drsyms.
+ - Ported the drinjectlib and drconfiglib libraries to Linux.  Routines that
+   are still Windows-only are marked in the API docs.
+ - Added dr_inject_prepare_to_exec() on Linux
+ - Added drsym_free_resources()
+ - Added drsym_module_has_symbols()
+ - Added a type_id field to drsym_info_t (without compatibility changes)
+ - Added drsym_enumerate_symbols_ex() and drsym_search_symbols_ex() which
+   return drsym_info_t on each symbol
+ - Added dr_exit_process() to cleanly shut down with a specified
+   exit code
+ - Added dr_convert_handle_to_pid()
+ - Added dr_nudge_client_ex() to enable nudging other processes
+   from within a client
+ - Added reg_resize_to_opsz()
+ - Added dr_save_arith_flags_to_xax() and dr_restore_arith_flags_from_xax()
+ - Added dr_snwprintf() and dr_vsnwprintf()
+ - Added drwrap_replace_native(), drwrap_is_replaced(),
+   drwrap_is_replaced_native()
+ - Added dr_clobber_retaddr_after_read()
+ - Added dr_get_string_option() and dr_get_integer_option() to support querying
+   arbitrary DynamoRIO runtime options
+ - Added support for building with Visual Studio 2010 and with MSBuild
+ - Added instr_is_near_ubr() and instr_is_near_call_direct()
+ - Added exported CMake cross-platform assembly support in
+   cpp2asm_support.cmake and auxiliary files
+ - Added get_DynamoRIO_defines() to DynamoRIOConfig.cmake
+ - Added DR_EMIT_MUST_END_TRACE flag
+ - Improved the performance of dr_safe_read() such that it out-performs
+   DR_TRY_EXCEPT and no longer invokes a system call on Windows.
+ - Added dr_redirect_native_target()
+ - Added dr_mark_safe_to_suspend()
+ - Added dr_mutex_mark_as_app(), dr_rwlock_mark_as_app(), and
+   dr_recurlock_mark_as_app()
+ - Added dr_get_main_module()
+ - Added module import iterators dr_module_import_iterator_start(),
+   dr_module_import_iterator_hasnext() dr_module_import_iterator_next(),
+   dr_module_import_iterator_stop(), dr_symbol_import_iterator_start(),
+   dr_symbol_import_iterator_hasnext(), dr_symbol_import_iterator_next(), and
+   dr_symbol_import_iterator_stop().
+ - Added DR_FAST_IR to allow clients to inline some key IR routines
+ - Added -logdir runtime option for control over the log directory
+ - Added drmgr_get_parent_cls_field()
+ - Added support for building DynamoRIO with Visual Studio 2012 and
+   the Windows 8 WDK
+ - Added a new operand type enabling an instr_t to be used as a
+   memory reference: opnd_create_mem_instr(), opnd_is_mem_instr(),
+   opnd_get_mem_instr_disp()
+ - Added DYNAMORIO_CONFIGDIR alternative to HOME as a config dir location.
+   Additionally, drrun uses a temp dir for config files rather than failing.
+ - Added library search path control via the client_basename.drpath file
+ - Added drmgr_register_pre_syscall_event_ex()
+ - Added DR_MEMPROT_GUARD for dr_memory_protect (Windows only).
+ - Added dr_sscanf()
+ - Added notifications on application faults and additional information
+   on client faults
+ - Added conversion between UTF-16 and UTF-8 to dr_snprintf() and
+   dr_snwprintf()
+ - Added simplified -c client argument form to drrun, drconfig, and drinject.
+ - Added official support for the \ref op_speed "-opt_speed" option
+   to prioritize speed over a simple code stream.
+ - Added dr_atomic_add32_return_sum()
+ - Deprecated dr_save_arith_flags() and dr_restore_arith_flags()
+ - Fixed performance regression involving inlined clean calls
+ - Fixed bug involving 32-bit Linux support on a 64-bit Linux
+   kernel on an AVX-enabled processor (Issue 754)
+ - Fixed bug involving multimedia state on a 32-bit Windows kernel
+   (Issue 139)
+ - Fixed bugs building and running on Ubuntu 11.10 (Issue 718, Issue 720)
+ - Several other bug fixes
+ - Added dr_raw_mem_alloc() and dr_raw_mem_free(). However, they are still
+   experimental, are in flux, and are subject to change in the next release.
+
+**************************************************
+<hr>
+The changes between version 3.2.0 and 3.1.0 are:
+
+ - Added support for PECOFF + DWARF2 symbols on Windows in the
+   drsyms Extension
+ - Added support for building extensions as static libraries (subject to
+   licensing constraints) via DR_EXT_{DRWRAP,DRUTIL,DRMGR,DRSYMS}_STATIC
+ - Added support for linking C clients with libc via DynamoRIO_USE_LIBC
+ - Added dr_insert_clean_call_ex()
+ - Added a no-frills drwrap mode for faster but constrained wrapping
+ - Added drwrap_get_drcontext() for performance
+ - Added drwrap notification on exceptions bypassing post-hooks
+ - Added drwrap_wrap_ex() to pass initial constant user data
+ - Added drwrap_is_wrapped() and drwrap_is_post_wrap()
+ - Added drwrap_set_global_flags() to control safety of
+   application memory accesses
+ - Added drwrap_get_mcontext_ex() to avoid the cost of copying
+   multimedia register values when not necessary
+ - Added drwrap interface for caching post-call addresses
+ - Added drmgr_decode_sysnum_from_wrapper()
+ - Added drutil_expand_rep_string_ex() that returns additional
+   information about string loop expansion
+ - Added improved instrlist disassembly that includes labels and
+   instruction targets
+ - Added instr_compute_address_ex_pos() for instrs with multiple memory
+   operands.
+ - Added dr_get_client_base()
+ - Added dr_vsnprintf()
+ - Added service pack version to dr_get_os_version()
+ - Added mediation of note fields to drmgr
+ - Added custom storage in label instructions via instr_get_label_data_area()
+ - Added support for multiple non-meta control transfer instructions
+   with intra-block targets in one basic block to drmgr
+ - Added user data passing support among all four passes of drmgr
+ - Several bug fixes
+
+**************************************************
+<hr>
+Version 3.0.0 was a development version.  3.1.0 is the first official
+released version of the 3.x series.
+
+The changes between version 3.0.0 and 2.2.0 include the following major
+features:
+
+ - Added a private loader on Linux for better support for C++ clients and
+   third-party library usage by clients
+ - Added Linux support for \p drsyms to enable symbol processing in
+   Linux clients
+ - Added \p drutil Extension which provides memory address retrieval
+   and string loop expansion (note: LGPL license)
+ - Added a static library for decoding and encoding
+
+\b IMPORTANT: The 3.0.0 and onward client API is mostly backward
+compatible with releases from 1.0.0 (originally called 0.9.6: see below)
+onward with the exception of functions that involve dr_mcontext_t and
+several other source and binary compatibility changes since version 2.2.0
+described below.  The dr_mcontext_t struct and all structs that contain it
+have changed and are NOT backward compatible with releases prior to 3.0.0.
+
+A sample script for updating client sources to the 3.0.0 API's version of
+dr_mcontext_t and related functions is as follows:
+
+\code
+perl -pi -e '\
+s|dr_mcontext_t (\w+);|dr_mcontext_t \1 = {sizeof(\1),DR_MC_ALL,};|;\
+s|(dr_[gs]et_mcontext\(\S+,\s+\S+),\s+[^\s\)]+\)|\1)|;\
+s|(dr_redirect_execution\(\S+),\s+\S+\)|\1)|;\
+s|^\s+int app_errno;\s*\n||ms;\
+s|raw_mcontext\.|raw_mcontext->|g;\
+s|info->mcontext\.|info->mcontext->|g;\
+s|excpt->mcontext\.|excpt->mcontext->|g;' *.c
+\endcode
+
+The script makes 3 main changes.  First, any dr_mcontext_t allocated by the
+client must have its \p size and \p flags fields set.  Second, the \p app_errno
+parameter was removed from several functions; it required a local variable,
+so any local named \p app_errno is removed.  Third, the dr_mcontext_t
+fields in the fault, signal, and exception structs all became
+pointers.
+
+This script may not catch all cases.  Use your version control system to
+look at the diff after applying it to ensure it did not change anything it
+shouldn't have.  Run with debug build to catch other instances where
+dr_mcontext_t.size is not set.  Also note that using the dr_mcontext_t
+initialization syntax in the script will end up calling memset; for
+performance-critical situations, instead initialize only the size and flags
+fields separately.  Also note that if the xmm or ymm registers are not
+needed, asking for DR_MC_CONTROL and/or DR_MC_INTEGER is more performant
+than DR_MC_ALL.
+
+\b IMPORTANT: Further changes between version 3.0.0 and 2.2.0 include the following that
+affect source and/or binary compatibilty:
+
+ - Changed the #dr_mcontext_t structure field layout.  This is a binary
+   compatibility change with respect to versions prior to 3.0.0.
+ - Added a dr_mcontext_t.size field which must be set by the client prior
+   to calling dr_get_mcontext(), dr_set_mcontext(), or
+   dr_redirect_execution.  This is a source compatibility change with
+   respect to versions prior to 3.0.0.
+ - Added a dr_mcontext_t.flags field which must be set by the client prior
+   to calling dr_get_mcontext(), dr_set_mcontext(), or
+   dr_redirect_execution.  This is a source compatibility change with
+   respect to versions prior to 3.0.0.
+ - Removed the app_errno parameter from dr_get_mcontext(),
+   dr_set_mcontext(), and dr_redirect_execution().  This is a source
+   compatibility change with respect to versions prior to 3.0.0.
+ - Changed all dr_mcontext_t fields in the dr_restore_state_info_t,
+   dr_exception_t, and dr_siginfo_t structs to be pointers.  This is a
+   source compatibility change with respect to versions prior to 3.0.0.
+ - Changed the bool typedef from int to char for C++ compatibility.
+   This is a binary compatibility change with respect to versions
+   prior to 3.0.0.
+ - Changed the signature of drwrap_unwrap(), in order to allow one of the
+   pre or post hooks to be optional (Issue 562).  This is a source
+   compatibility change with respect to versions prior to 3.0.0.
+ - Moved console printing support from the drsyms Extension to core DR.  The
+   drsym_write_to_console() and drsym_using_console() are no longer
+   supported.  Instead, call dr_enable_console_printing() in dr_init(),
+   which then enables dr_printf() and dr_fprintf() to print to the console
+   (with some limitations: see dr_enable_console_printing() documentation).
+   This is a source compatibility change with respect to versions
+   prior to 3.0.0.
+ - Added a \p flags argument to most of the routines in the \p drsyms extension
+   to control demangling, and added drsym_demangle_symbol().  This is a source
+   compatibility change with respect to versions prior to 3.0.0.
+ - Added drsym_get_module_debug_kind() and a \p debug_kind field to the \p
+   drsym_info_t struct written by drsym_lookup_address().  These additions allow
+   drsyms users to determine what kind of debug info is available for a module.
+   The \p debug_kind field creates a binary compatibility change for users of \p
+   drsym_info_t with respect to versions prior to 3.0.0.
+
+Additional changes between version 3.0.0 and 2.2.0 include the following:
+
+ - Added \p drvector to drcontainers Extension: simple resizable vector
+ - Added a windbg script for auto-locating libraries for easier
+   debugging
+ - Added dr_mutex_self_owns() and recursive lock support (dr_recurlock_*)
+   (Issue 219)
+ - Added dr_map_file(), dr_unmap_file(), and dr_file_size() (Issue 542)
+ - Added dr_rename_file() and dr_delete_file().
+ - Added routines to disassemble to a buffer rather than a file (Issue 524)
+ - Added support for the AVX and FMA ISA extensions
+ - Added dr_insert_get_seg_base()
+ - Added return value to dr_redirect_execution() and dr_set_mcontext()
+ - Increased maximum option string from 512 to 2048 (Issue 363)
+ - Increased default stack size from 20KB to 56KB to make it easier to use
+   C++ and external libraries with larger stack usage
+ - Added dr_get_os_version() (Issue 304)
+ - Deprecated the "meta-instruction that can fault" property and
+   instr_is_meta_may_fault(), instr_set_meta_may_fault(),
+   instrlist_meta_fault_preinsert(), instrlist_meta_fault_postinsert(),
+   and instrlist_meta_fault_append().
+ - Added dr_using_app_state()
+ - Added instr_encode_to_copy() and instrlist_encode_to_copy()
+ - Added disassemble_set_syntax() for -syntax_intel control without
+   runtime options and proc_set_vendor() to control vendor-specific
+   ISA details when decoding or encoding
+ - Added instrlist_set_fall_through_target() and
+   instrlist_set_return_target()
+ - Added hashtable_clear() to the drcontainers Extension
+ - Several bug fixes
+
+**************************************************
+<hr>
+The changes between version 2.2.0 and 2.1.0 are:
+
+ - Added \p drwrap Extension which provides function wrapping
+   and replacing (note: LGPL license)
+ - Added \p drmgr Extension: the DynamoRIO Multi-Instrumentation Manager
+   Extension, a mediator for combining and coordinating multiple
+   instrumentation passes
+ - Added read-write locks (Issue 406)
+ - Added isolation of client-opened files from the application (Issue 357)
+ - Added dr_mcontext_t.xip for syscall events (Issue 442)
+ - Several bug fixes
+
+**************************************************
+<hr>
+The changes between version 2.1.0 and 2.0.0 are:
+
+ - Added Windows 7 support
+ - Added clean call sequence optimization and auto-inlining.
+ - Added Windows child process following support for clients: -follow_children
+   is now on by default for both Windows and Linux.
+ - Added DR_TRY_EXCEPT() (Issue 51)
+ - Added dynamic client auxiliary library loading support
+   via dr_load_aux_library(), dr_lookup_aux_library_routine(), and
+   dr_unload_aux_library()
+ - Added dr_switch_to_app_state() and dr_switch_to_dr_state()
+ - Added dr_client_thread_set_suspendable()
+ - Added dr_get_random_value(), dr_set_random_seed(), and dr_get_random_seed()
+ - Added dr_file_exists() and dr_directory_exists() for Linux
+ - Added support for dr_get_mcontext() from secondary thread init events,
+   and changed its return type to bool
+ - Added dynamic hashtable resizing to the drcontainers hashtable
+ - Added dr_app_pc_from_cache_pc()
+ - Added a segment list to module_data_t for Linux and internal
+   support for non-contiguously-mapped modules (Issue 160)
+ - Added PEB isolation (Issue 249) and dr_get_app_PEB()
+ - Added drsym_enumerate_symbols() to the \p drsyms Extension
+ - Added limited support for printing to the cmd window (Issue 261) via the
+   \p drsyms Extension: drsym_write_to_console() and drsym_using_console()
+ - Renamed the REG_ constants to DR_REG_ to avoid conflicts with system
+   headers (Issue 34).  Clients should set(DynamoRIO_REG_COMPATIBILITY ON)
+   prior to configure_DynamoRIO_client() to use the old constants and avoid
+   any source changes; this will happen automatically if the client
+   targets version 2.0 or earlier.  Binary compatibility is unaffected.
+ - Deprecated dr_request_synchronized_exit() and replaced it with
+   dr_set_process_exit_behavior().  Now a full thread synch is performed
+   at exit time in release build if a process exit event or thread exit
+   event is registered.  dr_set_process_exit_behavior() can provide
+   more performant exit performance for clients that have flexible
+   exit event requirements.
+ - Switched debug build to also be an INTERNAL=ON build
+ - Fixed bug in handling single-byte-bb selfmod code
+ - Fixed bugs in handling alarm signals
+ - Fixed 64-bit Windows stack alignment bug (Issue 331)
+ - Fixed handling of "data32 rex.w call"
+ - Fixed Issue 320: a problem with thread-private cache resizing
+ - Fixed Issue 319: decode movlhps and movhlps properly
+ - Fixed Issue 139: add xmm0-7 preservation for 32-bit Linux applications,
+   which may have noticeable impacts on clients calling clean calls:
+   e.g., pushing bbs over the max size limit or having a noticeable
+   performance hit.
+ - Support building sources using Visual Studio
+
+**************************************************
+<hr>
+In version 2.0.0, the configuration and deployment API and tools changed and
+are not backward compatible with earlier versions: see below for details.
+The changes between version 2.0.0 and 1.5.0 are:
+
+ - Changed the configuration and deployment model for both Linux and
+   Windows to use a configuration file based approach on both platforms,
+   which adds control over child processes on Linux and supports local
+   configuration on Windows for un-privileged and parallel execution
+   (Issue 265).  The registry is no longer used for individual application
+   configuration on Windows other than to point at the location for
+   global configuration files, when used.<br>
+   \b IMPORTANT: On Windows the following non-backward-compatible changes
+   have been made:
+   - drdeploy.exe no longer exists (replaced by drconfig.exe and drrun.exe)
+   - drconfig.dll is now drconfiglib.dll
+   - drconfiglib.dll's API routines now take in a process id to support
+     one-time targeted-process configuration (to support parallel execution)
+   - configuration is either per-user or global, with per-user taking
+     precedence when both exist
+   - configuration does NOT enable systemwide injection by default:
+     use the -syswide_on parameter to drconfig or drrun for that
+     (it requires administrative privileges)
+
+   \b IMPORTANT: On Linux, if you're using custom injection via
+   raw environment variables rather than using the \p drdeploy script,
+   you must also set DYNAMORIO_RUNUNDER to 1 for injection to work with
+   this release.
+ - Added drinjectlib.dll and dr_inject.h, making custom injection tools
+   easier to build (Issue 246)
+ - Added DynamoRIO Extension support for auxiliary libraries that extend the
+   DynamoRIO API (Issue 277)
+ - Added symbol lookup support via Extension (Windows only for now) (Issue 44)
+ - Added a "drcontainers" Extension that initially contains a hashtable
+ - Added thread creation support: dr_create_client_thread() (Issue 41)
+ - Added dr_sleep()
+ - Added dr_set_itimer() and dr_get_itimer() (Linux-only) (Issue 283)
+ - Added dr_app_pc_for_decoding()
+ - Added -synch_at_exit option and dr_request_synchronized_exit() to
+   provide guarantees over thread exit event timing in release build
+ - Added instr_cmovcc_triggered() and instr_cmovcc_to_jcc()
+ - Renamed OP_fcmovene to OP_fcmovne
+ - Implemented instr_invert_cbr() for OP_jcc_short
+ - Added the full path to modules in module_data_t
+ - Added dr_get_proc_address_ex() to support indirect code objects
+ - Added dr_get_milliseconds() and dr_get_time() impl for Linux
+ - Added instr_is_undefined()
+
+**************************************************
+<hr>
+The changes between version 1.5.0 and 1.4.0 are:
+
+ - Added a private loader on Windows for better support for library usage
+   by clients
+ - Added nudge support on Linux
+ - Added dr_suspend_all_other_threads() and dr_resume_all_other_threads()
+ - Made it easier for clients to use faults to push rare events out of
+   instrumentation paths:
+   - Added access to the pre-translated context and the code fragment
+     information for both
+     dr_register_signal_event() and dr_register_exception_event()
+     This changed the return type for exception event callbacks.
+   - Added a signal/exception event on a fault in non-code-cache
+     DynamoRIO code, such as client-generated code.
+   - Added the "meta-instruction that can fault" property via
+     instr_is_meta_may_fault(), instr_set_meta_may_fault(),
+     instrlist_meta_fault_preinsert(), instrlist_meta_fault_postinsert(),
+     and instrlist_meta_fault_append().
+   - Added a new event dr_register_restore_state_ex_event() that provides
+     the pre-translated context and code fragment information, and allows
+     for translation failure for non-fault translations.
+ - Added dr_dup_file_handle()
+ - Added dr_memory_is_dr_internal() and dr_memory_is_in_client()
+ - Added dr_get_parent_id()
+ - Added decode_opcode_name()
+ - Removed the deprecated snprintf() as it causes symbol pre-emption
+   problems on Linux.  Older clients should switch to dr_snprintf().
+ - Fixed bug in cross-architecture execve (Issue 146)
+ - Clone record is now passed via dstack instead of ebp (Issue 149)
+ - Fixed close() syscall handling, !HAVE_TLS assert & minor issues (Issue 151)
+
+**************************************************
+<hr>
+The changes between version 1.4.0 and 1.3.2 are:
+
+ - Added directly-addressable thread-local storage slots for exclusive
+   client use:
+   - dr_raw_tls_calloc()
+   - dr_raw_tls_cfree()
+ - Provide 64-bit versions of the drdeploy.exe and drview.exe tools
+ - Provide dr_get_proc_address() on Linux
+ - Added dr_query_memory_ex() to allow address space walking on Linux
+ - Added -msgbox_mask on Linux: waits for a keypress
+   - Added STDIN and dr_get_stdin_file()
+ - Added shared library versioning on Linux
+ - Support calling dr_get_mcontext() from bb and trace callbacks
+ - Provide support for building clients using CMake (see cmake/, and for
+   an example of usage see samples/CMakeLists.txt)
+ - Provide support for clients to use -fvisibility by setting
+   the define USE_VISIBILITY_ATTRIBUTES for dr_defines.h
+ - Added instr_compute_address_ex() for instrs with multiple memory operands
+ - Provide dr_snprintf() (identical to snprintf()) for consistent naming
+   and to avoid gcc warnings about using pointers with %x (which we're
+   using because there is no portable way to precisely control %p)
+ - The statistics viewer \c DRgui.exe is no longer supported on Windows
+   NT.  Statistics still work, but the graphical application itself will
+   not run on NT.
+ - Changed the top-level registry key to "DynamoRIO"
+ - Re-arranged layout of bin and samples directories
+ - Symbols for all binaries are now included
+
+**************************************************
+<hr>
+The changes between version 1.3.2 and 1.3.1 are:
+
+ - Added support for Linux execve of cross-architectural executables
+   (e.g., 32-bit process performing execve of 64-bit executable)
+   - Also, libdrpreload.so is now kept in the same libXX/{debug,release}
+     directory as libdynamorio.so
+ - instr_convert_short_meta_jmp_to_long() now returns the longer version of
+   the taken jump, to use when setting the target of a jecxz or loop*
+   branch.
+ - Various bug fixes including in these areas:
+   - dr_syscall_set_result() and dr_syscall_invoke_another()
+   - 64-bit drinject stack alignment
+   - 64-bit erroneous assert in dr_get_process_id()
+   - 64-bit dr_file_{tell,seek} worked but returned failure
+   - -opt_memory bugs resulting in asserts
+   - sigprocmask() corner case bug
+   - signal handler sharing for NPTL threads
+   - decoding across page boundaries on Linux
+
+**************************************************
+<hr>
+Version 1.3.1 is identical to 1.3.0 but is under a BSD license (see \ref
+page_license).
+
+We re-numbered the previous DynamoRIO versions as follows:
+
+ - 1.0.0 = 0.9.6 build 9600
+ - 1.1.0 = 0.9.6 build 9601
+ - 1.2.0 = 0.9.6 build 9602
+
+**************************************************
+<hr>
+The changes between version 1.3.0 and version 1.2.0 (0.9.6 9602) are:
+
+ - Version numbering shift to 1.x.y instead of 0.9.6 960x
+ - New system call pre, post, and filter events, and new system call
+   parameter and result access, along with a feature to chain system calls:
+   - dr_register_pre_syscall_event()
+   - dr_register_post_syscall_event()
+   - dr_register_filter_syscall_event()
+   - dr_syscall_get_param()
+   - dr_syscall_set_param()
+   - dr_syscall_set_sysnum()
+   - dr_syscall_get_result()
+   - dr_syscall_set_result()
+   - dr_syscall_invoke_another()
+   - dr_is_wow64()
+ - New signal event for Linux
+   - dr_register_signal_event()
+ - New option "-pause_on_error", and error messages to
+   stdout by default for release builds, to improve Linux debugging
+ - New routines for memory allocation and memory manipulation:
+   - dr_nonheap_alloc()
+   - dr_nonheap_free()
+   - dr_memory_protect()
+ - New option \ref op_syntax_intel "-syntax_intel" for Intel-style disassembly
+ - New option \ref op_sysenter "-sysenter_is_int80"
+ - The parameter to an application's system call (normally kept in the eax
+   register) can now be freely changed in basic blocks on all platforms
+ - Added support for 64-bit -thread_private
+ - Added corner-case undocumented IA-32 opcode support
+ - Fixed bug running multi-threaded 64-bit Linux apps
+ - Fixed bugs in 64-bit Linux signal handling
+ - Fixed bug running -thread_private debug build
+ - Fixed bug running 32-bit apps on 64-bit Linux on AMD processors
+ - Fixed bug where OS_OPEN_APPEND overwrote instead of appending on Windows
+
+**************************************************
+<hr>
+The changes between the 0.9.6 release builds 9602 and 9601 are:
+
+ - Performance improvements for both the base DynamoRIO system and for
+   client instrumentation when running on Pentium M, Core, and Core 2
+   processors.
+ - 64-bit bug fixes
+ - Added several convenience routines:
+   - get_register_name()
+   - reg_to_pointer_sized()
+   - reg_is_gpr()
+   - reg_is_segment()
+   - reg_32_to_8()
+ - Disassembly now expands immed sizes to match operands
+ - Fixed bug in instr_is_nop()
+
+**************************************************
+<hr>
+The changes between the 0.9.6 release builds 9601 and 9600 are:
+
+ - The Windows registry key used is now "VMware, Inc." instead of "VMware"
+ - Added large file support (see #DR_FILE_ALLOW_LARGE)
+ - Added support for decoding from a copy of code: decode_from_copy() and
+   disassemble_from_copy().
+ - Changed the default options to favor performance, and added the
+   \ref op_memory "-opt_memory" runtime option to prioritize memory instead.
+
+Release 0.9.6 is \b not backward compatible with prior releases 0.9.1-0.9.5.
+
+The major changes between the 0.9.6 and 0.9.5 releases include 64-bit
+support, multiple clients, state translation, trace contents, and Linux
+module events and fast system calls:
+
+ - 64-bit applications and clients are now supported.  This changed
+   several function signatures:
+   - instr_encode()
+   - decode_next_pc()
+   - decode_sizeof()
+   - decode_eflags_usage()
+   - instr_init()
+   - The binary trace dump format changed.
+   .
+   Several new functions were added:
+   - set_x86_mode()
+   - get_x86_mode()
+   - instr_set_x86_mode()
+   - instr_get_x86_mode()
+   - opnd_create_rel_addr()
+   - opnd_create_far_rel_addr()
+   - opnd_is_rel_addr()
+   - opnd_is_near_rel_addr()
+   - opnd_is_far_rel_addr()
+   - instr_has_rel_addr_reference()
+   - instr_get_rel_addr_target()
+   - instr_get_rel_addr_dst_idx()
+   - instr_get_rel_addr_src_idx()
+   - instr_shrink_to_32_bits()
+   - opnd_shrink_to_32_bits()
+   - reg_32_to_64()
+   - reg_64_to_32()
+   - reg_is_extended()
+   - reg_parameter_num()
+   .
+   To build a 64-bit client, set the \p X86_64 preprocessor define before
+   including the DynamoRIO header files, and link with the 64-bit build of
+   DynamoRIO (for a 32-bit client, set \p X86_32).
+ - Multiple clients are now supported.  This changed the signatures of
+   dr_init(), dr_get_options(), and dr_get_client_path().  It also changed
+   how clients are deployed and nudged, and how events are unregistered:
+   explicit unregistration routines are now used.
+ - State translation in the presence of clients is now fully supported.
+   This changed the signature for the basic block and trace event callbacks
+   (see dr_register_bb_event() and dr_register_trace_event()), added a
+   new event dr_register_restore_state_event(), and added new functions
+   instr_set_translation(), instr_set_meta_no_translation(), and INSTR_XL8().
+ - The trace callback (#dr_register_trace_event()) now presents original
+   application code to the client, rather than code that has already
+   been modified for execution in the code cache.  The client also has
+   flexibility in which instrumentation is included from constituent
+   basic blocks added to a trace (the \p for_trace parameter: see
+   #dr_register_bb_event()).
+ - Fast system calls (syscall and sysenter) are now supported on Linux.
+ - Module load/unload events and module iteration are now supported on Linux.
+ - System calls for 32-bit applications on 64-bit kernels are no longer
+   hidden by vsyscall; related functions were removed:
+   instr_is_lol64_syscall(), instr_is_32on64_syscall().
+ - Due to both 64-bit support and full WOW64 (32-bit applications on 64-bit
+   Windows) support, xmm registers were added to dr_mcontext_t, and a
+   new function dr_mcontext_xmm_fields_valid() was added.
+ - Far instr-type operands are now supported: opnd_create_far_instr(),
+   opnd_is_near_instr(), opnd_is_far_instr().
+ - Miscellaneous new functions were added:
+   - instr_convert_short_meta_jmp_to_long()
+   - instr_reads_from_reg()
+   - LOCK()
+   - OPND_CREATE_INT_32OR8()
+   - OPND_CREATE_INT_16OR8()
+   - instrlist_meta_append()
+   - dr_using_all_private_caches()
+ - The type of nudge arguments was changed from (void *) to uint64.
+ - The signature of dr_lookup_module() changed.  It no longer has an
+   IMAGE_SECTION_HEADER out argument.  See dr_lookup_module_section()
+   for that functionality.
+ - The disassemble-from-address routines now return NULL when pointed at
+   invalid instructions (matching the decode routines).
+ - The routines to access DynamoRIO tls slots from the cache were changed.
+   dr_insert_write_temp_tls was eliminated in favor of a generalized #dr_save_reg
+   with more flexibility on which slot can be used.  #dr_save_arith_flags was
+   similarly generalized.  Slots are now guaranteed to remain valid until the
+   next non-meta instruction allowing access to saved registers during clean
+   calls via #dr_read_saved_reg and #dr_write_saved_reg.  #dr_insert_mbr_instrumentation
+   also now requires caller to specify the spill slot to be clobbered
+   which must be less than dr_max_opnd_accessible_spill_slot().
+
+**************************************************
+<hr>
+The major changes between the 0.9.5 and 0.9.4 releases are:
+
+ - The basic block hook (\ref sec_events_bb) passes completely unmodified
+   application code to the client (no mangling or elision).
+ - The old client hook exports have been replaced with an explicit event
+   registration model.
+ - Instruction representation simplification: the client only sees fully
+   decoded instructions.
+ - Easier-to-use clean calls (see #dr_insert_clean_call).
+ - Library support (-wrap on linux, ntdll on windows: see \ref sec_extlibs
+   and \ref sec_utils).
+ - Some features have been removed (these are easily implemented by a
+   client): there is no more edge-counting profile build, no more
+   custom exit stubs, and no more prefixes.
+ - Infrastructure improvements:
+   - Thread-shared caches (can still request thread-private: \ref
+     op_thread_priv "-thread_private option").  Note that there are
+     some subtle changes stemming from using thread-shared: in particular,
+     note that the context passed to the deletion event may be NULL
+     (see #dr_register_delete_event).
+   - Direct access to TLS slots (#dr_save_reg, dr_insert_write_temp_tls,
+     #dr_insert_write_tls_field).
+ - Module events (#dr_register_module_load_event),
+   module iteration (#dr_module_iterator_start, #dr_lookup_module, etc.),
+   and memory querying (#dr_query_memory, #dr_virtual_query).
+ - The full API is now documented in html and pdf for easy browsing.
+ - Numerous type and routine name changes.
+
+
+***************************************************************************
+\htmlonly
+<table width=100% bgcolor="#000000" cellspacing=0 cellpadding=2 border=0>
+  <tr><td><table width=100% bgcolor="#0000C0" cellspacing=0 cellpadding=1 border=0>
+  <tr><td><table width=100% bgcolor="#0000C0" cellspacing=0 cellpadding=1 border=0>
+  <tr><td></td></tr></table></td></tr></table></td></tr></table>
+\endhtmlonly
+\section sec_limits Limitations
+
+\subsection sec_limit_clients Client Limitations
+The most important limitation on a client is that it remain transparent.
+This is described fully in \ref transparency.
+Here we summarize the key points to remain transparent:
+
+  - For full transparency, the client should be a self-contained library
+with linkage to nothing other than DynamoRIO libraries.  We
+provide private loading that makes some use of system libraries safe, but
+global resource conflicts can still occur and clients are cautioned from
+using system-interacting library routines.
+See \ref sec_extlibs for further details.
+  - Currently, the communication API provided by DynamoRIO is limited to file
+I/O and nudges.
+
+\subsection sec_limit_platforms Platform Limitations
+  - This version of DynamoRIO supports Windows 8, 8.1, and 10.
+    However, systemwide injection (-syswide_on) is not yet supported on
+    Windows 8 or higher except for WOW64 (i.e., 32-bit applications on
+    a 64-bit kernel).
+  - DynamoRIO currently supports the following NT-based 32-bit
+    Windows systems: XP (32-bit, service packs 0-3), 2003 (32-bit, service
+    packs 0-2), Vista (32-bit, service packs 0-1),
+    Windows 7 (32-bit, service packs 0-1), Windows 8, Windows 8.1, and
+    Windows 10.
+    It does not support Windows 95, 98, or ME.
+    It no longer officially supports NT (all service packs) or 2000 (all service
+    packs), although the core DynamoRIO library should still work there: it
+    is only the tools and utility programs that will fail to run.
+    Windows Server 2008 is expected to work but has not
+    been tested.
+  - This release of DynamoRIO supports running 32-bit
+    Windows applications on the following 64-bit Windows operating
+    systems: Windows XP Professional x64 (service pack 2), Windows 2003
+    x64 (service pack 2), Vista x64 (service packs 0-1), Windows 7
+    (service packs 0-1), Windows Server 2008, Windows 8, Windows 8.1, and
+    Windows 10.
+    Only the 32-bit
+    code will be seen, and child processes created will not be injected
+    into.  On 64-bit Windows 32-bit applications are automatically run
+    through the Windows-On-Windows or WOW64 emulator so system call and
+    indirect call processing clients must be aware of
+    #instr_is_wow64_syscall().
+  - On all versions of Windows, attaching DynamoRIO to an already-running
+    process can result in loss of control if the attach point is in the
+    middle of an operating system event callback. From the callback return
+    point until the next system call hook, no instructions will be observed
+    by a client.
+\anchor limits_64bit
+  - This release of DynamoRIO supports running
+    64-bit Windows applications, using the 64-bit DynamoRIO build, on
+    the following 64-bit Windows systems: Windows XP Professional x64
+    (service pack 2), Windows 2003
+    x64 (service pack 2), Vista x64 (service packs 0-1), Windows 7 x64
+    (service packs 0-1), Windows 8, Windows 8.1, and Windows 10.
+    Windows Server 2008 is expected to work but has not
+    been tested.
+  - DynamoRIO does not support any Itanium based Windows systems.
+  - This release does not fully support applications that mix 32-bit and
+    64-bit code.  Future releases will support such mixtures.
+  - When running a cygwin application under control of DynamoRIO,
+    stderr and stdout output from DynamoRIO or its clients may not
+    be visible.
+  - UTF-8 support is not yet present in drinjectlib, drconfiglib,
+    drrun.exe, drconfig.exe, or drinject.exe.  It is present in the
+    core DR API.
+  - This release of DynamoRIO has support for most 32-bit and
+    64-bit Linux
+    distributions running on Intel-compatible hardware, including
+    Ubuntu and Fedora.
+  - This release of DynamoRIO has support for running 32-bit
+    Linux applications on 64-bit Linux operating systems on
+    AMD64-compatible hardware.
+  - Cross-architecture execve (e.g., a 32-bit process performing execve of
+    a 64-bit executable) may stop working if the paths to the
+    libdynamorio.so and libdrpreload.so libraries are renamed.
+  - This release of DynamoRIO supports 32-bit applications running on
+    32-bit Linux operating systems on AArch32 ARMv7 and ARMv8 hardware.
+    However, a few features are not yet ported: traces, clean
+    call inlining and other optimizations, and several samples.
+  - This release of DynamoRIO has experimental support for 32-bit Android
+    applications running on AArch32 ARMv7 and ARMv8 hardware.
+    However, a few features are not yet ported: traces, clean
+    call inlining and other optimizations, and several samples.
+  - This release of DynamoRIO has experimental support for 64-bit
+    applications running on 64-bit Linux operating systems on AArch64 ARMv8
+    hardware.  However, floating-point and SIMD instruction operands are
+    not fully decoded or encoded yet, and a few features are not yet
+    ported: traces, clean call inlining and other optimizations, and
+    several samples and provided tools.
+  - This release of DynamoRIO includes support for applications using the Linux kernel
+    restartable sequence ("rseq") feature, subject to the limitations listed
+    in \ref sec_rseq.
+
+\subsection sec_limit_perf Performance Limitations
+
+  - In order to present a more straightforward code stream to clients,
+    DynamoRIO has several optimizations disabled in this release.
+    System-call-heavy applications are the ones most likely to be affected.
+    Future releases may allow clients to choose performance versus
+    visibility.  This release does provide the \ref op_memory "-opt_memory option"
+    to enable prioritizing memory usage and the \ref op_speed "-opt_speed option"
+    to prioritize performance at the cost of more complex basic blocks that
+    cross control transfers.
+  - The performance when starting up large desktop applications
+    may be noticeably worse than native.  Upcoming releases will
+    address this issue.
+  - The performance when
+    running  Java, .Net, Flash or similar managed execution
+    applications can be noticeably worse then native.  This can
+    include applications that load these components as in-process
+    plugins (such as Internet Explorer). Upcoming releases will
+    address this issue.
+  - When using DynamoRIO on all or many processes on a system
+    simultaneously, memory usage may become a factor.  Upcoming
+    releases will address this issue.
+
+\subsection sec_limit_deploy Deployment Limitations
+
+  - The dr_config.lib library is not multi-thread safe.  Users of the
+    library should ensure that no more then one thread accesses the
+    library at a time.
+  - Other installed software that uses hooks may not always be
+    interoperable with DynamoRIO.
+  - Other installed software may conflict with DynamoRIO's use of the
+    \c \\HKLM\\SOFTWARE\\Microsoft\\Windows\\WindowsNT\\CurrentVersion\\AppInit_DLLs
+    registry key (only very rarely an issue), which is used for
+    the -syswide_on feature.
+  - On Windows, the Enhanced Mitigation Experience Toolkit (EMET) may prevent
+    applications from running under DynamoRIO
+    (<a href="https://github.com/dynamorio/dynamorio/issues/1546">issue 1546</a>).
+    Please disable EMET for the application if necessary.
+  - On Windows 7 and Windows Server 2008 R2, the digital signature
+    requirement for AppInit_DLLs libraries is disabled when systemwide
+    injection is requested (-syswide_on).  This can be a security concern.
+  - On Windows 8 or 8.1, system wide injection (-syswide_on) is not yet supported.
+  - Cygwin processes may not work with DynamoRIO due to cygwin's
+    implementation of fork being incompatible with DynamoRIO.
+  - A Windows application that does not statically link with
+    user32.dll will not be run under control of DynamoRIO using
+    system-wide injection unless its
+    parent process (typically cmd.exe or explorer.exe, for manually
+    launched applications) is already under DynamoRIO control.  Only some small
+    non-graphical applications do not link with user32.dll.
+  - When invoking an application in any way that is not from a parent
+    process under DynamoRIO control, DynamoRIO takes control a little
+    later and in some rare cases the application has already created a new
+    thread.  This is in violation of the Windows specficiations, but cygwin
+    processes do this.  This new thread will not be under DynamoRIO
+    control and can cause a variety of problems.  In such cases it is best
+    to invoke from a parent process under DynamoRIO control.  However, for
+    32-bit applications on 64-bit Windows operating systems, DynamoRIO
+    takes over later even from the parent.  Future releases will address
+    this limitation.
+  - This release does not support running some Windows services under
+    control of DynamoRIO: the "System" process, smss.exe, csrss.exe, and protected
+    processes on Windows Vista.
+
+\anchor limits_vista_service_messagebox
+  - On Windows Vista most services are run in a separate session as a
+    security feature.  This means that neither DynamoRIO nor its
+    client will be able to display a messagebox when running in said
+    services (they have no associated visible window station). See
+    dr_messagebox().
+  - On Windows Vista the code from
+    certain dlls (found mostly in services) and the code subsequently
+    called from those dlls is run natively and is not visible to the
+    instrumentation APIs.  This only applies to dlls that have a .pexe
+    section (only 13 dlls have such a section in a standard Vista
+    install) which seems to be associated with a likely obfuscation
+    method involving kernel side components that this release has no
+    other workaround for.
+\anchor limits_linux_preload
+  - On Linux, non-default late injection (requested via \p -late to drrun)
+    is unable to run binaries with the suid or sgid permission bits set.
+    Default injection is capable of executing these binaries, but if late
+    injection is desired, one method of running these binaries
+    is to place both libdrpreload.so and libdynamorio's full paths in
+    /etc/ld.so.preload.
+    You'll need to use a \ref sec_lin_deploy "separate configure step approach".
+    Don't forget to run drconfig to create a configuration for the
+    application first; otherwise, libdrpreload.so will refuse to take
+    control.  This method of injection takes control part-way through
+    initialization of the target application, rather than at the very
+    beginning.  Alternatively, you could run as root, or remove the suid
+    and sgid bits: however, both of those solutions may open up security
+    holes and are not recommended.  If the suid or sgid binary is a leaf
+    child process of the parent target application, another option is to
+    run the problematic child process natively by either creating a configuration
+    file for the child with the "-norun" parameter or running with the
+    \ref op_children "-no_follow_children" runtime option.
+  - On Linux, the private loader will fail to load libpthread.so.  Therefore
+    clients and the libraries they use cannot link against libpthread.so.
+
+***************************************************************************
+\htmlonly
+<table width=100% bgcolor="#000000" cellspacing=0 cellpadding=2 border=0>
+  <tr><td><table width=100% bgcolor="#0000C0" cellspacing=0 cellpadding=1 border=0>
+  <tr><td><table width=100% bgcolor="#0000C0" cellspacing=0 cellpadding=1 border=0>
+  <tr><td></td></tr></table></td></tr></table></td></tr></table>
+\endhtmlonly
+\section sec_future Plans for Future Releases
+
+We hope to include the following major features in future releases:
+
+ - Libraries to facilitate building tools that use shadow memory, examine
+   system calls, and insert heavyweight instrumentation.
+ - Earliest Windows injection.  Today drinject injects fairly late; from a
+   parent process, injection is very early (before kernel32.dll is loaded),
+   but we plan to provide injection at the very first user-mode instruction
+   in the future.
+ - Persistent and process-shared code caches.
+ - Full control over trace building.
+
+To discuss current and future features, join the <a
+href="http://groups.google.com/group/dynamorio-users/">DynamoRIO Users
+group</a>.
+
+*/

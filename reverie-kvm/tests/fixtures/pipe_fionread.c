@@ -362,10 +362,16 @@ static void excluded(int native) {
   CHECK(fd >= 0);
   refused(fd, ENOTTY);
   CHECK(close(fd) == 0);
+  errno = 0;
   fd = open("/proc", O_RDONLY | O_DIRECTORY);
-  CHECK(fd >= 0);
-  refused(fd, ENOTTY);
-  CHECK(close(fd) == 0);
+  if (native) {
+    CHECK(fd >= 0);
+    refused(fd, ENOTTY);
+    CHECK(close(fd) == 0);
+  } else {
+    // The backend refuses its own procfs, /proc itself included.
+    CHECK(fd == -1 && errno == EACCES);
+  }
   puts(
       native ? "excluded-native-behavior-checked"
              : "excluded-kvm-refusals-checked");

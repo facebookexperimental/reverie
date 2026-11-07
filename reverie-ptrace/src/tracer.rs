@@ -4213,9 +4213,9 @@ impl<T: Tool + 'static> TracerBuilder<T> {
         // `execve`, but that is tricky when ptracing the `execve` call.
         resolve_program(&mut command)?;
 
-        // Disable sanitizers that use ptrace from running on tracer.
-        command.env("LSAN_OPTIONS", "detect_leaks=0");
-        command.env("ASAN_OPTIONS", "detect_leaks=0");
+        // A sanitizer build's leak check cannot run under this tracer; turn
+        // it off and keep the guest's other sanitizer settings.
+        command.turn_off_leak_check();
 
         let intercept_rdtsc = events.has_rdtsc();
         #[cfg(all(test, target_arch = "x86_64"))]
@@ -9071,9 +9071,11 @@ mod tests {
                 assert_eq!(argument.as_bytes(), *expected, "exec must retain argv");
             }
             assert_eq!(read(stack + 24)?, 0, "argv terminator");
-            // TracerBuilder adds these two sanitizer settings after env_clear.
+            // TracerBuilder turns the leak check off in the command's sanitizer
+            // options, keeping its other settings, and sets the two variables
+            // when the command does not.
             for (index, expected) in [
-                b"ASAN_OPTIONS=detect_leaks=0".as_slice(),
+                b"ASAN_OPTIONS=exitcode=42:detect_leaks=0".as_slice(),
                 b"LSAN_OPTIONS=detect_leaks=0",
                 b"REVERIE_PREINIT_TEST=retained",
             ]
@@ -9140,6 +9142,7 @@ mod tests {
         command
             .arg("canonical-exec")
             .env_clear()
+            .env("ASAN_OPTIONS", "exitcode=42")
             .env("REVERIE_PREINIT_TEST", "retained");
         let tracer = TracerBuilder::<CanonicalExecTool>::new(command)
             .spawn()

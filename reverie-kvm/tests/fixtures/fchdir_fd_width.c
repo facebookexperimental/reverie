@@ -99,6 +99,10 @@ static void record(const char *object, uint64_t upper, int unused,
          state);
 }
 
+// The harness's /proc, which the program inherits as its standard input and
+// keeps here: the backend refuses a guest's own open of procfs.
+static int inherited_proc = -1;
+
 static void restore_base(int saved, const char *base) {
   CHECK(fchdir(saved) == 0);
   check_state(base, base_marker, sizeof(base_marker) - 1);
@@ -188,8 +192,8 @@ static void negative(const char *object, unsigned variant, uint64_t upper,
 static void policy(const char *object, int proc, uint64_t upper, int unused,
                    int guest, int saved, const char *base) {
   check_state(base, base_marker, sizeof(base_marker) - 1);
-  int directory = open(proc ? "/proc" : "policy-target",
-                       O_DIRECTORY | (proc ? O_RDONLY : O_PATH));
+  int directory = proc ? dup(inherited_proc)
+                       : open("policy-target", O_DIRECTORY | O_PATH);
   CHECK(directory >= 0);
   unsigned char expected_version[4096];
   size_t version_size = 0;
@@ -234,6 +238,8 @@ int main(int argc, char **argv) {
   CHECK(fchdir(saved) == 0);
   CHECK(getcwd(base, sizeof(base)) != NULL);
   write_marker("marker", base_marker, sizeof(base_marker) - 1);
+  inherited_proc = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 100);
+  CHECK(inherited_proc >= 100);
   // Clearing bit 31 of INT_MIN would resolve to this live directory and must
   // be detected as incorrect success, rather than another EBADF by accident.
   CHECK(dup2(saved, STDIN_FILENO) == STDIN_FILENO);
@@ -265,5 +271,6 @@ int main(int argc, char **argv) {
   CHECK(unlink("policy-target/marker") == 0 && rmdir("policy-target") == 0);
   CHECK(unlink("marker") == 0);
   CHECK(close(STDIN_FILENO) == 0 && close(saved) == 0);
+  CHECK(close(inherited_proc) == 0);
   return 0;
 }

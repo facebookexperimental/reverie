@@ -89,6 +89,84 @@ impl Drop for ChildStack {
     }
 }
 
+/// `struct clone_args` through `set_tid_size`: `CLONE_ARGS_SIZE_VER1`, the
+/// layout since Linux 5.5 (include/uapi/linux/sched.h).
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+}
+
+/// Linux's `CSIGNAL`: the exit-signal bits of `clone`'s flags. Spelled here
+/// because the `libc` crate does not define it for Android.
+const CSIGNAL: libc::c_int = 0xff;
+
+/// Like [`clone`] without namespaces, but the child gets process ID `pid`
+/// through `clone3`'s `set_tid`, in the PID namespace this process creates
+/// its children in (normally its own). `flags` may hold only the child's exit
+/// signal; any other flag is refused with `EINVAL` before the call (see
+/// [`Command::pid`](crate::Command::pid)).
+///
+/// The kernel's errors stand: `EPERM` without `CAP_SYS_ADMIN` or
+/// `CAP_CHECKPOINT_RESTORE` over that namespace, `EEXIST` when a task,
+/// process group or session holds `pid`, `EINVAL` when `pid` is not in
+/// `1..pid_max`, `E2BIG` on Linux 5.3 and 5.4 (`clone3` without `set_tid`),
+/// and `ENOSYS` where `clone3` is unavailable: before Linux 5.3, or refused by
+/// a seccomp filter.
+///
+/// The child runs on a copy of the calling thread's stack, as after `fork`:
+/// a raw `clone3` cannot start a function on a new stack without an assembly
+/// trampoline, and without `CLONE_VM` it needs none. `cb` runs behind an
+/// `extern "C"` frame, as [`clone`]'s callback does, so a panic in it aborts
+/// the child rather than unwinding into the frames it copied from its
+/// parent. As after the raw `clone` of [`clone`], a C library that caches the
+/// process ID (bionic does) still holds the parent's in the child, so `cb`
+/// must not rely on `getpid()`.
+pub(super) fn clone_with_pid<F>(cb: F, flags: libc::c_int, pid: Pid) -> Result<Pid, Errno>
+where
+    F: FnMut() -> i32,
+{
+    extern "C" fn run<G: FnMut() -> i32>(cb: &mut G) -> libc::c_int {
+        // No pthread_atfork handler runs in this child.
+        super::launch_window::reset_after_raw_clone();
+        cb()
+    }
+
+    if flags & !CSIGNAL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let set_tid: libc::pid_t = pid.as_raw();
+    let args = CloneArgs {
+        exit_signal: (flags & CSIGNAL) as u64,
+        set_tid: std::ptr::from_ref(&set_tid) as u64,
+        set_tid_size: 1,
+        ..CloneArgs::default()
+    };
+    // The callback stays on this thread's stack: the child gets its own copy.
+    let mut cb = cb;
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            std::ptr::from_ref(&args),
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if res == 0 {
+        let code = run(&mut cb);
+        unsafe { libc::_exit(code) }
+    }
+    Errno::result(res).map(|child| Pid::from_raw(child as libc::pid_t))
+}
+
 pub fn clone<F>(cb: F, flags: libc::c_int) -> Result<Pid, Errno>
 where
     F: FnMut() -> i32,

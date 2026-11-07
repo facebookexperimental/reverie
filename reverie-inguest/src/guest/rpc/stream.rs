@@ -21,7 +21,9 @@ use crate::guest::support::raw_result;
 use crate::guest::support::tool_callback_active;
 use crate::trap::raw_syscall6;
 
-/// Move an owned ordinary coordinator socket above the guest's low descriptors.
+/// Move an owned ordinary coordinator socket into the runtime range, at or
+/// above [`crate::guest::protect::RUNTIME_FD_MIN`], above the guest's low
+/// descriptors.
 ///
 /// This preserves the same open-file description and connection, setting
 /// close-on-exec on its new descriptor. It neither connects nor authenticates a
@@ -30,7 +32,8 @@ use crate::trap::raw_syscall6;
 /// drops the original owner exactly once; failure drops it and returns the
 /// actual duplication error. Native inherited-gate streams do not use this.
 pub fn move_ordinary_coordinator_stream(stream: UnixStream) -> io::Result<UnixStream> {
-    // Explicit InitialImage placement; the ordinary connection does not opt in.
+    // InitialImage placement, which fails rather than keep a low number; the
+    // ordinary connection uses `protect::place_runtime_fd`, which falls back.
     // An occupied high descriptor is skipped, never overwritten.
     let reserved_fd = raw_result(unsafe {
         raw_syscall6(
@@ -38,7 +41,7 @@ pub fn move_ordinary_coordinator_stream(stream: UnixStream) -> io::Result<UnixSt
             [
                 stream.as_raw_fd() as u64,
                 libc::F_DUPFD_CLOEXEC as u64,
-                1024,
+                crate::guest::protect::RUNTIME_FD_MIN as u64,
                 0,
                 0,
                 0,
@@ -470,6 +473,94 @@ mod tests {
                     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
                     0
                 );
+            },
+        );
+    }
+
+    /// A coordinator connection the runtime moves off its number for a guest
+    /// call (CoordinatorRpc::relocate, as protect::relocate_runtime_fd uses it)
+    /// answers the next request on its new number, with the old one closed,
+    /// and is recorded there as the coordinator's. A relocation while a
+    /// request of this process holds the connection refuses (EBUSY) rather
+    /// than wait for itself.
+    #[test]
+    fn a_relocated_coordinator_connection_answers_the_next_request() {
+        isolated_coordinator_move_test(
+            "guest::rpc::stream::tests::a_relocated_coordinator_connection_answers_the_next_request",
+            || {
+                use std::os::unix::net::UnixListener;
+                use std::time::Duration;
+
+                use reverie_rpc_transport::RequestEnvelope;
+                use reverie_rpc_transport::codec::encode;
+
+                let directory = std::env::temp_dir()
+                    .join(format!("ordinary-rpc-relocate-{}", std::process::id()));
+                std::fs::create_dir(&directory).unwrap();
+                let directory_owner = std::fs::File::open(&directory).unwrap();
+                let path = std::path::PathBuf::from(format!(
+                    "/proc/self/fd/{}/socket",
+                    directory_owner.as_raw_fd()
+                ));
+                let listener = UnixListener::bind(&path).unwrap();
+                // SAFETY: gettid reads the actual test thread identity.
+                let tid = reverie::Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+                let peer = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let send = |socket: &mut UnixStream, bytes: Vec<u8>| {
+                        socket
+                            .write_all(&(bytes.len() as u32).to_be_bytes())
+                            .unwrap();
+                        socket.write_all(&bytes).unwrap();
+                    };
+                    send(&mut socket, encode(&73_u64).unwrap());
+                    for (request, response) in [(19_u64, 91_u64), (23, 97)] {
+                        let expected = encode(&RequestEnvelope { from: tid, request }).unwrap();
+                        let mut prefix = [0; 4];
+                        socket.read_exact(&mut prefix).unwrap();
+                        assert_eq!(u32::from_be_bytes(prefix) as usize, expected.len());
+                        let mut received = vec![0; expected.len()];
+                        socket.read_exact(&mut received).unwrap();
+                        assert_eq!(received, expected);
+                        send(&mut socket, encode(&response).unwrap());
+                    }
+                    assert_eq!(socket.read(&mut [0]).unwrap(), 0);
+                });
+                let rpc = crate::guest::rpc::CoordinatorRpc::<OrdinaryConnectionModel>::connect(
+                    &path,
+                    |_, _| panic!("ordinary connection unexpectedly reconnected"),
+                )
+                .unwrap();
+                let from = rpc.raw_fd();
+                crate::guest::protect::reserve_coordinator_fd(from).unwrap();
+                assert_eq!(rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
+                {
+                    let _in_flight = rpc.connection.lock();
+                    assert_eq!(
+                        rpc.relocate(from).unwrap_err().raw_os_error(),
+                        Some(libc::EBUSY)
+                    );
+                }
+                assert_eq!(rpc.raw_fd(), from, "a refused relocation moves nothing");
+                let moved = rpc.relocate(from).unwrap();
+                assert_ne!(moved, from);
+                assert_eq!(rpc.raw_fd(), moved);
+                assert_eq!(crate::guest::protect::coordinator_fd(), Some(moved));
+                // The caller closes the old number, as relocate_runtime_fd does.
+                // SAFETY: `from` is owned by no one after the relocation.
+                unsafe { raw_syscall6(libc::SYS_close, [from as u64, 0, 0, 0, 0, 0]) };
+                assert_eq!(rpc.send_blocking_unless_in_flight(23).unwrap(), 97);
+                drop(rpc);
+                peer.join().unwrap();
+                std::fs::remove_file(directory.join("socket")).unwrap();
+                drop(directory_owner);
+                std::fs::remove_dir(&directory).unwrap();
             },
         );
     }

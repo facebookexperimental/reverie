@@ -1,0 +1,5 @@
+./test -M 'op[0].size == 16' -P 'entry(&data,&data_END,&data2,bytes,size,asm)@inst'
+
+# Although multiple bytesuctions use %xmm regs, only one reads the whole
+# register, so the filter matches exactly 1 bytesuction.
+

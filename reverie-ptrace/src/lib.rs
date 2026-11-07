@@ -52,6 +52,7 @@ mod failure;
 mod gdbstub;
 mod injected_syscall;
 mod perf;
+mod pidfd_self;
 mod poll_on_wake;
 pub mod regs;
 mod segv_state;

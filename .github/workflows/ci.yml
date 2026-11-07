@@ -1,7 +1,26 @@
 name: Rust
 
+# Owner decision, 2026-10-27: run CI automatically only for pull requests not
+# opened by the project bot (hermit-bot3). The hosted `regular` job runs for
+# such a pull request once it is out of draft, from a branch or a fork; it uses
+# no secrets and the read-only token below. The self-hosted `hardware` job runs
+# for a pull request only when the owner opened it, its head branch is in this
+# repository (not a fork), and it is not a draft: a third party's code must not
+# run unreviewed on the PMU hosts, and an owner-opened pull request from someone
+# else's fork would otherwise run every later push from that fork there.
 on:
   workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+# One run per pull request: a newer push cancels the older run, so pushes do
+# not queue up on the small self-hosted pool. Dispatches keep their own group.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -10,6 +29,7 @@ env:
 jobs:
   regular:
     name: Regular tests (GitHub-hosted)
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
     runs-on: ubuntu-latest
 
     steps:
@@ -17,7 +37,11 @@ jobs:
       with:
         submodules: false
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+      # Refresh the index first: the runner image's index can name package
+      # versions the mirror no longer serves, and install then fails with 404.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
     - name: Establish ordinary-user namespace prerequisite
       id: userns
       timeout-minutes: 1
@@ -93,9 +117,36 @@ jobs:
         cat "$generation/bundle/github.env" >> "$GITHUB_ENV"
     - name: DBT virtual identity and pidfd_open policy
       run: reverie-dbt/scripts/test-identity-policy.sh
+    - name: DBT Strace caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-examples/strace-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT Counter1 caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-examples/counter1-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT lifecycle caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-dbt/tests/fixtures/caller-lifecycle-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
     - name: Test regular workspace cases
       run: >-
-        cargo test --workspace --exclude reverie-kvm --exclude reverie-inguest --all-features --no-fail-fast --
+        cargo test --workspace --exclude reverie-kvm --exclude reverie-kvm-core --exclude reverie-linuxemu --exclude reverie-inguest --all-features --no-fail-fast --
         --test-threads=1
         --skip container::tests::bind_to_low_port
         --skip container::tests::mount_error_from_child_is_returned
@@ -166,7 +217,9 @@ jobs:
           ) ||
           (
             github.event_name == 'pull_request' &&
-            github.event.pull_request.user.login == 'rrnewton'
+            github.event.pull_request.user.login == 'rrnewton' &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            !github.event.pull_request.draft
           )
         )
       }}
@@ -234,6 +287,8 @@ jobs:
         fi
     - name: Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: clippy, rustfmt
     - name: Build
       run: cargo build --workspace --all-features
     - name: LiteInst allocator fixtures
@@ -244,6 +299,34 @@ jobs:
         generation="$RUNNER_TEMP/liteinst-allocator-$GITHUB_JOB-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
         scripts/build-liteinst-test-runtime.rs --for-ci "$generation"
         cat "$generation/bundle/github.env" >> "$GITHUB_ENV"
+    - name: DBT native client
+      run: reverie-dbt/scripts/build-client.sh
+    - name: DBT Strace caller artifact and standalone gates
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-examples/strace-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT Counter1 caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-examples/counter1-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT lifecycle caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-dbt/tests/fixtures/caller-lifecycle-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
     - name: Host-dependent workspace tests
       env:
         REVERIE_REQUIRE_KVM: "1"

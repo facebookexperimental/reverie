@@ -13,8 +13,7 @@
 //!
 //! This module is part of Reverie's core, next to [`Tool`](crate::Tool),
 //! [`Guest`](crate::Guest) and [`Backend`](crate::Backend). It was step U6a
-//! of the provider seam (<https://github.com/rrnewton/hermit/issues/4485>,
-//! epic <https://github.com/rrnewton/hermit/issues/4492>) as its own crate,
+//! of the provider seam (<https://github.com/rrnewton/hermit/issues/4659>) as its own crate,
 //! reverie-linux-provider, which now only re-exports this module. It names no
 //! backend: reverie-kvm implements the memory traits for its guest arena and
 //! fixes the associated types; reverie-kvm's syscall executor and the
@@ -43,7 +42,7 @@
 //! that provider route. SaBRe does not route `Guest::inject` through it yet,
 //! and [`Backend`](crate::Backend) does not carry a provider. The remaining
 //! routes are later steps, tracked in
-//! <https://github.com/rrnewton/hermit/issues/4485>.
+//! <https://github.com/rrnewton/hermit/issues/4659>.
 //!
 //! # Rules every provider is held to
 //!
@@ -118,11 +117,15 @@ pub enum ProviderOutcome<Plan> {
     /// The raw Linux result: a nonnegative value, or `-errno` for a Linux
     /// error.
     Return(i64),
-    /// A blocking call was cancelled because the issuing task was retired
-    /// or cancelled (for example a read of inherited standard input). There is
-    /// no result. The backend must neither fabricate one nor resume the
-    /// Tool's handler, and it ends the issuing task's handler without a
-    /// result.
+    /// The call was cancelled because the issuing task was retired or
+    /// cancelled. Either a blocking call that was already running was
+    /// cancelled (for example a read of inherited standard input), or the call
+    /// was not run at all because it was made after the issuing task's thread
+    /// group had exited, or after the task had been cancelled (for example by
+    /// another thread's exec): such a task is dead, as a Linux thread killed
+    /// by its group's exit is, and its call does not return. There is no
+    /// result. The backend must neither fabricate one nor resume the Tool's
+    /// handler, and it ends the issuing task's handler without a result.
     Cancelled,
     /// The call observed that the issuing task's thread group has already
     /// exited with `status`, an exit the provider committed before or during

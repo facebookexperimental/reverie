@@ -690,12 +690,14 @@ pub unsafe fn install_instruction_signal_handler(
     };
     #[cfg(not(feature = "exec-private-init"))]
     let handler = instruction_sigsegv_handler;
-    // Through the runtime's private restorer, like the SIGSYS handler.
+    // Through the runtime's private restorer, like the SIGSYS handler, and
+    // with the same mask (`guest::runtime_mask`).
     unsafe {
-        crate::signal::install_runtime_handler(
+        crate::signal::install_masked_runtime_handler(
             libc::SIGSEGV,
             handler,
             if on_alt_stack { libc::SA_ONSTACK } else { 0 },
+            crate::guest::runtime_mask::runtime_action_mask(),
         )
     }
 }

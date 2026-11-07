@@ -12,9 +12,14 @@ use crate::gdbstub::commands::*;
 use crate::gdbstub::hex::*;
 
 #[derive(PartialEq, Debug)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "each variant names the `qXfer:<object>:read` packet it parses"
+)]
 pub enum qXfer {
     FeaturesRead { offset: usize, len: usize },
     AuxvRead { offset: usize, len: usize },
+    ThreadsRead { offset: usize, len: usize },
 }
 
 impl ParseCommand for qXfer {
@@ -44,8 +49,41 @@ impl ParseCommand for qXfer {
                 offset: decode_hex(offset).ok()?,
                 len: decode_hex(len).ok()?,
             })
+        } else if bytes.starts_with(b":threads:read:") {
+            let mut iter = bytes[b":threads:read:".len()..].split_mut(|c| *c == b':' || *c == b',');
+            let annex = iter.next()?;
+            if annex != b"" {
+                return None;
+            }
+            let offset = iter.next()?;
+            let len = iter.next()?;
+            Some(qXfer::ThreadsRead {
+                offset: decode_hex(offset).ok()?,
+                len: decode_hex(len).ok()?,
+            })
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_threads_read() {
+        assert_eq!(
+            qXfer::parse(BytesMut::from(&b":threads:read::0,fff"[..])),
+            Some(qXfer::ThreadsRead {
+                offset: 0,
+                len: 0xfff
+            })
+        );
+        assert_eq!(
+            qXfer::parse(BytesMut::from(&b":threads:read:annex:0,fff"[..])),
+            None,
+            "the threads object has no annex"
+        );
     }
 }

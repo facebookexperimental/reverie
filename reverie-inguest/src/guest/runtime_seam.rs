@@ -226,6 +226,7 @@ pub unsafe fn process_tool_syscall_with(event: &mut SyscallEvent, patcher: &dyn 
     }
     // SAFETY: as above.
     unsafe { crate::guest::installed_tool::dispatch(event) };
+    crate::guest::protect::observe_guest_descriptor_change(event);
     patcher.observe_mapping(event);
 }
 

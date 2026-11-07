@@ -37,7 +37,7 @@ fn process_outcome_reports_an_action_the_executor_keeps() {
         executor: &mut executor,
         memory: memory.clone(),
         process_context: ProcessExecutionContext::SyscallBoundary(
-            CompletedSyscallBoundary::for_test(),
+            &CompletedSyscallBoundary::FOR_TEST,
         ),
         callback_site: None,
         original_syscall: None,
@@ -88,7 +88,7 @@ fn process_outcome_reports_an_action_the_executor_keeps() {
 fn run_handler<F>(
     backend: &mut KvmBackend,
     executor: &mut ElfExecutor,
-    context: ProcessExecutionContext,
+    context: ProcessExecutionContext<'_>,
     handler: F,
 ) -> HandlerOutcome<std::result::Result<i64, Errno>>
 where
@@ -121,14 +121,14 @@ where
         signal_guard: SignalGuard::Ordinary,
     };
     // No instruction executes in this initialized VM control.
-    let registers = unsafe { std::mem::zeroed() };
+    let registers: libc::user_regs_struct = unsafe { std::mem::zeroed() };
     let mut guest = KvmGuest::new(
         pid,
         pid,
         tool.clone(),
         memory,
         &[],
-        registers,
+        &registers,
         &mut state,
         &mut adapter,
         global.as_ref(),
@@ -220,7 +220,7 @@ fn a_later_call_does_not_report_an_action_an_earlier_call_staged() {
         executor: &mut executor,
         memory: memory.clone(),
         process_context: ProcessExecutionContext::SyscallBoundary(
-            CompletedSyscallBoundary::for_test(),
+            &CompletedSyscallBoundary::FOR_TEST,
         ),
         callback_site: None,
         original_syscall: None,
@@ -309,7 +309,7 @@ fn a_process_outcome_with_a_failed_result_is_a_run_error() {
         GuestMemory::new(0, STACK_CAPACITY).unwrap(),
         &[],
         // This mock has no vCPU and never accesses registers.
-        unsafe { std::mem::zeroed() },
+        &crate::runtime::ZEROED_USER_REGISTERS,
         &mut state,
         &mut provider,
         global.as_ref(),

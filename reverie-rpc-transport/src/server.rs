@@ -43,6 +43,8 @@ use crate::envelope::RequestEnvelope;
 use crate::error::RpcError;
 use crate::initial_image::InitialImageAdmission;
 use crate::successor::SuccessorAdmission;
+use crate::tool_activation::ActivationConnection;
+use crate::tool_activation::ActivationRun;
 
 /// `SO_PEERPIDFD` (Linux 6.5): a pidfd for the process that connected the
 /// socket. Defined here because the libc crate exports it only from its
@@ -161,6 +163,25 @@ fn mapping_capture_peer(
     Ok(Some((run, peer)))
 }
 
+fn tool_activation_peer(
+    run: Option<&ActivationRun>,
+    stream: &UnixStream,
+) -> Result<Option<ActivationConnection>, RpcError> {
+    let Some(run) = run else {
+        return Ok(None);
+    };
+    let result = (|| {
+        let peer = stream.peer_cred()?.pid().ok_or_else(|| {
+            crate::tool_activation::invalid("Tool activation connection has no physical peer")
+        })?;
+        run.accepted(peer)
+    })();
+    if result.is_err() {
+        run.fail("Tool activation accepted socket authentication failed");
+    }
+    result.map(Some)
+}
+
 /// A coordinator that serves one shared [`GlobalTool`] instance to many guest
 /// processes over a Unix-domain socket.
 pub struct RpcServer<G: GlobalTool> {
@@ -177,6 +198,7 @@ pub struct RpcServer<G: GlobalTool> {
     initial_image: Option<InitialImageSetup>,
     native_successor: Option<Arc<dyn SuccessorAdmission>>,
     mapping_capture: Option<reverie::MappingCaptureRun>,
+    tool_activation: Option<ActivationRun>,
 }
 
 #[derive(Clone)]
@@ -202,6 +224,7 @@ struct ConnectionSetup {
     native_close: Option<Arc<dyn SuccessorAdmission>>,
     cancellation: Option<(usize, RequestCancellation)>,
     mapping_capture: Option<(reverie::MappingCaptureRun, i32)>,
+    tool_activation: Option<ActivationConnection>,
 }
 
 /// Actual error outcome of cancelling a received, admitted request. Fields are
@@ -667,6 +690,7 @@ where
             initial_image: None,
             native_successor: None,
             mapping_capture: None,
+            tool_activation: None,
         })
     }
 
@@ -709,6 +733,7 @@ where
             initial_image: None,
             native_successor: None,
             mapping_capture: None,
+            tool_activation: None,
         })
     }
 
@@ -765,6 +790,7 @@ where
             initial_image: None,
             native_successor: None,
             mapping_capture: None,
+            tool_activation: None,
         })
     }
 
@@ -773,6 +799,17 @@ where
     /// Tool-supplied numeric sender. No connection or cleanup policy is enabled.
     pub fn mapping_capture(mut self, run: reverie::MappingCaptureRun) -> Self {
         self.mapping_capture = Some(run);
+        self
+    }
+
+    /// Require explicit root-bound Tool activation and completion receipts.
+    ///
+    /// Bind `run` to the actual child before polling this server. Configuration
+    /// readers and ordinary RPC retain their existing behavior but provide no
+    /// activation credit. The launcher must join `run.completed()` with the
+    /// actual waited normal exit. This does not change legacy readiness flags.
+    pub fn tool_activation(mut self, run: ActivationRun) -> Self {
+        self.tool_activation = Some(run);
         self
     }
 
@@ -960,35 +997,46 @@ where
                 let native_successor = self.native_successor.clone();
                 let request_cancellation = cancellation.clone();
                 let mapping_capture = self.mapping_capture.clone();
+                let activation_run = self.tool_activation.clone();
                 connections.spawn(async move {
                     let _connection_guard = connection_guard;
                     let future = async move {
                         let mut stream = stream;
-                        let mapping_capture = mapping_capture_peer(mapping_capture, &stream)?;
-                        let admitted = admit_connection(admission.as_ref(), &stream)?;
-                        let cancellation = request_cancellation.map(|cancel| (connection, cancel));
-                        let config_bytes = match initial_image {
-                            Some(hook) => Some(connection_io(
-                                image_handshake(&mut stream, admitted, &hook,
-                                    native_successor.as_deref()),
-                                admitted, cancellation.as_ref()).await?),
-                            None => None,
-                        };
-                        serve_connection_owned(
-                            global,
-                            config,
-                            stream,
-                            ConnectionSetup {
-                                readiness,
-                                connection_readiness,
-                                admitted,
-                                handshake: config_bytes,
-                                native_close: native_successor,
-                                cancellation,
-                                mapping_capture,
-                            },
-                        )
-                        .await
+                        let tool_activation = tool_activation_peer(activation_run.as_ref(), &stream)?;
+                        let result = async {
+                            let mapping_capture = mapping_capture_peer(mapping_capture, &stream)?;
+                            let admitted = admit_connection(admission.as_ref(), &stream)?;
+                            let cancellation = request_cancellation.map(|cancel| (connection, cancel));
+                            let config_bytes = match initial_image {
+                                Some(hook) => Some(connection_io(
+                                    image_handshake(&mut stream, admitted, &hook,
+                                        native_successor.as_deref()),
+                                    admitted, cancellation.as_ref()).await?),
+                                None => None,
+                            };
+                            serve_connection_owned(
+                                global,
+                                config,
+                                stream,
+                                ConnectionSetup {
+                                    readiness,
+                                    connection_readiness,
+                                    admitted,
+                                    handshake: config_bytes,
+                                    native_close: native_successor,
+                                    cancellation,
+                                    mapping_capture,
+                                    tool_activation,
+                                },
+                            )
+                            .await
+                        }.await;
+                        if result.is_err() {
+                            if let Some(run) = &activation_run {
+                                run.fail("Tool activation connection setup or serving failed");
+                            }
+                        }
+                        result
                     };
                     if retain_issues {
                         let mut future = std::pin::pin!(future);
@@ -1033,6 +1081,11 @@ where
                 cancellation.joined(outcome);
             }
         }
+        if result.is_err() {
+            if let Some(run) = &self.tool_activation {
+                run.fail("Tool activation serving owner failed");
+            }
+        }
         result
     }
 
@@ -1054,6 +1107,7 @@ where
             completed: false,
         };
         let result = async {
+            let tool_activation = tool_activation_peer(self.tool_activation.as_ref(), &stream)?;
             let mapping_capture = mapping_capture_peer(self.mapping_capture.clone(), &stream)?;
             let admitted = admit_connection(self.admission.as_ref(), &stream)?;
             let config = self.config.clone();
@@ -1081,11 +1135,17 @@ where
                     native_close: self.native_successor.clone(),
                     cancellation: None,
                     mapping_capture,
+                    tool_activation,
                 },
             )
             .await
         }
         .await;
+        if result.is_err() {
+            if let Some(run) = &self.tool_activation {
+                run.fail("Tool activation connection setup or serving failed");
+            }
+        }
         match result {
             Err(error) if guard.monitor.is_some() => {
                 let error = Arc::new(error);
@@ -1294,8 +1354,30 @@ where
 async fn serve_connection_owned<G, S>(
     global: Arc<G>,
     config: G::Config,
+    stream: S,
+    mut setup: ConnectionSetup,
+) -> Result<(), ConnectionError>
+where
+    G: GlobalTool,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let mut activation = setup.tool_activation.take();
+    let result =
+        serve_connection_requests(global, config, stream, setup, activation.as_mut()).await;
+    if result.is_err() {
+        if let Some(activation) = &activation {
+            activation.fail();
+        }
+    }
+    result
+}
+
+async fn serve_connection_requests<G, S>(
+    global: Arc<G>,
+    config: G::Config,
     mut stream: S,
     setup: ConnectionSetup,
+    mut activation: Option<&mut ActivationConnection>,
 ) -> Result<(), ConnectionError>
 where
     G: GlobalTool,
@@ -1309,6 +1391,7 @@ where
         native_close,
         cancellation,
         mapping_capture,
+        tool_activation: _,
     } = setup;
     let cancellation_admitted = admitted;
     let mut request_number = 0usize;
@@ -1323,6 +1406,9 @@ where
         Some(frames) => std::borrow::Cow::Borrowed(frames.config.as_slice()),
         None => std::borrow::Cow::Owned(encode(&config)?),
     };
+    if let Some(activation) = activation.as_deref_mut() {
+        activation.config(&config_bytes);
+    }
     connection_io(
         write_message(&mut stream, &config_bytes),
         cancellation_admitted,
@@ -1357,6 +1443,9 @@ where
         {
             Ok(bytes) => bytes,
             Err(ConnectionError::Rpc(RpcError::Closed)) => {
+                if let Some(activation) = activation.as_deref_mut() {
+                    activation.closed()?;
+                }
                 if strict_sender {
                     let hook = native_close.as_ref().ok_or_else(|| {
                         crate::successor::invalid("native stream lost its lifecycle owner")
@@ -1378,7 +1467,13 @@ where
             }
             Err(e) => return Err(e),
         };
+        // The existing mapping-capture family has the same reserved negative
+        // Tid prefix. Its full eight-byte discriminator is checked first; all
+        // other reserved frames still reach activation rejection, never G.
         if let Some(token) = crate::mapping_capture::decode_request(&request_bytes)? {
+            if let Some(activation) = activation.as_deref() {
+                activation.before_application()?;
+            }
             let authorized = mapping_capture
                 .as_ref()
                 .is_some_and(|(run, peer)| run.authorize(token, *peer));
@@ -1391,8 +1486,31 @@ where
             .await?;
             continue;
         }
+        // Reserve the whole control family before ANY application decode,
+        // including legacy G::Request=(), which can accept trailing bytes.
+        if let Some(control) = crate::tool_activation::decode_request(&request_bytes)? {
+            let activation = activation.as_deref().ok_or_else(|| {
+                crate::tool_activation::invalid("Tool activation control on a legacy RPC server")
+            })?;
+            let pending = activation.stage(control)?;
+            connection_io(
+                write_message(&mut stream, &control.acknowledgement()),
+                cancellation_admitted,
+                cancellation.as_ref(),
+            )
+            .await?;
+            pending.commit()?;
+            continue;
+        }
+        if let Some(activation) = activation.as_deref() {
+            activation.before_application()?;
+        }
         let RequestEnvelope { from, request } =
             decode::<RequestEnvelope<G::Request>>(&request_bytes)?;
+        let _application = activation
+            .as_deref()
+            .map(|activation| activation.application(from.as_raw()))
+            .transpose()?;
         // Combined native-image admission binds every RPC sender to this
         // accepted process. Legacy/InitialImage-only admission retains its
         // first-request check; a forked child reconnects before sending.
@@ -1458,6 +1576,823 @@ where
 // connection error so a coordinator operator can see it.
 fn tracing_disconnect(e: &RpcError) {
     eprintln!("reverie-rpc-transport: guest connection ended with error: {e}");
+}
+
+#[cfg(test)]
+mod tool_activation_tests {
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicU64;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::io::ReadBuf;
+
+    use super::*;
+    use crate::tool_activation::ExitOrigin;
+    use crate::tool_activation::FinishedReceipt;
+    use crate::tool_activation::ToolControl;
+
+    const LIMIT: Duration = Duration::from_secs(2);
+    const CONFIG: u64 = 0x1234_5678_9abc_def0;
+
+    #[derive(Default)]
+    struct CountingGlobal {
+        requests: AtomicUsize,
+    }
+
+    #[reverie::global_tool]
+    impl GlobalTool for CountingGlobal {
+        type Request = ();
+        type Response = u64;
+        type Config = u64;
+
+        async fn receive_rpc(&self, _from: reverie::Tid, _request: ()) -> u64 {
+            self.requests.fetch_add(1, Ordering::SeqCst) as u64 + 1
+        }
+    }
+
+    fn root() -> i32 {
+        std::process::id() as i32
+    }
+
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(LIMIT, future)
+            .await
+            .expect("Tool transport fixture timed out")
+    }
+
+    fn run() -> ActivationRun {
+        let run = ActivationRun::new();
+        run.bind_root(root()).unwrap();
+        run
+    }
+
+    fn server(run: Option<ActivationRun>) -> (RpcServer<CountingGlobal>, Arc<CountingGlobal>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "reverie-tool-activation-{}-{}.sock",
+            root(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let global = Arc::new(CountingGlobal::default());
+        let server = RpcServer::bind_exclusive(path, global.clone(), CONFIG).unwrap();
+        (
+            match run {
+                Some(run) => server.tool_activation(run),
+                None => server,
+            },
+            global,
+        )
+    }
+
+    async fn config(stream: &mut UnixStream) -> crate::initial_image::ConfigDigest {
+        let bytes = read_message(stream, DEFAULT_MAX_FRAME_LEN).await.unwrap();
+        assert_eq!(crate::codec::decode_exact::<u64>(&bytes).unwrap(), CONFIG);
+        crate::initial_image::config_digest(&bytes)
+    }
+
+    async fn control(stream: &mut UnixStream, request: ToolControl) -> Result<(), RpcError> {
+        write_message(stream, &request.encode()).await?;
+        let bytes = read_message(stream, crate::tool_activation::FRAME_LEN).await?;
+        request.check_ack(&bytes)
+    }
+
+    fn finished(digest: crate::initial_image::ConfigDigest) -> ToolControl {
+        ToolControl::Finished {
+            digest,
+            receipt: FinishedReceipt::explicit_exit(23, 231, ExitOrigin::Deferred).unwrap(),
+        }
+    }
+
+    async fn application(stream: &mut UnixStream, sender: i32) -> Result<u64, RpcError> {
+        let bytes = encode(&RequestEnvelope {
+            from: reverie::Tid::from_raw(sender),
+            request: (),
+        })?;
+        write_message(stream, &bytes).await?;
+        decode(&read_message(stream, DEFAULT_MAX_FRAME_LEN).await?)
+    }
+
+    #[tokio::test]
+    async fn actual_primary_allows_startup_and_exit_hook_rpc_with_exact_receipt() {
+        let run = run();
+        let (server, global) = server(Some(run.clone()));
+        let path = server.path().to_owned();
+        let client_run = run.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+            stream.set_read_timeout(Some(LIMIT)).unwrap();
+            stream.set_write_timeout(Some(LIMIT)).unwrap();
+            let bytes = crate::read_config_frame(&mut stream).unwrap();
+            let config: u64 = crate::codec::decode_exact(&bytes).unwrap();
+            assert_eq!(config, CONFIG);
+            let digest = crate::initial_image::config_digest(&bytes);
+            // Ordinary Config and application requests are not activation.
+            assert!(client_run.completed().is_err());
+            {
+                let rpc = crate::BlockingRpcClient::<CountingGlobal>::from_borrowed_stream(
+                    &mut stream,
+                    reverie::Tid::from_raw(root()),
+                    &config,
+                );
+                assert_eq!(rpc.try_send_rpc(()).unwrap(), 1);
+            }
+            assert!(client_run.completed().is_err());
+            crate::exchange_tool_control(&mut stream, &ToolControl::Claim { digest }).unwrap();
+            // A real startup hook can use this same G before Started.
+            {
+                let rpc = crate::BlockingRpcClient::<CountingGlobal>::from_borrowed_stream(
+                    &mut stream,
+                    reverie::Tid::from_raw(root()),
+                    &config,
+                );
+                assert_eq!(rpc.try_send_rpc(()).unwrap(), 2);
+            }
+            crate::exchange_tool_control(&mut stream, &ToolControl::Started { digest }).unwrap();
+            assert!(client_run.completed().is_err());
+            // Likewise, awaited consuming-hook RPC precedes Finished.
+            {
+                let rpc = crate::BlockingRpcClient::<CountingGlobal>::from_borrowed_stream(
+                    &mut stream,
+                    reverie::Tid::from_raw(root()),
+                    &config,
+                );
+                assert_eq!(rpc.try_send_rpc(()).unwrap(), 3);
+            }
+            crate::exchange_tool_control(&mut stream, &finished(digest)).unwrap();
+        });
+        tokio::time::timeout(LIMIT, server.serve_one())
+            .await
+            .unwrap()
+            .unwrap();
+        client.await.unwrap();
+        let receipt = run.completed().unwrap();
+        assert_eq!(receipt.exit_code(), 23);
+        assert_eq!(receipt.syscall(), 231);
+        assert_eq!(
+            receipt.scope(),
+            crate::tool_activation::ExitScope::ExitGroup
+        );
+        assert_eq!(receipt.origin(), ExitOrigin::Deferred);
+        assert_eq!(global.requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn mapping_capture_and_activation_share_the_primary_without_cross_decoding() {
+        let run = run();
+        let (server, global) = server(Some(run.clone()));
+        let request = crate::mapping_capture::encode_request(reverie::MappingCaptureToken {
+            nonce: 1,
+            identity: reverie::MappingCaptureIdentity {
+                process: root(),
+                thread: root(),
+                address_space: [1, 2],
+                private_owner: [3, 4, 5, 6],
+                private_version: 7,
+            },
+        })
+        .unwrap();
+        assert_eq!(&request[..8], &[255, 255, 255, 255, b'M', b'C', 1, 0]);
+        let client = async {
+            let mut stream = UnixStream::connect(server.path()).await.unwrap();
+            let digest = config(&mut stream).await;
+            control(&mut stream, ToolControl::Claim { digest })
+                .await
+                .unwrap();
+            for started in [false, true] {
+                if started {
+                    control(&mut stream, ToolControl::Started { digest })
+                        .await
+                        .unwrap();
+                }
+                write_message(&mut stream, &request).await.unwrap();
+                let response = read_message(&mut stream, DEFAULT_MAX_FRAME_LEN)
+                    .await
+                    .unwrap();
+                // No mapping owner is installed: preserve its exact framed
+                // refusal and the live primary, without dispatching to G.
+                assert_eq!(response, crate::mapping_capture::reply(&request, false));
+                assert!(!crate::mapping_capture::is_ack(&request, &response));
+                assert_eq!(
+                    application(&mut stream, root()).await.unwrap(),
+                    u64::from(started) + 1
+                );
+            }
+            control(&mut stream, finished(digest)).await.unwrap();
+        };
+        let (result, ()) = bounded(async { tokio::join!(server.serve_one(), client) }).await;
+        result.unwrap();
+        assert_eq!(run.completed().unwrap().exit_code(), 23);
+        assert_eq!(global.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn temporary_config_readers_do_not_claim_and_can_close() {
+        let run = run();
+        let (server, global) = server(Some(run.clone()));
+        let path = server.path().to_owned();
+        for _ in 0..2 {
+            let client = async {
+                let mut stream = UnixStream::connect(&path).await.unwrap();
+                config(&mut stream).await;
+            };
+            let (result, ()) = bounded(async { tokio::join!(server.serve_one(), client) }).await;
+            result.unwrap();
+            assert!(run.completed().is_err());
+        }
+        let client = async {
+            let mut stream = UnixStream::connect(&path).await.unwrap();
+            let digest = config(&mut stream).await;
+            control(&mut stream, ToolControl::Claim { digest })
+                .await
+                .unwrap();
+            control(&mut stream, ToolControl::Started { digest })
+                .await
+                .unwrap();
+            control(&mut stream, finished(digest)).await.unwrap();
+        };
+        let (result, ()) = bounded(async { tokio::join!(server.serve_one(), client) }).await;
+        result.unwrap();
+        assert_eq!(run.completed().unwrap().exit_code(), 23);
+        assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unbound_or_rebound_root_cannot_serve_config() {
+        for rebound in [false, true] {
+            let run = ActivationRun::new();
+            if rebound {
+                run.bind_root(root()).unwrap();
+                assert!(run.bind_root(root()).is_err());
+            }
+            let (server, global) = server(Some(run.clone()));
+            let client = async {
+                let mut stream = UnixStream::connect(server.path()).await.unwrap();
+                assert!(
+                    read_message(&mut stream, DEFAULT_MAX_FRAME_LEN)
+                        .await
+                        .is_err()
+                );
+            };
+            let (result, ()) = bounded(async { tokio::join!(server.serve_one(), client) }).await;
+            assert!(result.is_err());
+            assert!(run.bind_root(root()).is_err());
+            assert!(run.completed().is_err());
+            assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    fn invalid_controls(digest: crate::initial_image::ConfigDigest) -> Vec<Vec<u8>> {
+        let claim = ToolControl::Claim { digest }.encode();
+        let mut result = vec![claim[..4].to_vec(), claim[..47].to_vec()];
+        let mut trailing = claim.to_vec();
+        trailing.push(0);
+        result.push(trailing);
+        for (index, value) in [
+            (4, b'X'),
+            (6, 1),
+            (6, 3),
+            (7, 0),
+            (7, 2),
+            (7, 4),
+            (7, 6),
+            (7, 7),
+            (40, 1),
+        ] {
+            let mut bytes = claim.to_vec();
+            bytes[index] = value;
+            result.push(bytes);
+        }
+        for (index, value) in [
+            (40, 0),
+            (40, 2),
+            (42, 0),
+            (42, 1),
+            (42, 3),
+            (43, 0),
+            (43, 3),
+            (44, 1),
+            (47, 60),
+        ] {
+            let mut bytes = finished(digest).encode().to_vec();
+            bytes[index] = value;
+            result.push(bytes);
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn malformed_reserved_frames_are_sticky_and_never_unit_requests() {
+        let digest = crate::initial_image::config_digest(&encode(&CONFIG).unwrap());
+        for enabled in [false, true] {
+            let mut frames = invalid_controls(digest);
+            // All six valid kinds are reserved even for a legacy unit-request G.
+            if !enabled {
+                for request in [
+                    ToolControl::Claim { digest },
+                    ToolControl::Started { digest },
+                    finished(digest),
+                ] {
+                    frames.push(request.encode().to_vec());
+                    frames.push(request.acknowledgement().to_vec());
+                }
+            }
+            for bytes in frames {
+                let run = run();
+                let (server, global) = server(enabled.then(|| run.clone()));
+                let client = async {
+                    let mut stream = UnixStream::connect(server.path()).await.unwrap();
+                    config(&mut stream).await;
+                    write_message(&mut stream, &bytes).await.unwrap();
+                    assert!(
+                        read_message(&mut stream, DEFAULT_MAX_FRAME_LEN)
+                            .await
+                            .is_err()
+                    );
+                };
+                let (result, ()) =
+                    bounded(async { tokio::join!(server.serve_one(), client) }).await;
+                assert!(result.is_err());
+                assert!(run.completed().is_err());
+                if enabled {
+                    assert!(run.accepted(root()).is_err());
+                }
+                assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_legacy_stream_rejects_reserved_control_before_unit_dispatch() {
+        let global = Arc::new(CountingGlobal::default());
+        let (server, mut client) = tokio::io::duplex(256);
+        let request = ToolControl::Claim { digest: [0; 32] }.encode();
+        let future = serve_stream(global.clone(), CONFIG, server);
+        let client = async {
+            read_message(&mut client, DEFAULT_MAX_FRAME_LEN)
+                .await
+                .unwrap();
+            write_message(&mut client, &request).await.unwrap();
+            assert!(
+                read_message(&mut client, DEFAULT_MAX_FRAME_LEN)
+                    .await
+                    .is_err()
+            );
+        };
+        let (result, ()) = bounded(async { tokio::join!(future, client) }).await;
+        assert!(result.is_err());
+        assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_out_of_order_wrong_digest_sender_and_post_finished_refuse() {
+        for scenario in 0..10 {
+            let run = run();
+            let (server, global) = server(Some(run.clone()));
+            let client = async {
+                let mut stream = UnixStream::connect(server.path()).await.unwrap();
+                let digest = config(&mut stream).await;
+                if scenario == 0 {
+                    assert!(
+                        control(&mut stream, ToolControl::Started { digest })
+                            .await
+                            .is_err()
+                    );
+                    return;
+                }
+                if scenario == 1 {
+                    assert!(control(&mut stream, finished(digest)).await.is_err());
+                    return;
+                }
+                if scenario == 2 {
+                    let mut wrong = digest;
+                    wrong[0] ^= 1;
+                    assert!(
+                        control(&mut stream, ToolControl::Claim { digest: wrong })
+                            .await
+                            .is_err()
+                    );
+                    return;
+                }
+                control(&mut stream, ToolControl::Claim { digest })
+                    .await
+                    .unwrap();
+                match scenario {
+                    3 => assert!(
+                        control(&mut stream, ToolControl::Claim { digest })
+                            .await
+                            .is_err()
+                    ),
+                    4 => assert!(control(&mut stream, finished(digest)).await.is_err()),
+                    5 => assert!(application(&mut stream, root() + 1).await.is_err()),
+                    _ => {
+                        control(&mut stream, ToolControl::Started { digest })
+                            .await
+                            .unwrap();
+                        if scenario == 6 {
+                            assert!(
+                                control(&mut stream, ToolControl::Started { digest })
+                                    .await
+                                    .is_err()
+                            );
+                        } else if scenario == 7 {
+                            let mut wrong = digest;
+                            wrong[31] ^= 1;
+                            assert!(control(&mut stream, finished(wrong)).await.is_err());
+                        } else {
+                            control(&mut stream, finished(digest)).await.unwrap();
+                            if scenario == 8 {
+                                assert!(control(&mut stream, finished(digest)).await.is_err());
+                            } else {
+                                assert!(application(&mut stream, root()).await.is_err());
+                            }
+                        }
+                    }
+                }
+            };
+            let (result, ()) = bounded(async { tokio::join!(server.serve_one(), client) }).await;
+            assert!(result.is_err());
+            assert!(run.completed().is_err());
+            assert!(run.accepted(root()).is_err());
+            assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn claimed_primary_close_is_sticky_before_and_after_started() {
+        for started in [false, true] {
+            let run = run();
+            let (server, global) = server(Some(run.clone()));
+            let client = async {
+                let mut stream = UnixStream::connect(server.path()).await.unwrap();
+                let digest = config(&mut stream).await;
+                control(&mut stream, ToolControl::Claim { digest })
+                    .await
+                    .unwrap();
+                if started {
+                    control(&mut stream, ToolControl::Started { digest })
+                        .await
+                        .unwrap();
+                }
+            };
+            let (result, ()) = bounded(async { tokio::join!(server.serve_one(), client) }).await;
+            assert!(result.is_err());
+            assert!(run.completed().is_err());
+            // The next actual accepted root socket cannot replace that owner.
+            let replacement = async {
+                let mut stream = UnixStream::connect(server.path()).await.unwrap();
+                assert!(
+                    read_message(&mut stream, DEFAULT_MAX_FRAME_LEN)
+                        .await
+                        .is_err()
+                );
+            };
+            let (result, ()) =
+                bounded(async { tokio::join!(server.serve_one(), replacement) }).await;
+            assert!(result.is_err());
+            assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn second_root_stream_cannot_claim_start_finish_or_hide_malformed_control() {
+        for operation in 0..4 {
+            let run = run();
+            let (server, global) = server(Some(run.clone()));
+            let path = server.path().to_owned();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let serving = tokio::spawn(server.serve_until(async {
+                let _ = stopped.await;
+            }));
+            let scenario = async {
+                let mut primary = UnixStream::connect(&path).await.unwrap();
+                let digest = config(&mut primary).await;
+                control(&mut primary, ToolControl::Claim { digest })
+                    .await
+                    .unwrap();
+                control(&mut primary, ToolControl::Started { digest })
+                    .await
+                    .unwrap();
+                let mut second = UnixStream::connect(&path).await.unwrap();
+                assert_eq!(config(&mut second).await, digest);
+                if operation == 3 {
+                    let mut malformed = ToolControl::Claim { digest }.encode();
+                    malformed[6] = 1;
+                    write_message(&mut second, &malformed).await.unwrap();
+                    assert!(
+                        read_message(&mut second, DEFAULT_MAX_FRAME_LEN)
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    let request = match operation {
+                        0 => ToolControl::Claim { digest },
+                        1 => ToolControl::Started { digest },
+                        _ => finished(digest),
+                    };
+                    assert!(control(&mut second, request).await.is_err());
+                }
+                assert!(control(&mut primary, finished(digest)).await.is_err());
+            };
+            tokio::time::timeout(LIMIT, scenario).await.unwrap();
+            stop.send(()).unwrap();
+            tokio::time::timeout(LIMIT, serving)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(run.completed().is_err());
+            assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_nonprimary_cannot_dispatch_after_finished() {
+        let run = run();
+        let (server, global) = server(Some(run.clone()));
+        let path = server.path().to_owned();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.serve_until(async {
+            let _ = stopped.await;
+        }));
+        bounded(async {
+            let mut primary = UnixStream::connect(&path).await.unwrap();
+            let digest = config(&mut primary).await;
+            let mut other = UnixStream::connect(&path).await.unwrap();
+            config(&mut other).await;
+            control(&mut primary, ToolControl::Claim { digest })
+                .await
+                .unwrap();
+            control(&mut primary, ToolControl::Started { digest })
+                .await
+                .unwrap();
+            control(&mut primary, finished(digest)).await.unwrap();
+            assert!(application(&mut other, root()).await.is_err());
+        })
+        .await;
+        stop.send(()).unwrap();
+        bounded(serving).await.unwrap().unwrap();
+        assert!(run.completed().is_err());
+        assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Default)]
+    struct PendingGlobal {
+        entered: Notify,
+        requests: AtomicUsize,
+    }
+
+    #[reverie::global_tool]
+    impl GlobalTool for PendingGlobal {
+        type Request = ();
+        type Response = u64;
+        type Config = u64;
+
+        async fn receive_rpc(&self, _from: reverie::Tid, _request: ()) -> u64 {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_application_cannot_cross_finished_commit() {
+        let run = run();
+        let global = Arc::new(PendingGlobal::default());
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..2 {
+            let (stream, client) = UnixStream::pair().unwrap();
+            let tool_activation = tool_activation_peer(Some(&run), &stream).unwrap();
+            servers.push(tokio::spawn(serve_connection_inner(
+                global.clone(),
+                CONFIG,
+                stream,
+                ConnectionSetup {
+                    tool_activation,
+                    ..ConnectionSetup::default()
+                },
+            )));
+            clients.push(client);
+        }
+        let mut pending = clients.pop().unwrap();
+        let mut primary = clients.pop().unwrap();
+        bounded(async {
+            let digest = config(&mut primary).await;
+            config(&mut pending).await;
+            control(&mut primary, ToolControl::Claim { digest })
+                .await
+                .unwrap();
+            control(&mut primary, ToolControl::Started { digest })
+                .await
+                .unwrap();
+            let bytes = encode(&RequestEnvelope {
+                from: reverie::Tid::from_raw(root()),
+                request: (),
+            })
+            .unwrap();
+            write_message(&mut pending, &bytes).await.unwrap();
+            global.entered.notified().await;
+            assert!(control(&mut primary, finished(digest)).await.is_err());
+        })
+        .await;
+        for server in servers {
+            server.abort();
+            let _ = bounded(server).await;
+        }
+        assert!(run.completed().is_err());
+        assert_eq!(global.requests.load(Ordering::SeqCst), 1);
+    }
+
+    // Re-executed as a real child with its own kernel socket peer credentials.
+    // In an ordinary test run it performs no operation.
+    #[test]
+    fn activation_peer_child_fixture() {
+        let Some(path) = std::env::var_os("REVERIE_TOOL_ACTIVATION_TEST_SOCKET") else {
+            return;
+        };
+        let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+        stream.set_read_timeout(Some(LIMIT)).unwrap();
+        stream.set_write_timeout(Some(LIMIT)).unwrap();
+        let bytes = crate::read_config_frame(&mut stream).unwrap();
+        let digest = crate::initial_image::config_digest(&bytes);
+        assert!(crate::exchange_tool_control(&mut stream, &ToolControl::Claim { digest }).is_err());
+    }
+
+    #[tokio::test]
+    async fn actual_helper_child_peer_cannot_claim_bound_parent_root() {
+        let run = run();
+        let (server, global) = server(Some(run.clone()));
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "server::tool_activation_tests::activation_peer_child_fixture",
+            ])
+            .env("REVERIE_TOOL_ACTIVATION_TEST_SOCKET", server.path())
+            .kill_on_drop(true);
+        let scenario = async {
+            let (result, output) = tokio::join!(server.serve_one(), child.output());
+            assert!(result.is_err());
+            let output = output.unwrap();
+            assert!(
+                output.status.success(),
+                "child assertion failed: {:?}",
+                output
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let summaries = stdout
+                .lines()
+                .filter(|line| line.starts_with("test result:"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                summaries.len(),
+                1,
+                "missing or duplicate child summary: {stdout}"
+            );
+            assert!(
+                summaries[0].starts_with("test result: ok. 1 passed;"),
+                "wrong child selection: {stdout}"
+            );
+        };
+        tokio::time::timeout(LIMIT, scenario).await.unwrap();
+        assert!(run.completed().is_err());
+        assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+    }
+
+    struct FaultWrite {
+        stream: UnixStream,
+        remaining: usize,
+        fail_flush: bool,
+        run: ActivationRun,
+    }
+
+    impl AsyncRead for FaultWrite {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, bytes)
+        }
+    }
+
+    impl AsyncWrite for FaultWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            assert!(
+                self.run.completed().is_err(),
+                "ack committed before complete write"
+            );
+            if self.remaining == 0 {
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            let len = bytes.len().min(self.remaining);
+            match Pin::new(&mut self.stream).poll_write(cx, &bytes[..len]) {
+                Poll::Ready(Ok(written)) => {
+                    self.remaining -= written;
+                    Poll::Ready(Ok(written))
+                }
+                other => other,
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            // Include a full payload whose final flush fails.
+            assert!(self.run.completed().is_err(), "ack committed before flush");
+            if self.remaining == 0 && self.fail_flush {
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_partial_and_unflushed_ack_never_commit_a_receipt() {
+        for phase in 0..3 {
+            for partial in [0, 1, 4, 17, 51, 52] {
+                let run = run();
+                let global = Arc::new(CountingGlobal::default());
+                let (stream, mut client) = UnixStream::pair().unwrap();
+                let activation = tool_activation_peer(Some(&run), &stream).unwrap();
+                let config_length = 4 + encode(&CONFIG).unwrap().len();
+                let stream = FaultWrite {
+                    stream,
+                    remaining: config_length + phase * 52 + partial,
+                    fail_flush: partial == 52,
+                    run: run.clone(),
+                };
+                let server = serve_connection_inner(
+                    global.clone(),
+                    CONFIG,
+                    stream,
+                    ConnectionSetup {
+                        tool_activation: activation,
+                        ..ConnectionSetup::default()
+                    },
+                );
+                let client = async {
+                    let digest = config(&mut client).await;
+                    let requests = [
+                        ToolControl::Claim { digest },
+                        ToolControl::Started { digest },
+                        finished(digest),
+                    ];
+                    for (index, request) in requests.into_iter().enumerate().take(phase + 1) {
+                        let result = control(&mut client, request).await;
+                        if index == phase && partial != 52 {
+                            assert!(result.is_err());
+                        } else {
+                            // A complete payload is visible even if server flush
+                            // then fails; only server commit grants the receipt.
+                            result.unwrap();
+                        }
+                    }
+                };
+                let (result, ()) =
+                    tokio::time::timeout(LIMIT, async { tokio::join!(server, client) })
+                        .await
+                        .unwrap();
+                assert!(result.is_err());
+                assert!(run.completed().is_err());
+                assert!(run.accepted(root()).is_err());
+                assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_control_header_or_payload_is_sticky() {
+        for truncate in [1, 3, 4, 5, 51] {
+            let run = run();
+            let (server, global) = server(Some(run.clone()));
+            let client = async {
+                let mut stream = UnixStream::connect(server.path()).await.unwrap();
+                let digest = config(&mut stream).await;
+                let mut bytes = 48u32.to_be_bytes().to_vec();
+                bytes.extend_from_slice(&ToolControl::Claim { digest }.encode());
+                stream.write_all(&bytes[..truncate]).await.unwrap();
+                stream.shutdown().await.unwrap();
+            };
+            let (result, ()) = bounded(async { tokio::join!(server.serve_one(), client) }).await;
+            assert!(result.is_err());
+            assert!(run.completed().is_err());
+            assert!(run.accepted(root()).is_err());
+            assert_eq!(global.requests.load(Ordering::SeqCst), 0);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -114,7 +114,7 @@ const SYS_SECCOMP_CODE: libc::c_int = 1;
 
 core::arch::global_asm!(
     r#"
-    .text
+    .pushsection .text.reverie_inguest_trusted_syscall,"ax",@progbits
     .p2align 4
     .global reverie_inguest_trusted_syscall
     .hidden reverie_inguest_trusted_syscall
@@ -146,7 +146,9 @@ reverie_inguest_trusted_syscall_return_ip:
     pop r12
     ret
     .size reverie_inguest_trusted_syscall, .-reverie_inguest_trusted_syscall
+    .popsection
 
+    .text
     .p2align 4
     .global reverie_inguest_guest_syscall
     .hidden reverie_inguest_guest_syscall

@@ -41,6 +41,7 @@ use reverie::Pid;
 use reverie::SignalProcessId;
 use reverie::ThreadOwnership;
 use reverie::Tool;
+pub use reverie_kvm_core::bootstrap::VMCALL_SYSCALL_TRANSPORT;
 
 use crate::Error;
 use crate::GuestMemory;
@@ -70,6 +71,7 @@ use crate::bootstrap::stage_process_syscall_return;
 use crate::bootstrap::syscall_hypercall_address;
 use crate::bootstrap::thread_tool_stack_top;
 use crate::bootstrap::try_set_syscall_return_park;
+use crate::clock::StepMode;
 use crate::elf::LoadedStaticElf;
 use crate::elf::TaskLifecycleTable;
 use crate::elf::initial_thread_name;
@@ -109,15 +111,11 @@ use crate::signal::Ucontext;
 use crate::signal::XsaveImage;
 use crate::stats::KvmBackendStats;
 use crate::stats::KvmExitCollector;
+use crate::step_filter::StepClass;
 use crate::syscall::FRAME_SIZE;
 use crate::syscall::RETURN_FLAGS_WORD;
 use crate::syscall::RETURN_RIP_WORD;
 use crate::syscall::SAVED_RBX_WORD;
-
-/// KVM currently permits userspace exits for this standardized hypercall.
-/// The prototype uses it as a transport opcode and places the syscall frame
-/// address in the first hypercall argument.
-pub const VMCALL_SYSCALL_TRANSPORT: u64 = 12;
 
 const SYSCALL_FRAME_STRIDE: u64 = 4096;
 const PAGE_SIZE: u64 = 4096;
@@ -145,15 +143,23 @@ pub(crate) struct InstructionBoundary<I> {
 
 pub(crate) type TimestampBoundary = InstructionBoundary<crate::timestamp::TimestampInstruction>;
 pub(crate) type CpuidBoundary = InstructionBoundary<crate::cpuid_instruction::Instruction>;
+/// The user registers at which a due timer request is delivered, with that
+/// request: those of a vCPU stopped in user mode (see
+/// [`KvmBackend::timer_instruction_boundary`]), or those the return of a
+/// syscall resumes the guest with (see
+/// [`KvmBackend::syscall_return_timer_boundary`]).
+pub(crate) type TimerBoundary = InstructionBoundary<crate::preemption_timer::TimerDue>;
 
 pub(crate) enum ToolInstructionBoundary {
     Timestamp(TimestampBoundary),
     Cpuid(CpuidBoundary),
+    Timer(TimerBoundary),
 }
 
 pub(crate) enum ToolInstructionResult {
     Timestamp(reverie::RdtscResult),
     Cpuid(reverie::CpuIdResult),
+    Timer,
 }
 
 impl ToolInstructionBoundary {
@@ -161,23 +167,43 @@ impl ToolInstructionBoundary {
         match self {
             Self::Timestamp(boundary) => boundary.user_registers(),
             Self::Cpuid(boundary) => boundary.user_registers(),
+            Self::Timer(boundary) => boundary.user_registers(),
         }
     }
 }
 
 impl<I> InstructionBoundary<I> {
     pub(crate) fn user_registers(&self) -> libc::user_regs_struct {
-        let mut registers = crate::runtime::kvm_registers(self.registers, u64::MAX);
-        registers.cs = self.code_segment.into();
-        registers.ss = self.stack_segment.into();
-        registers.ds = self.special_registers.ds.selector.into();
-        registers.es = self.special_registers.es.selector.into();
-        registers.fs = self.special_registers.fs.selector.into();
-        registers.gs = self.special_registers.gs.selector.into();
-        registers.fs_base = self.special_registers.fs.base;
-        registers.gs_base = self.special_registers.gs.base;
-        registers
+        user_registers_with_segments(
+            self.registers,
+            u64::MAX,
+            &self.special_registers,
+            self.code_segment,
+            self.stack_segment,
+        )
     }
+}
+
+/// The user registers a Tool callback sees: `registers` with `orig_rax`, the
+/// code and stack segment selectors, and the data segment selectors and the
+/// FS and GS bases of `special`.
+pub(crate) fn user_registers_with_segments(
+    registers: kvm_regs,
+    orig_rax: u64,
+    special: &kvm_bindings::kvm_sregs,
+    code_segment: u16,
+    stack_segment: u16,
+) -> libc::user_regs_struct {
+    let mut user = crate::runtime::kvm_registers(registers, orig_rax);
+    user.cs = code_segment.into();
+    user.ss = stack_segment.into();
+    user.ds = special.ds.selector.into();
+    user.es = special.es.selector.into();
+    user.fs = special.fs.selector.into();
+    user.gs = special.gs.selector.into();
+    user.fs_base = special.fs.base;
+    user.gs_base = special.gs.base;
+    user
 }
 
 /// The signal Linux raises for a CPU exception taken in user mode.
@@ -391,9 +417,12 @@ fn install_worker_interrupt_handler() -> Result<()> {
     }
 }
 
-fn set_guest_interrupt_signal_mask(how: libc::c_int) -> Result<bool> {
+/// Blocks or unblocks the worker interrupt signal on this thread and returns
+/// whether it was blocked before. An actual change is noted for the
+/// preemption timer, whose vCPU signal mask follows this thread's mask.
+pub(crate) fn set_guest_interrupt_signal_mask(how: libc::c_int) -> Result<bool> {
     // SAFETY: set and previous are initialized before libc reads or writes them.
-    unsafe {
+    let was_blocked = unsafe {
         let mut set = std::mem::zeroed::<libc::sigset_t>();
         let mut previous = std::mem::zeroed::<libc::sigset_t>();
         libc::sigemptyset(&mut set);
@@ -402,8 +431,12 @@ fn set_guest_interrupt_signal_mask(how: libc::c_int) -> Result<bool> {
         if error != 0 {
             return Err(std::io::Error::from_raw_os_error(error).into());
         }
-        Ok(libc::sigismember(&previous, worker_interrupt_signal()) == 1)
+        libc::sigismember(&previous, worker_interrupt_signal()) == 1
+    };
+    if was_blocked != (how == libc::SIG_BLOCK) {
+        crate::preemption_timer::note_thread_mask_change();
     }
+    Ok(was_blocked)
 }
 type GuestWorkerResult = Result<(ExitStatus, Vec<u8>, Vec<u8>)>;
 
@@ -1274,12 +1307,7 @@ fn validate_root_pid(pid: i32) -> Result<i32> {
     }
 }
 
-/// The PID-namespace init process seen by the deterministic container. The
-/// ptrace backend runs the guest inside a real PID namespace whose `init` is
-/// PID 1, so the conventional root guest (PID 3, see detcore `ROOT_DETPID`) has
-/// `getppid() == 1`. KVM synthesizes the guest identity rather than using a real
-/// namespace, so it must reproduce the same parent value for parity.
-pub(crate) const CONTAINER_INIT_PID: i32 = 1;
+pub(crate) use crate::elf::CONTAINER_INIT_PID;
 
 /// Deterministic parent PID for the container's root guest, matching the ptrace
 /// backend. A guest that is itself the namespace init (PID 1) has no parent and
@@ -1310,11 +1338,30 @@ fn normalize_completed_syscall_boundary_registers(
 }
 
 fn normalize_completed_syscall_boundary_registers_with_read(
-    mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    read: impl FnMut(u64, &mut [u8]) -> Result<()>,
     mut registers: kvm_regs,
     hypercall_instruction: [u8; 3],
     hypercall_address: u64,
 ) -> Result<kvm_regs> {
+    normalize_completed_syscall_boundary_registers_in_place(
+        read,
+        &mut registers,
+        hypercall_instruction,
+        hypercall_address,
+    )?;
+    Ok(registers)
+}
+
+/// [`normalize_completed_syscall_boundary_registers_with_read`] on
+/// `registers` where they are, with the same checks and reads in the same
+/// order. `registers` changes only after every check has passed, so an error
+/// leaves it as it was.
+fn normalize_completed_syscall_boundary_registers_in_place(
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    registers: &mut kvm_regs,
+    hypercall_instruction: [u8; 3],
+    hypercall_address: u64,
+) -> Result<()> {
     let return_address = hypercall_address
         .checked_add(hypercall_instruction.len() as u64)
         .ok_or_else(|| Error::UnexpectedVcpuExit("hypercall RIP overflow".to_owned()))?;
@@ -1338,7 +1385,7 @@ fn normalize_completed_syscall_boundary_registers_with_read(
     // any process action can consume the exit. Both admitted RIP forms model
     // that same completed-hypercall state.
     registers.rax = 0;
-    Ok(registers)
+    Ok(())
 }
 
 /// What a syscall exit's first guest-memory copy read: the whole transport
@@ -1370,6 +1417,19 @@ pub(crate) struct SyscallExitRead {
 }
 
 impl SyscallExitRead {
+    /// An exit read with every field zero and no hypercall bytes, to be
+    /// overwritten by [`KvmBackend::read_syscall_exit_into`] before anything
+    /// reads it.
+    pub(crate) fn empty() -> Self {
+        Self {
+            frame_address: 0,
+            frame: [0; FRAME_SIZE],
+            hypercall_address: 0,
+            hypercall: None,
+            generation: crate::entry::MappingGeneration::INITIAL,
+        }
+    }
+
     /// The registers the guest held at its `syscall` instruction that the
     /// trampoline overwrites before its hypercall, as it saved them in the
     /// frame first (`bootstrap::syscall_trampoline`): the return RIP, which
@@ -1552,20 +1612,51 @@ impl CompletedSyscallBoundary {
         backend: &KvmBackend,
         frame_address: u64,
         action_return_registers: Option<kvm_regs>,
-        mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+        read: impl FnMut(u64, &mut [u8]) -> Result<()>,
     ) -> Result<Self> {
-        let mut frame = [0; FRAME_SIZE];
-        read(frame_address, &mut frame)?;
-        let (registers, special_registers) =
-            backend.completed_syscall_boundary_registers_with_read(&mut read)?;
-        Ok(Self {
-            frame_address,
-            frame,
-            registers,
-            special_registers,
-            action_return_registers,
+        let mut boundary = Self::empty();
+        boundary.capture_with_read_into(backend, frame_address, read)?;
+        boundary.action_return_registers = action_return_registers;
+        Ok(boundary)
+    }
+
+    /// The capture [`Self::capture_with_read`] makes, with no action-return
+    /// registers, written over `self` where it is instead of into a new
+    /// value that is then moved: the frame read, the general registers, the
+    /// hypercall read and check, and the special registers, in that order,
+    /// then the plain fields. Every field is overwritten on success, so
+    /// nothing of an earlier capture survives. On an error `self` holds
+    /// partial values; every caller discards it with the error and never
+    /// reads it.
+    fn capture_with_read_into(
+        &mut self,
+        backend: &KvmBackend,
+        frame_address: u64,
+        mut read: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        read(frame_address, &mut self.frame)?;
+        backend.completed_syscall_boundary_registers_with_read_into(
+            &mut read,
+            &mut self.registers,
+            &mut self.special_registers,
+        )?;
+        self.frame_address = frame_address;
+        self.action_return_registers = None;
+        self.stage_action_outcome = false;
+        Ok(())
+    }
+
+    /// A boundary with every field zero, to be overwritten by a capture
+    /// before anything reads it.
+    fn empty() -> Self {
+        Self {
+            frame_address: 0,
+            frame: [0; FRAME_SIZE],
+            registers: kvm_regs::default(),
+            special_registers: kvm_bindings::kvm_sregs::default(),
+            action_return_registers: None,
             stage_action_outcome: false,
-        })
+        }
     }
 
     pub(crate) async fn capture_admitted(
@@ -1592,13 +1683,21 @@ impl CompletedSyscallBoundary {
     /// mapping (the same entry gate), covers exactly the frame and hypercall
     /// this capture reads, and the gate still admits at the generation the
     /// read saw; otherwise this is `capture_admitted`, unchanged.
-    pub(crate) async fn capture_admitted_reusing(
+    ///
+    /// The boundary is captured into `slot`, where it stays, and is lent
+    /// back: a syscall callback's boundary is otherwise moved (about 670
+    /// bytes, by `memcpy`) out of the capture and again into the callback's
+    /// executor, on every syscall a Tool handles. The reads, their order and
+    /// every check are those of a capture by value; only where the result is
+    /// stored differs. A syscall callback's boundary has no action-return
+    /// registers (`capture_admitted` with `None`).
+    pub(crate) async fn capture_admitted_reusing<'slot>(
         backend: &mut KvmBackend,
         frame_address: u64,
-        action_return_registers: Option<kvm_regs>,
         stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
         exit: Option<(&SyscallExitRead, &GuestMemory)>,
-    ) -> Result<Option<Self>> {
+        slot: &'slot mut CompletedBoundarySlot,
+    ) -> Result<Option<&'slot Self>> {
         let hypercall_address = syscall_hypercall_address(
             backend.hypercall_instruction,
             backend.syscall_trampoline_address,
@@ -1611,25 +1710,32 @@ impl CompletedSyscallBoundary {
                 && Arc::ptr_eq(memory.entry_gate_ref(), backend.memory.entry_gate_ref())
         });
         let reused = reuse.map(|(exit, _)| {
-            (exit.generation, move |backend: &KvmBackend| {
-                Self::capture_with_read(
-                    backend,
-                    frame_address,
-                    action_return_registers,
-                    |address, bytes| exit.read(address, bytes),
-                )
-            })
+            (
+                exit.generation,
+                move |backend: &KvmBackend, boundary: &mut Self| {
+                    boundary.capture_with_read_into(backend, frame_address, |address, bytes| {
+                        exit.read(address, bytes)
+                    })
+                },
+            )
         });
-        backend
-            .prepare_action_read_or_reuse(stop, reused, |backend, access| {
-                Self::capture_with_read(
-                    backend,
-                    frame_address,
-                    action_return_registers,
-                    |address, bytes| access.read_raw(address, bytes),
-                )
-            })
-            .await
+        let captured = backend
+            .prepare_action_read_or_reuse(
+                stop,
+                reused,
+                &mut slot.boundary,
+                |backend, access, boundary| {
+                    boundary.capture_with_read_into(backend, frame_address, |address, bytes| {
+                        access.read_raw(address, bytes)
+                    })
+                },
+            )
+            .await?;
+        let slot: &'slot CompletedBoundarySlot = slot;
+        Ok(match captured {
+            Some(()) => Some(&slot.boundary),
+            None => None,
+        })
     }
 
     pub(crate) async fn capture_for_action_admitted(
@@ -1687,8 +1793,13 @@ impl CompletedSyscallBoundary {
         Ok(())
     }
 
+    /// [`Self::for_test`] as a constant, which a test may borrow for as long
+    /// as it likes.
     #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
+    pub(crate) const FOR_TEST: Self = Self::for_test();
+
+    #[cfg(test)]
+    pub(crate) const fn for_test() -> Self {
         Self {
             frame_address: 0x1000,
             frame: [0; FRAME_SIZE],
@@ -1698,6 +1809,23 @@ impl CompletedSyscallBoundary {
             special_registers: unsafe { std::mem::zeroed() },
             action_return_registers: None,
             stage_action_outcome: false,
+        }
+    }
+}
+
+/// Where [`CompletedSyscallBoundary::capture_admitted_reusing`] captures a
+/// boundary, kept for a thread's run so that each syscall callback's capture
+/// overwrites it in place. Its contents are reachable only through a
+/// successful capture, which overwrites every field first, so no earlier
+/// capture's state can be read through it.
+pub(crate) struct CompletedBoundarySlot {
+    boundary: CompletedSyscallBoundary,
+}
+
+impl CompletedBoundarySlot {
+    pub(crate) fn new() -> Self {
+        Self {
+            boundary: CompletedSyscallBoundary::empty(),
         }
     }
 }
@@ -1822,6 +1950,27 @@ pub struct KvmBackend {
     /// as an issue in the dev-hermit parent repository, at
     /// ai_docs/evidence/kvm-kernel-trait-design-20261016/pending-issue-reverie-kvm-segment-slot.md.
     pending_segment: Option<(SegmentBase, u64)>,
+    /// The user instruction the syscall trampoline, stopped at its VMCALL
+    /// within a precise timer event's stepping window, returns to (see
+    /// `prepare_timer_steps`), until the breakpoint there takes the guest
+    /// back or the guest is found in user mode.
+    trampoline_return: Option<u64>,
+    /// Whether a single step's fault frame still holds the step's trap flag.
+    stepped_fault: crate::preemption_timer::SteppedFault,
+}
+
+/// RFLAGS' trap flag.
+const TRAP_FLAG: u64 = 1 << 8;
+
+/// The refusal, by name, of what a guest does at `rip` while a precise timer
+/// event single-steps it: it sets its own trap flag, which the steps take
+/// over, or runs an instruction the steps cannot run (see
+/// [`crate::step_filter::StepClass::Refused`]).
+fn refused_while_stepping(what: &str, rip: u64) -> Error {
+    Error::GuestClock(format!(
+        "preemption timer: the guest {what} at {rip:#x} while a precise timer event \
+         single-steps it, which this backend does not support"
+    ))
 }
 
 struct CompletedToolPanic {
@@ -1938,7 +2087,8 @@ impl KvmBackend {
         &mut self,
     ) -> Result<Option<crate::entry::owner::CallbackScope>> {
         self.check_entry_owner()?;
-        let Some(owner) = self.entry_driver_owner() else {
+        // Borrowed, not cloned: the borrow ends before the origin is stored.
+        let Some(owner) = self.entry_driver.as_ref() else {
             return Ok(None);
         };
         let callback = owner.begin_callback(None)?;
@@ -2008,6 +2158,15 @@ impl KvmBackend {
 
     pub(crate) fn guest_thread_is_cancelled(&self) -> bool {
         self.is_guest_thread && self.thread_group.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Makes this backend a worker of its thread group and cancels the group's
+    /// workers without a group exit status, as another thread's exec or a
+    /// peer's failure does. For unit tests of the cancellation checks.
+    #[cfg(test)]
+    pub(crate) fn cancel_as_worker_for_test(&mut self) {
+        self.is_guest_thread = true;
+        self.thread_group.cancel_workers();
     }
 
     /// Creates a VM with one vCPU and a memory slot starting at GPA zero.
@@ -2143,6 +2302,8 @@ impl KvmBackend {
             exit_collector: None,
             abandoned_runs: Arc::default(),
             pending_segment: None,
+            trampoline_return: None,
+            stepped_fault: Default::default(),
         })
     }
 
@@ -2301,8 +2462,7 @@ impl KvmBackend {
         regs.rip = entry_point;
         regs.rflags = 2;
         self.vcpu.set_regs(&regs)?;
-        self.vcpu.new_guest();
-        Ok(())
+        self.vcpu.new_guest()
     }
 
     /// Returns the Tool scratch-page top for this backend. Process leaders use
@@ -2315,7 +2475,7 @@ impl KvmBackend {
 
     /// Ends a public run that returned; see `RunAdmission::finish`.
     pub(crate) fn finish_run(&self, admission: RunAdmission) {
-        admission.finish(&self.thread_group);
+        admission.finish(&*self.thread_group);
     }
 
     /// Releases a guest thread's transport and Tool scratch-page slot.
@@ -2443,8 +2603,7 @@ impl KvmBackend {
         // A new image starts a new task lifetime: nothing staged for an
         // earlier one survives (on the base it died with that executor).
         self.clear_pending_segment();
-        self.vcpu.new_elf_guest();
-        Ok(())
+        self.vcpu.new_elf_guest()
     }
 
     /// Loads image bytes from the supplied open file, retaining the final executable.
@@ -2512,6 +2671,103 @@ impl KvmBackend {
         Ok(())
     }
 
+    /// Reserve the host directory at the absolute path `path` for the Tool.
+    ///
+    /// This is the reservation's whole contract; the README and
+    /// `reverie_linuxemu::elf::ToolDirectory` refer to it.
+    ///
+    /// - **A read-only file system.** The directory must be on a file system
+    ///   that is itself read-only (its superblock: the `ro` super option of
+    ///   its mount in `/proc/self/mountinfo`), not only on a read-only mount
+    ///   of a writable one, such as a read-only bind, and empty. On a local
+    ///   file system whose superblock is its only writer, such as a fresh
+    ///   read-only tmpfs, nothing can then be created in it by any route the
+    ///   executor does not see, another mount of the same file system and a
+    ///   race between a check and the call it checks included. Where
+    ///   something else writes behind a read-only superblock, names can
+    ///   still appear in the directory, and no check here detects it: a
+    ///   writable NFS, CIFS or 9p mount of the same export, a FUSE daemon, a
+    ///   lower layer of an overlayfs changed elsewhere, or a loop image whose
+    ///   backing file is writable.
+    /// - **The exact path.** The executor reaches the directory for a guest
+    ///   path call only where the call names exactly `path`, byte for byte,
+    ///   as an `O_DIRECTORY` open that creates nothing or as `newfstatat`
+    ///   (also `stat` and `lstat`), and only while `path` still resolves to
+    ///   the directory recorded now: the same filesystem type, device and
+    ///   inode. Keep the path and the mounts under it stable for the run:
+    ///   once an ancestor is renamed or another mount covers the path, the
+    ///   exact path is refused too, and the recorded directory stays refused
+    ///   under any name.
+    /// - **Every other route fails with `ENOENT`,** as a lookup of a name
+    ///   that does not exist fails: the guest is to see no directory there.
+    ///   That is every other path call that resolves to the directory
+    ///   (through a symbolic link, relative to the working directory or to a
+    ///   descriptor, by a `..`, or as `statx`), an open the kernel refuses
+    ///   for a directory (a write mode or `O_TRUNC`, `O_DIRECT`), a working
+    ///   directory in it (`chdir`, `fchdir`), removing, renaming or replacing
+    ///   it, and every call that would create, remove, rename or link a name
+    ///   in it: `open`, `openat` and `creat` with `O_CREAT`, `O_TMPFILE`,
+    ///   `mkdir`, `mknod`, `symlink`, `link`, `rename`, `unlink` and `rmdir`.
+    ///   procfs objects keep their own refusal, `EACCES`, also as the parent
+    ///   directory a call that changes a name checks first.
+    /// - **A final symbolic link,** spelled without a trailing slash, is
+    ///   answered as Linux answers it: a named `O_CREAT` open with `O_EXCL`
+    ///   or `O_NOFOLLOW` finds the link itself (`EEXIST`, `ELOOP`), an
+    ///   `O_TMPFILE` open with `O_NOFOLLOW` finds no directory there
+    ///   (`ENOTDIR`), and a creation through a final link into the directory
+    ///   is not refused: the kernel follows the link and answers for the
+    ///   read-only file system, `EROFS`, and creates nothing.
+    /// - **A trailing slash.** A creating open spelled with a trailing slash
+    ///   that reaches the directory, as `reserved/` or through a link as
+    ///   `l/`, answers `ENOENT`, where Linux answers `EISDIR` for any such
+    ///   spelling before it looks anything up.
+    /// - **Two more `EROFS` answers.** A creating open (`O_CREAT`,
+    ///   `O_TMPFILE`), `mkdir`, `mknod`, `symlink`, `link`, `rename` and
+    ///   `unlink` check the directory whose name they change and then act by
+    ///   path: if another process redirects a symbolic link in that path to
+    ///   the directory in between, the call fails as the read-only file
+    ///   system answers, `EROFS` (or `EXDEV` for a `rename` across mounts),
+    ///   not `ENOENT`. And with `fs.protected_symlinks=1`, a
+    ///   creation below another user's link `L` in a sticky world-writable
+    ///   directory (`L/new`) answers `EROFS`: that rule refuses the
+    ///   executor's own lookup of `L`, a refused lookup decides nothing, and
+    ///   the kernel's lookup follows `L` as an intermediate component.
+    ///   Neither creates anything.
+    /// - **Descriptors** opened there work as any other descriptor: the
+    ///   calls that name one are not refused, but a lookup from one that
+    ///   resolves to the directory or creates a name in it is.
+    /// - **Not covered:** AF_UNIX socket paths in `bind`, `connect` and
+    ///   `sendto` go to the host unchecked (a `bind` below the directory
+    ///   answers `EROFS`), and the interpreter an executable names in
+    ///   `PT_INTERP` is opened without the check; see
+    ///   <https://github.com/rrnewton/reverie/issues/1171>. Objects below
+    ///   the directory are not protected either, because the executor does
+    ///   not look below it: the directory must be empty.
+    /// - **Enforcement** is the built-in LinuxEmu executor's, which runs the
+    ///   installed image. A guest whose calls go to a caller-supplied
+    ///   [`crate::SyscallExecutor`] or to another provider gets no such
+    ///   protection: that executor must enforce the reservation itself.
+    ///
+    /// A Tool that keeps the exact path from the guest therefore keeps the
+    /// directory to itself, and a descriptor it opens there can stand for a
+    /// directory the Tool serves itself. The directory's identity is
+    /// recorded now, in this process's mount namespace, where the guest's
+    /// file operations run. Fork, clone and exec keep the reservation. Fails
+    /// with [`Error::StaticElfNotInstalled`] without an installed image, and
+    /// with [`Error::HostIo`] where the path is relative, names no directory,
+    /// names a procfs one (which the executor refuses whatever names it), or
+    /// names a directory whose file system is not read-only (a read-only bind
+    /// of a writable one included).
+    pub fn reserve_tool_directory(&mut self, path: &Path) -> Result<()> {
+        AbandonedRuns::admit(&self.abandoned_runs)?;
+        let loaded = self
+            .static_elf
+            .as_mut()
+            .ok_or(Error::StaticElfNotInstalled)?;
+        loaded.tool_directory = Some(crate::elf::ToolDirectory::open(path).map_err(Error::HostIo)?);
+        Ok(())
+    }
+
     /// Whether the installed image reports host metadata timestamps.
     fn host_metadata_timestamps_enabled(&self) -> bool {
         self.static_elf
@@ -2550,22 +2806,32 @@ impl KvmBackend {
         Ok((registers, self.vcpu.get_sregs()?))
     }
 
-    fn completed_syscall_boundary_registers_with_read(
+    /// [`Self::completed_syscall_boundary_registers`], reading the hypercall
+    /// instruction through `read` and storing both register sets where the
+    /// caller keeps them: the general registers, the normalization's checks
+    /// and read, then the special registers, in that order, as a returned
+    /// pair was built. On an error the destinations hold partial values and
+    /// the caller discards them with the error.
+    fn completed_syscall_boundary_registers_with_read_into(
         &self,
         read: impl FnMut(u64, &mut [u8]) -> Result<()>,
-    ) -> Result<(kvm_regs, kvm_bindings::kvm_sregs)> {
+        registers: &mut kvm_regs,
+        special_registers: &mut kvm_bindings::kvm_sregs,
+    ) -> Result<()> {
         let hypercall_address = syscall_hypercall_address(
             self.hypercall_instruction,
             self.syscall_trampoline_address,
             self.syscall_frame_address,
         );
-        let registers = normalize_completed_syscall_boundary_registers_with_read(
+        self.vcpu.get_regs_into(registers)?;
+        normalize_completed_syscall_boundary_registers_in_place(
             read,
-            self.vcpu.get_regs()?,
+            registers,
             self.hypercall_instruction,
             hypercall_address,
         )?;
-        Ok((registers, self.vcpu.get_sregs()?))
+        self.vcpu.get_sregs_into(special_registers)?;
+        Ok(())
     }
 
     fn snapshot_process(&self) -> Result<KvmProcessSnapshot> {
@@ -2733,6 +2999,19 @@ impl KvmBackend {
         self.pending_segment = None;
     }
 
+    /// [`Self::read_syscall_exit_into`] into new storage, returned with the
+    /// request (for tests).
+    #[cfg(test)]
+    pub(crate) fn read_syscall_exit(
+        &self,
+        memory: &GuestMemory,
+        frame_address: u64,
+    ) -> Result<(SyscallRequest, SyscallExitRead)> {
+        let mut exit = SyscallExitRead::empty();
+        let request = self.read_syscall_exit_into(memory, frame_address, &mut exit)?;
+        Ok((request, exit))
+    }
+
     /// Reads a syscall exit's transport frame and decodes its request, as
     /// [`SyscallRequest::read_from`] does, and in the same admission also
     /// reads the trampoline's hypercall instruction, which the exit's
@@ -2740,34 +3019,35 @@ impl KvmBackend {
     /// [`SyscallExitRead`]). The frame read and its errors are exactly
     /// `read_from`'s; the extra read is only an attempt, and its failure
     /// changes nothing but leaves the boundary to copy again.
-    pub(crate) fn read_syscall_exit(
+    ///
+    /// The exit read is stored in `exit`, where the caller keeps it, rather
+    /// than returned: the same single admitted copy, with the frame copied
+    /// straight into place. Every field
+    /// of `exit` is overwritten on success; on an error it holds partial
+    /// values and the caller discards it with the error.
+    pub(crate) fn read_syscall_exit_into(
         &self,
         memory: &GuestMemory,
         frame_address: u64,
-    ) -> Result<(SyscallRequest, SyscallExitRead)> {
+        exit: &mut SyscallExitRead,
+    ) -> Result<SyscallRequest> {
         let hypercall_address = syscall_hypercall_address(
             self.hypercall_instruction,
             self.syscall_trampoline_address,
             self.syscall_frame_address,
         );
-        let mut frame = [0; FRAME_SIZE];
         let mut hypercall = [0; 3];
         let (generation, read) = memory.read_raw_and_try_read(
             frame_address,
-            &mut frame,
+            &mut exit.frame,
             hypercall_address,
             &mut hypercall,
         )?;
-        Ok((
-            SyscallRequest::from_frame(&frame),
-            SyscallExitRead {
-                frame_address,
-                frame,
-                hypercall_address,
-                hypercall: read.then_some(hypercall),
-                generation,
-            },
-        ))
+        exit.frame_address = frame_address;
+        exit.hypercall_address = hypercall_address;
+        exit.hypercall = read.then_some(hypercall);
+        exit.generation = generation;
+        Ok(SyscallRequest::from_frame(&exit.frame))
     }
 
     /// Capture one complete parent read state only after admission. The owned
@@ -2780,8 +3060,12 @@ impl KvmBackend {
     ) -> Result<Option<T>> {
         self.prepare_action_read_or_reuse(
             stop,
-            None::<(crate::entry::MappingGeneration, fn(&Self) -> Result<T>)>,
-            capture,
+            None::<(
+                crate::entry::MappingGeneration,
+                fn(&Self, &mut ()) -> Result<T>,
+            )>,
+            &mut (),
+            |backend, access, ()| capture(backend, access),
         )
         .await
     }
@@ -2795,14 +3079,19 @@ impl KvmBackend {
     /// cancellation, the copy failures checked around an admitted copy) runs
     /// in the same order as for a fresh copy. Otherwise the attempt copies,
     /// exactly as `prepare_action_read`.
-    async fn prepare_action_read_or_reuse<T, R>(
+    ///
+    /// Both `reused` and `capture` are lent `destination`, which lets a
+    /// capture write its value where the caller keeps it rather than return
+    /// it; `prepare_action_read` lends nothing.
+    async fn prepare_action_read_or_reuse<T, D, R>(
         &mut self,
         mut stop: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
         mut reused: Option<(crate::entry::MappingGeneration, R)>,
-        capture: impl Fn(&Self, &crate::memory::RawMemoryRead<'_>) -> Result<T>,
+        destination: &mut D,
+        capture: impl Fn(&Self, &crate::memory::RawMemoryRead<'_>, &mut D) -> Result<T>,
     ) -> Result<Option<T>>
     where
-        R: FnOnce(&Self) -> Result<T>,
+        R: FnOnce(&Self, &mut D) -> Result<T>,
     {
         let gate = self.memory.entry_gate();
         // The first attempt subscribes to nothing: it nearly always reads at
@@ -2833,11 +3122,14 @@ impl KvmBackend {
                 // The failures an admitted copy checks before and after it
                 // runs; the bytes themselves were copied under admission.
                 self.memory.check_copy_failures()?;
-                let value = reused(self);
+                let value = reused(self, destination);
                 self.memory.check_copy_failures()?;
                 return value.map(Some);
             }
-            if let Some(value) = self.memory.try_read_with(|access| capture(self, access))? {
+            if let Some(value) = self
+                .memory
+                .try_read_with(|access| capture(self, access, destination))?
+            {
                 return Ok(Some(value));
             }
             let Some((changed, cancelled)) = subscriptions else {
@@ -4606,6 +4898,219 @@ impl KvmBackend {
             .map(ToolInstructionBoundary::Timestamp))
     }
 
+    /// The thread's due timer request, taken for `Tool::handle_timer_event`
+    /// at the user instruction boundary where the vCPU is stopped, or None.
+    /// Read before each entry; with no request due it reads nothing and
+    /// issues no syscall.
+    ///
+    /// Only a vCPU stopped in user mode (a CPL 3 code segment) stands at a
+    /// user instruction boundary: an exit that interrupts the guest there
+    /// (a kick) stops it between two instructions, and the callback sees the
+    /// live registers. A syscall's exit, `rt_sigreturn`'s included, delivers a
+    /// request it finds due at the syscall's return instead (see
+    /// [`Self::syscall_return_timer_boundary`]), and an exit whose Tool
+    /// callback ran cancelled the request it found outstanding before that
+    /// callback. So a request found due anywhere else was found by a kick
+    /// that stopped the guest in ring 0, in the syscall trampoline or in an
+    /// exception stub. It is armed again at its target (a late precise one as
+    /// an imprecise one, see [`crate::preemption_timer::TimerState::defer_due`]),
+    /// so the next entry has the timer overflow at the earliest count past
+    /// the clock, and the exit that follows decides it then.
+    pub(crate) fn timer_instruction_boundary(&mut self) -> Result<Option<ToolInstructionBoundary>> {
+        let Some(due) = self.vcpu.timer_due() else {
+            return Ok(None);
+        };
+        let special = self.vcpu.get_sregs()?;
+        if special.cs.dpl != 3 {
+            self.vcpu.defer_due_timer();
+            return Ok(None);
+        }
+        let registers = self.vcpu.get_regs()?;
+        self.vcpu.take_due_timer();
+        Ok(Some(ToolInstructionBoundary::Timer(InstructionBoundary {
+            registers,
+            instruction: due,
+            special_registers: special,
+            code_segment: special.cs.selector,
+            stack_segment: special.ss.selector,
+        })))
+    }
+
+    /// The thread's due timer request, taken for `Tool::handle_timer_event`
+    /// at the return of the syscall whose exit found it due, or None. With no
+    /// request due it issues no syscall. The syscall made no Tool callback,
+    /// which would have cancelled the request, and it has completed: the
+    /// callback sees `returned`, the user registers the guest resumes with
+    /// (see `process_syscall_return_registers`), in user mode. The vCPU itself
+    /// waits in the ring-0 trampoline, which returns the guest to them on the
+    /// next entry. Delivering here, rather than at a later kick in user mode,
+    /// keeps a guest that makes syscalls faster than a kick lands from
+    /// postponing the event to its last one.
+    pub(crate) fn syscall_return_timer_boundary(
+        &mut self,
+        returned: kvm_regs,
+    ) -> Result<Option<ToolInstructionBoundary>> {
+        let Some(due) = self.vcpu.timer_due() else {
+            return Ok(None);
+        };
+        let special = self.vcpu.get_sregs()?;
+        self.vcpu.take_due_timer();
+        Ok(Some(ToolInstructionBoundary::Timer(InstructionBoundary {
+            registers: returned,
+            instruction: due,
+            special_registers: special,
+            code_segment: crate::signal::USER_CODE_SELECTOR,
+            stack_segment: crate::signal::USER_DATA_SELECTOR,
+        })))
+    }
+
+    /// Sets up the next entry for an armed precise timer request within its
+    /// stepping window (see `preemption_timer.rs`); outside it, the entry
+    /// runs unstepped and nothing is read. Each entry either single-steps one
+    /// user instruction, runs unstepped to a user instruction where a
+    /// breakpoint takes the guest back, or runs unstepped to an exit that
+    /// comes before any user instruction can retire a branch:
+    /// - In user mode the instruction at RIP decides (see
+    ///   [`crate::step_filter::classify`]); an instruction the steps cannot
+    ///   run is refused by name.
+    /// - In the syscall trampoline at its VMCALL, the entry runs to the user
+    ///   instruction the trampoline returns to, which the syscall frame
+    ///   names: the return of a syscall that made no Tool callback has no
+    ///   exit of its own. A host interrupt that stops the trampoline on its
+    ///   way back keeps that run.
+    /// - Anywhere else in ring 0 (the trampoline before its VMCALL, an
+    ///   exception stub before its HLT) it runs unstepped: that exit comes
+    ///   first.
+    pub(crate) fn prepare_timer_steps(&mut self) -> Result<()> {
+        if !self.vcpu.timer_stepping() {
+            self.trampoline_return = None;
+            return Ok(());
+        }
+        if let Some(collector) = self.exit_collector.as_deref() {
+            collector.record_timer_window_entry();
+        }
+        let special = self.vcpu.get_sregs()?;
+        let registers = self.vcpu.get_regs()?;
+        let mode = if special.cs.dpl == 3 {
+            self.trampoline_return = None;
+            // Outside a single step, RFLAGS shows the guest's own trap flag,
+            // which a POPF whose run a host interrupt ended, or an
+            // `rt_sigreturn`, may have loaded: it is refused at every
+            // user-mode entry in the window, whatever runs next.
+            if self.vcpu.last_step_mode().0 != StepMode::Step && registers.rflags & TRAP_FLAG != 0 {
+                return Err(refused_while_stepping(
+                    "sets its own trap flag",
+                    registers.rip,
+                ));
+            }
+            let mut code = crate::step_filter::InstructionBytes::default();
+            let fetched = crate::timestamp::fetch_user_code(
+                &self.memory,
+                special.cr3,
+                registers.rip,
+                &mut code.0[..crate::step_filter::MAX_INSTRUCTION_BYTES],
+            );
+            match crate::step_filter::classify(&code.0[..fetched], registers.rip) {
+                StepClass::Step => StepMode::Step,
+                StepClass::RunOver { length } => StepMode::RunTo(registers.rip + length),
+                StepClass::Unstepped => StepMode::Off,
+                StepClass::Refused(what) => {
+                    return Err(refused_while_stepping(what, registers.rip));
+                }
+            }
+        } else {
+            let hypercall = syscall_hypercall_address(
+                self.hypercall_instruction,
+                self.syscall_trampoline_address,
+                self.syscall_frame_address,
+            );
+            if [
+                hypercall,
+                hypercall + self.hypercall_instruction.len() as u64,
+            ]
+            .contains(&registers.rip)
+            {
+                self.trampoline_return = Some(crate::bootstrap::breakpoint_staged_return(
+                    &self.memory,
+                    self.syscall_frame_address,
+                )?);
+            }
+            self.trampoline_return
+                .map_or(StepMode::Off, StepMode::RunTo)
+        };
+        self.vcpu.step_next_entry(mode);
+        Ok(())
+    }
+
+    /// Finishes the `Debug` exit of an entry that `prepare_timer_steps` set
+    /// up: a single step's (DR6.BS), or a breakpoint's at the address the
+    /// entry ran to (DR6.B0). The guest's own trap flag, which a run to a
+    /// breakpoint leaves in RFLAGS (loaded by POPF or `rt_sigreturn`), is
+    /// refused by name, found there or trapping first. Any other is refused.
+    pub(crate) fn finish_timer_step(
+        &mut self,
+        debug: kvm_bindings::kvm_debug_exit_arch,
+    ) -> Result<()> {
+        const SINGLE_STEP: u64 = 1 << 14;
+        const BREAKPOINT_0: u64 = 1;
+        match self.vcpu.last_step_mode().0 {
+            StepMode::Step if debug.dr6 & SINGLE_STEP != 0 => Ok(()),
+            StepMode::RunTo(address) if debug.dr6 & BREAKPOINT_0 != 0 && debug.pc == address => {
+                if self.trampoline_return == Some(address) {
+                    self.trampoline_return = None;
+                }
+                if self.vcpu.get_regs()?.rflags & TRAP_FLAG != 0 {
+                    return Err(refused_while_stepping("sets its own trap flag", address));
+                }
+                Ok(())
+            }
+            StepMode::RunTo(_) if debug.dr6 & SINGLE_STEP != 0 => {
+                Err(refused_while_stepping("sets its own trap flag", debug.pc))
+            }
+            _ => Err(Error::UnexpectedVcpuExit(format!(
+                "debug exit outside a timer step: {debug:?}"
+            ))),
+        }
+    }
+
+    /// Notes an entry that a host signal interrupted: a stepped entry that
+    /// stopped in ring 0 had its instruction fault, and the frame its
+    /// exception stub halts with keeps the step's trap flag until then (see
+    /// [`crate::preemption_timer::SteppedFault`]).
+    pub(crate) fn note_interrupted_entry(&mut self) -> Result<()> {
+        if self.vcpu.last_step_mode().1 {
+            let in_ring_0 = self.vcpu.get_sregs()?.cs.dpl == 0;
+            self.stepped_fault.interrupted(in_ring_0);
+        }
+        Ok(())
+    }
+
+    /// Clears the trap flag a single step left in the frame of the exception
+    /// that ended it, before anything reads or resumes that frame: the CPU
+    /// pushed RFLAGS with the step's TF, which is not the guest's. The
+    /// exception (a page fault, a general protection fault, ...) is the
+    /// guest's own and reaches the Tool as before, which cancels the timer
+    /// request. Does nothing for a frame no step pushed.
+    pub(crate) fn scrub_stepped_exception_frame(&mut self) -> Result<()> {
+        if !self
+            .stepped_fault
+            .take_at_halt(self.vcpu.last_step_mode().1)
+        {
+            return Ok(());
+        }
+        let halted = self.vcpu.get_regs()?;
+        let Some(vector) = exception_from_halt(halted.rip) else {
+            return Ok(());
+        };
+        // An optional error code, then RIP, CS, RFLAGS, RSP and SS.
+        let first = u64::from(exception_pushes_error_code(vector));
+        let address = halted.rsp + (first + 2) * std::mem::size_of::<u64>() as u64;
+        let mut flags = [0; std::mem::size_of::<u64>()];
+        self.memory.read_raw(address, &mut flags)?;
+        let flags = u64::from_le_bytes(flags) & !TRAP_FLAG;
+        self.memory.write_raw(address, &flags.to_le_bytes())
+    }
+
     fn cpuid_instruction_exception(&self) -> Result<Option<CpuidBoundary>> {
         if !self.cpuid_interception.enabled() {
             return Ok(None);
@@ -4769,6 +5274,9 @@ impl KvmBackend {
                 .ok_or_else(|| Error::UnexpectedVcpuExit("CPUID RIP overflow".to_owned()))?;
                 self.resume_instruction_registers(boundary, registers)
             }
+            // The guest resumes where the timer event found it: nothing of
+            // its register file was replaced, and the next entry runs it on.
+            (ToolInstructionBoundary::Timer(_), ToolInstructionResult::Timer) => Ok(()),
             _ => Err(Error::UnexpectedVcpuExit(
                 "instruction callback result kind changed".to_owned(),
             )),
@@ -5041,6 +5549,75 @@ impl KvmBackend {
         )
     }
 
+    /// Whether a signal can be delivered where a timer event's callback found
+    /// the vCPU, at a user instruction boundary (see
+    /// [`Self::timer_instruction_boundary`]): still in user mode, with no
+    /// event that KVM has yet to inject. A host interrupt can end an entry
+    /// while the CPU delivers an exception to its stub; the guest then stands
+    /// at the faulting instruction, and the next entry delivers the exception.
+    /// Moving the guest to a handler there would deliver that exception at the
+    /// handler instead, so the selection waits for the first user boundary
+    /// with no event left to inject, which that exception's own boundary
+    /// leaves (see `KvmBackend::deliver_signal_at_timer_boundary`).
+    pub(crate) fn timer_boundary_takes_signal(&self) -> Result<bool> {
+        if self.vcpu.get_sregs()?.cs.dpl != 3 {
+            return Ok(false);
+        }
+        let events = self.vcpu.get_vcpu_events()?;
+        Ok(events.exception.injected == 0
+            && events.exception.pending == 0
+            && events.interrupt.injected == 0
+            && events.nmi.injected == 0
+            && events.nmi.pending == 0)
+    }
+
+    /// The complete user registers of a vCPU that stands at a user
+    /// instruction boundary, as a Tool callback there sees them: `registers`
+    /// with `orig_rax`, and the segment selectors and the FS and GS bases the
+    /// vCPU holds (an unstarted clone, or a timer event's boundary).
+    pub(crate) fn user_boundary_registers(
+        &self,
+        registers: kvm_regs,
+        orig_rax: u64,
+    ) -> Result<libc::user_regs_struct> {
+        let special = self.vcpu.get_sregs()?;
+        Ok(user_registers_with_segments(
+            registers,
+            orig_rax,
+            &special,
+            special.cs.selector,
+            special.ss.selector,
+        ))
+    }
+
+    /// Delivers `pending` at the user instruction boundary where a timer
+    /// event's callback found the vCPU (see
+    /// [`Self::timer_boundary_takes_signal`]), with `interrupted`, the live
+    /// user registers, as the interrupted context. This is no syscall's
+    /// return, so nothing restarts, as on Linux's return to user mode from
+    /// the interrupt that preempts a thread, which enters with `orig_ax` -1.
+    /// Like an unstarted clone's, the vCPU's continuation is changed directly.
+    pub(crate) fn deliver_selected_signal_at_timer_boundary(
+        &mut self,
+        executor: &mut ElfExecutor,
+        interrupted: kvm_regs,
+        pending: crate::executor::PendingSignal,
+    ) -> Result<bool> {
+        self.deliver_selected_signal_at_boundary(
+            executor,
+            self.syscall_frame_address,
+            interrupted,
+            pending,
+            None,
+            true,
+        )
+    }
+
+    /// Builds `pending`'s signal frame for `interrupted` and resumes the guest
+    /// at its handler: through `fault`'s exception frame, by setting the
+    /// vCPU's registers when `live_registers` (the vCPU stands at a user
+    /// instruction boundary), or else through the syscall frame the
+    /// trampoline returns with.
     fn deliver_selected_signal_at_boundary(
         &mut self,
         executor: &mut ElfExecutor,
@@ -5048,7 +5625,7 @@ impl KvmBackend {
         interrupted: kvm_regs,
         pending: crate::executor::PendingSignal,
         fault: Option<&UserTrap>,
-        thread_entry: bool,
+        live_registers: bool,
     ) -> Result<bool> {
         let signal = pending.event.signal();
         match executor.signal_disposition(signal) {
@@ -5142,7 +5719,7 @@ impl KvmBackend {
         handler.rflags &= !((1 << 8) | (1 << 10) | (1 << 16));
         if let Some(fault) = fault {
             fault.resume_user(self, handler)?;
-        } else if thread_entry {
+        } else if live_registers {
             self.vcpu.set_regs(&handler)?;
         } else {
             stage_process_syscall_return(
@@ -5152,6 +5729,13 @@ impl KvmBackend {
                 handler,
             )?;
         }
+        // The frame holds the interrupted FPU state. As Linux's handle_signal
+        // does with fpu__clear_user_states, the handler then starts in the
+        // initial state; rt_sigreturn restores the frame's. Every delivery
+        // point builds its frame here.
+        // SAFETY: the fixed KVM CPUID policy limits the vCPU's XSAVE state to
+        // the x87, SSE and YMM components, which kvm_xsave holds.
+        unsafe { self.vcpu.set_xsave(&XsaveImage::initialized_kvm())? };
         executor.enter_signal_handler(pending, action, autodisarm);
         Ok(true)
     }
@@ -6434,7 +7018,7 @@ fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
 mod worker_panic_tests;
 
 #[cfg(test)]
-pub(crate) use tests::minimal_test_elf;
+pub(crate) use crate::elf::minimal_test_elf;
 
 #[cfg(test)]
 mod user_trap_signal_tests {
@@ -10568,44 +11152,6 @@ mod tests {
         }
     }
 
-    pub(crate) fn minimal_test_elf(code: &[u8]) -> Vec<u8> {
-        const LOAD_ADDRESS: u64 = 0x20_0000;
-        const CODE_OFFSET: usize = 0x1000;
-        let mut image = vec![0; CODE_OFFSET + code.len()];
-        let put_u16 = |image: &mut [u8], offset: usize, value: u16| {
-            image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-        };
-        let put_u32 = |image: &mut [u8], offset: usize, value: u32| {
-            image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        };
-        let put_u64 = |image: &mut [u8], offset: usize, value: u64| {
-            image[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        };
-
-        image[..4].copy_from_slice(b"\x7fELF");
-        image[4] = 2;
-        image[5] = 1;
-        image[6] = 1;
-        put_u16(&mut image, 16, 2);
-        put_u16(&mut image, 18, 62);
-        put_u32(&mut image, 20, 1);
-        put_u64(&mut image, 24, LOAD_ADDRESS);
-        put_u64(&mut image, 32, 64);
-        put_u16(&mut image, 52, 64);
-        put_u16(&mut image, 54, 56);
-        put_u16(&mut image, 56, 1);
-        put_u32(&mut image, 64, 1);
-        put_u32(&mut image, 68, 5);
-        put_u64(&mut image, 72, CODE_OFFSET as u64);
-        put_u64(&mut image, 80, LOAD_ADDRESS);
-        put_u64(&mut image, 88, LOAD_ADDRESS);
-        put_u64(&mut image, 96, code.len() as u64);
-        put_u64(&mut image, 104, 0x2000);
-        put_u64(&mut image, 112, 0x1000);
-        image[CODE_OFFSET..].copy_from_slice(code);
-        image
-    }
-
     #[test]
     fn timestamp_boundary_respects_hardware_instruction_fetch_fault_priority() {
         const BOUNDARY: u64 = 0x40_0000;
@@ -12618,6 +13164,7 @@ mod tests {
     include!("vm/kept_rpc_failure_tests.rs");
     include!("vm/empty_signal_boundary_tests.rs");
     include!("vm/instruction_callback_panic_tests.rs");
+    include!("vm/timer_signal_deferral_tests.rs");
 }
 
 #[cfg(test)]
@@ -12747,3 +13294,11 @@ static DELAY_AFTER_CLEAR_TID_WAKE_MS: std::sync::atomic::AtomicU64 =
 #[cfg(test)]
 #[path = "vm/group_exit_order_tests.rs"]
 mod group_exit_order_tests;
+
+#[cfg(test)]
+#[path = "vm/group_exit_injection_loop_tests.rs"]
+mod group_exit_injection_loop_tests;
+
+#[cfg(test)]
+#[path = "vm/initial_fpu_state_tests.rs"]
+mod initial_fpu_state_tests;

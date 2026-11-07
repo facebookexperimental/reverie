@@ -185,9 +185,26 @@ pub struct PreparedExec<'fd> {
     inherited: Vec<std::os::fd::BorrowedFd<'fd>>,
     cwd: Option<std::fs::File>,
     ptrace_launch_facts: bool,
+    stdio: Option<reverie::process::PreparedStdio>,
+    parent_stdio: Option<reverie::process::ParentStdio>,
 }
 
 impl<'fd> PreparedExec<'fd> {
+    /// Install only the supplied common stdio plan in the original child.
+    ///
+    /// This does not implement the remaining Command/container setup. The
+    /// caller retains namespace/resource setup and must reject any unsupported
+    /// child setup. Streams are installed after inherited cwd/fd setup, before
+    /// ptrace registration and exec. Default requests inherit.
+    pub fn with_stdio(mut self, stdio: reverie::process::PreparedStdio) -> Self {
+        self.stdio = Some(stdio);
+        self
+    }
+
+    pub(super) fn take_parent_stdio(&mut self) -> Option<reverie::process::ParentStdio> {
+        self.parent_stdio.take()
+    }
+
     /// Match the ordinary ptrace child's deterministic address-space and
     /// terminal job-control setup before exec, without changing this parent.
     /// The default constructor preserves its existing inherited behavior.
@@ -278,10 +295,15 @@ impl<'fd> PreparedExec<'fd> {
             inherited,
             cwd,
             ptrace_launch_facts: false,
+            stdio: None,
+            parent_stdio: None,
         })
     }
 
-    pub(super) fn fork(&self, evidence: CleanupReceipt) -> Result<PendingChild, std::io::Error> {
+    pub(super) fn fork(
+        &mut self,
+        evidence: CleanupReceipt,
+    ) -> Result<PendingChild, std::io::Error> {
         // SAFETY: the child uses only raw syscalls and immutable preallocated
         // storage, then execve or exit_group. It cannot unwind or run Drop.
         // Parent memory and all retained CString buffers remain live in both
@@ -333,16 +355,22 @@ impl<'fd> PreparedExec<'fd> {
             record.child_created = true;
             record.owner = CleanupOwner::PendingPidfd;
         }
-        Ok(PendingChild {
+        let pending = PendingChild {
             pid: Pid::from_raw(child as i32),
             pidfd,
             owned: true,
             evidence,
             _local: core::marker::PhantomData,
-        })
+        };
+        // The atomic pidfd owner already exists. Close every parent copy of
+        // a child stream NOW, before any fallible tracing registration or wait.
+        // Retaining this request in ChildOwner/LaunchFailure must not retain a
+        // writer that could prevent the real output reader from seeing EOF.
+        self.parent_stdio = self.stdio.as_mut().map(|stdio| stdio.finish_parent());
+        Ok(pending)
     }
 
-    unsafe fn child_entry(&self, parent: u64) -> ! {
+    unsafe fn child_entry(&mut self, parent: u64) -> ! {
         // SAFETY: raw scalar syscall operands; the child has not exec'd guest
         // code. The parent-death check closes the gap before EXITKILL can be
         // installed at the first ptrace stop.
@@ -414,6 +442,14 @@ impl<'fd> PreparedExec<'fd> {
                 {
                     exit_child();
                 }
+            }
+            if let Some(stdio) = self.stdio.as_mut()
+                // SAFETY: this is the original clone's private fd table; the
+                // prebuilt plan owns every staging descriptor. The child never
+                // returns or unwinds, including on partial installation failure.
+                && stdio.install_child().is_err()
+            {
+                exit_child();
             }
             if syscall6(
                 libc::SYS_ptrace as u64,

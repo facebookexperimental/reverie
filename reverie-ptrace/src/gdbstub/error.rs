@@ -48,6 +48,10 @@ pub enum Error {
     ThreadIdNotSpecified,
     #[error("Unknown thread {0}")]
     UnknownThread(Pid),
+    #[error("Thread {0} is running, and no stopped thread shares its address space")]
+    ThreadRunning(Pid),
+    #[error("Thread {0} is held in a tool callback, where its registers cannot change")]
+    ThreadParked(Pid),
     #[error("gdbserver failed to receive stop event")]
     GdbServerStopEventRecvError,
 }

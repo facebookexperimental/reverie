@@ -57,9 +57,10 @@ pub struct RcbClockSnapshot {
 /// A host without a usable branch counter leaves the clock unavailable, which
 /// is not an error; [`read_guest_rcb_clock`] then reports `Unsupported`.
 pub fn initialize_rcb_clock() -> io::Result<()> {
-    initialize_rcb_clock_with(|| unsafe {
-        reverie::InGuestRcbCounter::current_thread_with_syscall_gate(raw_syscall6)
-    })
+    initialize_rcb_clock_with(
+        || unsafe { reverie::InGuestRcbCounter::current_thread_with_syscall_gate(raw_syscall6) },
+        true,
+    )
 }
 
 /// Bind an explicitly disabled clock for the authenticated no-RCB private image.
@@ -107,11 +108,20 @@ pub unsafe fn disable_rcb_clock_for_current_thread() -> io::Result<()> {
 pub unsafe fn initialize_rcb_clock_with_counter(
     counter: reverie::InGuestRcbCounter,
 ) -> io::Result<()> {
-    initialize_rcb_clock_with(|| Ok(counter))
+    // The caller may already hold the counter's number (its boundary
+    // controls), so it keeps it; the runtime still records it as its own.
+    initialize_rcb_clock_with(|| Ok(counter), false)
 }
 
+/// Binds the counter `create` returns to the calling thread. With `place`, the
+/// counter's descriptor first moves to the runtime's range
+/// ([`crate::guest::protect::runtime_fd_minimums`]) where a number there is free;
+/// either way the runtime records it as its own
+/// ([`crate::guest::protect::record_runtime_fd`]), so the guest cannot close,
+/// duplicate onto or otherwise reach it.
 fn initialize_rcb_clock_with(
     create: impl FnOnce() -> Result<reverie::InGuestRcbCounter, reverie::Errno>,
+    place: bool,
 ) -> io::Result<()> {
     // Whatever binding allocates (the counter's box, and the PMU builder's
     // and environment overrides' own buffers) comes from the private Tool
@@ -143,13 +153,41 @@ fn initialize_rcb_clock_with(
     RCB_COUNTER_ORIGIN.set(0);
     RCB_CLOCK_OFFSET.set(0);
     RCB_CLOCK_RESTORED.set(false);
-    let clock = match create() {
+    let mut clock = match create() {
         Ok(clock) => clock,
         // The in-guest clock is optional. CPU discovery, perf-event setup,
         // mmap, reset, and enable failures all mean unavailable, not a failed
         // Tool installation.
         Err(_) => return Ok(()),
     };
+    if place {
+        // Signals stay blocked from the move's close of the first number to
+        // the check of that number (protect::record_if_open).
+        let _blocked = crate::guest::protect::block_all_signals()?;
+        let created = clock.descriptor();
+        for minimum in crate::guest::protect::runtime_fd_minimums() {
+            // SAFETY: the counter was just created on this thread and nothing
+            // borrows its descriptor. Where no number is free in the runtime's
+            // range it keeps the one perf_event_open gave it.
+            let moved = unsafe { clock.move_descriptor_at_least(minimum) };
+            if moved.is_ok() || clock.descriptor() != created {
+                break;
+            }
+        }
+        if clock.descriptor() != created {
+            // The counter moved. Its first number is the same perf event, so
+            // if it did not close (a seccomp filter the guest installed can
+            // fail close, or report success without running it), the runtime
+            // keeps it as its own too rather than leave it reachable.
+            crate::guest::protect::record_if_open(created)?;
+        }
+        // Recorded before the guard restores the mask: a signal held during
+        // the move is delivered then, and its handler must already find the
+        // counter protected.
+        crate::guest::protect::record_runtime_fd(clock.descriptor())?;
+    } else {
+        crate::guest::protect::record_runtime_fd(clock.descriptor())?;
+    }
     let active_entry = if active_depth == 0 {
         0
     } else {
@@ -164,6 +202,44 @@ fn initialize_rcb_clock_with(
     RCB_HANDLER_DEDUCTION.set(0);
     RCB_HANDLER_DEPTH.set(active_depth);
     Ok(())
+}
+
+/// Moves this thread's own performance-counter descriptor off `fd`, a number a
+/// guest `dup2`, `dup3` or `F_DUPFD` is about to take
+/// (protect::make_room_for_guest_descriptor), to a free number in the
+/// runtime's range, closing `fd` and recording the new number in its place.
+/// Returns the new number, or `None` when `fd` is not this thread's bound
+/// counter (an inherited copy in a fork child that has not re-bound yet is
+/// not). Fails, moving nothing, when no number is free. The caller blocks
+/// every signal (protect::block_all_signals); every syscall here goes through
+/// the counter's own syscall gate.
+pub fn relocate_rcb_counter(fd: libc::c_int) -> io::Result<Option<libc::c_int>> {
+    let owner = unsafe { raw_syscall6(libc::SYS_gettid, [0; 6]) } as libc::pid_t;
+    let current = RCB_CLOCK.get();
+    if current.is_null() || RCB_CLOCK_OWNER.get() != owner {
+        return Ok(None);
+    }
+    // SAFETY: the bound counter belongs to this thread (threads are refused
+    // on these backends), and no borrow of it is live while the runtime
+    // dispatches a guest syscall: rcb_clock's callers read through it and
+    // return before the dispatch reaches the descriptor protections.
+    let clock = unsafe { &mut *current };
+    if clock.descriptor() != fd {
+        return Ok(None);
+    }
+    for minimum in crate::guest::protect::runtime_fd_minimums() {
+        // SAFETY: as above; no boundary_fd borrow is held outside tests.
+        let moved = unsafe { clock.move_descriptor_at_least(minimum) };
+        if moved.is_ok() || clock.descriptor() != fd {
+            break;
+        }
+    }
+    let moved = clock.descriptor();
+    if moved == fd {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
+    crate::guest::protect::replace_recorded_fd(fd, moved)?;
+    Ok(Some(moved))
 }
 
 /// Capture the actual guest-only counter value for an inactive continuation.
@@ -232,13 +308,15 @@ fn rcb_clock() -> io::Result<Option<&'static reverie::InGuestRcbCounter>> {
     }
     if RCB_CLOCK_OWNER.get() != owner {
         // A fork/clone child inherits the parent's TLS bytes, including an fd
-        // that still measures the parent thread. Leak that inherited handle
-        // and bind a fresh PMU event to this calling thread. Binding is the
+        // that still measures the parent thread. Close a fork child's copy of
+        // that descriptor (leaving the handle's memory leaked, as before) and
+        // bind a fresh PMU event to this calling thread. Binding is the
         // runtime's own code, not the guest's: it reads CPUID (PMU discovery),
         // which must run natively, as inside a Tool callback, rather than be
         // emulated through the fallback continuation, which a fork child can
         // still be running when it first gets here.
         let _runtime_code = crate::guest::support::ToolCallbackGuard::enter();
+        crate::guest::protect::close_inherited_runtime_fds()?;
         initialize_rcb_clock()?;
     }
     let current = RCB_CLOCK.get();
@@ -333,7 +411,7 @@ mod tests {
             reverie::Errno::EBUSY,
             reverie::Errno::EIO,
         ] {
-            initialize_rcb_clock_with(|| Err(error)).unwrap();
+            initialize_rcb_clock_with(|| Err(error), true).unwrap();
             assert!(RCB_CLOCK.get().is_null());
             assert_eq!(RCB_CLOCK_AVAILABILITY.get(), ClockAvailability::Unavailable);
             assert_eq!(RCB_CLOCK_OWNER.get(), owner);
@@ -408,15 +486,122 @@ mod tests {
             // An explicit ordinary setup still calls its real creation seam;
             // disabled mode is not a permanent global change to the initializer.
             let mut attempts = 0;
-            initialize_rcb_clock_with(|| {
-                attempts += 1;
-                Err(reverie::Errno::EACCES)
-            })
+            initialize_rcb_clock_with(
+                || {
+                    attempts += 1;
+                    Err(reverie::Errno::EACCES)
+                },
+                true,
+            )
             .unwrap();
             assert_eq!(attempts, 1);
             assert_eq!(RCB_CLOCK_AVAILABILITY.get(), ClockAvailability::Unavailable);
         })
         .join()
         .unwrap();
+    }
+
+    /// When a counter's first number survives its close after the move to the
+    /// runtime's range (a guest seccomp filter can fake that close), the
+    /// runtime records the first number too, so neither name for the perf
+    /// event is reachable or unreported. Needs a usable branch counter: on a
+    /// host without one there is no counter to move, and the test says so.
+    #[test]
+    fn a_counter_number_that_survives_its_close_is_recorded_too() {
+        use crate::guest::protect::RUNTIME_FD_MIN;
+        use crate::guest::protect::is_runtime_owned_fd;
+        use crate::guest::protect::tests::in_child_with_soft_nofile;
+        use crate::guest::protect::tests::is_open;
+        use crate::guest::protect::tests::suppress_close_of;
+        in_child_with_soft_nofile(2048, || {
+            // SAFETY: a fresh forked child; this thread owns the counter.
+            let counter = match unsafe {
+                reverie::InGuestRcbCounter::current_thread_with_syscall_gate(raw_syscall6)
+            } {
+                Ok(counter) => counter,
+                Err(error) => {
+                    eprintln!("no usable branch counter on this host ({error:?}); nothing to move");
+                    return;
+                }
+            };
+            let created = counter.descriptor();
+            assert!(created < RUNTIME_FD_MIN, "created at {created}");
+            suppress_close_of(created);
+            initialize_rcb_clock_with(|| Ok(counter), true).unwrap();
+            let bound = unsafe { &*RCB_CLOCK.get() }.descriptor();
+            assert!(bound >= RUNTIME_FD_MIN, "moved to {bound}");
+            assert!(is_open(created), "the filter kept the first number open");
+            assert!(is_runtime_owned_fd(created));
+            assert!(is_runtime_owned_fd(bound));
+        });
+    }
+
+    /// A guest `dup2` onto this thread's counter number goes ahead as on
+    /// Linux: the runtime first moves the counter to another number, records
+    /// that one instead, and keeps counting through it; so does a guest
+    /// `F_DUPFD` whose answer is the counter's number. Needs a usable branch
+    /// counter: on a host without one there is no counter to move, and the
+    /// test says so.
+    #[test]
+    fn a_guest_dup2_onto_the_counter_moves_it_and_it_keeps_counting() {
+        use crate::guest::protect::is_runtime_owned_fd;
+        use crate::guest::protect::protect_runtime_descriptors;
+        use crate::guest::protect::tests::event;
+        use crate::guest::protect::tests::in_child_with_soft_nofile;
+        use crate::guest::protect::tests::is_open;
+        in_child_with_soft_nofile(2048, || {
+            // SAFETY: a fresh forked child; this thread owns the counter.
+            let counter = match unsafe {
+                reverie::InGuestRcbCounter::current_thread_with_syscall_gate(raw_syscall6)
+            } {
+                Ok(counter) => counter,
+                Err(error) => {
+                    eprintln!("no usable branch counter on this host ({error:?}); nothing to move");
+                    return;
+                }
+            };
+            initialize_rcb_clock_with(|| Ok(counter), true).unwrap();
+            let before = unsafe { &*RCB_CLOCK.get() }.descriptor();
+            let first = read_guest_rcb_clock().unwrap();
+            let mut dup = event(libc::SYS_dup2, [0, before as u64, 0, 0, 0, 0]);
+            assert!(!unsafe { protect_runtime_descriptors(&mut dup, true) });
+            let after = unsafe { &*RCB_CLOCK.get() }.descriptor();
+            assert_ne!(after, before);
+            assert!(is_runtime_owned_fd(after));
+            assert!(!is_runtime_owned_fd(before));
+            assert!(!is_open(before), "the old number is free for the guest");
+            let mut spin = 0_u64;
+            for step in 0..100_000_u64 {
+                spin = std::hint::black_box(spin.wrapping_add(step ^ spin));
+            }
+            let second = read_guest_rcb_clock().unwrap();
+            assert!(second > first, "the counter stopped: {first} -> {second}");
+
+            let mut f_dupfd = event(
+                libc::SYS_fcntl,
+                [0, libc::F_DUPFD_CLOEXEC as u64, after as u64, 0, 0, 0],
+            );
+            assert!(!unsafe { protect_runtime_descriptors(&mut f_dupfd, true) });
+            let last = unsafe { &*RCB_CLOCK.get() }.descriptor();
+            assert_ne!(last, after);
+            assert!(is_runtime_owned_fd(last));
+            assert!(!is_runtime_owned_fd(after));
+            let got = unsafe {
+                raw_syscall6(
+                    libc::SYS_fcntl,
+                    [0, libc::F_DUPFD_CLOEXEC as u64, after as u64, 0, 0, 0],
+                )
+            };
+            assert_eq!(
+                got,
+                i64::from(after),
+                "the guest gets the counter's old number"
+            );
+            for step in 0..100_000_u64 {
+                spin = std::hint::black_box(spin.wrapping_add(step ^ spin));
+            }
+            let third = read_guest_rcb_clock().unwrap();
+            assert!(third > second, "the counter stopped: {second} -> {third}");
+        });
     }
 }

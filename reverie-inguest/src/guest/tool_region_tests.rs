@@ -38,6 +38,65 @@ const OUTPUT_LIMIT: usize = 64 * 1024;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const FORK_TIMEOUT: Duration = Duration::from_secs(3);
 
+#[test]
+fn local_publication_scalar_get_does_not_read_uninitialized_value() {
+    let publication = RegionPublication::new();
+    assert!(publication.get().is_none());
+    assert!(!publication.published.load(Ordering::Acquire));
+    assert!(publication.get().is_none());
+}
+
+#[test]
+fn local_publication_scalar_set_moves_once_and_preserves_rejected_payload() {
+    // This local slot never supplies runtime ownership or touches fixed memory.
+    // Full-width error payloads exercise transfer without fabricating a ToolRegion.
+    let publication = RegionPublication::new();
+    let mut original = ManuallyDrop::new(Err::<ToolRegion, i32>(0x1234_5678));
+    let slot = black_box(core::ptr::from_ref(&publication).cast::<c_void>());
+    let payload = black_box(core::ptr::from_mut(&mut *original).cast::<c_void>());
+    // SAFETY: this test exclusively owns the unpublished local slot and the
+    // initialized, disjoint payload. On success original is never read/dropped.
+    assert_eq!(unsafe { RegionPublication::set_opaque(slot, payload) }, 0);
+    let published = publication.get().unwrap();
+    assert!(matches!(published, Err(errno) if *errno == 0x1234_5678));
+
+    let mut rejected = ManuallyDrop::new(Err::<ToolRegion, i32>(-0x0234_5678));
+    let slot = black_box(core::ptr::from_ref(&publication).cast::<c_void>());
+    let payload = black_box(core::ptr::from_mut(&mut *rejected).cast::<c_void>());
+    // SAFETY: the same exclusive local ownership holds. The already-published
+    // path must leave rejected initialized and unchanged for its owner.
+    assert_eq!(
+        unsafe { RegionPublication::set_opaque(slot, payload) },
+        libc::EAGAIN
+    );
+    assert!(matches!(
+        ManuallyDrop::into_inner(rejected),
+        Err(errno) if errno == -0x0234_5678
+    ));
+    assert!(core::ptr::eq(published, publication.get().unwrap()));
+    assert!(matches!(publication.get(), Some(Err(errno)) if *errno == 0x1234_5678));
+}
+
+#[test]
+fn duplicate_publication_returns_real_reserve_error_without_replacing_owner() {
+    isolated(
+        "duplicate_publication_returns_real_reserve_error_without_replacing_owner",
+        || {
+            let owner = ToolRegion::reserve().unwrap();
+            let _initializing = InitializationGuard::acquire().unwrap();
+            let proposed = ToolRegion::reserve_inner();
+            assert!(matches!(&proposed, Err(errno) if *errno == libc::EEXIST));
+            // SAFETY: this isolated process owns the real initialization gate;
+            // proposed is the actual ordinary reserve result. The published
+            // owner must remain untouched and the rejected result returned.
+            let rejected = unsafe { REGION.set_under_gate(proposed) }.unwrap_err();
+            assert!(matches!(rejected, Err(errno) if errno == libc::EEXIST));
+            assert!(core::ptr::eq(owner, published_owner().unwrap()));
+            assert!(matches!(REGION.get(), Some(Ok(region)) if core::ptr::eq(owner, region)));
+        },
+    );
+}
+
 struct Captured {
     bytes: Vec<u8>,
     exceeded: bool,

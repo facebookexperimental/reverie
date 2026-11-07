@@ -634,3 +634,13 @@ impl GuestThreadGroup {
         }
     }
 }
+
+impl crate::executor::GuestWorkers for GuestThreadGroup {
+    fn has_unjoined_workers(&self) -> bool {
+        GuestThreadGroup::has_unjoined_workers(self)
+    }
+
+    fn join_workers(&self) {
+        GuestThreadGroup::join_workers(self)
+    }
+}
