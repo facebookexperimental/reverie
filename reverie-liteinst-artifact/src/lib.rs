@@ -59265,14 +59265,14 @@ mod tests {
                 0,
                 "fixed_scalar_publication_get_location",
                 "tool_region.rs",
-                89_u32,
+                94_u32,
                 36_u32,
             ),
             (
                 1,
                 "fixed_scalar_publication_set_location",
                 "tool_region.rs",
-                138,
+                143,
                 36,
             ),
             (
@@ -60599,7 +60599,7 @@ mod tests {
         let context = detcore_validate_control_context("987e72b");
         let filename = &context["rv:reverie-inguest/src/guest/tool_region.rs"];
         let mut readonly = BTreeMap::new();
-        for (address, file, line) in [(0x400000, 0x500000, 89_u32), (0x400100, 0x500100, 138_u32)] {
+        for (address, file, line) in [(0x400000, 0x500000, 94_u32), (0x400100, 0x500100, 143_u32)] {
             let mut location = vec![0; 24];
             location[8..16].copy_from_slice(&(filename.len() as u64).to_le_bytes());
             location[16..20].copy_from_slice(&line.to_le_bytes());
