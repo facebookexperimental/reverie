@@ -106,6 +106,7 @@ const _: () = assert!(disjoint(&LOADER_WINDOW, &RUNTIME_WINDOW));
 
 /// Why a built image may not be mapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ArtifactError {
     /// The image failed parsing or validation.
     Image(ImageError),
