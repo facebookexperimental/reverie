@@ -18355,6 +18355,63 @@ struct NoScopeCensus {
 }
 // Physical census only. The production caller separately requires actual
 // verified sources, actual compiler feature events and the whole101B recipe.
+/// Absence proof for a retained getter whose thunk is not in this
+/// image: refuse, naming the site, if any executable byte start holds
+/// the thunk shape encoding this cell's offset, or any relocation
+/// names the cell. In this code family the thunk is the only access
+/// form for these cells (verified on both image flavors); initial-exec
+/// or GOT forms would arrive as TLS relocations, which the relocation
+/// scan covers by symbol index.
+fn refuse_inlined_tls_access(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    canonical: &str,
+    cell_offset: u64,
+    cell_index: usize,
+) -> Result<()> {
+    for segment in &elf.program_headers {
+        if segment.p_type != program_header::PT_LOAD || segment.p_flags & program_header::PF_X == 0
+        {
+            continue;
+        }
+        let at = loader_meta_usize(segment.p_offset)?;
+        let length = loader_meta_usize(segment.p_filesz)?;
+        let code = loader_meta_slice(bytes, at, length)?;
+        for (start, candidate) in code.windows(22).enumerate() {
+            if candidate[..4] != [0x50, 0x48, 0x8d, 0x3d]
+                || candidate[8] != 0xe8
+                || candidate[13..16] != [0x48, 0x8d, 0x80]
+                || candidate[20..] != [0x59, 0xc3]
+                || u64::from(u32::from_le_bytes(candidate[16..20].try_into().unwrap()))
+                    != cell_offset
+            {
+                continue;
+            }
+            let address = segment
+                .p_vaddr
+                .checked_add(start as u64)
+                .ok_or("inlined TLS access address overflows")?;
+            return Err(format!(
+                "other TLS getter {canonical} is absent but its cell at offset {cell_offset:#x} is accessed by an inlined thunk at {address:#x} in no-scope image"
+            ));
+        }
+    }
+    for relocation in elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .chain(elf.pltrelocs.iter())
+    {
+        require(
+            relocation.r_sym != cell_index,
+            format!(
+                "other TLS getter {canonical} is absent but a relocation names its cell in no-scope image"
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 fn no_installation_scope_census(
     elf: &Elf<'_>,
     bytes: &[u8],
@@ -18398,9 +18455,58 @@ fn no_installation_scope_census(
             })
             .collect();
         require(
-            candidates.len() == 1,
-            "other TLS getter absent or duplicated in no-scope image",
+            candidates.len() <= 1,
+            "other TLS getter duplicated in no-scope image",
         )?;
+        // Authenticate the named cell first: both the present-getter
+        // path and the absence proof bind to it.
+        let cells: Vec<(usize, _)> = elf
+            .syms
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.st_type() == sym::STT_TLS
+                    && elf
+                        .strtab
+                        .get_at(candidate.st_name)
+                        .and_then(canonical_rust_symbol)
+                        .as_deref()
+                        == Some(cell_canonical)
+            })
+            .collect();
+        require(
+            cells.len() == 1,
+            format!(
+                "other TLS getter {canonical} cell {cell_canonical} absent or duplicated in no-scope image"
+            ),
+        )?;
+        let (cell_index, cell_symbol) = cells[0];
+        let cell_name = elf
+            .strtab
+            .get_at(cell_symbol.st_name)
+            .ok_or("other TLS getter cell name absent")?;
+        require(
+            cell_symbol.st_bind() == sym::STB_LOCAL
+                && cell_symbol.st_size != 0
+                && !elf
+                    .dynsyms
+                    .iter()
+                    .any(|dynamic| elf.dynstrtab.get_at(dynamic.st_name) == Some(cell_name)),
+            format!(
+                "other TLS getter {canonical} cell {cell_canonical} is malformed/dynamic/nonlocal in no-scope image"
+            ),
+        )?;
+        let cell_offset = cell_symbol.st_value;
+        if candidates.is_empty() {
+            // The thunk is absent from this image. That is admissible
+            // only with proof that nothing reaches the cell anyway:
+            // no thunk-shaped access to its offset at any executable
+            // byte start, and no relocation naming the cell. An
+            // inlined access refuses by name and site; it is never
+            // silently unpatched.
+            refuse_inlined_tls_access(elf, bytes, canonical, cell_offset, cell_index)?;
+            continue;
+        }
         let symbol = candidates[0];
         require(
             symbol.st_type() == sym::STT_FUNC
@@ -18422,47 +18528,6 @@ fn no_installation_scope_census(
             "other TLS getter is not complete file-backed RX",
         )?;
         let code = &bytes[at..at + 22];
-        // Bind the cell offset from this ELF's own authenticated TLS
-        // symbol for the named cell; the thunk's shape is then exact
-        // with that offset implanted. A missing, duplicated, dynamic
-        // or nonlocal cell, or an encoded offset that disagrees with
-        // it, refuses by name.
-        let cells: Vec<_> = elf
-            .syms
-            .iter()
-            .filter(|candidate| {
-                candidate.st_type() == sym::STT_TLS
-                    && elf
-                        .strtab
-                        .get_at(candidate.st_name)
-                        .and_then(canonical_rust_symbol)
-                        .as_deref()
-                        == Some(cell_canonical)
-            })
-            .collect();
-        require(
-            cells.len() == 1,
-            format!(
-                "other TLS getter {canonical} cell {cell_canonical} absent or duplicated in no-scope image"
-            ),
-        )?;
-        let cell_symbol = cells[0];
-        let cell_name = elf
-            .strtab
-            .get_at(cell_symbol.st_name)
-            .ok_or("other TLS getter cell name absent")?;
-        require(
-            cell_symbol.st_bind() == sym::STB_LOCAL
-                && cell_symbol.st_size != 0
-                && !elf
-                    .dynsyms
-                    .iter()
-                    .any(|dynamic| elf.dynstrtab.get_at(dynamic.st_name) == Some(cell_name)),
-            format!(
-                "other TLS getter {canonical} cell {cell_canonical} is malformed/dynamic/nonlocal in no-scope image"
-            ),
-        )?;
-        let cell_offset = cell_symbol.st_value;
         let encoded_offset = u32::from_le_bytes(
             code[16..20]
                 .try_into()
@@ -18797,7 +18862,7 @@ fn validate_no_installation_scope_evidence(
                         name.starts_with("_RNvXs2_NtCs_16reverie_liteinst11patch_alloc")
                     })
             })
-            && proof.other_tls_getters.len() == NO_SCOPE_OTHER_GETTERS.len()
+            && proof.other_tls_getters.len() <= NO_SCOPE_OTHER_GETTERS.len()
             && proof
                 .other_tls_getters
                 .windows(2)
@@ -46746,7 +46811,10 @@ mod tests {
                 11 => bad.allocation.binding = sym::STB_GLOBAL,
                 12 => bad.allocation_sha256 = "0".repeat(64),
                 13 => bad.mappings[0].flags = 7,
-                14 => bad.other_tls_getters.pop().map(|_| ()).unwrap(),
+                14 => {
+                    bad.other_tls_getters[0].getter.name =
+                        bad.other_tls_getters[1].getter.name.clone()
+                }
                 15 => bad.other_tls_getters[1] = bad.other_tls_getters[0].clone(),
                 16 => bad.other_tls_getters[0].module_slot += 1,
                 17 => bad.other_tls_getters[0].getter.binding = sym::STB_GLOBAL,
@@ -47049,6 +47117,25 @@ mod tests {
         assert!(
             census(&wrong_static).is_err(),
             "getter whose named cell is absent or duplicated must refuse"
+        );
+        // Two getters absent with no reference to their cells (their
+        // symbols and thunk bytes both gone) are accepted: the census
+        // records only the getters physically present.
+        let mut absent = base.clone();
+        for index in [1_usize, 2] {
+            put(&mut absent, 0x4000 + (index + 1) * 24, 4, 0);
+            let address = 0x1500 + index * 0x40;
+            absent[address..address + 22].fill(0);
+        }
+        let absent = census(&absent).expect("absent unreferenced getters census positive");
+        assert_eq!(absent.other_tls_getters.len(), 2);
+        // The same absence with the thunk bytes left behind (an
+        // inlined access to the cell) is refused.
+        let mut inlined = base.clone();
+        put(&mut inlined, 0x4000 + 2 * 24, 4, 0);
+        assert!(
+            census(&inlined).is_err(),
+            "absent getter with an inlined access to its cell must refuse"
         );
         assert_eq!(good.loader_writer_count, 2);
         assert!(good.other_getter_pointer_slots.is_empty());
