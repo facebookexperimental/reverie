@@ -1053,36 +1053,32 @@ fn read_status<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<String> {
 /// where a syscall resume runs the call first; and a blocked
 /// synchronous signal (a requeued SIGSYS is the case in point) is
 /// dequeued by the step trap, where an in-place call would leave it
-/// queued for the guest's next trap to merge into. An unreadable
-/// or unparseable status refuses admission (the stepped transports
+/// queued for the guest's next trap to merge into. A mask or queue
+/// that cannot be read refuses admission (the stepped transports
 /// then report the death or refusal their own way); it must never
 /// abort the run, as `guest_has_own_seccomp_filter` already treats
 /// an unreadable count.
-fn pending_signal_refuses_from_masks(pending: u64, blocked: u64) -> bool {
-    pending & (!blocked | SYNCHRONOUS_SIGNAL_BITS) != 0
+fn signal_refuses_in_place(signo: i32, blocked: u64) -> bool {
+    (1..=64).contains(&signo)
+        && (blocked & (1u64 << (signo - 1)) == 0
+            || SYNCHRONOUS_SIGNAL_BITS & (1u64 << (signo - 1)) != 0)
 }
 
-fn pending_signal_refusal_from_status(status: Option<&str>) -> bool {
-    let Some(status) = status else {
-        return true;
-    };
-    let field = |name: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-    };
-    let (Some(own_pending), Some(shared), Some(blocked)) =
-        (field("SigPnd:"), field("ShdPnd:"), field("SigBlk:"))
-    else {
-        return true;
-    };
-    pending_signal_refuses_from_masks(own_pending | shared, blocked)
+fn peek_refusal(private: Result<bool, ()>, shared: Result<bool, ()>) -> bool {
+    !matches!((private, shared), (Ok(false), Ok(false)))
 }
 
 fn pending_signal_refuses_in_place(task: &Stopped) -> bool {
-    let status = read_status(format!("/proc/{}/status", task.pid()));
-    pending_signal_refusal_from_status(status.ok().as_deref())
+    let Ok(blocked) = sigmask(task) else {
+        return true;
+    };
+    let peek = |flags| {
+        task.peeksiginfo_any(flags, |info| {
+            signal_refuses_in_place(info.si_signo, blocked)
+        })
+        .map_err(|_| ())
+    };
+    peek_refusal(peek(None), peek(Some(safeptrace::PeekSigInfoFlags::SHARED)))
 }
 
 fn in_place_seccomp_baseline_admitted(baseline: Option<u64>) -> bool {
@@ -18697,34 +18693,24 @@ mod tests {
 
     #[test]
     fn in_place_pending_signal_gate_fails_closed_and_refuses_blocked_synchronous() {
-        use super::pending_signal_refusal_from_status;
+        use super::peek_refusal;
+        use super::signal_refuses_in_place;
         let bit = |signal: i32| 1u64 << (signal - 1);
-        let status = |pending: u64, shared: u64, blocked: u64| {
-            format!("SigPnd:\t{pending:016x}\nShdPnd:\t{shared:016x}\nSigBlk:\t{blocked:016x}\n")
-        };
 
-        // Missing, empty, missing-field, and invalid-hex statuses must
-        // refuse in-place admission rather than fail open (or abort).
-        assert!(pending_signal_refusal_from_status(None));
-        assert!(pending_signal_refusal_from_status(Some("")));
-        assert!(pending_signal_refusal_from_status(Some(
-            "SigPnd:\t0\nShdPnd:\t0\n"
-        )));
-        assert!(pending_signal_refusal_from_status(Some(
-            "SigPnd:\tnot-hex\nShdPnd:\t0\nSigBlk:\t0\n"
-        )));
+        // A mask or queue that cannot be read refuses admission
+        // rather than fail open (the N1 mutation).
+        assert!(peek_refusal(Err(()), Ok(false)));
+        assert!(peek_refusal(Ok(false), Err(())));
+        assert!(peek_refusal(Err(()), Err(())));
+        assert!(peek_refusal(Ok(true), Ok(false)));
+        assert!(peek_refusal(Ok(false), Ok(true)));
+        assert!(!peek_refusal(Ok(false), Ok(false)));
 
-        let usr1 = bit(libc::SIGUSR1);
-        assert!(!pending_signal_refusal_from_status(Some(&status(0, 0, 0))));
-        assert!(!pending_signal_refusal_from_status(Some(&status(
-            usr1, 0, usr1
-        ))));
-        assert!(pending_signal_refusal_from_status(Some(&status(
-            usr1, 0, 0
-        ))));
-        assert!(pending_signal_refusal_from_status(Some(&status(
-            0, usr1, 0
-        ))));
+        let usr1 = libc::SIGUSR1;
+        assert!(!signal_refuses_in_place(usr1, bit(usr1)));
+        assert!(signal_refuses_in_place(usr1, 0));
+        assert!(!signal_refuses_in_place(0, 0));
+        assert!(!signal_refuses_in_place(65, 0));
 
         // Blocked synchronous signals refuse even though the current
         // mask blocks them; dropping the synchronous-bits term makes
@@ -18737,14 +18723,13 @@ mod tests {
             libc::SIGTRAP,
             libc::SIGFPE,
         ] {
-            let pending_bit = bit(signal);
             assert!(
-                pending_signal_refusal_from_status(Some(&status(pending_bit, 0, pending_bit,))),
+                signal_refuses_in_place(signal, bit(signal)),
                 "blocked synchronous signal {signal} must refuse in place"
             );
             assert!(
-                pending_signal_refusal_from_status(Some(&status(0, pending_bit, pending_bit,))),
-                "shared blocked synchronous signal {signal} must refuse in place"
+                signal_refuses_in_place(signal, 0),
+                "unblocked synchronous signal {signal} must refuse in place"
             );
         }
     }
