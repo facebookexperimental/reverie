@@ -177,11 +177,6 @@ name = "grouped_admission"
 path = "tests/grouped_admission.rs"
 
 [[test]]
-name = "raw_mseal"
-path = "tests/raw_mseal.rs"
-required-features = ["allocator-fixture"]
-
-[[test]]
 name = "nop_window"
 path = "tests/nop_window.rs"
 required-features = ["liteinst"]

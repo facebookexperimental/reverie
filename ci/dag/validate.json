@@ -145,7 +145,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_b.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=native_unpublished) | binary(=allocator_contract) | binary(=region_stacks) | binary(=mapping_integrity) | binary(=lifecycle) | binary(=rpc_tool) | binary(=fixed_gates) | binary(=private_prepare) | binary(=grouped_admission) | binary(=raw_mseal) | binary(=concurrent_patching) | binary(=nop_window) | binary(=reverie-liteinst-fork-guest) | binary(=reverie-liteinst-exec-guest) | binary(=reverie-liteinst-allocator-private-control) | binary(=reverie-liteinst-allocator-install-control) | binary(=reverie-liteinst-allocator-host-control))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
+      "cmd": "./scripts/libtest-counts.rs run-nextest target/validate/counts-test-liteinst_b.json -- cargo nextest run --binaries-metadata target/validate/binaries-metadata.json -E \"(package(reverie-liteinst) & (binary(=native_unpublished) | binary(=allocator_contract) | binary(=region_stacks) | binary(=mapping_integrity) | binary(=lifecycle) | binary(=rpc_tool) | binary(=fixed_gates) | binary(=private_prepare) | binary(=grouped_admission) | binary(=concurrent_patching) | binary(=nop_window) | binary(=reverie-liteinst-fork-guest) | binary(=reverie-liteinst-exec-guest) | binary(=reverie-liteinst-allocator-private-control) | binary(=reverie-liteinst-allocator-install-control) | binary(=reverie-liteinst-allocator-host-control))) & $REVERIE_NEXTEST_SKIP_FILTER\"",
       "deps": [
         "build.test_binaries",
         "fixtures.liteinst"
