@@ -1510,6 +1510,98 @@ async fn a_process_that_ends_itself_with_a_signal_reports_it_and_its_exit_first(
     );
 }
 
+/// Exactly one physical-exit observation per process, on normal exits
+/// and on a signal death. The pidfd observer is spawned per admitted
+/// connection, so a second emission for a pid means the guest opened a
+/// second coordinator connection during its exit handling (the
+/// in-guest host closed the exiting thread's connection before
+/// `on_exit_process`, whose RPC then lazily reconnected). All exit
+/// callbacks must run over the connection the process already has.
+#[tokio::test(flavor = "current_thread")]
+async fn one_physical_exit_per_process_on_signal_and_normal_exits() {
+    let (_preload_directory, preload) = compile_noop_preload();
+    let admission = std::sync::Arc::new(ExitObservingAdmission::default());
+    let (result, global) = tokio::time::timeout(
+        Duration::from_secs(30),
+        LiteinstBackend::with_connection_admission(
+            admission.clone(),
+            LiteinstBackend::run_with_output_and_preload::<CoordinatorOnlyTool>(
+                guest_command("exit-observations"),
+                (),
+                preload,
+            ),
+        ),
+    )
+    .await
+    .expect("in-guest run hung")
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    let children: Vec<(String, i32, u16)> = stdout
+        .lines()
+        .map(|line| {
+            let mut words = line.split(' ');
+            let label = words.next().unwrap().to_owned();
+            let pid = words.next().unwrap().strip_prefix("pid=").unwrap();
+            let status = words.next().unwrap().strip_prefix("status=0x").unwrap();
+            (
+                label,
+                pid.parse().unwrap(),
+                u16::from_str_radix(status, 16).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(children.len(), 2, "{stdout}");
+    assert_eq!(children[0].2, 3 << 8, "{stdout}");
+    assert_eq!(children[1].2 & 0x7f, libc::SIGABRT as u16, "{stdout}");
+    let mut observed = global.observed.lock().unwrap().clone();
+    observed.extend(admission.finish());
+    observed.sort_by_key(|(sequence, ..)| *sequence);
+    // The two children plus the root, whose own normal exit is reported
+    // in this mode too.
+    let mut pids: Vec<i32> = observed.iter().map(|(_, pid, _)| *pid).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    assert_eq!(pids.len(), children.len() + 1, "{observed:?}");
+    for pid in pids {
+        let kinds: Vec<Observed> = observed
+            .iter()
+            .filter(|(_, owner, _)| *owner == pid)
+            .map(|(_, _, what)| *what)
+            .collect();
+        for (name, count) in [
+            (
+                "ExitThread",
+                kinds
+                    .iter()
+                    .filter(|what| matches!(what, Observed::ExitThread(_)))
+                    .count(),
+            ),
+            (
+                "ExitProcess",
+                kinds
+                    .iter()
+                    .filter(|what| matches!(what, Observed::ExitProcess(_)))
+                    .count(),
+            ),
+            (
+                "PhysicallyExited",
+                kinds
+                    .iter()
+                    .filter(|what| **what == Observed::PhysicallyExited)
+                    .count(),
+            ),
+        ] {
+            assert_eq!(count, 1, "{name} for pid {pid}: {kinds:?}");
+        }
+        assert_eq!(
+            kinds.last(),
+            Some(&Observed::PhysicallyExited),
+            "pid {pid}: {kinds:?}"
+        );
+    }
+}
+
 /// A Tool-injected clone3 outside a syscall handler is refused by number
 /// before reading its changing record or creating a child. The guest's own
 /// clone3 classifier is unchanged from main and is not claimed repaired.

@@ -87,6 +87,9 @@ static CALLBACK_ALARM_INSTALL: AtomicI64 = AtomicI64::new(i64::MIN);
 /// Set by the `self-signal-deaths` mode: the SIGFPE and SIGBUS signal
 /// callbacks abandon a SIGKILL injection and then try an effect.
 static ABANDONED_EFFECTS: AtomicBool = AtomicBool::new(false);
+/// Set by the `exit-observations` mode: the exit callbacks report every
+/// exit, not only signal deaths.
+static REPORT_ALL_EXITS: AtomicBool = AtomicBool::new(false);
 /// The `raise-sigbus` case's page, mapped shared before the child forks, so
 /// the parent sees what the child's Tool wrote: word 0 is what the SIGBUS
 /// callback wrote through guest memory, and words 1 and 2 the errno of its
@@ -654,10 +657,12 @@ impl Tool for LifecycleTool {
         _thread_state: (),
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        if matches!(
-            exit_status,
-            ExitStatus::Signaled(..) | ExitStatus::SignaledRaw(..)
-        ) {
+        if REPORT_ALL_EXITS.load(Ordering::Relaxed)
+            || matches!(
+                exit_status,
+                ExitStatus::Signaled(..) | ExitStatus::SignaledRaw(..)
+            )
+        {
             global_state
                 .send_rpc(lifecycle_event(
                     EVENT_EXIT_THREAD,
@@ -675,10 +680,12 @@ impl Tool for LifecycleTool {
         global_state: &G,
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        if matches!(
-            exit_status,
-            ExitStatus::Signaled(..) | ExitStatus::SignaledRaw(..)
-        ) {
+        if REPORT_ALL_EXITS.load(Ordering::Relaxed)
+            || matches!(
+                exit_status,
+                ExitStatus::Signaled(..) | ExitStatus::SignaledRaw(..)
+            )
+        {
             global_state
                 .send_rpc(lifecycle_event(
                     EVENT_EXIT_PROCESS,
@@ -1013,6 +1020,27 @@ fn self_signal_deaths() {
             );
             continue;
         }
+        println!("{label} pid={child} status={status:#x}");
+    }
+}
+
+/// Forks two children (one exiting normally, one by SIGABRT) that are
+/// reported like the self-signal-deaths cases; with REPORT_ALL_EXITS
+/// the root's own normal exit is reported too.
+fn exit_observations() {
+    REPORT_ALL_EXITS.store(true, Ordering::Relaxed);
+    install_tool();
+    let cases: [(&str, fn()); 2] = [
+        ("exit-normal", || unsafe { libc::_exit(3) }),
+        ("exit-abort", || unsafe { libc::abort() }),
+    ];
+    for (label, run) in cases {
+        let child = fork_or_panic();
+        if child == 0 {
+            run();
+            unsafe { libc::_exit(70) }
+        }
+        let status = wait_raw(child);
         println!("{label} pid={child} status={status:#x}");
     }
 }
@@ -2887,6 +2915,10 @@ fn main() {
         )
     {
         self_signal_filter_probe(mode);
+        return;
+    }
+    if mode == "exit-observations" {
+        exit_observations();
         return;
     }
     if mode == "self-signal-deaths" {

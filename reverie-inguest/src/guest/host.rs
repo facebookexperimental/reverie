@@ -1520,11 +1520,14 @@ fn finish_fork_child<T: Tool + 'static, R: HostRuntime>(
         Ok(Err(error)) => tool_fatal(124, &error),
         Err(ending) => {
             drop(child_guest);
+            // Process exit unwraps the slot's Arc; no clone may be live.
+            drop(tool_arc);
             finish_ending(host, child_lease, (child_tid, child_pid), ending)
         }
     }
     if let Some(ending) = deliver_staged_signals(tool, &mut child_guest) {
         drop(child_guest);
+        drop(tool_arc);
         finish_ending(host, child_lease, (child_tid, child_pid), ending);
     }
     runtime.emit_stage(b"fork-child-thread-start-complete");
@@ -1564,9 +1567,6 @@ fn finish_tool_exit<T: Tool + 'static, R: HostRuntime>(
     if let Err(error) = on_exit {
         tool_fatal(125, &error);
     }
-    // The callbacks above may have used this thread's connection; it will
-    // not be used again past this point.
-    rpc.close_current_thread();
     if process_exit {
         let tool = host.tool.lock().take().unwrap_or_else(|| fatal(126));
         let mut tool = Arc::try_unwrap(tool).unwrap_or_else(|_| fatal(126));
@@ -1577,6 +1577,12 @@ fn finish_tool_exit<T: Tool + 'static, R: HostRuntime>(
             tool_fatal(125, &Error::from(error));
         }
     }
+    // The exit callbacks above may have used this thread's connection
+    // (on_exit_process receives the RPC handle too); past this point it
+    // will not be used again. Closing it earlier would make a later
+    // callback lazily open a second connection for the same process,
+    // which the coordinator admits as a second process connection.
+    rpc.close_current_thread();
 }
 
 struct ToolExitContext {
