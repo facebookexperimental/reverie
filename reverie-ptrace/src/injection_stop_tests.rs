@@ -55,6 +55,7 @@ enum Mode {
     ReplaceNumber,
     ReplaceThenPrivate,
     ReplaceWithPendingSignal,
+    ReplaceWithSharedPending,
     ReplaceInterruptedRestart,
     InheritedTrapRewrite,
     SameThenPrivate,
@@ -283,6 +284,16 @@ impl Tool for StopTool {
                         );
                         1
                     }
+                    Mode::ReplaceWithSharedPending => {
+                        // SIGSYS is blocked and pending only in the
+                        // shared (process-directed) queue at this
+                        // stop. Admission must refuse in place, so
+                        // this write takes the private page on both
+                        // runs; dropping the SHARED peek admits it
+                        // and the transport pin turns red.
+                        assert_eq!(guest.inject(replacement()).await?, 1);
+                        1
+                    }
                     Mode::ReplaceInterruptedRestart => {
                         if *guest.thread_state() != 0 {
                             // The restarted guest write itself: run it.
@@ -498,6 +509,21 @@ impl Fixture {
                 234, 0, 0, 0, 0x0f, 0x05,
             ]);
         }
+        if mode == Mode::ReplaceWithSharedPending {
+            // rt_sigprocmask(SIG_BLOCK, SIGSET, NULL, 8): block SIGSYS
+            // (set word patched below).
+            code.extend_from_slice(&[0xb8, 14, 0, 0, 0, 0x31, 0xff, 0xbe]);
+            code.extend_from_slice(&(SIGSET as u32).to_le_bytes());
+            code.extend_from_slice(&[0x31, 0xd2, 0x41, 0xba, 8, 0, 0, 0, 0x0f, 0x05]);
+            // kill(gettid(), SIGSYS): the guest is single-threaded,
+            // so the tid is the tgid and the signal queues
+            // process-directed (shared queue only) while blocked.
+            // gettid is used because getpid is subscribed.
+            code.extend_from_slice(&[
+                0xb8, 186, 0, 0, 0, 0x0f, 0x05, 0x89, 0xc7, 0xbe, 31, 0, 0, 0, 0xb8, 62, 0, 0, 0,
+                0x0f, 0x05,
+            ]);
+        }
         if mode == Mode::ReplaceInterruptedRestart {
             // rt_sigaction(SIGALRM, SIGACT, NULL, 8) with SA_RESTART
             // (patched below), then alarm(1)
@@ -574,6 +600,10 @@ impl Fixture {
         if mode == Mode::ReplaceWithPendingSignal {
             // Blocked set at SIGSET: SIGUSR1 only.
             elf[0x20a0..0x20a8].copy_from_slice(&(1u64 << (10 - 1)).to_le_bytes());
+        }
+        if mode == Mode::ReplaceWithSharedPending {
+            // Blocked set at SIGSET: SIGSYS only.
+            elf[0x20a0..0x20a8].copy_from_slice(&(1u64 << (libc::SIGSYS - 1)).to_le_bytes());
         }
         let shared = if mode == Mode::PostExecTail {
             let shared = path.with_extension("shared-word");
@@ -680,9 +710,11 @@ async fn run_once(mode: Mode, force_stepped: bool) -> RunOutcome {
         ExitStatus::Exited(if mode == Mode::PostExecTail { 27 } else { 0 })
     );
     let expected_stdout: &[u8] = match mode {
-        Mode::Replace | Mode::TailOther | Mode::PostExecTail | Mode::ReplaceWithPendingSignal => {
-            b"R"
-        }
+        Mode::Replace
+        | Mode::TailOther
+        | Mode::PostExecTail
+        | Mode::ReplaceWithPendingSignal
+        | Mode::ReplaceWithSharedPending => b"R",
         Mode::SameThenPrivate => b"OR",
         Mode::ReplaceThenPrivate => b"RO",
         Mode::ReplaceInterruptedRestart => b"O",
@@ -775,6 +807,9 @@ async fn run(mode: Mode) {
         Mode::ReplaceNumber => ((0, 0, 0, 0), (0, 1, 0, 0)),
         Mode::ReplaceThenPrivate => ((1, 0, 0, 0), (2, 0, 0, 0)),
         Mode::ReplaceWithPendingSignal => ((0, 0, 1, 0), (1, 0, 1, 0)),
+        // Blocked SIGSYS pending only in the shared queue refuses
+        // in place, so the write is private on both runs.
+        Mode::ReplaceWithSharedPending => ((1, 0, 0, 0), (1, 0, 0, 0)),
         Mode::ReplaceInterruptedRestart => ((0, 0, 0, 0), (0, 0, 0, 1)),
         Mode::SameThenPrivate => ((1, 1, 0, 0), (1, 1, 0, 0)),
         // A divergent tail injection has no exit stop to restore at,
@@ -902,6 +937,11 @@ async fn divergent_first_inject_in_place_then_private() {
 #[tokio::test(flavor = "current_thread")]
 async fn divergent_inject_with_pending_signal_delivers_after_resume() {
     run(Mode::ReplaceWithPendingSignal).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn divergent_inject_with_shared_pending_sigsys_stays_private() {
+    run(Mode::ReplaceWithSharedPending).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -15851,8 +15851,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         // it does on the stepped transports, where the step dequeues
         // it first; a syscall resume would run the rewritten call
         // to completion first and deliver it afterwards. The cheap
-        // refusals above run before this procfs read, and a status
-        // that cannot be read refuses here instead of aborting.
+        // refusals above run before these mask and queue peeks, and
+        // a read that fails refuses here instead of aborting.
         if self.pending_signal.is_some() || pending_signal_refuses_in_place(task) {
             return Ok(false);
         }
