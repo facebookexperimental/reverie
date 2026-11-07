@@ -39,6 +39,9 @@ pub use borrowed_entry::RcbNestedReturn;
 pub use borrowed_entry::RcbObservation;
 pub use borrowed_entry::RcbObservationCoordinates;
 pub use borrowed_entry::RcbReturnBoundary;
+pub use borrowed_entry::ReleaseFailure;
+pub use borrowed_entry::ReleasedPreparedMapping;
+pub use borrowed_entry::VerifiedReady;
 
 /// Numeric preparation inputs, NOT image/source/entry qualification authority.
 /// The only consuming operation is unsafe and retains all physical obligations.

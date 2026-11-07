@@ -6,7 +6,7 @@ use crate::launcher::exec_stop::trace;
 
 const NATIVE_BYTES: [u8; 9] = [0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x05, 0x41, 0xff, 0xe4];
 
-impl PreparedMapping<'_> {
+impl<'fd> PreparedMapping<'fd> {
     /// Restore registrations/context, detach once and await the original child.
     /// This borrows the complete outer owner; cancellation retains every stop,
     /// returned event and wait driver in it. It does not create a Ready value.
@@ -69,6 +69,56 @@ impl PreparedMapping<'_> {
         self.restore_guest_for_release(operation_deadline).await?;
         self.detach_restored_guest(operation_deadline, live_deadline)
             .await
+    }
+
+    /// Restore registrations/context and detach once, returning the
+    /// retained owner for the caller's own terminal wait. This is
+    /// the release half of [`Self::handover_and_wait`]: same restore
+    /// and detach sequence, but guest execution is not awaited here.
+    ///
+    /// The consumed `ready` token must have been minted by this
+    /// mapping's ToolInitialization observation; it is rechecked
+    /// against the retained initialized stop and the token's child
+    /// identity before any physical change. A mismatch returns the
+    /// mapping unspent (only `entry.failed` remains unset, exactly
+    /// as a refused handover precondition).
+    ///
+    /// # Safety
+    /// The complete contract of [`Self::handover_and_wait`] applies,
+    /// with the wait obligation transferred to the returned
+    /// [`ReleasedPreparedMapping`]: the original synchronous ptracer
+    /// root retains it and every borrowed resource outside all
+    /// futures, polls its wait and the EXISTING RPC/services
+    /// concurrently on the original OS thread, and requires real
+    /// same-generation terminal confirmation (via wait or confirmed
+    /// cancellation) before releasing any of them. Dropping the
+    /// released owner is only bounded best-effort cleanup, not a
+    /// reap proof.
+    pub async unsafe fn release_after_ready(
+        mut self,
+        ready: VerifiedReady,
+        operation_deadline: Instant,
+    ) -> std::result::Result<ReleasedPreparedMapping<'fd>, Box<ReleaseFailure<'fd>>> {
+        if self.owner.generation.pid() != ready.pid
+            || self.entry.initialized_stop != Some((ready.terminal_ip, ready.reserved_signals))
+        {
+            return Err(Box::new(ReleaseFailure::new(
+                "mapped_ready_token_mismatch".into(),
+                self,
+            )));
+        }
+        let result = async {
+            self.restore_guest_for_release(operation_deadline).await?;
+            self.detach_after_restore(operation_deadline)
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(ReleasedPreparedMapping { mapping: self }),
+            Err(error) => {
+                self.entry.failed = true;
+                Err(Box::new(ReleaseFailure::new(error, self)))
+            }
+        }
     }
 
     // Shared real restoration only. The observational successor retains the
@@ -248,6 +298,12 @@ impl PreparedMapping<'_> {
         deadline: Instant,
         live_deadline: Option<Instant>,
     ) -> Result<ExitStatus> {
+        self.detach_after_restore(deadline)?;
+        self.wait_detached_terminal_with_deadline(live_deadline)
+            .await
+    }
+
+    fn detach_after_restore(&mut self, deadline: Instant) -> Result<()> {
         self.entry_thread()?;
         if Instant::now() >= deadline {
             return Err("mapped_handover_deadline_before_detach".into());
@@ -258,11 +314,22 @@ impl PreparedMapping<'_> {
                 // Driver stored synchronously BEFORE any cancellable await.
                 self.entry.wait = Some(running.wait_owned_on_ptracer_thread().into_driver());
                 self.entry.event = None;
+                Ok(())
             }
             Err((task, error)) => {
                 self.task = Some(task);
-                return Err(error.into());
+                Err(error.into())
             }
+        }
+    }
+
+    async fn wait_detached_terminal_with_deadline(
+        &mut self,
+        live_deadline: Option<Instant>,
+    ) -> Result<ExitStatus> {
+        if let Some(status) = self.entry.terminal {
+            self.owner.record_detached_terminal(status);
+            return Ok(status);
         }
         self.handover_wait_next_with_deadline(live_deadline).await?;
         match self.entry.terminal {
@@ -358,6 +425,33 @@ impl PreparedMapping<'_> {
         }
         self.entry_thread()?;
         Ok(())
+    }
+}
+
+impl<'fd> ReleasedPreparedMapping<'fd> {
+    /// Await the detached guest's actual terminal exit on the
+    /// original ptracer thread. `None` removes only the detached
+    /// execution deadline. An unexpected post-detach stop is an
+    /// error retaining this owner for cancellation; it is never
+    /// acknowledged as reaped.
+    pub async fn wait(&mut self, live_deadline: Option<Instant>) -> Result<ExitStatus> {
+        self.mapping
+            .wait_detached_terminal_with_deadline(live_deadline)
+            .await
+    }
+
+    /// Cleanup observations, including the retained owner's terminal proof.
+    pub fn cleanup(&self) -> super::super::CleanupState {
+        self.mapping.cleanup()
+    }
+
+    /// Request bounded kill/wait of the detached guest. Unconfirmed
+    /// retirement returns this complete released owner.
+    pub fn cancel(self) -> std::result::Result<super::super::CancelledPreparation, Box<Self>> {
+        match self.mapping.cancel() {
+            Ok(cancelled) => Ok(cancelled),
+            Err(mapping) => Err(Box::new(Self { mapping: *mapping })),
+        }
     }
 }
 
