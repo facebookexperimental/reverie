@@ -273,6 +273,10 @@ pub struct Runner {
     /// were removed without seeing a concurrent test's.
     #[cfg(test)]
     created_cgroups: Vec<PathBuf>,
+    /// Accounting reads (`CommandCgroup::usage`) per entry of `commands`;
+    /// 0 for a command run without a CPU budget.
+    #[cfg(test)]
+    accounting_reads: Vec<u64>,
 }
 
 impl Runner {
@@ -294,6 +298,8 @@ impl Runner {
             cgroup_parent: None,
             #[cfg(test)]
             created_cgroups: Vec::new(),
+            #[cfg(test)]
+            accounting_reads: Vec::new(),
         })
     }
 
@@ -566,6 +572,8 @@ impl Runner {
         if overflow.load(Ordering::Acquire) {
             bounds_failure = Some(format!("exceeded {byte_limit_description}"));
         }
+        #[cfg(test)]
+        let reads_before_finish = cgroup.as_ref().map(|cgroup| cgroup.reads()).unwrap_or(0);
         let measured_cpu = match cgroup {
             Some(cgroup) => match cgroup.finish() {
                 Ok(used) => Some(used),
@@ -606,6 +614,8 @@ impl Runner {
         )?;
         self.commands.push(evidence);
         self.command_cpu.push(measured_cpu);
+        #[cfg(test)]
+        self.accounting_reads.push(reads_before_finish);
         require(
             bounds_failure.is_none(),
             format!(
@@ -683,6 +693,10 @@ struct CommandCgroup {
     kill: fs::File,
     events: fs::File,
     removed: bool,
+    /// Accounting reads through `usage`, so a test can bound how often a
+    /// budgeted run polls.
+    #[cfg(test)]
+    reads: std::cell::Cell<u64>,
 }
 
 fn cpu_budget_failure(used: Duration, budget: Duration, wall: Duration) -> String {
@@ -736,6 +750,8 @@ impl CommandCgroup {
                 kill: open("cgroup.kill", true)?,
                 events: open("cgroup.events", false)?,
                 removed: false,
+                #[cfg(test)]
+                reads: std::cell::Cell::new(0),
             };
             require(
                 cgroup.usage()?.is_zero() && !cgroup.populated()?,
@@ -763,7 +779,14 @@ impl CommandCgroup {
     }
 
     fn usage(&self) -> Result<Duration> {
+        #[cfg(test)]
+        self.reads.set(self.reads.get() + 1);
         Self::field(&self.cpu_stat, "cpu.stat", "usage_usec").map(Duration::from_micros)
+    }
+
+    #[cfg(test)]
+    fn reads(&self) -> u64 {
+        self.reads.get()
     }
 
     fn populated(&self) -> Result<bool> {
@@ -67114,13 +67137,17 @@ mod runner_cpu_budget_tests {
     /// comparison instead let load-inflated kernel cgroup charges over a
     /// wall-bounded run decide the bound (dh-qe5ht). An accounting path
     /// that scans files or rereads per poll multiplies the accounting
-    /// batch and fails against the baseline.
+    /// batch and fails against the baseline. A separate poll-count bound
+    /// on the real budgeted run (one read per 50 ms poll, counted through
+    /// a test-only counter) keeps the polls-times-cost coverage: a busy
+    /// poll raises the count and fails, at any load.
     #[test]
     fn cpu_budget_records_measured_cpu_and_costs_the_producer_little() {
         let scratch = Scratch::new("cost");
         let mut runner =
             Runner::new(scratch.0.join("logs"), Duration::from_secs(60), 1 << 20).unwrap();
         runner.run("/bin/sh", &sh("sleep 2"), &scratch.0).unwrap();
+        let budgeted_wall = Instant::now();
         runner
             .run_cpu_bounded(
                 "/bin/sh",
@@ -67129,6 +67156,7 @@ mod runner_cpu_budget_tests {
                 Duration::from_secs(60),
             )
             .unwrap();
+        let budgeted_wall = budgeted_wall.elapsed();
         let output = runner
             .run_cpu_bounded(
                 "/bin/sh",
@@ -67148,6 +67176,23 @@ mod runner_cpu_budget_tests {
             "{busy_cpu:?}"
         );
         assert_own_cgroups_removed(&runner, 2);
+
+        // Poll-count bound: a budgeted run reads accounting once per
+        // 50 ms poll, plus one emptiness check at cgroup creation (the
+        // final read in `finish` is not counted). Host load stretches
+        // each sleep, which can only lower the count, never raise it.
+        let polls = runner.accounting_reads[1];
+        let max_polls = (budgeted_wall.as_millis() / 50 + 1) as u64 + 6;
+        println!(
+            "budgeted sleep 2: {polls} accounting reads over wall {budgeted_wall:?} \
+             (bound {max_polls})"
+        );
+        assert!(
+            polls <= max_polls,
+            "budgeted run polled accounting {polls} times over wall {budgeted_wall:?} \
+             (bound {max_polls})"
+        );
+        assert_eq!(runner.accounting_reads[0], 0);
 
         // Fixed-work cost guard: 2000 accounting reads interleaved with
         // 2000 baseline reads, charged to this thread only.
