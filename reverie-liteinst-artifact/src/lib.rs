@@ -3945,27 +3945,27 @@ const NO_INSTALLATION_SCOPE_POLICY: &str =
     "detcore_native_off_alloc101_reviewed_source_current_build_rx_loader_census_v1";
 const NO_INSTALLATION_SCOPE_SOURCE: (&str, u64, &str) = (
     "reverie-liteinst/src/patch_alloc.rs",
-    24943,
-    "9336107f903561bb5297f9897fd4c222e9cd2f80715817a07e330498ab7c17f5",
+    24942,
+    "3594983133be9a749cdc744717e04b7cfcd793a26d41f34669afbfdc964b3c18",
 );
 // Complete22B getters physically retained by the measured native OFF image.
 // These are other TLS, never allocator-operation targets or isolation credit.
 const NO_SCOPE_OTHER_GETTERS: [(&str, u64); 4] = [
     (
         "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest7support20TOOL_CALLBACK_ACTIVE0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1s_6option6OptionQIB27_INtNtNtB1s_4sync6atomic6AtomicbEEEEE9call_onceBc_",
-        0xe8,
+        0x199,
     ),
     (
         "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation5OWNER0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1i_6option6OptionQIB1X_INtNtB1i_4cell4CellONtB8_12ContinuationEEEEE9call_onceBc_",
-        0xf0,
+        0x180,
     ),
     (
         "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation7PENDING0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CellIB1Z_NtB8_7PendingEEEEEE9call_onceBc_",
-        0,
+        0x28,
     ),
     (
         "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest5alloc14DISPATCH_DEPTH0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CelljEEEEE9call_onceBc_",
-        0x140,
+        0x190,
     ),
 ];
 
@@ -20871,7 +20871,7 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
         hex: "",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/tool_region_constructor.rs"),
-        line: 803,
+        line: 841,
         column: 14,
     },
     DetcoreValidateDataSpec {
@@ -20880,7 +20880,7 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
         hex: "",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/tool_region_constructor.rs"),
-        line: 820,
+        line: 865,
         column: 14,
     },
     DetcoreValidateDataSpec {
@@ -20889,7 +20889,7 @@ const DETCORE_VALIDATE_DATA: &[DetcoreValidateDataSpec] = &[
         hex: "",
         file_hex: "",
         source_context_key: Some("rv:reverie-inguest/src/guest/tool_region_constructor.rs"),
-        line: 785,
+        line: 816,
         column: 18,
     },
     DetcoreValidateDataSpec {
