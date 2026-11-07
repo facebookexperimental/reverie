@@ -2545,7 +2545,18 @@ mod tests {
         );
     }
 
+    /// Build a marker-writing fixture binary. The static variant is
+    /// hermetic: a tiny `-nostdlib` assembly `_start` (openat, write,
+    /// close, exit), so the refusal tests never depend on a host
+    /// static libc (`libc.a`), which the validation image lacks. The
+    /// dynamic variant uses a C main so it carries a real PT_INTERP
+    /// naming the host dynamic linker.
     fn build_fixture(dir: &Path, name: &str, marker: &Path, statik: bool) -> std::path::PathBuf {
+        let out = dir.join(name);
+        if statik {
+            build_asm_fixture(dir, &out, marker, &["-static"]);
+            return out;
+        }
         let c = dir.join("fixture.c");
         std::fs::write(
             &c,
@@ -2555,14 +2566,113 @@ mod tests {
             ),
         )
         .unwrap();
-        let out = dir.join(name);
-        let mut cmd = std::process::Command::new("cc");
-        if statik {
-            cmd.arg("-static");
-        }
-        let status = cmd.arg("-o").arg(&out).arg(&c).status().unwrap();
-        assert!(status.success(), "cc fixture build failed");
+        let output = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(&out)
+            .arg(&c)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cc fixture build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         out
+    }
+
+    /// Assemble the hermetic `_start` fixture: create `marker`, write
+    /// "ran", exit 7. Linked `-nostdlib`, so no libc in any form.
+    fn build_asm_fixture(dir: &Path, out: &Path, marker: &Path, extra_flags: &[&str]) {
+        let marker = marker.display().to_string();
+        assert!(
+            !marker.contains('"') && !marker.contains('\\'),
+            "marker path must be asm-string safe: {marker}"
+        );
+        let asm = dir.join("fixture.S");
+        std::fs::write(&asm, fixture_asm_source(&marker)).unwrap();
+        let output = std::process::Command::new("cc")
+            .arg("-nostdlib")
+            .args(extra_flags)
+            .arg("-o")
+            .arg(out)
+            .arg(&asm)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cc asm fixture build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn fixture_asm_source(marker: &str) -> String {
+        format!(
+            r#".text
+.globl _start
+_start:
+    mov $257, %rax
+    mov $-100, %rdi
+    lea marker_path(%rip), %rsi
+    mov $577, %edx
+    mov $420, %r10d
+    syscall
+    test %rax, %rax
+    js .Lexit
+    mov %rax, %rdi
+    mov $1, %rax
+    lea ran_text(%rip), %rsi
+    mov $3, %edx
+    syscall
+    mov $3, %rax
+    syscall
+.Lexit:
+    mov $60, %rax
+    mov $7, %edi
+    syscall
+.section .rodata
+marker_path: .asciz "{marker}"
+ran_text: .ascii "ran"
+"#
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn fixture_asm_source(marker: &str) -> String {
+        format!(
+            r#".text
+.globl _start
+_start:
+    mov x8, #56
+    mov x0, #-100
+    adr x1, marker_path
+    mov x2, #577
+    mov x3, #420
+    svc #0
+    tbnz x0, #63, .Lexit
+    mov x9, x0
+    mov x8, #64
+    mov x0, x9
+    adr x1, ran_text
+    mov x2, #3
+    svc #0
+    mov x8, #57
+    mov x0, x9
+    svc #0
+.Lexit:
+    mov x8, #93
+    mov x0, #7
+    svc #0
+.section .rodata
+marker_path: .asciz "{marker}"
+ran_text: .ascii "ran"
+"#
+        )
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn fixture_asm_source(_marker: &str) -> String {
+        panic!("no hermetic static fixture for this target_arch");
     }
 
     #[test]
