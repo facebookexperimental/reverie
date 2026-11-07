@@ -26710,6 +26710,75 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
             },
         ],
         transfers: &[(91, 1), (104, 3)],
+    }, // Stable Rust 1.97.1 duplicate of template 25 (fixed_setup_bitmap_range):
+    // identical exact shape and Location profile, with the null panic GOT
+    // operand bound to panic_null_pointer_dereference. Selection is by
+    // bound GOT callee first, then by the existing Location profile.
+    DetcoreValidateTemplate {
+        role: "fixed_setup_bitmap_range",
+        hex: "504989f04889fe40f6c6070f85bf0000004885f60f84c8000000b0014c39c20f86a900000084c9746e89d14429c1498d7801f6c101741841b9010000004489c149d3e149c1e8064e094cc6084989f84839fa747a6666662e0f1f840000000000bf010000004489c148d3e74c89c148c1e90648097cce08498d4801bf0100000048d3e748c1e90648097cce084983c0024c39c275cbeb374c89c048c1e806488b44c6084c0fa3c0730431c059c349ffc04c39c20f94c074164c89c148c1e906488b4cce084c0fa3c14d8d400173e259c3488d15798b1200bf08000000ff1566471500488d3d678b1200ff1529561500",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 211,
+                next: 215,
+                key: "fixed_detcore_validate_fixed_setup_bitmap_range_208_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 222,
+                next: 226,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 229,
+                next: 233,
+                key: "fixed_detcore_validate_fixed_setup_bitmap_range_226_data",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 235,
+                next: 239,
+                key: "fixed_heap_panic_null",
+                got: true,
+            },
+        ],
+        transfers: &[(220, 1), (233, 3)],
+    },
+    // Stable Rust 1.97.1 duplicate of template 85 (fixed_setup_bitmap_range):
+    // identical exact shape and Location profile, with the null panic GOT
+    // operand bound to panic_null_pointer_dereference. Selection is by
+    // bound GOT callee first, then by the existing Location profile.
+    DetcoreValidateTemplate {
+        role: "fixed_setup_bitmap_range",
+        hex: "504989f04889fe40f6c6070f85bf0000004885f60f84c8000000b0014c39c20f86a900000084c9746e89d14429c1498d7801f6c101741841b9010000004489c149d3e149c1e8064e094cc6084989f84839fa747a6666662e0f1f840000000000bf010000004489c148d3e74c89c148c1e90648097cce08498d4801bf0100000048d3e748c1e90648097cce084983c0024c39c275cbeb374c89c048c1e806488b44c6084c0fa3c0730431c059c349ffc04c39c20f94c074164c89c148c1e906488b4cce084c0fa3c14d8d400173e259c3488d15c1e82100bf08000000ff150e352300488d3dafe82100ff15816d2300",
+        operands: &[
+            DetcoreValidateOperand {
+                displacement: 211,
+                next: 215,
+                key: "fixed_naked_bitmap_208_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 222,
+                next: 226,
+                key: "fixed_heap_panic_misaligned",
+                got: true,
+            },
+            DetcoreValidateOperand {
+                displacement: 229,
+                next: 233,
+                key: "fixed_naked_bitmap_226_location",
+                got: false,
+            },
+            DetcoreValidateOperand {
+                displacement: 235,
+                next: 239,
+                key: "fixed_heap_panic_null",
+                got: true,
+            },
+        ],
+        transfers: &[(220, 1), (233, 3)],
     },
     DetcoreValidateTemplate {
         role: "fixed_patch_alloc",
@@ -26950,10 +27019,11 @@ fn fixed_detcore_unique_template<'a>(
     if candidates.len() == 1 {
         return Ok(candidates[0]);
     }
+    let candidate_indices: BTreeSet<_> = candidates.iter().map(|(i, _)| *i).collect();
     require(
         role == "fixed_setup_bitmap_range"
-            && candidates.iter().map(|(i, _)| *i).collect::<BTreeSet<_>>()
-                == BTreeSet::from([25, 85])
+            && (candidate_indices == BTreeSet::from([25, 85])
+                || candidate_indices == BTreeSet::from([104, 105]))
             && candidates.len() == 2,
         why,
     )?;
@@ -26985,65 +27055,82 @@ fn fixed_detcore_got_discriminate<'a>(
     targets: &BTreeMap<String, u64>,
     got: &BTreeMap<u64, u64>,
 ) -> Vec<(usize, &'a DetcoreValidateTemplate)> {
-    if candidates.len() != 2 {
+    if candidates.len() < 2 {
         return candidates.to_vec();
     }
     let (_, first) = candidates[0];
-    let (_, second) = candidates[1];
-    if first.role != second.role || first.operands.len() != second.operands.len() {
-        return candidates.to_vec();
-    }
-    let layouts_match = first
-        .operands
-        .iter()
-        .zip(second.operands)
-        .all(|(a, b)| a.displacement == b.displacement && a.next == b.next && a.got == b.got);
-    let shapes_match = fixed_template_shape(
-        &fixed_hex(first.hex),
-        &fixed_hex(second.hex),
-        first.operands.iter().map(|op| op.displacement),
-    );
+    let layouts_match = candidates.iter().all(|(_, other)| {
+        other.role == first.role
+            && other.operands.len() == first.operands.len()
+            && first.operands.iter().zip(other.operands).all(|(a, b)| {
+                a.displacement == b.displacement && a.next == b.next && a.got == b.got
+            })
+    });
+    let shapes_match = candidates.iter().all(|(_, other)| {
+        fixed_template_shape(
+            &fixed_hex(first.hex),
+            &fixed_hex(other.hex),
+            first.operands.iter().map(|op| op.displacement),
+        )
+    });
     if !layouts_match || !shapes_match {
         return candidates.to_vec();
     }
-    let differing: Vec<usize> = first
-        .operands
-        .iter()
-        .zip(second.operands)
-        .enumerate()
-        .filter(|(_, (a, b))| a.key != b.key)
-        .map(|(index, _)| index)
+    let differing: Vec<usize> = (0..first.operands.len())
+        .filter(|&index| {
+            candidates
+                .iter()
+                .any(|(_, other)| other.operands[index].key != first.operands[index].key)
+        })
         .collect();
     if differing.is_empty()
-        || differing
-            .iter()
-            .any(|&index| !first.operands[index].got || !second.operands[index].got)
+        || differing.iter().any(|&index| {
+            candidates
+                .iter()
+                .any(|(_, other)| !other.operands[index].got)
+        })
     {
         return candidates.to_vec();
     }
-    if differing.iter().any(|&index| {
-        targets.get(first.operands[index].key) == targets.get(second.operands[index].key)
-            && targets.get(first.operands[index].key).is_some()
-    }) {
-        return candidates.to_vec();
-    }
+    let binds_at = |template: &DetcoreValidateTemplate, index: usize| {
+        let op = &template.operands[index];
+        let Some(expected) = targets.get(op.key) else {
+            return false;
+        };
+        let Ok(slot) = fixed_rip_target(address, bytes, op.displacement, op.next) else {
+            return false;
+        };
+        got.get(&slot) == Some(expected)
+    };
     let binds = |template: &DetcoreValidateTemplate| {
-        template.operands.iter().filter(|op| op.got).all(|op| {
-            let Some(expected) = targets.get(op.key) else {
-                return false;
-            };
-            let Ok(slot) = fixed_rip_target(address, bytes, op.displacement, op.next) else {
-                return false;
-            };
-            got.get(&slot) == Some(expected)
-        })
+        template
+            .operands
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.got)
+            .all(|(index, _)| binds_at(template, index))
     };
     let bound: Vec<_> = candidates
         .iter()
         .filter(|(_, template)| binds(template))
         .cloned()
         .collect();
-    if bound.len() == 1 {
+    // Every dropped candidate must fail only at a differing GOT operand:
+    // its callees at the shared operands still bind, so the discrimination
+    // is exactly the named-callee difference and nothing else.
+    let dropped_are_callee_only = candidates
+        .iter()
+        .filter(|(index, _)| !bound.iter().any(|(bound_index, _)| bound_index == index))
+        .all(|(_, template)| {
+            template
+                .operands
+                .iter()
+                .enumerate()
+                .filter(|(index, op)| op.got && !differing.contains(index))
+                .all(|(index, _)| binds_at(template, index))
+                && differing.iter().any(|&index| !binds_at(template, index))
+        });
+    if !bound.is_empty() && bound.len() < candidates.len() && dropped_are_callee_only {
         bound
     } else {
         candidates.to_vec()
