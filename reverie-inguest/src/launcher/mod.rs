@@ -722,15 +722,24 @@ tokio::task_local! {
 }
 
 /// Read the target ELF's program headers; true when PT_INTERP is
-/// absent (static executable). Any read/parse failure is an error:
-/// an uninspectable target must not run unconfined either.
+/// absent (static executable). A file shorter than the ELF ident
+/// or without ELF magic is not a static ELF at all (a script);
+/// the normal exec/shebang path owns it. Read/parse failures
+/// AFTER a full ELF ident are errors: an uninspectable ELF must
+/// not run unconfined either.
 fn target_is_static(program: &std::path::Path) -> io::Result<bool> {
     use std::io::Seek;
     use std::io::SeekFrom;
     let mut file = std::fs::File::open(program)?;
     let mut ident = [0u8; 20];
-    file.read_exact(&mut ident)?;
-    if &ident[0..4] != b"\x7fELF" {
+    let mut total = 0;
+    while total < ident.len() {
+        match file.read(&mut ident[total..])? {
+            0 => break,
+            n => total += n,
+        }
+    }
+    if total < ident.len() || &ident[0..4] != b"\x7fELF" {
         return Ok(false);
     }
     let class = ident[4];
@@ -2818,6 +2827,32 @@ ran_text: .ascii "ran"
         assert!(target_is_static(&statik).unwrap());
         assert!(!target_is_static(&dynamic).unwrap());
         assert!(!target_is_static(Path::new("/bin/true")).unwrap());
+    }
+
+    #[test]
+    fn short_and_non_elf_targets_are_not_static() {
+        // A bare "#!" (proot-suite test-shebang-length-limit) and
+        // other sub-ident non-ELF files are scripts, not static
+        // ELFs: the check must say not-static so the normal
+        // exec/shebang path handles them, not fail the launch
+        // with "failed to fill whole buffer".
+        // MUTATION ARM: restoring read_exact on the ident in
+        // target_is_static makes every case here error instead.
+        let dir = short_socket_tempdir();
+        for (name, bytes) in [
+            ("bare-shebang", b"#!".as_slice()),
+            ("empty", b"".as_slice()),
+            ("short-script", b"#!/bin/sh".as_slice()),
+            ("nineteen-bytes", b"not an elf at all!!".as_slice()),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            assert!(
+                !target_is_static(&path).unwrap(),
+                "{name} misclassified as static"
+            );
+            refuse_static_target(&path, &[]).unwrap();
+        }
     }
 
     #[test]
