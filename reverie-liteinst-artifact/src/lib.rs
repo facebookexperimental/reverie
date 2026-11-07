@@ -29110,6 +29110,91 @@ const FIXED_NAKED_PINNED_ORDINARY_INCOMING: &[FixedScalarHelperIncoming] = &[
         &[("fixed_native_owner_gettid", 12, false)],
     ),
 ];
+// The stable Rust 1.97.1 pinned-ordinary composition: identical roles and
+// premises to FIXED_NAKED_PINNED_ORDINARY_COHORT, with the stable exact
+// bodies for the five roles whose codegen changed (get/set opaque,
+// metadata, backing, and the two prepare entries) and their incoming call
+// offsets. This tuple is indivisible like the others.
+const FIXED_NAKED_STABLE_ORDINARY_COHORT: &[(&str, usize)] = &[
+    ("fixed_region_publication_get_opaque", 102),
+    ("fixed_region_publication_set_opaque", 103),
+    ("fixed_tool_heap_metadata", 95),
+    ("fixed_arena_backing", 94),
+    ("fixed_tool_require_owned", 59),
+    ("fixed_tool_alloc", 60),
+    ("fixed_tool_dealloc", 61),
+    ("fixed_tool_realloc", 62),
+    ("fixed_native_from_native", 78),
+    ("fixed_constructor_prepare", 96),
+    ("fixed_generic_prepare", 97),
+    ("fixed_arena_setup", 82),
+    ("fixed_native_owner_gettid", 79),
+];
+const FIXED_NAKED_STABLE_ORDINARY_INCOMING: &[FixedScalarHelperIncoming] = &[
+    (
+        "fixed_region_publication_get_opaque",
+        &[
+            ("fixed_tool_heap_metadata", 34, false),
+            ("fixed_arena_backing", 34, false),
+            ("fixed_native_from_native", 176, false),
+            ("fixed_constructor_prepare", 244, false),
+            ("fixed_generic_prepare", 244, false),
+        ],
+    ),
+    (
+        "fixed_region_publication_set_opaque",
+        &[
+            ("fixed_constructor_prepare", 194, false),
+            ("fixed_generic_prepare", 194, false),
+        ],
+    ),
+    (
+        "fixed_tool_heap_metadata",
+        &[
+            ("fixed_tool_require_owned", 4, false),
+            ("fixed_tool_alloc", 13, false),
+            ("fixed_tool_dealloc", 4, false),
+            ("fixed_tool_realloc", 26, false),
+        ],
+    ),
+    (
+        "fixed_native_from_native",
+        &[
+            ("fixed_constructor_prepare", 71, false),
+            ("fixed_generic_prepare", 71, false),
+        ],
+    ),
+    (
+        "fixed_arena_setup",
+        &[("fixed_native_from_native", 257, false)],
+    ),
+    (
+        "fixed_native_owner_gettid",
+        &[("fixed_native_from_native", 116, false)],
+    ),
+    (
+        "fixed_arena_mprotect",
+        &[
+            ("fixed_arena_setup", 95, false),
+            ("fixed_arena_setup", 119, false),
+        ],
+    ),
+    (
+        "fixed_setup_bitmap_range",
+        &[
+            ("fixed_arena_setup", 16, false),
+            ("fixed_arena_setup", 44, false),
+            ("fixed_arena_setup", 72, false),
+            ("fixed_arena_setup", 184, false),
+            ("fixed_arena_setup", 207, false),
+            ("fixed_arena_setup", 230, false),
+        ],
+    ),
+    (
+        "fixed_scalar_syscall",
+        &[("fixed_native_owner_gettid", 12, false)],
+    ),
+];
 const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
     FixedNakedComposition {
         image_kind: FixedImageKind::Standalone,
@@ -29152,6 +29237,23 @@ const FIXED_NAKED_COMPOSITIONS: &[FixedNakedComposition] = &[
         cohort: FIXED_NAKED_PINNED_ORDINARY_COHORT,
         incoming: FIXED_NAKED_PINNED_ORDINARY_INCOMING,
         setup_bitmap_template: Some(85),
+    },
+    FixedNakedComposition {
+        image_kind: FixedImageKind::Detcore,
+        native_syscalls: false,
+        cohort: FIXED_NAKED_STABLE_ORDINARY_COHORT,
+        incoming: FIXED_NAKED_STABLE_ORDINARY_INCOMING,
+        setup_bitmap_template: Some(105),
+    },
+    // The same stable tuple under the native-syscall Detcore image: the
+    // Hermit native producer qualifies this composition with native
+    // syscall witnesses, mirroring the pinned-native entry above.
+    FixedNakedComposition {
+        image_kind: FixedImageKind::Detcore,
+        native_syscalls: true,
+        cohort: FIXED_NAKED_STABLE_ORDINARY_COHORT,
+        incoming: FIXED_NAKED_STABLE_ORDINARY_INCOMING,
+        setup_bitmap_template: Some(105),
     },
 ];
 const FIXED_SOURCE_OWNED_TEMPLATE_END: usize = 94;
