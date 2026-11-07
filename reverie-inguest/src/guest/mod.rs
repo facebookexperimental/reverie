@@ -52,15 +52,24 @@ pub mod isa;
 /// can be subscribed there, which the subscription surface reports as-is.
 #[cfg(not(target_arch = "x86_64"))]
 pub mod instruction {
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct InstructionSubscriptions {
-        /// CPUID, trapped by CPUID faulting.
-        pub cpuid: bool,
-        /// RDTSC and RDTSCP, trapped by `PR_TSC_SIGSEGV`.
-        pub rdtsc: bool,
-    }
+    use std::io;
+
+    pub use super::event::InstructionSubscriptions;
+    use super::isa::Isa;
+    use super::isa::NativeIsa;
+
     pub fn any_instruction_subscribed() -> bool {
         false
+    }
+    /// Runtime admission reaches the native architecture's named
+    /// refusal through the Isa, exactly as on x86-64.
+    pub fn preflight_instruction_faulting(
+        subscriptions: InstructionSubscriptions,
+    ) -> io::Result<()> {
+        NativeIsa::admit_instruction_subscriptions(subscriptions)
+    }
+    pub fn enable_instruction_faulting(subscriptions: InstructionSubscriptions) -> io::Result<()> {
+        NativeIsa::enable_instruction_faulting(subscriptions)
     }
 }
 #[cfg(feature = "coordinator-rpc")]

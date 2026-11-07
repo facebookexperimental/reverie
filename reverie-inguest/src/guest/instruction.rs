@@ -40,14 +40,7 @@ const INSTRUCTION_CPUID: u8 = 1;
 const INSTRUCTION_RDTSC: u8 = 2;
 static INSTRUCTION_SUBSCRIPTIONS: AtomicU8 = AtomicU8::new(0);
 
-#[derive(Clone, Copy, Debug, Default)]
-/// Which faulting instructions the Tool subscribes to.
-pub struct InstructionSubscriptions {
-    /// CPUID, trapped by CPUID faulting.
-    pub cpuid: bool,
-    /// RDTSC and RDTSCP, trapped by the native TSC faulting control.
-    pub rdtsc: bool,
-}
+pub use crate::guest::event::InstructionSubscriptions;
 
 /// Records the subscribed instructions for this process and returns whether
 /// any is subscribed.
@@ -96,7 +89,8 @@ pub fn decode_instruction(bytes: &[u8]) -> Option<(InstructionEventKind, &'stati
 /// Checks that this thread can turn on the faulting each subscribed
 /// instruction needs, through the native architecture's admission
 /// probe. Fails with `Unsupported` when the architecture, kernel or
-/// CPU lacks the control.
+/// CPU lacks the control. Ends the process with status 126 if a
+/// control that was changed for the probe cannot be restored.
 pub fn preflight_instruction_faulting(subscriptions: InstructionSubscriptions) -> io::Result<()> {
     NativeIsa::admit_instruction_subscriptions(subscriptions)
 }

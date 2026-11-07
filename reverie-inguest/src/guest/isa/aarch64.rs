@@ -16,8 +16,9 @@ use super::InstructionCapabilities;
 use super::InstructionResult;
 use super::Isa;
 use crate::guest::event::InstructionEventKind;
-use crate::guest::instruction::InstructionSubscriptions;
+use crate::guest::event::InstructionSubscriptions;
 use crate::trap::frame::FrameError;
+use crate::trap::frame::REG_PC;
 use crate::trap::frame::SavedState;
 use crate::trap::frame::SignalFrame;
 
@@ -70,14 +71,6 @@ impl Isa for Aarch64 {
 
     const SYSCALL_LEN: u64 = 4;
     const SYSCALL_INSN: &'static [u8] = &[0x01, 0x00, 0x00, 0xd4];
-
-    fn audit_arch() -> u32 {
-        crate::arch::FILTER_ABI_AARCH64.audit_arch
-    }
-
-    fn rt_sigreturn_nr() -> i64 {
-        i64::from(crate::arch::FILTER_ABI_AARCH64.rt_sigreturn)
-    }
 
     fn syscall_number(context: &RegisterContext) -> i64 {
         context.regs[8] as i64
@@ -238,8 +231,7 @@ impl Isa for Aarch64 {
     }
 
     fn set_frame_resume(frame: &mut SignalFrame<'_>, entry: u64) {
-        // Sigcontext order: x0-x30 (0..30), sp (31), pc (32), pstate (33).
-        frame.set_register(32, entry as i64);
+        frame.set_register(REG_PC, entry as i64);
     }
 
     fn cpuid_inputs(_context: &RegisterContext) -> (u32, u32) {
@@ -252,5 +244,129 @@ impl Isa for Aarch64 {
         _result: InstructionResult,
     ) {
         crate::arch::trap_unreachable()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marked_context() -> RegisterContext {
+        let mut context = RegisterContext {
+            instruction_pointer: 0x4000,
+            stack_pointer: 0x8000,
+            ..RegisterContext::default()
+        };
+        for (index, value) in context.regs.iter_mut().enumerate() {
+            *value = 0x1000 + index as u64;
+        }
+        context.pstate = 0xabcd;
+        context
+    }
+
+    #[test]
+    fn syscall_number_args_and_result_use_x8_x0_to_x5_and_x0() {
+        let mut context = marked_context();
+        // Independent kernel constants: number in x8, args x0-x5.
+        assert_eq!(Aarch64::syscall_number(&context), 0x1008);
+        assert_eq!(
+            Aarch64::syscall_args(&context),
+            [0x1000, 0x1001, 0x1002, 0x1003, 0x1004, 0x1005]
+        );
+        let before = context.regs;
+        Aarch64::finish_syscall(&mut context, -9);
+        assert_eq!(context.regs[0], -9_i64 as u64);
+        assert_eq!(&context.regs[1..], &before[1..], "svc clobbers only x0");
+        assert_eq!(context.instruction_pointer, 0x4000);
+        assert_eq!(context.pstate, 0xabcd);
+    }
+
+    #[test]
+    fn restart_snapshot_is_exactly_x0_and_x8() {
+        let mut context = marked_context();
+        let snapshot = Aarch64::restart_snapshot(&context);
+        context.regs[0] = 1;
+        context.regs[1] = 2;
+        context.regs[8] = 3;
+        Aarch64::restore_restart_snapshot(&mut context, snapshot);
+        assert_eq!(context.regs[0], 0x1000);
+        assert_eq!(context.regs[8], 0x1008);
+        assert_eq!(context.regs[1], 2, "other registers are not restored");
+    }
+
+    #[test]
+    fn saved_state_round_trip_pins_sp_pc_and_pstate() {
+        let mut saved = SavedState::new().unwrap();
+        for (index, value) in saved.registers.iter_mut().enumerate() {
+            *value = 0x2000 + index as u64;
+        }
+        saved.sp = 0x9000;
+        saved.pc = 0x4004;
+        saved.pstate = 0x1234;
+        let mut context = Aarch64::context_from_saved(&saved, 0x4000);
+        assert_eq!(context.instruction_pointer, 0x4000);
+        assert_eq!(context.stack_pointer, 0x9000);
+        assert_eq!(context.pstate, 0x1234);
+        assert_eq!(context.regs, saved.registers);
+        assert!(context.extended_state_unavailable());
+
+        context.regs[0] = 77;
+        context.stack_pointer = 0x9100;
+        context.pstate = 0x5678;
+        Aarch64::commit_context(&mut saved, &context, 4).unwrap();
+        assert_eq!(saved.pc, 0x4004, "commit resumes ip + svc len");
+        assert_eq!(saved.sp, 0x9100);
+        assert_eq!(saved.pstate, 0x5678);
+        assert_eq!(saved.registers[0], 77);
+        assert_eq!(saved.registers[8], 0x2008);
+        Aarch64::commit_context(&mut saved, &context, 0).unwrap();
+        assert_eq!(saved.pc, 0x4000, "zero-length commit restarts at svc");
+        assert!(Aarch64::commit_context(&mut saved, &context, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn user_regs_mapping_uses_kernel_layout_not_isa_round_trip() {
+        let context = marked_context();
+        let regs = Aarch64::user_regs_from_context(&context);
+        // Kernel user_pt_regs: regs[31], sp, pc, pstate.
+        assert_eq!(regs.regs, context.regs);
+        assert_eq!(regs.sp, 0x8000);
+        assert_eq!(regs.pc, 0x4000);
+        assert_eq!(regs.pstate, 0xabcd);
+
+        let event = Aarch64::user_regs_from_event(172, [10, 11, 12, 13, 14, 15], 0x5000);
+        assert_eq!(event.regs[8], 172, "syscall number slot is x8");
+        assert_eq!(event.regs[..6], [10, 11, 12, 13, 14, 15]);
+        assert_eq!(event.regs[6], 0);
+        assert_eq!(event.regs[7], 0);
+        assert_eq!(event.regs[9], 0);
+        assert_eq!(event.pc, 0x5000);
+        assert_eq!(event.sp, 0);
+        assert_eq!(
+            Aarch64::event_from_user_regs(&event),
+            (172, [10, 11, 12, 13, 14, 15])
+        );
+
+        let mut applied = marked_context();
+        let mut view = Aarch64::user_regs_from_event(99, [1, 2, 3, 4, 5, 6], 0x6000);
+        view.sp = 0xa000;
+        view.pstate = 0x77;
+        Aarch64::apply_user_regs(&mut applied, &view);
+        assert_eq!(applied.regs[8], 99);
+        assert_eq!(applied.regs[..6], [1, 2, 3, 4, 5, 6]);
+        assert_eq!(applied.stack_pointer, 0xa000);
+        assert_eq!(applied.pstate, 0x77);
+        assert_eq!(
+            applied.instruction_pointer, 0x4000,
+            "the view never supplies the instruction pointer"
+        );
+    }
+
+    #[test]
+    fn syscall_encoding_and_site_use_svc_four_bytes() {
+        assert_eq!(Aarch64::SYSCALL_LEN, 4);
+        assert_eq!(Aarch64::SYSCALL_INSN, [0x01, 0x00, 0x00, 0xd4]);
+        assert_eq!(Aarch64::syscall_site(0x4004), 0x4000);
+        assert_eq!(Aarch64::syscall_site(3), 0);
     }
 }

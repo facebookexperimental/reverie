@@ -8,6 +8,12 @@
 
 //! The one architecture seam for the in-guest runtime.
 //!
+//! Division of responsibility: `crate::arch` owns the seccomp ABI
+//! (audit architecture, rt_sigreturn number, runtime page size),
+//! `trap::frame` owns the kernel signal-frame layout, and this
+//! trait owns register/instruction/continuation facts. Facts live
+//! in exactly one of those homes.
+//!
 //! Generic guest code names only [`Isa`] (through [`NativeIsa`]): the
 //! register-context layout, the syscall ABI over that layout, conversion
 //! to and from the signal frame's saved state and the ptrace-shaped
@@ -19,7 +25,7 @@
 use std::io;
 
 use super::event::InstructionEventKind;
-use super::instruction::InstructionSubscriptions;
+use super::event::InstructionSubscriptions;
 use crate::trap::frame::FrameError;
 use crate::trap::frame::SignalFrame;
 
@@ -84,11 +90,6 @@ pub trait Isa: Copy + Send + Sync + 'static {
     const SYSCALL_LEN: u64;
     /// This architecture's syscall instruction encoding.
     const SYSCALL_INSN: &'static [u8];
-
-    /// `AUDIT_ARCH_*` for this architecture's syscall ABI.
-    fn audit_arch() -> u32;
-    /// This architecture's `rt_sigreturn` syscall number.
-    fn rt_sigreturn_nr() -> i64;
 
     /// The address of a trapped syscall instruction, given the
     /// address its `SIGSYS` frame resumes at (just past it).
@@ -230,12 +231,6 @@ mod tests {
             0x4000 - NativeIsa::SYSCALL_LEN
         );
         assert_eq!(NativeIsa::syscall_site(1), 0);
-    }
-
-    #[test]
-    fn native_filter_facts_match_the_arch_module() {
-        assert_eq!(NativeIsa::audit_arch(), crate::arch::AUDIT_ARCH_NATIVE);
-        assert_eq!(NativeIsa::rt_sigreturn_nr(), libc::SYS_rt_sigreturn);
     }
 
     #[test]

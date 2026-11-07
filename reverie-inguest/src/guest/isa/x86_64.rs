@@ -17,7 +17,7 @@ use super::InstructionCapabilities;
 use super::InstructionResult;
 use super::Isa;
 use crate::guest::event::InstructionEventKind;
-use crate::guest::instruction::InstructionSubscriptions;
+use crate::guest::event::InstructionSubscriptions;
 use crate::guest::support::SignalInstallGuard;
 use crate::guest::support::exit_now;
 use crate::trap::frame::FrameError;
@@ -179,14 +179,6 @@ impl Isa for X86_64 {
 
     const SYSCALL_LEN: u64 = 2;
     const SYSCALL_INSN: &'static [u8] = &[0x0f, 0x05];
-
-    fn audit_arch() -> u32 {
-        crate::arch::FILTER_ABI_X86_64.audit_arch
-    }
-
-    fn rt_sigreturn_nr() -> i64 {
-        i64::from(crate::arch::FILTER_ABI_X86_64.rt_sigreturn)
-    }
 
     fn syscall_number(context: &RegisterContext) -> i64 {
         context.rax as i64

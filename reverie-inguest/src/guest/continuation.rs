@@ -899,8 +899,10 @@ pub fn complete(frame: &mut SignalFrame<'_>) -> Result<bool, FrameError> {
     let owner_tid = unsafe { core::ptr::addr_of!((*pointer).owner_tid).read() };
     let generation = unsafe { core::ptr::addr_of!((*pointer).generation).read() };
     let instruction = core::ptr::addr_of!(fallback_completion_syscall) as usize;
-    if instruction.checked_add(2) != Some(resume as usize)
-        || unsafe { core::slice::from_raw_parts(instruction as *const u8, 2) } != [0x0f, 0x05]
+    if instruction.checked_add(NativeIsa::SYSCALL_LEN as usize) != Some(resume as usize)
+        || unsafe {
+            core::slice::from_raw_parts(instruction as *const u8, NativeIsa::SYSCALL_INSN.len())
+        } != NativeIsa::SYSCALL_INSN
         || phase != Phase::ReadyToReturn
         || owner_tid != current_tid()
         || PENDING.get().is_none()

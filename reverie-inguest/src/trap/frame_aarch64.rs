@@ -35,7 +35,7 @@ const SVE_SIG_FLAG_SM: u16 = 0x1;
 /// pstate, in sigcontext order.
 const REGISTERS: usize = 34;
 const REG_SP: usize = 31;
-const REG_PC: usize = 32;
+pub(crate) const REG_PC: usize = 32;
 const REG_PSTATE: usize = 33;
 
 /// A malformed or incompatible architectural signal-frame image.
