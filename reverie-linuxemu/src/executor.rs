@@ -152,6 +152,9 @@ use xattr::*;
 mod mm;
 pub(crate) use mm::*;
 mod pkeys;
+pub(crate) mod vm_flags;
+#[cfg(test)]
+mod vm_flags_tests;
 use pkeys::*;
 mod random;
 use random::*;

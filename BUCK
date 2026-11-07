@@ -957,6 +957,7 @@ rust_library(
         "fbsource//third-party/rust:kvm-bindings",
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:thiserror",
+        "fbsource//third-party/rust:tracing",
         ":reverie",
         ":reverie-kvm-core",
         ":reverie-linuxemu-terminal-read",

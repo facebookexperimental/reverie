@@ -181,7 +181,7 @@ impl GuestMemory {
         guest_address: u64,
         length: u64,
         prot: Option<u8>,
-        flags: u8,
+        flags: u16,
         identity: Option<MappingIdentity>,
     ) {
         let Ok(Some((first_page, last_page))) = self.checked_page_range(guest_address, length)
@@ -310,40 +310,98 @@ impl GuestMemory {
             .address_space
             .lock()
             .expect("guest memory access map lock poisoned");
-        let page_size = PAGE_SIZE as u64;
-        let mut pages: Vec<UserMappingRun> = access
+        let pages: Vec<UserMappingRun> = access
             .pages
             .iter()
-            .filter_map(|(&page, state)| {
-                let reservation = access.reservations.get(&page).copied();
-                if reservation.is_some_and(RegionKind::permanent) {
-                    return None;
-                }
-                let start = access.physical_to_user(page * page_size)?;
-                let (accessible, writable) = match state.unguarded() {
-                    UserPageState::Accessible { writable, .. } => (true, writable),
-                    _ => (false, false),
-                };
-                Some(UserMappingRun {
-                    start,
-                    end: start + page_size,
-                    declared: state.declared(),
-                    accessible,
-                    writable,
-                    reservation,
-                    file_offset: access.file_pages.get(&page).copied(),
-                    shared_anonymous: access.shared_anonymous_pages.contains(&page),
-                    shared_file: access.backing_pages.get(&page).is_some_and(|installed| {
-                        matches!(
-                            installed._slice.backing.kind,
-                            super::BackingKind::OrdinaryFile { .. }
-                        )
-                    }),
-                    identity: access.identity_of(page),
-                })
-            })
+            .filter_map(|(&page, state)| access.page_run(page, *state))
             .collect();
         drop(access);
+        UserMappingRuns::of_pages(pages)
+    }
+
+    /// The mapped user pages of the user range
+    /// `[user_address, user_address + length)` in runs of equal state, as
+    /// [`GuestMemory::user_mapping_runs`] gives them for the whole address
+    /// space but cut at the range's ends: a run that continues past an end
+    /// is cut there. The work is proportional to the smaller of the range's
+    /// pages and the address space's.
+    pub fn user_mapping_runs_in(&self, user_address: u64, length: u64) -> UserMappingRuns {
+        let page_size = PAGE_SIZE as u64;
+        let start = user_address & !(page_size - 1);
+        let end = user_address
+            .saturating_add(length)
+            .saturating_add(page_size - 1)
+            & !(page_size - 1);
+        if end <= start {
+            return UserMappingRuns { runs: Vec::new() };
+        }
+        let access = self
+            .mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned");
+        let (physical, _) = access.mapped_pages_in(start, end - start);
+        let pages: Vec<UserMappingRun> = physical
+            .into_iter()
+            .filter_map(|page| access.page_run(page, *access.pages.get(&page)?))
+            .collect();
+        drop(access);
+        UserMappingRuns::of_pages(pages)
+    }
+
+    /// How many pages of the address space carry the provider flags in
+    /// `mask` ([`DeclaredMapping::flags`]), counted once per bit: zero
+    /// exactly when no page carries any bit of `mask`, and for one bit the
+    /// number of pages that carry it. Kept as the pages change, so the answer
+    /// costs no walk.
+    pub fn flagged_pages(&self, mask: u16) -> usize {
+        self.mapping
+            .address_space
+            .lock()
+            .expect("guest memory access map lock poisoned")
+            .pages
+            .flagged_pages(mask)
+    }
+}
+
+impl AddressSpaceState {
+    /// The one-page run of physical page `page`, in state `state`, for the
+    /// list of mappings; `None` for a page this backend reserves for itself
+    /// or one with no user address.
+    fn page_run(&self, page: u64, state: UserPageState) -> Option<UserMappingRun> {
+        let page_size = PAGE_SIZE as u64;
+        let reservation = self.reservations.get(&page).copied();
+        if reservation.is_some_and(RegionKind::permanent) {
+            return None;
+        }
+        let start = self.physical_to_user(page * page_size)?;
+        let (accessible, writable) = match state.unguarded() {
+            UserPageState::Accessible { writable, .. } => (true, writable),
+            _ => (false, false),
+        };
+        Some(UserMappingRun {
+            start,
+            end: start + page_size,
+            declared: state.declared(),
+            accessible,
+            writable,
+            reservation,
+            file_offset: self.file_pages.get(&page).copied(),
+            shared_anonymous: self.shared_anonymous_pages.contains(&page),
+            shared_file: self.backing_pages.get(&page).is_some_and(|installed| {
+                matches!(
+                    installed._slice.backing.kind,
+                    super::BackingKind::OrdinaryFile { .. }
+                )
+            }),
+            identity: self.identity_of(page),
+        })
+    }
+}
+
+impl UserMappingRuns {
+    /// The runs of the one-page runs `pages`, in any order.
+    fn of_pages(mut pages: Vec<UserMappingRun>) -> Self {
         pages.sort_by_key(|page| page.start);
         let mut runs: Vec<UserMappingRun> = Vec::new();
         for page in pages {
@@ -352,7 +410,7 @@ impl GuestMemory {
                 _ => runs.push(page),
             }
         }
-        UserMappingRuns { runs }
+        Self { runs }
     }
 }
 

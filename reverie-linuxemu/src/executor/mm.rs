@@ -1221,38 +1221,90 @@ fn madvise_arguments(args: &[u64; 6]) -> Result<Option<(libc::c_int, u64, u64)>,
     Ok(Some((advice, start, length)))
 }
 
-// The mapping flags of the hints this backend accepts, as it keeps them on
-// the pages (`DeclaredMapping::flags`): Linux's VM_RAND_READ, VM_SEQ_READ,
-// VM_HUGEPAGE, VM_NOHUGEPAGE and VM_MERGEABLE.
-pub(super) const FLAG_RANDOM: u8 = 1;
-pub(super) const FLAG_SEQUENTIAL: u8 = 2;
-pub(super) const FLAG_HUGEPAGE: u8 = 4;
-pub(super) const FLAG_NOHUGEPAGE: u8 = 8;
-pub(super) const FLAG_MERGEABLE: u8 = 16;
+// The mapping flags this backend keeps on the pages
+// (`DeclaredMapping::flags`), each for one of Linux's `vm_flags`
+// (`include/linux/mm.h`), which the list of mappings reports
+// (`vm_flags::line_vm_flags`). Linux merges no two mappings whose flags
+// differ, but for the flags that stick to a merged mapping, so the list keeps
+// apart lines whose flags differ but for those
+// (`mapping_list::STICKY_FLAGS`). First the hints this backend accepts:
+// Linux's VM_RAND_READ, VM_SEQ_READ, VM_HUGEPAGE, VM_NOHUGEPAGE (which
+// `MAP_STACK` sets too) and VM_MERGEABLE.
+pub(crate) const FLAG_RANDOM: u16 = 1;
+pub(crate) const FLAG_SEQUENTIAL: u16 = 2;
+pub(crate) const FLAG_HUGEPAGE: u16 = 4;
+pub(crate) const FLAG_NOHUGEPAGE: u16 = 8;
+pub(crate) const FLAG_MERGEABLE: u16 = 16;
 /// Linux's `VM_ACCOUNT`: a private mapping charged to the commit limit since
 /// it was made writable (`accountable_mapping` in `mm/vma.c`, `mprotect_fixup`
 /// in `mm/mprotect.c`). Linux merges no two mappings whose flags differ, so
 /// it keeps such a mapping apart from one never writable, as the list of
 /// mappings must (`mapping_list`).
-pub(crate) const FLAG_ACCOUNT: u8 = 32;
+pub(crate) const FLAG_ACCOUNT: u16 = 32;
 /// Linux's `VM_NORESERVE`: a mapping made with `MAP_NORESERVE`, which is never
-/// charged.
-pub(crate) const FLAG_NORESERVE: u8 = 64;
+/// charged, where Linux honours it (`vm.overcommit_memory` is not 2).
+pub(crate) const FLAG_NORESERVE: u16 = 64;
+/// `VM_ACCOUNT` may be gone: a private page charged (with `FLAG_ACCOUNT`)
+/// that `mprotect(2)` made not writable. Linux takes the charge back then
+/// from an anonymous mapping with no `anon_vma` (`mprotect_fixup`), which
+/// depends on whether and where the mapping was written, merged and split,
+/// none of which the pages hold. The page keeps `FLAG_ACCOUNT`, so the list's
+/// lines stay as they were, and a private anonymous line any of whose pages
+/// carries this has no flags reported. Making the page writable again
+/// charges it, and clears this. Never set on a guarded page (an install
+/// prepares the mapping's `anon_vma`) nor in the stack window.
+pub(crate) const FLAG_ACCOUNT_UNKNOWN: u16 = 0x80;
+/// Linux's `VM_GROWSDOWN`, from `MAP_GROWSDOWN` (`calc_vm_flag_bits`).
+pub(crate) const FLAG_GROWSDOWN: u16 = 0x100;
+/// Linux's `VM_LOCKED`, from `MAP_LOCKED` (`calc_vm_flag_bits`); a forked
+/// child's copy loses it (`dup_mmap` clears `VM_LOCKED_MASK`). `mlock(2)`
+/// and the like are refused, so nothing else sets it.
+pub(crate) const FLAG_LOCKED: u16 = 0x200;
+/// Linux's `VM_SYNC`, from `MAP_SYNC` (`calc_vm_flag_bits`): every mmap that
+/// succeeds with it has the flag.
+pub(crate) const FLAG_SYNC: u16 = 0x400;
+/// `MAP_HUGETLB`: Linux maps huge pages, with `VM_HUGETLB`, which this
+/// backend's pages are not, so no line that carries it has flags reported.
+pub(crate) const FLAG_HUGETLB: u16 = 0x800;
+/// Linux's `VM_MAYBE_GUARD` (`gu`): a guard was installed in the mapping
+/// (`madvise_guard_install` sets it on the whole mapping). It sticks: a
+/// split and a fork copy it, and a merged mapping has it if any part had it
+/// (`VMA_STICKY_FLAGS`). An install sets it on every page of each line it
+/// touches, and before a call can split a line the list's line that has it
+/// on some pages gets it on all (`mapping_list::spread_guard_marks`).
+pub(crate) const FLAG_MAYBE_GUARD: u16 = 0x1000;
 
 /// The flags Linux gives a new mapping made with `mmap(2)` flags `flags` and
-/// protection `prot` (`do_mmap` and `accountable_mapping`): `VM_NORESERVE`
-/// for `MAP_NORESERVE`, and `VM_ACCOUNT` for a private writable mapping
-/// without it.
-pub(crate) fn new_mapping_flags(flags: u64, prot: u64) -> u8 {
-    let noreserve = flags & libc::MAP_NORESERVE as u64 != 0;
+/// protection `prot` (`do_mmap`, `calc_vm_flag_bits` and
+/// `accountable_mapping`): `VM_NORESERVE` for `MAP_NORESERVE` unless the
+/// host's overcommit mode is 2 (`OVERCOMMIT_NEVER`), which ignores it;
+/// `VM_ACCOUNT` for a private writable mapping without `VM_NORESERVE`;
+/// `VM_GROWSDOWN`, `VM_LOCKED`, `VM_SYNC` and `VM_NOHUGEPAGE` for
+/// `MAP_GROWSDOWN`, `MAP_LOCKED`, `MAP_SYNC` and `MAP_STACK` (Linux is
+/// built with transparent huge pages: this backend accepts their advice);
+/// and [`FLAG_HUGETLB`] for `MAP_HUGETLB`.
+pub(crate) fn new_mapping_flags(flags: u64, prot: u64) -> u16 {
+    let noreserve = flags & libc::MAP_NORESERVE as u64 != 0
+        && super::vm_flags::host_vm_facts().overcommit_memory
+            != Some(super::vm_flags::OVERCOMMIT_NEVER);
     let shared = flags & libc::MAP_SHARED as u64 != 0;
-    if noreserve {
+    let charge = if noreserve {
         FLAG_NORESERVE
     } else if !shared && prot & libc::PROT_WRITE as u64 != 0 {
         FLAG_ACCOUNT
     } else {
         0
-    }
+    };
+    [
+        (libc::MAP_GROWSDOWN, FLAG_GROWSDOWN),
+        (libc::MAP_LOCKED, FLAG_LOCKED),
+        (libc::MAP_SYNC, FLAG_SYNC),
+        (libc::MAP_STACK, FLAG_NOHUGEPAGE),
+        (libc::MAP_HUGETLB, FLAG_HUGETLB),
+    ]
+    .into_iter()
+    .filter(|(map, _)| flags & *map as u64 != 0)
+    .fold(charge, |bits, (_, flag)| bits | flag)
 }
 
 /// The flags a madvise(2) call that this backend accepts as a hint sets and
@@ -1265,7 +1317,7 @@ pub(crate) fn new_mapping_flags(flags: u64, prot: u64) -> u8 {
 /// `MADV_PAGEOUT`, which Linux applies without `madvise_update_vma`, so
 /// they never split a mapping), advice this backend refuses, and arguments
 /// Linux refuses.
-pub(super) fn madvise_flag_change(args: &[u64; 6]) -> Option<(u64, u64, u8, u8)> {
+pub(super) fn madvise_flag_change(args: &[u64; 6]) -> Option<(u64, u64, u16, u16)> {
     let (advice, start, length) = madvise_arguments(args).ok().flatten()?;
     let (set, clear) = match advice {
         libc::MADV_NORMAL => (0, FLAG_RANDOM | FLAG_SEQUENTIAL),

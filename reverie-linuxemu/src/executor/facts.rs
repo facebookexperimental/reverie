@@ -694,6 +694,51 @@ impl ElfExecutor {
     /// calls this once on a forked child's memory, before the child runs; the
     /// memory counts each change in the child's own record.
     pub fn keep_inherited_stack_mappings_apart(memory: &GuestMemory) {
+        Self::keep_window_mappings_apart(memory);
+    }
+
+    /// Prepares a forked child's copy of the address space (a fork's, not a
+    /// vfork child's, which shares its parent's on Linux), before the child
+    /// runs, as `dup_mmap` makes the child's mappings: the stack window's
+    /// inherited mappings are kept apart
+    /// ([`ElfExecutor::keep_inherited_stack_mappings_apart`]), and no
+    /// mapping of the child is locked (`dup_mmap` clears `VM_LOCKED_MASK` on
+    /// each copy, `mm/mmap.c`; `FLAG_LOCKED`), while every other flag is
+    /// copied as it is. `dup_mmap` copies each mapping as a mapping of its
+    /// own and merges none, so a page that loses `FLAG_LOCKED` also gets the
+    /// lineage `UNLOCKED_IN_FORK_LINEAGE`, which no mapping beside it has
+    /// (a mapping outside the window has lineage zero), and its mapping
+    /// stays a line of its own rather than merge with a neighbour whose
+    /// flags it now has. Only `memory`, the child's copy, changes. A copy
+    /// that shares its parent's address space
+    /// ([`GuestMemory::shares_parent_address_space`]) is left as it is: on
+    /// Linux it is the parent's own address space, whose mappings stay
+    /// locked.
+    pub fn inherit_mappings_in_forked_child(memory: &GuestMemory) {
+        if memory.shares_parent_address_space() {
+            return;
+        }
+        Self::keep_window_mappings_apart(memory);
+        if memory.flagged_pages(super::FLAG_LOCKED) == 0 {
+            return;
+        }
+        // No locked mapping lies in the window, which no mapping can be
+        // placed in after load; this edit skips the window's pages.
+        memory.edit_user_declared(0, crate::memory::USER_ADDRESS_END, |declared, _| {
+            if declared.flags & super::FLAG_LOCKED == 0 {
+                declared
+            } else {
+                crate::memory::DeclaredMapping {
+                    flags: declared.flags & !super::FLAG_LOCKED,
+                    lineage: UNLOCKED_IN_FORK_LINEAGE,
+                    ..declared
+                }
+            }
+        });
+    }
+
+    /// See [`ElfExecutor::keep_inherited_stack_mappings_apart`].
+    fn keep_window_mappings_apart(memory: &GuestMemory) {
         // A record that is not certain lists nothing until the next image.
         let Some(pages) = memory.user_stack_window_pages() else {
             return;
@@ -728,18 +773,54 @@ pub(super) fn stack_window_mappings(
         return Ok(None);
     }
     let mut mappings = Vec::new();
+    let host = super::vm_flags::host_vm_facts();
     for run in runs {
         let backing = if (run.start..=run.end).contains(&image.start_stack) {
             reverie::MappingBacking::Stack
         } else {
             reverie::MappingBacking::Anonymous
         };
-        let prot = run.declared.map_or(0, |declared| u32::from(declared.prot));
-        mappings.push(reverie::MappingFact::new(
-            run.start, run.end, prot, false, 0, backing,
-        )?);
+        let prot = run.declared.map_or(0, |declared| declared.prot);
+        let flags = run.declared.map_or(0, |declared| declared.flags) | run.sticky;
+        let vm_flags = super::vm_flags::line_vm_flags(
+            prot,
+            flags,
+            false,
+            super::vm_flags::FlagBacking::StackWindow,
+            image.read_implies_exec,
+            host,
+        );
+        let fact =
+            reverie::MappingFact::new(run.start, run.end, u32::from(prot), false, 0, backing)?;
+        mappings.push(super::mapping_list::with_vm_flags(fact, vm_flags));
     }
     Ok(Some(mappings))
+}
+
+/// The lineage (`DeclaredMapping::lineage`) of a forked child's page whose
+/// mapping was locked in the parent
+/// ([`ElfExecutor::inherit_mappings_in_forked_child`]).
+pub(super) const UNLOCKED_IN_FORK_LINEAGE: u16 = 1;
+
+/// The stack window's mapping of `memory` that holds the page at user
+/// address `address`, as its list gives it, with the guard flag
+/// (`FLAG_MAYBE_GUARD`) it has on any page and on every page; `None` when
+/// the window's record is not certain, or no known mapping holds the page.
+pub(super) fn stack_window_line_holding(
+    memory: &GuestMemory,
+    address: u64,
+) -> Option<super::mapping_list::LineExtent> {
+    let pages = memory.user_stack_window_pages()?;
+    let run = stack_window_runs(&pages)
+        .into_iter()
+        .find(|run| run.start <= address && address < run.end)?;
+    run.declared?;
+    Some(super::mapping_list::LineExtent {
+        start: run.start,
+        end: run.end,
+        sticky: run.sticky,
+        sticky_everywhere: run.sticky_everywhere,
+    })
 }
 
 /// A run of the stack window: adjacent mapped pages with the same declared
@@ -750,31 +831,50 @@ pub(super) fn stack_window_mappings(
 struct WindowRun {
     start: u64,
     end: u64,
+    /// The pages' declared mapping, but for the guard flag
+    /// (`FLAG_MAYBE_GUARD`), which sticks to a merged mapping.
     declared: Option<crate::memory::DeclaredMapping>,
+    /// The guard flag, where any page of the run has it.
+    sticky: u16,
+    /// The guard flag, where every page of the run has it.
+    sticky_everywhere: u16,
 }
 
 /// The runs of the stack window's pages, lowest first: each maximal run of
 /// adjacent pages with the same declared mapping (protection, flags and
-/// lineage), which Linux keeps as one mapping. Linux merges two adjacent
-/// mappings when their flags, file, policy, userfaultfd context, `anon_vma`
-/// and name agree (`is_mergeable_vma` and `is_mergeable_anon_vma` in
-/// `mm/vma.c`). In the window no file, policy, userfaultfd context or name
-/// can be set, so that is when their protection, the flags of the madvise
-/// hints this executor keeps, and their lineage agree.
+/// lineage) but for the guard flag (`FLAG_MAYBE_GUARD`), which Linux keeps
+/// as one mapping. Linux merges two adjacent mappings when their flags but
+/// the sticky ones (`VMA_STICKY_FLAGS`, which hold `VM_MAYBE_GUARD`), file,
+/// policy, userfaultfd context, `anon_vma` and name agree
+/// (`is_mergeable_vma` and `is_mergeable_anon_vma` in `mm/vma.c`). In the
+/// window no file, policy, userfaultfd context or name can be set, so that
+/// is when their protection, the other flags this executor keeps, and their
+/// lineage agree. `FLAG_ACCOUNT_UNKNOWN` never reaches the window: only
+/// `GuestMemory::edit_user_declared` sets it, which skips the stack's pages.
 fn stack_window_runs(pages: &[crate::memory::WindowPage]) -> Vec<WindowRun> {
+    let guard = super::FLAG_MAYBE_GUARD;
     let mut runs: Vec<WindowRun> = Vec::new();
     for page in pages {
         let declared = page
             .declared
             .filter(|_| page.reservation == Some(crate::memory::RegionKind::Stack));
+        let sticky = declared.map_or(0, |declared| declared.flags & guard);
+        let declared = declared.map(|declared| crate::memory::DeclaredMapping {
+            flags: declared.flags & !guard,
+            ..declared
+        });
         match runs.last_mut() {
             Some(run) if run.end == page.user_address && run.declared == declared => {
                 run.end += PAGE_SIZE;
+                run.sticky |= sticky;
+                run.sticky_everywhere &= sticky;
             }
             _ => runs.push(WindowRun {
                 start: page.user_address,
                 end: page.user_address + PAGE_SIZE,
                 declared,
+                sticky,
+                sticky_everywhere: sticky,
             }),
         }
     }
@@ -2870,18 +2970,56 @@ mod memory_map_tests {
     /// The part of `map` in the stack window, as an incomplete list: what
     /// these tests check of the stack window's mappings, which the list of
     /// the whole address space holds beside the image's and every other
-    /// mapping (`mapping_list::list_mappings`).
+    /// mapping (`mapping_list::list_mappings`). Each window mapping's
+    /// `vm_flags` are checked to be the exec stack's (`VM_STACK_FLAGS`:
+    /// `mr mw me gd ac`, with the access bits of its protection), and then
+    /// left out, so that these tests compare ranges, protection and names;
+    /// [`window_flags`] gives them.
     fn window(map: Result<reverie::MemoryMap, FactError>) -> Result<reverie::MemoryMap, FactError> {
         map.map(|map| {
             reverie::MemoryMap::new(
                 map.mappings
                     .into_iter()
                     .filter(|mapping| WINDOW.0 <= mapping.start && mapping.end <= WINDOW.1)
+                    .map(|mut mapping| {
+                        let flags = mapping.vm_flags.expect("a window mapping has its flags");
+                        let stack = reverie::VM_MAYREAD
+                            | reverie::VM_MAYWRITE
+                            | reverie::VM_MAYEXEC
+                            | reverie::VM_GROWSDOWN
+                            | reverie::VM_ACCOUNT;
+                        assert_eq!(flags & stack, stack, "{mapping:?}");
+                        mapping.vm_flags = None;
+                        mapping
+                    })
                     .collect(),
                 false,
             )
             .unwrap()
         })
+    }
+
+    /// The `vm_flags` of the stack window's mappings in `map`, lowest first.
+    fn window_flags(map: &reverie::MemoryMap) -> Vec<Option<u64>> {
+        map.mappings
+            .iter()
+            .filter(|mapping| WINDOW.0 <= mapping.start && mapping.end <= WINDOW.1)
+            .map(|mapping| mapping.vm_flags)
+            .collect()
+    }
+
+    /// The exec stack's `vm_flags` (`rd wr mr mw me gd ac`), with `more`.
+    fn stack_flags(more: u64) -> Option<u64> {
+        Some(
+            reverie::VM_READ
+                | reverie::VM_WRITE
+                | reverie::VM_MAYREAD
+                | reverie::VM_MAYWRITE
+                | reverie::VM_MAYEXEC
+                | reverie::VM_GROWSDOWN
+                | reverie::VM_ACCOUNT
+                | more,
+        )
     }
 
     fn change(
@@ -2946,11 +3084,12 @@ mod memory_map_tests {
     }
 
     /// A forked child's copy of `memory`, as the backend makes it: a copy of
-    /// the address space, whose inherited stack mappings the executor keeps
-    /// apart (`ElfExecutor::keep_inherited_stack_mappings_apart`).
+    /// the address space, whose inherited mappings the executor makes as
+    /// Linux's `dup_mmap` does
+    /// (`ElfExecutor::inherit_mappings_in_forked_child`).
     fn forked(memory: &GuestMemory) -> GuestMemory {
         let child = memory.snapshot().unwrap();
-        ElfExecutor::keep_inherited_stack_mappings_apart(&child);
+        ElfExecutor::inherit_mappings_in_forked_child(&child);
         child
     }
 
@@ -3396,6 +3535,17 @@ mod memory_map_tests {
             advise(&mut executor, STACK_PAGE, first);
             advise(&mut executor, STACK_PAGE, second);
             advise(&mut executor, STACK_PAGE + page, second);
+            // `rd wr mr mw me gd ac`, with `sr` or `nh` on the advised line.
+            let kept = if second == libc::MADV_SEQUENTIAL {
+                reverie::VM_SEQ_READ
+            } else {
+                reverie::VM_NOHUGEPAGE
+            };
+            assert_eq!(
+                window_flags(&executor.memory_map(&memory, tid).unwrap()),
+                vec![stack_flags(0), stack_flags(kept), stack_flags(0)],
+                "{first} then {second}"
+            );
             assert_eq!(
                 window(executor.memory_map(&memory, tid)),
                 Ok(listed(vec![
@@ -3422,7 +3572,7 @@ mod memory_map_tests {
         let page = PAGE_SIZE;
         let declared =
             |user: u64| memory.declared_mapping(memory.user_range_to_guest(user, page).unwrap());
-        let mapping_with = |prot: u32, flags: u8| {
+        let mapping_with = |prot: u32, flags: u16| {
             Some(crate::memory::DeclaredMapping {
                 prot: prot as u8,
                 flags,

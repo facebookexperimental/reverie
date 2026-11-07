@@ -3763,9 +3763,10 @@ impl KvmBackend {
 
         let mut child = Self::from_process_snapshot(child_snapshot)?;
         if !share_address_space {
-            // The Linux provider keeps apart the stack window's mappings a
-            // forked child inherits.
-            ElfExecutor::keep_inherited_stack_mappings_apart(&child.memory);
+            // The Linux provider makes the forked child's mappings as
+            // `dup_mmap` does: the stack window's inherited mappings kept
+            // apart, and none locked.
+            ElfExecutor::inherit_mappings_in_forked_child(&child.memory);
         }
         if let Some(child_executor) = prepared_executor.as_mut() {
             child_executor.set_clear_child_tid(clear_child_tid);

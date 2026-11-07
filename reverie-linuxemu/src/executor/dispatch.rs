@@ -178,6 +178,77 @@ pub(super) fn execute_basic_syscall_with_read_context(
     action
 }
 
+/// The syscalls that change the address space's layout, which dispatch
+/// serializes under the memory's allocation transaction
+/// ([`execute_basic_syscall_dispatch`]), and before which it keeps the guard
+/// flag on every page of each line a split may cut
+/// (`mapping_list::spread_guard_marks`, at the addresses
+/// [`layout_edit_boundaries`] names). madvise counts: MADV_DONTNEED
+/// classifies pages and then zeroes them, and a mapping replaced between the
+/// two (by a host-owned worker's executor) must not have its new contents
+/// erased; and its flag changes split lines.
+pub(super) const LAYOUT_SYSCALLS: [libc::c_long; 7] = [
+    libc::SYS_brk,
+    libc::SYS_mmap,
+    libc::SYS_mremap,
+    libc::SYS_munmap,
+    libc::SYS_mprotect,
+    libc::SYS_madvise,
+    libc::SYS_pkey_mprotect,
+];
+
+/// Whether syscall `number` is one of [`LAYOUT_SYSCALLS`].
+pub(super) fn mutates_layout(number: u64) -> bool {
+    LAYOUT_SYSCALLS
+        .iter()
+        .any(|layout| *layout as u64 == number)
+}
+
+/// The user addresses at which layout syscall `number` with `args` may split
+/// a line (a mapping as Linux lists it): the ends of each range it may
+/// change, maps over, unmaps or moves, rounded to pages; `None` for a
+/// syscall not in [`LAYOUT_SYSCALLS`]. Generous: an address that splits
+/// nothing costs a lookup. `state` gives the program break.
+pub(super) fn layout_edit_boundaries(
+    number: u64,
+    args: &[u64; 6],
+    state: &LoadedStaticElf,
+) -> Option<Vec<u64>> {
+    let page_down = |address: u64| address & !(PAGE_SIZE - 1);
+    let page_up = |address: u64| address.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let range =
+        |start: u64, length: u64| vec![page_down(start), page_up(start.saturating_add(length))];
+    let number = number as libc::c_long;
+    Some(match number {
+        libc::SYS_mmap => {
+            // Only a fixed mapping can replace part of a line;
+            // MAP_FIXED_NOREPLACE maps nothing over one.
+            if args[3] & libc::MAP_FIXED as u64 != 0 {
+                range(args[0], args[1])
+            } else {
+                Vec::new()
+            }
+        }
+        libc::SYS_munmap | libc::SYS_mprotect | libc::SYS_pkey_mprotect | libc::SYS_madvise => {
+            range(args[0], args[1])
+        }
+        libc::SYS_mremap => {
+            // The source's ends, where a shrink cuts it, and a fixed
+            // destination's ends.
+            let mut boundaries = range(args[0], args[1]);
+            boundaries.push(page_up(args[0].saturating_add(args[2])));
+            if args[3] & libc::MREMAP_FIXED as u64 != 0 {
+                boundaries.extend(range(args[4], args[2]));
+            }
+            boundaries
+        }
+        // A break that shrinks unmaps from the new break's page up to the
+        // old break's page end.
+        libc::SYS_brk => vec![page_up(args[0]), page_up(state.mm.program_break)],
+        _ => return None,
+    })
+}
+
 fn execute_basic_syscall_dispatch(
     memory: &mut GuestMemory,
     state: &mut LoadedStaticElf,
@@ -189,15 +260,7 @@ fn execute_basic_syscall_dispatch(
         reverie::SignalTaskIdentity,
     )>,
 ) -> SyscallAction {
-    // madvise counts: MADV_DONTNEED classifies pages and then zeroes them, and
-    // a mapping replaced between the two (by a host-owned worker's executor)
-    // must not have its new contents erased.
-    let mutates_layout = matches!(request.number(), number if
-        number == libc::SYS_brk as u64 || number == libc::SYS_mmap as u64
-        || number == libc::SYS_mremap as u64 || number == libc::SYS_munmap as u64
-        || number == libc::SYS_mprotect as u64 || number == libc::SYS_madvise as u64
-        || number == libc::SYS_pkey_mprotect as u64);
-    if !mutates_layout {
+    if !mutates_layout(request.number()) {
         return execute_basic_syscall_inner(
             memory,
             state,
@@ -222,6 +285,13 @@ fn execute_basic_syscall_dispatch(
     state.mm.mmap_limit = cursors.mmap_limit;
     let number = request.number();
     let args = request.args();
+    // Before any path below can split a line, under the allocation
+    // transaction, which every change to the layout holds.
+    super::mapping_list::spread_guard_marks(
+        &owner,
+        &super::mapping_list::ImageMapFacts::of(state),
+        &layout_edit_boundaries(number, args, state).unwrap_or_default(),
+    );
     if vfork_child_moves_break(&owner, state, number, args) {
         drop(transaction);
         return SyscallAction::Failure(crate::Error::VforkChildCapability {
@@ -853,13 +923,13 @@ fn execute_basic_syscall_inner(
         _ if number == libc::SYS_mprotect as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED
             let result = mprotect(&ProviderMemory(memory), args);
-            account_writable_range(memory, result, args);
+            account_protection_change(memory, result, args);
             result
         }
         _ if number == libc::SYS_pkey_mprotect as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED
             let result = pkey_mprotect(&ProviderMemory(memory), args);
-            account_writable_range(memory, result, args);
+            account_protection_change(memory, result, args);
             result
         }
         _ if number == libc::SYS_pkey_alloc as u64 => {
@@ -882,7 +952,20 @@ fn execute_basic_syscall_inner(
                     }
                 });
             }
-            madvise(&ProviderMemory(memory), args)
+            let result = madvise(&ProviderMemory(memory), args);
+            // A guard installed, over a range with holes too: Linux marks
+            // each mapping the range touches, whole (`VM_MAYBE_GUARD`).
+            if args[2] as libc::c_int == MADV_GUARD_INSTALL
+                && (result == 0 || result == negative_errno(libc::ENOMEM))
+            {
+                super::mapping_list::mark_guarded_lines(
+                    memory,
+                    &super::mapping_list::ImageMapFacts::of(state),
+                    args[0],
+                    args[1].saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1),
+                );
+            }
+            result
         }
         _ if number == libc::SYS_munlock as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1208,26 +1291,44 @@ impl ElfExecutor {
 }
 
 /// After a successful `mprotect(2)` or `pkey_mprotect(2)` (`result`, of
-/// `args`) that made a range writable, charges each private mapping of it
-/// that was not charged and is not `MAP_NORESERVE` memory (`VM_ACCOUNT`, as
-/// `mprotect_fixup` in `mm/mprotect.c` sets it), for the list of mappings
-/// (`mapping_list`). Linux also takes the charge back from an anonymous
-/// mapping made read-only before any page of it was written (one with no
-/// `anon_vma`); the pages do not say whether one was written, so a charge
-/// stays, as on Linux for every mapping that was.
-fn account_writable_range(memory: &GuestMemory, result: i64, args: &[u64; 6]) {
-    if result != 0 || args[2] & libc::PROT_WRITE as u64 == 0 {
+/// `args`), the charge of each private page of the range, for the list of
+/// mappings (`mapping_list`), as `mprotect_fixup` (`mm/mprotect.c`) changes
+/// `VM_ACCOUNT`:
+/// - made writable: charged (`FLAG_ACCOUNT`), unless it is `MAP_NORESERVE`
+///   or `MAP_HUGETLB` memory, and known to be (`FLAG_ACCOUNT_UNKNOWN`
+///   cleared);
+/// - otherwise, a charged page may have lost its charge: Linux takes it back
+///   from an anonymous mapping with no `anon_vma`, which depends on whether
+///   the mapping was written, which the pages do not say, so it gets
+///   `FLAG_ACCOUNT_UNKNOWN` and keeps `FLAG_ACCOUNT`. Not a guarded page:
+///   installing a guard prepared its mapping's `anon_vma`
+///   (`madvise_guard_install`), so the charge stays. A file mapping never
+///   loses it, which the list of mappings reads from the line's backing.
+///
+/// Shared pages are never charged. The protection change was applied to the
+/// whole range or to none of it (`ProviderMemory::protect` refuses the range
+/// before it changes any page), so a success names every page it changed.
+fn account_protection_change(memory: &GuestMemory, result: i64, args: &[u64; 6]) {
+    if result != 0 {
         return;
     }
+    let writable = args[2] & libc::PROT_WRITE as u64 != 0;
     memory.edit_user_declared(args[0], args[1], |declared, shared| {
-        if shared || declared.flags & FLAG_NORESERVE != 0 {
-            declared
-        } else {
-            crate::memory::DeclaredMapping {
-                flags: declared.flags | FLAG_ACCOUNT,
-                ..declared
+        let flags = declared.flags;
+        let flags = if shared {
+            flags
+        } else if writable {
+            if flags & (FLAG_NORESERVE | FLAG_HUGETLB) != 0 {
+                flags
+            } else {
+                flags & !FLAG_ACCOUNT_UNKNOWN | FLAG_ACCOUNT
             }
-        }
+        } else if flags & FLAG_ACCOUNT != 0 && flags & FLAG_MAYBE_GUARD == 0 {
+            flags | FLAG_ACCOUNT_UNKNOWN
+        } else {
+            flags
+        };
+        crate::memory::DeclaredMapping { flags, ..declared }
     });
 }
 

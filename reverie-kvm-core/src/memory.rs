@@ -1457,10 +1457,12 @@ pub struct DeclaredMapping {
     /// The declared protection.
     pub prot: u8,
     /// The provider's flags.
-    pub flags: u8,
+    pub flags: u16,
     /// The provider's lineage, zero for a new mapping
     /// ([`GuestMemory::map_user_protection`]). LinuxEmu gives each mapping of
-    /// the stack window that a forked child inherits one of its own.
+    /// the stack window that a forked child inherits one of its own, and
+    /// another to each page of a forked child whose mapping was locked in the
+    /// parent.
     pub lineage: u16,
 }
 
@@ -2898,7 +2900,7 @@ impl GuestMemory {
     /// `[user_address, user_address + length)` that lies in the stack window
     /// ([`GuestMemory::user_stack_window_pages`]), whose pages alone keep
     /// flags. An undeclared page stays so, and an unmapped one is skipped.
-    pub fn flag_user_range(&self, user_address: u64, length: u64, set: u8, clear: u8) {
+    pub fn flag_user_range(&self, user_address: u64, length: u64, set: u16, clear: u16) {
         self.edit_stack_window_pages(user_address, length, |declared| DeclaredMapping {
             flags: declared.flags & !clear | set,
             ..declared
@@ -7070,7 +7072,7 @@ mod tests {
     const RW: u8 = (libc::PROT_READ | libc::PROT_WRITE) as u8;
     const RWX: u8 = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u8;
 
-    fn declared(prot: u8, flags: u8) -> DeclaredMapping {
+    fn declared(prot: u8, flags: u16) -> DeclaredMapping {
         DeclaredMapping {
             prot,
             flags,
@@ -7126,6 +7128,104 @@ mod tests {
         (memory, window)
     }
 
+    /// Provider flags wider than a byte (`DeclaredMapping::flags` is a u16)
+    /// are kept on the pages and counted per bit as the pages change
+    /// (`GuestMemory::flagged_pages`), in each copy of the address space for
+    /// itself; a run query over a range (`GuestMemory::user_mapping_runs_in`)
+    /// gives the runs the whole query gives, cut at its ends.
+    #[test]
+    fn wide_provider_flags_are_kept_counted_and_cleared_per_address_space() {
+        let page = PAGE_SIZE as u64;
+        let (memory, window) = watched_stack_window();
+        // Four pages of identity memory, whose user addresses are physical.
+        let low = MIB;
+        memory
+            .reserve_region(low, 4 * page, RegionKind::Mmap)
+            .unwrap()
+            .commit();
+        memory.map_user_protection(low, 4 * page, RW).unwrap();
+        memory.describe_mapping(low, 4 * page, None, 0x1200, None);
+        assert_eq!(memory.declared_mapping(low), Some(declared(RW, 0x1200)));
+        assert_eq!(memory.flagged_pages(0x1000), 4);
+        assert_eq!(memory.flagged_pages(0x1200), 8);
+        assert_eq!(memory.flagged_pages(0x0400), 0);
+        // A window page carries 0x200 too, and a protection change keeps it.
+        memory.flag_user_range(window, page, 0x200, 0);
+        assert_eq!(memory.flagged_pages(0x200), 5);
+        memory.protect_user_range(low, page, R).unwrap();
+        assert_eq!(memory.declared_mapping(low), Some(declared(R, 0x1200)));
+        assert_eq!(memory.flagged_pages(0x200), 5);
+        // An unmapped page carries nothing.
+        memory.unmap_user_range(low + 3 * page, page).unwrap();
+        assert_eq!(memory.flagged_pages(0x1000), 3);
+        assert_eq!(memory.flagged_pages(0x200), 4);
+        let _ = memory.set_user_guards(low + page, page, true);
+        assert!(memory.is_guard_page(low + page));
+
+        // A fork's copy keeps the counts; clearing a flag there leaves the
+        // parent's pages and counts as they were.
+        let child = memory.snapshot().unwrap();
+        assert_eq!(child.flagged_pages(0x200), 4);
+        child.edit_user_declared(low, 4 * page, |declared, _| DeclaredMapping {
+            flags: declared.flags & !0x200,
+            ..declared
+        });
+        child.flag_user_range(window, page, 0, 0x200);
+        assert_eq!(child.flagged_pages(0x200), 0);
+        assert_eq!(child.flagged_pages(0x1000), 3);
+        assert_eq!(child.declared_mapping(low), Some(declared(R, 0x1000)));
+        assert_eq!(
+            child.declared_mapping(low + page),
+            Some(declared(RW, 0x1000))
+        );
+        assert!(child.is_guard_page(low + page), "the guard stays");
+        assert_eq!(
+            held(&child),
+            Some(vec![(window, USER_STACK_TOP, declared(RW, 0))]),
+            "the window's page lost the flag too, and the record stays certain"
+        );
+        assert_eq!(memory.flagged_pages(0x200), 4);
+        assert_eq!(memory.declared_mapping(low), Some(declared(R, 0x1200)));
+        assert_eq!(
+            held(&memory),
+            Some(vec![
+                (window, window + page, declared(RW, 0x200)),
+                (window + page, USER_STACK_TOP, declared(RW, 0)),
+            ])
+        );
+        // The ranged query: the runs of the whole query inside the range,
+        // cut at its ends.
+        let whole: Vec<(u64, u64, Option<DeclaredMapping>)> = memory
+            .user_mapping_runs()
+            .runs
+            .iter()
+            .map(|run| (run.start, run.end, run.declared))
+            .collect();
+        assert!(whole.contains(&(low, low + page, Some(declared(R, 0x1200)))));
+        assert!(whole.contains(&(low + page, low + 3 * page, Some(declared(RW, 0x1200)))));
+        let cut: Vec<(u64, u64, Option<DeclaredMapping>)> = memory
+            .user_mapping_runs_in(low + 2 * page, 8 * page)
+            .runs
+            .iter()
+            .map(|run| (run.start, run.end, run.declared))
+            .collect();
+        assert_eq!(
+            cut,
+            vec![(low + 2 * page, low + 3 * page, Some(declared(RW, 0x1200)))]
+        );
+        let top: Vec<(u64, u64)> = memory
+            .user_mapping_runs_in(window, 2 * page)
+            .runs
+            .iter()
+            .map(|run| (run.start, run.end))
+            .collect();
+        assert_eq!(
+            top,
+            vec![(window, window + page), (window + page, window + 2 * page)]
+        );
+        assert!(memory.user_mapping_runs_in(low, 0).runs.is_empty());
+    }
+
     /// The window's pages hold the mapping declared for them: a protection
     /// change keeps a page's flags and lineage, flags and lineages are set on
     /// the window's declared pages only, an unmapped page leaves a gap, a move
@@ -7157,7 +7257,7 @@ mod tests {
         memory.flag_user_range(low, page, 5, 0);
         assert_eq!(held(&memory), around(declared(RW, 5)));
         memory.set_user_stack_window_lineage(low, page, 7);
-        let lineaged = |prot: u8, flags: u8| DeclaredMapping {
+        let lineaged = |prot: u8, flags: u16| DeclaredMapping {
             prot,
             flags,
             lineage: 7,

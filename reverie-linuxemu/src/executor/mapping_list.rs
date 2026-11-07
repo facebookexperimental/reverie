@@ -26,6 +26,12 @@
 //! contiguous offsets, or the same shared anonymous object at contiguous
 //! offsets.
 //!
+//! Two flags stick to a merged mapping rather than keep it apart
+//! ([`STICKY_FLAGS`]): a line has one if any of its pages has it.
+//!
+//! Each line reports Linux's `vm_flags` where they are established
+//! (`super::vm_flags::line_vm_flags`).
+//!
 //! Where that differs from Linux, the difference is Linux's history of
 //! `anon_vma`s, which no page holds: two private anonymous mappings that
 //! each took an `anon_vma` of its own, by a write fault, before a call made
@@ -55,11 +61,23 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use super::mm::FLAG_ACCOUNT_UNKNOWN;
+use super::mm::FLAG_MAYBE_GUARD;
+use super::vm_flags::FileVmFacts;
+use super::vm_flags::FlagBacking;
 use crate::GuestMemory;
 use crate::memory::DeclaredMapping;
 use crate::memory::MappingIdentity;
 use crate::memory::USER_STACK_TOP;
 use crate::memory::UserMappingRun;
+
+/// The provider flags that stick to a merged mapping instead of keeping it
+/// apart (`DeclaredMapping::flags`): two lines that differ only in these
+/// merge, and the line has each if any of its pages has it. Linux's
+/// `VM_MAYBE_GUARD` is sticky (`VMA_STICKY_FLAGS`); `FLAG_ACCOUNT_UNKNOWN`
+/// is no flag of Linux's, only a doubt about `VM_ACCOUNT`, which the pages
+/// keep, so the lines stay as they were without it.
+pub(crate) const STICKY_FLAGS: u16 = FLAG_ACCOUNT_UNKNOWN | FLAG_MAYBE_GUARD;
 
 /// What a mapping maps, as Linux names it in `maps`
 /// ([`crate::memory::MappingIdentity`] holds one).
@@ -73,6 +91,9 @@ pub(crate) enum MappedObject {
         /// The superblock's device (`i_sb->s_dev`), as Linux prints it.
         raw_device: u64,
         raw_inode: u64,
+        /// What decides the mapping's flags, as it was when the mapping was
+        /// made (`None`: not known).
+        vm_facts: Option<FileVmFacts>,
     },
     /// `MAP_SHARED | MAP_ANONYMOUS` memory, which Linux backs with a shmem
     /// file of its own named `/dev/zero (deleted)` (`shmem_zero_setup`). The
@@ -95,8 +116,10 @@ pub(crate) enum MappedObject {
 }
 
 impl MappedObject {
-    /// The identity of a mapping of `file`, or `None` where the host cannot
-    /// describe the file.
+    /// The identity of a mapping of `file` made now, or `None` where the
+    /// host cannot describe the file. It holds the facts that decide the
+    /// mapping's flags, read now, as Linux fixes them when it maps the file
+    /// ([`FileVmFacts::of`]).
     pub(crate) fn file(file: &Arc<std::fs::File>) -> Option<MappingIdentity> {
         let (st_dev, raw_inode) = fstat_identity(file.as_raw_fd())?;
         let raw_device = superblock_device(file.as_raw_fd()).unwrap_or(st_dev);
@@ -104,6 +127,7 @@ impl MappedObject {
             file: file.clone(),
             raw_device,
             raw_inode,
+            vm_facts: FileVmFacts::of(file),
         }))
     }
 
@@ -257,6 +281,7 @@ enum LineBacking {
         raw_device: u64,
         raw_inode: u64,
         offset: u64,
+        vm_facts: Option<FileVmFacts>,
     },
     SharedAnonymous {
         identity: MappingIdentity,
@@ -270,7 +295,13 @@ enum LineBacking {
 struct Line {
     start: u64,
     end: u64,
+    /// The first run's declared mapping; every run of the line has the same
+    /// but for [`STICKY_FLAGS`].
     declared: DeclaredMapping,
+    /// The [`STICKY_FLAGS`] any run of the line has.
+    sticky: u16,
+    /// The [`STICKY_FLAGS`] every run of the line has.
+    sticky_everywhere: u16,
     shared: bool,
     backing: LineBacking,
 }
@@ -293,6 +324,7 @@ impl Line {
                     file,
                     raw_device,
                     raw_inode,
+                    vm_facts,
                 }),
                 Some(offset),
                 false,
@@ -301,6 +333,7 @@ impl Line {
                 raw_device: *raw_device,
                 raw_inode: *raw_inode,
                 offset,
+                vm_facts: *vm_facts,
             },
             (
                 Some(MappedObject::SharedAnonymous {
@@ -328,17 +361,30 @@ impl Line {
             start: run.start,
             end: run.end,
             declared,
+            sticky: declared.flags & STICKY_FLAGS,
+            sticky_everywhere: declared.flags & STICKY_FLAGS,
             shared,
             backing,
         }))
+    }
+
+    /// Adds `next`, which [`Line::merges_with`] this line, to it.
+    fn absorb(&mut self, next: &Line) {
+        self.end = next.end;
+        self.sticky |= next.sticky;
+        self.sticky_everywhere &= next.sticky_everywhere;
     }
 
     /// Whether `next`, which starts where this line ends, is part of the same
     /// mapping on Linux (see the module documentation).
     fn merges_with(&self, next: &Line) -> bool {
         let length = self.end - self.start;
+        let unsticky = |declared: DeclaredMapping| DeclaredMapping {
+            flags: declared.flags & !STICKY_FLAGS,
+            ..declared
+        };
         self.end == next.start
-            && self.declared == next.declared
+            && unsticky(self.declared) == unsticky(next.declared)
             && self.shared == next.shared
             && match (&self.backing, &next.backing) {
                 (LineBacking::Anonymous, LineBacking::Anonymous) => true,
@@ -370,12 +416,26 @@ impl Line {
     }
 
     /// The line as Linux prints it, for an address space whose program break
-    /// is `brk` and whose image fixed `image`.
+    /// is `brk` and whose image fixed `image`, with Linux's `vm_flags` where
+    /// they are established.
     fn fact(
         self,
         image: &ImageMapFacts,
         brk: u64,
     ) -> Result<reverie::MappingFact, reverie::FactError> {
+        let flag_backing = match &self.backing {
+            LineBacking::Anonymous => FlagBacking::Anonymous,
+            LineBacking::File { vm_facts, .. } => FlagBacking::File(vm_facts.as_ref()),
+            LineBacking::SharedAnonymous { .. } => FlagBacking::SharedAnonymous,
+        };
+        let vm_flags = super::vm_flags::line_vm_flags(
+            self.declared.prot,
+            self.declared.flags | self.sticky,
+            self.shared,
+            flag_backing,
+            image.read_implies_exec,
+            super::vm_flags::host_vm_facts(),
+        );
         let (offset, backing) = match self.backing {
             LineBacking::Anonymous => {
                 // `vma_is_initial_heap`, which Linux tests before the stack.
@@ -393,6 +453,7 @@ impl Line {
                 raw_device,
                 raw_inode,
                 offset,
+                ..
             } => (
                 offset,
                 reverie::MappingBacking::File {
@@ -415,14 +476,29 @@ impl Line {
                 },
             ),
         };
-        reverie::MappingFact::new(
+        let fact = reverie::MappingFact::new(
             self.start,
             self.end,
             u32::from(self.declared.prot),
             self.shared,
             offset,
             backing,
-        )
+        )?;
+        Ok(with_vm_flags(fact, vm_flags))
+    }
+}
+
+/// `fact` with `vm_flags`, where they are given and are a set Linux can
+/// print for it; otherwise `fact` as it is, with none. A set Linux cannot
+/// print (such as `VM_EXEC` without `VM_MAYEXEC`, which a protection change
+/// this backend allows and Linux refuses can leave) is not established.
+pub(super) fn with_vm_flags(
+    fact: reverie::MappingFact,
+    vm_flags: Option<u64>,
+) -> reverie::MappingFact {
+    match vm_flags {
+        Some(vm_flags) => fact.clone().with_vm_flags(vm_flags).unwrap_or(fact),
+        None => fact,
     }
 }
 
@@ -449,11 +525,33 @@ pub(crate) fn list_mappings(
     let brk = memory
         .allocation_cursors()
         .map_or(image.start_brk, |cursors| cursors.program_break);
+    let window = window.map(|window| (window.user_start, window.user_end));
+    let (lines, unknown_runs) = build_lines(memory.user_mapping_runs().runs, image, window);
+    for line in lines {
+        let touches_unknown = unknown_runs
+            .iter()
+            .any(|&(start, end)| line.start <= end && start <= line.end);
+        if !touches_unknown {
+            mappings.push(line.fact(image, brk)?);
+        }
+    }
+    mappings.sort_by_key(|mapping| mapping.start);
+    reverie::MemoryMap::new(mappings, unknown_runs.is_empty())
+}
+
+/// The lines of `runs` (in address order) outside the stack window
+/// `window` (`[start, end)`), for an image that fixed `image`, and the
+/// ranges of the runs whose mapping is not known, which no line crosses.
+fn build_lines(
+    runs: Vec<UserMappingRun>,
+    image: &ImageMapFacts,
+    window: Option<(u64, u64)>,
+) -> (Vec<Line>, Vec<(u64, u64)>) {
     let mut lines: Vec<Line> = Vec::new();
     // The ranges of pages whose mapping is not known.
     let mut unknown_runs: Vec<(u64, u64)> = Vec::new();
-    for run in memory.user_mapping_runs().runs {
-        if window.is_some_and(|window| (window.user_start..window.user_end).contains(&run.start)) {
+    for run in runs {
+        if window.is_some_and(|(start, end)| (start..end).contains(&run.start)) {
             continue;
         }
         let Ok(line) = Line::of(&run) else {
@@ -470,19 +568,131 @@ pub(crate) fn list_mappings(
         // lists it.
         match lines.last_mut() {
             Some(last) if line.start != image.start_brk && last.merges_with(&line) => {
-                last.end = line.end;
+                last.absorb(&line);
             }
             _ => lines.push(line),
         }
     }
-    for line in lines {
-        let touches_unknown = unknown_runs
-            .iter()
-            .any(|&(start, end)| line.start <= end && start <= line.end);
-        if !touches_unknown {
-            mappings.push(line.fact(image, brk)?);
+    (lines, unknown_runs)
+}
+
+/// The extent of a line and its sticky flags ([`STICKY_FLAGS`]): those any
+/// of its pages has, and those all of them have.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LineExtent {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) sticky: u16,
+    pub(crate) sticky_everywhere: u16,
+}
+
+/// The stack window's user range of `memory`, if it has one.
+fn stack_window(memory: &GuestMemory) -> Option<(u64, u64)> {
+    memory
+        .user_layout()
+        .0
+        .into_iter()
+        .find(|window| window.user_end == USER_STACK_TOP)
+        .map(|window| (window.user_start, window.user_end))
+}
+
+/// The line of `memory` (whose image fixed `image`) that holds the page at
+/// user address `address`, as the list of mappings would give it: `None`
+/// for a page outside every line (unmapped, the backend's own, or a page
+/// whose mapping is not known). In the stack window, the window's mapping
+/// that holds it (`facts::stack_window_runs`), if the window's record is
+/// certain. Outside it, the runs around the page are read, over a range
+/// that grows until the line ends inside it on both sides, so the work is
+/// proportional to the line, not to the address space.
+pub(crate) fn line_holding(
+    memory: &GuestMemory,
+    image: &ImageMapFacts,
+    address: u64,
+) -> Option<LineExtent> {
+    let page = reverie_kvm_core::layout::PAGE_SIZE;
+    let address = address & !(page - 1);
+    let window = stack_window(memory);
+    if let Some((start, end)) = window
+        && (start..end).contains(&address)
+    {
+        return super::facts::stack_window_line_holding(memory, address);
+    }
+    let mut radius = 16 * page;
+    loop {
+        let low = address.saturating_sub(radius);
+        let high = address.saturating_add(radius).min(!(page - 1));
+        let runs = memory.user_mapping_runs_in(low, high - low).runs;
+        let (lines, _) = build_lines(runs, image, window);
+        let line = lines
+            .into_iter()
+            .find(|line| line.start <= address && address < line.end)?;
+        // A line that reaches an end of the range may go on past it.
+        let open = line.start == low && low != 0 || line.end == high && high < USER_STACK_TOP;
+        if !open || radius >= USER_STACK_TOP {
+            return Some(LineExtent {
+                start: line.start,
+                end: line.end,
+                sticky: line.sticky,
+                sticky_everywhere: line.sticky_everywhere,
+            });
+        }
+        radius = radius.saturating_mul(8);
+    }
+}
+
+/// Sets the provider flags `set` on every declared page of the user range
+/// `[start, end)`, outside the stack window and in it.
+fn set_flags(memory: &GuestMemory, start: u64, end: u64, set: u16) {
+    if end <= start {
+        return;
+    }
+    memory.edit_user_declared(start, end - start, |declared, _| DeclaredMapping {
+        flags: declared.flags | set,
+        ..declared
+    });
+    memory.flag_user_range(start, end - start, set, 0);
+}
+
+/// Before a call that may split lines at the user addresses `boundaries`
+/// (the ends of the ranges it changes): each line that holds a boundary's
+/// page and has the guard flag (`FLAG_MAYBE_GUARD`) on some of its pages
+/// but not all gets it on all, so that every part a split leaves keeps it,
+/// as a split copies `VM_MAYBE_GUARD` on Linux. This changes no line's
+/// flags: the line has the flag already ([`STICKY_FLAGS`]). Nothing is read
+/// when no page of the address space has the flag.
+pub(crate) fn spread_guard_marks(memory: &GuestMemory, image: &ImageMapFacts, boundaries: &[u64]) {
+    if memory.flagged_pages(FLAG_MAYBE_GUARD) == 0 {
+        return;
+    }
+    for &boundary in boundaries {
+        if let Some(line) = line_holding(memory, image, boundary)
+            && line.sticky & FLAG_MAYBE_GUARD != 0
+            && line.sticky_everywhere & FLAG_MAYBE_GUARD == 0
+        {
+            set_flags(memory, line.start, line.end, FLAG_MAYBE_GUARD);
         }
     }
-    mappings.sort_by_key(|mapping| mapping.start);
-    reverie::MemoryMap::new(mappings, unknown_runs.is_empty())
+}
+
+/// After `MADV_GUARD_INSTALL` over the user range `[start, start + length)`
+/// applied (with or without holes): sets the guard flag
+/// (`FLAG_MAYBE_GUARD`) on every page of each line the range touches, as
+/// Linux sets `VM_MAYBE_GUARD` on each whole mapping the advice covers part
+/// of (`madvise_guard_install`).
+pub(crate) fn mark_guarded_lines(
+    memory: &GuestMemory,
+    image: &ImageMapFacts,
+    start: u64,
+    length: u64,
+) {
+    let page = reverie_kvm_core::layout::PAGE_SIZE;
+    let Some(end) = start.checked_add(length) else {
+        return;
+    };
+    if end <= start {
+        return;
+    }
+    let low = line_holding(memory, image, start).map_or(start, |line| line.start);
+    let high = line_holding(memory, image, end - page).map_or(end, |line| line.end);
+    set_flags(memory, low, high, FLAG_MAYBE_GUARD);
 }

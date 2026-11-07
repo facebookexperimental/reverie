@@ -26,6 +26,7 @@ libc = "0.2.186"
 reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
 reverie-kvm-core = { version = "0.5.4", path = "../reverie-kvm-core" }
 thiserror = "2.0.18"
+tracing = "0.1.41"
 
 [dev-dependencies]
 reverie-kvm-core = { version = "0.5.4", path = "../reverie-kvm-core", features = ["test-support"] }

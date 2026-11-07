@@ -26,6 +26,11 @@
 //!   map's own states tell everything about the watched pages. A clone
 //!   shares the record until it takes one of its own
 //!   ([`UserPages::detach_watch`]).
+//! - [`UserPages`] counts, for each bit of the provider flags
+//!   ([`super::DeclaredMapping::flags`]), the pages whose declared mapping
+//!   carries it ([`UserPages::flagged_pages`]). Every method that changes a
+//!   page's logical state keeps the counts, so a provider can tell at once
+//!   that no page carries a flag without walking the pages.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -115,6 +120,9 @@ pub(super) struct UserPages {
     scratch: Vec<u64>,
     /// The watched pages, if any; see [`UserPages::watch`].
     watch: Option<Watch>,
+    /// For each bit of the provider flags, how many pages of the logical map
+    /// carry it in their declared mapping ([`UserPages::flagged_pages`]).
+    flag_pages: [usize; 16],
 }
 
 /// A range of pages whose logical state [`UserPages`] watches.
@@ -154,7 +162,44 @@ impl UserPages {
             map: Versioned::new(BTreeMap::new()),
             scratch: Vec::new(),
             watch: None,
+            flag_pages: [0; 16],
         }
+    }
+
+    /// The provider flags a page in `state` carries.
+    fn flags_of(state: Option<UserPageState>) -> u16 {
+        state
+            .and_then(UserPageState::declared)
+            .map_or(0, |declared| declared.flags)
+    }
+
+    /// Keeps the flag counts for a page whose logical state goes from `old`
+    /// to `new` (`None`: absent).
+    fn count_flags(&mut self, old: Option<UserPageState>, new: Option<UserPageState>) {
+        let (old, new) = (Self::flags_of(old), Self::flags_of(new));
+        if old == new {
+            return;
+        }
+        for (bit, count) in self.flag_pages.iter_mut().enumerate() {
+            let mask = 1u16 << bit;
+            match (old & mask != 0, new & mask != 0) {
+                (true, false) => *count -= 1,
+                (false, true) => *count += 1,
+                _ => {}
+            }
+        }
+    }
+
+    /// How many pages carry the provider flags in `mask`, counted once per
+    /// bit: zero exactly when no page carries any bit of `mask`, and for one
+    /// bit the number of pages that carry it.
+    pub(super) fn flagged_pages(&self, mask: u16) -> usize {
+        self.flag_pages
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| mask & (1u16 << bit) != 0)
+            .map(|(_, count)| count)
+            .sum()
     }
 
     /// Watches pages `first..=last` from now on, with a record of its own,
@@ -270,6 +315,7 @@ impl UserPages {
         let previous = self.map.edit().insert(page, state);
         debug_assert!(!(exposed && previous.is_some()));
         let previous = if exposed { Some(EXPOSED) } else { previous };
+        self.count_flags(previous, Some(state));
         if previous != Some(state) {
             self.count_change(page, page);
         }
@@ -283,6 +329,7 @@ impl UserPages {
         } else {
             self.map.edit().remove(page)
         };
+        self.count_flags(previous, None);
         if previous.is_some() {
             self.count_change(*page, *page);
         }
@@ -297,6 +344,7 @@ impl UserPages {
         }
         self.scratch.clear();
         self.map.edit().clear();
+        self.flag_pages = [0; 16];
     }
 
     /// Exactly `insert(page, EXPOSED)` of the logical map, without touching
@@ -313,6 +361,7 @@ impl UserPages {
         } else {
             None
         };
+        self.count_flags(previous, Some(EXPOSED));
         self.scratch.insert(index, page);
         if previous != Some(EXPOSED) {
             self.count_change(page, page);
@@ -330,7 +379,8 @@ impl UserPages {
             return;
         }
         if self.map.contains_key(&page) {
-            self.map.edit().remove(&page);
+            let previous = self.map.edit().remove(&page);
+            self.count_flags(previous, None);
             self.count_change(page, page);
         }
     }
@@ -459,17 +509,36 @@ mod tests {
             flags,
             lineage: 0,
         };
-        match choice % 5 {
+        match choice % 7 {
             0 => UserPageState::undeclared(false, false),
             1 => UserPageState::undeclared(true, false),
             2 => UserPageState::undeclared(true, true),
             3 => UserPageState::of(declared(libc::PROT_READ | libc::PROT_WRITE, 0)),
-            _ => UserPageState::of(declared(libc::PROT_READ | libc::PROT_WRITE, 1)),
+            4 => UserPageState::of(declared(libc::PROT_READ | libc::PROT_WRITE, 1)),
+            5 => UserPageState::of(declared(libc::PROT_READ, 0x1001)).guarded(),
+            _ => UserPageState::NoAccess {
+                declared: Some(declared(0, 0x8000)),
+            },
         }
     }
 
     fn assert_same(pages: &UserPages, model: &BTreeMap<u64, UserPageState>, rng: &mut Lcg) {
         assert_eq!(pages.len(), model.len());
+        // Each flag bit's count is the number of the model's pages that
+        // carry it.
+        for bit in 0..16 {
+            let mask = 1u16 << bit;
+            let carrying = model
+                .values()
+                .filter(|state| UserPages::flags_of(Some(**state)) & mask != 0)
+                .count();
+            assert_eq!(pages.flagged_pages(mask), carrying, "bit {bit}");
+        }
+        let any = model
+            .values()
+            .filter(|state| UserPages::flags_of(Some(**state)) & 0x1001 != 0)
+            .count();
+        assert_eq!(pages.flagged_pages(0x1001) == 0, any == 0);
         assert_eq!(&pages.to_map(), model);
         assert!(pages.keys().eq(model.keys()));
         assert!(pages.keys().rev().eq(model.keys().rev()));
@@ -536,7 +605,7 @@ mod tests {
                     .collect();
                 match rng.next(8) {
                     0 | 1 => {
-                        let value = state(rng.next(5));
+                        let value = state(rng.next(7));
                         assert_eq!(pages.insert(page, value), model.insert(page, value));
                     }
                     2 => assert_eq!(pages.remove(&page), model.remove(&page)),

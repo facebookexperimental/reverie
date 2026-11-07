@@ -591,7 +591,78 @@ pub struct MappingFact {
     pub offset: u64,
     /// What backs the mapping, and the name Linux prints for it.
     pub backing: MappingBacking,
+    /// Linux's `vm_flags` for the mapping (`include/linux/mm.h`, in the
+    /// x86-64 numbering of Linux 7.1, the `VM_*` constants of this module):
+    /// the bits `show_smap_vma_flags` prints as `VmFlags` in `smaps`, among
+    /// those [`MappingFact::validate`] accepts. `None` where the backend
+    /// cannot establish all of them, and on any architecture other than
+    /// x86-64, whose numbering differs. Protection-key bits are never set.
+    ///
+    /// `serde(default)` lets JSON written without the field decode to
+    /// `None`; a positional (bincode) carrier of this type would need its own
+    /// version bump, and the field must never be skipped when serializing.
+    #[serde(default)]
+    pub vm_flags: Option<u64>,
 }
+
+/// `VM_READ` (`include/linux/mm.h`, Linux 7.1): `rd` in `smaps`' `VmFlags`.
+pub const VM_READ: u64 = 1 << 0;
+/// `VM_WRITE`: `wr`.
+pub const VM_WRITE: u64 = 1 << 1;
+/// `VM_EXEC`: `ex`.
+pub const VM_EXEC: u64 = 1 << 2;
+/// `VM_SHARED`: `sh`.
+pub const VM_SHARED: u64 = 1 << 3;
+/// `VM_MAYREAD`: `mr`.
+pub const VM_MAYREAD: u64 = 1 << 4;
+/// `VM_MAYWRITE`: `mw`.
+pub const VM_MAYWRITE: u64 = 1 << 5;
+/// `VM_MAYEXEC`: `me`.
+pub const VM_MAYEXEC: u64 = 1 << 6;
+/// `VM_MAYSHARE`: `ms`.
+pub const VM_MAYSHARE: u64 = 1 << 7;
+/// `VM_GROWSDOWN`: `gd`.
+pub const VM_GROWSDOWN: u64 = 1 << 8;
+/// `VM_MAYBE_GUARD`: `gu`, which kernels after 6.17 print.
+pub const VM_MAYBE_GUARD: u64 = 1 << 11;
+/// `VM_LOCKED`: `lo`.
+pub const VM_LOCKED: u64 = 1 << 13;
+/// `VM_SEQ_READ`: `sr`.
+pub const VM_SEQ_READ: u64 = 1 << 15;
+/// `VM_RAND_READ`: `rr`.
+pub const VM_RAND_READ: u64 = 1 << 16;
+/// `VM_ACCOUNT`: `ac`.
+pub const VM_ACCOUNT: u64 = 1 << 20;
+/// `VM_NORESERVE`: `nr`.
+pub const VM_NORESERVE: u64 = 1 << 21;
+/// `VM_SYNC`: `sf`.
+pub const VM_SYNC: u64 = 1 << 23;
+/// `VM_HUGEPAGE`: `hg`.
+pub const VM_HUGEPAGE: u64 = 1 << 29;
+/// `VM_NOHUGEPAGE`: `nh`.
+pub const VM_NOHUGEPAGE: u64 = 1 << 30;
+/// `VM_MERGEABLE`: `mg`.
+pub const VM_MERGEABLE: u64 = 1 << 31;
+/// Every `VM_*` bit a [`MappingFact::vm_flags`] may hold.
+pub const VM_KNOWN_FLAGS: u64 = VM_READ
+    | VM_WRITE
+    | VM_EXEC
+    | VM_SHARED
+    | VM_MAYREAD
+    | VM_MAYWRITE
+    | VM_MAYEXEC
+    | VM_MAYSHARE
+    | VM_GROWSDOWN
+    | VM_MAYBE_GUARD
+    | VM_LOCKED
+    | VM_SEQ_READ
+    | VM_RAND_READ
+    | VM_ACCOUNT
+    | VM_NORESERVE
+    | VM_SYNC
+    | VM_HUGEPAGE
+    | VM_NOHUGEPAGE
+    | VM_MERGEABLE;
 
 impl MappingFact {
     /// A mapping with these fields, in the order Linux prints them, if
@@ -612,6 +683,19 @@ impl MappingFact {
             shared,
             offset,
             backing,
+            vm_flags: None,
+        };
+        mapping.validate()?;
+        Ok(mapping)
+    }
+
+    /// The mapping with [`vm_flags`](Self::vm_flags) `vm_flags`, if
+    /// [`MappingFact::validate`] accepts it; otherwise
+    /// `Err(FactError::Errno(EIO))`.
+    pub fn with_vm_flags(self, vm_flags: u64) -> Result<Self, FactError> {
+        let mapping = Self {
+            vm_flags: Some(vm_flags),
+            ..self
         };
         mapping.validate()?;
         Ok(mapping)
@@ -636,7 +720,14 @@ impl MappingFact {
     ///   no newline, and is none of the names that have a variant of their
     ///   own, nor begins `[anon:` or `[anon_shmem:`;
     /// - an anonymous memory name is one `prctl(PR_SET_VMA,
-    ///   PR_SET_VMA_ANON_NAME)` accepts.
+    ///   PR_SET_VMA_ANON_NAME)` accepts;
+    /// - [`vm_flags`](Self::vm_flags), where given, holds no bit outside
+    ///   [`VM_KNOWN_FLAGS`]; its `VM_READ`, `VM_WRITE` and `VM_EXEC` are
+    ///   [`prot`](Self::prot)'s bits, each within the matching `VM_MAY*` bit
+    ///   (`VM_MAYREAD >> 4 == VM_READ`, which `mprotect(2)` relies on); its
+    ///   `VM_MAYSHARE` is [`shared`](Self::shared); and `VM_SHARED` comes
+    ///   only with `VM_MAYSHARE`. `VM_SHARED` without `VM_MAYWRITE` is
+    ///   accepted: a shared mapping of a write-sealed memfd has it.
     ///
     /// These are the rules under which [`MemoryMap::from_maps`] reads back
     /// the line Linux prints for the mapping as the same mapping.
@@ -649,8 +740,30 @@ impl MappingFact {
             && self.prot & !any_prot == 0
             && page_aligned(self.offset)
             && (self.offset == 0 || self.backing.has_file())
-            && self.backing.is_valid();
+            && self.backing.is_valid()
+            && self
+                .vm_flags
+                .is_none_or(|flags| self.vm_flags_are_valid(flags));
         if valid { Ok(()) } else { Err(MALFORMED) }
+    }
+
+    /// Whether `flags` keeps the rules [`MappingFact::validate`] gives
+    /// [`vm_flags`](Self::vm_flags) for this mapping.
+    fn vm_flags_are_valid(&self, flags: u64) -> bool {
+        let access = VM_READ | VM_WRITE | VM_EXEC;
+        let prot = [
+            (libc::PROT_READ, VM_READ),
+            (libc::PROT_WRITE, VM_WRITE),
+            (libc::PROT_EXEC, VM_EXEC),
+        ]
+        .into_iter()
+        .filter(|(bit, _)| self.prot & *bit as u32 != 0)
+        .fold(0, |bits, (_, flag)| bits | flag);
+        flags & !VM_KNOWN_FLAGS == 0
+            && flags & access == prot
+            && flags & access & !((flags & (VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC)) >> 4) == 0
+            && (flags & VM_MAYSHARE != 0) == self.shared
+            && (flags & VM_SHARED == 0 || flags & VM_MAYSHARE != 0)
     }
 }
 
@@ -1654,6 +1767,7 @@ mod memory_map_tests {
     use super::*;
 
     const MALFORMED: Result<MemoryMap, FactError> = Err(FactError::Errno(Errno::EIO));
+    const MALFORMED_FACT: FactError = FactError::Errno(Errno::EIO);
     const RW: u32 = (libc::PROT_READ | libc::PROT_WRITE) as u32;
 
     /// `map` as Linux's `show_map_vma` prints it, written here from Linux's
@@ -2264,6 +2378,168 @@ mod memory_map_tests {
         ] {
             assert_eq!(MemoryMap::from_maps(text), MALFORMED, "{text:?}");
         }
+    }
+
+    /// A mapping's `vm_flags`: none from the constructors and the parser;
+    /// accepted where they are a set Linux prints for such a mapping, with
+    /// the `VmFlags` lines Linux 7.1.3 printed for them (the design's host
+    /// probes, `probe/vmflags.py`, `tmp/probe2.py`, `tmp/probe3.py`), and
+    /// refused otherwise; and kept through JSON, from which a fact written
+    /// without them reads back as `None`.
+    #[test]
+    fn vm_flags_are_checked_against_the_mapping_and_survive_json() {
+        let base = VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+        let anonymous = mapping(0x40_0000, 0x40_1000, RW, MappingBacking::Anonymous);
+        assert_eq!(anonymous.vm_flags, None);
+        assert_eq!(
+            line("00400000-00401000 rw-p 00000000 00:00 0 ").map(|m| m.vm_flags),
+            Ok(None)
+        );
+        let shared = |prot: u32| {
+            MappingFact::new(
+                0x40_0000,
+                0x40_1000,
+                prot,
+                true,
+                0,
+                file(libc::makedev(0, 1), 5, b"/memfd:sealed (deleted)"),
+            )
+            .unwrap()
+        };
+        let read = libc::PROT_READ as u32;
+        for (what, mapping, flags) in [
+            // `rd wr mr mw me ac`
+            (
+                "anonymous rw",
+                &anonymous,
+                VM_READ | VM_WRITE | base | VM_ACCOUNT,
+            ),
+            // `rd wr mr mw me ac nh`: MAP_STACK.
+            (
+                "MAP_STACK rw",
+                &anonymous,
+                VM_READ | VM_WRITE | base | VM_ACCOUNT | VM_NOHUGEPAGE,
+            ),
+            // `rd wr mr mw me gu lo sf ac nr gd` cannot all come at once, but
+            // each of these bits is one Linux prints.
+            (
+                "every provider bit",
+                &anonymous,
+                VM_READ
+                    | VM_WRITE
+                    | base
+                    | VM_GROWSDOWN
+                    | VM_MAYBE_GUARD
+                    | VM_LOCKED
+                    | VM_SEQ_READ
+                    | VM_RAND_READ
+                    | VM_ACCOUNT
+                    | VM_NORESERVE
+                    | VM_SYNC
+                    | VM_HUGEPAGE
+                    | VM_NOHUGEPAGE
+                    | VM_MERGEABLE,
+            ),
+            // `rd wr sh mr mw me ms`: shared anonymous memory.
+            (
+                "shared rw",
+                &shared(RW),
+                VM_READ | VM_WRITE | VM_SHARED | base | VM_MAYSHARE,
+            ),
+            // `rd mr me ms`: a shared mapping of a file opened O_RDONLY.
+            (
+                "shared read-only file",
+                &shared(read),
+                VM_READ | VM_MAYREAD | VM_MAYEXEC | VM_MAYSHARE,
+            ),
+            // `rd sh mr me ms`: a write-sealed memfd, shared, read-only.
+            (
+                "write-sealed memfd",
+                &shared(read),
+                VM_READ | VM_SHARED | VM_MAYREAD | VM_MAYEXEC | VM_MAYSHARE,
+            ),
+            // `rd mr mw`: a private mapping on a noexec mount.
+            (
+                "noexec private",
+                &mapping(0x40_0000, 0x40_1000, read, MappingBacking::Anonymous),
+                VM_READ | VM_MAYREAD | VM_MAYWRITE,
+            ),
+        ] {
+            let with = mapping.clone().with_vm_flags(flags);
+            assert_eq!(with.as_ref().map(|m| m.vm_flags), Ok(Some(flags)), "{what}");
+            assert_eq!(with.unwrap().validate(), Ok(()), "{what}");
+        }
+        let malformed = Err(FactError::Errno(Errno::EIO));
+        for (what, mapping, flags) in [
+            // `ht`, `sd` and a protection-key bit are not bits a fact holds.
+            (
+                "VM_HUGETLB",
+                &anonymous,
+                VM_READ | VM_WRITE | base | 1 << 22,
+            ),
+            (
+                "VM_SOFTDIRTY",
+                &anonymous,
+                VM_READ | VM_WRITE | base | 1 << 27,
+            ),
+            (
+                "VM_PKEY_BIT0",
+                &anonymous,
+                VM_READ | VM_WRITE | base | 1 << 32,
+            ),
+            // The access bits are the protection's.
+            ("no wr", &anonymous, VM_READ | base),
+            ("ex", &anonymous, VM_READ | VM_WRITE | VM_EXEC | base),
+            // Within the VM_MAY* bits.
+            (
+                "wr without mw",
+                &anonymous,
+                VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYEXEC,
+            ),
+            // VM_MAYSHARE is `shared`, and VM_SHARED needs it.
+            (
+                "ms on a private mapping",
+                &anonymous,
+                VM_READ | VM_WRITE | base | VM_MAYSHARE,
+            ),
+            (
+                "sh alone",
+                &anonymous,
+                VM_READ | VM_WRITE | base | VM_SHARED,
+            ),
+            (
+                "no ms on a shared mapping",
+                &shared(RW),
+                VM_READ | VM_WRITE | VM_SHARED | base,
+            ),
+        ] {
+            assert_eq!(
+                mapping.clone().with_vm_flags(flags).map(|m| m.vm_flags),
+                malformed,
+                "{what}"
+            );
+            let changed = MappingFact {
+                vm_flags: Some(flags),
+                ..mapping.clone()
+            };
+            assert_eq!(changed.validate(), Err(MALFORMED_FACT), "{what}");
+        }
+
+        // JSON keeps the flags; JSON written before the field existed reads
+        // back as `None`.
+        let flagged = anonymous
+            .clone()
+            .with_vm_flags(VM_READ | VM_WRITE | base | VM_ACCOUNT)
+            .unwrap();
+        let text = serde_json::to_string(&flagged).unwrap();
+        assert!(text.contains("\"vm_flags\":1048691"), "{text}");
+        assert_eq!(serde_json::from_str::<MappingFact>(&text).unwrap(), flagged);
+        let old = text.replace(",\"vm_flags\":1048691", "");
+        assert!(!old.contains("vm_flags"), "{old}");
+        assert_eq!(
+            serde_json::from_str::<MappingFact>(&old).unwrap(),
+            anonymous
+        );
     }
 
     /// Facts built with the constructors print as Linux would and read back

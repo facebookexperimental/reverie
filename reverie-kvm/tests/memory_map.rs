@@ -292,10 +292,28 @@ fn without_start(mapping: &MappingFact) -> (u64, u32, bool, u64, MappingBacking)
     )
 }
 
-/// The backend's list while the window is unchanged: the window, `prot`.
+/// The backend's list while the window is unchanged: the window, `prot`,
+/// with the flags Linux gives the stack it makes at exec (`VM_STACK_FLAGS`,
+/// which Linux 7.1.3 prints as `rd wr mr mw me gd ac`), `ex` too for an
+/// executable stack.
 fn stack(prot: u32) -> MemoryMap {
+    let mut flags = reverie::VM_READ
+        | reverie::VM_WRITE
+        | reverie::VM_MAYREAD
+        | reverie::VM_MAYWRITE
+        | reverie::VM_MAYEXEC
+        | reverie::VM_GROWSDOWN
+        | reverie::VM_ACCOUNT;
+    if prot & libc::PROT_EXEC as u32 != 0 {
+        flags |= reverie::VM_EXEC;
+    }
     MemoryMap::new(
-        vec![MappingFact::new(WINDOW_START, TOP, prot, false, 0, MappingBacking::Stack).unwrap()],
+        vec![
+            MappingFact::new(WINDOW_START, TOP, prot, false, 0, MappingBacking::Stack)
+                .unwrap()
+                .with_vm_flags(flags)
+                .unwrap(),
+        ],
         false,
     )
     .unwrap()
@@ -796,4 +814,176 @@ fn a_kvm_guest_with_a_guard_zone_on_its_stack_reads_it_as_linux_does() {
         native.stacks[&PARENT_UNGUARDED].size,
         native.stacks[&BEFORE].size
     );
+}
+
+/// What one run of `fixtures/vm_flags.c` printed: each case's address and,
+/// natively, its mapping's `VmFlags`, by point and case.
+#[derive(Debug, Default)]
+struct FlagListing {
+    addresses: BTreeMap<(u64, String), u64>,
+    flags: BTreeMap<(u64, String), String>,
+}
+
+fn flag_listing(stdout: &[u8]) -> FlagListing {
+    let mut listing = FlagListing::default();
+    for line in String::from_utf8(stdout.to_vec()).unwrap().lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields[..] {
+            ["case", point, name, address] => {
+                listing.addresses.insert(
+                    (point.parse().unwrap(), name.to_owned()),
+                    u64::from_str_radix(address, 16).unwrap(),
+                );
+            }
+            ["flags", point, name, ref flags @ ..] => {
+                listing
+                    .flags
+                    .insert((point.parse().unwrap(), name.to_owned()), flags.join(" "));
+            }
+            _ => panic!("fixture line {line:?}"),
+        }
+    }
+    listing
+}
+
+/// `vm_flags` as Linux's `show_smap_vma_flags` prints them, in bit order.
+fn mnemonics(vm_flags: u64) -> String {
+    [
+        (reverie::VM_READ, "rd"),
+        (reverie::VM_WRITE, "wr"),
+        (reverie::VM_EXEC, "ex"),
+        (reverie::VM_SHARED, "sh"),
+        (reverie::VM_MAYREAD, "mr"),
+        (reverie::VM_MAYWRITE, "mw"),
+        (reverie::VM_MAYEXEC, "me"),
+        (reverie::VM_MAYSHARE, "ms"),
+        (reverie::VM_GROWSDOWN, "gd"),
+        (reverie::VM_MAYBE_GUARD, "gu"),
+        (reverie::VM_LOCKED, "lo"),
+        (reverie::VM_SEQ_READ, "sr"),
+        (reverie::VM_RAND_READ, "rr"),
+        (reverie::VM_ACCOUNT, "ac"),
+        (reverie::VM_NORESERVE, "nr"),
+        (reverie::VM_SYNC, "sf"),
+        (reverie::VM_HUGEPAGE, "hg"),
+        (reverie::VM_NOHUGEPAGE, "nh"),
+        (reverie::VM_MERGEABLE, "mg"),
+    ]
+    .iter()
+    .filter(|(bit, _)| vm_flags & bit != 0)
+    .map(|(_, name)| *name)
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+/// Each mapping's `vm_flags` on KVM are the `VmFlags` Linux prints for the
+/// same mapping of the same program (`fixtures/vm_flags.c`): `MAP_STACK`
+/// (`nh`), as glibc makes a thread's stack too, `MAP_GROWSDOWN` (`gd`),
+/// `MAP_LOCKED` (`lo`, gone in a forked child), `MAP_SYNC` (`sf`) on
+/// anonymous memory and on a private mapping of a file, `MAP_NORESERVE`
+/// (`nr`); a guard (`gu`) on the whole mapping it was installed in, through
+/// a split, through a merge with a plain mapping and the guarded part's
+/// unmapping, and in a forked child; the charge (`ac`) a private file
+/// mapping and guarded anonymous memory keep when made read-only; shared
+/// mappings of a file opened read-only (no `sh`, no `mw`) and read-write,
+/// of shared anonymous memory and of a memfd; and a thread's stack.
+///
+/// Named differences, where the backend reports no flags: anonymous memory
+/// made read-only, which Linux leaves charged or not by whether it was
+/// written (`rd mr mw me` here, never written), and `MAP_HUGETLB`, which
+/// Linux maps with huge pages (`ht`) and the backend with 4 KiB ones. A
+/// sealed memfd's `mw` and a `noexec` mount are checked by the provider's
+/// unit tests: this backend refuses `F_ADD_SEALS`, and a `noexec` mount
+/// needs a namespace.
+#[test]
+fn a_kvm_guests_mapping_flags_are_linuxs() {
+    Kvm::new().expect("vm_flags test requires usable /dev/kvm");
+    let directory = Directory::new();
+    let executable = compile(
+        &directory,
+        "vm_flags",
+        include_str!("fixtures/vm_flags.c"),
+        &[],
+    );
+    let native_files = directory.0.join("native");
+    let kvm_files = directory.0.join("kvm");
+    std::fs::create_dir(&native_files).unwrap();
+    std::fs::create_dir(&kvm_files).unwrap();
+    let run = std::process::Command::new(&executable)
+        .arg("native")
+        .arg(&native_files)
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "native: {run:?}");
+    let native = flag_listing(&run.stdout);
+
+    let argv = [
+        executable.to_str().unwrap(),
+        "tool",
+        kvm_files.to_str().unwrap(),
+    ];
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_file_with_context(
+            std::fs::File::open(&executable).unwrap(),
+            &argv,
+            &[],
+            &directory.0,
+        )
+        .unwrap();
+    let (log, code, stdout, stderr) =
+        futures::executor::block_on(backend.run_static_elf_with_tool::<FactTool>((), true))
+            .unwrap();
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    let kvm = flag_listing(&stdout);
+    let facts = log.0.into_inner().unwrap();
+    assert_eq!(facts.len(), 2, "{facts:?}");
+    assert_eq!(
+        kvm.addresses.keys().collect::<Vec<_>>(),
+        native.flags.keys().collect::<Vec<_>>()
+    );
+
+    let not_established = ["anonymous-read-only", "hugetlb"];
+    for ((point, name), linux) in &native.flags {
+        let address = kvm.addresses[&(*point, name.clone())];
+        let map = match &facts[point].1 {
+            Ok(map) => map,
+            other => panic!("point {point}: {other:?}"),
+        };
+        let line = map
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start <= address && address < mapping.end)
+            .unwrap_or_else(|| panic!("{name} at point {point}: no line holds {address:#x}"));
+        let ours = line.vm_flags.map(mnemonics);
+        if not_established.contains(&name.as_str()) {
+            assert_eq!(ours, None, "{name} at point {point}: Linux's {linux}");
+        } else {
+            assert_eq!(
+                ours.as_deref(),
+                Some(linux.as_str()),
+                "{name} at point {point}"
+            );
+        }
+    }
+    // Linux's own answers for the named differences, and for the cases the
+    // design's probes recorded (dh-9j8ue `tmp/probe2.py`, `tmp/probe3.py`).
+    let linux = |point: u64, name: &str| native.flags[&(point, name.to_owned())].as_str();
+    assert_eq!(linux(1, "anonymous-read-only"), "rd mr mw me");
+    assert!(linux(1, "hugetlb").split(' ').any(|flag| flag == "ht"));
+    assert_eq!(linux(1, "stack"), "rd wr mr mw me ac nh");
+    assert_eq!(linux(1, "glibc-stack"), "rd wr mr mw me ac nh");
+    assert_eq!(
+        linux(1, "guard-merged-then-unmapped"),
+        "rd wr mr mw me gu ac"
+    );
+    assert_eq!(linux(1, "guard-split-last"), "rd mr mw me gu ac");
+    assert_eq!(linux(1, "file-read-only"), "rd mr mw me ac");
+    assert_eq!(linux(1, "guarded-read-only"), "rd mr mw me gu ac");
+    assert_eq!(linux(1, "shared-file-read-only"), "rd mr me ms");
+    assert_eq!(linux(1, "locked"), "rd wr mr mw me lo ac");
+    assert_eq!(linux(2, "locked"), "rd wr mr mw me ac");
+    assert_eq!(linux(2, "guard-split-first"), "rd wr mr mw me gu ac");
 }

@@ -1385,6 +1385,7 @@ dependencies = [
  "reverie-core",
  "reverie-kvm-core",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
