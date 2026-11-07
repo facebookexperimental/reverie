@@ -18954,7 +18954,10 @@ fn qualify_allocator_tls_boundary_in_source_context(
     {
         require(
             allocation_bytes.len() == 241
-                && matches!(cell.address, 0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x110 | 0x128),
+                && matches!(
+                    cell.address,
+                    0x98 | 0xa0 | 0xd8 | 0xe0 | 0xe8 | 0x110 | 0x128
+                ),
             format!(
                 "Detcore validate allocation/TLS shape differs: allocation length {}, cell offset {:#x}",
                 allocation_bytes.len(),
