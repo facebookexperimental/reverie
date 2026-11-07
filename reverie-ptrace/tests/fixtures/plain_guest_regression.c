@@ -6566,6 +6566,31 @@ static void sigtrap_self_queued(int unblock, int ignore) {
   long r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&none, 8, SHAPE_INJECT);
   say("selfq ppoll r=%ld handled=%d code=%d\n", r, sq_n, sq_code);
 }
+/* As the unblock self-queued mode, but a kernel POSIX timer kills
+ * this thread 200 ms later, while the queued SIGTRAP is at its
+ * delivery stop, so the tracer can find the thread in its exit
+ * stop while classifying that stop. The timer needs no guest
+ * syscall at expiry, so it lands even while the tracer holds
+ * classification. */
+static void mode_sigtrap_self_queued_then_group_kill(void) {
+  struct sigevent sev;
+  memset(&sev, 0, sizeof sev);
+  sev.sigev_notify = SIGEV_THREAD_ID;
+  sev.sigev_signo = SIGKILL;
+  sev._sigev_un._tid = (pid_t)syscall(SYS_gettid);
+  timer_t timerid;
+  if (timer_create(CLOCK_MONOTONIC, &sev, &timerid) != 0)
+    die("timer_create SIGKILL");
+  struct itimerspec its;
+  memset(&its, 0, sizeof its);
+  its.it_value.tv_nsec = 200000000;
+  if (timer_settime(timerid, 0, &its, NULL) != 0)
+    die("timer_settime SIGKILL");
+  sigtrap_self_queued(1, 0);
+  /* The timer SIGKILL lands while the unblocked SIGTRAP above is at
+   * its delivery stop; reaching here at all means it did not. */
+  say("selfqkill survived\n");
+}
 static void mode_sigtrap_self_queued_ppoll(void) {
   sigtrap_self_queued(0, 0);
 }
@@ -6589,6 +6614,8 @@ int main(int argc, char** argv) {
   const char* m = argv[1];
   if (!strcmp(m, "sig_pending"))
     mode_sig_pending();
+  else if (!strcmp(m, "sigtrap_self_queued_then_group_kill"))
+    mode_sigtrap_self_queued_then_group_kill();
   else if (!strcmp(m, "sigtrap_self_queued_ppoll"))
     mode_sigtrap_self_queued_ppoll();
   else if (!strcmp(m, "sigtrap_self_queued_unblock"))

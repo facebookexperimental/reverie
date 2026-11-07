@@ -7512,6 +7512,54 @@ async fn a_self_queued_sigtrap_the_guest_ignores_is_dropped_as_natively() {
     }
 }
 
+/// The self-queued SIGTRAP above, with a sibling SIGKILLing the group
+/// while its delivery stop is being classified: classification is held
+/// (test hook) until the thread's exit stop is published, so the siginfo
+/// it then reads is the exit stop's (code 1541, its fault member holding
+/// pid/uid). That is the thread leaving the classified stop for its exit
+/// stop, not a guest SIGTRAP no trap explains (dh-ovzxo): the run ends
+/// with the guest's own SIGKILL instead of `UnattributedSigtrap`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_self_queued_sigtrap_overtaken_by_a_group_kill_is_not_unattributed() {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            crate::task::SIGTRAP_CLASSIFY_EXIT_HOLD.store(false, Ordering::SeqCst);
+            crate::task::SIGTRAP_CLASSIFY_EXIT_OBSERVED.store(false, Ordering::SeqCst);
+        }
+    }
+    for tail in [false, true] {
+        let _clear = Clear;
+        crate::task::SIGTRAP_CLASSIFY_EXIT_OBSERVED.store(false, Ordering::SeqCst);
+        crate::task::SIGTRAP_CLASSIFY_EXIT_HOLD.store(true, Ordering::SeqCst);
+        let options = GuestOptions {
+            tail,
+            ..GuestOptions::default()
+        };
+        let run = run_guest_options("sigtrap_self_queued_then_group_kill", options)
+            .await
+            .unwrap_or_else(|error| panic!("tail={tail}: group-killed run was refused: {error:#}"));
+        assert!(
+            crate::task::SIGTRAP_CLASSIFY_EXIT_OBSERVED.load(Ordering::SeqCst),
+            "tail={tail}: classification never met the published exit stop (hold fired {} times): status={:?} report={}",
+            crate::task::SIGTRAP_CLASSIFY_HOLD_FIRED.load(Ordering::SeqCst),
+            run.status,
+            run.report
+        );
+        assert_eq!(
+            run.status,
+            ExitStatus::Signaled(Signal::SIGKILL, false),
+            "tail={tail}: {}",
+            run.report
+        );
+        assert!(
+            !run.report.contains("selfqkill survived"),
+            "tail={tail}: {}",
+            run.report
+        );
+    }
+}
+
 /// Limit L1 of <https://github.com/rrnewton/reverie/issues/1262>, pinned: a
 /// mask-swapping wait that a Tool's signal callback injects (SIGVTALRM's
 /// `ppoll`, whose temporary mask blocks a caught SIGTRAP and admits a pending
