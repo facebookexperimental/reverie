@@ -16,11 +16,14 @@
 //! except through the stage that currently owns it:
 //!
 //! ```
+//! let manifest = &reverie_loader::manifest::LOADER_MANIFEST;
 //! let mapped = reverie_loader::stage::Mapped::from_mapped_stop(7u32);
 //! let (_handed_off, stop) = mapped
 //!     .runtime_started()
-//!     .tool_ready()
-//!     .armed()
+//!     .tool_ready(manifest, 0x1000, Some(0x1000))
+//!     .expect("launched entry satisfies the manifest init contract")
+//!     .armed(manifest.controls, reverie_loader::manifest::Controls::NONE)
+//!     .expect("every required control is armed")
 //!     .hand_over();
 //! assert_eq!(stop, 7);
 //! ```
@@ -48,6 +51,15 @@
 //! launcher's physical work, done while holding the stop through
 //! [`Mapped::stop_mut`] and its siblings, and refusal at any step is
 //! total: the launcher tears the stop down instead of advancing.
+//! The transitions that claim init and arming take evidence — the
+//! manifest plus the entry actually launched, and the controls
+//! actually armed — and refuse by name, returning the stage, when
+//! that evidence does not satisfy the manifest.
+
+use crate::manifest::Control;
+use crate::manifest::Controls;
+use crate::manifest::InitRefusal;
+use crate::manifest::ToolManifest;
 
 /// The loader and runtime images are mapped at their fixed addresses.
 /// Owns the stopped task `S`.
@@ -136,9 +148,23 @@ impl<S> RuntimeStarted<S> {
     }
 
     /// The tool is ready: tool initialization has completed per its
-    /// init contract.
-    pub fn tool_ready(self) -> ToolReady<S> {
-        ToolReady(self.0)
+    /// init contract. Takes evidence: the manifest, the checked
+    /// image's entry point, and the entry the launcher actually
+    /// launched (`None` if it launched nothing). Refuses by name,
+    /// returning this stage for teardown, unless the launched
+    /// entry is exactly what the manifest's init contract requires
+    /// — an image is never silently run as if it had declared a
+    /// different init.
+    pub fn tool_ready(
+        self,
+        manifest: &ToolManifest,
+        image_entry: u64,
+        launched_entry: Option<u64>,
+    ) -> Result<ToolReady<S>, (Self, InitRefusal)> {
+        match manifest.check_init_entry(image_entry, launched_entry) {
+            Ok(()) => Ok(ToolReady(self.0)),
+            Err(refusal) => Err((self, refusal)),
+        }
     }
 }
 
@@ -159,12 +185,21 @@ impl<S> ToolReady<S> {
         self.0
     }
 
-    /// Every control the tool's manifest requires is armed. Callers
-    /// must have established that — for example via
-    /// [`crate::manifest::Controls::unmet`] returning `None` — before
-    /// claiming this stage.
-    pub fn armed(self) -> Armed<S> {
-        Armed(self.0)
+    /// Every control the tool's manifest requires is armed. Takes
+    /// evidence: the required controls (from the manifest) and the
+    /// controls actually armed. Refuses by name, returning this
+    /// stage for teardown, while any required control is unmet —
+    /// the check lives here, in the loader, so a launcher cannot
+    /// claim `Armed` without it succeeding.
+    pub fn armed(
+        self,
+        required: Controls,
+        armed: Controls,
+    ) -> Result<Armed<S>, (Self, Control)> {
+        match required.unmet(armed) {
+            None => Ok(Armed(self.0)),
+            Some(unmet) => Err((self, unmet)),
+        }
     }
 }
 
@@ -197,9 +232,22 @@ impl<S> Armed<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::InitContract;
+    use crate::manifest::LOADER_MANIFEST;
+    use crate::manifest::PROBE_RUNTIME_MANIFEST;
 
     #[derive(Debug, PartialEq, Eq)]
     struct DummyStop(u32);
+
+    const ENTRY: u64 = 0x1000;
+
+    fn ready(stop: DummyStop) -> ToolReady<DummyStop> {
+        Mapped::from_mapped_stop(stop)
+            .runtime_started()
+            .tool_ready(&LOADER_MANIFEST, ENTRY, Some(ENTRY))
+            .map_err(|(_stage, refusal)| refusal)
+            .expect("image-entry init at the image entry")
+    }
 
     #[test]
     fn the_stages_chain_in_order_carrying_the_stop() {
@@ -207,8 +255,82 @@ mod tests {
         let mut started = mapped.runtime_started();
         started.stop_mut().0 += 1;
         assert_eq!(started.stop(), &DummyStop(2));
-        let (_done, stop) = started.tool_ready().armed().hand_over();
+        let (_done, stop) = started
+            .tool_ready(&LOADER_MANIFEST, ENTRY, Some(ENTRY))
+            .map_err(|(_stage, refusal)| refusal)
+            .expect("image-entry init at the image entry")
+            .armed(LOADER_MANIFEST.controls, Controls::NONE)
+            .map_err(|(_stage, unmet)| unmet)
+            .expect("no controls required")
+            .hand_over();
         assert_eq!(stop, DummyStop(2));
+    }
+
+    #[test]
+    fn tool_ready_refuses_an_init_entry_mismatch_by_name() {
+        // ImageEntry declared, a different entry launched.
+        let (stage, refusal) = Mapped::from_mapped_stop(DummyStop(3))
+            .runtime_started()
+            .tool_ready(&LOADER_MANIFEST, ENTRY, Some(ENTRY + 0x1000))
+            .err()
+            .expect("mismatched entry must refuse");
+        assert_eq!(
+            refusal,
+            InitRefusal::ExpectedImageEntry {
+                image_entry: ENTRY,
+                launched_entry: Some(ENTRY + 0x1000),
+            }
+        );
+        assert_eq!(stage.into_stop(), DummyStop(3));
+        // Address declared, the image entry launched instead.
+        let mut address_manifest = LOADER_MANIFEST.clone();
+        address_manifest.init = InitContract::Address(ENTRY + 0x2000);
+        let (stage, refusal) = Mapped::from_mapped_stop(DummyStop(4))
+            .runtime_started()
+            .tool_ready(&address_manifest, ENTRY, Some(ENTRY))
+            .err()
+            .expect("address init run as image entry must refuse");
+        assert_eq!(
+            refusal,
+            InitRefusal::ExpectedAddress {
+                address: ENTRY + 0x2000,
+                launched_entry: Some(ENTRY),
+            }
+        );
+        assert_eq!(stage.into_stop(), DummyStop(4));
+        // None declared, an entry launched anyway.
+        let mut none_manifest = LOADER_MANIFEST.clone();
+        none_manifest.init = InitContract::None;
+        let (stage, refusal) = Mapped::from_mapped_stop(DummyStop(5))
+            .runtime_started()
+            .tool_ready(&none_manifest, ENTRY, Some(ENTRY))
+            .err()
+            .expect("no-init manifest entered anyway must refuse");
+        assert_eq!(
+            refusal,
+            InitRefusal::ExpectedNoEntry {
+                launched_entry: ENTRY,
+            }
+        );
+        assert_eq!(stage.into_stop(), DummyStop(5));
+    }
+
+    #[test]
+    fn armed_refuses_an_unmet_control_by_name() {
+        let required = PROBE_RUNTIME_MANIFEST.controls;
+        let (stage, unmet) = ready(DummyStop(6))
+            .armed(required, Controls::NONE)
+            .err()
+            .expect("unarmed controls must refuse");
+        assert_eq!(unmet, Control::TrapFilter);
+        // The stage is returned, so the stop remains teardown-able,
+        // and the same stage succeeds once the evidence satisfies it.
+        let (_done, stop) = stage
+            .armed(required, required)
+            .map_err(|(_stage, unmet)| unmet)
+            .expect("exactly the required controls armed")
+            .hand_over();
+        assert_eq!(stop, DummyStop(6));
     }
 
     #[test]
@@ -223,18 +345,12 @@ mod tests {
                 .into_stop(),
             DummyStop(0)
         );
+        assert_eq!(ready(DummyStop(0)).into_stop(), DummyStop(0));
         assert_eq!(
-            Mapped::from_mapped_stop(DummyStop(0))
-                .runtime_started()
-                .tool_ready()
-                .into_stop(),
-            DummyStop(0)
-        );
-        assert_eq!(
-            Mapped::from_mapped_stop(DummyStop(0))
-                .runtime_started()
-                .tool_ready()
-                .armed()
+            ready(DummyStop(0))
+                .armed(Controls::NONE, Controls::NONE)
+                .map_err(|(_stage, unmet)| unmet)
+                .expect("no controls required")
                 .into_stop(),
             DummyStop(0)
         );

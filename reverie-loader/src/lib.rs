@@ -57,5 +57,6 @@ pub use manifest::Controls;
 pub use manifest::GateRange;
 pub use manifest::ImageSpec;
 pub use manifest::InitContract;
+pub use manifest::InitRefusal;
 pub use manifest::ManifestError;
 pub use manifest::ToolManifest;

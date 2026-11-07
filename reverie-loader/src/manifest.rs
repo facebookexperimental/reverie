@@ -50,6 +50,7 @@ pub struct ImageSpec {
 
 /// How the loader initializes the tool after mapping, before arming.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InitContract {
     /// Run the image's own entry point; readiness is the image's to
     /// signal by its own convention.
@@ -63,6 +64,7 @@ pub enum InitContract {
 
 /// One control the loader can arm, named for refusals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Control {
     /// The syscall trap filter.
     TrapFilter,
@@ -121,22 +123,40 @@ impl Controls {
     /// A launcher must refuse handoff while this returns `Some`
     /// (refusal is total: the guest never runs partially armed).
     pub const fn unmet(self, armed: Self) -> Option<Control> {
-        if self.trap_filter && !armed.trap_filter {
+        // Destructure both sets so adding a control field without
+        // handling it here is a compile error, not a silent pass.
+        let Self {
+            trap_filter,
+            cpuid_faulting,
+            rdtsc_trapping,
+            vdso_rewrite,
+            sigsys_handler,
+            sigsegv_handler,
+        } = self;
+        let Self {
+            trap_filter: armed_trap_filter,
+            cpuid_faulting: armed_cpuid_faulting,
+            rdtsc_trapping: armed_rdtsc_trapping,
+            vdso_rewrite: armed_vdso_rewrite,
+            sigsys_handler: armed_sigsys_handler,
+            sigsegv_handler: armed_sigsegv_handler,
+        } = armed;
+        if trap_filter && !armed_trap_filter {
             return Some(Control::TrapFilter);
         }
-        if self.cpuid_faulting && !armed.cpuid_faulting {
+        if cpuid_faulting && !armed_cpuid_faulting {
             return Some(Control::CpuidFaulting);
         }
-        if self.rdtsc_trapping && !armed.rdtsc_trapping {
+        if rdtsc_trapping && !armed_rdtsc_trapping {
             return Some(Control::RdtscTrapping);
         }
-        if self.vdso_rewrite && !armed.vdso_rewrite {
+        if vdso_rewrite && !armed_vdso_rewrite {
             return Some(Control::VdsoRewrite);
         }
-        if self.sigsys_handler && !armed.sigsys_handler {
+        if sigsys_handler && !armed_sigsys_handler {
             return Some(Control::SigsysHandler);
         }
-        if self.sigsegv_handler && !armed.sigsegv_handler {
+        if sigsegv_handler && !armed_sigsegv_handler {
             return Some(Control::SigsegvHandler);
         }
         None
@@ -146,6 +166,7 @@ impl Controls {
 /// Why a manifest is not internally consistent. Each refusal is named;
 /// none depends on any image bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ManifestError {
     /// The image window is empty.
     EmptyWindow,
@@ -182,6 +203,52 @@ pub enum ManifestError {
         /// The init address.
         address: u64,
     },
+    /// The page size is not the one this x86-64 loader maps with
+    /// ([`crate::image::PAGE_SIZE`], 4 KiB). Returned by
+    /// [`ToolManifest::validate_with_page_size`] so a launcher on a
+    /// host with any other page size refuses by name instead of
+    /// silently assuming 4 KiB alignment.
+    UnsupportedPageSize {
+        /// The page size that was supplied.
+        page_size: u64,
+    },
+}
+
+/// Why a launcher's actual init entry does not satisfy a manifest's
+/// [`InitContract`]. Each refusal is named; a launcher must refuse
+/// handoff (and, where it can, refuse before launching at all) rather
+/// than run an image as if it had declared a different init.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InitRefusal {
+    /// The manifest requires the image entry, but the launcher
+    /// entered (or would enter) somewhere else, or nowhere.
+    ExpectedImageEntry {
+        /// The checked image's entry point.
+        image_entry: u64,
+        /// The entry the launcher actually used, if any.
+        launched_entry: Option<u64>,
+    },
+    /// The manifest requires a fixed init address, but the launcher
+    /// entered (or would enter) somewhere else, or nowhere.
+    ExpectedAddress {
+        /// The declared init address.
+        address: u64,
+        /// The entry the launcher actually used, if any.
+        launched_entry: Option<u64>,
+    },
+    /// The manifest requires no loader-driven entry, but the
+    /// launcher entered (or would enter) the image.
+    ExpectedNoEntry {
+        /// The entry the launcher actually used.
+        launched_entry: u64,
+    },
+    /// This launcher only honours [`InitContract::ImageEntry`] and
+    /// the manifest declares a different init contract.
+    UnsupportedInit {
+        /// The declared init contract.
+        init: InitContract,
+    },
 }
 
 /// What a tool provides to the loader. Data only; see the module docs.
@@ -208,11 +275,27 @@ impl ToolManifest {
     /// of an init address needs an image and is checked by
     /// [`crate::artifact::check_image`].
     pub fn validate(&self) -> Result<(), ManifestError> {
+        self.validate_with_page_size(PAGE_SIZE)
+    }
+
+    /// [`validate`](Self::validate) against an explicit page size.
+    ///
+    /// This loader contract is x86-64 with 4 KiB pages only: image
+    /// validation, gate pages and segment rounding all use
+    /// [`crate::image::PAGE_SIZE`]. Taking the size as an input lets
+    /// a launcher pass its host page size and get a named
+    /// [`ManifestError::UnsupportedPageSize`] refusal on any other
+    /// host (for example a 64 KiB-page host) instead of the 4 KiB
+    /// assumption being baked in silently.
+    pub fn validate_with_page_size(&self, page_size: u64) -> Result<(), ManifestError> {
+        if page_size != PAGE_SIZE {
+            return Err(ManifestError::UnsupportedPageSize { page_size });
+        }
         let window = &self.image.policy.window;
         if window.is_empty() {
             return Err(ManifestError::EmptyWindow);
         }
-        if !window.start.is_multiple_of(PAGE_SIZE) || !window.end.is_multiple_of(PAGE_SIZE) {
+        if !window.start.is_multiple_of(page_size) || !window.end.is_multiple_of(page_size) {
             return Err(ManifestError::WindowMisaligned);
         }
         if window.start < TOOL_REGION.start || window.end > TOOL_REGION.end {
@@ -225,7 +308,7 @@ impl ToolManifest {
             if gate.is_empty() {
                 return Err(ManifestError::EmptyGate { index });
             }
-            if !gate.start.is_multiple_of(PAGE_SIZE) || !gate.end.is_multiple_of(PAGE_SIZE) {
+            if !gate.start.is_multiple_of(page_size) || !gate.end.is_multiple_of(page_size) {
                 return Err(ManifestError::GateMisaligned { index });
             }
             if gate.start < window.start || gate.end > window.end {
@@ -247,6 +330,66 @@ impl ToolManifest {
         }
         Ok(())
     }
+
+    /// The entry a launcher must use to honour this manifest's init
+    /// contract for an image whose entry point is `image_entry`:
+    /// the image entry itself, the declared address, or no entry.
+    pub const fn expected_init_entry(&self, image_entry: u64) -> Option<u64> {
+        match self.init {
+            InitContract::ImageEntry => Some(image_entry),
+            InitContract::Address(address) => Some(address),
+            InitContract::None => None,
+        }
+    }
+
+    /// Refuses by name unless `launched_entry` is exactly the entry
+    /// this manifest's init contract requires for `image_entry`.
+    /// A launcher calls this with the entry it launched (or is
+    /// about to launch); anything else means the image ran as if
+    /// it had declared a different init.
+    pub const fn check_init_entry(
+        &self,
+        image_entry: u64,
+        launched_entry: Option<u64>,
+    ) -> Result<(), InitRefusal> {
+        match self.init {
+            InitContract::ImageEntry => {
+                if matches!(launched_entry, Some(entry) if entry == image_entry) {
+                    Ok(())
+                } else {
+                    Err(InitRefusal::ExpectedImageEntry {
+                        image_entry,
+                        launched_entry,
+                    })
+                }
+            }
+            InitContract::Address(address) => {
+                if matches!(launched_entry, Some(entry) if entry == address) {
+                    Ok(())
+                } else {
+                    Err(InitRefusal::ExpectedAddress {
+                        address,
+                        launched_entry,
+                    })
+                }
+            }
+            InitContract::None => match launched_entry {
+                None => Ok(()),
+                Some(launched_entry) => Err(InitRefusal::ExpectedNoEntry { launched_entry }),
+            },
+        }
+    }
+
+    /// Refuses by name unless this manifest declares
+    /// [`InitContract::ImageEntry`]. For launchers that only ever
+    /// enter an image at its own entry point: any other contract
+    /// is a named refusal, never silently run as `ImageEntry`.
+    pub const fn require_image_entry_init(&self) -> Result<(), InitRefusal> {
+        match self.init {
+            InitContract::ImageEntry => Ok(()),
+            init => Err(InitRefusal::UnsupportedInit { init }),
+        }
+    }
 }
 
 /// The loader image, expressed as a manifest. The loader is not a tool:
@@ -262,9 +405,12 @@ pub const LOADER_MANIFEST: ToolManifest = ToolManifest {
     init: InitContract::ImageEntry,
 };
 
-/// The production tool runtime, expressed as a manifest: the runtime
-/// window with TLS allowed on its own FS base, its gate page, every
-/// control armed before handoff, initialization from its entry point.
+/// The production-shaped tool runtime, expressed as a manifest: the
+/// runtime window with TLS allowed on its own FS base, its gate
+/// page, every control armed before handoff, initialization from
+/// its entry point. No launcher consumes this manifest yet; it is
+/// the checked-in contract the production runtime image is checked
+/// against (see `check_runtime` equivalence in `artifact` tests).
 pub const RUNTIME_MANIFEST: ToolManifest = ToolManifest {
     image: ImageSpec {
         policy: RUNTIME_POLICY,
@@ -394,22 +540,159 @@ mod tests {
 
     #[test]
     fn the_checked_in_manifests_carry_the_existing_constants() {
-        assert_eq!(LOADER_MANIFEST.image.policy, LOADER_POLICY);
-        assert_eq!(RUNTIME_MANIFEST.image.policy, RUNTIME_POLICY);
+        // Full-content pins: every field of every checked-in manifest
+        // (image policy, gates, controls, init) is asserted exactly,
+        // so no field — in particular a probe/counter control bit —
+        // can drift silently. Flipping e.g. the probe's
+        // `trap_filter` to false must fail this test by name.
         assert_eq!(
-            PROBE_RUNTIME_MANIFEST.image.policy,
-            Policy {
-                window: RUNTIME_WINDOW,
-                allow_tls: false,
+            LOADER_MANIFEST,
+            ToolManifest {
+                image: ImageSpec {
+                    policy: LOADER_POLICY,
+                },
+                gates: core::slice::from_ref(&LOADER_GATE),
+                controls: Controls::NONE,
+                init: InitContract::ImageEntry,
             }
         );
-        assert_eq!(LOADER_MANIFEST.gates, &[LOADER_GATE]);
-        assert_eq!(RUNTIME_MANIFEST.gates, &[RUNTIME_GATE]);
-        assert_eq!(LOADER_MANIFEST.controls, Controls::NONE);
-        assert_eq!(RUNTIME_MANIFEST.controls, Controls::ALL);
+        assert_eq!(
+            RUNTIME_MANIFEST,
+            ToolManifest {
+                image: ImageSpec {
+                    policy: RUNTIME_POLICY,
+                },
+                gates: core::slice::from_ref(&RUNTIME_GATE),
+                controls: Controls::ALL,
+                init: InitContract::ImageEntry,
+            }
+        );
+        assert_eq!(
+            PROBE_RUNTIME_MANIFEST,
+            ToolManifest {
+                image: ImageSpec {
+                    policy: Policy {
+                        window: RUNTIME_WINDOW,
+                        allow_tls: false,
+                    },
+                },
+                gates: core::slice::from_ref(&RUNTIME_GATE),
+                controls: Controls {
+                    trap_filter: true,
+                    cpuid_faulting: true,
+                    rdtsc_trapping: true,
+                    vdso_rewrite: false,
+                    sigsys_handler: true,
+                    sigsegv_handler: true,
+                },
+                init: InitContract::ImageEntry,
+            }
+        );
+        assert_eq!(
+            COUNTER_RUNTIME_MANIFEST,
+            ToolManifest {
+                image: ImageSpec {
+                    policy: Policy {
+                        window: RUNTIME_WINDOW,
+                        allow_tls: false,
+                    },
+                },
+                gates: core::slice::from_ref(&RUNTIME_GATE),
+                controls: Controls {
+                    trap_filter: true,
+                    cpuid_faulting: false,
+                    rdtsc_trapping: false,
+                    vdso_rewrite: false,
+                    sigsys_handler: true,
+                    sigsegv_handler: false,
+                },
+                init: InitContract::ImageEntry,
+            }
+        );
+        // The probe controls check can fail, by name, in field order:
+        // it is not a tautology against Controls::ALL.
         let probe_controls = PROBE_RUNTIME_MANIFEST.controls;
-        assert!(!probe_controls.vdso_rewrite);
-        assert_eq!(probe_controls.unmet(Controls::ALL), None);
+        assert_eq!(probe_controls.unmet(Controls::NONE), Some(Control::TrapFilter));
+        assert_eq!(
+            probe_controls.unmet(Controls {
+                trap_filter: true,
+                ..Controls::NONE
+            }),
+            Some(Control::CpuidFaulting)
+        );
+        assert_eq!(probe_controls.unmet(probe_controls), None);
+    }
+
+    #[test]
+    fn an_unsupported_page_size_is_refused_by_name() {
+        assert_eq!(PROBE_RUNTIME_MANIFEST.validate_with_page_size(PAGE_SIZE), Ok(()));
+        assert_eq!(
+            PROBE_RUNTIME_MANIFEST.validate_with_page_size(65_536),
+            Err(ManifestError::UnsupportedPageSize { page_size: 65_536 })
+        );
+        assert_eq!(
+            COUNTER_RUNTIME_MANIFEST.validate_with_page_size(16_384),
+            Err(ManifestError::UnsupportedPageSize { page_size: 16_384 })
+        );
+        assert_eq!(
+            RUNTIME_MANIFEST.validate_with_page_size(0),
+            Err(ManifestError::UnsupportedPageSize { page_size: 0 })
+        );
+    }
+
+    #[test]
+    fn an_init_entry_mismatch_is_refused_by_name() {
+        let entry = 0x6000_e100_1000_u64;
+        let mut m = manifest(LOADER_WINDOW, &[LOADER_GATE]);
+        m.init = InitContract::ImageEntry;
+        assert_eq!(m.expected_init_entry(entry), Some(entry));
+        assert_eq!(m.check_init_entry(entry, Some(entry)), Ok(()));
+        assert_eq!(
+            m.check_init_entry(entry, Some(entry + 0x1000)),
+            Err(InitRefusal::ExpectedImageEntry {
+                image_entry: entry,
+                launched_entry: Some(entry + 0x1000),
+            })
+        );
+        assert_eq!(
+            m.check_init_entry(entry, None),
+            Err(InitRefusal::ExpectedImageEntry {
+                image_entry: entry,
+                launched_entry: None,
+            })
+        );
+        assert_eq!(m.require_image_entry_init(), Ok(()));
+        m.init = InitContract::Address(entry + 0x2000);
+        assert_eq!(m.expected_init_entry(entry), Some(entry + 0x2000));
+        assert_eq!(m.check_init_entry(entry, Some(entry + 0x2000)), Ok(()));
+        assert_eq!(
+            m.check_init_entry(entry, Some(entry)),
+            Err(InitRefusal::ExpectedAddress {
+                address: entry + 0x2000,
+                launched_entry: Some(entry),
+            })
+        );
+        assert_eq!(
+            m.require_image_entry_init(),
+            Err(InitRefusal::UnsupportedInit {
+                init: InitContract::Address(entry + 0x2000),
+            })
+        );
+        m.init = InitContract::None;
+        assert_eq!(m.expected_init_entry(entry), None);
+        assert_eq!(m.check_init_entry(entry, None), Ok(()));
+        assert_eq!(
+            m.check_init_entry(entry, Some(entry)),
+            Err(InitRefusal::ExpectedNoEntry {
+                launched_entry: entry,
+            })
+        );
+        assert_eq!(
+            m.require_image_entry_init(),
+            Err(InitRefusal::UnsupportedInit {
+                init: InitContract::None,
+            })
+        );
     }
 
     #[test]

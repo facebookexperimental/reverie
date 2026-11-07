@@ -26,7 +26,11 @@ pub use private_runtime::PrivateRuntimeMetadata;
 pub use private_runtime::PrivateRuntimeMetadataError;
 pub use private_runtime::TlsTemplate;
 
-/// The page size the loader maps with.
+/// The page size the loader maps with. This public contract is
+/// x86-64 with 4 KiB pages only; a launcher must refuse other host
+/// page sizes by name (see
+/// [`crate::manifest::ToolManifest::validate_with_page_size`])
+/// instead of assuming this value holds on its host.
 pub const PAGE_SIZE: u64 = 4096;
 
 /// The most loadable segments an image may have. The loader and runtime

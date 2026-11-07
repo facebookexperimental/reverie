@@ -41,7 +41,10 @@ use reverie_inguest::launcher::exec_stop::register_words;
 use reverie_loader::artifact;
 use reverie_loader::manifest::COUNTER_RUNTIME_MANIFEST;
 use reverie_loader::manifest::Controls;
+use reverie_loader::manifest::ToolManifest;
+use reverie_loader::stage::Armed;
 use reverie_loader::stage::Mapped;
+use reverie_loader::stage::ToolReady;
 use safeptrace::Event;
 use safeptrace::ExitStatus;
 use safeptrace::Regs;
@@ -85,11 +88,34 @@ impl RuntimeKind {
         }
     }
 
-    fn required_controls(self) -> u64 {
+    /// The protocol bits with no manifest counterpart (alternate
+    /// stack, closed descriptors, self-test probes) for this kind.
+    fn mechanics_controls(self) -> u64 {
         match self {
-            RuntimeKind::Probe => REQUIRED_CONTROLS,
-            RuntimeKind::Counter => COUNTER_REQUIRED_CONTROLS,
+            RuntimeKind::Probe => {
+                CONTROL_ALTSTACK
+                    | CONTROL_FDS_CLOSED
+                    | CONTROL_CPUID_PROBE
+                    | CONTROL_TSC_PROBE
+                    | CONTROL_SYSCALL_PROBE
+            }
+            RuntimeKind::Counter => {
+                CONTROL_ALTSTACK | CONTROL_FDS_CLOSED | CONTROL_SYSCALL_PROBE
+            }
         }
+    }
+
+    /// The required protocol control word, derived from this kind's
+    /// manifest controls plus its mechanics bits — never a second
+    /// hard-coded table that could drift from the manifest. The
+    /// checked-in manifests derive exactly `REQUIRED_CONTROLS` /
+    /// `COUNTER_REQUIRED_CONTROLS`, which the fixture images are
+    /// built against; the unit tests pin that agreement.
+    fn required_controls(self) -> u64 {
+        protocol_controls_for(
+            self.image_kind().manifest().controls,
+            self.mechanics_controls(),
+        )
     }
 
     fn ready_evidence(self) -> control::ReadyEvidence {
@@ -169,6 +195,76 @@ fn armed_controls(controls: u64) -> Controls {
     }
 }
 
+/// The inverse of [`armed_controls`]: the protocol word a manifest's
+/// controls require, plus `mechanics` bits with no manifest
+/// counterpart. There is no vDSO-rewrite protocol bit, so a manifest
+/// requiring it can never be reported armed on this lane and is
+/// refused by name at [`claim_armed`] — never silently dropped.
+fn protocol_controls_for(controls: Controls, mechanics: u64) -> u64 {
+    let mut word = mechanics;
+    if controls.trap_filter {
+        word |= CONTROL_FILTER;
+    }
+    if controls.cpuid_faulting {
+        word |= CONTROL_CPUID;
+    }
+    if controls.rdtsc_trapping {
+        word |= CONTROL_TSC;
+    }
+    if controls.sigsys_handler {
+        word |= CONTROL_SIGSYS;
+    }
+    if controls.sigsegv_handler {
+        word |= CONTROL_SIGSEGV;
+    }
+    word
+}
+
+/// The entry this launcher will launch for `manifest`, or a named
+/// refusal. This launcher only ever enters an image at its own
+/// entry point, so it reads `manifest.init` and refuses any
+/// contract other than `ImageEntry` by name, before anything is
+/// spawned or mapped — a `Custom` manifest declaring `Address(x)`
+/// or `None` is never run as if it said `ImageEntry`.
+fn launcher_entry_for(manifest: &ToolManifest, image_entry: u64) -> Result<u64> {
+    manifest.require_image_entry_init().map_err(|refusal| {
+        format!("loader refused: unsupported init contract: {refusal:?}")
+    })?;
+    manifest
+        .check_init_entry(image_entry, Some(image_entry))
+        .map_err(|refusal| format!("loader refused: init entry mismatch: {refusal:?}"))?;
+    Ok(image_entry)
+}
+
+/// Refuses by name on any host page size this x86-64/4 KiB loader
+/// contract does not support. The size is an input so the refused
+/// case is testable without a 64 KiB-page host.
+fn refuse_unsupported_page_size(manifest: &ToolManifest, page_size: u64) -> Result<()> {
+    manifest.validate_with_page_size(page_size).map_err(|error| {
+        format!("loader refused: unsupported host page size {page_size}: {error:?}").into()
+    })
+}
+
+/// The host page size, from the auxiliary vector (not `sysconf`).
+fn host_page_size() -> Result<u64> {
+    reverie_inguest::guest::support::page_size()
+        .map_err(|error| format!("loader refused: host page size unavailable: {error}").into())
+}
+
+/// Claims the `Armed` stage from the reported protocol word: the
+/// loader's single armed-transition call site. The evidence is
+/// the word mapped through [`armed_controls`]; the stage
+/// transition itself performs the manifest `unmet` check and this
+/// helper names any unmet control as a total refusal.
+fn claim_armed<S>(ready: ToolReady<S>, manifest: &ToolManifest, controls: u64) -> Result<Armed<S>> {
+    ready
+        .armed(manifest.controls, armed_controls(controls))
+        .map_err(|(_stage, unmet)| {
+            format!("loader refused: required control not armed: {unmet:?} (controls={controls:#x})")
+                .into()
+        })
+}
+
 fn run(
     loader: &SealedImage,
     runtime: &SealedImage,
@@ -187,6 +283,15 @@ fn run(
     report["runtime_kind"] = json!(runtime_kind.name());
     let loader_image = loader.checked()?;
     let runtime_image = runtime.checked()?;
+    // Refuse before spawning anything: this x86-64 loader contract
+    // is 4 KiB-page only, and this launcher only honours
+    // ImageEntry init. Both manifests are read here; the entries
+    // below are the only entries this run will launch.
+    let host_page_size = host_page_size()?;
+    refuse_unsupported_page_size(loader.kind().manifest(), host_page_size)?;
+    refuse_unsupported_page_size(runtime.kind().manifest(), host_page_size)?;
+    let loader_entry = launcher_entry_for(loader.kind().manifest(), loader_image.entry())?;
+    let runtime_entry = launcher_entry_for(runtime.kind().manifest(), runtime_image.entry())?;
     let inherited = [loader.fd(), runtime.fd(), observations.as_raw_fd()];
     let environment: Vec<_> = std::env::vars_os().collect();
     let launch = PreparedExec::new(
@@ -248,7 +353,7 @@ fn run(
         observations,
         &entry,
         mask,
-        runtime_image.entry(),
+        runtime_entry,
         &inherited,
         runtime_kind.required_controls(),
     )?;
@@ -313,7 +418,7 @@ fn run(
     };
     let mut mapped = Mapped::from_mapped_stop(bundle);
     let mut bootstrap = entry;
-    bootstrap.rip = loader_image.entry();
+    bootstrap.rip = loader_entry;
     bootstrap.rsp = STACK_TOP - 8; // SysV function entry, private zero return slot.
     bootstrap.rdi = CONTROL_ADDRESS;
     bootstrap.orig_rax = u64::MAX;
@@ -348,21 +453,19 @@ fn run(
     if let Some(address) = witness_address {
         report["witness_at_ready"] = json!(read_witness(started.stop().task(), address)?);
     }
-    let ready = started.tool_ready();
-    // Armed is claimed only once every control the running runtime's
-    // manifest requires is reported armed; an unmet control is a
-    // named refusal, never a partially armed handoff.
-    if let Some(unmet) = runtime
-        .kind()
-        .manifest()
-        .controls
-        .unmet(armed_controls(controls))
-    {
-        return Err(format!(
-            "loader refused: required control not armed: {unmet:?} (controls={controls:#x})"
-        )
-        .into());
-    }
+    // ToolReady is claimed only with init evidence: the runtime
+    // manifest, its image entry, and the entry actually launched
+    // above. A mismatch is a named refusal, never a silent pass.
+    let ready = match started.tool_ready(
+        runtime.kind().manifest(),
+        runtime_image.entry(),
+        Some(runtime_entry),
+    ) {
+        Ok(ready) => ready,
+        Err((_stage, refusal)) => {
+            return Err(format!("loader refused: init entry mismatch: {refusal:?}").into());
+        }
+    };
     for fd in inherited {
         match std::fs::symlink_metadata(format!("/proc/{pid}/fd/{fd}")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -373,7 +476,11 @@ fn run(
             }
         }
     }
-    let armed = ready.armed();
+    // Armed is claimed only once every control the running runtime's
+    // manifest requires is reported armed; an unmet control is a
+    // named refusal at this single call site, never a partially
+    // armed handoff.
+    let armed = claim_armed(ready, runtime.kind().manifest(), controls)?;
     {
         let stop = armed.stop();
         stop.context.restore(stop.task())?;
@@ -1045,4 +1152,123 @@ fn main() {
         REFUSAL_EXIT
     };
     std::process::exit(status);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reverie_loader::manifest::InitContract;
+    use reverie_loader::manifest::PROBE_RUNTIME_MANIFEST;
+
+    fn dummy_ready() -> ToolReady<u32> {
+        Mapped::from_mapped_stop(7_u32)
+            .runtime_started()
+            .tool_ready(&PROBE_RUNTIME_MANIFEST, 0x1000, Some(0x1000))
+            .map_err(|(_stage, refusal)| refusal)
+            .expect("probe manifest init at its image entry")
+    }
+
+    #[test]
+    fn required_controls_are_derived_from_the_manifest() {
+        // The derived words agree exactly with the protocol
+        // constants the fixture images are built against.
+        assert_eq!(RuntimeKind::Probe.required_controls(), REQUIRED_CONTROLS);
+        assert_eq!(
+            RuntimeKind::Counter.required_controls(),
+            COUNTER_REQUIRED_CONTROLS
+        );
+        // Derivation is from the manifest controls, not a constant:
+        // dropping the trap filter drops exactly its protocol bit.
+        let mut without_filter = PROBE_RUNTIME_MANIFEST.controls;
+        without_filter.trap_filter = false;
+        assert_eq!(
+            protocol_controls_for(without_filter, RuntimeKind::Probe.mechanics_controls()),
+            REQUIRED_CONTROLS & !CONTROL_FILTER
+        );
+        // Round trip: the derived word arms exactly its manifest.
+        assert_eq!(
+            armed_controls(RuntimeKind::Probe.required_controls()),
+            PROBE_RUNTIME_MANIFEST.controls
+        );
+        assert_eq!(
+            armed_controls(RuntimeKind::Counter.required_controls()),
+            COUNTER_RUNTIME_MANIFEST.controls
+        );
+    }
+
+    #[test]
+    fn launcher_refuses_at_the_armed_site_when_a_control_is_unmet() {
+        // The refused case at the launcher's single armed-transition
+        // call site (`claim_armed` in `run`), not a loader-crate
+        // unmet() unit: a word missing the trap-filter bit is a
+        // named refusal, and the full derived word arms.
+        let missing_filter = RuntimeKind::Probe.required_controls() & !CONTROL_FILTER;
+        let error = match claim_armed(dummy_ready(), &PROBE_RUNTIME_MANIFEST, missing_filter) {
+            Ok(_) => panic!("unarmed trap filter must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("required control not armed: TrapFilter"),
+            "refusal names the unmet control: {error}"
+        );
+        let error = match claim_armed(dummy_ready(), &COUNTER_RUNTIME_MANIFEST, 0) {
+            Ok(_) => panic!("no armed controls must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("required control not armed: TrapFilter"),
+            "counter refusal names the unmet control: {error}"
+        );
+        let (_handed_off, stop) = claim_armed(
+            dummy_ready(),
+            &PROBE_RUNTIME_MANIFEST,
+            RuntimeKind::Probe.required_controls(),
+        )
+        .expect("the derived word arms the probe manifest")
+        .hand_over();
+        assert_eq!(stop, 7);
+    }
+
+    #[test]
+    fn launcher_refuses_a_manifest_whose_init_is_not_image_entry() {
+        let entry = 0x1000_u64;
+        assert_eq!(
+            launcher_entry_for(&PROBE_RUNTIME_MANIFEST, entry).ok(),
+            Some(entry)
+        );
+        let mut address = PROBE_RUNTIME_MANIFEST.clone();
+        address.init = InitContract::Address(entry);
+        let error = launcher_entry_for(&address, entry)
+            .err()
+            .expect("Address init must refuse on this launcher")
+            .to_string();
+        assert!(
+            error.contains("unsupported init contract") && error.contains("Address"),
+            "refusal names the init contract: {error}"
+        );
+        let mut none = PROBE_RUNTIME_MANIFEST.clone();
+        none.init = InitContract::None;
+        let error = launcher_entry_for(&none, entry)
+            .err()
+            .expect("None init must refuse on this launcher")
+            .to_string();
+        assert!(
+            error.contains("unsupported init contract") && error.contains("None"),
+            "refusal names the init contract: {error}"
+        );
+    }
+
+    #[test]
+    fn launcher_refuses_an_unsupported_host_page_size() {
+        assert!(refuse_unsupported_page_size(&PROBE_RUNTIME_MANIFEST, 4096).is_ok());
+        let error = refuse_unsupported_page_size(&PROBE_RUNTIME_MANIFEST, 65_536)
+            .err()
+            .expect("64 KiB pages must refuse")
+            .to_string();
+        assert!(
+            error.contains("unsupported host page size 65536")
+                && error.contains("UnsupportedPageSize"),
+            "refusal names the page size: {error}"
+        );
+    }
 }
