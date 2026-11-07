@@ -2552,6 +2552,17 @@ fn leader_self_exec_bounded(test: &str) -> bool {
     leader_self_exec_bounded_with_output(test, false)
 }
 
+/// [`leader_self_exec_bounded`], with a per-case CPU/wall budget pair
+/// instead of the shared 30 s wall (owner rule 2026-11-01: the CPU cap
+/// is primary at about 1.5x the observed CPU, at most 60 s; the wall
+/// is the 8x backstop, at most 600 s). The CPU cap is enforced with
+/// prlimit's RLIMIT_CPU on the self-exec child; the wall stays a GNU
+/// timeout backstop. Only for cases whose measured cost needs it:
+/// every other case keeps the shared 30 s wall.
+fn leader_self_exec_bounded_capped(test: &str, cpu_seconds: u64, wall_seconds: u64) -> bool {
+    leader_self_exec_bounded_limited(test, false, wall_seconds, Some(cpu_seconds), |_| {})
+}
+
 fn leader_self_exec_bounded_with_output(test: &str, forward_output: bool) -> bool {
     leader_self_exec_bounded_configured(test, forward_output, |_| {})
 }
@@ -2561,6 +2572,16 @@ fn leader_self_exec_bounded_with_output(test: &str, forward_output: bool) -> boo
 fn leader_self_exec_bounded_configured(
     test: &str,
     forward_output: bool,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> bool {
+    leader_self_exec_bounded_limited(test, forward_output, 30, None, configure)
+}
+
+fn leader_self_exec_bounded_limited(
+    test: &str,
+    forward_output: bool,
+    wall_seconds: u64,
+    cpu_seconds: Option<u64>,
     configure: impl FnOnce(&mut std::process::Command),
 ) -> bool {
     if !kvm_available(test) {
@@ -2579,7 +2600,13 @@ fn leader_self_exec_bounded_configured(
     std::fs::set_permissions(&result_directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
     let execution_log = result_directory.0.join("libtest.log");
     let mut command = std::process::Command::new("timeout");
-    command.args(["--kill-after=2s", "30s"]);
+    command.args(["--kill-after=2s", &format!("{wall_seconds}s")]);
+    if let Some(cpu_seconds) = cpu_seconds {
+        command
+            .arg("prlimit")
+            .arg(format!("--cpu={cpu_seconds}"))
+            .arg("--");
+    }
     if broker_test_protocol::selected(test) {
         // Test runners can locate the helper at execution time on another host.
         command.arg(match std::env::var_os("REVERIE_KVM_TEST_BROKER_LAUNCHER") {
@@ -23338,7 +23365,16 @@ fn shared_file_publications_kick_running_and_new_vcpus_as_natively() {
 #[test]
 fn shared_file_threads_that_exited_stop_counting_in_the_guests_order() {
     const TEST: &str = "shared_file_threads_that_exited_stop_counting_in_the_guests_order";
-    if !leader_self_exec_bounded(TEST) {
+    // Budget (dh-ynyvd, owner rule 2026-11-01): this case runs seven
+    // modes, each natively and under KVM, and is wall-dominated.
+    // Measured 2026-11-07 (single case, /usr/bin/time -v): quiet
+    // completion 20.2 s wall at 6.9 CPU-s; under taskset contention
+    // (2 CPUs, 6 spinners) it died at the old 30 s wall having used
+    // only about 4.5 CPU-s. A loaded completion extrapolates to about
+    // 10 CPU-s, so the CPU cap is 15 (1.5x) and the wall backstop is
+    // 120 (8x). The seven modes are distinct exit/clear_child_tid
+    // classes, so the workload is not shrunk to fit the old wall.
+    if !leader_self_exec_bounded_capped(TEST, 15, 120) {
         return;
     }
     let directory = TestDirectory::new();
