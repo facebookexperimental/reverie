@@ -1058,8 +1058,12 @@ fn read_status<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<String> {
 /// then report the death or refusal their own way); it must never
 /// abort the run, as `guest_has_own_seccomp_filter` already treats
 /// an unreadable count.
-fn pending_signal_refuses_in_place(task: &Stopped) -> bool {
-    let Ok(status) = read_status(format!("/proc/{}/status", task.pid())) else {
+fn pending_signal_refuses_from_masks(pending: u64, blocked: u64) -> bool {
+    pending & (!blocked | SYNCHRONOUS_SIGNAL_BITS) != 0
+}
+
+fn pending_signal_refusal_from_status(status: Option<&str>) -> bool {
+    let Some(status) = status else {
         return true;
     };
     let field = |name: &str| {
@@ -1073,8 +1077,16 @@ fn pending_signal_refuses_in_place(task: &Stopped) -> bool {
     else {
         return true;
     };
-    let pending = own_pending | shared;
-    pending & (!blocked | SYNCHRONOUS_SIGNAL_BITS) != 0
+    pending_signal_refuses_from_masks(own_pending | shared, blocked)
+}
+
+fn pending_signal_refuses_in_place(task: &Stopped) -> bool {
+    let status = read_status(format!("/proc/{}/status", task.pid()));
+    pending_signal_refusal_from_status(status.ok().as_deref())
+}
+
+fn in_place_seccomp_baseline_admitted(baseline: Option<u64>) -> bool {
+    baseline == Some(1)
 }
 
 /// Whether a SIGTRAP is queued for the stopped `task`, in its own signal
@@ -15856,8 +15868,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         // SIGSYS, which the private transport discards at its step
         // stop but an in-place run cannot consume mid-callback
         // without resuming the guest past this stop.
-        Ok(self.global_state.seccomp_filter_baseline == Some(1)
-            && !self.guest_has_own_seccomp_filter(task.pid()))
+        Ok(
+            in_place_seccomp_baseline_admitted(self.global_state.seccomp_filter_baseline)
+                && !self.guest_has_own_seccomp_filter(task.pid()),
+        )
     }
 
     /// Runs the pending syscall (rewritten to `nr`/`args` first when
@@ -18667,6 +18681,69 @@ mod tests {
             classify_private_step(u64::MAX, Signal::SIGTRAP, u64::MAX - 1, 2),
             PrivateStep::Unexpected
         );
+    }
+
+    #[test]
+    fn in_place_pending_signal_gate_fails_closed_and_refuses_blocked_synchronous() {
+        use super::pending_signal_refusal_from_status;
+        let bit = |signal: i32| 1u64 << (signal - 1);
+        let status = |pending: u64, shared: u64, blocked: u64| {
+            format!("SigPnd:\t{pending:016x}\nShdPnd:\t{shared:016x}\nSigBlk:\t{blocked:016x}\n")
+        };
+
+        // Missing, empty, missing-field, and invalid-hex statuses must
+        // refuse in-place admission rather than fail open (or abort).
+        assert!(pending_signal_refusal_from_status(None));
+        assert!(pending_signal_refusal_from_status(Some("")));
+        assert!(pending_signal_refusal_from_status(Some(
+            "SigPnd:\t0\nShdPnd:\t0\n"
+        )));
+        assert!(pending_signal_refusal_from_status(Some(
+            "SigPnd:\tnot-hex\nShdPnd:\t0\nSigBlk:\t0\n"
+        )));
+
+        let usr1 = bit(libc::SIGUSR1);
+        assert!(!pending_signal_refusal_from_status(Some(&status(0, 0, 0))));
+        assert!(!pending_signal_refusal_from_status(Some(&status(
+            usr1, 0, usr1
+        ))));
+        assert!(pending_signal_refusal_from_status(Some(&status(
+            usr1, 0, 0
+        ))));
+        assert!(pending_signal_refusal_from_status(Some(&status(
+            0, usr1, 0
+        ))));
+
+        // Blocked synchronous signals refuse even though the current
+        // mask blocks them; dropping the synchronous-bits term makes
+        // these pass admission (the B2 mutation).
+        for signal in [
+            libc::SIGSYS,
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGTRAP,
+            libc::SIGFPE,
+        ] {
+            let pending_bit = bit(signal);
+            assert!(
+                pending_signal_refusal_from_status(Some(&status(pending_bit, 0, pending_bit,))),
+                "blocked synchronous signal {signal} must refuse in place"
+            );
+            assert!(
+                pending_signal_refusal_from_status(Some(&status(0, pending_bit, pending_bit,))),
+                "shared blocked synchronous signal {signal} must refuse in place"
+            );
+        }
+    }
+
+    #[test]
+    fn in_place_seccomp_baseline_requires_exactly_one_reverie_filter() {
+        use super::in_place_seccomp_baseline_admitted;
+        assert!(!in_place_seccomp_baseline_admitted(None));
+        assert!(!in_place_seccomp_baseline_admitted(Some(0)));
+        assert!(in_place_seccomp_baseline_admitted(Some(1)));
+        assert!(!in_place_seccomp_baseline_admitted(Some(2)));
     }
 
     #[test]
