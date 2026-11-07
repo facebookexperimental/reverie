@@ -17879,6 +17879,11 @@ fn fixed_tls_cell_access_recipe(
             16,
             &[(4, 8), (9, 13)],
         ),
+        ("fixed_tls_fn_once", 0x110) => (
+            "50488d3db86b3c00e883433600488d801001000059c3",
+            16,
+            &[(4, 8), (9, 13)],
+        ),
         _ => {
             return Err(format!(
                 "unsupported whole TLS read role/cell-offset pair: role={role}, cell={:#x}",
