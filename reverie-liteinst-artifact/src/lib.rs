@@ -1124,8 +1124,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-inguest/src/guest/sigalrm.rs",
-        54366,
-        "b5a9486a3513d5b0f289f00bafd50a55d746d6f60bf9d22387c79fbb2ab75bfd",
+        55207,
+        "d31b0451697e6d475771bb6cf20ffbc6bd2ab71aa28c941172488d7125928fbc",
     ),
     (
         "reverie-inguest/src/guest/signal.rs",
@@ -1134,13 +1134,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-inguest/src/guest/tool_install.rs",
-        25859,
-        "527b74c43a82c5f79980dc78dc60b9dcce78061562238bc7ec615f7c4f43d0d6",
+        25848,
+        "80bb4d540979ad5cfb183faaf8fc74866893e729532f0a14df83bc1b900ba928",
     ),
     (
         "reverie-inguest/src/signal.rs",
-        12283,
-        "ad9d54094d90d87a173ade48023551d8d54ea976e60901d08663791ffe66d672",
+        13338,
+        "cbdd3081dd22b50fe833fa5b30cb9893c960f6754843b892955307879032520c",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/bootstrap_env_aux.rs",
@@ -1289,8 +1289,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-inguest/src/lib.rs",
-        11734,
-        "0fbf94503eac27b65e52967c11c675e23e7a2f50338ca32150002ff4c64fabbf",
+        11792,
+        "2d3a8d6906a102cce3627d3b42ff87a334480807b44af14beaa4e60e7eeb78d4",
     ),
     (
         "reverie-syscalls/Cargo.toml",
@@ -1299,8 +1299,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-syscalls/src/lib.rs",
-        1164,
-        "76dfe6ee7a71bd618f4d0c77a8e8a8a55658972f1b8167447bfb49ec26d2cb3b",
+        1194,
+        "b24191133b84f9d7e2c76a1ce59b289c3735d9cf40590571a070481ca53d654f",
     ),
     (
         "reverie-syscalls/src/linux_abi.rs",
@@ -1314,8 +1314,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-syscalls/src/reserved_fds.rs",
-        16820,
-        "ce489a529546ec85eafe842232f623c6393e3ccf2fd2b82c7bfaef828805f451",
+        19493,
+        "7292ea41830525c114eae8d2acf394dee1accd7a48804412c446c6737a181f23",
     ),
     (
         "reverie-liteinst/Cargo.toml",
@@ -1344,28 +1344,28 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-inguest/src/guest/alloc.rs",
-        35416,
-        "478f8a7e6d857b39af51ea58f0c337c663a13e928994fa5736ced0da51311f7d",
+        36599,
+        "3c6e8229d6daf422036416d30e8c868040a9b3fff5c719af6d3f40320b23cdef",
     ),
     (
         "reverie-inguest/src/guest/tool_region_constructor.rs",
-        45836,
-        "dafb7519e9af3440270b926ef03cdb2d07f4b78b74250910e3764b664cd9cf51",
+        47324,
+        "7d62d70deb74244b71b4e00c0325afd73667babe7018ccf38829e5bee534460f",
     ),
     (
         "reverie-inguest/src/guest/tool_region_arena.rs",
-        16277,
-        "1a1b10e054a8b887fd90a6acab09040ab7faa8c9ed23782f064147d7bed0061e",
+        16617,
+        "f20a635748faaad7e568cb3786d6c91576b25a03fb9185f70ade34e9f3eb4daa",
     ),
     (
         "reverie-inguest/src/guest/tool_region.rs",
-        51153,
-        "65a11a98e19d34d1655cba4e24ec8ecb6688140ebe94637c0f28264a3ab30ca7",
+        51920,
+        "13b271ccc95b8fd3c2f5d04f05c0482b70449ed703e7957d2b65ee55cb49adb6",
     ),
     (
         "reverie-inguest/src/guest/tool_region_keyed.rs",
-        24192,
-        "57ee407899e8650f1ef79714c8548cc82065a070e99fa92b2080a42874c5ca3a",
+        24969,
+        "272e5e3bf719e317f54551fbf174ba8a1d5020373356102d9003fbe77a512be1",
     ),
     (
         "reverie-inguest/src/guest/installed_tool.rs",
@@ -1374,8 +1374,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie-inguest/src/guest/mod.rs",
-        2409,
-        "69c5722ca621a2671f60b16b43ac76958ddc2d1fd55417a30bcd21b32d03852a",
+        3497,
+        "4020e358c802b8e5efe43614acd7ac0759cf00977794445cabca179f46967328",
     ),
     (
         "reverie-inguest/src/guest/rpc.rs",
@@ -1502,8 +1502,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     // Bind the added input-ownership and facility-admission source premises.
     (
         "reverie-inguest/src/launcher/mod.rs",
-        94608,
-        "3fbd11f163faac386583cd648e4e8b8ec5034463ec44e6fc90654e0cd873254b",
+        94802,
+        "3e2a00f582f24652e81305e659e0960bcf6b334514b58140f886aa292de278f8",
     ),
     (
         "reverie/src/native_syscall.rs",
