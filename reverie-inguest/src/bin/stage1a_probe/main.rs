@@ -844,7 +844,7 @@ fn bootstrap_until_ready(
         .ok_or("invalid trace record")?;
     for _ in 0..100_000 {
         let (stopped, event) =
-            trace::stopped(task.syscall(signal.take())?, "Hermit bootstrap stop")?;
+            trace::stopped(task.syscall(signal.take())?, "runtime bootstrap stop")?;
         task = stopped;
         match event {
             Event::Syscall => {

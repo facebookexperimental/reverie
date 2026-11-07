@@ -1011,6 +1011,69 @@ fn counter_clone3_named_refusal_without_guest_thread() {
     }
 }
 
+/// The exact refusal a swapped kind/image pair produces, byte for
+/// byte except the tracee pid (the one field no run can fix): the
+/// image refuses a control page whose required word is not its own
+/// by issuing `exit_group(EXIT_FAILURE)` from its runtime gate, so
+/// the launcher's next waited stop is the exit, not a bootstrap
+/// stop, and it refuses naming exactly that.
+fn assert_swapped_refusal(observation: &Observation, name: &str, kind: &str) {
+    let report = &observation.report;
+    assert_eq!(report["runtime_kind"], kind, "{name} report: {report}");
+    assert_eq!(report["outcome"], "refused", "{name} report: {report}");
+    assert_ne!(
+        report["detached"], true,
+        "{name} must never detach a handed-off guest"
+    );
+    assert!(
+        report.get("journal_error").is_none(),
+        "{name} refusal is the loader's, not a journal error: {report}"
+    );
+    let refusal = report["refusal"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name} must carry the exact refusal text: {report}"));
+    let pid = refusal
+        .strip_prefix("loader refused: expected runtime bootstrap stop, got Exited(Pid(")
+        .and_then(|rest| rest.strip_suffix(&format!("), Exited({EXIT_FAILURE}))")))
+        .unwrap_or_else(|| panic!("{name} exact refusal text differs: {refusal:?}"));
+    assert!(
+        !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()),
+        "{name} refusal pid field must be exactly the tracee pid: {refusal:?}"
+    );
+    assert_eq!(
+        observation.capture.stderr,
+        format!("{refusal}\n").into_bytes(),
+        "{name} stderr is exactly the refusal line"
+    );
+    assert!(
+        observation.capture.stdout.is_empty(),
+        "{name} guest never runs, so stdout stays empty"
+    );
+    // The swapped image's only bootstrap step is its own refusal:
+    // exit_group(EXIT_FAILURE) entered through the runtime gate.
+    let bootstrap = array(&report["bootstrap_syscalls"]);
+    assert_eq!(bootstrap.len(), 1, "{name} report: {report}");
+    assert_eq!(
+        u(&bootstrap[0]["effective_number"]),
+        libc::SYS_exit_group as u64,
+        "{name} report: {report}"
+    );
+    assert_eq!(
+        bootstrap[0]["args"],
+        json!([EXIT_FAILURE, 0, 0, 0, 0, 0]),
+        "{name} report: {report}"
+    );
+    assert_eq!(bootstrap[0]["gate"], "runtime", "{name} report: {report}");
+    assert_eq!(bootstrap[0]["phase"], "entry", "{name} report: {report}");
+    assert_eq!(
+        report["cleanup"]["terminal_status"],
+        json!({"code": EXIT_FAILURE, "kind": "exited"}),
+        "{name} report: {report}"
+    );
+    assert!(report["guest_status"].is_null(), "{name} report: {report}");
+    assert_eq!(report["guest_events"], json!([]), "{name} report: {report}");
+}
+
 #[test]
 fn runtime_kind_paired_with_the_other_kinds_image_is_refused_both_ways() {
     // Fail-closed in both directions (PR1311 Major (c)): each
@@ -1018,14 +1081,24 @@ fn runtime_kind_paired_with_the_other_kinds_image_is_refused_both_ways() {
     // with no handoff — the host demands the kind's control word
     // and ready evidence, and each image refuses a control page
     // whose required word is not its own. The guest never runs.
+    // Each direction's refusal is pinned exactly (see
+    // `assert_swapped_refusal`): an any-refusal pass would let a
+    // wrong-mechanism refusal (a crash, a journal error, a later
+    // stop) masquerade as the swap check working.
     let true_bin = Path::new("/bin/true");
     assert!(true_bin.is_file(), "swap guest /bin/true must exist");
-    for (name, counter_kind, runtime) in [
-        ("probe-kind-counter-image", false, images().runtime.clone()),
+    for (name, counter_kind, runtime, kind) in [
+        (
+            "probe-kind-counter-image",
+            false,
+            images().runtime.clone(),
+            "probe",
+        ),
         (
             "counter-kind-probe-image",
             true,
             probe_runtime().to_path_buf(),
+            "counter",
         ),
     ] {
         let observation = observe_swapped(Scratch::new(name), counter_kind, &runtime, true_bin);
@@ -1035,20 +1108,6 @@ fn runtime_kind_paired_with_the_other_kinds_image_is_refused_both_ways() {
             "{name} must exit with the probe refusal code; stderr: {}",
             String::from_utf8_lossy(&observation.capture.stderr)
         );
-        assert_eq!(
-            observation.report["outcome"], "refused",
-            "{name} report: {}",
-            observation.report
-        );
-        assert_ne!(
-            observation.report["detached"], true,
-            "{name} must never detach a handed-off guest"
-        );
-        assert!(
-            observation.report["refusal"].is_string()
-                || observation.report["journal_error"].is_string(),
-            "{name} must name its refusal: {}",
-            observation.report
-        );
+        assert_swapped_refusal(&observation, name, kind);
     }
 }
