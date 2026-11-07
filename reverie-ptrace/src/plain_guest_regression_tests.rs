@@ -2087,6 +2087,39 @@ fn resume_recorder(
 /// dumps. A hard limit of 0 cannot be raised without `CAP_SYS_RESOURCE`, so
 /// each child would fail its `setrlimit` and exit 99 before reaching the
 /// behaviour under test.
+/// Whether this host reports a core dump (`WCOREDUMP`) for a process
+/// killed by SIGSYS, learned from a control child killed by SIGSYS outside
+/// the tracer. The answer is the host's, not the tracer's: it follows the
+/// inherited core limit (a validate service running with `LimitCORE=1`
+/// reports no dump), so a traced guest killed by SIGSYS must be checked
+/// against it rather than against a hardcoded flag.
+fn native_sigsys_coredump() -> bool {
+    // SAFETY: between `fork` and `raise`/`_exit` the child only calls
+    // async-signal-safe functions and touches its own stack.
+    match unsafe { libc::fork() } {
+        -1 => panic!("fork SIGSYS control child: {}", Errno::last()),
+        0 => unsafe {
+            libc::signal(libc::SIGSYS, libc::SIG_DFL);
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGSYS);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::raise(libc::SIGSYS);
+            libc::_exit(99);
+        },
+        pid => {
+            let mut status = 0;
+            // SAFETY: `status` is a valid, writable wait status.
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(
+                libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+                "SIGSYS control child wait status {status:#x}"
+            );
+            libc::WCOREDUMP(status)
+        }
+    }
+}
+
 fn require_capped_crash_dumps() {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -7760,7 +7793,7 @@ async fn a_seccomp_trap_of_a_wait_run_between_syscall_stops_ends_the_run() {
     );
     assert_eq!(
         prequeued.status,
-        ExitStatus::Signaled(Signal::SIGSYS, true),
+        ExitStatus::Signaled(Signal::SIGSYS, native_sigsys_coredump()),
         "{}",
         prequeued.report
     );
