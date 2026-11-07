@@ -28,6 +28,7 @@ use reverie::syscalls::OFlag;
 use reverie::syscalls::Openat;
 use reverie::syscalls::PathPtr;
 use reverie::syscalls::ProtFlags;
+use reverie::syscalls::Quotactl;
 use reverie::syscalls::RtSigprocmask;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Write as WriteCall;
@@ -55,6 +56,7 @@ enum Mode {
     ReplaceThenPrivate,
     ReplaceWithPendingSignal,
     ReplaceInterruptedRestart,
+    InheritedTrapRewrite,
     SameThenPrivate,
     TailSame,
     TailOther,
@@ -318,6 +320,24 @@ impl Tool for StopTool {
                             other => panic!("interrupted futex returned {other:?}"),
                         }
                     }
+                    Mode::InheritedTrapRewrite => {
+                        // An inherited RET_TRAP filter traps quotactl
+                        // (getppid and uname are called by the spawn and tracer
+                        // paths themselves, so neither can be the trapped
+                        // number here).
+                        // Admission must refuse in place (baseline
+                        // above one), so the private transport reports
+                        // the trapped call as ENOSYS; run in place it
+                        // would report the rolled-back number as a
+                        // successful result. Deleting the baseline
+                        // gate call turns this red.
+                        match guest.inject(Quotactl::default()).await {
+                            Err(Errno::ENOSYS) => {
+                                return Err(Errno::ENOSYS.into());
+                            }
+                            other => panic!("inherited trap rewrite returned {other:?}"),
+                        }
+                    }
                     Mode::SameThenPrivate => {
                         assert_eq!(guest.inject(original).await?, 1);
                         assert_eq!(guest.regs().await.rip, rip);
@@ -372,6 +392,20 @@ impl Tool for StopTool {
             }
             other => panic!("unexpected intercepted syscall {other:?}"),
         }
+    }
+
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: reverie::Signal,
+    ) -> Result<Option<reverie::Signal>, Errno> {
+        // The inherited-trap witness's trapped injection leaves its
+        // SIGSYS held; dropping it at its report is what lets the
+        // guest survive to the boundary on the private transport.
+        if guest.config().mode == Mode::InheritedTrapRewrite && signal == reverie::Signal::SIGSYS {
+            return Ok(None);
+        }
+        Ok(Some(signal))
     }
 
     async fn handle_rdtsc_event<G: Guest<Self>>(
@@ -722,7 +756,9 @@ async fn run(mode: Mode) {
         // A divergent tail injection has no exit stop to restore at,
         // so it takes the private page on both transports.
         Mode::TailOther => ((1, 0, 0), (1, 0, 0)),
-        Mode::TailSame | Mode::ReplaceInterruptedRestart => ((0, 0, 0), (0, 0, 0)),
+        Mode::TailSame | Mode::ReplaceInterruptedRestart | Mode::InheritedTrapRewrite => {
+            ((0, 0, 0), (0, 0, 0))
+        }
         Mode::PostExec => ((0, 1, 0), (0, 1, 0)),
         Mode::PostExecTail => ((1, 1, 0), (1, 1, 0)),
         Mode::Emulate | Mode::EmulateErrno => ((0, 0, 0), (0, 0, 0)),
@@ -738,6 +774,67 @@ async fn run(mode: Mode) {
 #[tokio::test(flavor = "current_thread")]
 async fn divergent_inject_interrupted_restarts_the_guest_call() {
     run(Mode::ReplaceInterruptedRestart).await;
+}
+
+/// Witness for the inherited-filter refusal: a dedicated thread
+/// installs a RET_TRAP filter on uname (inherited by the guest it
+/// then traces on that same thread, so the seccomp baseline is 2),
+/// and the Tool rewrites the guest's write to quotactl. On both
+/// transports the Tool must see Err(ENOSYS) and the guest -38, as
+/// on main; deleting the baseline gate call lets it run in place
+/// and report Ok(110) instead.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn inherited_ret_trap_rewrite_reports_enosys_on_both_transports() {
+    std::thread::spawn(|| {
+        unsafe {
+            let statement = |code: u32, k: u32, jt: u8, jf: u8| libc::sock_filter {
+                code: code as u16,
+                jt,
+                jf,
+                k,
+            };
+            let filter = [
+                statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
+                statement(
+                    libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                    libc::SYS_quotactl as u32,
+                    0,
+                    1,
+                ),
+                statement(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_TRAP, 0, 0),
+                statement(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW, 0, 0),
+            ];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr() as *mut libc::sock_filter,
+            };
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &program as *const libc::sock_fprog
+                ),
+                0
+            );
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let in_place = run_once(Mode::InheritedTrapRewrite, false).await;
+            let stepped = run_once(Mode::InheritedTrapRewrite, true).await;
+            assert_eq!(
+                (in_place.0, &in_place.1, &in_place.2),
+                (stepped.0, &stepped.1, &stepped.2),
+                "inherited trap rewrite differs between transports"
+            );
+        });
+    })
+    .join()
+    .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
