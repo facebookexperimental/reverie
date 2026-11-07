@@ -253,12 +253,15 @@ fn host_page_size() -> Result<u64> {
 
 /// Claims the `Armed` stage from the reported protocol word: the
 /// loader's single armed-transition call site. The evidence is
-/// the word mapped through [`armed_controls`]; the stage
+/// only the word mapped through [`armed_controls`]; the required
+/// set is the one bound into `ready` from the manifest its
+/// `tool_ready` accepted, so this site cannot re-derive "required"
+/// from a manifest (or word) of its own choosing. The stage
 /// transition itself performs the manifest `unmet` check and this
 /// helper names any unmet control as a total refusal.
-fn claim_armed<S>(ready: ToolReady<S>, manifest: &ToolManifest, controls: u64) -> Result<Armed<S>> {
+fn claim_armed<S>(ready: ToolReady<S>, controls: u64) -> Result<Armed<S>> {
     ready
-        .armed(manifest.controls, armed_controls(controls))
+        .armed(armed_controls(controls))
         .map_err(|(_stage, unmet)| {
             format!(
                 "loader refused: required control not armed: {unmet:?} (controls={controls:#x})"
@@ -482,7 +485,7 @@ fn run(
     // manifest requires is reported armed; an unmet control is a
     // named refusal at this single call site, never a partially
     // armed handoff.
-    let armed = claim_armed(ready, runtime.kind().manifest(), controls)?;
+    let armed = claim_armed(ready, controls)?;
     {
         let stop = armed.stop();
         stop.context.restore(stop.task())?;
@@ -1170,6 +1173,14 @@ mod tests {
             .expect("probe manifest init at its image entry")
     }
 
+    fn counter_ready() -> ToolReady<u32> {
+        Mapped::from_mapped_stop(7_u32)
+            .runtime_started()
+            .tool_ready(&COUNTER_RUNTIME_MANIFEST, 0x1000, Some(0x1000))
+            .map_err(|(_stage, refusal)| refusal)
+            .expect("counter manifest init at its image entry")
+    }
+
     #[test]
     fn required_controls_are_derived_from_the_manifest() {
         // The derived words agree exactly with the protocol
@@ -1205,7 +1216,7 @@ mod tests {
         // unmet() unit: a word missing the trap-filter bit is a
         // named refusal, and the full derived word arms.
         let missing_filter = RuntimeKind::Probe.required_controls() & !CONTROL_FILTER;
-        let error = match claim_armed(dummy_ready(), &PROBE_RUNTIME_MANIFEST, missing_filter) {
+        let error = match claim_armed(dummy_ready(), missing_filter) {
             Ok(_) => panic!("unarmed trap filter must refuse"),
             Err(error) => error.to_string(),
         };
@@ -1213,7 +1224,11 @@ mod tests {
             error.contains("required control not armed: TrapFilter"),
             "refusal names the unmet control: {error}"
         );
-        let error = match claim_armed(dummy_ready(), &COUNTER_RUNTIME_MANIFEST, 0) {
+        // The required set comes from the manifest `tool_ready`
+        // accepted, not from this call site: a counter-ready stage
+        // refuses the empty word by the counter manifest's own
+        // first required control.
+        let error = match claim_armed(counter_ready(), 0) {
             Ok(_) => panic!("no armed controls must refuse"),
             Err(error) => error.to_string(),
         };
@@ -1221,13 +1236,10 @@ mod tests {
             error.contains("required control not armed: TrapFilter"),
             "counter refusal names the unmet control: {error}"
         );
-        let (_handed_off, stop) = claim_armed(
-            dummy_ready(),
-            &PROBE_RUNTIME_MANIFEST,
-            RuntimeKind::Probe.required_controls(),
-        )
-        .expect("the derived word arms the probe manifest")
-        .hand_over();
+        let (_handed_off, stop) =
+            claim_armed(dummy_ready(), RuntimeKind::Probe.required_controls())
+                .expect("the derived word arms the probe manifest")
+                .hand_over();
         assert_eq!(stop, 7);
     }
 

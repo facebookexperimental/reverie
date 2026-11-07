@@ -22,7 +22,7 @@
 //!     .runtime_started()
 //!     .tool_ready(manifest, 0x1000, Some(0x1000))
 //!     .expect("launched entry satisfies the manifest init contract")
-//!     .armed(manifest.controls, reverie_loader::manifest::Controls::NONE)
+//!     .armed(reverie_loader::manifest::Controls::NONE)
 //!     .expect("every required control is armed")
 //!     .hand_over();
 //! assert_eq!(stop, 7);
@@ -74,10 +74,14 @@ pub struct Mapped<S>(S);
 pub struct RuntimeStarted<S>(S);
 
 /// The tool is initialized: tool initialization has completed per its
-/// init contract. Owns the stopped task `S`.
+/// init contract. Owns the stopped task `S`, and carries the controls
+/// the manifest accepted by [`RuntimeStarted::tool_ready`] requires —
+/// [`ToolReady::armed`] checks the observed controls against that
+/// bound set, so a caller cannot re-derive "required" from what it
+/// happened to arm.
 #[derive(Debug)]
 #[must_use = "a ready stop must be advanced or torn down, not dropped silently"]
-pub struct ToolReady<S>(S);
+pub struct ToolReady<S>(S, Controls);
 
 /// Every control the tool's manifest requires is armed. Owns the
 /// stopped task `S`.
@@ -154,7 +158,8 @@ impl<S> RuntimeStarted<S> {
     /// returning this stage for teardown, unless the launched
     /// entry is exactly what the manifest's init contract requires
     /// — an image is never silently run as if it had declared a
-    /// different init.
+    /// different init. On success the manifest's required controls
+    /// are bound into the returned stage.
     pub fn tool_ready(
         self,
         manifest: &ToolManifest,
@@ -162,7 +167,7 @@ impl<S> RuntimeStarted<S> {
         launched_entry: Option<u64>,
     ) -> Result<ToolReady<S>, (Self, InitRefusal)> {
         match manifest.check_init_entry(image_entry, launched_entry) {
-            Ok(()) => Ok(ToolReady(self.0)),
+            Ok(()) => Ok(ToolReady(self.0, manifest.controls)),
             Err(refusal) => Err((self, refusal)),
         }
     }
@@ -185,14 +190,24 @@ impl<S> ToolReady<S> {
         self.0
     }
 
+    /// The controls the manifest accepted at `tool_ready` requires:
+    /// the set [`armed`](Self::armed) checks the observed controls
+    /// against.
+    pub fn required_controls(&self) -> Controls {
+        self.1
+    }
+
     /// Every control the tool's manifest requires is armed. Takes
-    /// evidence: the required controls (from the manifest) and the
-    /// controls actually armed. Refuses by name, returning this
-    /// stage for teardown, while any required control is unmet —
-    /// the check lives here, in the loader, so a launcher cannot
-    /// claim `Armed` without it succeeding.
-    pub fn armed(self, required: Controls, armed: Controls) -> Result<Armed<S>, (Self, Control)> {
-        match required.unmet(armed) {
+    /// evidence: only the controls actually observed armed. The
+    /// required set is the one bound from the manifest when this
+    /// stage was created — it is not a parameter, so a caller
+    /// cannot satisfy the check by declaring whatever it armed to
+    /// be what was required. Refuses by name, returning this stage
+    /// for teardown, while any required control is unmet — the
+    /// check lives here, in the loader, so a launcher cannot claim
+    /// `Armed` without it succeeding.
+    pub fn armed(self, observed: Controls) -> Result<Armed<S>, (Self, Control)> {
+        match self.1.unmet(observed) {
             None => Ok(Armed(self.0)),
             Some(unmet) => Err((self, unmet)),
         }
@@ -245,6 +260,14 @@ mod tests {
             .expect("image-entry init at the image entry")
     }
 
+    fn probe_ready(stop: DummyStop) -> ToolReady<DummyStop> {
+        Mapped::from_mapped_stop(stop)
+            .runtime_started()
+            .tool_ready(&PROBE_RUNTIME_MANIFEST, ENTRY, Some(ENTRY))
+            .map_err(|(_stage, refusal)| refusal)
+            .expect("probe image-entry init at the image entry")
+    }
+
     #[test]
     fn the_stages_chain_in_order_carrying_the_stop() {
         let mapped = Mapped::from_mapped_stop(DummyStop(1));
@@ -255,7 +278,7 @@ mod tests {
             .tool_ready(&LOADER_MANIFEST, ENTRY, Some(ENTRY))
             .map_err(|(_stage, refusal)| refusal)
             .expect("image-entry init at the image entry")
-            .armed(LOADER_MANIFEST.controls, Controls::NONE)
+            .armed(Controls::NONE)
             .map_err(|(_stage, unmet)| unmet)
             .expect("no controls required")
             .hand_over();
@@ -310,19 +333,45 @@ mod tests {
 
     #[test]
     fn armed_refuses_an_unmet_control_by_name() {
+        // The required set is bound from the manifest `tool_ready`
+        // accepted (the probe manifest requires the trap filter);
+        // the caller supplies only what it observed armed.
         let required = PROBE_RUNTIME_MANIFEST.controls;
-        let (stage, unmet) = ready(DummyStop(6))
-            .armed(required, Controls::NONE)
-            .expect_err("unarmed controls must refuse");
+        let mut lacking_filter = required;
+        lacking_filter.trap_filter = false;
+        let (stage, unmet) = probe_ready(DummyStop(6))
+            .armed(lacking_filter)
+            .expect_err("observed controls lacking the trap filter must refuse");
         assert_eq!(unmet, Control::TrapFilter);
         // The stage is returned, so the stop remains teardown-able,
         // and the same stage succeeds once the evidence satisfies it.
         let (_done, stop) = stage
-            .armed(required, required)
+            .armed(required)
             .map_err(|(_stage, unmet)| unmet)
             .expect("exactly the required controls armed")
             .hand_over();
         assert_eq!(stop, DummyStop(6));
+    }
+
+    #[test]
+    fn armed_is_bound_to_the_manifest_tool_ready_accepted() {
+        // Same observed evidence (nothing armed), opposite verdicts:
+        // the only difference is which manifest each `tool_ready`
+        // accepted, so the required set cannot be coming from the
+        // caller or from the observed set.
+        let (_done, stop) = ready(DummyStop(7))
+            .armed(Controls::NONE)
+            .map_err(|(_stage, unmet)| unmet)
+            .expect("loader manifest requires no controls")
+            .hand_over();
+        assert_eq!(stop, DummyStop(7));
+        let probe = probe_ready(DummyStop(8));
+        assert_eq!(probe.required_controls(), PROBE_RUNTIME_MANIFEST.controls);
+        let (stage, unmet) = probe
+            .armed(Controls::NONE)
+            .expect_err("probe manifest controls unmet must refuse");
+        assert_eq!(unmet, Control::TrapFilter);
+        assert_eq!(stage.into_stop(), DummyStop(8));
     }
 
     #[test]
@@ -340,7 +389,7 @@ mod tests {
         assert_eq!(ready(DummyStop(0)).into_stop(), DummyStop(0));
         assert_eq!(
             ready(DummyStop(0))
-                .armed(Controls::NONE, Controls::NONE)
+                .armed(Controls::NONE)
                 .map_err(|(_stage, unmet)| unmet)
                 .expect("no controls required")
                 .into_stop(),
