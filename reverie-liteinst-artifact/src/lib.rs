@@ -61053,11 +61053,32 @@ mod tests {
     #[test]
     fn detcore_patch_alloc_uniquely_matches_the_0110_template() {
         // The Detcore leaf's 241-byte alloc (cell offset 0x110) still
-        // selects exactly one template: index 106, the 0x110 entry added
-        // by the same append that must not widen standalone scope.
-        let (index, template) = (106, &DETCORE_VALIDATE_TEMPLATES[106]);
-        assert_eq!(template.role, "fixed_patch_alloc");
-        assert_eq!(fixed_hex(template.hex).len(), 241);
+        // selects exactly one template. Find that entry by identity,
+        // never by table position: role, extent, and the TLS cell
+        // offset read by the body's `cmp qword ptr [rax + cell], 0`
+        // at bytes 63..70 (48 83 b8 <cell: u32 LE>). A literal index
+        // broke twice when table appends shifted this entry.
+        let identified: Vec<usize> = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                if t.role != "fixed_patch_alloc" {
+                    return false;
+                }
+                let body = fixed_hex(t.hex);
+                body.len() == 241
+                    && body[63..66] == [0x48, 0x83, 0xb8]
+                    && u32::from_le_bytes(body[66..70].try_into().unwrap()) == 0x110
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            identified.len(),
+            1,
+            "exactly one fixed_patch_alloc template reads cell 0x110"
+        );
+        let index = identified[0];
+        let template = &DETCORE_VALIDATE_TEMPLATES[index];
         let actual = fixed_hex(template.hex);
         let candidates: Vec<usize> = DETCORE_VALIDATE_TEMPLATES
             .iter()
