@@ -713,8 +713,8 @@ thread_local! {
     /// `read_at` operations and bytes performed through `field` on this
     /// thread, so a test can bound the work of one accounting read
     /// deterministically, with no clock involved.
-    static FIELD_READ_OPS: std::cell::Cell<u64> = std::cell::Cell::new(0);
-    static FIELD_READ_BYTES: std::cell::Cell<u64> = std::cell::Cell::new(0);
+    static FIELD_READ_OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FIELD_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl CommandCgroup {
