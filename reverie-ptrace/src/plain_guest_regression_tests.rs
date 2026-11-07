@@ -7512,7 +7512,7 @@ async fn a_self_queued_sigtrap_the_guest_ignores_is_dropped_as_natively() {
     }
 }
 
-/// The self-queued SIGTRAP above, with a sibling SIGKILLing the group
+/// The self-queued SIGTRAP above, with a kernel POSIX timer SIGKILLing the thread
 /// while its delivery stop is being classified: classification is held
 /// (test hook) until the thread's exit stop is published, so the siginfo
 /// it then reads is the exit stop's (code 1541, its fault member holding

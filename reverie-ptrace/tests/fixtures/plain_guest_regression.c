@@ -6531,7 +6531,7 @@ static void sq_handler(int sig, siginfo_t* si, void* uc) {
   sq_n++;
   sq_code = si->si_code;
 }
-static void sigtrap_self_queued(int unblock, int ignore) {
+static void sigtrap_self_queued_as(int unblock, int ignore, int marker) {
   warm();
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
@@ -6552,7 +6552,7 @@ static void sigtrap_self_queued(int unblock, int ignore) {
   memset(&si, 0, sizeof si);
   si.si_signo = SIGTRAP;
   si.si_code = TRAP_BRKPT;
-  si.si_pid = 4242;
+  si.si_pid = marker;
   if (syscall(SYS_rt_tgsigqueueinfo, getpid(), syscall(SYS_gettid), SIGTRAP, &si) != 0)
     die("queue SIGTRAP");
   if (unblock) {
@@ -6586,10 +6586,15 @@ static void mode_sigtrap_self_queued_then_group_kill(void) {
   its.it_value.tv_nsec = 200000000;
   if (timer_settime(timerid, 0, &its, NULL) != 0)
     die("timer_settime SIGKILL");
-  sigtrap_self_queued(1, 0);
+  /* Unique marker so the tracer-side test hold can tell this run's
+   * queued trap from any concurrently running test's. */
+  sigtrap_self_queued_as(1, 0, 4243);
   /* The timer SIGKILL lands while the unblocked SIGTRAP above is at
    * its delivery stop; reaching here at all means it did not. */
   say("selfqkill survived\n");
+}
+static void sigtrap_self_queued(int unblock, int ignore) {
+  sigtrap_self_queued_as(unblock, ignore, 4242);
 }
 static void mode_sigtrap_self_queued_ppoll(void) {
   sigtrap_self_queued(0, 0);

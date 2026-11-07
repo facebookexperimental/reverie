@@ -2726,14 +2726,17 @@ fn trap_siginfo_names_stop(info: &libc::siginfo_t, ip: u64, step_report_is_si_us
 /// SIGTRAP stops that `handle_sigtrap` took as watch hits only.
 pub(crate) static WATCH_TRAPS_CLAIMED: AtomicU64 = AtomicU64::new(0);
 
-/// Holds the first unclaimed-SIGTRAP classification
+/// Holds the intended run's unclaimed-SIGTRAP classification
 /// (`TracedTask::unattributed_sigtrap`, reached from `handle_sigtrap`)
 /// until the task's exit stop is published, so a test can force the
 /// ordering a loaded tracer thread produces by chance: the tracee
 /// left the classified stop for its exit stop while it was being
 /// classified. The ptracer thread is not the test thread, so these
-/// are process-wide; tests arm them one run at a time.
-/// `SIGTRAP_CLASSIFY_EXIT_OBSERVED` records the outcome.
+/// are process-wide, and consumption is gated on the arming
+/// fixture's unique self-queued siginfo marker (si_pid 4243):
+/// an unrelated concurrent classification neither consumes the
+/// arm nor writes the outcome. `SIGTRAP_CLASSIFY_EXIT_OBSERVED`
+/// records the intended classification's outcome.
 #[cfg(test)]
 pub(crate) static SIGTRAP_CLASSIFY_EXIT_HOLD: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
@@ -12721,7 +12724,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         ip: u64,
     ) -> Result<Option<(i32, u64)>, TraceError> {
         #[cfg(test)]
-        if SIGTRAP_CLASSIFY_EXIT_HOLD.swap(false, Ordering::SeqCst) {
+        if SIGTRAP_CLASSIFY_EXIT_HOLD.load(Ordering::SeqCst)
+            && task.getsiginfo().is_ok_and(|info| {
+                // SAFETY: `si_pid` reads the sender member, which a
+                // self-queued siginfo fills in.
+                info.si_signo == libc::SIGTRAP
+                    && info.si_code == libc::TRAP_BRKPT
+                    && unsafe { info.si_pid() } == 4243
+            })
+            && SIGTRAP_CLASSIFY_EXIT_HOLD.swap(false, Ordering::SeqCst)
+        {
             SIGTRAP_CLASSIFY_HOLD_FIRED.fetch_add(1, Ordering::SeqCst);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             let exit_signature = |task: &Stopped| {
@@ -12750,9 +12762,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         // PF_SIGNALED probe tells a real exit stop from a guest that
         // forged the signature by queueing it to itself, so a forged
         // one still falls through to the run-ending return below. For
-        // a real one, claim nothing here: the guarded resume that
-        // follows refuses for the dead stop, as for any other stop the
-        // tracee left for its exit stop.
+        // a real one, claim nothing here: what follows settles the
+        // dead stop as for any other stop the tracee left for its
+        // exit stop (the guarded resume refuses for a leader with
+        // another traced thread; any other task's exit is reported
+        // by its final wait even if its exit stop is resumed).
         if info.si_signo == libc::SIGTRAP
             && info.si_code == libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8)
             && matches!(
