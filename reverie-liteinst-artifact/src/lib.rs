@@ -10,6 +10,7 @@ use std::fs::{self};
 use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -165,7 +166,7 @@ impl FileIdentity {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandEvidence {
     pub program: String,
@@ -1056,6 +1057,8 @@ struct CompilerRootBinding {
 /// authorize compiler filenames or establish the current Cargo source graph.
 pub struct VerifiedCompiledSources {
     record: CompiledSources,
+    current_build: Option<CurrentBuildEvidence>,
+    standalone_metadata: Option<Value>,
 }
 const COMPILED_RV_LOCATION_FILES: [&str; 7] = [
     "reverie-liteinst/src/patch_alloc.rs",
@@ -2610,7 +2613,13 @@ impl VerifiedCompiledSources {
             files,
             leaf,
         };
-        Ok(Self { record })
+        Ok(Self {
+            record,
+            current_build: None,
+            standalone_metadata: (expected.layout == CompiledSourceLayout::HermitGit
+                && expected.image_kind == FixedImageKind::Standalone)
+                .then(|| metadata.clone()),
+        })
     }
     /// Explicit closed-profile Hermit source-copy authority. It never catches a Git error
     /// or accepts caller-supplied metadata, inventories or compiler mappings.
@@ -2793,6 +2802,9 @@ impl VerifiedCompiledSources {
                 files,
                 leaf,
             },
+            current_build: None,
+            standalone_metadata: (expected.image_kind == FixedImageKind::Standalone)
+                .then(|| metadata.clone()),
         };
         verified.verify_unchanged(runner)?;
         Ok(verified)
@@ -2802,6 +2814,64 @@ impl VerifiedCompiledSources {
     }
     pub fn package(&self) -> &PackageIdentity {
         &self.record.leaf
+    }
+    /// Bind the actual retained successful Cargo build, independently of the
+    /// default-feature metadata used to resolve package/source identities.
+    /// Consumers must call this again with their retained hashed command output;
+    /// a deserialized absence record cannot construct this opaque context.
+    /// `selected_elf` is the original current Cargo output. A staged copy is
+    /// joined separately by its entire ELF digest during qualification.
+    pub fn with_current_build(
+        &self,
+        command: &CommandEvidence,
+        selected_elf: &Path,
+        target_directory: &Path,
+    ) -> Result<Self> {
+        self.verify_files()?;
+        let current_build =
+            current_build_evidence(&self.record, command, selected_elf, target_directory)?;
+        Ok(Self {
+            record: self.record.clone(),
+            current_build: Some(current_build),
+            standalone_metadata: self.standalone_metadata.clone(),
+        })
+    }
+    pub fn with_standalone_current_build(
+        &self,
+        command: &CommandEvidence,
+        selected_elf: &Path,
+        target_directory: &Path,
+        runner: &mut Runner,
+    ) -> Result<Self> {
+        let result = self.verify_unchanged(runner).and_then(|_| {
+            let metadata = self
+                .standalone_metadata
+                .as_ref()
+                .ok_or("standalone build lacks fresh factory metadata")?;
+            let binding = standalone_current_build_sources(&self.record, metadata, runner)?;
+            current_build_evidence_in_scope(
+                &self.record,
+                command,
+                selected_elf,
+                target_directory,
+                Some(&binding),
+            )
+        });
+        let closed = self.verify_unchanged(runner);
+        let current_build = match (result, closed) {
+            (Ok(value), Ok(())) => value,
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+            (Err(error), Err(close)) => {
+                return Err(format!(
+                    "{error}; standalone build source close failed: {close}"
+                ));
+            }
+        };
+        Ok(Self {
+            record: self.record.clone(),
+            current_build: Some(current_build),
+            standalone_metadata: self.standalone_metadata.clone(),
+        })
     }
     /// Exact retained Cargo compiler spelling; canonical PackageIdentity remains
     /// unchanged for artifact selection. Consumers compare this raw path exactly.
@@ -2842,6 +2912,9 @@ impl VerifiedCompiledSources {
         self.verify_files()
     }
     fn verify_files(&self) -> Result<()> {
+        if let Some(build) = &self.current_build {
+            verify_current_build_files(build)?;
+        }
         if let CompiledSourceAuthority::DeclaredContent {
             workspace_inventory,
             workspace_sha256,
@@ -3085,6 +3158,613 @@ pub fn select_artifact(
     Ok(candidates.remove(0))
 }
 
+fn current_cargo_executable(program: &str) -> Result<Option<FileIdentity>> {
+    if program == "cargo" {
+        return Ok(None);
+    }
+    let path = Path::new(program);
+    require(
+        path.is_absolute() && path.file_name().is_some_and(|name| name == "cargo"),
+        "current build program is neither cargo nor an absolute cargo executable",
+    )?;
+    let file = FileIdentity::read(path)?;
+    require(
+        file.path == path
+            && fs::metadata(path)
+                .map_err(|e| e.to_string())?
+                .permissions()
+                .mode()
+                & 0o111
+                != 0,
+        "current Cargo executable is not canonical or executable",
+    )?;
+    Ok(Some(file))
+}
+
+fn verify_current_build_files(build: &CurrentBuildEvidence) -> Result<()> {
+    build.command.stdout.verify()?;
+    build.command.stderr.verify()?;
+    build.artifact.verify()?;
+    require(
+        current_cargo_executable(&build.command.program)? == build.cargo_executable,
+        "current Cargo executable identity changed after binding",
+    )
+}
+
+fn current_build_command(
+    command: &CommandEvidence,
+    sources: &CompiledSources,
+    target: &Path,
+    features: &[String],
+) -> Result<Option<FileIdentity>> {
+    let cargo_executable = current_cargo_executable(&command.program)?;
+    require(
+        command.status == 0
+            && command.cwd == sources.workspace_root
+            && command.arguments.first().is_some_and(|a| a == "build"),
+        "current build lacks its successful Cargo command/source root",
+    )?;
+    let mut switches = BTreeSet::new();
+    let mut options = BTreeMap::new();
+    let mut arguments = command.arguments.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--locked"
+            | "--offline"
+            | "--lib"
+            | "--no-default-features"
+            | "--message-format=json-render-diagnostics" => require(
+                switches.insert(argument.as_str()),
+                "current build repeats a Cargo switch",
+            )?,
+            "--manifest-path" | "-p" | "--profile" | "--target-dir" | "--features" => {
+                let value = arguments.next().ok_or("current build option lacks value")?;
+                require(
+                    options.insert(argument.as_str(), value.as_str()).is_none(),
+                    "current build repeats a Cargo option",
+                )?;
+            }
+            _ => return Err("current build has an unsupported Cargo argument".into()),
+        }
+    }
+    require(
+        switches
+            == BTreeSet::from([
+                "--locked",
+                "--offline",
+                "--lib",
+                "--no-default-features",
+                "--message-format=json-render-diagnostics",
+            ])
+            && options.get("--manifest-path").copied() == sources.manifest.path.to_str()
+            && options.get("-p").copied() == Some("detcore-liteinst")
+            && options.get("--profile").copied() == Some("liteinst-runtime")
+            && options.get("--target-dir").copied() == target.to_str(),
+        "current build command differs from the explicit Detcore profile/target/source",
+    )?;
+    // exec-private-init is an implied feature of exec-native-injection. The
+    // canonical native producer requests the latter, not the derived feature.
+    let mut requested = features.to_vec();
+    if requested
+        .iter()
+        .any(|feature| feature == "exec-native-injection")
+    {
+        require(
+            requested
+                .iter()
+                .any(|feature| feature == "exec-private-init"),
+            "native compiler event lacks its implied private-init feature",
+        )?;
+        requested.retain(|feature| feature != "exec-private-init");
+    }
+    require_explicit_cargo_features(&command.arguments, &requested)?;
+    Ok(cargo_executable)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StandaloneCurrentBuildSources {
+    wrapper: PackageIdentity,
+    workspace_files: BTreeMap<String, FileIdentity>,
+}
+
+fn standalone_current_build_sources(
+    sources: &CompiledSources,
+    metadata: &Value,
+    runner: &mut Runner,
+) -> Result<StandaloneCurrentBuildSources> {
+    require(
+        sources.layout == CompiledSourceLayout::HermitGit
+            && sources.image_kind == FixedImageKind::Standalone,
+        "standalone build source binding requires the owned Hermit nested workspace",
+    )?;
+    let mut workspace_files = BTreeMap::new();
+    match &sources.authority {
+        CompiledSourceAuthority::Git { workspace_head, .. } => {
+            for relative in CONTENT_WORKSPACE_FILES {
+                workspace_files.insert(
+                    relative.to_owned(),
+                    compiled_blob_file(&sources.workspace_root, workspace_head, relative, runner)?,
+                );
+            }
+        }
+        CompiledSourceAuthority::DeclaredContent {
+            workspace_inventory,
+            ..
+        } => {
+            require(
+                workspace_inventory
+                    .iter()
+                    .map(|entry| entry.relative.as_str())
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from(CONTENT_WORKSPACE_FILES)
+                    && workspace_inventory.len() == CONTENT_WORKSPACE_FILES.len(),
+                "standalone declared workspace inventory differs from its six owned files",
+            )?;
+            for relative in CONTENT_WORKSPACE_FILES {
+                let file = sources
+                    .files
+                    .get(&format!("workspace:{relative}"))
+                    .ok_or("standalone declared workspace file absent")?;
+                let declared = workspace_inventory
+                    .iter()
+                    .find(|entry| entry.relative == relative)
+                    .ok_or("standalone workspace file has no declared authority")?;
+                file.verify()?;
+                require(
+                    file.path == sources.workspace_root.join(relative)
+                        && file.sha256 == declared.sha256
+                        && fs::metadata(&file.path).map_err(|e| e.to_string())?.len()
+                            == declared.size,
+                    "standalone workspace file differs from declared source authority",
+                )?;
+                workspace_files.insert(relative.to_owned(), file.clone());
+            }
+        }
+    }
+    require(
+        workspace_files.get("liteinst-runtime-build/Cargo.toml") == Some(&sources.manifest),
+        "standalone workspace manifest differs from the existing source authority",
+    )?;
+    let wrapper = standalone_wrapper_package(metadata, &sources.workspace_root, &workspace_files)?;
+    Ok(StandaloneCurrentBuildSources {
+        wrapper,
+        workspace_files,
+    })
+}
+
+fn standalone_wrapper_package(
+    metadata: &Value,
+    root: &Path,
+    workspace_files: &BTreeMap<String, FileIdentity>,
+) -> Result<PackageIdentity> {
+    let name = "hermit-liteinst-runtime-artifact";
+    let target = "hermit_liteinst_runtime_artifact";
+    let manifest = workspace_files
+        .get("liteinst-runtime-build/runtime/Cargo.toml")
+        .ok_or("authorized standalone wrapper manifest absent")?;
+    let source_file = workspace_files
+        .get("liteinst-runtime-build/runtime/src/lib.rs")
+        .ok_or("authorized standalone wrapper source absent")?;
+    manifest.verify()?;
+    source_file.verify()?;
+    let nested = root.join("liteinst-runtime-build");
+    require(
+        manifest.path == nested.join("runtime/Cargo.toml")
+            && source_file.path == nested.join("runtime/src/lib.rs")
+            && metadata["workspace_root"].as_str() == nested.to_str(),
+        "standalone wrapper or metadata belongs to a different nested workspace",
+    )?;
+    let id = format!(
+        "path+file://{}#{name}@0.5.1",
+        nested.join("runtime").display()
+    );
+    let packages: Vec<_> = metadata["packages"]
+        .as_array()
+        .ok_or("fresh standalone metadata packages absent")?
+        .iter()
+        .filter(|package| package["name"] == name)
+        .collect();
+    require(
+        packages.len() == 1,
+        "fresh standalone wrapper package absent or duplicated",
+    )?;
+    let package = packages[0];
+    require(
+        package["id"] == id
+            && package["version"] == "0.5.1"
+            && package.get("source") == Some(&Value::Null)
+            && package["manifest_path"].as_str() == manifest.path.to_str()
+            && strings(&metadata["workspace_members"])?
+                .iter()
+                .filter(|member| *member == &id)
+                .count()
+                == 1,
+        "fresh standalone wrapper identity differs from its authorized local package",
+    )?;
+    let targets: Vec<_> = package["targets"]
+        .as_array()
+        .ok_or("standalone wrapper targets absent")?
+        .iter()
+        .filter(|candidate| candidate["name"] == target)
+        .collect();
+    require(
+        targets.len() == 1,
+        "standalone wrapper target absent or duplicated",
+    )?;
+    let target_record = targets[0];
+    require(
+        target_record["src_path"].as_str() == source_file.path.to_str()
+            && strings(&target_record["kind"])? == ["lib"]
+            && strings(&target_record["crate_types"])? == ["lib"],
+        "standalone wrapper target differs from its exact lib/lib source",
+    )?;
+    Ok(PackageIdentity {
+        id,
+        name: name.into(),
+        manifest: manifest.path.clone(),
+        source: None,
+        target: target.into(),
+        kind: vec!["lib".into()],
+        crate_types: vec!["lib".into()],
+        target_source: source_file.path.clone(),
+    })
+}
+
+fn standalone_current_build_command(
+    command: &CommandEvidence,
+    sources: &CompiledSources,
+    target: &Path,
+) -> Result<Option<FileIdentity>> {
+    let cargo_executable = current_cargo_executable(&command.program)?;
+    let expected = standalone_current_build_arguments(target)?;
+    require(
+        command.status == 0
+            && sources.layout == CompiledSourceLayout::HermitGit
+            && sources.image_kind == FixedImageKind::Standalone
+            && sources.manifest.path
+                == sources
+                    .workspace_root
+                    .join("liteinst-runtime-build/Cargo.toml")
+            && Some(command.cwd.as_path()) == sources.manifest.path.parent()
+            && command.arguments == expected,
+        "standalone current build differs from the exact nested release multipackage command",
+    )?;
+    Ok(cargo_executable)
+}
+
+fn standalone_current_build_arguments(target: &Path) -> Result<Vec<String>> {
+    Ok(vec![
+        "build",
+        "--locked",
+        "--no-default-features",
+        "--manifest-path",
+        "Cargo.toml",
+        "-p",
+        "hermit-liteinst-runtime-artifact",
+        "-p",
+        "reverie-liteinst-preload",
+        "--lib",
+        "--profile",
+        "release",
+        "--target-dir",
+        target.to_str().ok_or("standalone target is not UTF-8")?,
+        "--message-format=json-render-diagnostics",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect())
+}
+
+fn current_build_evidence_in_scope(
+    sources: &CompiledSources,
+    command: &CommandEvidence,
+    selected_elf: &Path,
+    target_directory: &Path,
+    standalone: Option<&StandaloneCurrentBuildSources>,
+) -> Result<CurrentBuildEvidence> {
+    // Data only. Public factories require fresh opaque sources; the standalone
+    // factory additionally binds all owned workspace files to that authority.
+    require(
+        if standalone.is_some() {
+            sources.layout == CompiledSourceLayout::HermitGit
+                && sources.image_kind == FixedImageKind::Standalone
+                && sources.leaf.name == "reverie-liteinst-preload"
+        } else {
+            sources.image_kind == FixedImageKind::Detcore
+        },
+        "current build source image differs from its explicit witness scope",
+    )?;
+    command.stdout.verify()?;
+    command.stderr.verify()?;
+    require(
+        fs::metadata(&command.stdout.path)
+            .map_err(|e| e.to_string())?
+            .len()
+            <= 64 * 1024 * 1024,
+        "current Cargo compiler stream exceeds its retained byte cap",
+    )?;
+    let messages = fs::read_to_string(&command.stdout.path).map_err(|e| e.to_string())?;
+    let canonical_target = fs::canonicalize(target_directory).map_err(|e| e.to_string())?;
+    require(
+        canonical_target.as_os_str() == target_directory.as_os_str()
+            && canonical_target != sources.workspace_root,
+        "current build target must be an explicit separate directory",
+    )?;
+    if let Some(binding) = standalone {
+        require(
+            binding
+                .workspace_files
+                .values()
+                .all(|file| !file.path.starts_with(&canonical_target)),
+            "standalone current build target overlaps authorized source paths",
+        )?;
+    }
+    let target_directory = canonical_target;
+    let expected_profile = if standalone.is_some() {
+        NoScopeCohort::StandaloneRelease62.profile()
+    } else {
+        NoScopeCohort::DetcoreNative101.profile()
+    };
+    let required_names: &[&str] = if standalone.is_some() {
+        &[
+            "hermit-liteinst-runtime-artifact",
+            "reverie-liteinst-preload",
+            "reverie-liteinst",
+            "reverie-inguest",
+        ]
+    } else {
+        &["detcore-liteinst", "reverie-inguest", "reverie-liteinst"]
+    };
+    let mut packages = BTreeMap::new();
+    for line in messages.lines().filter(|line| !line.is_empty()) {
+        let event: Value = serde_json::from_str(line)
+            .map_err(|e| format!("current Cargo compiler stream: {e}"))?;
+        if event["reason"] != "compiler-artifact" {
+            continue;
+        }
+        let candidates: Vec<_> = sources
+            .packages
+            .values()
+            .chain(standalone.map(|binding| &binding.wrapper))
+            .filter(|package| {
+                required_names.contains(&package.name.as_str())
+                    && event["package_id"] == package.id
+                    && event["target"]["name"] == package.target
+            })
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        require(candidates.len() == 1, "ambiguous current compiled package")?;
+        let package = candidates[0];
+        require(
+            real_file(Path::new(
+                event["manifest_path"]
+                    .as_str()
+                    .ok_or("current manifest absent")?,
+            ))? == package.manifest
+                && real_file(Path::new(
+                    event["target"]["src_path"]
+                        .as_str()
+                        .ok_or("current source absent")?,
+                ))? == package.target_source
+                && strings(&event["target"]["kind"])? == package.kind
+                && strings(&event["target"]["crate_types"])? == package.crate_types
+                && event["profile"] == expected_profile,
+            "current compiler event differs from verified source/target/profile",
+        )?;
+        let features = strings(&event["features"])?;
+        let mut normalized = features.clone();
+        normalized.sort();
+        normalized.dedup();
+        require(
+            features == normalized,
+            "current compiler features are not a unique sorted set",
+        )?;
+        let outputs = strings(&event["filenames"])?
+            .iter()
+            .map(|path| real_file(Path::new(path)))
+            .collect::<Result<Vec<_>>>()?;
+        require(
+            !outputs.is_empty()
+                && outputs
+                    .iter()
+                    .all(|path| path.starts_with(&target_directory))
+                && outputs.iter().collect::<BTreeSet<_>>().len() == outputs.len(),
+            "current dependency output is absent, duplicated or outside the isolated target",
+        )?;
+        require(
+            packages
+                .insert(
+                    package.name.clone(),
+                    CurrentBuildPackage {
+                        package: package.clone(),
+                        features,
+                        profile: event["profile"].clone(),
+                        outputs,
+                    },
+                )
+                .is_none(),
+            "duplicate current compiler artifact for a required source package",
+        )?;
+    }
+    require(
+        packages.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            == required_names.iter().copied().collect(),
+        "current build lacks the actual leaf/core/inguest compiler events",
+    )?;
+    let leaf = &packages[&sources.leaf.name];
+    let selected = select_artifact(
+        &messages,
+        &leaf.package,
+        &leaf.features,
+        &expected_profile,
+        &target_directory,
+    )?;
+    let artifact = FileIdentity::read(selected_elf)?;
+    require(
+        artifact.path == selected.reported_path,
+        "current build witness selects a different actual Cargo ELF",
+    )?;
+    let cargo_executable = if standalone.is_some() {
+        standalone_current_build_command(command, sources, &target_directory)?
+    } else {
+        current_build_command(command, sources, &target_directory, &leaf.features)?
+    };
+    let evidence = CurrentBuildEvidence {
+        command: command.clone(),
+        cargo_executable,
+        target_directory,
+        artifact,
+        compiled_sources_sha256: sha256(&serde_json::to_vec(sources).map_err(|e| e.to_string())?),
+        packages,
+        standalone_sources: standalone.cloned(),
+    };
+    if standalone.is_some() {
+        require(
+            no_scope_build_features(&evidence)? == NoScopeCohort::StandaloneRelease62,
+            "standalone current build is not the measured nonfixture OFF release cohort",
+        )?;
+    }
+    Ok(evidence)
+}
+
+fn current_build_evidence(
+    sources: &CompiledSources,
+    command: &CommandEvidence,
+    selected_elf: &Path,
+    target_directory: &Path,
+) -> Result<CurrentBuildEvidence> {
+    // This returns data only. The public factory first verifies its opaque
+    // source context; callers cannot obtain one by deserializing these records.
+    require(
+        sources.image_kind == FixedImageKind::Detcore,
+        "current build witness requires a Detcore source identity",
+    )?;
+    command.stdout.verify()?;
+    command.stderr.verify()?;
+    require(
+        fs::metadata(&command.stdout.path)
+            .map_err(|e| e.to_string())?
+            .len()
+            <= 64 * 1024 * 1024,
+        "current Cargo compiler stream exceeds its retained byte cap",
+    )?;
+    let messages = fs::read_to_string(&command.stdout.path).map_err(|e| e.to_string())?;
+    let canonical_target = fs::canonicalize(target_directory).map_err(|e| e.to_string())?;
+    require(
+        canonical_target.as_os_str() == target_directory.as_os_str()
+            && canonical_target != sources.workspace_root,
+        "current build target must be an explicit separate directory",
+    )?;
+    let target_directory = canonical_target;
+    let expected_profile = serde_json::json!({"opt_level":"3", "debuginfo":0,
+        "debug_assertions":true,"overflow_checks":true,"test":false});
+    let mut packages = BTreeMap::new();
+    for line in messages.lines().filter(|line| !line.is_empty()) {
+        let event: Value = serde_json::from_str(line)
+            .map_err(|e| format!("current Cargo compiler stream: {e}"))?;
+        if event["reason"] != "compiler-artifact" {
+            continue;
+        }
+        let candidates: Vec<_> = sources
+            .packages
+            .values()
+            .filter(|package| {
+                ["reverie-liteinst", "reverie-inguest", "detcore-liteinst"]
+                    .contains(&package.name.as_str())
+                    && event["package_id"] == package.id
+                    && event["target"]["name"] == package.target
+            })
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        require(candidates.len() == 1, "ambiguous current compiled package")?;
+        let package = candidates[0];
+        require(
+            real_file(Path::new(
+                event["manifest_path"]
+                    .as_str()
+                    .ok_or("current manifest absent")?,
+            ))? == package.manifest
+                && real_file(Path::new(
+                    event["target"]["src_path"]
+                        .as_str()
+                        .ok_or("current source absent")?,
+                ))? == package.target_source
+                && strings(&event["target"]["kind"])? == package.kind
+                && strings(&event["target"]["crate_types"])? == package.crate_types
+                && event["profile"] == expected_profile,
+            "current compiler event differs from verified source/target/profile",
+        )?;
+        let features = strings(&event["features"])?;
+        let mut normalized = features.clone();
+        normalized.sort();
+        normalized.dedup();
+        require(
+            features == normalized,
+            "current compiler features are not a unique sorted set",
+        )?;
+        let outputs = strings(&event["filenames"])?
+            .iter()
+            .map(|path| real_file(Path::new(path)))
+            .collect::<Result<Vec<_>>>()?;
+        require(
+            !outputs.is_empty()
+                && outputs
+                    .iter()
+                    .all(|path| path.starts_with(&target_directory))
+                && outputs.iter().collect::<BTreeSet<_>>().len() == outputs.len(),
+            "current dependency output is absent, duplicated or outside the isolated target",
+        )?;
+        require(
+            packages
+                .insert(
+                    package.name.clone(),
+                    CurrentBuildPackage {
+                        package: package.clone(),
+                        features,
+                        profile: event["profile"].clone(),
+                        outputs,
+                    },
+                )
+                .is_none(),
+            "duplicate current compiler artifact for a required source package",
+        )?;
+    }
+    require(
+        packages.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            == BTreeSet::from(["detcore-liteinst", "reverie-inguest", "reverie-liteinst"]),
+        "current build lacks the actual leaf/core/inguest compiler events",
+    )?;
+    let leaf = &packages["detcore-liteinst"];
+    let selected = select_artifact(
+        &messages,
+        &leaf.package,
+        &leaf.features,
+        &expected_profile,
+        &target_directory,
+    )?;
+    let artifact = FileIdentity::read(selected_elf)?;
+    require(
+        artifact.path == selected.reported_path,
+        "current build witness selects a different actual Cargo ELF",
+    )?;
+    let cargo_executable =
+        current_build_command(command, sources, &target_directory, &leaf.features)?;
+    Ok(CurrentBuildEvidence {
+        command: command.clone(),
+        cargo_executable,
+        target_directory,
+        artifact,
+        compiled_sources_sha256: sha256(&serde_json::to_vec(sources).map_err(|e| e.to_string())?),
+        packages,
+        standalone_sources: None,
+    })
+}
+
 const ALLOCATOR_BACKING_SYMBOL: &str = "reverie_liteinst_allocator_backing_v1";
 const FIXED_ARENA_VERSION: u32 = 1;
 
@@ -3157,6 +3837,138 @@ pub struct AllocatorTlsBoundary {
     pub direct_allocation: Option<DirectAllocationTlsEvidence>,
 }
 
+/// The historical boundary is serialized without a new tag or wrapper. The
+/// second arm is a distinct, source-and-build-qualified absence claim; it never
+/// invents a TLS cell or provider for a build whose allocator has no such edge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum AllocatorInstallationEvidence {
+    Existing(Box<AllocatorTlsBoundary>),
+    NoInstallationScope(Box<NoInstallationScopeEvidence>),
+}
+impl<'de> Deserialize<'de> for AllocatorInstallationEvidence {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        // Deserialize each complete arm directly. Serde's intermediate untagged
+        // content decoder cannot preserve CommandEvidence's existing u128 time
+        // field. Neither arm changes shape, and both retain deny_unknown_fields.
+        let value = Value::deserialize(deserializer)?;
+        if value.get("kind").is_some() {
+            serde_json::from_value(value)
+                .map(|proof| Self::NoInstallationScope(Box::new(proof)))
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(|boundary| Self::Existing(Box::new(boundary)))
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+impl AllocatorInstallationEvidence {
+    fn existing(&self) -> Option<&AllocatorTlsBoundary> {
+        match self {
+            Self::Existing(boundary) => Some(boundary.as_ref()),
+            Self::NoInstallationScope(_) => None,
+        }
+    }
+    #[cfg(test)]
+    fn existing_mut(&mut self) -> &mut AllocatorTlsBoundary {
+        match self {
+            Self::Existing(boundary) => boundary.as_mut(),
+            Self::NoInstallationScope(_) => panic!("test requires historical TLS evidence"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentBuildPackage {
+    package: PackageIdentity,
+    features: Vec<String>,
+    profile: Value,
+    outputs: Vec<PathBuf>,
+}
+/// Data retained inside the new absence arm. Only with_current_build can bind
+/// it to an opaque source context; deserializing it does not create authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentBuildEvidence {
+    command: CommandEvidence,
+    cargo_executable: Option<FileIdentity>,
+    target_directory: PathBuf,
+    artifact: FileIdentity,
+    compiled_sources_sha256: String,
+    packages: BTreeMap<String, CurrentBuildPackage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    standalone_sources: Option<StandaloneCurrentBuildSources>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnisolatedTlsGetter {
+    getter: SymbolEvidence,
+    cell_offset: u64,
+    module_slot: u64,
+    plt_address: u64,
+    sha256: String,
+}
+/// Finite no-INSTALLATION_DEPTH evidence for the measured native OFF allocation
+/// route. Other guest TLS and its provider remain explicitly unisolated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoInstallationScopeEvidence {
+    kind: String,
+    version: u32,
+    policy: String,
+    elf_sha256: String,
+    compiled_sources_sha256: String,
+    reverie_pin: String,
+    source: FileIdentity,
+    current_build: CurrentBuildEvidence,
+    allocation: SymbolEvidence,
+    allocation_sha256: String,
+    mappings: Vec<TlsExecutableMapping>,
+    static_symbol_count: usize,
+    dynamic_symbol_count: usize,
+    raw_names_sha256: String,
+    loader_writer_count: usize,
+    loader_writers_sha256: String,
+    installation_symbols: Vec<String>,
+    installation_getters: Vec<u64>,
+    installation_writer_count: usize,
+    other_tls_getters: Vec<UnisolatedTlsGetter>,
+    other_getter_pointer_slots: Vec<u64>,
+    other_tls_unisolated: bool,
+}
+const NO_INSTALLATION_SCOPE_POLICY: &str =
+    "detcore_native_off_alloc101_reviewed_source_current_build_rx_loader_census_v1";
+const NO_INSTALLATION_SCOPE_SOURCE: (&str, u64, &str) = (
+    "reverie-liteinst/src/patch_alloc.rs",
+    24943,
+    "9336107f903561bb5297f9897fd4c222e9cd2f80715817a07e330498ab7c17f5",
+);
+// Complete22B getters physically retained by the measured native OFF image.
+// These are other TLS, never allocator-operation targets or isolation credit.
+const NO_SCOPE_OTHER_GETTERS: [(&str, u64); 4] = [
+    (
+        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest7support20TOOL_CALLBACK_ACTIVE0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1s_6option6OptionQIB27_INtNtNtB1s_4sync6atomic6AtomicbEEEEE9call_onceBc_",
+        0xe8,
+    ),
+    (
+        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation5OWNER0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1i_6option6OptionQIB1X_INtNtB1i_4cell4CellONtB8_12ContinuationEEEEE9call_onceBc_",
+        0xf0,
+    ),
+    (
+        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest12continuation7PENDING0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CellIB1Z_NtB8_7PendingEEEEEE9call_onceBc_",
+        0,
+    ),
+    (
+        "_RNvYNCNKNvNtNtCs_15reverie_inguest5guest5alloc14DISPATCH_DEPTH0s_0INtNtNtCs_4core3ops8function6FnOnceTINtNtB1k_6option6OptionQIB1Z_INtNtB1k_4cell4CelljEEEEE9call_onceBc_",
+        0x140,
+    ),
+];
+
 /// Versioned finite absence evidence, not a TLS-isolation or source authority.
 /// Consumer admission always re-extracts this from its actual ELF and verified
 /// compiled sources and compares the entire qualification record.
@@ -3209,7 +4021,7 @@ pub struct AllocatorBackingEvidence {
     /// reaching these typed implementations, not an invented global object.
     pub compiler_global_type: String,
     pub fixed_backing_record: ImmutableAllocatorObject,
-    pub tls_boundary: AllocatorTlsBoundary,
+    pub tls_boundary: AllocatorInstallationEvidence,
     pub allocator_transfers: BTreeMap<String, Vec<ConstructorTransfer>>,
     pub readonly_objects: BTreeMap<String, FixedReadonlyEvidence>,
     pub selection_objects: BTreeMap<String, SymbolEvidence>,
@@ -3324,6 +4136,27 @@ const FIXED_EMITTED_ROLE_SYMBOLS: &[(&str, &str)] = &[
     (
         "fixed_patch_realloc",
         "_RNvXs3_NtCs_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCs_4core5alloc6global11GlobalAlloc7realloc",
+    ),
+    // The genuine OFF native Detcore leaf at840 emits these four exact
+    // GlobalAlloc methods with impl ordinal Xs2: PatchAllocationScope's Drop
+    // impl is not compiled without liteinst or allocator-fixture. Its compiler
+    // shims select these LOCAL methods through RELATIVE/RELRO GOT slots. This
+    // finite spelling census grants no machine or TLS-boundary admission.
+    (
+        "fixed_patch_alloc",
+        "_RNvXs2_NtCs_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCs_4core5alloc6global11GlobalAlloc5alloc",
+    ),
+    (
+        "fixed_patch_alloc_zeroed",
+        "_RNvXs2_NtCs_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCs_4core5alloc6global11GlobalAlloc12alloc_zeroed",
+    ),
+    (
+        "fixed_patch_dealloc",
+        "_RNvXs2_NtCs_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCs_4core5alloc6global11GlobalAlloc7dealloc",
+    ),
+    (
+        "fixed_patch_realloc",
+        "_RNvXs2_NtCs_16reverie_liteinst11patch_allocNtB5_26FixedPrivatePatchAllocatorNtNtNtCs_4core5alloc6global11GlobalAlloc7realloc",
     ),
     (
         "fixed_patch_require_owned",
@@ -17282,6 +18115,600 @@ fn direct_tls_getter_census(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoScopeCohort {
+    DetcoreNative101,
+    DetcoreOrdinary101,
+    StandaloneRelease62,
+}
+
+impl NoScopeCohort {
+    fn profile(self) -> Value {
+        let debug = self != Self::StandaloneRelease62;
+        serde_json::json!({"opt_level":"3", "debuginfo":0,
+            "debug_assertions":debug,"overflow_checks":debug,"test":false})
+    }
+    fn features(self) -> &'static [(&'static str, &'static [&'static str])] {
+        match self {
+            Self::DetcoreNative101 => &[
+                (
+                    "detcore-liteinst",
+                    &["exec-native-injection", "exec-private-init"],
+                ),
+                (
+                    "reverie-liteinst",
+                    &[
+                        "exec-native-injection",
+                        "exec-private-init",
+                        "exec-private-successor",
+                        "fixed-syscall-gates",
+                        "native-exec-state",
+                    ],
+                ),
+                (
+                    "reverie-inguest",
+                    &[
+                        "coordinator-rpc",
+                        "exec-native-injection",
+                        "exec-private-init",
+                        "exec-private-successor",
+                        "fixed-syscall-gates",
+                        "launcher",
+                        "native-exec-state",
+                        "rcb-clock",
+                    ],
+                ),
+            ],
+            Self::DetcoreOrdinary101 => &[
+                ("detcore-liteinst", &[]),
+                ("reverie-liteinst", &[]),
+                (
+                    "reverie-inguest",
+                    &["coordinator-rpc", "launcher", "rcb-clock"],
+                ),
+            ],
+            Self::StandaloneRelease62 => &[
+                ("hermit-liteinst-runtime-artifact", &[]),
+                ("reverie-liteinst-preload", &[]),
+                ("reverie-liteinst", &[]),
+                (
+                    "reverie-inguest",
+                    &["coordinator-rpc", "launcher", "rcb-clock"],
+                ),
+            ],
+        }
+    }
+}
+
+fn select_no_scope_cohort(packages: &BTreeMap<&str, (&[String], &Value)>) -> Result<NoScopeCohort> {
+    let candidates: Vec<_> = [
+        NoScopeCohort::DetcoreNative101,
+        NoScopeCohort::DetcoreOrdinary101,
+        NoScopeCohort::StandaloneRelease62,
+    ]
+    .into_iter()
+    .filter(|cohort| {
+        let expected = cohort.features();
+        packages.len() == expected.len()
+            && expected.iter().all(|(name, features)| {
+                packages
+                    .get(*name)
+                    .is_some_and(|(features_actual, profile)| {
+                        features_actual
+                            .iter()
+                            .map(String::as_str)
+                            .eq(features.iter().copied())
+                            && **profile == cohort.profile()
+                    })
+            })
+    })
+    .collect();
+    require(
+        candidates.len() == 1,
+        "no-scope build has an unreviewed package/feature/test/profile cohort",
+    )?;
+    Ok(candidates[0])
+}
+
+fn no_scope_build_features(build: &CurrentBuildEvidence) -> Result<NoScopeCohort> {
+    let packages = build
+        .packages
+        .iter()
+        .map(|(name, package)| {
+            (
+                name.as_str(),
+                (package.features.as_slice(), &package.profile),
+            )
+        })
+        .collect();
+    let cohort = select_no_scope_cohort(&packages)?;
+    if cohort == NoScopeCohort::StandaloneRelease62 {
+        let binding = build
+            .standalone_sources
+            .as_ref()
+            .ok_or("standalone no-scope build lacks its authorized workspace binding")?;
+        let root = build
+            .command
+            .cwd
+            .parent()
+            .ok_or("standalone workspace parent absent")?;
+        require(
+            build.command.cwd == root.join("liteinst-runtime-build")
+                && build.command.arguments
+                    == standalone_current_build_arguments(&build.target_directory)?
+                && build.target_directory.is_absolute()
+                && binding
+                    .workspace_files
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from(CONTENT_WORKSPACE_FILES)
+                && binding.workspace_files.len() == CONTENT_WORKSPACE_FILES.len()
+                && binding.workspace_files.iter().all(|(relative, file)| {
+                    file.path == root.join(relative)
+                        && file.sha256.len() == 64
+                        && file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                && binding.wrapper == build.packages["hermit-liteinst-runtime-artifact"].package
+                && binding.wrapper.id
+                    == format!(
+                        "path+file://{}#hermit-liteinst-runtime-artifact@0.5.1",
+                        root.join("liteinst-runtime-build/runtime").display()
+                    )
+                && binding.wrapper.name == "hermit-liteinst-runtime-artifact"
+                && binding.wrapper.source.is_none()
+                && binding.wrapper.target == "hermit_liteinst_runtime_artifact"
+                && binding.wrapper.kind == ["lib"]
+                && binding.wrapper.crate_types == ["lib"]
+                && binding.wrapper.manifest
+                    == binding.workspace_files["liteinst-runtime-build/runtime/Cargo.toml"].path
+                && binding.wrapper.target_source
+                    == binding.workspace_files["liteinst-runtime-build/runtime/src/lib.rs"].path,
+            "standalone no-scope wrapper/source inventory binding is inconsistent",
+        )?;
+    } else {
+        require(
+            build.standalone_sources.is_none(),
+            "Detcore no-scope build has a foreign standalone binding",
+        )?;
+    }
+    Ok(cohort)
+}
+
+fn installation_scope_raw_name(name: &str) -> bool {
+    name.contains("INSTALLATION_DEPTH")
+        || name.contains("PatchAllocationScope")
+        || name.contains("fixture_installation_depth")
+        || canonical_rust_symbol(name).as_deref()
+            == Some("_RNvNtCs_16reverie_liteinst11patch_alloc5enter")
+}
+
+struct NoScopeCensus {
+    mappings: Vec<TlsExecutableMapping>,
+    raw_names_sha256: String,
+    loader_writer_count: usize,
+    loader_writers_sha256: String,
+    other_tls_getters: Vec<UnisolatedTlsGetter>,
+    other_getter_pointer_slots: Vec<u64>,
+}
+// Physical census only. The production caller separately requires actual
+// verified sources, actual compiler feature events and the whole101B recipe.
+fn no_installation_scope_census(elf: &Elf<'_>, bytes: &[u8]) -> Result<NoScopeCensus> {
+    let mut raw_names = Vec::new();
+    for (dynamic, symbols, strings) in [
+        (false, &elf.syms, &elf.strtab),
+        (true, &elf.dynsyms, &elf.dynstrtab),
+    ] {
+        for symbol in symbols.iter() {
+            let name = strings
+                .get_at(symbol.st_name)
+                .ok_or("no-scope raw symbol name malformed")?;
+            raw_names.push((
+                dynamic,
+                name,
+                symbol.st_info,
+                symbol.st_other,
+                symbol.st_shndx,
+                symbol.st_value,
+                symbol.st_size,
+            ));
+            require(
+                !installation_scope_raw_name(name),
+                "no-scope image retains an installation cell/getter/writer identity",
+            )?;
+        }
+    }
+    let mut other_tls_getters = Vec::new();
+    for (canonical, cell_offset) in NO_SCOPE_OTHER_GETTERS {
+        let candidates: Vec<_> = elf
+            .syms
+            .iter()
+            .filter(|symbol| {
+                elf.strtab
+                    .get_at(symbol.st_name)
+                    .and_then(canonical_rust_symbol)
+                    .as_deref()
+                    == Some(canonical)
+            })
+            .collect();
+        require(
+            candidates.len() == 1,
+            "other TLS getter absent or duplicated in no-scope image",
+        )?;
+        let symbol = candidates[0];
+        require(
+            symbol.st_type() == sym::STT_FUNC
+                && symbol.st_bind() == sym::STB_LOCAL
+                && symbol.st_size == 22
+                && symbol.st_value != 0
+                && !elf.dynsyms.iter().any(|dynamic| {
+                    elf.dynstrtab
+                        .get_at(dynamic.st_name)
+                        .and_then(canonical_rust_symbol)
+                        .as_deref()
+                        == Some(canonical)
+                }),
+            "other TLS getter is malformed/dynamic/nonlocal in no-scope image",
+        )?;
+        let (segment, at) = unique_file_mapping(elf, bytes, symbol.st_value, 22)?;
+        require(
+            segment.p_flags == program_header::PF_R | program_header::PF_X,
+            "other TLS getter is not complete file-backed RX",
+        )?;
+        let code = &bytes[at..at + 22];
+        let module_slot = fixed_rip_target(symbol.st_value, code, 4, 8)?;
+        let plt_address = fixed_rip_target(symbol.st_value, code, 9, 13)?;
+        let mut expected = fixed_hex("50488d3d00000000e800000000488d800000000059c3");
+        expected[16..20].copy_from_slice(
+            &u32::try_from(cell_offset)
+                .map_err(|e| e.to_string())?
+                .to_le_bytes(),
+        );
+        let expected = expected
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        fixed_whole_recipe(
+            symbol.st_value,
+            code,
+            &expected,
+            &[(4, 8, module_slot), (9, 13, plt_address)],
+        )?;
+        fixed_tls_descriptor(elf, bytes, module_slot)?;
+        fixed_tls_import(elf, bytes, plt_address)?;
+        other_tls_getters.push(UnisolatedTlsGetter {
+            getter: symbol_evidence(elf.strtab.get_at(symbol.st_name).unwrap(), &symbol),
+            cell_offset,
+            module_slot,
+            plt_address,
+            sha256: sha256(code),
+        });
+    }
+    other_tls_getters.sort_by_key(|getter| getter.getter.address);
+    let writers = loader_writers(elf)?;
+    let mut mappings = Vec::new();
+    let mut physical_getters = BTreeSet::new();
+    for (index, segment) in elf.program_headers.iter().enumerate() {
+        if segment.p_type != program_header::PT_LOAD || segment.p_flags & program_header::PF_X == 0
+        {
+            continue;
+        }
+        let at = loader_meta_usize(segment.p_offset)?;
+        let length = loader_meta_usize(segment.p_filesz)?;
+        let code = loader_meta_slice(bytes, at, length)?;
+        let end = segment
+            .p_vaddr
+            .checked_add(segment.p_filesz)
+            .ok_or("no-scope RX span overflow")?;
+        require(
+            segment.p_flags == program_header::PF_R | program_header::PF_X
+                && segment.p_filesz != 0
+                && segment.p_memsz >= segment.p_filesz
+                && writers.iter().all(|writer| {
+                    writer.relocation.r_offset >= end || writer.end <= segment.p_vaddr
+                }),
+            "no-scope RX mapping is malformed, writable or loader-modified",
+        )?;
+        mappings.push(TlsExecutableMapping {
+            program_header_index: index,
+            file_offset: segment.p_offset,
+            virtual_address: segment.p_vaddr,
+            file_size: segment.p_filesz,
+            memory_size: segment.p_memsz,
+            flags: segment.p_flags,
+            sha256: sha256(code),
+        });
+        // Every physical byte start, including unnamed code outside sections.
+        for (offset, candidate) in code.windows(22).enumerate() {
+            if candidate[..4] != [0x50, 0x48, 0x8d, 0x3d]
+                || candidate[8] != 0xe8
+                || candidate[13..16] != [0x48, 0x8d, 0x80]
+                || candidate[20..] != [0x59, 0xc3]
+            {
+                continue;
+            }
+            let address = segment
+                .p_vaddr
+                .checked_add(offset as u64)
+                .ok_or("getter census overflow")?;
+            let getter = other_tls_getters
+                .iter()
+                .find(|getter| getter.getter.address == address)
+                .ok_or("unknown or unnamed whole TLS getter in no-scope image")?;
+            require(
+                sha256(candidate) == getter.sha256 && physical_getters.insert(address),
+                "other TLS getter physical identity duplicated or differs",
+            )?;
+        }
+    }
+    require(
+        !mappings.is_empty()
+            && physical_getters
+                == other_tls_getters
+                    .iter()
+                    .map(|getter| getter.getter.address)
+                    .collect(),
+        "no-scope complete RX getter census differs from exact typed getter population",
+    )?;
+    let mut pointer_slots = BTreeSet::new();
+    let mut raw_writers = Vec::new();
+    for writer in &writers {
+        let relocation = &writer.relocation;
+        let width = loader_meta_usize(writer.end - relocation.r_offset)?;
+        let (_, at) = unique_file_mapping(elf, bytes, relocation.r_offset, width)?;
+        let raw = loader_meta_slice(bytes, at, width)?;
+        let mut targets = raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_le_bytes(*word))
+            .collect::<Vec<_>>();
+        if let Some(target) = relocation
+            .r_addend
+            .and_then(|addend| u64::try_from(addend).ok())
+        {
+            targets.push(target);
+        }
+        if relocation.r_sym != 0 {
+            let symbol = elf
+                .dynsyms
+                .get(relocation.r_sym)
+                .ok_or("no-scope writer symbol absent")?;
+            if symbol.st_shndx != section_header::SHN_UNDEF as usize {
+                let addend = relocation
+                    .r_addend
+                    .unwrap_or_else(|| targets.first().copied().unwrap_or(0) as i64);
+                targets.push(
+                    symbol
+                        .st_value
+                        .checked_add_signed(addend)
+                        .ok_or("no-scope writer target overflow")?,
+                );
+            }
+        }
+        if targets.iter().any(|target| {
+            other_tls_getters.iter().any(|getter| {
+                getter.getter.address <= *target
+                    && *target < getter.getter.address.saturating_add(22)
+            })
+        }) {
+            pointer_slots.insert(relocation.r_offset);
+        }
+        raw_writers.push((
+            relocation.r_offset,
+            writer.end,
+            relocation.r_type,
+            relocation.r_sym,
+            relocation.r_addend,
+            sha256(raw),
+            targets,
+        ));
+    }
+    Ok(NoScopeCensus {
+        mappings,
+        raw_names_sha256: sha256(&serde_json::to_vec(&raw_names).map_err(|e| e.to_string())?),
+        loader_writer_count: writers.len(),
+        loader_writers_sha256: sha256(
+            &serde_json::to_vec(&raw_writers).map_err(|e| e.to_string())?,
+        ),
+        other_tls_getters,
+        other_getter_pointer_slots: pointer_slots.into_iter().collect(),
+    })
+}
+
+fn derive_no_installation_scope_evidence(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    code: &BTreeMap<u64, Vec<u8>>,
+    roles: &BTreeMap<String, sym::Sym>,
+    sources: Option<&VerifiedCompiledSources>,
+) -> Result<NoInstallationScopeEvidence> {
+    let sources = sources.ok_or("no-scope allocation needs verified compiled sources")?;
+    sources.require_image(DETCORE_ROOT)?;
+    sources.verify_files()?;
+    let build = sources
+        .current_build
+        .as_ref()
+        .ok_or("no-scope allocation needs actual current-build witness")?;
+    no_scope_build_features(build)?;
+    let compiled_sources_sha256 =
+        sha256(&serde_json::to_vec(sources.record()).map_err(|e| e.to_string())?);
+    require(
+        build.compiled_sources_sha256 == compiled_sources_sha256
+            && build.artifact.sha256 == sha256(bytes),
+        "no-scope current build is for different sources/ELF",
+    )?;
+    let source = sources
+        .record
+        .files
+        .get(&format!("rv:{}", NO_INSTALLATION_SCOPE_SOURCE.0))
+        .ok_or("reviewed no-scope source identity absent")?;
+    source.verify()?;
+    require(
+        source.sha256 == NO_INSTALLATION_SCOPE_SOURCE.2
+            && fs::metadata(&source.path).map_err(|e| e.to_string())?.len()
+                == NO_INSTALLATION_SCOPE_SOURCE.1,
+        "no-scope source differs from the exact reviewed private-cell/writer cfg proof",
+    )?;
+    let allocation = roles
+        .get("fixed_patch_alloc")
+        .ok_or("no-scope allocation role absent")?;
+    let allocation_bytes = code
+        .get(&allocation.st_value)
+        .ok_or("no-scope allocation full bytes absent")?;
+    require(
+        detcore_no_scope_allocation_shape(allocation_bytes),
+        "no-scope allocation is not the exact101B body",
+    )?;
+    for role in &FIXED_REQUIRED_ROLES[..4] {
+        let symbol = &roles[*role];
+        require(
+            elf.strtab
+                .get_at(symbol.st_name)
+                .and_then(canonical_rust_symbol)
+                .is_some_and(|name| {
+                    name.starts_with("_RNvXs2_NtCs_16reverie_liteinst11patch_alloc")
+                }),
+            "no-scope operation is outside the measured exact OFF impl cohort",
+        )?;
+    }
+    authenticate_loader_metadata(elf, bytes)?;
+    let census = no_installation_scope_census(elf, bytes)?;
+    Ok(NoInstallationScopeEvidence {
+        kind: "no_installation_scope".into(),
+        version: 1,
+        policy: NO_INSTALLATION_SCOPE_POLICY.into(),
+        elf_sha256: sha256(bytes),
+        compiled_sources_sha256,
+        reverie_pin: sources.record.reverie_pin.clone(),
+        source: source.clone(),
+        current_build: build.clone(),
+        allocation: symbol_evidence(elf.strtab.get_at(allocation.st_name).unwrap(), allocation),
+        allocation_sha256: sha256(allocation_bytes),
+        mappings: census.mappings,
+        static_symbol_count: elf.syms.len(),
+        dynamic_symbol_count: elf.dynsyms.len(),
+        raw_names_sha256: census.raw_names_sha256,
+        loader_writer_count: census.loader_writer_count,
+        loader_writers_sha256: census.loader_writers_sha256,
+        installation_symbols: Vec::new(),
+        installation_getters: Vec::new(),
+        installation_writer_count: 0,
+        other_tls_getters: census.other_tls_getters,
+        other_getter_pointer_slots: census.other_getter_pointer_slots,
+        other_tls_unisolated: true,
+    })
+}
+
+fn validate_no_installation_scope_evidence(
+    backing: &AllocatorBackingEvidence,
+    proof: &NoInstallationScopeEvidence,
+    image_kind: FixedImageKind,
+) -> Result<()> {
+    let hash = |value: &str, n: usize| {
+        value.len() == n && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    no_scope_build_features(&proof.current_build)?;
+    require(
+        image_kind == FixedImageKind::Detcore
+            && proof.kind == "no_installation_scope"
+            && proof.version == 1
+            && proof.policy == NO_INSTALLATION_SCOPE_POLICY
+            && proof.other_tls_unisolated
+            && hash(&proof.reverie_pin, 40)
+            && proof.source.sha256 == NO_INSTALLATION_SCOPE_SOURCE.2
+            && proof.current_build.artifact.sha256 == proof.elf_sha256
+            && proof.current_build.compiled_sources_sha256 == proof.compiled_sources_sha256
+            && proof.current_build.command.status == 0
+            && match &proof.current_build.cargo_executable {
+                None => proof.current_build.command.program == "cargo",
+                Some(executable) => {
+                    executable.path.is_absolute()
+                        && executable
+                            .path
+                            .file_name()
+                            .is_some_and(|name| name == "cargo")
+                        && executable.path.to_str()
+                            == Some(proof.current_build.command.program.as_str())
+                        && hash(&executable.sha256, 64)
+                }
+            }
+            && [
+                &proof.elf_sha256,
+                &proof.compiled_sources_sha256,
+                &proof.raw_names_sha256,
+                &proof.loader_writers_sha256,
+                &proof.allocation_sha256,
+            ]
+            .iter()
+            .all(|value| hash(value, 64))
+            && proof.static_symbol_count != 0
+            && proof.dynamic_symbol_count != 0
+            && proof.loader_writer_count != 0
+            && proof.installation_symbols.is_empty()
+            && proof.installation_getters.is_empty()
+            && proof.installation_writer_count == 0
+            && !proof.mappings.is_empty()
+            && proof.mappings.iter().all(|mapping| {
+                mapping.flags == program_header::PF_R | program_header::PF_X
+                    && mapping.file_size != 0
+                    && mapping.memory_size >= mapping.file_size
+                    && hash(&mapping.sha256, 64)
+                    && mapping.file_offset.checked_add(mapping.file_size).is_some()
+                    && mapping
+                        .virtual_address
+                        .checked_add(mapping.memory_size)
+                        .is_some()
+            })
+            && proof
+                .mappings
+                .windows(2)
+                .all(|pair| pair[0].program_header_index < pair[1].program_header_index)
+            && backing.functions.get("fixed_patch_alloc") == Some(&proof.allocation)
+            && backing.function_sha256.get("fixed_patch_alloc") == Some(&proof.allocation_sha256)
+            && proof.allocation.size == 101
+            && proof.allocation.binding == sym::STB_LOCAL
+            && fixed_emitted_role(&proof.allocation.name) == Some("fixed_patch_alloc")
+            && FIXED_REQUIRED_ROLES[..4].iter().all(|role| {
+                backing
+                    .functions
+                    .get(*role)
+                    .and_then(|symbol| canonical_rust_symbol(&symbol.name))
+                    .is_some_and(|name| {
+                        name.starts_with("_RNvXs2_NtCs_16reverie_liteinst11patch_alloc")
+                    })
+            })
+            && proof.other_tls_getters.len() == NO_SCOPE_OTHER_GETTERS.len()
+            && proof
+                .other_tls_getters
+                .windows(2)
+                .all(|pair| pair[0].getter.address < pair[1].getter.address)
+            && proof
+                .other_getter_pointer_slots
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+        "no-installation-scope source/build/body/census evidence incomplete or inconsistent",
+    )?;
+    let mut retained = BTreeSet::new();
+    for getter in &proof.other_tls_getters {
+        let canonical = canonical_rust_symbol(&getter.getter.name)
+            .ok_or("other TLS getter type name malformed")?;
+        require(
+            NO_SCOPE_OTHER_GETTERS.contains(&(canonical.as_str(), getter.cell_offset))
+                && retained.insert(canonical)
+                && getter.getter.binding == sym::STB_LOCAL
+                && getter.getter.size == 22
+                && getter.getter.address != 0
+                && hash(&getter.sha256, 64)
+                && getter.module_slot != 0
+                && getter.module_slot.is_multiple_of(8)
+                && getter.plt_address != 0,
+            "no-scope other TLS getter loses its exact unisolated population",
+        )?;
+    }
+    Ok(())
+}
+
 fn direct_tls_source_context(
     sources: Option<&VerifiedCompiledSources>,
 ) -> Result<&VerifiedCompiledSources> {
@@ -18439,7 +19866,72 @@ fn validate_fixed_backing_evidence_in_source_context(
             && record.payload_sha256 == sha256(&expected),
         "Fixed backing lacks its immutable exact span/cursor record",
     )?;
-    let tls = &backing.tls_boundary;
+    match &backing.tls_boundary {
+        AllocatorInstallationEvidence::Existing(tls) => {
+            validate_existing_allocator_tls_boundary(tls, image_kind)?
+        }
+        AllocatorInstallationEvidence::NoInstallationScope(proof) => {
+            validate_no_installation_scope_evidence(backing, proof, image_kind)?
+        }
+    }
+    require(
+        backing
+            .compiler_routes
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from(SHIMS),
+        "Fixed backing lacks four compiler-selected typed routes",
+    )?;
+    for (shim, role) in [
+        ("__rust_alloc", "fixed_patch_alloc"),
+        ("__rust_alloc_zeroed", "fixed_patch_alloc_zeroed"),
+        ("__rust_realloc", "fixed_patch_realloc"),
+        ("__rust_dealloc", "fixed_patch_dealloc"),
+    ] {
+        let route = &backing.compiler_routes[shim];
+        require(
+            backing.functions.get(role) == Some(&route.implementation)
+                && backing.functions.get(shim) == Some(&route.shim)
+                && route.shim.binding == sym::STB_LOCAL
+                && route.implementation.binding == sym::STB_LOCAL
+                && route.call_path.len() >= 2
+                && route.call_path.first() == Some(&route.shim.address)
+                && route.call_path.last() == Some(&route.implementation.address),
+            format!("Fixed {shim} route does not bind its actual distinct typed operation"),
+        )?;
+    }
+    require(
+        FIXED_REQUIRED_ROLES
+            .iter()
+            .all(|role| backing.functions.contains_key(*role))
+            && FIXED_PUBLICATION_REQUIRED_ROLES.iter().all(|role| {
+                backing.functions.contains_key(*role)
+                    && backing.allocator_transfers.contains_key(*role)
+            })
+            && backing.functions.keys().eq(backing.function_sha256.keys())
+            && backing
+                .function_sha256
+                .values()
+                .all(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            && backing
+                .owned_setup_transfers
+                .contains_key("fixed_arena_setup")
+            && FIXED_REQUIRED_ROLES[..4]
+                .iter()
+                .all(|role| backing.allocator_transfers.contains_key(*role))
+            && backing
+                .allocator_transfers
+                .keys()
+                .all(|role| backing.functions.contains_key(role)),
+        "Fixed backing lacks whole required function/setup evidence",
+    )
+}
+
+fn validate_existing_allocator_tls_boundary(
+    tls: &AllocatorTlsBoundary,
+    image_kind: FixedImageKind,
+) -> Result<()> {
     require(
         tls.dependency == "existing_installation_depth_tls"
             && tls.provider_symbol == "__tls_get_addr"
@@ -18450,7 +19942,7 @@ fn validate_fixed_backing_evidence_in_source_context(
             && canonical_rust_symbol(&tls.tls_cell.name).as_deref() == Some(FIXED_TLS_CELL_ROLE)
             && match image_kind {
                 FixedImageKind::Standalone => {
-                    matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x48 | 0x80 | 0x88)
+                    matches!(tls.tls_cell.address, 0x40 | 0x48 | 0x80 | 0x88)
                 }
                 FixedImageKind::Detcore => {
                     matches!(
@@ -18499,7 +19991,7 @@ fn validate_fixed_backing_evidence_in_source_context(
             resolution == "local_relative_readonly_function_pointer"
                 && (tls.tls_cell.address == 0x48
                     || (image_kind == FixedImageKind::Standalone
-                        && matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x80)))
+                        && matches!(tls.tls_cell.address, 0x40 | 0x80)))
                 && edge.local_got_slot.is_none()
                 && tls
                     .local_chain
@@ -18556,7 +20048,7 @@ fn validate_fixed_backing_evidence_in_source_context(
         _ => return Err("Fixed TLS local function-pointer evidence is inconsistent".into()),
     }
     if image_kind == FixedImageKind::Standalone
-        && matches!(tls.tls_cell.address, 0x30 | 0x40 | 0x80)
+        && matches!(tls.tls_cell.address, 0x40 | 0x80)
         && tls.local_key_object.is_some()
     {
         let try_with = tls.local_chain.get("fixed_tls_try_with");
@@ -18569,13 +20061,7 @@ fn validate_fixed_backing_evidence_in_source_context(
                     .is_some_and(|key| key != 0 && key.is_multiple_of(8))
                 && tls.local_key_transfer.as_ref().is_some_and(|edge| {
                     try_with.is_some_and(|caller| {
-                        let call_offset = match (tls.tls_cell.address, caller.size) {
-                            (0x30, 235) => Some(0x18),
-                            (0x40 | 0x80, 175) => Some(0x15),
-                            _ => None,
-                        };
-                        call_offset.and_then(|offset| caller.address.checked_add(offset))
-                            == Some(edge.instruction)
+                        caller.address.checked_add(0x15) == Some(edge.instruction)
                     })
                 })
                 && tls
@@ -18597,60 +20083,7 @@ fn validate_fixed_backing_evidence_in_source_context(
             "new DEV TLS offset lacks its complete Some-LocalKey whole chain",
         )?;
     }
-    require(
-        backing
-            .compiler_routes
-            .keys()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>()
-            == BTreeSet::from(SHIMS),
-        "Fixed backing lacks four compiler-selected typed routes",
-    )?;
-    for (shim, role) in [
-        ("__rust_alloc", "fixed_patch_alloc"),
-        ("__rust_alloc_zeroed", "fixed_patch_alloc_zeroed"),
-        ("__rust_realloc", "fixed_patch_realloc"),
-        ("__rust_dealloc", "fixed_patch_dealloc"),
-    ] {
-        let route = &backing.compiler_routes[shim];
-        require(
-            backing.functions.get(role) == Some(&route.implementation)
-                && backing.functions.get(shim) == Some(&route.shim)
-                && route.shim.binding == sym::STB_LOCAL
-                && route.implementation.binding == sym::STB_LOCAL
-                && route.call_path.len() >= 2
-                && route.call_path.first() == Some(&route.shim.address)
-                && route.call_path.last() == Some(&route.implementation.address),
-            format!("Fixed {shim} route does not bind its actual distinct typed operation"),
-        )?;
-    }
-    require(
-        FIXED_REQUIRED_ROLES
-            .iter()
-            .all(|role| backing.functions.contains_key(*role))
-            && fixed_required_publication_roles(backing.functions.keys().map(String::as_str))
-                .iter()
-                .all(|role| {
-                    backing.functions.contains_key(*role)
-                        && backing.allocator_transfers.contains_key(*role)
-                })
-            && backing.functions.keys().eq(backing.function_sha256.keys())
-            && backing
-                .function_sha256
-                .values()
-                .all(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            && backing
-                .owned_setup_transfers
-                .contains_key("fixed_arena_setup")
-            && FIXED_REQUIRED_ROLES[..4]
-                .iter()
-                .all(|role| backing.allocator_transfers.contains_key(*role))
-            && backing
-                .allocator_transfers
-                .keys()
-                .all(|role| backing.functions.contains_key(role)),
-        "Fixed backing lacks whole required function/setup evidence",
-    )
+    Ok(())
 }
 
 #[cfg(test)]
@@ -18726,15 +20159,27 @@ fn qualify_fixed_allocator_in_source_context(
             )?;
         }
     }
-    let tls = qualify_allocator_tls_boundary_in_source_context(
-        elf,
-        bytes,
-        code,
-        disassembly,
-        got,
-        image_kind,
-        sources,
-    )?;
+    let tls = if image_kind == FixedImageKind::Detcore
+        && code
+            .get(&roles["fixed_patch_alloc"].st_value)
+            .is_some_and(|body| body.len() == 101)
+    {
+        AllocatorInstallationEvidence::NoInstallationScope(Box::new(
+            derive_no_installation_scope_evidence(elf, bytes, code, &roles, sources)?,
+        ))
+    } else {
+        AllocatorInstallationEvidence::Existing(Box::new(
+            qualify_allocator_tls_boundary_in_source_context(
+                elf,
+                bytes,
+                code,
+                disassembly,
+                got,
+                image_kind,
+                sources,
+            )?,
+        ))
+    };
     let context = fixed_machine_context(
         (elf, bytes),
         code,
@@ -18777,20 +20222,33 @@ fn qualify_fixed_allocator_in_source_context(
             .ok_or("Fixed compiler shim lacks full bytes")?;
         let dev = shim_code.len() > 22;
         let edges = if image_kind == FixedImageKind::Detcore {
-            fixed_detcore_compiler_shim_recipe(
-                DETCORE_ROOT,
-                shim,
-                shim_symbol.st_value,
-                shim_code,
-                implementation.st_value,
-                DetcoreRecipeBindings {
-                    targets: &context.targets,
-                    got,
-                    readonly: &context.readonly,
-                    context: &context.compiled_filenames,
-                },
-                tls.tls_cell.address,
-            )?
+            let bindings = DetcoreRecipeBindings {
+                targets: &context.targets,
+                got,
+                readonly: &context.readonly,
+                context: &context.compiled_filenames,
+            };
+            if let Some(tls) = tls.existing() {
+                fixed_detcore_compiler_shim_recipe(
+                    DETCORE_ROOT,
+                    shim,
+                    shim_symbol.st_value,
+                    shim_code,
+                    implementation.st_value,
+                    bindings,
+                    tls.tls_cell.address,
+                )?
+            } else {
+                fixed_detcore_compiler_shim_recipe_in_scope(
+                    DETCORE_ROOT,
+                    shim,
+                    shim_symbol.st_value,
+                    shim_code,
+                    implementation.st_value,
+                    bindings,
+                    None,
+                )?
+            }
         } else {
             fixed_compiler_shim_recipe(
                 shim,
@@ -24405,6 +25863,119 @@ const DETCORE_VALIDATE_TEMPLATES: &[DetcoreValidateTemplate] = &[
         ],
     },
 ];
+// Distinct from every historical TLS-bearing241B recipe. Measured in the true
+// Git840 native OFF DSO c4157195: full101B, b62a329a... before address binding.
+// The only masked fields are the six bound RIP operands below.
+const DETCORE_NO_SCOPE_ALLOC: DetcoreValidateTemplate = DetcoreValidateTemplate {
+    role: "fixed_patch_alloc",
+    hex: "415653504889d34989f6ff1530293b004885c07427488b702040f6c60775274885f67434bf010000004c89f64889da4883c4085b415eff2594293b0031c04883c4085b415ec3488d1553fa3700bf08000000ff1598073b00488d3d41fa3700ff15231a3b00",
+    operands: &[
+        DetcoreValidateOperand {
+            displacement: 12,
+            next: 16,
+            key: "fixed_arena_backing",
+            got: true,
+        },
+        DetcoreValidateOperand {
+            displacement: 56,
+            next: 60,
+            key: "fixed_tool_alloc",
+            got: true,
+        },
+        DetcoreValidateOperand {
+            displacement: 73,
+            next: 77,
+            key: "fixed_detcore_validate_fixed_patch_alloc_207_data",
+            got: false,
+        },
+        DetcoreValidateOperand {
+            displacement: 84,
+            next: 88,
+            key: "fixed_heap_panic_misaligned",
+            got: true,
+        },
+        DetcoreValidateOperand {
+            displacement: 91,
+            next: 95,
+            key: "fixed_detcore_validate_fixed_patch_alloc_228_data",
+            got: false,
+        },
+        DetcoreValidateOperand {
+            displacement: 97,
+            next: 101,
+            key: "fixed_panic_null_reference",
+            got: true,
+        },
+    ],
+    transfers: &[(10, 0), (54, 1), (82, 3), (95, 5)],
+};
+fn detcore_no_scope_allocation_shape(bytes: &[u8]) -> bool {
+    fixed_template_shape(
+        bytes,
+        &fixed_hex(DETCORE_NO_SCOPE_ALLOC.hex),
+        DETCORE_NO_SCOPE_ALLOC
+            .operands
+            .iter()
+            .map(|operand| operand.displacement),
+    )
+}
+fn fixed_detcore_no_scope_allocation_recipe(
+    address: u64,
+    bytes: &[u8],
+    DetcoreRecipeBindings {
+        targets,
+        got,
+        readonly,
+        context,
+    }: DetcoreRecipeBindings<'_>,
+) -> Result<Vec<ConstructorTransfer>> {
+    require(
+        detcore_no_scope_allocation_shape(bytes),
+        "unknown whole no-scope allocation recipe",
+    )?;
+    let mut fields = Vec::new();
+    let mut resolved = Vec::new();
+    for operand in DETCORE_NO_SCOPE_ALLOC.operands {
+        let expected = *targets
+            .get(operand.key)
+            .ok_or_else(|| format!("unbound no-scope allocation operand {}", operand.key))?;
+        require(expected != 0, "null no-scope allocation typed operand")?;
+        let actual = fixed_rip_target(address, bytes, operand.displacement, operand.next)?;
+        if operand.got {
+            require(
+                got.get(&actual) == Some(&expected),
+                "no-scope allocation loses exact local RELATIVE/RELRO callee",
+            )?;
+            fields.push((operand.displacement, operand.next, actual));
+        } else {
+            let spec = DETCORE_VALIDATE_DATA
+                .iter()
+                .find(|spec| spec.key == operand.key)
+                .ok_or("no-scope allocation readonly specification absent")?;
+            detcore_validate_readonly_recipe(spec, expected, targets, readonly, context)?;
+            fields.push((operand.displacement, operand.next, expected));
+        }
+        resolved.push((expected, operand.got.then_some(actual)));
+    }
+    fixed_whole_recipe(address, bytes, DETCORE_NO_SCOPE_ALLOC.hex, &fields)?;
+    DETCORE_NO_SCOPE_ALLOC
+        .transfers
+        .iter()
+        .map(|&(pc, index)| {
+            let &(target, local_got_slot) = resolved
+                .get(index)
+                .ok_or("no-scope transfer lacks operand")?;
+            Ok(ConstructorTransfer {
+                instruction: address
+                    .checked_add(pc as u64)
+                    .ok_or("no-scope transfer overflow")?,
+                target,
+                local_got_slot,
+            })
+        })
+        .collect()
+}
+
 struct DetcoreRecipeBindings<'a> {
     targets: &'a BTreeMap<String, u64>,
     got: &'a BTreeMap<u64, u64>,
@@ -24473,6 +26044,31 @@ fn fixed_detcore_validate_recipe_identity(
     }: DetcoreRecipeBindings<'_>,
     tls_cell_offset: u64,
 ) -> Result<DetcoreRecipeIdentity> {
+    fixed_detcore_validate_recipe_in_scope(
+        role,
+        address,
+        bytes,
+        DetcoreRecipeBindings {
+            targets,
+            got,
+            readonly,
+            context,
+        },
+        Some(tls_cell_offset),
+    )
+}
+fn fixed_detcore_validate_recipe_in_scope(
+    role: &str,
+    address: u64,
+    bytes: &[u8],
+    DetcoreRecipeBindings {
+        targets,
+        got,
+        readonly,
+        context,
+    }: DetcoreRecipeBindings<'_>,
+    tls_cell_offset: Option<u64>,
+) -> Result<DetcoreRecipeIdentity> {
     let candidates: Vec<_> = DETCORE_VALIDATE_TEMPLATES
         .iter()
         .enumerate()
@@ -24528,7 +26124,8 @@ fn fixed_detcore_validate_recipe_identity(
                 .unwrap(),
         );
         require(
-            u64::from(encoded) == tls_cell_offset,
+            u64::from(encoded)
+                == tls_cell_offset.ok_or("TLS recipe cannot use no-scope evidence")?,
             "validate TLS read differs from authenticated exact LOCAL8 cell",
         )?;
     }
@@ -24609,6 +26206,35 @@ fn fixed_detcore_compiler_shim_recipe(
     }: DetcoreRecipeBindings<'_>,
     tls_cell_offset: u64,
 ) -> Result<Vec<ConstructorTransfer>> {
+    fixed_detcore_compiler_shim_recipe_in_scope(
+        expected_root,
+        shim,
+        address,
+        bytes,
+        implementation,
+        DetcoreRecipeBindings {
+            targets,
+            got,
+            readonly,
+            context,
+        },
+        Some(tls_cell_offset),
+    )
+}
+fn fixed_detcore_compiler_shim_recipe_in_scope(
+    expected_root: &str,
+    shim: &str,
+    address: u64,
+    bytes: &[u8],
+    implementation: u64,
+    DetcoreRecipeBindings {
+        targets,
+        got,
+        readonly,
+        context,
+    }: DetcoreRecipeBindings<'_>,
+    tls_cell_offset: Option<u64>,
+) -> Result<Vec<ConstructorTransfer>> {
     require(
         expected_root == DETCORE_ROOT,
         "Detcore shim recipe requested by wrong constructor contract",
@@ -24624,7 +26250,7 @@ fn fixed_detcore_compiler_shim_recipe(
         implementation != 0 && targets.get(method) == Some(&implementation),
         "Detcore shim lacks the selected exact typed implementation",
     )?;
-    let edges = fixed_detcore_validate_recipe(
+    let edges = fixed_detcore_validate_recipe_in_scope(
         shim,
         address,
         bytes,
@@ -24635,7 +26261,8 @@ fn fixed_detcore_compiler_shim_recipe(
             context,
         },
         tls_cell_offset,
-    )?;
+    )?
+    .edges;
     require(
         edges.len() == 2
             && edges[0].target == implementation
@@ -25042,7 +26669,7 @@ fn fixed_machine_context(
     got: &BTreeMap<u64, u64>,
     shims: &BTreeMap<String, sym::Sym>,
     record: &ImmutableAllocatorObject,
-    tls: &AllocatorTlsBoundary,
+    tls: &AllocatorInstallationEvidence,
     (image_kind, sources, roles): (
         FixedImageKind,
         Option<&VerifiedCompiledSources>,
@@ -25061,11 +26688,13 @@ fn fixed_machine_context(
         .iter()
         .map(|(role, s)| (role.clone(), s.st_value))
         .collect();
-    targets.insert("fixed_tls_get_addr_plt".into(), tls.plt_address);
-    targets.insert(
-        "fixed_publication_tls_descriptor".into(),
-        tls.tls_module_slot,
-    );
+    if let Some(tls) = tls.existing() {
+        targets.insert("fixed_tls_get_addr_plt".into(), tls.plt_address);
+        targets.insert(
+            "fixed_publication_tls_descriptor".into(),
+            tls.tls_module_slot,
+        );
+    }
     let mut readonly = BTreeMap::new();
     let mut readonly_evidence = BTreeMap::new();
     let mut selection_objects = BTreeMap::new();
@@ -25138,6 +26767,7 @@ fn fixed_machine_context(
             }
             let templates: Vec<_> = DETCORE_VALIDATE_TEMPLATES
                 .iter()
+                .chain(tls.existing().is_none().then_some(&DETCORE_NO_SCOPE_ALLOC))
                 .enumerate()
                 .filter(|(_, t)| {
                     t.role == role
@@ -25565,6 +27195,7 @@ pub struct FixedGuardedTerminal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AuthenticatedDetcoreOperationKind {
     ValidateTemplate(usize),
+    NoInstallationScopeAlloc101,
     NativeFixedSyscall3,
     NativeFixedSyscall6,
 }
@@ -25577,6 +27208,35 @@ struct AuthenticatedDetcoreOperation {
     // their whole recipe. A later coherent join cannot substitute a different
     // publication/gate address even when the two public maps agree.
     scalar_storage: Option<(u64, u64)>,
+}
+fn fixed_detcore_no_scope_qualified_operation(
+    role: &str,
+    address: u64,
+    (bytes, instructions): (&[u8], &[EncodedConstructorInstruction]),
+    bindings: DetcoreRecipeBindings<'_>,
+    internal_switch: bool,
+) -> Result<AuthenticatedDetcoreOperation> {
+    let got = bindings.got;
+    let (kind, edges) = if role == "fixed_patch_alloc" {
+        (
+            AuthenticatedDetcoreOperationKind::NoInstallationScopeAlloc101,
+            fixed_detcore_no_scope_allocation_recipe(address, bytes, bindings)?,
+        )
+    } else {
+        let recipe = fixed_detcore_validate_recipe_in_scope(role, address, bytes, bindings, None)?;
+        (
+            AuthenticatedDetcoreOperationKind::ValidateTemplate(recipe.template_index),
+            recipe.edges,
+        )
+    };
+    fixed_census_transfers(instructions, address, bytes, &edges, got, internal_switch)?;
+    Ok(AuthenticatedDetcoreOperation {
+        role: role.into(),
+        address,
+        kind,
+        edges,
+        scalar_storage: None,
+    })
 }
 
 fn fixed_detcore_qualified_operation(
@@ -27385,10 +29045,11 @@ fn qualify_fixed_operation_closure(
     got: &BTreeMap<u64, u64>,
     roles: &BTreeMap<String, sym::Sym>,
     context: &FixedMachineContext,
-    tls: &AllocatorTlsBoundary,
+    tls: &AllocatorInstallationEvidence,
     (image_kind, _sources): (FixedImageKind, Option<&VerifiedCompiledSources>),
 ) -> Result<FixedOperationClosure> {
     let scalar_publication = fixed_scalar_publication_present(roles.keys().map(String::as_str));
+    let existing_tls = tls.existing();
     let mut pending = FIXED_REQUIRED_ROLES
         .iter()
         .map(|role| roles[*role].st_value)
@@ -27506,19 +29167,45 @@ fn qualify_fixed_operation_closure(
                 || (scalar_publication && fixed_scalar_recipe_role(role)))
                 && address != trusted.st_value
             {
-                match fixed_detcore_qualified_operation(
-                    role,
-                    address,
-                    (actual, &instructions),
-                    DetcoreRecipeBindings {
-                        targets: &context.targets,
-                        got,
-                        readonly: &context.readonly,
-                        context: &context.compiled_filenames,
-                    },
-                    tls.tls_cell.address,
-                    internal_switch,
-                ) {
+                let bindings = DetcoreRecipeBindings {
+                    targets: &context.targets,
+                    got,
+                    readonly: &context.readonly,
+                    context: &context.compiled_filenames,
+                };
+                let qualified = if image_kind == FixedImageKind::Detcore {
+                    if let Some(tls) = existing_tls {
+                        fixed_detcore_qualified_operation(
+                            role,
+                            address,
+                            (actual, &instructions),
+                            bindings,
+                            tls.tls_cell.address,
+                            internal_switch,
+                        )
+                    } else {
+                        fixed_detcore_no_scope_qualified_operation(
+                            role,
+                            address,
+                            (actual, &instructions),
+                            bindings,
+                            internal_switch,
+                        )
+                    }
+                } else {
+                    fixed_detcore_qualified_operation(
+                        role,
+                        address,
+                        (actual, &instructions),
+                        bindings,
+                        existing_tls
+                            .ok_or("qualification lacks existing TLS evidence")?
+                            .tls_cell
+                            .address,
+                        internal_switch,
+                    )
+                };
+                match qualified {
                     Ok(witness) => {
                         chosen = Some((role.clone(), witness.edges.clone()));
                         require(
@@ -27532,18 +29219,24 @@ fn qualify_fixed_operation_closure(
                 continue;
             }
             let attempts = if image_kind == FixedImageKind::Detcore {
-                vec![fixed_detcore_validate_recipe(
-                    role,
-                    address,
-                    actual,
-                    DetcoreRecipeBindings {
-                        targets: &context.targets,
-                        got,
-                        readonly: &context.readonly,
-                        context: &context.compiled_filenames,
-                    },
-                    tls.tls_cell.address,
-                )]
+                let bindings = DetcoreRecipeBindings {
+                    targets: &context.targets,
+                    got,
+                    readonly: &context.readonly,
+                    context: &context.compiled_filenames,
+                };
+                vec![if let Some(tls) = existing_tls {
+                    fixed_detcore_validate_recipe(
+                        role,
+                        address,
+                        actual,
+                        bindings,
+                        tls.tls_cell.address,
+                    )
+                } else {
+                    fixed_detcore_validate_recipe_in_scope(role, address, actual, bindings, None)
+                        .map(|identity| identity.edges)
+                }]
             } else {
                 vec![
                     fixed_wrapper_recipe(
@@ -27605,7 +29298,10 @@ fn qualify_fixed_operation_closure(
                                 readonly: &context.readonly,
                                 context: &context.compiled_filenames,
                             },
-                            tls.tls_cell.address,
+                            existing_tls
+                                .ok_or("qualification lacks existing TLS evidence")?
+                                .tls_cell
+                                .address,
                             internal_switch,
                         )?;
                         require(
@@ -27618,12 +29314,13 @@ fn qualify_fixed_operation_closure(
                 break;
             }
             if image_kind == FixedImageKind::Standalone
-                && tls
-                    .local_chain
-                    .get(role)
-                    .is_some_and(|s| s.address == address && s.size == symbol.st_size)
+                && existing_tls.is_some_and(|tls| {
+                    tls.local_chain
+                        .get(role)
+                        .is_some_and(|s| s.address == address && s.size == symbol.st_size)
+                })
             {
-                match fixed_tls_transfers(role, symbol, &instructions, tls, got) {
+                match fixed_tls_transfers(role, symbol, &instructions, existing_tls.unwrap(), got) {
                     Ok(edges) => {
                         chosen = Some((role.clone(), edges));
                         break;
@@ -27681,7 +29378,7 @@ fn qualify_fixed_operation_closure(
                 )?;
                 continue;
             }
-            if edge.target == tls.plt_address {
+            if let Some(tls) = existing_tls.filter(|tls| edge.target == tls.plt_address) {
                 require(
                     tls.callsites.iter().any(|actual| actual == edge),
                     "Fixed allocator adds an unproved external TLS call",
@@ -27762,6 +29459,17 @@ fn qualify_fixed_operation_closure(
             &context.targets,
         )?;
     } else if image_kind == FixedImageKind::Detcore {
+        if existing_tls.is_none() {
+            require(
+                detcore_witnesses
+                    .get("fixed_patch_alloc")
+                    .is_some_and(|witness| {
+                        witness.kind
+                            == AuthenticatedDetcoreOperationKind::NoInstallationScopeAlloc101
+                    }),
+                "no-scope closure lacks its complete authenticated101B allocation",
+            )?;
+        }
         let selected = roles
             .iter()
             .map(|(role, symbol)| (role.clone(), symbol.st_value))
@@ -33003,6 +34711,46 @@ pub struct ConsumerExpectation<'a> {
     pub oracle_sha256: &'a BTreeMap<String, String>,
 }
 
+fn require_explicit_cargo_features(arguments: &[String], features: &[String]) -> Result<()> {
+    require(
+        arguments
+            .iter()
+            .filter(|argument| argument.as_str() == "--no-default-features")
+            .count()
+            == 1,
+        "producer command requires explicit --no-default-features",
+    )?;
+    require(
+        !arguments.iter().any(|argument| {
+            argument.starts_with("--all-features")
+                || argument.starts_with("--features=")
+                || argument.starts_with("-F")
+        }),
+        "producer command has a noncanonical Cargo feature selector",
+    )?;
+    let mut requested = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if argument == "--features" {
+            requested.push(
+                arguments
+                    .get(index + 1)
+                    .ok_or("producer command has --features without a value")?
+                    .as_str(),
+            );
+        }
+    }
+    let joined = features.join(",");
+    let expected = if features.is_empty() {
+        Vec::new()
+    } else {
+        vec![joined.as_str()]
+    };
+    require(
+        requested == expected,
+        "producer command's explicit feature selection differs from the independent expectation",
+    )
+}
+
 /// Requires caller-provided identities independent of this receipt. Does not
 /// dlopen, invoke Cargo or silently return on absence. The test must separately
 /// validate dladdr owner/base/hash and the genuine configured guest bootstrap.
@@ -33144,6 +34892,23 @@ pub fn verify_runtime_receipt(
         selected_again == receipt.cargo_artifact,
         "producer current-Cargo artifact selection does not match receipt",
     )?;
+    let rebound_sources = if matches!(
+        receipt.qualification.allocator_backing.tls_boundary,
+        AllocatorInstallationEvidence::NoInstallationScope(_)
+    ) {
+        Some(
+            expected
+                .compiled_sources
+                .ok_or("no-scope consumer lacks fresh compiled sources")?
+                .with_current_build(
+                    builds[0],
+                    &receipt.cargo_artifact.reported_path,
+                    &receipt.target_directory,
+                )?,
+        )
+    } else {
+        None
+    };
     require(
         real_file(selected_path)? == receipt.artifact.path,
         "selected runtime path differs from qualified loaded-artifact path",
@@ -33281,7 +35046,7 @@ pub fn verify_runtime_receipt(
         receipt.qualification.readelf_versions.clone(),
         receipt.qualification.readelf_symbols_relocations.clone(),
         receipt.qualification.objdump_disassembly.clone(),
-        expected.compiled_sources,
+        rebound_sources.as_ref().or(expected.compiled_sources),
     )?;
     require(
         independent == receipt.qualification,
@@ -33595,6 +35360,322 @@ mod tests {
         assert_eq!(kept, b"tail");
         assert_eq!(stream.reads, 2);
         assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    // Parser/data controls only. The data CompiledSources below is never put in
+    // VerifiedCompiledSources; no synthetic compiler JSON grants source authority.
+    #[test]
+    fn no_installation_scope_current_build_controls() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        struct OwnedScratch(PathBuf);
+        impl Drop for OwnedScratch {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "no-installation-build-controls-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir(&root).unwrap();
+        let _owned = OwnedScratch(root.clone());
+        let target = root.join("isolated-target");
+        fs::create_dir(&target).unwrap();
+        fs::write(root.join("Cargo.toml"), b"data-only root manifest").unwrap();
+        let profile = serde_json::json!({"opt_level":"3","debuginfo":0,
+            "debug_assertions":true,"overflow_checks":true,"test":false});
+        let features = [
+            vec!["exec-native-injection", "exec-private-init"],
+            vec![
+                "exec-native-injection",
+                "exec-private-init",
+                "exec-private-successor",
+                "fixed-syscall-gates",
+                "native-exec-state",
+            ],
+            vec![
+                "coordinator-rpc",
+                "exec-native-injection",
+                "exec-private-init",
+                "exec-private-successor",
+                "fixed-syscall-gates",
+                "launcher",
+                "native-exec-state",
+                "rcb-clock",
+            ],
+        ];
+        let mut packages = BTreeMap::new();
+        let mut events = Vec::new();
+        for (index, name) in ["detcore-liteinst", "reverie-liteinst", "reverie-inguest"]
+            .into_iter()
+            .enumerate()
+        {
+            fs::create_dir(root.join(name)).unwrap();
+            let manifest = root.join(name).join("Cargo.toml");
+            let source = root.join(name).join("lib.rs");
+            fs::write(&manifest, b"data-only package manifest").unwrap();
+            fs::write(&source, b"data-only source").unwrap();
+            let output = target.join(if index == 0 {
+                "libdetcore_liteinst.so".into()
+            } else {
+                format!("lib{name}.rlib")
+            });
+            fs::write(
+                &output,
+                b"data-only compiler output, not an ELF qualification",
+            )
+            .unwrap();
+            let package = PackageIdentity {
+                id: format!("path+file:///{name}#0.1.0"),
+                name: name.into(),
+                manifest,
+                source: None,
+                target: name.replace('-', "_"),
+                kind: vec![if index == 0 { "cdylib" } else { "lib" }.into()],
+                crate_types: vec![if index == 0 { "cdylib" } else { "lib" }.into()],
+                target_source: source,
+            };
+            events.push(serde_json::json!({"reason":"compiler-artifact","package_id":package.id,
+                "manifest_path":package.manifest,"target":{"name":package.target,"kind":package.kind,
+                    "crate_types":package.crate_types,"src_path":package.target_source},
+                "profile":profile,"features":features[index],"filenames":[output],"fresh":false}));
+            packages.insert(name.into(), package);
+        }
+        events.push(serde_json::json!({"reason":"build-finished","success":true}));
+        let sources = CompiledSources {
+            layout: CompiledSourceLayout::HermitGit,
+            image_kind: FixedImageKind::Detcore,
+            workspace_root: root.clone(),
+            authority: CompiledSourceAuthority::Git {
+                workspace_head: "1".repeat(40),
+                workspace_tree: "2".repeat(40),
+                reverie_tree: "3".repeat(40),
+            },
+            manifest: FileIdentity::read(&root.join("Cargo.toml")).unwrap(),
+            reverie_pin: "4".repeat(40),
+            reverie_root: root.clone(),
+            leaf: packages["detcore-liteinst"].clone(),
+            packages,
+            files: BTreeMap::new(),
+        };
+        let stdout = root.join("stdout");
+        let stderr = root.join("stderr");
+        fs::write(&stdout, b"").unwrap();
+        fs::write(&stderr, b"").unwrap();
+        let command = CommandEvidence {
+            program: "cargo".into(),
+            cwd: root.clone(),
+            status: 0,
+            elapsed_millis: 0,
+            arguments: vec![
+                "build".into(),
+                "--locked".into(),
+                "--offline".into(),
+                "--manifest-path".into(),
+                root.join("Cargo.toml").to_str().unwrap().into(),
+                "-p".into(),
+                "detcore-liteinst".into(),
+                "--no-default-features".into(),
+                "--features".into(),
+                "exec-native-injection".into(),
+                "--profile".into(),
+                "liteinst-runtime".into(),
+                "--target-dir".into(),
+                target.to_str().unwrap().into(),
+                "--lib".into(),
+                "--message-format=json-render-diagnostics".into(),
+            ],
+            stdout: FileIdentity::read(&stdout).unwrap(),
+            stderr: FileIdentity::read(&stderr).unwrap(),
+        };
+        let selected = target.join("libdetcore_liteinst.so");
+        let check = |messages: &[Value], template: &CommandEvidence| {
+            fs::write(
+                &stdout,
+                messages
+                    .iter()
+                    .map(|event| serde_json::to_string(event).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let mut command = template.clone();
+            command.stdout = FileIdentity::read(&stdout).unwrap();
+            current_build_evidence(&sources, &command, &selected, &target)
+        };
+        let good = check(&events, &command).unwrap();
+        no_scope_build_features(&good).unwrap();
+        assert_eq!(good.artifact.path, selected);
+        assert_eq!(good.packages.len(), 3);
+        let mut absolute = command.clone();
+        absolute.program = fs::canonicalize(env!("CARGO"))
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into();
+        let actual = check(&events, &absolute)
+            .expect("the actual Cargo toolchain executable is a valid retained program");
+        assert_eq!(
+            actual.cargo_executable,
+            Some(FileIdentity::read(Path::new(&absolute.program)).unwrap())
+        );
+        verify_current_build_files(&actual).unwrap();
+        let toolchain = root.join("toolchain");
+        fs::create_dir(&toolchain).unwrap();
+        let scratch_cargo = toolchain.join("cargo");
+        fs::write(&scratch_cargo, b"data-only executable witness").unwrap();
+        let mut absolute = command.clone();
+        absolute.program = scratch_cargo.to_str().unwrap().into();
+        assert!(
+            check(&events, &absolute).is_err(),
+            "nonexecutable canonical cargo file"
+        );
+        fs::set_permissions(&scratch_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let retained = check(&events, &absolute).unwrap();
+        verify_current_build_files(&retained).unwrap();
+        fs::write(&scratch_cargo, b"changed executable bytes").unwrap();
+        assert!(
+            verify_current_build_files(&retained).is_err(),
+            "retained absolute executable digest cannot drift"
+        );
+        for wrong in [
+            "toolchain/cargo".to_owned(),
+            root.join("absent/cargo").to_str().unwrap().into(),
+            toolchain.join("renamed").to_str().unwrap().into(),
+        ] {
+            let mut bad = command.clone();
+            bad.program = wrong;
+            assert!(
+                check(&events, &bad).is_err(),
+                "relative/nonexistent/renamed Cargo program"
+            );
+        }
+        for index in 0..3 {
+            let mut bad = events.clone();
+            bad.remove(index);
+            assert!(
+                check(&bad, &command).is_err(),
+                "missing actual compiled package{index}"
+            );
+            let mut bad = events.clone();
+            bad.insert(index, bad[index].clone());
+            assert!(
+                check(&bad, &command).is_err(),
+                "duplicate actual compiled package{index}"
+            );
+            for (field, replacement) in [
+                ("package_id", serde_json::json!("foreign package")),
+                ("manifest_path", serde_json::json!(root.join("Cargo.toml"))),
+                ("filenames", serde_json::json!([root.join("Cargo.toml")])),
+                (
+                    "filenames",
+                    serde_json::json!([selected.clone(), selected.clone()]),
+                ),
+                ("features", serde_json::json!(["unsorted", "first"])),
+                ("features", serde_json::json!(["liteinst", "liteinst"])),
+                (
+                    "profile",
+                    serde_json::json!({"opt_level":"3","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":true}),
+                ),
+            ] {
+                let mut bad = events.clone();
+                bad[index][field] = replacement;
+                assert!(
+                    check(&bad, &command).is_err(),
+                    "package{index} wrong{field}"
+                );
+            }
+            for field in ["src_path", "kind", "crate_types"] {
+                let mut bad = events.clone();
+                bad[index]["target"][field] = if field == "src_path" {
+                    serde_json::json!(root.join("Cargo.toml"))
+                } else {
+                    serde_json::json!(["bin"])
+                };
+                assert!(
+                    check(&bad, &command).is_err(),
+                    "package{index} wrong typed target{field}"
+                );
+            }
+            // A current core/inguest stream is independently required even if
+            // the leaf feature set itself stayed unchanged.
+            for feature in ["allocator-fixture", "default", "liteinst"] {
+                let mut build = good.clone();
+                let name = ["detcore-liteinst", "reverie-liteinst", "reverie-inguest"][index];
+                build
+                    .packages
+                    .get_mut(name)
+                    .unwrap()
+                    .features
+                    .push(feature.into());
+                assert!(
+                    no_scope_build_features(&build).is_err(),
+                    "unreviewed{feature} in{name}"
+                );
+            }
+        }
+        for alteration in 0..4 {
+            let mut bad = events.clone();
+            match alteration {
+                0 => {
+                    bad.pop();
+                }
+                1 => bad[3]["success"] = Value::Bool(false),
+                2 => bad.push(bad[3].clone()),
+                3 => {
+                    bad[3]["success"] = Value::Null;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                check(&bad, &command).is_err(),
+                "noncurrent/failed completion{alteration}"
+            );
+        }
+        for alteration in 0..8 {
+            let mut bad = command.clone();
+            match alteration {
+                0 => bad.status = 1,
+                1 => bad.program = "rustc".into(),
+                2 => bad.cwd = target.clone(),
+                3 => {
+                    bad.arguments.retain(|arg| arg != "--no-default-features");
+                }
+                4 => bad.arguments.push("--no-default-features".into()),
+                5 => bad
+                    .arguments
+                    .extend(["--features".into(), "liteinst".into()]),
+                6 => bad.arguments.push("--all-features".into()),
+                7 => {
+                    let at = bad
+                        .arguments
+                        .iter()
+                        .position(|arg| arg == "exec-native-injection")
+                        .unwrap();
+                    bad.arguments[at] = "exec-native-injection,liteinst".into();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                check(&events, &bad).is_err(),
+                "unsupported/failed explicit command{alteration}"
+            );
+        }
+        let current = check(&events, &command).unwrap();
+        fs::write(&stdout, b"changed after retaining command identity").unwrap();
+        assert!(current_build_evidence(&sources, &current.command, &selected, &target).is_err());
+        let current = check(&events, &command).unwrap();
+        let copy = target.join("copied.so");
+        fs::copy(&selected, &copy).unwrap();
+        assert!(
+            current_build_evidence(&sources, &current.command, &copy, &target).is_err(),
+            "same-byte staged copy cannot replace original selected Cargo output"
+        );
+        fs::write(&stderr, b"changed retained stderr").unwrap();
+        assert!(current_build_evidence(&sources, &current.command, &selected, &target).is_err());
     }
 
     // Additional controls in the existing current-artifact test. These exercise
@@ -42828,7 +44909,7 @@ mod tests {
                     .into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>()),
                 file_offset: 0x800, section_index: 1, load_segment_index: 0,
             },
-            tls_boundary: AllocatorTlsBoundary {
+            tls_boundary: AllocatorInstallationEvidence::Existing(Box::new(AllocatorTlsBoundary {
                 dependency: "existing_installation_depth_tls".to_owned(),
                 provider_symbol: "__tls_get_addr".to_owned(), provider_version: "GLIBC_2.3".to_owned(),
                 provider_library: "ld-linux-x86-64.so.2".to_owned(),
@@ -42842,7 +44923,7 @@ mod tests {
                 function_sha256: BTreeMap::from([("fixed_patch_alloc".to_owned(), "0".repeat(64))]),
                 local_chain: BTreeMap::from([("fixed_patch_alloc".to_owned(), functions["fixed_patch_alloc"].clone())]),
                 direct_allocation: None,
-            },
+            })),
             allocator_transfers: FIXED_REQUIRED_ROLES[..4]
                 .iter()
                 .chain(FIXED_PUBLICATION_REQUIRED_ROLES.iter())
@@ -43033,11 +45114,12 @@ mod tests {
             assert!(validate_fixed_backing_evidence(&wrong_source).is_err());
         }
         let mut diagnostic_tls = backing.clone();
-        diagnostic_tls.tls_boundary.tls_cell.address = 0x88;
+        diagnostic_tls.tls_boundary.existing_mut().tls_cell.address = 0x88;
         validate_fixed_backing_evidence(&diagnostic_tls).unwrap();
         fixed_tls_offset_schema_controls(&backing);
         fixed_tls_direct_schema_controls(&backing);
         fixed_tls_direct_census_controls();
+        no_installation_scope_schema_controls(&backing);
         let value = serde_json::to_value(&backing).unwrap();
         assert!(value.get("fixed_native_syscalls").is_none());
         for field in [
@@ -43097,13 +45179,21 @@ mod tests {
             );
         }
         let mut wrong_tls_argument = backing.clone();
-        wrong_tls_argument.tls_boundary.tls_cell.address += 8;
+        wrong_tls_argument
+            .tls_boundary
+            .existing_mut()
+            .tls_cell
+            .address += 8;
         assert!(validate_fixed_backing_evidence(&wrong_tls_argument).is_err());
         let mut wrong_tls_call = backing.clone();
-        wrong_tls_call.tls_boundary.callsites[0].target += 1;
+        wrong_tls_call.tls_boundary.existing_mut().callsites[0].target += 1;
         assert!(validate_fixed_backing_evidence(&wrong_tls_call).is_err());
         let mut guessed_tls_pointer_origin = backing.clone();
-        guessed_tls_pointer_origin.tls_boundary.callsites[0].local_got_slot = Some(0x6000);
+        guessed_tls_pointer_origin
+            .tls_boundary
+            .existing_mut()
+            .callsites[0]
+            .local_got_slot = Some(0x6000);
         assert!(validate_fixed_backing_evidence(&guessed_tls_pointer_origin).is_err());
         for unproved_owner in ["7detcore", "16detcore_liteinst"] {
             let mut wrong_owner = backing.clone();
@@ -43136,6 +45226,562 @@ mod tests {
         unknown["legacy_exemption"] = serde_json::json!(true);
         assert!(serde_json::from_value::<AllocatorBackingEvidence>(unknown).is_err());
         fixed_native_syscall_controls(&backing);
+    }
+
+    // Structural data controls only. No fabricated record is put in an opaque
+    // source context, used to qualify an ELF, or granted execution evidence.
+    fn no_installation_scope_schema_controls(baseline: &AllocatorBackingEvidence) {
+        let old = baseline.tls_boundary.existing().unwrap();
+        assert_eq!(
+            serde_json::to_value(old).unwrap(),
+            serde_json::to_value(&baseline.tls_boundary).unwrap(),
+            "historical v1/v2 evidence must keep its exact JSON shape"
+        );
+        let file = |path: &str, hash: &str| FileIdentity {
+            path: path.into(),
+            sha256: hash.into(),
+        };
+        let mut backing = baseline.clone();
+        for required in &FIXED_REQUIRED_ROLES[..4] {
+            backing.functions.get_mut(*required).unwrap().name = FIXED_EMITTED_ROLE_SYMBOLS
+                .iter()
+                .find(|&&(role, name)| role == *required && name.starts_with("_RNvXs2_"))
+                .unwrap()
+                .1
+                .replace("Cs_", "CsTest_");
+        }
+        let mut allocation = backing.functions["fixed_patch_alloc"].clone();
+        allocation.name = FIXED_EMITTED_ROLE_SYMBOLS
+            .iter()
+            .find(|&&(role, name)| role == "fixed_patch_alloc" && name.starts_with("_RNvXs2_"))
+            .unwrap()
+            .1
+            .replace("Cs_", "CsTest_");
+        allocation.size = 101;
+        backing
+            .functions
+            .insert("fixed_patch_alloc".into(), allocation.clone());
+        backing
+            .function_sha256
+            .insert("fixed_patch_alloc".into(), "5".repeat(64));
+        let mut packages = BTreeMap::new();
+        for (name, features) in [
+            (
+                "detcore-liteinst",
+                vec!["exec-native-injection", "exec-private-init"],
+            ),
+            (
+                "reverie-liteinst",
+                vec![
+                    "exec-native-injection",
+                    "exec-private-init",
+                    "exec-private-successor",
+                    "fixed-syscall-gates",
+                    "native-exec-state",
+                ],
+            ),
+            (
+                "reverie-inguest",
+                vec![
+                    "coordinator-rpc",
+                    "exec-native-injection",
+                    "exec-private-init",
+                    "exec-private-successor",
+                    "fixed-syscall-gates",
+                    "launcher",
+                    "native-exec-state",
+                    "rcb-clock",
+                ],
+            ),
+        ] {
+            packages.insert(name.into(),CurrentBuildPackage {package:PackageIdentity {id:name.into(),name:name.into(),
+                manifest:format!("/schema/{name}/Cargo.toml").into(),source:None,target:name.replace('-',"_"),
+                kind:vec!["lib".into()],crate_types:vec!["lib".into()],target_source:format!("/schema/{name}/lib.rs").into()},
+                features:features.into_iter().map(str::to_owned).collect(),outputs:vec![format!("/schema/target/{name}").into()],
+                profile:serde_json::json!({"opt_level":"3","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false})});
+        }
+        let proof = NoInstallationScopeEvidence {
+            kind: "no_installation_scope".into(),
+            version: 1,
+            policy: NO_INSTALLATION_SCOPE_POLICY.into(),
+            elf_sha256: "1".repeat(64),
+            compiled_sources_sha256: "2".repeat(64),
+            reverie_pin: "3".repeat(40),
+            source: file(
+                "/schema/reverie-liteinst/src/patch_alloc.rs",
+                NO_INSTALLATION_SCOPE_SOURCE.2,
+            ),
+            current_build: CurrentBuildEvidence {
+                command: CommandEvidence {
+                    program: "cargo".into(),
+                    arguments: vec![],
+                    cwd: "/schema".into(),
+                    status: 0,
+                    elapsed_millis: 0,
+                    stdout: file("/schema/stdout", &"0".repeat(64)),
+                    stderr: file("/schema/stderr", &"0".repeat(64)),
+                },
+                cargo_executable: None,
+                target_directory: "/schema/target".into(),
+                artifact: file("/schema/target/lib.so", &"1".repeat(64)),
+                compiled_sources_sha256: "2".repeat(64),
+                packages,
+                standalone_sources: None,
+            },
+            allocation,
+            allocation_sha256: "5".repeat(64),
+            mappings: vec![TlsExecutableMapping {
+                program_header_index: 1,
+                file_offset: 0x1000,
+                virtual_address: 0x1000,
+                file_size: 0x1000,
+                memory_size: 0x1000,
+                flags: 5,
+                sha256: "6".repeat(64),
+            }],
+            static_symbol_count: 10,
+            dynamic_symbol_count: 2,
+            raw_names_sha256: "7".repeat(64),
+            loader_writer_count: 2,
+            loader_writers_sha256: "8".repeat(64),
+            installation_symbols: vec![],
+            installation_getters: vec![],
+            installation_writer_count: 0,
+            other_tls_getters: NO_SCOPE_OTHER_GETTERS
+                .iter()
+                .enumerate()
+                .map(|(index, (name, offset))| UnisolatedTlsGetter {
+                    getter: SymbolEvidence {
+                        name: name.replace("Cs_", "CsTest_"),
+                        address: 0x1500 + index as u64 * 0x40,
+                        size: 22,
+                        binding: sym::STB_LOCAL,
+                        visibility: sym::STV_DEFAULT,
+                    },
+                    cell_offset: *offset,
+                    module_slot: 0x3300,
+                    plt_address: 0x1810,
+                    sha256: "9".repeat(64),
+                })
+                .collect(),
+            other_getter_pointer_slots: vec![],
+            other_tls_unisolated: true,
+        };
+        let check = |proof: &NoInstallationScopeEvidence| {
+            validate_no_installation_scope_evidence(&backing, proof, FixedImageKind::Detcore)
+        };
+        check(&proof).unwrap();
+        let value = serde_json::to_value(AllocatorInstallationEvidence::NoInstallationScope(
+            Box::new(proof.clone()),
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<AllocatorInstallationEvidence>(value.clone()).unwrap(),
+            AllocatorInstallationEvidence::NoInstallationScope(Box::new(proof.clone()))
+        );
+        let encoded = serde_json::to_vec(&AllocatorInstallationEvidence::NoInstallationScope(
+            Box::new(proof.clone()),
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AllocatorInstallationEvidence>(&encoded).unwrap(),
+            AllocatorInstallationEvidence::NoInstallationScope(Box::new(proof.clone()))
+        );
+        for field in value.as_object().unwrap().keys() {
+            let mut bad = value.clone();
+            bad.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<AllocatorInstallationEvidence>(bad).is_err(),
+                "missing absence field{field}"
+            );
+        }
+        let mut unknown = value;
+        unknown["tls_cell"] = serde_json::json!({});
+        assert!(
+            serde_json::from_value::<AllocatorInstallationEvidence>(unknown).is_err(),
+            "no mixed/fake TLS-cell schema"
+        );
+        for mutation in 0..22 {
+            let mut bad = proof.clone();
+            match mutation {
+                0 => bad.version = 2,
+                1 => bad.policy.push('x'),
+                2 => bad.other_tls_unisolated = false,
+                3 => bad.installation_symbols.push("INSTALLATION_DEPTH".into()),
+                4 => bad.installation_getters.push(0x1500),
+                5 => bad.installation_writer_count = 1,
+                6 => bad.source.sha256 = "0".repeat(64),
+                7 => bad.current_build.compiled_sources_sha256 = "0".repeat(64),
+                8 => bad.current_build.artifact.sha256 = "0".repeat(64),
+                9 => bad.current_build.command.status = 1,
+                10 => bad.allocation.size = 241,
+                11 => bad.allocation.binding = sym::STB_GLOBAL,
+                12 => bad.allocation_sha256 = "0".repeat(64),
+                13 => bad.mappings[0].flags = 7,
+                14 => bad.other_tls_getters.pop().map(|_| ()).unwrap(),
+                15 => bad.other_tls_getters[1] = bad.other_tls_getters[0].clone(),
+                16 => bad.other_tls_getters[0].cell_offset += 1,
+                17 => bad.other_tls_getters[0].getter.binding = sym::STB_GLOBAL,
+                18 => bad.other_tls_getters[0].getter.name.push('x'),
+                19 => bad.other_getter_pointer_slots = vec![8, 8],
+                20 => bad.current_build.command.program = "/toolchain/cargo".into(),
+                21 => {
+                    bad.current_build.cargo_executable =
+                        Some(file("/toolchain/cargo", &"0".repeat(64)))
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                check(&bad).is_err(),
+                "incomplete/wrong absence record{mutation}"
+            );
+        }
+        assert!(
+            validate_no_installation_scope_evidence(&backing, &proof, FixedImageKind::Standalone)
+                .is_err()
+        );
+        for required in &FIXED_REQUIRED_ROLES[..4] {
+            let mut wrong = backing.clone();
+            wrong.functions.get_mut(*required).unwrap().name =
+                wrong.functions[*required].name.replace("Xs2_", "Xs3_");
+            let mut same_record = proof.clone();
+            if *required == "fixed_patch_alloc" {
+                same_record.allocation = wrong.functions[*required].clone();
+            }
+            assert!(
+                validate_no_installation_scope_evidence(
+                    &wrong,
+                    &same_record,
+                    FixedImageKind::Detcore
+                )
+                .is_err(),
+                "historical ON method cannot be substituted in no-scope OFF cohort{required}"
+            );
+        }
+    }
+
+    // Complete mini-ELF physical controls. Unlike a list of invented symbol
+    // records, this includes actual dynamic version/provider, descriptor,
+    // relocation, RELRO and PLT joins. It never constructs source authority.
+    #[test]
+    fn no_installation_scope_physical_census_controls() {
+        fn put(bytes: &mut [u8], at: usize, width: usize, value: u64) {
+            bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        fn rip(bytes: &mut [u8], address: u64, field: usize, next: usize, target: u64) {
+            let displacement =
+                i32::try_from(target as i64 - (address + next as u64) as i64).unwrap();
+            bytes[field..next].copy_from_slice(&displacement.to_le_bytes());
+        }
+        let mut base = vec![0u8; 0x9000];
+        base[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (at, width, value) in [
+            (16, 2, 3),
+            (18, 2, 62),
+            (20, 4, 1),
+            (32, 8, 64),
+            (40, 8, 0x8000),
+            (52, 2, 64),
+            (54, 2, 56),
+            (56, 2, 6),
+            (58, 2, 64),
+            (60, 2, 12),
+            (62, 2, 11),
+        ] {
+            put(&mut base, at, width, value);
+        }
+        for (index, kind, flags, address, size) in [
+            (0, 1, 4, 0, 0x1000),
+            (1, 1, 5, 0x1000, 0x1000),
+            (2, 1, 6, 0x3000, 0x1000),
+            (3, 1, 4, 0x4000, 0x5000),
+            (4, 2, 6, 0x3800, 0x200),
+            (5, program_header::PT_GNU_RELRO as u64, 4, 0x3000, 0x1000),
+        ] {
+            let at = 64 + index * 56;
+            for (offset, width, value) in [
+                (0, 4, kind),
+                (4, 4, flags),
+                (8, 8, address),
+                (16, 8, address),
+                (24, 8, address),
+                (32, 8, size),
+                (40, 8, size),
+                (48, 8, 4096),
+            ] {
+                put(&mut base, at + offset, width, value);
+            }
+        }
+        let mut static_names = vec![0u8];
+        let mut static_offsets = Vec::new();
+        for (index, (canonical, cell_offset)) in NO_SCOPE_OTHER_GETTERS.into_iter().enumerate() {
+            static_offsets.push(static_names.len());
+            static_names.extend_from_slice(canonical.replace("Cs_", "Cs1_").as_bytes());
+            static_names.push(0);
+            let row = 0x4000 + (index + 1) * 24;
+            let address = 0x1500 + index * 0x40;
+            for (offset, width, value) in [
+                (0, 4, static_offsets[index] as u64),
+                (4, 1, sym::STT_FUNC as u64),
+                (6, 2, 1),
+                (8, 8, address as u64),
+                (16, 8, 22),
+            ] {
+                put(&mut base, row + offset, width, value);
+            }
+            let mut getter = fixed_hex("50488d3d00000000e800000000488d800000000059c3");
+            getter[16..20].copy_from_slice(&(cell_offset as u32).to_le_bytes());
+            rip(&mut getter, address as u64, 4, 8, 0x3300);
+            rip(&mut getter, address as u64, 9, 13, 0x1810);
+            base[address..address + 22].copy_from_slice(&getter);
+        }
+        let forbidden_name_offset = static_names.len();
+        static_names.extend_from_slice(FIXED_TLS_CELL_ROLE.replace("Cs_", "Cs1_").as_bytes());
+        static_names.push(0);
+        assert!(static_names.len() < 0x1000);
+        base[0x6000..0x6000 + static_names.len()].copy_from_slice(&static_names);
+        let dynamic_names =
+            b"\0__tls_get_addr\0GLIBC_2.3\0ld-linux-x86-64.so.2\0INSTALLATION_DEPTH\0";
+        base[0x4600..0x4600 + dynamic_names.len()].copy_from_slice(dynamic_names);
+        for (offset, width, value) in [
+            (0, 4, 1),
+            (4, 1, ((sym::STB_GLOBAL << 4) | sym::STT_FUNC) as u64),
+        ] {
+            put(&mut base, 0x4418 + offset, width, value);
+        }
+        for (index, (tag, value)) in [
+            (goblin::elf::dynamic::DT_STRTAB, 0x4600),
+            (goblin::elf::dynamic::DT_STRSZ, dynamic_names.len() as u64),
+            (goblin::elf::dynamic::DT_SYMTAB, 0x4400),
+            (goblin::elf::dynamic::DT_SYMENT, 24),
+            (goblin::elf::dynamic::DT_HASH, 0x5400),
+            (goblin::elf::dynamic::DT_RELA, 0x4800),
+            (goblin::elf::dynamic::DT_RELASZ, 24),
+            (goblin::elf::dynamic::DT_RELAENT, 24),
+            (goblin::elf::dynamic::DT_JMPREL, 0x4900),
+            (goblin::elf::dynamic::DT_PLTRELSZ, 24),
+            (
+                goblin::elf::dynamic::DT_PLTREL,
+                goblin::elf::dynamic::DT_RELA,
+            ),
+            (goblin::elf::dynamic::DT_VERSYM, 0x5200),
+            (goblin::elf::dynamic::DT_VERNEED, 0x5300),
+            (goblin::elf::dynamic::DT_VERNEEDNUM, 1),
+            (goblin::elf::dynamic::DT_BIND_NOW, 0),
+            (goblin::elf::dynamic::DT_NULL, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(&mut base, 0x3800 + index * 16, 8, tag);
+            put(&mut base, 0x3808 + index * 16, 8, value);
+        }
+        for (index, value) in [1, 2, 1, 0, 0].into_iter().enumerate() {
+            put(&mut base, 0x5400 + index * 4, 4, value);
+        }
+        put(&mut base, 0x5202, 2, 2);
+        let provider_library = dynamic_names
+            .windows(b"ld-linux-x86-64.so.2".len())
+            .position(|window| window == b"ld-linux-x86-64.so.2")
+            .unwrap();
+        let provider_version = dynamic_names
+            .windows(b"GLIBC_2.3".len())
+            .position(|window| window == b"GLIBC_2.3")
+            .unwrap();
+        for (offset, width, value) in [
+            (0, 2, 1),
+            (2, 2, 1),
+            (4, 4, provider_library as u64),
+            (8, 4, 16),
+            (16, 4, 0),
+            (20, 2, 0),
+            (22, 2, 2),
+            (24, 4, provider_version as u64),
+        ] {
+            put(&mut base, 0x5300 + offset, width, value);
+        }
+        for (at, slot, kind, index) in [
+            (0x4800, 0x3300, reloc::R_X86_64_DTPMOD64, 0),
+            (0x4900, 0x3380, reloc::R_X86_64_JUMP_SLOT, 1),
+        ] {
+            put(&mut base, at, 8, slot);
+            put(
+                &mut base,
+                at + 8,
+                8,
+                ((index as u64) << 32) | u64::from(kind),
+            );
+        }
+        let mut plt = fixed_hex("ff25000000006800000000e900000000");
+        rip(&mut plt, 0x1810, 2, 6, 0x3380);
+        rip(&mut plt, 0x1810, 12, 16, 0x1800);
+        base[0x1810..0x1820].copy_from_slice(&plt);
+        let section_names=b"\0.plt\0.symtab\0.strtab\0.dynsym\0.dynstr\0.rela.dyn\0.rela.plt\0.gnu.version\0.gnu.version_r\0.got\0.shstrtab\0";
+        base[0x5500..0x5500 + section_names.len()].copy_from_slice(section_names);
+        for (index, name, kind, flags, address, size, link, entry) in [
+            (1, ".plt", 1, 6, 0x1800, 32, 0, 16),
+            (2, ".symtab", 2, 0, 0x4000, 120, 3, 24),
+            (3, ".strtab", 3, 0, 0x6000, static_names.len() as u64, 0, 0),
+            (4, ".dynsym", 11, 2, 0x4400, 48, 5, 24),
+            (5, ".dynstr", 3, 2, 0x4600, dynamic_names.len() as u64, 0, 0),
+            (6, ".rela.dyn", 4, 2, 0x4800, 24, 4, 24),
+            (7, ".rela.plt", 4, 2, 0x4900, 24, 4, 24),
+            (8, ".gnu.version", 0x6fffffff, 2, 0x5200, 4, 4, 2),
+            (9, ".gnu.version_r", 0x6ffffffe, 2, 0x5300, 32, 5, 0),
+            (10, ".got", 1, 3, 0x3300, 0x100, 0, 0),
+            (
+                11,
+                ".shstrtab",
+                3,
+                0,
+                0x5500,
+                section_names.len() as u64,
+                0,
+                0,
+            ),
+        ] {
+            let name_offset = section_names
+                .windows(name.len() + 1)
+                .position(|window| {
+                    window[..name.len()] == *name.as_bytes() && window[name.len()] == 0
+                })
+                .unwrap();
+            let at = 0x8000 + index * 64;
+            for (offset, width, value) in [
+                (0, 4, name_offset as u64),
+                (4, 4, kind),
+                (8, 8, flags),
+                (16, 8, address),
+                (24, 8, address),
+                (32, 8, size),
+                (40, 4, link),
+                (48, 8, 8),
+                (56, 8, entry),
+            ] {
+                put(&mut base, at + offset, width, value);
+            }
+        }
+        put(&mut base, 0x8000 + 9 * 64 + 44, 4, 1);
+        let census =
+            |bytes: &[u8]| no_installation_scope_census(&Elf::parse(bytes).unwrap(), bytes);
+        let good = census(&base).expect("complete physical no-scope census positive");
+        assert_eq!(good.other_tls_getters.len(), 4);
+        assert_eq!(good.loader_writer_count, 2);
+        assert!(good.other_getter_pointer_slots.is_empty());
+        assert_eq!(good.mappings.len(), 1);
+        assert!(
+            derive_no_installation_scope_evidence(
+                &Elf::parse(&base).unwrap(),
+                &base,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                None
+            )
+            .is_err(),
+            "physical data alone never substitutes for source/build authority"
+        );
+        for binding in [sym::STB_LOCAL, sym::STB_GLOBAL, sym::STB_WEAK] {
+            for kind in [sym::STT_TLS, sym::STT_FUNC, sym::STT_NOTYPE] {
+                let mut bad = base.clone();
+                let row = 0x4000 + 5 * 24;
+                put(&mut bad, 0x8000 + 2 * 64 + 32, 8, 144);
+                put(&mut bad, row, 4, forbidden_name_offset as u64);
+                put(&mut bad, row + 4, 1, ((binding << 4) | kind) as u64);
+                assert!(
+                    census(&bad).is_err(),
+                    "installation identity must not be filtered by size/type/binding"
+                );
+            }
+        }
+        for index in 0..4 {
+            let row = 0x4000 + (index + 1) * 24;
+            let address = 0x1500 + index * 0x40;
+            for alteration in 0..5 {
+                let mut bad = base.clone();
+                match alteration {
+                    0 => put(
+                        &mut bad,
+                        row + 4,
+                        1,
+                        ((sym::STB_GLOBAL << 4) | sym::STT_FUNC) as u64,
+                    ),
+                    1 => put(&mut bad, row + 16, 8, 0),
+                    2 => put(&mut bad, row + 4, 1, sym::STT_OBJECT as u64),
+                    3 => put(&mut bad, row, 4, 0),
+                    4 => {
+                        bad[0x6000 + static_offsets[index] + 8] ^= 1;
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    census(&bad).is_err(),
+                    "other getter{index} missing/nonlocal/wrong identity{alteration}"
+                );
+            }
+            let mut duplicate = base.clone();
+            let extra = 0x4000 + 5 * 24;
+            duplicate.copy_within(row..row + 24, extra);
+            put(&mut duplicate, 0x8000 + 2 * 64 + 32, 8, 144);
+            assert!(
+                census(&duplicate).is_err(),
+                "duplicate complete getter{index}"
+            );
+            for byte in 0..22 {
+                let mut bad = base.clone();
+                bad[address + byte] ^= 1;
+                assert!(census(&bad).is_err(), "complete getter{index} byte{byte}");
+            }
+        }
+        let mut unnamed = base.clone();
+        unnamed.copy_within(0x1500..0x1516, 0x1e00);
+        rip(&mut unnamed[0x1e00..0x1e16], 0x1e00, 4, 8, 0x3300);
+        rip(&mut unnamed[0x1e00..0x1e16], 0x1e00, 9, 13, 0x1810);
+        assert!(
+            census(&unnamed).is_err(),
+            "whole unknown getter outside executable sections"
+        );
+        for alteration in 0..5 {
+            let mut bad = base.clone();
+            match alteration {
+                0 => bad[0x4600 + provider_version] ^= 1,
+                1 => bad[0x4600 + provider_library] ^= 1,
+                2 => put(&mut bad, 0x4810, 8, 1),
+                3 => bad[0x1810] ^= 1,
+                4 => put(&mut bad, 64 + 5 * 56, 4, program_header::PT_NULL as u64),
+                _ => unreachable!(),
+            }
+            assert!(
+                census(&bad).is_err(),
+                "provider/descriptor/PLT/protection mutation{alteration}"
+            );
+        }
+        // Complete loader writers, including pointers to other unisolated TLS,
+        // are retained. They never become allocator-operation admission.
+        let mut pointer = base.clone();
+        put(&mut pointer, 0x3800 + 6 * 16 + 8, 8, 48);
+        put(&mut pointer, 0x8000 + 6 * 64 + 32, 8, 48);
+        put(&mut pointer, 0x4818, 8, 0x3400);
+        put(&mut pointer, 0x4820, 8, reloc::R_X86_64_RELATIVE as u64);
+        put(&mut pointer, 0x4828, 8, 0x1501);
+        assert_eq!(
+            census(&pointer).unwrap().other_getter_pointer_slots,
+            [0x3400]
+        );
+        put(&mut pointer, 0x4818, 8, 0x1f00);
+        assert!(
+            census(&pointer).is_err(),
+            "any loader writer overlapping physical RX refuses"
+        );
+        let mut writable = base.clone();
+        put(&mut writable, 64 + 56 + 4, 4, 7);
+        assert!(census(&writable).is_err());
+        let mut changed = base;
+        changed[0x1f00] = 0x90;
+        assert_ne!(
+            census(&changed).unwrap().mappings,
+            good.mappings,
+            "every physical RX byte contributes to evidence"
+        );
     }
 
     // Physical mini-ELF census controls only: no verified-source fabrication,
@@ -43465,7 +46111,7 @@ mod tests {
     // additive route before implementation; hashes here do not qualify an ELF.
     fn fixed_tls_direct_schema_controls(backing: &AllocatorBackingEvidence) {
         let mut direct = backing.clone();
-        let tls = &mut direct.tls_boundary;
+        let tls = direct.tls_boundary.existing_mut();
         tls.tls_cell.address = 0x40;
         let allocation = tls.local_chain.get_mut("fixed_patch_alloc").unwrap();
         allocation.size = 186;
@@ -43539,7 +46185,7 @@ mod tests {
         }
         for mutation in 0..7 {
             let mut bad = decoded.clone();
-            let tls = &mut bad.tls_boundary;
+            let tls = bad.tls_boundary.existing_mut();
             match mutation {
                 0 => tls.callsites.clear(),
                 1 => tls.callsites.push(tls.callsites[0].clone()),
@@ -43581,7 +46227,7 @@ mod tests {
             validate_fixed_backing_evidence_in_source_context(b, FixedImageKind::Detcore)
         };
         let mut direct = retained.clone();
-        let tls = &mut direct.tls_boundary;
+        let tls = direct.tls_boundary.existing_mut();
         tls.local_chain.remove("fixed_tls_fn_once").unwrap();
         tls.function_sha256.remove("fixed_tls_fn_once").unwrap();
         tls.callsites.truncate(1);
@@ -43589,7 +46235,8 @@ mod tests {
             check(&direct).is_err(),
             "missing getter still requires direct provenance"
         );
-        let allocation_sha256 = direct.tls_boundary.function_sha256["fixed_patch_alloc"].clone();
+        let allocation_sha256 =
+            direct.tls_boundary.existing_mut().function_sha256["fixed_patch_alloc"].clone();
         let mut value = serde_json::to_value(&direct).unwrap();
         value["tls_boundary"]["direct_allocation"] = serde_json::json!({
             "version": 2, "policy": DETCORE_DIRECT_TLS_CENSUS_POLICY,
@@ -43612,8 +46259,14 @@ mod tests {
         );
         assert!(
             validate_direct_allocation_tls_evidence(
-                &decoded.tls_boundary,
-                decoded.tls_boundary.direct_allocation.as_ref().unwrap(),
+                decoded.tls_boundary.existing().unwrap(),
+                decoded
+                    .tls_boundary
+                    .existing()
+                    .unwrap()
+                    .direct_allocation
+                    .as_ref()
+                    .unwrap(),
             )
             .is_err(),
             "v2 cannot enter the standalone v1 validator"
@@ -43640,7 +46293,7 @@ mod tests {
         }
         for mutation in 0..11 {
             let mut bad = decoded.clone();
-            let tls = &mut bad.tls_boundary;
+            let tls = bad.tls_boundary.existing_mut();
             match mutation {
                 0 => tls.tls_cell.address = 0x128,
                 1 => tls.tls_cell.size = 9,
@@ -43658,7 +46311,8 @@ mod tests {
                 9 => {
                     let _ = tls.local_chain.insert(
                         "fixed_tls_fn_once".into(),
-                        retained.tls_boundary.local_chain["fixed_tls_fn_once"].clone(),
+                        retained.tls_boundary.existing().unwrap().local_chain["fixed_tls_fn_once"]
+                            .clone(),
                     );
                 }
                 10 => tls.callsites[0].target += 1,
@@ -44006,7 +46660,7 @@ mod tests {
                     .unwrap()
                     .name = "_RNvCsTest_16detcore_liteinst26REVERIE_LITEINST_ALLOCATOR".into();
             }
-            let tls = &mut sample.tls_boundary;
+            let tls = sample.tls_boundary.existing_mut();
             tls.tls_cell.address = offset;
             tls.tls_module_slot = module;
             tls.tls_offset_slot = module + 8;
@@ -44055,14 +46709,18 @@ mod tests {
             }
             if kind == FixedImageKind::Detcore && matches!(offset, 0x128 | 0xe8) {
                 let mut extra = sample.clone();
-                let getter = extra.tls_boundary.local_chain["fixed_tls_fn_once"].clone();
-                let hash = extra.tls_boundary.function_sha256["fixed_tls_fn_once"].clone();
+                let getter =
+                    extra.tls_boundary.existing_mut().local_chain["fixed_tls_fn_once"].clone();
+                let hash =
+                    extra.tls_boundary.existing_mut().function_sha256["fixed_tls_fn_once"].clone();
                 extra
                     .tls_boundary
+                    .existing_mut()
                     .local_chain
                     .insert("fixed_tls_cell_getter".into(), getter);
                 extra
                     .tls_boundary
+                    .existing_mut()
                     .function_sha256
                     .insert("fixed_tls_cell_getter".into(), hash);
                 assert!(
@@ -44072,7 +46730,7 @@ mod tests {
             }
             for mutation in 0..10 {
                 let mut bad = sample.clone();
-                let tls = &mut bad.tls_boundary;
+                let tls = bad.tls_boundary.existing_mut();
                 match mutation {
                     0 => tls.tls_cell.address = 0x50,
                     1 => tls.tls_cell.size = 9,
@@ -44093,13 +46751,13 @@ mod tests {
             }
             for &(role, _, _, _, _) in chain {
                 let mut bad = sample.clone();
-                bad.tls_boundary.local_chain.remove(role);
+                bad.tls_boundary.existing_mut().local_chain.remove(role);
                 assert!(
                     check(&bad).is_err(),
                     "profile{offset:#x} missing chain{role}"
                 );
                 let mut bad = sample.clone();
-                bad.tls_boundary.function_sha256.remove(role);
+                bad.tls_boundary.existing_mut().function_sha256.remove(role);
                 assert!(
                     check(&bad).is_err(),
                     "profile{offset:#x} missing hash{role}"
@@ -44109,6 +46767,7 @@ mod tests {
                 let mut missing_fn_once_body = sample.clone();
                 missing_fn_once_body
                     .tls_boundary
+                    .existing_mut()
                     .local_chain
                     .get_mut("fixed_tls_fn_once")
                     .unwrap()
@@ -44117,7 +46776,7 @@ mod tests {
 
                 for mutation in 0..9 {
                     let mut bad = sample.clone();
-                    let tls = &mut bad.tls_boundary;
+                    let tls = bad.tls_boundary.existing_mut();
                     match mutation {
                         0 => tls.local_key_object = None,
                         1 => tls.local_key_transfer = None,
@@ -44136,12 +46795,13 @@ mod tests {
                     );
                 }
                 let mut bad = sample.clone();
-                let tls = &mut bad.tls_boundary;
+                let tls = bad.tls_boundary.existing_mut();
                 tls.local_key_object = None;
                 tls.local_key_transfer = None;
                 tls.local_key_resolution = None;
                 assert!(check(&bad).is_err(), "stripped DEV is not optimized");
                 bad.tls_boundary
+                    .existing_mut()
                     .local_chain
                     .get_mut("fixed_patch_alloc")
                     .unwrap()
@@ -44151,16 +46811,17 @@ mod tests {
                 for mutation in 0..3 {
                     let mut bad = sample.clone();
                     match mutation {
-                        0 => bad.tls_boundary.local_key_object = Some(0x8000),
+                        0 => bad.tls_boundary.existing_mut().local_key_object = Some(0x8000),
                         1 => {
-                            bad.tls_boundary.local_key_transfer = Some(ConstructorTransfer {
-                                instruction: 1,
-                                target: 2,
-                                local_got_slot: None,
-                            })
+                            bad.tls_boundary.existing_mut().local_key_transfer =
+                                Some(ConstructorTransfer {
+                                    instruction: 1,
+                                    target: 2,
+                                    local_got_slot: None,
+                                })
                         }
                         2 => {
-                            bad.tls_boundary.local_key_resolution =
+                            bad.tls_boundary.existing_mut().local_key_resolution =
                                 Some("local_relative_readonly_function_pointer".into())
                         }
                         _ => unreachable!(),
@@ -47630,6 +50291,84 @@ mod tests {
                 let bytes = elf_symbols(&[(&wrong, sym::STB_LOCAL)]);
                 let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
                 assert!(!roles.contains_key(role));
+            }
+            // The OFF native methods are required compiler-selected identities,
+            // not optional helpers. Replace one required synthetic symbol so its
+            // absence, unknown ordinal and ON/OFF duplicates exercise the actual
+            // production cardinality check rather than only name selection.
+            fn replacing_required_patch_role(role: &str, extra: &[(&str, u8)]) -> Vec<u8> {
+                let mut bytes = elf_symbols(extra);
+                let index = FIXED_REQUIRED_ROLES
+                    .iter()
+                    .position(|name| *name == role)
+                    .unwrap();
+                // The fixed fixture's first five entries are the required roles.
+                // Remove this one function before supplying the measured variant.
+                bytes[0x2000 + 24 * (index + 1) + 4] = sym::STT_NOTYPE;
+                bytes
+            }
+            for (role, method) in [
+                ("fixed_patch_alloc", "5alloc"),
+                ("fixed_patch_alloc_zeroed", "12alloc_zeroed"),
+                ("fixed_patch_dealloc", "7dealloc"),
+                ("fixed_patch_realloc", "7realloc"),
+            ] {
+                let old = FIXED_EMITTED_ROLE_SYMBOLS
+                    .iter()
+                    .find(|(name, _)| *name == role)
+                    .unwrap()
+                    .1
+                    .replace("Cs_", "Cs1_");
+                assert!(old.contains("Xs3_") && old.ends_with(method));
+                let new = old.replacen("Xs3_", "Xs2_", 1);
+                for name in [&old, &new] {
+                    let bytes = replacing_required_patch_role(role, &[(name, sym::STB_LOCAL)]);
+                    let roles = fixed_role_symbols(&Elf::parse(&bytes).unwrap()).unwrap();
+                    assert_eq!(fixed_emitted_role(name), Some(role));
+                    assert_eq!(roles.len(), FIXED_REQUIRED_ROLES.len());
+                    assert_eq!(roles[role].st_bind(), sym::STB_LOCAL);
+                }
+                for extras in [
+                    vec![],
+                    vec![(new.as_str(), sym::STB_GLOBAL)],
+                    vec![(new.as_str(), sym::STB_WEAK)],
+                    vec![
+                        (old.as_str(), sym::STB_LOCAL),
+                        (new.as_str(), sym::STB_LOCAL),
+                    ],
+                    vec![
+                        (new.as_str(), sym::STB_LOCAL),
+                        (old.as_str(), sym::STB_LOCAL),
+                    ],
+                    vec![
+                        (new.as_str(), sym::STB_LOCAL),
+                        (new.as_str(), sym::STB_LOCAL),
+                    ],
+                ] {
+                    let bytes = replacing_required_patch_role(role, &extras);
+                    assert!(fixed_role_symbols(&Elf::parse(&bytes).unwrap()).is_err());
+                }
+                // No general impl-ordinal, allocator, trait, method, module or
+                // originating-crate pattern may authorize these required roles.
+                for wrong in [
+                    new.replace("Xs2_", "Xs1_"),
+                    new.replace("Xs2_", "Xs4_"),
+                    new.replace("Xs2_", "Xs9_"),
+                    new.replace("26FixedPrivatePatchAllocator", "21PrivatePatchAllocator"),
+                    new.replace("11GlobalAlloc", "10GuestAlloc"),
+                    new.strip_suffix(method).unwrap().to_owned() + "11not_allowed",
+                    new.replace("11patch_alloc", "10tool_alloc"),
+                    new.replace("16reverie_liteinst", "9untrusted"),
+                ] {
+                    assert_ne!(new, wrong);
+                    assert_ne!(fixed_emitted_role(&wrong), Some(role));
+                    let bytes = replacing_required_patch_role(role, &[(&wrong, sym::STB_LOCAL)]);
+                    assert!(fixed_role_symbols(&Elf::parse(&bytes).unwrap()).is_err());
+                }
+                // Keeping the original required ON symbol must not allow an OFF
+                // alias to coexist at another address and choose an arbitrary one.
+                let bytes = elf_symbols(&[(&new, sym::STB_LOCAL)]);
+                assert!(fixed_role_symbols(&Elf::parse(&bytes).unwrap()).is_err());
             }
         }
         // Exact observed atomic helper spellings feed the same production
@@ -53976,6 +56715,256 @@ mod tests {
         }
         detcore_publication_cohort_controls();
         detcore_keyed_normal_publication_controls();
+    }
+
+    // Whole-body/operand controls from actual native OFF ELF c4157195. These
+    // data-only recipe controls neither manufacture source authority nor qualify
+    // the retained ELF; production also requires its current-build and census.
+    #[test]
+    fn observed_detcore_no_installation_scope_whole_recipe() {
+        let address = 0xb38860;
+        let bytes = fixed_hex(
+            "415653504889d34989f6ff1530293b004885c07427488b702040f6c60775274885f67434bf010000004c89f64889da4883c4085b415eff2594293b0031c04883c4085b415ec3488d1553fa3700bf08000000ff1598073b00488d3d41fa3700ff15231a3b00",
+        );
+        assert_eq!(bytes.len(), 101);
+        assert_eq!(
+            sha256(&bytes),
+            "b62a329a92dc5b8197133bad3e35e45e1b828beeb3e9c055761b2a448d0191af"
+        );
+        let filename = b"/home/newton/.cargo/git/checkouts/reverie-2fc770f7a9c80803/840aebe/reverie-liteinst/src/patch_alloc.rs".to_vec();
+        assert_eq!(filename.len(), 102);
+        let context = BTreeMap::from([(
+            "rv:reverie-liteinst/src/patch_alloc.rs".into(),
+            filename.clone(),
+        )]);
+        let readonly = BTreeMap::from([
+            (
+                0xeb8300,
+                fixed_hex("000000000000000066000000000000006c00000018000000"),
+            ),
+            (0x8892a, filename),
+        ]);
+        let targets = BTreeMap::from([
+            ("fixed_arena_backing".into(), 0xcd0310),
+            ("fixed_tool_alloc".into(), 0xceb420),
+            ("fixed_heap_panic_misaligned".into(), 0xe8cd00),
+            ("fixed_panic_null_reference".into(), 0xe8cce7),
+            (
+                "fixed_detcore_validate_fixed_patch_alloc_207_data".into(),
+                0xeb8300,
+            ),
+            (
+                "fixed_detcore_validate_fixed_patch_alloc_228_data".into(),
+                0xeb8300,
+            ),
+            (
+                "fixed_detcore_validate_fixed_patch_alloc_207_data_file".into(),
+                0x8892a,
+            ),
+            (
+                "fixed_detcore_validate_fixed_patch_alloc_228_data_file".into(),
+                0x8892a,
+            ),
+        ]);
+        let got = BTreeMap::from([
+            (0xeeb1a0, 0xcd0310),
+            (0xeeb230, 0xceb420),
+            (0xee9050, 0xe8cd00),
+            (0xeea2e8, 0xe8cce7),
+        ]);
+        let check = |body: &[u8],
+                     ts: &BTreeMap<String, u64>,
+                     gs: &BTreeMap<u64, u64>,
+                     ro: &BTreeMap<u64, Vec<u8>>,
+                     ctx: &BTreeMap<String, Vec<u8>>| {
+            fixed_detcore_no_scope_allocation_recipe(
+                address,
+                body,
+                DetcoreRecipeBindings {
+                    targets: ts,
+                    got: gs,
+                    readonly: ro,
+                    context: ctx,
+                },
+            )
+        };
+        let edges = check(&bytes, &targets, &got, &readonly, &context).unwrap();
+        assert_eq!(
+            edges,
+            [
+                ConstructorTransfer {
+                    instruction: address + 10,
+                    target: 0xcd0310,
+                    local_got_slot: Some(0xeeb1a0)
+                },
+                ConstructorTransfer {
+                    instruction: address + 54,
+                    target: 0xceb420,
+                    local_got_slot: Some(0xeeb230)
+                },
+                ConstructorTransfer {
+                    instruction: address + 82,
+                    target: 0xe8cd00,
+                    local_got_slot: Some(0xee9050)
+                },
+                ConstructorTransfer {
+                    instruction: address + 95,
+                    target: 0xe8cce7,
+                    local_got_slot: Some(0xeea2e8)
+                },
+            ]
+        );
+        let instructions: Vec<_> = [
+            (0, 2),
+            (2, 1),
+            (3, 1),
+            (4, 3),
+            (7, 3),
+            (10, 6),
+            (16, 3),
+            (19, 2),
+            (21, 4),
+            (25, 4),
+            (29, 2),
+            (31, 3),
+            (34, 2),
+            (36, 5),
+            (41, 3),
+            (44, 3),
+            (47, 4),
+            (51, 1),
+            (52, 2),
+            (54, 6),
+            (60, 2),
+            (62, 4),
+            (66, 1),
+            (67, 2),
+            (69, 1),
+            (70, 7),
+            (77, 5),
+            (82, 6),
+            (88, 7),
+            (95, 6),
+        ]
+        .into_iter()
+        .map(|(offset, size)| EncodedConstructorInstruction {
+            address: address + offset as u64,
+            bytes: bytes[offset..offset + size].to_vec(),
+        })
+        .collect();
+        let qualify = |code: &[EncodedConstructorInstruction]| {
+            fixed_detcore_no_scope_qualified_operation(
+                "fixed_patch_alloc",
+                address,
+                (&bytes, code),
+                DetcoreRecipeBindings {
+                    targets: &targets,
+                    got: &got,
+                    readonly: &readonly,
+                    context: &context,
+                },
+                false,
+            )
+        };
+        let witness = qualify(&instructions).unwrap();
+        assert_eq!(
+            witness.kind,
+            AuthenticatedDetcoreOperationKind::NoInstallationScopeAlloc101
+        );
+        for index in 0..instructions.len() {
+            let mut bad = instructions.clone();
+            bad.remove(index);
+            assert!(
+                qualify(&bad).is_err(),
+                "missing measured instruction{index}"
+            );
+        }
+        for index in 0..bytes.len() {
+            let mut bad = bytes.clone();
+            bad[index] ^= 1;
+            assert!(
+                check(&bad, &targets, &got, &readonly, &context).is_err(),
+                "changed whole-body byte{index}"
+            );
+        }
+        assert!(check(&bytes[..100], &targets, &got, &readonly, &context).is_err());
+        let mut extra = bytes.clone();
+        extra.push(0x90);
+        assert!(check(&extra, &targets, &got, &readonly, &context).is_err());
+        for key in targets.keys() {
+            let mut bad = targets.clone();
+            bad.remove(key);
+            assert!(
+                check(&bytes, &bad, &got, &readonly, &context).is_err(),
+                "missing typed binding{key}"
+            );
+            let mut bad = targets.clone();
+            *bad.get_mut(key).unwrap() ^= 1;
+            assert!(
+                check(&bytes, &bad, &got, &readonly, &context).is_err(),
+                "wrong typed binding{key}"
+            );
+        }
+        // A correctly encoded call cannot substitute the publication allocator
+        // or either panic provider for the fixed tool allocator destination.
+        for wrong in [0xcd0310, 0xe8cd00, 0xe8cce7] {
+            let mut bad = got.clone();
+            bad.insert(0xeeb230, wrong);
+            assert!(check(&bytes, &targets, &bad, &readonly, &context).is_err());
+        }
+        for slot in got.keys() {
+            let mut bad = got.clone();
+            bad.remove(slot);
+            assert!(check(&bytes, &targets, &bad, &readonly, &context).is_err());
+            let mut bad = got.clone();
+            *bad.get_mut(slot).unwrap() ^= 1;
+            assert!(check(&bytes, &targets, &bad, &readonly, &context).is_err());
+        }
+        for (location, payload) in &readonly {
+            for index in 0..payload.len() {
+                let mut bad = readonly.clone();
+                bad.get_mut(location).unwrap()[index] ^= 1;
+                assert!(
+                    check(&bytes, &targets, &got, &bad, &context).is_err(),
+                    "changed readonly byte{location:#x}/{index}"
+                );
+            }
+            let mut bad = readonly.clone();
+            bad.remove(location);
+            assert!(check(&bytes, &targets, &got, &bad, &context).is_err());
+        }
+        assert!(check(&bytes, &targets, &got, &readonly, &BTreeMap::new()).is_err());
+        let mut wrong_context = context.clone();
+        wrong_context.values_mut().next().unwrap()[0] ^= 1;
+        assert!(check(&bytes, &targets, &got, &readonly, &wrong_context).is_err());
+        let bindings = || DetcoreRecipeBindings {
+            targets: &targets,
+            got: &got,
+            readonly: &readonly,
+            context: &context,
+        };
+        assert!(
+            fixed_detcore_validate_recipe("fixed_patch_alloc", address, &bytes, bindings(), 0xe8)
+                .is_err(),
+            "new no-scope body must not enter a historical TLS-bearing recipe"
+        );
+        let historical = DETCORE_VALIDATE_TEMPLATES
+            .iter()
+            .find(|template| {
+                template.role == "fixed_patch_alloc" && fixed_hex(template.hex).len() == 241
+            })
+            .unwrap();
+        assert!(
+            fixed_detcore_validate_recipe_in_scope(
+                "fixed_patch_alloc",
+                address,
+                &fixed_hex(historical.hex),
+                bindings(),
+                None
+            )
+            .is_err(),
+            "no-scope selection must not remove the cell requirement from the old241B body"
+        );
     }
 
     // Literal extents and independently retained bindings from gate40 ELF d86724af.
