@@ -1394,8 +1394,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 86] = [
     ),
     (
         "reverie-liteinst/src/patch_alloc.rs",
-        24942,
-        "3594983133be9a749cdc744717e04b7cfcd793a26d41f34669afbfdc964b3c18",
+        26462,
+        "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
     ),
     (
         "reverie-inguest/src/guest/alloc.rs",
@@ -3997,8 +3997,8 @@ const NO_INSTALLATION_SCOPE_POLICY: &str =
     "detcore_native_off_alloc101_reviewed_source_current_build_rx_loader_census_v1";
 const NO_INSTALLATION_SCOPE_SOURCE: (&str, u64, &str) = (
     "reverie-liteinst/src/patch_alloc.rs",
-    24942,
-    "3594983133be9a749cdc744717e04b7cfcd793a26d41f34669afbfdc964b3c18",
+    26462,
+    "799b94da011fa6d9313a296a74592fd060c12dd8543176ff4d56e7f82abb02bc",
 );
 // Complete22B getters physically retained by the measured native OFF image.
 // These are other TLS, never allocator-operation targets or isolation credit.

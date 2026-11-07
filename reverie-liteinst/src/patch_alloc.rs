@@ -23,12 +23,19 @@ use reverie_inguest::guest::alloc::fixed_copy_bytes;
 use reverie_inguest::guest::alloc::fixed_zero_bytes;
 use reverie_inguest::guest::tool_region::fixed_arena_backing;
 
+use reverie_inguest::guest::alloc::MAX_PAGE_SIZE;
+
 const PATCH_HEAP_BYTES: usize = 32 * 1024 * 1024;
 
+// Keep the arena's first page out of the file-backed final data page on
+// hosts using the largest supported page size.
+#[repr(C, align(65536))]
 struct PatchHeap {
     bytes: UnsafeCell<[u8; PATCH_HEAP_BYTES]>,
     next: AtomicUsize,
 }
+
+const _: () = assert!(core::mem::align_of::<PatchHeap>() == MAX_PAGE_SIZE);
 
 // SAFETY: reservations use a single atomic cursor and never overlap.
 unsafe impl Sync for PatchHeap {}
@@ -627,6 +634,35 @@ mod tests {
             allocator.dealloc(pointer, small);
             let _installation = enter();
             assert!(allocator.alloc(huge).is_null());
+        }
+    }
+
+    #[test]
+    fn patch_heap_is_largest_page_aligned_and_anonymous() {
+        assert_eq!(core::mem::align_of::<PatchHeap>(), MAX_PAGE_SIZE);
+        let (start, end) = legacy_patch_heap_bounds();
+        let page_size = reverie_inguest::guest::support::page_size().unwrap() as usize;
+        assert_eq!(start % page_size, 0);
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        for address in [start, end - 1] {
+            let line = maps
+                .lines()
+                .find(|line| {
+                    let (start, end) = line
+                        .split_whitespace()
+                        .next()
+                        .and_then(|range| range.split_once('-'))
+                        .unwrap();
+                    (usize::from_str_radix(start, 16).unwrap()
+                        ..usize::from_str_radix(end, 16).unwrap())
+                        .contains(&address)
+                })
+                .unwrap_or_else(|| panic!("{address:#x} is in no mapping:\n{maps}"));
+            let inode = line.split_whitespace().nth(4).unwrap();
+            assert_eq!(
+                inode, "0",
+                "the Patch heap at {address:#x} is file-backed: {line}"
+            );
         }
     }
 }
