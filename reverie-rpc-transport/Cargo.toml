@@ -24,10 +24,10 @@ reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
 serde = { version = "1.0.219", features = ["derive"] }
 sha2 = "0.10.9"
 thiserror = "2.0.18"
-tokio = { version = "1.52.4", features = ["io-util", "net", "rt", "sync", "macros"] }
+tokio = { version = "1.54.1", features = ["io-util", "net", "rt", "sync", "macros"] }
 
 [dev-dependencies]
-tokio = { version = "1.52.4", features = ["full", "test-util"] }
+tokio = { version = "1.54.1", features = ["full", "test-util"] }
 
 [[bin]]
 name = "mapped_rpc_fork_fixture"

@@ -40,7 +40,7 @@ reverie-linuxemu = { version = "0.5.4", path = "../reverie-linuxemu", features =
 # The reference backend of the timer tests' ptrace comparison (tests/timer_events.rs).
 reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace" }
 serde = { version = "1.0.219", features = ["derive"] }
-tokio = { version = "1.52.4", features = ["rt-multi-thread"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
 
 # Ordinary-main startup for explicitly broker-routed integration tests.
 [[bin]]

@@ -79,12 +79,12 @@ reverie = { version = "0.5.4", path = "../reverie", optional = true, package = "
 reverie-rpc-transport = { version = "0.5.4", path = "../reverie-rpc-transport", optional = true }
 
 tempfile = { version = "3.27.0", optional = true }
-tokio = { version = "1.52.4", features = ["macros", "net", "rt", "time"], optional = true }
+tokio = { version = "1.54.1", features = ["macros", "net", "rt", "time"], optional = true }
 tracing = { version = "0.1.41", optional = true }
 
 [dev-dependencies]
 reverie-loader = { version = "0.5.4", path = "../reverie-loader" }
-tokio = { version = "1.52.4", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 
