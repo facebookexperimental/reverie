@@ -918,10 +918,11 @@ mod tests {
                     // (Sequential handling would deadlock the test: the
                     // sibling's reply must arrive before the fork, while
                     // the child's connection is only accepted after it.)
-                    // Four connects arrive: root, sibling, fork child,
-                    // grandchild.
+                    // Five connects arrive: root, sibling, the fork
+                    // child's newborn thread, the fork child's rebound
+                    // root, grandchild.
                     let mut handlers = Vec::new();
-                    for index in 0..4 {
+                    for index in 0..5 {
                         let (mut socket, _) = listener.accept().unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -979,6 +980,25 @@ mod tests {
                     .map(|connection| connection.fd())
                     .find(|fd| *fd != root_fd)
                     .expect("sibling connection recorded");
+                // The sibling socket's cookie survives number reuse, so
+                // the child can prove the copy itself is closed.
+                let sibling_cookie = {
+                    let mut cookie = 0u64;
+                    let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+                    assert_eq!(
+                        unsafe {
+                            libc::getsockopt(
+                                sibling_fd,
+                                libc::SOL_SOCKET,
+                                libc::SO_COOKIE,
+                                (&mut cookie as *mut u64).cast(),
+                                &mut len,
+                            )
+                        },
+                        0
+                    );
+                    cookie
+                };
                 // SAFETY: fork with no other live test threads (sibling
                 // joined above); the child exits by _exit below.
                 let forked = unsafe { libc::fork() };
@@ -991,13 +1011,65 @@ mod tests {
                     // Child: host fork paths call this first thing.
                     super::super::note_fork_in_child();
                     let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        // At the reset boundary: the sibling copy is
-                        // drained and closed, the inherited root entry is
-                        // kept (rekeyed) for exchange's reconnect.
+                        // A newborn thread sending first performs the
+                        // reset: it must open its own connection, not
+                        // adopt the inherited root entry, which is
+                        // rekeyed to the leader (this thread) whoever
+                        // resets.
+                        let newborn_rpc = rpc.clone();
+                        let newborn_fd = std::thread::spawn(move || {
+                            assert_eq!(newborn_rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
+                            newborn_rpc.thread_connection().fd()
+                        })
+                        .join()
+                        .unwrap();
+                        // At the reset boundary (the newborn's send ran
+                        // it): the sibling copy is drained and closed
+                        // (proved by cookie: the newborn's socket may
+                        // already reuse the sibling's number), the
+                        // inherited root entry is kept (rekeyed to the
+                        // leader) for exchange's reconnect, and the
+                        // newborn has its own connection.
                         rpc.fork_child_reset_if_needed();
-                        assert_eq!(unsafe { libc::fcntl(sibling_fd, libc::F_GETFD) }, -1);
+                        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+                            let Ok(fd) = entry
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .parse::<libc::c_int>()
+                            else {
+                                continue;
+                            };
+                            let mut cookie = 0u64;
+                            let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+                            if unsafe {
+                                libc::getsockopt(
+                                    fd,
+                                    libc::SOL_SOCKET,
+                                    libc::SO_COOKIE,
+                                    (&mut cookie as *mut u64).cast(),
+                                    &mut len,
+                                )
+                            } == 0
+                            {
+                                assert_ne!(cookie, sibling_cookie);
+                            }
+                        }
+                        let mut remaining: Vec<_> = rpc
+                            .connection
+                            .ordinary()
+                            .snapshot()
+                            .iter()
+                            .map(|connection| connection.fd())
+                            .collect();
+                        remaining.sort_unstable();
+                        let mut expected = vec![root_fd, newborn_fd];
+                        expected.sort_unstable();
+                        assert_eq!(remaining, expected);
                         assert_ne!(unsafe { libc::fcntl(root_fd, libc::F_GETFD) }, -1);
                         assert_eq!(rpc.send_blocking_unless_in_flight(19).unwrap(), 91);
+                        // The leader's own connection is the rebound root.
+                        assert_eq!(rpc.thread_connection().fd(), rpc.raw_fd());
                         // The reconnect opens its socket before closing
                         // the inherited root copy, so the new root number
                         // differs from root_fd and may reuse sibling_fd;

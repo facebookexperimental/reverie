@@ -586,19 +586,20 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         if super::exec_private::active() {
             rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE);
         }
-        // Hand the child its inherited root entry, rekeyed to its own
-        // tid: `exchange` then sees the pid mismatch on it and runs the
-        // long-proven reconnect path (root hook rebind included), while
-        // sibling copies close here.
+        // Hand the child its inherited root entry, rekeyed to the process
+        // leader (`pid`, whose tid it is): `exchange` then sees the pid
+        // mismatch on it and runs the long-proven reconnect path (root
+        // hook rebind included), while sibling copies close here. The
+        // leader owns the root whoever performs the reset: if an admitted
+        // newborn thread sends first it must open its own connection, not
+        // adopt (and re-stamp) the root, or later native-frame root
+        // checks in this child refuse the leader by owner.
         let connections = self.connection.ordinary();
         let root = connections.take_by_fd(self.fd.load(Ordering::Acquire));
         let drained = connections.drain_all();
         close_drained_connections(drained);
         if let Some(root) = root {
-            connections
-                .by_tid
-                .lock()
-                .insert(Self::current_tid().as_raw(), root);
+            connections.by_tid.lock().insert(pid.as_raw(), root);
         }
         self.fork_generation.fetch_add(1, Ordering::AcqRel);
     }
