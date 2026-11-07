@@ -17,12 +17,23 @@
 //! `rpc.rs`; it now lives here so it is written and reviewed once.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
+
+fn current_owner() -> usize {
+    // pthread_self is async-signal-safe and identifies the live thread
+    // without issuing a syscall that could re-enter the SIGSYS handler.
+    // The low bit keeps the owner word nonzero (pthread_t is an aligned
+    // control-block address on glibc and musl), so 0 unambiguously means
+    // free even if a thread pointer were ever null. Each thread must run
+    // on its own libc thread pointer, as DynamoRIO's private control block
+    // and the private runtime's genuine-private-FS contract provide.
+    unsafe { libc::pthread_self() as usize | 1 }
+}
 
 /// An allocation-free spinlock usable from async-signal context.
 pub struct SpinMutex<T> {
-    held: AtomicBool,
+    owner: AtomicUsize,
     value: UnsafeCell<T>,
 }
 
@@ -30,16 +41,17 @@ impl<T> SpinMutex<T> {
     /// Create a new `SpinMutex`. `const` so it can initialize a `static`.
     pub const fn new(value: T) -> Self {
         Self {
-            held: AtomicBool::new(false),
+            owner: AtomicUsize::new(0),
             value: UnsafeCell::new(value),
         }
     }
 
     /// Acquire the lock, spinning until it is free.
     pub fn lock(&self) -> SpinGuard<'_, T> {
+        let owner = current_owner();
         while self
-            .held
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .owner
+            .compare_exchange_weak(0, owner, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             core::hint::spin_loop();
@@ -49,12 +61,30 @@ impl<T> SpinMutex<T> {
 
     /// Acquire the lock only if it is free now.
     pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
-        self.held
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        self.owner
+            .compare_exchange(0, current_owner(), Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
             // Lazily: a guard built for a failed attempt would release the
             // lock its real owner still holds when it is dropped.
             .then(|| SpinGuard { mutex: self })
+    }
+
+    /// Spin on contention from another thread, but refuse same-thread
+    /// re-entry. Cross-thread critical sections are short and contain no
+    /// Tool code or I/O, while waiting on our own lock would deadlock if a
+    /// signal interrupted the thread already holding it.
+    pub fn lock_unless_reentered(&self) -> Option<SpinGuard<'_, T>> {
+        let owner = current_owner();
+        loop {
+            match self
+                .owner
+                .compare_exchange_weak(0, owner, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(SpinGuard { mutex: self }),
+                Err(current) if current == owner => return None,
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
     }
 }
 
@@ -84,7 +114,7 @@ impl<T> core::ops::DerefMut for SpinGuard<'_, T> {
 
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        self.mutex.held.store(false, Ordering::Release);
+        self.mutex.owner.store(0, Ordering::Release);
     }
 }
 
@@ -104,8 +134,9 @@ mod tests {
                 "a held lock was acquired twice (attempt {attempt})"
             );
         }
-        assert!(
-            mutex.held.load(Ordering::Relaxed),
+        assert_ne!(
+            mutex.owner.load(Ordering::Relaxed),
+            0,
             "a failed attempt released the lock"
         );
         drop(held);
@@ -113,5 +144,50 @@ mod tests {
         *again += 1;
         drop(again);
         assert_eq!(*mutex.lock(), 2);
+    }
+
+    #[test]
+    fn lock_unless_reentered_refuses_only_the_owning_thread() {
+        // Same-thread refusal, with the outer hold taken through the same
+        // method production uses. Run it on a detached thread reporting by
+        // channel so a mutant that spins on re-entry fails by timeout
+        // assertion instead of hanging this test process.
+        static REENTRY_MUTEX: SpinMutex<u8> = SpinMutex::new(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _held = REENTRY_MUTEX.lock_unless_reentered().unwrap();
+            tx.send(REENTRY_MUTEX.lock_unless_reentered().is_none())
+                .unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            "same-thread re-entry through lock_unless_reentered was not refused"
+        );
+
+        // Two racing holders must exclude each other: the child must not
+        // acquire while the outer lock_unless_reentered hold is live, and
+        // must acquire once it is dropped.
+        let mutex = SpinMutex::new(1);
+        let held = mutex.lock_unless_reentered().unwrap();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waited = std::thread::scope(|scope| {
+            let child = scope.spawn(|| {
+                let guard = mutex.lock_unless_reentered().unwrap();
+                acquired_tx.send(()).unwrap();
+                *guard
+            });
+            assert!(
+                acquired_rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
+                "a second lock_unless_reentered holder acquired concurrently"
+            );
+            drop(held);
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            child.join().unwrap()
+        });
+        assert_eq!(waited, 1);
     }
 }
