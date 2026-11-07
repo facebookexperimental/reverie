@@ -3766,7 +3766,7 @@ impl KvmBackend {
             // The Linux provider makes the forked child's mappings as
             // `dup_mmap` does: the stack window's inherited mappings kept
             // apart, and none locked.
-            ElfExecutor::inherit_mappings_in_forked_child(&child.memory);
+            ElfExecutor::inherit_mappings_in_forked_child(&child.memory)?;
         }
         if let Some(child_executor) = prepared_executor.as_mut() {
             child_executor.set_clear_child_tid(clear_child_tid);

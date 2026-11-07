@@ -787,7 +787,7 @@ fn a_fork_clears_locked_in_the_childs_copy_alone_and_a_vfork_child_clears_nothin
     assert_ne!(flags(&memory, locked) & FLAG_LOCKED, 0);
 
     let child = memory.snapshot().unwrap();
-    ElfExecutor::inherit_mappings_in_forked_child(&child);
+    ElfExecutor::inherit_mappings_in_forked_child(&child).unwrap();
     assert_eq!(flags(&child, locked) & FLAG_LOCKED, 0, "the child's copy");
     assert_ne!(flags(&memory, locked) & FLAG_LOCKED, 0, "the parent's");
     assert_ne!(flags(&child, guarded + PAGE) & FLAG_MAYBE_GUARD, 0);
@@ -815,7 +815,7 @@ fn a_fork_clears_locked_in_the_childs_copy_alone_and_a_vfork_child_clears_nothin
     // vfork: the child's copy shares its parent's address space on Linux.
     let shared = memory.snapshot_sharing_address_space().unwrap();
     assert!(shared.shares_parent_address_space());
-    ElfExecutor::inherit_mappings_in_forked_child(&shared);
+    ElfExecutor::inherit_mappings_in_forked_child(&shared).unwrap();
     assert_ne!(flags(&shared, locked) & FLAG_LOCKED, 0, "the vfork copy");
     assert_ne!(flags(&memory, locked) & FLAG_LOCKED, 0, "its parent's");
     assert_eq!(shared.flagged_pages(FLAG_LOCKED), 1);
@@ -1400,7 +1400,7 @@ fn review_nested_fork_keeps_newly_unlocked_neighbor_apart() {
         PRIVATE | FIXED | libc::MAP_LOCKED as u64,
     );
     let child_memory = memory.snapshot().unwrap();
-    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory).unwrap();
     let mut child = executor
         .fork_child(executor.state.pid + 40, false, false)
         .unwrap();
@@ -1427,7 +1427,7 @@ fn review_nested_fork_keeps_newly_unlocked_neighbor_apart() {
         (base + PAGE, base + 2 * PAGE, text("rd wr mr mw me lo ac"))
     );
     let grand_memory = child_memory.snapshot().unwrap();
-    ElfExecutor::inherit_mappings_in_forked_child(&grand_memory);
+    ElfExecutor::inherit_mappings_in_forked_child(&grand_memory).unwrap();
     let grand = child
         .fork_child(child.state.pid + 40, false, false)
         .unwrap();
@@ -1465,7 +1465,7 @@ fn reviewer_remapped_inherited_locked_mappings_keep_distinct_lineages() {
         memory.write_raw(physical, &[1]).unwrap();
     }
     let child_memory = memory.snapshot().unwrap();
-    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory).unwrap();
     let mut child = executor
         .fork_child(executor.state.pid + 40, false, false)
         .unwrap();
@@ -1518,7 +1518,7 @@ fn an_inherited_locked_mapping_has_a_lineage_of_its_own_and_rejoins_its_parts() 
     mmap(&mut executor, &memory, base, 2, RW, locked);
     mmap(&mut executor, &memory, base + 3 * PAGE, 2, RW, locked);
     let child_memory = memory.snapshot().unwrap();
-    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory).unwrap();
     let lineage = |at: u64| {
         child_memory
             .declared_mapping(child_memory.user_range_to_guest(at, PAGE).unwrap())
@@ -1531,7 +1531,7 @@ fn an_inherited_locked_mapping_has_a_lineage_of_its_own_and_rejoins_its_parts() 
         "one mapping, one lineage"
     );
     assert_ne!(lineage(base), lineage(base + 3 * PAGE), "two mappings, two");
-    let others: BTreeSet<u16> = child_memory
+    let others: BTreeSet<u32> = child_memory
         .user_mapping_runs()
         .runs
         .iter()
@@ -1582,36 +1582,136 @@ fn an_inherited_locked_mapping_has_a_lineage_of_its_own_and_rejoins_its_parts() 
     );
 }
 
-/// Round 2, finding 3: when a line of descent of forks has used lineages
-/// up to `u16::MAX`, the lineages are renumbered in order before new ones
-/// are given, keeping every two pages' lineages equal or different as they
-/// were, and the new ones are again those of no other page.
+/// Round 3 witness (`rv1342-delta2-validation-evidence/probe.diff`): with
+/// 65,535 distinct lineages already live (a long line of descent of forks,
+/// each leaving one unlocked mapping, compressed here into the declaration
+/// editor), a fork's newly unlocked mapping still gets a lineage no page has:
+/// moved beside A, it stays a mapping of its own without A's `gu`
+/// (`rv1342-delta-api-lineage-probe.log`: child-moved-A, child-moved-C).
 #[test]
-fn fresh_lineages_renumber_before_they_run_out() {
+fn reviewer_dense_retained_lineages_do_not_alias_a_new_fork_mapping() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let mut memory = GuestMemory::new(0, 512 * 1024 * 1024).unwrap();
+    let mut state = crate::elf::load_static_elf(
+        &mut memory,
+        &crate::elf::minimal_test_elf(&[0xf4]),
+        &["vm-flags-dense-lineages"],
+        &[],
+        &directory.0,
+    )
+    .unwrap();
+    state.children = ChildWaitContext::test_root();
+    let mut executor = ElfExecutor::new(state, false);
+    let classes = u64::from(u16::MAX);
+    let base = room(&mut executor, &memory, classes + 4);
+    mmap(&mut executor, &memory, base, classes, RW, PRIVATE | FIXED);
+    let next = std::cell::Cell::new(1u32);
+    memory.edit_user_declared(base, classes * PAGE, |declared, _| {
+        let lineage = next.get();
+        next.set(lineage + 1);
+        crate::memory::DeclaredMapping {
+            lineage,
+            ..declared
+        }
+    });
+    assert_eq!(next.get(), u32::from(u16::MAX) + 1);
+    let old_lineage = memory
+        .declared_mapping(memory.user_range_to_guest(base, PAGE).unwrap())
+        .unwrap()
+        .lineage;
+    assert_eq!(old_lineage, 1, "first retained lineage");
+    let source = base + (classes + 2) * PAGE;
+    mmap(
+        &mut executor,
+        &memory,
+        source,
+        1,
+        RW,
+        PRIVATE | FIXED | libc::MAP_LOCKED as u64,
+    );
+    for at in [base, source] {
+        let physical = memory.user_range_to_guest(at, 1).unwrap();
+        memory.write_raw(physical, &[1]).unwrap();
+    }
+    let child_memory = memory.snapshot().unwrap();
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory).unwrap();
+    let mut child = executor
+        .fork_child(executor.state.pid + 41, false, false)
+        .unwrap();
+    ok(call(
+        &mut child,
+        &child_memory,
+        libc::SYS_madvise,
+        [base, PAGE, mm::MADV_GUARD_INSTALL as u64, 0, 0, 0],
+    ));
+    assert_eq!(
+        call(
+            &mut child,
+            &child_memory,
+            libc::SYS_mremap,
+            [
+                source,
+                PAGE,
+                PAGE,
+                (libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED) as u64,
+                base + PAGE,
+                0,
+            ],
+        ),
+        (base + PAGE) as i64,
+    );
+    assert_eq!(
+        [base, base + PAGE].map(|at| flags_at(&child, &child_memory, at)),
+        [
+            (base, base + PAGE, text("rd wr mr mw me gu ac")),
+            (base + PAGE, base + 2 * PAGE, text("rd wr mr mw me ac")),
+        ],
+        "a fresh fork mapping must not acquire an older mapping's lineage or gu",
+    );
+}
+
+/// Round 3: the lineages a fork gives are the least that no page has, and
+/// the parent's copy keeps its own; and the allocator gives none twice,
+/// refusing where too few are left rather than reuse a live one.
+#[test]
+fn fresh_lineages_skip_every_live_one_and_leave_the_parent_alone() {
+    use super::facts::free_lineages;
+    let set = |lineages: &[u32]| lineages.iter().copied().collect::<BTreeSet<u32>>();
+    assert_eq!(free_lineages(&set(&[]), 2, u32::MAX), Some(vec![1, 2]));
+    assert_eq!(
+        free_lineages(&set(&[0, 2, 5]), 3, u32::MAX),
+        Some(vec![1, 3, 4])
+    );
+    assert_eq!(free_lineages(&set(&[1, 2, 3]), 2, 5), Some(vec![4, 5]));
+    assert_eq!(
+        free_lineages(&set(&[1, 2, 3]), 3, 5),
+        None,
+        "two left, not three"
+    );
+    assert_eq!(free_lineages(&set(&[1, 2, 3, 4, 5]), 1, 5), None);
+    assert_eq!(free_lineages(&set(&[1, 2]), 0, 2), Some(vec![]));
+
     let _host = inject_host_vm_facts(HOST);
     let directory = Directory::new();
     let (mut executor, memory) = loaded(&directory);
-    let base = room(&mut executor, &memory, 7);
+    let base = room(&mut executor, &memory, 5);
     let lineage_of = |memory: &GuestMemory, at: u64| {
         memory
             .declared_mapping(memory.user_range_to_guest(at, PAGE).unwrap())
             .unwrap()
             .lineage
     };
-    // Three mappings with lineages left by earlier forks, the last two
-    // alike, and a locked one.
-    for (at, lineage) in [
-        (base, u16::MAX),
-        (base + 2 * PAGE, 65000),
-        (base + 4 * PAGE, 65000),
-    ] {
+    // Mappings with lineages earlier forks left, among them the greatest
+    // there is, and a locked one.
+    for (at, lineage) in [(base, u32::MAX), (base + 2 * PAGE, 1)] {
         mmap(&mut executor, &memory, at, 1, RW, PRIVATE | FIXED);
         memory.edit_user_declared(at, PAGE, |declared, _| crate::memory::DeclaredMapping {
             lineage,
             ..declared
         });
     }
-    let locked = base + 6 * PAGE;
+    let locked = base + 4 * PAGE;
     mmap(
         &mut executor,
         &memory,
@@ -1621,13 +1721,9 @@ fn fresh_lineages_renumber_before_they_run_out() {
         PRIVATE | FIXED | libc::MAP_LOCKED as u64,
     );
     let child = memory.snapshot().unwrap();
-    ElfExecutor::inherit_mappings_in_forked_child(&child);
-    let [high, low, alike, unlocked] =
-        [base, base + 2 * PAGE, base + 4 * PAGE, locked].map(|at| lineage_of(&child, at));
-    assert!(low < high, "renumbered in order: {low} {high}");
-    assert_eq!(low, alike, "equal lineages stay equal");
-    assert!(high < 1000, "renumbered down: {high}");
-    let all: Vec<u16> = child
+    ElfExecutor::inherit_mappings_in_forked_child(&child).unwrap();
+    let unlocked = lineage_of(&child, locked);
+    let others: Vec<u32> = child
         .user_mapping_runs()
         .runs
         .iter()
@@ -1636,10 +1732,19 @@ fn fresh_lineages_renumber_before_they_run_out() {
         .map(|declared| declared.lineage)
         .collect();
     assert!(
-        unlocked != 0 && !all.contains(&unlocked),
-        "{unlocked} {all:?}"
+        unlocked != 0 && !others.contains(&unlocked),
+        "{unlocked} {others:?}"
     );
-    assert_eq!(lineage_of(&memory, base), u16::MAX, "the parent's stay");
+    assert_eq!(
+        [base, base + 2 * PAGE].map(|at| lineage_of(&child, at)),
+        [u32::MAX, 1],
+        "the lineages already given stay"
+    );
+    assert_eq!(lineage_of(&memory, locked), 0, "the parent's stays");
+    assert_ne!(
+        child.flagged_pages(FLAG_LOCKED),
+        memory.flagged_pages(FLAG_LOCKED)
+    );
 }
 
 /// Finding 4 witness (`rv1342-flags-mergeable-probe.log`: shared).
@@ -2141,7 +2246,7 @@ fn drive_a_run(executor: &mut ElfExecutor, memory: &GuestMemory, directory: &Dir
     ));
     line(executor, memory, noreserve);
     let child_memory = memory.snapshot().unwrap();
-    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory).unwrap();
     let mut child = executor
         .fork_child(executor.state.pid + 40, false, false)
         .unwrap();
@@ -2208,7 +2313,7 @@ fn the_host_facts_are_captured_as_the_run_starts_and_kept_through_fork_and_exec(
         );
     }
     let child_memory = memory.snapshot().unwrap();
-    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory).unwrap();
     let mut child = executor
         .fork_child(executor.state.pid + 40, false, false)
         .unwrap();

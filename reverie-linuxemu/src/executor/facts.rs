@@ -712,18 +712,20 @@ impl ElfExecutor {
     /// has, in this fork, in any later one, and wherever a move puts it
     /// later (mremap keeps a page's lineage), while its own parts, split and
     /// joined again, still merge. Only `memory`, the child's copy, changes.
-    /// A copy
+    /// It fails, changing no lineage, only where the address space has no
+    /// lineage left that no page has, which takes more than four billion
+    /// pages (`fresh_lineages`). A copy
     /// that shares its parent's address space
     /// ([`GuestMemory::shares_parent_address_space`]) is left as it is: on
     /// Linux it is the parent's own address space, whose mappings stay
     /// locked.
-    pub fn inherit_mappings_in_forked_child(memory: &GuestMemory) {
+    pub fn inherit_mappings_in_forked_child(memory: &GuestMemory) -> crate::Result<()> {
         if memory.shares_parent_address_space() {
-            return;
+            return Ok(());
         }
         Self::keep_window_mappings_apart(memory);
         if memory.flagged_pages(super::FLAG_LOCKED) == 0 {
-            return;
+            return Ok(());
         }
         // No locked mapping lies in the window, which no mapping can be
         // placed in after load; the edits skip the window's pages.
@@ -745,8 +747,8 @@ impl ElfExecutor {
             }
             last = Some(declared);
         }
-        let mut lineage = fresh_lineages(memory, mappings.len());
-        for (start, end) in mappings {
+        let lineages = fresh_lineages(memory, mappings.len())?;
+        for ((start, end), lineage) in mappings.into_iter().zip(lineages) {
             memory.edit_user_declared(start, end - start, |declared, _| {
                 if declared.flags & super::FLAG_LOCKED == 0 {
                     declared
@@ -758,8 +760,8 @@ impl ElfExecutor {
                     }
                 }
             });
-            lineage = lineage.wrapping_add(1).max(1);
         }
+        Ok(())
     }
 
     /// See [`ElfExecutor::keep_inherited_stack_mappings_apart`].
@@ -770,8 +772,8 @@ impl ElfExecutor {
         };
         for (index, run) in stack_window_runs(&pages).into_iter().enumerate() {
             if run.declared.is_some() {
-                // Adjacent runs get different lineages, even past u16::MAX.
-                memory.set_user_stack_window_lineage(run.start, run.end - run.start, index as u16);
+                // Adjacent runs get different lineages, even past u32::MAX.
+                memory.set_user_stack_window_lineage(run.start, run.end - run.start, index as u32);
             }
         }
     }
@@ -821,55 +823,54 @@ pub(super) fn stack_window_mappings(
     Ok(Some(mappings))
 }
 
-/// The first of `count` consecutive lineages (`DeclaredMapping::lineage`)
-/// that no page of `memory` has, for the mappings of a forked child that
-/// were locked in the parent, one each
-/// ([`ElfExecutor::inherit_mappings_in_forked_child`]): those just past the
-/// greatest lineage of any page. A move keeps a page's lineage, so two such
-/// mappings never merge, nor one with any other mapping, wherever they are
-/// put later; a mapping made since has lineage zero.
+/// `count` lineages (`DeclaredMapping::lineage`) that no page of `memory`
+/// has, the least such, for the mappings of a forked child that were locked
+/// in the parent, one each
+/// ([`ElfExecutor::inherit_mappings_in_forked_child`]). A move keeps a
+/// page's lineage, so no two such mappings merge, nor one with any other
+/// mapping, wherever they are put later. A lineage no page has any more is
+/// free again: no mapping can be confused with a page that is gone.
 ///
-/// The lineages of a line of descent of forks grow by one per locked
-/// mapping each fork unlocks. Should they reach `u16::MAX`, the lineages of
-/// the pages outside the stack window are first renumbered `1..=k`, in
-/// order, `k` being how many distinct nonzero ones they have, which keeps
-/// every two pages' lineages equal or different as they were. That leaves
-/// room unless the address space holds more than about 65,000 distinct
-/// lineages, more mappings than Linux's default `vm.max_map_count` (65,530)
-/// allows one process; past that, lineages are reused.
-pub(super) fn fresh_lineages(memory: &GuestMemory, count: usize) -> u16 {
-    let greatest = |runs: &[crate::memory::UserMappingRun]| {
-        runs.iter()
-            .filter_map(|run| run.declared)
-            .map(|declared| usize::from(declared.lineage))
-            .max()
-            .unwrap_or(0)
-    };
-    let runs = memory.user_mapping_runs().runs;
-    if greatest(&runs) + count <= usize::from(u16::MAX) {
-        return (greatest(&runs) + 1) as u16;
-    }
-    let ranks: std::collections::BTreeMap<u16, u16> = runs
+/// A lineage still held by a page is never given again. The distinct
+/// lineages are at most the address space's pages, one per page of guest
+/// memory, so the 32-bit lineages leave free ones for any guest under
+/// 16 TiB; [`free_lineages`] checks it, and where none is left this fails
+/// with [`crate::Error::HostAllocation`], changing nothing, rather than
+/// give one twice.
+pub(super) fn fresh_lineages(memory: &GuestMemory, count: usize) -> crate::Result<Vec<u32>> {
+    let live: std::collections::BTreeSet<u32> = memory
+        .user_mapping_runs()
+        .runs
         .iter()
-        .filter(|run| run.reservation != Some(crate::memory::RegionKind::Stack))
         .filter_map(|run| run.declared)
         .map(|declared| declared.lineage)
-        .filter(|lineage| *lineage != 0)
-        .collect::<std::collections::BTreeSet<u16>>()
-        .into_iter()
-        .zip(1..=u16::MAX)
         .collect();
-    memory.edit_user_declared(0, crate::memory::USER_ADDRESS_END, |declared, _| {
-        crate::memory::DeclaredMapping {
-            lineage: ranks
-                .get(&declared.lineage)
-                .copied()
-                .unwrap_or(declared.lineage),
-            ..declared
+    free_lineages(&live, count, u32::MAX).ok_or(crate::Error::HostAllocation {
+        what: "a lineage of its own for each mapping a fork child inherits locked",
+        bytes: count.saturating_mul(std::mem::size_of::<u32>()),
+    })
+}
+
+/// The `count` least lineages in `1..=greatest` that `live` does not hold,
+/// in order; `None` when fewer than `count` are left.
+pub(super) fn free_lineages(
+    live: &std::collections::BTreeSet<u32>,
+    count: usize,
+    greatest: u32,
+) -> Option<Vec<u32>> {
+    let mut free = Vec::with_capacity(count);
+    let mut taken = live.range(1..=greatest).copied().peekable();
+    for candidate in 1..=greatest {
+        if free.len() == count {
+            break;
         }
-    });
-    let greatest = greatest(&memory.user_mapping_runs().runs);
-    u16::try_from(greatest + 1).unwrap_or(1)
+        if taken.peek() == Some(&candidate) {
+            taken.next();
+        } else {
+            free.push(candidate);
+        }
+    }
+    (free.len() == count).then_some(free)
 }
 
 /// The stack window's mapping of `memory` that holds the page at user
@@ -3159,7 +3160,7 @@ mod memory_map_tests {
     /// (`ElfExecutor::inherit_mappings_in_forked_child`).
     fn forked(memory: &GuestMemory) -> GuestMemory {
         let child = memory.snapshot().unwrap();
-        ElfExecutor::inherit_mappings_in_forked_child(&child);
+        ElfExecutor::inherit_mappings_in_forked_child(&child).unwrap();
         child
     }
 

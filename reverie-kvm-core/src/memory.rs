@@ -1461,9 +1461,12 @@ pub struct DeclaredMapping {
     /// The provider's lineage, zero for a new mapping
     /// ([`GuestMemory::map_user_protection`]). LinuxEmu gives each mapping of
     /// the stack window that a forked child inherits one of its own, and
-    /// to each mapping of a forked child that was locked in the parent one
-    /// that neither neighbour has.
-    pub lineage: u16,
+    /// each mapping of a forked child that was locked in the parent one that
+    /// no other page of the address space has. 32 bits wide, so that the
+    /// distinct lineages of the pages, at most one per page of guest memory,
+    /// always leave a free one; a page's state is 16 bytes with it (12 with
+    /// a 16-bit lineage).
+    pub lineage: u32,
 }
 
 /// A mapped page of the stack window, as
@@ -2911,7 +2914,7 @@ impl GuestMemory {
     /// of the user range `[user_address, user_address + length)` that lies in
     /// the stack window to `lineage`. An undeclared page stays so, and an
     /// unmapped one is skipped.
-    pub fn set_user_stack_window_lineage(&self, user_address: u64, length: u64, lineage: u16) {
+    pub fn set_user_stack_window_lineage(&self, user_address: u64, length: u64, lineage: u32) {
         self.edit_stack_window_pages(user_address, length, |declared| DeclaredMapping {
             lineage,
             ..declared
@@ -7544,7 +7547,7 @@ mod tests {
         let low = window + inside - 8 * MIB;
         memory.set_user_stack_window_lineage(low, page, 2);
         memory.set_user_stack_window_lineage(low + page, USER_STACK_TOP - low - page, 1);
-        let lineaged = |lineage: u16| DeclaredMapping {
+        let lineaged = |lineage: u32| DeclaredMapping {
             prot: RW,
             flags: 0,
             lineage,
@@ -10606,5 +10609,17 @@ mod rebind_tests {
         assert!(callback.origin().same_as(&callback.origin()));
         let other = DriverScope::new();
         assert!(!first.same_as(&other.owner().origin()));
+    }
+}
+
+#[cfg(test)]
+mod page_state_size_tests {
+    /// A page's state, which the address space keeps for every mapped page,
+    /// is 16 bytes with a 32-bit lineage (`DeclaredMapping::lineage`; 12
+    /// with a 16-bit one), and a declared mapping 8.
+    #[test]
+    fn a_pages_state_is_sixteen_bytes() {
+        assert_eq!(std::mem::size_of::<super::DeclaredMapping>(), 8);
+        assert_eq!(std::mem::size_of::<super::UserPageState>(), 16);
     }
 }
