@@ -234,22 +234,9 @@ fn launcher_entry_for(manifest: &ToolManifest, image_entry: u64) -> Result<u64> 
     Ok(image_entry)
 }
 
-/// Refuses by name on any host page size this x86-64/4 KiB loader
-/// contract does not support. The size is an input so the refused
-/// case is testable without a 64 KiB-page host.
-fn refuse_unsupported_page_size(manifest: &ToolManifest, page_size: u64) -> Result<()> {
-    manifest
-        .validate_with_page_size(page_size)
-        .map_err(|error| {
-            format!("loader refused: unsupported host page size {page_size}: {error:?}").into()
-        })
-}
-
-/// The host page size, from the auxiliary vector (not `sysconf`).
-fn host_page_size() -> Result<u64> {
-    reverie_inguest::guest::support::page_size()
-        .map_err(|error| format!("loader refused: host page size unavailable: {error}").into())
-}
+// The host page size refusal lives in `SealedImage::checked`
+// (through `check_image_with_page_size`), shared by every launcher
+// on that path; this probe no longer carries a private copy.
 
 /// Claims the `Armed` stage from the reported protocol word: the
 /// loader's single armed-transition call site. The evidence is
@@ -286,15 +273,13 @@ fn run(
         witness,
     } = controls;
     report["runtime_kind"] = json!(runtime_kind.name());
+    // Refuse before spawning anything: `checked` now includes the
+    // host page size (this x86-64 loader contract is 4 KiB-page
+    // only), and this launcher only honours ImageEntry init. Both
+    // manifests are read here; the entries below are the only
+    // entries this run will launch.
     let loader_image = loader.checked()?;
     let runtime_image = runtime.checked()?;
-    // Refuse before spawning anything: this x86-64 loader contract
-    // is 4 KiB-page only, and this launcher only honours
-    // ImageEntry init. Both manifests are read here; the entries
-    // below are the only entries this run will launch.
-    let host_page_size = host_page_size()?;
-    refuse_unsupported_page_size(loader.kind().manifest(), host_page_size)?;
-    refuse_unsupported_page_size(runtime.kind().manifest(), host_page_size)?;
     let loader_entry = launcher_entry_for(loader.kind().manifest(), loader_image.entry())?;
     let runtime_entry = launcher_entry_for(runtime.kind().manifest(), runtime_image.entry())?;
     let inherited = [loader.fd(), runtime.fd(), observations.as_raw_fd()];
@@ -1272,14 +1257,18 @@ mod tests {
 
     #[test]
     fn launcher_refuses_an_unsupported_host_page_size() {
-        assert!(refuse_unsupported_page_size(&PROBE_RUNTIME_MANIFEST, 4096).is_ok());
-        let error = refuse_unsupported_page_size(&PROBE_RUNTIME_MANIFEST, 65_536)
-            .expect_err("64 KiB pages must refuse")
-            .to_string();
-        assert!(
-            error.contains("unsupported host page size 65536")
-                && error.contains("UnsupportedPageSize"),
-            "refusal names the page size: {error}"
+        // The refusal this launcher gets through `SealedImage::
+        // checked`, exercised at its shared check with a synthetic
+        // 64 KiB page size (the refusal precedes image parsing, so
+        // the bytes need not be a valid image).
+        use reverie_loader::artifact::ArtifactError;
+        use reverie_loader::artifact::check_image_with_page_size;
+        use reverie_loader::manifest::ManifestError;
+        assert_eq!(
+            check_image_with_page_size(&[0u8; 16], &PROBE_RUNTIME_MANIFEST, 65_536).map(|_| ()),
+            Err(ArtifactError::Manifest(
+                ManifestError::UnsupportedPageSize { page_size: 65_536 }
+            ))
         );
     }
 }

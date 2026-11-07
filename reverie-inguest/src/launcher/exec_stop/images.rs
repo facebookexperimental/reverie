@@ -106,15 +106,32 @@ impl SealedImage {
         self.kind
     }
 
-    /// Validate the retained sealed bytes under this fixed image contract.
+    /// Validate the retained sealed bytes under this fixed image
+    /// contract, on this host: the host page size (from the
+    /// auxiliary vector) is part of the check, so a host whose page
+    /// size this x86-64/4 KiB loader contract does not support is
+    /// refused by name here — every launcher through this type
+    /// (sealing at [`read`](Self::read), mapping, the probe host)
+    /// gets that refusal instead of assuming 4 KiB pages.
     pub fn checked(&self) -> Result<ValidatedImage<'_>> {
-        artifact::check_image(&self.bytes, self.kind.manifest()).map_err(|e| {
-            let reason = match self.kind {
-                Kind::Loader => "invalid_loader_image",
-                Kind::Runtime | Kind::Custom(_) => "invalid_runtime_image",
-            };
-            format!("{reason}: {e:?}").into()
-        })
+        let page_size = crate::guest::support::page_size()
+            .map_err(|e| format!("loader refused: host page size unavailable: {e}"))?;
+        self.checked_with_page_size(page_size)
+    }
+
+    /// [`checked`](Self::checked) against an explicit host page
+    /// size, so the unsupported-host refusal is testable without a
+    /// 64 KiB-page host.
+    pub fn checked_with_page_size(&self, page_size: u64) -> Result<ValidatedImage<'_>> {
+        artifact::check_image_with_page_size(&self.bytes, self.kind.manifest(), page_size).map_err(
+            |e| {
+                let reason = match self.kind {
+                    Kind::Loader => "invalid_loader_image",
+                    Kind::Runtime | Kind::Custom(_) => "invalid_runtime_image",
+                };
+                format!("{reason}: {e:?}").into()
+            },
+        )
     }
 
     /// Exact descriptor inherited by the child and used for image mapping.
@@ -126,5 +143,35 @@ impl SealedImage {
 impl AsFd for SealedImage {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.file.as_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_with_a_synthetic_64k_page_size_refuses_by_name() {
+        // The page-size refusal precedes image parsing, so the
+        // bytes need not be a valid image: a synthetic 64 KiB host
+        // page size must refuse naming UnsupportedPageSize, at this
+        // launcher-library check every SealedImage consumer shares.
+        let file = File::from(
+            memfd_create(c"reverie-test-image", MFdFlags::MFD_CLOEXEC)
+                .expect("memfd for test image"),
+        );
+        let image = SealedImage {
+            file,
+            bytes: vec![0; 16],
+            kind: Kind::Runtime,
+        };
+        let error = match image.checked_with_page_size(65_536) {
+            Ok(_) => panic!("64 KiB pages must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("UnsupportedPageSize") && error.contains("65536"),
+            "refusal names the unsupported page size: {error}"
+        );
     }
 }

@@ -199,11 +199,31 @@ impl From<ManifestError> for ArtifactError {
 /// the image (an [`InitContract::ImageEntry`] needs no extra check —
 /// image validation already requires an executable entry). On success
 /// the image may be mapped under this manifest.
+///
+/// This form assumes the loader's own [`PAGE_SIZE`]; a launcher on a
+/// real host should call [`check_image_with_page_size`] with the
+/// host page size so an unsupported host is refused by name here,
+/// at image-check time, instead of being assumed away.
 pub fn check_image<'a>(
     bytes: &'a [u8],
     manifest: &ToolManifest,
 ) -> Result<ValidatedImage<'a>, ArtifactError> {
-    manifest.validate()?;
+    check_image_with_page_size(bytes, manifest, PAGE_SIZE)
+}
+
+/// [`check_image`] against an explicit host page size: the manifest
+/// must [`validate_with_page_size`](ToolManifest::validate_with_page_size),
+/// so any page size other than the one this x86-64 loader maps with
+/// refuses as [`ManifestError::UnsupportedPageSize`] before the image
+/// bytes are even parsed. The size is a parameter (this crate is
+/// `no_std` and cannot ask the host) so the refused case is testable
+/// without a 64 KiB-page host.
+pub fn check_image_with_page_size<'a>(
+    bytes: &'a [u8],
+    manifest: &ToolManifest,
+    page_size: u64,
+) -> Result<ValidatedImage<'a>, ArtifactError> {
+    manifest.validate_with_page_size(page_size)?;
     let image = check(bytes, &manifest.image.policy, manifest.gates)?;
     if let InitContract::Address(address) = manifest.init {
         let executable = image
@@ -357,6 +377,30 @@ mod tests {
         let mut live_init = RUNTIME_MANIFEST;
         live_init.init = InitContract::Address(TEXT);
         assert_eq!(check_image(&bytes, &live_init).map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn check_image_with_page_size_refuses_an_unsupported_host_by_name() {
+        use crate::manifest::ManifestError;
+        use crate::manifest::RUNTIME_MANIFEST;
+        let bytes = image(RX, &body(&[0x0f, 0x05, 0xc3], &[0x90]));
+        // A synthetic 64 KiB host page size refuses by name, before
+        // the (valid) image bytes matter; the loader's own page
+        // size accepts the same bytes.
+        assert_eq!(
+            check_image_with_page_size(&bytes, &RUNTIME_MANIFEST, 65_536).map(|_| ()),
+            Err(ArtifactError::Manifest(
+                ManifestError::UnsupportedPageSize { page_size: 65_536 }
+            ))
+        );
+        assert_eq!(
+            check_image_with_page_size(&bytes, &RUNTIME_MANIFEST, PAGE_SIZE).map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(
+            check_image_with_page_size(&bytes, &RUNTIME_MANIFEST, PAGE_SIZE),
+            check_image(&bytes, &RUNTIME_MANIFEST)
+        );
     }
 
     #[test]
