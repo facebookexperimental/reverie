@@ -785,6 +785,16 @@ mod tests {
         armed.rdtsc_trapping = false;
         armed.sigsegv_handler = false;
         assert_eq!(Controls::ALL.unmet(armed), Some(Control::RdtscTrapping));
+        // The vDSO branch on its own: no checked-in manifest requires
+        // the rewrite, so only a vdso-only set reaches it first.
+        assert_eq!(
+            Controls {
+                vdso_rewrite: true,
+                ..Controls::NONE
+            }
+            .unmet(Controls::NONE),
+            Some(Control::VdsoRewrite)
+        );
         // A control not required is never reported, armed or not.
         let required = Controls {
             sigsegv_handler: true,
