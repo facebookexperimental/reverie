@@ -53,6 +53,9 @@ impl<S> ThreadStates<S> {
         self.slots.lock().is_empty()
     }
 
+    // Only the initial-image lifecycle (and tests) probe membership;
+    // ordinary dispatch always goes through checkout.
+    #[cfg(any(test, feature = "exec-private-init"))]
     pub(super) fn contains(&self, tid: i32) -> bool {
         self.slots.lock().contains_key(&tid)
     }
@@ -149,6 +152,8 @@ impl<S> ThreadStates<S> {
     /// caller has already established that no lease is outstanding (the
     /// initial-image flows check emptiness first); a leased slot keeps
     /// its state and the new one is returned.
+    // Only the successor restore flow publishes over an available slot.
+    #[cfg(feature = "exec-private-successor")]
     pub(super) fn publish(&self, tid: i32, state: S) -> Result<(), S> {
         let mut slots = self.slots.lock();
         match slots.get_mut(&tid) {
@@ -166,6 +171,9 @@ impl<S> ThreadStates<S> {
 
     /// Remove `tid`'s available state, if any. A leased slot is untouched
     /// and yields `None`.
+    // Only the initial-image lifecycle (and tests) remove available
+    // state; ordinary thread exit goes through `Lease::retire`.
+    #[cfg(any(test, feature = "exec-private-init"))]
     pub(super) fn remove(&self, tid: i32) -> Option<S> {
         let mut slots = self.slots.lock();
         match slots.get(&tid) {
