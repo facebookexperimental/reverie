@@ -1896,8 +1896,10 @@ pub fn load_static_elf_file(
 /// [`load_static_elf_with_execfn`] takes it: the filename Linux names in
 /// `AT_EXECFN` and copies to the top of the new stack, and a script's own
 /// argument after its interpreter; `None` means `argv[0]` and, for a script,
-/// the path of `file`. Either way the new task is named by the path of
-/// `file`.
+/// the path of `file`. The new task is named as [`initial_thread_name`]
+/// names it, by `execfn` as given, not by the path `file` resolves to; with
+/// no `execfn`, the path of `file` is the filename it is named by, as a
+/// native exec of that file under any `argv[0]` names it.
 pub fn load_static_elf_file_with_execfn(
     memory: &mut GuestMemory,
     file: File,
@@ -1910,7 +1912,15 @@ pub fn load_static_elf_file_with_execfn(
     // Fix the host core_pattern before the first image runs (`core_dump`).
     crate::core_dump::host_core_pattern();
     let image = read_file_image(&file)?;
-    let invoked_path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    // With no filename given, the file's own path is the one it was exec'd
+    // by; `argv[0]` may be anything (`exec -a`).
+    let invoked_path = match execfn {
+        Some(_) => None,
+        None => Some(std::fs::read_link(format!(
+            "/proc/self/fd/{}",
+            file.as_raw_fd()
+        ))?),
+    };
     let owner = memory.clone();
     let _transaction = owner.allocation_guard();
     begin_image(memory)?;
@@ -1933,12 +1943,14 @@ pub fn load_static_elf_file_with_execfn(
             return Err(error);
         }
     };
-    let thread_name = initial_thread_name(&invoked_path);
-    loaded.thread_name = thread_name;
-    *loaded
-        .thread_group_leader_name
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = thread_name;
+    if let Some(invoked_path) = invoked_path {
+        let thread_name = initial_thread_name(&invoked_path);
+        loaded.thread_name = thread_name;
+        *loaded
+            .thread_group_leader_name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = thread_name;
+    }
     Ok(loaded)
 }
 
@@ -2346,7 +2358,9 @@ fn load_executable(
     } else {
         resolve_executable_path(argv0, envp, cwd).unwrap_or_else(|_| PathBuf::from(argv0))
     };
-    let thread_name = initial_thread_name(&executable_path);
+    // Named by the filename the image was exec'd by, as given: a `#!`
+    // script's, not its interpreter's, and a symlink's, not its target's.
+    let thread_name = initial_thread_name(Path::new(std::ffi::OsStr::from_bytes(execfn)));
     let argv0 = argv0.as_bytes().to_vec();
 
     // The guest starts with what a child of this process has after exec. An
@@ -2462,11 +2476,27 @@ fn load_executable(
     })
 }
 
-pub fn initial_thread_name(executable_path: &Path) -> [u8; TASK_COMM_LEN] {
-    let basename = executable_path
-        .file_name()
-        .unwrap_or(executable_path.as_os_str())
-        .as_bytes();
+/// The name (`comm`) Linux gives a task that execs the filename `execfn`,
+/// the one it names in `AT_EXECFN` (bprm->filename): its bytes after the
+/// last `/`, cut to `TASK_COMM_LEN - 1` = 15 bytes and NUL-padded. Linux
+/// 6.17 `begin_new_exec` (fs/exec.c:1246) calls
+/// `__set_task_comm(me, kbasename(bprm->filename), true)`, and
+/// `__set_task_comm` (fs/exec.c:1083) copies at most 15 bytes. For a `#!`
+/// script bprm->filename stays the script's, and a symlink is not resolved,
+/// so the name is the script's or the link's, never the interpreter's or
+/// the target's.
+///
+/// One form is not this rule: `execveat(fd, "", AT_EMPTY_PATH)` (glibc's
+/// `fexecve`) names the task after the opened file's dentry
+/// (bprm->comm_from_dentry, fs/exec.c:1242), not after its `/dev/fd/N`
+/// filename. The executor refuses that form (`execveat` with a dirfd or
+/// flags), so no image is named by it here.
+pub fn initial_thread_name(execfn: &Path) -> [u8; TASK_COMM_LEN] {
+    let filename = execfn.as_os_str().as_bytes();
+    let basename = filename
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or(filename);
     let mut name = [0; TASK_COMM_LEN];
     let length = basename.len().min(TASK_COMM_LEN - 1);
     name[..length].copy_from_slice(&basename[..length]);
@@ -4033,6 +4063,148 @@ mod tests {
             initial_thread_name(Path::new("/tmp/abcdefghijklmnopq")),
             *b"abcdefghijklmno\0",
         );
+    }
+
+    /// Each expected name is what native Linux 7.1.3 gave the same filename
+    /// (the reverie#1106 probe, run outside any backend; its case is named):
+    /// the filename's bytes after its last `/`, cut to 15 bytes.
+    #[test]
+    fn initial_thread_name_is_linux_kbasename_of_the_exec_filename() {
+        for (execfn, expected) in [
+            // direct-relative, script-shebang (AT_EXECFN is the script's).
+            ("./probe", b"probe\0\0\0\0\0\0\0\0\0\0\0"),
+            ("./t.sh", b"t.sh\0\0\0\0\0\0\0\0\0\0\0\0"),
+            // symlink-alias-absolute: the link, not its target.
+            ("/w/alias", b"alias\0\0\0\0\0\0\0\0\0\0\0"),
+            // name-exactly-15, name-exactly-16, name-24.
+            ("./abcdefghijklmno", b"abcdefghijklmno\0"),
+            ("./abcdefghijklmnop", b"abcdefghijklmno\0"),
+            ("./abcdefghijklmnopqrstuvwx", b"abcdefghijklmno\0"),
+            // script-name-over-16.
+            ("./script-name-over-16-bytes.sh", b"script-name-ove\0"),
+            // exec-proc-self-fd, exec-dev-fd: a descriptor path is named by
+            // its number.
+            ("/proc/self/fd/3", b"3\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+            ("/dev/fd/3", b"3\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+            // exec-dirfd-relative-alias: Linux's bprm->filename for
+            // execveat(dirfd, "alias", 0).
+            ("/dev/fd/3/alias", b"alias\0\0\0\0\0\0\0\0\0\0\0"),
+        ] {
+            assert_eq!(
+                initial_thread_name(Path::new(execfn)),
+                *expected,
+                "execfn={execfn}"
+            );
+        }
+    }
+
+    /// The loader names the task by the exec filename (`AT_EXECFN`), not by
+    /// the image or its canonical path: a launcher-rewritten `#!` script is
+    /// named after the script (native `script-shebang`), a script the loader
+    /// resolves itself likewise, and a symlink alias after the link (native
+    /// `symlink-alias-absolute`), whichever entry loads it.
+    #[test]
+    fn loaded_image_is_named_by_the_exec_filename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("reverie-kvm-thread-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let interpreter = dir.join("interpreter");
+        std::fs::write(&interpreter, test_static_elf(&[0x0f, 0x0b])).unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = dir.join("alias-of-interp");
+        std::os::unix::fs::symlink(&interpreter, &alias).unwrap();
+        let script = dir.join("t.sh");
+        let script_body = format!("#!{}\n", interpreter.display());
+        std::fs::write(&script, &script_body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let interpreter_name = interpreter.to_str().unwrap();
+        let alias_name = alias.to_str().unwrap();
+        let script_name = script.to_str().unwrap();
+        let names = |loaded: &LoadedStaticElf| {
+            (
+                loaded.thread_name,
+                *loaded.thread_group_leader_name.lock().unwrap(),
+            )
+        };
+        let expect = |name: &[u8; TASK_COMM_LEN]| (*name, *name);
+        let image = test_static_elf(&[0x0f, 0x0b]);
+
+        // A launcher that rewrote the script's argv to its interpreter.
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let loaded = load_static_elf_with_execfn(
+            &mut memory,
+            &image,
+            Some(b"./t.sh"),
+            &[interpreter_name, "./t.sh"],
+            &[],
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(names(&loaded), expect(b"t.sh\0\0\0\0\0\0\0\0\0\0\0\0"));
+
+        // The same through the retained-file entry, given the interpreter.
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let loaded = load_static_elf_file_with_execfn(
+            &mut memory,
+            File::open(&interpreter).unwrap(),
+            Some(script_name.as_bytes()),
+            &[interpreter_name, script_name],
+            &[],
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(names(&loaded), expect(b"t.sh\0\0\0\0\0\0\0\0\0\0\0\0"));
+
+        // A script the loader resolves itself, as an in-guest execve gives it.
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let loaded = load_static_elf_with_execfn(
+            &mut memory,
+            script_body.as_bytes(),
+            Some(b"./t.sh"),
+            &["./t.sh"],
+            &[],
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(names(&loaded), expect(b"t.sh\0\0\0\0\0\0\0\0\0\0\0\0"));
+
+        // A symlink alias: named after the link by the bytes entry, with or
+        // without an explicit filename (`argv[0]` is then `AT_EXECFN`), and
+        // by the file entry given the filename.
+        let alias_expected = expect(b"alias-of-interp\0");
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let loaded = load_static_elf(&mut memory, &image, &[alias_name], &[], &dir).unwrap();
+        assert_eq!(names(&loaded), alias_expected);
+        // The file entry with no filename has only the opened file, whose
+        // path is the link's target, so it is named after the target (this
+        // is the entry's documented rule, with no exec filename for Linux to
+        // compare; under an unrelated `argv[0]` the `file_script_exec_*`
+        // KVM tests check it against a native `exec -a`).
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let loaded = load_static_elf_file(
+            &mut memory,
+            File::open(&alias).unwrap(),
+            &[alias_name],
+            &[],
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(names(&loaded), expect(b"interpreter\0\0\0\0\0"));
+        let mut memory = GuestMemory::new(0, TEST_MEMORY_SIZE).unwrap();
+        let loaded = load_static_elf_file_with_execfn(
+            &mut memory,
+            File::open(&interpreter).unwrap(),
+            Some(alias_name.as_bytes()),
+            &[alias_name],
+            &[],
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(names(&loaded), alias_expected);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The mmap window ends at Linux's mmap_base, its physical end agrees with

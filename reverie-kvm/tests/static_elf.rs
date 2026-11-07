@@ -1467,56 +1467,99 @@ int main(int argc, char **argv) {
 /// A launcher installs a file as exec'd by a filename of its own, here a
 /// link to the file: the process's executable is the file from the first
 /// instruction, so it can exec `/proc/self/exe`, and its stack names the
-/// filename in `AT_EXECFN`.
+/// filename in `AT_EXECFN`. The task is named after the link, not its target,
+/// as natively (`symlink-alias-absolute`: an absolute link `alias` to `probe`
+/// gives `comm=alias`).
 #[test]
 fn initial_exec_file_with_execfn_self_execs() {
-    initial_exec_file_with_execfn_control("initial_exec_file_with_execfn_self_execs", "file");
+    initial_exec_file_with_execfn_control(
+        "initial_exec_file_with_execfn_self_execs",
+        "file",
+        "launched-alias",
+        "launched-alias",
+    );
 }
 
 /// The same for a `#!` script that a launcher has already rewritten to its
 /// interpreter: the interpreter's file is the executable, the script's
 /// filename is `AT_EXECFN`, and the self-exec runs the interpreter again.
+/// The task is named after the script, not its interpreter
+/// (`script-shebang`: `./t.sh` gives `comm=t.sh`), here with a name of
+/// exactly 15 bytes, kept whole (`name-exactly-15`).
 #[test]
 fn initial_exec_file_with_execfn_script_self_execs() {
     initial_exec_file_with_execfn_control(
         "initial_exec_file_with_execfn_script_self_execs",
         "script",
+        "launched-script",
+        "launched-script",
+    );
+}
+
+/// A link name of exactly 16 bytes loses its last byte (`name-exactly-16`:
+/// `abcdefghijklmnop` gives `comm=abcdefghijklmno`).
+#[test]
+fn initial_exec_file_with_execfn_names_16_byte_alias() {
+    initial_exec_file_with_execfn_control(
+        "initial_exec_file_with_execfn_names_16_byte_alias",
+        "file",
+        "launched-alias16",
+        "launched-alias1",
     );
 }
 
 /// The control: the bytes entry, given the same image, filename and
 /// arguments, retains no file, so the following stat and the self-exec of
-/// `/proc/self/exe` both fail with ENOENT.
+/// `/proc/self/exe` both fail with ENOENT. It names the task as the file
+/// entry does.
 #[test]
 fn initial_exec_bytes_with_execfn_cannot_self_exec() {
     initial_exec_file_with_execfn_control(
         "initial_exec_bytes_with_execfn_cannot_self_exec",
         "bytes",
+        "launched-alias",
+        "launched-alias",
     );
 }
 
-fn initial_exec_file_with_execfn_control(test: &str, case: &str) {
+/// Hermit's launch: the bytes entry for a `#!` script whose argv the
+/// launcher rewrote to the interpreter, named over 16 bytes. Linux names it
+/// after the script's first 15 bytes (`script-name-over-16`:
+/// `./script-name-over-16-bytes.sh` gives `comm=script-name-ove`).
+#[test]
+fn initial_exec_bytes_with_execfn_names_long_script() {
+    initial_exec_file_with_execfn_control(
+        "initial_exec_bytes_with_execfn_names_long_script",
+        "bytes-script",
+        "launched-script-over-16",
+        "launched-script",
+    );
+}
+
+/// `case` is `file` or `bytes` (the entry) for a link named `name`, or
+/// `script` or `bytes-script` for a `#!` script named `name`; `comm` is the
+/// name Linux gives the first image.
+fn initial_exec_file_with_execfn_control(test: &str, case: &str, name: &str, comm: &str) {
     if !leader_self_exec_bounded(test) {
         return;
     }
+    let bytes = case.starts_with("bytes");
+    let script = case.ends_with("script");
     let directory = TestDirectory::new();
     let program = compile_c_program(
         &directory.0,
         "image-file",
         INITIAL_EXEC_FILE_WITH_EXECFN_PROGRAM,
     );
-    let execfn = if case == "script" {
-        let script = directory.0.join("launched-script");
-        std::fs::write(&script, format!("#!{}\n", program.display())).unwrap();
-        script
+    let execfn = directory.0.join(name);
+    if script {
+        std::fs::write(&execfn, format!("#!{}\n", program.display())).unwrap();
     } else {
-        let alias = directory.0.join("launched-alias");
-        std::os::unix::fs::symlink(&program, &alias).unwrap();
-        alias
-    };
+        std::os::unix::fs::symlink(&program, &execfn).unwrap();
+    }
     let program_text = program.to_str().unwrap();
     let execfn_text = execfn.to_str().unwrap();
-    let argv = if case == "script" {
+    let argv = if script {
         vec![program_text, execfn_text, "argument-preserved"]
     } else {
         vec![execfn_text, "argument-preserved"]
@@ -1524,7 +1567,7 @@ fn initial_exec_file_with_execfn_control(test: &str, case: &str) {
     let environment = [format!("EXEC_IMAGE={program_text}")];
     let envp = environment.iter().map(String::as_str).collect::<Vec<_>>();
     let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
-    if case == "bytes" {
+    if bytes {
         backend
             .install_static_elf_with_exec_context(
                 &std::fs::read(&program).unwrap(),
@@ -1547,21 +1590,18 @@ fn initial_exec_file_with_execfn_control(test: &str, case: &str) {
     }
     let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
     let arguments = argv.join(" ");
-    // The first image's `comm=image-file` is a known deviation from Linux,
-    // pinned here as the value both entries give today: Linux names the task
-    // by the last component of the filename it was exec'd by
-    // (`launched-alias`, `launched-script`), and these entries name it by the
-    // file's path (https://github.com/rrnewton/reverie/issues/1106). A fix
-    // for that issue changes this expectation. The self-exec names it `exe`,
-    // as Linux does.
-    let expected = if case == "bytes" {
+    // The first image is named after the last component of the filename it
+    // was exec'd by (https://github.com/rrnewton/reverie/issues/1106), never
+    // after the image file (`image-file`). The self-exec names it `exe`, as
+    // Linux does.
+    let expected = if bytes {
         format!(
-            "before argv={arguments} execfn={execfn_text} comm=image-file exe=EACCES stat errno=2\n\
+            "before argv={arguments} execfn={execfn_text} comm={comm} exe=EACCES stat errno=2\n\
              self-exec errno=2\n"
         )
     } else {
         format!(
-            "before argv={arguments} execfn={execfn_text} comm=image-file exe=EACCES same_file=1\n\
+            "before argv={arguments} execfn={execfn_text} comm={comm} exe=EACCES same_file=1\n\
              after argv={arguments} execfn=/proc/self/exe comm=exe exe=EACCES same_file=1\n"
         )
     };
@@ -2917,6 +2957,135 @@ fn leader_self_exec_name_alias() {
 fn leader_self_exec_name_script() {
     leader_self_exec_name_control("leader_self_exec_name_script", "script");
 }
+
+/// An in-guest exec chain names each image as native Linux names it, by the
+/// filename it was exec'd by (reverie#1106). Every expected line is the
+/// native output of the same program, steps and file names (the reverie#1106
+/// probe, run outside any backend on Linux 7.1.3: cases `name-exactly-15`,
+/// `exec-execve-16`, `script-name-over-16`, `exec-proc-self-fd`,
+/// `exec-dev-fd`, `exec-empty-path-alias` and `exec-dirfd-relative-alias`),
+/// except the lines the comment below records as KVM differences.
+#[test]
+fn in_guest_exec_names_each_image_by_its_filename() {
+    if !leader_self_exec_bounded("in_guest_exec_names_each_image_by_its_filename") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let directory = TestDirectory::new();
+    let program = compile_c_program(&directory.0, "name-probe", EXEC_NAME_CHAIN_PROGRAM);
+    for alias in ["chosen-alias", "abcdefghijklmno", "abcdefghijklmnop"] {
+        std::os::unix::fs::symlink(&program, directory.0.join(alias)).unwrap();
+    }
+    let script = directory.0.join("script-name-over-16-bytes.sh");
+    std::fs::write(&script, format!("#!{}\n", program.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let steps = "STEPS=execve:./abcdefghijklmno,execve:./abcdefghijklmnop,\
+                 execve:./script-name-over-16-bytes.sh,execve:chosen-alias,\
+                 procfd:./chosen-alias,devfd:./chosen-alias,empty:./chosen-alias,\
+                 dirrel:chosen-alias";
+    // A bare name: Linux resolves it against the working directory, the
+    // executor searches PATH, which names only that directory here, so both
+    // run the link; it is named after the link, not its resolved target.
+    let path = format!("PATH={}", directory.0.display());
+    let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+    backend
+        .install_static_elf_file_with_context(
+            std::fs::File::open(&program).unwrap(),
+            &[program.to_str().unwrap()],
+            &[steps, &path],
+            &directory.0,
+        )
+        .unwrap();
+    let (code, stdout, stderr) = backend.run_static_elf_captured().unwrap();
+    // The last four lines record KVM differences in which execs the executor
+    // runs, not in naming. Natively they are `procfd ./chosen-alias comm=9`,
+    // `devfd ./chosen-alias comm=9` (named by bprm->filename `/proc/self/fd/9`
+    // or `/dev/fd/9`), `empty ./chosen-alias comm=name-probe` (AT_EMPTY_PATH
+    // names the task after the opened file's dentry) and
+    // `dirrel chosen-alias comm=chosen-alias`. On KVM the executor opens an
+    // exec path without following magic links, so a descriptor path fails
+    // with ELOOP (40), and it refuses `execveat` with a dirfd or flags with
+    // ENOTSUP (95).
+    let expected = "initial comm=name-probe\n\
+                    execve ./abcdefghijklmno comm=abcdefghijklmno\n\
+                    execve ./abcdefghijklmnop comm=abcdefghijklmno\n\
+                    execve ./script-name-over-16-bytes.sh comm=script-name-ove\n\
+                    execve chosen-alias comm=chosen-alias\n\
+                    procfd ./chosen-alias errno=40\n\
+                    devfd ./chosen-alias errno=40\n\
+                    empty ./chosen-alias errno=95\n\
+                    dirrel chosen-alias errno=95\n";
+    assert_eq!(
+        (code, String::from_utf8_lossy(&stdout).into_owned()),
+        (0, expected.to_owned()),
+        "stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+/// Prints the name `PR_GET_NAME` gives this image, then runs the next of the
+/// comma-separated `mode:target` steps in `STEPS`: `execve` of `target`,
+/// `procfd` or `devfd` (`target` opened onto descriptor 9 and exec'd as
+/// `/proc/self/fd/9` or `/dev/fd/9`), `empty` (`execveat(9, "",
+/// AT_EMPTY_PATH)`, glibc's `fexecve`) or `dirrel` (`execveat` of `target`
+/// relative to a descriptor for `.`). An exec that fails prints its errno and
+/// the next step runs.
+const EXEC_NAME_CHAIN_PROGRAM: &str = r###"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+extern char **environ;
+
+int main(int argc, char **argv) {
+    (void)argc;
+    char name[17] = {0};
+    if (prctl(PR_GET_NAME, name)) return 10;
+    const char *label = getenv("LABEL");
+    printf("%s comm=%s\n", label ? label : "initial", name);
+    char steps[4096];
+    snprintf(steps, sizeof(steps), "%s", getenv("STEPS") ? getenv("STEPS") : "");
+    char *cursor = steps;
+    while (*cursor) {
+        char *comma = strchr(cursor, ',');
+        if (comma) *comma = 0;
+        char *mode = cursor, *target = strchr(cursor, ':');
+        cursor = comma ? comma + 1 : cursor + strlen(cursor);
+        if (!target) return 11;
+        *target++ = 0;
+        char value[512];
+        snprintf(value, sizeof(value), "%s %s", mode, target);
+        if (setenv("LABEL", value, 1) || setenv("STEPS", cursor, 1)) return 12;
+        fflush(stdout);
+        if (!strcmp(mode, "execve")) {
+            execve(target, argv, environ);
+        } else if (!strcmp(mode, "procfd") || !strcmp(mode, "devfd") || !strcmp(mode, "empty")) {
+            int fd = open(target, O_RDONLY);
+            if (fd < 0 || dup2(fd, 9) != 9) return 13;
+            if (fd != 9) close(fd);
+            if (!strcmp(mode, "empty")) {
+                syscall(SYS_execveat, 9, "", argv, environ, AT_EMPTY_PATH);
+            } else {
+                execve(mode[0] == 'p' ? "/proc/self/fd/9" : "/dev/fd/9", argv, environ);
+            }
+        } else if (!strcmp(mode, "dirrel")) {
+            int directory = open(".", O_RDONLY | O_DIRECTORY);
+            if (directory < 0) return 14;
+            syscall(SYS_execveat, directory, target, argv, environ, 0);
+        } else {
+            return 15;
+        }
+        printf("%s errno=%d\n", value, errno);
+    }
+    return 0;
+}
+"###;
 
 #[test]
 fn leader_self_exec_mutable_0_normal() {

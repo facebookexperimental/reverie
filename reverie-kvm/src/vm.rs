@@ -79,7 +79,6 @@ use crate::bootstrap::try_set_syscall_return_park;
 use crate::clock::StepMode;
 use crate::elf::LoadedStaticElf;
 use crate::elf::TaskLifecycleTable;
-use crate::elf::initial_thread_name;
 use crate::elf::load_static_elf;
 use crate::elf::load_static_elf_file;
 use crate::elf::load_static_elf_file_with_execfn;
@@ -2894,11 +2893,13 @@ impl KvmBackend {
     /// Loads image bytes from the supplied open file, retaining the final executable.
     ///
     /// Positional reads start at zero without changing the file's shared offset.
-    /// `argv[0]` remains independent of the file identity. The retained object's
-    /// path supplies the initial executable name; later exec uses its invoked name.
-    /// For scripts, each interpreter is read from its retained open file, and the
-    /// final interpreter's file and bytes become the executable identity. The
-    /// original script still supplies the invoked name and script argument.
+    /// `argv[0]` remains independent of the file identity. The retained
+    /// object's path supplies the initial executable name, as the filename a
+    /// native exec of it under any `argv[0]` is named by; a later exec uses
+    /// its own filename. For scripts, each interpreter is read from its
+    /// retained open file, and the final interpreter's file and bytes become
+    /// the executable identity. The original script still supplies the
+    /// invoked name and script argument.
     /// This does not add initial execution authorization or snapshot concurrent
     /// host file writes. The caller must provide a stable, readable executable.
     pub fn install_static_elf_file_with_context(
@@ -2924,8 +2925,10 @@ impl KvmBackend {
     /// `argv` to its interpreter passes the interpreter's file and the
     /// script's filename as `execfn`, so that the guest's stack and its
     /// executable both match what `execve` of the script gives a native
-    /// process. The new task is named by the path of `file`, as
-    /// [`Self::install_static_elf_file_with_context`] names it.
+    /// process. The new task is named by `execfn`, as Linux names it: by the
+    /// filename's bytes after its last `/`, cut to 15 bytes (`kbasename` in
+    /// `begin_new_exec`), so a script is named after itself rather than its
+    /// interpreter, and a symlink after itself rather than its target.
     pub fn install_static_elf_file_with_exec_context(
         &mut self,
         file: File,
@@ -3317,12 +3320,7 @@ impl KvmBackend {
             .and_then(|file| std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok())
             .unwrap_or_else(|| executable_path.to_owned());
         loaded.executable_file = executable_file;
-        let thread_name = initial_thread_name(executable_path);
-        loaded.thread_name = thread_name;
-        *loaded
-            .thread_group_leader_name
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = thread_name;
+        // The loader named the new image by `execfn` (`elf::initial_thread_name`).
         loaded.stdin = self.clone_reserved_stdin()?;
         configure_long_mode(
             &mut self.memory,
