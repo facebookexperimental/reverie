@@ -774,14 +774,146 @@ fn target_is_static(program: &std::path::Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Read an ELF's PT_INTERP string, if any.
+fn elf_interp(path: &std::path::Path) -> io::Result<Option<String>> {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    let mut file = std::fs::File::open(path)?;
+    let mut ident = [0u8; 20];
+    let mut total = 0;
+    while total < ident.len() {
+        match file.read(&mut ident[total..])? {
+            0 => break,
+            n => total += n,
+        }
+    }
+    if total < 20 || &ident[0..4] != b"\x7fELF" {
+        return Ok(None);
+    }
+    let class = ident[4];
+    let read_u16 = |file: &mut std::fs::File, offset: u64| -> io::Result<u16> {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; 2];
+        file.read_exact(&mut buf)?;
+        Ok(u16::from_ne_bytes(buf))
+    };
+    let read_u64 = |file: &mut std::fs::File, offset: u64| -> io::Result<u64> {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf)?;
+        Ok(u64::from_ne_bytes(buf))
+    };
+    let read_u32 = |file: &mut std::fs::File, offset: u64| -> io::Result<u32> {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; 4];
+        file.read_exact(&mut buf)?;
+        Ok(u32::from_ne_bytes(buf))
+    };
+    let (phoff, phentsize, phnum) = match class {
+        2 => (
+            read_u64(&mut file, 32)?,
+            read_u16(&mut file, 54)?,
+            read_u16(&mut file, 56)?,
+        ),
+        1 => (
+            read_u32(&mut file, 28).map(u64::from)?,
+            read_u16(&mut file, 42)?,
+            read_u16(&mut file, 44)?,
+        ),
+        _ => return Ok(None),
+    };
+    const PT_INTERP: u32 = 3;
+    for index in 0..u64::from(phnum) {
+        let base = phoff + index * u64::from(phentsize);
+        if read_u32(&mut file, base)? != PT_INTERP {
+            continue;
+        }
+        let (offset, filesz) = match class {
+            2 => (
+                read_u64(&mut file, base + 8)?,
+                read_u64(&mut file, base + 32)?,
+            ),
+            _ => (
+                read_u32(&mut file, base + 4).map(u64::from)?,
+                read_u32(&mut file, base + 16).map(u64::from)?,
+            ),
+        };
+        if filesz == 0 || filesz > 4096 {
+            return Ok(None);
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0u8; filesz as usize];
+        file.read_exact(&mut bytes)?;
+        if bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+    }
+    Ok(None)
+}
+
+/// Precise linker recognition (musereview bar): `program` counts as
+/// a dynamic linker ONLY when its target argument's own PT_INTERP
+/// names it (string-equal or canonical-equal). A bare ET_DYN
+/// exemption would admit static-pie guests, so there is none.
+/// Returns the target to check instead, when recognized.
+fn linker_target(
+    program: &std::path::Path,
+    args: &[std::ffi::OsString],
+) -> Option<std::path::PathBuf> {
+    // The executable a linker loads is its first non-option
+    // argument. Skip options, including the known value-taking
+    // ones; anything we cannot parse confidently falls through to
+    // checking `program` itself, which refuses a no-PT_INTERP
+    // program. Fail-safe, never an exemption.
+    const VALUE_OPTIONS: &[&str] = &[
+        "--argv0",
+        "--hwcap",
+        "--inhibit-rpath",
+        "--library-path",
+        "--platform",
+        "--preload",
+    ];
+    let mut tokens = args.iter().map(|arg| arg.to_string_lossy());
+    let target = loop {
+        match tokens.next() {
+            None => return None,
+            Some(text) if text.is_empty() => continue,
+            Some(text) if text == "--" => break tokens.next(),
+            Some(text) if text.starts_with('-') => {
+                if !text.contains('=') && VALUE_OPTIONS.contains(&text.as_ref()) {
+                    tokens.next();
+                }
+            }
+            Some(text) => break Some(text),
+        }
+    }?;
+    let target = std::path::PathBuf::from(target.into_owned());
+    let interp = elf_interp(&target).ok()??;
+    let interp_path = std::path::Path::new(&interp);
+    let names_program = interp_path == program
+        || matches!(
+            (interp_path.canonicalize(), program.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        );
+    names_program.then_some(target)
+}
+
 /// Refuse static targets before spawn unless the typed opt-out is in
 /// scope. A static guest has no interpreter to load the preload
 /// runtime, so launching it would run it unconfined.
-fn refuse_static_target(program: &std::path::Path) -> io::Result<()> {
+fn refuse_static_target(program: &std::path::Path, args: &[std::ffi::OsString]) -> io::Result<()> {
     if STATIC_OPTOUT.try_with(|_| ()).is_ok() {
         return Ok(());
     }
-    if target_is_static(program)? {
+    // Linker-as-program: when the target argument's PT_INTERP
+    // names `program`, `program` is the dynamic linker itself and
+    // the target is the guest that will actually run (with the
+    // preload loaded by that linker), so check the target instead.
+    // A no-PT_INTERP program with no such target -- a static or
+    // static-pie guest, or a linker invoked alone -- is refused.
+    let effective = linker_target(program, args).unwrap_or_else(|| program.to_path_buf());
+    if target_is_static(&effective)? {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "static executables are not supported by the in-guest backend (no PT_INTERP)",
@@ -1121,7 +1253,9 @@ where
     let preload = preload.canonicalize()?;
     let arg0 = command.get_arg0().to_owned();
     let program = command.find_program()?;
-    refuse_static_target(&program)?;
+    let guest_args: Vec<std::ffi::OsString> =
+        command.get_args().map(|arg| arg.to_os_string()).collect();
+    refuse_static_target(&program, &guest_args)?;
     command.program(program).arg0(arg0);
 
     let directory = tempfile::Builder::new()
@@ -2691,12 +2825,12 @@ ran_text: .ascii "ran"
         let dir = short_socket_tempdir();
         let marker = dir.path().join("marker");
         let statik = build_fixture(dir.path(), "fx-static2", &marker, true);
-        let err = refuse_static_target(&statik).unwrap_err();
+        let err = refuse_static_target(&statik, &[]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("no PT_INTERP"), "{err}");
         assert!(!marker.exists());
         let dynamic = build_fixture(dir.path(), "fx-dynamic2", &marker, false);
-        refuse_static_target(&dynamic).unwrap();
+        refuse_static_target(&dynamic, &[]).unwrap();
     }
 
     #[tokio::test]
@@ -2740,5 +2874,155 @@ ran_text: .ascii "ran"
         let command2 = reverie::process::Command::new(dynamic.to_str().unwrap());
         let _ = PreloadBackend::run_with_preload::<EchoTool>(command2, 7, preload).await;
         assert!(marker2.exists(), "dynamic guest never spawned");
+    }
+
+    /// The host dynamic linker the dynamic fixture names.
+    fn fixture_ldso(dynamic: &Path) -> std::path::PathBuf {
+        let interp = elf_interp(dynamic)
+            .unwrap()
+            .expect("dynamic fixture carries PT_INTERP");
+        std::path::PathBuf::from(interp)
+    }
+
+    #[test]
+    fn linker_as_program_checks_its_target() {
+        // ld.so (ET_DYN, no PT_INTERP by definition) as program --
+        // literoot's shebang/interp routes launch exactly this
+        // shape: program=ld.so, first argument=the ELF it loads.
+        // The TARGET decides, never a bare ET_DYN exemption.
+        let dir = short_socket_tempdir();
+        let marker = dir.path().join("marker");
+        let statik = build_fixture(dir.path(), "fx-static4", &marker, true);
+        let dynamic = build_fixture(dir.path(), "fx-dynamic4", &marker, false);
+        let ldso = fixture_ldso(&dynamic);
+        // Linker + static target: refused (target would run
+        // unconfined -- no interpreter loads the preload into it).
+        let err = refuse_static_target(&ldso, &[statik.as_os_str().to_os_string()]).unwrap_err();
+        assert!(err.to_string().contains("no PT_INTERP"), "{err}");
+        // Linker + dynamic target: admitted (the linker loads the
+        // preload into its target).
+        refuse_static_target(&ldso, &[dynamic.as_os_str().to_os_string()]).unwrap();
+        // Linker alone: refused. No target names it as an
+        // interpreter, so it is indistinguishable from a static-pie
+        // guest at this layer; admitting it would be the bare
+        // ET_DYN exemption the review bar rejects.
+        let err = refuse_static_target(&ldso, &[]).unwrap_err();
+        assert!(err.to_string().contains("no PT_INTERP"), "{err}");
+        // Linker options are skipped when finding the target,
+        // including value-taking ones in both spellings.
+        let err = refuse_static_target(
+            &ldso,
+            &[
+                "--inhibit-cache".to_owned().into(),
+                statik.as_os_str().to_os_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no PT_INTERP"), "{err}");
+        refuse_static_target(
+            &ldso,
+            &[
+                "--library-path".to_owned().into(),
+                "/nonexistent".to_owned().into(),
+                dynamic.as_os_str().to_os_string(),
+            ],
+        )
+        .unwrap();
+        let err = refuse_static_target(
+            &ldso,
+            &[
+                "--library-path=/nonexistent".to_owned().into(),
+                statik.as_os_str().to_os_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no PT_INTERP"), "{err}");
+    }
+
+    #[test]
+    fn static_pie_guest_still_refused() {
+        // musereview bar: an ET_DYN static-pie GUEST must not pass
+        // as a "linker". Hermetic static-pie shape: ET_DYN with no
+        // PT_INTERP, from the same nostdlib asm fixture (a real
+        // `cc -static-pie` would need host libc.a/rcrt1; the ELF
+        // facts the refusal reads are identical).
+        let dir = short_socket_tempdir();
+        let marker = dir.path().join("marker");
+        let out = dir.path().join("fx-staticpie");
+        build_asm_fixture(
+            dir.path(),
+            &out,
+            &marker,
+            &["-pie", "-Wl,--no-dynamic-linker"],
+        );
+        let header = std::fs::read(&out).unwrap();
+        assert_eq!(
+            u16::from_ne_bytes([header[16], header[17]]),
+            3,
+            "fixture must be ET_DYN"
+        );
+        assert!(elf_interp(&out).unwrap().is_none());
+        assert!(target_is_static(&out).unwrap());
+        // As program: refused (no target names it as interpreter).
+        assert!(refuse_static_target(&out, &[]).is_err());
+        // As a would-be linker in front of a dynamic target: still
+        // refused -- the target's PT_INTERP names the real linker,
+        // not this guest.
+        let dynamic = build_fixture(dir.path(), "fx-dynamic5", &marker, false);
+        assert!(refuse_static_target(&out, &[dynamic.as_os_str().to_os_string()]).is_err());
+        // As ld.so's target argument: refused (it has no PT_INTERP
+        // naming the linker).
+        let ldso = fixture_ldso(&dynamic);
+        assert!(refuse_static_target(&ldso, &[out.as_os_str().to_os_string()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn linker_as_program_launches_dynamic_target_only() {
+        #[derive(Default, Debug)]
+        struct EchoGlobal;
+        #[reverie::tool]
+        impl reverie::GlobalTool for EchoGlobal {
+            type Request = u64;
+            type Response = u64;
+            type Config = u64;
+            async fn receive_rpc(&self, _from: reverie::Pid, message: u64) -> u64 {
+                message
+            }
+        }
+        #[derive(Default)]
+        struct EchoTool;
+        #[reverie::tool]
+        impl reverie::Tool for EchoTool {
+            type GlobalState = EchoGlobal;
+            type ThreadState = ();
+        }
+        let dir = short_socket_tempdir();
+        let preload = dir.path().join("preload.so");
+        std::fs::write(&preload, b"unused-before-refusal").unwrap();
+        let dynamic_marker = dir.path().join("marker-linker-dynamic");
+        let dynamic = build_fixture(dir.path(), "fx-dynamic6", &dynamic_marker, false);
+        let ldso = fixture_ldso(&dynamic);
+        // MUTATION ARM: dropping the linker_target redirect (always
+        // checking `program`) refuses ld.so itself and the dynamic
+        // half below never spawns.
+        let mut command = reverie::process::Command::new(ldso.to_str().unwrap());
+        command.arg(dynamic.to_str().unwrap());
+        let _ = PreloadBackend::run_with_preload::<EchoTool>(command, 7, preload.clone()).await;
+        assert!(
+            dynamic_marker.exists(),
+            "ld.so + dynamic target never spawned"
+        );
+        let static_marker = dir.path().join("marker-linker-static");
+        let statik = build_fixture(dir.path(), "fx-static6", &static_marker, true);
+        let mut command = reverie::process::Command::new(ldso.to_str().unwrap());
+        command.arg(statik.to_str().unwrap());
+        let err = PreloadBackend::run_with_preload::<EchoTool>(command, 7, preload)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no PT_INTERP"),
+            "ld.so + static target refusal: {err}"
+        );
+        assert!(!static_marker.exists(), "static target ran unconfined");
     }
 }
