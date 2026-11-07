@@ -1,6 +1,6 @@
 [package]
 name = "reverie-loader"
-description = "Reverie in-guest loader: validation of the fixed-address loader and tool runtime images, and the loader's initialization stages."
+description = "Hermit's in-guest loader: validation of the fixed-address loader and runtime images, and the loader's initialization stages."
 version = "0.5.4"
 authors = ["Meta Platforms"]
 edition = "2024"
