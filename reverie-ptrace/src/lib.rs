@@ -138,3 +138,85 @@ pub use tracer::quarantine_cleanup_resource;
 pub use tracer::spawn_fn;
 pub use tracer::spawn_fn_with_config;
 pub use validation::PmuValidationError;
+
+/// CPU-seconds a test's `cc` fixture build may consume. Each fixture
+/// is tens of lines of C and builds in well under a CPU-second, so
+/// this is generous headroom against a runaway compiler, not a
+/// scheduling deadline.
+#[cfg(test)]
+const FIXTURE_COMPILE_CPU_SECONDS: u64 = 30;
+
+/// Compiles one `tests/fixtures` C source for a unit test, bounding
+/// the compiler by CPU time rather than wall time.
+///
+/// Fixtures build on the test host at run time (the binary may be
+/// built elsewhere), so the bound must not be a wall clock: under
+/// host load a 1 s wall timeout killed compiles that had used only
+/// milliseconds of CPU, failing tests before they tested anything
+/// (dh-uelw3). `RLIMIT_CPU` is inherited by the `cc` driver's
+/// children, each holding its own budget; wall time is left to the
+/// test harness.
+#[cfg(test)]
+pub(crate) fn compile_c_fixture(
+    source: &std::path::Path,
+    output: &std::path::Path,
+) -> std::process::ExitStatus {
+    compile_c_fixture_bounded(source, output, FIXTURE_COMPILE_CPU_SECONDS)
+}
+
+#[cfg(test)]
+fn compile_c_fixture_bounded(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    cpu_seconds: u64,
+) -> std::process::ExitStatus {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new("cc");
+    command
+        .args(["-std=c11", "-O1"])
+        .arg(source)
+        .arg("-o")
+        .arg(output);
+    // SAFETY: the callback only sets this child's own CPU rlimit
+    // between fork and exec and touches no other state.
+    unsafe {
+        command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: cpu_seconds,
+                rlim_max: cpu_seconds,
+            };
+            if libc::setrlimit(libc::RLIMIT_CPU, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.status().expect("run cc")
+}
+
+#[cfg(test)]
+mod compile_c_fixture_tests {
+    #[test]
+    fn fixture_compile_uses_a_cpu_bound_not_a_wall_bound() {
+        let directory =
+            std::env::temp_dir().join(format!("reverie-compile-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("probe.c");
+        std::fs::write(&source, "int main(void) { return 42; }\n").unwrap();
+
+        let output = directory.join("probe");
+        let status = super::compile_c_fixture(&source, &output);
+        assert!(status.success(), "compile probe fixture: {status}");
+        let ran = std::process::Command::new(&output).status().unwrap();
+        assert_eq!(ran.code(), Some(42));
+
+        // A zero CPU budget kills the compiler itself: the bound is
+        // really on the toolchain's CPU, and a nonzero budget many
+        // times the fixture's own CPU cost is what lets it build.
+        let starved = super::compile_c_fixture_bounded(&source, &directory.join("starved"), 0);
+        assert!(!starved.success(), "zero CPU budget built: {starved}");
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+}

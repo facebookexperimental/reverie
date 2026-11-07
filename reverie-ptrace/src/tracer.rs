@@ -5955,21 +5955,11 @@ mod tests {
             let source = fixture("fatal_exec_timer.c");
             let output = std::env::temp_dir()
                 .join(format!("reverie-fatal-exec-timer-{}", std::process::id()));
-            let status = std::process::Command::new("timeout")
-                .args([
-                    "--signal=TERM",
-                    "--kill-after=1s",
-                    "1s",
-                    "cc",
-                    "-std=c11",
-                    "-O1",
-                ])
-                .arg(&source)
-                .arg("-o")
-                .arg(&output)
-                .status()
-                .unwrap();
-            assert!(status.success(), "compile bounded exec timer payload");
+            let status = crate::compile_c_fixture(&source, &output);
+            assert!(
+                status.success(),
+                "compile bounded exec timer payload: {status}"
+            );
             eprintln!("exec timer payload: {}", output.display());
             std::ffi::CString::new(output.as_os_str().as_encoded_bytes()).unwrap()
         });

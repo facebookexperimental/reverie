@@ -387,20 +387,7 @@ mod tests {
             .join("tests/fixtures/guest_traced_mmap.c");
         let output =
             std::env::temp_dir().join(format!("reverie-guest-traced-mmap-{}", std::process::id()));
-        let status = std::process::Command::new("timeout")
-            .args([
-                "--signal=TERM",
-                "--kill-after=1s",
-                "10s",
-                "cc",
-                "-std=c11",
-                "-O1",
-            ])
-            .arg(&source)
-            .arg("-o")
-            .arg(&output)
-            .status()
-            .expect("run cc");
+        let status = crate::compile_c_fixture(&source, &output);
         assert!(status.success(), "cc {}: {status}", source.display());
         output
     }

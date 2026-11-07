@@ -99,21 +99,11 @@ mod fatal_namespace_timer_tests {
                 "reverie-fatal-namespace-timer-{}",
                 std::process::id()
             ));
-            let status = std::process::Command::new("timeout")
-                .args([
-                    "--signal=TERM",
-                    "--kill-after=1s",
-                    "1s",
-                    "cc",
-                    "-std=c11",
-                    "-O1",
-                ])
-                .arg(source)
-                .arg("-o")
-                .arg(&output)
-                .status()
-                .unwrap();
-            assert!(status.success(), "bounded namespace payload compile failed");
+            let status = crate::compile_c_fixture(&source, &output);
+            assert!(
+                status.success(),
+                "bounded namespace payload compile failed: {status}"
+            );
             output
         });
         PAYLOAD.clone()
