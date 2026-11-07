@@ -346,6 +346,18 @@ impl SiteSlot {
             words_recorded: AtomicBool::new(false),
         }
     }
+
+    #[cfg(all(feature = "liteinst", any(test, feature = "native-exec-state")))]
+    fn has_installed_hook_or_adapter(&self) -> bool {
+        !self.hook.load(Ordering::Acquire).is_null()
+            || !self.adapter.load(Ordering::Acquire).is_null()
+    }
+
+    #[cfg(all(not(feature = "liteinst"), any(test, feature = "native-exec-state")))]
+    fn has_installed_hook_or_adapter(&self) -> bool {
+        // Without site patching there are no hook/adapter slots to install.
+        false
+    }
 }
 
 /// Retained for process lifetime, including after mapping invalidation and
@@ -1856,8 +1868,7 @@ pub(crate) fn native_exec_site_cut() -> Result<(), crate::native_exec_state::Sta
     for slot in sites.iter() {
         if slot.address.load(Ordering::Acquire) != 0
             || slot.state.load(Ordering::Acquire) != 0
-            || !slot.hook.load(Ordering::Acquire).is_null()
-            || !slot.adapter.load(Ordering::Acquire).is_null()
+            || slot.has_installed_hook_or_adapter()
             || slot.mapping_end.load(Ordering::Acquire) != 0
             || slot.trap_count.load(Ordering::Acquire) != 0
             || slot.hook_count.load(Ordering::Acquire) != 0
@@ -4507,6 +4518,7 @@ mod tests {
             perf_fds().is_empty(),
             "handler accounting lazily opened a PMU"
         );
+        #[cfg(feature = "liteinst")]
         assert!(super::ARENAS.get().unwrap().is_empty());
         assert_eq!(SITES.get().unwrap().len(), MAX_PATCH_SITES);
         let after = super::read_runtime_maps().unwrap();
@@ -4529,7 +4541,11 @@ mod tests {
     fn native_preparation_has_no_executable_arena_and_patcher_keeps_real_aliases() {
         const CHILD: &str = "REVERIE_LITEINST_PREPARATION_TEST_CHILD";
         let Some(mode) = std::env::var_os(CHILD) else {
-            for mode in ["native", "patcher"] {
+            #[cfg(feature = "liteinst")]
+            let modes = ["native", "patcher"];
+            #[cfg(not(feature = "liteinst"))]
+            let modes = ["native"];
+            for mode in modes {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -4569,18 +4585,20 @@ mod tests {
             .iter()
             .filter(|map| map.executable)
             .collect::<Vec<_>>();
-        let arenas = super::ARENAS.get().unwrap();
+        #[cfg(feature = "liteinst")]
+        let arena_count = super::ARENAS.get().unwrap().len();
+        #[cfg(not(feature = "liteinst"))]
+        let arena_count = 0;
         assert_eq!(SITES.get().unwrap().len(), MAX_PATCH_SITES);
         assert!(SITES.get().unwrap().iter().all(|site| {
             site.address.load(Ordering::Acquire) == 0
                 && site.state.load(Ordering::Acquire) == 0
                 && !site.publication_attempted.load(Ordering::Acquire)
-                && site.hook.load(Ordering::Acquire).is_null()
-                && site.adapter.load(Ordering::Acquire).is_null()
+                && !site.has_installed_hook_or_adapter()
         }));
         match preparation {
             super::InstrumentationPreparation::NativeTrapOnly => {
-                assert!(arenas.is_empty());
+                assert_eq!(arena_count, 0);
                 assert_eq!(
                     after_exec, before_exec,
                     "native preparation added executable code"
@@ -4588,14 +4606,14 @@ mod tests {
             }
             super::InstrumentationPreparation::Patcher => {
                 assert!(
-                    !arenas.is_empty(),
+                    arena_count > 0,
                     "ordinary patcher still requires real arenas"
                 );
                 let added = after_exec
                     .iter()
                     .filter(|map| !before_exec.contains(map))
                     .collect::<Vec<_>>();
-                assert_eq!(added.len(), arenas.len());
+                assert_eq!(added.len(), arena_count);
                 for executable in added {
                     assert_ne!(executable.inode, 0);
                     assert!(!executable.writable);

@@ -81,6 +81,33 @@
       "jobs_env": "CARGO_BUILD_JOBS"
     },
     {
+      "group": "build",
+      "job": "liteinst_native_exec_features",
+      "desc": "LiteInst native-exec feature pair",
+      "description": "Compile reverie-liteinst in the exact no-default-features native-exec configuration Hermit uses, plus its liteinst-on pair. The workspace stable-feature build cannot catch this combination because workspace defaults unify the liteinst feature on.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "cargo check --locked -p reverie-liteinst --no-default-features --features exec-native-injection && cargo check --locked -p reverie-liteinst --no-default-features --features exec-native-injection,liteinst",
+      "deps": [],
+      "env": {},
+      "timeout": 600,
+      "cpu_timeout": 300,
+      "priority": 80,
+      "hint": {
+        "resources": {
+          "cargo-build": 1
+        },
+        "est_duration_s": 90,
+        "rss_baseline_bytes": 8000000000,
+        "hard_mem_max_bytes": 16000000000,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8
+      },
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS"
+    },
+    {
       "group": "fixtures",
       "job": "liteinst",
       "desc": "LiteInst allocator fixtures (disabled: dh-hkdh0)",
