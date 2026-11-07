@@ -295,8 +295,12 @@ mod stop_observation_tests {
             .unwrap();
         let (child, event) = initial.assume_stopped();
         assert_eq!(event, crate::Event::Signal(Signal::SIGSTOP));
-        let mut former_wait = Box::pin(child.resume_retaining(None).unwrap().wait_owned());
+        // Resume the known Clone stop while the newborn is still held. If
+        // the newborn execs first, its SIGKILL can supersede that Clone stop
+        // with EXIT, and the old parent capability would resume the EXIT
+        // before the test's ExitFuture claims it (dh-uug32).
         let old_running = parent.resume_retaining(None).unwrap();
+        let mut former_wait = Box::pin(child.resume_retaining(None).unwrap().wait_owned());
         let first = tokio::time::timeout(remaining(deadline), old_exit.as_mut())
             .await
             .unwrap()
