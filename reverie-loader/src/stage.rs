@@ -268,8 +268,7 @@ mod tests {
         let (stage, refusal) = Mapped::from_mapped_stop(DummyStop(3))
             .runtime_started()
             .tool_ready(&LOADER_MANIFEST, ENTRY, Some(ENTRY + 0x1000))
-            .err()
-            .expect("mismatched entry must refuse");
+            .expect_err("mismatched entry must refuse");
         assert_eq!(
             refusal,
             InitRefusal::ExpectedImageEntry {
@@ -284,8 +283,7 @@ mod tests {
         let (stage, refusal) = Mapped::from_mapped_stop(DummyStop(4))
             .runtime_started()
             .tool_ready(&address_manifest, ENTRY, Some(ENTRY))
-            .err()
-            .expect("address init run as image entry must refuse");
+            .expect_err("address init run as image entry must refuse");
         assert_eq!(
             refusal,
             InitRefusal::ExpectedAddress {
@@ -300,8 +298,7 @@ mod tests {
         let (stage, refusal) = Mapped::from_mapped_stop(DummyStop(5))
             .runtime_started()
             .tool_ready(&none_manifest, ENTRY, Some(ENTRY))
-            .err()
-            .expect("no-init manifest entered anyway must refuse");
+            .expect_err("no-init manifest entered anyway must refuse");
         assert_eq!(
             refusal,
             InitRefusal::ExpectedNoEntry {
@@ -316,8 +313,7 @@ mod tests {
         let required = PROBE_RUNTIME_MANIFEST.controls;
         let (stage, unmet) = ready(DummyStop(6))
             .armed(required, Controls::NONE)
-            .err()
-            .expect("unarmed controls must refuse");
+            .expect_err("unarmed controls must refuse");
         assert_eq!(unmet, Control::TrapFilter);
         // The stage is returned, so the stop remains teardown-able,
         // and the same stage succeeds once the evidence satisfies it.

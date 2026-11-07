@@ -1241,8 +1241,7 @@ mod tests {
         let mut address = PROBE_RUNTIME_MANIFEST.clone();
         address.init = InitContract::Address(entry);
         let error = launcher_entry_for(&address, entry)
-            .err()
-            .expect("Address init must refuse on this launcher")
+            .expect_err("Address init must refuse on this launcher")
             .to_string();
         assert!(
             error.contains("unsupported init contract") && error.contains("Address"),
@@ -1251,8 +1250,7 @@ mod tests {
         let mut none = PROBE_RUNTIME_MANIFEST.clone();
         none.init = InitContract::None;
         let error = launcher_entry_for(&none, entry)
-            .err()
-            .expect("None init must refuse on this launcher")
+            .expect_err("None init must refuse on this launcher")
             .to_string();
         assert!(
             error.contains("unsupported init contract") && error.contains("None"),
@@ -1264,8 +1262,7 @@ mod tests {
     fn launcher_refuses_an_unsupported_host_page_size() {
         assert!(refuse_unsupported_page_size(&PROBE_RUNTIME_MANIFEST, 4096).is_ok());
         let error = refuse_unsupported_page_size(&PROBE_RUNTIME_MANIFEST, 65_536)
-            .err()
-            .expect("64 KiB pages must refuse")
+            .expect_err("64 KiB pages must refuse")
             .to_string();
         assert!(
             error.contains("unsupported host page size 65536")
