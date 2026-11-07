@@ -612,7 +612,10 @@ mod tests {
         // The probe controls check can fail, by name, in field order:
         // it is not a tautology against Controls::ALL.
         let probe_controls = PROBE_RUNTIME_MANIFEST.controls;
-        assert_eq!(probe_controls.unmet(Controls::NONE), Some(Control::TrapFilter));
+        assert_eq!(
+            probe_controls.unmet(Controls::NONE),
+            Some(Control::TrapFilter)
+        );
         assert_eq!(
             probe_controls.unmet(Controls {
                 trap_filter: true,
@@ -625,7 +628,10 @@ mod tests {
 
     #[test]
     fn an_unsupported_page_size_is_refused_by_name() {
-        assert_eq!(PROBE_RUNTIME_MANIFEST.validate_with_page_size(PAGE_SIZE), Ok(()));
+        assert_eq!(
+            PROBE_RUNTIME_MANIFEST.validate_with_page_size(PAGE_SIZE),
+            Ok(())
+        );
         assert_eq!(
             PROBE_RUNTIME_MANIFEST.validate_with_page_size(65_536),
             Err(ManifestError::UnsupportedPageSize { page_size: 65_536 })

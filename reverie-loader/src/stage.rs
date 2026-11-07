@@ -191,11 +191,7 @@ impl<S> ToolReady<S> {
     /// stage for teardown, while any required control is unmet —
     /// the check lives here, in the loader, so a launcher cannot
     /// claim `Armed` without it succeeding.
-    pub fn armed(
-        self,
-        required: Controls,
-        armed: Controls,
-    ) -> Result<Armed<S>, (Self, Control)> {
+    pub fn armed(self, required: Controls, armed: Controls) -> Result<Armed<S>, (Self, Control)> {
         match required.unmet(armed) {
             None => Ok(Armed(self.0)),
             Some(unmet) => Err((self, unmet)),

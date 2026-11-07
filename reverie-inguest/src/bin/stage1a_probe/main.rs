@@ -99,9 +99,7 @@ impl RuntimeKind {
                     | CONTROL_TSC_PROBE
                     | CONTROL_SYSCALL_PROBE
             }
-            RuntimeKind::Counter => {
-                CONTROL_ALTSTACK | CONTROL_FDS_CLOSED | CONTROL_SYSCALL_PROBE
-            }
+            RuntimeKind::Counter => CONTROL_ALTSTACK | CONTROL_FDS_CLOSED | CONTROL_SYSCALL_PROBE,
         }
     }
 
@@ -227,9 +225,9 @@ fn protocol_controls_for(controls: Controls, mechanics: u64) -> u64 {
 /// spawned or mapped — a `Custom` manifest declaring `Address(x)`
 /// or `None` is never run as if it said `ImageEntry`.
 fn launcher_entry_for(manifest: &ToolManifest, image_entry: u64) -> Result<u64> {
-    manifest.require_image_entry_init().map_err(|refusal| {
-        format!("loader refused: unsupported init contract: {refusal:?}")
-    })?;
+    manifest
+        .require_image_entry_init()
+        .map_err(|refusal| format!("loader refused: unsupported init contract: {refusal:?}"))?;
     manifest
         .check_init_entry(image_entry, Some(image_entry))
         .map_err(|refusal| format!("loader refused: init entry mismatch: {refusal:?}"))?;
@@ -240,9 +238,11 @@ fn launcher_entry_for(manifest: &ToolManifest, image_entry: u64) -> Result<u64> 
 /// contract does not support. The size is an input so the refused
 /// case is testable without a 64 KiB-page host.
 fn refuse_unsupported_page_size(manifest: &ToolManifest, page_size: u64) -> Result<()> {
-    manifest.validate_with_page_size(page_size).map_err(|error| {
-        format!("loader refused: unsupported host page size {page_size}: {error:?}").into()
-    })
+    manifest
+        .validate_with_page_size(page_size)
+        .map_err(|error| {
+            format!("loader refused: unsupported host page size {page_size}: {error:?}").into()
+        })
 }
 
 /// The host page size, from the auxiliary vector (not `sysconf`).
@@ -260,8 +260,10 @@ fn claim_armed<S>(ready: ToolReady<S>, manifest: &ToolManifest, controls: u64) -
     ready
         .armed(manifest.controls, armed_controls(controls))
         .map_err(|(_stage, unmet)| {
-            format!("loader refused: required control not armed: {unmet:?} (controls={controls:#x})")
-                .into()
+            format!(
+                "loader refused: required control not armed: {unmet:?} (controls={controls:#x})"
+            )
+            .into()
         })
 }
 
