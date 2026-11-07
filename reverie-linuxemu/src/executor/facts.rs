@@ -712,10 +712,13 @@ impl ElfExecutor {
     /// has, in this fork, in any later one, and wherever a move puts it
     /// later (mremap keeps a page's lineage), while its own parts, split and
     /// joined again, still merge. Only `memory`, the child's copy, changes.
-    /// It fails, changing no lineage, only where the address space has no
-    /// lineage left that no page has, which takes more than four billion
-    /// pages (`fresh_lineages`). A copy
-    /// that shares its parent's address space
+    /// It fails only where the address space has no lineage left that no
+    /// page has, which takes more than four billion pages
+    /// (`fresh_lineages`). The window's mappings may already have been
+    /// relabelled by then (`keep_window_mappings_apart` runs first), but no
+    /// locked mapping's lineage or flags change until the allocation
+    /// succeeds, and the caller then discards the prepared child, which
+    /// never runs. A copy that shares its parent's address space
     /// ([`GuestMemory::shares_parent_address_space`]) is left as it is: on
     /// Linux it is the parent's own address space, whose mappings stay
     /// locked.

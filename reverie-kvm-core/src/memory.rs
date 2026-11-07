@@ -1462,10 +1462,12 @@ pub struct DeclaredMapping {
     /// ([`GuestMemory::map_user_protection`]). LinuxEmu gives each mapping of
     /// the stack window that a forked child inherits one of its own, and
     /// each mapping of a forked child that was locked in the parent one that
-    /// no other page of the address space has. 32 bits wide, so that the
-    /// distinct lineages of the pages, at most one per page of guest memory,
-    /// always leave a free one; a page's state is 16 bytes with it (12 with
-    /// a 16-bit lineage).
+    /// no other page of the address space has. 32 bits wide: the distinct
+    /// lineages of the pages are at most one per page of guest memory, so a
+    /// free one exists for any guest below 16 TiB. LinuxEmu's allocator
+    /// still checks, and refuses the fork rather than reuse a live lineage
+    /// if none is left. A page's state is 16 bytes with it (12 with a 16-bit
+    /// lineage).
     pub lineage: u32,
 }
 
