@@ -160,6 +160,11 @@ rust_library(
                 },
             },
             "features": {"default": [], "nightly": [], "rcb-observation": []},
+            "test": [
+                {"name": "first_instruction_cpuid", "path": "../tests/first_instruction_cpuid.rs"},
+                {"name": "convert", "path": "../tests/convert.rs"},
+                {"name": "vfork", "path": "../tests/vfork.rs"},
+            ],
         },
         "cargo_toml_dir": "reverie-ptrace",
         "edge_features": [],
