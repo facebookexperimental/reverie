@@ -666,7 +666,14 @@ impl ElfExecutor {
         Self::with_output(state, output)
     }
 
+    /// The executor of a run's first task, whose process is `state`, as
+    /// loaded: it captures the host's facts that decide the flags of the
+    /// guest's mappings (`vm_flags::HostVmFacts::capture_for_run`)
+    /// now, before the guest's first instruction, and logs them at INFO
+    /// under the caller's subscriber, once for the run: the run's forks,
+    /// clones and execs keep them.
     pub fn with_output(mut state: LoadedStaticElf, output: Option<CapturedOutput>) -> Self {
+        state.host_vm_facts = super::vm_flags::HostVmFacts::capture_for_run();
         let file_table;
         let _retirement = state.file_retirement.hold();
         let transaction = state.signal_transaction.clone();

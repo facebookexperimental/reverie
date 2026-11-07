@@ -187,7 +187,9 @@ pub(super) fn execute_basic_syscall_with_read_context(
 /// classifies pages and then zeroes them, and a mapping replaced between the
 /// two (by a host-owned worker's executor) must not have its new contents
 /// erased; and its flag changes split lines.
-pub(super) const LAYOUT_SYSCALLS: [libc::c_long; 7] = [
+/// munlock and munlockall count: they take `FLAG_LOCKED` from the mappings
+/// they unlock, which splits a line munlock covers part of.
+pub(super) const LAYOUT_SYSCALLS: [libc::c_long; 9] = [
     libc::SYS_brk,
     libc::SYS_mmap,
     libc::SYS_mremap,
@@ -195,6 +197,8 @@ pub(super) const LAYOUT_SYSCALLS: [libc::c_long; 7] = [
     libc::SYS_mprotect,
     libc::SYS_madvise,
     libc::SYS_pkey_mprotect,
+    libc::SYS_munlock,
+    libc::SYS_munlockall,
 ];
 
 /// Whether syscall `number` is one of [`LAYOUT_SYSCALLS`].
@@ -229,9 +233,13 @@ pub(super) fn layout_edit_boundaries(
                 Vec::new()
             }
         }
-        libc::SYS_munmap | libc::SYS_mprotect | libc::SYS_pkey_mprotect | libc::SYS_madvise => {
-            range(args[0], args[1])
-        }
+        libc::SYS_munmap
+        | libc::SYS_mprotect
+        | libc::SYS_pkey_mprotect
+        | libc::SYS_madvise
+        | libc::SYS_munlock => range(args[0], args[1]),
+        // Unlocking every mapping whole splits none.
+        libc::SYS_munlockall => Vec::new(),
         libc::SYS_mremap => {
             // The source's ends, where a shrink cuts it, and a fixed
             // destination's ends.
@@ -945,9 +953,9 @@ fn execute_basic_syscall_inner(
             // mappings it covers: the pages keep them (`DeclaredMapping::flags`).
             if let Some((start, length, set, clear)) = madvise_flag_change(args) {
                 memory.flag_user_range(start, length, set, clear);
-                memory.edit_user_declared(start, length, |declared, _| {
+                memory.edit_user_declared(start, length, |declared, shared| {
                     crate::memory::DeclaredMapping {
-                        flags: declared.flags & !clear | set,
+                        flags: declared.flags & !clear | advised_flags(set, shared),
                         ..declared
                     }
                 });
@@ -969,11 +977,16 @@ fn execute_basic_syscall_inner(
         }
         _ if number == libc::SYS_munlock as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED
-            munlock_guest_range(&ProviderMemory(memory), args[0], args[1])
+            let result = munlock_guest_range(&ProviderMemory(memory), args[0], args[1]);
+            if result == 0 {
+                unlock_mappings(memory, args[0], args[1]);
+            }
+            result
         }
         _ if number == libc::SYS_munlockall as u64 => {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-145): Review the deterministic no-op unlock-all model.
+            unlock_all_mappings(memory);
             0
         }
         _ if number == libc::SYS_mincore as u64 => mincore(&mut ProviderMemory(memory), args),
@@ -1288,6 +1301,64 @@ impl ElfExecutor {
             }
         }
     }
+}
+
+/// After a `munlock(2)` of `[address, address + length)` that succeeded:
+/// takes `FLAG_LOCKED` from the mappings it unlocked, as
+/// `apply_vma_lock_flags` clears `VM_LOCKED_MASK` (`mm/mlock.c`): the pages
+/// of the range, rounded to whole pages as Linux rounds it, from its start
+/// up to the first page no mapping holds, where Linux stops (and fails with
+/// ENOMEM, which this backend's validation does not report, see
+/// `munlock_guest_range`). A mapping it covers part of is split there, and
+/// a part left with the flags of its neighbour merges with it, as
+/// `mlock_fixup` merges them; the list of mappings finds both from the
+/// pages.
+fn unlock_mappings(memory: &GuestMemory, address: u64, length: u64) {
+    if memory.flagged_pages(FLAG_LOCKED) == 0 {
+        return;
+    }
+    let Some((start, length)) = munlock_range(address, length) else {
+        return;
+    };
+    let mut end = start;
+    for run in memory.user_mapping_runs_in(start, length).runs {
+        if run.start != end {
+            break;
+        }
+        end = run.end;
+    }
+    clear_locked(memory, start, end - start);
+}
+
+/// After `munlockall(2)`: takes `FLAG_LOCKED` from every mapping, as
+/// `apply_mlockall_flags` clears `VM_LOCKED_MASK` from each (`mm/mlock.c`).
+fn unlock_all_mappings(memory: &GuestMemory) {
+    if memory.flagged_pages(FLAG_LOCKED) != 0 {
+        clear_locked(memory, 0, crate::memory::USER_ADDRESS_END);
+    }
+}
+
+/// Clears `FLAG_LOCKED` on the declared pages of the user range
+/// `[start, start + length)`. No page of the stack window has it.
+fn clear_locked(memory: &GuestMemory, start: u64, length: u64) {
+    memory.edit_user_declared(start, length, |declared, _| {
+        crate::memory::DeclaredMapping {
+            flags: declared.flags & !FLAG_LOCKED,
+            ..declared
+        }
+    });
+}
+
+/// The provider flags advice that sets `set` sets on a page that is shared
+/// or not: all of them, but `FLAG_MERGEABLE` on a shared page. Linux accepts
+/// `MADV_MERGEABLE` there and leaves the mapping as it was: `ksm_madvise`
+/// returns without `VM_MERGEABLE` for a mapping that `ksm_compatible`
+/// rejects, as it does every `VM_SHARED` or `VM_MAYSHARE` one
+/// (`mm/ksm.c`). Every other flag the advice this backend accepts sets is
+/// set on any mapping. (The stack window, which the window's own editor
+/// flags, is private.)
+fn advised_flags(set: u16, shared: bool) -> u16 {
+    if shared { set & !FLAG_MERGEABLE } else { set }
 }
 
 /// After a successful `mprotect(2)` or `pkey_mprotect(2)` (`result`, of

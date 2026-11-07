@@ -306,7 +306,7 @@ pub(super) fn mmap_with_shared_files(
             address,
             length as u64,
             Some(prot as u8),
-            super::new_mapping_flags(flags, prot),
+            super::new_mapping_flags(flags, prot, &state.host_vm_facts),
             identity,
         );
     } else {
@@ -377,7 +377,7 @@ pub(super) fn mmap_with_shared_files(
             address,
             length as u64,
             Some(prot as u8),
-            super::new_mapping_flags(flags, prot),
+            super::new_mapping_flags(flags, prot, &state.host_vm_facts),
             identity,
         );
     }

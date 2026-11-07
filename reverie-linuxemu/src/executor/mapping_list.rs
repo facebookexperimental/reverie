@@ -261,6 +261,8 @@ pub(crate) struct ImageMapFacts {
     pub(crate) start_stack: u64,
     pub(crate) start_brk: u64,
     pub(crate) read_implies_exec: bool,
+    /// The host's facts the run captured (`LoadedStaticElf::host_vm_facts`).
+    pub(crate) host: super::vm_flags::HostVmFacts,
 }
 
 impl ImageMapFacts {
@@ -269,6 +271,7 @@ impl ImageMapFacts {
             start_stack: state.stack_pointer,
             start_brk: state.mm.heap_base,
             read_implies_exec: state.linux_personality & super::facts::READ_IMPLIES_EXEC != 0,
+            host: state.host_vm_facts,
         }
     }
 }
@@ -368,11 +371,26 @@ impl Line {
         }))
     }
 
-    /// Adds `next`, which [`Line::merges_with`] this line, to it.
+    /// Adds `next`, which [`Line::merges_with`] this line, to it. A file
+    /// line's facts stay known only while every part's are: those of the
+    /// parts with known facts agree on the flags (`merges_with`), and a part
+    /// whose facts are not known makes the whole line's not known, so that
+    /// no part's flags are reported from another's facts.
     fn absorb(&mut self, next: &Line) {
         self.end = next.end;
         self.sticky |= next.sticky;
         self.sticky_everywhere &= next.sticky_everywhere;
+        if let (
+            LineBacking::File { vm_facts, .. },
+            LineBacking::File {
+                vm_facts: next_facts,
+                ..
+            },
+        ) = (&mut self.backing, &next.backing)
+            && next_facts.is_none()
+        {
+            *vm_facts = None;
+        }
     }
 
     /// Whether `next`, which starts where this line ends, is part of the same
@@ -389,15 +407,27 @@ impl Line {
             && match (&self.backing, &next.backing) {
                 (LineBacking::Anonymous, LineBacking::Anonymous) => true,
                 (
-                    LineBacking::File { file, offset, .. },
+                    LineBacking::File {
+                        file,
+                        offset,
+                        vm_facts,
+                        ..
+                    },
                     LineBacking::File {
                         file: next_file,
                         offset: next_offset,
+                        vm_facts: next_facts,
                         ..
                     },
                 ) => {
                     offset.checked_add(length) == Some(*next_offset)
                         && (Arc::ptr_eq(file, next_file) || same_description(file, next_file))
+                        && !super::vm_flags::file_flags_differ(
+                            vm_facts.as_ref(),
+                            next_facts.as_ref(),
+                            self.declared.flags & !STICKY_FLAGS,
+                            self.shared,
+                        )
                 }
                 (
                     LineBacking::SharedAnonymous {
@@ -434,7 +464,7 @@ impl Line {
             self.shared,
             flag_backing,
             image.read_implies_exec,
-            super::vm_flags::host_vm_facts(),
+            image.host,
         );
         let (offset, backing) = match self.backing {
             LineBacking::Anonymous => {

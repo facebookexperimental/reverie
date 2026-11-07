@@ -652,7 +652,7 @@ pub(super) fn mmap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: 
         address,
         length as u64,
         None,
-        new_mapping_flags(flags, prot),
+        new_mapping_flags(flags, prot, &state.host_vm_facts),
         identity,
     );
     if !fixed {
@@ -1257,8 +1257,10 @@ pub(crate) const FLAG_ACCOUNT_UNKNOWN: u16 = 0x80;
 /// Linux's `VM_GROWSDOWN`, from `MAP_GROWSDOWN` (`calc_vm_flag_bits`).
 pub(crate) const FLAG_GROWSDOWN: u16 = 0x100;
 /// Linux's `VM_LOCKED`, from `MAP_LOCKED` (`calc_vm_flag_bits`); a forked
-/// child's copy loses it (`dup_mmap` clears `VM_LOCKED_MASK`). `mlock(2)`
-/// and the like are refused, so nothing else sets it.
+/// child's copy loses it (`dup_mmap` clears `VM_LOCKED_MASK`), and
+/// `munlock(2)` and `munlockall(2)` take it from the mappings they unlock
+/// (`apply_vma_lock_flags`, `apply_mlockall_flags`). `mlock(2)` and the like
+/// are refused, so nothing else sets it.
 pub(crate) const FLAG_LOCKED: u16 = 0x200;
 /// Linux's `VM_SYNC`, from `MAP_SYNC` (`calc_vm_flag_bits`): every mmap that
 /// succeeds with it has the flag.
@@ -1277,16 +1279,17 @@ pub(crate) const FLAG_MAYBE_GUARD: u16 = 0x1000;
 /// The flags Linux gives a new mapping made with `mmap(2)` flags `flags` and
 /// protection `prot` (`do_mmap`, `calc_vm_flag_bits` and
 /// `accountable_mapping`): `VM_NORESERVE` for `MAP_NORESERVE` unless the
-/// host's overcommit mode is 2 (`OVERCOMMIT_NEVER`), which ignores it;
+/// host's overcommit mode, as the run captured it (`host`), is 2
+/// (`OVERCOMMIT_NEVER`), which ignores it; where the mode is not known, the
+/// flag is kept and the line has no flags reported;
 /// `VM_ACCOUNT` for a private writable mapping without `VM_NORESERVE`;
 /// `VM_GROWSDOWN`, `VM_LOCKED`, `VM_SYNC` and `VM_NOHUGEPAGE` for
 /// `MAP_GROWSDOWN`, `MAP_LOCKED`, `MAP_SYNC` and `MAP_STACK` (Linux is
 /// built with transparent huge pages: this backend accepts their advice);
 /// and [`FLAG_HUGETLB`] for `MAP_HUGETLB`.
-pub(crate) fn new_mapping_flags(flags: u64, prot: u64) -> u16 {
+pub(crate) fn new_mapping_flags(flags: u64, prot: u64, host: &super::vm_flags::HostVmFacts) -> u16 {
     let noreserve = flags & libc::MAP_NORESERVE as u64 != 0
-        && super::vm_flags::host_vm_facts().overcommit_memory
-            != Some(super::vm_flags::OVERCOMMIT_NEVER);
+        && host.overcommit_memory != Some(super::vm_flags::OVERCOMMIT_NEVER);
     let shared = flags & libc::MAP_SHARED as u64 != 0;
     let charge = if noreserve {
         FLAG_NORESERVE

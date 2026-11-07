@@ -1341,6 +1341,12 @@ pub struct LoadedStaticElf {
     /// Host-kernel ordering for O_CREAT|O_DIRECTORY on an existing regular
     /// procfs entry, established before this image can execute.
     pub regular_create_directory_policy: RegularCreateDirectoryPolicy,
+    /// The host's facts that decide the flags of the guest's mappings
+    /// (`reverie::MappingFact::vm_flags`), captured once per run as the
+    /// executor makes the run's first task, before the guest's first
+    /// instruction (`ElfExecutor::with_output`); none until then. Forks,
+    /// clones and execs keep them, so that a run reads the host once.
+    pub(crate) host_vm_facts: crate::executor::vm_flags::HostVmFacts,
     pub fdinfo_files:
         std::collections::BTreeMap<i32, std::sync::Arc<crate::executor::FdinfoDescription>>,
     // AUTONOMOUS-BOT-IMPLEMENTED: Preserve deterministic file-object identity.
@@ -1566,6 +1572,7 @@ impl LoadedStaticElf {
             proc_files,
             synthetic_proc_nofollow_fds,
             regular_create_directory_policy: self.regular_create_directory_policy,
+            host_vm_facts: self.host_vm_facts,
             fdinfo_files,
             fd_object_inodes,
             file_identity_table: self.file_identity_table.clone(),
@@ -1598,6 +1605,7 @@ impl LoadedStaticElf {
         let thp_disabled =
             std::sync::Arc::new(AtomicU8::new(previous.thp_disabled.load(Ordering::SeqCst)));
         let regular_create_directory_policy = previous.regular_create_directory_policy;
+        let host_vm_facts = previous.host_vm_facts;
         let cloexec_fds = previous.cloexec_fds;
         let native_poll_fds = {
             let _proof = previous
@@ -1790,6 +1798,7 @@ impl LoadedStaticElf {
         self.proc_files = proc_files;
         self.synthetic_proc_nofollow_fds = synthetic_proc_nofollow_fds;
         self.regular_create_directory_policy = regular_create_directory_policy;
+        self.host_vm_facts = host_vm_facts;
         self.fdinfo_files = fdinfo_files;
         self.fd_object_inodes = fd_object_inodes;
         self.file_identity_table = file_identity_table;
@@ -2442,6 +2451,7 @@ fn load_executable(
         proc_files: std::collections::BTreeMap::new(),
         synthetic_proc_nofollow_fds: std::collections::BTreeSet::new(),
         regular_create_directory_policy: initialize_regular_create_directory_policy()?,
+        host_vm_facts: crate::executor::vm_flags::HostVmFacts::UNCAPTURED,
         fdinfo_files: std::collections::BTreeMap::new(),
         fd_object_inodes: std::collections::BTreeMap::new(),
         file_identity_table: std::sync::Arc::new(std::sync::Mutex::new(GuestFileIdentityTable {

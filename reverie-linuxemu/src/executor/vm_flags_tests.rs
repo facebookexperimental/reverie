@@ -1127,7 +1127,15 @@ fn syscall_names(text: &str) -> BTreeSet<String> {
 /// not followed; the one such page-editing method is
 /// `GuestMemory::snapshot`, which copies the address space into a new one
 /// and edits none of the caller's pages. A new one fails here, to be looked
-/// at.
+/// at, as does a dispatch arm in another form than `_ if <guard> =>` or a
+/// page edit in the dispatch before its match.
+///
+/// What this reading cannot see, and so does not check: a call made through
+/// a function pointer, a closure kept in a variable, a trait object or a
+/// macro; a function renamed on import (`use ... as ...`); and a method
+/// called by the fully qualified form `<Type as Trait>::name(`. No such
+/// call reaches a page edit from dispatch today; one added later is caught
+/// only by the tests of the call it makes.
 #[test]
 fn the_guard_spread_runs_for_every_syscall_whose_dispatch_edits_the_layout() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1189,6 +1197,30 @@ fn the_guard_spread_runs_for_every_syscall_whose_dispatch_edits_the_layout() {
     let inner_at = dispatch.find("fn execute_basic_syscall_inner(").unwrap();
     let inner_open = inner_at + dispatch[inner_at..].find('{').unwrap();
     let inner = &dispatch[inner_open..block_end(&dispatch, inner_open)];
+    // The arms are read in the one form dispatch writes them in,
+    // `_ if <guard> => <body>`, at the match's indentation; another form, or
+    // a page edit before the match, which no arm would show, fails here, to
+    // be looked at.
+    let match_at = inner
+        .find("let result = match number {")
+        .expect("the inner dispatch's match");
+    let prelude_edits: Vec<&String> = editing
+        .iter()
+        .filter(|(name, method)| {
+            !(**method && ambiguous.contains(*name)) && calls(&inner[..match_at], name, **method)
+        })
+        .map(|(name, _)| name)
+        .collect();
+    assert!(prelude_edits.is_empty(), "{prelude_edits:?}");
+    for arm_line in inner[match_at..].lines().filter(|line| {
+        line.starts_with("        ") && !line.starts_with("         ") && line.contains("=>")
+    }) {
+        let arm = arm_line.trim_start();
+        assert!(
+            arm.starts_with("_ if ") || arm.starts_with("_ =>"),
+            "{arm_line}"
+        );
+    }
     // Each dispatched syscall, and the page-editing functions its arm calls.
     let mut by_syscall: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for arm in inner.split("\n        _ if ").skip(1) {
@@ -1268,5 +1300,688 @@ fn the_guard_spread_runs_for_every_syscall_whose_dispatch_edits_the_layout() {
         "execute_basic_syscall_inner(",
     ] {
         assert!(spread < position(path), "{path}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The adversarial review of reverie#1342 at 39622d18: its four witnesses,
+// kept as they failed there, and the cases each fix adds. Every expected
+// `VmFlags` is native Linux 7.1.3's, from the reviewer's probes
+// (`rv1342-flags-probe.c`, `rv1342-flags-mergeable-probe.c`,
+// `rv1342-flags-unlock-probe.c`) or from `fix1_probe.c` (dh-9j8ue scratch,
+// `impl/fix1/probe/`), quoted at each case by its line name.
+
+/// Maps `pages` pages of descriptor `fd` (of the executor's state) at
+/// `at`, fixed, with `prot` and `flags`, from file offset `offset`.
+#[allow(clippy::too_many_arguments)]
+fn map_fd(
+    executor: &mut ElfExecutor,
+    memory: &GuestMemory,
+    at: u64,
+    pages: u64,
+    prot: u64,
+    flags: u64,
+    fd: i64,
+    offset: u64,
+) {
+    let mut owner = memory.clone();
+    let result = execute_basic_syscall(
+        &mut owner,
+        &mut executor.state,
+        &SyscallRequest::new(
+            libc::SYS_mmap as u64,
+            [
+                at,
+                pages * PAGE,
+                prot,
+                flags | libc::MAP_FIXED as u64,
+                fd as u64,
+                offset,
+            ],
+        ),
+    );
+    match result {
+        SyscallAction::Continue { result, .. } => assert_eq!(result, at as i64),
+        _ => panic!("mmap did not return Continue"),
+    }
+}
+
+/// A new memfd of `pages` pages that may be sealed.
+fn sealable_memfd(pages: u64) -> std::fs::File {
+    use std::os::fd::FromRawFd;
+    // SAFETY: a new memfd this test owns.
+    let raw = unsafe { libc::memfd_create(c"vm-flags-review".as_ptr(), libc::MFD_ALLOW_SEALING) };
+    assert!(raw >= 0);
+    // SAFETY: memfd_create returned a new descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(raw) };
+    file.set_len(pages * PAGE).unwrap();
+    file
+}
+
+/// Adds `F_SEAL_FUTURE_WRITE` to `file`, as another owner of it may.
+fn seal_future_writes(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fcntl on a descriptor this test owns.
+    let sealed = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_FUTURE_WRITE,
+        )
+    };
+    assert_eq!(sealed, 0);
+}
+
+/// `pages` free pages, unmapped, with a free page on each side.
+fn room(executor: &mut ElfExecutor, memory: &GuestMemory, pages: u64) -> u64 {
+    let base = mmap(executor, memory, 0, pages + 2, 0, PRIVATE);
+    ok(call(
+        executor,
+        memory,
+        libc::SYS_munmap,
+        [base, (pages + 2) * PAGE, 0, 0, 0, 0],
+    ));
+    base + PAGE
+}
+
+/// Finding 3 witness (`rv1342-flags-probe.log`: child-A/B, grandchild-A/B).
+#[test]
+fn review_nested_fork_keeps_newly_unlocked_neighbor_apart() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let base = mmap(&mut executor, &memory, 0, 2, 0, PRIVATE);
+    mmap(
+        &mut executor,
+        &memory,
+        base,
+        1,
+        RW,
+        PRIVATE | FIXED | libc::MAP_LOCKED as u64,
+    );
+    let child_memory = memory.snapshot().unwrap();
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    let mut child = executor
+        .fork_child(executor.state.pid + 40, false, false)
+        .unwrap();
+    ok(call(
+        &mut child,
+        &child_memory,
+        libc::SYS_madvise,
+        [base, PAGE, mm::MADV_GUARD_INSTALL as u64, 0, 0, 0],
+    ));
+    mmap(
+        &mut child,
+        &child_memory,
+        base + PAGE,
+        1,
+        RW,
+        PRIVATE | FIXED | libc::MAP_LOCKED as u64,
+    );
+    assert_eq!(
+        flags_at(&child, &child_memory, base),
+        (base, base + PAGE, text("rd wr mr mw me gu ac"))
+    );
+    assert_eq!(
+        flags_at(&child, &child_memory, base + PAGE),
+        (base + PAGE, base + 2 * PAGE, text("rd wr mr mw me lo ac"))
+    );
+    let grand_memory = child_memory.snapshot().unwrap();
+    ElfExecutor::inherit_mappings_in_forked_child(&grand_memory);
+    let grand = child
+        .fork_child(child.state.pid + 40, false, false)
+        .unwrap();
+    // Native Linux 7.1.3: dup_mmap preserves both one-page VMAs;
+    // only B's lo disappears, and B does not acquire A's gu.
+    assert_eq!(
+        flags_at(&grand, &grand_memory, base),
+        (base, base + PAGE, text("rd wr mr mw me gu ac"))
+    );
+    assert_eq!(
+        flags_at(&grand, &grand_memory, base + PAGE),
+        (base + PAGE, base + 2 * PAGE, text("rd wr mr mw me ac"))
+    );
+}
+
+/// Finding 3: a mapping unlocked in a fork child takes the least lineage
+/// neither neighbour has, whatever lineages earlier forks gave them.
+#[test]
+fn an_unlocked_mappings_lineage_is_neither_neighbours() {
+    use super::facts::unlocked_lineage;
+    assert_eq!(unlocked_lineage(None, None), 1);
+    assert_eq!(unlocked_lineage(Some(0), Some(0)), 1);
+    assert_eq!(unlocked_lineage(Some(1), None), 2);
+    assert_eq!(unlocked_lineage(None, Some(1)), 2);
+    assert_eq!(unlocked_lineage(Some(1), Some(2)), 3);
+    assert_eq!(unlocked_lineage(Some(2), Some(1)), 3);
+    assert_eq!(unlocked_lineage(Some(3), Some(7)), 1);
+}
+
+/// Finding 4 witness (`rv1342-flags-mergeable-probe.log`: shared).
+#[test]
+fn review_shared_anonymous_mergeable_advice_does_not_report_mg() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let base = mmap(
+        &mut executor,
+        &memory,
+        0,
+        1,
+        RW,
+        (libc::MAP_SHARED | libc::MAP_ANONYMOUS) as u64,
+    );
+    ok(call(
+        &mut executor,
+        &memory,
+        libc::SYS_madvise,
+        [base, PAGE, libc::MADV_MERGEABLE as u64, 0, 0, 0],
+    ));
+    assert_eq!(
+        flags_at(&executor, &memory, base).2,
+        text("rd wr sh mr mw me ms")
+    );
+}
+
+/// Finding 4: `MADV_MERGEABLE` sets `mg` on private mappings, anonymous and
+/// of a file, and on no shared mapping of a file, writable or not
+/// (`fix1_probe.log`: mg-private-anon, mg-shared-file-rdwr,
+/// mg-shared-file-rdonly, mg-private-file).
+#[test]
+fn mergeable_advice_marks_private_mappings_and_no_shared_one() {
+    use std::os::fd::AsRawFd;
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let file = sealable_memfd(1);
+    let shared = libc::MAP_SHARED as u64;
+    let private = libc::MAP_PRIVATE as u64;
+    let cases = [
+        (
+            "mg-shared-file-rdwr",
+            RW,
+            shared,
+            true,
+            "rd wr sh mr mw me ms",
+        ),
+        ("mg-shared-file-rdonly", R, shared, false, "rd mr me ms"),
+        ("mg-private-file", R, private, false, "rd mr mw me mg"),
+    ];
+    for (name, prot, flags, writable, linux) in cases {
+        let at = room(&mut executor, &memory, 1);
+        // The executor's own calls replace its state's descriptors with its
+        // table's, so the descriptor goes in just before the mmap.
+        let description = if writable {
+            file.try_clone().unwrap()
+        } else {
+            std::fs::File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap()
+        };
+        let fd = insert_file_with_flags(&mut executor.state, description, false, None);
+        assert!(fd >= 0);
+        map_fd(&mut executor, &memory, at, 1, prot, flags, fd, 0);
+        ok(call(
+            &mut executor,
+            &memory,
+            libc::SYS_madvise,
+            [at, PAGE, libc::MADV_MERGEABLE as u64, 0, 0, 0],
+        ));
+        assert_eq!(
+            flags_at(&executor, &memory, at),
+            (at, at + PAGE, text(linux)),
+            "{name}"
+        );
+    }
+    let at = mmap(&mut executor, &memory, 0, 1, RW, PRIVATE);
+    ok(call(
+        &mut executor,
+        &memory,
+        libc::SYS_madvise,
+        [at, PAGE, libc::MADV_MERGEABLE as u64, 0, 0, 0],
+    ));
+    assert_eq!(
+        flags_at(&executor, &memory, at).2,
+        text("rd wr mr mw me ac mg"),
+        "mg-private-anon"
+    );
+}
+
+/// Finding 5 witness (`rv1342-flags-unlock-probe.log`).
+#[test]
+fn review_unlock_calls_clear_published_lo() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    for unlock in [libc::SYS_munlock, libc::SYS_munlockall] {
+        let (mut executor, memory) = loaded(&directory);
+        let base = mmap(
+            &mut executor,
+            &memory,
+            0,
+            2,
+            RW,
+            PRIVATE | libc::MAP_LOCKED as u64,
+        );
+        ok(call(
+            &mut executor,
+            &memory,
+            unlock,
+            [base, 2 * PAGE, 0, 0, 0, 0],
+        ));
+        assert_eq!(
+            flags_at(&executor, &memory, base).2,
+            text("rd wr mr mw me ac"),
+            "unlock syscall {unlock}"
+        );
+    }
+}
+
+/// Finding 5: munlock unlocks exactly the pages of its range up to the
+/// first hole, splitting and merging lines as Linux does, and munlockall
+/// unlocks every mapping (`fix1_probe.log`: unlock-full,
+/// unlock-partial-first/second/merged, unlock-hole-before/after,
+/// unlockall-rw/r).
+#[test]
+fn unlocking_takes_locked_from_exactly_the_mappings_unlocked() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let locked = PRIVATE | FIXED | libc::MAP_LOCKED as u64;
+    let unlock = |executor: &mut ElfExecutor, at: u64, length: u64| {
+        call(
+            executor,
+            &memory,
+            libc::SYS_munlock,
+            [at, length, 0, 0, 0, 0],
+        )
+    };
+
+    let full = room(&mut executor, &memory, 2);
+    mmap(&mut executor, &memory, full, 2, RW, locked);
+    ok(unlock(&mut executor, full, 2 * PAGE));
+    assert_eq!(
+        flags_at(&executor, &memory, full),
+        (full, full + 2 * PAGE, text("rd wr mr mw me ac")),
+        "unlock-full"
+    );
+
+    let partial = room(&mut executor, &memory, 2);
+    mmap(&mut executor, &memory, partial, 2, RW, locked);
+    ok(unlock(&mut executor, partial, PAGE));
+    assert_eq!(
+        [partial, partial + PAGE].map(|at| flags_at(&executor, &memory, at)),
+        [
+            (partial, partial + PAGE, text("rd wr mr mw me ac")),
+            (
+                partial + PAGE,
+                partial + 2 * PAGE,
+                text("rd wr mr mw me lo ac")
+            ),
+        ],
+        "unlock-partial-first, unlock-partial-second"
+    );
+    // A length of one byte covers its whole page.
+    ok(unlock(&mut executor, partial + PAGE, 1));
+    assert_eq!(
+        flags_at(&executor, &memory, partial),
+        (partial, partial + 2 * PAGE, text("rd wr mr mw me ac")),
+        "unlock-partial-merged"
+    );
+
+    // Linux unlocks the mapping before the hole, fails with ENOMEM there and
+    // leaves the one after it locked. This backend's validation does not
+    // report the hole (`munlock_guest_range`, a known difference of its
+    // own), but unlocks what Linux unlocks.
+    let holed = room(&mut executor, &memory, 3);
+    mmap(&mut executor, &memory, holed, 1, RW, locked);
+    mmap(&mut executor, &memory, holed + 2 * PAGE, 1, RW, locked);
+    assert_eq!(unlock(&mut executor, holed, 3 * PAGE), 0);
+    assert_eq!(
+        [holed, holed + 2 * PAGE].map(|at| flags_at(&executor, &memory, at).2),
+        [text("rd wr mr mw me ac"), text("rd wr mr mw me lo ac")],
+        "unlock-hole-before, unlock-hole-after"
+    );
+    // A munlock that starts in a hole unlocks nothing.
+    let after = holed + 2 * PAGE;
+    assert_eq!(unlock(&mut executor, holed + PAGE, 2 * PAGE), 0);
+    assert_eq!(
+        flags_at(&executor, &memory, after).2,
+        text("rd wr mr mw me lo ac")
+    );
+
+    let all = room(&mut executor, &memory, 3);
+    mmap(&mut executor, &memory, all, 1, RW, locked);
+    mmap(&mut executor, &memory, all + 2 * PAGE, 1, R, locked);
+    ok(call(
+        &mut executor,
+        &memory,
+        libc::SYS_munlockall,
+        [0, 0, 0, 0, 0, 0],
+    ));
+    assert_eq!(
+        [all, all + 2 * PAGE, after].map(|at| flags_at(&executor, &memory, at).2),
+        [
+            text("rd wr mr mw me ac"),
+            text("rd mr mw me"),
+            text("rd wr mr mw me ac")
+        ],
+        "unlockall-rw, unlockall-r, and every other locked mapping"
+    );
+    assert_eq!(memory.flagged_pages(FLAG_LOCKED), 0);
+}
+
+/// Finding 2 witness (`rv1342-flags-probe.log`: seal-first, seal-second).
+#[test]
+fn reviewer_file_mapping_seal_snapshots_must_not_merge() {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let base = mmap(&mut executor, &memory, 0, 4, R, PRIVATE);
+    ok(call(
+        &mut executor,
+        &memory,
+        libc::SYS_munmap,
+        [base, 4 * PAGE, 0, 0, 0, 0],
+    ));
+    // The external owner may add a FUTURE_WRITE seal while the guest's
+    // original read-only shared mapping remains alive.
+    // SAFETY: a new memfd this test owns.
+    let raw = unsafe { libc::memfd_create(c"review-file-flags".as_ptr(), libc::MFD_ALLOW_SEALING) };
+    assert!(raw >= 0);
+    // SAFETY: memfd_create returned a new descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(raw) };
+    file.set_len(2 * PAGE).unwrap();
+    let fd = insert_file_with_flags(&mut executor.state, file.try_clone().unwrap(), false, None);
+    assert!(fd >= 0);
+    let map_file = |executor: &mut ElfExecutor, at: u64, offset: u64| {
+        let mut owner = memory.clone();
+        let result = execute_basic_syscall(
+            &mut owner,
+            &mut executor.state,
+            &SyscallRequest::new(
+                libc::SYS_mmap as u64,
+                [
+                    at,
+                    PAGE,
+                    R,
+                    (libc::MAP_SHARED | libc::MAP_FIXED) as u64,
+                    fd as u64,
+                    offset,
+                ],
+            ),
+        );
+        match result {
+            SyscallAction::Continue { result, .. } => assert_eq!(result, at as i64),
+            _ => panic!("mmap did not return Continue"),
+        }
+    };
+    map_file(&mut executor, base + PAGE, 0);
+    assert_eq!(
+        flags_at(&executor, &memory, base + PAGE),
+        (base + PAGE, base + 2 * PAGE, text("rd sh mr mw me ms")),
+    );
+    // SAFETY: fcntl on a descriptor this test owns.
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                file.as_raw_fd(),
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_FUTURE_WRITE,
+            )
+        },
+        0
+    );
+    map_file(&mut executor, base + 2 * PAGE, PAGE);
+    // Linux has two mappings: their VM_MAYWRITE bits differ, so they may
+    // not merge even though descriptor, protection and offsets agree.
+    assert_eq!(
+        [base + PAGE, base + 2 * PAGE].map(|at| flags_at(&executor, &memory, at)),
+        [
+            (base + PAGE, base + 2 * PAGE, text("rd sh mr mw me ms")),
+            (base + 2 * PAGE, base + 3 * PAGE, text("rd sh mr me ms")),
+        ],
+    );
+}
+
+/// Finding 2: the seal transition with the sealed mapping at the lower
+/// address keeps the two apart too (`fix1_probe.log`: seal-low-sealed,
+/// seal-low-unsealed); and a part whose facts are not known, beside a part
+/// whose are, in either order, leaves the line it joins with no flags,
+/// rather than the known part's.
+#[test]
+fn file_mappings_whose_captured_flags_differ_or_are_not_known_report_no_merged_flags() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    let (mut executor, memory) = loaded(&directory);
+    let shared = libc::MAP_SHARED as u64;
+
+    let low = room(&mut executor, &memory, 2);
+    let file = sealable_memfd(2);
+    let fd = insert_file_with_flags(&mut executor.state, file.try_clone().unwrap(), false, None);
+    map_fd(&mut executor, &memory, low + PAGE, 1, R, shared, fd, PAGE);
+    seal_future_writes(&file);
+    map_fd(&mut executor, &memory, low, 1, R, shared, fd, 0);
+    assert_eq!(
+        [low, low + PAGE].map(|at| flags_at(&executor, &memory, at)),
+        [
+            (low, low + PAGE, text("rd sh mr me ms")),
+            (low + PAGE, low + 2 * PAGE, text("rd sh mr mw me ms")),
+        ],
+        "seal-low-sealed, seal-low-unsealed"
+    );
+
+    // Two pages mapped alike are one line; then one of them has its facts
+    // made not known, as a capture that failed leaves them.
+    for unknown_page in [0, 1] {
+        let at = room(&mut executor, &memory, 2);
+        let file = sealable_memfd(2);
+        let fd =
+            insert_file_with_flags(&mut executor.state, file.try_clone().unwrap(), false, None);
+        map_fd(&mut executor, &memory, at, 1, R, shared, fd, 0);
+        map_fd(&mut executor, &memory, at + PAGE, 1, R, shared, fd, PAGE);
+        assert_eq!(
+            flags_at(&executor, &memory, at),
+            (at, at + 2 * PAGE, text("rd sh mr mw me ms")),
+            "one mapping, as on Linux (fix1_probe.log: no-seal-merged)"
+        );
+        let page = at + unknown_page * PAGE;
+        let guest = memory.user_range_to_guest(page, PAGE).unwrap();
+        let identity = memory.mapping_identities_in(guest, PAGE).remove(0);
+        let Some(super::mapping_list::MappedObject::File {
+            file,
+            raw_device,
+            raw_inode,
+            ..
+        }) = identity.downcast_ref::<super::mapping_list::MappedObject>()
+        else {
+            panic!("a file mapping's identity");
+        };
+        let unknown =
+            crate::memory::MappingIdentity::new(super::mapping_list::MappedObject::File {
+                file: file.clone(),
+                raw_device: *raw_device,
+                raw_inode: *raw_inode,
+                vm_facts: None,
+            });
+        memory.describe_mapping(guest, PAGE, None, 0, Some(unknown));
+        assert_eq!(
+            flags_at(&executor, &memory, at),
+            (at, at + 2 * PAGE, None),
+            "page {unknown_page} not known"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finding 1: the host's facts are captured as the run starts.
+
+/// A subscriber that counts the INFO events that log the host's mapping
+/// facts.
+struct HostFactsEvents(std::sync::Arc<AtomicU64>);
+
+impl tracing::Subscriber for HostFactsEvents {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        if *event.metadata().level() == tracing::Level::INFO
+            && message.0.starts_with("LinuxEmu host mapping facts")
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A run's life as these tests drive it: a mapping with `MAP_NORESERVE`, a
+/// guard, lists, a fork, the child's list, and the child's exec.
+fn drive_a_run(executor: &mut ElfExecutor, memory: &GuestMemory, directory: &Directory) {
+    let noreserve = mmap(
+        executor,
+        memory,
+        0,
+        1,
+        RW,
+        PRIVATE | libc::MAP_NORESERVE as u64,
+    );
+    let guarded = mmap(executor, memory, 0, 1, RW, PRIVATE);
+    ok(call(
+        executor,
+        memory,
+        libc::SYS_madvise,
+        [guarded, PAGE, mm::MADV_GUARD_INSTALL as u64, 0, 0, 0],
+    ));
+    line(executor, memory, noreserve);
+    let child_memory = memory.snapshot().unwrap();
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    let mut child = executor
+        .fork_child(executor.state.pid + 40, false, false)
+        .unwrap();
+    line(&child, &child_memory, guarded);
+    child.replace_after_exec(test_state(&directory.0)).unwrap();
+}
+
+/// The host's facts are read once, as the executor of the run's first task
+/// is made, before any syscall of the guest: loading reads none, and a
+/// change after that point reaches no mapping made or listed later, in the
+/// process, a fork child, or the image it executes.
+#[test]
+fn the_host_facts_are_captured_as_the_run_starts_and_kept_through_fork_and_exec() {
+    let directory = Directory::new();
+    // Linux 7.1.3 source: overcommit mode 2 ignores MAP_NORESERVE, and the
+    // mapping is charged (`do_mmap`, `mm/mmap.c`; as
+    // `map_noreserve_follows_the_hosts_overcommit_mode`); a host that
+    // prints no `gu` prints none for a guarded mapping.
+    let captured = HostVmFacts {
+        guard_flag_printed: Some(false),
+        overcommit_memory: Some(super::vm_flags::OVERCOMMIT_NEVER),
+    };
+    let mut memory = GuestMemory::new(0, 32 * 1024 * 1024).unwrap();
+    let mut state = crate::elf::load_static_elf(
+        &mut memory,
+        &crate::elf::minimal_test_elf(&[0xf4]),
+        &["vm-flags"],
+        &[],
+        &directory.0,
+    )
+    .unwrap();
+    state.children = ChildWaitContext::test_root();
+    assert_eq!(
+        state.host_vm_facts,
+        HostVmFacts::UNCAPTURED,
+        "loading reads none"
+    );
+    let mut executor = {
+        let _host = inject_host_vm_facts(captured);
+        ElfExecutor::new(state, false)
+    };
+    assert_eq!(executor.state.host_vm_facts, captured);
+    let _later = inject_host_vm_facts(HOST);
+    let noreserve = mmap(
+        &mut executor,
+        &memory,
+        0,
+        1,
+        RW,
+        PRIVATE | libc::MAP_NORESERVE as u64,
+    );
+    let guarded = mmap(&mut executor, &memory, 0, 1, RW, PRIVATE);
+    ok(call(
+        &mut executor,
+        &memory,
+        libc::SYS_madvise,
+        [guarded, PAGE, mm::MADV_GUARD_INSTALL as u64, 0, 0, 0],
+    ));
+    for at in [noreserve, guarded] {
+        assert_eq!(
+            flags_at(&executor, &memory, at).2,
+            text("rd wr mr mw me ac"),
+            "{at:#x}"
+        );
+    }
+    let child_memory = memory.snapshot().unwrap();
+    ElfExecutor::inherit_mappings_in_forked_child(&child_memory);
+    let mut child = executor
+        .fork_child(executor.state.pid + 40, false, false)
+        .unwrap();
+    assert_eq!(child.state.host_vm_facts, captured, "a fork keeps them");
+    assert_eq!(
+        flags_at(&child, &child_memory, guarded).2,
+        text("rd wr mr mw me ac")
+    );
+    child.replace_after_exec(test_state(&directory.0)).unwrap();
+    assert_eq!(child.state.host_vm_facts, captured, "an exec keeps them");
+}
+
+/// No list, mapping, fork or exec reads a host fact: the run read them all
+/// as its executor was made.
+#[test]
+fn no_list_or_mapping_reads_the_host_after_the_run_starts() {
+    let directory = Directory::new();
+    let before = super::vm_flags::host_fact_reads();
+    let (mut executor, memory) = loaded(&directory);
+    let read = super::vm_flags::host_fact_reads() - before;
+    assert_eq!(read, 2, "the guard probe and the overcommit mode");
+    drive_a_run(&mut executor, &memory, &directory);
+    assert_eq!(super::vm_flags::host_fact_reads() - before, read);
+}
+
+/// Each run logs its host facts at INFO once, under the subscriber current
+/// as the run starts, whatever else the run does, and a second run in the
+/// same process logs its own.
+#[test]
+fn each_run_logs_its_host_facts_once_under_its_own_subscriber() {
+    let _host = inject_host_vm_facts(HOST);
+    let directory = Directory::new();
+    for run in 0..2 {
+        let events = std::sync::Arc::new(AtomicU64::new(0));
+        tracing::subscriber::with_default(HostFactsEvents(events.clone()), || {
+            let (mut executor, memory) = loaded(&directory);
+            drive_a_run(&mut executor, &memory, &directory);
+        });
+        assert_eq!(events.load(Ordering::SeqCst), 1, "run {run}");
     }
 }

@@ -11,15 +11,15 @@
 //! (`reverie::MappingFact::vm_flags`): from the provider flags each page
 //! keeps (`DeclaredMapping::flags`, the `FLAG_*` constants of `mm`), the
 //! facts about a mapped file captured when the mapping was made
-//! ([`FileVmFacts`]), and two facts about the host kernel read once when the
-//! backend starts ([`HostVmFacts`]). No host state is read when a list is.
+//! ([`FileVmFacts`]), and two facts about the host kernel read once per run,
+//! before the guest's first instruction ([`HostVmFacts`]). No host state is
+//! read when a list is, or a mapping made.
 //!
 //! The answer is `None`, rather than a guess, wherever one of those does not
 //! establish every bit: see [`line_vm_flags`].
 
 use std::io::BufRead;
 use std::os::fd::AsRawFd;
-use std::sync::OnceLock;
 
 use reverie::VM_ACCOUNT;
 use reverie::VM_EXEC;
@@ -56,8 +56,8 @@ use super::mm::FLAG_SEQUENTIAL;
 use super::mm::FLAG_SYNC;
 
 /// Facts about the host kernel that decide flags Linux gives mappings, read
-/// once when the backend starts ([`host_vm_facts`]) and fixed for the run,
-/// so that no list reads the host. Each is `None` where it could not be
+/// once per run before the guest runs ([`HostVmFacts::capture_for_run`]) and
+/// fixed for the run, so that no list or mapping reads the host. Each is `None` where it could not be
 /// established, and a mapping whose flags depend on it then has none
 /// reported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,28 +79,33 @@ pub(crate) struct HostVmFacts {
 /// `OVERCOMMIT_NEVER` (`include/uapi/linux/mman.h`).
 pub(crate) const OVERCOMMIT_NEVER: u32 = 2;
 
-static HOST_VM_FACTS: OnceLock<HostVmFacts> = OnceLock::new();
-
 #[cfg(test)]
 std::thread_local! {
     /// A test's host facts for this thread, in place of the host's.
     static TEST_HOST_VM_FACTS: std::cell::Cell<Option<HostVmFacts>> =
         const { std::cell::Cell::new(None) };
+    /// How many times this thread read a host fact ([`overcommit_memory`],
+    /// [`guard_flag_printed`]), so a test can tell when they are read.
+    static HOST_FACT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The host's facts ([`HostVmFacts`]): read the first time they are asked
-/// for, which the executor does as it is made, before the guest runs, and
-/// logged then, once, at INFO; the same for the rest of the run.
-pub(crate) fn host_vm_facts() -> HostVmFacts {
-    #[cfg(test)]
-    if let Some(facts) = TEST_HOST_VM_FACTS.with(std::cell::Cell::get) {
-        return facts;
-    }
-    *HOST_VM_FACTS.get_or_init(|| {
-        let facts = HostVmFacts {
-            guard_flag_printed: guard_flag_printed(),
-            overcommit_memory: overcommit_memory(),
-        };
+impl HostVmFacts {
+    /// No fact established: what a process's state holds until its run
+    /// captures them ([`HostVmFacts::capture_for_run`]). A line whose flags
+    /// depend on one then has none reported; nothing is read lazily.
+    pub(crate) const UNCAPTURED: Self = Self {
+        guard_flag_printed: None,
+        overcommit_memory: None,
+    };
+
+    /// Reads the host's facts for a new run, and logs them at INFO, under
+    /// the caller's subscriber. The executor calls this once per run, as it
+    /// makes the run's first task (`ElfExecutor::with_output`), before the
+    /// guest's first instruction; forks and execs keep what it read
+    /// (`LoadedStaticElf::host_vm_facts`), and no list or mapping reads the
+    /// host.
+    pub(crate) fn capture_for_run() -> Self {
+        let facts = Self::read();
         tracing::info!(
             "LinuxEmu host mapping facts, fixed for the run: the kernel prints the guard \
              flag (gu): {:?}; vm.overcommit_memory: {:?}",
@@ -108,11 +113,22 @@ pub(crate) fn host_vm_facts() -> HostVmFacts {
             facts.overcommit_memory,
         );
         facts
-    })
+    }
+
+    fn read() -> Self {
+        #[cfg(test)]
+        if let Some(facts) = TEST_HOST_VM_FACTS.with(std::cell::Cell::get) {
+            return facts;
+        }
+        Self {
+            guard_flag_printed: guard_flag_printed(),
+            overcommit_memory: overcommit_memory(),
+        }
+    }
 }
 
-/// Makes [`host_vm_facts`] answer `facts` on this thread until the returned
-/// guard is dropped.
+/// Makes [`HostVmFacts::capture_for_run`] read `facts` on this thread, in
+/// place of the host's, until the returned guard is dropped.
 #[cfg(test)]
 pub(crate) fn inject_host_vm_facts(facts: HostVmFacts) -> impl Drop {
     struct Reset(Option<HostVmFacts>);
@@ -124,8 +140,23 @@ pub(crate) fn inject_host_vm_facts(facts: HostVmFacts) -> impl Drop {
     Reset(TEST_HOST_VM_FACTS.with(|cell| cell.replace(Some(facts))))
 }
 
+/// How many host facts this thread has read so far.
+#[cfg(test)]
+pub(crate) fn host_fact_reads() -> usize {
+    HOST_FACT_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn count_host_fact_read() {
+    HOST_FACT_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
+#[cfg(not(test))]
+fn count_host_fact_read() {}
+
 /// `vm.overcommit_memory`, if it reads as one of Linux's three modes.
 fn overcommit_memory() -> Option<u32> {
+    count_host_fact_read();
     std::fs::read_to_string("/proc/sys/vm/overcommit_memory")
         .ok()?
         .trim()
@@ -137,27 +168,34 @@ fn overcommit_memory() -> Option<u32> {
 /// Whether this host's kernel prints `gu` for a mapping with a guard: see
 /// [`HostVmFacts::guard_flag_printed`]. The guarded page is the middle one
 /// of three, between two inaccessible pages of the same mapping, so that its
-/// mapping merges with no other and the flag lands on nothing else.
+/// mapping merges with no other and the flag lands on nothing else. The
+/// mapping is made and removed by the system calls themselves, not libc's
+/// `mmap` and `munmap`: the probe runs inside a run (as its first task is
+/// made), where an allocator the backend's process interposes on those (a
+/// test's fault injector, a preloaded library) must not take the probe's
+/// mapping for one of the run's own.
 fn guard_flag_printed() -> Option<bool> {
+    count_host_fact_read();
     const PAGE: usize = 4096;
     struct Mapping(*mut libc::c_void);
     impl Drop for Mapping {
         fn drop(&mut self) {
             // SAFETY: the mapping is this function's own, three pages long.
-            unsafe { libc::munmap(self.0, 3 * PAGE) };
+            unsafe { libc::syscall(libc::SYS_munmap, self.0, 3 * PAGE) };
         }
     }
     // SAFETY: a new anonymous mapping at an address the kernel chooses.
     let address = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+        libc::syscall(
+            libc::SYS_mmap,
+            std::ptr::null_mut::<libc::c_void>(),
             3 * PAGE,
             libc::PROT_NONE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
             0,
         )
-    };
+    } as *mut libc::c_void;
     if address == libc::MAP_FAILED {
         return None;
     }
@@ -308,6 +346,55 @@ impl FileVmFacts {
     }
 }
 
+impl FileVmFacts {
+    /// The `vm_flags` these facts take from a mapping of the file whose
+    /// provider flags are `flags` and that is shared or not: `VM_SHARED`
+    /// and `VM_MAYWRITE` from a shared mapping of a description that may not
+    /// be written, `VM_MAYWRITE` from a shared mapping of a write-sealed
+    /// file, and `VM_MAYEXEC` on a `noexec` mount (`do_mmap`). `None` for a
+    /// `MAP_SYNC` mapping of a file whose filesystem refuses it, which Linux
+    /// never makes.
+    pub(crate) fn cleared_flags(&self, flags: u16, shared: bool) -> Option<u64> {
+        if flags & FLAG_SYNC != 0 && self.refuses_sync {
+            return None;
+        }
+        let mut cleared = 0;
+        if shared && !self.writable {
+            cleared |= VM_SHARED | VM_MAYWRITE;
+        }
+        if shared && self.write_sealed {
+            cleared |= VM_MAYWRITE;
+        }
+        if self.noexec {
+            cleared |= VM_MAYEXEC;
+        }
+        Some(cleared)
+    }
+}
+
+/// Whether two adjacent mappings of a file, otherwise one mapping (the same
+/// description at contiguous offsets, with the same protection, provider
+/// flags `flags`, and sharing `shared`), whose facts were captured as
+/// `first` and `second` when each was made, have flags known to differ:
+/// Linux merges no two mappings whose flags differ but for the sticky ones
+/// (`is_mergeable_vma` in `mm/vma.c`), and the facts of a file can change
+/// between two mmaps of it (an owner of the file may seal it). Facts that
+/// are not known do not keep the mappings apart; the merged line's facts
+/// are then not known either (`mapping_list`).
+pub(crate) fn file_flags_differ(
+    first: Option<&FileVmFacts>,
+    second: Option<&FileVmFacts>,
+    flags: u16,
+    shared: bool,
+) -> bool {
+    match (first, second) {
+        (Some(first), Some(second)) => {
+            first.cleared_flags(flags, shared) != second.cleared_flags(flags, shared)
+        }
+        _ => false,
+    }
+}
+
 /// What backs a line, as far as its flags go.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FlagBacking<'a> {
@@ -396,21 +483,7 @@ pub(crate) fn line_vm_flags(
     match backing {
         FlagBacking::Anonymous | FlagBacking::SharedAnonymous => {}
         FlagBacking::StackWindow => vm |= VM_GROWSDOWN | VM_ACCOUNT,
-        FlagBacking::File(facts) => {
-            let facts = facts?;
-            if flags & FLAG_SYNC != 0 && facts.refuses_sync {
-                return None;
-            }
-            if shared && !facts.writable {
-                vm &= !(VM_SHARED | VM_MAYWRITE);
-            }
-            if shared && facts.write_sealed {
-                vm &= !VM_MAYWRITE;
-            }
-            if facts.noexec {
-                vm &= !VM_MAYEXEC;
-            }
-        }
+        FlagBacking::File(facts) => vm &= !facts?.cleared_flags(flags, shared)?,
     }
     Some(vm)
 }

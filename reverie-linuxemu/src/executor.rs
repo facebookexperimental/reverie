@@ -567,6 +567,7 @@ pub fn native_loaded_state(cwd: &std::path::Path) -> LoadedStaticElf {
         synthetic_proc_nofollow_fds: std::collections::BTreeSet::new(),
         regular_create_directory_policy: initialize_regular_create_directory_policy()
             .expect("test KVM state requires a supported host open policy"),
+        host_vm_facts: vm_flags::HostVmFacts::UNCAPTURED,
         fdinfo_files: std::collections::BTreeMap::new(),
         fd_object_inodes: std::collections::BTreeMap::new(),
         file_identity_table: Arc::new(std::sync::Mutex::new(crate::elf::GuestFileIdentityTable {

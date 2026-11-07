@@ -705,11 +705,11 @@ impl ElfExecutor {
     /// mapping of the child is locked (`dup_mmap` clears `VM_LOCKED_MASK` on
     /// each copy, `mm/mmap.c`; `FLAG_LOCKED`), while every other flag is
     /// copied as it is. `dup_mmap` copies each mapping as a mapping of its
-    /// own and merges none, so a page that loses `FLAG_LOCKED` also gets the
-    /// lineage `UNLOCKED_IN_FORK_LINEAGE`, which no mapping beside it has
-    /// (a mapping outside the window has lineage zero), and its mapping
-    /// stays a line of its own rather than merge with a neighbour whose
-    /// flags it now has. Only `memory`, the child's copy, changes. A copy
+    /// own and merges none, so the pages of each mapping that loses
+    /// `FLAG_LOCKED` also get a lineage that neither mapping beside it has
+    /// (`unlocked_lineage`), and the mapping stays a line of its own rather
+    /// than merge with a neighbour whose flags it now has, in this fork and
+    /// in any later one. Only `memory`, the child's copy, changes. A copy
     /// that shares its parent's address space
     /// ([`GuestMemory::shares_parent_address_space`]) is left as it is: on
     /// Linux it is the parent's own address space, whose mappings stay
@@ -723,18 +723,54 @@ impl ElfExecutor {
             return;
         }
         // No locked mapping lies in the window, which no mapping can be
-        // placed in after load; this edit skips the window's pages.
-        memory.edit_user_declared(0, crate::memory::USER_ADDRESS_END, |declared, _| {
-            if declared.flags & super::FLAG_LOCKED == 0 {
-                declared
-            } else {
-                crate::memory::DeclaredMapping {
-                    flags: declared.flags & !super::FLAG_LOCKED,
-                    lineage: UNLOCKED_IN_FORK_LINEAGE,
-                    ..declared
-                }
+        // placed in after load; the edits skip the window's pages.
+        let runs = memory.user_mapping_runs().runs;
+        // The lineage of the run before the one at hand, as it is now, and
+        // where that run ends.
+        let mut before: Option<(u64, u16)> = None;
+        let mut index = 0;
+        while index < runs.len() {
+            let run = &runs[index];
+            let Some(declared) = run
+                .declared
+                .filter(|declared| declared.flags & super::FLAG_LOCKED != 0)
+            else {
+                before = run.declared.map(|declared| (run.end, declared.lineage));
+                index += 1;
+                continue;
+            };
+            // The locked mapping: the adjacent runs declared alike.
+            let mut end = run.end;
+            index += 1;
+            while let Some(next) = runs.get(index)
+                && next.start == end
+                && next.declared == Some(declared)
+            {
+                end = next.end;
+                index += 1;
             }
-        });
+            let lineage = unlocked_lineage(
+                before
+                    .filter(|(before_end, _)| *before_end == run.start)
+                    .map(|(_, lineage)| lineage),
+                runs.get(index)
+                    .filter(|next| next.start == end)
+                    .and_then(|next| next.declared)
+                    .map(|declared| declared.lineage),
+            );
+            memory.edit_user_declared(run.start, end - run.start, |declared, _| {
+                if declared.flags & super::FLAG_LOCKED == 0 {
+                    declared
+                } else {
+                    crate::memory::DeclaredMapping {
+                        flags: declared.flags & !super::FLAG_LOCKED,
+                        lineage,
+                        ..declared
+                    }
+                }
+            });
+            before = Some((end, lineage));
+        }
     }
 
     /// See [`ElfExecutor::keep_inherited_stack_mappings_apart`].
@@ -773,7 +809,6 @@ pub(super) fn stack_window_mappings(
         return Ok(None);
     }
     let mut mappings = Vec::new();
-    let host = super::vm_flags::host_vm_facts();
     for run in runs {
         let backing = if (run.start..=run.end).contains(&image.start_stack) {
             reverie::MappingBacking::Stack
@@ -788,7 +823,7 @@ pub(super) fn stack_window_mappings(
             false,
             super::vm_flags::FlagBacking::StackWindow,
             image.read_implies_exec,
-            host,
+            image.host,
         );
         let fact =
             reverie::MappingFact::new(run.start, run.end, u32::from(prot), false, 0, backing)?;
@@ -797,10 +832,20 @@ pub(super) fn stack_window_mappings(
     Ok(Some(mappings))
 }
 
-/// The lineage (`DeclaredMapping::lineage`) of a forked child's page whose
-/// mapping was locked in the parent
-/// ([`ElfExecutor::inherit_mappings_in_forked_child`]).
-pub(super) const UNLOCKED_IN_FORK_LINEAGE: u16 = 1;
+/// The lineage (`DeclaredMapping::lineage`) a forked child's mapping that
+/// was locked in the parent gets
+/// ([`ElfExecutor::inherit_mappings_in_forked_child`]), when the mapping
+/// just below it has lineage `below` and the one just above it `above`
+/// (`None`: no mapping is adjacent there): the least nonzero lineage that
+/// neither has, so that the child's mapping merges with neither, whatever
+/// lineages earlier forks left them (a mapping made since has lineage
+/// zero). The lineage of the mapping below is its new one where it was
+/// unlocked too.
+pub(super) fn unlocked_lineage(below: Option<u16>, above: Option<u16>) -> u16 {
+    (1..=3)
+        .find(|lineage| below != Some(*lineage) && above != Some(*lineage))
+        .expect("two neighbours leave one of three lineages free")
+}
 
 /// The stack window's mapping of `memory` that holds the page at user
 /// address `address`, as its list gives it, with the guard flag

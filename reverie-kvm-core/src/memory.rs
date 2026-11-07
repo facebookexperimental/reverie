@@ -1461,8 +1461,8 @@ pub struct DeclaredMapping {
     /// The provider's lineage, zero for a new mapping
     /// ([`GuestMemory::map_user_protection`]). LinuxEmu gives each mapping of
     /// the stack window that a forked child inherits one of its own, and
-    /// another to each page of a forked child whose mapping was locked in the
-    /// parent.
+    /// to each mapping of a forked child that was locked in the parent one
+    /// that neither neighbour has.
     pub lineage: u16,
 }
 
